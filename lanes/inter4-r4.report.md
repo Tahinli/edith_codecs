@@ -67,6 +67,40 @@ EVIDENCE: scratchpad/{ours.obmc,ref.obmc,ours.yuv.f0-5,ref.yuv.f0-5} | EC_OBMC +
 
 EVIDENCE: $HOME/.cache/inter4-g4.log | 64 aomenc encodes (32 attempts x 2 depths), every decoded frame Y/U/V vs ffmpeg | test result: ok. 1 passed; 0 failed; OBMC-on-rect-leaf blends 10 (8-bit) / 4 (10-bit), 0 mismatches
 
+## Verifier findings folded in (r4, after the OBMC commit)
+
+1. **`size_group_wh` was wrong for a 4-px side** (decode.rs ~9126): libaom
+   `size_group_lookup[BLOCK_SIZES_ALL]` (`common_data.h:60`) is **0** for
+   BLOCK_4X4/4X8/8X4/4X16/16X4, and our `0..=8 => 1` row gave those group 1 --
+   the `y_mode` / `interintra` / `interintra_mode` CDF row of every sub-8 leaf.
+   Fixed, and pinned by a new unit test `size_group_wh_matches_libaom_size_group_lookup`
+   that enumerates all 22 `BLOCK_SIZES_ALL` entries against the transcribed table
+   (class enumerate-the-table-domain).
+
+       cargo test -p ec-av1 --lib size_group_wh_matches -- --nocapture
+
+2. **rect var-tx SPLIT and the 10-bit coded rect TU are shipped unexercised.**
+   Swept cq {8,12,16,22} x both source axes x both depths with tx-size-search on,
+   reading `decode_probe`'s new `rect_inter: tu=.. txsplit=.. obmc_leaf=..` line:
+   `txsplit=0` in every single decoding attempt, and every 10-bit rect leaf is
+   `skip` (`tu=0`) at every cq that decodes at all. Below cq 22 the attempts stop
+   at another lane's refusal -- mostly `"a HORZ/VERT intra strip below 16x16 with
+   a split transform (per-unit rect prediction is not ported)"`, plus the sub-16
+   `HORZ_A/HORZ_B/VERT_A` and 32-level 1:4 ones. Deviation from the verifier's
+   ask, stated: I did NOT add an `#[ignore]`d pin -- an ignored test that runs
+   nothing carries the same information as the measurement now written into the
+   gate's own comment (stream.rs ~5097) and into the residue below, at less code.
+   The asserts stay where the feature does fire (8-bit `tu_total > 0`).
+
+3. `stream.rs` "aomenc keeps the last occurrence of a repeated `--enable-*` flag"
+   is CORRECT (class aomenc-first-flag-wins is about `--enable-*` repeats resolving
+   to the last one, and it is what the r4 obmc arm relies on) -- left unchanged.
+
+4. `cdf.rs` doc slip fixed: `EOB_PT_128_CHROMA_CLASS1_Q0` had lost its doc comment
+   to the `EOB_PT_128_LUMA_CLASS1_Q0` block added in r3; moved back.
+
+EVIDENCE: sweep output in this round's transcript | 16 aomenc encodes (cq 8/12/16/22 x 2 axes x 8/10-bit) decoded through release decode_probe | txsplit=0 in all 7 decoding attempts, 10-bit tu=0 in all 4, 8-bit cq22 tu=1 txsplit=0 obmc_leaf=1
+
 ## Refusals
 
 Lifted: `"OBMC on a 16x8/8x16 inter leaf (blend mismatches the reference on this shape)"`.
@@ -94,5 +128,8 @@ EVIDENCE: scratchpad/hg-head.obu | release decode_probe under a 6G scope | REFUS
 - accepted: which change fixed r3's OBMC mismatch is not bisected (interbis merge is the
   only candidate); the shape is now proven exact against an instrumented aomdec, so the
   question is archaeology, not a defect.
+- deferred: the rect var-tx SPLIT path and a coded 10-bit rect TU are unexercised --
+  unblocked by the sub-16 intra-rect-strip refusal landing (every lower-cq attempt
+  stops there before a rect inter leaf can carry a split tree).
 - accepted: `16x16 SPLITs=0` under this recipe (aomenc picks NONE/HORZ/VERT at 16);
   covered by the 8x8-leaf sibling gate.

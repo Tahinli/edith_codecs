@@ -9124,10 +9124,30 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> TxbSet {
 /// square `side` corner-cut: 8x8/8x16/16x8 -> 1, 16x16/16x32/32x16 -> 2,
 /// everything 32 and above -> 3.
 fn size_group_wh(w: usize, h: usize) -> usize {
+    // lane-inter4 r4: `size_group_lookup[BLOCK_SIZES_ALL]` (libaom
+    // `common_data.h:60`) is 0 for every block with a 4-px side
+    // (4x4/4x8/8x4/4x16/16x4), 1 for min side 8, 2 for 16, 3 above -- the old
+    // `0..=8 => 1` row gave a sub-8 leaf group 1 where libaom says 0.
     match w.min(h) {
-        0..=8 => 1,
+        0..=4 => 0,
+        8 => 1,
         16 => 2,
         _ => 3,
+    }
+}
+
+#[test]
+fn size_group_wh_matches_libaom_size_group_lookup() {
+    // `BLOCK_SIZES_ALL` in libaom's own order, with `size_group_lookup`'s
+    // transcribed values (common_data.h:60-62).
+    const TABLE: [((usize, usize), usize); 22] = [
+        ((4, 4), 0), ((4, 8), 0), ((8, 4), 0), ((8, 8), 1), ((8, 16), 1), ((16, 8), 1),
+        ((16, 16), 2), ((16, 32), 2), ((32, 16), 2), ((32, 32), 3), ((32, 64), 3),
+        ((64, 32), 3), ((64, 64), 3), ((64, 128), 3), ((128, 64), 3), ((128, 128), 3),
+        ((4, 16), 0), ((16, 4), 0), ((8, 32), 1), ((32, 8), 1), ((16, 64), 2), ((64, 16), 2),
+    ];
+    for ((w, h), want) in TABLE {
+        assert_eq!(size_group_wh(w, h), want, "size_group_wh({w}, {h})");
     }
 }
 
