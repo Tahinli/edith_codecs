@@ -2389,6 +2389,19 @@ pub(crate) fn intra_rect_in_inter_split_tx_hits() -> [usize; 3] {
     INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
 
+// lane-midcut r2: rect intra blocks inside an inter frame whose `tx_depth` CDF
+// ROW moved when libaom's inter-neighbour override was applied -- i.e. exactly
+// the blocks the key frame's deblock-grid approximation used to mis-read.
+thread_local! {
+    static INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS`].
+pub(crate) fn intra_rect_in_inter_txctx_override_hits() -> usize {
+    INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS.with(std::cell::Cell::get)
+}
+
 // lane-intra14 r1: how many intra-coded 1:4 strips decoded on the INTER
 // block path, per shape -- [0] 64x16, [1] 16x64, [2] 32x8, [3] 8x32. Every
 // one of them was the named refusal "an intra-coded 1:4 (or other non-2:1)
@@ -6747,7 +6760,20 @@ fn tx_size_context_rect(
     // var-tx tree had split (measured: a 32x8 intra strip at mi(118,280) of
     // the 10-bit 3840x1608 stream read ctx 1 where aomdec reads ctx 2).
     if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
-        return tx_size_context_txfm_rect(n, (mi_r, mi_c), own_w, own_h);
+        let ctx = tx_size_context_txfm_rect(n, (mi_r, mi_c), own_w, own_h);
+        // Count only the blocks the deblock-grid approximation got WRONG, so a
+        // gate asserting this counter proves the override changed a CDF row
+        // (class gate-blind-to-feature: a plain "rect intra in inter" tally is
+        // green on the buggy code too).
+        let stale = usize::from(
+            mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w,
+        ) + usize::from(
+            mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h,
+        );
+        if ctx != stale {
+            INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
+        return ctx;
     }
     let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
     let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
