@@ -5401,14 +5401,14 @@ impl Neighbours {
                 left_coded |= left.level != 0;
                 vote += dc_vote(left.dc);
             }
-            if plane == 0 && std::env::var_os("EC_DCDUMP").is_some() {
+            if std::env::var_os("EC_DCDUMP").is_some() {
                 let ab: Vec<String> = (0..w_mi)
-                    .map(|k| format!("{:?}/{}", self.above[mi_c + k][0].dc, self.above[mi_c + k][0].level))
+                    .map(|k| format!("{:?}/{}", self.above[mi_c + k][plane].dc, self.above[mi_c + k][plane].level))
                     .collect();
                 let lf: Vec<String> = (0..h_mi)
-                    .map(|k| format!("{:?}/{}", self.left[mi_r + k][0].dc, self.left[mi_r + k][0].level))
+                    .map(|k| format!("{:?}/{}", self.left[mi_r + k][plane].dc, self.left[mi_r + k][plane].level))
                     .collect();
-                eprintln!("EC_DCDUMP mi=({mi_r},{mi_c}) wh=({w},{h}) vote={vote} above=[{}] left=[{}]", ab.join(","), lf.join(","));
+                eprintln!("EC_DCDUMP mi=({mi_r},{mi_c}) plane={plane} wh=({w},{h}) vote={vote} above=[{}] left=[{}]", ab.join(","), lf.join(","));
             }
             (above_coded, left_coded, vote)
         })
@@ -22928,6 +22928,28 @@ fn decode_inter_block(
     } else {
         Vec::new()
     };
+    // libaom `av1_reset_entropy_context` / `av1_set_entropy_contexts`:
+    // `nplanes = 1 + (num_planes - 1) * xd->is_chroma_ref` -- a block that is
+    // NOT the chroma reference of its 4:2:0 pair codes no chroma transform at
+    // all, so it leaves its neighbours' CHROMA coefficient contexts exactly as
+    // it found them. `record_rect_mi`/`record_split_luma_rect_mi` below write
+    // all three planes unconditionally, and for such a strip the chroma grids
+    // are all-zero (see the `!has_chroma` arm above) -- that wiped the real
+    // left-neighbour chroma state, so the PAIR's own `all_zero` then read
+    // `txb_skip_ctx` one row low (lane-t900 r3, 10-bit 1920x792 stream,
+    // mi(40,220): base 1 where libaom gathers 2). Snapshot and restore is
+    // equivalent to not writing them, without threading a flag through both
+    // recorders.
+    let saved_chroma_ctx = (!has_chroma).then(|| {
+        let (w_mi, h_mi) = (write_w / MI, write_h / MI);
+        let left: Vec<[Neighbour; 2]> = (0..h_mi)
+            .filter_map(|k| neighbours.left.get(at.0 + k).map(|s| [s[1], s[2]]))
+            .collect();
+        let above: Vec<[Neighbour; 2]> = (0..w_mi)
+            .filter_map(|k| neighbours.above.get(at.1 + k).map(|s| [s[1], s[2]]))
+            .collect();
+        (left, above)
+    });
     if vartx_leaves.is_some() {
         // Plane 0 is already correct per transform unit
         // ([`Neighbours::record_mi_luma`] above); this writes everything else
@@ -22960,6 +22982,20 @@ fn decode_inter_block(
             uv_predict_mode,
             &[luma_grid, u_grid, v_grid],
         );
+    }
+    if let Some((left, above)) = saved_chroma_ctx {
+        for (k, v) in left.into_iter().enumerate() {
+            if let Some(slot) = neighbours.left.get_mut(at.0 + k) {
+                slot[1] = v[0];
+                slot[2] = v[1];
+            }
+        }
+        for (k, v) in above.into_iter().enumerate() {
+            if let Some(slot) = neighbours.above.get_mut(at.1 + k) {
+                slot[1] = v[0];
+                slot[2] = v[1];
+            }
+        }
     }
     if let Some((s, u_state, v_state)) = pair_chroma {
         let (pw, ph) = if s.horz { (16usize, 8usize) } else { (8, 16) };
