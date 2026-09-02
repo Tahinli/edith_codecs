@@ -631,6 +631,26 @@ fn scan_col(
     found
 }
 
+/// The half of libaom's `has_top_right` (mvref_common.c:264) that
+/// `setup_ref_mv_list` (mvref_common.c:497/546) gates the top-right mv probe on
+/// and that this crate can state exactly: `if (bs > mi_size_wide[BLOCK_64X64])
+/// return 0`. A 128x128 / 128x64 / 64x128 block has NO top-right candidate even
+/// though the cell diagonally above-right of it sits in decoded memory -- an
+/// ungated grid probe invented `(441,441) w=644` at `mi(32,0)` and desynced the
+/// drl symbols of the 128 inter gate (lane-sb128c r5).
+///
+/// corner-cut: the position-mask half of `has_top_right` is deliberately NOT
+/// applied here. It needs libaom's three shape refinements
+/// (`is_last_vertical_rect`, `is_first_horizontal_rect`, the `PARTITION_VERT_A`
+/// bottom-left square) which [`has_top_right`] does not port; applying the mask
+/// without them cost the 64-level AB, free-partition and 1:4 gates frame 16
+/// (measured lane-sb128c r6). Ceiling: a sub-128 block may still probe a
+/// top-right libaom would not, exactly as main does today; upgrade path = port
+/// the three refinements into [`has_top_right`] and gate on it whole.
+fn top_right_scan_allowed(bw4: usize, bh4: usize) -> bool {
+    bw4.max(bh4) <= 16
+}
+
 /// libaom `has_top_right` (mvref_common.c:264): whether the unit diagonally
 /// above-right of this block has been decoded *by the superblock's own
 /// recursion order*. The mask is `sb_size`-relative, so at a 128x128
@@ -875,7 +895,12 @@ pub fn find_mv_stack_with_sign_bias(
             &mut newmv_count,
             &mut processed_cols,
         );
-    let found_top_right = scan_top_right(
+    // libaom `setup_ref_mv_list` gates this probe on `has_top_right`
+    // (mvref_common.c:497/546): the diagonally-above-right unit of a 128x128
+    // block sits in decoded memory but is NOT available (bs > 16), so an
+    // ungated grid probe invents a candidate and desyncs the drl symbols.
+    let found_top_right = top_right_scan_allowed(bw4, bh4)
+        && scan_top_right(
             grid,
             mi_row,
             mi_col,
@@ -1668,7 +1693,12 @@ pub fn find_mv_stack_compound(
             &mut newmv_count,
             &mut processed_cols,
         );
-    let found_top_right = scan_top_right_compound(
+    // libaom `setup_ref_mv_list` gates this probe on `has_top_right`
+    // (mvref_common.c:497/546): the diagonally-above-right unit of a 128x128
+    // block sits in decoded memory but is NOT available (bs > 16), so an
+    // ungated grid probe invents a candidate and desyncs the drl symbols.
+    let found_top_right = top_right_scan_allowed(bw4, bh4)
+        && scan_top_right_compound(
             grid,
             mi_row,
             mi_col,
