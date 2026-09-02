@@ -16965,6 +16965,184 @@ mod tests {
         );
     }
 
+    /// lane-cdefstrip r1: the CDEF skip band under SKIPPED rectangular inter
+    /// strips (32x8 / 8x32 / 64x16 / 16x64 / 32x64 / 64x32, the rect and 1:4
+    /// arms), the sibling of the 8x8-leaf case lane-cdef fixed.
+    ///
+    /// A fresh `Neighbours` seeds `skip_grid` all-`false` ("not skip"), so any
+    /// decode arm that resolves `skip` and forgets `fill_skip_grid_rect` makes
+    /// `apply_cdef` FILTER an 8x8 unit libaom's `is_8x8_block_skip`
+    /// (`cdef.c:29-38`, `av1_cdef_compute_sb_list`'s dlist test) excludes --
+    /// a +-1 band that no entropy or prediction check can see.
+    /// `decode::cdef_unwritten_skip_units` is the direct instrument for that
+    /// class: it counts 8x8 CDEF units none of whose four mi cells any coded
+    /// block wrote this frame, and this gate hard-asserts it stays 0 while
+    /// `decode::rect_skip_band_hits` proves skipped rect strips really ran.
+    ///
+    /// MEASURED (lane-cdefstrip r1, 177 real aomenc streams incl. every arm
+    /// below): the count is already 0 everywhere -- the charter's premise that
+    /// the rect strip arms never write the band is FALSE. This gate is the
+    /// regression fence for it, not a fix.
+    #[test]
+    fn a_real_aomenc_stream_with_skipped_rect_inter_strips_keeps_the_cdef_skip_band() {
+        if !have_aomenc() {
+            return;
+        }
+        let (width, height, frames) = (192usize, 128usize, 6usize);
+        let mut refusals: Vec<String> = Vec::new();
+        let mut fired = 0u32;
+        // (depth, cq, source): the arms measured pixel-exact end to end in the
+        // r1 sweep (~/.cache/cdefstrip-tmp/sw.sh). Source `b` is the two-axis
+        // moving sinusoid that makes aomenc pick 16x64/32x64/8x32 strips at
+        // low cq and 32x8/64x16 at high cq; `a` is lane-inter16ab's source.
+        let src_b = "120+55*sin((X+N*4)/7)+40*sin((Y-N*2)/11)";
+        let src_a = "128+60*sin((Y+N*3)/5)+30*sin(X/23)";
+        for (depth, cq, lum) in [
+            (8u32, 18u32, src_b),
+            (8, 45, src_b),
+            (10, 18, src_b),
+            (10, 24, src_b),
+            (10, 24, src_a),
+            (8, 24, src_a),
+        ] {
+            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let src = format!(
+                "color=c=gray:s={width}x{height}:d=0.24:r=25,format=gray,\
+                 geq=lum='{lum}',format=yuv420p"
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &src, "-t", "0.24", "-pix_fmt", pix,
+                    "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &format!("--cq-level={cq}"),
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &format!("--bit-depth={depth}"),
+                    &format!("--input-bit-depth={depth}"),
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=9999",
+                    "--tile-columns=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-ab-partitions=0",
+                    "--min-partition-size=8",
+                    "--max-partition-size=64",
+                    // Last occurrence wins (aomenc-last-flag-wins): the three
+                    // flags this gate is about stay last.
+                    "--enable-rect-partitions=1",
+                    "--enable-1to4-partitions=1",
+                    "--enable-cdef=1",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture (depth={depth} cq={cq})"
+            );
+            let stream = out.stdout;
+            let unwritten_before = decode::cdef_unwritten_skip_units();
+            let rect_skip_before = decode::rect_skip_band_hits();
+            let skipped_before = decode::cdef_skipped_units();
+            let decoded = match decode_stream(&stream) {
+                Ok(f) => f,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.starts_with("unsupported: "),
+                        "decode error that is not a named refusal \
+                         (depth={depth} cq={cq}): {msg}"
+                    );
+                    refusals.push(format!("depth={depth} cq={cq}: {msg}"));
+                    continue;
+                }
+            };
+            assert_eq!(decoded.len(), frames, "frame count (depth={depth} cq={cq})");
+            assert_eq!(
+                decode::cdef_unwritten_skip_units(),
+                unwritten_before,
+                "an 8x8 CDEF unit was judged from an UNWRITTEN skip band \
+                 (a decode arm resolved `skip` without `fill_skip_grid_rect`) \
+                 (depth={depth} cq={cq})"
+            );
+            let reference = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames)
+            };
+            for (i, (ours, theirs)) in decoded.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(ours.y, theirs.y, "luma frame {i} (depth={depth} cq={cq})");
+                assert_eq!(ours.u, theirs.u, "U frame {i} (depth={depth} cq={cq})");
+                assert_eq!(ours.v, theirs.v, "V frame {i} (depth={depth} cq={cq})");
+            }
+            // Pixels are asserted for EVERY decoded attempt above; an attempt
+            // counts as FIRING only if this stream really exercised the class
+            // (a skipped rect strip wrote the band AND CDEF consulted it via
+            // the all-skip exclusion). aomenc picking no skipped strip at a
+            // given cq is a non-firing attempt, never a weakened assert.
+            let rect_skips = decode::rect_skip_band_hits() - rect_skip_before;
+            let excluded = decode::cdef_skipped_units() - skipped_before;
+            if rect_skips == 0 || excluded == 0 {
+                refusals.push(format!(
+                    "depth={depth} cq={cq}: exact but did not fire \
+                     (skipped rect strips {rect_skips}, excluded 8x8 units {excluded})"
+                ));
+                continue;
+            }
+            fired += 1;
+        }
+        eprintln!(
+            "a_real_aomenc_stream_with_skipped_rect_inter_strips_keeps_the_cdef_skip_band: \
+             {fired} firing+exact attempts, unwritten skip-band units {}, \
+             skipped rect strips {}, 8x8 units excluded {}\n{}",
+            decode::cdef_unwritten_skip_units(),
+            decode::rect_skip_band_hits(),
+            decode::cdef_skipped_units(),
+            refusals.join("\n")
+        );
+        assert!(
+            fired >= 3,
+            "fewer than 3 firing+pixel-exact attempts:\n{}",
+            refusals.join("\n")
+        );
+    }
+
     /// lane-sub8 r1: `--min-partition-size=4` on fine-detail noisy gradients
     /// at low cq reliably makes aomenc split an 8x8 block all the way to
     /// four `BLOCK_4X4` leaves (`PARTITION_SPLIT` below 8x8, spec
