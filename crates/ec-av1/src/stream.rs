@@ -8435,15 +8435,7 @@ mod tests {
                     // and covered by the square filter-intra gate instead.
                     "--enable-filter-intra=0",
                     "--reduced-tx-type-set=1",
-                    // 32, not the charter's 8: at 8 and at 16 the sub-16 AB
-                    // and split-transform strip arms (still refused by name in
-                    // this decoder) fire before the 32-level edge is reached
-                    // and EVERY attempt refuses (measured, both settings). At
-                    // 32 the 32-level edge block cannot split, so aomenc is
-                    // forced onto the gathered edge bit's HORZ/VERT -- exactly
-                    // the arm this round guards.
-                    "--min-partition-size=32",
-                    "--tune-content=film",
+                    "--min-partition-size=8",
                     "--max-partition-size=32",
                     "--obu",
                     "-o",
