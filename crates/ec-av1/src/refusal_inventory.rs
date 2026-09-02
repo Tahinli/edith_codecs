@@ -32,15 +32,13 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
-    "a coded 1:4 HORZ_4/VERT_4 strip whose transform splits only once (the unit is still a 2:1 rect, not a square)",
-    "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect prediction is not ported)",
+    "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "a 1:4 partition below 16x16 (PARTITION_HORZ_4/VERT_4, four 16x4/4x16 strips -- this decoder codes NONE, HORZ, VERT, the four AB arms and a clean split at 16x16)",
     "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
-    "a 32x32-level 1:4 strip with a split transform (per-unit 4:1 prediction is not ported, depth={depth})",
     "a Golomb tail longer than this decoder reads",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
