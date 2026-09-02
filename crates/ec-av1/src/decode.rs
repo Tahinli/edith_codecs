@@ -18399,7 +18399,7 @@ fn decode_inter_block(
             }
 
             let mut inter0_y = vec![0i32; side * side];
-            mc::predict_compound_intermediate(
+            mc::predict_compound_intermediate_kern(
                 &py0.data,
                 py0.width,
                 py0.true_width,
@@ -18409,6 +18409,8 @@ fn decode_inter_block(
                 scale0,
                 side,
                 side,
+                write_w,
+                write_h,
                 h_filter,
                 v_filter,
                 &mut inter0_y,
@@ -18424,7 +18426,7 @@ fn decode_inter_block(
                 );
             }
             let mut inter1_y = vec![0i32; side * side];
-            mc::predict_compound_intermediate(
+            mc::predict_compound_intermediate_kern(
                 &py1.data,
                 py1.width,
                 py1.true_width,
@@ -18434,6 +18436,8 @@ fn decode_inter_block(
                 scale1,
                 side,
                 side,
+                write_w,
+                write_h,
                 h_filter,
                 v_filter,
                 &mut inter1_y,
@@ -18471,7 +18475,7 @@ fn decode_inter_block(
             }
 
             let mut inter0_u = vec![0i32; chroma_side * chroma_side];
-            mc::predict_compound_intermediate(
+            mc::predict_compound_intermediate_kern(
                 &pu0.data,
                 pu0.width,
                 pu0.true_width,
@@ -18481,6 +18485,8 @@ fn decode_inter_block(
                 scale0,
                 chroma_side,
                 chroma_side,
+                write_chroma_w,
+                write_chroma_h,
                 h_filter,
                 v_filter,
                 &mut inter0_u,
@@ -18498,7 +18504,7 @@ fn decode_inter_block(
                 }
             }
             let mut inter1_u = vec![0i32; chroma_side * chroma_side];
-            mc::predict_compound_intermediate(
+            mc::predict_compound_intermediate_kern(
                 &pu1.data,
                 pu1.width,
                 pu1.true_width,
@@ -18508,6 +18514,8 @@ fn decode_inter_block(
                 scale1,
                 chroma_side,
                 chroma_side,
+                write_chroma_w,
+                write_chroma_h,
                 h_filter,
                 v_filter,
                 &mut inter1_u,
@@ -18541,7 +18549,7 @@ fn decode_inter_block(
             }
 
             let mut inter0_v = vec![0i32; chroma_side * chroma_side];
-            mc::predict_compound_intermediate(
+            mc::predict_compound_intermediate_kern(
                 &pv0.data,
                 pv0.width,
                 pv0.true_width,
@@ -18551,6 +18559,8 @@ fn decode_inter_block(
                 scale0,
                 chroma_side,
                 chroma_side,
+                write_chroma_w,
+                write_chroma_h,
                 h_filter,
                 v_filter,
                 &mut inter0_v,
@@ -18568,7 +18578,7 @@ fn decode_inter_block(
                 }
             }
             let mut inter1_v = vec![0i32; chroma_side * chroma_side];
-            mc::predict_compound_intermediate(
+            mc::predict_compound_intermediate_kern(
                 &pv1.data,
                 pv1.width,
                 pv1.true_width,
@@ -18578,6 +18588,8 @@ fn decode_inter_block(
                 scale1,
                 chroma_side,
                 chroma_side,
+                write_chroma_w,
+                write_chroma_h,
                 h_filter,
                 v_filter,
                 &mut inter1_v,
@@ -19489,7 +19501,7 @@ fn decode_inter_block(
             let mut pred_u = vec![0u16; chroma_side * chroma_side];
             let mut pred_v = vec![0u16; chroma_side * chroma_side];
             if luma_scale == mc::REF_NO_SCALE {
-                mc::predict_with_filters(
+                mc::predict_with_filters_kern(
                     &py_ref.data,
                     py_ref.width,
                     py_ref.true_width,
@@ -19498,11 +19510,13 @@ fn decode_inter_block(
                     mv_to_q4(py, mv.0, true),
                     side,
                     side,
+                    write_w,
+                    write_h,
                     h_filter,
                     v_filter,
                     &mut pred_y,
                 );
-                mc::predict_with_filters(
+                mc::predict_with_filters_kern(
                     &pu_ref.data,
                     pu_ref.width,
                     pu_ref.true_width,
@@ -19511,11 +19525,13 @@ fn decode_inter_block(
                     mv_to_q4(cpy, mv.0, false),
                     chroma_side,
                     chroma_side,
+                    write_chroma_w,
+                    write_chroma_h,
                     h_filter,
                     v_filter,
                     &mut pred_u,
                 );
-                mc::predict_with_filters(
+                mc::predict_with_filters_kern(
                     &pv_ref.data,
                     pv_ref.width,
                     pv_ref.true_width,
@@ -19524,12 +19540,14 @@ fn decode_inter_block(
                     mv_to_q4(cpy, mv.0, false),
                     chroma_side,
                     chroma_side,
+                    write_chroma_w,
+                    write_chroma_h,
                     h_filter,
                     v_filter,
                     &mut pred_v,
                 );
             } else {
-                mc::predict_scaled(
+                mc::predict_scaled_kern(
                     &py_ref.data,
                     py_ref.width,
                     py_ref.true_width,
@@ -19539,11 +19557,13 @@ fn decode_inter_block(
                     luma_scale,
                     side,
                     side,
+                    write_w,
+                    write_h,
                     h_filter,
                     v_filter,
                     &mut pred_y,
                 );
-                mc::predict_scaled(
+                mc::predict_scaled_kern(
                     &pu_ref.data,
                     pu_ref.width,
                     pu_ref.true_width,
@@ -19553,11 +19573,13 @@ fn decode_inter_block(
                     luma_scale,
                     chroma_side,
                     chroma_side,
+                    write_chroma_w,
+                    write_chroma_h,
                     h_filter,
                     v_filter,
                     &mut pred_u,
                 );
-                mc::predict_scaled(
+                mc::predict_scaled_kern(
                     &pv_ref.data,
                     pv_ref.width,
                     pv_ref.true_width,
@@ -19567,6 +19589,8 @@ fn decode_inter_block(
                     luma_scale,
                     chroma_side,
                     chroma_side,
+                    write_chroma_w,
+                    write_chroma_h,
                     h_filter,
                     v_filter,
                     &mut pred_v,
