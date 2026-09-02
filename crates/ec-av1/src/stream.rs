@@ -10113,6 +10113,206 @@ mod tests {
         );
     }
 
+    /// lane-sub8 r1: `--min-partition-size=4` on fine-detail noisy gradients
+    /// at low cq reliably makes aomenc split an 8x8 block all the way to
+    /// four `BLOCK_4X4` leaves (`PARTITION_SPLIT` below 8x8, spec
+    /// `decode_partition`'s recursion bottom) -- confirmed with
+    /// `EC_AV1_TRACE=1` against `examples/decode_probe` before this gate was
+    /// written (`partition_w8 ... value=3` at mi=(0,0) on the very first
+    /// block). [`decode::sub8_split_hits`] hard-asserts the path actually
+    /// ran rather than every attempt landing on `PARTITION_NONE`.
+    #[test]
+    fn a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            let msg = format!(
+                "no aomenc at {}",
+                aomenc_path().display()
+            );
+            assert!(
+                std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+                "EC_AV1_REQUIRE_AOMENC is set but {msg}"
+            );
+            eprintln!("SKIP a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact: {msg}");
+            return;
+        }
+        // round 2: `--enable-rect-partitions=0` was added below to keep
+        // aomenc off HORZ/VERT-below-8x8 elsewhere in the same tile, but it
+        // is NOT sufficient alone -- see the round-2 report
+        // (lanes/sub8-r1.report.md) for the live finding: 0/160 attempts
+        // across both 64x64 and a spatially-isolated single-16x16-leaf
+        // fixture passed, and every SPLIT that fires is immediately
+        // followed by a spurious HORZ/VERT read on the very next sibling
+        // 8x8 leaf, which reads as a real desync left behind by
+        // `decode_leaf_split4`/`read_intra_mode_sub8`, not an encoder
+        // choice this recipe can dodge. Tried and rejected: shrinking the
+        // frame to 16x16 (single 16x16 leaf, at most 4 candidate 8x8s) --
+        // that surfaces an UNRELATED pre-existing tiny-frame edge-straddle
+        // defect (reproduces with zero sub8 code involved, `--min-partition
+        // -size`/`--max-partition-size` absent entirely), so it is not a
+        // safe way to isolate the leaf count. Left red; do not "fix" this
+        // gate by picking fixture parameters that dodge the desync without
+        // finding it.
+        // lane-sub8 r6: three arms. The mi-granular mode maps
+        // (`sub8_mode_col`/`uv_mode_col` and their row twins) are per TILE --
+        // the verifier's repro was a 128x64 `--tile-columns=1` stream (seeds
+        // 207/228) whose every mismatching luma pixel sat at x>=64, the tile
+        // boundary -- so one arm per tile axis is part of this gate.
+        for (width, height, tile_args) in [
+            (64usize, 64usize, &[][..]),
+            (128usize, 64usize, &["--tile-columns=1"][..]),
+            (64usize, 128usize, &["--tile-rows=1"][..]),
+        ] {
+        let mut refusals = Vec::new();
+        let mut fired_runs = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 100 + attempt;
+            let cq = 6 + (attempt % 4) * 2;
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &gradients_source(seed, width, height, "rate=25"),
+                    "-vf",
+                    // `noise` without `all_seed` re-renders differently on
+                    // every run (seeded-fixture-not-reproducible); pinning it
+                    // makes (seed, cq) name one exact stream.
+                    &format!("noise=alls=40:allf=t:all_seed={seed},format=yuv420p"),
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &format!("--cq-level={cq}"),
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    "--min-partition-size=4",
+                    "--max-partition-size=8",
+                    // Below 8x8 only PARTITION_NONE/SPLIT are decodable (HORZ/VERT
+                    // need a real rectangular transform, see the module doc above);
+                    // disabling rect partitions entirely -- not just AB -- keeps
+                    // aomenc from picking the still-refused HORZ/VERT arms almost
+                    // every attempt (round 2 measured ~90% HORZ/VERT-below-8x8
+                    // refusals with --enable-ab-partitions=0 alone).
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-restoration=0",
+                    "--enable-cdef=0",
+                    "--loopfilter-control=0",
+                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in
+                    // mvstack; this is a key-frame-only fixture, but keep it off for
+                    // safety against a run that emits a second frame.
+                    "--enable-ref-frame-mvs=0",
+                    "--limit=1",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .args(tile_args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            if !out.status.success() {
+                refusals.push(format!(
+                    "seed={seed} cq={cq}: aomenc itself refused the fixture"
+                ));
+                continue;
+            }
+            let stream = out.stdout;
+            let before = decode::sub8_split_hits();
+            let tiles_before = decode::tile_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    // Only a named refusal ("unsupported: ...") is a skip
+                    // reason; any other decode error is this decoder failing.
+                    let msg = e.to_string();
+                    assert!(
+                        msg.starts_with("unsupported: "),
+                        "decode error that is not a named refusal \
+                         (seed={seed} cq={cq} tiles={tile_args:?}): {msg}"
+                    );
+                    refusals.push(format!("seed={seed} cq={cq}: {msg}"));
+                    continue;
+                }
+            };
+            // gate-blind-to-feature: a tile arm must actually decode more
+            // than one tile, not merely carry `tile_info.cols > 1`.
+            assert!(
+                tile_args.is_empty() || decode::tile_hits() - tiles_before >= 2,
+                "tiles={tile_args:?} decoded only {} tile(s) (seed={seed} cq={cq})",
+                decode::tile_hits() - tiles_before
+            );
+            if decode::sub8_split_hits() == before {
+                refusals.push(format!(
+                    "seed={seed} cq={cq}: decoded, but no block read a real PARTITION_SPLIT below 8x8"
+                ));
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (seed={seed} cq={cq})"
+            );
+            assert_eq!(
+                frames[0].u, ffmpeg_frames[0].u,
+                "U vs ffmpeg (seed={seed} cq={cq})"
+            );
+            assert_eq!(
+                frames[0].v, ffmpeg_frames[0].v,
+                "V vs ffmpeg (seed={seed} cq={cq})"
+            );
+            fired_runs += 1;
+            if fired_runs >= 4 {
+                break;
+            }
+        }
+        assert!(
+            fired_runs >= 4,
+            "fewer than 4 firing+pixel-exact runs out of 40 attempts \
+             ({width}x{height} tiles={tile_args:?}):\n{}",
+            refusals.join("\n")
+        );
+        }
+    }
+
     /// lane-av1golden7 r9's decisive fixture: a real aomenc stream (seed 59,
     /// `--tune-content=film`, GOLDEN_FRAME firing downstream) whose frame-0
     /// *intra keyframe* mismatched ffmpeg on 3855/4096 luma pixels -- traced
