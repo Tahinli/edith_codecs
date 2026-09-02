@@ -5890,7 +5890,11 @@ mod tests {
             // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
             // is ALWAYS pixel-compared; the counter only decides whether the
             // attempt counts as firing.
-            let counted = fired.0 + fired.1 + fired.2 != 0;
+            // lane-uv8 r3: every one of the three chroma classes this gate
+            // exists for (directional, smooth/paeth, CfL) must fire on the
+            // SAME pixel-compared attempt -- a sum-nonzero predicate would
+            // pass on an attempt that only ever hit DC-adjacent CfL.
+            let counted = fired.0 > 0 && fired.1 > 0 && fired.2 > 0;
             if !counted {
                 uncounted_exact += 1;
                 refusals.push(format!(
