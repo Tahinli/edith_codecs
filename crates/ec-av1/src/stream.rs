@@ -2450,7 +2450,7 @@ mod tests {
                 "--enable-tx-size-search=0",
                 "--enable-cdef=1",
                 "--enable-restoration=1",
-                "--min-partition-size=32",
+                "--min-partition-size=16",
                 "--max-partition-size=32",
                 "--enable-palette=0",
                 "--enable-intrabc=0",
@@ -14570,6 +14570,13 @@ mod tests {
     fn a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact()
     {
         const NAME: &str = "a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact";
+        // Seed 46 mismatches ffmpeg at cq 32 on BOTH depths while carrying
+        // ZERO 1:4 strips -- an open defect of another shape, being diagnosed
+        // by lane-band46. Excluded here by name so this gate's
+        // `out_of_scope_mismatch` assert stays a hard 0 instead of swallowing
+        // it; the pin below decodes exactly that seed and is what un-ignoring
+        // will prove.
+        const EXCLUDED_SEEDS: &[u32] = &[46];
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -14602,99 +14609,12 @@ mod tests {
         // whose transform splits once (see the assert at the end).
         let mut depth1_refusals = 0u32;
         for (bit_depth, cq) in [(8u32, 45u32), (8, 32), (8, 60), (10, 45), (10, 32), (10, 60)] {
-            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
             for attempt in 0..n_attempts {
                 let seed = 42 + attempt;
-                // `gradients_source`, the content the sibling split-transform
-                // superblock gate uses. A band/noise `geq` fixture was tried
-                // first (r1) and gave 12/12 pixel-exact streams carrying ZERO
-                // 1:4 strips -- vacuous. Odd attempts render it transposed so
-                // HORZ_4 and VERT_4 both appear (class scan-weights-cross-axis).
-                let bands = format!(
-                    "geq=lum='mod(floor(Y/16),2)*160+48':cb=128:cr=128,noise=alls=10:all_seed={seed}"
-                );
-                let source = if attempt % 2 == 0 {
-                    format!("color=c=black:size={width}x{height}:duration=0.04:rate=25,{bands}")
-                } else {
-                    format!(
-                        "color=c=black:size={height}x{width}:duration=0.04:rate=25,{bands},transpose=1"
-                    )
-                };
-                let y4m = Command::new("ffmpeg")
-                    .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
-                        pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
-                    ])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output()
-                    .expect("ffmpeg failed to run");
-                assert!(
-                    y4m.status.success(),
-                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
-                    String::from_utf8_lossy(&y4m.stderr)
-                );
-                let cq_arg = format!("--cq-level={cq}");
-                let depth_arg = format!("--bit-depth={bit_depth}");
-                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
-                let mut child = Command::new(aomenc_path())
-                    .args([
-                        "--codec=av1",
-                        "--passes=1",
-                        "--end-usage=q",
-                        &cq_arg,
-                        "--cpu-used=0",
-                        "--threads=1",
-                        "--row-mt=0",
-                        "--sb-size=64",
-                        &depth_arg,
-                        &input_depth_arg,
-                        "--enable-rect-partitions=1",
-                        // AB off: it competes with 1:4 in the RD search (with
-                        // AB on, 0 superblock 1:4 strips appeared in 16
-                        // compared streams), and AB below 16x16 is another
-                        // lane's refusal.
-                        "--enable-ab-partitions=0",
-                        "--enable-1to4-partitions=1",
-                        // 16, not 8: with 8 every seed of this recipe stops
-                        // at a 32x32-level PARTITION_HORZ_4/VERT_4 (partition
-                        // values 8/9, 32x8/8x32 luma strips), a shape this
-                        // decoder does not code at all yet -- 12/12 attempts
-                        // refused before a pixel was compared (measured r1).
-                        // At 16 the 1:4 split happens at the superblock, the
-                        // 64x16/16x64 strips whose chroma half is 32x8/8x32.
-                        "--min-partition-size=16",
-                        "--max-partition-size=64",
-                        "--enable-restoration=0",
-                        "--enable-palette=0",
-                        "--deltaq-mode=0",
-                        "--enable-filter-intra=0",
-                        "--enable-cfl-intra=0",
-                        "--enable-intrabc=0",
-                        "--obu",
-                        "-o",
-                        "-",
-                        "-",
-                    ])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
-                let out = child.wait_with_output().expect("aomenc failed to run");
-                assert!(
-                    out.status.success(),
-                    "{NAME}: aomenc refused the fixture: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                let stream = out.stdout;
+                if EXCLUDED_SEEDS.contains(&seed) {
+                    continue;
+                }
+                let stream = rectchroma_stream(bit_depth, cq, attempt, width, height);
                 let before = crate::decode::rect_split_chroma_shape_hits();
                 let split_before = crate::decode::rect_split_tx_hits();
                 let rect4_before = (
@@ -14804,6 +14724,12 @@ mod tests {
             proved[2],
             proved[3]
         );
+        assert_eq!(
+            out_of_scope_mismatch, 0,
+            "{NAME}: {out_of_scope_mismatch} attempts carrying no 1:4 strip mismatched \
+             ffmpeg -- a defect of another shape, not out of scope for the suite (the one \
+             known case, seed 46, is in EXCLUDED_SEEDS and pinned separately)"
+        );
         assert!(
             matched > 0,
             "{NAME}: every attempt refused; the gate never decoded a stream"
@@ -14834,4 +14760,147 @@ mod tests {
         );
         eprintln!("{NAME}: {depth1_refusals} attempts refused the depth-1 1:4 split strip by name");
     }
+
+    /// The chroma-rect gate's fixture + aomenc recipe for one attempt, shared
+    /// with the seed-46 pin test below so the pin cannot drift from the gate.
+    fn rectchroma_stream(
+        bit_depth: u32,
+        cq: u32,
+        attempt: u32,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        const NAME: &str = "rectchroma_stream";
+        let seed = 42 + attempt;
+        let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+        // `gradients_source`, the content the sibling split-transform
+        // superblock gate uses. A band/noise `geq` fixture was tried
+        // first (r1) and gave 12/12 pixel-exact streams carrying ZERO
+        // 1:4 strips -- vacuous. Odd attempts render it transposed so
+        // HORZ_4 and VERT_4 both appear (class scan-weights-cross-axis).
+        let bands = format!(
+            "geq=lum='mod(floor(Y/16),2)*160+48':cb=128:cr=128,noise=alls=10:all_seed={seed}"
+        );
+        let source = if attempt % 2 == 0 {
+            format!("color=c=black:size={width}x{height}:duration=0.04:rate=25,{bands}")
+        } else {
+            format!(
+                "color=c=black:size={height}x{width}:duration=0.04:rate=25,{bands},transpose=1"
+            )
+        };
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
+                pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let cq_arg = format!("--cq-level={cq}");
+        let depth_arg = format!("--bit-depth={bit_depth}");
+        let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                &cq_arg,
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                &depth_arg,
+                &input_depth_arg,
+                "--enable-rect-partitions=1",
+                // AB off: it competes with 1:4 in the RD search (with
+                // AB on, 0 superblock 1:4 strips appeared in 16
+                // compared streams), and AB below 16x16 is another
+                // lane's refusal.
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=1",
+                // 16, not 8: with 8 every seed of this recipe stops
+                // at a 32x32-level PARTITION_HORZ_4/VERT_4 (partition
+                // values 8/9, 32x8/8x32 luma strips), a shape this
+                // decoder does not code at all yet -- 12/12 attempts
+                // refused before a pixel was compared (measured r1).
+                // At 16 the 1:4 split happens at the superblock, the
+                // 64x16/16x64 strips whose chroma half is 32x8/8x32.
+                "--min-partition-size=16",
+                "--max-partition-size=64",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-filter-intra=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "{NAME}: aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    /// PIN for the one stream the chroma-rect gate excludes: cq 32 seed 46
+    /// mismatches ffmpeg at BOTH bit depths while carrying zero 1:4 strips,
+    /// so the defect belongs to some other shape -- the stream decodes, the
+    /// pixels are wrong. Undiagnosed; lane-band46 owns it. Un-ignoring this
+    /// test is the proof that it is fixed.
+    #[test]
+    #[ignore = "band fixture cq32 seed 46 mismatches ffmpeg with zero 1:4 strips (8- and 10-bit) -- undiagnosed, lane-band46"]
+    fn the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact() {
+        const NAME: &str = "the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        // seed 46 == attempt 4 of the gate's sweep, cq 32.
+        for bit_depth in [8u32, 10] {
+            let stream = rectchroma_stream(bit_depth, 32, 4, width, height);
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: {bit_depth}-bit seed 46 refused: {e}"));
+            let reference = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames.len())
+            };
+            assert_eq!(frames.len(), reference.len(), "{NAME}: frame count");
+            for (i, (got, want)) in frames.iter().zip(&reference).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma ({bit_depth}-bit seed 46)");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U ({bit_depth}-bit seed 46)");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V ({bit_depth}-bit seed 46)");
+            }
+        }
+    }
+
 }
