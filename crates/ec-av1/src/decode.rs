@@ -281,10 +281,12 @@ fn maybe_read_delta_q(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_
     if mi_r % sb_mi != 0 || mi_c % sb_mi != 0 {
         return;
     }
-    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag, which
-    // it computes against the 64x64 root; under a 128 superblock no leaf this
-    // decoder codes can be the whole superblock (the root is always SPLIT).
-    if is_whole_sb && !sb128() && skip {
+    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag,
+    // computed against the sequence's own superblock size (lane-sb128b r1:
+    // it used to be hardcoded against 64 and disabled under `sb128`, which a
+    // `PARTITION_NONE` 128x128 root -- itself the whole superblock -- makes
+    // wrong).
+    if is_whole_sb && skip {
         return;
     }
     let mut abs = dec.symbol(&mut cdfs.delta_q) as i32;
@@ -340,10 +342,12 @@ fn maybe_read_delta_lf(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi
     if mi_r % sb_mi != 0 || mi_c % sb_mi != 0 {
         return;
     }
-    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag, which
-    // it computes against the 64x64 root; under a 128 superblock no leaf this
-    // decoder codes can be the whole superblock (the root is always SPLIT).
-    if is_whole_sb && !sb128() && skip {
+    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag,
+    // computed against the sequence's own superblock size (lane-sb128b r1:
+    // it used to be hardcoded against 64 and disabled under `sb128`, which a
+    // `PARTITION_NONE` 128x128 root -- itself the whole superblock -- makes
+    // wrong).
+    if is_whole_sb && skip {
         return;
     }
     let multi = DELTA_LF_MULTI.with(|c| c.get());
@@ -7414,8 +7418,12 @@ fn read_intra_mode(
     // `segment_id`, `cdef`, `delta_q` -- `cdef` lands right here.
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
     istep!("cdef", 0);
-    maybe_read_delta_q(dec, cdfs, mi_r, mi_c, side == 64, skip);
-    maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, side == 64, skip);
+    // lane-sb128b r1: "this leaf IS the superblock" is `side == sb_size`, not
+    // a hardcoded 64 -- a `PARTITION_NONE` 128x128 root is the whole
+    // superblock and skips `delta_q` exactly like a 64 one under a 64 root.
+    let whole_sb = side == sb_mi_cur() as usize * 4;
+    maybe_read_delta_q(dec, cdfs, mi_r, mi_c, whole_sb, skip);
+    maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, whole_sb, skip);
     istep!("dq", 0);
     // `read_intrabc_info` (spec 5.11.13, libaom decodemv.c:693, called at
     // :811 right after `skip_txfm`/`segment_id`/`cdef`/`delta_q` and before
@@ -8252,7 +8260,11 @@ fn decode_block(
         let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side, None);
         (resolved, if resolved == 64 { 32 } else { resolved })
     } else {
-        (side, luma_tx)
+        // lane-sb128b r1: `max_txsize_rect_lookup[BLOCK_128X128]` is
+        // TX_64X64, so a 128x128 block is always FOUR luma transform units
+        // even with `tx_select` off -- the TU loop below, never the
+        // single-unit path.
+        (side.min(64), luma_tx)
     };
     if tx_select && logical_tx < side && uv_mode != DC_PRED {
         SQ_CHROMA_TX_HITS.with(|c| c.set(c.get() + 1));
@@ -8393,7 +8405,12 @@ fn decode_block(
         let u_grid = vec![0i32; chroma_side * chroma_side];
         let v_grid = vec![0i32; chroma_side * chroma_side];
         neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
-    } else if !tx_select || logical_tx == side {
+    } else if logical_tx == side {
+        // lane-sb128b r1: the test used to be `!tx_select || logical_tx == side`.
+        // Without `tx_select` `logical_tx` IS `side` at every size <= 64, so
+        // that arm was redundant -- and wrong at 128, where
+        // `max_txsize_rect_lookup` caps the block's transform at 64 and the
+        // block is four units whether or not `tx_select` is on.
         // A single luma transform unit -- the old path, unchanged (including
         // the 64x64 corner case, `logical_tx == side == 64` with
         // `coeff_tx_side == 32`).
@@ -8542,7 +8559,11 @@ fn decode_block(
                     tu_px,
                     tu_py,
                     logical_tx,
-                    logical_tx,
+                    // The unit's own COEFFICIENT grid, half its side at
+                    // TX_64X64 (a 64-point transform codes nothing past 32);
+                    // identical to `logical_tx` at every smaller size
+                    // (lane-sb128b r1).
+                    coeff_tx_side,
                     base_q_idx,
                     None,
                     filter_intra,
@@ -9978,8 +9999,14 @@ fn read_tx_size(
     // key-frame path's own deblock-grid approximation.
     ctx_override: Option<usize>,
 ) -> usize {
-    let ctx = ctx_override.unwrap_or_else(|| tx_size_context(n, at_mi, side));
-    let depth = match side {
+    // `max_txsize_rect_lookup[bsize]` (libaom `read_selected_tx_size` /
+    // `get_tx_size_context`): a block wider than 64 still tops out at
+    // TX_64X64, so BLOCK_128X128 reads BLOCK_64X64's own category (its depth
+    // chain 64->32->16->8->4 is the same four steps) and resolves against 64,
+    // never against its own 128 side (lane-sb128b r1).
+    let max_tx = side.min(64);
+    let ctx = ctx_override.unwrap_or_else(|| tx_size_context(n, at_mi, max_tx));
+    let depth = match max_tx {
         8 => {
             dec.symbol(&mut cdfs.tx_size_cat0[ctx])
         }
@@ -9992,7 +10019,7 @@ fn read_tx_size(
         64 => {
             dec.symbol(&mut cdfs.tx_size_cat3[ctx])
         }
-        _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64"),
+        _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64/128"),
     };
     if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
         let (rng, _) = dec.debug_state();
@@ -10004,7 +10031,7 @@ fn read_tx_size(
     if depth != 0 {
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
     }
-    side >> depth
+    max_tx >> depth
 }
 
 /// `txfm_partition_context` (libaom `av1_common_int.h`): an inter block's
@@ -11250,6 +11277,17 @@ fn sb_visit_order(r0: u32, r1: u32, c0: u32, c1: u32, sb128: bool) -> Vec<(u32, 
 /// decides the root -- only SPLIT recurses into the four 64x64 quadrants this
 /// decoder codes, the other seven arms refuse by name.
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// How many 128x128 superblock roots resolved to `PARTITION_NONE` -- one
+    /// whole 128x128 block (lane-sb128b r1's gate counter).
+    pub(crate) static PART128_NONE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`PART128_NONE_HITS`], for a gate's own before/after delta.
+pub(crate) fn part128_none_hits() -> usize {
+    PART128_NONE_HITS.with(std::cell::Cell::get)
+}
+
 fn read_sb128_root(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -11264,7 +11302,7 @@ fn read_sb128_root(
     sb_c: u32,
     mi_cols: u32,
     mi_rows: u32,
-) -> Result<()> {
+) -> Result<usize> {
     let (mi_r128, mi_c128) = ((sb_r & !1) * SB_MI, (sb_c & !1) * SB_MI);
     crate::restoration::read_lr(
         dec,
@@ -11298,13 +11336,31 @@ fn read_sb128_root(
         }
         PARTITION_SPLIT
     };
-    if part128 != PARTITION_SPLIT {
+    // lane-sb128b r1: `PARTITION_NONE` -- one 128x128 block -- is decoded by
+    // the key-frame caller below. The six remaining arms (HORZ/VERT and the
+    // four AB shapes) still need the rect/AB machinery at this size.
+    if part128 != PARTITION_SPLIT && part128 != PARTITION_NONE {
         return Err(unsupported(
-            "a 128x128 superblock partition other than SPLIT (NONE/HORZ/VERT and the four AB arms at the 128 root are not decoded)",
+            "a 128x128 superblock HORZ/VERT or AB partition (only SPLIT and NONE are decoded at the 128 root)",
         ));
     }
-    PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
-    Ok(())
+    if part128 == PARTITION_SPLIT {
+        PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
+    } else {
+        PART128_NONE_HITS.with(|c| c.set(c.get() + 1));
+        // lane-sb128b r1 RESIDUAL: the luma half of a 128x128 `PARTITION_NONE`
+        // block is coded below (four TX_64X64 units), but its CHROMA is not:
+        // `av1_get_max_uv_txsize` runs `av1_get_adjusted_tx_size` over the
+        // 64x64 uv plane block, so the uv transform is TX_32X32 and each
+        // plane is FOUR units -- `decode_block` codes exactly one whole-plane
+        // chroma unit, which desyncs the tile at the first such block (gate
+        // `a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact`,
+        // 384x384 cq63: decoded, small deltas over 94% of the luma plane).
+        return Err(unsupported(
+            "a 128x128 PARTITION_NONE block's chroma (its 64x64 uv plane block is four TX_32X32 units, and this decoder codes one whole-plane chroma unit per block)",
+        ));
+    }
+    Ok(part128)
 }
 
 pub(crate) fn decode_key_frame_tile_with_cdfs(
@@ -11482,9 +11538,19 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         );
         TILE_HITS.with(|c| c.set(c.get() + 1));
 
+    // lane-sb128b r1: set when the 128 root resolved to `PARTITION_NONE` --
+    // its one block covers all four 64x64 quadrants, so the remaining three
+    // visits of this superblock code nothing at all.
+    let mut sb128_none = false;
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
         if row_start {
             neighbours.start_row();
+        }
+        if sb_start {
+            sb128_none = false;
+        }
+        if sb128_none {
+            continue;
         }
         {
             // lane-sb128 r1: the 128 root. Its loop-restoration units are read
@@ -11493,7 +11559,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             // `BLOCK_128X128` CDF (8 symbols) decides the root -- only SPLIT
             // recurses into the four 64x64 quadrants this decoder codes.
             if sb128 && sb_start {
-                read_sb128_root(
+                let part128 = read_sb128_root(
                     &mut dec,
                     &mut cdfs,
                     &neighbours,
@@ -11505,6 +11571,62 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                     mi_cols,
                     mi_rows,
                 )?;
+                if part128 == PARTITION_NONE {
+                    // One 128x128 intra block: four TX_64X64 luma units and a
+                    // single 64x64 chroma unit per plane (`av1_get_max_uv_txsize`
+                    // of a 128x128 block is TX_64X64 over its 64x64 uv plane
+                    // block). No CfL, no filter intra, no palette at this size --
+                    // [`read_intra_mode`]'s own size gates already say so.
+                    sb128_none = true;
+                    CDEF_TRANSMITTED.with(|c| c.set(false));
+                    let at128 = ((sb_r & !1) as usize * 4, (sb_c & !1) as usize * 4);
+                    decode_block(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        at128,
+                        SB * 2,
+                        TxbSet::Luma64,
+                        TxbSet::Chroma32,
+                        TX32,
+                        TX32,
+                        (&scan32, &scan32),
+                        false,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        base_q_idx,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        allow_intrabc,
+                        &scan32,
+                        &scan16,
+                        &scan8,
+                        &scan4,
+                        tx_select,
+                        reduced_tx_set,
+                    )?;
+                    // libaom writes one `cdef_strength` into the block's own
+                    // `MB_MODE_INFO`, which every mi cell of the block --
+                    // hence all four 64x64 CDEF units -- points at; our grid
+                    // is per-unit, so the read (which only ever lands in the
+                    // top-left unit, `read_cdef`'s index 0) is copied across.
+                    let (q_r, q_c) = ((sb_r & !1) as usize, (sb_c & !1) as usize);
+                    CDEF_IDX_GRID.with(|g| {
+                        let mut g = g.borrow_mut();
+                        let cols = CDEF_SB_COLS.with(|c| c.get());
+                        if cols > 0 && q_r * cols + q_c < g.len() {
+                            let idx = g[q_r * cols + q_c];
+                            for (dr, dc) in [(0, 1), (1, 0), (1, 1)] {
+                                let i = (q_r + dr) * cols + q_c + dc;
+                                if q_c + dc < cols && i < g.len() {
+                                    g[i] = idx;
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
             }
             if !sb128 {
                 crate::restoration::read_lr(
@@ -18594,7 +18716,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
         {
             if sb128 && sb_start {
-                read_sb128_root(
+                if read_sb128_root(
                     &mut dec,
                     &mut cdfs,
                     &neighbours,
@@ -18605,7 +18727,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     sb_c,
                     mi_cols,
                     mi_rows,
-                )?;
+                )? != PARTITION_SPLIT
+                {
+                    // lane-sb128b r1 decodes a `PARTITION_NONE` 128 root on
+                    // KEY frames only; an inter 128x128 leaf needs whole-block
+                    // MC, OBMC and compound at a size this path has never run.
+                    return Err(unsupported(
+                        "a 128x128 superblock PARTITION_NONE root on an inter frame (only the key-frame path codes a whole 128x128 block)",
+                    ));
+                }
             }
             if !sb128 {
                 crate::restoration::read_lr(
