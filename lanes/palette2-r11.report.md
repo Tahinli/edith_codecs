@@ -88,14 +88,25 @@ EVIDENCE: scratchpad/s46.obu (146 B, sha256 a109adab4397...) + aomstep.log/ourst
 EVIDENCE: scratchpad/ourpre.yuv.f0 vs aompre.yuv.f0 | `EC_AV1_PREFILT_DUMP` both decoders, same stream | 2165 luma samples differ, bbox x136..191 y64..127 (the last superblock only); post-filter 2242, so the loop filter is not the source
 EVIDENCE: scratchpad (per-block diff map) | counted prefilter diffs inside every block aomdec reported for SB(128,64) | first defective block = TL 16x16 at px(128,64) of a 32x32 VERT_A, 25/256 wrong, wedge rows 68..71
 
-## STEP 3 -- suite status at the turn cap
-`systemd-run --user --unit=palette2-suite-r11-1788310477` (full `cargo test -p ec-av1 --lib
--- --test-threads=1`, log `$HOME/.cache/palette2-suite-r11.log`) was still RUNNING when this
-round hit its tool cap -- no `test result` line yet, so NO suite totals are claimed for r11.
-The three tests run by name on the merged tree before it started:
-`refusal_inventory` (3 tests) and `gate_coverage` (7 tests) PASS;
-`a_real_aomenc_stream_with_filter_intra_on_a_horz_vert_strip_decodes_pixel_exact` FAILS,
-same message as r10 (seed 46, first luma mismatch (188,62) ours=116 ffmpeg=115, 2242 samples,
-bbox x135..191 y62..127).
-`deferred: full-suite totals -- run was mid-flight at the cap -- read
-$HOME/.cache/palette2-suite-r11.log (unit palette2-suite-r11-1788310477) at the start of r12`.
+## STEP 3 -- full suite on the merged tree
+```
+systemd-run --user --unit=palette2-suite-r11-1788310477 -p MemoryMax=10G --same-dir \
+  bash -lc 'EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-palette2 \
+            nice -n 10 cargo test -p ec-av1 --lib -j3 -- --test-threads=1 \
+            > $HOME/.cache/palette2-suite-r11.log 2>&1'
+```
+-> **306 passed; 1 failed; 26 ignored** (735.05s). r10 was 294/2/27.
+The ONE failure is this lane's known red gate,
+`stream::tests::a_real_aomenc_stream_with_filter_intra_on_a_horz_vert_strip_decodes_pixel_exact`
+(seed 46, message unchanged). r10's second failure,
+`decode::tests::nz_map_ctx_offset_tables_match_the_rect_rule`, is gone: main deleted that
+stale test and the merge took the deletion. Both palette gates, `filter_intra_*`,
+`split_transform_*`, `superblock_level_*`, the tiny sweep, `tx_select`, `refusal_inventory`,
+`gate_coverage` and `base_ctx_rect_offsets_match_the_transcribed_tables_over_the_whole_domain`
+all pass inside that run.
+
+`fix-now: r12 -- the lane does not merge into main until seed 46 is pixel-exact (see STEP 2
+for the localization; it is a reconstruction defect behind the refusal this lane lifted, not
+an entropy or palette defect).`
+
+EVIDENCE: $HOME/.cache/palette2-suite-r11.log | full `cargo test -p ec-av1 --lib -- --test-threads=1` under systemd unit palette2-suite-r11-1788310477 on the merged tree (b79b698) | test result: FAILED. 306 passed; 1 failed; 26 ignored; 735.05s -- the single failure is the seed-46 gate
