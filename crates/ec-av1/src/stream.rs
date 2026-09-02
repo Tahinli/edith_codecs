@@ -2972,6 +2972,64 @@ mod tests {
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
     }
+    /// lane-troykf r2: `crates/ec-av1/fixtures/troy_kf2700.obu` is a 1920x792
+    /// 10-bit AV1 key frame taken out of one of the user's own films
+    /// (`ffmpeg -ss 2700 -c:v copy -f obu`, then truncated to its first temporal
+    /// unit, 36 kB) -- the ONLY stream in this repo that contains a SKIPPED
+    /// `UV_CFL_PRED` block. 30 aomenc recipes (r1's 20 plus r2's chroma-correlated
+    /// `geq` sweep, cq 40..63, cpu-used 0..2, min/max-partition 4..64, 8 and
+    /// 10 bit) never made the encoder pick one, so the counter can only be
+    /// hard-asserted against a real film frame. The instrumented oracle agrees:
+    /// `EC_TRACE_MODE=1 aomdec` prints 5 `EC_IMODE_VAL ... uv_mode=13 skip=1`
+    /// lines for this frame.
+    ///
+    /// The defect it pins (fixed at 29cd53f, `decode.rs:7719`/`:10528`/`:10891`):
+    /// a skipped intra block must still PREDICT with CfL -- libaom's
+    /// `predict_and_reconstruct_intra_block` predicts every plane and guards only
+    /// the residual on `skip_txfm`. Before the fix this frame had 499 wrong
+    /// chroma samples (U rows 48..79 cols 464..492); after it, zero.
+    ///
+    /// The ffmpeg reference is `ffmpeg -f obu -i <fixture> -f rawvideo
+    /// -pix_fmt yuv420p10le -` (what `ffmpeg_decode_sequence_10bit` runs).
+    #[test]
+    fn a_real_film_key_frame_with_a_skipped_cfl_block_decodes_pixel_exact() {
+        const NAME: &str = "a_real_film_key_frame_with_a_skipped_cfl_block_decodes_pixel_exact";
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/troy_kf2700.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (1920usize, 792usize);
+        let before = crate::decode::troy_chroma_counters();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let after = crate::decode::troy_chroma_counters();
+        let skip_cfl = after.0 - before.0;
+        assert_eq!(frames.len(), 1, "{NAME}: one key frame");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        // Asserted before the ffmpeg compare so an absent ffmpeg cannot make the
+        // gate vacuous: the skipped-CfL path is exercised on every run.
+        assert!(
+            skip_cfl > 0,
+            "{NAME}: zero skipped-CfL blocks -- the fixture no longer exercises defect 1"
+        );
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME} pixel compare: no ffmpeg (skipped_cfl={skip_cfl})");
+            return;
+        }
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(
+            frames[0].u, ffmpeg_frames[0].u,
+            "{NAME}: U vs ffmpeg ({skip_cfl} skipped-CfL blocks)"
+        );
+        assert_eq!(
+            frames[0].v, ffmpeg_frames[0].v,
+            "{NAME}: V vs ffmpeg ({skip_cfl} skipped-CfL blocks)"
+        );
+        eprintln!("{NAME}: pixel-exact, skipped_cfl={skip_cfl}");
+    }
 
     /// lane-hbd10 r1: a real `aomenc --bit-depth=10 --superres-mode=1
     /// --superres-denominator=12` key frame, decoded pixel-exact against
@@ -11583,7 +11641,10 @@ mod tests {
             // fire on his real film. Its evidence is Troy's own key frames
             // (lanes/troykf-r1.report.md): ss=2700 went 499 wrong chroma
             // samples -> 0 on this fix alone. The count is printed so a future
-            // recipe that does reach it is visible immediately.
+            // recipe that does reach it is visible immediately. r2 pinned that
+            // film frame as a fixture instead:
+            // `a_real_film_key_frame_with_a_skipped_cfl_block_decodes_pixel_exact`
+            // hard-asserts the counter.
             assert!(
                 dir_pairs > 0,
                 "{NAME}: no directional 1:4 chroma pair decoded (depth={depth}) -- defect 2 \
