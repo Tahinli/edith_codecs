@@ -2219,6 +2219,22 @@ pub(crate) fn rect4_coeff_hits() -> usize {
     RECT4_COEFF_HITS.with(|c| c.get())
 }
 
+// lane-sbab r1: how many superblock-level (64x64) AB partitions fired IN AN
+// INTER frame, per arm, in `PARTITION_HORZ_A`, `_HORZ_B`, `_VERT_A`,
+// `_VERT_B` order (the intra-frame counterpart is `SB_AB_HITS`). Each arm is
+// two 32x32 inter squares plus one true 64x32/32x64 inter strip; the gate
+// asserts the arms it proves separately so a run whose RD only picked one
+// cannot pass as proof of the others.
+thread_local! {
+    static SB_AB_INTER_HITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// [`SB_AB_INTER_HITS`] per arm (HORZ_A, HORZ_B, VERT_A, VERT_B at 64x64 in an
+/// inter frame).
+pub fn sb_ab_inter_hits_by_arm() -> [usize; 4] {
+    SB_AB_INTER_HITS.with(std::cell::Cell::get)
+}
+
 // lane-inter16ab r1: how many 16x16-level AB partitions fired IN AN INTER
 // frame, per arm, in `PARTITION_HORZ_A`, `_HORZ_B`, `_VERT_A`, `_VERT_B`
 // order (the intra-frame counterpart is `AB16_HITS`). Each arm is two 8x8
@@ -21468,13 +21484,141 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 }
                 continue;
             }
-            if part64 != PARTITION_SPLIT {
-                return Err(unsupported(
-                    "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this \
-                     decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, \
-                     VERT, HORZ_4 or VERT_4)",
-                ));
+            if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&part64) {
+                // lane-sbab r1: the four superblock-level AB arms on the
+                // INTER path -- two 32x32 inter squares plus one true
+                // 64x32/32x64 inter strip, in libaom `decode_partition`'s own
+                // order (decodeframe.c: HORZ_A = TL, TR, bottom strip;
+                // HORZ_B = top strip, BL, BR; VERT_A = TL, BL, right strip;
+                // VERT_B = left strip, TR, BR). Every piece is one this
+                // decoder already proves elsewhere: the 32x32 square is the
+                // `PARTITION_NONE`-under-SPLIT block below, the strip is the
+                // `PARTITION_HORZ`/`VERT` piece above (`inter_piece!`, which
+                // keeps `side = SB` for syntax/CDF and names its true
+                // footprint through `write_w`/`write_h`). The intra-frame
+                // twin of this arm is lane-part32 r4's `SB_AB_HITS` block.
+                SB_AB_INTER_HITS.with(|c| {
+                    let mut h = c.get();
+                    h[part64 - PARTITION_HORZ_A] += 1;
+                    c.set(h);
+                });
+                // lane-part32 r5 / class visit-order-changes-availability:
+                // only the two VERTICAL arms visit TL, BL, TR, BR, so only
+                // they switch libaom's `has_tr`/`has_bl` tables.
+                let _vert_guard = (part64 == PARTITION_VERT_A || part64 == PARTITION_VERT_B)
+                    .then(crate::encode::Reach::vert_ab_partition);
+                let (mi_row0, mi_col0) = (
+                    sb_r as usize * SB_MI as usize,
+                    sb_c as usize * SB_MI as usize,
+                );
+                // 32 px = 8 MI units.
+                let tl = (mi_row0, mi_col0);
+                let tr = (mi_row0, mi_col0 + 8);
+                let bl = (mi_row0 + 8, mi_col0);
+                let br = (mi_row0 + 8, mi_col0 + 8);
+                macro_rules! ab_strip64 {
+                    ($mi:expr, $ww:expr, $wh:expr) => {
+                        inter_piece!(
+                            $mi,
+                            SB,
+                            TxbSet::Luma64,
+                            TxbSet::Luma64,
+                            TxbSet::Chroma32,
+                            TX32,
+                            TX32,
+                            &scan32,
+                            &scan32,
+                            3,
+                            $ww,
+                            $wh
+                        )
+                    };
+                }
+                // The 32x32 squares carry a full square residual, so unlike
+                // `inter_piece!` (which hardcodes `reject_residual = true`
+                // for its strips) they pass `false`.
+                macro_rules! ab_square32 {
+                    ($mi:expr) => {
+                        decode_inter_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            &mut grid,
+                            $mi,
+                            BLOCK,
+                            mi_cols,
+                            mi_rows,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            &ref_y,
+                            &ref_u,
+                            &ref_v,
+                            &ref_slots,
+                            &sign_bias_table,
+                            &global_motion,
+                            base_q_idx,
+                            TxbSet::Luma32,
+                            TxbSet::Luma32Inter,
+                            TxbSet::Chroma16,
+                            TX32,
+                            TX16,
+                            &scan32,
+                            &scan16,
+                            3,
+                            allow_high_precision_mv,
+                            force_integer_mv,
+                            interp_fixed,
+                            enable_dual_filter,
+                            tpl_frame.as_ref(),
+                            reference_select,
+                            enable_masked_compound,
+                            enable_interintra_compound,
+                            enable_jnt_comp,
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints,
+                            skip_mode_present,
+                            skip_mode_frame,
+                            switchable_motion_mode,
+                            allow_warped_motion,
+                            false,
+                            BLOCK,
+                            BLOCK,
+                            allow_screen_content_tools,
+                            frame_width as usize,
+                        )?
+                    };
+                }
+                match part64 {
+                    PARTITION_HORZ_A => {
+                        ab_square32!(tl);
+                        ab_square32!(tr);
+                        ab_strip64!(bl, 64, 32);
+                    }
+                    PARTITION_HORZ_B => {
+                        ab_strip64!(tl, 64, 32);
+                        ab_square32!(bl);
+                        ab_square32!(br);
+                    }
+                    PARTITION_VERT_A => {
+                        ab_square32!(tl);
+                        ab_square32!(bl);
+                        ab_strip64!(tr, 32, 64);
+                    }
+                    _ => {
+                        ab_strip64!(tl, 32, 64);
+                        ab_square32!(tr);
+                        ab_square32!(br);
+                    }
+                }
+                continue;
             }
+            // Every value of the 10-symbol `partition_w64` alphabet is now
+            // handled above except SPLIT, which falls through to the quadrant
+            // loop below (lane-sbab r1 took the AB four; the rect/1:4 arms
+            // and NONE `continue` earlier).
+            debug_assert_eq!(part64, PARTITION_SPLIT);
 
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
