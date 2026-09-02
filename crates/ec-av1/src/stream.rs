@@ -17677,17 +17677,14 @@ mod tests {
 
     /// lane-sb128b r1 gate: a real `aomenc --sb-size=128` KEY frame whose 128
     /// roots resolve to `PARTITION_NONE` -- one whole 128x128 intra block,
-    /// four TX_64X64 luma transform units and ONE TX_64X64 chroma unit per
-    /// plane (`av1_get_max_uv_txsize(BLOCK_128X128)` over its 64x64 uv plane
-    /// block), a coefficient set (`TxbSet::Chroma64`) no block at 64 or below
-    /// can reach. The r1 gate above pins `--max-partition-size=64`, which
+    /// four TX_64X64 luma transform units and FOUR TX_32X32 chroma units per
+    /// plane (`av1_get_max_uv_txsize(BLOCK_128X128)` is
+    /// `av1_get_adjusted_tx_size` of its 64x64 uv plane block's TX_64X64, so
+    /// TX_32X32) -- lane-sb128b r2's `chroma_split_tx_hits` asserts them. The r1 gate above pins `--max-partition-size=64`, which
     /// makes every 128 root a forced SPLIT and leaves this arm unexercised.
     /// Smooth gradients at a high `--cq-level` are what make the RD search
     /// keep a whole 128x128 block; `part128_none_hits` HARD-asserts it did.
     #[test]
-    #[ignore = "lane-sb128b r1 reproducer: the 128 NONE luma path decodes, its \
-                 chroma (four TX_32X32 units, not one) is not coded yet, so the \
-                 product path refuses the arm by name"]
     fn a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact() {
         const NAME: &str =
             "a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact";
@@ -17794,9 +17791,22 @@ mod tests {
             };
             assert_eq!(frames.len(), 1);
             for (i, (got, want)) in frames.iter().zip(&want).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
-                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
-                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+                for (name, a, b, w) in [
+                    ("Y", &got.y, &want.y, width),
+                    ("U", &got.u, &want.u, width / 2),
+                    ("V", &got.v, &want.v, width / 2),
+                ] {
+                    let n = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+                    let first = a.iter().zip(b.iter()).position(|(x, y)| x != y);
+                    assert_eq!(
+                        n, 0,
+                        "{NAME} frame {i} {name} vs ffmpeg (seed {seed}): {n} differ, first row {} col {} ours {:?} ffmpeg {:?}",
+                        first.unwrap_or(0) / w,
+                        first.unwrap_or(0) % w,
+                        first.map(|k| a[k]),
+                        first.map(|k| b[k]),
+                    );
+                }
             }
             let hits = crate::decode::part128_none_hits() - before;
             eprintln!("seed {seed} cq {cq} {width}x{height}: part128_none_hits +{hits}");
