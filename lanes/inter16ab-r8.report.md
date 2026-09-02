@@ -64,8 +64,8 @@ gate behind it. disposition: accepted (no change needed).
 
 ## 7. Suite (r8, full `cargo test -p ec-av1 --lib`) — RED, 395 passed / 8 failed / 33 ignored
 Log: `$HOME/.cache/inter16ab-suite-r8.log` (1275 s). Baseline comparison at the PARENT commit
-`ba40d38` (detached worktree, own target dir, log `$HOME/.cache/inter16ab-base-r8.log`, partial —
-the run was cut by the turn cap):
+`ba40d38` (detached worktree, own target dir, log `$HOME/.cache/inter16ab-base-r8.log`, COMPLETE:
+`1 passed; 7 failed` in 54.9 s):
 
 | test | ba40d38 (before fix) | ee04373 (after fix) |
 |---|---|---|
@@ -75,13 +75,13 @@ the run was cut by the turn cap):
 | `a_real_aomenc_10bit_..._split_transform_intra_block_...` | FAILED | FAILED (pre-existing) |
 | `a_real_aomenc_inter_sequence_with_a_class1_chroma_eob_...` | FAILED | FAILED (pre-existing) |
 | `a_real_aomenc_10bit_..._filter_intra_on_an_intra_block_...` | **ok** | **FAILED — regression or attempt-reselection, UNRESOLVED** |
-| `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_...` | not reached (cap) | FAILED (arm-count assert, VERT_4/split-tx-8x4 read 0 with no rect-residual refusal left) |
-| `real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire...` | not reached (cap) | FAILED (arm never fired) |
+| `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_...` | FAILED | FAILED (pre-existing; arm-count assert, VERT_4/split-tx-8x4 read 0) |
+| `real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire...` | FAILED | FAILED (pre-existing; arm never fired) |
 
-The five pre-existing failures come from the three merges of r7 (main 787c66f + intersub8 + sbab),
+The SEVEN pre-existing failures come from the three merges of r7 (main 787c66f + intersub8 + sbab),
 which were never suite-checked (r7 §4 deferred it). The two 1:4 failures are ARM-COUNT asserts, not
 pixel mismatches — both say "0 attempts carried the arm, 0 mismatched", the signature of class
 `parallel-flake-is-attempt-selection` (the desync fix changes which attempt each sweep lands on).
 The `filter_intra` 10-bit one is the only red that flipped from green and is NOT explained.
-disposition: fix-now for the next round (r9) — first step is to re-run the two 1:4 gates and the
-filter-intra gate at `ba40d38` vs `ee04373` back to back (the baseline run was cut mid-way).
+disposition: fix-now for r9 on the ONE flipped gate (10-bit filter-intra); the other seven are r7
+merge debt, red before this round's fix. Baseline run is complete (`1 passed; 7 failed`).
