@@ -44,6 +44,8 @@ fn main() {
         );
         let (h4, v4, pairs, sub8) = ec_av1::decode::inter16_rect4_counters();
         println!("inter16_1to4: horz4={h4} vert4={v4} chroma_pairs={pairs} sub8_pieces={sub8}");
+        let leaf = ec_av1::stream::vartx_rect_leaf_hits();
+        println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
