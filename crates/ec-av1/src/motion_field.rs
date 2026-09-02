@@ -31,13 +31,23 @@ pub struct MotionField {
     cells: Vec<Option<SavedMv>>,
     pub order_hint: u32,
     pub ref_order_hints: [u32; 7],
+    /// libaom `motion_field_projection`'s own first test: a start frame whose
+    /// `frame_type` is `KEY_FRAME`/`INTRA_ONLY_FRAME` is never projected at
+    /// all (`return 0`), so it also never spends a `ref_stamp` slot.
+    pub is_intra: bool,
 }
 
 impl MotionField {
     /// A field sized for an `mi_cols` by `mi_rows` frame, all cells
     /// initially unset (spec 7.9's own reset to `-1`/invalid before any
     /// block writes into it).
-    pub fn new(mi_cols: usize, mi_rows: usize, order_hint: u32, ref_order_hints: [u32; 7]) -> Self {
+    pub fn new(
+        mi_cols: usize,
+        mi_rows: usize,
+        order_hint: u32,
+        ref_order_hints: [u32; 7],
+        is_intra: bool,
+    ) -> Self {
         let cols = mi_cols.div_ceil(2);
         let rows = mi_rows.div_ceil(2);
         Self {
@@ -46,6 +56,7 @@ impl MotionField {
             cells: vec![None; cols * rows],
             order_hint,
             ref_order_hints,
+            is_intra,
         }
     }
 
@@ -53,10 +64,14 @@ impl MotionField {
     /// mi_col)` — every `MiInfo` inside one 8x8 cell shares a single
     /// motion-field entry, matching `av1_copy_frame_mvs`'s own half-resolution
     /// write.
-    pub fn set(&mut self, mi_row: usize, mi_col: usize, saved: SavedMv) {
+    /// `saved == None` is `av1_copy_frame_mvs`'s own leading clear
+    /// (`mv->ref_frame = NONE_FRAME; mv->mv.as_int = 0;`), which every block
+    /// of an inter frame performs -- an intra (or nothing-to-store) block
+    /// sharing an 8x8 cell with an earlier inter one wipes that cell.
+    pub fn set(&mut self, mi_row: usize, mi_col: usize, saved: Option<SavedMv>) {
         let (r, c) = (mi_row / 2, mi_col / 2);
         if r < self.rows && c < self.cols {
-            self.cells[r * self.cols + c] = Some(saved);
+            self.cells[r * self.cols + c] = saved;
         }
     }
 
@@ -217,6 +232,14 @@ fn motion_field_projection(
     dir: u8,
     tpl_cells: &mut [Option<((i32, i32), i32)>],
 ) -> bool {
+    // libaom's own first two `return 0`s, in order: a key/intra-only start
+    // frame is never projected (and so never spends a `ref_stamp` slot --
+    // returning `true` here made a forward key frame, `--enable-fwd-kf=1`,
+    // consume the slot ALTREF/LAST2 should have had), then the frame-size
+    // test.
+    if start.is_intra {
+        return false;
+    }
     let mvs_rows = mi_rows.div_ceil(2);
     let mvs_cols = mi_cols.div_ceil(2);
     if start.rows != mvs_rows || start.cols != mvs_cols {
@@ -264,6 +287,24 @@ fn motion_field_projection(
     true
 }
 
+thread_local! {
+    /// Frames whose `av1_setup_motion_field` saw at least one forward
+    /// references holding a key/intra-only frame -- the `ref_stamp` path
+    /// [`motion_field_projection`]'s intra early return governs.
+    static REFSTAMP_INTRA_FRAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The subset of those frames with TWO or more such references.
+    static REFSTAMP_INTRA2_FRAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reads the counter above (gate
+/// `a_real_aomenc_inter_sequence_with_forward_keyframes_and_temporal_mvs_decodes_pixel_exact`).
+pub fn refstamp_intra_frames() -> (usize, usize) {
+    (
+        REFSTAMP_INTRA_FRAMES.with(std::cell::Cell::get),
+        REFSTAMP_INTRA2_FRAMES.with(std::cell::Cell::get),
+    )
+}
+
 /// `av1_setup_motion_field` (spec 7.9.2's own driver): scans up to
 /// [`MFMV_STACK_SIZE`]`= 3` reference-frame slots in libaom's fixed order
 /// (`LAST_FRAME`, then `BWDREF_FRAME`/`ALTREF2_FRAME`/`ALTREF_FRAME` when
@@ -287,12 +328,38 @@ pub fn setup_motion_field(
     let cols = mi_cols.div_ceil(2);
     let rows = mi_rows.div_ceil(2);
     let mut cells = vec![None; cols * rows];
+    // `av1_setup_motion_field`'s own head: `if (!enable_order_hint) return;`
+    // leaves every `tpl_mvs` cell INVALID.
+    if order_hint_bits == 0 {
+        return TplField { cols, rows, cells };
+    }
 
     let slot_of =
         |ref_frame: i8| slots[ref_frame_idx[(ref_frame - LAST_FRAME) as usize] as usize].as_ref();
     let order_hint_of = |ref_frame: i8| slot_of(ref_frame).map_or(0, |m| m.order_hint);
 
     let mut ref_stamp = 2i32; // MFMV_STACK_SIZE - 1
+
+    // Gate counter (lane-refstamp): frames whose forward references include at
+    // least two key/intra-only frames, i.e. exactly the `ref_stamp` path the
+    // early return above fixes.
+    let intra_forward_refs = [
+        BWDREF_FRAME,
+        crate::mvstack::ALTREF2_FRAME,
+        ALTREF_FRAME,
+    ]
+    .into_iter()
+    .filter(|&rf| {
+        get_relative_dist(order_hint_bits, order_hint_of(rf), cur_order_hint) > 0
+            && slot_of(rf).is_some_and(|m| m.is_intra)
+    })
+    .count();
+    if intra_forward_refs >= 1 {
+        REFSTAMP_INTRA_FRAMES.with(|c| c.set(c.get() + 1));
+    }
+    if intra_forward_refs >= 2 {
+        REFSTAMP_INTRA2_FRAMES.with(|c| c.set(c.get() + 1));
+    }
 
     if let Some(last) = slot_of(LAST_FRAME) {
         let alt_of_lst = last.ref_order_hints[(ALTREF_FRAME - LAST_FRAME) as usize];
@@ -420,7 +487,17 @@ pub fn add_tpl_ref_mv(
     if row8 < 0 || col8 < 0 {
         return None;
     }
-    let (fwd_mv, ref_frame_offset) = tpl.get(row8 as usize / 2, col8 as usize / 2)?;
+    let probe = tpl.get(row8 as usize / 2, col8 as usize / 2);
+    if std::env::var_os("EC_TRACE_TPL").is_some() {
+        match probe {
+            None => eprintln!("EC_TPL mi_row={mi_row} mi_col={mi_col} blk=({blk_row},{blk_col}) INVALID"),
+            Some((m, rfo)) => eprintln!(
+                "EC_TPL mi_row={mi_row} mi_col={mi_col} blk=({blk_row},{blk_col}) mfmv0=({},{}) rfo={rfo}",
+                m.0, m.1
+            ),
+        }
+    }
+    let (fwd_mv, ref_frame_offset) = probe?;
     let projected = get_mv_projection(fwd_mv, cur_offset_0, ref_frame_offset);
     let mv = lower_mv_precision(projected, allow_high_precision_mv);
     Some(TplCandidate { mv })
@@ -454,14 +531,14 @@ mod tests {
         // A slot-0 inter frame (order_hint 2) that coded one 8x8 cell's MV
         // against its own LAST_FRAME (order_hint 1). The current frame
         // (order_hint 4) names that same slot as *its* LAST_FRAME.
-        let mut mf = MotionField::new(16, 16, 2, [1, 0, 0, 0, 0, 0, 0]);
+        let mut mf = MotionField::new(16, 16, 2, [1, 0, 0, 0, 0, 0, 0], false);
         mf.set(
             0,
             0,
-            SavedMv {
+            Some(SavedMv {
                 mv: (-64, 0),
                 ref_frame: LAST_FRAME,
-            },
+            }),
         );
         let slots: [Option<MotionField>; 8] =
             std::array::from_fn(|i| if i == 0 { Some(mf.clone()) } else { None });
