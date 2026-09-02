@@ -33,6 +33,8 @@ fn main() {
         println!("rect4_32: horz={h} vert={v} coded={c}");
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
+        let leaf = ec_av1::stream::vartx_rect_leaf_hits();
+        println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
