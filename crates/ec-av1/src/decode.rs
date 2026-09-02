@@ -1913,6 +1913,18 @@ pub fn inter_sb128_none_hits() -> usize {
 }
 
 thread_local! {
+    /// lane-sb128c r3: how many INTRA-coded 128x128 blocks inside an INTER
+    /// frame this decoder reconstructed (mu-chunk chroma, four TX_64X64 luma
+    /// units) -- the gate's witness that the lifted refusal's case fired.
+    pub(crate) static INTRA_128_IN_INTER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_128_IN_INTER_HITS`], for a gate's before/after delta.
+pub fn intra_128_in_inter_hits() -> usize {
+    INTRA_128_IN_INTER_HITS.with(std::cell::Cell::get)
+}
+
+thread_local! {
     static INTER_SB_NONE_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
@@ -5515,6 +5527,14 @@ fn read_intra_mode_rect(
         0
     };
     istep!("angle_y", angle_delta_y);
+    // lane-sb128c r3 (class sweep): libaom `read_intra_mode_uv(.., is_cfl_allowed(xd), ..)`
+    // and `is_cfl_allowed` (blockd.h) is `block_size_wide[bsize] <= 32 &&
+    // block_size_high[bsize] <= 32` on the LUMA bsize. Deciding the alphabet
+    // here, from the block's own size, is the single point every caller routes
+    // through -- a caller passing `true` for a >32 strip used to pick the
+    // 14-symbol CFL CDF, same value but a different range (class
+    // wrong-alphabet-same-value).
+    let cfl = cfl && bw <= 32 && bh <= 32;
     let uv_mode = if !has_chroma {
         DC_PRED
     } else if cfl {
@@ -8496,6 +8516,10 @@ fn read_intra_mode(
         0
     };
     istep!("angle_y", angle_delta_y);
+    // lane-sb128c r3 (class sweep): `is_cfl_allowed` on the luma bsize, decided
+    // here so every `decode_block` caller (64x64 and 128x128 roots included)
+    // picks the right alphabet -- see [`read_intra_mode_rect`]'s twin.
+    let cfl = cfl && side <= 32;
     let uv_mode = if cfl {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
@@ -11474,7 +11498,9 @@ fn read_block_tx_size(
         // lane-sb128c r1: `max_txsize_rect_lookup[BLOCK_128X128]` is TX_64X64,
         // so a 128x128 inter block is FOUR luma units even with `tx_mode ==
         // TX_MODE_LARGEST` -- the same leaf shape the var-tx tree hands back.
-        if is_inter && side > 64 {
+        // lane-sb128c r3: intra too -- an INTRA 128x128 block under
+        // `TX_MODE_LARGEST` also resolves to TX_64X64, i.e. four luma units.
+        if side > 64 {
             let step = 64 / MI;
             let mut leaves = Vec::new();
             for row in (0..side / MI).step_by(step) {
@@ -11531,7 +11557,10 @@ fn read_block_tx_size(
             n,
             at_mi,
             side,
-            Some(tx_size_context_txfm(n, at_mi, side)),
+            // lane-sb128c r3: `get_tx_size_context` compares the neighbour txfm
+            // contexts against `tx_size_wide[max_txsize_rect_lookup[bsize]]`,
+            // which is 64 for BLOCK_128X128 -- never the block's own 128 side.
+            Some(tx_size_context_txfm(n, at_mi, side.min(64))),
         )
     };
     set_txfm_ctxs(n, at_mi, tx, side_mi, side_mi, skip && is_inter);
@@ -16393,11 +16422,6 @@ fn decode_inter_block(
     // chunk). An INTRA block at that size inside an inter frame takes the
     // intra tail below, which still codes one whole-block chroma unit and one
     // `read_tx_size` at 128 -- refuse by name instead of mis-decoding it.
-    if side > 64 && !is_inter {
-        return Err(unsupported(
-            "an INTRA-coded 128x128 block inside an inter frame (only the inter half of a 128x128 root is decoded here)",
-        ));
-    }
     if std::env::var_os("EC_TRACE_MODE").is_some() {
         eprintln!(
             "EC_MODE mi_row={} mi_col={} rng={} is_inter={} skip={} side={side}",
@@ -18841,9 +18865,16 @@ fn decode_inter_block(
         .1;
         let reach = Reach::of(side, px, py, y.width, y.height);
         let split_luma = vartx_leaves.is_some();
+        // lane-sb128c r3: a 128x128 INTRA block inside an inter frame codes
+        // its chroma per 64x64 mu chunk, exactly as the inter half above --
+        // `decode_token_recon_block` walks `mu_blocks_wide/high` and codes
+        // every plane of a chunk before the next chunk's luma. These collect
+        // the four TX_32X32 units per plane for the block-level write-back.
+        let mut u_units = vec![0i32; chroma_side * chroma_side];
+        let mut v_units = vec![0i32; chroma_side * chroma_side];
         if let Some(leaves) = vartx_leaves.clone() {
             let reduced = REDUCED_TX_SET_INTER.with(std::cell::Cell::get);
-            for &(row, col, tx_px) in &leaves {
+            for (idx, &(row, col, tx_px)) in leaves.iter().enumerate() {
                 let tu_mi = (at_mi.0 + row, at_mi.1 + col);
                 let (tu_px, tu_py) = (px + col * MI, py + row * MI);
                 // A transform unit inside a block is not a block at that
@@ -18894,9 +18925,96 @@ fn decode_inter_block(
                     )?
                 };
                 neighbours.record_mi_luma(tu_mi, tx_px, &tu_grid);
+                if side > 64 {
+                    let chunk = (row / 16, col / 16);
+                    let done = idx + 1 == leaves.len()
+                        || (leaves[idx + 1].0 / 16, leaves[idx + 1].1 / 16) != chunk;
+                    if !done {
+                        continue;
+                    }
+                    let (cr, cc) = chunk;
+                    // `av1_get_max_uv_txsize(BLOCK_128X128)` =
+                    // `av1_get_adjusted_tx_size(TX_64X64)` = TX_32X32.
+                    let cu_tx = 32usize;
+                    let luma_span = cu_tx * 2;
+                    let cu_mi = (at_mi.0 + cr * 16, at_mi.1 + cc * 16);
+                    let cu_around = neighbours.around_mi(cu_mi, luma_span);
+                    let (cu_x, cu_y) = (cpx + cc * cu_tx, cpy + cr * cu_tx);
+                    let cu_reach = crate::decode::tu_reach(
+                        side, side,
+                        cc * luma_span, cr * luma_span, luma_span,
+                        reach, px, py, y.width, y.height,
+                    );
+                    let cu_scan = default_scan(cu_tx);
+                    for plane_idx in 1..3 {
+                        let buf: &mut PlaneBuf = if plane_idx == 1 { &mut *u } else { &mut *v };
+                        let cu_grid = if skip {
+                            buf.reconstruct(
+                                cu_x,
+                                cu_y,
+                                cu_tx,
+                                uv_predict_mode,
+                                angle_delta_uv,
+                                cu_reach,
+                                &vec![0i32; cu_tx * cu_tx],
+                                None,
+                                None,
+                                smooth_neighbor_uv,
+                            );
+                            vec![0i32; cu_tx * cu_tx]
+                        } else {
+                            read_plane(
+                                dec,
+                                cdfs,
+                                chroma_set,
+                                &cu_scan,
+                                plane_idx,
+                                cu_around[plane_idx],
+                                mode,
+                                uv_predict_mode,
+                                angle_delta_uv,
+                                cu_reach,
+                                buf,
+                                cu_x,
+                                cu_y,
+                                cu_tx,
+                                cu_tx,
+                                base_q_idx,
+                                // CfL is refused above 32x32
+                                // (`is_cfl_allowed`), so never here.
+                                None,
+                                None,
+                                // The uv plane block (64x64) is larger than
+                                // the unit (32x32): `get_txb_ctx`'s offset-10
+                                // rows, +3 on the `txb_skip_chroma_32` table
+                                // (lane-sb128b r3).
+                                Some(3),
+                                smooth_neighbor_uv,
+                            )?
+                        };
+                        // Immediately, so the NEXT chunk's unit reads this
+                        // one's coefficient context.
+                        neighbours.record_mi_chroma(
+                            cu_mi, luma_span, luma_span, plane_idx, &cu_grid,
+                        );
+                        CHROMA_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                        let dst = if plane_idx == 1 { &mut u_units } else { &mut v_units };
+                        for rr in 0..cu_tx {
+                            let start = (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
+                            dst[start..start + cu_tx]
+                                .copy_from_slice(&cu_grid[rr * cu_tx..][..cu_tx]);
+                        }
+                    }
+                }
             }
         }
-        if skip {
+        if side > 64 {
+            // Chroma is already coded and reconstructed per mu chunk above.
+            luma_grid = vec![0i32; side * side];
+            u_grid = std::mem::take(&mut u_units);
+            v_grid = std::mem::take(&mut v_units);
+            INTRA_128_IN_INTER_HITS.with(|c| c.set(c.get() + 1));
+        } else if skip {
             if !split_luma {
                 y.reconstruct(
                     px,
@@ -21149,7 +21267,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         skip_mode_frame,
                         switchable_motion_mode,
                         allow_warped_motion,
-                        true,
+                        // lane-sb128c r3: `reject_residual` is about a
+                        // RECTANGULAR strip decoded with square dimensions --
+                        // the 128x128 NONE root is square, and a hardcoded
+                        // `true` refused every one of them at its first
+                        // non-skip block.
+                        $ww != $side || $wh != $side,
                         $ww,
                         $wh,
                         allow_screen_content_tools,
@@ -21160,8 +21283,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             if sb128_none {
                 INTER_SB128_NONE_HITS.with(|c| c.set(c.get() + 1));
                 let at128 = ((sb_r & !1) as usize * 4, (sb_c & !1) as usize * 4);
+                // lane-sb128c r3: `at128` is in SUB16 units like `sb_at`;
+                // `decode_inter_block` takes MI. Unconverted it was (0,0) for
+                // the first 128 root and a quarter-position for every other
+                // one -- the whole-frame gate never got past superblock 1.
                 inter_piece!(
-                    at128, SB * 2,
+                    sub16_to_mi(at128), SB * 2,
                     TxbSet::Luma64, TxbSet::Luma64, TxbSet::Chroma32, TX32, TX32,
                     &scan32, &scan32, 3, SB * 2, SB * 2
                 );
