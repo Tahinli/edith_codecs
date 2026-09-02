@@ -34,7 +34,6 @@ const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
-    "a 1:4 partition below 16x16 (PARTITION_HORZ_4/VERT_4, four 16x4/4x16 strips -- this decoder codes NONE, HORZ, VERT, the four AB arms and a clean split at 16x16)",
     "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
@@ -81,6 +80,10 @@ const REFUSALS: &[&str] = &[
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
     "a motion_mode symbol for a block shape with no CDF row here",
+    // lane-r14 r2: the whole-transform case of every 64-axis inter strip is
+    // coded; only the SPLIT of a 1:4 strip with a 64-px axis is left, whose
+    // `sub_tx_size_map` entry is rectangular (TX_64X16 -> TX_32X16).
+    "a split transform on a 1:4 inter strip with a 64-px axis",
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
