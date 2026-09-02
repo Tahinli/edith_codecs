@@ -32,7 +32,6 @@ const REFUSALS: &[&str] = &[
     "a nonzero angle delta on an 8x8 intra leaf in an inter frame (no gate reaches this leaf with one; the >=16x16 arm decodes deltas)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
-    "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "an OBMC neighbour whose interp filter was never recorded (no switchable symbol for that block)",
     "an intra 4x4 block inside an inter frame's sub-8x8 split (this decoder codes only inter 4x4 sub-blocks there)",
     "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition (this decoder codes only inter sub-blocks there)",
