@@ -620,6 +620,11 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             // refuses by name there if the slot is still empty -- widened
             // (lane-av1refs) from `GOLDEN_FRAME`'s own slot alone to every
             // one of the 7 single-reference slots.
+            // lane-fimv r1: record the header state the fimv gate asserts on
+            // (`motion_mode_allowed`'s `!cur_frame_force_integer_mv` clause).
+            if header.force_integer_mv {
+                decode::note_force_integer_mv_frame();
+            }
             let other_refs: [Option<&Picture>; 8] = std::array::from_fn(|ref_frame| {
                 if ref_frame == 0 {
                     None
@@ -9228,6 +9233,234 @@ mod tests {
              ({matched} matches, {named_refusals} refusals of {attempts}) -- gate vacuous"
         );
         assert!(matched > 0, "{name}: every attempt refused -- no pixel comparison ran");
+    }
+
+    /// lane-fimv r1 (class `wrong-alphabet-same-value`): libaom
+    /// `motion_mode_allowed` (blockd.h ~1484) only returns `WARPED_CAUSAL`
+    /// when `!xd->cur_frame_force_integer_mv`, so on a frame whose header set
+    /// `force_integer_mv` an otherwise warp-eligible block reads the 2-symbol
+    /// `obmc_cdf`, not the 3-symbol `motion_mode_cdf`. This decoder read the
+    /// 3-symbol alphabet there (silent tile desync, no refusal named it).
+    ///
+    /// The fixture is screen content that is mostly static with only
+    /// whole-pixel motion, which is exactly what aomenc's own
+    /// `av1_is_integer_mv` (`encoder_utils.c:1357`, >=80% of blocks matching
+    /// their collocated block) needs to set `cur_frame_force_integer_mv`
+    /// under `--tune-content=screen` (seq `force_integer_mv == 2`, adaptive:
+    /// `encoder.c:4171`). Two hard asserts, both class
+    /// `gate-blind-to-feature`: at least one decoded frame header carried
+    /// `force_integer_mv = 1`, and at least one block took the 2-symbol
+    /// alphabet where `allow_warped_motion = 1` and `num_proj_ref >= 1` would
+    /// have picked the 3-symbol one. A decode error or a pixel mismatch is a
+    /// FAILURE, never a skip.
+    #[track_caller]
+    fn run_fimv_motion_mode_gate(name: &str, ten_bit: bool) {
+        let _gate_lock = lock_gate_counters();
+        assert!(have_ffmpeg(), "{name}: ffmpeg required");
+        assert!(have_aomenc(), "{name}: no aomenc at {}", aomenc_path().display());
+        let (width, height, frame_count) = (64usize, 64usize, 20usize);
+        let fimv_frames_before = crate::decode::fimv_frame_hits();
+        let alphabet_before = crate::decode::fimv_alphabet_hits();
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        let mut attempts = 0u32;
+        let mut refusals = Vec::new();
+        for cq in [32u32, 45, 55] {
+            for step in [4u32, 8] {
+                attempts += 1;
+                // lane-fimv r1: per-attempt snapshots. The aggregate
+                // assertions below are satisfied by a single lucky cq/step
+                // cell; these prove EVERY attempt that decoded and
+                // pixel-compared really carried the header state and the
+                // forced alphabet under test (class gate-blind-to-feature).
+                let attempt_fimv_before = crate::decode::fimv_frame_hits();
+                let attempt_alphabet_before = crate::decode::fimv_alphabet_hits();
+                let duration = frame_count as f64 / 25.0;
+                // Flat screen-content tiles with hard edges, translating by a
+                // whole number of pixels per frame: static enough for
+                // `av1_is_integer_mv`, moving enough for a real inter block
+                // with overlappable neighbours.
+                let source = format!(
+                    "color=c=black:s={width}x{height}:r=25,\
+                     drawbox=x='8+{step}*mod(trunc(t*25)\\,3)':y=8:w=20:h=20:color=white:t=fill,\
+                     drawbox=x=36:y='6+{step}*mod(trunc(t*25)+1\\,3)':w=16:h=16:color=0x808080:t=fill,\
+                     drawbox=x=4:y=44:w=56:h=12:color=0xC0C0C0:t=fill"
+                );
+                let pix_fmt = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t",
+                        &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
+                        "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let mut args: Vec<&str> = vec![
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    // single reference only: the 10-bit compound MC defect
+                    // (see `a_real_compound_global_warp_10bit_stream_...`)
+                    // is unrelated to this lane and would mask it.
+                    "--auto-alt-ref=0",
+                    "--lag-in-frames=0",
+                    "--enable-fwd-kf=0",
+                    "--enable-order-hint=1",
+                    // the flag combination this gate exists for: warp allowed
+                    // by the header, OBMC available, global motion off (so the
+                    // GLOBALMV suppression is not what picks the alphabet).
+                    "--tune-content=screen",
+                    "--enable-warped-motion=1",
+                    "--enable-obmc=1",
+                    "--enable-global-motion=0",
+                    "--enable-masked-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-dist-wtd-comp=0",
+                    // partition/intra tools this decoder does not code yet --
+                    // the same exclusion list every inter gate here carries.
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                ];
+                if ten_bit {
+                    args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+                }
+                args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{name} failed outright (cq {cq} step {step}): {msg}"
+                        );
+                        named_refusals += 1;
+                        refusals.push(format!("cq {cq} step {step}: {msg}"));
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let want = if ten_bit {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
+                    && frames
+                        .iter()
+                        .zip(&want)
+                        .any(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v)
+                {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (cq {cq}) to {path}");
+                }
+                for (i, (got, want)) in frames.iter().zip(&want).enumerate() {
+                    assert_eq!(got.y, want.y, "{name} frame {i} luma vs ffmpeg (cq {cq} step {step})");
+                    assert_eq!(got.u, want.u, "{name} frame {i} U vs ffmpeg (cq {cq} step {step})");
+                    assert_eq!(got.v, want.v, "{name} frame {i} V vs ffmpeg (cq {cq} step {step})");
+                }
+                assert!(
+                    crate::decode::fimv_frame_hits() > attempt_fimv_before,
+                    "{name} (cq {cq} step {step}): decoded and compared all \
+                     frames but no frame header had force_integer_mv=1 -- \
+                     this attempt is vacuous"
+                );
+                assert!(
+                    crate::decode::fimv_alphabet_hits() > attempt_alphabet_before,
+                    "{name} (cq {cq} step {step}): no block was forced onto the \
+                     2-symbol obmc alphabet by force_integer_mv while \
+                     allow_warped_motion=1 and num_proj_ref>=1 -- this attempt \
+                     is vacuous"
+                );
+                matched += 1;
+            }
+        }
+        let fimv_frames = crate::decode::fimv_frame_hits() - fimv_frames_before;
+        let alphabet = crate::decode::fimv_alphabet_hits() - alphabet_before;
+        eprintln!(
+            "{name}: {matched}/{attempts} pixel-exact, {named_refusals} named refusals, \
+             force_integer_mv frames={fimv_frames}, forced-2-symbol blocks={alphabet}\n{}",
+            refusals.join("\n")
+        );
+        assert!(matched > 0, "{name}: every attempt refused -- no pixel comparison ran");
+        assert!(
+            fimv_frames > 0,
+            "{name}: no decoded frame header had force_integer_mv=1 \
+             ({matched} matches of {attempts}) -- gate vacuous"
+        );
+        assert!(
+            alphabet > 0,
+            "{name}: no block read the 2-symbol obmc alphabet where \
+             allow_warped_motion=1 and num_proj_ref>=1 would have picked the \
+             3-symbol motion_mode alphabet -- gate vacuous"
+        );
+    }
+
+    /// 8-bit arm of [`run_fimv_motion_mode_gate`].
+    #[test]
+    fn a_real_force_integer_mv_warp_stream_decodes_pixel_exact() {
+        run_fimv_motion_mode_gate("a_real_force_integer_mv_warp_stream_decodes_pixel_exact", false);
+    }
+
+    /// 10-bit arm of [`run_fimv_motion_mode_gate`] -- both of his films are
+    /// `yuv420p10le`.
+    #[test]
+    fn a_real_force_integer_mv_warp_10bit_stream_decodes_pixel_exact() {
+        run_fimv_motion_mode_gate(
+            "a_real_force_integer_mv_warp_10bit_stream_decodes_pixel_exact",
+            true,
+        );
     }
 
     /// 8-bit arm of [`run_compound_global_warp_gate`].
