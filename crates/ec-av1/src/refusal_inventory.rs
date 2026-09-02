@@ -29,24 +29,23 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
-    "a nonzero angle delta on an 8x8 intra leaf in an inter frame (no gate reaches this leaf with one; the >=16x16 arm decodes deltas)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
-    "an OBMC neighbour whose interp filter was never recorded (no switchable symbol for that block)",
+    "an OBMC neighbour whose switchable interp filter was never recorded",
     "an intra 4x4 block inside an inter frame's sub-8x8 split (this decoder codes only inter 4x4 sub-blocks there)",
     "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition (this decoder codes only inter sub-blocks there)",
     "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
     "a rectangular inter luma transform unit whose shape has no coefficient table set here",
     "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
     "a rectangular transform unit whose shape has no coefficient scan table here",
-    "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
-    "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
     "a Golomb tail longer than this decoder reads",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
-    "a 128x128 superblock HORZ/VERT or AB partition (only SPLIT and NONE are decoded at the 128 root)",
+    "a 128x128 superblock partition value outside the 8-symbol alphabet",
+    "an inter var-tx tree with a leaf transform larger than 64x64",
+    "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
@@ -59,6 +58,12 @@ const REFUSALS: &[&str] = &[
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with no mode-info grid",
     "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
+    // Still live, but NARROWED: lane-rectres r1 added the 32x32-level 1:4
+    // strips (32x8 / 8x32) to `rect_inter_residual_supported` -- THE shape both
+    // 10-bit 3840x1608 film cuts and every measured 1080p offset stopped on
+    // (gate `a_real_aomenc_inter_sequence_with_32x32_level_1to4_strips_codes_\
+    // their_rect_residual`). The string stays because the shapes below 8x8 and
+    // the AB-partition footprints still have no rectangular residual path.
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
     "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
     "a reference picture whose height does not match this frame's own true size",
@@ -67,10 +72,9 @@ const REFUSALS: &[&str] = &[
     // lane-intrainter r1 lifted the >=16x16 square case (per-TU intra
     // prediction + coefficients, gate
     // `a_real_aomenc_inter_sequence_with_a_split_transform_intra_block_decodes_pixel_exact`);
-    // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
-    "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
+    // lane-leaf8tx r4 lifted the 8x8 leaf's TX_4X4 2x2 grid (gate
+    // `a_real_aomenc_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact`).
     "an inter frame with no key frame before it",
-    "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
     // lane-inter16ab r1 lifted the AB half and r2 the 1:4 half (four 16x4 /
     // 4x16 inter strips, their 8x4/4x8 chroma pair built from BOTH strips'
     // motion vectors -- gate
@@ -90,7 +94,6 @@ const REFUSALS: &[&str] = &[
     // what is left is the 1:4 shape, whose `bsize_to_tx_size_cat` breaks the
     // size-group/category diagonal the 2:1 shapes share.
     "an intra-coded 16x4/4x16 strip on the inter block path (the 16x16-level 1:4 inter partition is refused before this point)",
-    "a split (nonzero tx_depth) transform on an intra HORZ/VERT strip in an inter frame",
     // The same arm's screen-content gate: palette/intrabc syntax is consumed
     // for square blocks only, so a strip in such a frame would skip symbols.
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
