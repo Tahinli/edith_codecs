@@ -2273,6 +2273,46 @@ pub(crate) fn intra_rect_strip_in_inter_hits(class: usize) -> usize {
     INTRA_RECT_IN_INTER_HITS.with(|c| c.get()[class])
 }
 
+// lane-intrasplit r1: intra HORZ/VERT strips inside an INTER frame whose luma
+// transform is SPLIT, bucketed by the read `tx_depth` (index 1 and 2; index 0
+// is never incremented) -- the gate's proof that the lifted path ran per depth.
+thread_local! {
+    static INTRA_RECT_IN_INTER_SPLIT_TX_HITS: std::cell::Cell<[usize; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
+}
+
+/// Current value of [`INTRA_RECT_IN_INTER_SPLIT_TX_HITS`], indexed by tx depth.
+pub(crate) fn intra_rect_in_inter_split_tx_hits() -> [usize; 3] {
+    INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
+}
+
+// lane-intra14 r1: how many intra-coded 1:4 strips decoded on the INTER
+// block path, per shape -- [0] 64x16, [1] 16x64, [2] 32x8, [3] 8x32. Every
+// one of them was the named refusal "an intra-coded 1:4 (or other non-2:1)
+// rect strip on the inter block path" before this round.
+thread_local! {
+    static INTRA_RECT4_IN_INTER_HITS: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
+}
+
+/// Current value of [`INTRA_RECT4_IN_INTER_HITS`] for one shape
+/// (0 = 64x16, 1 = 16x64, 2 = 32x8, 3 = 8x32).
+pub(crate) fn intra_rect4_strip_in_inter_hits(shape: usize) -> usize {
+    INTRA_RECT4_IN_INTER_HITS.with(|c| c.get()[shape])
+}
+
+// lane-intra14 r1: set while an INTRA block of an INTER frame is decoded
+// through one of the key-frame rect readers ([`decode_block_rect4`],
+// [`decode_block_rect64`]). `Some((size_group, skip))` tells
+// [`read_intra_mode_rect`] that (a) `skip`/segment id/cdef/delta-q were
+// already read by [`decode_inter_block`] and (b) the luma mode comes off
+// `y_mode_cdf[size_group_lookup[bsize]]` (libaom `read_intra_block_mode_info`,
+// decodemv.c:1189), never the key frame's above/left `kf_y_mode` pair.
+thread_local! {
+    static INTRA_IN_INTER_MODE: std::cell::Cell<Option<(usize, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 // lane-rectx r5: how many times a NON-strip `kf_y_mode` reader
 // ([`decode_block`], [`decode_block_rect`], [`decode_block_rect64`]) took an
 // above/left mode from the mi-exact map that DIFFERS from its coarse 16x16
@@ -6186,6 +6226,13 @@ fn read_intra_mode_rect(
     } else {
         cfl
     };
+    // lane-intra14 r1: on the INTER block path everything up to and including
+    // `is_inter` was already read by [`decode_inter_block`], so this reader
+    // starts at the mode syntax with the `skip` that caller read.
+    let inter = INTRA_IN_INTER_MODE.with(std::cell::Cell::get);
+    let skip = if let Some((_, skip)) = inter {
+        skip
+    } else {
     // Same `intra_segment_id` placement as the square reader above.
     let (seg_w_mi, seg_h_mi) = (bw / 4, bh / 4);
     if seg_id_pre_skip() {
@@ -6225,9 +6272,18 @@ fn read_intra_mode_rect(
             ));
         }
     }
-    let above_ctx = INTRA_MODE_CTX[above_mode];
-    let left_ctx = INTRA_MODE_CTX[left_mode];
-    let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
+    skip
+    };
+    // libaom `read_intra_block_mode_info` (decodemv.c:1189) vs the key
+    // frame's `read_intra_frame_mode_info` (decodemv.c:1065 `read_intra_mode`
+    // off `kf_y_mode_cdf[above][left]`).
+    let mode = if let Some((size_group, _)) = inter {
+        dec.symbol(&mut cdfs.y_mode[size_group])
+    } else {
+        let above_ctx = INTRA_MODE_CTX[above_mode];
+        let left_ctx = INTRA_MODE_CTX[left_mode];
+        dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx])
+    };
     istep!("mode", mode as i32);
     let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
         read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED])
@@ -6952,9 +7008,18 @@ fn decode_intra_rect_in_inter(
         (8, 16) => (1usize, 1usize),
         (16, 32) => (2, 2),
         (32, 64) => (3, 3),
+        // lane-intra14 r1: the 1:4 strips, read off libaom's own tables --
+        // `size_group_lookup` (common_data.h:61) gives BLOCK_8X32/32X8 group
+        // 1 and BLOCK_16X64/64X16 group 2, while
+        // `bsize_to_tx_size_depth_table` (blockd.h:1347) gives them depth
+        // 3 and 4, i.e. tx categories 2 and 3 -- the diagonal a 2:1 strip
+        // keeps is genuinely broken here, which is why the shape was refused
+        // rather than read from the 2:1 row.
+        (8, 32) => (1, 2),
+        (16, 64) => (2, 3),
         _ => {
             return Err(unsupported(
-                "an intra-coded 1:4 (or other non-2:1) rect strip on the inter block path",
+                "an intra-coded 16x4/4x16 strip on the inter block path (the 16x16-level 1:4 inter partition is refused before this point)",
             ))
         }
     };
@@ -6966,6 +7031,70 @@ fn decode_intra_rect_in_inter(
             "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
              is consumed for square blocks only)",
         ));
+    }
+    // lane-intra14 r1: a 1:4 strip decodes through the very readers the KEY
+    // FRAME path already proves for this shape ([`decode_block_rect4`] at the
+    // 32 level, [`decode_block_rect64`] at 64 -- both already handle the 1:4
+    // luma/chroma transform tables, the per-unit split walk and the strip's
+    // own neighbour records). The ONLY difference on an inter frame is the
+    // mode-info read, which [`INTRA_IN_INTER_MODE`] switches to
+    // `read_intra_block_mode_info`'s `y_mode[size_group]` plus the `skip`
+    // this caller already read. `tx_cat` above is the same category those
+    // readers hardcode (cat 2 in `decode_block_rect4`, cat 3 in
+    // `decode_block_rect64`), asserted here so a future shape cannot drift.
+    if bw.max(bh) == 4 * bw.min(bh) {
+        debug_assert_eq!(tx_cat, if bw.max(bh) == 64 { 3 } else { 2 });
+        INTRA_IN_INTER_MODE.with(|c| c.set(Some((size_group, skip))));
+        let res = if bw.max(bh) == 64 {
+            decode_block_rect64(
+                dec,
+                cdfs,
+                neighbours,
+                (mi_r / (SUB / MI), mi_c / (SUB / MI)),
+                bw,
+                bh,
+                y,
+                u,
+                v,
+                ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+                allow_screen_content_tools,
+                base_q_idx,
+                TX_SELECT_INTER.with(std::cell::Cell::get),
+                REDUCED_TX_SET_INTER.with(std::cell::Cell::get),
+            )
+        } else {
+            decode_block_rect4(
+                dec,
+                cdfs,
+                neighbours,
+                (mi_r, mi_c),
+                bw,
+                bh,
+                None,
+                y,
+                u,
+                v,
+                ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+                allow_screen_content_tools,
+                base_q_idx,
+                TX_SELECT_INTER.with(std::cell::Cell::get),
+            )
+            .map(|_| ())
+        };
+        INTRA_IN_INTER_MODE.with(|c| c.set(None));
+        res?;
+        let shape = match (bw, bh) {
+            (64, 16) => 0,
+            (16, 64) => 1,
+            (32, 8) => 2,
+            _ => 3,
+        };
+        INTRA_RECT4_IN_INTER_HITS.with(|h| {
+            let mut v = h.get();
+            v[shape] += 1;
+            h.set(v);
+        });
+        return Ok(());
     }
     let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
     if mode >= 13 {
@@ -7042,7 +7171,9 @@ fn decode_intra_rect_in_inter(
     }
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(mi_r, mi_c, r, c);
     let depth = if TX_SELECT_INTER.with(std::cell::Cell::get) {
-        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+        // The INTER frame's own `TXFM_CONTEXT` bands, not the key frame's
+        // deblock-grid approximation -- [`tx_size_context_txfm_rect`].
+        let ctx = tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw.min(64), bh.min(64));
         match tx_cat {
             1 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
             2 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
@@ -7053,15 +7184,20 @@ fn decode_intra_rect_in_inter(
     };
     if depth != 0 {
         TX_DEPTH_HITS.with(|h| h.set(h.get() + 1));
-        // merge b51719f+lane-intrarect (class merge-cross-product-defect):
-        // main's 10-bit `split_transform_intra_block` gate reaches this arm
-        // with a nonzero tx depth, and the split rect-TU walk mis-decodes it
-        // (2340 luma samples off at seed 51; refusing here restores that gate
-        // while the depth-0 strip the lane proved keeps decoding). The lane's
-        // own gate never exercised a split strip.
-        return Err(unsupported(
-            "a split (nonzero tx_depth) transform on an intra HORZ/VERT strip in an inter frame",
-        ));
+        // lane-intrasplit r1: a split intra strip in an inter frame walks the
+        // key frame's own per-TU path ([`decode_rect_split`] below); what was
+        // wrong when this refusal was written was the depth SYMBOL, not the walk.
+        INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(|h| {
+            let mut v = h.get();
+            v[depth.min(2)] += 1;
+            h.set(v);
+        });
+    }
+    // lane-intrasplit r3: print EVERY intra strip with its depth, not only the
+    // split ones -- a `depth=0`-only stream is a witness gap in the SOURCE, and
+    // the two are indistinguishable when the diagnostic fires on splits alone.
+    if std::env::var_os("EC_SPLITSTRIP").is_some() {
+        eprintln!("EC_SPLITSTRIP mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} depth={depth}");
     }
     let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
     let modes = RectStripModes {
@@ -7095,6 +7231,22 @@ fn decode_intra_rect_in_inter(
         base_q_idx,
         REDUCED_TX_SET_INTER.with(std::cell::Cell::get),
     )?;
+    // `set_txfm_ctxs` (libaom `decodeframe.c:1078`, at the end of
+    // `decode_token_recon_block`): an INTRA block records its TRANSFORM size in
+    // both `TXFM_CONTEXT` bands -- the above row over the block's width, the
+    // left column over its height. This arm wrote neither before lane-intrasplit
+    // r1, so every later block in the frame read a stale `tx_size`/`txfm_split`
+    // context across the strip's footprint.
+    for i in 0..bw / MI {
+        if let Some(cell) = neighbours.above_txfm.get_mut(mi_c + i) {
+            *cell = tx_w as u8;
+        }
+    }
+    for i in 0..bh / MI {
+        if let Some(cell) = neighbours.left_txfm.get_mut(mi_r + i) {
+            *cell = tx_h as u8;
+        }
+    }
     let class = match bw.max(bh) {
         64 => 0,
         32 => 1,
@@ -12650,6 +12802,44 @@ fn tx_size_context(n: &Neighbours, (mi_r, mi_c): (usize, usize), own_side: usize
 /// a neighbour's var-tx tree splits. [`tx_size_context`]'s deblock-grid
 /// approximation coincides with this only while every neighbour codes one
 /// whole-block transform, which is exactly what `TxMode::Select` ends.
+/// [`tx_size_context_txfm`] with the block's own width and height (lane-intrasplit
+/// r1): `get_tx_size_context` compares the neighbour ABOVE against
+/// `tx_size_wide[max_txsize_rect_lookup[bsize]]` and the neighbour to the LEFT
+/// against `tx_size_high[...]` (libaom `pred_common.h:342`), which for a 2:1
+/// strip are two different numbers. The intra strip inside an inter frame read
+/// this through [`tx_size_context_rect`] -- the key frame's deblock-grid
+/// approximation -- so once `TxMode::Select` made the depth symbol exist, it was
+/// read off the wrong CDF row whenever a neighbour's var-tx tree had split.
+fn tx_size_context_txfm_rect(
+    n: &Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    own_w: usize,
+    own_h: usize,
+) -> usize {
+    let has_above = mi_r > n.tile_row0_mi;
+    let has_left = mi_c > n.tile_col0_mi;
+    let mut above = usize::from(n.above_txfm[mi_c]) >= own_w;
+    let mut left = usize::from(n.left_txfm[mi_r]) >= own_h;
+    if has_above && n.above_inter[mi_c] {
+        above = n.above_side_mi[mi_c] >= own_w;
+    }
+    if has_left && n.left_inter[mi_r] {
+        left = n.left_side_mi[mi_r] >= own_h;
+    }
+    match (has_above, has_left) {
+        (true, true) => usize::from(above) + usize::from(left),
+        (true, false) => usize::from(above),
+        (false, true) => usize::from(left),
+        (false, false) => 0,
+    }
+}
+
+/// lane-intrasplit r3: `above_inter`/`left_inter` are mi-granular bands (they
+/// are written and read everywhere else with a raw mi index); the SUB-cell
+/// division this pair used read a cell four blocks away, so the inter-neighbour
+/// override above fired on the wrong neighbour -- the first divergence of the
+/// 10-bit gate's stream was exactly this (`tx_depth` ctx 0 where libaom has 1,
+/// at the intra block right of an inter one).
 fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usize) -> usize {
     let has_above = mi_r > n.tile_row0_mi;
     let has_left = mi_c > n.tile_col0_mi;
