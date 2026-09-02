@@ -2157,6 +2157,44 @@ pub(crate) fn sb_rect_hits() -> usize {
     SB_RECT_HITS.with(|c| c.get())
 }
 
+// lane-golomb r2: the 32x32-level FRAME-EDGE partition. Slot 0/1 = the
+// gathered edge bit read as 0 (HORZ/VERT) / 1 (SPLIT); slot 2 = a 32-level
+// PARTITION_HORZ decoded with `has_rows32 == false` (only the top 32x16 half
+// is coded), slot 3 = a PARTITION_VERT with `has_cols32 == false`. Both tile
+// paths (intra and inter) feed the same counter.
+//
+// lane-golomb r3: slots 4..7 are the same four facts one level up, at the
+// SUPERBLOCK (64x64) edge -- 4/5 = the gathered 64-level bit read as
+// HORZ/VERT / SPLIT, 6 = a 64x32 bottom-edge strip decoded with
+// `has_rows == false`, 7 = a 32x64 right-edge strip. Real aomenc answers a
+// bottom-edge superblock with the 64-level HORZ (measured: 192x80 flat-band,
+// every SB of the last row), so the 32-level slots stay 0 on that content and
+// only these prove the arm fired.
+thread_local! {
+    static EDGE32_HITS: std::cell::Cell<[usize; 8]> =
+        const { std::cell::Cell::new([0; 8]) };
+}
+
+/// Current value of [`EDGE32_HITS`].
+pub(crate) fn edge32_hits() -> [usize; 8] {
+    EDGE32_HITS.with(|c| c.get())
+}
+
+/// [`bump_edge32`] of `base + bit`, returning the bit -- the gathered edge
+/// reads are `if`-conditions, so the counter has to ride the expression.
+fn bump_edge32_bit(base: usize, bit: usize) -> usize {
+    bump_edge32(base + bit.min(1));
+    bit
+}
+
+fn bump_edge32(slot: usize) {
+    EDGE32_HITS.with(|c| {
+        let mut h = c.get();
+        h[slot] += 1;
+        c.set(h)
+    });
+}
+
 // lane-part32 r4: how many superblock-level AB blocks (`PARTITION_HORZ_A`/
 // `_B`/`VERT_A`/`_B` at 64x64 -- two 32x32 squares plus one 64x32/32x64
 // strip) fired. Real aomenc picks these at 64 even with
@@ -4325,6 +4363,36 @@ impl Neighbours {
                 }
                 if let Some(cell) = self.delta_lf_grid.get_mut(idx) {
                     *cell = snapshot;
+                }
+            }
+        }
+    }
+
+    /// One var-tx / split-tx LEAF's own LUMA transform dims over its mi span.
+    /// libaom `get_transform_size` (av1_loopfilter.c:207) applies the split
+    /// override only `if ((plane == AOM_PLANE_Y) && ...)` -- chroma keeps
+    /// `av1_get_max_uv_txsize(mbmi->bsize)`, the whole BLOCK's uv transform.
+    /// Routing a leaf through [`Self::fill_lf_grid_rect`] recomputed the uv
+    /// dims from the LEAF span and so invented chroma transform edges the
+    /// deblocker then filtered (lane-golomb r6). `ref_grid`/`delta_lf_grid`
+    /// are already correct from the block's own fill over the same span.
+    fn fill_lf_grid_leaf_luma(
+        &mut self,
+        at_mi: (usize, usize),
+        w_mi: usize,
+        h_mi: usize,
+        tx_px: u8,
+        tx_h_px: u8,
+    ) {
+        let (mi_r, mi_c) = at_mi;
+        for rr in 0..h_mi {
+            for cc in 0..w_mi {
+                let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
+                if let Some(cell) = self.tx_grid.get_mut(idx) {
+                    *cell = tx_px;
+                }
+                if let Some(cell) = self.tx_h_grid.get_mut(idx) {
+                    *cell = tx_h_px;
                 }
             }
         }
@@ -9258,8 +9326,22 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
 
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
+    // lane-golomb r6: one file per DECODE-order picture, like aomdec's own
+    // `ec_dump16` static index -- a single `.f0` overwritten every frame made
+    // the post-deblock stage uncomparable across a sequence.
+    thread_local! {
+        static STAGE_IDX: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let idx = STAGE_IDX.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(var.to_string()).or_insert(0);
+        let i = *e;
+        *e += 1;
+        i
+    });
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}"))
     {
         for p in [y, u, v] {
             let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
@@ -12359,8 +12441,8 @@ fn read_inter_plane_rect(
     // `av1_get_ext_tx_set_type`'s DCT-only clamp is on `tx_size_sqr_up`, i.e.
     // the *longer* side of this rect transform.
     let default_tx_type = match inherited_luma_tx_type {
-        Some(t) if w.max(h) < 32 => t,
-        _ => TxType::DctDct,
+        Some(t) => reduce_inherited_chroma_tx_type(t, w, h),
+        None => TxType::DctDct,
     };
     // lane-r14 r2: a 64-length axis codes only its low 32 coefficients
     // (`av1_get_max_eob`), so the coded unit is the `min(w,32) x min(h,32)`
@@ -12527,6 +12609,45 @@ fn read_inter_luma8(
 
 /// The [`TxbSet`] one leaf of an inter block's var-tx tree reads its
 /// coefficient tables from -- the inter counterpart of [`txbset_for`].
+/// `av1_get_tx_type`'s chroma tail (libaom `av1/common/blockd.h:1291-1305`):
+/// an inter block's chroma transform inherits the *colocated luma* unit's
+/// coded `tx_type`, then drops back to `DCT_DCT` unless that type is a member
+/// of the extended set the CHROMA transform size selects
+/// (`av1_ext_tx_used[av1_get_ext_tx_set_type(uv_tx, 1, reduced)][tx_type]`,
+/// `blockd.h:1036`/`1097`). lane-golomb r7: we used to force `DCT_DCT` at
+/// every chroma side >= 32, but `av1_get_ext_tx_set_type`'s DCT-only rung is
+/// `tx_size_sqr_up > TX_32X32`; at exactly TX_32X32 an inter block reads
+/// `EXT_TX_SET_DCT_IDTX`, so a 64x64 inter block whose first luma leaf coded
+/// `IDTX` inherits IDTX on its 32x32 chroma units. `IDTX` and `DCT_DCT` are
+/// both `TX_CLASS_2D`, so that mistake left the entropy stream perfectly in
+/// sync and only corrupted the inverse transform (one 64x64 superblock of
+/// high-frequency chroma noise, luma bit-exact).
+fn reduce_inherited_chroma_tx_type(t: TxType, w: usize, h: usize) -> TxType {
+    use TxType::*;
+    let sqr_up = w.max(h);
+    let sqr = w.min(h);
+    let reduced = REDUCED_TX_SET_INTER.with(std::cell::Cell::get);
+    // `av1_get_ext_tx_set_type(tx_size, is_inter = 1, reduced)`.
+    let allowed: &[TxType] = if sqr_up > 32 {
+        // EXT_TX_SET_DCTONLY
+        &[DctDct]
+    } else if sqr_up == 32 || reduced {
+        // EXT_TX_SET_DCT_IDTX
+        &[DctDct, Idtx]
+    } else if sqr == 16 {
+        // EXT_TX_SET_DTT9_IDTX_1DDCT -- TX_TYPES 0..=11, i.e. everything but
+        // the four 1D ADST/FLIPADST types.
+        &[
+            DctDct, AdstDct, DctAdst, AdstAdst, FlipAdstDct, DctFlipAdst, FlipAdstFlipAdst,
+            AdstFlipAdst, FlipAdstAdst, Idtx, VDct, HDct,
+        ]
+    } else {
+        // EXT_TX_SET_ALL16
+        return t;
+    };
+    if allowed.contains(&t) { t } else { DctDct }
+}
+
 fn inter_txbset_for(tx_px: usize, reduced_tx_set: bool) -> TxbSet {
     match tx_px {
         32 => TxbSet::Luma32Inter,
@@ -13032,6 +13153,18 @@ fn deblock_plane(
     // last coded mi column's horizontal edges were filtered when libaom's
     // real output leaves them untouched (r6's post-deblock diff, 37 px, all
     // in columns 44-47); clipping here closes it (3/3 frames pixel-exact).
+    // lane-golomb r9: the bound is the MI-ROUNDED frame, not the coded
+    // frame. libaom's `av1_filter_block_plane_vert/horz` walk the superblock
+    // and stop at `cm->mi_params.mi_cols`/`mi_rows`, which
+    // `av1_set_mb_mi` derives from `ALIGN_POWER_OF_TWO(width, 3)` -- the
+    // 8-pixel-aligned frame, i.e. a 68-wide frame is filtered out to column
+    // 72 and the vertical edge AT x=68 is a real edge that rewrites the
+    // in-crop columns 64..67. Clipping at `frame_width` skipped it, which is
+    // the +-1 straddling-band defect (68x192 cq35, frame 1, 141 luma pixels
+    // all in columns 64..67; frame 0 survived because that edge carried no
+    // filter level there). r7's superres measurement is preserved: its frame
+    // was already 8-aligned, so this bound equals `frame_width` there and
+    // still excludes the superblock padding up to `true_width`.
     let (cw, ch) = if chroma {
         (frame_width.div_ceil(2), frame_height.div_ceil(2))
     } else {
@@ -13042,11 +13175,17 @@ fn deblock_plane(
         plane.true_height.min(ch),
         plane.width,
     );
+    if std::env::var_os("EC_AV1_DEBLOCK_TRACE_V").is_some() {
+        eprintln!("DEBLOCK plane={plane_idx} tw={tw} th={th} stride={stride} true={}x{} crop={cw}x{ch}", plane.true_width, plane.true_height);
+    }
     let mut y0 = 0usize;
     while y0 < th {
         let mut x0 = 4usize;
         while x0 < tw {
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 0, chroma, x0, y0) {
+                if std::env::var_os("EC_AV1_DEBLOCK_TRACE_V").is_some() && plane_idx == 0 {
+                    eprintln!("VEDGE x0={x0} y0={y0} len={len} level={level}");
+                }
                 filter_edge(
                     &mut plane.data,
                     y0 * stride + x0,
@@ -13246,13 +13385,30 @@ fn apply_loop_restoration(
     deblocked_v: &PlaneBuf,
     lr: &LoopRestorationParams,
     grid: &crate::restoration::RestorationGrid,
+    // lane-golomb r8: this frame header's own (cropped) luma size. Loop
+    // restoration is the ONE post-decode filter that does NOT run over the
+    // mi-rounded plane: libaom's `av1_loop_restoration_filter_frame` sizes
+    // every plane with `av1_get_upsampled_plane_size` -- `plane_w =
+    // ROUND_POWER_OF_TWO(cm->superres_upscaled_width, ss_x)`, `plane_h =
+    // ROUND_POWER_OF_TWO(cm->height, ss_y)` (`av1/common/restoration.c:47`)
+    // -- and asserts it equals the buffer's CROP width
+    // (`restoration.c:1106`), then `av1_extend_frame(..., plane_w, plane_h,
+    // ...)` (`restoration.c:1109`) replicates the right/bottom border from
+    // that cropped edge before any unit is filtered. Deblock and CDEF DO
+    // walk the mi grid, which is why passing `true_width`/`true_height`
+    // here went unnoticed until a frame whose size is not a multiple of 8
+    // (68 -> mi-rounded 72): the LR taps at the last four real columns then
+    // read this decoder's own decoded samples at columns 68..71 where
+    // libaom reads column 67 replicated -- +-1 over the straddling band
+    // (class av1-truesize-lane: true frame size vs mi-rounded).
+    (frame_w, frame_h): (usize, usize),
 ) {
     y.data = crate::restoration::apply_loop_restoration_plane(
         &y.data,
         &deblocked_y.data,
         y.width,
-        y.true_width,
-        y.true_height,
+        frame_w,
+        frame_h,
         0,
         lr.frame_restoration_type[0],
         lr.loop_restoration_size[0],
@@ -13263,8 +13419,8 @@ fn apply_loop_restoration(
         &u.data,
         &deblocked_u.data,
         u.width,
-        u.true_width,
-        u.true_height,
+        frame_w.div_ceil(2),
+        frame_h.div_ceil(2),
         1,
         lr.frame_restoration_type[1],
         lr.loop_restoration_size[1],
@@ -13275,8 +13431,8 @@ fn apply_loop_restoration(
         &v.data,
         &deblocked_v.data,
         v.width,
-        v.true_width,
-        v.true_height,
+        frame_w.div_ceil(2),
+        frame_h.div_ceil(2),
         1,
         lr.frame_restoration_type[2],
         lr.loop_restoration_size[2],
@@ -13841,12 +13997,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                     (true, false) => {
                         trace_edge((sb_r * SB_MI) as usize, (sb_c * SB_MI) as usize, 12, ctx, dec.debug_state().0 as u32);
                         let b = dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
+                        bump_edge32(4 + b.min(1) as usize);
                         bump_edge_part(b.min(1) as usize);
                         if b == 1 { PARTITION_SPLIT } else { PARTITION_HORZ }
                     }
                     (false, true) => {
                         trace_edge((sb_r * SB_MI) as usize, (sb_c * SB_MI) as usize, 12, ctx, dec.debug_state().0 as u32);
                         let b = dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
+                        bump_edge32(4 + b.min(1) as usize);
                         bump_edge_part(b.min(1) as usize);
                         if b == 1 { PARTITION_SPLIT } else { PARTITION_VERT }
                     }
@@ -13916,6 +14074,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         &cdfs.partition_w32[ctx32],
                                         VERT_ALIKE,
                                     ));
+                                    bump_edge32(b.min(1) as usize);
                                     bump_edge_part(2 + b.min(1) as usize);
                                     if b == 1 { PARTITION_SPLIT } else { PARTITION_HORZ }
                                 }
@@ -13925,6 +14084,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         &cdfs.partition_w32[ctx32],
                                         HORZ_ALIKE,
                                     ));
+                                    bump_edge32(b.min(1) as usize);
                                     bump_edge_part(2 + b.min(1) as usize);
                                     if b == 1 { PARTITION_SPLIT } else { PARTITION_VERT }
                                 }
@@ -14582,6 +14742,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     tx_select,
                                     reduced_tx_set,
                                 )?;
+                                if !has_rows32 {
+                                    bump_edge32(2);
+                                }
                                 // lane-hgkf r1: at the frame edge only the first half of the strip is
                                 // coded (libaom `decode_partition` guards the second half with the same
                                 // test that made this partition non-square).
@@ -14623,6 +14786,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     tx_select,
                                     reduced_tx_set,
                                 )?;
+                                if !has_cols32 {
+                                    bump_edge32(3);
+                                }
                                 // lane-hgkf r1: at the frame edge only the first half of the strip is
                                 // coded (libaom `decode_partition` guards the second half with the same
                                 // test that made this partition non-square).
@@ -15013,6 +15179,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         tx_select,
                         reduced_tx_set,
                     )?;
+                    if !has_rows {
+                        bump_edge32(6);
+                    }
                     // lane-golomb r1: at the frame edge only the first half of the
                     // strip is coded (libaom `decode_partition` guards the second
                     // with the same has_rows test that made this partition non-square).
@@ -15054,6 +15223,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         tx_select,
                         reduced_tx_set,
                     )?;
+                    if !has_cols {
+                        bump_edge32(7);
+                    }
                     // lane-golomb r1: at the frame edge only the first half of the
                     // strip is coded (libaom `decode_partition` guards the second
                     // with the same has_cols test that made this partition non-square).
@@ -15276,7 +15448,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
+    apply_loop_restoration(
+        &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
+        (frame_width as usize, frame_height as usize),
+    );
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
@@ -15668,10 +15843,9 @@ fn read_inter_plane(
     // `tx_type` -- `av1_get_tx_type` (libaom `blockd.h`): an inter block's
     // chroma plane never codes its own `tx_type` symbol, but (unlike an
     // intra block, which falls back to `Intra_Mode_To_Tx_Type`) it inherits
-    // the colocated luma transform's coded type verbatim, clamped back to
-    // `DCT_DCT` at the chroma tx sizes the spec forces DCT-only
-    // (`av1_get_ext_tx_set_type`: `tx_size_sqr_up >= TX_32X32`, i.e. this
-    // function's own `side >= 32`). `None` for the luma call itself
+    // the colocated luma transform's coded type, narrowed to the extended
+    // set the CHROMA size selects ([`reduce_inherited_chroma_tx_type`]).
+    // `None` for the luma call itself
     // (`plane_idx == 0`), where the `TxbSet`'s own symbol (or the true
     // `DCT_DCT` default at 32-point+) already resolves it without help.
     inherited_luma_tx_type: Option<TxType>,
@@ -15689,8 +15863,8 @@ fn read_inter_plane(
     };
     let mut coding = cdfs.txb(set, tx_mode);
     let default_tx_type = match inherited_luma_tx_type {
-        Some(t) if side < 32 => t,
-        _ => TxType::DctDct,
+        Some(t) => reduce_inherited_chroma_tx_type(t, side, side),
+        None => TxType::DctDct,
     };
     let (grid, tx_type) = read_coeffs(
         dec,
@@ -16083,22 +16257,33 @@ fn obmc_mask(len: usize) -> &'static [u8] {
 /// A bordering block's own resolved interp filter kernel, `(h, v)` --
 /// mirrors [`resolve_interp_filter`]'s own return order from its stored
 /// `[u8; 2]` (`Neighbours::above_filter`/`left_filter`, `[sym0, sym1]` =
-/// `[v_sym, h_sym]`). Never calls `from_switchable_symbol` on the `[3, 3]`
-/// sentinel: that value is only ever stored for an intra neighbour (already
-/// excluded by [`overlappable_above`]/[`overlappable_left`]'s `is_inter`
-/// gate) or when `interp_fixed` is `Some` for the whole frame, handled here
-/// first.
+/// `[v_sym, h_sym]`). The `[3, 3]` sentinel is only ever stored for an intra
+/// neighbour (excluded by [`overlappable_above`]/[`overlappable_left`]'s
+/// `is_inter` gate) or when `interp_fixed` is `Some` for the whole frame
+/// (handled here first) -- so a sentinel reaching the kernel lookup means the
+/// stream desynced upstream, and this refuses instead of panicking.
 fn neighbour_filter(
     interp_fixed: Option<mc::InterpFilterKind>,
     sym: [u8; 2],
-) -> (mc::InterpFilterKind, mc::InterpFilterKind) {
+) -> Result<(mc::InterpFilterKind, mc::InterpFilterKind)> {
     if let Some(kind) = interp_fixed {
-        return (kind, kind);
+        return Ok((kind, kind));
     }
-    (
+    // lane-golomb r9: this used to hand the sentinel straight to
+    // `from_switchable_symbol`, which PANICS on any value above 2 -- a crash
+    // on stream data (measured on a real 192x68 cq40 aomenc stream, where an
+    // inter leaf below 8x8 desyncs upstream and leaves an unrecorded filter
+    // behind). A decoder must refuse such a stream by name, never abort the
+    // process; the desync that produces the sentinel belongs to lane-intersub8.
+    if sym[0] > 2 || sym[1] > 2 {
+        return Err(unsupported(
+            "an OBMC neighbour whose switchable interp filter was never recorded",
+        ));
+    }
+    Ok((
         mc::InterpFilterKind::from_switchable_symbol(sym[1] as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym[0] as usize),
-    )
+    ))
 }
 
 /// One neighbour's own re-prediction over a `w`x`h` region, MC'd fresh
@@ -16376,7 +16561,7 @@ fn obmc_blend(
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.above_filter[mi_col + off4],
-        );
+        )?;
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
@@ -16395,7 +16580,7 @@ fn obmc_blend(
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.left_filter[mi_row + off4],
-        );
+        )?;
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
@@ -19516,21 +19701,21 @@ fn decode_inter_block(
         },
     );
     // lane-txselect: a var-tx block's deblock edges follow its own transform
-    // units, not the block. Chroma still reads `tx_h_grid / 2` (the block's
-    // uv transform is not split) -- a known corner-cut of this round.
+    // units, not the block -- for LUMA only (lane-golomb r6): the chroma
+    // grids keep the block's own `av1_get_max_uv_txsize`, which is what
+    // libaom's `get_transform_size` reads for `plane != AOM_PLANE_Y`.
     if let Some(leaves) = &vartx_leaves {
         for &(row, col, tw, th) in leaves {
-            neighbours.fill_lf_grid_rect(
+            // lane-r14's RECT leaf dims through lane-golomb r6's luma-only
+            // writer: fill_lf_grid_rect would recompute CHROMA tx dims from
+            // the leaf span, but libaom's `get_transform_size` splits only for
+            // AOM_PLANE_Y (merge J, ledger constraint).
+            neighbours.fill_lf_grid_leaf_luma(
                 (at_mi.0 + row, at_mi.1 + col),
                 tw / MI,
                 th / MI,
                 tw as u8,
                 th as u8,
-                if globalmv_for_lf {
-                    -ref_frame_for_lf
-                } else {
-                    ref_frame_for_lf
-                },
             );
         }
     }
@@ -21245,7 +21430,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // true size. Height must still match: AV1 superres never scales height
     // (r8's derivation, `mc.rs`'s own doc), and nothing in this decode path
     // has a vertical scaling pass.
-    if reference.height != true_height {
+    // lane-golomb r8: the comparison is against the header's own frame
+    // height, NOT the mi-rounded `true_height`. libaom compares references
+    // on the CROPPED dimensions -- `av1_setup_scale_factors_for_frame(&sf,
+    // ref->y_crop_width, ref->y_crop_height, cm->width, cm->height)`
+    // (`av1/common/reconinter.c`), and a reference is "scaled" only when
+    // those differ (`av1_is_scaled`). A decoded `Picture` is cropped to
+    // `fw`/`fh`, so for any height that is not a multiple of 8 (68 ->
+    // mi_rows 18 -> `true_height` 72) this test compared 68 against 72 and
+    // refused every same-size reference (class av1-truesize-lane: true
+    // frame size vs mi-rounded). Height must still MATCH: AV1 superres
+    // never scales height, and no path here has a vertical scaling pass.
+    if reference.height != frame_height as usize {
         return Err(unsupported(
             "a reference picture whose height does not match this frame's own true size",
         ));
@@ -21685,7 +21881,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                     // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                     // (libaom `ec_read_partition_impl`).
-                    if dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE)) == 1 {
+                    if bump_edge32_bit(
+                        4,
+                        dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE)),
+                    ) == 1 {
                         PARTITION_SPLIT
                     } else {
                         PARTITION_HORZ
@@ -21695,7 +21894,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                     // bit IS the partition -- 0 means PARTITION_VERT, only 1 means SPLIT
                     // (libaom `ec_read_partition_impl`).
-                    if dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE)) == 1 {
+                    if bump_edge32_bit(
+                        4,
+                        dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE)),
+                    ) == 1 {
                         PARTITION_SPLIT
                     } else {
                         PARTITION_VERT
@@ -21870,7 +22072,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                             // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                             // (libaom `ec_read_partition_impl`).
-                            if dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE)) == 1 {
+                            if {
+                                        let b = dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE));
+                                        bump_edge32(b.min(1) as usize);
+                                        b
+                                    } == 1 {
                                 PARTITION_SPLIT
                             } else {
                                 PARTITION_HORZ
@@ -21880,7 +22086,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                             // bit IS the partition -- 0 means PARTITION_VERT, only 1 means SPLIT
                             // (libaom `ec_read_partition_impl`).
-                            if dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE)) == 1 {
+                            if {
+                                        let b = dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE));
+                                        bump_edge32(b.min(1) as usize);
+                                        b
+                                    } == 1 {
                                 PARTITION_SPLIT
                             } else {
                                 PARTITION_VERT
@@ -22607,55 +22817,63 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             allow_screen_content_tools,
                             frame_width as usize,
                         )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            sub16_to_mi((r32 as usize * 2 + 1, c32 as usize * 2)),
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            BLOCK,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
+                        if !has_rows32 {
+                            bump_edge32(2);
+                        }
+                        // lane-golomb r2: at the frame edge only the first half of the
+                        // strip is coded (libaom `decode_partition` guards the second
+                        // with the same has_rows32 test that made this partition non-square).
+                        if has_rows32 {
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                sub16_to_mi((r32 as usize * 2 + 1, c32 as usize * 2)),
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                BLOCK,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                        }
                     }
                     PARTITION_VERT => {
                         // lane-rect r2: mirror of PARTITION_HORZ above with
@@ -22710,55 +22928,63 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             allow_screen_content_tools,
                             frame_width as usize,
                         )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            sub16_to_mi((r32 as usize * 2, c32 as usize * 2 + 1)),
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            SUB,
-                            BLOCK,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
+                        if !has_cols32 {
+                            bump_edge32(3);
+                        }
+                        // lane-golomb r2: at the frame edge only the first half of the
+                        // strip is coded (libaom `decode_partition` guards the second
+                        // with the same has_cols32 test that made this partition non-square).
+                        if has_cols32 {
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                sub16_to_mi((r32 as usize * 2, c32 as usize * 2 + 1)),
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                SUB,
+                                BLOCK,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                        }
                     }
                     PARTITION_HORZ_A => {
                         // lane-partab r1: two 16x16 squares on top + a true
@@ -23338,7 +23564,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
+    apply_loop_restoration(
+        &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
+        (frame_width as usize, frame_height as usize),
+    );
 
     let motion_field = build_motion_field(
         &grid,
@@ -23410,6 +23639,36 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-golomb r7: [`reduce_inherited_chroma_tx_type`] must reproduce
+    /// `av1_ext_tx_used[av1_get_ext_tx_set_type(uv_tx, 1, reduced)]`
+    /// (libaom `av1/common/blockd.h:1036`/`1097`) exactly -- the g35 residue
+    /// was one 64x64 inter superblock whose 32x32 chroma units are
+    /// `EXT_TX_SET_DCT_IDTX`, where IDTX survives and we forced `DCT_DCT`.
+    #[test]
+    fn an_inter_chroma_transform_narrows_its_inherited_tx_type_to_its_own_set() {
+        use TxType::*;
+        // EXT_TX_SET_DCTONLY: `tx_size_sqr_up > TX_32X32`.
+        set_inter_tx_mode(true, false, true);
+        assert_eq!(reduce_inherited_chroma_tx_type(Idtx, 64, 64), DctDct);
+        // EXT_TX_SET_DCT_IDTX at exactly TX_32X32 -- the residue's case.
+        assert_eq!(reduce_inherited_chroma_tx_type(Idtx, 32, 32), Idtx);
+        assert_eq!(reduce_inherited_chroma_tx_type(AdstAdst, 32, 32), DctDct);
+        // EXT_TX_SET_DTT9_IDTX_1DDCT at `tx_size_sqr == TX_16X16`: the four
+        // 1D ADST/FLIPADST types (TX_TYPES 12..15) drop out, the rest stay.
+        assert_eq!(reduce_inherited_chroma_tx_type(HDct, 16, 16), HDct);
+        assert_eq!(reduce_inherited_chroma_tx_type(FlipAdstAdst, 16, 16), FlipAdstAdst);
+        assert_eq!(reduce_inherited_chroma_tx_type(HAdst, 16, 16), DctDct);
+        // EXT_TX_SET_ALL16 below that (`tx_size_sqr < TX_16X16`, so a 16x8
+        // chroma unit too).
+        assert_eq!(reduce_inherited_chroma_tx_type(HAdst, 16, 8), HAdst);
+        assert_eq!(reduce_inherited_chroma_tx_type(VFlipAdst, 8, 8), VFlipAdst);
+        // `reduced_tx_set` collapses every inter set to DCT_IDTX.
+        set_inter_tx_mode(true, true, true);
+        assert_eq!(reduce_inherited_chroma_tx_type(Idtx, 8, 8), Idtx);
+        assert_eq!(reduce_inherited_chroma_tx_type(HAdst, 8, 8), DctDct);
+        set_inter_tx_mode(true, false, true);
+    }
 
     /// lane-fistrip r1 (class `enumerate-the-table-domain`): every block
     /// shape this decoder can hand [`filter_intra_size_class_rect`], against
