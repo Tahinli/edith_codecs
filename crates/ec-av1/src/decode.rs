@@ -2184,6 +2184,31 @@ pub(crate) fn rect4_coeff_hits() -> usize {
     RECT4_COEFF_HITS.with(|c| c.get())
 }
 
+// lane-inter16ab r1: how many 16x16-level AB partitions fired IN AN INTER
+// frame, per arm, in `PARTITION_HORZ_A`, `_HORZ_B`, `_VERT_A`, `_VERT_B`
+// order (the intra-frame counterpart is `AB16_HITS`). Each arm is two 8x8
+// inter leaves (`decode_inter_block8`) plus one true 16x8/8x16 inter strip
+// (`decode_inter_block` with `write_w`/`write_h`); the gate asserts every
+// arm separately so a run whose RD only picked one cannot pass as proof of
+// four.
+thread_local! {
+    static AB16_INTER_HITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// [`AB16_INTER_HITS`] per arm (HORZ_A, HORZ_B, VERT_A, VERT_B at 16x16 in an
+/// inter frame).
+pub fn ab16_inter_hits_by_arm() -> [usize; 4] {
+    AB16_INTER_HITS.with(std::cell::Cell::get)
+}
+
+fn bump_ab16_inter(arm: usize) {
+    AB16_INTER_HITS.with(|c| {
+        let mut v = c.get();
+        v[arm] += 1;
+        c.set(v);
+    });
+}
+
 // lane-r14: the 16x16-level 1:4 pair -- four 16x4 (`PARTITION_HORZ_4`) or
 // 4x16 (`PARTITION_VERT_4`) strips, `CHROMA` counting the odd strips that
 // close a 4:2:0 chroma pair and `COEFF` the strips with a coded residual.
@@ -20690,6 +20715,83 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     )?
                 };
             }
+            // lane-inter16ab r1: one 8x8 inter leaf of a 16x16-level AB
+            // partition (libaom `decode_partition` PARTITION_HORZ_A/_B/
+            // VERT_A/_B at BLOCK_16X16 code `bsize2` = BLOCK_8X8 for two of
+            // their three pieces, decodeframe.c ~1900). Same body the
+            // PARTITION_SPLIT arm runs per leaf, minus its own partition
+            // symbol (an AB piece carries none) and its `prev_leaves`
+            // bookkeeping.
+            macro_rules! inter_leaf8 {
+                ($outer:expr, $leaf:expr) => {{
+                    let leaf_mi = $leaf;
+                                    let (
+                                        skip,
+                                        is_inter,
+                                        skip_mode_leaf,
+                                        compound_ctx8,
+                                        leaf_filter,
+                                        leaf_refs,
+                                    ) = decode_inter_block8(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            &mut grid,
+                                            mi_cols,
+                                            mi_rows,
+                                            $outer,
+                                            leaf_mi,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            &ref_y,
+                                            &ref_u,
+                                            &ref_v,
+                                            &ref_slots,
+                                            base_q_idx,
+                                            &scan8,
+                                            &scan4,
+                                            allow_high_precision_mv,
+                                            force_integer_mv,
+                                            &global_motion,
+                                            enable_dual_filter,
+                                            reference_select,
+                                            enable_masked_compound,
+                                            enable_interintra_compound,
+                                            enable_jnt_comp,
+                                            order_hint_bits,
+                                            order_hint,
+                                            ref_order_hints,
+                                            skip_mode_present,
+                                            skip_mode_frame,
+                                            reduced_tx_set,
+                                            interp_fixed,
+                                            switchable_motion_mode,
+                                            allow_warped_motion,
+                                            allow_screen_content_tools,
+                                            &sign_bias_table,
+                                            tpl_frame.as_ref(),
+                                            frame_width as usize,
+                                        )?;
+                                    neighbours.record_inter_rect_mi(
+                                        leaf_mi,
+                                        2,
+                                        2,
+                                        skip,
+                                        is_inter,
+                                        leaf_refs.0,
+                                        leaf_filter,
+                                        skip_mode_leaf,
+                                    );
+                                    if let Some(ref1) = leaf_refs.1
+                                        && let Some((_, _, group_idx, idx)) = compound_ctx8
+                                    {
+                                        neighbours.record_compound_ctx_rect_mi(
+                                            leaf_mi, 2, 2, ref1, group_idx, idx,
+                                        );
+                                    }
+                }};
+            }
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             let (has_cols, has_rows) = (
                 sb_c * SB_MI + SB_MI / 2 < mi_cols,
@@ -21172,9 +21274,104 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         frame_width as usize,
                                     )?;
                                 }
+                            } else if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&part16) {
+                                // lane-inter16ab r1: the four AB (T-shaped)
+                                // partitions at the 16x16 level of an INTER
+                                // frame -- two 8x8 inter leaves plus one true
+                                // 16x8/8x16 inter strip. libaom
+                                // `decode_partition` (decodeframe.c ~5040,
+                                // `bsize2 = get_partition_subsize(bsize,
+                                // PARTITION_SPLIT)` = BLOCK_8X8 here) visits:
+                                //   HORZ_A: TL 8x8, TR 8x8, bottom 16x8
+                                //   HORZ_B: top 16x8, BL 8x8, BR 8x8
+                                //   VERT_A: TL 8x8, BL 8x8, right 8x16
+                                //   VERT_B: left 8x16, TR 8x8, BR 8x8
+                                // Every piece is inside the frame by
+                                // construction: an AB value can only be read
+                                // from the (has_cols16 && has_rows16) branch
+                                // above, i.e. mi_row+2 < mi_rows and
+                                // mi_col+2 < mi_cols, which is exactly
+                                // libaom's own `has_rows`/`has_cols`.
+                                //
+                                // VERT_A/VERT_B visit TL,BL,TR,BR, so a
+                                // bottom-left square's top-right neighbour is
+                                // the partition's own not-yet-decoded
+                                // rectangle: libaom switches those squares
+                                // onto `has_tr_vert_*`/`has_bl_vert_*`
+                                // (`reconintra.c get_has_tr_table`) --
+                                // `Reach::vert_ab_partition()`, the same
+                                // guard the intra 16-level arm and the
+                                // 32-level inter AB arms take (class
+                                // `visit-order-changes-availability`).
+                                //
+                                // OBMC/warp and compound stay legal here:
+                                // every piece is >= 8x8, so libaom's
+                                // `is_motion_variation_allowed_bsize`
+                                // (min(bw,bh) >= 8, blockd.h) and
+                                // `is_comp_ref_allowed` (block_size_wide +
+                                // block_size_high >= 16, blockd.h) both hold
+                                // and the leaf/strip decoders' own gates
+                                // apply unchanged.
+                                bump_ab16_inter(part16 - PARTITION_HORZ_A);
+                                let _vert_guard = if part16 == PARTITION_VERT_A
+                                    || part16 == PARTITION_VERT_B
+                                {
+                                    Some(crate::encode::Reach::vert_ab_partition())
+                                } else {
+                                    None
+                                };
+                                let (mi_row0, mi_col0) = sub16_to_mi(at16);
+                                let tl = (mi_row0, mi_col0);
+                                let tr = (mi_row0, mi_col0 + 2);
+                                let bl = (mi_row0 + 2, mi_col0);
+                                let br = (mi_row0 + 2, mi_col0 + 2);
+                                macro_rules! ab_strip16 {
+                                    ($mi:expr, $ww:expr, $wh:expr) => {
+                                        inter_piece!(
+                                            $mi,
+                                            SUB,
+                                            TxbSet::Luma16,
+                                            if reduced_tx_set {
+                                                TxbSet::Luma16Inter
+                                            } else {
+                                                TxbSet::Luma16InterSet1
+                                            },
+                                            TxbSet::Chroma8,
+                                            TX16,
+                                            TX8,
+                                            &scan16,
+                                            &scan8,
+                                            1,
+                                            $ww,
+                                            $wh
+                                        )
+                                    };
+                                }
+                                match part16 {
+                                    PARTITION_HORZ_A => {
+                                        inter_leaf8!(at16, tl);
+                                        inter_leaf8!(at16, tr);
+                                        ab_strip16!(bl, 16, 8);
+                                    }
+                                    PARTITION_HORZ_B => {
+                                        ab_strip16!(tl, 16, 8);
+                                        inter_leaf8!(at16, bl);
+                                        inter_leaf8!(at16, br);
+                                    }
+                                    PARTITION_VERT_A => {
+                                        inter_leaf8!(at16, tl);
+                                        inter_leaf8!(at16, bl);
+                                        ab_strip16!(tr, 8, 16);
+                                    }
+                                    _ => {
+                                        ab_strip16!(tl, 8, 16);
+                                        inter_leaf8!(at16, tr);
+                                        inter_leaf8!(at16, br);
+                                    }
+                                }
                             } else if part16 != PARTITION_SPLIT {
                                 return Err(unsupported(
-                                    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
+                                    "an inter 16x16-level 1:4 partition (HORZ_4/VERT_4 -- four 16x4 or 4x16 inter strips; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT, SPLIT or AB)",
                                 ));
                             } else {
                                 if has_cols16 && has_rows16 {
