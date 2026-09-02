@@ -55,7 +55,6 @@ const REFUSALS: &[&str] = &[
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
     "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
-    "a sequence using 128x128 superblocks on a frame larger than 64x64 (this decoder's whole partition/CDEF/LR grid is 64x64-superblock only; aomenc picks 128x128 at --cpu-used=0)",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with no mode-info grid",
