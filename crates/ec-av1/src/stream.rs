@@ -122,6 +122,12 @@ pub fn leaf8_intrabc_hits() -> usize {
     crate::decode::leaf8_intrabc_hits()
 }
 
+/// lane-sb128c r8: the 128 root's INTRA (key-frame) rect arm -- (128x64
+/// blocks, 64x128 blocks, blocks per resolved intra `tx_depth` 0/1/2).
+pub fn intra_sb128_counters() -> (usize, usize, [usize; 3]) {
+    crate::decode::intra_sb128_hits()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -22346,6 +22352,177 @@ mod tests {
             inter_arms > 0,
             "{NAME}: the gathered arm fired only on key frames -- no INTER \
              128x64/64x128 block was decoded, which is the film's own shape"
+        );
+    }
+
+    /// lane-sb128c r8: the 128 root's HORZ/VERT arm on a KEY frame -- one
+    /// 128x64 (or 64x128) INTRA block, the shape r7 still refused by name.
+    /// A smooth `gradients` source makes the key frame itself take the arm
+    /// (`mandelbrot`'s key frames always split), at sizes whose last
+    /// superblock row/column is a partial 64 so the gathered frame-edge bit
+    /// decides the root. `--enable-tx-size-search=1` on half the arms is what
+    /// makes the intra `tx_depth` symbol real (depth 1 = 32x32 units,
+    /// depth 2 = 16x16). Every decode-order frame (hidden alt-refs included)
+    /// is compared against the instrumented aomdec, and the per-depth
+    /// counters are printed for every compared attempt.
+    #[test]
+    fn a_real_aomenc_sb128_intra_rect_block_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_sb128_intra_rect_block_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // (tag, cq, width, height, 10-bit, vertical twin, tx-size-search)
+        let arms: Vec<(u32, &str, usize, usize, bool, bool, bool)> = vec![
+            (42, "--cq-level=55", 384, 320, false, false, false),
+            (43, "--cq-level=32", 384, 320, true, false, true),
+            (44, "--cq-level=8", 256, 192, false, false, true),
+            (46, "--cq-level=55", 192, 256, false, true, false),
+            (45, "--cq-level=45", 192, 256, true, true, true),
+        ];
+        let (mut matched, mut named_refusals, mut out_of_scope) = (0u32, 0u32, 0u32);
+        let (mut horz_arms, mut vert_arms) = (0u32, 0u32);
+        let mut depth_seen = [0usize; 3];
+        for (tag, cq, width, height, ten_bit, vert, tx_search) in arms {
+            let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i",
+                    // DETERMINISTIC smooth source: lavfi `gradients` ignores
+                    // its seed and gives a different picture every run (a
+                    // whole round was spent on a "flake" that was really this),
+                    // so the smoothness comes from long-period sinusoids
+                    // through `geq` instead -- same effect on the encoder's
+                    // partition choice, byte-identical across runs.
+                    &format!(
+                        "nullsrc=size={width}x{height}:rate=25,format=yuv420p,                         geq=lum='128+90*sin((X+2*N)/37)+30*sin(Y/29)':                         cb='128+30*sin(X/23)':cr='128+30*sin((Y+N)/19)'"
+                    ),
+                    "-pix_fmt", pix, "-strict", "-1", "-t", "0.2",
+                    "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut args: Vec<&str> = vec![
+                "--codec=av1", "--passes=1", "--end-usage=q", cq,
+                "--cpu-used=0", "--threads=1", "--row-mt=0",
+                "--sb-size=128", "--min-partition-size=64",
+                "--enable-rect-partitions=1", "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0", "--enable-palette=0",
+                "--enable-intrabc=0", "--deltaq-mode=0", "--limit=5",
+                // EVERY frame a key frame: this gate exists for the INTRA
+                // 128x64/64x128 block, and a mixed stream lands on other
+                // lanes' inter gaps (sub-8 leaves, rect inter residual)
+                // before it ever gets there. The inter twin of this same
+                // 128-root arm has its own gate
+                // (`..._sb128_gathered_edge_horz_partition_decodes_pixel_exact`).
+                "--kf-max-dist=1",
+            ];
+            // AOMENC FLAG PRECEDENCE: the LAST occurrence wins, so this
+            // per-arm override goes after the base recipe.
+            args.push(if tx_search {
+                "--enable-tx-size-search=1"
+            } else {
+                "--enable-tx-size-search=0"
+            });
+            if ten_bit {
+                args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+            }
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = intra_sb128_counters();
+            if let Err(e) = decode_stream(&stream) {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unsupported"),
+                    "{NAME} failed outright, not a named refusal \
+                     (arm {tag} {width}x{height}): {msg}"
+                );
+                named_refusals += 1;
+                eprintln!("{NAME}: arm {tag} {width}x{height} refusal: {msg}");
+                continue;
+            }
+            let (frames, hidden) = decode_all_frames_vs_oracle(
+                &stream,
+                &format!("sb128c-intra-{tag}-{width}x{height}"),
+            );
+            assert!(frames > 0, "{NAME}: no frames decoded at {width}x{height}");
+            let after = intra_sb128_counters();
+            let (horz, vert_hits) = (after.0 - before.0, after.1 - before.1);
+            let depth: Vec<usize> =
+                (0..3).map(|i| after.2[i] - before.2[i]).collect();
+            eprintln!(
+                "{NAME}: arm {tag} cq {cq} {width}x{height} {}bit {} txsearch={}: \
+                 {frames} frames pixel-exact ({hidden} hidden), \
+                 intra_128x64 +{horz} intra_64x128 +{vert_hits} \
+                 depth[64/32/16] {depth:?}",
+                if ten_bit { 10 } else { 8 },
+                if vert { "VERT" } else { "HORZ" },
+                u8::from(tx_search),
+            );
+            if horz == 0 && vert_hits == 0 {
+                out_of_scope += 1;
+            }
+            if horz > 0 {
+                horz_arms += 1;
+            }
+            if vert_hits > 0 {
+                vert_arms += 1;
+            }
+            for i in 0..3 {
+                depth_seen[i] += depth[i];
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals}); the gate never \
+             decoded a stream"
+        );
+        assert!(
+            horz_arms > 0,
+            "{NAME}: {matched} stream(s) decoded pixel-exact ({out_of_scope} carried \
+             no 128-root rect intra block at all) but NOT ONE key-frame 128x64 \
+             block fired -- the shape this gate exists for"
+        );
+        assert!(
+            vert_arms > 0,
+            "{NAME}: the VERT twin never produced a key-frame 64x128 block"
+        );
+        assert!(
+            depth_seen[0] > 0,
+            "{NAME}: no depth-0 (TX_64X64) intra 128-rect block: {depth_seen:?}"
         );
     }
 
