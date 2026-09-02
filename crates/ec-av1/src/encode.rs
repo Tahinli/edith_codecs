@@ -1261,13 +1261,32 @@ impl Reach {
         tx_h: usize,
         block: Self,
     ) -> Self {
+        // A block wider than 64 is coded in 64x64 "mu" chunks in raster
+        // order, so both libaom predicates special-case it (lane-sb128c r10);
+        // without this the last unit column of every chunk of a 128x64 block
+        // predicts from a chunk libaom has not decoded yet.
+        let wide = bw > 64;
         Self {
-            above_right: if col_off + tx_w < bw {
+            above_right: if row_off > 0 {
+                // `has_top_right`'s `row_off > 0` branch: the offset is taken
+                // modulo the 64-wide chunk, except for the one unit whose
+                // top-right corner is the centre of a 128x128 block.
+                if wide {
+                    (row_off == 64 && col_off + tx_w == 64) || (col_off % 64) + tx_w < 64
+                } else {
+                    col_off + tx_w < bw
+                }
+            } else if col_off + tx_w < bw {
                 true
             } else {
-                row_off == 0 && block.above_right
+                block.above_right
             },
-            below_left: if col_off > 0 {
+            below_left: if wide && col_off > 0 && col_off % 64 == 0 {
+                // `has_bottom_left`: at the left edge of a right-hand chunk
+                // the bottom-left pixels are in the already-coded left chunk,
+                // provided they stay inside it.
+                (row_off % 64) + tx_h < bh.min(64)
+            } else if col_off > 0 {
                 false
             } else if row_off + tx_h < bh {
                 true
