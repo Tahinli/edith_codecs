@@ -14807,7 +14807,6 @@ mod tests {
     /// the partition guard. `#[ignore]` so the suite stays green; run it with
     /// `cargo test -p ec-av1 --lib -- --ignored a_32x32_frame_edge_rect_partition_with_a_flat`.
     #[test]
-    #[ignore = "open r2 defect: the 32-level edge HORZ strip reconstructs wrong pixels"]
     fn a_32x32_frame_edge_rect_partition_with_a_flat_band_decodes_pixel_exact() {
         edge32_gate(
             "a_32x32_frame_edge_rect_partition_with_a_flat_band_decodes_pixel_exact",
@@ -14836,7 +14835,7 @@ mod tests {
         // tile walk is exercised too.
         arms.push((192, 80, 5, false));
         let cqs: [u32; 8] = [35, 40, 45, 50, 55, 57, 59, 61];
-        let mut totals = [0usize; 4];
+        let mut totals = [0usize; 8];
         let mut compared = 0usize;
         let mut refusals: Vec<String> = Vec::new();
         for &(width, height, frame_count, ten_bit) in &arms {
@@ -14958,7 +14957,7 @@ mod tests {
                 };
                 let after = crate::decode::edge32_hits();
                 let delta: Vec<usize> =
-                    (0..4).map(|i| after[i] - before[i]).collect();
+                    (0..8).map(|i| after[i] - before[i]).collect();
                 let reference = if ten_bit {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len())
                 } else {
@@ -14999,7 +14998,7 @@ mod tests {
                     }
                 }
                 compared += 1;
-                for i in 0..4 {
+                for i in 0..8 {
                     totals[i] += delta[i];
                 }
             }
@@ -15010,27 +15009,39 @@ mod tests {
             refusals.join("\n")
         );
         assert!(
-            totals[0] + totals[1] > 0,
-            "{NAME}: no 32x32-level frame-edge partition bit was read at all over \
+            totals[0] + totals[1] + totals[4] + totals[5] > 0,
+            "{NAME}: no frame-edge partition bit was read at all over \
              {compared} compared attempts -- the gate proved nothing"
         );
+        // lane-golomb r3: the flat-band arm's ASSERT moved one level up. Until
+        // r3 the last superblock row was reached through a 32-level edge bit
+        // only because our own out-of-frame transform units had desynced the
+        // stream; with that fixed, real aomenc answers a bottom-edge
+        // superblock with the 64-level `PARTITION_HORZ` (and a right-edge one
+        // with `PARTITION_VERT`) and the 32-level slots stay 0 on this
+        // content. Slots 6/7 are the strips actually decoded at the edge.
         assert!(
-            !flat_band || totals[2] > 0,
-            "{NAME}: the 32-level edge bit never named PARTITION_HORZ at the bottom edge \
+            !flat_band || totals[6] > 0,
+            "{NAME}: no 64x32 bottom-edge HORZ strip was decoded \
              (edge32={totals:?}, {compared} compared attempts)"
         );
         assert!(
-            !flat_band || totals[3] > 0,
-            "{NAME}: the 32-level edge bit never named PARTITION_VERT at the right edge \
+            !flat_band || totals[7] > 0,
+            "{NAME}: no 32x64 right-edge VERT strip was decoded \
              (edge32={totals:?}, {compared} compared attempts)"
         );
         eprintln!(
-            "{NAME}: {compared} pixel-exact attempts, edge32 bits [horz_or_vert={} split={}] \
-             bottom-HORZ={} right-VERT={}, {} named refusals",
+            "{NAME}: {compared} pixel-exact attempts, 32-level edge bits \
+             [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, 64-level edge bits \
+             [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, {} named refusals",
             totals[0],
             totals[1],
             totals[2],
             totals[3],
+            totals[4],
+            totals[5],
+            totals[6],
+            totals[7],
             refusals.len()
         );
         for r in &refusals {
