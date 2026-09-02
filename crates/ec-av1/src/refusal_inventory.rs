@@ -34,6 +34,7 @@ const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
+    "an OBMC neighbour whose switchable interp filter was never recorded",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
@@ -67,7 +68,14 @@ const REFUSALS: &[&str] = &[
     "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
     "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
-    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
+    // lane-inter16ab r1 lifted the AB half (HORZ_A/HORZ_B/VERT_A/VERT_B at
+    // the 16x16 level of an inter frame: two 8x8 inter leaves plus one true
+    // 16x8/8x16 inter strip, gate
+    // `a_real_aomenc_inter_sequence_with_16x16_level_ab_partitions_decodes_pixel_exact`).
+    // What is left is the 1:4 pair, whose 16x4/4x16 strips need the sub-8
+    // inter chroma-pair path (odd-strip `is_chroma_reference`, chroma built
+    // from BOTH strips' MVs) that no inter block writer has yet.
+    "an inter 16x16-level 1:4 partition (HORZ_4/VERT_4 -- four 16x4 or 4x16 inter strips; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT, SPLIT or AB)",
     "an intra mode this decoder does not code (round 2)",
     // lane-intrarect r1 lifted the whole-shape refusal that stood here (the
     // inter path's intra arm now routes 2:1 strips through `decode_rect_split`);
@@ -81,10 +89,6 @@ const REFUSALS: &[&str] = &[
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
     "a motion_mode symbol for a block shape with no CDF row here",
-    // lane-r14 r2: the whole-transform case of every 64-axis inter strip is
-    // coded; only the SPLIT of a 1:4 strip with a 64-px axis is left, whose
-    // `sub_tx_size_map` entry is rectangular (TX_64X16 -> TX_32X16).
-    "a split transform on a 1:4 inter strip with a 64-px axis",
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
