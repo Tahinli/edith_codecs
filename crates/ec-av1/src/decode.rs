@@ -1374,6 +1374,24 @@ pub(crate) fn palette_split_tx_hits() -> usize {
     PALETTE_SPLIT_TX_HITS.with(|c| c.get())
 }
 
+// lane-hgkf r2: SKIPPED intra blocks whose `tx_depth` split the luma transform
+// and which are therefore predicted one transform unit at a time (a skipped
+// block codes no coefficients, so nothing else in the stream witnesses this
+// path -- only the pixels do).
+thread_local! {
+    static SKIP_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SKIP_SPLIT_TX_HITS`] (blocks, not units).
+pub fn skip_split_tx_hits() -> usize {
+    SKIP_SPLIT_TX_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`SKIP_SPLIT_TX_HITS`] before a gate's own decode attempt.
+pub fn reset_skip_split_tx_hits() {
+    SKIP_SPLIT_TX_HITS.with(|c| c.set(0));
+}
+
 // lane-intrainter r1: intra blocks inside an INTER frame whose `tx_depth`
 // symbol split their luma transform, bucketed by block side (8, 16, 32, 64) --
 // the gate's proof that the lifted path actually ran, per size.
@@ -1955,6 +1973,33 @@ thread_local! {
 }
 
 /// Current value of [`SB_RECT_HITS`].
+// lane-hgkf r1: the frame-edge partition bit, one level each. Slot 0 = a
+// 64-level gathered edge bit read as HORZ/VERT, 1 = the same bit read as
+// SPLIT, 2/3 = the 32-level pair. A gate asserting slot 0 or 2 proves the
+// non-SPLIT edge arm actually decoded (before this round the bit was read and
+// thrown away, so that arm was unreachable).
+thread_local! {
+    static EDGE_PART_HITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// Current value of [`EDGE_PART_HITS`].
+pub(crate) fn edge_part_hits() -> [usize; 4] {
+    EDGE_PART_HITS.with(|c| c.get())
+}
+
+/// Reset [`EDGE_PART_HITS`] (a gate counts one stream at a time).
+pub(crate) fn reset_edge_part_hits() {
+    EDGE_PART_HITS.with(|c| c.set([0; 4]));
+}
+
+fn bump_edge_part(slot: usize) {
+    EDGE_PART_HITS.with(|c| {
+        let mut h = c.get();
+        h[slot] += 1;
+        c.set(h);
+    });
+}
+
 pub(crate) fn sb_rect_hits() -> usize {
     SB_RECT_HITS.with(|c| c.get())
 }
@@ -5639,6 +5684,16 @@ fn decode_rect_split(
             let tu_mi = (mi_r + tu_row * (tx_h / MI), mi_c + tu_col * (tx_w / MI));
             let (tu_px, tu_py) = (px + tu_col * tx_w, py + tu_row * tx_h);
             let (col_off, row_off) = (tu_col * tx_w, tu_row * tx_h);
+            // lane-hgkf r1 (ported from lane-golomb 791d87a, unmerged):
+            // libaom clips `av1_foreach_transformed_block_in_plane` to
+            // `max_blocks_wide/high` (`mb_to_right_edge`/`mb_to_bottom_edge`,
+            // i.e. `mi_cols * 4` / `mi_rows * 4`): a transform unit whose
+            // TOP-LEFT sample falls outside the frame is never coded. We read
+            // coefficients for those phantom units and desynced the stream at
+            // the very next symbol.
+            if tu_px >= y.true_width || tu_py >= y.true_height {
+                continue;
+            }
             // `has_top_right`/`has_bottom_left` (libaom `reconintra.c`) for a
             // transform unit INSIDE a block, which is a different rule from
             // the standalone-block table [`Reach::of`] applies -- and the
@@ -8088,6 +8143,26 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// [`crate::intra::predict`] instead of hand-rolling `DC_PRED` alone.
 /// lane-tiny r4: raw padded-plane dump for filter-stage bisection, written
 /// only when `var` names a path. Same byte shape as `EC_AV1_PREFILT_DUMP`.
+/// lane-hgkf r2: 16-bit cropped stage dump, the high-bitdepth twin of
+/// [`dump_stage`] (whose `as u8` truncation hides |delta| <= 2 defects) --
+/// matches aomdec's own `ec_dump16` rung byte for byte (crop dims, u16 LE).
+fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, fh: usize) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var(var)
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+    {
+        for (p, w, h) in [(y, fw, fh), (u, fw.div_ceil(2), fh.div_ceil(2)), (v, fw.div_ceil(2), fh.div_ceil(2))] {
+            for row in 0..h {
+                let mut bytes = Vec::with_capacity(w * 2);
+                for &s in &p.data[row * p.width..][..w] {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let _ = f.write_all(&bytes);
+            }
+        }
+    }
+}
+
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
     if let Ok(path) = std::env::var(var)
@@ -8233,6 +8308,7 @@ impl PlaneBuf {
     /// via [`Self::edges_rect`] and [`crate::intra::predict`]'s own
     /// already-rect-capable `(bw, bh)` pair.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     fn reconstruct_rect(
         &mut self,
         x: usize,
@@ -8291,6 +8367,16 @@ impl PlaneBuf {
             }
             prediction
         };
+        // lane-hgkf r2: per-TU prediction trace, the twin of aomdec's
+        // EC_PRED/EC_PREDND rungs (x/y are this plane's pixel origin).
+        if std::env::var_os("EC_PRED").is_some() {
+            let sum: i64 = prediction.iter().map(|&v| i64::from(v)).sum();
+            let row0: Vec<u16> = prediction[..bw.min(8)].to_vec();
+            let col0: Vec<u16> = (0..bh.min(8)).map(|r| prediction[r * bw]).collect();
+            eprintln!(
+                "@{} OUR_PRED x={x} y={y} bw={bw} bh={bh} mode={mode} ad={angle_delta} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller()
+            );
+        }
         for row in 0..bh {
             for col in 0..bw {
                 let idx = row * bw + col;
@@ -8310,6 +8396,7 @@ impl PlaneBuf {
     /// nudges the prediction by [`cfl_scaled`]'s per-sample amount before the
     /// residual is added — `av1_cfl_predict_block`'s own clip-then-add-residual
     /// order (cfl.c).
+    #[track_caller]
     fn reconstruct(
         &mut self,
         x: usize,
@@ -8373,6 +8460,16 @@ impl PlaneBuf {
             }
             prediction
         };
+        // lane-hgkf r2: per-TU prediction trace, the twin of aomdec's
+        // EC_PRED/EC_PREDND rungs (x/y are this plane's pixel origin).
+        if std::env::var_os("EC_PRED").is_some() {
+            let sum: i64 = prediction.iter().map(|&v| i64::from(v)).sum();
+            let row0: Vec<u16> = prediction[..side.min(8)].to_vec();
+            let col0: Vec<u16> = (0..side.min(8)).map(|r| prediction[r * side]).collect();
+            eprintln!(
+                "@{} OUR_PRED x={x} y={y} side={side} side={side} mode={mode} ad={angle_delta} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller()
+            );
+        }
         for row in 0..side {
             for col in 0..side {
                 let idx = row * side + col;
@@ -8704,18 +8801,69 @@ fn decode_block(
     if skip {
         // A skipped block codes no residual syntax at all (spec 5.11.34):
         // straight prediction, on every plane.
-        y.reconstruct(
-            px,
-            py,
-            side,
-            mode,
-            angle_delta_y,
-            reach,
-            &vec![0i32; side * side],
-            None,
-            filter_intra,
-            smooth_neighbor,
-        );
+        //
+        // lane-hgkf r2: an intra block's `tx_depth` is read whether or not it
+        // is skipped (only an INTER skip forces the largest transform), and
+        // spec 7.11.2 / libaom `predict_and_reconstruct_intra_block` predicts
+        // ONE TRANSFORM UNIT AT A TIME -- each unit's edges are the units
+        // already written left/above of it inside this same block. Predicting
+        // the whole `side`x`side` at once gives a different (uniformly off by
+        // ~1) answer, which is exactly the residue this lane was chasing.
+        // The palette/intrabc override path keeps the single-call shape (its
+        // per-TU windowing is the non-skip loop's own `palette_y_buf` slice,
+        // untested for skip and unreachable in these streams).
+        let split_tx_skip =
+            tx_select && logical_tx < side && palette_y_buf.is_none() && intrabc_bufs.is_none();
+        if split_tx_skip {
+            SKIP_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+            let n_axis = side / logical_tx;
+            for tu_row in 0..n_axis {
+                for tu_col in 0..n_axis {
+                    let tu_px = px + tu_col * logical_tx;
+                    let tu_py = py + tu_row * logical_tx;
+                    if tu_px >= y.true_width || tu_py >= y.true_height {
+                        continue;
+                    }
+                    let tu_reach = tu_reach(
+                        side,
+                        side,
+                        tu_col * logical_tx,
+                        tu_row * logical_tx,
+                        logical_tx,
+                        reach,
+                        px,
+                        py,
+                        y.width,
+                        y.height,
+                    );
+                    y.reconstruct(
+                        tu_px,
+                        tu_py,
+                        logical_tx,
+                        mode,
+                        angle_delta_y,
+                        tu_reach,
+                        &vec![0i32; logical_tx * logical_tx],
+                        None,
+                        filter_intra,
+                        smooth_neighbor,
+                    );
+                }
+            }
+        } else {
+            y.reconstruct(
+                px,
+                py,
+                side,
+                mode,
+                angle_delta_y,
+                reach,
+                &vec![0i32; side * side],
+                None,
+                filter_intra,
+                smooth_neighbor,
+            );
+        }
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone());
@@ -8852,6 +9000,12 @@ fn decode_block(
                 );
                 let tu_px = px + tu_col * logical_tx;
                 let tu_py = py + tu_row * logical_tx;
+                // Same libaom clip as `decode_rect_split`'s loop above; a
+                // square block only hangs off the frame when the frame's mi
+                // dimensions are odd at the block's own level.
+                if tu_px >= y.true_width || tu_py >= y.true_height {
+                    continue;
+                }
                 let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
                 // A transform unit inside a block is NOT a block at that
                 // position (lane-palette2 r12): `Reach::of` granted the
@@ -9127,18 +9281,59 @@ fn decode_leaf8(
     let (cpx, cpy) = (px / 2, py / 2);
     let (luma_grid, u_grid, v_grid);
     if skip {
-        y.reconstruct(
-            px,
-            py,
-            8,
-            mode,
-            angle_delta_y,
-            reach,
-            &vec![0i32; 64],
-            None,
-            filter_intra,
-            smooth_neighbor,
-        );
+        // lane-hgkf r2 (same shape as `decode_block`'s own skip branch): an
+        // 8x8 leaf whose `tx_depth` resolved to TX_4X4 predicts FOUR 4x4
+        // transform units, each off the units already written left/above of
+        // it inside this same leaf -- an intra block's transform size is read
+        // whether or not it is skipped, and spec 7.11.2 predicts per unit.
+        if resolved == 4 {
+            SKIP_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+            for tu_row in 0..2 {
+                for tu_col in 0..2 {
+                    let (tu_px, tu_py) = (px + tu_col * 4, py + tu_row * 4);
+                    if tu_px >= y.true_width || tu_py >= y.true_height {
+                        continue;
+                    }
+                    let tu_reach = tu_reach(
+                        8,
+                        8,
+                        tu_col * 4,
+                        tu_row * 4,
+                        4,
+                        reach,
+                        px,
+                        py,
+                        y.width,
+                        y.height,
+                    );
+                    y.reconstruct(
+                        tu_px,
+                        tu_py,
+                        4,
+                        mode,
+                        angle_delta_y,
+                        tu_reach,
+                        &vec![0i32; 16],
+                        None,
+                        filter_intra,
+                        smooth_neighbor,
+                    );
+                }
+            }
+        } else {
+            y.reconstruct(
+                px,
+                py,
+                8,
+                mode,
+                angle_delta_y,
+                reach,
+                &vec![0i32; 64],
+                None,
+                filter_intra,
+                smooth_neighbor,
+            );
+        }
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
         u.reconstruct(
             cpx,
@@ -12049,28 +12244,24 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 }
                 p
             } else {
-                // lane-golomb r1 (class `parsed-then-discarded`): the gathered
-                // bit is the answer, not a formality -- libaom's
-                // `ec_read_partition_impl` returns `PARTITION_HORZ` (resp.
-                // `PARTITION_VERT`) when it reads 0, and only `PARTITION_SPLIT`
-                // when it reads 1. Forcing SPLIT here desynced the last
-                // superblock row of every frame whose height is not a multiple
-                // of 64 -- the Hunger Games head (3840x1608) diverges at
-                // mi_row=400 mi_col=0, the first block of that row.
+                // lane-hgkf r1 (class `parsed-then-discarded`, same finding as
+                // the unmerged lane-golomb r1): the gathered bit IS the
+                // partition -- libaom `ec_read_partition_impl` returns
+                // PARTITION_HORZ (resp. VERT) for 0 and only SPLIT for 1.
+                // Forcing SPLIT desynced the last superblock row of every
+                // frame whose height is not a multiple of 64: the Hunger
+                // Games key frames (3840x1608) diverge at mi_row=400 mi_col=0,
+                // the first block of that row.
                 match (has_cols, has_rows) {
                     (true, false) => {
-                        if dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE)) == 1 {
-                            PARTITION_SPLIT
-                        } else {
-                            PARTITION_HORZ
-                        }
+                        let b = dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
+                        bump_edge_part(b.min(1) as usize);
+                        if b == 1 { PARTITION_SPLIT } else { PARTITION_HORZ }
                     }
                     (false, true) => {
-                        if dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE)) == 1 {
-                            PARTITION_SPLIT
-                        } else {
-                            PARTITION_VERT
-                        }
+                        let b = dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
+                        bump_edge_part(b.min(1) as usize);
+                        if b == 1 { PARTITION_SPLIT } else { PARTITION_VERT }
                     }
                     _ => PARTITION_SPLIT,
                 }
@@ -12128,26 +12319,25 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                             }
                             p
                         } else {
+                            // lane-hgkf r1: the 32-level frame-edge bit is the
+                            // partition too (same libaom reader as the
+                            // superblock level above).
                             match (has_cols32, has_rows32) {
                                 (true, false) => {
-                                    // lane-golomb r1 (class `parsed-then-discarded`): the gathered
-                                    // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
-                                    // (libaom `ec_read_partition_impl`).
-                                    if dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE)) == 1 {
-                                        PARTITION_SPLIT
-                                    } else {
-                                        PARTITION_HORZ
-                                    }
+                                    let b = dec.symbol_fixed(&gather(
+                                        &cdfs.partition_w32[ctx32],
+                                        VERT_ALIKE,
+                                    ));
+                                    bump_edge_part(2 + b.min(1) as usize);
+                                    if b == 1 { PARTITION_SPLIT } else { PARTITION_HORZ }
                                 }
                                 (false, true) => {
-                                    // lane-golomb r1 (class `parsed-then-discarded`): the gathered
-                                    // bit IS the partition -- 0 means PARTITION_VERT, only 1 means SPLIT
-                                    // (libaom `ec_read_partition_impl`).
-                                    if dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE)) == 1 {
-                                        PARTITION_SPLIT
-                                    } else {
-                                        PARTITION_VERT
-                                    }
+                                    let b = dec.symbol_fixed(&gather(
+                                        &cdfs.partition_w32[ctx32],
+                                        HORZ_ALIKE,
+                                    ));
+                                    bump_edge_part(2 + b.min(1) as usize);
+                                    if b == 1 { PARTITION_SPLIT } else { PARTITION_VERT }
                                 }
                                 _ => PARTITION_SPLIT,
                             }
@@ -12608,6 +12798,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             HORZ_ALIKE,
                                         ))
                                     };
+                                    // lane-hgkf r1: slots 2/3 of
+                                    // [`EDGE_PART_HITS`], the gate's proof the
+                                    // non-SPLIT edge arm actually decoded.
+                                    bump_edge_part(if edge_split == 1 { 3 } else { 2 });
                                     if edge_split == 0 {
                                         // lane-oddh r1: the strip IS decodable
                                         // -- libaom's `decode_partition` codes
@@ -12774,22 +12968,27 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     tx_select,
                                     reduced_tx_set,
                                 )?;
-                                decode_block_rect(
-                                    &mut dec,
-                                    &mut cdfs,
-                                    &mut neighbours,
-                                    (at32.0 + 1, at32.1),
-                                    32,
-                                    16,
-                                    &mut y,
-                                    &mut u,
-                                    &mut v,
-                                    enable_filter_intra,
-                                    allow_screen_content_tools,
-                                    base_q_idx,
-                                    tx_select,
-                                    reduced_tx_set,
-                                )?;
+                                // lane-hgkf r1: at the frame edge only the first half of the strip is
+                                // coded (libaom `decode_partition` guards the second half with the same
+                                // test that made this partition non-square).
+                                if has_rows32 {
+                                    decode_block_rect(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        (at32.0 + 1, at32.1),
+                                        32,
+                                        16,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        enable_filter_intra,
+                                        allow_screen_content_tools,
+                                        base_q_idx,
+                                        tx_select,
+                                        reduced_tx_set,
+                                    )?;
+                                }
                             }
                             PARTITION_VERT => {
                                 // lane-intradisp r1: mirror of PARTITION_HORZ
@@ -12810,22 +13009,27 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     tx_select,
                                     reduced_tx_set,
                                 )?;
-                                decode_block_rect(
-                                    &mut dec,
-                                    &mut cdfs,
-                                    &mut neighbours,
-                                    (at32.0, at32.1 + 1),
-                                    16,
-                                    32,
-                                    &mut y,
-                                    &mut u,
-                                    &mut v,
-                                    enable_filter_intra,
-                                    allow_screen_content_tools,
-                                    base_q_idx,
-                                    tx_select,
-                                    reduced_tx_set,
-                                )?;
+                                // lane-hgkf r1: at the frame edge only the first half of the strip is
+                                // coded (libaom `decode_partition` guards the second half with the same
+                                // test that made this partition non-square).
+                                if has_cols32 {
+                                    decode_block_rect(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        (at32.0, at32.1 + 1),
+                                        16,
+                                        32,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        enable_filter_intra,
+                                        allow_screen_content_tools,
+                                        base_q_idx,
+                                        tx_select,
+                                        reduced_tx_set,
+                                    )?;
+                                }
                             }
                             PARTITION_HORZ_A => {
                                 // lane-part32 r1: two 16x16 squares on top +
@@ -13410,6 +13614,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // that isolate whether a decode-order frame's mismatch already exists
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -13453,8 +13658,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
     dump_stage("EC_AV1_POSTDEBLOCK_DUMP", &y, &u, &v);
+    dump_stage16("EC_AV1_POSTDEBLOCK_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
+    dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
@@ -21193,6 +21400,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // that isolate whether a decode-order frame's mismatch already exists
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -21219,8 +21427,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
     dump_stage("EC_AV1_POSTDEBLOCK_DUMP", &y, &u, &v);
+    dump_stage16("EC_AV1_POSTDEBLOCK_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
+    dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
 
     let motion_field = build_motion_field(

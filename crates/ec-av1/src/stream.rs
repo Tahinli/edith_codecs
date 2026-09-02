@@ -21482,4 +21482,171 @@ mod tests {
              yuv420p10le)"
         );
     }
+
+    /// lane-hgkf r1: a frame whose height (or width) is not a multiple of the
+    /// block size makes the last superblock row (column) read a GATHERED
+    /// partition bit instead of a full alphabet symbol -- and libaom's
+    /// `ec_read_partition_impl` answers that bit with `PARTITION_HORZ`
+    /// (resp. `VERT`) when it is 0, only `SPLIT` when it is 1. All three
+    /// key-frame edge readers (64-, 32- and 16-level) read the bit and threw
+    /// it away, forcing SPLIT; every such frame desynced at the first block
+    /// of its partial row. 192x136 / 136x192 is the smallest shape that hits
+    /// all three levels at once (136 = 2*64 + 8, so mi_rows = 34: the 64-,
+    /// 32- and 16-level halves all fall outside), and it is the shape of a
+    /// real 3840x1608 10-bit film key frame (1608 mod 64 == 8) that decoded
+    /// 51768 samples wrong before this round.
+    ///
+    /// The counter is sampled per attempt and read only on an attempt that
+    /// decoded AND is pixel-compared; slot 0/2 (the bit taken as HORZ/VERT)
+    /// must be nonzero or the gate proves nothing -- before this round that
+    /// arm was unreachable by construction.
+    #[test]
+    fn a_real_aomenc_stream_whose_frame_edge_partition_bit_is_horz_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_whose_frame_edge_partition_bit_is_horz_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let mut compared = 0usize;
+        let mut edge_horz_total = 0usize;
+        let mut edge_sub_total = 0usize;
+        // The last two shapes are the ledger-measured 64-level pair: on a
+        // flat band (192x80 / 80x192) real aomenc answers the bottom-edge
+        // superblock with the 64-level HORZ/VERT, which the 136 shapes above
+        // never produce (their SBs always split down to the 32/16 levels).
+        for (width, height, flat) in [
+            (192usize, 136usize, false),
+            (136usize, 192usize, false),
+            (192usize, 80usize, true),
+            (80usize, 192usize, true),
+        ] {
+            for depth in [8usize, 10] {
+                let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i",
+                        &if flat {
+                            format!("color=c=gray:size={width}x{height}")
+                        } else {
+                            format!("mandelbrot=size={width}x{height}:start_x=-0.6")
+                        },
+                        "-pix_fmt", pix, "-strict", "-1", "-t", "1", "-vframes", "1",
+                        "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg fixture ({width}x{height}, depth={depth}): {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let encode = || {
+                    let mut child = Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
+                            "--cpu-used=3", "--threads=1", "--row-mt=0", "--sb-size=64",
+                            "--kf-max-dist=0", "--enable-rect-partitions=1",
+                            "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
+                            "--enable-tx-size-search=0", "--reduced-tx-type-set=1",
+                            "--min-partition-size=8", "--max-partition-size=64",
+                            &format!("--input-bit-depth={depth}"),
+                            &format!("--bit-depth={depth}"),
+                            "--obu", "-o", "-", "-",
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("aomenc failed to start");
+                    child
+                        .stdin
+                        .take()
+                        .expect("aomenc stdin")
+                        .write_all(&y4m.stdout)
+                        .expect("writing y4m to aomenc");
+                    let out = child.wait_with_output().expect("aomenc failed to run");
+                    assert!(
+                        out.status.success(),
+                        "aomenc refused the fixture ({width}x{height}, depth={depth}): {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    out.stdout
+                };
+                let stream = encode();
+                assert_eq!(
+                    stream,
+                    encode(),
+                    "{NAME}: aomenc output is not reproducible ({width}x{height}, depth={depth})"
+                );
+                crate::decode::reset_edge_part_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME}: decode failed ({width}x{height}, depth={depth}): {msg}"
+                        );
+                        eprintln!(
+                            "{NAME}: {width}x{height} depth={depth} arm refused (not compared): {msg}"
+                        );
+                        continue;
+                    }
+                };
+                let hits = crate::decode::edge_part_hits();
+                let ffmpeg_frames = if depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frames.len())
+                };
+                assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg ({width}x{height}, depth={depth}, \
+                         edge bits horz/split 64-level {}/{}, sub-level {}/{})",
+                        hits[0], hits[1], hits[2], hits[3]
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg ({width}x{height}, depth={depth})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg ({width}x{height}, depth={depth})"
+                    );
+                }
+                compared += 1;
+                edge_horz_total += hits[0];
+                edge_sub_total += hits[2];
+                eprintln!(
+                    "{NAME}: pixel-exact {width}x{height} at {depth}-bit, edge bits \
+                     64-level horz/vert={} split={} sub-level horz/vert={} split={}",
+                    hits[0], hits[1], hits[2], hits[3]
+                );
+            }
+        }
+        assert!(
+            compared > 0,
+            "{NAME}: every arm refused -- the gate compared no pixels at all"
+        );
+        assert!(
+            edge_horz_total > 0,
+            "{NAME}: no 64-level frame-edge bit was ever answered HORZ/VERT -- the arm this \
+             round fixed never fired"
+        );
+        assert!(
+            edge_sub_total > 0,
+            "{NAME}: no 32/16-level frame-edge bit was ever answered HORZ/VERT"
+        );
+    }
 }
