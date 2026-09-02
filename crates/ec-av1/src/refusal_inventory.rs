@@ -29,7 +29,6 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
-    "a nonzero angle delta on an 8x8 intra leaf in an inter frame (no gate reaches this leaf with one; the >=16x16 arm decodes deltas)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an OBMC neighbour whose switchable interp filter was never recorded",
@@ -67,8 +66,8 @@ const REFUSALS: &[&str] = &[
     // lane-intrainter r1 lifted the >=16x16 square case (per-TU intra
     // prediction + coefficients, gate
     // `a_real_aomenc_inter_sequence_with_a_split_transform_intra_block_decodes_pixel_exact`);
-    // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
-    "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
+    // lane-leaf8tx r4 lifted the 8x8 leaf's TX_4X4 2x2 grid (gate
+    // `a_real_aomenc_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact`).
     "an inter frame with no key frame before it",
     // lane-inter16ab r1 lifted the AB half and r2 the 1:4 half (four 16x4 /
     // 4x16 inter strips, their 8x4/4x8 chroma pair built from BOTH strips'

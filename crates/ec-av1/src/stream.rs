@@ -7094,6 +7094,291 @@ mod tests {
     }
 
 
+    /// lane-leaf8tx r1: the refusal this round lifts on an INTRA 8x8 leaf
+    /// inside an INTER frame -- a nonzero luma `angle_delta_y` on it
+    /// (`--enable-angle-delta=1`,
+    /// `av1_use_angle_delta(BLOCK_8X8)`). Both counters are per-attempt
+    /// deltas on an attempt that decoded to the end and is pixel-compared
+    /// (class [[counter-from-refused-stream]]); a decode error or a mismatch
+    /// is a FAILURE, never a SKIP.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact() {
+        tx_split_angle_in_inter8_gate(8);
+    }
+
+    /// The 10-bit arm (both of the user's films are `yuv420p10le`).
+    #[test]
+    fn a_real_aomenc_10bit_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact() {
+        tx_split_angle_in_inter8_gate(10);
+    }
+
+    fn tx_split_angle_in_inter8_gate(bit_depth: u32) {
+        let name = format!("tx_split_angle_in_inter8_gate({bit_depth})");
+        if !have_ffmpeg() {
+            eprintln!("SKIP {name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 6usize);
+        let mut refusals = Vec::new();
+        let mut uncounted_exact = 0u32;
+        let mut counted_exact = 0u32;
+        let mut totals = (0usize, 0usize);
+        for attempt in 0..30u32 {
+            let seed = 42 + attempt;
+            // Same zoom + hard-cut fractal source the sibling uv_mode gate
+            // uses (a cut is what makes aomenc code INTRA blocks inside an
+            // inter frame); `noise` carries an explicit seed (class
+            // [[seeded-fixture-not-reproducible]]).
+            let source = format!(
+                "mandelbrot=size={width}x{height}:start_scale={}:rate=25[a];\
+                 mandelbrot=size={width}x{height}:start_scale={}:rate=25[b];\
+                 [a][b]overlay=enable='gte(n,3)',noise=alls=12:allf=t+u:all_seed={seed}",
+                5.0 - f64::from(attempt) * 0.06,
+                0.9 + f64::from(attempt) * 0.11
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.24",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let cq = format!("--cq-level={}", 12 + (attempt % 5) * 7);
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            // The y4m goes through a PID-keyed FILE, never aomenc's stdin
+            // (pipe deadlock, class [[gate-loader-slurps-whole-file]]).
+            let y4m_path = std::env::temp_dir().join(format!(
+                "ec-av1-leaf8tx-{}-{bit_depth}-{seed}.y4m",
+                std::process::id()
+            ));
+            std::fs::write(&y4m_path, &y4m.stdout).expect("writing the y4m fixture");
+            let child = Command::new(aomenc_path())
+                .args(depth_args)
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq,
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-max-dist=9999",
+                    "--kf-min-dist=9999",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=0",
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-ref-frame-mvs=0",
+                    // Per-arm overrides LAST (aomenc keeps the last
+                    // occurrence of a repeated --enable-* flag). Rect
+                    // partitions stay off so the leaf's unrelated sub-16 rect
+                    // inter refusal never fires.
+                    "--enable-rect-partitions=0",
+                    "--enable-tx-size-search=1",
+                    "--enable-angle-delta=1",
+                    "--enable-directional-intra=1",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--obu",
+                    "-o",
+                    "-",
+                ])
+                // r1 diagnostic: EC_LEAF8TX_CONTROL=1 turns THIS lane's two
+                // tools back off (last occurrence of a repeated --enable-*
+                // wins), so any mismatch that survives is not this lane's.
+                .args(match std::env::var("EC_LEAF8TX_CONTROL").as_deref() {
+                    Ok("angle") => vec!["--enable-tx-size-search=0", "--enable-angle-delta=1"],
+                    Ok("tx") => vec!["--enable-tx-size-search=1", "--enable-angle-delta=0"],
+                    Ok("tx8") => vec![
+                        "--enable-tx-size-search=1",
+                        "--enable-angle-delta=0",
+                        "--max-partition-size=8",
+                    ],
+                    Ok(_) => vec!["--enable-tx-size-search=0", "--enable-angle-delta=0"],
+                    // Shipped recipe (lane-leaf8tx r4): BOTH of this lane's
+                    // tools on -- the tx_depth split at an 8x8 intra-in-inter
+                    // leaf is what the lifted refusal covers, so
+                    // `--enable-tx-size-search=1` must survive the per-arm
+                    // override (aomenc keeps the LAST occurrence). Odd
+                    // attempts also cap the partition at 8x8, the shape that
+                    // produces the 2x2 TX_4X4 grid most often.
+                    Err(_) => {
+                        if attempt % 2 == 1 {
+                            vec![
+                                "--enable-tx-size-search=1",
+                                "--enable-angle-delta=1",
+                                "--max-partition-size=8",
+                            ]
+                        } else {
+                            vec!["--enable-tx-size-search=1", "--enable-angle-delta=1"]
+                        }
+                    }
+                })
+                .arg(&y4m_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            let _ = std::fs::remove_file(&y4m_path);
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = (
+                decode::intra_in_inter_split_tx_hits()[0],
+                decode::intra_in_inter8_angle_delta_y_hits(),
+            );
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{name} decode failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+            };
+            let now = (
+                decode::intra_in_inter_split_tx_hits()[0],
+                decode::intra_in_inter8_angle_delta_y_hits(),
+            );
+            let fired = (now.0 - before.0, now.1 - before.1);
+            totals = (totals.0 + fired.0, totals.1 + fired.1);
+            // Both lifted capabilities must fire on the SAME pixel-compared
+            // attempt.
+            let counted = fired.1 > 0;
+            if !counted {
+                uncounted_exact += 1;
+                refusals.push(format!(
+                    "seed {seed}: decoded and pixel-compared, but split-tx {} / angle-delta {} \
+                     8x8 intra-in-inter leaves",
+                    fired.0, fired.1
+                ));
+            }
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            eprintln!(
+                "{name} seed={seed} {cq}: 8x8 intra-in-inter leaves with tx_depth=1 {}, with a \
+                 nonzero angle_delta_y {} (split-tx per size 8/16/32/64 {:?})",
+                fired.0,
+                fired.1,
+                decode::intra_in_inter_split_tx_hits()
+            );
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                for (plane, (g, w)) in [
+                    ("Y", (&got.y, &want.y)),
+                    ("U", (&got.u, &want.u)),
+                    ("V", (&got.v, &want.v)),
+                ] {
+                    let stride = if plane == "Y" { width } else { width / 2 };
+                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                        eprintln!(
+                            "{name} seed={seed}: frame {i} {plane} first diff at ({}, {}) got {} \
+                             want {} ({} samples differ)",
+                            at % stride,
+                            at / stride,
+                            g[at],
+                            w[at],
+                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
+                        );
+                    }
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
+            }
+            if counted {
+                counted_exact += 1;
+            }
+        }
+        // lane-leaf8tx r4: continue-and-sweep -- every arm is encoded,
+        // decoded and pixel-compared on every plane of every decode-order
+        // frame above; the counters are asserted ONCE here. A decode error or
+        // a mismatch is a failure, never a SKIP, and `uncounted_exact`
+        // (decoded + compared but neither capability fired) is the
+        // out-of-scope-mismatch bucket that the sweep tolerates only while at
+        // least one attempt did fire.
+        gate_buckets(
+            &name,
+            counted_exact,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
+        assert!(
+            totals.0 > 0,
+            "{name}: no decoded+compared attempt carried an 8x8 intra-in-inter leaf with \
+             tx_depth split to 4x4 (split-tx per size {:?}, angle-delta {}):\n{}",
+            decode::intra_in_inter_split_tx_hits(),
+            totals.1,
+            refusals.join("\n")
+        );
+        assert!(
+            totals.1 > 0,
+            "{name}: no decoded+compared attempt carried a nonzero angle_delta_y on an 8x8 \
+             intra-in-inter leaf (split-tx {}):\n{}",
+            totals.0,
+            refusals.join("\n")
+        );
+    }
+
     /// lane-chroma r2 stage 1: a real aomenc key frame with
     /// `--enable-smooth-intra=1` (opposite of every sibling recipe's `=0`)
     /// and `--enable-paeth-intra=0` -- paeth chroma stays off so the still-
@@ -18819,6 +19104,8 @@ mod tests {
         let (width, height, frames) = (192usize, 128usize, 6usize);
         let mut refusals: Vec<String> = Vec::new();
         let mut fired = 0u32;
+        let mut cdef_fired = 0u32;
+        let mut leaf_fired = 0u32;
         for (depth, cq, sp) in [(8u32, 8u32, 3u32), (8, 10, 3), (8, 12, 6), (10, 8, 3), (10, 12, 6)] {
             let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
             let src = format!(
@@ -18908,16 +19195,19 @@ mod tests {
                 }
             };
             assert_eq!(decoded.len(), frames, "frame count (depth={depth} cq={cq})");
-            assert!(
-                decode::cdef_skipped_units() > skipped_before,
-                "no 8x8 CDEF unit was excluded by the all-skip rule \
-                 (depth={depth} cq={cq})"
-            );
-            assert!(
-                decode::inter8_skip_band_hits() > leaves_before,
-                "no sub-16x16 inter leaf wrote the CDEF skip band \
-                 (depth={depth} cq={cq})"
-            );
+            // lane-leaf8tx r2: continue-and-sweep, not a per-attempt hard
+            // assert. Lifting a refusal reshuffles WHICH attempt this gate
+            // lands on (class [[parallel-flake-is-attempt-selection]]): the
+            // first decoded attempt need not carry a sub-16 leaf, and
+            // aborting there skipped the pixel compare entirely. Every
+            // decoded attempt is compared; the counters are asserted once,
+            // at the end, over the compared attempts.
+            if decode::cdef_skipped_units() > skipped_before {
+                cdef_fired += 1;
+            }
+            if decode::inter8_skip_band_hits() > leaves_before {
+                leaf_fired += 1;
+            }
             let reference = if depth == 10 {
                 ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
             } else {
@@ -18936,7 +19226,19 @@ mod tests {
         // hard-asserts both counters plus all six frames on all three planes.
         assert!(
             fired >= 2,
-            "fewer than 2 firing+pixel-exact attempts:\n{}",
+            "fewer than 2 decoded+pixel-exact attempts:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            cdef_fired > 0,
+            "no compared attempt excluded an 8x8 CDEF unit by the all-skip rule \
+             ({fired} compared):\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            leaf_fired > 0,
+            "no compared attempt had a sub-16x16 inter leaf write the CDEF skip band \
+             ({fired} compared):\n{}",
             refusals.join("\n")
         );
     }

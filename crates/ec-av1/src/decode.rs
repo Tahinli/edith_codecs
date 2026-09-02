@@ -181,6 +181,16 @@ thread_local! {
     static INTRA_IN_INTER8_UV_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    static INTRA_IN_INTER8_ANGLE_DELTA_Y_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Nonzero luma angle deltas coded by an intra 8x8 leaf inside an inter frame
+/// (lane-leaf8tx r1) -- counted only in [`decode_inter_block8`]'s intra arm.
+pub(crate) fn intra_in_inter8_angle_delta_y_hits() -> usize {
+    INTRA_IN_INTER8_ANGLE_DELTA_Y_HITS.with(|c| c.get())
+}
+
 /// `(directional, smooth/paeth, CfL)` chroma modes coded by an intra 8x8 leaf
 /// inside an inter frame -- see [`INTRA_IN_INTER8_UV_DIR_HITS`].
 pub(crate) fn intra_in_inter8_uv_hits() -> (usize, usize, usize) {
@@ -3898,11 +3908,17 @@ fn read_coeffs(
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
+    let dbg_txbskip = if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        coding.txb_skip[skip_ctx]
+    } else {
+        [0; 3]
+    };
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if std::env::var_os("EC_TRACE_COEFF").is_some() {
         let (rng, _) = dec.debug_state();
         eprintln!(
-            "EC_COEFF_STEP tag=all_zero ctx={skip_ctx} all_zero={} rng={rng}",
+            "EC_COEFF_STEP tag=all_zero side={} ctx={skip_ctx} cdf={dbg_txbskip:?} all_zero={} rng={rng}",
+            coding.side,
             all_zero as i32
         );
     }
@@ -4017,6 +4033,17 @@ fn read_coeffs(
             let mut sent = 0;
             loop {
                 let k = dec.symbol(&mut coding.br[ctx]) as i32;
+                if ec_trace_coeff {
+                    // lane-leaf8tx r3: the `br` rung was missing from THIS
+                    // path's trace, so the cross-decoder range ladder was
+                    // blind to every base-range symbol and mis-reported the
+                    // first divergence (class [[gate-blind-to-feature]]).
+                    let (rng, _) = dec.debug_state();
+                    let apos = col * side + row;
+                    eprintln!(
+                        "EC_COEFF_STEP tag=br c={scan_idx} pos={apos} ctx={ctx} k={k} rng={rng}"
+                    );
+                }
                 if trace {
                     eprintln!(
                         "TRACE br scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={k}"
@@ -24274,18 +24301,16 @@ fn decode_inter_block8(
         };
         if angle_delta_y != 0 {
             INTRA_IN_INTER_ANGLE_DELTA_Y_HITS.with(|c| c.set(c.get() + 1));
-            // lane-angleinter r1: the >=16x16 arm's lift is gated by a real
-            // aomenc stream; this leaf's is NOT -- 80 attempts across two
-            // sizes and five quantisers never produced an 8x8 intra leaf with
-            // a nonzero delta (the leaf's own sibling refusals -- non-DC
-            // chroma, the TX_4X4 split, sub-16 rect inter leaves -- fire
-            // first). The prediction below would handle it; refusing keeps
-            // the rule that no lift ships ungated. Note the claim is about
-            // THIS DECODER's gate coverage, not about what an encoder writes.
-            return Err(unsupported(
-                "a nonzero angle delta on an 8x8 intra leaf in an inter frame (no gate reaches \
-                 this leaf with one; the >=16x16 arm decodes deltas)",
-            ));
+            // lane-leaf8tx r1: `av1_use_angle_delta(BLOCK_8X8)` is true
+            // (`bsize >= BLOCK_8X8`), so this leaf codes `angle_delta_y` off
+            // `angle_delta_cdf[mode - V_PRED]` exactly as a key-frame block
+            // does (libaom `read_intra_angle_info` inside
+            // `read_intra_block_mode_info`, decodemv.c), and the delta feeds
+            // the directional predictor + the edge filter/upsample decision
+            // through the same `reconstruct` argument below. Counted
+            // separately from the >=16x16 arm so the gate cannot be satisfied
+            // by a bigger block.
+            INTRA_IN_INTER8_ANGLE_DELTA_Y_HITS.with(|c| c.set(c.get() + 1));
         }
         // lane-uv8 r1: the delta'd angle decides the intra edge filter, and a
         // directional luma mode is already legal on this leaf -- the arm
@@ -24429,11 +24454,15 @@ fn decode_inter_block8(
             }
         }
 
-        // lane-intrainter r1: the 8x8 leaf's own intra `tx_depth` can only
-        // resolve to TX_4X4, whose 2x2 unit grid this leaf path has no
-        // prediction loop for (the >=16x16 square path above does). Refuse by
-        // name rather than mis-reconstruct.
-        if read_block_tx_size(
+        // lane-leaf8tx r1: the 8x8 leaf's own intra `tx_depth` (libaom
+        // `read_tx_size` -> `read_selected_tx_size`, max depth 1 at
+        // BLOCK_8X8) resolves to TX_4X4, and `decode_block`
+        // (`decodeframe.c`) then codes one intra prediction + one
+        // coefficient set PER 4x4 transform unit in raster order, each unit
+        // predicting off the units reconstructed before it -- the same loop
+        // the >=16x16 intra-in-inter arm runs. Chroma stays one 4x4 unit
+        // (`av1_get_max_uv_txsize`).
+        let intra_leaves = read_block_tx_size(
             dec,
             cdfs,
             neighbours,
@@ -24443,28 +24472,86 @@ fn decode_inter_block8(
             false,
             skip,
         )?
-        .1
-        .is_some()
-        {
-            return Err(unsupported(
-                "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 \
-                 transform units",
-            ));
-        }
+        .1;
+        // lane-leaf8tx r4: the per-TU loop below is entropy- and pixel-exact
+        // against aomdec once `tx_size_context_txfm` stopped reading
+        // `above_inter`/`left_inter` four mi away (r3), so the refusal that
+        // used to sit here is lifted; gate
+        // `a_real_aomenc_{,10bit_}inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact`.
+        split8 = intra_leaves.is_some();
         let reach = Reach::of(SIDE, px, py, y.width, y.height);
+        if let Some(leaves) = intra_leaves {
+            for &(row, col, tx_px, _) in &leaves {
+                let tu_mi = (leaf_mi.0 + row, leaf_mi.1 + col);
+                let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+                // A transform unit inside a block is not a block at that
+                // position: top-right / bottom-left availability is the
+                // block's, narrowed by the unit's offset inside it.
+                let tu_reach = Reach::of_tu(SIDE, SIDE, col * MI, row * MI, tx_px, tx_px, reach);
+                let tu_grid = if skip {
+                    y.reconstruct(
+                        tu_px,
+                        tu_py,
+                        tx_px,
+                        mode,
+                        angle_delta_y,
+                        tu_reach,
+                        &vec![0i32; tx_px * tx_px],
+                        None,
+                        filter_intra,
+                        smooth_neighbor,
+                    );
+                    vec![0i32; tx_px * tx_px]
+                } else {
+                    // The unit is smaller than the block it sits in, so
+                    // `txb_skip_ctx` is the neighbour-magnitude table, not
+                    // the lone-TU 0 (`get_txb_ctx_general`).
+                    let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tx_px / MI);
+                    read_plane(
+                        dec,
+                        cdfs,
+                        // Intra 4x4 luma: seven-type
+                        // `EXT_TX_SET_DTT4_IDTX_1DDCT` unless reduced, whose
+                        // CDF row is the intra dir (`fi_tx_row` inside
+                        // `read_plane` maps a filter-intra block's).
+                        txbset_for(tx_px, reduced_tx_set),
+                        &default_scan(tx_px),
+                        0,
+                        neighbours.around_mi(tu_mi, tx_px)[0],
+                        mode,
+                        mode,
+                        angle_delta_y,
+                        tu_reach,
+                        y,
+                        tu_px,
+                        tu_py,
+                        tx_px,
+                        tx_px,
+                        base_q_idx,
+                        None,
+                        filter_intra,
+                        Some(tu_skip_ctx),
+                        smooth_neighbor,
+                    )?
+                };
+                neighbours.record_mi_luma(tu_mi, tx_px, &tu_grid);
+            }
+        }
         if skip {
-            y.reconstruct(
-                px,
-                py,
-                SIDE,
-                mode,
-                angle_delta_y,
-                reach,
-                &vec![0i32; SIDE * SIDE],
-                None,
-                filter_intra,
-                smooth_neighbor,
-            );
+            if !split8 {
+                y.reconstruct(
+                    px,
+                    py,
+                    SIDE,
+                    mode,
+                    angle_delta_y,
+                    reach,
+                    &vec![0i32; SIDE * SIDE],
+                    None,
+                    filter_intra,
+                    smooth_neighbor,
+                );
+            }
             // CfL's AC contribution is the luma this leaf just reconstructed,
             // averaged over the 4x4 chroma block (`cfl_ac_q3`, spec 7.11.5).
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
@@ -24497,7 +24584,13 @@ fn decode_inter_block8(
             v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
         } else {
             let around = neighbours.around_mi(leaf_mi, 8);
-            luma_grid = read_plane(
+            luma_grid = if split8 {
+                // Already coded and reconstructed unit by unit above; the
+                // block-level grid only feeds the neighbour write-back,
+                // which the `saved_luma_ctx` restore below keeps per-TU.
+                vec![0i32; SIDE * SIDE]
+            } else {
+                read_plane(
                 dec,
                 cdfs,
                 // lane-uv8 r3: an intra leaf inside an inter frame is
@@ -24526,7 +24619,8 @@ fn decode_inter_block8(
                 filter_intra,
                 None,
                 smooth_neighbor,
-            )?;
+            )?
+            };
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
             u_grid = read_plane(
                 dec,
