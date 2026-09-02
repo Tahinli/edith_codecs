@@ -119,6 +119,16 @@ pub(crate) enum TxbSet {
     /// [`LumaRect32x16`](TxbSet::LumaRect32x16) has none).
     LumaRect32x8,
     LumaRect32x16,
+    /// lane-inter4 r2: [`LumaRect32x16`](TxbSet::LumaRect32x16)'s INTER twin --
+    /// same coefficient tables (`get_txsize_entropy_ctx` reduces TX_32X16 and
+    /// TX_16X32 alike to the 32x32 set, 512-coefficient `eob_pt`), but an
+    /// inter block DOES code a `tx_type` symbol here: `av1_get_ext_tx_set_type`
+    /// with `tx_size_sqr_up == TX_32X32` and `is_inter` returns
+    /// `EXT_TX_SET_DCT_IDTX` (2 symbols), whose CDF is
+    /// `default_inter_ext_tx_cdf[3][txsize_sqr_map[TX_32X16] == TX_16X16]`,
+    /// i.e. exactly [`INTER_TX_TYPE_SET3_16`](crate::cdf::INTER_TX_TYPE_SET3_16)
+    /// -- the same table the square `Luma16Inter` set reads.
+    LumaRect32x16Inter,
     /// The chroma 16x8/8x16 transform under the same strip (lane-rectwire):
     /// [`Chroma16`](TxbSet::Chroma16)'s tables except `eob_pt`, which reads
     /// the true 128-position [`crate::cdf::EOB_PT_128_CHROMA`] instead of
@@ -165,6 +175,24 @@ pub(crate) enum TxbSet {
     /// 16x16 row's five-symbol reduced CDF here and desynced on the very
     /// first coded rect leaf.
     LumaRect16x8Set1,
+    /// lane-inter4 r3: [`LumaRect16x8`](TxbSet::LumaRect16x8)'s INTER twin --
+    /// the same coefficient tables (`get_txsize_entropy_ctx` reduces TX_16X8
+    /// and TX_8X16 alike to the 16x16 set, 128-position `eob_pt`), with the
+    /// inter `tx_type` alphabet in place of the intra one. Under
+    /// `reduced_tx_set` `av1_get_ext_tx_set_type` (`tx_size_sqr_up ==
+    /// TX_16X16`, `is_inter`) returns `EXT_TX_SET_DCT_IDTX` (2 symbols),
+    /// whose CDF row is `default_inter_ext_tx_cdf[1][txsize_sqr_map[TX_16X8]
+    /// == TX_8X8]`, i.e. [`INTER_TX_TYPE_SET3_8`](crate::cdf::INTER_TX_TYPE_SET3_8)
+    /// -- the same table the square `Luma8Inter` set reads.
+    LumaRect16x8Inter,
+    /// [`LumaRect16x8Inter`](TxbSet::LumaRect16x8Inter)'s `reduced_tx_set:
+    /// false` counterpart: `tx_size_sqr` is `TX_8X8` here (NOT the
+    /// `txsize_sqr_up_map` `TX_16X16` the coefficient tables use), so
+    /// `av1_ext_tx_set_lookup[is_inter=1][tx_size_sqr == TX_16X16 -> 0]` is
+    /// `EXT_TX_SET_ALL16` -- sixteen symbols, `default_inter_ext_tx_cdf[1]
+    /// [TX_8X8]`, i.e. [`INTER_TX_TYPE_SET1_8`](crate::cdf::INTER_TX_TYPE_SET1_8),
+    /// the table [`Luma8InterSet1`](TxbSet::Luma8InterSet1) also reads.
+    LumaRect16x8InterSet1,
     /// The chroma 8x4/4x8 transform under the same leaf (lane-rectx):
     /// [`Chroma8`](TxbSet::Chroma8)'s tables except `eob_pt`, which reads the
     /// true 32-position [`crate::cdf::EOB_PT_32_CHROMA`] instead of
@@ -489,13 +517,13 @@ pub(crate) struct Cdfs {
     /// `BLOCK_8X8`, 1 = `BLOCK_16X16`, 2 = `BLOCK_32X32`, 3 = `BLOCK_64X64`
     /// (`default_obmc_cdf`'s own `BLOCK_SIZES_ALL` indices 3/6/9/12 --
     /// this decoder only ever codes those four square sizes).
-    pub obmc: [[u16; 3]; 6],
+    pub obmc: [[u16; 3]; 14],
     /// `motion_mode` (spec 5.11.24's `read_motion_mode`), the 3-symbol
     /// `SIMPLE_TRANSLATION`/`OBMC_CAUSAL`/`WARPED_CAUSAL` alphabet read
     /// instead of [`Self::obmc`] whenever `motion_mode_allowed` resolves to
     /// `WARPED_CAUSAL`-eligible -- same square-bsize indexing as `obmc`.
     /// lane-warp round 1.
-    pub motion_mode: [[u16; 4]; 6],
+    pub motion_mode: [[u16; 4]; 14],
     /// `interintra`, indexed by `size_group_lookup[bsize]` -- see
     /// `cdf::INTERINTRA`'s own doc.
     pub interintra: [[u16; 3]; 4],
@@ -1699,6 +1727,18 @@ impl Cdfs {
                 tx_type: None,
                 eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
             },
+            TxbSet::LumaRect32x16Inter => TxbTables {
+                side: 32,
+                txb_skip: &mut self.txb_skip_luma_32,
+                eob_pt: &mut self.eob_pt_512_luma,
+                eob_extra: &mut self.eob_extra_luma_32,
+                base: &mut self.base_luma_32,
+                base_eob: &mut self.base_eob_luma_32,
+                br: &mut self.br_luma_32,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_16.as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_512_luma_class1),
+            },
             TxbSet::LumaRect32x16 => TxbTables {
                 side: 32,
                 txb_skip: &mut self.txb_skip_luma_32,
@@ -1806,6 +1846,30 @@ impl Cdfs {
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_4_set1[mode].as_mut_slice()),
                 eob_pt_class1: Some(&mut self.eob_pt_64_luma_class1),
+            },
+            TxbSet::LumaRect16x8Inter => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_128_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_8.as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_128_luma_class1),
+            },
+            TxbSet::LumaRect16x8InterSet1 => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_128_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_8_set1.as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_128_luma_class1),
             },
             TxbSet::ChromaRect8x4 => TxbTables {
                 side: 8,
