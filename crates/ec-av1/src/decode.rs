@@ -6824,15 +6824,6 @@ fn tx_size_context_rect(
     // this way, lane-sb128b r1). Without the cap the 64x128 half of a 128-root
     // VERT reads the tx-depth symbol off row 0 where libaom uses row 1.
     let (own_w, own_h) = (own_w.min(64), own_h.min(64));
-    // lane-frame80: inside an INTER frame the real `TXFM_CONTEXT` bands exist
-    // (and carry libaom's "an inter neighbour contributes its own BLOCK size"
-    // override, `pred_common.h:342`); this deblock-grid approximation is the
-    // KEY frame's only. Reading it in an inter frame put the `tx_depth` symbol
-    // of every rect intra strip whose above/left neighbour is a var-tx-split
-    // inter block on the wrong CDF row (ctx 1 where aomdec has 2).
-    if TX_SELECT_INTER.with(std::cell::Cell::get) {
-        return tx_size_context_txfm_rect(n, (mi_r, mi_c), own_w, own_h);
-    }
     let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
     let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
     if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
@@ -13728,11 +13719,6 @@ fn tx_h_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
 /// to the left (at its own topmost mi row) coded a transform at least as wide
 /// as `own_side`.
 fn tx_size_context(n: &Neighbours, (mi_r, mi_c): (usize, usize), own_side: usize) -> usize {
-    // lane-frame80: see [`tx_size_context_rect`] -- an inter frame's own
-    // `TXFM_CONTEXT` bands, never this key-frame approximation.
-    if TX_SELECT_INTER.with(std::cell::Cell::get) {
-        return tx_size_context_txfm(n, (mi_r, mi_c), own_side);
-    }
     let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_side;
     let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_side;
     usize::from(above) + usize::from(left)
