@@ -230,6 +230,22 @@ pub(crate) enum TxbSet {
     /// counterpart: `EXT_TX_SET_DTT4_IDTX_1DDCT`, the seven-symbol `TX_4X4`
     /// row [`LumaRect4x8Set1`](TxbSet::LumaRect4x8Set1) reads.
     LumaRect16x4Set1,
+    /// The luma 8x4/4x8 transform of an INTER `PARTITION_HORZ`/`PARTITION_VERT`
+    /// leaf under an 8x8 block (lane-intersub8 r3): every coefficient table is
+    /// [`LumaRect4x8`](TxbSet::LumaRect4x8)'s (`get_txsize_entropy_ctx` squares
+    /// `TX_8X4` up to the 8x8 class, 32-position `eob_pt`), with the INTER
+    /// `tx_type` alphabet in its place. Under `reduced_tx_set`
+    /// `av1_get_ext_tx_set_type` (`tx_size_sqr_up == TX_8X8`, `is_inter`)
+    /// returns `EXT_TX_SET_DCT_IDTX`, whose row is
+    /// `default_inter_ext_tx_cdf[?][txsize_sqr_map[TX_8X4] == TX_4X4]` -- the
+    /// same `TX_4X4` inter row [`Luma4Inter`](TxbSet::Luma4Inter) reads.
+    LumaRect8x4Inter,
+    /// [`LumaRect8x4Inter`](TxbSet::LumaRect8x4Inter)'s `reduced_tx_set: false`
+    /// counterpart: `tx_size_sqr == TX_4X4` with `tx_size_sqr_up == TX_8X8`, so
+    /// `av1_ext_tx_set_lookup[is_inter=1][...]` is `EXT_TX_SET_ALL16` -- sixteen
+    /// symbols at the `TX_4X4` inter row, the table
+    /// [`Luma4InterSet1`](TxbSet::Luma4InterSet1) also reads.
+    LumaRect8x4InterSet1,
 }
 
 /// The tables one transform block is coded with, borrowed from the state for
@@ -1790,6 +1806,30 @@ impl Cdfs {
                 br: &mut self.br_luma_8,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_4[mode].as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_32_luma_class1),
+            },
+            TxbSet::LumaRect8x4Inter => TxbTables {
+                side: 8,
+                txb_skip: &mut self.txb_skip_luma_8,
+                eob_pt: &mut self.eob_pt_32_luma,
+                eob_extra: &mut self.eob_extra_luma_8,
+                base: &mut self.base_luma_8,
+                base_eob: &mut self.base_eob_luma_8,
+                br: &mut self.br_luma_8,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_4.as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_32_luma_class1),
+            },
+            TxbSet::LumaRect8x4InterSet1 => TxbTables {
+                side: 8,
+                txb_skip: &mut self.txb_skip_luma_8,
+                eob_pt: &mut self.eob_pt_32_luma,
+                eob_extra: &mut self.eob_extra_luma_8,
+                base: &mut self.base_luma_8,
+                base_eob: &mut self.base_eob_luma_8,
+                br: &mut self.br_luma_8,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_4_set1.as_mut_slice()),
                 eob_pt_class1: Some(&mut self.eob_pt_32_luma_class1),
             },
             TxbSet::LumaRect4x8Set1 => TxbTables {
