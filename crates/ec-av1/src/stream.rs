@@ -105,6 +105,17 @@ pub fn rect_wii_hits() -> [usize; 6] {
     crate::decode::rect_wii_hits()
 }
 
+/// lane-sb128c r7: the 128 root's rect arms -- (gathered edge HORZ, gathered
+/// edge VERT, inter 128x64 blocks, inter 64x128 blocks).
+pub fn sb128_rect_counters() -> (usize, usize, usize, usize) {
+    (
+        crate::decode::part128_edge_horz_hits(),
+        crate::decode::part128_edge_vert_hits(),
+        crate::decode::inter_sb128_horz_hits(),
+        crate::decode::inter_sb128_vert_hits(),
+    )
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -21521,6 +21532,173 @@ mod tests {
         );
     }
 
+    /// lane-sb128c r7 GATE: the 128 root's GATHERED bottom/right-edge arm --
+    /// the only 128-partition shape the user's 1080p AV1 film reaches
+    /// (`mi_rows = 270`, so every bottom 128 row has `has_rows128 == false`,
+    /// one gathered bit, and the film codes `PARTITION_HORZ`: a 128x64 block
+    /// whose bottom half is outside the frame and never decoded). Frame sizes
+    /// here are chosen so the LAST superblock row (or column, for the VERT
+    /// twin at 192x256) is partial, which is what forces the gathered symbol.
+    /// Both the key frame and the inter frames of each stream carry the arm;
+    /// `part128_edge_*_hits` and `inter_sb128_*_hits` HARD-assert it fired,
+    /// and `decode_all_frames_vs_oracle` compares EVERY decode-order frame
+    /// (hidden alt-refs included) against the instrumented aomdec.
+    #[test]
+    fn a_real_aomenc_sb128_gathered_edge_horz_partition_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_sb128_gathered_edge_horz_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // (seed, cq, width, height, 10-bit, vertical twin). Every size has a
+        // PARTIAL last superblock row (or column, for the VERT twin): 320 px
+        // = 80 mi rows, two full 128 rows and a 64-px remainder; 256 px = 64
+        // mi = two full rows and none, so the VERT arm uses 192 px = 48 mi on
+        // the column axis. A smooth `gradients` source makes the KEY frame
+        // take the arm too, which is still refused by name (square-block
+        // intra), so this gate's source is `mandelbrot`: its key frames split
+        // and its inter frames keep the 128x64/64x128 edge block.
+        let arms: Vec<(u32, &str, usize, usize, bool, bool)> = vec![
+            (42, "--cq-level=55", 384, 320, false, false),
+            (43, "--cq-level=55", 384, 320, true, false),
+            (44, "--cq-level=32", 192, 256, false, true),
+            (45, "--cq-level=45", 192, 256, true, true),
+        ];
+        let (mut matched, mut named_refusals) = (0u32, 0u32);
+        let (mut edge_arms, mut inter_arms) = (0u32, 0u32);
+        for (seed, cq, width, height, ten_bit, vert) in arms {
+            let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i",
+                    &format!(
+                        "mandelbrot=size={width}x{height}:rate=25:start_x=-0.6:start_y=-0.4"
+                    ),
+                    "-pix_fmt", pix, "-strict", "-1", "-t", "0.2",
+                    "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut args: Vec<&str> = vec![
+                "--codec=av1", "--passes=1", "--end-usage=q", cq,
+                "--cpu-used=0", "--threads=1", "--row-mt=0",
+                "--sb-size=128", "--min-partition-size=64",
+                "--enable-rect-partitions=1", "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0", "--enable-palette=0",
+                "--enable-intrabc=0", "--enable-tx-size-search=0",
+                "--deltaq-mode=0", "--limit=5",
+            ];
+            if ten_bit {
+                args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+            }
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let (before_edge, before_inter) = if vert {
+                (
+                    crate::decode::part128_edge_vert_hits(),
+                    crate::decode::inter_sb128_vert_hits(),
+                )
+            } else {
+                (
+                    crate::decode::part128_edge_horz_hits(),
+                    crate::decode::inter_sb128_horz_hits(),
+                )
+            };
+            // A refusal is still a legal outcome for an arm whose stream hits
+            // some OTHER lane's gap, but never for all of them (asserted
+            // below), and never as a silent skip.
+            if let Err(e) = decode_stream(&stream) {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unsupported"),
+                    "{NAME} failed outright, not a named refusal \
+                     (seed {seed} {width}x{height}): {msg}"
+                );
+                named_refusals += 1;
+                eprintln!("{NAME}: seed {seed} {width}x{height} refusal: {msg}");
+                continue;
+            }
+            let (frames, hidden) = decode_all_frames_vs_oracle(
+                &stream,
+                &format!("sb128c-edge-{seed}-{width}x{height}"),
+            );
+            assert!(frames > 0, "{NAME}: no frames decoded at {width}x{height}");
+            let (edge, inter) = if vert {
+                (
+                    crate::decode::part128_edge_vert_hits() - before_edge,
+                    crate::decode::inter_sb128_vert_hits() - before_inter,
+                )
+            } else {
+                (
+                    crate::decode::part128_edge_horz_hits() - before_edge,
+                    crate::decode::inter_sb128_horz_hits() - before_inter,
+                )
+            };
+            eprintln!(
+                "{NAME}: seed {seed} cq {cq} {width}x{height} {}bit {}: \
+                 {frames} frames pixel-exact ({hidden} hidden), \
+                 edge_hits +{edge} inter_128rect_blocks +{inter}",
+                if ten_bit { 10 } else { 8 },
+                if vert { "VERT" } else { "HORZ" },
+            );
+            if edge > 0 {
+                edge_arms += 1;
+            }
+            if inter > 0 {
+                inter_arms += 1;
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals}); the gate never \
+             decoded a stream"
+        );
+        assert!(
+            edge_arms > 0,
+            "{NAME}: {matched} stream(s) decoded pixel-exact but NOT ONE 128 root \
+             took the gathered frame-edge HORZ/VERT arm this gate exists for"
+        );
+        assert!(
+            inter_arms > 0,
+            "{NAME}: the gathered arm fired only on key frames -- no INTER \
+             128x64/64x128 block was decoded, which is the film's own shape"
+        );
+    }
+
     #[test]
     #[ignore = "lane-sb128 r2 diagnostic: is the frame-6 mismatch sb128-specific?"]
     fn sb128_r2_control_sb64() {
@@ -21728,6 +21906,177 @@ mod tests {
                  part128_symbols={part128} cdef_idx_hits={cdef_idx} tmv_hits={tmv}"
             );
         }
+    }
+
+    /// lane-sb128c r1: an INTER frame whose 128x128 superblock root really
+    /// resolves `PARTITION_NONE` -- one whole 128x128 inter block, the shape
+    /// Troy's first inter frame stops this decoder on. r1 wired it: four
+    /// TX_64X64 luma units (`max_txsize_rect_lookup[BLOCK_128X128]`), four
+    /// TX_32X32 chroma units (`av1_get_max_uv_txsize`), interleaved Y,U,V per
+    /// 64x64 "mu" chunk (libaom `decode_token_recon_block`) with the chroma
+    /// `txb_skip_ctx` offset-10 rows, and OBMC's overlap capped at a 64x64
+    /// block's half (`reconinter.c` 860/899).
+    ///
+    /// `--max-partition-size=128` is what lets the root be NONE at all (the
+    /// sibling gate above pins 64, so its roots always SPLIT). Every arm hard
+    /// asserts its own `inter_sb128_none_hits` delta, so a recipe that stops
+    /// choosing the shape fails instead of passing vacuously; every decode
+    /// order frame is compared by [`decode_all_frames_vs_oracle`], which
+    /// panics on a refusal or any differing byte. Arms: 8-bit and 10-bit (his
+    /// films are 10-bit) with `tx-size-search=0` (TX_MODE_LARGEST, the block's
+    /// four TX_64X64 units come straight from `max_txsize_rect_lookup`) and an
+    /// 8-bit `tx-size-search=1` arm (the var-tx tree at 128).
+    // lane-sb128c r3: green. `--min-partition-size=32` let the RD search reach
+    // 16x16-level AB / SB-level AB shapes that other lanes still refuse (two of
+    // the three arms stopped there, measured); at 64 every arm decodes and the
+    // 128 root still resolves NONE.
+    #[test]
+    fn a_real_aomenc_inter_128x128_none_root_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_inter_128x128_none_root_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc/aomdec");
+            return;
+        }
+        let (width, height) = (256usize, 256usize);
+        let mut intra128_total = 0usize;
+        for (ten_bit, tx_search, seed) in [(false, false, 61u32), (true, false, 61), (false, true, 62)] {
+            let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!(
+                        "{},noise=all_seed={seed}:alls=6:allf=t",
+                        gradients_source(seed, width, height, "duration=0.32:rate=25")
+                    ),
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.32",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=62",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=128",
+                "--max-partition-size=128",
+                "--min-partition-size=64",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--deltaq-mode=0",
+                "--limit=8",
+            ];
+            // Spelled ONCE per invocation (a repeated `--enable-*` keeps its
+            // LAST occurrence, measured 2026-09-02).
+            args.push(if tx_search {
+                "--enable-tx-size-search=1"
+            } else {
+                "--enable-tx-size-search=0"
+            });
+            if ten_bit {
+                args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+            }
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let header = {
+                let mut parser = ec_av1_syntax::Av1Parser::new();
+                let mut pos = 0usize;
+                while let Ok(obu) = parser.parse_obu(&stream[pos..]) {
+                    pos += obu.total_size;
+                    if pos >= stream.len() {
+                        break;
+                    }
+                }
+                parser
+                    .sequence_header()
+                    .map(|q| (q.use_128x128_superblock, q.color_config.bit_depth))
+            };
+            assert_eq!(
+                header,
+                Some((true, if ten_bit { 10 } else { 8 })),
+                "{NAME}: the encoder did not write a 128x128-superblock sequence header at \
+                 the requested bit depth -- the flag never arrived"
+            );
+            let before = (
+                crate::decode::inter_sb128_none_hits(),
+                crate::decode::chroma_split_tx_hits(),
+                crate::decode::intra_128_in_inter_hits(),
+            );
+            let (frames, hidden) = decode_all_frames_vs_oracle(
+                &stream,
+                &format!("sb128c-inter-none-{}-{}", if ten_bit { 10 } else { 8 }, tx_search),
+            );
+            let (none128, chroma_units, intra128) = (
+                crate::decode::inter_sb128_none_hits() - before.0,
+                crate::decode::chroma_split_tx_hits() - before.1,
+                crate::decode::intra_128_in_inter_hits() - before.2,
+            );
+            intra128_total += intra128;
+            assert!(
+                frames >= 6,
+                "{NAME} ({pix} tx_search={tx_search}): only {frames} decode-order frames"
+            );
+            assert!(
+                none128 >= 1,
+                "{NAME} ({pix} tx_search={tx_search}): no 128x128 PARTITION_NONE root on an \
+                 inter frame -- the recipe stopped exercising the shape this gate names"
+            );
+            eprintln!(
+                "{NAME} ({pix} tx_search={tx_search}): {frames} decode-order frames pixel-exact \
+                 ({hidden} hidden), inter_sb128_none_hits={none128} chroma_units={chroma_units} \
+                 intra_128_in_inter={intra128}"
+            );
+        }
+        assert!(
+            intra128_total >= 1,
+            "{NAME}: no INTRA-coded 128x128 block inside an inter frame across the three arms -- \
+             the refusal this round lifted is no longer exercised"
+        );
     }
 
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level

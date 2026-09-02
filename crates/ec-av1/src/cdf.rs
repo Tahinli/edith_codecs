@@ -1645,7 +1645,7 @@ pub const SKIP_MODE: [[u16; 3]; 3] = [[32621, 32768, 0], [20708, 32768, 0], [812
 /// `motion_mode_allowed` (spec 5.11.24's `read_motion_mode`) offers
 /// `OBMC_CAUSAL` rather than `WARPED_CAUSAL` -- lane-motionmode round 1
 /// never reaches the three-way `motion_mode_cdf`, see `decode.rs`.
-pub const OBMC: [[u16; 3]; 14] = [
+pub const OBMC: [[u16; 3]; 17] = [
     [10437, 32768, 0],
     [17432, 32768, 0],
     [25817, 32768, 0],
@@ -1669,6 +1669,11 @@ pub const OBMC: [[u16; 3]; 14] = [
     // BLOCK_8X16 (4) and BLOCK_16X8 (5) of libaom's `default_obmc_cdf`.
     [9371, 32768, 0],
     [9301, 32768, 0],
+    // lane-sb128c r5: the 128-root rows -- BLOCK_64X128 (13), BLOCK_128X64
+    // (14), BLOCK_128X128 (15) of libaom's `default_obmc_cdf`.
+    [31014, 32768, 0],
+    [31560, 32768, 0],
+    [32638, 32768, 0],
 ];
 
 /// `default_motion_mode_cdf` (spec 9.4, `entropymode.c`), the square-bsize
@@ -1678,7 +1683,7 @@ pub const OBMC: [[u16; 3]; 14] = [
 /// `read_motion_mode` reads instead of [`OBMC`] whenever `motion_mode_allowed`
 /// (spec 5.11.24) resolves to `WARPED_CAUSAL`-eligible (`num_proj_ref >= 1`
 /// under `allow_warped_motion`) -- lane-warp round 1.
-pub const MOTION_MODE: [[u16; 4]; 14] = [
+pub const MOTION_MODE: [[u16; 4]; 17] = [
     [7651, 24760, 32768, 0],
     [19419, 26810, 32768, 0],
     [26260, 29116, 32768, 0],
@@ -1698,6 +1703,13 @@ pub const MOTION_MODE: [[u16; 4]; 14] = [
     // `default_motion_mode_cdf` indices 4 and 5).
     [4738, 24765, 32768, 0],
     [5391, 25528, 32768, 0],
+    // lane-sb128c r5: BLOCK_64X128 / 128X64 / 128X128 rows (libaom
+    // `default_motion_mode_cdf` indices 13, 14, 15). Without them a 128x128
+    // inter block fell through `w == h => trailing_zeros - 3` to row 4 (the
+    // BLOCK_16X32 row) and narrowed the msac by the wrong interval.
+    [28898, 30397, 32768, 0],
+    [30878, 31335, 32768, 0],
+    [32507, 32558, 32768, 0],
 ];
 
 /// `default_interintra_cdf` (spec 9.4): `interintra`, indexed by
