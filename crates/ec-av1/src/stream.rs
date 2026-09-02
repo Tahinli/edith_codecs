@@ -14152,6 +14152,61 @@ mod tests {
                      decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
                 );
             }
+            // lane-midcut r3 RECT ARM: the recipe above spells
+            // `--enable-rect-partitions=0 --min-partition-size=32`, so it can
+            // never produce a RECT interintra block -- the delta assert at the
+            // end of this gate was unsatisfiable on it (the gate disabled the
+            // very shape it claims to prove). Re-encode the SAME source with
+            // the rect overrides APPENDED (aomenc keeps the LAST occurrence of
+            // a repeated flag) and compare every decode-order frame of that
+            // stream against aomdec, until a rect interintra block fires.
+            if crate::decode::interintra_rect_hits() == rect_before {
+                let mut rect_args = args.clone();
+                rect_args.extend_from_slice(&[
+                    "--enable-rect-partitions=1",
+                    "--min-partition-size=8",
+                    "--max-partition-size=64",
+                ]);
+                let mut child = Command::new(aomenc_path())
+                    .args(&rect_args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "{NAME} RECT-ARM: aomenc refused its own recipe plus the rect overrides: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let rect_stream = out.stdout;
+                match decode_stream(&rect_stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} RECT-ARM failed outright, not a named refusal (seed {seed}): {msg}"
+                        );
+                        eprintln!("{NAME} RECT-ARM: skipped on a named refusal: {msg}");
+                    }
+                    Ok(_) => {
+                        let (total, hidden) =
+                            decode_all_frames_vs_oracle(&rect_stream, &format!("{NAME}-rect"));
+                        eprintln!(
+                            "{NAME} RECT-ARM: seed {seed}: {total} decode-order frames, {hidden} \
+                             hidden, all pixel-exact vs the oracle, interintra_rect_hits={}",
+                            crate::decode::interintra_rect_hits() - rect_before
+                        );
+                    }
+                }
+            }
             matched += 1;
         }
         assert!(
