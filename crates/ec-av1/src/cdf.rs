@@ -843,11 +843,11 @@ pub const NZ_MAP_CTX_OFFSET_32: [[u8; 5]; 5] = [
 // `pos = col*32+row` raster (same convention [`SCAN_32X16`]'s doc comment
 // already documents this decoder transcribes out of).
 pub const NZ_MAP_CTX_OFFSET_32X64: [[u8; 5]; 5] = [
-    [0, 11, 11, 11, 11],
-    [11, 11, 11, 11, 11],
-    [6, 6, 21, 21, 21],
-    [6, 21, 21, 21, 21],
-    [21, 21, 21, 21, 21],
+    [0, 11, 6, 6, 21],
+    [11, 11, 6, 21, 21],
+    [11, 11, 21, 21, 21],
+    [11, 11, 21, 21, 21],
+    [11, 11, 21, 21, 21],
 ];
 
 /// [`NZ_MAP_CTX_OFFSET_32X64`]'s `TX_64X32` counterpart (libaom
@@ -856,11 +856,11 @@ pub const NZ_MAP_CTX_OFFSET_32X64: [[u8; 5]; 5] = [
 /// regardless of row -- transpose of [`NZ_MAP_CTX_OFFSET_32X64`]'s `row < 2`
 /// branch, same r3 fix (see that table's doc comment).
 pub const NZ_MAP_CTX_OFFSET_64X32: [[u8; 5]; 5] = [
-    [0, 16, 6, 6, 21],
-    [16, 16, 6, 21, 21],
-    [16, 16, 21, 21, 21],
-    [16, 16, 21, 21, 21],
-    [16, 16, 21, 21, 21],
+    [0, 16, 16, 16, 16],
+    [16, 16, 16, 16, 16],
+    [6, 6, 21, 21, 21],
+    [6, 21, 21, 21, 21],
+    [21, 21, 21, 21, 21],
 ];
 
 /// `Default_Txb_Skip_Cdf[2][2][7..10]` (spec 9.4): the all-zero flag of a
