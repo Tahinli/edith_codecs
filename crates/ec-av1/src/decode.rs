@@ -1468,6 +1468,36 @@ pub(crate) fn sb_rect4_vert_hits() -> usize {
     SB_RECT4_VERT_HITS.with(|c| c.get())
 }
 
+// lane-tx64x16 r3: the 32x32-level 1:4 arms, counted per orientation --
+// `PARTITION_HORZ_4` (four 32x8 strips) and `PARTITION_VERT_4` (four 8x32
+// strips), the arms the Hunger Games mid-film extract stops at.
+thread_local! {
+    static RECT4_32_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECT4_32_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many 32x32-level 1:4 strips actually read coefficients (non-skip):
+/// a gate that only counted strips would pass on an all-skip stream, which
+/// exercises none of the new scan/context tables.
+thread_local! {
+    static RECT4_COEFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `RECT4_COEFF_HITS`.
+pub(crate) fn rect4_coeff_hits() -> usize {
+    RECT4_COEFF_HITS.with(|c| c.get())
+}
+
+/// Current value of `RECT4_32_HORZ_HITS` (32x8 strips decoded).
+pub(crate) fn rect4_32_horz_hits() -> usize {
+    RECT4_32_HORZ_HITS.with(|c| c.get())
+}
+
+/// Current value of `RECT4_32_VERT_HITS` (8x32 strips decoded).
+pub(crate) fn rect4_32_vert_hits() -> usize {
+    RECT4_32_VERT_HITS.with(|c| c.get())
+}
+
 // lane-rect64q r1: how many of [`decode_block_rect64`]'s three per-plane
 // dequant calls actually observed `CURRENT_Q_IDX != base_q_idx` -- proof the
 // running-vs-stale-snapshot bug this round fixed is exercised by a gate, not
@@ -2076,6 +2106,27 @@ const SCAN_4X8: [u16; 32] = [
     23, 26, 29, 27, 30, 31,
 ];
 
+/// `Default_Scan_16x4`, this decoder's own row-major transcription of
+/// libaom's column-major `default_scan_16x4` (`scan.c:66`) -- the CHROMA
+/// plane of a 32x8 `PARTITION_HORZ_4` strip at the 32x32 level
+/// (lane-tx64x16 r3). The transcription rule (`row * w + col` with
+/// `row = p % h`, `col = p / h`) was validated by REGENERATING the existing
+/// [`SCAN_16X8`] from `default_scan_16x8` byte for byte before these two
+/// were emitted -- a naive copy installs the transpose (class
+/// reference-layout-not-spec).
+const SCAN_16X4: [u16; 64] = [
+    0, 16, 1, 32, 17, 2, 48, 33, 18, 3, 49, 34, 19, 4, 50, 35, 20, 5, 51, 36, 21, 6, 52, 37, 22, 7,
+    53, 38, 23, 8, 54, 39, 24, 9, 55, 40, 25, 10, 56, 41, 26, 11, 57, 42, 27, 12, 58, 43, 28, 13,
+    59, 44, 29, 14, 60, 45, 30, 15, 61, 46, 31, 62, 47, 63,
+];
+/// `Default_Scan_4x16`, [`SCAN_16X4`]'s transpose (the chroma plane of an
+/// 8x32 `PARTITION_VERT_4` strip).
+const SCAN_4X16: [u16; 64] = [
+    0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 16, 11, 14, 17, 20, 15, 18, 21, 24, 19, 22, 25, 28,
+    23, 26, 29, 32, 27, 30, 33, 36, 31, 34, 37, 40, 35, 38, 41, 44, 39, 42, 45, 48, 43, 46, 49, 52,
+    47, 50, 53, 56, 51, 54, 57, 60, 55, 58, 61, 59, 62, 63,
+];
+
 /// [`neighbour`] with independent `w` (row stride)/`h` (row-bound) extents
 /// (lane-rectwire, mirrors [`record_rect`](Neighbours::record_rect)'s
 /// asymmetric-extent pattern).
@@ -2531,6 +2582,8 @@ fn read_coeffs_rect(
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
         let (row, col) = (pos / w, pos % w);
+        // libaom's column-major `coeff_idx`, for ladder comparison.
+        let apos = col * h + row;
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, w * h);
             let l = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
@@ -5142,6 +5195,286 @@ fn decode_leaf_rect(
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, mi_w, mi_h, mode);
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, mi_w, mi_h, uv_predict_mode);
     Ok(mode)
+}
+
+/// Decodes one 32x8 / 8x32 strip of a 32x32-level `PARTITION_HORZ_4` /
+/// `PARTITION_VERT_4` (lane-tx64x16 r3): [`decode_block_rect`]'s 4:1 sibling,
+/// addressed by REAL mi coordinates for the same reason [`decode_leaf_rect`]
+/// is -- strips 1 and 3 start 8 px into a 16-px [`SUB`] cell, which an
+/// `at`-derived `px = c * SUB` cannot name. `prev_strip` carries the previous
+/// strip's mode so this one's mode context sees its true above/left
+/// neighbour inside the same 32x32 (`decode_leaf_rect`'s convention).
+///
+/// Tables: LUMA `TX_32X8`/`TX_8X32` averages to the 16x16 entropy context
+/// ([`TxbSet::LumaRect32x8`], 256 positions) and scans with
+/// [`SCAN_32X8`]/[`SCAN_8X32`]; CHROMA `TX_16X4`/`TX_4X16` averages to the
+/// 8x8 one ([`TxbSet::Chroma8`], 64 positions) and scans with
+/// [`SCAN_16X4`]/[`SCAN_4X16`]. Neither shape takes the rect sqrt2 scale --
+/// `get_rect_tx_log_ratio` fires at ratio 1 only, and this is ratio 2
+/// (`inverse_transform_2d_typed_wh`'s own `rect_scale`).
+///
+/// A split transform (`tx_depth != 0`) refuses by name: `depth_to_tx_size` of
+/// a 4:1 strip is not simply `bw.min(bh) >> (depth - 1)` the way a 2:1
+/// strip's is, so [`decode_rect_split`]'s per-unit walk cannot be reused
+/// unexamined.
+#[allow(clippy::too_many_arguments)]
+fn decode_block_rect4(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    strip_mi: (usize, usize),
+    bw: usize,
+    bh: usize,
+    prev_strip: Option<((usize, usize), usize)>,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    enable_filter_intra: bool,
+    allow_screen_content_tools: bool,
+    base_q_idx: u8,
+    tx_select: bool,
+) -> Result<(usize, usize)> {
+    let _ = base_q_idx;
+    let (mi_r, mi_c) = strip_mi;
+    let (r, c) = (mi_r / (SUB / MI), mi_c / (SUB / MI));
+    let (mi_w, mi_h) = (bw / MI, bh / MI);
+    let mut above_mode = neighbours.above_mode[c];
+    let mut left_mode = neighbours.left_mode[r];
+    if let Some(((pr, pc), pmode)) = prev_strip {
+        if pc == mi_c && mi_r == pr + mi_h {
+            above_mode = pmode;
+        } else if pr == mi_r && mi_c == pc + mi_w {
+            left_mode = pmode;
+        }
+    }
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+        read_intra_mode_rect(
+            dec,
+            cdfs,
+            above_mode,
+            left_mode,
+            true,
+            bw,
+            bh,
+            enable_filter_intra,
+            neighbours.skip_txfm_ctx(mi_r, mi_c),
+            allow_screen_content_tools,
+            mi_r,
+            mi_c,
+        )?;
+    let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
+    if smooth_neighbor {
+        SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
+    }
+    let smooth_neighbor_uv =
+        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+    if filter_intra.is_some() {
+        FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
+    }
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED {
+        DC_PRED
+    } else {
+        uv_mode
+    };
+    let depth = if tx_select {
+        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+    } else {
+        0
+    };
+    if depth != 0 {
+        // lane-tx64x16 r4: the depth is IN the message -- it says which port
+        // the next round owes. depth 1 of a 4:1 strip is TX_16X8/TX_8X16
+        // (`sub_tx_size_map[TX_32X8] == TX_16X8`), a RECTANGULAR transform
+        // unit with no luma coefficient tables here; depth 2 is TX_8X8,
+        // square, the shape `decode_rect_split` already walks. The film stops
+        // at depth 2, synthetic band fixtures hit both.
+        return Err(unsupported(format!(
+            "a 32x32-level 1:4 strip with a split transform (per-unit 4:1 prediction is not \
+             ported, depth={depth})"
+        )));
+    }
+    // The coarse (16-px [`SUB`] cell) mode/side arrays cannot name a strip
+    // that is 8 px tall, so each strip stamps every cell it touches and the
+    // LAST strip wins -- which is the right answer for the block below/right
+    // of the 32x32, the only reader outside it. Written after this strip's
+    // own context read above, never before.
+    for cell in 0..bw.div_ceil(SUB) {
+        neighbours.above_mode[c + cell] = mode;
+        neighbours.above_uv_mode[c + cell] = uv_predict_mode;
+        neighbours.above_side[c + cell] = bw;
+    }
+    for cell in 0..bh.div_ceil(SUB) {
+        neighbours.left_mode[r + cell] = mode;
+        neighbours.left_uv_mode[r + cell] = uv_predict_mode;
+        neighbours.left_side[r + cell] = bh;
+    }
+    let (px, py) = (mi_c * MI, mi_r * MI);
+    let (cpx, cpy) = (px / 2, py / 2);
+    let (chroma_w, chroma_h) = (bw / 2, bh / 2);
+    let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+    let (luma_scan, chroma_scan): (&[u16], &[u16]) = if bw > bh {
+        (&SCAN_32X8, &SCAN_16X4)
+    } else {
+        (&SCAN_8X32, &SCAN_4X16)
+    };
+    let (luma_levels, u_levels, v_levels) = if skip {
+        (
+            vec![0i32; bw * bh],
+            vec![0i32; chroma_w * chroma_h],
+            vec![0i32; chroma_w * chroma_h],
+        )
+    } else {
+        let around = neighbours.around_mi_rect((mi_r, mi_c), bw, bh);
+        let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x8, mode);
+        let (luma_levels, luma_tx_type) = read_coeffs_rect(
+            dec,
+            &mut luma_coding,
+            luma_scan,
+            bw,
+            bh,
+            0,
+            dc_sign_ctx(around[0].2),
+            TxType::DctDct,
+        )?;
+        let mut planes = Vec::with_capacity(2);
+        for plane in 1..3 {
+            let default_tx = default_intra_tx_type(uv_predict_mode as u8);
+            let skip_ctx = usize::from(around[plane].0) + usize::from(around[plane].1);
+            let mut coding = cdfs.txb(TxbSet::Chroma8, uv_predict_mode);
+            let (levels, tx_type) = read_coeffs_rect(
+                dec,
+                &mut coding,
+                chroma_scan,
+                chroma_w,
+                chroma_h,
+                skip_ctx,
+                dc_sign_ctx(around[plane].2),
+                default_tx,
+            )?;
+            planes.push((levels, tx_type));
+        }
+        let (v_levels, v_tx_type) = planes.pop().expect("plane 2");
+        let (u_levels, u_tx_type) = planes.pop().expect("plane 1");
+        RECT4_COEFF_HITS.with(|c| c.set(c.get() + 1));
+        let luma_residual = dequant_and_inverse_typed_wh(
+            &luma_levels,
+            bw,
+            bh,
+            crate::decode::bit_depth(),
+            block_q_idx(),
+            plane_q_delta(0).0,
+            plane_q_delta(0).1,
+            luma_tx_type,
+        );
+        y.reconstruct_rect(
+            px,
+            py,
+            bw,
+            bh,
+            mode,
+            angle_delta_y,
+            reach,
+            &luma_residual,
+            None,
+            filter_intra,
+            smooth_neighbor,
+        );
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        for (plane, buf, levels, tx_type) in [
+            (1usize, &mut *u, &u_levels, u_tx_type),
+            (2, &mut *v, &v_levels, v_tx_type),
+        ] {
+            let residual = dequant_and_inverse_typed_wh(
+                levels,
+                chroma_w,
+                chroma_h,
+                crate::decode::bit_depth(),
+                block_q_idx(),
+                plane_q_delta(plane).0,
+                plane_q_delta(plane).1,
+                tx_type,
+            );
+            buf.reconstruct_rect(
+                cpx,
+                cpy,
+                chroma_w,
+                chroma_h,
+                uv_predict_mode,
+                angle_delta_uv,
+                reach,
+                &residual,
+                alpha
+                    .zip(ac.as_deref())
+                    .map(|((au, av), ac)| (if plane == 1 { au } else { av }, ac)),
+                None,
+                smooth_neighbor_uv,
+            );
+        }
+        neighbours.record_mi_rect(
+            (mi_r, mi_c),
+            bw,
+            bh,
+            &[luma_levels, u_levels, v_levels],
+        );
+        neighbours.fill_skip_grid_rect((mi_r, mi_c), mi_w, mi_h, skip);
+        neighbours.fill_lf_grid_rect((mi_r, mi_c), mi_w, mi_h, bw as u8, bh as u8, 0);
+        if bw > bh {
+            RECT4_32_HORZ_HITS.with(|c| c.set(c.get() + 1));
+        } else {
+            RECT4_32_VERT_HITS.with(|c| c.set(c.get() + 1));
+        }
+        return Ok((mode, uv_predict_mode));
+    };
+    y.reconstruct_rect(
+        px,
+        py,
+        bw,
+        bh,
+        mode,
+        angle_delta_y,
+        reach,
+        &luma_levels,
+        None,
+        filter_intra,
+        smooth_neighbor,
+    );
+    let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+    u.reconstruct_rect(
+        cpx,
+        cpy,
+        chroma_w,
+        chroma_h,
+        uv_predict_mode,
+        angle_delta_uv,
+        reach,
+        &u_levels,
+        alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+        None,
+        smooth_neighbor_uv,
+    );
+    v.reconstruct_rect(
+        cpx,
+        cpy,
+        chroma_w,
+        chroma_h,
+        uv_predict_mode,
+        angle_delta_uv,
+        reach,
+        &v_levels,
+        alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+        None,
+        smooth_neighbor_uv,
+    );
+    neighbours.record_mi_rect((mi_r, mi_c), bw, bh, &[luma_levels, u_levels, v_levels]);
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), mi_w, mi_h, skip);
+    neighbours.fill_lf_grid_rect((mi_r, mi_c), mi_w, mi_h, bw as u8, bh as u8, 0);
+    if bw > bh {
+        RECT4_32_HORZ_HITS.with(|c| c.set(c.get() + 1));
+    } else {
+        RECT4_32_VERT_HITS.with(|c| c.set(c.get() + 1));
+    }
+    Ok((mode, uv_predict_mode))
 }
 
 /// Decodes one true `bw`x`bh` superblock-level `PARTITION_HORZ`/
@@ -10135,6 +10468,47 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     tx_select,
                                     reduced_tx_set,
                                 )?;
+                            }
+                            PARTITION_HORZ_4 | PARTITION_VERT_4 => {
+                                // lane-tx64x16 r3: the 1:4 pair at the 32x32
+                                // level -- four 32x8 (or 8x32) strips in
+                                // raster order, `quarter_step` = 2 mi, with
+                                // libaom `decode_partition`'s own `i > 0`
+                                // frame-edge break.
+                                let horz = part32 == PARTITION_HORZ_4;
+                                let base_mi = (at32.0 * (SUB / MI), at32.1 * (SUB / MI));
+                                let mut prev: Option<((usize, usize), usize)> = None;
+                                for i in 0..4 {
+                                    let strip_mi = if horz {
+                                        (base_mi.0 + i * 2, base_mi.1)
+                                    } else {
+                                        (base_mi.0, base_mi.1 + i * 2)
+                                    };
+                                    if i > 0
+                                        && (strip_mi.0 >= mi_rows as usize
+                                            || strip_mi.1 >= mi_cols as usize)
+                                    {
+                                        break;
+                                    }
+                                    let (bw, bh) = if horz { (32, 8) } else { (8, 32) };
+                                    let (mode, _uv) = decode_block_rect4(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        strip_mi,
+                                        bw,
+                                        bh,
+                                        prev,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        enable_filter_intra,
+                                        allow_screen_content_tools,
+                                        base_q_idx,
+                                        tx_select,
+                                    )?;
+                                    prev = Some((strip_mi, mode));
+                                }
                             }
                             _ => {
                                 return Err(unsupported(format!(
@@ -17423,6 +17797,37 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// lane-tx64x16 r3: the two new 4:1 chroma scans are a TRANSPOSED PAIR --
+    /// `SCAN_4X16[i]` must name the transpose of the position
+    /// `SCAN_16X4[i]` names (class scan-weights-cross-axis: a naive copy of
+    /// libaom's column-major `default_scan_*` installs the transpose and only
+    /// an asymmetric check catches it). Also pins both as permutations, and
+    /// pins the same relation for the 32x8/8x32 luma pair this arm reuses.
+    #[test]
+    fn the_rect4_scans_are_transposed_pairs() {
+        for (a, b, w, h) in [
+            (&SCAN_16X4[..], &SCAN_4X16[..], 16usize, 4usize),
+            (&SCAN_32X8[..], &SCAN_8X32[..], 32, 8),
+        ] {
+            let mut seen_a: Vec<u16> = a.to_vec();
+            seen_a.sort_unstable();
+            assert_eq!(
+                seen_a,
+                (0..(w * h) as u16).collect::<Vec<_>>(),
+                "{w}x{h} scan is not a permutation of its positions"
+            );
+            for (i, (&pa, &pb)) in a.iter().zip(b.iter()).enumerate() {
+                let (row, col) = (pa as usize / w, pa as usize % w);
+                assert_eq!(
+                    pb as usize,
+                    col * w.min(h) + row,
+                    "scan step {i}: {w}x{h} visits (row {row}, col {col}) but its transpose \
+                     visits position {pb}"
+                );
+            }
+        }
+    }
 
     /// lane-rectsplit r4 (class `enumerate-table-domain`): [`base_ctx`]'s
     /// `TX_CLASS_2D` arm must, over the WHOLE 5x5 domain of both rect shapes
