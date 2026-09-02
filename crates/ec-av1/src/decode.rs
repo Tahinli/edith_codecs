@@ -3318,6 +3318,29 @@ pub fn sub8_inter_split_hits() -> usize {
     SUB8_INTER_SPLIT_HITS.with(|c| c.get())
 }
 
+// lane-t900 r7: sub-8x8 inter groups whose one chroma unit inherits a
+// `tx_type` DIFFERENT from the group's FIRST sub-block -- the only shape that
+// tells the two rules apart (`av1_get_tx_type` indexes `xd->tx_type_map`,
+// which `set_mi_offsets` re-points to the CHROMA-REFERENCE sub-block, so the
+// first sub-block's type is never the one). Reading it off sub-block 0
+// inverted one 4x4 chroma unit on the wrong basis with the entropy stream
+// perfectly in sync (no chroma `tx_type` symbol is coded), so a gate can only
+// see this rule through this counter.
+thread_local! {
+    static SUB8_CHROMA_TX_FROM_REF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `SUB8_CHROMA_TX_FROM_REF_HITS`.
+pub fn sub8_chroma_tx_from_ref_hits() -> usize {
+    SUB8_CHROMA_TX_FROM_REF_HITS.with(|c| c.get())
+}
+
+fn note_sub8_chroma_tx(first_sub: TxType, chroma_ref: TxType, coeffs: bool) {
+    if coeffs && first_sub != chroma_ref {
+        SUB8_CHROMA_TX_FROM_REF_HITS.with(|c| c.set(c.get() + 1));
+    }
+}
+
 // How many 4x8 / 8x4 leaves (lane-tx4x8's `PARTITION_VERT`/`PARTITION_HORZ`
 // of an 8x8 block) this thread's decode reconstructed with REAL coefficients
 // -- a skipped leaf exercises the prediction and the mi bookkeeping but never
@@ -14668,6 +14691,9 @@ fn read_inter_plane_rect(
         ac_delta,
         tx_type,
     );
+    if std::env::var_os("EC_TRACE_TXTYPE").is_some() {
+        eprintln!("OUR_TXTYPE plane={plane_idx} x={x} y={y} w={w} h={h} tx_type={tx_type:?} inh={inherited_luma_tx_type:?}");
+    }
     // `reconstruct_mc_rect` reads both buffers at the square prediction
     // stride, so the dense `w x h` residual is re-laid at that stride first.
     let mut strided = vec![0i32; stride * stride];
@@ -18450,6 +18476,9 @@ fn read_inter_plane(
         None,
     )?;
     note_chroma_class1(plane_idx, tx_type);
+    if std::env::var_os("EC_TRACE_TXTYPE").is_some() {
+        eprintln!("OUR_TXTYPE plane={plane_idx} x={x} y={y} side={side} tx_type={tx_type:?} inh={inherited_luma_tx_type:?}");
+    }
     // lane-inter8 r1: a 64-point transform covers the whole 64x64 area but
     // codes only its top-left 32x32 of frequencies (spec 5.11.40) -- the
     // caller hands the 32-point `scan` there, and the coded corner goes into
@@ -22452,10 +22481,11 @@ fn decode_inter_block(
         // lane-t900 r6: THAT WITNESS EXISTS, so `EC_INTRA16X4_DECODE` is gone
         // and the refusal is narrowed back to "no chroma-pair record". The
         // witness is a REAL 10-bit 1920x792 128-superblock film stream, not an
-        // aomenc recipe: `fixtures/troy_sb128_inter_witness.obu` (166303 bytes,
-        // 19 frame-carrying OBUs, 14 decode-order frames) decodes all 14
-        // decode-order frames byte-exact against instrumented aomdec
-        // (`EC_AV1_FINAL_DUMP`) and all 12 shown frames pixel-exact against
+        // aomenc recipe: `fixtures/troy_sb128_inter_witness.obu` (177773 bytes,
+        // 23 frame-carrying OBUs, 16 decode-order frames, extended from 14 in
+        // lane-t900 r7) decodes all 16 decode-order frames byte-exact against
+        // instrumented aomdec
+        // (`EC_AV1_FINAL_DUMP`) and all 15 shown frames pixel-exact against
         // ffmpeg, while this arm fires 78x 16x4 + 149x 4x16 (108 of them
         // chroma-paired). Unlike lane-sub8x4 r3's phantom (class
         // `counter-from-refused-stream`) every one of those hits lies inside a
@@ -23283,6 +23313,7 @@ fn decode_inter_sub8_split4(
     let mut piece: [Option<(i8, (i32, i32), mc::InterpFilterKind, mc::InterpFilterKind)>; 4] =
         [None; 4];
     let mut first_tx_type = TxType::DctDct;
+    let mut sub0_tx_type = TxType::DctDct;
     let mut last_skip = true;
     // Set when the chroma-reference (last) sub-block is INTRA: it coded the
     // group's one chroma unit itself.
@@ -23577,14 +23608,19 @@ fn decode_inter_sub8_split4(
                 None,
                 None,
             )?;
-            if i == 0 || piece[0].is_none() {
-                // `av1_get_tx_type`: an inter block's chroma inherits the
-                // tx_type of the CO-LOCATED luma position, which for the
-                // group's one chroma unit is luma (0, 0) -- the FIRST
-                // sub-block, not the last. lane-sub8intra: an INTRA first
-                // sub-block writes no inter tx_type there at all, so the
-                // later inter sub-blocks' own is what `xd->tx_type_map`
-                // holds.
+            if i == 0 {
+                sub0_tx_type = tx_type;
+            }
+            if i == 3 {
+                // `av1_get_tx_type`'s chroma tail scales `blk_row`/`blk_col`
+                // back by the subsampling, but it indexes `xd->tx_type_map`,
+                // which `set_mi_offsets` (av1_common_int.h:1679) re-points to
+                // the CURRENT sub-block's own mi -- so the group's one chroma
+                // unit inherits the CHROMA-REFERENCE (last) sub-block's
+                // tx_type, never the group's first. lane-t900 r7: reading it
+                // off sub-block 0 left the entropy stream in sync (no symbol
+                // is coded for chroma) and inverted one 4x4 chroma unit on the
+                // wrong basis.
                 first_tx_type = tx_type;
             }
             neighbours.record_mi_luma_rect(lmi, B4, B4, &luma_grid);
@@ -23674,6 +23710,8 @@ fn decode_inter_sub8_split4(
                 &pred_v, Some(first_tx_type), None,
             )?
             .0;
+            let coded = ug.iter().chain(vg.iter()).any(|&c| c != 0);
+            note_sub8_chroma_tx(sub0_tx_type, first_tx_type, coded);
             (ug, vg)
         };
         neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
@@ -24205,6 +24243,7 @@ fn decode_inter_sub8_rect2(
     let mut piece: [Option<(i8, (i32, i32), mc::InterpFilterKind, mc::InterpFilterKind)>; 2] =
         [None; 2];
     let mut first_tx_type = TxType::DctDct;
+    let mut sub0_tx_type = TxType::DctDct;
     let mut last_skip = true;
     // Set when the chroma-reference sub-block is INTRA: it coded the group's
     // one chroma unit itself.
@@ -24553,13 +24592,15 @@ fn decode_inter_sub8_rect2(
                         None,
                     )?
                 };
-                if idx == 0 && (i == 0 || piece[0].is_none()) {
-                    // `av1_get_tx_type`: the group's one chroma unit scales
-                    // back to luma (0, 0), i.e. the FIRST sub-block's first
-                    // transform unit -- unless that sub-block is INTRA
-                    // (lane-sub8intra), in which case it wrote no inter
-                    // tx_type at all and `xd->tx_type_map[0]` of the
-                    // chroma-reference block is this one's.
+                if idx == 0 && i == 0 {
+                    sub0_tx_type = tu_tx_type;
+                }
+                if idx == 0 && i == 1 {
+                    // `av1_get_tx_type` indexes `xd->tx_type_map`, which
+                    // `set_mi_offsets` (av1_common_int.h:1679) re-points to the
+                    // CURRENT sub-block: the group's one chroma unit inherits
+                    // the CHROMA-REFERENCE (second) sub-block's first transform
+                    // unit, never the first sub-block's (lane-t900 r7).
                     first_tx_type = tu_tx_type;
                 }
                 neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
@@ -24663,6 +24704,8 @@ fn decode_inter_sub8_rect2(
                 &pred_v, Some(first_tx_type), None,
             )?
             .0;
+            let coded = ug.iter().chain(vg.iter()).any(|&c| c != 0);
+            note_sub8_chroma_tx(sub0_tx_type, first_tx_type, coded);
             (ug, vg)
         };
         neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);

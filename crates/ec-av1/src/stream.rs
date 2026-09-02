@@ -87,6 +87,13 @@ pub fn rect32x8_inter_tu_hits() -> [usize; 2] {
     crate::decode::rect32x8_inter_tu_hits()
 }
 
+/// lane-t900 r7: sub-8x8 inter groups whose one chroma unit inherited a
+/// `tx_type` different from the group's FIRST sub-block, i.e. groups that can
+/// only decode right under `av1_get_tx_type`'s chroma-reference rule.
+pub fn sub8_chroma_tx_from_ref_hits() -> usize {
+    crate::decode::sub8_chroma_tx_from_ref_hits()
+}
+
 /// lane-intra16x4: `(16x4, 4x16, chroma-reference)` INTRA strips decoded inside
 /// an inter 16x16-level 1:4 partition.
 pub fn intra16x4_in_inter_hits() -> (usize, usize, usize) {
@@ -30282,12 +30289,18 @@ mod tests {
     }
 
     /// lane-t900 r6: the 128-superblock INTER witness.
-    /// `crates/ec-av1/fixtures/troy_sb128_inter_witness.obu`, 166303 bytes,
-    /// sha256 `1191ce80e2c6c5855eaf7a8f5e8cda2cdf809f467b0dbc5e26df96dfa6b2c8bd`:
-    /// the first 19 frame-carrying OBUs of a 2 s cut taken 900 s into a 10-bit
-    /// 1920x792 AV1 stream with `use_128x128_superblock=1`, 14 decode-order
-    /// frames, 12 shown. Cut twice independently from the source (`-ss 900 -t 2
+    /// `crates/ec-av1/fixtures/troy_sb128_inter_witness.obu`, 177773 bytes,
+    /// sha256 `09d995946d27695ef4b7b1a24a4d7ad85f8e2c8176d58ee54e825efc061f9cbc`:
+    /// the first 23 frame-carrying OBUs of a 2 s cut taken 900 s into a 10-bit
+    /// 1920x792 AV1 stream with `use_128x128_superblock=1`, 16 decode-order
+    /// frames, 15 shown. Cut twice independently from the source (`-ss 900 -t 2
     /// -c:v copy` then the OBU truncation) -- both cuts hash identically.
+    /// lane-t900 r7 extended it from 19 OBUs / 14 frames: decode-order frame 14
+    /// is the ONLY frame in this repository's fixtures whose sub-8x8 inter
+    /// chroma inherits a `tx_type` from a chroma-reference sub-block that
+    /// differs from its group's first sub-block AND codes coefficients
+    /// (`sub8_chroma_tx_from_ref_hits`), i.e. the only frame that can tell
+    /// `av1_get_tx_type`'s two candidate rules apart.
     ///
     /// It is the first stream in this repository that decodes exactly while
     /// five separately-found defects' paths all fire, which is why the asserts
@@ -30344,6 +30357,7 @@ mod tests {
             crate::decode::intra_in_inter_txctx_hits(),
             crate::decode::edge_filter_mi_fix_hits(),
         );
+        let sub8tx_before = crate::decode::sub8_chroma_tx_from_ref_hits();
         let i16_before = crate::decode::intra16x4_in_inter_hits();
         let frames = match decode_stream(&stream) {
             Ok(frames) => frames,
@@ -30358,6 +30372,7 @@ mod tests {
             crate::decode::intra_in_inter_txctx_hits() - before.5,
             crate::decode::edge_filter_mi_fix_hits() - before.6,
         );
+        let sub8tx = crate::decode::sub8_chroma_tx_from_ref_hits() - sub8tx_before;
         let i16_now = crate::decode::intra16x4_in_inter_hits();
         let i16 = (
             i16_now.0 - i16_before.0,
@@ -30375,13 +30390,14 @@ mod tests {
             ("intra16x4_in_inter 16x4", i16.0),
             ("intra16x4_in_inter 4x16", i16.1),
             ("intra16x4_in_inter chroma_ref", i16.2),
+            ("sub8_chroma_tx_from_ref", sub8tx),
         ] {
             assert!(
                 n > 0,
                 "{NAME}: {what} never fired on this stream -- the gate would be vacuous for it"
             );
         }
-        assert_eq!(frames.len(), 12, "{NAME}: 12 shown frames");
+        assert_eq!(frames.len(), 15, "{NAME}: 15 shown frames");
         assert_eq!((frames[0].width, frames[0].height), (width, height));
         let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
         assert_eq!(
@@ -30397,9 +30413,10 @@ mod tests {
             assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
         }
         eprintln!(
-            "{NAME}: 12 shown frames pixel-exact on every plane; warp_plane_suppress={} \
+            "{NAME}: 15 shown frames pixel-exact on every plane; warp_plane_suppress={} \
              cdef_idx={} inter_sb128_vert={} interintra_rect={} non_chroma_ref_ctx_skip={} \
-             intra_in_inter_txctx={} edge_filter_mi_fix={} intra16x4_in_inter={:?}",
+             intra_in_inter_txctx={} edge_filter_mi_fix={} intra16x4_in_inter={:?} \
+             sub8_chroma_tx_from_ref={sub8tx}",
             fired.0, fired.1, fired.2, fired.3, fired.4, fired.5, fired.6, i16
         );
     }
