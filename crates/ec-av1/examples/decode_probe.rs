@@ -41,6 +41,9 @@ fn main() {
             "intra_rect4_in_inter: 64x16={} 16x64={} 32x8={} 8x32={}",
             i4.0, i4.1, i4.2, i4.3
         );
+        println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
+        let (h84, h48) = ec_av1::decode::sub8_inter_rect_hits();
+        println!("sub8_inter_rect: horz8x4={h84} vert4x8={h48}");
         let leaf = ec_av1::stream::vartx_rect_leaf_hits();
         println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
         // lane-inter16ab r1: the 16x16-level inter AB arms, so a recipe sweep
