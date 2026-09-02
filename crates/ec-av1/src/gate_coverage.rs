@@ -230,59 +230,14 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
 /// OFF in every gate that names it (a hard hole -- no stream can carry it) or
 /// merely defaulted (unknown, and unknown is not coverage).
 #[cfg(test)]
-const NEVER_ON_8BIT: &[(&str, &str)] = &[
-    (
-        "deblocking",
-        "on in no 8-bit gate: 7 pin --loopfilter-control=0, the other 34 default (on) -- and defaulted is unknown, so no stream is proven to run the loop filter",
-    ),
-    (
-        "enable-diff-wtd-comp",
-        "on in no 8-bit gate: 6 pin =0, 35 default; difference-weighted compound masks are unproven",
-    ),
-    (
-        "enable-directional-intra",
-        "on in no 8-bit gate: pinned =0 in 32 of 41, defaulted in 9 -- the directional gates drive the modes through other flags, never this one",
-    ),
-    (
-        "enable-fwd-kf",
-        "on in no 8-bit gate: 11 pin =0, 30 default (aomenc's default is off), so forward keyframes are never coded",
-    ),
-    (
-        "enable-onesided-comp",
-        "on in no 8-bit gate: 17 pin =0, 24 default; one-sided compound prediction is unproven",
-    ),
-    (
-        "enable-tx-size-search",
-        "on in no 8-bit gate: pinned =0 in 34 of 41 -- the pin that hid a real-stream PANIC from lane-ab16 until TX_MODE_SELECT was landed by lane-txselect; its gates spell the tool through the recipe, not this flag",
-    ),
-];
+const NEVER_ON_8BIT: &[(&str, &str)] = &[];
 
 /// [`DEFAULT_ON_TOOLS`] entries no 10-bit gate spells on, with the reason.
 #[cfg(test)]
 const NEVER_ON_10BIT: &[(&str, &str)] = &[
     (
-        "deblocking",
-        "hole at both depths, see the 8-bit list (1 of the 15 10-bit gates pins =0, 14 default)",
-    ),
-    (
         "enable-diff-wtd-comp",
-        "hole at both depths, see the 8-bit list (1 pinned off, 14 defaulted)",
-    ),
-    (
-        "enable-fwd-kf",
-        "hole at both depths, see the 8-bit list (3 pinned off, 12 defaulted)",
-    ),
-    (
-        "enable-interintra-wedge",
-        "on in no 10-bit gate: 5 pin =0, 10 default -- wedge interintra masks are exercised at 8 bits only, the shape that cost lane-hbdinter two 10-bit-only defects",
-    ),
-    (
-        "enable-onesided-comp",
-        "hole at both depths, see the 8-bit list (5 pinned off, 10 defaulted)",
-    ),
-    (
-        "enable-tx-size-search",
-        "hole at both depths, see the 8-bit list (11 of 15 pin =0)",
+        "on in no 10-bit gate: 1 pinned off, 14 defaulted -- lane-defon r1 closed the 8-bit hole on the masked-compound gate (diffwtd_hits) and added a 10-bit one-sided-compound gate, but the 10-bit fixture source is `gradients`, whose smooth content never wins a difference-weighted mask (measured 8/8 pixel-exact, diffwtd_hits == 0); it needs a mandelbrot fixture in ten_bit_tool_gate",
     ),
 ];
 
@@ -461,6 +416,19 @@ mod tests {
     /// helper, an explicit `--bit-depth=10`/`--input-bit-depth=10`, or a
     /// `yuv420p10le` fixture handed to aomenc. Everything else is aomenc's
     /// 8-bit default.
+    /// lane-defon r1: a gate helper parameterised on `bit_depth` builds BOTH
+    /// an 8-bit and a 10-bit stream from one recipe, so its flags cover both
+    /// depths -- classifying it by the 10-bit strings inside its conditional
+    /// alone hid `--enable-tx-size-search=1` from the 8-bit list.
+    fn covers_both_depths(body: &str) -> bool {
+        body.contains("if bit_depth == 10")
+    }
+
+    /// Whether a gate body drives a stream at this depth.
+    fn covers_depth(body: &str, ten_bit: bool) -> bool {
+        covers_both_depths(body) || is_ten_bit(body) == ten_bit
+    }
+
     fn is_ten_bit(body: &str) -> bool {
         body.contains("encode_10bit_gradients")
             || body.contains("ten_bit_tool_gate(")
@@ -473,7 +441,7 @@ mod tests {
     fn enabled_at(ten_bit: bool) -> BTreeSet<String> {
         let mut on = BTreeSet::new();
         for gate in gate_bodies() {
-            if is_ten_bit(gate) != ten_bit {
+            if !covers_depth(gate, ten_bit) {
                 continue;
             }
             for (flag, value) in flags_in(gate) {
@@ -561,7 +529,7 @@ mod tests {
     fn default_on_settings(ten_bit: bool) -> (usize, BTreeMap<&'static str, (usize, usize, usize)>) {
         let gates: Vec<&str> = gate_bodies()
             .into_iter()
-            .filter(|b| is_ten_bit(b) == ten_bit)
+            .filter(|b| covers_depth(b, ten_bit))
             .collect();
         let mut per_tool = BTreeMap::new();
         for &(tool, spellings, _, on) in DEFAULT_ON_TOOLS {

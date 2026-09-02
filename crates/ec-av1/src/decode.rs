@@ -728,6 +728,56 @@ pub(crate) fn deblock_hits() -> usize {
     DEBLOCK_HITS.with(|c| c.get())
 }
 
+// lane-defon r1: how many COMPOUND_REFERENCE blocks read a
+// `UNIDIR_COMP_REFERENCE` pair (both references on the same temporal side,
+// spec 5.11.25 `comp_reference_type == 0`) -- the gate's proof that a
+// stream built with `--enable-onesided-comp=1` really exercised the
+// `uni_comp_ref` alphabet rather than only bidirectional pairs.
+thread_local! {
+    static UNI_COMP_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`UNI_COMP_HITS`].
+pub(crate) fn uni_comp_hits() -> usize {
+    UNI_COMP_HITS.with(|c| c.get())
+}
+
+// lane-defon r1: how many blocks blended through a `COMPOUND_DIFFWTD` mask
+// (`mc::diffwtd_mask`) -- the narrower half of `MASKED_COMPOUND_HITS`, the
+// gate's proof that `--enable-diff-wtd-comp=1` reached the difference-weighted
+// blend and not only the wedge arm.
+thread_local! {
+    static DIFFWTD_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DIFFWTD_HITS`].
+pub(crate) fn diffwtd_hits() -> usize {
+    DIFFWTD_HITS.with(|c| c.get())
+}
+
+// lane-defon r1: how many FORWARD KEYFRAMES were decoded -- a KEY frame coded
+// with `show_frame == 0`, output later by a `show_existing_frame` header
+// (aomenc `--enable-fwd-kf=1 --fwd-kf-dist=N`). Counted from
+// `stream::decode_stream`, which is where the frame header is consumed; the
+// gate's proof that the on-value really reached the bitstream rather than
+// being dropped by the rate control.
+thread_local! {
+    static FWD_KF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FWD_KF_HITS`].
+pub(crate) fn fwd_kf_hits() -> usize {
+    FWD_KF_HITS.with(|c| c.get())
+}
+
+/// Records one decoded forward keyframe (see [`FWD_KF_HITS`]).
+pub(crate) fn note_fwd_kf() {
+    FWD_KF_HITS.with(|c| c.set(c.get() + 1));
+}
+
 // How many [`read_tx_size`] reads resolved a `tx_depth` strictly less than
 // the block's own side, across every call on the current thread -- the same
 // before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
@@ -12628,6 +12678,7 @@ fn read_compound_ref_frames(
     let type_ctx = comp_reference_type_ctx(above, left);
     let unidir = dec.symbol(&mut cdfs.comp_ref_type[type_ctx]) == 0;
     if unidir {
+        UNI_COMP_HITS.with(|c| c.set(c.get() + 1));
         // uni_comp_ref (p0): forward vs. backward -- av1_get_pred_context_-
         // uni_comp_ref_p is single_ref_p1's own forward/backward vote.
         let bit = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p1_ctx(a, a1, l, l1)][0]);
@@ -13649,6 +13700,7 @@ fn decode_inter_block(
             // either way, only the mask source differs.
             let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
                 diffwtd_mask_y = vec![0u8; side * side];
+                DIFFWTD_HITS.with(|c| c.set(c.get() + 1));
                 mc::diffwtd_mask(&inter0_y, &inter1_y, mask_type == 1, &mut diffwtd_mask_y);
                 Some(diffwtd_mask_y.as_slice())
             } else {
@@ -15598,6 +15650,7 @@ fn decode_inter_block8(
                 let mut diffwtd_mask_y = Vec::new();
                 let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
                     diffwtd_mask_y = vec![0u8; SIDE * SIDE];
+                    DIFFWTD_HITS.with(|c| c.set(c.get() + 1));
                     mc::diffwtd_mask(&inter0_y, &inter1_y, mask_type == 1, &mut diffwtd_mask_y);
                     Some(diffwtd_mask_y.as_slice())
                 } else {
