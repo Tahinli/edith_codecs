@@ -871,6 +871,21 @@ pub(crate) fn filter_intra_rect_hits() -> usize {
     FILTER_INTRA_RECT_HITS.with(|c| c.get())
 }
 
+// As [`FILTER_INTRA_RECT_HITS`], counting only the strips BELOW 16x16
+// (8x16/16x8 leaves of a 16x16 HORZ/VERT partition, lane-fistrip r1) -- the
+// shapes whose `use_filter_intra` symbol had no CDF class before this round.
+// A gate asserting the wider counter would be satisfied by a 32x16 strip and
+// prove nothing about the new shapes.
+thread_local! {
+    static FILTER_INTRA_RECT_SUB16_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FILTER_INTRA_RECT_SUB16_HITS`].
+pub(crate) fn filter_intra_rect_sub16_hits() -> usize {
+    FILTER_INTRA_RECT_SUB16_HITS.with(|c| c.get())
+}
+
 // How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
 // (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
 // call on the current thread -- the same before/after counter pattern as
@@ -5170,9 +5185,12 @@ fn decode_leaf_rect(
         eprintln!("  skip={skip} mode={mode} angle_delta_y={angle_delta_y} uv_mode={uv_mode}");
     }
     if filter_intra.is_some() {
-        return Err(unsupported(
-            "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
-        ));
+        // lane-fistrip r1: `predict_filter_intra` already walks its 4x2
+        // patches over a true `bw`x`bh` block (lane-rectsplit r1), so an
+        // 8x16/16x8 strip predicts through the same call `reconstruct_rect`
+        // below already makes; this refusal was square-only prose.
+        FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
+        FILTER_INTRA_RECT_SUB16_HITS.with(|c| c.set(c.get() + 1));
     }
     let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
     let depth = if tx_select {
@@ -18251,6 +18269,109 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-fistrip r1 (class `enumerate-the-table-domain`): every block
+    /// shape this decoder can hand [`filter_intra_size_class_rect`], against
+    /// `av1_filter_intra_allowed_bsize` (`block_size_wide <= 32 &&
+    /// block_size_high <= 32`) and `default_filter_intra_cdfs`
+    /// (entropymode.c) row by row. A class that exists must carry ITS OWN
+    /// bsize's default probability -- a wrong row is a silently different
+    /// symbol, not a decode error. The shapes with no class are listed here
+    /// with their reason so the residue is pinned rather than implied.
+    #[test]
+    fn filter_intra_classes_carry_their_own_libaom_default_row() {
+        // `default_filter_intra_cdfs[bsize]`, BLOCK_SIZES_ALL order, as
+        // (width, height, default, refused_by) for the shapes <= 32 on both
+        // axes. The first three fields are GENERATED from the oracle by
+        // `scripts/extract-filter-intra-cdfs.py` (it reads BLOCK_SIZES_ALL's
+        // order from enums.h and the table from entropymode.c, so no hand
+        // transcription can drift -- lane-fistrip r1 listed the four 1:4
+        // shapes as 16384 out of exactly that kind of guess; their real rows
+        // are 12770/10368/20229/18101). `refused_by` is `None` for a shape
+        // this decoder's partition tree reaches today -- it must own a class,
+        // and that class must carry exactly this row -- and the refusal
+        // string that blocks the shape otherwise. Either way the row is
+        // pinned HERE, so the round that lifts one of those refusals cannot
+        // land a wrong CDF row for the shape it unlocks.
+        const BELOW_8X8: &str =
+            "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)";
+        const PART16: &str = "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes \
+             only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)";
+        const PART32: &str = "a 32x32 partition type this decoder does not code (value={part32})";
+        let libaom: &[(usize, usize, u16, Option<&str>)] = &[
+            (4, 4, 4621, None),
+            (4, 8, 6743, Some(BELOW_8X8)),
+            (8, 4, 5893, Some(BELOW_8X8)),
+            (8, 8, 7866, None),
+            (8, 16, 12551, None),
+            (16, 8, 9394, None),
+            (16, 16, 12408, None),
+            (16, 32, 14301, None),
+            (32, 16, 12756, None),
+            (32, 32, 22343, None),
+            // The 1:4 strips: a 16x16-level PARTITION_HORZ_4/VERT_4 gives
+            // 4x16/16x4, a 32x32-level one 8x32/32x8, and both partition
+            // values refuse by name before any leaf is coded.
+            (4, 16, 12770, Some(PART16)),
+            (16, 4, 10368, Some(PART16)),
+            (8, 32, 20229, Some(PART32)),
+            (32, 8, 18101, Some(PART32)),
+        ];
+        let mut classes_seen = std::collections::BTreeSet::new();
+        for &(bw, bh, default, refused_by) in libaom {
+            match filter_intra_size_class_rect(bw, bh) {
+                Some(class) => {
+                    assert!(
+                        refused_by.is_none(),
+                        "{bw}x{bh} has a CDF class but is listed as refused by {refused_by:?} -- \
+                         one of the two is stale"
+                    );
+                    assert_eq!(
+                        crate::cdf::FILTER_INTRA[class][0],
+                        default,
+                        "{bw}x{bh} (class {class}) must carry default_filter_intra_cdfs' own row"
+                    );
+                    assert_eq!(
+                        &crate::cdf::FILTER_INTRA[class][1..],
+                        &[32768u16, 0][..],
+                        "{bw}x{bh} (class {class}) is a 2-symbol CDF: {{p, 32768, count}}"
+                    );
+                    assert!(
+                        classes_seen.insert(class),
+                        "class {class} is claimed by two shapes -- one of them reads the other's \
+                         probability"
+                    );
+                }
+                None => {
+                    let why = refused_by.unwrap_or_else(|| {
+                        panic!(
+                            "{bw}x{bh} is inside av1_filter_intra_allowed_bsize and reachable, \
+                             but has no CDF class -- its use_filter_intra symbol is never read"
+                        )
+                    });
+                    assert!(!why.is_empty(), "{bw}x{bh}'s refusal string must name the blocker");
+                }
+            }
+        }
+        // The other direction: every row of `cdf::FILTER_INTRA` was claimed
+        // by exactly one shape above, so no row can be left over (or shared)
+        // once a class is added or removed.
+        assert_eq!(
+            classes_seen.len(),
+            crate::cdf::FILTER_INTRA.len(),
+            "cdf::FILTER_INTRA has {} rows but only {:?} are claimed by an allowed shape",
+            crate::cdf::FILTER_INTRA.len(),
+            classes_seen
+        );
+        // Past the bound on either axis: no symbol at all (spec
+        // `filter_intra_mode_info` never reads one).
+        for (bw, bh) in [(64, 64), (64, 32), (32, 64)] {
+            assert!(
+                filter_intra_size_class_rect(bw, bh).is_none(),
+                "{bw}x{bh} is past av1_filter_intra_allowed_bsize's <=32 bound"
+            );
+        }
+    }
     use super::*;
 
     /// lane-tx64x16 r3: the two new 4:1 chroma scans are a TRANSPOSED PAIR --
