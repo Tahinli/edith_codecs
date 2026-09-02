@@ -20851,13 +20851,22 @@ fn decode_inter_block(
     if vartx_leaves.is_some() {
         // Plane 0 is already correct per transform unit
         // ([`Neighbours::record_mi_luma`] above); this writes everything else
-        // [`Neighbours::record_rect`] would.
-        // lane-mergefix r3 (class `tx-grid-published-block-side`): a var-tx
-        // block is NOT always square -- a superblock-level PARTITION_VERT
-        // inter strip is 32x64 with `side == 64`, and publishing `side, side`
-        // stamped the PARENT's 64 into `above_side_mi`/`left_side_mi`, so the
-        // next superblock's partition ctx read 0 where libaom read 1.
-        neighbours.record_split_luma_rect_mi(at, write_w, write_h, mode_for_tx, uv_predict_mode, [&u_grid, &v_grid]);
+        // [`Neighbours::record_rect`] would (a var-tx block is always square,
+        // so `write_w == write_h == side`).
+        //
+        // lane-mergefix r3 (class `tx-grid-published-block-side`, OPEN): that
+        // premise is FALSE for a superblock-level PARTITION_VERT inter strip
+        // (32x64 with `side == 64`), which stamps the PARENT's 64 into
+        // `above_side_mi`/`left_side_mi` and makes the next superblock's
+        // 64-level partition ctx read 0 where the oracle reads 1. Passing
+        // `write_w, write_h` here (or republishing only the two side bands,
+        // per piece or over the parent span) fixes that ladder AND turns two
+        // attempts of `real_aomenc_1to4_streams_..._rect_vartx_leaves_fire`
+        // into the named "non-skip rectangular strip needs rectangular
+        // residual coding" refusal -- all three variants measured in r3, see
+        // lanes/mergefix-r3.report.md. Left at the parent value until the
+        // band write moves into the partition arms.
+        neighbours.record_split_luma_rect_mi(at, side, side, mode_for_tx, uv_predict_mode, [&u_grid, &v_grid]);
     } else {
         neighbours.record_rect_mi(
             at,
