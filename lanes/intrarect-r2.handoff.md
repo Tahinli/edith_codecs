@@ -40,15 +40,13 @@ value, different CDF, msac range diverging at the block's first coefficient symb
 Negative control for r1's `reject_residual` move: 8 attempts in the same sweep still refuse
 "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding".
 
-FULL SUITE: `systemd-run --user --unit=intrarect-suite-r2` was still RUNNING at 249/366 tests
-with 0 failures printed when the cap hit -- log `$HOME/.cache/intrarect-suite-r2.log`. It is
-NOT claimed green.
+FULL SUITE: FINISHED GREEN after the cap -- `test result: ok. 337 passed; 0 failed; 29
+ignored; 0 measured; 0 filtered out; finished in 257.15s`
+(`$HOME/.cache/intrarect-suite-r2.log`).
 
-## Exact next step for r3
+## Exact next step for r3 (one item)
 
-1. `grep -E "^test result|^failures:" -A 12 $HOME/.cache/intrarect-suite-r2.log` (re-run the
-   unit if it was reaped). Expect `0 failed`; anything else is r3's work.
-2. The real open item is the MERGE, not a defect: this branch is **not rebased onto main**.
+The only open item is the MERGE, not a defect: this branch is **not rebased onto main**.
    main now carries lane-fiinter (square intra-in-inter reads `use_filter_intra`) and
    lane-rect1d; `decode_intra_rect_in_inter` reads no such symbol, so on the merged tree the
    rect arm needs the same read wired (this lane's gate spells `--enable-filter-intra=0`, so
