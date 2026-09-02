@@ -21849,6 +21849,15 @@ fn decode_inter_block8(
         // but `DC_PRED` was refused here, which is what blocked the low-cq
         // CDEF arms and the 10-bit gates.
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            eprintln!(
+                "EC_ISTEP8 mi_row={} mi_col={} name=modes y={mode} uv={uv_mode} fi_enabled={} rng={}",
+                leaf_mi.0,
+                leaf_mi.1,
+                ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+                dec.debug_state().0
+            );
+        }
         if (9..=12).contains(&uv_mode) {
             SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
             INTRA_IN_INTER8_UV_SMOOTH_HITS.with(|c| c.set(c.get() + 1));
@@ -21909,14 +21918,39 @@ fn decode_inter_block8(
         // `av1_filter_intra_allowed`'s `palette_size[0] == 0` term is implied:
         // a real palette-Y block already returned above.
         let mut filter_intra = None;
+        // lane-uv8 r2: the oracle's `EC_ISTEP` ladder (`EC_TRACE_MODE_STEP`)
+        // prints `use_filter_intra` for an intra block inside an INTER frame
+        // and nothing else, so this leaf needs the same two lines for a
+        // range-ladder diff against it.
+        let ec_istep8 = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
         if mode == DC_PRED
             && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
             && let Some(class) = filter_intra_size_class(SIDE)
-            && dec.symbol(&mut cdfs.filter_intra[class]) != 0
         {
-            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
-            INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
-            filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
+            let use_fi = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
+            if ec_istep8 {
+                eprintln!(
+                    "EC_ISTEP mi_row={} mi_col={} name=use_filter_intra val={} rng={}",
+                    leaf_mi.0,
+                    leaf_mi.1,
+                    u8::from(use_fi),
+                    dec.debug_state().0
+                );
+            }
+            if use_fi {
+                FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                let fi = dec.symbol(&mut cdfs.filter_intra_mode);
+                if ec_istep8 {
+                    eprintln!(
+                        "EC_ISTEP mi_row={} mi_col={} name=filter_intra_mode val={fi} rng={}",
+                        leaf_mi.0,
+                        leaf_mi.1,
+                        dec.debug_state().0
+                    );
+                }
+                filter_intra = Some(fi);
+            }
         }
         mode_for_tx = mode;
         let (mi_row, mi_col) = leaf_mi;
