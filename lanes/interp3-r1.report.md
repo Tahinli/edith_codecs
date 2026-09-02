@@ -81,3 +81,16 @@ in a counter/table helper and no stream is known to reach them):
   msac RANGE element by element (never `tell()`).
 - deferred(needs that fix): the 10-bit arm of the new gate, and the counter-proving
   pixel-exact claim.
+
+## Suite
+
+`systemd-run --user --unit=interp3-suite-r1 -p MemoryMax=10G --same-dir bash -lc 'EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-interp3 nice -n 10 cargo test -p ec-av1 --lib -j3 > $HOME/.cache/interp3-suite-r1.log 2>&1'`
+
+**372 passed; 0 failed; 33 ignored; 1208.18s** (main's 371/0/32 plus this round's
+`an_obmc_neighbour_with_no_recorded_filter_refuses_instead_of_panicking`, plus the new
+gate ignored). Every OBMC/compound sibling gate green on this tip, including
+`a_real_aomenc_stream_with_obmc_decodes_pixel_exact`,
+`a_real_aomenc_stream_with_obmc_8x8_decodes_pixel_exact`,
+`a_real_aomenc_stream_with_compound_references_decodes_pixel_exact`,
+`a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact`
+and both `..._8x8_leaf_split_...` arms -- the entropy change did not move any of them.
