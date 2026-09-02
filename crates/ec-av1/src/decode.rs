@@ -916,6 +916,10 @@ thread_local! {
     // their rect max transform into square sub-transforms.
     static RECT_INTER_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT_INTER_TXSPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // lane-r14 r2: luma transform units of an inter strip with a 64-px axis
+    // (64x32/32x64/64x16/16x64), whose coefficients are coded as the
+    // truncated low-32 corner.
+    static RECT64_INTER_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // lane-inter4 r3: 16x16-level PARTITION_HORZ / PARTITION_VERT on an inter
     // frame -- 16x8 and 8x16 inter leaves.
     static INTER_LEAF16_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -961,6 +965,11 @@ pub(crate) fn rect_inter_tu_hits() -> usize {
 /// Current value of [`RECT_INTER_TXSPLIT_HITS`] (lane-inter4 r2).
 pub(crate) fn rect_inter_txsplit_hits() -> usize {
     RECT_INTER_TXSPLIT_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT64_INTER_TU_HITS`] (lane-r14 r2).
+pub(crate) fn rect64_inter_tu_hits() -> usize {
+    RECT64_INTER_TU_HITS.with(|c| c.get())
 }
 
 /// Sets the current thread's [`TX_SELECT_INTER`]/[`REDUCED_TX_SET_INTER`]/
@@ -10889,7 +10898,19 @@ fn read_block_tx_size(
 /// `DTT9_IDTX_1DDCT` row at `tx_size_sqr == TX_8X8`, only reachable through a
 /// rect transform), neither of which exists yet -- both stay refused by name.
 fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
-    matches!((w, h), (32, 16) | (16, 32) | (16, 8) | (8, 16))
+    matches!(
+        (w, h),
+        // 2:1 strips whose transform is coded in full (lane-inter4).
+        (32, 16) | (16, 32) | (16, 8) | (8, 16)
+            // lane-r14 r2: strips with a 64-px axis. `av1_get_max_eob` codes
+            // only the low 32 coefficients of a 64-length axis, so these read
+            // exactly the truncated corner the INTRA superblock-strip path
+            // already reads (`read_intra_mode_rect`), through
+            // `av1_get_adjusted_tx_size`'s CDF set. Their `tx_size_sqr_up` is
+            // `TX_64X64`, so `av1_get_ext_tx_set_type` is `DCT_ONLY` and no
+            // `tx_type` symbol is coded at all.
+            | (64, 32) | (32, 64) | (64, 16) | (16, 64)
+    )
 }
 
 /// The luma coefficient/`tx_type` table set of a whole-block rectangular
@@ -10910,6 +10931,13 @@ fn rect_inter_luma_set(w: usize, h: usize) -> TxbSet {
                 TxbSet::LumaRect16x8InterSet1
             }
         }
+        // lane-r14 r2: `av1_get_adjusted_tx_size` maps TX_64X32/TX_32X64 to
+        // TX_32X32 and TX_64X16/TX_16X64 to TX_32X16/TX_16X32, and
+        // `get_txsize_entropy_ctx`/`txsize_log2_minus4` agree with the
+        // adjusted size, so the existing sets are bit-exact. Neither carries a
+        // `tx_type` table (DCT_ONLY above), so the intra/inter split is moot.
+        (64, 32) | (32, 64) => TxbSet::Luma64,
+        (64, 16) | (16, 64) => TxbSet::LumaRect32x16,
         _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
     }
 }
@@ -10922,6 +10950,13 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> TxbSet {
     match (w, h) {
         (16, 8) | (8, 16) => TxbSet::ChromaRect16x8,
         (8, 4) | (4, 8) => TxbSet::ChromaRect8x4,
+        // lane-r14 r2: chroma of a 64-axis strip -- 32x16/16x32 under a
+        // 64x32/32x64 one, 32x8/8x32 under a 64x16/16x64 one. Neither chroma
+        // unit has a 64-px axis, so both are coded in full; `Chroma16` is the
+        // exact set for TX_32X8/TX_8X32 (`get_txsize_entropy_ctx` = TX_16X16,
+        // `txsize_log2_minus4` = 4), same as the intra strip path uses.
+        (32, 16) | (16, 32) => TxbSet::ChromaRect32x16,
+        (32, 8) | (8, 32) => TxbSet::Chroma16,
         _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
     }
 }
@@ -10967,6 +11002,8 @@ fn rect_scan(w: usize, h: usize) -> &'static [u16] {
         (8, 16) => &SCAN_8X16,
         (8, 4) => &SCAN_8X4,
         (4, 8) => &SCAN_4X8,
+        (32, 8) => &SCAN_32X8,
+        (8, 32) => &SCAN_8X32,
         _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
     }
 }
@@ -11033,6 +11070,16 @@ fn read_block_tx_size_rect(
     }
     TXFM_SPLIT_HITS.with(|c| c.set(c.get() + 1));
     RECT_INTER_TXSPLIT_HITS.with(|c| c.set(c.get() + 1));
+    // lane-r14 r2: `sub_tx_size_map` is square for every shape this decoder
+    // splits (TX_32X16 -> TX_16X16, TX_64X32 -> TX_32X32) EXCEPT the 1:4
+    // strips with a 64-px axis, where it stays rectangular
+    // (TX_64X16 -> TX_32X16, TX_16X64 -> TX_16X32) and the square recursion
+    // below would code the wrong tree.
+    if tx_w.max(tx_h) == 64 && tx_w.min(tx_h) == 16 {
+        return Err(unsupported(
+            "a split transform on a 1:4 inter strip with a 64-px axis",
+        ));
+    }
     let sub = tx_w.min(tx_h);
     let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(at_mi.1));
     let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(at_mi.0));
@@ -11096,16 +11143,50 @@ fn read_inter_plane_rect(
         Some(t) if w.max(h) < 32 => t,
         _ => TxType::DctDct,
     };
-    let (grid, tx_type) = read_coeffs_rect(
-        dec,
-        &mut coding,
-        rect_scan(w, h),
-        w,
-        h,
-        skip_ctx,
-        dc_sign_ctx(around.2),
-        default_tx_type,
-    )?;
+    // lane-r14 r2: a 64-length axis codes only its low 32 coefficients
+    // (`av1_get_max_eob`), so the coded unit is the `min(w,32) x min(h,32)`
+    // corner, zero-extended into the true `w x h` grid before the inverse
+    // transform -- exactly what the intra superblock-strip path does. A
+    // corner that comes out square (32x32, under a 64x32/32x64 strip) reads
+    // through the SQUARE coefficient reader with `rect_shape = Some((w, h))`,
+    // because `av1_nz_map_ctx_offset` is indexed by the real, un-adjusted
+    // rectangular shape (lane-sbpart r8).
+    let (cw, ch) = (w.min(32), h.min(32));
+    if plane_idx == 0 && w.max(h) == 64 {
+        RECT64_INTER_TU_HITS.with(|c| c.set(c.get() + 1));
+    }
+    let (corner, tx_type) = if (cw, ch) == (32, 32) {
+        let scan32 = default_scan(TX32);
+        read_coeffs(
+            dec,
+            &mut coding,
+            &scan32,
+            skip_ctx,
+            dc_sign_ctx(around.2),
+            default_tx_type,
+            Some((w, h)),
+        )?
+    } else {
+        read_coeffs_rect(
+            dec,
+            &mut coding,
+            rect_scan(cw, ch),
+            cw,
+            ch,
+            skip_ctx,
+            dc_sign_ctx(around.2),
+            default_tx_type,
+        )?
+    };
+    let grid = if (cw, ch) == (w, h) {
+        corner
+    } else {
+        let mut full = vec![0i32; w * h];
+        for row in 0..ch {
+            full[row * w..][..cw].copy_from_slice(&corner[row * cw..][..cw]);
+        }
+        full
+    };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
     let residual = dequant_and_inverse_typed_wh(
         &grid,
@@ -21883,8 +21964,16 @@ mod tests {
         // non-skip, so the named refusal is the rectangular-inter-residual
         // one. Either string proves what the pin was written for: a non-SPLIT
         // superblock never silently decodes as SPLIT.
+        // lane-r14 r2: the rectangular-residual refusal is gone (a 64x32 strip
+        // now codes its truncated low-32 coefficient corner), so this
+        // hand-written fixture walks further still and stops on the limit of
+        // the FIXTURE rather than of the decoder: it names no reference
+        // pictures. All three strings prove the one thing this pin exists for
+        // -- a non-SPLIT superblock never silently decodes as SPLIT.
         assert!(
-            msg.contains("SPLIT") || msg.contains("rectangular residual coding"),
+            msg.contains("SPLIT")
+                || msg.contains("rectangular residual coding")
+                || msg.contains("no picture at this frame's own ref_frame_idx slot"),
             "expected the named inter-SB-partition refusal, got: {msg}"
         );
     }

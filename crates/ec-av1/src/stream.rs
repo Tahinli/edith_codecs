@@ -68,6 +68,12 @@ pub fn inter_rect_counters() -> (usize, usize, usize, usize, usize, usize) {
     )
 }
 
+/// lane-r14 r2: luma transform units of an inter strip with a 64-px axis,
+/// coded as the truncated low-32 coefficient corner.
+pub fn rect64_inter_tu_hits() -> usize {
+    crate::decode::rect64_inter_tu_hits()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -5964,10 +5970,21 @@ mod tests {
         // NON-skip, so it stops at "a non-skip rectangular (HORZ/VERT/HORZ_B)
         // strip needs rectangular residual coding". The 10-bit twin below is
         // `#[ignore]`d with that exact reason rather than deleted or weakened.
+        // lane-r14 r2 re-measured the 8-bit-only note above: the residual
+        // refusal it names is GONE (this round codes a 64-px transform axis as
+        // its truncated low-32 corner), and a 10-bit sweep of this exact
+        // recipe now reaches the arm -- 2 pixel-exact attempts, 2 64x32 and 2
+        // 32x64 strips, 2 of them carrying a coded 64-axis residual. It stays
+        // 8-bit here for a DIFFERENT, newly exposed reason: 10-bit attempt 14
+        // (cq 61, horizontal split, motion step 12) mismatches ffmpeg while
+        // decoding ZERO superblock-level rect strips and zero 64-axis
+        // residual units, i.e. a defect of some other shape that this gate
+        // must not absorb. See lanes/r14-r2.report.md.
         for bit_depth in [8u32] {
             let (mut named_refusals, mut matched, mut out_of_scope, mut oos_mismatch) =
                 (0u32, 0u32, 0u32, 0u32);
             let (mut horz_proved, mut vert_proved) = (0usize, 0usize);
+            let mut rect64_tus = 0usize;
             for attempt in 0..16u32 {
                 // Two orientations (the transposed pair a one-sided gate could
                 // never separate) x four quantisers x two motion steps: which
@@ -6040,6 +6057,7 @@ mod tests {
                 );
                 let stream = out.stdout;
                 let before = crate::stream::inter_rect_counters();
+                let rect64_before = crate::stream::rect64_inter_tu_hits();
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
                         let msg = e.to_string();
@@ -6056,6 +6074,7 @@ mod tests {
                 };
                 let after = crate::stream::inter_rect_counters();
                 let (horz, vert) = (after.2 - before.2, after.3 - before.3);
+                let rect64 = crate::stream::rect64_inter_tu_hits() - rect64_before;
                 let ffmpeg_frames = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
                 } else {
@@ -6084,17 +6103,28 @@ mod tests {
                 }
                 horz_proved += horz;
                 vert_proved += vert;
+                rect64_tus += rect64;
                 matched += 1;
             }
             eprintln!(
                 "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
                  attempts carrying the arm, 64x32 strips={horz_proved}, 32x64 strips={vert_proved}, \
+                 64-axis residual TUs={rect64_tus}, \
                  {out_of_scope} attempts carried none ({oos_mismatch} of them mismatched)"
             );
             assert_eq!(
                 oos_mismatch, 0,
                 "{NAME}: {oos_mismatch} attempt(s) with no superblock-level inter rect strip \
                  decoded but mismatched ffmpeg -- a defect of another shape, not a pass"
+            );
+            // lane-r14 r2: the residual half of the arm -- a strip that is not
+            // `skip` and codes a real 64-axis transform unit. Without this the
+            // gate proves only the partition symbol.
+            assert!(
+                rect64_tus > 0,
+                "{NAME} ({bit_depth}-bit): no superblock-level rect strip carried a coded \
+                 64-axis residual transform unit inside a pixel-exact attempt \
+                 (horz={horz_proved}, vert={vert_proved}) -- the residual arm proved nothing"
             );
             assert!(
                 horz_proved + vert_proved > 0,
