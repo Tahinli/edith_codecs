@@ -30035,17 +30035,13 @@ mod tests {
                 }
             }
         }
-        // lane-sub8x4 r2: the `--tile-columns=1` arm COMMON's neighbour-map
-        // rule asks for is NOT here, and the reason is measured, not assumed.
-        // The same 192x128 cq-63 recipe with `--tile-columns=1` desyncs at
-        // decode-order frame 4 -- and it desyncs identically with
-        // `--min-partition-size=16 --max-partition-size=16` (frame 3, 13256
-        // luma px), i.e. with no sub-8x8 block of any kind in the stream, so
-        // the defect is a pre-existing multi-tile one and not this lane's
-        // bands. Streams pinned at `~/.cache/sub8x4-tmp/tiles.obu` (sub-8x8)
-        // and `t16.obu` (no sub-8x8); see lanes/sub8x4-r2.report.md. Restore
-        // this arm when that defect is fixed:
-        //     arms.push((8, 63, 192, 128, true));
+        // lane-sub8x4 r3: the `--tile-columns=1` arm COMMON's neighbour-map
+        // rule asks for. It was excluded in r2 because it desynced at
+        // decode-order frame 4 -- identically with `--min-partition-size=16
+        // --max-partition-size=16`, i.e. with no sub-8x8 block at all. That was
+        // main's `1d2259c` (the saved motion field kept only the LAST tile's
+        // columns), merged into this lane in r3; the arm is restored here.
+        arms.push((8, 63, 192, 128, true));
         for (depth, cq, width, height, tiles) in arms {
             let arm = format!("depth={depth} cq={cq} {width}x{height} tiles={tiles}");
             let stream = encode(depth, cq, width, height, tiles);
