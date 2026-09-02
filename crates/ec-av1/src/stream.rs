@@ -2572,6 +2572,147 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
+    /// lane-kf900 r3: the palette colour reader at BOTH bit depths.
+    ///
+    /// `read_palette_colors_y`/`_uv` (decode.rs, mirroring `decodemv.c:478`
+    /// and `:509`) size every raw literal they read by the sequence's
+    /// `bit_depth`: the first colour is `bit_depth` bits, `min_bits` is
+    /// `bit_depth - 3` (Y/U) or `bit_depth - 4` (V), `range` starts at
+    /// `1 << bit_depth`, and the clamp/wrap bound is `(1 << bit_depth) - 1`.
+    /// Ours hardcoded 8, so every 10-bit palette block read TWO BITS TOO FEW
+    /// per transmitted colour and silently decoded the rest of the tile from
+    /// the wrong bit position.
+    ///
+    /// It was silent because raw literals are EQUIPROBABLE: at the ranges
+    /// this content reaches an equiprobable read maps the msac range onto
+    /// itself (62728 -> 31364 -> renormalised 62728), so a cross-decoder
+    /// RANGE ladder stays bit-identical straight through the miscount and
+    /// only the decoded VALUE moves. Pinned on a 256x192 10-bit
+    /// `--cq-level=59` stream whose first block is a 32x16 palette: aomdec's
+    /// `EC_PAL` ladder and ours agreed on every range and disagreed on the
+    /// very first colour index (0 vs 1); after the fix all 1024 `EC_PAL`
+    /// lines of that block match aomdec line for line.
+    ///
+    /// The recipe is the 8-bit `..._with_palette_y_...` gate's, with the
+    /// depth as the only variable, so a failure here is the depth and
+    /// nothing else. HARD-asserts [`decode::palette_hits`] moved on each arm
+    /// (a stream with no real palette block would prove nothing) and
+    /// compares all three planes against ffmpeg's decode of the same bytes.
+    #[test]
+    fn a_real_aomenc_palette_stream_decodes_pixel_exact_at_8_and_10_bit() {
+        const NAME: &str = "a_real_aomenc_palette_stream_decodes_pixel_exact_at_8_and_10_bit";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        for depth in [8usize, 10] {
+            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let render = || {
+                Command::new("ffmpeg")
+                    .args([
+                        "-v", "error",
+                        "-f", "lavfi",
+                        "-i", "smptebars=size=64x64:rate=25",
+                        "-vf", "hue=s=0",
+                        "-pix_fmt", pix_fmt,
+                        "-strict", "-1",
+                        "-t", "0.04",
+                        "-f", "yuv4mpegpipe",
+                        "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run")
+                    .stdout
+            };
+            let y4m_a = render();
+            let y4m_b = render();
+            assert_eq!(
+                y4m_a, y4m_b,
+                "{NAME}: smptebars must render byte-identical across two runs at {depth}-bit"
+            );
+            let y4m = y4m_a;
+            let depth_arg = format!("--bit-depth={depth}");
+            let input_depth_arg = format!("--input-bit-depth={depth}");
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=30",
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    "--tune-content=screen",
+                    "--enable-palette=1",
+                    "--enable-intrabc=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=32",
+                    "--max-partition-size=32",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-tx-size-search=0",
+                    "--loopfilter-control=0",
+                    "--limit=1",
+                ])
+                // Per-arm overrides go AFTER the base recipe: aomenc keeps the
+                // LAST occurrence of a repeated flag.
+                .args([&depth_arg, &input_depth_arg])
+                .args(["--obu", "-o", "-", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the {depth}-bit fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::palette_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => panic!("{NAME}: decode_stream refused the {depth}-bit stream: {e}"),
+            };
+            assert!(
+                decode::palette_hits() > before,
+                "{NAME}: no real palette block at {depth}-bit -- gate is vacuous"
+            );
+            let ffmpeg_frames = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, 1)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, 1)
+            };
+            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma at {depth}-bit");
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U at {depth}-bit");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V at {depth}-bit");
+        }
+    }
+
     /// lane-hbd r5: a real `aomenc --bit-depth=10` stream, decoded through
     /// this crate's own 10-bit planes (`Picture` widened to `u16` in an
     /// earlier round) and checked pixel-exact against ffmpeg's own decode of
