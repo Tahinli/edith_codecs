@@ -480,6 +480,26 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // inter frames are decoded on a thread that previously decoded a
         // different sequence would inherit that sequence's bit.
         crate::decode::set_enable_edge_filter(enable_edge_filter);
+        // lane-sb128 r1: `use_128x128_superblock` (spec 5.5.1). The key-frame
+        // tile path reads the 128 partition root and recurses SPLIT into the
+        // four 64x64 quadrants; the inter tile path is still written for a
+        // 64x64 root only (its own superblock loop, OBMC/mvstack neighbour
+        // caps and `read_cdef` reset all key off `SB_MI`), so refuse there by
+        // name rather than desync. A frame at most 64x64 decodes identically
+        // either way (its 128 root reads no symbol -- neither half is in
+        // frame, so SPLIT is inferred), so the refusal is scoped to frames
+        // bigger than one 64x64 superblock.
+        let use_sb128 = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.use_128x128_superblock);
+        let sb128_active = use_sb128 && (header.mi_cols > 16 || header.mi_rows > 16);
+        crate::decode::set_sb128(sb128_active);
+        if sb128_active && header.frame_type != FrameType::Key {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "an inter frame under a 128x128 superblock (this decoder's inter tile path recurses a 64x64 superblock root only)",
+            ));
+        }
         // lane-hbd r5: `BIT_DEPTH` (decode.rs) drives `crate::decode::sample_max`,
         // which every dequant/inverse-transform clamp reads -- set per frame,
         // not once per process, for the same cross-sequence-on-one-thread
@@ -15410,6 +15430,287 @@ mod tests {
         eprintln!(
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
         );
+    }
+
+    /// lane-sb128 r1 gate: a real `aomenc --sb-size=128` stream (the size his
+    /// Troy encode uses -- `EC_TRACE=1 aomdec troy-head.obu` prints
+    /// `EC_PART mi_row=0 mi_col=0 bsize=15` = `BLOCK_128X128`) must decode
+    /// pixel-exact. `--max-partition-size=64` keeps the RD search from ever
+    /// choosing a 128-level NONE/HORZ/VERT/AB arm, so every 128 root here is
+    /// genuinely `PARTITION_SPLIT` -- the one arm
+    /// `decode_key_frame_tile_with_cdfs` codes; the other seven refuse by
+    /// name (`PART128_NON_SPLIT_REFUSAL`) and stay refused after this round.
+    ///
+    /// What the 128 root actually changes, and what this gate therefore
+    /// proves: the 8-symbol `partition_w128` CDF and its forced-split gather
+    /// at the frame edge, the quadrant VISIT ORDER (TL, TR, BL, BR inside one
+    /// superblock, not raster over 64x64 superblocks), one loop-restoration
+    /// read per 128x128 instead of per 64x64, `delta_q`/`delta_lf` once per
+    /// 128x128, and the per-64x64 `cdef_idx` read inside the 128 superblock.
+    /// 256x192 gives a 2x2 grid of 128 superblocks whose bottom row is a
+    /// partial superblock (the gathered forced-split read); 384x384 gives a
+    /// 3x3 grid of whole ones. 8-bit sweep plus one 10-bit stream (his films
+    /// are `yuv420p10le`). Only a missing tool SKIPs.
+    #[test]
+    fn a_real_aomenc_stream_with_128x128_superblocks_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_128x128_superblocks_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let base: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=40",
+            "--cpu-used=0",
+            "--threads=1",
+            "--row-mt=0",
+            "--sb-size=128",
+            "--max-partition-size=64",
+            "--enable-rect-partitions=1",
+            "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0",
+            // aomenc emits PARTITION_HORZ_4/VERT_4 below 16x16 even with the
+            // flag off (ledger, lane-modectx r1), so bound the search instead.
+            "--min-partition-size=16",
+            "--enable-restoration=1",
+            "--enable-palette=0",
+            "--deltaq-mode=0",
+            "--enable-intrabc=0",
+            "--enable-tx-size-search=0",
+            "--limit=1",
+        ];
+        let encode = |y4m: &[u8], extra: &[&str]| -> Vec<u8> {
+            let mut args = base.clone();
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(y4m)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let render = |seed: u32, width: usize, height: usize, ten_bit: bool| -> Vec<u8> {
+            let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+            let out = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &gradients_source(seed, width, height, "duration=0.04:rate=25"),
+                    "-pix_fmt",
+                    pix,
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                out.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        // (seed, width, height, 10-bit): 256x192 = 2x2 superblocks with a
+        // partial bottom row; 384x384 = 3x3 whole ones.
+        let arms: Vec<(u32, usize, usize, bool)> = vec![
+            (42, 256, 192, false),
+            (43, 256, 192, false),
+            (44, 256, 192, false),
+            (45, 384, 384, false),
+            (46, 256, 192, true),
+            (47, 384, 384, true),
+        ];
+        for (seed, width, height, ten_bit) in arms {
+            let y4m = render(seed, width, height, ten_bit);
+            let extra: Vec<&str> = if ten_bit {
+                vec!["--input-bit-depth=10", "--bit-depth=10"]
+            } else {
+                vec![]
+            };
+            let stream = encode(&y4m, &extra);
+            let parsed = {
+                let mut parser = ec_av1_syntax::Av1Parser::new();
+                let mut pos = 0usize;
+                while let Ok(obu) = parser.parse_obu(&stream[pos..]) {
+                    pos += obu.total_size;
+                    if pos >= stream.len() {
+                        break;
+                    }
+                }
+                parser
+                    .sequence_header()
+                    .map(|q| (q.use_128x128_superblock, q.color_config.bit_depth))
+            };
+            assert_eq!(
+                parsed,
+                Some((true, if ten_bit { 10 } else { 8 })),
+                "{NAME} (seed {seed}): the encoder did not write a 128x128-superblock \
+                 sequence header at the requested bit depth -- the flag never arrived"
+            );
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let want = if ten_bit {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, 1)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, 1)
+            };
+            assert_eq!(frames.len(), 1);
+            for (i, (got, want)) in frames.iter().zip(&want).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        // 256x192 codes 3 whole + 1 partial superblock, 384x384 codes 9 whole
+        // ones, so a run that decoded anything at all must have read real 128
+        // partition symbols and split every one of them.
+        assert!(
+            crate::decode::part128_symbols() >= 3 * matched as usize,
+            "{NAME}: only {} 128-level partition symbols over {matched} decoded streams -- \
+             the 128 root never fired",
+            crate::decode::part128_symbols()
+        );
+        assert!(
+            crate::decode::part128_split_hits() >= 4 * matched as usize,
+            "{NAME}: only {} 128 superblocks split",
+            crate::decode::part128_split_hits()
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact, {named_refusals} named refusals, \
+             part128_symbols={} part128_split_hits={}",
+            crate::decode::part128_symbols(),
+            crate::decode::part128_split_hits()
+        );
+    }
+
+    /// lane-sb128 r1: the inter half of a `--sb-size=128` stream is refused by
+    /// NAME (the inter tile path still recurses a 64x64 root only), never
+    /// silently decoded at the wrong superblock size the way this decoder did
+    /// before this round -- which is what made every earlier Troy "stop" a
+    /// desync artefact rather than a real capability gap.
+    #[test]
+    fn a_real_aomenc_128x128_inter_stream_refuses_by_name() {
+        const NAME: &str = "a_real_aomenc_128x128_inter_stream_refuses_by_name";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let (width, height) = (256usize, 192usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &gradients_source(51, width, height, "duration=0.24:rate=25"),
+                "-pix_fmt",
+                "yuv420p",
+                "-t",
+                "0.24",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success(), "ffmpeg fixture");
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=40",
+                "--cpu-used=1",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=128",
+                "--max-partition-size=64",
+                "--deltaq-mode=0",
+                "--limit=6",
+                "--lag-in-frames=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(out.status.success(), "aomenc refused the fixture");
+        let err = decode_stream(&out.stdout)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            err.contains("an inter frame under a 128x128 superblock"),
+            "{NAME}: expected the scoped inter refusal, got: {err:?}"
+        );
+        eprintln!("{NAME}: {err}");
     }
 
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level

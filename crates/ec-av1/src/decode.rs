@@ -56,6 +56,67 @@ const PARTITION_VERT_4: usize = 9;
 const SB_MI: u32 = 16;
 const BLOCK_MI: u32 = 8;
 
+// lane-sb128 r1: this sequence's `use_128x128_superblock` (spec 5.5.1).
+// Every superblock-granular rule below (`delta_q`/`delta_lf`'s "is this the
+// superblock's own top-left mi?", the loop-restoration read's unit span, the
+// partition tree's own root level) keys off it; `SB_MI` stays the 64x64
+// *quadrant* size a 128 superblock is decoded in, which is also what the CDEF
+// grid is indexed by (libaom `read_cdef` reads one `cdef_idx` per 64x64
+// inside a 128 superblock).
+thread_local! {
+    static SB128: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`SB128`] for this thread (called once per frame from `stream.rs`).
+pub(crate) fn set_sb128(v: bool) {
+    SB128.with(|c| c.set(v));
+    crate::encode::set_reach_superblock_px(if v { 128 } else { 64 });
+}
+
+fn sb128() -> bool {
+    SB128.with(|c| c.get())
+}
+
+/// This sequence's superblock size in mi units (16 = 64x64, 32 = 128x128).
+fn sb_mi_cur() -> u32 {
+    if sb128() { SB_MI * 2 } else { SB_MI }
+}
+
+/// How many real 128-level partition symbols this decoder has read, and how
+/// many superblocks resolved to `PARTITION_SPLIT` (coded or forced) -- the
+/// gate's proof a `--sb-size=128` stream exercised the 128 partition root.
+thread_local! {
+    static PART128_SYMBOLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PART128_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PART128_SYMBOLS`].
+pub(crate) fn part128_symbols() -> usize {
+    PART128_SYMBOLS.with(|c| c.get())
+}
+
+/// Current value of [`PART128_SPLIT_HITS`].
+pub(crate) fn part128_split_hits() -> usize {
+    PART128_SPLIT_HITS.with(|c| c.get())
+}
+
+/// The one 128-level partition arm this decoder codes so far.
+const PART128_NON_SPLIT_REFUSAL: &str =
+    "a 128x128 superblock partition other than SPLIT (NONE/HORZ/VERT/HORZ_A/HORZ_B/VERT_A/VERT_B at the 128 root are not decoded)";
+
+/// [`gather`] over an alphabet of any length -- the 128-level partition CDF
+/// has 8 symbols (no `PARTITION_HORZ_4`/`_VERT_4` at `BLOCK_128X128`, spec
+/// `partition_cdf_length`), so its forced-split gather sums 5 elements where
+/// the 64/32 levels sum 6.
+fn gather_of(cdf: &[u16], elements: &[usize]) -> [u16; 3] {
+    let split: u16 = elements.iter().map(|&e| element_prob(cdf, e)).sum();
+    [32768 - split, 32768, 0]
+}
+
+/// [`VERT_ALIKE`]/[`HORZ_ALIKE`] without the 1:4 arms, for the 128 root.
+const VERT_ALIKE128: [usize; 5] = [2, PARTITION_SPLIT, 4, 6, 7];
+const HORZ_ALIKE128: [usize; 5] = [1, PARTITION_SPLIT, 4, 5, 6];
+
 // How many `use_filter_intra` symbols this decoder has read as `1`, across
 // every call on the current thread -- the cheap counter [`filter_intra_hits`] gate
 // tests read (before/after, not the absolute value) to prove a stream
@@ -206,10 +267,14 @@ fn maybe_read_delta_q(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_
     if !DELTA_Q_PRESENT.with(|c| c.get()) {
         return;
     }
-    if mi_r % SB_MI as usize != 0 || mi_c % SB_MI as usize != 0 {
+    let sb_mi = sb_mi_cur() as usize;
+    if mi_r % sb_mi != 0 || mi_c % sb_mi != 0 {
         return;
     }
-    if is_whole_sb && skip {
+    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag, which
+    // it computes against the 64x64 root; under a 128 superblock no leaf this
+    // decoder codes can be the whole superblock (the root is always SPLIT).
+    if is_whole_sb && !sb128() && skip {
         return;
     }
     let mut abs = dec.symbol(&mut cdfs.delta_q) as i32;
@@ -261,10 +326,14 @@ fn maybe_read_delta_lf(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi
     if !DELTA_LF_PRESENT.with(|c| c.get()) {
         return;
     }
-    if mi_r % SB_MI as usize != 0 || mi_c % SB_MI as usize != 0 {
+    let sb_mi = sb_mi_cur() as usize;
+    if mi_r % sb_mi != 0 || mi_c % sb_mi != 0 {
         return;
     }
-    if is_whole_sb && skip {
+    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag, which
+    // it computes against the 64x64 root; under a 128 superblock no leaf this
+    // decoder codes can be the whole superblock (the root is always SPLIT).
+    if is_whole_sb && !sb128() && skip {
         return;
     }
     let multi = DELTA_LF_MULTI.with(|c| c.get());
@@ -2151,6 +2220,18 @@ fn note_chroma_class1(plane_idx: usize, tx_type: TxType) {
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
 const SB: usize = 64;
+/// The `above_side`/`left_side` value a cell with no decoded neighbour holds
+/// (tile start, superblock-row start).
+///
+/// [`Neighbours::partition_ctx_mi`] reads it as libaom's
+/// `av1_get_partition_plane_context` reads its own zero-initialised
+/// `above_partition_context` byte: bit `bsl` clear, i.e. "the neighbour is at
+/// least as wide as this block". lane-sb128 r1: the old sentinel was `SB`
+/// (64), which reads identically at every level up to 64x64 but sets the bit
+/// at the `BLOCK_128X128` root (64 * 2 <= 128) -- the 128-level partition
+/// symbol was read off CDF row 3 where libaom uses row 0 (aomdec
+/// `EC_PART mi_row=0 mi_col=0 bsize=15 ctx=16`, i.e. `bsl*4 + 0`).
+const NO_NEIGHBOUR_SIDE: usize = 128;
 const BLOCK: usize = 32;
 const SUB: usize = 16;
 const TX32: usize = 32;
@@ -3376,10 +3457,10 @@ impl Neighbours {
             left_mode: vec![DC_PRED; rows],
             above_uv_mode: vec![DC_PRED; cols],
             left_uv_mode: vec![DC_PRED; rows],
-            above_side: vec![SB; cols],
-            left_side: vec![SB; rows],
-            above_side_mi: vec![SB; cols * (SUB / MI)],
-            left_side_mi: vec![SB; rows * (SUB / MI)],
+            above_side: vec![NO_NEIGHBOUR_SIDE; cols],
+            left_side: vec![NO_NEIGHBOUR_SIDE; rows],
+            above_side_mi: vec![NO_NEIGHBOUR_SIDE; cols * (SUB / MI)],
+            left_side_mi: vec![NO_NEIGHBOUR_SIDE; rows * (SUB / MI)],
             sub8_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
             sub8_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
             uv_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
@@ -3444,7 +3525,7 @@ impl Neighbours {
         let end = col1_mi.min(self.above.len());
         for i in col0_mi.min(end)..end {
             self.above[i] = Default::default();
-            self.above_side_mi[i] = SB;
+            self.above_side_mi[i] = NO_NEIGHBOUR_SIDE;
         }
         let (sc0, sc1) = (
             col0_mi / (SUB / MI),
@@ -3452,7 +3533,7 @@ impl Neighbours {
         );
         for i in sc0.min(sc1)..sc1 {
             self.above_mode[i] = DC_PRED;
-            self.above_side[i] = SB;
+            self.above_side[i] = NO_NEIGHBOUR_SIDE;
         }
         // lane-inter8 r2: the inter bands are mi-granular, so they reset over
         // the tile's own mi column span directly.
@@ -3791,8 +3872,8 @@ impl Neighbours {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_uv_mode.iter_mut().for_each(|m| *m = DC_PRED);
-        self.left_side.iter_mut().for_each(|s| *s = SB);
-        self.left_side_mi.iter_mut().for_each(|s| *s = SB);
+        self.left_side.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE);
+        self.left_side_mi.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_skip_mode.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
@@ -10659,6 +10740,50 @@ pub(crate) fn take_last_frame_wide_margin() -> Option<Picture> {
 /// PRIMARY_REF_NONE`). Returns the tile's own end-of-tile adapted table
 /// alongside the picture, for the caller to save into whichever reference
 /// slots this frame's `refresh_frame_flags` names.
+/// The order the 64x64 superblock quadrants of a tile are decoded in.
+///
+/// At `sb_size == 64` this is plain raster order over the tile's own
+/// superblock grid. At `sb_size == 128` libaom's `decode_partition` recurses
+/// each 128x128 superblock in raster order and visits its four 64x64
+/// quadrants (TL, TR, BL, BR) before moving to the next superblock, so the
+/// 64-level bodies must run in that nested order. `row_start` marks the first
+/// item of each *superblock* row (where the left neighbour context resets),
+/// `sb_start` the first item of each superblock (where the 128 root's own
+/// loop-restoration units and partition symbol are read).
+fn sb_visit_order(r0: u32, r1: u32, c0: u32, c1: u32, sb128: bool) -> Vec<(u32, u32, bool, bool)> {
+    let mut out = Vec::new();
+    if !sb128 {
+        for r in r0..r1 {
+            for c in c0..c1 {
+                out.push((r, c, c == c0, true));
+            }
+        }
+        return out;
+    }
+    let mut r = r0;
+    while r < r1 {
+        let mut first_in_row = true;
+        let mut c = c0;
+        while c < c1 {
+            let mut first_in_sb = true;
+            for qr in 0..2 {
+                for qc in 0..2 {
+                    let (rr, cc) = (r + qr, c + qc);
+                    if rr >= r1 || cc >= c1 {
+                        continue;
+                    }
+                    out.push((rr, cc, first_in_row, first_in_sb));
+                    first_in_row = false;
+                    first_in_sb = false;
+                }
+            }
+            c += 2;
+        }
+        r += 2;
+    }
+    out
+}
+
 pub(crate) fn decode_key_frame_tile_with_cdfs(
     tiles: &[&[u8]],
     tile_info: &TileInfo,
@@ -10691,6 +10816,12 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         return Err(unsupported("a frame with no mode-info grid"));
     }
     ENABLE_EDGE_FILTER.with(|f| f.set(enable_edge_filter));
+    let sb128 = sb128();
+    if sb128 && allow_intrabc {
+        return Err(unsupported(
+            "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
+        ));
+    }
     let (sb_cols, sb_rows) = (mi_cols.div_ceil(SB_MI), mi_rows.div_ceil(SB_MI));
     INTRABC_MI_GRID.with(|g| {
         *g.borrow_mut() = allow_intrabc.then(|| {
@@ -10828,19 +10959,74 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         );
         TILE_HITS.with(|c| c.set(c.get() + 1));
 
-    for sb_r in sb_r0..sb_r1 {
-        neighbours.start_row();
-        for sb_c in sb_c0..sb_c1 {
-            crate::restoration::read_lr(
-                &mut dec,
-                &mut cdfs,
-                lr,
-                &mut lr_grid,
-                &mut lr_reference,
-                sb_r * SB_MI,
-                sb_c * SB_MI,
-                SB_MI,
-            );
+    for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
+        if row_start {
+            neighbours.start_row();
+        }
+        {
+            // lane-sb128 r1: the 128 root. Its loop-restoration units are read
+            // once for the whole 128x128 (spec 5.11.57 is called with the
+            // superblock's own size), then one partition symbol off the
+            // `BLOCK_128X128` CDF (8 symbols) decides the root -- only SPLIT
+            // recurses into the four 64x64 quadrants this decoder codes.
+            if sb128 && sb_start {
+                let (mi_r128, mi_c128) = ((sb_r & !1) * SB_MI, (sb_c & !1) * SB_MI);
+                crate::restoration::read_lr(
+                    &mut dec,
+                    &mut cdfs,
+                    lr,
+                    &mut lr_grid,
+                    &mut lr_reference,
+                    mi_r128,
+                    mi_c128,
+                    SB_MI * 2,
+                );
+                let at128 = ((mi_r128 / SUB_MI) as usize, (mi_c128 / SUB_MI) as usize);
+                let ctx128 = neighbours.partition_ctx(at128, 128);
+                let (has_cols128, has_rows128) =
+                    (mi_c128 + SB_MI < mi_cols, mi_r128 + SB_MI < mi_rows);
+                let part128 = if has_cols128 && has_rows128 {
+                    PART128_SYMBOLS.with(|c| c.set(c.get() + 1));
+                    let p = dec.symbol(&mut cdfs.partition_w128[ctx128]);
+                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                        eprintln!("TRACE partition_w128 ctx={ctx128} value={p}");
+                    }
+                    p
+                } else {
+                    match (has_cols128, has_rows128) {
+                        (true, false) => {
+                            dec.symbol_fixed(&gather_of(
+                                &cdfs.partition_w128[ctx128],
+                                &VERT_ALIKE128,
+                            ));
+                        }
+                        (false, true) => {
+                            dec.symbol_fixed(&gather_of(
+                                &cdfs.partition_w128[ctx128],
+                                &HORZ_ALIKE128,
+                            ));
+                        }
+                        _ => {}
+                    }
+                    PARTITION_SPLIT
+                };
+                if part128 != PARTITION_SPLIT {
+                    return Err(unsupported(PART128_NON_SPLIT_REFUSAL));
+                }
+                PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
+            }
+            if !sb128 {
+                crate::restoration::read_lr(
+                    &mut dec,
+                    &mut cdfs,
+                    lr,
+                    &mut lr_grid,
+                    &mut lr_reference,
+                    sb_r * SB_MI,
+                    sb_c * SB_MI,
+                    SB_MI,
+                );
+            }
             CDEF_TRANSMITTED.with(|c| c.set(false));
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
