@@ -22046,7 +22046,15 @@ fn decode_inter_block8(
             luma_grid = read_plane(
                 dec,
                 cdfs,
-                TxbSet::Luma8,
+                // lane-uv8 r3: an intra leaf inside an inter frame is
+                // `is_inter == 0` in `av1_get_ext_tx_set_type`, so its 8x8
+                // luma reads the INTRA set -- seven-type
+                // `EXT_TX_SET_DTT4_IDTX_1DDCT` when `reduced_tx_set == 0`,
+                // five-type `EXT_TX_SET_DTT4_IDTX` when it is 1. Hardcoding
+                // the reduced set read the wrong ALPHABET (class
+                // [[wrong-alphabet-same-value]]) and desynced at the leaf's
+                // first `tx_type`.
+                txbset_for(8, reduced_tx_set),
                 scan8,
                 0,
                 around[0],
