@@ -11903,16 +11903,51 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                              does not code yet",
                                         ));
                                     }
-                                    if has_cols16 {
+                                    // lane-hgkf r1, same class as the 64/32-level
+                                    // fix above: this gathered bit IS the partition
+                                    // (libaom `ec_read_partition_impl`), 0 =
+                                    // HORZ/VERT and only 1 = SPLIT. Forcing SPLIT
+                                    // desynced the bottom band of a 3840x1608 frame
+                                    // at mi_row=400 mi_col=32. Only the in-frame
+                                    // half of the strip is coded.
+                                    let edge_bit = if has_cols16 {
                                         dec.symbol_fixed(&gather(
                                             &cdfs.partition_w16[ctx16],
                                             VERT_ALIKE,
-                                        ));
+                                        ))
                                     } else {
                                         dec.symbol_fixed(&gather(
                                             &cdfs.partition_w16[ctx16],
                                             HORZ_ALIKE,
-                                        ));
+                                        ))
+                                    };
+                                    bump_edge_part(if edge_bit == 1 { 3 } else { 2 });
+                                    if edge_bit != 1 {
+                                        let strip_mi = (
+                                            sr * SUB_MI as usize,
+                                            sc * SUB_MI as usize,
+                                        );
+                                        let (sw, sh) = if has_cols16 { (16, 8) } else { (8, 16) };
+                                        let mode = decode_leaf_rect(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            at16,
+                                            strip_mi,
+                                            sw,
+                                            sh,
+                                            None,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            enable_filter_intra,
+                                            allow_screen_content_tools,
+                                            base_q_idx,
+                                            tx_select,
+                                            reduced_tx_set,
+                                        )?;
+                                        let _ = mode;
+                                        continue;
                                     }
                                     let (mi_row0, mi_col0) =
                                         (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
