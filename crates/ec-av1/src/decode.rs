@@ -1876,6 +1876,34 @@ pub(crate) fn wii_hits() -> usize {
     WII_HITS.with(|c| c.get())
 }
 
+/// lane-inter16ab r5: the six RECTANGULAR wedge shapes, in this order --
+/// the counter slots of [`RECT_WEDGE_HITS`]/[`RECT_WII_HITS`].
+pub(crate) const RECT_WEDGE_SHAPES: [(usize, usize); 6] =
+    [(8, 16), (16, 8), (16, 32), (32, 16), (8, 32), (32, 8)];
+
+fn rect_wedge_slot(bw: usize, bh: usize) -> Option<usize> {
+    RECT_WEDGE_SHAPES.iter().position(|&s| s == (bw, bh))
+}
+
+// lane-inter16ab r5: how many COMPOUND_WEDGE / wedge-INTERINTRA blocks used a
+// RECTANGULAR codebook row (hgtw/hltw), per shape -- the gate's proof that
+// the rect wedge masks lifted this round actually fired, not just the square
+// ones already counted by `WEDGE_HITS`/`WII_HITS`.
+thread_local! {
+    static RECT_WEDGE_HITS: std::cell::Cell<[usize; 6]> = const { std::cell::Cell::new([0; 6]) };
+    static RECT_WII_HITS: std::cell::Cell<[usize; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
+
+/// Current value of [`RECT_WEDGE_HITS`], indexed by [`RECT_WEDGE_SHAPES`].
+pub(crate) fn rect_wedge_hits() -> [usize; 6] {
+    RECT_WEDGE_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT_WII_HITS`], indexed by [`RECT_WEDGE_SHAPES`].
+pub(crate) fn rect_wii_hits() -> [usize; 6] {
+    RECT_WII_HITS.with(|c| c.get())
+}
+
 // lane-inter4 r4: how many 16x8/8x16 INTER LEAVES actually ran the OBMC
 // blend -- the gate's proof that `--enable-obmc=1` reached this shape (the
 // r3 refusal's replacement: prefilt frames are bit-exact vs an instrumented
@@ -16996,23 +17024,29 @@ fn decode_inter_block(
                     Some(b) => dec.symbol(&mut cdfs.compound_type[b]),
                     None => 1,
                 };
-                if wedge_bsize.is_some() && compound_type == 0 && write_w != write_h {
-                    // The wedge mask codebook (`wedge.rs`) is built for the
-                    // square sizes only; a rect wedge block is refused by
-                    // name rather than blended with the wrong mask.
-                    return Err(unsupported(
-                        "a COMPOUND_WEDGE mask on a rectangular inter block (the wedge codebook is square-only)",
-                    ));
-                }
                 if let Some(wedge_bsize) = wedge_bsize.filter(|_| compound_type == 0) {
                     // COMPOUND_WEDGE: lane-wedge r3, codebook checksum-
                     // verified vs independent C dump (wedge.rs).
                     let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
                     let wedge_sign = dec.literal(1);
                     WEDGE_HITS.with(|c| c.set(c.get() + 1));
+                    if let Some(k) = rect_wedge_slot(write_w, write_h) {
+                        RECT_WEDGE_HITS.with(|c| {
+                            let mut a = c.get();
+                            a[k] += 1;
+                            c.set(a);
+                        });
+                    }
+                    // lane-inter16ab r5: the codebook row is this block's TRUE
+                    // footprint (`av1_wedge_params_lookup[bsize]`: hgtw for
+                    // h>w, hltw for h<w, plus that bsize's own signflip row).
+                    // Masks are padded to stride `max(bw,bh) == side`, so the
+                    // square blend below indexes them unchanged and the
+                    // padding never reaches the frame (only `write_w x
+                    // write_h` is written out).
                     wedge_mask = Some(
                         crate::wedge::wedge_masks()
-                            .codebook(side)
+                            .codebook(write_w, write_h)
                             .mask(wedge_sign as usize, wedge_index as usize),
                     );
                 } else {
@@ -18011,11 +18045,6 @@ fn decode_inter_block(
                     let wedge_bsize = bsize_all_index(write_w, write_h)
                         .expect("interintra shape is a BLOCK_SIZES_ALL size");
                     let wedge = dec.symbol(&mut cdfs.wedge_interintra[wedge_bsize]) == 1;
-                    if wedge && write_w != write_h {
-                        return Err(unsupported(
-                            "a wedge interintra mask on a rectangular inter block (the wedge codebook is square-only)",
-                        ));
-                    }
                     if wedge {
                         // lane-wii r2 (spec 5.11.25): `wedge_index` is an
                         // ADAPTING CDF symbol over the same `wedge_bsize` row;
@@ -18023,9 +18052,19 @@ fn decode_inter_block(
                         // INTERINTRA_WEDGE_SIGN 0 (blockd.h).
                         let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
                         WII_HITS.with(|c| c.set(c.get() + 1));
+                        if let Some(k) = rect_wedge_slot(write_w, write_h) {
+                            RECT_WII_HITS.with(|c| {
+                                let mut a = c.get();
+                                a[k] += 1;
+                                c.set(a);
+                            });
+                        }
+                        // lane-inter16ab r5: true-footprint codebook row,
+                        // mask padded to stride `max(bw,bh) == side` -- see
+                        // the compound site's own comment.
                         wedge_mask = Some((
                             crate::wedge::wedge_masks()
-                                .codebook(side)
+                                .codebook(write_w, write_h)
                                 .mask(0, wedge_index as usize),
                             side,
                         ));
@@ -19778,7 +19817,7 @@ fn decode_inter_block8(
                         WEDGE_HITS.with(|c| c.set(c.get() + 1));
                         wedge_mask = Some(
                             crate::wedge::wedge_masks()
-                                .codebook(SIDE)
+                                .codebook(SIDE, SIDE)
                                 .mask(wedge_sign as usize, wedge_index as usize),
                         );
                     } else {
@@ -20244,7 +20283,7 @@ fn decode_inter_block8(
                     WII_HITS.with(|c| c.set(c.get() + 1));
                     wedge_mask = Some((
                         crate::wedge::wedge_masks()
-                            .codebook(SIDE)
+                            .codebook(SIDE, SIDE)
                             .mask(0, wedge_index as usize),
                         SIDE,
                     ));
