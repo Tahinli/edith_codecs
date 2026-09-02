@@ -4638,6 +4638,23 @@ impl Neighbours {
     /// planes 1/2. Falls back to the coarse [`SUB`] slot on whichever axis no
     /// block has recorded the exact neighbouring mi.
     fn smooth_uv_neighbour(&self, mi_r: usize, mi_c: usize, r: usize, c: usize) -> bool {
+        // lane-kf900 r2: libaom reads the chroma neighbours off the CHROMA
+        // REFERENCE block, not off the mi that carries the chroma syntax.
+        // `set_mi_row_col` (`blockd.h`) takes
+        // `base_mi = &xd->mi[-(mi_row & ss_y) * stride - (mi_col & ss_x)]` and
+        // only then `chroma_above_mbmi = base_mi[-stride]` /
+        // `chroma_left_mbmi = base_mi[-1]`. A sub-8 pair codes its chroma at
+        // the ODD mi, so without the snap we looked one mi row/column too far
+        // down/right -- the mi-exact slot never matched and the coarse
+        // fallback answered instead. Measured on a 4K 10-bit key frame, chroma
+        // 8x4 at (688, 100) = mi (51, 344): libaom's
+        // `get_intra_edge_filter_type` is 1 (the chroma block above it is
+        // `UV_SMOOTH_PRED`), ours was 0, which flips
+        // `av1_use_intra_edge_upsample(8, 4, -6, type)` (`blk_wh == 12`:
+        // false for type 1, TRUE for type 0) and upsampled an edge libaom
+        // leaves alone -- +1 on rows 2/3 of that block and every chroma block
+        // predicting from it (class `context-read-from-one-cell`).
+        let (mi_r, mi_c) = (mi_r & !1, mi_c & !1);
         // lane-mtfix r1: availability is TILE-relative on BOTH axes and on the
         // coarse fallback too. `above_uv_mode` is a frame-wide [`SUB`]-grid
         // array that `start_tile` does not clear, so a block on a tile's first
