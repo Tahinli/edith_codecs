@@ -31,6 +31,7 @@ fn main() {
     let report = || {
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
+        println!("skip_split_tx: {}", ec_av1::decode::skip_split_tx_hits());
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         let ir = ec_av1::stream::inter_rect_counters();
