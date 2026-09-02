@@ -274,6 +274,22 @@ impl MiGrid {
             None
         }
     }
+
+    /// The unit at `(row, col)` ignoring the tile window -- the frame-level
+    /// read `av1_copy_frame_mvs` (this crate's
+    /// `crate::decode::build_motion_field`) needs: it stores EVERY block of
+    /// the frame, and it runs after the last tile has already narrowed
+    /// [`Self::set_tile_bounds`], so reading it through [`Self::get`] saved
+    /// only the last tile's columns into the motion field and every other
+    /// tile's temporal candidates silently vanished from the next frame's
+    /// MV stack.
+    pub fn get_frame(&self, row: usize, col: usize) -> Option<&MiInfo> {
+        if row < self.rows && col < self.cols {
+            self.cells[row * self.cols + col].as_ref()
+        } else {
+            None
+        }
+    }
 }
 
 /// One entry of the reference MV stack: a candidate motion vector and the
