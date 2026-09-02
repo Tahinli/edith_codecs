@@ -100,10 +100,6 @@ pub(crate) fn part128_split_hits() -> usize {
     PART128_SPLIT_HITS.with(|c| c.get())
 }
 
-/// The one 128-level partition arm this decoder codes so far.
-const PART128_NON_SPLIT_REFUSAL: &str =
-    "a 128x128 superblock partition other than SPLIT (NONE/HORZ/VERT/HORZ_A/HORZ_B/VERT_A/VERT_B at the 128 root are not decoded)";
-
 /// [`gather`] over an alphabet of any length -- the 128-level partition CDF
 /// has 8 symbols (no `PARTITION_HORZ_4`/`_VERT_4` at `BLOCK_128X128`, spec
 /// `partition_cdf_length`), so its forced-split gather sums 5 elements where
@@ -11011,7 +11007,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                     PARTITION_SPLIT
                 };
                 if part128 != PARTITION_SPLIT {
-                    return Err(unsupported(PART128_NON_SPLIT_REFUSAL));
+                    return Err(unsupported(
+                        "a 128x128 superblock partition other than SPLIT (NONE/HORZ/VERT and the four AB arms at the 128 root are not decoded)",
+                    ));
                 }
                 PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
             }
