@@ -84,4 +84,10 @@ Disposition: deferred(needs a real aomenc stream with `--enable-palette=1` that 
 
 ## 4. Suite
 
-`cargo test -p ec-av1 --lib` (systemd unit, EC_AV1_REQUIRE_AOMENC=1): SUITE_RESULT_PLACEHOLDER
+`cargo test -p ec-av1 --lib` (systemd unit, EC_AV1_REQUIRE_AOMENC=1): **335 passed; 0 failed; 29 ignored** (768.77s), log `$HOME/.cache/modectx-suite.log`.
+
+EVIDENCE: $HOME/.cache/modectx-suite.log | `systemd-run --user --unit=modectx-suite-1788316736 ... cargo test -p ec-av1 --lib -j3` on 4339963 | test result: ok. 335 passed; 0 failed; 29 ignored
+
+Gate re-run of the charter siblings is inside that suite run (32x32_level_1to4, superblock_level_1to4,
+split_transform_*, coded_rect_strip_below_16x16, sub8_*, filter_intra_*, multi_tile/two+four tile
+columns and tile rows, tiny sweep, refusal_inventory, gate_coverage — all ok).
