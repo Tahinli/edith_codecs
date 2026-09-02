@@ -3946,6 +3946,18 @@ impl Neighbours {
     /// `cols`/`rows` are in [`SUB`] units; `mi_cols`/`mi_rows` are the frame's
     /// true (unpadded) size in 4x4 mode-info units.
     fn new(cols: usize, rows: usize, mi_cols: usize, mi_rows: usize) -> Self {
+        // lane-sb128c r7: a 128x64 block at the bottom frame edge records its
+        // neighbour state over the whole 64-row extent, past the frame's last
+        // mi row (mi_rows 198, block rows 192..208). libaom's own context
+        // buffers are superblock-aligned for exactly that reason
+        // (`av1_alloc_context_buffers` rounds to `MAX_MIB_SIZE`), so pad the
+        // side arrays to a superblock multiple and leave those cells unread --
+        // every availability check uses the true `mi_rows`/`mi_cols` below.
+        let sb_sub = (sb_mi_cur() as usize) / (SUB / MI);
+        let (cols, rows) = (
+            cols.next_multiple_of(sb_sub),
+            rows.next_multiple_of(sb_sub),
+        );
         Self {
             above: vec![[Neighbour::default(); 3]; cols * (SUB / MI)],
             left: vec![[Neighbour::default(); 3]; rows * (SUB / MI)],
@@ -5015,7 +5027,14 @@ impl Neighbours {
             round_up_even(self.mi_cols),
         ];
         for cell in 0..h_mi {
-            self.left[mi_r + cell] = std::array::from_fn(|plane| {
+            // lane-sb128c r7: a 128x64 at the bottom frame edge names mi rows
+            // past the padded side arrays (mi_rows 198, block rows 192..208);
+            // libaom's own arrays are superblock-sized, so those cells simply
+            // have no reader. Same guard the `left_side_mi` loop above uses.
+            let Some(left_slot) = self.left.get_mut(mi_r + cell) else {
+                break;
+            };
+            *left_slot = std::array::from_fn(|plane| {
                 if cell < h_mi.min(bound_h[plane].saturating_sub(mi_r)) {
                     states[plane]
                 } else {
@@ -5024,7 +5043,10 @@ impl Neighbours {
             });
         }
         for cell in 0..w_mi {
-            self.above[mi_c + cell] = std::array::from_fn(|plane| {
+            let Some(above_slot) = self.above.get_mut(mi_c + cell) else {
+                break;
+            };
+            *above_slot = std::array::from_fn(|plane| {
                 if cell < w_mi.min(bound_w[plane].saturating_sub(mi_c)) {
                     states[plane]
                 } else {
@@ -13675,6 +13697,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                     mi_cols,
                     mi_rows,
                 )?;
+                if matches!(part128, PARTITION_HORZ | PARTITION_VERT) {
+                    // lane-sb128c r7: the INTER path decodes these (two 128x64
+                    // / two 64x128 blocks, the film's own bottom-edge shape);
+                    // the key path's `decode_block` is square-only, so an
+                    // intra 128x64 would silently decode as four 64x64
+                    // quadrants. Refuse by name instead of corrupting.
+                    return Err(unsupported(
+                        "a 128x128 superblock HORZ/VERT partition on an intra frame (the inter path decodes it; the intra one is square-block only)",
+                    ));
+                }
                 if part128 == PARTITION_NONE {
                     // One 128x128 intra block: four TX_64X64 luma units and a
                     // single 64x64 chroma unit per plane (`av1_get_max_uv_txsize`
