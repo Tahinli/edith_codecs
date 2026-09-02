@@ -6555,6 +6555,11 @@ fn decode_intra_rect_in_inter(
             v[depth.min(2)] += 1;
             h.set(v);
         });
+        if std::env::var_os("EC_SPLITSTRIP").is_some() {
+            eprintln!(
+                "EC_SPLITSTRIP mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} depth={depth}"
+            );
+        }
     }
     let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
     let modes = RectStripModes {
@@ -12038,6 +12043,17 @@ fn rect_inter_luma_set(w: usize, h: usize) -> TxbSet {
                 TxbSet::LumaRect16x4Inter
             } else {
                 TxbSet::LumaRect16x4Inter1
+            }
+        }
+        // lane-intrasplit r2: the leaf a SPLIT 16x4/4x16 inter strip resolves
+        // to -- libaom `sub_tx_size_map[TX_16X4] == TX_8X4` (common_data.h:180).
+        // Reachable only since lane-r14's general `read_var_tx_size`; before
+        // that merge the strip's split was refused by name.
+        (8, 4) | (4, 8) => {
+            if REDUCED_TX_SET_INTER.with(std::cell::Cell::get) {
+                TxbSet::LumaRect8x4Inter
+            } else {
+                TxbSet::LumaRect8x4Inter1
             }
         }
         (16, 8) | (8, 16) => {
