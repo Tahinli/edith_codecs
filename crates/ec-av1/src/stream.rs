@@ -15882,6 +15882,268 @@ mod tests {
             crate::decode::cdef_idx_hits()
         );
     }
+    /// lane-edgeboth r1 GATE: frame sizes whose width AND height are both
+    /// 8 mod 16, so the bottom-right corner of the frame is a partition node
+    /// with `has_rows == false && has_cols == false` at every level it
+    /// reaches -- libaom `decode_partition` forces PARTITION_SPLIT there and
+    /// reads NO symbol (`else if (!has_rows && !has_cols) partition =
+    /// PARTITION_SPLIT;`), then drops the out-of-frame children on its
+    /// `if (mi_row >= mi_rows || mi_col >= mi_cols) return;` early return.
+    /// The 64 and 32 levels already inferred that split; the 16 level refused
+    /// by name until r1, on both the intra (key) and the inter path -- so both
+    /// arms are swept here. Every compared attempt must show a 16-level
+    /// both-cut hit, and the sweep must show 32- and 64-level hits too (200x72
+    /// puts all three levels in that state: mi_cols 50, mi_rows 18, so the
+    /// nodes at mi (16,48) of size 64, 32 and 16 are all cut on both axes).
+    #[test]
+    fn a_real_aomenc_both_axes_cut_corner_block_decodes_pixel_exact() {
+        both_axes_cut_sweep(
+            "a_real_aomenc_both_axes_cut_corner_block_decodes_pixel_exact",
+            ("key", 1, "--kf-max-dist=0", "--limit=1"),
+        );
+    }
+
+    /// lane-edgeboth r1, INTER half of the same lift. `#[ignore]`d, and the
+    /// reason is MEASURED, not assumed: the inter path's both-cut corner block
+    /// itself decodes exactly (200x72 inter cq 32, luma diff bounding box rows
+    /// 64..=71 cols 15..=186 -- the corner at cols 192..=199 is clean), but the
+    /// bottom 8-row frame-edge BAND of an inter frame is wrong, and the
+    /// control 192x72 (width a multiple of 16, so zero both-cut nodes: hits
+    /// [0,0,0,0]) fails identically at rows 64..=71 cols 8..=188. That band is
+    /// the forced one-axis HORZ half strip on the inter path -- lane-oddh's
+    /// own inter gate is `#[ignore]`d for the same arm -- so this gate turns
+    /// green with that defect, not with anything this lane changed.
+    #[test]
+    #[ignore = "2026-09-02 lane-edgeboth r1: blocked by the pre-existing inter frame-edge half-strip band defect, not by the both-cut corner -- control 192x72 (zero both-cut hits) mismatches identically at rows 64..=71"]
+    fn a_real_aomenc_both_axes_cut_corner_inter_frames_decode_pixel_exact() {
+        both_axes_cut_sweep(
+            "a_real_aomenc_both_axes_cut_corner_inter_frames_decode_pixel_exact",
+            ("inter", 6, "--kf-max-dist=9999", "--limit=6"),
+        );
+    }
+
+    fn both_axes_cut_sweep(
+        name: &'static str,
+        (arm, frames, kf_arg, limit_arg): (&str, usize, &str, &str),
+    ) {
+        // Kept upper-case so every message string below reads the same as in
+        // the sibling gates.
+        #[allow(non_snake_case)]
+        let NAME = name;
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let sizes: &[(usize, usize)] = &[(200, 72), (136, 104), (264, 136), (72, 200), (104, 136)];
+        let mut compared = 0u32;
+        let mut refusals: Vec<String> = Vec::new();
+        let mut totals = [0usize; 4];
+        for &(width, height) in sizes {
+            let mut size_compared = 0u32;
+            {
+                for bit_depth in [8u32, 10u32] {
+                    // cq 58 is left out on purpose: measured r1, it is where
+                    // libaom starts answering the frame-edge gathered symbol
+                    // with a rect strip and other lanes' refusals fire first
+                    // ("a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
+                    // rectangular residual coding").
+                    for cq in [32u32, 45] {
+                        let source = format!("mandelbrot=size={width}x{height}:rate=25");
+                        // Feed exactly `frames` frames: --limit=1 makes
+                        // aomenc stop reading after the first one and the
+                        // y4m write then dies on a broken pipe.
+                        let dur = format!("{}", frames as f64 / 25.0);
+                        let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                        let y4m = Command::new("ffmpeg")
+                            .args([
+                                "-v", "error", "-f", "lavfi", "-i", &source, "-t", &dur,
+                                "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                            ])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .output()
+                            .expect("ffmpeg failed to run");
+                        assert!(
+                            y4m.status.success(),
+                            "{NAME}: ffmpeg refused the {width}x{height} {bit_depth}-bit \
+                             fixture: {}",
+                            String::from_utf8_lossy(&y4m.stderr)
+                        );
+                        let depth_arg = format!("--bit-depth={bit_depth}");
+                        let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                        let cq_arg = format!("--cq-level={cq}");
+                        let mut child = Command::new(aomenc_path())
+                            .args([
+                                "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg,
+                                // cpu-used >= 1 keeps libaom on 64x64
+                                // superblocks at these sizes
+                                // (`av1_select_sb_size`).
+                                "--cpu-used=4", "--threads=1", "--row-mt=0",
+                                // --lag-in-frames=0: no hidden alt-ref, so
+                                // decode order == display order and the
+                                // compare below covers every frame the stream
+                                // carries (class gate-blind-to-hidden-frames).
+                                kf_arg, limit_arg, "--lag-in-frames=0",
+                                &depth_arg, &input_depth_arg,
+                                // Other lanes' named refusals this recipe must
+                                // not trip. The both-cut corner is FORCED down
+                                // to 8x8 leaves, which is exactly where the
+                                // 8x8-intra-leaf-in-an-inter-frame gaps live,
+                                // so the intra tool set and tx-size search are
+                                // pinned off: without them 30/30 inter
+                                // attempts refused (measured r1) on "a nonzero
+                                // angle delta on an 8x8 intra leaf in an inter
+                                // frame", "a non-DC chroma mode on an 8x8
+                                // inter-frame leaf" and "an 8x8 intra leaf in
+                                // an inter frame whose tx_depth splits it into
+                                // 4x4 transform units".
+                                "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                                "--enable-1to4-partitions=0",
+                                "--min-partition-size=8", "--max-partition-size=64",
+                                "--enable-palette=0", "--enable-intrabc=0",
+                                "--enable-warped-motion=0", "--enable-obmc=0",
+                                "--enable-masked-comp=0", "--enable-interintra-comp=0",
+                                "--enable-onesided-comp=0", "--enable-interintra-wedge=0",
+                                "--enable-smooth-interintra=0", "--enable-ref-frame-mvs=0",
+                                "--enable-angle-delta=0", "--enable-cfl-intra=0",
+                                "--enable-directional-intra=0", "--enable-smooth-intra=0",
+                                "--enable-paeth-intra=0", "--enable-filter-intra=0",
+                                "--enable-tx-size-search=0",
+                                "--obu", "-o", "-", "-",
+                            ])
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .expect("aomenc failed to start");
+                        child
+                            .stdin
+                            .take()
+                            .expect("aomenc stdin")
+                            .write_all(&y4m.stdout)
+                            .expect("write y4m");
+                        let out = child.wait_with_output().expect("aomenc failed to run");
+                        assert!(
+                            out.status.success(),
+                            "aomenc refused: {}",
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                        let stream = out.stdout;
+
+                        // Reset, never a delta across attempts: a refused
+                        // attempt's hits must not count (class
+                        // counter-from-refused-stream).
+                        crate::decode::reset_edge_both_cut_hits();
+                        let decoded = match decode_stream(&stream) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                let msg = e.to_string();
+                                assert!(
+                                    msg.contains("unsupported"),
+                                    "{NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} \
+                                     failed outright, not a named refusal: {msg}"
+                                );
+                                eprintln!(
+                                    "  {NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} \
+                                     REFUSED {msg}"
+                                );
+                                refusals.push(msg);
+                                continue;
+                            }
+                        };
+                        let hits = crate::decode::edge_both_cut_hits();
+                        let reference = if bit_depth == 10 {
+                            ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
+                        } else {
+                            ffmpeg_decode_sequence(&stream, width, height, frames)
+                        };
+                        assert_eq!(
+                            decoded.len(),
+                            frames,
+                            "{NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} decoded {} \
+                             frames, expected {frames}",
+                            decoded.len()
+                        );
+                        assert_eq!(
+                            reference.len(),
+                            frames,
+                            "{NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} reference \
+                             frame count"
+                        );
+                        for (i, (ours, theirs)) in decoded.iter().zip(&reference).enumerate() {
+                            let nd =
+                                |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+                            // Where a mismatch lands is the whole diagnosis
+                            // here (corner block vs elsewhere), so print the
+                            // luma bounding box before the assert kills the run.
+                            if nd(&ours.y, &theirs.y) > 0 {
+                                let (mut r0, mut c0, mut r1, mut c1) =
+                                    (usize::MAX, usize::MAX, 0usize, 0usize);
+                                for row in 0..height {
+                                    for col in 0..width {
+                                        if ours.y[row * width + col] != theirs.y[row * width + col] {
+                                            r0 = r0.min(row);
+                                            c0 = c0.min(col);
+                                            r1 = r1.max(row);
+                                            c1 = c1.max(col);
+                                        }
+                                    }
+                                }
+                                eprintln!(
+                                    "  {NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} \
+                                     frame {i} luma diff bbox rows {r0}..={r1} cols {c0}..={c1}"
+                                );
+                            }
+                            assert_eq!(
+                                (
+                                    nd(&ours.y, &theirs.y),
+                                    nd(&ours.u, &theirs.u),
+                                    nd(&ours.v, &theirs.v)
+                                ),
+                                (0, 0, 0),
+                                "{NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} frame \
+                                 {i} differs from ffmpeg"
+                            );
+                        }
+                        // Every compared attempt must carry the case, so no
+                        // compared attempt is out of scope and
+                        // out_of_scope_mismatch is 0 by construction.
+                        assert!(
+                            hits[0] > 0,
+                            "{NAME}: {width}x{height} {arm} {bit_depth}-bit cq {cq} decoded \
+                             pixel-exact but no 16-level both-axes-cut block fired \
+                             (hits={hits:?}) -- the recipe no longer reaches the lifted arm"
+                        );
+                        for l in 0..4 {
+                            totals[l] += hits[l];
+                        }
+                        compared += 1;
+                        size_compared += 1;
+                    }
+                }
+            }
+            assert!(
+                size_compared > 0,
+                "{NAME}: every {width}x{height} attempt refused -- that size proved nothing"
+            );
+        }
+        assert!(
+            totals[1] > 0 && totals[2] > 0,
+            "{NAME}: no 32-level ({}) or 64-level ({}) both-axes-cut node fired -- 200x72 puts \
+             both in that state, so the sweep stopped reaching them",
+            totals[1],
+            totals[2]
+        );
+        eprintln!(
+            "{NAME}: {compared} attempts pixel-exact over {} sizes ({arm} arm), \
+             out_of_scope_mismatch=0, both_cut hits [16,32,64,128]={totals:?}, {} named refusals",
+            sizes.len(),
+            refusals.len()
+        );
+    }
+
     /// lane-tiny r4 GATE (was r1's `#[ignore]`d probe): every tiny key-frame
     /// size real aomenc will encode, decoded pixel-exact against ffmpeg.
     /// Tiny frames are where every edge/partial-superblock corner case is
