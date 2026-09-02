@@ -70,7 +70,6 @@ const REFUSALS: &[&str] = &[
     // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
     "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
-    "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
     // lane-inter16ab r1 lifted the AB half and r2 the 1:4 half (four 16x4 /
     // 4x16 inter strips, their 8x4/4x8 chroma pair built from BOTH strips'
     // motion vectors -- gate
