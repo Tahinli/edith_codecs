@@ -284,10 +284,6 @@ const NEVER_ON_10BIT: &[(&str, &str)] = &[
         "enable-tx-size-search",
         "hole at both depths, see the 8-bit list (11 of 15 pin =0)",
     ),
-    (
-        "multi-tile",
-        "on in no 10-bit gate: all 15 leave --tile-columns/--tile-rows defaulted at 0, so every 10-bit stream is single-tile and no tile edge or per-tile CDF reset is checked at high bit depth",
-    ),
 ];
 
 #[cfg(test)]
