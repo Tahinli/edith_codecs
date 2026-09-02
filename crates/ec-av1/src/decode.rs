@@ -4181,10 +4181,17 @@ impl Neighbours {
     ) {
         let (mi_r, mi_c) = at_mi;
         // `av1_get_max_uv_txsize` under 4:2:0: the block's chroma extent is
-        // half its luma one (min 4 px, the smallest transform), capped at
-        // TX_32X32 -- independent of this block's luma `tx_depth`.
-        let uv_tx_w = ((w_mi * MI / 2).max(4).min(32)) as u8;
-        let uv_tx_h = ((h_mi * MI / 2).max(4).min(32)) as u8;
+        // half its luma one (min 4 px, the smallest transform).
+        // lane-sb128c r4: the old `.min(32)` TX_32X32 cap was inert for every
+        // block up to 64 wide (64/2 == 32) and WRONG for a 128-sided one: it
+        // published an internal chroma TU edge every 32 chroma px inside the
+        // block, which libaom only filters when the block is not
+        // `curr_skipped` -- and a non-skip 128 block reaches here again
+        // through its own per-leaf calls (`w_mi * MI == 64`, uv 32), which
+        // publish that edge correctly. The cap is therefore redundant where
+        // it was right and harmful where it was not.
+        let uv_tx_w = (w_mi * MI / 2).max(4) as u8;
+        let uv_tx_h = (h_mi * MI / 2).max(4) as u8;
         let cur = CURRENT_DELTA_LF.with(|c| c.get());
         let snapshot: [i8; 4] = if DELTA_LF_MULTI.with(|c| c.get()) {
             std::array::from_fn(|i| cur[i].clamp(-63, 63) as i8)
@@ -8845,8 +8852,13 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
 
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
+    // lane-sb128c r4: decode-order index like `EC_AV1_PREFILT_DUMP`'s -- a
+    // fixed `.f0` overwrote every frame, so the only comparable stage dump
+    // was the last decoded picture (aomdec's own rung indexes its files).
+    static STAGE_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let idx = STAGE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}"))
     {
         for p in [y, u, v] {
             let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
@@ -19251,9 +19263,16 @@ fn decode_inter_block(
         },
     );
     // lane-txselect: a var-tx block's deblock edges follow its own transform
-    // units, not the block. Chroma still reads `tx_h_grid / 2` (the block's
-    // uv transform is not split) -- a known corner-cut of this round.
-    if let Some(leaves) = &vartx_leaves {
+    // units, not the block.
+    // lane-sb128c r4: libaom `set_one_param_for_line_luma` suppresses every
+    // edge that is a TU edge but not a PU edge when
+    // `curr_skipped = mbmi->skip_txfm && is_inter_block(mbmi)`, so a SKIP
+    // inter block's internal transform edges are never filtered even though
+    // `get_transform_size` still reports TX_64X64 for it. The only block that
+    // reaches here skipped is the 128 root (`read_block_tx_size` hands back
+    // four TX_64X64 leaves for `side > 64` regardless of `skip`); leaving its
+    // block-level 128 publication in place is exactly that suppression.
+    if let Some(leaves) = (!(skip && is_inter)).then_some(()).and(vartx_leaves.as_ref()) {
         for &(row, col, tx_px) in leaves {
             neighbours.fill_lf_grid_rect(
                 (at_mi.0 + row, at_mi.1 + col),
