@@ -54,3 +54,11 @@ suspect the pu_edge/tx grid for blocks in the partial last mi row.
 ## Disposition
 - fix-now (r5): the decode-frame-2 32-px prediction band above.
 - accepted: r3's partition-context finding stays unshipped (sibling-gate trade).
+
+## Sibling gate batch (one invocation, after the fix)
+`cargo test -p ec-av1 --lib -j3 -- <the 9 r2 sibling names> a_frame_edge_straddling_band_decodes_pixel_exact real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx`
+-> `test result: FAILED. 10 passed; 1 failed; 0 ignored` in 108.06s
+(log `$HOME/.cache/mergefix-r4-sib.log`). The single failure is the lane's own straddling
+gate at its pre-existing 3622 px; no sibling traded.
+EVIDENCE: $HOME/.cache/mergefix-r4-sib.log | the 11 gates above in one invocation on the
+shipped tree | 10 passed, 1 failed (straddling, unchanged 3622 px).
