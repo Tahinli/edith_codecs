@@ -2197,6 +2197,26 @@ thread_local! {
     static RECT4_16_CHROMA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT4_16_COEFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT4_16_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-kf1200: pairs whose chroma edge-filter type read from the PAIR's
+    /// base mi differs from what the strip's own (odd) mi would have said --
+    /// the shape that made 4 chroma samples of the Hunger Games `-ss 1200`
+    /// key frame miss by 1. Zero here means a gate never exercised the fix.
+    static RECT4_16_UV_PAIR_FILT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-kf1200 r2: sub-8x8 chroma blocks that are `skip_txfm` AND
+    /// `UV_CFL_PRED` -- the arm that used to drop the CfL alpha entirely.
+    static SKIP_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
+/// that reconstructed as flat DC before lane-kf1200 r2).
+pub fn skip_cfl_hits() -> usize {
+    SKIP_CFL_HITS.with(|c| c.get())
+}
+
+/// How many 16x4/4x16 chroma pairs took a different `intra_edge_filter_type`
+/// from the pair's base mi than the strip's own mi would have given.
+pub fn rect4_16_uv_pair_filt_hits() -> usize {
+    RECT4_16_UV_PAIR_FILT_HITS.with(|c| c.get())
 }
 
 // lane-troykf r1: the two chroma defects Troy's key frames exposed --
@@ -7731,14 +7751,22 @@ fn decode_rect4_16(
                 RECT4_16_CHROMA_DIR_HITS.with(|h| h.set(h.get() + 1));
             }
             let pair_reach = Reach::of_rect(pw, ph, ppx, ppy, y.width, y.height);
-            // libaom `get_intra_edge_filter_type` reads `chroma_above_mbmi` /
-            // `chroma_left_mbmi` -- the neighbours of the CHROMA REFERENCE
-            // position, not of the closing strip. At `lmi` the above cell is
-            // the pair's own first strip, so the mi-exact map missed and the
-            // coarse fallback answered; the filter type then flipped the
-            // `use_intra_edge_upsample` decision (blk_wh 12 <= 16 for type 0,
-            // no upsample for type 1) on directional chroma.
-            let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c);
+            // lane-kf1200 r1: the chroma edge-filter type reads the neighbours
+            // of the CHROMA block, which for a 16x4/4x16 pair is `pair_mi`'s
+            // 16x8/8x16 region -- libaom builds `chroma_above_mbmi`/
+            // `chroma_left_mbmi` from `mi[-((mi_row & ss_y) * stride + (mi_col
+            // & ss_x))]` (`set_mi_offsets`, av1/common/blockd.h ~1050), i.e.
+            // the pair's top-left luma mi, never this leaf's odd row/column.
+            // Reading `lmi` here named the leaf directly above (a non-chroma
+            // -reference 4-row block, `uv_mode == UV_DC_PRED`) and so lost a
+            // SMOOTH neighbour: filt_type 0 instead of 1 turned
+            // `av1_use_intra_edge_upsample` on (blk_wh 12 <= 16) for a
+            // directional chroma strip, moving 4 samples by 1.
+            let smooth_neighbor_uv =
+                neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c);
+            if smooth_neighbor_uv != neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c) {
+                RECT4_16_UV_PAIR_FILT_HITS.with(|h| h.set(h.get() + 1));
+            }
             let (u_levels, v_levels) = if skip {
                 let zeros = vec![0i32; cw * ch];
                 // libaom `predict_and_reconstruct_intra_block` (decodeframe.c
@@ -10551,11 +10579,18 @@ fn decode_leaf_split4(
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[3] {
-        // As the rect4 pair above: a skipped block still predicts, and CfL is
-        // prediction (libaom `predict_and_reconstruct_intra_block`).
+        // A skipped chroma block still gets its CfL contribution: libaom's
+        // `predict_and_reconstruct_intra_block` calls `cfl_predict_block`
+        // from `av1_predict_intra_block_facade` (av1/common/reconintra.c:1719)
+        // whenever `mbmi->uv_mode == UV_CFL_PRED`, before any residual is
+        // added -- `skip_txfm` only drops the residual, never the alpha.
+        // lane-troykf and lane-kf1200 fixed THIS SAME arm independently; the
+        // merge keeps one fix and feeds both lanes' counters so neither of
+        // their gates goes vacuous.
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
         if alpha.is_some() {
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
+            SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
         u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv);
         v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv);
@@ -10910,11 +10945,18 @@ fn decode_leaf_rect8(
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[1] {
-        // As the rect4 pair above: a skipped block still predicts, and CfL is
-        // prediction (libaom `predict_and_reconstruct_intra_block`).
+        // A skipped chroma block still gets its CfL contribution: libaom's
+        // `predict_and_reconstruct_intra_block` calls `cfl_predict_block`
+        // from `av1_predict_intra_block_facade` (av1/common/reconintra.c:1719)
+        // whenever `mbmi->uv_mode == UV_CFL_PRED`, before any residual is
+        // added -- `skip_txfm` only drops the residual, never the alpha.
+        // lane-troykf and lane-kf1200 fixed THIS SAME arm independently; the
+        // merge keeps one fix and feeds both lanes' counters so neither of
+        // their gates goes vacuous.
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
         if alpha.is_some() {
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
+            SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
         u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv);
         v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv);

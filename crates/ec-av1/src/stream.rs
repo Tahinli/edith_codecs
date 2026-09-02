@@ -3031,6 +3031,47 @@ mod tests {
         eprintln!("{NAME}: pixel-exact, skipped_cfl={skip_cfl}");
     }
 
+    /// lane-kf1200 r2: the same film's `-ss 300` key frame, pinned because no
+    /// aomenc recipe reaches its shape -- a SKIPPED sub-8x8 chroma block whose
+    /// `uv_mode` is `UV_CFL_PRED`. (lane-troykf r1 burned 20 recipes across cq
+    /// 40..63 and nine lavfi sources hunting exactly this block and never got
+    /// one; ledger dead-end "never produced a SKIPPED 1:4 or sub-8x8 CfL
+    /// block".) Before the fix the two sub-8x8 skip arms passed `None` for the
+    /// CfL argument, so the block reconstructed as flat DC and 463 bytes of
+    /// this frame's chroma were wrong. HARD-asserts `skip_cfl_hits` moved, so
+    /// the fixture cannot silently stop exercising the arm.
+    #[test]
+    fn the_hunger_games_ss300_key_frame_skipped_cfl_decodes_pixel_exact() {
+        const NAME: &str = "the_hunger_games_ss300_key_frame_skipped_cfl_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/hg_ss300_key_frame.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        let before = crate::decode::skip_cfl_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let skipped_cfl = crate::decode::skip_cfl_hits() - before;
+        assert!(
+            skipped_cfl > 0,
+            "{NAME}: zero skipped sub-8x8 CfL blocks -- the fixture no longer \
+             exercises the arm this test exists for"
+        );
+        assert_eq!(frames.len(), 1, "{NAME}: one key frame");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
+        eprintln!("{NAME}: {skipped_cfl} skipped sub-8x8 CfL chroma blocks, frame pixel-exact");
+    }
+
     /// lane-hbd10 r1: a real `aomenc --bit-depth=10 --superres-mode=1
     /// --superres-denominator=12` key frame, decoded pixel-exact against
     /// ffmpeg's own 10-bit decode. Proves `superres::upscale_row`'s
@@ -21173,6 +21214,11 @@ mod tests {
             let (mut horz_proved, mut vert_proved) = (0usize, 0usize);
             let (mut chroma_proved, mut coeff_proved) = (0usize, 0usize);
             let mut split_proved = 0usize;
+            // lane-kf1200: chroma pairs whose intra-edge filter type comes out
+            // different when read from the PAIR's base mi (libaom's
+            // `chroma_above_mbmi`) rather than the odd strip mi -- the shape
+            // that was silently wrong by 1 on the Hunger Games key frames.
+            let mut pair_filt_proved = 0usize;
             let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
             // The second half of the window turns `--enable-tx-size-search` on:
             // that is what makes a 16x4 strip SPLIT its transform (depth 1 =
@@ -21185,11 +21231,26 @@ mod tests {
                 let axis = if attempt % 2 == 0 { "Y" } else { "X" };
                 let step = 67 + (attempt / 2) * 12;
                 let noise = 6 + (attempt % 4) * 3;
-                let source = format!(
-                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
-                     geq=lum='mod(floor({axis}/4)*{step},256)',\
-                     noise=alls={noise}:all_seed={seed},format=yuv420p"
-                );
+                // lane-kf1200: the odd attempts carry CHROMA content. The
+                // original gray source leaves both chroma planes constant, so
+                // every `uv_mode` is DC and a pair's edge-filter type can never
+                // differ from its strip's -- the shape that shipped wrong for
+                // months. A smooth chroma gradient makes aomenc pick SMOOTH /
+                // directional `uv_mode`s next to each other.
+                let source = if attempt % 2 == 0 {
+                    format!(
+                        "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                         geq=lum='mod(floor({axis}/4)*{step},256)',\
+                         noise=alls={noise}:all_seed={seed},format=yuv420p"
+                    )
+                } else {
+                    format!(
+                        "color=c=black:s={width}x{height}:d={duration}:r=25,format=yuv420p,\
+                         geq=lum='mod(floor({axis}/4)*{step},256)'\
+                         :cb='128+100*sin((X+Y)/23)':cr='128+100*cos(X/19)',\
+                         noise=alls={noise}:all_seed={seed}"
+                    )
+                };
                 let cq_level = format!("--cq-level={}", 24 + (attempt % 4) * 8);
                 let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
@@ -21268,6 +21329,7 @@ mod tests {
                 );
                 let stream = out.stdout;
                 let before = crate::decode::rect4_16_counters();
+                let pair_filt_before = crate::decode::rect4_16_uv_pair_filt_hits();
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
                         let msg = e.to_string();
@@ -21336,6 +21398,7 @@ mod tests {
                 vert_proved += vert;
                 chroma_proved += chroma;
                 coeff_proved += coeff;
+                pair_filt_proved += crate::decode::rect4_16_uv_pair_filt_hits() - pair_filt_before;
                 split_proved += split;
                 matched += 1;
             }
@@ -21368,11 +21431,17 @@ mod tests {
                 "{NAME}: {bit_depth}-bit compared attempts never split a strip's transform -- \
                  the `--enable-tx-size-search=1` half of the window proved nothing"
             );
+            assert!(
+                pair_filt_proved > 0,
+                "{NAME}: {bit_depth}-bit compared attempts never decoded a chroma pair whose \
+                 edge-filter type differs between the pair's base mi and the strip's own mi -- \
+                 the lane-kf1200 fix is unexercised, so this gate would pass with it reverted"
+            );
             eprintln!(
                 "{NAME}: {bit_depth}-bit {matched} compared attempts, {horz_proved} 16x4 / \
                  {vert_proved} 4x16 strips, {chroma_proved} chroma pairs, {coeff_proved} coded \
-                 units, {split_proved} split-transform strips, {named_refusals} refusals, \
-                 {out_of_scope} out of scope"
+                 units, {split_proved} split-transform strips, {pair_filt_proved} pair-base \
+                 filt-type flips, {named_refusals} refusals, {out_of_scope} out of scope"
             );
         }
     }
