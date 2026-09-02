@@ -71,6 +71,20 @@ pub(crate) fn filter_intra_hits() -> usize {
     FILTER_INTRA_HITS.with(|c| c.get())
 }
 
+// lane-fiinter r1: how many of those `use_filter_intra == 1` symbols belonged
+// to an INTRA block inside an INTER frame (`read_intra_block_mode_info`'s own
+// `read_filter_intra_mode_info` call), which no gate exercised before this
+// round -- every inter gate recipe passed `--enable-filter-intra=0`.
+thread_local! {
+    static INTRA_IN_INTER_FILTER_INTRA_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_IN_INTER_FILTER_INTRA_HITS`].
+pub(crate) fn intra_in_inter_filter_intra_hits() -> usize {
+    INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.get())
+}
+
 // lane-realworld r1: this frame's `cdef.bits` (spec 5.9.19), threaded into
 // [`maybe_read_cdef_idx`] the same way [`ENABLE_EDGE_FILTER`] threads a
 // frame-level flag through the recursive block decode -- `0` (the default)
@@ -825,6 +839,11 @@ thread_local! {
     // frame-constant.
     static TX_SELECT_INTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REDUCED_TX_SET_INTER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    // lane-fiinter r1: this sequence header's own `enable_filter_intra` bit,
+    // frame-constant like the two above and stashed the same way -- an intra
+    // block inside an inter frame reads `use_filter_intra` under it.
+    static ENABLE_FILTER_INTRA_INTER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Current value of [`TXFM_SPLIT_READS`].
@@ -837,10 +856,16 @@ pub(crate) fn txfm_split_hits() -> usize {
     TXFM_SPLIT_HITS.with(|c| c.get())
 }
 
-/// Sets the current thread's [`TX_SELECT_INTER`]/[`REDUCED_TX_SET_INTER`].
-pub(crate) fn set_inter_tx_mode(tx_select: bool, reduced_tx_set: bool) {
+/// Sets the current thread's [`TX_SELECT_INTER`]/[`REDUCED_TX_SET_INTER`]/
+/// [`ENABLE_FILTER_INTRA_INTER`].
+pub(crate) fn set_inter_tx_mode(
+    tx_select: bool,
+    reduced_tx_set: bool,
+    enable_filter_intra: bool,
+) {
     TX_SELECT_INTER.with(|c| c.set(tx_select));
     REDUCED_TX_SET_INTER.with(|c| c.set(reduced_tx_set));
+    ENABLE_FILTER_INTRA_INTER.with(|c| c.set(enable_filter_intra));
 }
 
 // How many `partition_w16` reads (a 16x16 block's own partition symbol, key
@@ -15547,6 +15572,24 @@ fn decode_inter_block(
                 ));
             }
         }
+        // lane-fiinter r1: `read_filter_intra_mode_info` (libaom `decodemv.c`,
+        // the tail of `read_intra_block_mode_info`) -- an intra block inside
+        // an INTER frame reads `use_filter_intra` in exactly the same place a
+        // key-frame block does, right after the palette syntax. Nothing read
+        // it here before this round, and aomenc enables filter intra by
+        // default, so every inter frame carrying one desynced at this symbol.
+        // `av1_filter_intra_allowed`'s `palette_size[0] == 0` term is implied:
+        // a real palette-Y block already returned above.
+        let mut filter_intra = None;
+        if mode == DC_PRED
+            && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
+            && let Some(class) = filter_intra_size_class(side)
+            && dec.symbol(&mut cdfs.filter_intra[class]) != 0
+        {
+            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
+        }
         mode_for_tx = mode;
         block_filter = [3, 3];
         ref_frame_for_lf = 0;
@@ -15613,7 +15656,7 @@ fn decode_inter_block(
                         tu_reach,
                         &vec![0i32; tx_px * tx_px],
                         None,
-                        None,
+                        filter_intra,
                         false,
                     );
                     vec![0i32; tx_px * tx_px]
@@ -15640,7 +15683,7 @@ fn decode_inter_block(
                         tx_px,
                         base_q_idx,
                         None,
-                        None,
+                        filter_intra,
                         Some(tu_skip_ctx),
                         false,
                     )?
@@ -15659,7 +15702,7 @@ fn decode_inter_block(
                     reach,
                     &vec![0i32; side * side],
                     None,
-                    None,
+                    filter_intra,
                     false,
                 );
             }
@@ -15717,7 +15760,7 @@ fn decode_inter_block(
                     luma_tx,
                     base_q_idx,
                     None,
-                    None,
+                    filter_intra,
                     None,
                     false,
                 )?
@@ -17139,6 +17182,24 @@ fn decode_inter_block8(
                 ));
             }
         }
+        // lane-fiinter r1: `read_filter_intra_mode_info` (libaom `decodemv.c`,
+        // the tail of `read_intra_block_mode_info`) -- an intra block inside
+        // an INTER frame reads `use_filter_intra` in exactly the same place a
+        // key-frame block does, right after the palette syntax. Nothing read
+        // it here before this round, and aomenc enables filter intra by
+        // default, so every inter frame carrying one desynced at this symbol.
+        // `av1_filter_intra_allowed`'s `palette_size[0] == 0` term is implied:
+        // a real palette-Y block already returned above.
+        let mut filter_intra = None;
+        if mode == DC_PRED
+            && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
+            && let Some(class) = filter_intra_size_class(SIDE)
+            && dec.symbol(&mut cdfs.filter_intra[class]) != 0
+        {
+            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
+        }
         mode_for_tx = mode;
         let (mi_row, mi_col) = leaf_mi;
         for dr in 0..2 {
@@ -17195,7 +17256,7 @@ fn decode_inter_block8(
                 reach,
                 &vec![0i32; SIDE * SIDE],
                 None,
-                None,
+                filter_intra,
                 false,
             );
             u.reconstruct(
@@ -17245,7 +17306,7 @@ fn decode_inter_block8(
                 TX8,
                 base_q_idx,
                 None,
-                None,
+                filter_intra,
                 None,
                 false,
             )?;
@@ -17414,6 +17475,10 @@ pub fn decode_inter_frame_tile(
         false,
         false,
         DeltaParams::default(),
+        // `enable_filter_intra`: this crate's own encoder never writes the
+        // sequence bit (`encode.rs`), so no intra-in-inter block of a stream
+        // reaching this entry point reads a `use_filter_intra` symbol.
+        false,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -17497,8 +17562,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // same contract as [`decode_key_frame_tile_with_cdfs`]'s own `delta`
     // param -- only `q_present`/`q_res` are read.
     delta: DeltaParams,
+    // lane-fiinter r1: this sequence header's own `enable_filter_intra` bit
+    // (spec 5.5.2), stashed in a thread-local with `tx_select` rather than
+    // threaded through `decode_inter_block`'s fifty parameters -- read by the
+    // intra-in-inter arms' `read_filter_intra_mode_info`.
+    enable_filter_intra: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
-    set_inter_tx_mode(tx_select, reduced_tx_set);
+    set_inter_tx_mode(tx_select, reduced_tx_set, enable_filter_intra);
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
         order_hint_bits,
