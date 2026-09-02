@@ -690,6 +690,33 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let started_from = initial_cdfs.clone();
         // lane-frame80: narrow the EC_TRACE_COEFF rungs to one DECODE-order frame.
         decode::set_coeff_trace_frame(pictures_decoded);
+        // lane-t900 r9: one line per DECODE-order frame naming the header
+        // fields a desync cliff is usually keyed on (frame type, base q,
+        // primary_ref, the 7 ref slots, refresh mask, order hints).
+        if std::env::var_os("EC_PROBE_HDR").is_some() {
+            eprintln!(
+                "EC_HDR decode_idx={pictures_decoded} type={:?} show={} show_existing={}                  base_q={} primary_ref={} ref_idx={:?} refresh=0x{:02x} order_hint={}                  tiles={}x{} txmode={:?} interp={:?} reduced_tx={} allow_warp={}                  switchable_mo={} ref_mvs={} skip_mode={} cdef={:?} lr={:?}",
+                header.frame_type,
+                header.show_frame,
+                header.show_existing_frame,
+                header.quantization.base_q_idx,
+                header.primary_ref_frame,
+                header.ref_frame_idx,
+                header.refresh_frame_flags,
+                header.order_hint,
+                header.tile_info.cols,
+                header.tile_info.rows,
+                header.tx_mode,
+                header.interpolation_filter,
+                header.reduced_tx_set,
+                header.allow_warped_motion,
+                header.is_motion_mode_switchable,
+                header.use_ref_frame_mvs,
+                header.skip_mode_present,
+                header.cdef.bits,
+                header.loop_restoration.frame_restoration_type,
+            );
+        }
 
         let order_hint_bits = parser
             .sequence_header()
