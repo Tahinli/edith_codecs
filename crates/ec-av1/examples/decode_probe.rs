@@ -33,6 +33,7 @@ fn main() {
         println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
+        println!("rect_intrabc_reads: {}", ec_av1::stream::rect_intrabc_reads());
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         // lane-inter16ab r1: the 16x16-level inter AB arms, so a recipe sweep
@@ -55,6 +56,15 @@ fn main() {
         );
         let r328 = ec_av1::stream::rect32x8_inter_tu_hits();
         println!("rect32x8_inter_tu: 32x8={} 8x32={}", r328[0], r328[1]);
+        // lane-kf900 r1: the counter the skipped-8x8-split-transform gate
+        // asserts -- printed here so a recipe sweep can see it fire without a
+        // test-binary rebuild.
+        println!("skip_split_tx: {}", ec_av1::decode::skip_split_tx_hits());
+        let es = ec_av1::decode::inter_edge_strip_hits();
+        println!(
+            "inter_edge_strip: h64={} v64={} h32={} v32={} h16={} v16={}",
+            es[0], es[1], es[2], es[3], es[4], es[5]
+        );
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
