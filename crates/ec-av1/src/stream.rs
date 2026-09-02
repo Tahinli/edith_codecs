@@ -15936,9 +15936,15 @@ mod tests {
             guarded_attempts += 1;
             let name = format!("{gate_name}-s{seed}");
             let (frames, hidden) = decode_all_frames_vs_oracle(&stream, &name);
-            assert_eq!(
-                frames, frame_count,
-                "{gate_name} seed {seed}: {frames} decode-order frames, expected {frame_count}"
+            // `>=`, not `==`: `decode_all_frames_vs_oracle` already asserts our
+            // decode-order frame COUNT equals the oracle's and compares every
+            // one of them; this is only the vacuity guard. libaom emits 16 or
+            // 17 decode-order frames for the same 0.64 s source depending on
+            // the alt-ref structure it picks per seed.
+            assert!(
+                frames >= frame_count,
+                "{gate_name} seed {seed}: only {frames} decode-order frames, expected at least \
+                 {frame_count}"
             );
             compared += 1;
             eprintln!(
