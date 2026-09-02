@@ -9379,6 +9379,17 @@ fn decode_rect4_16_strip(
         record_strip_palette(
             neighbours, lmi, bw, bh, pal_y_size, pal_y_colors, pal_uv_size, pal_uv_colors,
         );
+    // `set_txfm_ctxs(mbmi->tx_size, n4_w, n4_h, skip && is_inter, xd)`
+    // (libaom `decode_token_recon_block`, run for EVERY block of an inter
+    // frame): the above row records `tx_size_wide` over the block's width and
+    // the left column `tx_size_high` over its height. This 1:4 strip reader is
+    // also the INTER frame's reader for the shape ([`decode_intra_rect4_in_inter`]),
+    // and it published neither band -- so the block after a 64x16 strip read
+    // the row's init value 64 as its left transform height and took
+    // `tx_size_cat3` row 1 where libaom takes row 0 (lane-frame36 r1: the
+    // 3840x1608 10-bit stream's first silent wall, decode-order frame 33 at
+    // mi(16,480)). Same write as [`set_txfm_ctxs`], rect-aware.
+    txfm_partition_update_rect(neighbours, lmi, (tx_w, tx_h), (bw, bh));
     Ok((mode, last_uv_mode, (tx_w, tx_h)))
 }
 
@@ -9890,6 +9901,17 @@ fn decode_block_rect64(
     neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, puv_size, puv_colors);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
+    // `set_txfm_ctxs(mbmi->tx_size, n4_w, n4_h, skip && is_inter, xd)`
+    // (libaom `decode_token_recon_block`, run for EVERY block of an inter
+    // frame): the above row records `tx_size_wide` over the block's width and
+    // the left column `tx_size_high` over its height. This 1:4 strip reader is
+    // also the INTER frame's reader for the shape ([`decode_intra_rect4_in_inter`]),
+    // and it published neither band -- so the block after a 64x16 strip read
+    // the row's init value 64 as its left transform height and took
+    // `tx_size_cat3` row 1 where libaom takes row 0 (lane-frame36 r1: the
+    // 3840x1608 10-bit stream's first silent wall, decode-order frame 33 at
+    // mi(16,480)). Same write as [`set_txfm_ctxs`], rect-aware.
+    txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
     SB_RECT_HITS.with(|c| c.set(c.get() + 1));
     match (bw, bh) {
         (64, 16) => SB_RECT4_HORZ_HITS.with(|c| c.set(c.get() + 1)),
@@ -13386,6 +13408,19 @@ fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usiz
     }
     if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= side;
+    }
+    if std::env::var_os("EC_TXCTX").is_some() {
+        eprintln!(
+            "EC_TXCTX mi={mi_r},{mi_c} own={side} ha={has_above} hl={has_left} \
+             above_txfm={} left_txfm={} above_inter={} left_inter={} above_side={} left_side={} \
+             above={above} left={left}",
+            n.above_txfm[mi_c],
+            n.left_txfm[mi_r],
+            n.above_inter[mi_c],
+            n.left_inter[mi_r],
+            n.above_side_mi[mi_c],
+            n.left_side_mi[mi_r],
+        );
     }
     match (has_above, has_left) {
         (true, true) => usize::from(above) + usize::from(left),
