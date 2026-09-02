@@ -35,3 +35,11 @@ EVIDENCE: ~/.cache/rect64port-tmp/t33.log + out.raw (389007360 B = 21 frames) | 
 - deferred: the witness fixture `hg_rect64_witness.obu` and the gate
   `a_10bit_film_inter_frame_with_a_64x32_split_intra_strip_decodes_pixel_exact` — nothing to pin
   while every candidate frame refuses.
+
+## Suite
+`cargo test -p ec-av1 --lib -j3` (systemd unit, EC_AV1_REQUIRE_AOMENC=1):
+417 passed, 3 failed, 37 ignored — identical totals and identical failing names to base 78d8ff7
+(a_frame_edge_straddling_band, a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions,
+real_aomenc_1to4_streams_..._rect_vartx_leaves_fire). No regression; refusal_inventory,
+gate_coverage, split_transform_intra_strip and intra_1to4 tests are among the 417 passed.
+EVIDENCE: $HOME/.cache/rect64port-suite-r1.log | full lib suite on 35f33c9 | 417/3/37, the 3 known reds
