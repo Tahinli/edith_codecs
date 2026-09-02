@@ -28,13 +28,11 @@ const CAPABILITY_CLAIMS: &[&str] = &[
     "a non-2D tx class on a rectangular transform (never expected at this size)",
     "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
     "a nonzero angle delta (this encoder never writes one)",
-    "a tx_type symbol on a rectangular transform (never expected at this size)",
 ];
 
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
     "a coded (non-skip) HORZ_B/VERT_B rect strip below 16x16 (this decoder ports only the skip case at this size)",
-    "a coded (non-skip) HORZ/VERT rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect prediction is not ported)",
     "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
