@@ -4279,7 +4279,7 @@ fn read_coeffs_rect(
         };
         if rect_trace {
             let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=sign_rect pos={pos} sign={} rng={rng}", u8::from(negative));
+            eprintln!("EC_COEFF_STEP tag=sign_rect pos={pos} sign={} dcctx={sign_ctx} rng={rng}", u8::from(negative));
         }
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
             let g = read_golomb(dec)?;
@@ -5335,6 +5335,15 @@ impl Neighbours {
                 let left = &self.left[mi_r + cell][plane];
                 left_coded |= left.level != 0;
                 vote += dc_vote(left.dc);
+            }
+            if plane == 0 && std::env::var_os("EC_DCDUMP").is_some() {
+                let ab: Vec<String> = (0..w_mi)
+                    .map(|k| format!("{:?}/{}", self.above[mi_c + k][0].dc, self.above[mi_c + k][0].level))
+                    .collect();
+                let lf: Vec<String> = (0..h_mi)
+                    .map(|k| format!("{:?}/{}", self.left[mi_r + k][0].dc, self.left[mi_r + k][0].level))
+                    .collect();
+                eprintln!("EC_DCDUMP mi=({mi_r},{mi_c}) wh=({w},{h}) vote={vote} above=[{}] left=[{}]", ab.join(","), lf.join(","));
             }
             (above_coded, left_coded, vote)
         })
@@ -24115,7 +24124,29 @@ fn decode_inter_block8(
                 // there before. Every leaf of the gate's stream is compound,
                 // so the 16x16 below a split block read partition ctx 0
                 // instead of 1 and mis-read PARTITION_SPLIT as NONE.
+                // lane-vartxsplit r1: the COMPOUND twin of `decode_leaf8`'s
+                // `saved_luma_ctx` (class: twin functions drift). When the
+                // leaf's transform split, `read_inter_luma8` returns an
+                // all-zero placeholder grid and each 4x4 TU has already
+                // written its own plane-0 coefficient state through
+                // `record_mi_luma`; recording the placeholder over all three
+                // planes erased those four cul_level/DC-sign cells, so the
+                // NEXT block read `dc_sign_ctx` 1 where libaom reads 0.
+                let saved_luma_ctx = split8.then(|| {
+                    (
+                        [neighbours.left[leaf_mi.0][0], neighbours.left[leaf_mi.0 + 1][0]],
+                        [neighbours.above[leaf_mi.1][0], neighbours.above[leaf_mi.1 + 1][0]],
+                    )
+                });
                 neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+                if let Some((left, above)) = saved_luma_ctx {
+                    for (cell, state) in left.into_iter().enumerate() {
+                        neighbours.left[leaf_mi.0 + cell][0] = state;
+                    }
+                    for (cell, state) in above.into_iter().enumerate() {
+                        neighbours.above[leaf_mi.1 + cell][0] = state;
+                    }
+                }
                 // lane-cdef r1: ... and the CDEF skip band too. `apply_cdef`'s
                 // `is_8x8_block_skip` (libaom `cdef.c:29-38`) reads all four mi
                 // cells of the 8x8; this leaf wrote none of them, so a 64x64
