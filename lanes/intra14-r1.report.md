@@ -80,7 +80,7 @@ candidate stream.
   key frame) -- the new stop is still inside decode-order frame 1.
 
 EVIDENCE: /tmp/claude-1000/.../scratchpad/census3/kf/seg_4500.obu | decode_probe before/after the change, EC_AV1_FINAL_DUMP file count | 4 intra 16x64 strips decoded; stop string moved from the 1:4 refusal to "transform unit is 64x32"; 1 frame dumped
-EVIDENCE: $HOME/.cache/intra14-suite-r1.log | `cargo test -p ec-av1 --lib` under a systemd unit | see totals below
+EVIDENCE: $HOME/.cache/intra14-suite-r1.log | `cargo test -p ec-av1 --lib` under a systemd unit (MemoryMax=10G) | test result: ok. 367 passed; 0 failed; 33 ignored (2 of them this lane's gate arms); 616.84s
 
 ## Residue
 
