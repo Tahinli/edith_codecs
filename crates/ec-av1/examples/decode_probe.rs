@@ -32,6 +32,42 @@ fn main() {
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
     };
+    // lane-tiles: the tiling a real stream actually uses is a decision input
+    // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
+    // from the frame headers before saying anything about pixels.
+    let mut parser = ec_av1_syntax::Av1Parser::new();
+    let mut seen: Vec<(u32, u32, bool, u32)> = Vec::new();
+    let mut pos = 0usize;
+    let mut frames_seen = 0usize;
+    // OBU at a time, so one unparseable OBU late in the stream still leaves
+    // every earlier frame header's tiling reported.
+    while pos < data.len() {
+        let Ok(obu) = parser.parse_obu(&data[pos..]) else {
+            break;
+        };
+        pos += obu.total_size.max(1);
+        let header = match &obu.kind {
+            ec_av1_syntax::ObuKind::FrameHeader(h) => h,
+            ec_av1_syntax::ObuKind::Frame(h, _) => h,
+            _ => continue,
+        };
+        frames_seen += 1;
+        let t = &header.tile_info;
+        let entry = (t.cols, t.rows, t.uniform_spacing, t.context_update_tile_id);
+        if !seen.contains(&entry) {
+            seen.push(entry);
+        }
+    }
+    println!("TILING: {frames_seen} frame headers parsed");
+    for (cols, rows, uniform, ctx_id) in &seen {
+        println!(
+            "TILING: cols={cols} rows={rows} uniform_spacing={uniform} context_update_tile_id={ctx_id}"
+        );
+    }
+    if seen.is_empty() {
+        println!("TILING: no frame header parsed");
+    }
+
     match ec_av1::stream::decode_stream(&data) {
         Ok(frames) if frames.is_empty() => {
             println!("OK but EMPTY: no frames -- is {path} an IVF rather than a raw OBU stream?");
