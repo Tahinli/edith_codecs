@@ -45,6 +45,11 @@ fn main() {
         println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
         let (h84, h48) = ec_av1::decode::sub8_inter_rect_hits();
         println!("sub8_inter_rect: horz8x4={h84} vert4x8={h48}");
+        let si = ec_av1::stream::sub8_intra_rect_hits();
+        println!(
+            "sub8_intra_rect: horz8x4={} vert4x8={} chroma_ref={} mixed={} split4x4={}",
+            si.0, si.1, si.2, si.3, si.4
+        );
         let leaf = ec_av1::stream::vartx_rect_leaf_hits();
         println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
         // lane-inter16ab r1: the 16x16-level inter AB arms, so a recipe sweep
@@ -110,6 +115,12 @@ fn main() {
         // rectangular residual transform unit (a skipped one codes none).
         let r328 = ec_av1::stream::rect32x8_inter_tu_hits();
         println!("rect32x8_inter_tu: 32x8={} 8x32={}", r328[0], r328[1]);
+        // lane-intra16x4: INTRA strips of an inter 16x16-level 1:4 partition.
+        let i164 = ec_av1::stream::intra16x4_in_inter_hits();
+        println!(
+            "intra16x4_in_inter: 16x4={} 4x16={} chroma_ref={}",
+            i164.0, i164.1, i164.2
+        );
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it

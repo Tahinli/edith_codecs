@@ -32,8 +32,6 @@ const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an OBMC neighbour whose switchable interp filter was never recorded",
-    "an intra 4x4 block inside an inter frame's sub-8x8 split (this decoder codes only inter 4x4 sub-blocks there)",
-    "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition (this decoder codes only inter sub-blocks there)",
     "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
     "a rectangular inter luma transform unit whose shape has no coefficient table set here",
     "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
