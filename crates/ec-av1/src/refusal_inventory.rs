@@ -68,6 +68,7 @@ const REFUSALS: &[&str] = &[
     // prediction + coefficients, gate
     // `a_real_aomenc_inter_sequence_with_a_split_transform_intra_block_decodes_pixel_exact`);
     // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
+    "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
     "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
     // lane-inter16ab r1 lifted the AB half (HORZ_A/HORZ_B/VERT_A/VERT_B at
