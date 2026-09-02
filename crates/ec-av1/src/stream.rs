@@ -1110,7 +1110,8 @@ mod tests {
         let mut child = Command::new(aomenc_path())
             .args([
                 "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
-                "--cpu-used=0", "--sb-size=128", "--kf-max-dist=0", "--limit=1",
+                "--cpu-used=0", "--sb-size=128", "--min-partition-size=16",
+                "--kf-max-dist=0", "--limit=1",
                 "--threads=1", "--row-mt=0", "--obu", "-o", "-", "-",
             ])
             .stdin(Stdio::piped())
@@ -1141,12 +1142,25 @@ mod tests {
         assert!(sb128, "aomenc ignored --sb-size=128: this stream is 64x64-superblock");
 
         let _guard = lock_gate_counters();
+        let before = crate::decode::part128_symbols()
+            + crate::decode::part128_gathered_symbols();
         let (frames, hidden) =
             decode_all_frames_vs_oracle(&stream, "sb128-oddh-64x72");
         assert!(frames > 0, "no frames decoded for {width}x{height}");
+        // The 128 root actually READ a partition symbol here: at mi_rows=18
+        // `has_rows` is true, so BLOCK_128X128 is not a forced split.
+        let part128 = crate::decode::part128_symbols()
+            + crate::decode::part128_gathered_symbols()
+            - before;
+        assert!(
+            part128 > 0,
+            "{width}x{height} decoded without reading a single BLOCK_128X128 \
+             partition symbol -- the gate proves nothing about the 128 root"
+        );
         eprintln!(
             "a_real_aomenc_128x128_superblock_stream_decodes_pixel_exact: \
-             {frames} frames pixel-exact ({hidden} hidden) at {width}x{height}"
+             {frames} frames pixel-exact ({hidden} hidden) at {width}x{height}, \
+             part128_symbols={part128}"
         );
     }
 
