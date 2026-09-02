@@ -4954,10 +4954,16 @@ fn decode_block_rect4(
         0
     };
     if depth != 0 {
-        return Err(unsupported(
+        // lane-tx64x16 r4: the depth is IN the message -- it says which port
+        // the next round owes. depth 1 of a 4:1 strip is TX_16X8/TX_8X16
+        // (`sub_tx_size_map[TX_32X8] == TX_16X8`), a RECTANGULAR transform
+        // unit with no luma coefficient tables here; depth 2 is TX_8X8,
+        // square, the shape `decode_rect_split` already walks. The film stops
+        // at depth 2, synthetic band fixtures hit both.
+        return Err(unsupported(format!(
             "a 32x32-level 1:4 strip with a split transform (per-unit 4:1 prediction is not \
-             ported)",
-        ));
+             ported, depth={depth})"
+        )));
     }
     // The coarse (16-px [`SUB`] cell) mode/side arrays cannot name a strip
     // that is 8 px tall, so each strip stamps every cell it touches and the
