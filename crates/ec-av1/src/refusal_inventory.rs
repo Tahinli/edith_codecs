@@ -42,6 +42,8 @@ const REFUSALS: &[&str] = &[
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
+    "a 128x128 superblock partition other than SPLIT (NONE/HORZ/VERT and the four AB arms at the 128 root are not decoded)",
+    "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "a palette block on a HORZ/VERT intra strip below 16x16 (reconstruction not ported)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
@@ -49,7 +51,6 @@ const REFUSALS: &[&str] = &[
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
     "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
-    "a sequence using 128x128 superblocks on a frame larger than 64x64 (this decoder's whole partition/CDEF/LR grid is 64x64-superblock only; aomenc picks 128x128 at --cpu-used=0)",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with no mode-info grid",
@@ -68,7 +69,15 @@ const REFUSALS: &[&str] = &[
     "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
     "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
     "an intra mode this decoder does not code (round 2)",
-    "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
+    // lane-intrarect r1 lifted the whole-shape refusal that stood here (the
+    // inter path's intra arm now routes 2:1 strips through `decode_rect_split`);
+    // what is left is the 1:4 shape, whose `bsize_to_tx_size_cat` breaks the
+    // size-group/category diagonal the 2:1 shapes share.
+    "an intra-coded 1:4 (or other non-2:1) rect strip on the inter block path",
+    "a split (nonzero tx_depth) transform on an intra HORZ/VERT strip in an inter frame",
+    // The same arm's screen-content gate: palette/intrabc syntax is consumed
+    // for square blocks only, so a strip in such a frame would skip symbols.
+    "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
     "a motion_mode symbol for a block shape with no CDF row here",
