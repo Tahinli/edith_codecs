@@ -16978,6 +16978,7 @@ mod tests {
         let expected_tiles = (1usize << tile_cols_log2) * (1usize << tile_rows_log2);
         let mut matched = 0u32;
         let mut named_refusals = 0u32;
+        let mut uv_edge_suppressed = 0usize;
         let n_attempts: u32 = std::env::var("EC_TILES_GATE_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -17129,6 +17130,7 @@ mod tests {
 
             let before = crate::decode::tile_hits();
             let pal_before = crate::decode::palette_tile_left_hits();
+            let uv_edge_before = crate::decode::uv_tile_edge_suppressed_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -17176,6 +17178,13 @@ mod tests {
                      (seed {seed})"
                 );
             }
+            // lane-mtfix r1: the chroma edge-filter neighbour of a block on a
+            // tile's first mi row/column lives in the tile above/left, where
+            // libaom has no neighbour at all. This counts the reads suppressed
+            // there whose frame-wide coarse slot held a non-DC mode -- the
+            // reads that would otherwise pick the wrong chroma edge filter
+            // strength (they did, before this fix: seed 46 of this gate).
+            uv_edge_suppressed += crate::decode::uv_tile_edge_suppressed_hits() - uv_edge_before;
             matched += 1;
         }
         assert!(
@@ -17183,21 +17192,29 @@ mod tests {
             "{name}: every attempt refused ({named_refusals}); the gate never decoded a \
              multi-tile stream with the coding tools on"
         );
-        eprintln!("{name}: {matched} pixel-exact matches, {named_refusals} named refusals");
+        eprintln!(
+            "{name}: {matched} pixel-exact matches, {named_refusals} named refusals, \
+             {uv_edge_suppressed} chroma edge reads suppressed at a tile edge"
+        );
     }
 
     #[test]
     fn a_real_aomenc_multi_tile_intra_stream_decodes_pixel_exact() {
-        run_multi_tile_gate(
-            "a_real_aomenc_multi_tile_intra_stream_decodes_pixel_exact",
-            1,
-            1,
-            8,
-            1,
-            &[],
-            false,
-            None,
-        );
+        const NAME: &str = "a_real_aomenc_multi_tile_intra_stream_decodes_pixel_exact";
+        let before = crate::decode::uv_tile_edge_suppressed_hits();
+        run_multi_tile_gate(NAME, 1, 1, 8, 1, &[], false, None);
+        // lane-mtfix r1: this is the only arm with a tile ROW boundary, so it
+        // is the one that exercises the tile-relative guard on the chroma
+        // edge-filter neighbour. Without the guard, seed 46's first block of
+        // the bottom-right tile read the tile ABOVE it and mis-filtered its
+        // chroma edge (U/V off by 1..2 over chroma x[120..127] y[32..37]).
+        if have_ffmpeg() && have_aomenc() {
+            assert!(
+                crate::decode::uv_tile_edge_suppressed_hits() > before,
+                "{NAME}: no chroma edge-filter neighbour read was suppressed at a tile edge -- \
+                 the tile-relative guard is untested by this gate"
+            );
+        }
     }
 
     #[test]
