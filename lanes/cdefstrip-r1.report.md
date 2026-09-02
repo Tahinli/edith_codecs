@@ -79,3 +79,6 @@ and green.
 ## 6. Suite
 `cargo test -p ec-av1 --lib` under a systemd unit -> $HOME/.cache/cdefstrip-suite-r1.log: see
 the line appended below.
+
+`cargo test -p ec-av1 --lib` (unit `cdefstrip-suite-1788349014.service`, log
+$HOME/.cache/cdefstrip-suite-r1.log): **401 passed, 0 failed, 33 ignored**, 1396.72s.
