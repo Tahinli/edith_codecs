@@ -20,6 +20,8 @@ Base: lane-inter4 `49af875` (contains lane-interbis's motion-field fix). Commits
   now wipe their 8x8 cells instead of `continue`ing. Latent until sub-8x8 leaves (only they share
   a cell), ported now.
 - `crates/ec-av1/src/stream.rs:614` — the key-frame DPB slot is constructed with `is_intra: true`.
+- `crates/ec-av1/src/gate_coverage.rs:221,272` — the 10-bit `enable-ref-frame-mvs` /
+  `enable-fwd-kf` coverage holes are closed by the new gate; entries deleted, 8-bit reasons reworded.
 - `scripts/instrument-aom-oracle.sh` — new **rung 14**: `EC_TRACE_TPL` (`EC_TPL ... mfmv0=(..,..)
   rfo=..` / `INVALID` in `add_tpl_ref_mv`) and the per-entry `EC_STACK` dump under rung 4's
   `EC_TRACE_MODE`. Both existed only as hand edits in `~/.cache/aom-oracle/src` (lane-interbis)
@@ -56,7 +58,17 @@ unchanged and green in the suite below.
 
 ## Suite
 
-SUITE_PLACEHOLDER
+`cargo test -p ec-av1 --lib` (systemd unit, MemoryMax=10G): **326 passed, 0 failed, 31 ignored**
+(`$HOME/.cache/refstamp-suite2.log`). The first run on the same tree failed exactly 2 tests --
+`gate_coverage::never_exercised_10bit_matches_the_gate_recipes` and `never_on_10bit_...` -- because
+the new gate CLOSED two 10-bit coverage holes (`enable-ref-frame-mvs`, `enable-fwd-kf`); commit
+`00d37d3` deletes those entries and reworded the two 8-bit reasons (`is_ten_bit` classifies a
+dual-depth gate as 10-bit only, so the 8-bit lists keep the tools with an accurate reason).
+Siblings all green in that run: `..._temporal_mv_candidates_...`, `..._altref_sequence_hidden_frames_...`,
+every `..._inter_sequence_...`, `..._obmc_...`, `..._warped_motion_...`, `refusal_inventory` (3/3),
+`gate_coverage` (9/9).
+
+EVIDENCE: /home/tahinli/.cache/refstamp-suite2.log | systemd-run unit, cargo test -p ec-av1 --lib -j3 | "test result: ok. 326 passed; 0 failed; 31 ignored" in 379 s
 
 ## Residue
 
