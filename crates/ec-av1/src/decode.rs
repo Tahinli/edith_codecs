@@ -6894,14 +6894,14 @@ fn decode_rect_split(
         // the coded unit is the 32x32 corner [`decode_block_rect64`]'s own
         // depth-0 arm already reads on the key-frame path.
         //
-        // NO WITNESS YET (r1, measured): on both 10-bit 3840x1608 film cuts
-        // this arm fires (16x 64x32 + 2x 32x64 / 2x 32x64) but the SAME frame
-        // then stops at "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
-        // rectangular residual coding", so no frame containing it ever
-        // finishes and no pixel comparison is possible. A refusal is lifted
-        // only with a gate (COMMON charter), so the arm stays behind
-        // `EC_RECT64_SPLIT=1` and the refusal below is still the default.
-        (64, 32) | (32, 64) if std::env::var_os("EC_RECT64_SPLIT").is_some() => None,
+        // lane-sub8x4 r3: WITNESS FOUND, so this is no longer behind
+        // `EC_RECT64_SPLIT`. r1's "no witness" was true only while the
+        // sub-8x8 intra leaves still refused: with those lifted (r2) the
+        // first 50 frame OBUs of the 10-bit 3840x1608 stream's head decode
+        // all 33 frames pixel-exact against ffmpeg while this arm fires 90x
+        // 64x32 + 5x 32x64 -- pinned as `fixtures/hg_rect64_intra16x4_witness.obu`
+        // and gated by `a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact`.
+        (64, 32) | (32, 64) => None,
         _ => {
             return Err(unsupported(format!(
                 "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma \
@@ -21894,15 +21894,20 @@ fn decode_inter_block(
         // footprint), so an INTRA 16x4 / 4x16 strip inside a 1:4 partition is
         // refused by name rather than decoded with a 8x2 chroma transform
         // libaom never coded.
-        // lane-intra16x4 r1: the strip DECODES (through the key frame's own
-        // per-strip body, [`decode_rect4_16_strip`]) only under
-        // `EC_INTRA16X4_DECODE`. It is not pixel-proven yet -- the r1 gate is
-        // RED (`a_real_aomenc_inter_sequence_with_intra_16x4_strips_...`,
-        // #[ignore]d with its measurement), so the refusal STAYS the default
-        // behaviour and the env switch is what the film probes use to measure
-        // the next wall. Class `refusal-lifted-without-a-gate`.
+        // lane-intra16x4 r1: the strip DECODES through the key frame's own
+        // per-strip body, [`decode_rect4_16_strip`].
+        // lane-sub8x4 r3: pixel-proven, so `EC_INTRA16X4_DECODE` is gone. r1
+        // and r2 found no witness because every firing film frame ALSO carried
+        // a sub-8x8 intra block, which refused until r2 lifted it; on this tip
+        // the first 50 frame OBUs of the 10-bit 3840x1608 stream's head decode
+        // all 33 frames pixel-exact while this arm fires 31x 16x4 + 17x 4x16
+        // (23 of them chroma-paired). Pinned as
+        // `fixtures/hg_rect64_intra16x4_witness.obu`, gated by
+        // `a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact`.
+        // The refusal below is NARROWED, not deleted: it still stands for a
+        // 16x4/4x16 strip with no chroma-pair record and for every other
+        // sub-8 shape.
         let strip16 = strip_chroma
-            .filter(|_| std::env::var_os("EC_INTRA16X4_DECODE").is_some())
             .filter(|_| write_w.min(write_h) == 4 && write_w.max(write_h) == 16)
             .map(|s| (s.horz, s.has_chroma));
         if write_w.min(write_h) < 8 && strip16.is_none() {
