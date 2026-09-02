@@ -3058,11 +3058,37 @@ thread_local! {
     // whose width or height is not a multiple of 8 is the only shape that
     // produces one; the straddling-band gate arms assert it grew.
     static CDEF_STRADDLE_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // lane-cdefstrip r1: 8x8 CDEF units visited with an UNWRITTEN skip band
+    // (see `Neighbours::skip_written`).
+    static CDEF_UNWRITTEN_SKIP_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // lane-cdefstrip r1: (d) skip RECTANGULAR blocks (every strip arm: 32x8,
+    // 8x32, 16x8, 32x16, 64x16, AB/1:4 pieces...) that wrote the CDEF skip
+    // band, and (e) 8x8 CDEF units whose four mi cells do NOT agree on skip --
+    // the shape libaom's `is_8x8_block_skip` (`cdef.c:29-38`) exists for: an
+    // 8-tall strip pair where only one half is skip must still be FILTERED.
+    static RECT_SKIP_BAND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CDEF_MIXED_SKIP_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `RECT_SKIP_BAND_HITS`.
+pub fn rect_skip_band_hits() -> usize {
+    RECT_SKIP_BAND_HITS.with(|c| c.get())
+}
+
+/// Current value of `CDEF_MIXED_SKIP_UNITS`.
+pub fn cdef_mixed_skip_units() -> usize {
+    CDEF_MIXED_SKIP_UNITS.with(|c| c.get())
 }
 
 /// Current value of `CDEF_SKIPPED_UNITS`.
 pub(crate) fn cdef_skipped_units() -> usize {
     CDEF_SKIPPED_UNITS.with(|c| c.get())
+}
+
+/// How many 8x8 CDEF units [`apply_cdef`] visited whose skip band no coded
+/// block wrote this frame -- a writer gap, always a defect (lane-cdefstrip r1).
+pub fn cdef_unwritten_skip_units() -> usize {
+    CDEF_UNWRITTEN_SKIP_UNITS.with(|c| c.get())
 }
 
 /// Current value of `INTER8_SKIP_BAND_HITS`.
@@ -4331,6 +4357,15 @@ struct Neighbours {
     /// granularity by [`apply_cdef`] since `skip` is constant across every
     /// mi cell one coded block covers.
     skip_grid: Vec<bool>,
+    /// lane-cdefstrip r1 instrument: whether any coded block actually WROTE
+    /// [`Self::skip_grid`] at this mi cell during this frame. A fresh
+    /// `Neighbours` seeds `skip_grid` all-`false` ("not skip"), so a decode
+    /// arm that forgets [`Self::fill_skip_grid_rect`] silently makes
+    /// [`apply_cdef`] filter an 8x8 unit libaom's `is_8x8_block_skip`
+    /// (`cdef.c:29-38`) excludes -- exactly the lane-cdef defect, and
+    /// unobservable from the pixels alone. Counted by
+    /// [`cdef_unwritten_skip_units`].
+    skip_written: Vec<bool>,
     skip_grid_cols_mi: usize,
     /// Per-4x4-mi luma transform width in pixels (8/16/32/64) -- this decoder
     /// never splits a coded block's transform below its own size (round 2:
@@ -4450,6 +4485,7 @@ impl Neighbours {
             mi_cols,
             mi_rows,
             skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
+            skip_written: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
             skip_grid_cols_mi: cols * (SUB / MI),
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
@@ -4864,13 +4900,17 @@ impl Neighbours {
     /// [`Self::fill_skip_grid`] with independent row/col extents (lane-partitions r1).
     fn fill_skip_grid_rect(&mut self, at_mi: (usize, usize), w_mi: usize, h_mi: usize, skip: bool) {
         let (mi_r, mi_c) = at_mi;
+        if skip && w_mi != h_mi {
+            RECT_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
+        }
         for rr in 0..h_mi {
             for cc in 0..w_mi {
-                if let Some(cell) = self
-                    .skip_grid
-                    .get_mut((mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc))
-                {
+                let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
+                if let Some(cell) = self.skip_grid.get_mut(idx) {
                     *cell = skip;
+                }
+                if let Some(cell) = self.skip_written.get_mut(idx) {
+                    *cell = true;
                 }
             }
         }
@@ -14424,6 +14464,47 @@ fn apply_cdef(
     // lane-part32 r2 debug rung, env-gated: see `apply_deblock`'s sibling.
     if std::env::var_os("EC_AV1_DEBUG_SKIP_CDEF").is_some() {
         return;
+    }
+    // lane-cdefstrip r1 instrument, BEFORE either early return so it is valid
+    // for every frame: an 8x8 CDEF unit none of whose four mi cells a coded
+    // block wrote this frame. `Neighbours` seeds `skip_grid` all-false, so a
+    // decode arm that forgets `fill_skip_grid_rect` reads "not skip" and CDEF
+    // filters a unit libaom's `is_8x8_block_skip` (`cdef.c:29-38`) may exclude.
+    // Always 0 on every stream measured; a gate asserts it stays 0.
+    {
+        let mut r = 0usize;
+        while r < skip_grid.mi_rows {
+            let mut c = 0usize;
+            while c < skip_grid.mi_cols {
+                if (0..2).any(|rr| {
+                    (0..2).any(|cc| {
+                        !skip_grid
+                            .skip_written
+                            .get((r + rr) * skip_grid.skip_grid_cols_mi + (c + cc))
+                            .copied()
+                            .unwrap_or(true)
+                    })
+                }) {
+                    CDEF_UNWRITTEN_SKIP_UNITS.with(|c2| c2.set(c2.get() + 1));
+                    if std::env::var_os("EC_AV1_DEBUG_CDEF_BAND").is_some() {
+                        eprintln!("cdef band unwritten at mi ({r},{c}) px ({},{})", r * 4, c * 4);
+                    }
+                }
+                let cell = |rr: usize, cc: usize| {
+                    skip_grid
+                        .skip_grid
+                        .get((r + rr) * skip_grid.skip_grid_cols_mi + (c + cc))
+                        .copied()
+                        .unwrap_or(false)
+                };
+                let first = cell(0, 0);
+                if (0..2).any(|rr| (0..2).any(|cc| cell(rr, cc) != first)) {
+                    CDEF_MIXED_SKIP_UNITS.with(|c2| c2.set(c2.get() + 1));
+                }
+                c += 2;
+            }
+            r += 2;
+        }
     }
     // `cdef.bits == 0` still means "no filtering at all" whenever the single
     // (index 0) strength pair is all-zero -- the fast path every existing
