@@ -16991,18 +16991,28 @@ mod tests {
         let (width, height, frames) = (192usize, 128usize, 6usize);
         let mut refusals: Vec<String> = Vec::new();
         let mut fired = 0u32;
-        // (depth, cq, source): the arms measured pixel-exact end to end in the
-        // r1 sweep (~/.cache/cdefstrip-tmp/sw.sh). Source `b` is the two-axis
-        // moving sinusoid that makes aomenc pick 16x64/32x64/8x32 strips at
-        // low cq and 32x8/64x16 at high cq; `a` is lane-inter16ab's source.
+        // (depth, cq, source): every arm of the r1 sweep
+        // (~/.cache/cdefstrip-tmp/sw.sh) that this decoder decodes at all.
+        // Source `b` is the two-axis moving sinusoid that makes aomenc pick
+        // 16x64/32x64/8x32 strips at low cq and 32x8/64x16 at high cq; `a` is
+        // lane-inter16ab's source.
+        // lane-lastframe8 r1: the two arms r1 left out -- `(8, 24, src_b)` and
+        // `(8, 18, src_a)`, whose LAST decode-order frame mismatched (8370 and
+        // 945 luma px) -- are back in. Their defect was the rect compound
+        // block's `compound_type`/`wedge_idx` CDF row, read at the enclosing
+        // square `side` instead of the true bsize (decode.rs
+        // `wedge_bsize_index`), so this list is no longer "the measured-exact
+        // subset" but the whole decodable sweep.
         let src_b = "120+55*sin((X+N*4)/7)+40*sin((Y-N*2)/11)";
         let src_a = "128+60*sin((Y+N*3)/5)+30*sin(X/23)";
         for (depth, cq, lum) in [
             (8u32, 18u32, src_b),
+            (8, 24, src_b),
             (8, 45, src_b),
             (10, 18, src_b),
             (10, 24, src_b),
             (10, 24, src_a),
+            (8, 18, src_a),
             (8, 24, src_a),
         ] {
             let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
