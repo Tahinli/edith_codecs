@@ -627,6 +627,9 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.mi_rows as usize,
                 header.order_hint,
                 ref_order_hints,
+                // `frame_type` for the DPB slot: a key (or intra-only) frame is
+                // never a projection source, and never spends a `ref_stamp`.
+                true,
             );
             (picture, end_cdfs, motion_field)
         } else {
@@ -6258,6 +6261,150 @@ mod tests {
                 tmv_proved > 0,
                 "{NAME} ({bit_depth}-bit): no compared attempt ever folded a temporal MV \
                  candidate into a block's stack -- gate proved nothing"
+            );
+        }
+    }
+
+    /// lane-refstamp r1: `av1_setup_motion_field`'s `ref_stamp` budget in the
+    /// presence of FORWARD KEY FRAMES (`--enable-fwd-kf=1`), which is the only
+    /// configuration where a *forward* reference slot (BWDREF/ALTREF2/ALTREF)
+    /// holds a key frame while temporal MV projection runs. libaom's
+    /// `motion_field_projection` returns 0 for such a start frame, so it costs
+    /// no `ref_stamp`; ours used to project the (empty) field and report
+    /// success, spending the slot ALTREF/LAST2 should have had and losing
+    /// their temporal candidates.
+    ///
+    /// Both bit depths; EVERY decoded frame (including the hidden alt-refs)
+    /// compared to the oracle in decode order; a refusal is counted, never
+    /// SKIPped. Two hard counters make the gate non-vacuous: frames that
+    /// actually took the >=2-intra-forward-refs `ref_stamp` path, and blocks
+    /// that folded a temporal MV candidate into their stack.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_forward_keyframes_and_temporal_mvs_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_inter_sequence_with_forward_keyframes_and_temporal_mvs_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 24usize);
+        for bit_depth in [8u32, 10u32] {
+            let (mut named_refusals, mut compared, mut tmv_proved, mut stamp_proved) =
+                (0u32, 0u32, 0usize, 0usize);
+            let mut stamp2_proved = 0usize;
+            for attempt in 0..2u32 {
+                let duration = frame_count as f64 / 25.0;
+                // Natural-ish motion: structure translating along X at 3 px per
+                // frame plus a slow vertical drift, the source family the
+                // temporal-MV gate already decodes fully.
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='128+58*sin((X+N*3)/6)+18*sin((Y+N*2)/23)',format=yuv420p"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let cq_arg = format!("--cq-level={}", if attempt == 0 { 34 } else { 45 });
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
+                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0", "--min-partition-size=16",
+                    "--max-partition-size=32",
+                    // Per-arm/feature overrides go LAST (aomenc keeps the LAST
+                    // occurrence of a repeated --enable-* flag).
+                    "--enable-order-hint=1", "--enable-ref-frame-mvs=1",
+                    "--enable-fwd-kf=1", "--fwd-kf-dist=8", "--kf-max-dist=1000",
+                    "--lag-in-frames=16", "--auto-alt-ref=1", "--arnr-maxframes=0",
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before_tmv = decode::tmv_hits();
+                let before_stamp = crate::motion_field::refstamp_intra_frames();
+                if let Err(e) = decode_stream(&stream) {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                         attempt {attempt}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
+                    continue;
+                }
+                let tmv = decode::tmv_hits() - before_tmv;
+                let stamp = crate::motion_field::refstamp_intra_frames().0 - before_stamp.0;
+                let stamp2 = crate::motion_field::refstamp_intra_frames().1 - before_stamp.1;
+                // Every frame, hidden ones included, compared in DECODE order.
+                let (total, hidden) = decode_all_frames_vs_oracle(
+                    &stream,
+                    &format!("{NAME}-{bit_depth}bit-attempt{attempt}"),
+                );
+                eprintln!(
+                    "{NAME} ({bit_depth}-bit attempt {attempt}): {total} frames decoded \
+                     ({hidden} hidden), temporal candidates={tmv}, frames with a key/intra \
+                     forward ref={stamp} (two or more: {stamp2})"
+                );
+                compared += 1;
+                tmv_proved += tmv;
+                stamp_proved += stamp;
+                stamp2_proved += stamp2;
+            }
+            assert!(
+                compared > 0,
+                "{NAME} ({bit_depth}-bit): every attempt refused ({named_refusals}) -- gate \
+                 proved nothing"
+            );
+            assert!(
+                tmv_proved > 0,
+                "{NAME} ({bit_depth}-bit): no compared attempt folded a temporal MV candidate \
+                 into a block's stack -- gate proved nothing"
+            );
+            assert!(
+                stamp_proved > 0,
+                "{NAME} ({bit_depth}-bit): no compared attempt ever had a forward reference \
+                 holding a key/intra frame ({stamp2_proved} frames had two) -- the ref_stamp \
+                 path this gate exists for never ran"
             );
         }
     }

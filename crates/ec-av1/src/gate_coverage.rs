@@ -177,10 +177,6 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
         "never spelled; rect transforms reach the decoder only through partition shape, never through a gate that names the tool",
     ),
     (
-        "enable-ref-frame-mvs",
-        "off in 27 gates, on in none: temporal MV projection is unimplemented",
-    ),
-    (
         "enable-tx64",
         "never spelled; TX_64X64 appears only where aomenc's default picks it, which is unknown per stream",
     ),
@@ -226,10 +222,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // 1D tx class).
     ("enable-intrabc", "hole at both depths, see the 8-bit list"),
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
-    (
-        "enable-ref-frame-mvs",
-        "hole at both depths, see the 8-bit list",
-    ),
     ("enable-tx64", "hole at both depths, see the 8-bit list"),
 ];
 
