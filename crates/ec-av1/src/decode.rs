@@ -1519,6 +1519,41 @@ pub(crate) fn palette_split_tx_hits() -> usize {
     PALETTE_SPLIT_TX_HITS.with(|c| c.get())
 }
 
+thread_local! {
+    /// lane-pal8 r1: square 8x8 LEAVES ([`decode_leaf8`]) that actually use a
+    /// palette (Y or UV) -- the shape every 8-bit `--tune-content=screen`
+    /// stream stopped on, since aomenc palettes square blocks at 8 bit and
+    /// `--min-partition-size=8` puts them on this leaf path.
+    static PALETTE_LEAF8_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_LEAF8_HITS`].
+pub(crate) fn palette_leaf8_hits() -> usize {
+    PALETTE_LEAF8_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`PALETTE_LEAF8_HITS`] (per-attempt gate counting).
+pub(crate) fn reset_palette_leaf8_hits() {
+    PALETTE_LEAF8_HITS.with(|c| c.set(0));
+}
+
+thread_local! {
+    /// lane-pal8 r1: NON-SKIP palette blocks on a superblock-level (64-level)
+    /// HORZ/VERT or 1:4 strip ([`decode_block_rect64`]) -- i.e. a palette
+    /// block that also carries a real, corner-cropped luma transform.
+    static PALETTE_SB_STRIP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_SB_STRIP_HITS`].
+pub(crate) fn palette_sb_strip_hits() -> usize {
+    PALETTE_SB_STRIP_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`PALETTE_SB_STRIP_HITS`] (per-attempt gate counting).
+pub(crate) fn reset_palette_sb_strip_hits() {
+    PALETTE_SB_STRIP_HITS.with(|c| c.set(0));
+}
+
 // lane-hgkf r2: SKIPPED intra blocks whose `tx_depth` split the luma transform
 // and which are therefore predicted one transform unit at a time (a skipped
 // block codes no coefficients, so nothing else in the stream witnesses this
@@ -8593,6 +8628,14 @@ fn decode_block_rect64(
         // needs the plain, uncropped rect reader [`decode_block_rect`] already
         // has, not this one's truncation. `skip` (no residual at all) is
         // still supported below (lane-palette2 r4).
+        //
+        // lane-pal8 r1 MEASURED the lift and it is NOT free: dropping this
+        // refusal decodes `testsrc2` 128x128 10-bit cq55 `--enable-palette=1
+        // --min-partition-size=8 --tile-columns=1` with a whole-frame pixel
+        // mismatch (the arm the gate below counts). Something in this shape's
+        // palette prediction or its corner-cropped residual is wrong, and the
+        // refusal stays until that is found -- it is counted, never skipped.
+        PALETTE_SB_STRIP_HITS.with(|c| c.set(c.get() + 1));
         return Err(unsupported(
             "a palette block with a real transform on a superblock-level HORZ/VERT \
              strip (corner-cropped luma coefficients not ported for palette)",
@@ -10670,7 +10713,15 @@ fn decode_leaf8(
     // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
     // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
     // `decode_block` caller at 16x16 and up.
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, _palette_y, _palette_uv) =
+    // lane-pal8 r1: this leaf's own palette-Y mode ctx and colour cache
+    // (`av1_get_palette_mode_ctx` / `av1_get_palette_cache`, decodemv.c:567,
+    // `read_palette_mode_info`), at its REAL mi position -- passing
+    // `None`/`&[]` read `palette_y_mode` off CDF row 0 and refused by name the
+    // moment a real 8x8 palette block fired, which is where every 8-bit
+    // `--tune-content=screen --min-partition-size=8` stream stopped.
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi(leaf_mi);
+    let palette_uv_cache = neighbours.palette_uv_cache_mi(leaf_mi);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode(
             dec,
             cdfs,
@@ -10682,11 +10733,31 @@ fn decode_leaf8(
             neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
             allow_screen_content_tools,
             allow_intrabc,
-            None,
-            &[],
+            Some((palette_ctx, &palette_cache)),
+            &palette_uv_cache,
             leaf_mi.0,
             leaf_mi.1,
         )?;
+    // `av1_visit_palette`'s reconstruction (decodeframe.c:1135): the colour
+    // index map, mapped through the base colours, IS the block's prediction --
+    // carried to the next `reconstruct`/`read_plane` through the same
+    // [`PALETTE_PRED`] slot [`decode_block`] uses at 16x16 and up.
+    let palette_y_buf: Option<Vec<u16>> = palette_y
+        .as_ref()
+        .map(|p| p.map.iter().map(|&i| p.colors[i as usize]).collect());
+    let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|p| {
+        (
+            p.map.iter().map(|&i| p.u_colors[i as usize]).collect(),
+            p.map.iter().map(|&i| p.v_colors[i as usize]).collect(),
+        )
+    });
+    let (pal_y_size, pal_y_colors) =
+        palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
+    let (pal_uv_size, pal_uv_colors) =
+        palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
+    if palette_y.is_some() || palette_uv.is_some() {
+        PALETTE_LEAF8_HITS.with(|c| c.set(c.get() + 1));
+    }
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
     } else {
@@ -10715,7 +10786,11 @@ fn decode_leaf8(
         // transform units, each off the units already written left/above of
         // it inside this same leaf -- an intra block's transform size is read
         // whether or not it is skipped, and spec 7.11.2 predicts per unit.
-        if resolved == 4 {
+        // A palette block's prediction is the whole-block index map, never
+        // per-transform-unit edges ([`decode_block`]'s own `split_tx_skip`
+        // rule) -- so a palette leaf takes the single 8x8 reconstruct below
+        // even when `tx_depth` resolved to TX_4X4.
+        if resolved == 4 && palette_y_buf.is_none() {
             SKIP_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
             for tu_row in 0..2 {
                 for tu_col in 0..2 {
@@ -10750,6 +10825,9 @@ fn decode_leaf8(
                 }
             }
         } else {
+            if let Some(buf) = &palette_y_buf {
+                set_palette_pred(buf.clone());
+            }
             y.reconstruct(
                 px,
                 py,
@@ -10764,6 +10842,9 @@ fn decode_leaf8(
             );
         }
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
+        if let Some((ub, _)) = &palette_uv_bufs {
+            set_palette_pred(ub.clone());
+        }
         u.reconstruct(
             cpx,
             cpy,
@@ -10776,6 +10857,9 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv,
         );
+        if let Some((_, vb)) = &palette_uv_bufs {
+            set_palette_pred(vb.clone());
+        }
         v.reconstruct(
             cpx,
             cpy,
@@ -10793,6 +10877,9 @@ fn decode_leaf8(
         v_grid = vec![0i32; 16];
     } else if resolved != 4 {
         let around = neighbours.around_mi(leaf_mi, 8);
+        if let Some(buf) = &palette_y_buf {
+            set_palette_pred(buf.clone());
+        }
         luma_grid = read_plane(
             dec,
             cdfs,
@@ -10820,6 +10907,9 @@ fn decode_leaf8(
             smooth_neighbor,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
+        if let Some((ub, _)) = &palette_uv_bufs {
+            set_palette_pred(ub.clone());
+        }
         u_grid = read_plane(
             dec,
             cdfs,
@@ -10842,6 +10932,9 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv,
         )?;
+        if let Some((_, vb)) = &palette_uv_bufs {
+            set_palette_pred(vb.clone());
+        }
         v_grid = read_plane(
             dec,
             cdfs,
@@ -10893,6 +10986,19 @@ fn decode_leaf8(
                     y.height,
                 );
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
+                // Each 4x4 unit predicts from its own window of the block's
+                // 8x8 colour-index map ([`decode_block`]'s per-TU slice at
+                // 16x16 and up) -- the whole-block buffer would be taken by
+                // the FIRST unit and indexed at the wrong stride.
+                if let Some(buf) = &palette_y_buf {
+                    PALETTE_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                    let mut window = vec![0u16; 16];
+                    for row in 0..4 {
+                        let src = (tu_row * 4 + row) * 8 + tu_col * 4;
+                        window[row * 4..][..4].copy_from_slice(&buf[src..][..4]);
+                    }
+                    set_palette_pred(window);
+                }
                 let tu_grid = read_plane(
                     dec,
                     cdfs,
@@ -10932,6 +11038,9 @@ fn decode_leaf8(
         }
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
+        if let Some((ub, _)) = &palette_uv_bufs {
+            set_palette_pred(ub.clone());
+        }
         u_grid = read_plane(
             dec,
             cdfs,
@@ -10954,6 +11063,9 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv,
         )?;
+        if let Some((_, vb)) = &palette_uv_bufs {
+            set_palette_pred(vb.clone());
+        }
         v_grid = read_plane(
             dec,
             cdfs,
@@ -11004,12 +11116,12 @@ fn decode_leaf8(
                 neighbours.above[leaf_mi.1 + cell][2] = v_state;
             }
         }
-    // Non-palette 8x8 leaf (this path never reads a palette): clear the
-    // above/left palette state over its own cell so the next block's ctx and
-    // colour cache do not read a previous block's palette (lane-palette2 r8).
+    // This leaf's own palette state into the mi-granular above/left bands
+    // (sizes 0 when it used none, which is what clears a previous block's
+    // palette out of the next block's ctx and colour cache).
     {
-        neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
-        neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_y_rect(leaf_mi, 8, 8, pal_y_size, pal_y_colors);
+        neighbours.record_palette_uv_rect(leaf_mi, 8, 8, pal_uv_size, pal_uv_colors);
     }
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
         neighbours.fill_lf_grid(leaf_mi, 2, 4, 0);
@@ -11017,12 +11129,12 @@ fn decode_leaf8(
         return Ok(mode);
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
-    // Non-palette 8x8 leaf (this path never reads a palette): clear the
-    // above/left palette state over its own cell so the next block's ctx and
-    // colour cache do not read a previous block's palette (lane-palette2 r8).
+    // This leaf's own palette state into the mi-granular above/left bands
+    // (sizes 0 when it used none, which is what clears a previous block's
+    // palette out of the next block's ctx and colour cache).
     {
-        neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
-        neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_y_rect(leaf_mi, 8, 8, pal_y_size, pal_y_colors);
+        neighbours.record_palette_uv_rect(leaf_mi, 8, 8, pal_uv_size, pal_uv_colors);
     }
     INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
