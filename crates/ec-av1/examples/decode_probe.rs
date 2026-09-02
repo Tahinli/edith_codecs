@@ -84,6 +84,18 @@ fn main() {
             "intra_rect4_in_inter: 64x16={} 16x64={} 32x8={} 8x32={}",
             i4.0, i4.1, i4.2, i4.3
         );
+        // lane-cdefstrip r1: 8x8 CDEF units whose skip band no coded block
+        // wrote this frame -- non-zero means a decode arm forgot
+        // `fill_skip_grid_rect`, and CDEF filtered a unit libaom may skip.
+        println!(
+            "cdef_unwritten_skip_units: {}",
+            ec_av1::decode::cdef_unwritten_skip_units()
+        );
+        println!(
+            "cdef_band: rect_skip_writes={} mixed_skip_units={}",
+            ec_av1::decode::rect_skip_band_hits(),
+            ec_av1::decode::cdef_mixed_skip_units()
+        );
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
