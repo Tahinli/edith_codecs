@@ -16400,10 +16400,12 @@ fn decode_inter_block(
     }
     if std::env::var_os("EC_TRACE_MODE").is_some() {
         eprintln!(
-            "EC_MODE mi_row={} mi_col={} rng={}",
+            "EC_MODE mi_row={} mi_col={} rng={} is_inter={} skip={} side={side}",
             rmi,
             cmi,
-            dec.debug_state().0
+            dec.debug_state().0,
+            u8::from(is_inter),
+            u8::from(skip)
         );
     }
     // lane-warp r5: see `reject_residual` -- a square-block decode of a
@@ -18708,7 +18710,19 @@ fn decode_inter_block(
         // directional intra-in-inter block was refused above.
         let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
         let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
-        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        // lane-sb128c r2: libaom `read_intra_mode_uv(ec_ctx, r, is_cfl_allowed(xd), bsize)`
+        // -- `is_cfl_allowed` (blockd.h:1298) is
+        // `block_size_wide[bsize] <= 32 && block_size_high[bsize] <= 32`, so a
+        // 64x64 (or 64-wide/high) intra block inside an INTER frame reads the
+        // 13-symbol `uv_mode_no_cfl` alphabet. Reading the 14-symbol CFL one
+        // gives the same VALUE but a different range, and desynced the tile at
+        // this symbol (class wrong-alphabet-same-value).
+        let cfl_allowed = write_w.max(write_h) <= 32;
+        let uv_mode = if cfl_allowed {
+            dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
+        };
         if (9..=12).contains(&uv_mode) {
             SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
         }
