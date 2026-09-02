@@ -86,6 +86,12 @@ pub fn intra16x4_in_inter_hits() -> (usize, usize, usize) {
     crate::decode::intra16x4_in_inter_hits()
 }
 
+/// lane-sub8intra: INTRA 8x4/4x8 leaves inside an inter frame's sub-8x8
+/// HORZ/VERT partition, `(8x4, 4x8, chroma-reference, mixed groups)`.
+pub fn sub8_intra_rect_hits() -> (usize, usize, usize, usize) {
+    crate::decode::sub8_intra_rect_hits()
+}
+
 /// lane-r14 r3: RECTANGULAR var-tx leaf transform units, `[32x16, 16x32]` --
 /// the leaves `sub_tx_size_map` produces when a 1:4 strip with a 64-px axis
 /// splits its transform (`[TX_64X16] == TX_32X16`, `[TX_16X64] == TX_16X32`).
