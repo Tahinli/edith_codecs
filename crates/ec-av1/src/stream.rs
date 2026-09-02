@@ -3891,9 +3891,16 @@ mod tests {
              pixel-compared:\n{}",
             refusals.join("\n")
         );
+        // MEASURED (r1, 90 attempts; r2 re-ran the 45-attempt sweep at both
+        // depths): only the 32x16/16x32 class is REACHABLE on this branch --
+        // the inter tile path refuses any SB-level partition other than
+        // NONE/SPLIT, so a 64x32/32x64 intra strip cannot be produced at all,
+        // and every 16x8/8x16 candidate stops at a sub-16 refusal owned by
+        // another lane. So the bar is that class, hard, not "two of three":
+        // a green run still cannot come from a stream that fired nothing.
         assert!(
-            shapes.iter().filter(|n| **n > 0).count() >= 2,
-            "{NAME} ({bit_depth}-bit): fewer than two intra-rect shape classes fired over \
+            shapes[1] > 0,
+            "{NAME} ({bit_depth}-bit): no 32x16/16x32 intra rect strip fired over \
              {compared} compared streams (64-level={} 32-level={} 16-level={})",
             shapes[0],
             shapes[1],
