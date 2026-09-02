@@ -41,3 +41,23 @@ Run:
 `EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-intrainter cargo test -p ec-av1 --lib -- split_transform_intra_block --nocapture`
 
 EVIDENCE: $HOME/.cache/intrainter-suite.log | aomenc cut-fractal stream, ours vs ffmpeg, all 8 frames Y/U/V | 8-bit seed 45: 12 split intra-in-inter 16x16 blocks, 0 differing samples; 10-bit seed 72: 1 such block, 0 differing samples
+
+## Suite
+
+`EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-intrainter cargo test -p ec-av1 --lib`
+(as user unit `intrainter-suite-1788315424.service`, log `$HOME/.cache/intrainter-suite.log`):
+`test result: ok. 341 passed; 0 failed; 31 ignored; 0 measured` in 457.31s — includes every sibling
+(inter_sequence*, tx_select, 8x8_leaf_split, split_transform_*, filter_intra_*, cfl,
+refusal_inventory, gate_coverage).
+
+## Film
+
+`troy-head.obu` and `troy5.obu` both stop at "a coded HORZ/VERT strip whose chroma transform has no
+rect coefficient tables here" (lane-rectchroma), not at this lane's refusal.
+
+## Residue
+
+- deferred(a follow-up arm at --max-partition-size=64 and a lower cq): 32x32/64x64 split
+  intra-in-inter blocks never fired; the per-TU loop is size-generic but unproven above 16x16.
+- deferred(a per-TU intra loop inside decode_inter_block8): the 8x8 leaf's TX_4X4 2x2 grid,
+  now the narrower named refusal.
