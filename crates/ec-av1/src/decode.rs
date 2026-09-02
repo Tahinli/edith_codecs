@@ -1730,24 +1730,61 @@ pub(crate) fn build_motion_field(
     mi_cols: usize,
     mi_rows: usize,
     order_hint: u32,
+    order_hint_bits: u32,
     ref_order_hints: [u32; 7],
 ) -> crate::motion_field::MotionField {
     let mut field =
         crate::motion_field::MotionField::new(mi_cols, mi_rows, order_hint, ref_order_hints);
+    // lane-interbis r1: libaom `av1_calculate_ref_frame_side` -- a reference
+    // whose OrderHint is AHEAD of (or equal to) this frame's is "on the other
+    // side", and `av1_copy_frame_mvs` skips it entirely, so a compound block
+    // referencing one stores only its OTHER side's mv. With
+    // `enable_order_hint` off (`order_hint_bits == 0`) every side is 0 and
+    // nothing is skipped.
+    let other_side = |rf: i8| -> bool {
+        if order_hint_bits == 0 {
+            return false;
+        }
+        let oh = ref_order_hints[(rf - LAST_FRAME) as usize];
+        crate::motion_field::get_relative_dist(order_hint_bits, oh, order_hint) > 0
+            || oh == order_hint
+    };
+    // libaom `REFMVS_LIMIT` (`mvref_common.h`): a stored motion field mv is
+    // capped at 12 bits per component; a longer one is not stored at all.
+    const REFMVS_LIMIT: i32 = (1 << 12) - 1;
     for row in 0..mi_rows {
         for col in 0..mi_cols {
-            if let Some(info) = grid.get(row, col)
-                && info.is_inter
-                && info.ref_frame > 0
-            {
-                field.set(
-                    row,
-                    col,
-                    crate::motion_field::SavedMv {
-                        mv: info.mv,
-                        ref_frame: info.ref_frame,
-                    },
-                );
+            let Some(info) = grid.get(row, col) else {
+                continue;
+            };
+            if !info.is_inter {
+                continue;
+            }
+            // `av1_copy_frame_mvs` walks BOTH reference slots and the LAST
+            // qualifying one wins -- a compound block stores its second
+            // reference's mv, never its first (unless the second is on the
+            // other side or over the limit). Storing slot 0 unconditionally
+            // put the wrong (mv, ref_frame_offset) pair in every compound
+            // block's cell, which a later frame's temporal candidate then
+            // projected with the wrong reference distance.
+            let mut saved: Option<crate::motion_field::SavedMv> = None;
+            for (rf, mv) in [
+                (info.ref_frame, Some(info.mv)),
+                (info.ref_frame1.unwrap_or(0), info.mv1),
+            ] {
+                let (Some(mv), true) = (mv, rf > 0) else {
+                    continue;
+                };
+                if other_side(rf) {
+                    continue;
+                }
+                if mv.0.abs() > REFMVS_LIMIT || mv.1.abs() > REFMVS_LIMIT {
+                    continue;
+                }
+                saved = Some(crate::motion_field::SavedMv { mv, ref_frame: rf });
+            }
+            if let Some(saved) = saved {
+                field.set(row, col, saved);
             }
         }
     }
@@ -14412,6 +14449,10 @@ fn decode_inter_block(
             );
             let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
             let mut is_globalmv = false;
+            // lane-interbis r1: which single-ref mode this block resolved to,
+            // in the oracle's own numbering (NEARESTMV=13 .. NEWMV=16), for
+            // the `EC_MODE_VAL` value ladder below.
+            let mut dbg_mode = 16u32;
             let (mv, is_new_mv) = if !not_new {
                 // NEWMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting at 0):
                 // read at most two `drl_mode` bits, one per stack entry past the
@@ -14444,9 +14485,11 @@ fn decode_inter_block(
                 let mv = if !not_zero {
                     // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1), already
                     // computed at this block's own position in `gm_table`.
+                    dbg_mode = 15;
                     gm_table[(ref_frame - LAST_FRAME) as usize]
                 } else {
                     let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                    dbg_mode = if nearest { 13 } else { 14 };
                     if nearest {
                         stack.nearest_mv
                     } else {
@@ -14468,6 +14511,21 @@ fn decode_inter_block(
                 };
                 (mv, false)
             };
+            if std::env::var_os("EC_TRACE_MODE").is_some() {
+                for (i, e) in stack.entries.iter().enumerate() {
+                    eprintln!(
+                        "EC_STACK mi_row={mi_row} mi_col={mi_col} ref={ref_frame} i={i} this=({},{}) comp=(0,0) w={}",
+                        e.mv.0, e.mv.1, e.weight
+                    );
+                }
+                eprintln!(
+                    "EC_MODE_VAL mi_row={mi_row} mi_col={mi_col} mode={dbg_mode} ref0={ref_frame} ref1=-1 mv0=({},{}) stack={} rng={}",
+                    mv.0,
+                    mv.1,
+                    stack.entries.len(),
+                    dec.debug_state().0
+                );
+            }
             // lane-gm r2: the two libaom predicates single-ref GLOBALMV
             // blocks need -- `is_global_mv_block` (blockd.h:421-429, mode
             // GLOBAL* AND model > TRANSLATION AND min(bw,bh) >= 8px, gating
@@ -18985,6 +19043,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         mi_cols as usize,
         mi_rows as usize,
         order_hint,
+        order_hint_bits,
         ref_order_hints,
     );
 
