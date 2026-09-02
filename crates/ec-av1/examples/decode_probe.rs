@@ -146,6 +146,72 @@ fn main() {
             _ => continue,
         };
         frames_seen += 1;
+        // lane-frame36: `EC_PROBE_HDR=1` prints one line per frame header, so a
+        // silent wall can be triaged by "which header field is new at frame N"
+        // before any pixel work (class: a header field parsed then never consumed).
+        if std::env::var("EC_PROBE_HDR").is_ok() {
+            let h = header;
+            let gm: Vec<String> = h
+                .global_motion
+                .iter()
+                .map(|w| format!("{:?}", w.model))
+                .collect();
+            println!(
+                "HDR {}: type={:?} show={} showable={} show_existing={}({}) intra={} \
+                 size={}x{} up={} superres={}/{} order_hint={} primary_ref={} refresh={:#04x} \
+                 refs={:?} order_hints={:?} sign_bias={:?} err_res={} disable_cdf={} \
+                 screen_tools={} int_mv={} intrabc={} hp_mv={} interp={:?} switchable_motion={} \
+                 ref_mvs={} base_q={} seg={} deltaq={} deltalf={} lf_level={:?} lf_deltas={:?}/{:?} \
+                 cdef_bits={} lr={:?} tx_mode={:?} ref_sel={} skip_mode={}({:?}) warp={} \
+                 reduced_tx={} gm={:?} grain={}/seed={} lossless={}",
+                frames_seen - 1,
+                h.frame_type,
+                h.show_frame,
+                h.showable_frame,
+                h.show_existing_frame,
+                h.frame_to_show_map_idx,
+                h.frame_is_intra,
+                h.frame_width,
+                h.frame_height,
+                h.upscaled_width,
+                h.use_superres,
+                h.superres_denom,
+                h.order_hint,
+                h.primary_ref_frame,
+                h.refresh_frame_flags,
+                h.ref_frame_idx,
+                h.order_hints,
+                h.ref_frame_sign_bias,
+                h.error_resilient_mode,
+                h.disable_cdf_update,
+                h.allow_screen_content_tools,
+                h.force_integer_mv,
+                h.allow_intrabc,
+                h.allow_high_precision_mv,
+                h.interpolation_filter,
+                h.is_motion_mode_switchable,
+                h.use_ref_frame_mvs,
+                h.quantization.base_q_idx,
+                h.segmentation.enabled,
+                h.delta.q_present,
+                h.delta.lf_present,
+                h.loop_filter.level,
+                h.loop_filter.ref_deltas,
+                h.loop_filter.mode_deltas,
+                h.cdef.bits,
+                h.loop_restoration.frame_restoration_type,
+                h.tx_mode,
+                h.reference_select,
+                h.skip_mode_present,
+                h.skip_mode_frame,
+                h.allow_warped_motion,
+                h.reduced_tx_set,
+                gm,
+                h.film_grain.apply_grain,
+                h.film_grain.grain_seed,
+                h.coded_lossless,
+            );
+        }
         let t = &header.tile_info;
         let entry = (t.cols, t.rows, t.uniform_spacing, t.context_update_tile_id);
         if !seen.contains(&entry) {
