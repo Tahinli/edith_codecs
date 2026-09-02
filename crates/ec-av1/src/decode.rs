@@ -886,6 +886,19 @@ pub(crate) fn filter_intra_rect_sub16_hits() -> usize {
     FILTER_INTRA_RECT_SUB16_HITS.with(|c| c.get())
 }
 
+// As [`FILTER_INTRA_RECT_SUB16_HITS`], one partition level further down:
+// 4x8/8x4 leaves of an 8x8 HORZ/VERT (lane-fi8 r1). A gate on the sub16
+// counter would be satisfied by a 16x8 strip and prove nothing here.
+thread_local! {
+    static FILTER_INTRA_RECT_SUB8_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FILTER_INTRA_RECT_SUB8_HITS`].
+pub(crate) fn filter_intra_rect_sub8_hits() -> usize {
+    FILTER_INTRA_RECT_SUB8_HITS.with(|c| c.get())
+}
+
 // How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
 // (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
 // call on the current thread -- the same before/after counter pattern as
@@ -3949,6 +3962,15 @@ impl Neighbours {
 /// offered (`cfl`, `is_cfl_allowed`, spec 5.11.5), chroma-from-luma -- the
 /// third element carries that mode's `(alpha_q3_u, alpha_q3_v)`, `None` for
 /// plain DC chroma.
+/// spec 5.11.47 / libaom `av1_read_tx_type`'s `fimode_to_intradir`: which
+/// `intra_ext_tx_cdf` row a luma transform reads. A filter-intra block's
+/// `mode` is always `DC_PRED`, so the row comes from the FILTER-INTRA mode
+/// instead (the defect commit 1a89ed9 fixed at the square sites).
+fn fi_tx_row(mode: usize, filter_intra: Option<usize>) -> usize {
+    const FIMODE_TO_INTRADIR: [usize; 5] = [DC_PRED, V_PRED, H_PRED, D157_PRED, DC_PRED];
+    filter_intra.map_or(mode, |fi| FIMODE_TO_INTRADIR[fi])
+}
+
 /// A block-size class index into [`cdf::FILTER_INTRA`]/`Cdfs::filter_intra`,
 /// or `None` when `side` is past `av1_filter_intra_allowed_bsize`'s <=32
 /// bound (spec `filter_intra_mode_info` never reads a symbol there).
@@ -3977,6 +3999,11 @@ fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
         // identical mode/uv_mode values, range 34808 vs the oracle's 40668).
         (16, 8) => Some(6),
         (8, 16) => Some(7),
+        // lane-fi8 r1: the sub-8 rect leaves are allowed too (both sides <=
+        // 32), and `decode_leaf_rect8` codes them -- rows 1/2 of
+        // `default_filter_intra_cdfs`, NOT BLOCK_4X4's row 0.
+        (4, 8) => Some(8),
+        (8, 4) => Some(9),
         _ if bw == bh => filter_intra_size_class(bw),
         _ => None,
     }
@@ -4964,7 +4991,7 @@ fn decode_block_rect(
         // decoder consumed one that was never there.
         {
         let around = neighbours.around_rect(at, bw, bh);
-        let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, mode);
+        let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, fi_tx_row(mode, filter_intra));
         let (luma_levels, luma_tx_type) = read_coeffs_rect(
             dec,
             &mut luma_coding,
@@ -5245,7 +5272,7 @@ fn decode_leaf_rect(
         } else {
             TxbSet::LumaRect16x8Set1
         };
-        let mut luma_coding = cdfs.txb(luma_set, mode);
+        let mut luma_coding = cdfs.txb(luma_set, fi_tx_row(mode, filter_intra));
         let (l_levels, luma_tx_type) = read_coeffs_rect(
             dec, &mut luma_coding, luma_scan, bw, bh, 0, dc_sign_ctx(around[0].2), TxType::DctDct,
         )?;
@@ -6745,12 +6772,7 @@ fn read_plane(
     // filter-intra is on) -- caller passes the raw filter-intra mode 0..4 in
     // `filter_intra`, only meaningful for `plane_idx == 0` (chroma has no
     // filter-intra in AV1).
-    const FIMODE_TO_INTRADIR: [usize; 5] = [DC_PRED, V_PRED, H_PRED, D157_PRED, DC_PRED];
-    let tx_mode = if plane_idx == 0 {
-        filter_intra.map_or(tx_mode, |fi| FIMODE_TO_INTRADIR[fi])
-    } else {
-        tx_mode
-    };
+    let tx_mode = if plane_idx == 0 { fi_tx_row(tx_mode, filter_intra) } else { tx_mode };
     let mut coding = cdfs.txb(set, tx_mode);
     // Luma's `default_tx_type` is only a fallback for the sizes whose
     // `TxbSet` carries no symbol at all (32-point and up), which the spec
@@ -7661,6 +7683,11 @@ fn read_intra_mode_sub8(
     left_mode: usize,
     has_chroma: bool,
     enable_filter_intra: bool,
+    // [`filter_intra_size_class_rect`] for the LEAF's own shape: 0 for a
+    // `BLOCK_4X4` split leaf, 8/9 for a 4x8/8x4 rect leaf. Reading the flag
+    // from the wrong row is the same VALUE with a different interval, so it
+    // desyncs a block or two later, not here (class `wrong-alphabet-same-value`).
+    fi_class: usize,
     skip_ctx: usize,
     allow_intrabc: bool,
     mi_r: usize,
@@ -7718,9 +7745,7 @@ fn read_intra_mode_sub8(
     };
     let mut filter_intra = None;
     if mode == DC_PRED && enable_filter_intra {
-        // `BLOCK_4X4`'s own row (class 0, `filter_intra_size_class(4)`) --
-        // every sub-8x8 leaf here is a `BLOCK_4X4`.
-        let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[0]) != 0;
+        let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[fi_class]) != 0;
         if trace {
             eprintln!("TRACE sub8 use_filter_intra value={}", use_filter_intra as i32);
         }
@@ -7800,8 +7825,9 @@ fn decode_leaf_split4(
         let has_chroma = i == 3;
         let skip_ctx = neighbours.skip_txfm_ctx(lmi.0, lmi.1);
         let (skip, mode, angle_delta_y, chroma, filter_intra) = read_intra_mode_sub8(
-            dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra, skip_ctx,
-            allow_intrabc, lmi.0, lmi.1,
+            dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra,
+            filter_intra_size_class(4).expect("BLOCK_4X4 has its own filter_intra row"),
+            skip_ctx, allow_intrabc, lmi.0, lmi.1,
         )?;
         leaf_modes[i] = mode;
         leaf_skips[i] = skip;
@@ -7942,9 +7968,12 @@ fn decode_leaf_split4(
 ///   = `{31, 30}` (width 4 above, height 8 left), not the `{31, 31}` a
 ///   `BLOCK_4X4` split writes.
 ///
-/// Filter intra on one of these leaves is refused by name: `predict_filter_intra`
-/// is square-only in this decoder (the same refusal the 16x16-level rect
-/// strips already carry).
+/// Filter intra on one of these leaves is decoded (lane-fi8 r1): the flag is
+/// read from `BLOCK_4X8`/`BLOCK_8X4`'s own `cdf::FILTER_INTRA` row (classes
+/// 8/9, NOT `BLOCK_4X4`'s), the predictor is [`crate::intra::predict_filter_intra`]
+/// over the leaf's true `bw`x`bh` -- per 4x4 transform unit, with that unit's
+/// own edge, when `tx_depth` splits it -- and the coded `tx_type` row is
+/// [`fi_tx_row`]'s `fimode_to_intradir`, not the block's raw `DC_PRED`.
 #[allow(clippy::too_many_arguments)]
 fn decode_leaf_rect8(
     dec: &mut SymbolDecoder,
@@ -7994,13 +8023,19 @@ fn decode_leaf_rect8(
         let has_chroma = i == 1;
         let skip_ctx = neighbours.skip_txfm_ctx(lmi.0, lmi.1);
         let (skip, mode, angle_delta_y, chroma, filter_intra) = read_intra_mode_sub8(
-            dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra, skip_ctx,
-            allow_intrabc, lmi.0, lmi.1,
+            dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra,
+            filter_intra_size_class_rect(bw, bh)
+                .expect("BLOCK_4X8/BLOCK_8X4 are inside av1_filter_intra_allowed_bsize"),
+            skip_ctx, allow_intrabc, lmi.0, lmi.1,
         )?;
         if filter_intra.is_some() {
-            return Err(unsupported(
-                "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
-            ));
+            // lane-fi8 r1: `predict_filter_intra` walks its 4x2 patches over
+            // a true `bw`x`bh` block, so a 4x8/8x4 leaf predicts through the
+            // same `reconstruct_rect`/`reconstruct` calls below -- and under
+            // a split transform, per 4x4 unit with that unit's own edge,
+            // which is exactly what the depth-1 loop already does.
+            FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
+            FILTER_INTRA_RECT_SUB8_HITS.with(|c| c.set(c.get() + 1));
         }
         // `TxMode::Select`'s `tx_depth` (spec 5.11.16) exists at a 4x8/8x4
         // leaf too, and is read for every intra block, skipped or not. Its
@@ -8057,8 +8092,8 @@ fn decode_leaf_rect8(
                     // prediction of the same mode produces.
                     let zeros = vec![0i32; 16];
                     y.reconstruct(
-                        tu_px, tu_py, 4, mode, angle_delta_y, tu_reach, &zeros, None, None,
-                        smooth_neighbor,
+                        tu_px, tu_py, 4, mode, angle_delta_y, tu_reach, &zeros, None,
+                        filter_intra, smooth_neighbor,
                     );
                     neighbours.record_mi_luma(tu_mi, 4, &zeros);
                     continue;
@@ -8085,7 +8120,7 @@ fn decode_leaf_rect8(
                     TX4,
                     base_q_idx,
                     None,
-                    None,
+                    filter_intra,
                     Some(tu_skip_ctx),
                     smooth_neighbor,
                 )?;
@@ -8111,7 +8146,8 @@ fn decode_leaf_rect8(
         let grid = if skip {
             let zeros = vec![0i32; bw * bh];
             y.reconstruct_rect(
-                px, py, bw, bh, mode, angle_delta_y, reach, &zeros, None, None, smooth_neighbor,
+                px, py, bw, bh, mode, angle_delta_y, reach, &zeros, None, filter_intra,
+                smooth_neighbor,
             );
             zeros
         } else {
@@ -8124,7 +8160,7 @@ fn decode_leaf_rect8(
             } else {
                 TxbSet::LumaRect4x8Set1
             };
-            let mut coding = cdfs.txb(set, mode);
+            let mut coding = cdfs.txb(set, fi_tx_row(mode, filter_intra));
             let (levels, tx_type) = read_coeffs_rect(
                 dec,
                 &mut coding,
@@ -8153,7 +8189,8 @@ fn decode_leaf_rect8(
                 tx_type,
             );
             y.reconstruct_rect(
-                px, py, bw, bh, mode, angle_delta_y, reach, &residual, None, None, smooth_neighbor,
+                px, py, bw, bh, mode, angle_delta_y, reach, &residual, None, filter_intra,
+                smooth_neighbor,
             );
             levels
         };
@@ -18293,15 +18330,13 @@ mod tests {
         // string that blocks the shape otherwise. Either way the row is
         // pinned HERE, so the round that lifts one of those refusals cannot
         // land a wrong CDF row for the shape it unlocks.
-        const BELOW_8X8: &str =
-            "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)";
         const PART16: &str = "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes \
              only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)";
         const PART32: &str = "a 32x32 partition type this decoder does not code (value={part32})";
         let libaom: &[(usize, usize, u16, Option<&str>)] = &[
             (4, 4, 4621, None),
-            (4, 8, 6743, Some(BELOW_8X8)),
-            (8, 4, 5893, Some(BELOW_8X8)),
+            (4, 8, 6743, None),
+            (8, 4, 5893, None),
             (8, 8, 7866, None),
             (8, 16, 12551, None),
             (16, 8, 9394, None),
