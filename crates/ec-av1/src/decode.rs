@@ -4596,20 +4596,7 @@ fn decode_rect_split(
             //    (`row_off + tx_high < plane_bh`) they are the left
             //    neighbour's, already reconstructed; the last row falls back
             //    to the block-level answer.
-            let tu_reach = Reach {
-                above_right: if col_off + tx < bw {
-                    true
-                } else {
-                    row_off == 0 && block_reach.above_right
-                },
-                below_left: if col_off > 0 {
-                    false
-                } else if row_off + tx < bh {
-                    true
-                } else {
-                    block_reach.below_left
-                },
-            };
+            let tu_reach = Reach::of_tu(bw, bh, col_off, row_off, tx, block_reach);
             // The unit's own window on the block's palette prediction.
             if let Some(buf) = &m.palette_y {
                 let tu_buf: Vec<u16> = (0..tx)
@@ -7075,7 +7062,19 @@ fn decode_block(
                 let tu_px = px + tu_col * logical_tx;
                 let tu_py = py + tu_row * logical_tx;
                 let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
-                let tu_reach = Reach::of(logical_tx, tu_px, tu_py, y.width, y.height);
+                // A transform unit inside a block is NOT a block at that
+                // position (lane-palette2 r12): `Reach::of` granted the
+                // top-right 8x8 unit of a 16x16 D203 block bottom-left
+                // pixels libaom refuses outright (`col_off > 0`), which is
+                // the diagonal wedge seed 46 reconstructed wrong.
+                let tu_reach = Reach::of_tu(
+                    side,
+                    side,
+                    tu_col * logical_tx,
+                    tu_row * logical_tx,
+                    logical_tx,
+                    reach,
+                );
                 // This transform unit's own bsize (`logical_tx`) is smaller
                 // than the block it sits in (`side`), so `txb_skip_ctx` is
                 // the neighbour-magnitude table, not the lone-TU 0 (spec
@@ -7443,7 +7442,7 @@ fn decode_leaf8(
                 let tu_px = px + tu_col * 4;
                 let tu_py = py + tu_row * 4;
                 let tu_around = neighbours.around_mi(tu_mi, 4)[0];
-                let tu_reach = Reach::of(4, tu_px, tu_py, y.width, y.height);
+                let tu_reach = Reach::of_tu(8, 8, tu_col * 4, tu_row * 4, 4, reach);
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
                 let tu_grid = read_plane(
                     dec,
