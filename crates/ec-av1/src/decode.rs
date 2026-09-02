@@ -2012,6 +2012,33 @@ pub(crate) fn intra_rect_in_inter_split_tx_hits() -> [usize; 3] {
     INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
 
+// lane-intra14 r1: how many intra-coded 1:4 strips decoded on the INTER
+// block path, per shape -- [0] 64x16, [1] 16x64, [2] 32x8, [3] 8x32. Every
+// one of them was the named refusal "an intra-coded 1:4 (or other non-2:1)
+// rect strip on the inter block path" before this round.
+thread_local! {
+    static INTRA_RECT4_IN_INTER_HITS: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
+}
+
+/// Current value of [`INTRA_RECT4_IN_INTER_HITS`] for one shape
+/// (0 = 64x16, 1 = 16x64, 2 = 32x8, 3 = 8x32).
+pub(crate) fn intra_rect4_strip_in_inter_hits(shape: usize) -> usize {
+    INTRA_RECT4_IN_INTER_HITS.with(|c| c.get()[shape])
+}
+
+// lane-intra14 r1: set while an INTRA block of an INTER frame is decoded
+// through one of the key-frame rect readers ([`decode_block_rect4`],
+// [`decode_block_rect64`]). `Some((size_group, skip))` tells
+// [`read_intra_mode_rect`] that (a) `skip`/segment id/cdef/delta-q were
+// already read by [`decode_inter_block`] and (b) the luma mode comes off
+// `y_mode_cdf[size_group_lookup[bsize]]` (libaom `read_intra_block_mode_info`,
+// decodemv.c:1189), never the key frame's above/left `kf_y_mode` pair.
+thread_local! {
+    static INTRA_IN_INTER_MODE: std::cell::Cell<Option<(usize, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 // lane-rectx r5: how many times a NON-strip `kf_y_mode` reader
 // ([`decode_block`], [`decode_block_rect`], [`decode_block_rect64`]) took an
 // above/left mode from the mi-exact map that DIFFERS from its coarse 16x16
@@ -5652,6 +5679,13 @@ fn read_intra_mode_rect(
     } else {
         cfl
     };
+    // lane-intra14 r1: on the INTER block path everything up to and including
+    // `is_inter` was already read by [`decode_inter_block`], so this reader
+    // starts at the mode syntax with the `skip` that caller read.
+    let inter = INTRA_IN_INTER_MODE.with(std::cell::Cell::get);
+    let skip = if let Some((_, skip)) = inter {
+        skip
+    } else {
     // Same `intra_segment_id` placement as the square reader above.
     let (seg_w_mi, seg_h_mi) = (bw / 4, bh / 4);
     if seg_id_pre_skip() {
@@ -5670,9 +5704,18 @@ fn read_intra_mode_rect(
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip);
     maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, false, skip);
     istep!("dq", 0);
-    let above_ctx = INTRA_MODE_CTX[above_mode];
-    let left_ctx = INTRA_MODE_CTX[left_mode];
-    let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
+    skip
+    };
+    // libaom `read_intra_block_mode_info` (decodemv.c:1189) vs the key
+    // frame's `read_intra_frame_mode_info` (decodemv.c:1065 `read_intra_mode`
+    // off `kf_y_mode_cdf[above][left]`).
+    let mode = if let Some((size_group, _)) = inter {
+        dec.symbol(&mut cdfs.y_mode[size_group])
+    } else {
+        let above_ctx = INTRA_MODE_CTX[above_mode];
+        let left_ctx = INTRA_MODE_CTX[left_mode];
+        dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx])
+    };
     istep!("mode", mode as i32);
     let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
         read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED])
@@ -6328,9 +6371,18 @@ fn decode_intra_rect_in_inter(
         (8, 16) => (1usize, 1usize),
         (16, 32) => (2, 2),
         (32, 64) => (3, 3),
+        // lane-intra14 r1: the 1:4 strips, read off libaom's own tables --
+        // `size_group_lookup` (common_data.h:61) gives BLOCK_8X32/32X8 group
+        // 1 and BLOCK_16X64/64X16 group 2, while
+        // `bsize_to_tx_size_depth_table` (blockd.h:1347) gives them depth
+        // 3 and 4, i.e. tx categories 2 and 3 -- the diagonal a 2:1 strip
+        // keeps is genuinely broken here, which is why the shape was refused
+        // rather than read from the 2:1 row.
+        (8, 32) => (1, 2),
+        (16, 64) => (2, 3),
         _ => {
             return Err(unsupported(
-                "an intra-coded 1:4 (or other non-2:1) rect strip on the inter block path",
+                "an intra-coded 16x4/4x16 strip on the inter block path (the 16x16-level 1:4 inter partition is refused before this point)",
             ))
         }
     };
@@ -6342,6 +6394,70 @@ fn decode_intra_rect_in_inter(
             "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
              is consumed for square blocks only)",
         ));
+    }
+    // lane-intra14 r1: a 1:4 strip decodes through the very readers the KEY
+    // FRAME path already proves for this shape ([`decode_block_rect4`] at the
+    // 32 level, [`decode_block_rect64`] at 64 -- both already handle the 1:4
+    // luma/chroma transform tables, the per-unit split walk and the strip's
+    // own neighbour records). The ONLY difference on an inter frame is the
+    // mode-info read, which [`INTRA_IN_INTER_MODE`] switches to
+    // `read_intra_block_mode_info`'s `y_mode[size_group]` plus the `skip`
+    // this caller already read. `tx_cat` above is the same category those
+    // readers hardcode (cat 2 in `decode_block_rect4`, cat 3 in
+    // `decode_block_rect64`), asserted here so a future shape cannot drift.
+    if bw.max(bh) == 4 * bw.min(bh) {
+        debug_assert_eq!(tx_cat, if bw.max(bh) == 64 { 3 } else { 2 });
+        INTRA_IN_INTER_MODE.with(|c| c.set(Some((size_group, skip))));
+        let res = if bw.max(bh) == 64 {
+            decode_block_rect64(
+                dec,
+                cdfs,
+                neighbours,
+                (mi_r / (SUB / MI), mi_c / (SUB / MI)),
+                bw,
+                bh,
+                y,
+                u,
+                v,
+                ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+                allow_screen_content_tools,
+                base_q_idx,
+                TX_SELECT_INTER.with(std::cell::Cell::get),
+                REDUCED_TX_SET_INTER.with(std::cell::Cell::get),
+            )
+        } else {
+            decode_block_rect4(
+                dec,
+                cdfs,
+                neighbours,
+                (mi_r, mi_c),
+                bw,
+                bh,
+                None,
+                y,
+                u,
+                v,
+                ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+                allow_screen_content_tools,
+                base_q_idx,
+                TX_SELECT_INTER.with(std::cell::Cell::get),
+            )
+            .map(|_| ())
+        };
+        INTRA_IN_INTER_MODE.with(|c| c.set(None));
+        res?;
+        let shape = match (bw, bh) {
+            (64, 16) => 0,
+            (16, 64) => 1,
+            (32, 8) => 2,
+            _ => 3,
+        };
+        INTRA_RECT4_IN_INTER_HITS.with(|h| {
+            let mut v = h.get();
+            v[shape] += 1;
+            h.set(v);
+        });
+        return Ok(());
     }
     let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
     if mode >= 13 {
