@@ -30144,6 +30144,72 @@ mod tests {
         );
     }
 
+    /// lane-frame36 r2: the hidden-ARF witness. `crates/ec-av1/fixtures/
+    /// hg_arf_witness.obu`, 32126 bytes, sha256
+    /// `7f3b060da5aa9c537633e760c4af71316237db7692f6ae0d459bd2c2dd867d37`:
+    /// the first 58 frame-carrying OBUs of a 2 s head cut of the 10-bit
+    /// 3840x1608 AV1 HDR10 stream, 40 decode-order frames, 37 shown.
+    ///
+    /// What it covers that no earlier fixture did: decode-order frame 33 is a
+    /// HIDDEN alt-ref (`show_frame=0`, order_hint 64, `cdef_bits=1`, loop
+    /// restoration `[Switchable, Sgrproj, Switchable]`, `skip_mode_frame`
+    /// [1,6]) -- the first frame of the stream carrying a SPLIT
+    /// superblock-level intra strip in an inter frame. Its 16x64 strip at
+    /// mi(192,140) reads `tx_depth=1` (TX_16X32), and until this round
+    /// [`decode_block_rect64`]'s split arm returned past the tail that
+    /// publishes the `TXFM_CONTEXT` bands, so the 32x64 block at mi(192,144)
+    /// read the row's init value 64 as its left transform height and took
+    /// `tx_size_cat3` row 2 where aomdec takes row 1 -- a desync no shown
+    /// frame exposed until the ARF was displayed (class
+    /// `gate-blind-to-hidden-frames`).
+    ///
+    /// The counter assert is on `rect64_split_txfm_publish_hits`, the split
+    /// arm that was silent, so a stream that stopped carrying the shape fails
+    /// the gate instead of passing it vacuously.
+    #[test]
+    fn a_10bit_film_hidden_arf_with_split_superblock_strips_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_10bit_film_hidden_arf_with_split_superblock_strips_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/hg_arf_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        let before = crate::decode::rect64_split_txfm_publish_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let fired = crate::decode::rect64_split_txfm_publish_hits() - before;
+        assert!(
+            fired > 0,
+            "{NAME}: no split superblock-level strip in the stream -- the gate would be vacuous"
+        );
+        assert_eq!(frames.len(), 37, "{NAME}: 37 shown frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg returned {} frames, we decoded {}",
+            ffmpeg_frames.len(),
+            frames.len()
+        );
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: 37 shown frames pixel-exact on every plane, \
+             rect64_split_txfm_publish={fired}"
+        );
+    }
+
 
     /// lane-sub8x4 r2, the gate that lifts BOTH sub-8x8 intra refusals ("an
     /// intra 4x4 block inside an inter frame's sub-8x8 split" and "an intra
