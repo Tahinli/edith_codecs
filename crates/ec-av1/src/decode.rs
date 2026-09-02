@@ -2691,6 +2691,21 @@ thread_local! {
     static INTER16_SUB8_PIECE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-intra16x4: INTRA-coded strips of an inter 16x16-level 1:4 partition --
+// [0] 16x4, [1] 4x16, [2] the odd (chroma-reference) ones, which carry the
+// pair's single 8x4 (4x8) chroma unit for BOTH strips.
+thread_local! {
+    static INTRA16X4_IN_INTER_HITS: std::cell::Cell<[usize; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
+}
+
+/// `(intra 16x4 strips, intra 4x16 strips, of which chroma-reference)` decoded
+/// inside an INTER 16x16-level 1:4 partition (lane-intra16x4).
+pub fn intra16x4_in_inter_hits() -> (usize, usize, usize) {
+    let v = INTRA16X4_IN_INTER_HITS.with(std::cell::Cell::get);
+    (v[0], v[1], v[2])
+}
+
 /// Current values of the inter 16x16-level 1:4 counters: `(16x4 strips, 4x16
 /// strips, chroma pairs closed, chroma pairs built from two different
 /// strips' motion vectors)`.
@@ -7222,6 +7237,9 @@ fn decode_intra_rect_in_inter(
     bh: usize,
     skip: bool,
     allow_screen_content_tools: bool,
+    // `(PARTITION_HORZ_4, is_chroma_reference)` when this strip is one of the
+    // four 16x4 / 4x16 strips of a 16x16-level 1:4 partition (lane-intra16x4).
+    strip16: Option<(bool, bool)>,
     y: &mut PlaneBuf,
     u: &mut PlaneBuf,
     v: &mut PlaneBuf,
@@ -7238,6 +7256,94 @@ fn decode_intra_rect_in_inter(
     // finding -- the category is NOT the same for every strip size).
     // A 1:4 strip breaks that diagonal (BLOCK_32X8 is group 1 but cat 2), so
     // it is refused by name rather than read from the wrong CDF row.
+    // lane-intra16x4: the 16x16-level 1:4 strip. `size_group_lookup`
+    // (common_data.h:61) puts BLOCK_16X4/BLOCK_4X16 in group 0 and its
+    // tx-depth category is 1 -- but nothing here has to know either, because
+    // the strip decodes through the very body the KEY FRAME path proves for
+    // this shape ([`decode_rect4_16_strip`]), including the 4:2:0 chroma
+    // pairing (`is_chroma_reference`: strips 0 and 2 read no chroma at all,
+    // strips 1 and 3 code one 8x4 (4x8) unit at the PAIR's origin). The only
+    // inter-frame difference is the mode-info read, which
+    // [`INTRA_IN_INTER_MODE`] switches to `read_intra_block_mode_info`'s
+    // `y_mode[0]` plus the `skip` this caller already read.
+    if let Some((horz, has_chroma)) = strip16 {
+        if allow_screen_content_tools {
+            return Err(unsupported(
+                "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
+                 is consumed for square blocks only)",
+            ));
+        }
+        debug_assert_eq!((bw, bh), if horz { (16, 4) } else { (4, 16) });
+        INTRA_IN_INTER_MODE.with(|c| c.set(Some((0, skip))));
+        let res = decode_rect4_16_strip(
+            dec,
+            cdfs,
+            neighbours,
+            (mi_r, mi_c),
+            horz,
+            has_chroma,
+            // The inter strips of the same partition publish their own
+            // mi-exact mode, so the key-frame caller's coarse-cell stand-in
+            // has nothing to add here.
+            None,
+            y,
+            u,
+            v,
+            ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+            allow_screen_content_tools,
+            base_q_idx,
+            TX_SELECT_INTER.with(std::cell::Cell::get),
+            REDUCED_TX_SET_INTER.with(std::cell::Cell::get),
+        );
+        INTRA_IN_INTER_MODE.with(|c| c.set(None));
+        let (mode, uv, (tx_w, tx_h)) = res?;
+        // lane-intra16x4, the same publication the 2:1 intra-in-inter strip
+        // makes ([`decode_intra_rect_in_inter`]'s own tail): libaom runs
+        // `set_txfm_ctxs(tx_size, n4_w, n4_h, skip && is_inter, xd)` for EVERY
+        // block of an inter frame, intra ones included, and
+        // `txfm_partition_update` for the var-tx context. The key-frame body
+        // writes neither (a key frame has no var-tx tree and its own readers
+        // use the deblock grid), so the block AFTER this strip read a stale
+        // band -- measured: a 128x128 8-bit stream decoded the two intra 16x4
+        // strips at mi(23,16)/(23,20) exactly and then broke on the very next
+        // 16x16 row.
+        txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
+        for i in 0..bw / MI {
+            if let Some(cell) = neighbours.above_txfm.get_mut(mi_c + i) {
+                *cell = tx_w as u8;
+            }
+        }
+        for i in 0..bh / MI {
+            if let Some(cell) = neighbours.left_txfm.get_mut(mi_r + i) {
+                *cell = tx_h as u8;
+            }
+        }
+        // [`decode_rect4_16`]'s own post-loop publication, per strip (the
+        // coarse 16-px cell holds one entry for the whole 16x16 and the last
+        // block to write it wins).
+        neighbours.above_mode[c] = mode;
+        neighbours.left_mode[r] = mode;
+        if let Some(uvm) = uv {
+            neighbours.above_uv_mode[c] = uvm;
+            neighbours.left_uv_mode[r] = uvm;
+        }
+        neighbours.above_side[c] = bw;
+        neighbours.left_side[r] = bh;
+        if std::env::var_os("EC_INTRA16X4").is_some() {
+            eprintln!(
+                "EC_INTRA16X4 decoded mi={mi_r},{mi_c} px={},{} horz={horz} has_chroma={has_chroma} skip={skip} mode={mode} uv={uv:?}",
+                mi_c * MI,
+                mi_r * MI
+            );
+        }
+        INTRA16X4_IN_INTER_HITS.with(|h| {
+            let mut v = h.get();
+            v[usize::from(!horz)] += 1;
+            v[2] += usize::from(has_chroma);
+            h.set(v);
+        });
+        return Ok(());
+    }
     let (size_group, tx_cat) = match (bw.min(bh), bw.max(bh)) {
         (8, 16) => (1usize, 1usize),
         (16, 32) => (2, 2),
@@ -8741,6 +8847,72 @@ fn decode_rect4_16(
             (mi_row0, mi_col0 + i)
         };
         let has_chroma = i % 2 == 1;
+        let (mode, uv, _tx) = decode_rect4_16_strip(
+            dec,
+            cdfs,
+            neighbours,
+            lmi,
+            horz,
+            has_chroma,
+            prev,
+            y,
+            u,
+            v,
+            enable_filter_intra,
+            allow_screen_content_tools,
+            base_q_idx,
+            tx_select,
+            reduced_tx_set,
+        )?;
+        if let Some(m) = uv {
+            last_uv_mode = m;
+        }
+        last_mode = mode;
+        prev = Some((lmi, mode));
+    }
+    // The coarse 16-px cell holds one entry for the whole 16x16: the last
+    // strip is what a block below (right) sees through it, the mi-exact maps
+    // above answering everything finer.
+    neighbours.above_mode[c] = last_mode;
+    neighbours.left_mode[r] = last_mode;
+    neighbours.above_uv_mode[c] = last_uv_mode;
+    neighbours.left_uv_mode[r] = last_uv_mode;
+    neighbours.above_side[c] = bw;
+    neighbours.left_side[r] = bh;
+    Ok(())
+}
+
+/// One 16x4 / 4x16 strip of a 16x16-level 1:4 partition, intra-coded --
+/// [`decode_rect4_16`]'s per-strip body, lifted (lane-intra16x4) so the INTER
+/// block path can decode a SINGLE intra strip of a partition whose other
+/// strips are inter. `prev` is the previous strip's `(mi, mode)` (the
+/// key-frame caller's coarse-cell stand-in; `None` on the inter path, where
+/// every strip publishes its own mi-exact mode). Returns
+/// `(y_mode, uv_predict_mode when this strip closes the 4:2:0 chroma pair)`.
+#[allow(clippy::too_many_arguments)]
+fn decode_rect4_16_strip(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    lmi: (usize, usize),
+    horz: bool,
+    has_chroma: bool,
+    prev: Option<((usize, usize), usize)>,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    enable_filter_intra: bool,
+    allow_screen_content_tools: bool,
+    base_q_idx: u8,
+    tx_select: bool,
+    reduced_tx_set: bool,
+) -> Result<(usize, Option<usize>, (usize, usize))> {
+    let (r, c) = (lmi.0 / (SUB / MI), lmi.1 / (SUB / MI));
+    let (bw, bh) = if horz { (16usize, 4usize) } else { (4, 16) };
+    let (mi_w, mi_h) = (bw / MI, bh / MI);
+    let scan: &[u16] = if horz { &SCAN_16X4 } else { &SCAN_4X16 };
+    let chroma_scan: &[u16] = if horz { &SCAN_8X4 } else { &SCAN_4X8 };
+    let mut last_uv_mode: Option<usize> = None;
         // `decode_block_rect4`'s own neighbour rule: the coarse 16-px cell
         // aliases all four strips onto one entry, so the mi-exact map wins and
         // the previous strip stands in on the split axis.
@@ -8814,7 +8986,16 @@ fn decode_rect4_16(
         // depth symbol is the 3-symbol `tx_size_cat1` -- not the 2-symbol
         // `cat0` a 4x8 leaf reads nor the `cat2` a 32x8 strip does.
         let depth = if tx_select {
-            let ctx = tx_size_context_rect(neighbours, lmi, bw, bh);
+            // lane-intra16x4: on an INTER frame `get_tx_size_context` reads the
+            // real `TXFM_CONTEXT` bands ([`tx_size_context_txfm_rect`], what
+            // the 2:1 intra-in-inter strip already does); the key frame's
+            // deblock-grid approximation is only right where those bands were
+            // never written.
+            let ctx = if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+                tx_size_context_txfm_rect(neighbours, lmi, bw, bh)
+            } else {
+                tx_size_context_rect(neighbours, lmi, bw, bh)
+            };
             dec.symbol(&mut cdfs.tx_size_cat1[ctx])
         } else {
             0
@@ -9156,7 +9337,7 @@ fn decode_rect4_16(
                     slot[2] = v_state;
                 }
             }
-            last_uv_mode = uv_predict_mode;
+            last_uv_mode = Some(uv_predict_mode);
         }
         if horz {
             RECT4_16_HORZ_HITS.with(|h| h.set(h.get() + 1));
@@ -9170,20 +9351,9 @@ fn decode_rect4_16(
         record_strip_palette(
             neighbours, lmi, bw, bh, pal_y_size, pal_y_colors, pal_uv_size, pal_uv_colors,
         );
-        last_mode = mode;
-        prev = Some((lmi, mode));
-    }
-    // The coarse 16-px cell holds one entry for the whole 16x16: the last
-    // strip is what a block below (right) sees through it, the mi-exact maps
-    // above answering everything finer.
-    neighbours.above_mode[c] = last_mode;
-    neighbours.left_mode[r] = last_mode;
-    neighbours.above_uv_mode[c] = last_uv_mode;
-    neighbours.left_uv_mode[r] = last_uv_mode;
-    neighbours.above_side[c] = bw;
-    neighbours.left_side[r] = bh;
-    Ok(())
+    Ok((mode, last_uv_mode, (tx_w, tx_h)))
 }
+
 
 /// Decodes one true `bw`x`bh` superblock-level `PARTITION_HORZ`/
 /// `PARTITION_VERT` strip (lane-sbpart r2, `bw, bh` one of `(64, 32)` /
@@ -21658,7 +21828,33 @@ fn decode_inter_block(
         // footprint), so an INTRA 16x4 / 4x16 strip inside a 1:4 partition is
         // refused by name rather than decoded with a 8x2 chroma transform
         // libaom never coded.
-        if write_w.min(write_h) < 8 {
+        // lane-intra16x4 r1: the strip DECODES (through the key frame's own
+        // per-strip body, [`decode_rect4_16_strip`]) only under
+        // `EC_INTRA16X4_DECODE`. It is not pixel-proven yet -- the r1 gate is
+        // RED (`a_real_aomenc_inter_sequence_with_intra_16x4_strips_...`,
+        // #[ignore]d with its measurement), so the refusal STAYS the default
+        // behaviour and the env switch is what the film probes use to measure
+        // the next wall. Class `refusal-lifted-without-a-gate`.
+        let strip16 = strip_chroma
+            .filter(|_| std::env::var_os("EC_INTRA16X4_DECODE").is_some())
+            .filter(|_| write_w.min(write_h) == 4 && write_w.max(write_h) == 16)
+            .map(|s| (s.horz, s.has_chroma));
+        if write_w.min(write_h) < 8 && strip16.is_none() {
+            if std::env::var_os("EC_INTRA16X4").is_some() {
+                let (idx, hc, prev_inter) = match strip_chroma {
+                    Some(s) => (
+                        if s.horz { rmi - s.pair_mi.0 } else { cmi - s.pair_mi.1 },
+                        s.has_chroma,
+                        s.prev.is_some(),
+                    ),
+                    None => (9, true, false),
+                };
+                eprintln!(
+                    "EC_INTRA16X4 w={write_w} h={write_h} pair_parity={idx} has_chroma={hc} prev_single_inter={prev_inter} skip={skip} mi={rmi},{cmi} tx_select={} scr={}",
+                    TX_SELECT_INTER.with(std::cell::Cell::get),
+                    allow_screen_content_tools,
+                );
+            }
             return Err(unsupported(
                 "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
             ));
@@ -21681,6 +21877,7 @@ fn decode_inter_block(
                 write_h,
                 skip,
                 allow_screen_content_tools,
+                strip16,
                 y,
                 u,
                 v,
