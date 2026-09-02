@@ -11441,6 +11441,166 @@ mod tests {
         );
     }
 
+    /// lane-troykf r1: Troy's key frames decoded with no refusal and WRONG
+    /// CHROMA (luma bit-exact at every one of ten seek points), from two
+    /// defects this gate pins:
+    ///
+    ///  1. a SKIPPED intra block whose `uv_mode` is `UV_CFL_PRED` still
+    ///     predicts with the CfL term -- libaom
+    ///     `predict_and_reconstruct_intra_block` (decodeframe.c) calls
+    ///     `av1_predict_intra_block_facade` unconditionally and only guards
+    ///     the residual on `mbmi->skip_txfm`. Three skip arms (the 16x16-level
+    ///     1:4 chroma pair and the two sub-8x8 4x4 groups) dropped it.
+    ///  2. the chroma intra-edge FILTER TYPE of a 1:4 pair comes from the
+    ///     CHROMA REFERENCE position (libaom `get_intra_edge_filter_type` ->
+    ///     `chroma_above_mbmi`/`chroma_left_mbmi`), not from the closing
+    ///     strip: at the closing strip the above cell is the pair's own first
+    ///     strip, the mi-exact UV map misses and the coarse fallback answers,
+    ///     which flipped `av1_use_intra_edge_upsample` (blk_wh 12 <= 16 for
+    ///     type 0, no upsample for type 1) and moved directional chroma by
+    ///     +-1..3.
+    ///
+    /// Recipe is a real `aomenc --sb-size=128 --cpu-used=0` (the shape Troy
+    /// uses) with 1:4 partitions and CfL on, both bit depths, and both
+    /// counters hard-asserted per compared attempt.
+    #[test]
+    fn a_real_aomenc_sb128_stream_whose_skipped_cfl_and_1to4_chroma_pairs_decode_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_sb128_stream_whose_skipped_cfl_and_1to4_chroma_pairs_decode_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let mut compared = 0usize;
+        let (width, height) = (256usize, 256usize);
+        for depth in [8usize, 10] {
+            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i",
+                    &format!(
+                        "mandelbrot=size={width}x{height},\
+                         noise=alls=20:allf=t+u:all_seed=7"
+                    ),
+                    "-pix_fmt", pix, "-strict", "-1", "-t", "1", "-vframes", "1",
+                    "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg fixture (depth={depth}): {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let encode = || {
+                let mut child = Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=52",
+                        "--cpu-used=0", "--threads=1", "--row-mt=0", "--sb-size=128",
+                        "--kf-max-dist=0", "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0", "--enable-1to4-partitions=1",
+                        "--enable-cfl-intra=1", "--enable-tx-size-search=0",
+                        "--enable-filter-intra=0", "--enable-intra-edge-filter=1",
+                        "--reduced-tx-type-set=1", "--min-partition-size=4",
+                        "--max-partition-size=32",
+                        &format!("--input-bit-depth={depth}"),
+                        &format!("--bit-depth={depth}"),
+                        "--obu", "-o", "-", "-",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture (depth={depth}): {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                out.stdout
+            };
+            let stream = encode();
+            assert_eq!(
+                stream,
+                encode(),
+                "{NAME}: aomenc output is not reproducible (depth={depth})"
+            );
+            let before = crate::decode::troy_chroma_counters();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME}: decode failed (depth={depth}): {msg}"
+                    );
+                    eprintln!("{NAME}: depth={depth} arm refused (not compared): {msg}");
+                    continue;
+                }
+            };
+            compared += 1;
+            // Counters read only on an attempt that decoded AND is compared.
+            let after = crate::decode::troy_chroma_counters();
+            let (skip_cfl, dir_pairs) = (after.0 - before.0, after.1 - before.1);
+            let ffmpeg_frames = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames.len())
+            };
+            assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma (depth={depth})");
+                assert_eq!(
+                    got.u, want.u,
+                    "{NAME} frame {i} U (depth={depth}, {skip_cfl} skipped-CfL blocks, \
+                     {dir_pairs} directional 1:4 chroma pairs)"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{NAME} frame {i} V (depth={depth}, {skip_cfl} skipped-CfL blocks, \
+                     {dir_pairs} directional 1:4 chroma pairs)"
+                );
+            }
+            // Defect 1 (skipped `UV_CFL_PRED`) is NOT asserted here: 20 aomenc
+            // recipes (cq 40..63, 9 lavfi sources, min/max-partition 4..64,
+            // both `--sb-size=128` and 64) never made the encoder pick a
+            // skipped 1:4 / sub-8x8 CfL block, so an assert would only ever
+            // fire on his real film. Its evidence is Troy's own key frames
+            // (lanes/troykf-r1.report.md): ss=2700 went 499 wrong chroma
+            // samples -> 0 on this fix alone. The count is printed so a future
+            // recipe that does reach it is visible immediately.
+            assert!(
+                dir_pairs > 0,
+                "{NAME}: no directional 1:4 chroma pair decoded (depth={depth}) -- defect 2 \
+                 is not exercised"
+            );
+            eprintln!(
+                "{NAME}: pixel-exact at {depth}-bit over {} frames, skipped_cfl={skip_cfl} \
+                 directional_1to4_chroma_pairs={dir_pairs}",
+                frames.len()
+            );
+        }
+        assert!(
+            compared > 0,
+            "{NAME}: every arm refused -- the gate compared no pixels at all"
+        );
+    }
+
     /// lane-ab16 r1: real `aomenc --enable-ab-partitions=1` streams whose
     /// 16x16 blocks are split T-shaped (`PARTITION_HORZ_A`/`_HORZ_B`/
     /// `_VERT_A`/`_VERT_B`: two 8x8 squares plus one 16x8/8x16 strip), the
