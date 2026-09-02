@@ -1726,6 +1726,32 @@ thread_local! {
     static OBMC_HITS_8: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-interp3 r1: how many inter blocks read a SWITCHABLE `interp_filter`
+// pair whose two directions differ (`enable_dual_filter` only -- with dual
+// filter off both directions take the single symbol, so this can never fire).
+// A gate asserting it proves the stream really carries dual-filter blocks.
+thread_local! {
+    static DUAL_FILTER_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// lane-interp3 r1: how many COMPOUND 8x8 leaves read their own
+// `read_mb_interp_filter` symbol(s) -- the read this round added (the leaf
+// used to skip it entirely, losing a symbol and stamping the `[3, 3]`
+// no-filter sentinel that made a neighbouring OBMC block panic).
+thread_local! {
+    static COMPOUND8_FILTER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DUAL_FILTER_DIFF_HITS`].
+pub(crate) fn dual_filter_diff_hits() -> usize {
+    DUAL_FILTER_DIFF_HITS.with(|c| c.get())
+}
+
+/// Current value of [`COMPOUND8_FILTER_HITS`].
+pub(crate) fn compound8_filter_hits() -> usize {
+    COMPOUND8_FILTER_HITS.with(|c| c.get())
+}
+
 // lane-warp round 1: how many blocks resolved `motion_mode_allowed` to
 // `WARPED_CAUSAL`-eligible (3-symbol read, `num_proj_ref >= 1` under
 // `allow_warped_motion`) AND the symbol actually decoded to `WARPED_CAUSAL`
@@ -14857,6 +14883,9 @@ fn resolve_interp_filter(
     } else {
         sym0
     };
+    if enable_dual_filter && sym0 != sym1 {
+        DUAL_FILTER_DIFF_HITS.with(|c| c.set(c.get() + 1));
+    }
     (
         mc::InterpFilterKind::from_switchable_symbol(sym1 as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym0 as usize),
@@ -15516,14 +15545,25 @@ fn obmc_mask(len: usize) -> &'static [u8] {
 fn neighbour_filter(
     interp_fixed: Option<mc::InterpFilterKind>,
     sym: [u8; 2],
-) -> (mc::InterpFilterKind, mc::InterpFilterKind) {
+) -> Result<(mc::InterpFilterKind, mc::InterpFilterKind)> {
     if let Some(kind) = interp_fixed {
-        return (kind, kind);
+        return Ok((kind, kind));
     }
-    (
+    // lane-interp3 r1: the `[3, 3]` sentinel reaching here is a DEFECT in
+    // whatever path recorded the neighbour (an inter block that never stored
+    // its own switchable symbols), and it used to abort the process through
+    // `from_switchable_symbol`'s panic. A decoder must never crash on a real
+    // stream: it stops by name instead, so the frame is refused and the
+    // stream is pinned like every other unsupported case.
+    if sym[0] > 2 || sym[1] > 2 {
+        return Err(unsupported(
+            "an OBMC neighbour whose interp filter was never recorded (no switchable symbol for that block)",
+        ));
+    }
+    Ok((
         mc::InterpFilterKind::from_switchable_symbol(sym[1] as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym[0] as usize),
-    )
+    ))
 }
 
 /// One neighbour's own re-prediction over a `w`x`h` region, MC'd fresh
@@ -15801,7 +15841,7 @@ fn obmc_blend(
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.above_filter[mi_col + off4],
-        );
+        )?;
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
@@ -15820,7 +15860,7 @@ fn obmc_blend(
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.left_filter[mi_row + off4],
-        );
+        )?;
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
@@ -19303,6 +19343,58 @@ fn decode_inter_block8(
                     );
                 }
 
+                // lane-interp3 r1: `read_mb_interp_filter` (libaom
+                // `decodemv.c` 1575, the tail of
+                // `read_inter_block_mode_info`) runs for EVERY inter block,
+                // compound included, right AFTER `read_compound_type` -- this
+                // leaf read no filter symbol at all, so a SWITCHABLE-filter
+                // stream lost one symbol (two under `enable_dual_filter`) at
+                // every compound 8x8 leaf, and the leaf recorded the `[3, 3]`
+                // "no filter" sentinel, which made a neighbouring OBMC block's
+                // `neighbour_filter` PANIC instead of blending.
+                // `av1_is_interp_needed` suppression terms for this arm:
+                // `skip_mode`, and `is_nontrans_global_motion` (mode
+                // GLOBAL_GLOBALMV with BOTH refs' models non-TRANSLATION) --
+                // WARPED_CAUSAL cannot occur on a compound block.
+                let gm_nontrans_c = compound_mode == 6
+                    && global_motion[(ref0 - LAST_FRAME) as usize].model
+                        != ec_av1_syntax::WarpModel::Translation
+                    && global_motion[(ref1 - LAST_FRAME) as usize].model
+                        != ec_av1_syntax::WarpModel::Translation;
+                // spec `get_ref_filter_type`, keyed on this block's ref0 and
+                // matching EITHER of the neighbour's references -- same shape
+                // as [`decode_inter_block`]'s compound arm. Same corner-cut as
+                // this leaf's single-ref arm below: the context comes from the
+                // enclosing 16x16's coarse slot.
+                let above_filter_ctx = if neighbours.above_ref[cmi] == ref0
+                    || neighbours.above_ref1[cmi] == Some(ref0)
+                {
+                    neighbours.above_filter[cmi]
+                } else {
+                    [3, 3]
+                };
+                let left_filter_ctx = if neighbours.left_ref[rmi] == ref0
+                    || neighbours.left_ref1[rmi] == Some(ref0)
+                {
+                    neighbours.left_filter[rmi]
+                } else {
+                    [3, 3]
+                };
+                let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+                    dec,
+                    cdfs,
+                    interp_fixed,
+                    enable_dual_filter,
+                    gm_nontrans_c || skip_mode,
+                    above_filter_ctx,
+                    left_filter_ctx,
+                    true,
+                );
+                leaf_filter_syms = resolved_filter;
+                if interp_fixed.is_none() && !(gm_nontrans_c || skip_mode) {
+                    COMPOUND8_FILTER_HITS.with(|c| c.set(c.get() + 1));
+                }
+
                 let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
                 let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
                 let scale0 = mc::scale_factor(py0.width, frame_width);
@@ -19334,11 +19426,6 @@ fn decode_inter_block8(
                 }
                 mode_for_tx = 0;
 
-                // lane-av1comp corner-cut, matching this leaf's single-ref
-                // arm below (`mc::predict`'s own fixed-Regular default):
-                // `decode_inter_block8` never resolves a switchable filter,
-                // so both compound taps use `Regular` too.
-                use mc::InterpFilterKind::Regular;
                 let mut inter0_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py0.data,
@@ -19350,8 +19437,8 @@ fn decode_inter_block8(
                     scale0,
                     SIDE,
                     SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_y,
                 );
                 let mut inter1_y = vec![0i32; SIDE * SIDE];
@@ -19365,8 +19452,8 @@ fn decode_inter_block8(
                     scale1,
                     SIDE,
                     SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_y,
                 );
                 let mut pred_y = vec![0u16; SIDE * SIDE];
@@ -19398,8 +19485,8 @@ fn decode_inter_block8(
                     scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_u,
                 );
                 let mut inter1_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -19413,8 +19500,8 @@ fn decode_inter_block8(
                     scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_u,
                 );
                 let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
@@ -19444,8 +19531,8 @@ fn decode_inter_block8(
                     scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_v,
                 );
                 let mut inter1_v = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -19459,8 +19546,8 @@ fn decode_inter_block8(
                     scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_v,
                 );
                 let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
@@ -22841,6 +22928,30 @@ mod tests {
     /// always cleared to `None` by `record_inter`, so the next block's own
     /// `NeighbourRef::uni` -- and `comp_reference_type_ctx` downstream of it
     /// -- could never see a real compound neighbour).
+    /// lane-interp3 r1: a decoder must never abort the process on
+    /// stream-derived state. `neighbour_filter` used to feed the `[3, 3]`
+    /// "no filter recorded" sentinel straight into
+    /// `InterpFilterKind::from_switchable_symbol`, whose `panic!` ("...alphabet
+    /// is exactly 3 symbols") crashed on a real aomenc dual-filter + OBMC
+    /// stream. It now refuses by name; the real symbols still decode.
+    #[test]
+    fn an_obmc_neighbour_with_no_recorded_filter_refuses_instead_of_panicking() {
+        assert!(
+            neighbour_filter(None, [3, 3])
+                .unwrap_err()
+                .to_string()
+                .contains("an OBMC neighbour whose interp filter was never recorded"),
+            "the [3, 3] sentinel must refuse by name, never panic"
+        );
+        assert!(neighbour_filter(None, [3, 0]).is_err());
+        let (h, v) = neighbour_filter(None, [0, 2]).expect("real symbols decode");
+        assert_eq!(h, mc::InterpFilterKind::Sharp, "sym[1] is the horizontal kernel");
+        assert_eq!(v, mc::InterpFilterKind::Regular, "sym[0] is the vertical kernel");
+        let (h, v) = neighbour_filter(Some(mc::InterpFilterKind::Smooth), [3, 3])
+            .expect("a fixed-filter frame never reads a symbol");
+        assert_eq!((h, v), (mc::InterpFilterKind::Smooth, mc::InterpFilterKind::Smooth));
+    }
+
     #[test]
     fn record_compound_ctx_stamps_ref1_for_the_next_block_to_read() {
         let mut n = Neighbours::new(4, 4, 16, 16);
