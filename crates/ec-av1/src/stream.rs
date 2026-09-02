@@ -68,6 +68,18 @@ pub fn inter_rect_counters() -> (usize, usize, usize, usize, usize, usize) {
     )
 }
 
+/// lane-intra14 r1: INTRA-coded 1:4 strips decoded on the INTER block path
+/// (64x16, 16x64, 32x8, 8x32) -- the counters a recipe sweep needs from
+/// outside the crate.
+pub fn intra_rect4_in_inter_counters() -> (usize, usize, usize, usize) {
+    (
+        crate::decode::intra_rect4_strip_in_inter_hits(0),
+        crate::decode::intra_rect4_strip_in_inter_hits(1),
+        crate::decode::intra_rect4_strip_in_inter_hits(2),
+        crate::decode::intra_rect4_strip_in_inter_hits(3),
+    )
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -4567,6 +4579,294 @@ mod tests {
             shapes[0],
             shapes[1],
             shapes[2]
+        );
+    }
+
+    /// lane-intra14 r1's decisive gate: a real aomenc INTER sequence with
+    /// `--enable-1to4-partitions=1`, whose fast-zooming content makes aomenc
+    /// code INTRA blocks inside inter frames on 1:4 strip shapes (32x8/8x32 at
+    /// the 32 level, 64x16/16x64 at the superblock level). Every such block
+    /// was the named refusal "an intra-coded 1:4 (or other non-2:1) rect strip
+    /// on the inter block path" until this round; they now decode through the
+    /// same `decode_block_rect4` / `decode_block_rect64` readers the KEY FRAME
+    /// 1:4 paths already prove, with only the mode-info read switched to
+    /// `read_intra_block_mode_info` (libaom decodemv.c:1189).
+    ///
+    /// Hard-asserts `intra_rect4_strip_in_inter_hits` (0 = 64x16, 1 = 16x64,
+    /// 2 = 32x8, 3 = 8x32) summed over the attempts that were actually
+    /// pixel-compared, and every decode-order frame is compared. A decode that
+    /// succeeds is ALWAYS pixel-compared (class
+    /// [[gate-skips-on-its-own-failure]]); exhausting every attempt without a
+    /// counted strip is a FAILURE, never a SKIP.
+    #[test]
+    // MEASURED (r1, 40 gate attempts + 150 recipe-sweep attempts, see
+    // lanes/intra14-r1.report.md): on THIS tree every aomenc stream that
+    // carries an intra 1:4 strip inside an inter frame ALSO carries a
+    // non-skip INTER 2:1 rect strip / SB-level AB partition / sub-8 inter
+    // partition, each refused by name by another lane's surface before the
+    // frame completes -- so no attempt can be pixel-compared yet and this
+    // gate cannot pass. It is `#[ignore]`d rather than weakened; un-ignore
+    // it (and re-run) once the inter rect-leaf lane lands.
+    #[ignore = "blocked: every stream with an intra 1:4 strip also hits the inter rect-strip refusal"]
+    fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact() {
+        intra_rect4_in_inter_gate(8);
+    }
+
+    /// The 10-bit arm (both of the user's films are `yuv420p10le`).
+    #[test]
+    // MEASURED (r1, 40 gate attempts + 150 recipe-sweep attempts, see
+    // lanes/intra14-r1.report.md): on THIS tree every aomenc stream that
+    // carries an intra 1:4 strip inside an inter frame ALSO carries a
+    // non-skip INTER 2:1 rect strip / SB-level AB partition / sub-8 inter
+    // partition, each refused by name by another lane's surface before the
+    // frame completes -- so no attempt can be pixel-compared yet and this
+    // gate cannot pass. It is `#[ignore]`d rather than weakened; un-ignore
+    // it (and re-run) once the inter rect-leaf lane lands.
+    #[ignore = "blocked: every stream with an intra 1:4 strip also hits the inter rect-strip refusal"]
+    fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit() {
+        intra_rect4_in_inter_gate(10);
+    }
+
+    fn intra_rect4_in_inter_gate(bit_depth: u32) {
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 8usize);
+        let mut refusals: Vec<String> = Vec::new();
+        let mut uncounted_exact = 0u32;
+        let mut compared = 0u32;
+        let mut shapes = [0usize; 4];
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            // Same source class as the 2:1 sibling gate: a FAST mandelbrot
+            // zoom (`end_scale`/`end_pts`) so consecutive frames share almost
+            // no content and aomenc's RD codes blocks INTRA inside INTER
+            // frames, with `--kf-min-dist=1000` forbidding a new key frame.
+            let source = format!(
+                "mandelbrot=size={width}x{height}:start_scale={}:end_scale=0.004:end_pts=8:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-vf", "hue=s=0", "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    "-strict", "-1", "-t", "0.32", "-f", "yuv4mpegpipe", "-strict", "-1", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            // MEASURED (r1, 40 attempts): `--cpu-used=0` makes aomenc pick
+            // 128x128 superblocks on this frame size, which decode_stream
+            // refuses by name, so the preset sweep starts at 1.
+            let cpu = format!("--cpu-used={}", 1 + attempt % 4);
+            // The higher the quantiser the more 1:4 intra strips inside inter
+            // frames, so the sweep walks cq 63 first.
+            let cq = format!("--cq-level={}", [63u32, 55, 45, 35][(attempt / 4) as usize % 4]);
+            let mut child = Command::new(aomenc_path())
+                .args(depth_args)
+                .arg(&cpu)
+                .arg(&cq)
+                .args([
+                    // Every flag spelled exactly once (class
+                    // [[aomenc-last-flag-wins]]). These are what the gate is
+                    // about: 1:4 partitions ON, min size 16 so the 16x16-level
+                    // 1:4 (refused elsewhere) is out of reach.
+                    "--enable-rect-partitions=1",
+                    "--enable-1to4-partitions=1",
+                    // MEASURED (r1): at `--min-partition-size=16` aomenc codes
+                    // 16x16-level 1:4 partitions (16x4/4x16 strips), which the
+                    // inter partition path refuses by name (another lane's
+                    // surface) in 12/40 attempts. 32 keeps this gate's two
+                    // reachable levels -- the 32-level 32x8/8x32 and the
+                    // superblock-level 64x16/16x64 -- and nothing else.
+                    "--min-partition-size=32",
+                    "--max-partition-size=64",
+                    // MEASURED (r1): with tx-size search ON, 8/40 attempts stop
+                    // at the 2:1 strip's own split-tx refusal (merge-cross-product,
+                    // another lane's surface) before a 1:4 strip is reached.
+                    "--enable-tx-size-search=0",
+                    "--enable-filter-intra=1",
+                    "--enable-intra-edge-filter=1",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-min-dist=1000",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    // Ledger dead-end (lane-r14): a NEW gate spelling
+                    // `--enable-cfl-intra=1` retires that tool from
+                    // `NEVER_EXERCISED_8BIT` on the flag alone while no CfL
+                    // hit counter exists to assert -- so it stays 0 here.
+                    // Palette stays 0 for the same class of reason: this arm
+                    // refuses a screen-content frame whole, so a palette flag
+                    // would buy no coverage.
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before: Vec<usize> =
+                (0..4).map(decode::intra_rect4_strip_in_inter_hits).collect();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "intra-1:4-in-inter decode failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed} {cpu} {cq}: {msg}"));
+                    continue;
+                }
+            };
+            let delta: Vec<usize> = (0..4)
+                .map(|k| decode::intra_rect4_strip_in_inter_hits(k) - before[k])
+                .collect();
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            eprintln!(
+                "intra14 gate {bit_depth}-bit seed={seed} {cpu} {cq}: intra 1:4 strips in inter \
+                 frames 64x16={} 16x64={} 32x8={} 8x32={}",
+                delta[0], delta[1], delta[2], delta[3]
+            );
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                for (plane, (g, w)) in [
+                    ("Y", (&got.y, &want.y)),
+                    ("U", (&got.u, &want.u)),
+                    ("V", (&got.v, &want.v)),
+                ] {
+                    let stride = if plane == "Y" { width } else { width / 2 };
+                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                        let maxd = g
+                            .iter()
+                            .zip(w.iter())
+                            .map(|(a, b)| i32::from(*a).abs_diff(i32::from(*b)))
+                            .max()
+                            .unwrap_or(0);
+                        eprintln!(
+                            "intra14 gate {bit_depth}-bit seed={seed}: frame {i} {plane} first \
+                             diff at ({}, {}) got {} want {} ({} samples differ, max |d|={maxd})",
+                            at % stride,
+                            at / stride,
+                            g[at],
+                            w[at],
+                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
+                        );
+                    }
+                    assert_eq!(g, w, "{plane} vs ffmpeg (seed {seed}, frame {i})");
+                }
+            }
+            compared += 1;
+            if delta.iter().all(|d| *d == 0) {
+                uncounted_exact += 1;
+                refusals.push(format!(
+                    "seed {seed} {cpu} {cq}: decoded and pixel-compared, but no intra 1:4 strip on \
+                     the inter path"
+                ));
+            }
+            for k in 0..4 {
+                shapes[k] += delta[k];
+            }
+            // Both LEVELS (32 and 64) is the bar; orientation is whichever the
+            // encoder picks.
+            if shapes[0] + shapes[1] > 0 && shapes[2] + shapes[3] > 0 {
+                break;
+            }
+        }
+        gate_buckets(
+            NAME,
+            compared - uncounted_exact,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
+        eprintln!(
+            "{NAME} ({bit_depth}-bit): compared {compared} streams, intra 1:4 strips in inter \
+             frames: 64x16={} 16x64={} 32x8={} 8x32={}; refusals:\n{}",
+            shapes[0],
+            shapes[1],
+            shapes[2],
+            shapes[3],
+            refusals.join("\n")
+        );
+        assert!(
+            compared > 0,
+            "{NAME} ({bit_depth}-bit): every attempt hit a named refusal -- nothing was \
+             pixel-compared:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            shapes[2] + shapes[3] > 0,
+            "{NAME} ({bit_depth}-bit): no 32-level intra 1:4 strip (32x8/8x32) fired over \
+             {compared} compared streams (64x16={} 16x64={} 32x8={} 8x32={})",
+            shapes[0],
+            shapes[1],
+            shapes[2],
+            shapes[3]
         );
     }
 
