@@ -18384,17 +18384,11 @@ mod tests {
     /// films are 10-bit) with `tx-size-search=0` (TX_MODE_LARGEST, the block's
     /// four TX_64X64 units come straight from `max_txsize_rect_lookup`) and an
     /// 8-bit `tx-size-search=1` arm (the var-tx tree at 128).
+    // lane-sb128c r3: green. `--min-partition-size=32` let the RD search reach
+    // 16x16-level AB / SB-level AB shapes that other lanes still refuse (two of
+    // the three arms stopped there, measured); at 64 every arm decodes and the
+    // 128 root still resolves NONE.
     #[test]
-    // lane-sb128c r1 leaves this gate RED: the recipe really fires the shape
-    // (`partition_w128 value=0` four times, traced), the key frame alone
-    // decodes, but the 8-frame stream stops on "a split intra strip whose
-    // transform unit is 32x64" -- an intra rect strip aomenc cannot have coded
-    // with `--enable-rect-partitions=0`, so our own 128 inter block desyncs
-    // first (class refusal-from-own-desync). r2 owns the range ladder.
-    #[ignore = "lane-sb128c r2: the 128 inter NONE block is now in sync (the uv_mode alphabet fix); \
-                 this stream also carries ONE intra-coded 128x128 block inside an inter frame \
-                 (aomdec EC_PART_VAL mi_row=32 mi_col=32 bsize=15 value=0 with no EC_MODE), which \
-                 is still refused by name -- see lanes/sb128c-r2.report.md"]
     fn a_real_aomenc_inter_128x128_none_root_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_inter_128x128_none_root_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
@@ -18403,6 +18397,7 @@ mod tests {
             return;
         }
         let (width, height) = (256usize, 256usize);
+        let mut intra128_total = 0usize;
         for (ten_bit, tx_search, seed) in [(false, false, 61u32), (true, false, 61), (false, true, 62)] {
             let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
             let y4m = Command::new("ffmpeg")
@@ -18446,7 +18441,7 @@ mod tests {
                 "--row-mt=0",
                 "--sb-size=128",
                 "--max-partition-size=128",
-                "--min-partition-size=32",
+                "--min-partition-size=64",
                 "--enable-rect-partitions=0",
                 "--enable-ab-partitions=0",
                 "--enable-1to4-partitions=0",
@@ -18508,15 +18503,18 @@ mod tests {
             let before = (
                 crate::decode::inter_sb128_none_hits(),
                 crate::decode::chroma_split_tx_hits(),
+                crate::decode::intra_128_in_inter_hits(),
             );
             let (frames, hidden) = decode_all_frames_vs_oracle(
                 &stream,
                 &format!("sb128c-inter-none-{}-{}", if ten_bit { 10 } else { 8 }, tx_search),
             );
-            let (none128, chroma_units) = (
+            let (none128, chroma_units, intra128) = (
                 crate::decode::inter_sb128_none_hits() - before.0,
                 crate::decode::chroma_split_tx_hits() - before.1,
+                crate::decode::intra_128_in_inter_hits() - before.2,
             );
+            intra128_total += intra128;
             assert!(
                 frames >= 6,
                 "{NAME} ({pix} tx_search={tx_search}): only {frames} decode-order frames"
@@ -18528,9 +18526,15 @@ mod tests {
             );
             eprintln!(
                 "{NAME} ({pix} tx_search={tx_search}): {frames} decode-order frames pixel-exact \
-                 ({hidden} hidden), inter_sb128_none_hits={none128} chroma_units={chroma_units}"
+                 ({hidden} hidden), inter_sb128_none_hits={none128} chroma_units={chroma_units} \
+                 intra_128_in_inter={intra128}"
             );
         }
+        assert!(
+            intra128_total >= 1,
+            "{NAME}: no INTRA-coded 128x128 block inside an inter frame across the three arms -- \
+             the refusal this round lifted is no longer exercised"
+        );
     }
 
     /// lane-sbpart r2: a real `aomenc` stream whose superblock-level

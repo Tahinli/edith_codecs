@@ -43,7 +43,6 @@ const REFUSALS: &[&str] = &[
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
     "a 128x128 superblock HORZ/VERT or AB partition (only SPLIT and NONE are decoded at the 128 root)",
-    "an INTRA-coded 128x128 block inside an inter frame (only the inter half of a 128x128 root is decoded here)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "a palette block on a HORZ/VERT intra strip below 16x16 (reconstruction not ported)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
