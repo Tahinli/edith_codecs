@@ -68,6 +68,12 @@ fn main() {
             "inter_edge_strip: h64={} v64={} h32={} v32={} h16={} v16={}",
             es[0], es[1], es[2], es[3], es[4], es[5]
         );
+        // lane-sbab r1: the superblock-level inter AB arms.
+        let sbab = ec_av1::decode::sb_ab_inter_hits_by_arm();
+        println!(
+            "inter_ab64: horz_a={} horz_b={} vert_a={} vert_b={}",
+            sbab[0], sbab[1], sbab[2], sbab[3]
+        );
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
