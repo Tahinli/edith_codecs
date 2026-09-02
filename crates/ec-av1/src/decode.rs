@@ -972,6 +972,28 @@ pub(crate) fn filter_intra_rect_hits() -> usize {
     FILTER_INTRA_RECT_HITS.with(|c| c.get())
 }
 
+// How many rectangular transform units actually coded coefficients through
+// [`read_coeffs_rect`] (`all_zero == 0`) -- lane-rect1d's measure that a gate
+// exercised the rect coefficient reader at all rather than passing on
+// all-skip blocks.
+thread_local! {
+    static RECT_COEFF_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECT_CLASS1_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_COEFF_TU_HITS`].
+pub(crate) fn rect_coeff_tu_hits() -> usize {
+    RECT_COEFF_TU_HITS.with(|c| c.get())
+}
+
+/// Rectangular transform units whose resolved `tx_type` is a 1D class
+/// (`V_DCT`/`H_DCT`) -- [`TX_CLASS1_HITS`]'s rect-only half, so a gate can
+/// pin that the 1D-class-on-a-RECT-transform path fired rather than settling
+/// for the square reader's own 1D types.
+pub(crate) fn rect_class1_hits() -> usize {
+    RECT_CLASS1_HITS.with(|c| c.get())
+}
+
 // As [`FILTER_INTRA_RECT_HITS`], counting only the strips BELOW 16x16
 // (8x16/16x8 leaves of a 16x16 HORZ/VERT partition, lane-fistrip r1) -- the
 // shapes whose `use_filter_intra` symbol had no CDF class before this round.
@@ -2777,6 +2799,7 @@ fn read_coeffs(
     let class = TxClass::of(tx_type);
     if class != TxClass::TwoD {
         TX_CLASS1_HITS.with(|c| c.set(c.get() + 1));
+        RECT_CLASS1_HITS.with(|c| c.set(c.get() + 1));
     }
     let eob = read_eob(dec, coding, class);
     if trace {
@@ -2927,6 +2950,7 @@ fn read_coeffs_rect(
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
+    RECT_COEFF_TU_HITS.with(|c| c.set(c.get() + 1));
     // lane-tx4x8: a 4x8/8x4 luma TU DOES carry a `tx_type` symbol (its set is
     // `EXT_TX_SET_DTT4_IDTX(_1DDCT)`, `tx_size_sqr_up == TX_8X8`), including
     // the `V_DCT`/`H_DCT` members whose 1D tx class needs its own scan and
@@ -5757,7 +5781,18 @@ fn decode_leaf_rect(
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
     let depth = if tx_select {
         let ctx = tx_size_context_rect(neighbours, leaf_mi, bw, bh);
-        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+        // lane-rect1d r1: the CATEGORY of this leaf is 1, not 2. libaom's
+        // `bsize_to_tx_size_cat` reads `bsize_to_tx_size_depth_table` and
+        // subtracts one: BLOCK_16X8/8X16 (and the 1:4 BLOCK_16X4/4X16 this
+        // function also decodes) sit at depth 2, so they read
+        // `tx_size_cdf[1]` -- the same table a 16x16 square block reads --
+        // while `tx_size_cat2` belongs to the 32-level shapes
+        // ([`decode_block_rect`]). Both tables carry three symbols, so the
+        // wrong one decodes a plausible depth from the wrong probabilities:
+        // the range diverges silently at the first such leaf and every later
+        // symbol in the tile is read from the wrong place (class
+        // `wrong-alphabet-same-value`, here same alphabet / wrong row).
+        dec.symbol(&mut cdfs.tx_size_cat1[ctx])
     } else {
         0
     };
