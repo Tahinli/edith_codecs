@@ -110,7 +110,14 @@ None added.
 
     $HOME/.cache/inter4-suite-r4.log
 
-See the tail of that log for the totals (systemd user unit, `cargo test -p ec-av1 --lib`).
+    test result: ok. 326 passed; 0 failed; 31 ignored; finished in 776.14s
+
+r3's 324 + the lane-interbis gate + this round's `size_group_wh` unit test; the 31
+ignored are unchanged (still including r2's 32x16/16x32 gate). Every sibling ran in
+it: `obmc*`, `16_level_rect_leaf`, `superblock_level_rect_partition`,
+`inter_sequence*`, `temporal_mv_candidates`, `refusal_inventory`, `gate_coverage`.
+
+EVIDENCE: $HOME/.cache/inter4-suite-r4.log | ec-av1 --lib under a systemd user unit at b0588e4 + this report | 326 passed / 0 failed / 31 ignored
 
 ## Film
 
