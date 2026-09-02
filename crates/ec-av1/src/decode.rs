@@ -1118,9 +1118,30 @@ pub(crate) fn palette_rect_hits() -> usize {
     PALETTE_RECT_HITS.with(|c| c.get())
 }
 
-// lane-palette2 r1: how many palette-Y blocks decoded with a split luma
-// transform (`tx_select && logical_tx != side`) -- proves the per-TU index-map
-// slicing actually ran, not just that the whole-block path stayed exact.
+// lane-palette2 r6: how many HORZ/VERT rect intra strips ran the
+// [`palette_bsize_ctx_wh`]-gated code path in [`read_intra_mode_rect`] --
+// i.e. `allow_screen_content_tools` was set and the strip's `bw`x`bh` was in
+// range, so `palette_y_mode`/`palette_uv_mode` were actually read (and, per
+// RD, almost always refused-on-use because the block doesn't end up USING a
+// palette -- see r5's report). This is the site the removed refusal
+// ("a HORZ/VERT intra strip in a screen-content frame") used to guard: it
+// fired here whether or not the block picked a palette, so this is the
+// counter that proves the case r5's narrower [`PALETTE_RECT_HITS`] almost
+// never observes.
+thread_local! {
+    static RECT_SCREEN_CONTENT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_SCREEN_CONTENT_HITS`].
+pub(crate) fn rect_screen_content_hits() -> usize {
+    RECT_SCREEN_CONTENT_HITS.with(|c| c.get())
+}
+
+// lane-palette2 r1: how many palette-Y luma transform UNITS decoded under a
+// split luma transform (`logical_tx != side`) -- proves the per-TU index-map
+// windowing actually ran, not just that the whole-block path stayed exact.
+// Counts units, not blocks (a 64x64 palette block split to 16x16 TUs adds 16);
+// first actually incremented in r7, when the refusal it guarded was lifted.
 thread_local! {
     static PALETTE_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1141,6 +1162,38 @@ thread_local! {
     /// sees stale state.
     static PALETTE_PRED: std::cell::RefCell<Option<Vec<u16>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+
+/// Arms the pending [`PALETTE_PRED`] override for the next `reconstruct`
+/// (`set`) / consumes it (`take`). Set and take MUST pair: a buffer armed at a
+/// site whose reconstruct never runs would be picked up by the NEXT block's
+/// reconstruct (class [[refusal-hides-a-defect]] / stale thread-local), so
+/// `EC_DEBUG_PAL=1` traces every arm and every consumption with its call site.
+#[track_caller]
+fn set_palette_pred(buf: Vec<u16>) {
+    if std::env::var_os("EC_DEBUG_PAL").is_some() {
+        let stale = PALETTE_PRED.with(|c| c.borrow().is_some());
+        eprintln!(
+            "PALSET len={} stale={stale} at {}",
+            buf.len(),
+            std::panic::Location::caller()
+        );
+    }
+    PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
+}
+
+#[track_caller]
+fn take_palette_pred() -> Option<Vec<u16>> {
+    let got = PALETTE_PRED.with(|c| c.borrow_mut().take());
+    if std::env::var_os("EC_DEBUG_PAL").is_some() {
+        eprintln!(
+            "PALTAKE len={:?} at {}",
+            got.as_ref().map(Vec::len),
+            std::panic::Location::caller()
+        );
+    }
+    got
 }
 
 thread_local! {
@@ -3302,12 +3355,36 @@ impl Neighbours {
     /// mirrors [`Self::record_rect`]'s loop shape, square-only (this lane's
     /// call sites are all square blocks).
     fn record_palette_y(&mut self, at: (usize, usize), side: usize, size: usize, colors: [u16; 8]) {
+        self.record_palette_y_rect(at, side, side, size, colors);
+    }
+
+    /// [`Self::record_palette_y`] with independent above (`w`)/left (`h`)
+    /// extents (lane-palette2 r4, mirrors [`Self::record_rect`] vs
+    /// [`Self::record`]): a true rect strip's above/left neighbour spans
+    /// differ.
+    fn record_palette_y_rect(
+        &mut self,
+        at: (usize, usize),
+        w: usize,
+        h: usize,
+        size: usize,
+        colors: [u16; 8],
+    ) {
         let (r, c) = at;
-        for cell in 0..side / SUB {
+        // `.max(1)`: a below-16px span covers no whole SUB cell, so the plain
+        // `w / SUB` loop was a NO-OP for every 16x8/8x16/8x8/4x4 leaf and the
+        // next block read a long-dead palette out of the above/left arrays
+        // (class [[cdf-row-held-constant]], lane-palette2 r8). libaom keeps
+        // `palette_size` per 4px mi cell; corner-cut: our grid is 16px, so a
+        // sub-16 leaf stamps its whole containing cell -- safe today because
+        // every sub-16 leaf path refuses palette outright (so it can only
+        // ever stamp `size == 0`, and its cell holds no palette sibling).
+        // Upgrade path: widen the palette arrays to mi granularity.
+        for cell in 0..(w / SUB).max(1) {
             self.above_palette_size[c + cell] = size;
             self.above_palette_colors[c + cell] = colors;
         }
-        for cell in 0..side / SUB {
+        for cell in 0..(h / SUB).max(1) {
             self.left_palette_size[r + cell] = size;
             self.left_palette_colors[r + cell] = colors;
         }
@@ -3316,12 +3393,22 @@ impl Neighbours {
     /// `av1_get_palette_mode_ctx` (pred_common.h:197): count of the above/left
     /// neighbours that are themselves a palette-Y block, plus
     /// `av1_get_palette_cache`'s own merged, ascending, deduplicated colour
-    /// cache (pred_common.c:73) -- the above neighbour is excluded at a
-    /// superblock's own top row (`r % 4 == 0` in [`SUB`]-grid units, 4 cells
-    /// per 64px SB, `MIN_SB_SIZE_LOG2`), the left neighbour never is.
+    /// cache (pred_common.c:73).
+    ///
+    /// The SB-top-row exclusion of the above neighbour (`row % 64` in
+    /// pred_common.c:76, `r % 4 == 0` here in [`SUB`]-grid units) belongs to
+    /// the CACHE ALONE -- `av1_get_palette_mode_ctx` reads plain
+    /// `xd->above_mbmi` with no such guard (lane-palette2 r7). Applying it to
+    /// the ctx too made every superblock in the frame's second SB row read
+    /// `palette_y_mode` off CDF row 0 while libaom used row 1, so a real
+    /// palette block decoded as "no palette" and the tile desynced from
+    /// there (class [[cdf-row-held-constant]]).
     fn palette_ctx_and_cache(&self, at: (usize, usize)) -> (usize, Vec<u16>) {
         let (r, c) = at;
         let above_ok = r % 4 != 0;
+        // `xd->above_mbmi` exists for every row but the tile's own first.
+        let above_is_palette =
+            r * (SUB / MI) > self.tile_row0_mi && self.above_palette_size[c] > 0;
         let (above_n, above_colors) = if above_ok && self.above_palette_size[c] > 0 {
             (self.above_palette_size[c], self.above_palette_colors[c])
         } else {
@@ -3338,7 +3425,7 @@ impl Neighbours {
         } else {
             (0, [0u16; 8])
         };
-        let ctx = usize::from(above_n > 0) + usize::from(left_n > 0);
+        let ctx = usize::from(above_is_palette) + usize::from(left_n > 0);
         let mut cache = Vec::with_capacity(16);
         let push_dedup = |cache: &mut Vec<u16>, v: u16| {
             if cache.last() != Some(&v) {
@@ -3374,12 +3461,28 @@ impl Neighbours {
     /// (U-channel) palette size/colours -- `size == 0` clears stale state the
     /// same way (lane-palette2 r1).
     fn record_palette_uv(&mut self, at: (usize, usize), side: usize, size: usize, colors: [u16; 8]) {
+        self.record_palette_uv_rect(at, side, side, size, colors);
+    }
+
+    /// [`Self::record_palette_uv`] with independent above (`w`)/left (`h`)
+    /// extents, in LUMA pixels (lane-palette2 r4, same convention as
+    /// [`Self::record_palette_y_rect`] -- the above/left grids are indexed at
+    /// luma resolution regardless of which plane the recorded state is for).
+    fn record_palette_uv_rect(
+        &mut self,
+        at: (usize, usize),
+        w: usize,
+        h: usize,
+        size: usize,
+        colors: [u16; 8],
+    ) {
         let (r, c) = at;
-        for cell in 0..side / SUB {
+        // See [`Self::record_palette_y_rect`] for the `.max(1)`.
+        for cell in 0..(w / SUB).max(1) {
             self.above_palette_uv_size[c + cell] = size;
             self.above_palette_uv_colors[c + cell] = colors;
         }
-        for cell in 0..side / SUB {
+        for cell in 0..(h / SUB).max(1) {
             self.left_palette_uv_size[r + cell] = size;
             self.left_palette_uv_colors[r + cell] = colors;
         }
@@ -4212,17 +4315,20 @@ fn palette_bsize_ctx(side: usize) -> Option<usize> {
 }
 
 /// [`palette_bsize_ctx`], generalised to a true `bw`x`bh` rect strip
-/// (lane-palette2 r1) -- the same `log2(bw*bh) - 6` formula, this decoder's
-/// square call sites are just `bw == bh`.
+/// (lane-palette2 r4) -- the same `log2(bw*bh) - 6` formula libaom's
+/// `num_pels_log2_lookup[bsize] - num_pels_log2_lookup[BLOCK_8X8]` computes
+/// for ANY bsize, not just the square ones a hand-picked table happened to
+/// enumerate before ([[cdf-row-held-constant]]: a table narrowed to a pinned
+/// row breaks the moment its indexing field moves off the diagonal, and a
+/// 64x32/32x64 superblock-level strip is exactly such a move). Every AV1
+/// block dimension is a power of two, so `bw*bh` always is too and
+/// `trailing_zeros` is `log2` exactly. `None` past `av1_allow_palette`'s own
+/// bound (`block_size_wide/high <= 64`, `sb_type >= BLOCK_8X8`).
 fn palette_bsize_ctx_wh(bw: usize, bh: usize) -> Option<usize> {
-    match (bw, bh) {
-        (8, 8) => Some(0),
-        (16, 16) => Some(2),
-        (32, 16) | (16, 32) => Some(3),
-        (32, 32) => Some(4),
-        (64, 64) => Some(6),
-        _ => None,
+    if !(8..=64).contains(&bw) || !(8..=64).contains(&bh) {
+        return None;
     }
+    Some(((bw * bh) as u32).trailing_zeros() as usize - 6)
 }
 
 /// A just-decoded palette-Y block's own size, base colours (only the first
@@ -4473,8 +4579,24 @@ fn decode_color_index_map(
     side: usize,
     uv: bool,
 ) -> Vec<u8> {
+    decode_color_index_map_wh(dec, cdfs, n, side, side, uv)
+}
+
+/// [`decode_color_index_map`], generalised to a true `bw`x`bh` rect strip
+/// (lane-palette2 r4): `decode_color_map_tokens`'s own wavefront diagonal
+/// (`row = i - j`, `col = j`) walked over `cols = bw`, `rows = bh`
+/// independently rather than one shared `side` -- the square call above is
+/// just `bw == bh`.
+fn decode_color_index_map_wh(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    n: usize,
+    bw: usize,
+    bh: usize,
+    uv: bool,
+) -> Vec<u8> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
-    let mut map = vec![0u8; side * side];
+    let mut map = vec![0u8; bw * bh];
     if trace {
         let (rng, _) = dec.debug_state();
         eprintln!("EC_PAL row=0 col=0 ctx=-1 n={n} rng={rng}");
@@ -4484,13 +4606,13 @@ fn decode_color_index_map(
         let (rng, _) = dec.debug_state();
         eprintln!("EC_PAL_VAL row=0 col=0 color_idx={} rng={rng}", map[0]);
     }
-    for i in 1..(2 * side - 1) {
-        let j_hi = i.min(side - 1);
-        let j_lo = i.saturating_sub(side - 1);
+    for i in 1..(bw + bh - 1) {
+        let j_hi = i.min(bw - 1);
+        let j_lo = i.saturating_sub(bh - 1);
         for j in (j_lo..=j_hi).rev() {
             let row = i - j;
             let col = j;
-            let (ctx, color_order) = palette_color_index_context(&map, side, row, col, n);
+            let (ctx, color_order) = palette_color_index_context(&map, bw, row, col, n);
             if trace {
                 let (rng, _) = dec.debug_state();
                 eprintln!("EC_PAL row={row} col={col} ctx={ctx} n={n} rng={rng}");
@@ -4500,7 +4622,7 @@ fn decode_color_index_map(
             } else {
                 dec.symbol(&mut cdfs.palette_y_color_index[n - 2][ctx][..=n])
             };
-            map[row * side + col] = color_order[symbol];
+            map[row * bw + col] = color_order[symbol];
             if trace {
                 let (rng, _) = dec.debug_state();
                 eprintln!("EC_PAL_VAL row={row} col={col} color_idx={symbol} rng={rng}");
@@ -4510,12 +4632,14 @@ fn decode_color_index_map(
     map
 }
 
-/// [`read_intra_mode`] for a true `bw`x`bh` rect strip (lane-intradisp r1):
-/// identical except the `use_filter_intra` size class comes from
-/// [`filter_intra_size_class_rect`] instead of the square-only
-/// [`filter_intra_size_class`] -- every other symbol this reads (`skip`,
-/// `y_mode`, `angle_delta`, `uv_mode`, `cfl_alphas`) is indexed by mode or
-/// neighbour state, never by block size.
+/// [`read_intra_mode`] for a true `bw`x`bh` rect strip (lane-intradisp r1,
+/// palette wired lane-palette2 r4): identical except the `use_filter_intra`
+/// size class comes from [`filter_intra_size_class_rect`] instead of the
+/// square-only [`filter_intra_size_class`], and the palette read (when
+/// `allow_screen_content_tools`) uses [`palette_bsize_ctx_wh`]/
+/// [`decode_color_index_map_wh`] instead of their square-only counterparts --
+/// every other symbol this reads (`skip`, `y_mode`, `angle_delta`, `uv_mode`,
+/// `cfl_alphas`) is indexed by mode or neighbour state, never by block size.
 #[allow(clippy::too_many_arguments)]
 fn read_intra_mode_rect(
     dec: &mut SymbolDecoder,
@@ -4528,6 +4652,11 @@ fn read_intra_mode_rect(
     enable_filter_intra: bool,
     skip_ctx: usize,
     allow_screen_content_tools: bool,
+    // As [`read_intra_mode`]'s own `palette`/`palette_uv_cache` params:
+    // `Some((palette_mode_ctx, color_cache))` reconstructs a real palette-Y
+    // block here, `None` still reads (and refuses on use) the symbol at ctx 0.
+    palette: Option<(usize, &[u16])>,
+    palette_uv_cache: &[u16],
     mi_r: usize,
     mi_c: usize,
 ) -> Result<(
@@ -4538,17 +4667,9 @@ fn read_intra_mode_rect(
     i32,
     Option<(i32, i32)>,
     Option<usize>,
+    Option<PaletteY>,
+    Option<PaletteUv>,
 )> {
-    // lane-screen consumes palette/intrabc syntax in the SQUARE reader only
-    // (`palette_bsize_ctx` is keyed on a single side). A rect strip in a
-    // screen-content frame would therefore skip symbols the encoder wrote and
-    // desync the tile, so refuse it by name rather than decode it wrong.
-    if allow_screen_content_tools {
-        return Err(unsupported(
-            "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
-             is consumed for square blocks only)",
-        ));
-    }
     let ec_istep = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
     macro_rules! istep {
         ($name:literal, $val:expr) => {
@@ -4613,6 +4734,42 @@ fn read_intra_mode_rect(
     if angle_delta_uv != 0 {
         UV_ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
     }
+    // `read_palette_mode_info` (spec 5.11.13), rect-generalised
+    // (lane-palette2 r4): same bsize-ctx-gated read as [`read_intra_mode`],
+    // just keyed by [`palette_bsize_ctx_wh`] instead of the square-only
+    // [`palette_bsize_ctx`]. Order matches spec/libaom exactly: mode/size/
+    // colours only here, the colour-index maps deferred past `filter_intra`
+    // (see [`read_intra_mode`]'s own comment on why -- `av1_visit_palette`
+    // runs from the caller, after the whole mode-info read).
+    let mut palette_y_pending: Option<(usize, [u16; 8])> = None;
+    let mut palette_uv_pending: Option<(usize, [u16; 8], [u16; 8])> = None;
+    if allow_screen_content_tools
+        && let Some(bsize_ctx) = palette_bsize_ctx_wh(bw, bh)
+    {
+        // r6: this is the exact site the removed blanket refusal used to
+        // guard -- reached for EVERY rect strip in a screen-content frame,
+        // independent of whether the block ends up using a palette.
+        RECT_SCREEN_CONTENT_HITS.with(|c| c.set(c.get() + 1));
+        let (mode_ctx, cache) = palette.unwrap_or((0, &[]));
+        let use_palette_y =
+            mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][mode_ctx]) != 0;
+        if use_palette_y {
+            if palette.is_none() {
+                return Err(unsupported(
+                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+                ));
+            }
+            let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
+            let colors = read_palette_colors_y(dec, n, cache);
+            palette_y_pending = Some((n, colors));
+        }
+        let palette_uv_mode_ctx = usize::from(use_palette_y);
+        if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[palette_uv_mode_ctx]) != 0 {
+            let n = 2 + dec.symbol(&mut cdfs.palette_uv_size[bsize_ctx]);
+            let (u_colors, v_colors) = read_palette_colors_uv(dec, n, palette_uv_cache);
+            palette_uv_pending = Some((n, u_colors, v_colors));
+        }
+    }
     let mut filter_intra = None;
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         let (rng, _) = dec.debug_state();
@@ -4623,8 +4780,11 @@ fn read_intra_mode_rect(
             filter_intra_size_class_rect(bw, bh)
         );
     }
+    // As the square path: `av1_filter_intra_allowed` excludes a palette-Y
+    // block (reconintra.h:77), so no `use_filter_intra` symbol exists there.
     if mode == DC_PRED
         && enable_filter_intra
+        && palette_y_pending.is_none()
         && let Some(class) = filter_intra_size_class_rect(bw, bh)
     {
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
@@ -4637,6 +4797,19 @@ fn read_intra_mode_rect(
             filter_intra = Some(fi_mode);
         }
     }
+    // `av1_visit_palette`: plane 0 (Y) then plane 1 (chroma, shared U/V map),
+    // same order as [`read_intra_mode`]'s own square path.
+    let palette_y = palette_y_pending.map(|(n, colors)| {
+        let map = decode_color_index_map_wh(dec, cdfs, n, bw, bh, false);
+        PALETTE_HITS.with(|c| c.set(c.get() + 1));
+        PALETTE_RECT_HITS.with(|c| c.set(c.get() + 1));
+        PaletteY { size: n, colors, map }
+    });
+    let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
+        let map = decode_color_index_map_wh(dec, cdfs, n, bw / 2, bh / 2, true);
+        PALETTE_UV_HITS.with(|c| c.set(c.get() + 1));
+        PaletteUv { size: n, u_colors, v_colors, map }
+    });
     Ok((
         skip,
         mode,
@@ -4645,6 +4818,8 @@ fn read_intra_mode_rect(
         angle_delta_uv,
         alpha,
         filter_intra,
+        palette_y,
+        palette_uv,
     ))
 }
 
@@ -4700,6 +4875,15 @@ struct RectStripModes {
     filter_intra: Option<usize>,
     smooth_neighbor: bool,
     smooth_neighbor_uv: bool,
+    /// lane-palette2 r9: the strip's palette-Y prediction (`bw`x`bh`, already
+    /// mapped through the colour table), sliced per transform unit below --
+    /// palette prediction reads no edge pixels, so a unit's slice of the
+    /// whole-block map IS its prediction. Without this a palette strip whose
+    /// transform splits predicted DC and came out flat grey while the entropy
+    /// stream stayed in sync (the coefficients are read either way).
+    palette_y: Option<Vec<u16>>,
+    /// As `palette_y`, for the un-split chroma transform (U, V).
+    palette_uv: Option<(Vec<u16>, Vec<u16>)>,
 }
 
 /// Decodes the planes of one `bw`x`bh` HORZ/VERT intra strip whose luma
@@ -4795,20 +4979,17 @@ fn decode_rect_split(
             //    (`row_off + tx_high < plane_bh`) they are the left
             //    neighbour's, already reconstructed; the last row falls back
             //    to the block-level answer.
-            let tu_reach = Reach {
-                above_right: if col_off + tx < bw {
-                    true
-                } else {
-                    row_off == 0 && block_reach.above_right
-                },
-                below_left: if col_off > 0 {
-                    false
-                } else if row_off + tx < bh {
-                    true
-                } else {
-                    block_reach.below_left
-                },
-            };
+            let tu_reach = Reach::of_tu(bw, bh, col_off, row_off, tx, block_reach);
+            // The unit's own window on the block's palette prediction.
+            if let Some(buf) = &m.palette_y {
+                let tu_buf: Vec<u16> = (0..tx)
+                    .flat_map(|i| {
+                        let base = (row_off + i) * bw + col_off;
+                        buf[base..base + tx].iter().copied()
+                    })
+                    .collect();
+                set_palette_pred(tu_buf);
+            }
             if m.skip {
                 y.reconstruct(
                     tu_px,
@@ -4860,10 +5041,16 @@ fn decode_rect_split(
     let reach = block_reach;
     let (u_grid, v_grid) = if m.skip {
         let zero = vec![0i32; chroma_w * chroma_h];
+        if let Some((ub, _)) = &m.palette_uv {
+            set_palette_pred(ub.clone());
+        }
         u.reconstruct_rect(
             cpx, cpy, chroma_w, chroma_h, m.uv_predict_mode, m.angle_delta_uv, reach, &zero,
             m.alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, m.smooth_neighbor_uv,
         );
+        if let Some((_, vb)) = &m.palette_uv {
+            set_palette_pred(vb.clone());
+        }
         v.reconstruct_rect(
             cpx, cpy, chroma_w, chroma_h, m.uv_predict_mode, m.angle_delta_uv, reach, &zero,
             m.alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, m.smooth_neighbor_uv,
@@ -4917,6 +5104,10 @@ fn decode_rect_split(
                 .zip(ac.as_deref())
                 .map(|((au, av), ac)| (if plane_idx == 1 { au } else { av }, ac));
             let plane = if plane_idx == 1 { &mut *u } else { &mut *v };
+            if let Some((ub, vb)) = &m.palette_uv {
+                let buf = if plane_idx == 1 { ub } else { vb };
+                set_palette_pred(buf.clone());
+            }
             plane.reconstruct_rect(
                 cpx,
                 cpy,
@@ -4977,7 +5168,9 @@ fn decode_block_rect(
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
     let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
+    let palette_uv_cache = neighbours.palette_uv_cache(at);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode_rect(
             dec,
             cdfs,
@@ -4989,6 +5182,8 @@ fn decode_block_rect(
             enable_filter_intra,
             neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
             allow_screen_content_tools,
+            Some((palette_ctx, &palette_cache)),
+            &palette_uv_cache,
             r * (SUB / MI),
             c * (SUB / MI),
         )?;
@@ -5053,10 +5248,34 @@ fn decode_block_rect(
             filter_intra,
             smooth_neighbor,
             smooth_neighbor_uv,
+            palette_y: palette_y
+                .as_ref()
+                .map(|p| p.map.iter().map(|&i| p.colors[i as usize]).collect()),
+            palette_uv: palette_uv.as_ref().map(|p| {
+                (
+                    p.map.iter().map(|&i| p.u_colors[i as usize]).collect(),
+                    p.map.iter().map(|&i| p.v_colors[i as usize]).collect(),
+                )
+            }),
         };
+        if palette_y.is_some() || palette_uv.is_some() {
+            PALETTE_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+        }
         decode_rect_split(
             dec, cdfs, neighbours, at, bw, bh, tx, &modes, y, u, v, base_q_idx, reduced_tx_set,
         )?;
+        // This early return skips this fn's own tail, so the palette
+        // neighbour state has to be stamped HERE too: without it a split-tx
+        // strip left the above/left palette arrays holding a DEAD block's
+        // colours, and the next block's colour cache
+        // ([`Neighbours::palette_uv_cache`]) then hit a cached entry with the
+        // wrong VALUE -- same bit count, so the entropy stream stayed in sync
+        // and only those pixels were wrong (lane-palette2 r10).
+        let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
+        neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+        let (puv_size, puv_colors) =
+            palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
+        neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
         RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
         return Ok(());
     }
@@ -5072,6 +5291,19 @@ fn decode_block_rect(
             skip as i32
         );
     }
+    // As [`decode_block`]'s own [`PALETTE_PRED`] wiring: a palette-Y/UV
+    // block's prediction is the reconstructed colour-index map, set fresh
+    // right before each `reconstruct_rect` call below (lane-palette2 r4).
+    if let Some(ref pyv) = palette_y {
+        let buf: Vec<u16> = pyv.map.iter().map(|&idx| pyv.colors[idx as usize]).collect();
+        set_palette_pred(buf);
+    }
+    let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|puv| {
+        (
+            puv.map.iter().map(|&idx| puv.u_colors[idx as usize]).collect(),
+            puv.map.iter().map(|&idx| puv.v_colors[idx as usize]).collect(),
+        )
+    });
     if skip {
         y.reconstruct_rect(
             px,
@@ -5087,6 +5319,9 @@ fn decode_block_rect(
             smooth_neighbor,
         );
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        if let Some((ub, _)) = &palette_uv_bufs {
+            set_palette_pred(ub.clone());
+        }
         u.reconstruct_rect(
             cpx,
             cpy,
@@ -5100,6 +5335,9 @@ fn decode_block_rect(
             None,
             smooth_neighbor_uv,
         );
+        if let Some((_, vb)) = &palette_uv_bufs {
+            set_palette_pred(vb.clone());
+        }
         v.reconstruct_rect(
             cpx,
             cpy,
@@ -5211,6 +5449,9 @@ fn decode_block_rect(
             smooth_neighbor,
         );
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        if let Some((ub, _)) = &palette_uv_bufs {
+            set_palette_pred(ub.clone());
+        }
         let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
         let mut u_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
@@ -5251,6 +5492,9 @@ fn decode_block_rect(
             None,
             smooth_neighbor_uv,
         );
+        if let Some((_, vb)) = &palette_uv_bufs {
+            set_palette_pred(vb.clone());
+        }
         let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
         let mut v_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
@@ -5295,6 +5539,11 @@ fn decode_block_rect(
         RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
         }
     }
+    let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
+    neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+    let (puv_size, puv_colors) =
+        palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
+    neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
@@ -5374,7 +5623,16 @@ fn decode_leaf_rect(
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+    // The palette-Y mode CDF row is picked by the neighbours' palette use
+    // (`palette_ctx_and_cache`), so this sub-16x16 leaf must pass its own real
+    // ctx/cache -- reading `palette_y_mode` off row 0 when a neighbour did use
+    // a palette narrows the wrong interval and desyncs the tile even when the
+    // decoded bit is the same. The cell is the 16px-SUB cell containing the
+    // leaf (the palette neighbour arrays have no finer granularity).
+    let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(pal_at);
+    let palette_uv_cache = neighbours.palette_uv_cache(pal_at);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode_rect(
             dec,
             cdfs,
@@ -5386,9 +5644,19 @@ fn decode_leaf_rect(
             enable_filter_intra,
             neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
             allow_screen_content_tools,
+            Some((palette_ctx, &palette_cache)),
+            &palette_uv_cache,
             leaf_mi.0,
             leaf_mi.1,
         )?;
+    if palette_y.is_some() || palette_uv.is_some() {
+        // Symbols (mode/size/colours/index map) are all read above, so the
+        // tile stays in sync; only the *pixel* reconstruction of a palette on
+        // a below-16x16 strip is unported and ungated (lane-palette2 r7).
+        return Err(unsupported(
+            "a palette block on a HORZ/VERT intra strip below 16x16 (reconstruction not ported)",
+        ));
+    }
     if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
         eprintln!("  skip={skip} mode={mode} angle_delta_y={angle_delta_y} uv_mode={uv_mode}");
     }
@@ -5512,6 +5780,12 @@ fn decode_leaf_rect(
     neighbours.record_mi_rect(leaf_mi, bw, bh, &[luma_levels, u_levels, v_levels]);
     neighbours.fill_skip_grid_rect(leaf_mi, mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect(leaf_mi, mi_w, mi_h, bw as u8, bh as u8, 0);
+    // This leaf is necessarily non-palette (a palette one refused above), so
+    // it must CLEAR the above/left palette state over its own span -- without
+    // this the next block's `palette_y_mode` ctx and colour cache were read
+    // off whatever block last covered the cell (lane-palette2 r8).
+    neighbours.record_palette_y_rect(pal_at, bw, bh, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect(pal_at, bw, bh, 0, [0u16; 8]);
     // A rect leaf spans mi_w x mi_h, so its mode reaches several columns and
     // rows -- record the whole span, not one cell.
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, mi_w, mi_h, mode);
@@ -5569,21 +5843,42 @@ fn decode_block_rect4(
             left_mode = pmode;
         }
     }
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
-        read_intra_mode_rect(
-            dec,
-            cdfs,
-            above_mode,
-            left_mode,
-            true,
-            bw,
-            bh,
-            enable_filter_intra,
-            neighbours.skip_txfm_ctx(mi_r, mi_c),
-            allow_screen_content_tools,
-            mi_r,
-            mi_c,
-        )?;
+    let (
+        skip,
+        mode,
+        angle_delta_y,
+        uv_mode,
+        angle_delta_uv,
+        alpha,
+        filter_intra,
+        palette_y,
+        palette_uv,
+    ) = read_intra_mode_rect(
+        dec,
+        cdfs,
+        above_mode,
+        left_mode,
+        true,
+        bw,
+        bh,
+        enable_filter_intra,
+        neighbours.skip_txfm_ctx(mi_r, mi_c),
+        allow_screen_content_tools,
+        None,
+        &[],
+        mi_r,
+        mi_c,
+    )?;
+    // Merge of lane-palette2: `read_intra_mode_rect` now reads the palette
+    // syntax for every rect strip, but this 1:4 decoder has no palette
+    // reconstruction path (its caller never passes a cache). The symbols are
+    // still read, so the stream stays in sync; a strip that ACTUALLY uses a
+    // palette is refused rather than reconstructed wrong.
+    if palette_y.is_some() || palette_uv.is_some() {
+        return Err(unsupported(
+            "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
+        ));
+    }
     let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
@@ -5788,7 +6083,7 @@ fn decode_block_rect4(
         None,
         smooth_neighbor_uv,
     );
-    neighbours.record_mi_rect((mi_r, mi_c), bw, bh, &[luma_levels, u_levels, v_levels]);
+    neighbours.record_mi_rect((mi_r, mi_c), bw, bh, &[luma_levels.to_vec(), u_levels, v_levels]);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), mi_w, mi_h, bw as u8, bh as u8, 0);
     if bw > bh {
@@ -5836,7 +6131,9 @@ fn decode_block_rect64(
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
     let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
+    let palette_uv_cache = neighbours.palette_uv_cache(at);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode_rect(
             dec,
             cdfs,
@@ -5855,9 +6152,23 @@ fn decode_block_rect64(
             enable_filter_intra,
             neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
             allow_screen_content_tools,
+            Some((palette_ctx, &palette_cache)),
+            &palette_uv_cache,
             r * (SUB / MI),
             c * (SUB / MI),
         )?;
+    if (palette_y.is_some() || palette_uv.is_some()) && !skip {
+        // The luma coefficient path here is the corner-cropped 32x32 real
+        // transform embedded in a 64x32/32x64 grid ([`decode_block_rect64`]'s
+        // own doc comment) -- a real (non-skip) palette block's residual
+        // needs the plain, uncropped rect reader [`decode_block_rect`] already
+        // has, not this one's truncation. `skip` (no residual at all) is
+        // still supported below (lane-palette2 r4).
+        return Err(unsupported(
+            "a palette block with a real transform on a superblock-level HORZ/VERT \
+             strip (corner-cropped luma coefficients not ported for palette)",
+        ));
+    }
     let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
@@ -5917,10 +6228,31 @@ fn decode_block_rect64(
             filter_intra,
             smooth_neighbor,
             smooth_neighbor_uv,
+            palette_y: palette_y
+                .as_ref()
+                .map(|p| p.map.iter().map(|&i| p.colors[i as usize]).collect()),
+            palette_uv: palette_uv.as_ref().map(|p| {
+                (
+                    p.map.iter().map(|&i| p.u_colors[i as usize]).collect(),
+                    p.map.iter().map(|&i| p.v_colors[i as usize]).collect(),
+                )
+            }),
         };
+        if palette_y.is_some() || palette_uv.is_some() {
+            PALETTE_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+        }
         decode_rect_split(
             dec, cdfs, neighbours, at, bw, bh, tx, &modes, y, u, v, base_q_idx, reduced_tx_set,
         )?;
+        // Same early-return palette stamp as [`decode_block_rect`]'s split arm
+        // (lane-palette2 r10): this return skips the fn's own tail, so a
+        // split-tx superblock strip would otherwise leave the above/left
+        // palette arrays holding a dead block's colours.
+        let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
+        neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+        let (puv_size, puv_colors) =
+            palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
+        neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
         RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
         return Ok(());
     }
@@ -5928,6 +6260,16 @@ fn decode_block_rect64(
     let (cpx, cpy) = (px / 2, py / 2);
     let (chroma_w, chroma_h) = (bw / 2, bh / 2);
     let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+    if let Some(ref pyv) = palette_y {
+        let buf: Vec<u16> = pyv.map.iter().map(|&idx| pyv.colors[idx as usize]).collect();
+        set_palette_pred(buf);
+    }
+    let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|puv| {
+        (
+            puv.map.iter().map(|&idx| puv.u_colors[idx as usize]).collect(),
+            puv.map.iter().map(|&idx| puv.v_colors[idx as usize]).collect(),
+        )
+    });
     if skip {
         y.reconstruct_rect(
             px,
@@ -5943,6 +6285,9 @@ fn decode_block_rect64(
             smooth_neighbor,
         );
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        if let Some((ub, _)) = &palette_uv_bufs {
+            set_palette_pred(ub.clone());
+        }
         u.reconstruct_rect(
             cpx,
             cpy,
@@ -5956,6 +6301,9 @@ fn decode_block_rect64(
             None,
             smooth_neighbor_uv,
         );
+        if let Some((_, vb)) = &palette_uv_bufs {
+            set_palette_pred(vb.clone());
+        }
         v.reconstruct_rect(
             cpx,
             cpy,
@@ -6215,6 +6563,11 @@ fn decode_block_rect64(
         neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[luma_levels, u_levels, v_levels]);
         RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
     }
+    let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
+    neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+    let (puv_size, puv_colors) =
+        palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
+    neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     SB_RECT_HITS.with(|c| c.set(c.get() + 1));
@@ -6790,42 +7143,50 @@ impl PlaneBuf {
         filter_intra: Option<usize>,
         smooth_neighbor: bool,
     ) {
-        let (above, left, corner) = self.edges_rect(x, y, bw, bh, reach);
-        if std::env::var_os("EC_DEBUG_EDGES").is_some() {
-            eprintln!(
-                "EDGES x={x} y={y} bw={bw} bh={bh} mode={mode} above={:?} left_len={:?} left0={:?} corner={corner:?} tx0={} ty0={} truew={} trueh={}",
-                above.as_ref().map(|a| (a.len(), a[0])),
-                left.as_ref().map(|l| l.len()),
-                left.as_ref().map(|l| l[0]),
-                self.tile_x0, self.tile_y0, self.true_width, self.true_height
-            );
-        }
-        let mut prediction = vec![0u16; bw * bh];
-        if let Some(fi_mode) = filter_intra {
-            crate::intra::predict_filter_intra(
-                fi_mode,
-                above.as_deref(),
-                left.as_deref(),
-                corner,
-                bw,
-                bh,
-                &mut prediction,
-            );
+        // As [`Self::reconstruct`]'s own [`PALETTE_PRED`] override
+        // (lane-palette2 r4): a palette block's prediction is the
+        // reconstructed colour-index map, needing no edge pixels at all.
+        let prediction = if let Some(buf) = take_palette_pred() {
+            buf
         } else {
-            let enable_edge_filter = ENABLE_EDGE_FILTER.with(std::cell::Cell::get);
-            predict(
-                mode as u8,
-                angle_delta,
-                above.as_deref(),
-                left.as_deref(),
-                corner,
-                bw,
-                bh,
-                enable_edge_filter,
-                smooth_neighbor,
-                &mut prediction,
-            );
-        }
+            let (above, left, corner) = self.edges_rect(x, y, bw, bh, reach);
+            if std::env::var_os("EC_DEBUG_EDGES").is_some() {
+                eprintln!(
+                    "EDGES x={x} y={y} bw={bw} bh={bh} mode={mode} above={:?} left_len={:?} left0={:?} corner={corner:?} tx0={} ty0={} truew={} trueh={}",
+                    above.as_ref().map(|a| (a.len(), a[0])),
+                    left.as_ref().map(|l| l.len()),
+                    left.as_ref().map(|l| l[0]),
+                    self.tile_x0, self.tile_y0, self.true_width, self.true_height
+                );
+            }
+            let mut prediction = vec![0u16; bw * bh];
+            if let Some(fi_mode) = filter_intra {
+                crate::intra::predict_filter_intra(
+                    fi_mode,
+                    above.as_deref(),
+                    left.as_deref(),
+                    corner,
+                    bw,
+                    bh,
+                    &mut prediction,
+                );
+            } else {
+                let enable_edge_filter = ENABLE_EDGE_FILTER.with(std::cell::Cell::get);
+                predict(
+                    mode as u8,
+                    angle_delta,
+                    above.as_deref(),
+                    left.as_deref(),
+                    corner,
+                    bw,
+                    bh,
+                    enable_edge_filter,
+                    smooth_neighbor,
+                    &mut prediction,
+                );
+            }
+            prediction
+        };
         for row in 0..bh {
             for col in 0..bw {
                 let idx = row * bw + col;
@@ -6869,7 +7230,7 @@ impl PlaneBuf {
         // A palette block's own [`PALETTE_PRED`] override (lane-palette r2)
         // takes priority over `predict()`/`predict_filter_intra` entirely --
         // palette prediction needs no edge pixels at all.
-        let prediction = if let Some(buf) = PALETTE_PRED.with(|c| c.borrow_mut().take()) {
+        let prediction = if let Some(buf) = take_palette_pred() {
             buf
         } else {
             let (above, left, corner) = self.edges(x, y, side, reach);
@@ -7197,7 +7558,7 @@ fn decode_block(
         (yb, ub, vb)
     });
     if let Some((yb, _, _)) = &intrabc_bufs {
-        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(yb.clone()));
+        set_palette_pred(yb.clone());
     }
     // A palette-Y block's own prediction is the reconstructed colour-index
     // map, not `predict()`'s edge-based one -- [`PALETTE_PRED`] carries it
@@ -7207,18 +7568,21 @@ fn decode_block(
     // would need the map sliced per-TU -- untested against a real
     // `--enable-palette=1` stream this round, so refuse by name rather than
     // guess at the slicing (charter's own named-acceptable fallback).
-    if let Some(ref py) = palette_y {
-        if tx_select && logical_tx != side {
-            return Err(unsupported(
-                "a palette block with a split luma transform (round 1)",
-            ));
-        }
-        let buf: Vec<u16> = py
-            .map
+    let palette_y_buf: Option<Vec<u16>> = palette_y.as_ref().map(|py| {
+        py.map
             .iter()
             .map(|&idx| py.colors[idx as usize])
-            .collect();
-        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
+            .collect()
+    });
+    // With one luma transform unit the whole `side`x`side` map is the
+    // prediction; with several (`logical_tx != side`) each unit takes its own
+    // `logical_tx`-sized window of that same map, set fresh inside the TU loop
+    // below (lane-palette2 r7) -- setting the full-block buffer here would be
+    // taken by the FIRST unit and indexed at the wrong stride.
+    if let Some(buf) = &palette_y_buf
+        && logical_tx == side
+    {
+        set_palette_pred(buf.clone());
     }
     // A UV-palette block's own chroma prediction override (lane-palette2 r1),
     // same [`PALETTE_PRED`] slot as Y above -- set fresh right before each
@@ -7255,7 +7619,7 @@ fn decode_block(
         );
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         u.reconstruct(
             cpx,
@@ -7270,7 +7634,7 @@ fn decode_block(
             smooth_neighbor_uv,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         v.reconstruct(
             cpx,
@@ -7317,7 +7681,7 @@ fn decode_block(
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         let u_grid = read_plane(
             dec,
@@ -7348,7 +7712,7 @@ fn decode_block(
             );
         }
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         let v_grid = read_plane(
             dec,
@@ -7390,12 +7754,34 @@ fn decode_block(
                 let tu_px = px + tu_col * logical_tx;
                 let tu_py = py + tu_row * logical_tx;
                 let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
-                let tu_reach = Reach::of_tu(side, logical_tx, tu_px, tu_py, y.width, y.height);
+                // A transform unit inside a block is NOT a block at that
+                // position (lane-palette2 r12): `Reach::of` granted the
+                // top-right 8x8 unit of a 16x16 D203 block bottom-left
+                // pixels libaom refuses outright (`col_off > 0`), which is
+                // the diagonal wedge seed 46 reconstructed wrong.
+                let tu_reach = Reach::of_tu(
+                    side,
+                    side,
+                    tu_col * logical_tx,
+                    tu_row * logical_tx,
+                    logical_tx,
+                    reach,
+                );
                 // This transform unit's own bsize (`logical_tx`) is smaller
                 // than the block it sits in (`side`), so `txb_skip_ctx` is
                 // the neighbour-magnitude table, not the lone-TU 0 (spec
                 // `get_txb_ctx_general`'s `plane_bsize != tx_size` branch).
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, logical_tx / MI);
+                if let Some(buf) = &palette_y_buf {
+                    PALETTE_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                    let mut window = vec![0u16; logical_tx * logical_tx];
+                    for row in 0..logical_tx {
+                        let src = (tu_row * logical_tx + row) * side + tu_col * logical_tx;
+                        window[row * logical_tx..][..logical_tx]
+                            .copy_from_slice(&buf[src..][..logical_tx]);
+                    }
+                    set_palette_pred(window);
+                }
                 let tu_grid = read_plane(
                     dec,
                     cdfs,
@@ -7432,7 +7818,7 @@ fn decode_block(
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         let chroma_around = neighbours.around(at, side);
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         let u_grid = read_plane(
             dec,
@@ -7457,7 +7843,7 @@ fn decode_block(
             smooth_neighbor_uv,
         )?;
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         let v_grid = read_plane(
             dec,
@@ -7765,7 +8151,7 @@ fn decode_leaf8(
                 if crate::encode::Reach::in_vert_ab() {
                     VERT_AB_TX4_HITS.with(|c| c.set(c.get() + 1));
                 }
-                let tu_reach = Reach::of_tu(8, 4, tu_px, tu_py, y.width, y.height);
+                let tu_reach = Reach::of_tu(8, 8, tu_col * 4, tu_row * 4, 4, reach);
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
                 let tu_grid = read_plane(
                     dec,
@@ -7878,12 +8264,28 @@ fn decode_leaf8(
                 neighbours.above[leaf_mi.1 + cell][2] = v_state;
             }
         }
+    // Non-palette 8x8 leaf (this path never reads a palette): clear the
+    // above/left palette state over its own cell so the next block's ctx and
+    // colour cache do not read a previous block's palette (lane-palette2 r8).
+    {
+        let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
+        neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
+    }
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
         neighbours.fill_lf_grid(leaf_mi, 2, 4, 0);
         neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
         return Ok(mode);
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    // Non-palette 8x8 leaf (this path never reads a palette): clear the
+    // above/left palette state over its own cell so the next block's ctx and
+    // colour cache do not read a previous block's palette (lane-palette2 r8).
+    {
+        let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
+        neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
+    }
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
@@ -8293,7 +8695,12 @@ fn decode_leaf_rect8(
                 };
                 let (tu_px, tu_py) = (tu_mi.1 * MI, tu_mi.0 * MI);
                 let tu_around = neighbours.around_mi(tu_mi, 4)[0];
-                let tu_reach = Reach::of(4, tu_px, tu_py, y.width, y.height);
+                // Same per-TU rule as every other split-transform site
+                // (lane-palette2 r12): a transform unit inside a block is not
+                // a block at that position, so its reach comes from the
+                // block's own row, offset by the unit's position.
+                let tu_reach =
+                    Reach::of_tu(bw, bh, tu_px - px, tu_py - py, 4, reach);
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
                 if skip {
                     // A skipped leaf still predicts per transform unit: the
@@ -18845,6 +19252,33 @@ mod tests {
         assert_eq!(n.above_ref1[0], Some(ALTREF_FRAME));
         assert_eq!(n.left_ref1[0], Some(ALTREF_FRAME));
         assert!(!is_uni_comp_ref(LAST_FRAME, n.above_ref1[0].unwrap()));
+    }
+
+    /// A below-16px leaf must clear the palette neighbour state over its own
+    /// cell: before lane-palette2 r8 `record_palette_y_rect`'s `w / SUB` loops
+    /// ran zero times for any sub-16 span, so `decode_leaf_rect` /
+    /// `decode_leaf8` left a previous block's palette size and colours in the
+    /// above/left arrays and the NEXT block read `palette_y_mode` off the
+    /// wrong CDF row with a stale colour cache (class
+    /// [[cdf-row-held-constant]]).
+    #[test]
+    fn a_sub16_leaf_after_a_palette_block_yields_palette_ctx_zero() {
+        let mut n = Neighbours::new(4, 4, 16, 16);
+        // A real 16x16 palette block covering SUB cell (1, 1).
+        n.record_palette_y_rect((1, 1), 16, 16, 2, [7, 9, 0, 0, 0, 0, 0, 0]);
+        let (ctx, cache) = n.palette_ctx_and_cache((1, 1));
+        assert_eq!(ctx, 2, "the palette block itself must be visible");
+        assert_eq!(cache, vec![7, 9]);
+        // An 8x8 non-palette leaf in that same cell.
+        n.record_palette_y_rect((1, 1), 8, 8, 0, [0u16; 8]);
+        let (ctx, cache) = n.palette_ctx_and_cache((1, 1));
+        assert_eq!(ctx, 0, "a sub-16 non-palette leaf must clear its own cell");
+        assert!(cache.is_empty(), "and its stale colour cache with it");
+        // Same for the chroma half.
+        n.record_palette_uv_rect((1, 1), 16, 16, 2, [1, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(n.palette_uv_cache((1, 1)), vec![1, 2]);
+        n.record_palette_uv_rect((1, 1), 8, 8, 0, [0u16; 8]);
+        assert!(n.palette_uv_cache((1, 1)).is_empty());
     }
 
     /// [`cdf::COMPOUND_MODE_CTX_MAP`] folded by hand against libaom's

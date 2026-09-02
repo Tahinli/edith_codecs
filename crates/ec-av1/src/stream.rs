@@ -3261,6 +3261,350 @@ mod tests {
         }
     }
 
+    /// A real `aomenc` fixture that lands palette syntax on a HORZ/VERT
+    /// intra strip (lane-palette2 r5, gating r4's `read_intra_mode_rect`
+    /// wiring). `smptebars`/`rgbtestsrc` at plain default settings both hit a
+    /// SQUARE palette refusal or an unrelated 32x32 `HORZ_A`/`VERT_A`/etc
+    /// partition FIRST on every size/cq combo probed -- `--enable-ab-
+    /// partitions=0` measurably does not stop aomenc choosing one at this
+    /// screen-content tune (byte-identical output with `=0` vs `=1`, same
+    /// aomenc quirk as `[[lane-sbpart-r2]]`'s SB-level AB). Forcing
+    /// `--min/max-partition-size=64` sidesteps that whole 32x32-level code
+    /// path: the only choices left at the (single, key-frame) superblock are
+    /// NONE/SPLIT/HORZ/VERT/AB/1to4 straight from [`decode_block_rect64`],
+    /// and a size/cq sweep (measured live this round) reliably lands
+    /// PARTITION_HORZ/VERT with a real (non-split-tx) palette block on both
+    /// sources. Drives `decode_stream` directly (below any refusal) and
+    /// HARD-asserts [`decode::palette_rect_hits`] moved on every attempt that
+    /// didn't refuse, before comparing pixels ([[gate-blind-to-feature]]) --
+    /// a decode that never lands a rect palette block is not a match.
+    #[test]
+    fn a_real_aomenc_stream_with_rect_palette_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_rect_palette_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let mut matched = 0u32;
+        let mut uncounted_exact = 0u32;
+        let mut named_refusals = 0u32;
+        let mut attempts = 0u32;
+        let sizes = [(64, 128), (128, 64), (128, 128), (128, 192), (192, 192)];
+        let cqs = [5u32, 15, 25, 35, 45, 55, 63];
+        for src_name in ["smptebars", "rgbtestsrc"] {
+            for (width, height) in sizes {
+                for cq in cqs {
+                    attempts += 1;
+                    let source = format!("{src_name}=size={width}x{height}:rate=25");
+                    let y4m = Command::new("ffmpeg")
+                        .args([
+                            "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p",
+                            "-t", "0.04", "-f", "yuv4mpegpipe", "-",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("ffmpeg failed to run");
+                    assert!(
+                        y4m.status.success(),
+                        "ffmpeg fixture: {}",
+                        String::from_utf8_lossy(&y4m.stderr)
+                    );
+                    let cq_arg = format!("--cq-level={cq}");
+                    let mut child = Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1",
+                            "--passes=1",
+                            "--end-usage=q",
+                            &cq_arg,
+                            "--cpu-used=4",
+                            "--threads=1",
+                            "--row-mt=0",
+                            "--sb-size=64",
+                            "--enable-palette=1",
+                            "--min-partition-size=16",
+                            "--max-partition-size=64",
+                            "--obu",
+                            "-o",
+                            "-",
+                            "-",
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("aomenc failed to start");
+                    child
+                        .stdin
+                        .take()
+                        .expect("aomenc stdin")
+                        .write_all(&y4m.stdout)
+                        .expect("writing y4m to aomenc");
+                    let out = child.wait_with_output().expect("aomenc failed to run");
+                    assert!(
+                        out.status.success(),
+                        "aomenc refused the fixture ({source} cq={cq}): {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let stream = out.stdout;
+                    let before = crate::decode::palette_rect_hits();
+                    let frames = match decode_stream(&stream) {
+                        Err(e) => {
+                            let msg = e.to_string();
+                            assert!(
+                                msg.contains("unsupported"),
+                                "{NAME} failed outright, not a named refusal \
+                                 ({source} cq={cq}): {msg}"
+                            );
+                            named_refusals += 1;
+                            eprintln!("{source} cq={cq}: refusal: {msg}");
+                            continue;
+                        }
+                        Ok(frames) => frames,
+                    };
+                    // A successful decode is ALWAYS pixel-compared; the hit
+                    // counter only decides whether the attempt counts toward
+                    // the hit-asserting total (class
+                    // [[gate-skips-on-its-own-failure]]: the old `continue`
+                    // here let 16/70 decoded attempts past without any pixel
+                    // check at all).
+                    let counted = crate::decode::palette_rect_hits() != before;
+                    if !counted {
+                        eprintln!(
+                            "{NAME}: {source} cq={cq} decoded without ever landing a rect \
+                             palette block (palette_rect_hits unchanged) -- pixel-compared, \
+                             not counted toward the hit assertion"
+                        );
+                    }
+                    let frame_count = frames.len();
+                    let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+                    if frames.iter().zip(&ffmpeg_frames).any(|(got, want)| {
+                        got.y != want.y || got.u != want.u || got.v != want.v
+                    }) && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
+                    {
+                        std::fs::write(&path, &stream).expect("writing pinned stream");
+                        eprintln!(
+                            "EC_AV1_GATE_DUMP: wrote mismatching stream ({source} cq={cq}) to {path}"
+                        );
+                    }
+                    for i in 0..frame_count {
+                        assert_eq!(
+                            frames[i].y, ffmpeg_frames[i].y,
+                            "{NAME}: {source} cq={cq} frame {i} luma vs ffmpeg"
+                        );
+                        assert_eq!(
+                            frames[i].u, ffmpeg_frames[i].u,
+                            "{NAME}: {source} cq={cq} frame {i} U vs ffmpeg"
+                        );
+                        assert_eq!(
+                            frames[i].v, ffmpeg_frames[i].v,
+                            "{NAME}: {source} cq={cq} frame {i} V vs ffmpeg"
+                        );
+                    }
+                    if counted {
+                        matched += 1;
+                    } else {
+                        uncounted_exact += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: no attempt out of {attempts} ever landed a matching rect palette \
+             block ({named_refusals} named refusals) -- palette_rect_hits never proven \
+             pixel-exact"
+        );
+        eprintln!(
+            "{NAME}: {matched}/{attempts} attempts matched pixel-exact, \
+             {uncounted_exact} decoded-and-pixel-exact but uncounted, {named_refusals} \
+             named refusals, palette_rect_hits={}",
+            crate::decode::palette_rect_hits()
+        );
+    }
+
+    /// The BROAD case (lane-palette2 r6, per its charter): a HORZ/VERT intra
+    /// strip in a screen-content-tools frame that does NOT necessarily use a
+    /// palette. This is what the refusal r4 removed actually guarded --
+    /// [`a_real_aomenc_stream_with_rect_palette_decodes_pixel_exact`] above
+    /// gates the rarer "and picks a palette" case, which r5 measured RD
+    /// almost never chooses -- 39/70 of that same sweep DID land here (a
+    /// clean rect-strip decode with `palette_rect_hits` unchanged), just
+    /// uncounted by r5's narrower assertion. Same `--min/max-partition-size=64`
+    /// recipe r5 measured live to dodge the 32x32-level AB-partition quirk
+    /// ([[lane-sbpart-r2]]), single key frame, size/cq sweep. HARD-asserts
+    /// [`decode::rect_screen_content_hits`] moved -- proof this stream
+    /// actually ran [`read_intra_mode_rect`]'s screen-content-tools branch --
+    /// before comparing pixels.
+    #[test]
+    fn a_real_aomenc_stream_with_rect_screen_content_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_rect_screen_content_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let mut matched = 0u32;
+        // Blocks that reconstructed a palette-Y prediction through a SPLIT
+        // luma transform (lane-palette2 r7's lifted refusal): the same
+        // screen-content streams exercise it, so this gate proves both.
+        let mut split_palette_matched = 0u32;
+        let mut uncounted_exact = 0u32;
+        let mut named_refusals = 0u32;
+        let mut attempts = 0u32;
+        let sizes = [(64, 128), (128, 64), (128, 128), (128, 192), (192, 192)];
+        let cqs = [5u32, 15, 25, 35, 45, 55, 63];
+        for src_name in ["smptebars", "rgbtestsrc"] {
+            for (width, height) in sizes {
+                for cq in cqs {
+                    attempts += 1;
+                    let source = format!("{src_name}=size={width}x{height}:rate=25");
+                    let y4m = Command::new("ffmpeg")
+                        .args([
+                            "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p",
+                            "-t", "0.04", "-f", "yuv4mpegpipe", "-",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("ffmpeg failed to run");
+                    assert!(
+                        y4m.status.success(),
+                        "ffmpeg fixture: {}",
+                        String::from_utf8_lossy(&y4m.stderr)
+                    );
+                    let cq_arg = format!("--cq-level={cq}");
+                    let mut child = Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1",
+                            "--passes=1",
+                            "--end-usage=q",
+                            &cq_arg,
+                            "--cpu-used=4",
+                            "--threads=1",
+                            "--row-mt=0",
+                            "--sb-size=64",
+                            "--enable-palette=1",
+                            "--min-partition-size=16",
+                            "--max-partition-size=64",
+                            "--obu",
+                            "-o",
+                            "-",
+                            "-",
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("aomenc failed to start");
+                    child
+                        .stdin
+                        .take()
+                        .expect("aomenc stdin")
+                        .write_all(&y4m.stdout)
+                        .expect("writing y4m to aomenc");
+                    let out = child.wait_with_output().expect("aomenc failed to run");
+                    assert!(
+                        out.status.success(),
+                        "aomenc refused the fixture ({source} cq={cq}): {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let stream = out.stdout;
+                    let before = crate::decode::rect_screen_content_hits();
+                    let split_before = crate::decode::palette_split_tx_hits();
+                    let frames = match decode_stream(&stream) {
+                        Err(e) => {
+                            let msg = e.to_string();
+                            assert!(
+                                msg.contains("unsupported"),
+                                "{NAME} failed outright, not a named refusal \
+                                 ({source} cq={cq}): {msg}"
+                            );
+                            named_refusals += 1;
+                            eprintln!("{source} cq={cq}: refusal: {msg}");
+                            continue;
+                        }
+                        Ok(frames) => frames,
+                    };
+                    // Same integrity rule as the palette gate above: decoded
+                    // means pixel-compared, counter or no counter.
+                    let counted = crate::decode::rect_screen_content_hits() != before;
+                    if !counted {
+                        eprintln!(
+                            "{NAME}: {source} cq={cq} decoded without ever running the rect \
+                             screen-content path (rect_screen_content_hits unchanged) -- \
+                             pixel-compared, not counted toward the hit assertion"
+                        );
+                    }
+                    let frame_count = frames.len();
+                    let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+                    if frames.iter().zip(&ffmpeg_frames).any(|(got, want)| {
+                        got.y != want.y || got.u != want.u || got.v != want.v
+                    }) && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
+                    {
+                        std::fs::write(&path, &stream).expect("writing pinned stream");
+                        eprintln!(
+                            "EC_AV1_GATE_DUMP: wrote mismatching stream ({source} cq={cq}) to {path}"
+                        );
+                    }
+                    for i in 0..frame_count {
+                        assert_eq!(
+                            frames[i].y, ffmpeg_frames[i].y,
+                            "{NAME}: {source} cq={cq} frame {i} luma vs ffmpeg"
+                        );
+                        assert_eq!(
+                            frames[i].u, ffmpeg_frames[i].u,
+                            "{NAME}: {source} cq={cq} frame {i} U vs ffmpeg"
+                        );
+                        assert_eq!(
+                            frames[i].v, ffmpeg_frames[i].v,
+                            "{NAME}: {source} cq={cq} frame {i} V vs ffmpeg"
+                        );
+                    }
+                    if counted {
+                        matched += 1;
+                    } else {
+                        uncounted_exact += 1;
+                    }
+                    if counted && crate::decode::palette_split_tx_hits() > split_before {
+                        split_palette_matched += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            split_palette_matched > 0,
+            "{NAME}: no pixel-exact attempt ever reconstructed a palette block with a \
+             split luma transform -- the lifted refusal is ungated"
+        );
+        assert!(
+            matched > 0,
+            "{NAME}: no attempt out of {attempts} ever landed a matching rect \
+             screen-content block ({named_refusals} named refusals) -- \
+             rect_screen_content_hits never proven pixel-exact"
+        );
+        eprintln!(
+            "{NAME}: {matched}/{attempts} attempts matched pixel-exact \
+             ({split_palette_matched} of them through a split-transform palette block), \
+             {uncounted_exact} decoded-and-pixel-exact but uncounted, \
+             {named_refusals} named refusals, rect_screen_content_hits={}, \
+             palette_split_tx_hits={}",
+            crate::decode::rect_screen_content_hits(),
+            crate::decode::palette_split_tx_hits()
+        );
+    }
+
     /// As [`a_real_aomenc_filter_intra_stream_decodes_pixel_exact`]'s
     /// harness, but with the deblocking filter left *on* (no
     /// `--loopfilter-control=0`) at a crf high enough that libaom actually
