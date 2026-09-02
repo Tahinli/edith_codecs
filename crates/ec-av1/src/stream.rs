@@ -18180,6 +18180,228 @@ mod tests {
     /// then compared pixel-exact are counted (class
     /// gate-skips-on-its-own-failure); the 10-bit arm is what retires
     /// `enable-1to4-partitions` from `NEVER_EXERCISED_10BIT`.
+    /// lane-r14: the 16x16-level 1:4 pair -- four 16x4 (`PARTITION_HORZ_4`) or
+    /// 4x16 (`PARTITION_VERT_4`) strips, the shape the wall
+    /// "a 1:4 partition below 16x16" refused. Fixture: 4-PIXEL bands (the
+    /// 8-pixel ones of the 32-level gate above, one size down -- a 16x4 strip
+    /// is flat where a 16x8 one is not), transposed per attempt so a
+    /// transposed scan or nz-map table cannot pass (class
+    /// scan-weights-cross-axis), plus an explicit-seed noise layer that keeps
+    /// aomenc out of screen-content mode. `--enable-filter-intra=1` and
+    /// `--enable-cfl-intra=1` are ON: this shape reads `use_filter_intra` off
+    /// its own CDF rows (classes 12/13) and its CfL averages the whole 16x8
+    /// (8x16) luma PAIR, not the strip. `--enable-tx-size-search=0`: a split
+    /// transform at this shape is still refused by name.
+    ///
+    /// Counters: 16x4 strips, 4x16 strips, chroma-reference strips (the odd
+    /// strip of each 4:2:0 pair, the only one that codes chroma) and strips
+    /// with a coded residual must all be nonzero over the compared attempts,
+    /// and only attempts that DECODED and were compared pixel-exact count
+    /// (class gate-skips-on-its-own-failure).
+    #[test]
+    fn a_real_aomenc_stream_with_a_16_level_1to4_partition_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_16_level_1to4_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 1usize);
+        let n_attempts: u32 = std::env::var("EC_R14_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        for bit_depth in [8u32, 10u32] {
+            let mut named_refusals = 0u32;
+            let mut matched = 0u32;
+            let (mut horz_proved, mut vert_proved) = (0usize, 0usize);
+            let (mut chroma_proved, mut coeff_proved) = (0usize, 0usize);
+            let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
+            for attempt in 0..n_attempts {
+                let seed = 42 + attempt;
+                let duration = frame_count as f64 / 25.0;
+                let axis = if attempt % 2 == 0 { "Y" } else { "X" };
+                let step = 67 + (attempt / 2) * 12;
+                let noise = 6 + (attempt % 4) * 3;
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='mod(floor({axis}/4)*{step},256)',\
+                     noise=alls={noise}:all_seed={seed},format=yuv420p"
+                );
+                let cq_level = format!("--cq-level={}", 24 + (attempt % 4) * 8);
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_level,
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1",
+                    "--min-partition-size=4",
+                    "--max-partition-size=16",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=1",
+                    "--enable-cfl-intra=1",
+                    "--enable-intrabc=0",
+                    "--enable-tx-size-search=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = crate::decode::rect4_16_counters();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, seed \
+                             {seed}): {msg}"
+                        );
+                        named_refusals += 1;
+                        eprintln!("{bit_depth}-bit seed {seed} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let now = crate::decode::rect4_16_counters();
+                let (horz, vert, chroma, coeff) = (
+                    now.0 - before.0,
+                    now.1 - before.1,
+                    now.2 - before.2,
+                    now.3 - before.3,
+                );
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if horz + vert == 0 {
+                    out_of_scope += 1;
+                    if mismatched {
+                        out_of_scope_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit seed {seed} MISMATCHES with zero 16-level \
+                             1:4 strips -- a pre-existing defect of another shape"
+                        );
+                    }
+                    continue;
+                }
+                if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!(
+                        "EC_AV1_GATE_DUMP: wrote mismatching stream ({bit_depth}-bit, seed \
+                         {seed}) to {path}"
+                    );
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg ({bit_depth}-bit, seed {seed})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg ({bit_depth}-bit, seed {seed})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg ({bit_depth}-bit, seed {seed})"
+                    );
+                }
+                horz_proved += horz;
+                vert_proved += vert;
+                chroma_proved += chroma;
+                coeff_proved += coeff;
+                matched += 1;
+            }
+            assert!(
+                matched > 0,
+                "{NAME}: every {bit_depth}-bit attempt refused or fell out of scope ({named_refusals} \
+                 refusals, {out_of_scope} out of scope); the gate proved nothing"
+            );
+            assert_eq!(
+                out_of_scope_mismatch, 0,
+                "{NAME}: {out_of_scope_mismatch} {bit_depth}-bit attempt(s) mismatch with no \
+                 16-level 1:4 strip at all"
+            );
+            assert!(
+                horz_proved > 0 && vert_proved > 0,
+                "{NAME}: {bit_depth}-bit compared attempts decoded {horz_proved} 16x4 and \
+                 {vert_proved} 4x16 strips -- both orientations must fire or a transposed table \
+                 passes"
+            );
+            assert!(
+                chroma_proved > 0,
+                "{NAME}: {bit_depth}-bit compared attempts closed {chroma_proved} chroma pairs"
+            );
+            assert!(
+                coeff_proved > 0,
+                "{NAME}: {bit_depth}-bit compared attempts coded no residual on any strip"
+            );
+            eprintln!(
+                "{NAME}: {bit_depth}-bit {matched} compared attempts, {horz_proved} 16x4 / \
+                 {vert_proved} 4x16 strips, {chroma_proved} chroma pairs, {coeff_proved} coded \
+                 strips, {named_refusals} refusals, {out_of_scope} out of scope"
+            );
+        }
+    }
+
     #[test]
     // lane-tx64x16 r4: the fixture r3 could not find. `gradients` never wins
     // a 32-level 1:4 shape; 8-pixel BANDS do -- each 32x8 strip is flat, so
