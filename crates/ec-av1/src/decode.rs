@@ -680,6 +680,46 @@ pub(crate) fn smooth_luma_hits() -> usize {
     SMOOTH_LUMA_HITS.with(|c| c.get())
 }
 
+thread_local! {
+    /// lane-band46 r1: how many split-transform units answered their intra
+    /// reach DIFFERENTLY under libaom's `row_off`/`col_off` rules than the
+    /// standalone-block lookup this decoder used to apply to them (class
+    /// reach-is-per-transform-unit). Every hit is a transform unit whose
+    /// above-right / below-left reference samples used to be wrong.
+    static SPLIT_TU_REACH_FIX_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SPLIT_TU_REACH_FIX_HITS`].
+pub(crate) fn split_tu_reach_fix_hits() -> usize {
+    SPLIT_TU_REACH_FIX_HITS.with(|c| c.get())
+}
+
+/// libaom `has_top_right`/`has_bottom_left` for one transform unit of a split
+/// transform ([`crate::encode::Reach::of_tu`]), counting how often that answer
+/// differs from the standalone-block answer the call sites used before
+/// lane-band46 r1 -- the counter a gate asserts on to prove a stream really
+/// exercised the fix.
+#[allow(clippy::too_many_arguments)]
+fn tu_reach(
+    bw: usize,
+    bh: usize,
+    tx: usize,
+    row_off: usize,
+    col_off: usize,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+) -> Reach {
+    let fixed = Reach::of_tu(bw, bh, tx, row_off, col_off, px, py, width, height);
+    let standalone = Reach::of(tx, px + col_off * MI, py + row_off * MI, width, height);
+    if fixed != standalone {
+        SPLIT_TU_REACH_FIX_HITS.with(|c| c.set(c.get() + 1));
+    }
+    fixed
+}
+
 // How many `uv_mode` reads resolved to `SMOOTH_PRED..=PAETH_PRED` (9..=12),
 // across every call on the current thread -- lane-chroma r3's own before/after
 // counter, proving a stream actually exercised chroma's smooth/paeth
@@ -7218,7 +7258,17 @@ fn decode_block(
                 let tu_px = px + tu_col * logical_tx;
                 let tu_py = py + tu_row * logical_tx;
                 let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
-                let tu_reach = Reach::of(logical_tx, tu_px, tu_py, y.width, y.height);
+                let tu_reach = tu_reach(
+                    side,
+                    side,
+                    logical_tx,
+                    tu_row * (logical_tx / MI),
+                    tu_col * (logical_tx / MI),
+                    px,
+                    py,
+                    y.width,
+                    y.height,
+                );
                 // This transform unit's own bsize (`logical_tx`) is smaller
                 // than the block it sits in (`side`), so `txb_skip_ctx` is
                 // the neighbour-magnitude table, not the lone-TU 0 (spec
@@ -7576,7 +7626,7 @@ fn decode_leaf8(
                 let tu_px = px + tu_col * 4;
                 let tu_py = py + tu_row * 4;
                 let tu_around = neighbours.around_mi(tu_mi, 4)[0];
-                let tu_reach = Reach::of(4, tu_px, tu_py, y.width, y.height);
+                let tu_reach = tu_reach(8, 8, 4, tu_row, tu_col, px, py, y.width, y.height);
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
                 let tu_grid = read_plane(
                     dec,
@@ -8104,7 +8154,17 @@ fn decode_leaf_rect8(
                 };
                 let (tu_px, tu_py) = (tu_mi.1 * MI, tu_mi.0 * MI);
                 let tu_around = neighbours.around_mi(tu_mi, 4)[0];
-                let tu_reach = Reach::of(4, tu_px, tu_py, y.width, y.height);
+                let tu_reach = tu_reach(
+                    bw,
+                    bh,
+                    4,
+                    if vert { tu } else { 0 },
+                    if vert { 0 } else { tu },
+                    px,
+                    py,
+                    y.width,
+                    y.height,
+                );
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
                 if skip {
                     // A skipped leaf still predicts per transform unit: the

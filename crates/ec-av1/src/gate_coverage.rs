@@ -280,10 +280,6 @@ const NEVER_ON_10BIT: &[(&str, &str)] = &[
         "enable-onesided-comp",
         "hole at both depths, see the 8-bit list (5 pinned off, 10 defaulted)",
     ),
-    (
-        "enable-tx-size-search",
-        "hole at both depths, see the 8-bit list (11 of 15 pin =0)",
-    ),
 ];
 
 #[cfg(test)]
