@@ -67,3 +67,28 @@ on 12 streams before the fix.
 ## Suite
 
 `$HOME/.cache/pal8-suite-r1.log` -- see the tail of this file / the lane report line.
+
+## Suite (full, `$HOME/.cache/pal8-suite-r1.log`)
+
+`systemd-run --user --unit=pal8-suite-... -p MemoryMax=10G ... cargo test -p ec-av1 --lib -j3`
+-> **401 passed, 1 failed, 33 ignored** in 1443 s. NOT the clean N/0 the charter asks for.
+
+The one failure is `stream::tests::a_frame_edge_straddling_band_decodes_pixel_exact`:
+`68x192 cq35 frames=5 10bit=true tile_cols=1 frame 1 plane Y: 6944 pixels differ,
+first at row 28 col 15 (ours 196 vs ffmpeg 197) [edge32=[5,27,0,5,2,16,0,1]]`.
+That gate's own source comment already documents the 8-BIT twin of this arm as a
+known, separate straddling-band defect ("68x192 cq35 frames=5 10bit=false frame 1
+plane Y: 141 pixels differ ... LUMA, inside the 4-px straddling COLUMN"); the arm
+here is the 10-bit one, which the merged lane-kf900 tip added.
+
+ATTRIBUTION NOT VERIFIED this round (turn cap). It is very unlikely to be this
+lane's change -- the whole diff is inert unless a block actually decodes a
+palette (`palette_y_buf.is_none()` keeps every non-palette path byte-identical)
+-- but the recipe DOES use `--tune-content=screen`, so palette is live in it and
+that must be checked, not assumed. Next step, one command:
+`git worktree add --detach <scratch> 3d5a737` (the pre-change merge commit) with
+its own `CARGO_TARGET_DIR` and run only
+`cargo test -p ec-av1 --lib a_frame_edge_straddling_band_decodes_pixel_exact`.
+Disposition: deferred(that one-test run at 3d5a737) -- if it fails there too, it
+is the merged straddling-band residue and belongs to that lane; if it passes,
+it is this lane's and the 8x8-leaf palette wiring must be bisected against it.
