@@ -779,6 +779,14 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                     header.mi_cols as usize,
                 )
             });
+            if std::env::var_os("EC_TPL").is_some() {
+                eprintln!(
+                    "EC_TPL order_hint={} use_ref_frame_mvs={} cells={}",
+                    header.order_hint,
+                    header.use_ref_frame_mvs,
+                    tpl_field.as_ref().map_or(0, crate::motion_field::TplField::filled_cells)
+                );
+            }
             let (picture, end_cdfs, motion_field) = decode_inter_frame_tile_with_cdfs(
                 &tile_bufs,
                 &header.tile_info,
