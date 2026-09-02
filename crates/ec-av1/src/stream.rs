@@ -2450,7 +2450,7 @@ mod tests {
                 "--enable-tx-size-search=0",
                 "--enable-cdef=1",
                 "--enable-restoration=1",
-                "--min-partition-size=16",
+                "--min-partition-size=32",
                 "--max-partition-size=32",
                 "--enable-palette=0",
                 "--enable-intrabc=0",
@@ -14549,5 +14549,251 @@ mod tests {
              {out_of_scope} attempts carried no 1:4 block ({out_of_scope_mismatch} of them \
              mismatched -- other lanes' shapes)"
         );
+    }
+
+    /// lane-rectchroma r1: a real `aomenc` stream in which a HORZ/VERT strip
+    /// splits its transform (`--enable-tx-size-search` left ON) and whose
+    /// chroma half is one of the four rect shapes that had NO coefficient
+    /// tables in [`crate::decode`] before this round -- 32x8 / 8x32 (the 1:4
+    /// superblock strips 64x16 / 16x64) and 8x4 / 4x8 (the 8x16 / 16x8 rect
+    /// of a 16x16-level AB partition). Every such strip refused by name
+    /// ("a coded HORZ/VERT strip whose chroma transform has no rect
+    /// coefficient tables here"), which is where both Troy extracts stopped.
+    ///
+    /// Per-shape counters, deltas taken only over attempts that then compared
+    /// pixel-exact (class counter-from-refused-stream), on 8 AND 10 bit (his
+    /// films are `yuv420p10le`). Odd seeds render the source transposed so
+    /// the 32x8/8x32 and 8x4/4x8 pairs both fire -- a single-orientation
+    /// sweep cannot catch a transposed scan table (class
+    /// scan-weights-cross-axis).
+    #[test]
+    fn a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact()
+    {
+        const NAME: &str = "a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        let n_attempts: u32 = std::env::var("EC_RECTCHROMA_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        // 32x8, 8x32, 8x4, 4x8, summed over both bit depths.
+        let mut proved = [0usize; 4];
+        let mut matched = 0u32;
+        let mut refusals = 0u32;
+        // Diagnostics: how much of the territory the COMPARED streams carried
+        // at all, so a zero above reads as "recipe picked nothing" rather
+        // than "the shape never split" without another run.
+        let (mut split_strips, mut rect4_strips) = (0usize, 0usize);
+        let mut all_rect4 = 0usize;
+        // Attempts that stopped at the new named refusal for a 1:4 strip
+        // whose transform splits once (see the assert at the end).
+        let mut depth1_refusals = 0u32;
+        for (bit_depth, cq) in [(8u32, 45u32), (8, 32), (8, 60), (10, 45), (10, 32), (10, 60)] {
+            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            for attempt in 0..n_attempts {
+                let seed = 42 + attempt;
+                // `gradients_source`, the content the sibling split-transform
+                // superblock gate uses. A band/noise `geq` fixture was tried
+                // first (r1) and gave 12/12 pixel-exact streams carrying ZERO
+                // 1:4 strips -- vacuous. Odd attempts render it transposed so
+                // HORZ_4 and VERT_4 both appear (class scan-weights-cross-axis).
+                let bands = format!(
+                    "geq=lum='mod(floor(Y/16),2)*160+48':cb=128:cr=128,noise=alls=10:all_seed={seed}"
+                );
+                let source = if attempt % 2 == 0 {
+                    format!("color=c=black:size={width}x{height}:duration=0.04:rate=25,{bands}")
+                } else {
+                    format!(
+                        "color=c=black:size={height}x{width}:duration=0.04:rate=25,{bands},transpose=1"
+                    )
+                };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
+                        pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let mut child = Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        &cq_arg,
+                        "--cpu-used=0",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        &depth_arg,
+                        &input_depth_arg,
+                        "--enable-rect-partitions=1",
+                        // AB off: it competes with 1:4 in the RD search (with
+                        // AB on, 0 superblock 1:4 strips appeared in 16
+                        // compared streams), and AB below 16x16 is another
+                        // lane's refusal.
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=1",
+                        // 16, not 8: with 8 every seed of this recipe stops
+                        // at a 32x32-level PARTITION_HORZ_4/VERT_4 (partition
+                        // values 8/9, 32x8/8x32 luma strips), a shape this
+                        // decoder does not code at all yet -- 12/12 attempts
+                        // refused before a pixel was compared (measured r1).
+                        // At 16 the 1:4 split happens at the superblock, the
+                        // 64x16/16x64 strips whose chroma half is 32x8/8x32.
+                        "--min-partition-size=16",
+                        "--max-partition-size=64",
+                        "--enable-restoration=0",
+                        "--enable-palette=0",
+                        "--deltaq-mode=0",
+                        "--enable-filter-intra=0",
+                        "--enable-cfl-intra=0",
+                        "--enable-intrabc=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "{NAME}: aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = crate::decode::rect_split_chroma_shape_hits();
+                let split_before = crate::decode::rect_split_tx_hits();
+                let rect4_before = (
+                    crate::decode::sb_rect4_horz_hits(),
+                    crate::decode::sb_rect4_vert_hits(),
+                );
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit seed \
+                             {seed}): {msg}"
+                        );
+                        refusals += 1;
+                        if msg.contains("splits only once") {
+                            depth1_refusals += 1;
+                        }
+                        all_rect4 += (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
+                            + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
+                        let r4 = (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
+                            + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit cq {cq} seed {seed} refusal (1:4 strips so \
+                             far {r4}): {msg}"
+                        );
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let after = crate::decode::rect_split_chroma_shape_hits();
+                if (0..4).any(|k| after[k] > before[k]) {
+                    eprintln!(
+                        "{NAME}: {bit_depth}-bit cq {cq} seed {seed} carries chroma shapes \
+                         32x8={} 8x32={} 8x4={} 4x8={}",
+                        after[0] - before[0],
+                        after[1] - before[1],
+                        after[2] - before[2],
+                        after[3] - before[3]
+                    );
+                }
+                let reference = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frames.len())
+                };
+                assert_eq!(frames.len(), reference.len(), "{NAME}: frame count");
+                for (i, (got, want)) in frames.iter().zip(&reference).enumerate() {
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg ({bit_depth}-bit cq {cq} seed {seed})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg ({bit_depth}-bit cq {cq} seed {seed})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg ({bit_depth}-bit cq {cq} seed {seed})"
+                    );
+                }
+                for k in 0..4 {
+                    proved[k] += after[k] - before[k];
+                }
+                split_strips += crate::decode::rect_split_tx_hits() - split_before;
+                rect4_strips += (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
+                    + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
+                matched += 1;
+            }
+        }
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {refusals} named refusals out of \
+             {} attempts; chroma shapes proved 32x8={} 8x32={} 8x4={} 4x8={}; compared \
+             streams carried {split_strips} split-transform strips and {rect4_strips} \
+             superblock 1:4 strips ({all_rect4} more in refused streams)",
+            6 * n_attempts,
+            proved[0],
+            proved[1],
+            proved[2],
+            proved[3]
+        );
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        assert!(
+            rect4_strips > 0,
+            "{NAME}: no superblock 1:4 strip in any pixel-exact stream -- recipe lost its \
+             territory, gate proved nothing this run"
+        );
+        // r1's actual capability delta. Before this round a 1:4 strip whose
+        // transform depth is 1 was decoded as if its units were SQUARE
+        // (`bw.min(bh) >> (depth - 1)`), because `sub_tx_size_map[TX_64X16]`
+        // is TX_32X16, a 2:1 RECT, not TX_16X16 -- 8-bit cq 45 seed 42 of
+        // this very recipe decoded 2 such strips and MISMATCHED ffmpeg on
+        // frame 0 luma. It is now refused by name (rect luma transform units
+        // inside a split strip are unported; the chroma half's 32x8/8x32
+        // tables this round wired are in place for it). This assert is what
+        // keeps that from silently regressing to a wrong-pixel decode.
+        assert!(
+            depth1_refusals > 0,
+            "{NAME}: no attempt reached a depth-1 1:4 split strip -- the recipe no longer \
+             covers the shape this round fixed"
+        );
+        eprintln!("{NAME}: {depth1_refusals} attempts refused the depth-1 1:4 split strip by name");
     }
 }
