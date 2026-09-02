@@ -32,15 +32,13 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
-    "a coded 1:4 HORZ_4/VERT_4 strip whose transform splits only once (the unit is still a 2:1 rect, not a square)",
-    "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect prediction is not ported)",
+    "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "a 1:4 partition below 16x16 (PARTITION_HORZ_4/VERT_4, four 16x4/4x16 strips -- this decoder codes NONE, HORZ, VERT, the four AB arms and a clean split at 16x16)",
     "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
-    "a 32x32-level 1:4 strip with a split transform (per-unit 4:1 prediction is not ported, depth={depth})",
     "a Golomb tail longer than this decoder reads",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
@@ -64,7 +62,11 @@ const REFUSALS: &[&str] = &[
     "a reference picture whose height does not match this frame's own true size",
     "a show_existing_frame header naming an empty reference slot",
     "an inter var-tx tree with a leaf transform larger than 32x32",
-    "an intra block in an inter frame whose tx_depth splits its luma transform (round 1)",
+    // lane-intrainter r1 lifted the >=16x16 square case (per-TU intra
+    // prediction + coefficients, gate
+    // `a_real_aomenc_inter_sequence_with_a_split_transform_intra_block_decodes_pixel_exact`);
+    // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
+    "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
     "an inter SB-level partition type other than NONE or SPLIT (this decoder's inter tile path recurses a superblock only as SPLIT)",
     "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
