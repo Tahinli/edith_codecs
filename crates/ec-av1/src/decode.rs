@@ -17969,6 +17969,11 @@ fn decode_inter_block(
                 // interval narrowing, not a wrong value (class
                 // wrong-alphabet-same-value).
                 let bsize_idx = match (write_w, write_h) {
+                    // lane-sb128c r5: the 128 root's own rows come FIRST --
+                    // the square arm below maps 128 to row 4 (BLOCK_16X32).
+                    (64, 128) => 14,
+                    (128, 64) => 15,
+                    (128, 128) => 16,
                     (w, h) if w == h => (w.trailing_zeros() - 3) as usize,
                     (16, 32) => 4,
                     (32, 16) => 5,
@@ -18986,7 +18991,11 @@ fn decode_inter_block(
                         dec,
                         cdfs,
                         txbset_for(tx_px, reduced),
-                        &default_scan(tx_px),
+                        // lane-sb128c r5: a TX_64X64 unit codes only its
+                        // top-left 32x32 of frequencies (spec 5.11.40), so
+                        // the scan and `tx_side` are the CODED corner while
+                        // `side` stays the transform's true 64.
+                        &default_scan(tx_px.min(32)),
                         0,
                         neighbours.around_mi(tu_mi, tx_px)[0],
                         mode,
@@ -18997,7 +19006,7 @@ fn decode_inter_block(
                         tu_px,
                         tu_py,
                         tx_px,
-                        tx_px,
+                        tx_px.min(32),
                         base_q_idx,
                         None,
                         filter_intra,
