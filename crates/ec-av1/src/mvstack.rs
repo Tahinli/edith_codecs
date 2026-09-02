@@ -251,6 +251,23 @@ impl MiGrid {
         (self.tile_row0, self.tile_col0)
     }
 
+    /// The raw recorded unit at `(row, col)`, IGNORING the current tile
+    /// bounds -- for the frame-wide consumers that run after the whole tile
+    /// walk is finished (`decode::build_motion_field`, libaom
+    /// `av1_copy_frame_mvs`, which is called per block over the whole frame
+    /// and knows nothing about tiles). [`Self::get`]'s tile narrowing is a
+    /// NEIGHBOUR-SCAN rule only; a frame-wide reader that used it silently
+    /// dropped every cell outside the LAST tile decoded (class
+    /// new-map-ignores-tile-edge, inverted: the frame-wide consumer inherited
+    /// the tile narrowing).
+    pub fn get_any(&self, row: usize, col: usize) -> Option<&MiInfo> {
+        if row < self.rows && col < self.cols {
+            self.cells[row * self.cols + col].as_ref()
+        } else {
+            None
+        }
+    }
+
     /// Records the unit at `(row, col)`. Out-of-range coordinates are a
     /// no-op — the caller only ever addresses units inside the grid it built.
     pub fn set(&mut self, row: usize, col: usize, info: MiInfo) {
