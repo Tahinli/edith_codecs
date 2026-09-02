@@ -16976,7 +16976,7 @@ fn neighbour_filter(
     // process; the desync that produces the sentinel belongs to lane-intersub8.
     if sym[0] > 2 || sym[1] > 2 {
         return Err(unsupported(
-            "an OBMC neighbour whose switchable interp filter was never recorded",
+            "an OBMC neighbour whose interp filter was never recorded (no switchable symbol for that block)",
         ));
     }
     Ok((
