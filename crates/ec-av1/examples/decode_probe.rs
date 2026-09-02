@@ -56,6 +56,16 @@ fn main() {
         println!(
             "inter_edge_strip: h64={} v64={} h32={} v32={} h16={} v16={}",
             es[0], es[1], es[2], es[3], es[4], es[5]
+
+        );
+        let (h4, v4, pairs, sub8) = ec_av1::decode::inter16_rect4_counters();
+        println!("inter16_1to4: horz4={h4} vert4={v4} chroma_pairs={pairs} sub8_pieces={sub8}");
+        let leaf4 = ec_av1::stream::vartx_rect_leaf4_hits();
+        println!("vartx_rect_leaf4: 8x4={} 4x8={}", leaf4[0], leaf4[1]);
+        let rw = ec_av1::stream::rect_wedge_hits();
+        let rwi = ec_av1::stream::rect_wii_hits();
+        println!(
+            "rect_wedge(8x16,16x8,16x32,32x16,8x32,32x8): compound={rw:?} interintra={rwi:?}"
         );
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
