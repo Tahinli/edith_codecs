@@ -8372,6 +8372,214 @@ mod tests {
 
 
     #[test]
+    // lane-sbab r1: the SUPERBLOCK-level (64x64) AB partitions on an INTER
+    // frame -- PARTITION_HORZ_A/_HORZ_B/_VERT_A/_VERT_B at 64x64, i.e. two
+    // 32x32 inter squares plus one true 64x32/32x64 inter strip, decoded in
+    // libaom `decode_partition`'s visit order. Every decode-order frame is
+    // compared Y/U/V against ffmpeg, refusals are counted and never SKIPped,
+    // out-of-scope mismatches fail the gate, and EACH of the four arms must
+    // have fired on a pixel-exact attempt (RD picking only HORZ_A is not
+    // proof of four). `--min-partition-size=32` keeps every AB piece at or
+    // above 32x32, `--max-partition-size=64` puts the AB symbol at the SB
+    // root, and `--enable-1to4-partitions=0` because the 64-level 1:4 pair is
+    // a different lane's shape.
+    fn a_real_aomenc_inter_sequence_with_superblock_level_ab_partitions_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_superblock_level_ab_partitions_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (256usize, 192usize, 6usize);
+        // Per arm, over both bit depths: how many pixel-exact attempts fired
+        // it at least once.
+        let mut arms_total = [0u32; 4];
+        for bit_depth in [8u32, 10u32] {
+            let (mut named_refusals, mut matched, mut out_of_scope, mut oos_mismatch) =
+                (0u32, 0u32, 0u32, 0u32);
+            let mut arms_proved = [0u32; 4];
+            for attempt in 0..20u32 {
+                // Axes measured live by the r1 sweep
+                // (~/.cache/sbab-tmp/sweep.sh, table in the report): two
+                // motion steps x two source orientations x five quantisers x
+                // a single-tile and a two-tile-column arm. All four arms
+                // appear in that table at both depths; no single (sp, shape,
+                // cq) point carries more than three of them, which is why the
+                // sweep is this wide.
+                let cq = [18, 26, 34, 45, 55][(attempt % 5) as usize];
+                let natural = attempt / 5 % 2 == 1;
+                let sp = if attempt / 10 % 2 == 0 { 3 } else { 8 };
+                // r1: a `--tile-columns=1` twin of these 20 attempts was run
+                // and is deliberately NOT in the gate -- its streams PANIC in
+                // `mc::from_switchable_symbol` (a 4th symbol out of a
+                // 3-symbol alphabet), the exact signature lane-inter16ab r1
+                // recorded for its own tiled arm and which the ledger pins to
+                // the below-8x8 inter leaf, not to anything this lane
+                // touches. Recorded as open residue in
+                // lanes/sbab-r1.report.md rather than turned into a SKIP or a
+                // weakened assert.
+                let tile_cols = "0";
+                let duration = frame_count as f64 / 25.0;
+                // Long-period continuous tone: the 64-level AB partitions
+                // need the L/T-shaped feature to span 32 px, so the sinusoid
+                // periods here are ~3x the 16-level gate's.
+                let lum = if natural {
+                    format!("128+58*sin((Y+N*{sp})/17)+40*sin(X/29)+20*sin((X+Y)/13)")
+                } else {
+                    format!("128+58*sin((X+N*{sp})/17)+40*sin(Y/29)+20*sin((X-Y)/13)")
+                };
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='{lum}',format=yuv420p"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let tile_arg = format!("--tile-columns={tile_cols}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
+                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--lag-in-frames=0", "--kf-max-dist=9999", &tile_arg,
+                    // Per-arm overrides go LAST: aomenc keeps the last
+                    // occurrence of a repeated --enable-* flag.
+                    "--enable-rect-partitions=1", "--enable-ab-partitions=1",
+                    "--enable-1to4-partitions=0", "--min-partition-size=32",
+                    "--max-partition-size=64",
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = decode::sb_ab_inter_hits_by_arm();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        named_refusals += 1;
+                        eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let after = decode::sb_ab_inter_hits_by_arm();
+                let fired: Vec<usize> = (0..4).map(|a| after[a] - before[a]).collect();
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if fired.iter().sum::<usize>() == 0 {
+                    out_of_scope += 1;
+                    if mismatched {
+                        oos_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit attempt {attempt} MISMATCHES with zero \
+                             64-level inter AB partition -- another shape's defect"
+                        );
+                    }
+                    continue;
+                }
+                if mismatched {
+                    for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                        let bad: Vec<usize> =
+                            (0..got.y.len()).filter(|&k| got.y[k] != want.y[k]).collect();
+                        if !bad.is_empty() {
+                            eprintln!(
+                                "{NAME}: attempt {attempt} {bit_depth}-bit frame {i}: {} luma \
+                                 pixels differ, first at ({}, {}), max |delta| {}",
+                                bad.len(),
+                                bad[0] % width,
+                                bad[0] / width,
+                                bad.iter()
+                                    .map(|&k| (got.y[k] as i32 - want.y[k] as i32).abs())
+                                    .max()
+                                    .unwrap_or(0)
+                            );
+                        }
+                    }
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                }
+                for a in 0..4 {
+                    if fired[a] > 0 {
+                        arms_proved[a] += 1;
+                        arms_total[a] += 1;
+                    }
+                }
+                matched += 1;
+            }
+            eprintln!(
+                "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
+                 attempts carrying a 64-level inter AB partition, per-arm attempts \
+                 HORZ_A/HORZ_B/VERT_A/VERT_B={arms_proved:?}, {out_of_scope} attempts carried \
+                 none ({oos_mismatch} of them mismatched)"
+            );
+            assert_eq!(
+                oos_mismatch, 0,
+                "{NAME}: {oos_mismatch} attempt(s) with no 64-level inter AB partition decoded \
+                 but mismatched ffmpeg -- a defect of another shape, not a pass"
+            );
+        }
+        assert!(
+            arms_total.iter().all(|&n| n > 0),
+            "{NAME}: not every 64-level inter AB arm fired on a pixel-exact attempt \
+             (HORZ_A/HORZ_B/VERT_A/VERT_B={arms_total:?}) -- the unfired arm(s) are unproven"
+        );
+    }
+
+    #[test]
     fn a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact() {
         if !have_ffmpeg() {
             eprintln!(

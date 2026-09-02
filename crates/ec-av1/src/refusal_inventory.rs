@@ -67,6 +67,10 @@ const REFUSALS: &[&str] = &[
     // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
     "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
+    // lane-sbab r1 lifted the superblock-level AB refusal that stood here
+    // (HORZ_A/HORZ_B/VERT_A/VERT_B at 64x64 of an inter frame: two 32x32
+    // inter squares plus one true 64x32/32x64 inter strip, gate
+    // `a_real_aomenc_inter_sequence_with_superblock_level_ab_partitions_decodes_pixel_exact`).
     // lane-inter16ab r1 lifted the AB half (HORZ_A/HORZ_B/VERT_A/VERT_B at
     // the 16x16 level of an inter frame: two 8x8 inter leaves plus one true
     // 16x8/8x16 inter strip, gate
