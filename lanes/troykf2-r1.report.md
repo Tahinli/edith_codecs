@@ -81,3 +81,8 @@ coverage, it does not widen capability).
 - deviation: the branch is NOT rebased onto today's main (`cc323d0`); its base is the charter's
   `fedb7fe`, which is main 85887c7 + the 128-SB work the film needs. It merges into main after
   lane-sb128c.
+
+## 4. Suite
+
+`cargo test -p ec-av1 --lib` (systemd user unit, MemoryMax=10G, log `$HOME/.cache/troykf2-suite-r1.log`):
+**386 passed; 0 failed; 35 ignored**, 1578 s.
