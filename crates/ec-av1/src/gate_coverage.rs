@@ -149,10 +149,6 @@ const ALIASES: &[(&str, &str)] = &[("superres-mode", "enable-superres")];
 #[cfg(test)]
 const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     (
-        "enable-angle-delta",
-        "off in 36 gates, on in none: the directional-intra gates pin it off to isolate the base modes",
-    ),
-    (
         "enable-cfl-intra",
         "off in 41 gates, on in none: chroma-from-luma prediction is unimplemented",
     ),
@@ -214,10 +210,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // gate passes `=1` for both. `enable-1to4-partitions` left it on 2026-09-02:
     // lane-tx64x16 r4's 32-level 1:4 gate has a 10-bit arm that asserts both
     // orientations and coded strips inside pixel-exact attempts.
-    (
-        "enable-angle-delta",
-        "hole at both depths, see the 8-bit list",
-    ),
     (
         "enable-cfl-intra",
         "hole at both depths, see the 8-bit list",
