@@ -1657,6 +1657,22 @@ pub(crate) fn reset_rect_intrabc_reads() {
     RECT_INTRABC_READS.with(|c| c.set(0));
 }
 
+thread_local! {
+    /// Blocks that USED intrabc at an 8x8 LEAF (`decode_leaf8`) specifically
+    /// -- the shape lane-kf900 r7 fixed; [`INTRABC_HITS`] counts every shape.
+    static LEAF8_INTRABC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`LEAF8_INTRABC_HITS`].
+pub(crate) fn leaf8_intrabc_hits() -> usize {
+    LEAF8_INTRABC_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`LEAF8_INTRABC_HITS`] (gate tests call this before a decode).
+pub(crate) fn reset_leaf8_intrabc_hits() {
+    LEAF8_INTRABC_HITS.with(|c| c.set(0));
+}
+
 /// Current value of [`INTRABC_HITS`].
 pub(crate) fn intrabc_hits() -> usize {
     INTRABC_HITS.with(|c| c.get())
@@ -3591,7 +3607,7 @@ fn read_coeffs(
         let t = dec.symbol(tx_type_cdf);
         if std::env::var_os("EC_TRACE_COEFF").is_some() {
             let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=tx_type rng={rng}");
+            eprintln!("EC_COEFF_STEP tag=tx_type len={len} rng={rng}");
         }
         if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
             let (range, value) = dec.debug_state();
@@ -10652,6 +10668,24 @@ fn decode_leaf8(
             leaf_mi.0,
             leaf_mi.1,
         )?;
+    // lane-kf900 r7: an 8x8 leaf consumed `use_intrabc` (and its DV) through
+    // `read_intra_mode` and then decoded the block as if it were ordinary
+    // intra. libaom's `is_inter_block` counts an intrabc block
+    // (`blockd.h:373`), so its luma `tx_type` comes off the INTER ext-tx set
+    // (`av1_get_ext_tx_set_type(TX_8X8, is_inter=1, 0)` = `EXT_TX_SET_ALL16`,
+    // a 16-symbol CDF) while we read the 7-symbol `TX_SET_INTRA_1` row: the
+    // same value with a different interval, so the tile desynced at the very
+    // next symbol (class `wrong-alphabet-same-value`). Everything below
+    // mirrors `decode_block`'s own intrabc handling at 16x16 and up.
+    let intrabc_dv = INTRABC_DV.with(|c| c.take());
+    if intrabc_dv.is_some() {
+        LEAF8_INTRABC_HITS.with(|c| c.set(c.get() + 1));
+    }
+    if intrabc_dv.is_some() && tx_select && !skip {
+        return Err(unsupported(
+            "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
+        ));
+    }
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
     } else {
@@ -10665,7 +10699,11 @@ fn decode_leaf8(
     // which splits the leaf's own 8x8 prediction into a 2x2 grid of 4x4
     // transform units, same raster-order per-TU pattern `decode_block`'s
     // multi-TU branch runs).
-    let resolved = if tx_select {
+    // ... and an intrabc leaf reads no intra `tx_depth` symbol at all: under
+    // `TX_MODE_SELECT` a skipped inter block takes the largest transform
+    // (`read_tx_size(.., is_inter=1, ..)`), and the unskipped case is refused
+    // above.
+    let resolved = if tx_select && intrabc_dv.is_none() {
         read_tx_size(dec, cdfs, neighbours, leaf_mi, 8, None)
     } else {
         8
@@ -10673,6 +10711,37 @@ fn decode_leaf8(
     let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
     let reach = Reach::of(8, px, py, y.width, y.height);
     let (cpx, cpy) = (px / 2, py / 2);
+    // spec 7.11.3.4 with `use_intrabc`, same as `decode_block`: predict from
+    // the CURRENT frame's own pre-loop-filter reconstruction (every loop
+    // filter is off whenever `allow_intrabc`, frame.rs:194/210/252/272) at
+    // the full-pel block vector, with the BILINEAR kernel libaom forces.
+    let intrabc_bufs = intrabc_dv.map(|(dv_row, dv_col)| {
+        let mut yb = vec![0u16; 8 * 8];
+        mc::predict_with_filter(
+            &y.data, y.width, y.true_width, y.true_height,
+            mv_to_q4(px, dv_col, true), mv_to_q4(py, dv_row, true),
+            8, 8, mc::InterpFilterKind::Bilinear, &mut yb,
+        );
+        let mut ub = vec![0u16; 4 * 4];
+        mc::predict_with_filter(
+            &u.data, u.width, u.true_width, u.true_height,
+            mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+            4, 4, mc::InterpFilterKind::Bilinear, &mut ub,
+        );
+        let mut vb = vec![0u16; 4 * 4];
+        mc::predict_with_filter(
+            &v.data, v.width, v.true_width, v.true_height,
+            mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+            4, 4, mc::InterpFilterKind::Bilinear, &mut vb,
+        );
+        (yb, ub, vb)
+    });
+    // The per-plane prediction override rides the same [`PALETTE_PRED`] slot
+    // `decode_block` uses: set fresh right before each plane's own
+    // `reconstruct`/`read_plane` call (the slot is taken, not copied).
+    if let Some((yb, _, _)) = &intrabc_bufs {
+        set_palette_pred(yb.clone());
+    }
     let (luma_grid, u_grid, v_grid);
     if skip {
         // lane-hgkf r2 (same shape as `decode_block`'s own skip branch): an
@@ -10729,6 +10798,9 @@ fn decode_leaf8(
             );
         }
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
+        if let Some((_, ub, _)) = &intrabc_bufs {
+            set_palette_pred(ub.clone());
+        }
         u.reconstruct(
             cpx,
             cpy,
@@ -10741,6 +10813,9 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv,
         );
+        if let Some((_, _, vb)) = &intrabc_bufs {
+            set_palette_pred(vb.clone());
+        }
         v.reconstruct(
             cpx,
             cpy,
@@ -10761,7 +10836,9 @@ fn decode_leaf8(
         luma_grid = read_plane(
             dec,
             cdfs,
-            if reduced_tx_set {
+            if intrabc_dv.is_some() {
+                txbset_for_inter(8, reduced_tx_set)
+            } else if reduced_tx_set {
                 TxbSet::Luma8
             } else {
                 TxbSet::Luma8Set1
@@ -10784,7 +10861,16 @@ fn decode_leaf8(
             None,
             smooth_neighbor,
         )?;
+        // `av1_get_tx_type` branches `PLANE_TYPE_UV` on `is_inter_block`, so
+        // an intrabc block's chroma tx_type is the colocated LUMA transform's
+        // coded type (lane-kf900 r6's own fix, `decode_block`'s line).
+        if intrabc_dv.is_some() {
+            INTRABC_CHROMA_TX.with(|c| c.set(Some(LUMA_TX_TYPE.with(std::cell::Cell::get))));
+        }
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
+        if let Some((_, ub, _)) = &intrabc_bufs {
+            set_palette_pred(ub.clone());
+        }
         u_grid = read_plane(
             dec,
             cdfs,
@@ -10807,6 +10893,9 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv,
         )?;
+        if let Some((_, _, vb)) = &intrabc_bufs {
+            set_palette_pred(vb.clone());
+        }
         v_grid = read_plane(
             dec,
             cdfs,
@@ -10829,6 +10918,11 @@ fn decode_leaf8(
             None,
             smooth_neighbor_uv,
         )?;
+        // Disarm: `INTRABC_CHROMA_TX` is `Some` across exactly this block's
+        // two chroma reads (`decode_block`'s own tail does the same) -- left
+        // set, every later chroma block would inherit this luma tx_type,
+        // which picks the scan and the inverse transform.
+        INTRABC_CHROMA_TX.with(|c| c.set(None));
     } else {
         // `tx_depth` resolved this leaf's luma to `TX4`: a 2x2 raster-order
         // grid of 4x4 transform units, each predicted from the leaf's own
@@ -10979,6 +11073,7 @@ fn decode_leaf8(
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
         neighbours.fill_lf_grid(leaf_mi, 2, 4, 0);
         neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
+        record_intrabc_mi(leaf_mi.0, leaf_mi.1, 2, intrabc_dv);
         return Ok(mode);
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
@@ -11003,6 +11098,10 @@ fn decode_leaf8(
     // -ss 900, first bad luma sample row 186 col 1803).
     neighbours.fill_lf_grid(leaf_mi, 2, resolved as u8, 0);
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
+    // The DV predictor of a LATER intrabc block is the ordinary `INTRA_FRAME`
+    // MV stack over this grid (`av1_find_mv_refs`), so an 8x8 leaf has to
+    // publish its own cells exactly like `decode_block` does.
+    record_intrabc_mi(leaf_mi.0, leaf_mi.1, 2, intrabc_dv);
     Ok(mode)
 }
 

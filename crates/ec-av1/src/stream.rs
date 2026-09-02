@@ -86,6 +86,12 @@ pub fn rect_intrabc_reads() -> usize {
     crate::decode::rect_intrabc_reads()
 }
 
+/// Blocks reconstructed with intra block copy at an 8x8 LEAF specifically
+/// (lane-kf900 r7's shape); [`crate::decode::intrabc_hits`] counts every shape.
+pub fn leaf8_intrabc_hits() -> usize {
+    crate::decode::leaf8_intrabc_hits()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -2845,7 +2851,7 @@ mod tests {
         const SB: &str = "smptebars=size=256x192:rate=25";
         // (arm, source, per-arm overrides AFTER the base recipe, expect_refusal,
         //  must_read_use_intrabc_on_a_rect_strip)
-        let arms: [(&str, &str, &[&str], bool, bool); 7] = [
+        let arms: [(&str, &str, &[&str], bool, bool); 8] = [
             ("testsrc2-cq50-txs0", TS, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"], true, true),
             ("smptebars-cq40-txs0", SB, &["--cq-level=40", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
             ("smptebars-cq45-txs0", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
@@ -2853,10 +2859,17 @@ mod tests {
             ("smptebars-cq50-txs1", SB, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
             ("smptebars-cq55-txs0", SB, &["--cq-level=55", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
             ("testsrc2-cq63-txs1", TS, &["--cq-level=63", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
+            // lane-kf900 r7: the 8x8-LEAF intrabc arm. Rect and 1:4
+            // partitions off (so no rect strip refuses first), palette on,
+            // `TxMode::Largest`: aomenc puts exactly one `use_intrabc` block
+            // on a `BLOCK_8X8` leaf here, the shape `decode_leaf8` decoded as
+            // ordinary intra before this round.
+            ("testsrc2-cq55-leaf8", TS, &["--cq-level=55", "--enable-palette=1", "--enable-tx-size-search=0", "--enable-rect-partitions=0", "--enable-1to4-partitions=0"], false, false),
         ];
         let (mut reads_total, mut refused, mut frames_compared) = (0usize, 0u32, 0usize);
         let (mut blocks_total, mut fired_arms, mut out_of_scope, mut out_of_scope_mismatch) =
             (0usize, 0u32, 0u32, 0u32);
+        let mut leaf8_total = 0usize;
         for (arm, src, extra, expect_refusal, must_read) in &arms {
             let render = || {
                 let out = Command::new("ffmpeg")
@@ -2928,6 +2941,7 @@ mod tests {
             let stream = out.stdout;
             decode::reset_rect_intrabc_reads();
             crate::decode::reset_intrabc_hits();
+            crate::decode::reset_leaf8_intrabc_hits();
             let decoded = decode_stream(&stream);
             let reads = decode::rect_intrabc_reads();
             // Blocks that decoded `use_intrabc == 1` (square path), i.e. that
@@ -2936,6 +2950,18 @@ mod tests {
             let blocks = crate::decode::intrabc_hits();
             reads_total += reads;
             blocks_total += blocks;
+            // The 8x8-leaf shape has its own counter: without it this gate's
+            // other arms (all rect/32x32 intrabc) would stay green while the
+            // leaf path decoded an intrabc block as ordinary intra (class
+            // `gate-blind-to-feature`).
+            let leaf8 = crate::decode::leaf8_intrabc_hits();
+            leaf8_total += leaf8;
+            if *arm == "testsrc2-cq55-leaf8" {
+                assert!(
+                    leaf8 > 0,
+                    "{NAME}: {arm} decoded no intrabc block at an 8x8 leaf -- the arm no                      longer exercises `decode_leaf8`'s intrabc path"
+                );
+            }
             if *must_read {
                 assert!(
                     reads > 0,
@@ -3006,7 +3032,12 @@ mod tests {
              {refused} refused by name, {frames_compared} frames compared, \
              {out_of_scope} out of scope ({out_of_scope_mismatch} mismatched)"
         );
+        eprintln!("{NAME}: {leaf8_total} intrabc block(s) at an 8x8 leaf");
         assert!(reads_total > 0, "{NAME}: gate is vacuous -- no arm read the symbol");
+        assert!(
+            leaf8_total > 0,
+            "{NAME}: no arm decoded an intrabc block at an 8x8 leaf -- lane-kf900 r7's fix              is untested"
+        );
         assert!(
             blocks_total > 0 && fired_arms > 0,
             "{NAME}: gate is vacuous -- no compared arm actually decoded an intrabc block"
