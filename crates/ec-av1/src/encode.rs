@@ -1020,7 +1020,7 @@ pub(crate) struct Reach {
 /// it. Indexed by the block's position in the superblock, in blocks of its own
 /// size, as `row * (128 / side) + col` (`Reach::table_stride`) -- libaom's
 /// 128, not this crate's 64 superblock -- bit by bit from the low end.
-const HAS_TOP_RIGHT: [&[u8]; 3] = [
+const HAS_TOP_RIGHT: [&[u8]; 4] = [
     &[255, 85, 119, 85, 127, 85, 119, 85],
     &[95, 87],
     // has_tr_8x8 (libaom av1/common/reconintra.c) -- table_stride(8) == 16
@@ -1029,17 +1029,44 @@ const HAS_TOP_RIGHT: [&[u8]; 3] = [
         255, 255, 85, 85, 119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85, 255, 127, 85, 85,
         119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85,
     ],
+
+    // has_tr_4x4 (libaom av1/common/reconintra.c, transcribed verbatim) --
+    // table_stride(4) == 32 (128 / 4), so 32 bits per row, 32 rows, 128
+    // bytes. Sub-8x8 leaves (lane-sub8) are the only blocks that reach here
+    // with side 4 outside a TX4 split; without their own row they clamped
+    // into the 8x8 table and read above-right samples the decoder has not
+    // written yet (all-zero pixels in the bottom-right triangle of a
+    // directional 4x4 leaf).
+    &[
+        255, 255, 255, 255, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127,
+        85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 255, 127, 255, 127, 85, 85, 85, 85,
+        119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127, 85, 85, 85, 85, 119, 119, 119, 119,
+        85, 85, 85, 85, 255, 255, 255, 127, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85,
+        127, 127, 127, 127, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 255, 127, 255, 127,
+        85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127, 85, 85, 85, 85,
+        119, 119, 119, 119, 85, 85, 85, 85,
+    ],
 ];
 
 /// `has_bl_16x16` / `has_bl_32x32`: the same, for the block below and to the
 /// left.
-const HAS_BOTTOM_LEFT: [&[u8]; 3] = [
+const HAS_BOTTOM_LEFT: [&[u8]; 4] = [
     &[84, 16, 84, 0, 84, 16, 84, 0],
     &[4, 4],
     // has_bl_8x8 (libaom av1/common/reconintra.c)
     &[
         84, 85, 16, 17, 84, 85, 0, 1, 84, 85, 16, 17, 84, 85, 0, 0, 84, 85, 16, 17, 84, 85, 0, 1,
         84, 85, 16, 17, 84, 85, 0, 0,
+    ],
+
+    // has_bl_4x4 (same source, same order).
+    &[
+        84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17,
+        84, 85, 85, 85, 0, 0, 1, 0, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84,
+        85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 0, 0, 0, 84, 85, 85, 85, 16, 17, 17, 17, 84,
+        85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 0, 1, 0, 84, 85,
+        85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85,
+        85, 85, 0, 0, 0, 0,
     ],
 ];
 
@@ -1104,6 +1131,38 @@ const HAS_TOP_RIGHT_RECT: [&[u8]; 2] = [&[15, 5, 7, 5], &[255, 119, 127, 119]];
 /// `has_bl_32x16`/`has_bl_16x32`, same source, same order.
 const HAS_BOTTOM_LEFT_RECT: [&[u8]; 2] = [&[78, 14, 78, 14], &[16, 0, 16, 0]];
 
+/// libaom `reconintra.c`'s `has_tr_*`/`has_bl_*` for the four rectangular
+/// block sizes this decoder codes, transcribed verbatim (lane-rectx r4).
+/// The 16x8/8x16 rows are what the 32x16/16x32 pair above cannot stand in
+/// for: they are 16 bytes, not 4, and their bit pattern is a different
+/// coding order entirely -- reading the 16x32 table for a 16x8 block gave
+/// the wrong bottom-left availability and a directional (D203) strip whose
+/// prediction diverged exactly where it starts reading below its own height.
+/// `has_tr_vert_tables`/`has_bl_vert_tables` hold the SAME pointers as these
+/// for every W<H entry, and are NULL for W>H (no VERT_A/B ever produces one),
+/// so the partition type does not select a different table at these sizes.
+fn has_tr_rect_table(bw: usize, bh: usize) -> &'static [u8] {
+    match (bw, bh) {
+        (16, 8) => &[255, 0, 85, 0, 119, 0, 85, 0, 127, 0, 85, 0, 119, 0, 85, 0],
+        (8, 16) => &[255, 255, 119, 119, 127, 127, 119, 119, 255, 127, 119, 119, 127, 127, 119, 119],
+        (32, 16) => &[15, 5, 7, 5],
+        (16, 32) => &[255, 119, 127, 119],
+        (64, 32) => &[19],
+        _ => &[127],
+    }
+}
+
+fn has_bl_rect_table(bw: usize, bh: usize) -> &'static [u8] {
+    match (bw, bh) {
+        (16, 8) => &[254, 84, 254, 16, 254, 84, 254, 0, 254, 84, 254, 16, 254, 84, 254, 0],
+        (8, 16) => &[16, 17, 0, 1, 16, 17, 0, 0, 16, 17, 0, 1, 16, 17, 0, 0],
+        (32, 16) => &[78, 14, 78, 14],
+        (16, 32) => &[16, 0, 16, 0],
+        (64, 32) => &[34],
+        _ => &[0],
+    }
+}
+
 impl Reach {
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
     /// in a frame of `width` by `height`.
@@ -1133,37 +1192,61 @@ impl Reach {
         }
     }
 
-    fn position_rect(bw: usize, bh: usize, x: usize, y: usize) -> (usize, usize, usize, usize) {
-        (
-            (y % SUPERBLOCK) / bh,
-            (x % SUPERBLOCK) / bw,
-            SUPERBLOCK / bh,
-            SUPERBLOCK / bw,
-        )
-    }
-
+    /// libaom `has_top_right` at block granularity (`row_off`/`col_off` 0,
+    /// the transform covering the whole block, luma): everything before the
+    /// table lookup is that function's own early-exit ladder.
     fn top_right_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
-        let (row, col, _per_row, per_col) = Self::position_rect(bw, bh, x, y);
-        if row == 0 {
+        const SB_MI: usize = SUPERBLOCK / 4;
+        let (mi_row, mi_col) = (y / 4, x / 4);
+        let bw_log2 = (bw / 4).trailing_zeros() as usize;
+        let bh_log2 = (bh / 4).trailing_zeros() as usize;
+        let blk_row = (mi_row & (SB_MI - 1)) >> bh_log2;
+        let blk_col = (mi_col & (SB_MI - 1)) >> bw_log2;
+        // Top row of the superblock: the top-right pixels are in the (already
+        // decoded) superblock above.
+        if blk_row == 0 {
             return true;
         }
-        if col + 1 == per_col {
+        // Rightmost column: they fall in the superblock to the right.
+        if ((blk_col + 1) << bw_log2) >= SB_MI {
             return false;
         }
-        let table = HAS_TOP_RIGHT_RECT[usize::from(bw == 16)];
-        Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
+        let table = has_tr_rect_table(bw, bh);
+        Self::bit(table, Self::rect_table_index(bw_log2, blk_row, blk_col))
     }
 
+    /// libaom `has_top_right`'s own index arithmetic:
+    /// `(blk_row << (MAX_MIB_SIZE_LOG2 - bw_in_mi_log2)) + blk_col`, and
+    /// `MAX_MIB_SIZE_LOG2` is 5 (`enums.h`: libaom's tables are laid out for a
+    /// 128x128 superblock = 32 mi), NOT this crate's 64x64 = 16. lane-rectx r5:
+    /// r4 wrote `4 - bw_log2`, halving the row stride -- every table row but
+    /// the first then read the wrong byte (16x8 wrong at 80 mi positions in a
+    /// 64-wide SB, 8x16 at 16, 32x16 at 64, a regression against main).
+    /// [`tests::rect_reach_tables_are_indexed_with_a_32_mi_row_stride`] pins it.
+    fn rect_table_index(bw_log2: usize, blk_row: usize, blk_col: usize) -> usize {
+        (blk_row << (5 - bw_log2)) + blk_col
+    }
+
+    /// libaom `has_bottom_left`, same granularity as [`Self::top_right_rect`].
     fn bottom_left_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
-        let (row, col, per_row, _per_col) = Self::position_rect(bw, bh, x, y);
-        if col == 0 {
-            return row * bh + bh < SUPERBLOCK;
+        const SB_MI: usize = SUPERBLOCK / 4;
+        let (mi_row, mi_col) = (y / 4, x / 4);
+        let bw_log2 = (bw / 4).trailing_zeros() as usize;
+        let bh_log2 = (bh / 4).trailing_zeros() as usize;
+        let blk_row = (mi_row & (SB_MI - 1)) >> bh_log2;
+        let blk_col = (mi_col & (SB_MI - 1)) >> bw_log2;
+        // Leftmost column of the superblock: the bottom-left pixels are in
+        // the left superblock iff they stay inside its height.
+        if blk_col == 0 {
+            return (blk_row << bh_log2) + (bh / 4) < SB_MI;
         }
-        if row + 1 == per_row {
+        // Bottom row (and not the leftmost column): they fall in the
+        // superblock below, which is not decoded yet.
+        if ((blk_row + 1) << bh_log2) >= SB_MI {
             return false;
         }
-        let table = HAS_BOTTOM_LEFT_RECT[usize::from(bw == 16)];
-        Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
+        let table = has_bl_rect_table(bw, bh);
+        Self::bit(table, Self::rect_table_index(bw_log2, blk_row, blk_col))
     }
 
     /// Marks every [`Reach::of`] made until the returned guard drops as being
@@ -1196,21 +1279,22 @@ impl Reach {
         if col + 1 == per_side {
             return false;
         }
-        // corner-cut: `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` only carry dedicated
-        // rows for side 8/16/32/64 (libaom's own `has_tr_8x8`/`has_tr_16x16`
-        // families); a `TxMode::Select` TX4 transform unit reaches here with
-        // side 4, whose real table (`has_tr_4x4`, 128 bytes) was never
-        // transcribed. Clamping into the 16/32 table's own bit range keeps
-        // this in-bounds and correct at every position that table already
-        // covers periodically -- wrong only at the small remainder past its
-        // length, a reach over-/under-estimate (extra or missing above-right
-        // reference pixels), never a stream desync (Reach never gates a
-        // symbol read). Ceiling: transcribe `has_tr_4x4`/`has_bl_4x4`
-        // verbatim and give TX4 its own `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` row.
-        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) {
-            HAS_TOP_RIGHT_VERT[Self::table(side)]
+        // lane-sub8 r4: side 4 now has its own `has_tr_4x4`/`has_bl_4x4` row
+        // (the clamp corner-cut that used to live here is gone); sides
+        // 16/32/64 share row 0 exactly as libaom's tables repeat.
+        // corner-cut: libaom transcribes no vert 4x4 row, so a side-4 block
+        // inside a `PARTITION_VERT_A`/`_B` falls back to the ordinary table
+        // -- a reach over-estimate (extra above-right reference pixels),
+        // never a stream desync. Ceiling: transcribe `has_tr_vert_4x4` /
+        // `has_bl_vert_4x4` and extend the VERT tables to four rows.
+        // NB: named `table_row`, not `row` -- `row` above is the block's
+        // position inside the superblock and is what the bit index below
+        // steps by (a merge that shadowed it desynced every block size).
+        let table_row = Self::table(side);
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) && table_row < HAS_TOP_RIGHT_VERT.len() {
+            HAS_TOP_RIGHT_VERT[table_row]
         } else {
-            HAS_TOP_RIGHT[Self::table(side)]
+            HAS_TOP_RIGHT[table_row]
         };
         Self::bit(
             table,
@@ -1230,11 +1314,22 @@ impl Reach {
         if row + 1 == per_side {
             return false;
         }
-        // corner-cut: see `top_right`'s note -- same clamp, same ceiling.
-        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) {
-            HAS_BOTTOM_LEFT_VERT[Self::table(side)]
+        // lane-sub8 r4: side 4 now has its own `has_tr_4x4`/`has_bl_4x4` row
+        // (the clamp corner-cut that used to live here is gone); sides
+        // 16/32/64 share row 0 exactly as libaom's tables repeat.
+        // corner-cut: libaom transcribes no vert 4x4 row, so a side-4 block
+        // inside a `PARTITION_VERT_A`/`_B` falls back to the ordinary table
+        // -- a reach over-estimate (extra above-right reference pixels),
+        // never a stream desync. Ceiling: transcribe `has_tr_vert_4x4` /
+        // `has_bl_vert_4x4` and extend the VERT tables to four rows.
+        // NB: named `table_row`, not `row` -- `row` above is the block's
+        // position inside the superblock and is what the bit index below
+        // steps by (a merge that shadowed it desynced every block size).
+        let table_row = Self::table(side);
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) && table_row < HAS_BOTTOM_LEFT_VERT.len() {
+            HAS_BOTTOM_LEFT_VERT[table_row]
         } else {
-            HAS_BOTTOM_LEFT[Self::table(side)]
+            HAS_BOTTOM_LEFT[table_row]
         };
         Self::bit(
             table,
@@ -1270,6 +1365,8 @@ impl Reach {
             1
         } else if side == 8 {
             2
+        } else if side == 4 {
+            3
         } else {
             0
         }
@@ -3128,6 +3225,49 @@ pub fn encode_sequence(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-rectx r5: libaom lays `has_tr_*`/`has_bl_*` out row-major for a
+    /// 128x128 superblock -- `MAX_MIB_SIZE_LOG2 = 5` mi columns per row, so a
+    /// row holds `32 >> bw_in_mi_log2` bits and the table holds
+    /// `32 >> bh_in_mi_log2` such rows. Walking every block position of that
+    /// superblock must therefore hit every bit of the table EXACTLY ONCE.
+    /// r4's `4 - bw_log2` index halved the row stride: the walk then covered
+    /// only a quarter of the 16x8 table and read the wrong byte for every
+    /// block row but the first (silently wrong above-right/below-left
+    /// availability -- wrong pixels, no error).
+    #[test]
+    fn rect_reach_tables_are_indexed_with_a_32_mi_row_stride() {
+        for (bw, bh) in [(16usize, 8usize), (8, 16), (32, 16), (16, 32), (64, 32), (32, 64)] {
+            let (bw_log2, bh_log2) =
+                ((bw / 4).trailing_zeros() as usize, (bh / 4).trailing_zeros() as usize);
+            let (rows, cols) = (32 >> bh_log2, 32 >> bw_log2);
+            for (name, table) in
+                [("has_tr", has_tr_rect_table(bw, bh)), ("has_bl", has_bl_rect_table(bw, bh))]
+            {
+                assert_eq!(
+                    table.len() * 8,
+                    rows * cols,
+                    "{name}_{bw}x{bh}: libaom's table is {rows} rows of {cols} bits"
+                );
+                let mut seen = vec![0u32; table.len() * 8];
+                for blk_row in 0..rows {
+                    for blk_col in 0..cols {
+                        let idx = Reach::rect_table_index(bw_log2, blk_row, blk_col);
+                        assert!(
+                            idx < seen.len(),
+                            "{name}_{bw}x{bh}: index {idx} past the table at ({blk_row},{blk_col})"
+                        );
+                        seen[idx] += 1;
+                    }
+                }
+                assert!(
+                    seen.iter().all(|&n| n == 1),
+                    "{name}_{bw}x{bh}: the block walk is not a bijection onto the table's bits \
+                     (row stride is not {cols})"
+                );
+            }
+        }
+    }
     use super::*;
     use crate::intra::{D45_PRED, D135_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
     use std::io::Write;
