@@ -6938,7 +6938,10 @@ fn decode_rect_split(
         // first 50 frame OBUs of the 10-bit 3840x1608 stream's head decode
         // all 33 frames pixel-exact against ffmpeg while this arm fires 90x
         // 64x32 + 5x 32x64 -- pinned as `fixtures/hg_rect64_intra16x4_witness.obu`
-        // and gated by `a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact`.
+        // and gated by `a_10bit_film_frames_with_rect64_corner_tus_decode_pixel_exact`.
+        // lane-wit16x4 r1 re-measured that fixture on the merged tip: this arm
+        // fires 64x32=148 32x64=123 (the 90/5 above were counted out of the
+        // frame-33 desync lane-frame36 r2 fixed), all 33 frames pixel-exact.
         (64, 32) | (32, 64) => None,
         _ => {
             return Err(unsupported(format!(
@@ -22317,13 +22320,35 @@ fn decode_inter_block(
         // the first 50 frame OBUs of the 10-bit 3840x1608 stream's head decode
         // all 33 frames pixel-exact while this arm fires 31x 16x4 + 17x 4x16
         // (23 of them chroma-paired). Pinned as
-        // `fixtures/hg_rect64_intra16x4_witness.obu`, gated by
-        // `a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact`.
+        // `fixtures/hg_rect64_intra16x4_witness.obu` -- MEASURED WRONG, see
+        // the lane-wit16x4 note below.
         // The refusal below is NARROWED, not deleted: it still stands for a
         // 16x4/4x16 strip with no chroma-pair record and for every other
         // sub-8 shape.
+        //
+        // lane-wit16x4 r1: RE-WIDENED to the whole shape, because r3's witness
+        // was a PHANTOM (class `counter-from-refused-stream`): the pinned
+        // fixture was measured while decode-order frame 33 was desynced, and
+        // on the merged tip (lane-frame36 r2 fixed that desync) the very same
+        // fixture decodes all 33 frames pixel-exact with `intra16x4_in_inter`
+        // 16x4=0 4x16=0 chroma_ref=0 -- the 31/17/23 were counted out of a
+        // wrong decode. Re-measured this round: NO stream anywhere decodes
+        // exactly while this arm fires. Two 2 s 10-bit film cuts (3840x1608 at
+        // 0 s: OK, 48 frames exact, 0 hits; at 300 s: 138/559 hits but frames
+        // 1 and 2 mismatch ffmpeg by 14105680 / 12470780 bytes), four 1920x792
+        // 128-SB cuts (hits only inside frames that refuse or are never shown
+        // -- the 6300 s cut's key frame is exact with 0 hits and its no-show
+        // frame 1 carries 169/445 with no display frame reachable before the
+        // 128x64-intra-on-inter refusal), and the aomenc gate
+        // `a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact`
+        // (run `--include-ignored` on this tip: FAILED, 0 pixel-exact attempts
+        // carrying the strip, per-arm [0, 0, 0]). A lifted refusal with no
+        // witness is a capability claim (class `refusal-lifted-without-a-gate`),
+        // so the decode path stays behind `EC_INTRA16X4_DECODE` for the round
+        // that finds a witness.
         let strip16 = strip_chroma
             .filter(|_| write_w.min(write_h) == 4 && write_w.max(write_h) == 16)
+            .filter(|_| std::env::var_os("EC_INTRA16X4_DECODE").is_some())
             .map(|s| (s.horz, s.has_chroma));
         if write_w.min(write_h) < 8 && strip16.is_none() {
             if std::env::var_os("EC_INTRA16X4").is_some() {
