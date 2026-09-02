@@ -2515,6 +2515,22 @@ pub(crate) fn uv_mode_mi_override_hits() -> usize {
     UV_MODE_MI_OVERRIDE_HITS.with(|c| c.get())
 }
 
+// lane-t900 r8: how many intra edge-filter-type reads (luma + chroma) the
+// INTER neighbour stamp saved: the coarse SUB band still held a SMOOTH mode
+// from an earlier block in that pixel row/column while the mi-exact map --
+// which an inter block only started writing this round -- correctly says the
+// neighbour is not smooth (libaom `is_smooth`: an inter neighbour's `mode` is
+// an INTER mode, and its `uv_mode` "is not set for inter blocks").
+thread_local! {
+    static INTER_NEIGHBOUR_NOT_SMOOTH_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTER_NEIGHBOUR_NOT_SMOOTH_HITS`].
+pub(crate) fn inter_neighbour_not_smooth_hits() -> usize {
+    INTER_NEIGHBOUR_NOT_SMOOTH_HITS.with(|c| c.get())
+}
+
 // lane-mtfix r1: how many times a chroma intra-edge filter-type read was
 // suppressed at a TILE edge that is not a frame edge -- the above/left
 // `uv_mode` neighbour of a block on a tile's first mi row/column lives in
@@ -5322,6 +5338,23 @@ impl Neighbours {
         skip_mode: bool,
     ) {
         let (r, c) = at_mi;
+        // lane-t900 r8 (class new-map-ignores-tile-edge's twin: a map NOBODY
+        // writes for a whole block class): an INTER block left the luma mode
+        // map untouched, so a later intra block's `get_intra_edge_filter_type`
+        // (spec 7.11.2, libaom `reconintra.h`'s `is_smooth`) fell back to the
+        // coarse SUB-row band, which still held a SMOOTH mode from an earlier
+        // block in that pixel row -- the directional edge filter then ran at
+        // strength 3 instead of 2. libaom reads `mbmi->mode` of the neighbour,
+        // which for an inter block is an INTER mode (>= NEARESTMV) and is
+        // never smooth; DC_PRED is this map's equivalent (the sub-8x8 groups
+        // already stamped it).
+        // The chroma twin: `is_smooth(mbmi, plane > 0)` returns 0 outright for
+        // an inter neighbour ("uv_mode is not set for inter blocks"), so the
+        // uv map must read DC_PRED over an inter block's cells too.
+        if is_inter {
+            self.record_mode_mi(r, c, w_mi, h_mi, DC_PRED);
+            self.record_uv_mode_mi(r, c, w_mi, h_mi, DC_PRED);
+        }
         let altref = is_inter && ref_frame == crate::mvstack::ALTREF_FRAME;
         for cell in 0..w_mi {
             self.above_skip[c + cell] = skip;
@@ -5702,6 +5735,11 @@ impl Neighbours {
         if above != self.above_uv_mode[c] || left != self.left_uv_mode[r] {
             UV_MODE_MI_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
         }
+        if (is_smooth_mode(self.above_uv_mode[c]) && !is_smooth_mode(above))
+            || (is_smooth_mode(self.left_uv_mode[r]) && !is_smooth_mode(left))
+        {
+            INTER_NEIGHBOUR_NOT_SMOOTH_HITS.with(|h| h.set(h.get() + 1));
+        }
         is_smooth_mode(above) || is_smooth_mode(left)
     }
 
@@ -5756,6 +5794,11 @@ impl Neighbours {
             self.modes_above_left_mi(mi_r, mi_c, (self.above_mode[c], self.left_mode[r]));
         if above != self.above_mode[c] || left != self.left_mode[r] {
             MODE_MI_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
+        }
+        if (is_smooth_mode(self.above_mode[c]) && !is_smooth_mode(above))
+            || (is_smooth_mode(self.left_mode[r]) && !is_smooth_mode(left))
+        {
+            INTER_NEIGHBOUR_NOT_SMOOTH_HITS.with(|h| h.set(h.get() + 1));
         }
         // A neighbour the coarse band offered where the tile edge makes it
         // unavailable -- must never happen (see `MODE_TILE_EDGE_COARSE_LEAKS`).
@@ -11052,7 +11095,7 @@ impl PlaneBuf {
             let row0: Vec<u16> = prediction[..side.min(8)].to_vec();
             let col0: Vec<u16> = (0..side.min(8)).map(|r| prediction[r * side]).collect();
             eprintln!(
-                "@{} OUR_PRED x={x} y={y} side={side} side={side} mode={mode} ad={angle_delta} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller()
+                "@{} OUR_PRED x={x} y={y} side={side} side={side} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller(), i32::from(smooth_neighbor)
             );
         }
         for row in 0..side {
