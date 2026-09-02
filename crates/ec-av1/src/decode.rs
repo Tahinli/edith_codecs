@@ -1571,6 +1571,30 @@ thread_local! {
     static INTRABC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Whether this frame's header set `allow_intrabc` -- [`INTRABC_MI_GRID`] is
+/// `Some` exactly then (set once per frame in `decode_frame`), so the flag
+/// needs no separate plumbing to reach the rect-strip mode reader.
+fn allow_intrabc_frame() -> bool {
+    INTRABC_MI_GRID.with(|g| g.borrow().is_some())
+}
+
+thread_local! {
+    /// How many rect intra strips READ the `use_intrabc` symbol (i.e. how many
+    /// times the fix below was exercised) -- the rect-strip gate's hit counter,
+    /// distinct from [`INTRABC_HITS`] which counts blocks that USE intrabc.
+    static RECT_INTRABC_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_INTRABC_READS`].
+pub(crate) fn rect_intrabc_reads() -> usize {
+    RECT_INTRABC_READS.with(|c| c.get())
+}
+
+/// Zeroes [`RECT_INTRABC_READS`] (gate tests call this before a decode).
+pub(crate) fn reset_rect_intrabc_reads() {
+    RECT_INTRABC_READS.with(|c| c.set(0));
+}
+
 /// Current value of [`INTRABC_HITS`].
 pub(crate) fn intrabc_hits() -> usize {
     INTRABC_HITS.with(|c| c.get())
@@ -5580,6 +5604,27 @@ fn read_intra_mode_rect(
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip);
     maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, false, skip);
     istep!("dq", 0);
+    // `read_intrabc_info` (spec 5.11.13, libaom `decodemv.c:892`, right after
+    // `skip`/`segment_id`/`cdef`/`delta_q` and before `mbmi->mode`): the
+    // `use_intrabc` symbol is read for EVERY intra block of an `allow_intrabc`
+    // frame -- `av1_allow_intrabc` is a frame-level test with no shape term, so
+    // rect strips read it exactly like square leaves ([`read_intra_mode`],
+    // [`read_intra_mode_sub8`]). Missing it here desynced the arithmetic
+    // decoder at the FIRST symbol of the first rect block of every
+    // `--tune-content=screen` key frame. Reconstruction of a real intrabc
+    // block at this shape is out of scope, so the flag is consumed and
+    // refused by name when it fires.
+    if allow_intrabc_frame() {
+        let use_intrabc = dec.symbol(&mut cdfs.intrabc) != 0;
+        RECT_INTRABC_READS.with(|c| c.set(c.get() + 1));
+        istep!("intrabc", use_intrabc as i32);
+        if use_intrabc {
+            INTRABC_HITS.with(|c| c.set(c.get() + 1));
+            return Err(unsupported(
+                "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
+            ));
+        }
+    }
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
