@@ -16325,57 +16325,88 @@ mod tests {
     #[test]
     fn filter_intra_classes_carry_their_own_libaom_default_row() {
         // `default_filter_intra_cdfs[bsize]`, BLOCK_SIZES_ALL order, as
-        // (width, height, default) for the shapes <= 32 on both axes.
-        let libaom: &[(usize, usize, u16)] = &[
-            (4, 4, 4621),
-            (4, 8, 6743),
-            (8, 4, 5893),
-            (8, 8, 7866),
-            (8, 16, 12551),
-            (16, 8, 9394),
-            (16, 16, 12408),
-            (16, 32, 14301),
-            (32, 16, 12756),
-            (32, 32, 22343),
-            (4, 16, 16384),
-            (16, 4, 16384),
-            (8, 32, 16384),
-            (32, 8, 16384),
+        // (width, height, default, refused_by) for the shapes <= 32 on both
+        // axes. The first three fields are GENERATED from the oracle by
+        // `scripts/extract-filter-intra-cdfs.py` (it reads BLOCK_SIZES_ALL's
+        // order from enums.h and the table from entropymode.c, so no hand
+        // transcription can drift -- lane-fistrip r1 listed the four 1:4
+        // shapes as 16384 out of exactly that kind of guess; their real rows
+        // are 12770/10368/20229/18101). `refused_by` is `None` for a shape
+        // this decoder's partition tree reaches today -- it must own a class,
+        // and that class must carry exactly this row -- and the refusal
+        // string that blocks the shape otherwise. Either way the row is
+        // pinned HERE, so the round that lifts one of those refusals cannot
+        // land a wrong CDF row for the shape it unlocks.
+        const BELOW_8X8: &str =
+            "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)";
+        const PART16: &str = "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes \
+             only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)";
+        const PART32: &str = "a 32x32 partition type this decoder does not code (value={part32})";
+        let libaom: &[(usize, usize, u16, Option<&str>)] = &[
+            (4, 4, 4621, None),
+            (4, 8, 6743, Some(BELOW_8X8)),
+            (8, 4, 5893, Some(BELOW_8X8)),
+            (8, 8, 7866, None),
+            (8, 16, 12551, None),
+            (16, 8, 9394, None),
+            (16, 16, 12408, None),
+            (16, 32, 14301, None),
+            (32, 16, 12756, None),
+            (32, 32, 22343, None),
+            // The 1:4 strips: a 16x16-level PARTITION_HORZ_4/VERT_4 gives
+            // 4x16/16x4, a 32x32-level one 8x32/32x8, and both partition
+            // values refuse by name before any leaf is coded.
+            (4, 16, 12770, Some(PART16)),
+            (16, 4, 10368, Some(PART16)),
+            (8, 32, 20229, Some(PART32)),
+            (32, 8, 18101, Some(PART32)),
         ];
-        // The shapes this decoder's partition tree can actually reach today
-        // (squares 4..32 plus the 16x16- and 32x32-level HORZ/VERT strips).
-        let reachable = [
-            (4, 4),
-            (8, 8),
-            (16, 16),
-            (32, 32),
-            (32, 16),
-            (16, 32),
-            (8, 16),
-            (16, 8),
-        ];
-        for &(bw, bh, default) in libaom {
-            let class = filter_intra_size_class_rect(bw, bh);
-            if reachable.contains(&(bw, bh)) {
-                let class = class.unwrap_or_else(|| {
-                    panic!("{bw}x{bh} is inside av1_filter_intra_allowed_bsize and reachable, \
-                            but has no CDF class -- its use_filter_intra symbol is never read")
-                });
-                assert_eq!(
-                    crate::cdf::FILTER_INTRA[class][0],
-                    default,
-                    "{bw}x{bh} (class {class}) must carry default_filter_intra_cdfs' own row"
-                );
-            } else {
-                // 4x8/8x4/4x16/16x4/8x32/32x8: sub-8x8 leaves and the 1:4
-                // strips, neither of which this decoder codes yet (their
-                // partition levels refuse by name first), so no class exists.
-                assert!(
-                    class.is_none(),
-                    "{bw}x{bh} gained a class without a decode path to use it"
-                );
+        let mut classes_seen = std::collections::BTreeSet::new();
+        for &(bw, bh, default, refused_by) in libaom {
+            match filter_intra_size_class_rect(bw, bh) {
+                Some(class) => {
+                    assert!(
+                        refused_by.is_none(),
+                        "{bw}x{bh} has a CDF class but is listed as refused by {refused_by:?} -- \
+                         one of the two is stale"
+                    );
+                    assert_eq!(
+                        crate::cdf::FILTER_INTRA[class][0],
+                        default,
+                        "{bw}x{bh} (class {class}) must carry default_filter_intra_cdfs' own row"
+                    );
+                    assert_eq!(
+                        &crate::cdf::FILTER_INTRA[class][1..],
+                        &[32768u16, 0][..],
+                        "{bw}x{bh} (class {class}) is a 2-symbol CDF: {{p, 32768, count}}"
+                    );
+                    assert!(
+                        classes_seen.insert(class),
+                        "class {class} is claimed by two shapes -- one of them reads the other's \
+                         probability"
+                    );
+                }
+                None => {
+                    let why = refused_by.unwrap_or_else(|| {
+                        panic!(
+                            "{bw}x{bh} is inside av1_filter_intra_allowed_bsize and reachable, \
+                             but has no CDF class -- its use_filter_intra symbol is never read"
+                        )
+                    });
+                    assert!(!why.is_empty(), "{bw}x{bh}'s refusal string must name the blocker");
+                }
             }
         }
+        // The other direction: every row of `cdf::FILTER_INTRA` was claimed
+        // by exactly one shape above, so no row can be left over (or shared)
+        // once a class is added or removed.
+        assert_eq!(
+            classes_seen.len(),
+            crate::cdf::FILTER_INTRA.len(),
+            "cdf::FILTER_INTRA has {} rows but only {:?} are claimed by an allowed shape",
+            crate::cdf::FILTER_INTRA.len(),
+            classes_seen
+        );
         // Past the bound on either axis: no symbol at all (spec
         // `filter_intra_mode_info` never reads one).
         for (bw, bh) in [(64, 64), (64, 32), (32, 64)] {
