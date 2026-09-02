@@ -869,6 +869,21 @@ pub(crate) fn filter_intra_rect_hits() -> usize {
     FILTER_INTRA_RECT_HITS.with(|c| c.get())
 }
 
+// As [`FILTER_INTRA_RECT_HITS`], counting only the strips BELOW 16x16
+// (8x16/16x8 leaves of a 16x16 HORZ/VERT partition, lane-fistrip r1) -- the
+// shapes whose `use_filter_intra` symbol had no CDF class before this round.
+// A gate asserting the wider counter would be satisfied by a 32x16 strip and
+// prove nothing about the new shapes.
+thread_local! {
+    static FILTER_INTRA_RECT_SUB16_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FILTER_INTRA_RECT_SUB16_HITS`].
+pub(crate) fn filter_intra_rect_sub16_hits() -> usize {
+    FILTER_INTRA_RECT_SUB16_HITS.with(|c| c.get())
+}
+
 // How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
 // (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
 // call on the current thread -- the same before/after counter pattern as
@@ -3477,6 +3492,13 @@ fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
     match (bw, bh) {
         (32, 16) => Some(4),
         (16, 32) => Some(5),
+        // lane-fistrip r1: `av1_filter_intra_allowed_bsize` is
+        // `block_size_wide <= 32 && block_size_high <= 32`, which the 16x16
+        // level's own 8x16/16x8 strips satisfy -- returning `None` here did
+        // not refuse them, it silently SKIPPED a symbol aomenc writes
+        // (class `symbol-consumption-gap`).
+        (8, 16) => Some(6),
+        (16, 8) => Some(7),
         _ if bw == bh => filter_intra_size_class(bw),
         _ => None,
     }
@@ -4657,9 +4679,12 @@ fn decode_leaf_rect(
             leaf_mi.1,
         )?;
     if filter_intra.is_some() {
-        return Err(unsupported(
-            "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
-        ));
+        // lane-fistrip r1: `predict_filter_intra` already walks its 4x2
+        // patches over a true `bw`x`bh` block (lane-rectsplit r1), so an
+        // 8x16/16x8 strip predicts through the same call `reconstruct_rect`
+        // below already makes; this refusal was square-only prose.
+        FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
+        FILTER_INTRA_RECT_SUB16_HITS.with(|c| c.set(c.get() + 1));
     }
     let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
     let depth = if tx_select {
@@ -16288,6 +16313,78 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-fistrip r1 (class `enumerate-the-table-domain`): every block
+    /// shape this decoder can hand [`filter_intra_size_class_rect`], against
+    /// `av1_filter_intra_allowed_bsize` (`block_size_wide <= 32 &&
+    /// block_size_high <= 32`) and `default_filter_intra_cdfs`
+    /// (entropymode.c) row by row. A class that exists must carry ITS OWN
+    /// bsize's default probability -- a wrong row is a silently different
+    /// symbol, not a decode error. The shapes with no class are listed here
+    /// with their reason so the residue is pinned rather than implied.
+    #[test]
+    fn filter_intra_classes_carry_their_own_libaom_default_row() {
+        // `default_filter_intra_cdfs[bsize]`, BLOCK_SIZES_ALL order, as
+        // (width, height, default) for the shapes <= 32 on both axes.
+        let libaom: &[(usize, usize, u16)] = &[
+            (4, 4, 4621),
+            (4, 8, 6743),
+            (8, 4, 5893),
+            (8, 8, 7866),
+            (8, 16, 12551),
+            (16, 8, 9394),
+            (16, 16, 12408),
+            (16, 32, 14301),
+            (32, 16, 12756),
+            (32, 32, 22343),
+            (4, 16, 16384),
+            (16, 4, 16384),
+            (8, 32, 16384),
+            (32, 8, 16384),
+        ];
+        // The shapes this decoder's partition tree can actually reach today
+        // (squares 4..32 plus the 16x16- and 32x32-level HORZ/VERT strips).
+        let reachable = [
+            (4, 4),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (32, 16),
+            (16, 32),
+            (8, 16),
+            (16, 8),
+        ];
+        for &(bw, bh, default) in libaom {
+            let class = filter_intra_size_class_rect(bw, bh);
+            if reachable.contains(&(bw, bh)) {
+                let class = class.unwrap_or_else(|| {
+                    panic!("{bw}x{bh} is inside av1_filter_intra_allowed_bsize and reachable, \
+                            but has no CDF class -- its use_filter_intra symbol is never read")
+                });
+                assert_eq!(
+                    crate::cdf::FILTER_INTRA[class][0],
+                    default,
+                    "{bw}x{bh} (class {class}) must carry default_filter_intra_cdfs' own row"
+                );
+            } else {
+                // 4x8/8x4/4x16/16x4/8x32/32x8: sub-8x8 leaves and the 1:4
+                // strips, neither of which this decoder codes yet (their
+                // partition levels refuse by name first), so no class exists.
+                assert!(
+                    class.is_none(),
+                    "{bw}x{bh} gained a class without a decode path to use it"
+                );
+            }
+        }
+        // Past the bound on either axis: no symbol at all (spec
+        // `filter_intra_mode_info` never reads one).
+        for (bw, bh) in [(64, 64), (64, 32), (32, 64)] {
+            assert!(
+                filter_intra_size_class_rect(bw, bh).is_none(),
+                "{bw}x{bh} is past av1_filter_intra_allowed_bsize's <=32 bound"
+            );
+        }
+    }
     use super::*;
 
     /// lane-rectsplit r2: `av1_nz_map_ctx_offset` is packed COLUMN-major, so
