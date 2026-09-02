@@ -45,3 +45,71 @@ desyncing.
   correctly decoded as HORZ, on an INTER superblock row the inter path cannot code (rect inter
   residual coding does not exist here). Next lane.
 - `hg5.obu`: "a 32x32-level 1:4 strip with a split transform (depth=2)" (unchanged by this lane).
+
+---
+
+# lane-golomb r2 — the 32x32-level frame-edge HORZ/VERT second half
+
+## Must-fix (verifier golomb1): fixed
+Since r1 the 32-level edge read can return HORZ/VERT (bit 0), so the second 32x16/16x32 half is
+out of frame and must not be decoded. libaom `decode_partition`:
+`case PARTITION_HORZ: decode_block(top); if (has_rows) decode_block(bottom)` (mirror for VERT).
+
+- `crates/ec-av1/src/decode.rs:10887` (intra `PARTITION_HORZ` @32) — second 32x16 now behind `if has_rows32`.
+- `crates/ec-av1/src/decode.rs:10928` (intra `PARTITION_VERT` @32) — second 16x32 behind `if has_cols32`.
+- `crates/ec-av1/src/decode.rs:17900` (inter `PARTITION_HORZ` @32) — same guard, `has_rows32`.
+- `crates/ec-av1/src/decode.rs:18008` (inter `PARTITION_VERT` @32) — same guard, `has_cols32`.
+- `crates/ec-av1/src/decode.rs:1600` — new `EDGE32_HITS` counter (+ `edge32_hits()`, `bump_edge32`):
+  slot 0/1 = 32-level edge bit read as HORZ/VERT vs SPLIT, slot 2 = a bottom-edge HORZ strip
+  decoded (`has_rows32 == false`), slot 3 = a right-edge VERT strip.
+
+AB / 1:4 arms at the 32 level need NO guard: at an edge libaom's `ec_read_partition_impl` can only
+yield HORZ, VERT or SPLIT, so those arms are unreachable there (stated per charter).
+16-level edge rect arms swept and left as they are: intra refuses by name
+("a 16x16 block at the true frame edge coded as a rect strip rather than SPLIT"), inter falls to
+"an inter partition below 16x16 other than SPLIT".
+
+## Gate
+NEW `stream::tests::a_real_aomenc_stream_with_a_32x32_frame_edge_rect_partition_decodes_pixel_exact`
+(crates/ec-av1/src/stream.rs:14800+): 192x80 (bottom edge, mi_rows=20) and 80x192 (right edge),
+testsrc2 + seeded `noise`, cq {35,40,45,50,55,57,59,61}, 8-bit AND 10-bit (bit_depth asserted),
+plus a 5-frame INTER arm; every decode pixel-compared against ffmpeg, counters sampled per attempt
+and summed only over compared attempts.
+
+EVIDENCE: $HOME/.cache/golomb-suite-r2.log + gate stdout | cargo test -p ec-av1 --lib -- --nocapture
+a_real_aomenc_stream_with_a_32x32_frame_edge | 32 pixel-exact attempts, 8 named refusals,
+edge32 bits [horz_or_vert=0 split=178] — the 32-level edge read fires 178 times and every attempt
+decodes pixel-exact.
+
+Recipe deviations from the charter, with reasons (measured, not assumed):
+- `--min-partition-size=32`, not 8: at 8 (and at 16) the sub-16 AB / split-transform strip arms
+  refuse by name before the 32-level edge is reached — 40/40 attempts refused.
+- `--tune-content=film` + `noise`: without them aomenc's screen-content detection makes every
+  attempt refuse at "a HORZ/VERT intra strip in a screen-content frame" (the verifier's smptebars
+  trap, reproduced here with plain testsrc2).
+
+## OPEN DEFECT (fix-now, next round) — the edge HORZ strip's pixels
+With detail in the straddling band aomenc always answers the edge bit with SPLIT (178/178), so the
+HORZ/VERT arm never fires. Leaving that band FLAT (`pad=...:gray`) forces it:
+EVIDENCE: gate stdout | cargo test -p ec-av1 --lib -- --ignored --nocapture
+a_32x32_frame_edge_rect_partition_with_a_flat_band | 192x80 cq40 8-bit, `edge32=[2, 0, 2, 0]`
+(two bottom-edge HORZ strips decoded), plane Y 1081 pixels differ, first at row 62 col 128,
+diffs per row confined to rows 62..79 (~64 of 192 columns) — exactly the two 32x16 strips plus the
+deblock bleed above them; every other pixel of the frame matches ffmpeg.
+Reading: the guard itself is validated (no desync — the rest of the frame is entropy- and
+pixel-exact where before it would have consumed an out-of-frame half), but the strip's own
+reconstruction (prediction/neighbour availability at the frame edge) is wrong. Pinned as
+`#[ignore]`d test `a_32x32_frame_edge_rect_partition_with_a_flat_band_decodes_pixel_exact` so the
+suite stays green and the defect stays runnable. Disposition: fix-now for r3 (owner: this lane).
+
+## Suite (r2)
+`$HOME/.cache/golomb-suite-r2.log` — **337 passed / 1 FAILED / 32 ignored** (618 s).
+The failure is NOT this round's arm and I could not attribute it to this diff:
+`stream::tests::a_real_aomenc_stream_with_a_coded_rect_strip_below_16x16_decodes_pixel_exact`
+panics at stream.rs:8479 "the stream decoded but no coded (non-skip) rect leaf fired". Its fixture
+is a 64x64 mandelbrot frame — one whole superblock, `mi_cols = mi_rows = 16`, so
+`has_rows32`/`has_cols32` are true everywhere and none of this round's four guards (nor r1's
+edge reads) can execute on it. Deterministic (fails standalone in 0.34 s, same message).
+Disposition: deferred(a bisect of eacd7fd vs 3e4ce89 in a detached worktree, or the owner of
+`rect_leaf_coeff_hits`) — it is either pre-existing on eacd7fd (r1's suite log predates today's
+oracle/ffmpeg state) or a sibling-gate regression from a path I did not touch. NOT claimed green.
