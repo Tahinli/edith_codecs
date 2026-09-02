@@ -12798,13 +12798,30 @@ fn apply_loop_restoration(
     deblocked_v: &PlaneBuf,
     lr: &LoopRestorationParams,
     grid: &crate::restoration::RestorationGrid,
+    // lane-golomb r8: this frame header's own (cropped) luma size. Loop
+    // restoration is the ONE post-decode filter that does NOT run over the
+    // mi-rounded plane: libaom's `av1_loop_restoration_filter_frame` sizes
+    // every plane with `av1_get_upsampled_plane_size` -- `plane_w =
+    // ROUND_POWER_OF_TWO(cm->superres_upscaled_width, ss_x)`, `plane_h =
+    // ROUND_POWER_OF_TWO(cm->height, ss_y)` (`av1/common/restoration.c:47`)
+    // -- and asserts it equals the buffer's CROP width
+    // (`restoration.c:1106`), then `av1_extend_frame(..., plane_w, plane_h,
+    // ...)` (`restoration.c:1109`) replicates the right/bottom border from
+    // that cropped edge before any unit is filtered. Deblock and CDEF DO
+    // walk the mi grid, which is why passing `true_width`/`true_height`
+    // here went unnoticed until a frame whose size is not a multiple of 8
+    // (68 -> mi-rounded 72): the LR taps at the last four real columns then
+    // read this decoder's own decoded samples at columns 68..71 where
+    // libaom reads column 67 replicated -- +-1 over the straddling band
+    // (class av1-truesize-lane: true frame size vs mi-rounded).
+    (frame_w, frame_h): (usize, usize),
 ) {
     y.data = crate::restoration::apply_loop_restoration_plane(
         &y.data,
         &deblocked_y.data,
         y.width,
-        y.true_width,
-        y.true_height,
+        frame_w,
+        frame_h,
         0,
         lr.frame_restoration_type[0],
         lr.loop_restoration_size[0],
@@ -12815,8 +12832,8 @@ fn apply_loop_restoration(
         &u.data,
         &deblocked_u.data,
         u.width,
-        u.true_width,
-        u.true_height,
+        frame_w.div_ceil(2),
+        frame_h.div_ceil(2),
         1,
         lr.frame_restoration_type[1],
         lr.loop_restoration_size[1],
@@ -12827,8 +12844,8 @@ fn apply_loop_restoration(
         &v.data,
         &deblocked_v.data,
         v.width,
-        v.true_width,
-        v.true_height,
+        frame_w.div_ceil(2),
+        frame_h.div_ceil(2),
         1,
         lr.frame_restoration_type[2],
         lr.loop_restoration_size[2],
@@ -14838,7 +14855,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
+    apply_loop_restoration(
+        &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
+        (frame_width as usize, frame_height as usize),
+    );
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
@@ -20714,7 +20734,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // true size. Height must still match: AV1 superres never scales height
     // (r8's derivation, `mc.rs`'s own doc), and nothing in this decode path
     // has a vertical scaling pass.
-    if reference.height != true_height {
+    // lane-golomb r8: the comparison is against the header's own frame
+    // height, NOT the mi-rounded `true_height`. libaom compares references
+    // on the CROPPED dimensions -- `av1_setup_scale_factors_for_frame(&sf,
+    // ref->y_crop_width, ref->y_crop_height, cm->width, cm->height)`
+    // (`av1/common/reconinter.c`), and a reference is "scaled" only when
+    // those differ (`av1_is_scaled`). A decoded `Picture` is cropped to
+    // `fw`/`fh`, so for any height that is not a multiple of 8 (68 ->
+    // mi_rows 18 -> `true_height` 72) this test compared 68 against 72 and
+    // refused every same-size reference (class av1-truesize-lane: true
+    // frame size vs mi-rounded). Height must still MATCH: AV1 superres
+    // never scales height, and no path here has a vertical scaling pass.
+    if reference.height != frame_height as usize {
         return Err(unsupported(
             "a reference picture whose height does not match this frame's own true size",
         ));
@@ -22664,7 +22695,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
+    apply_loop_restoration(
+        &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
+        (frame_width as usize, frame_height as usize),
+    );
 
     let motion_field = build_motion_field(
         &grid,
