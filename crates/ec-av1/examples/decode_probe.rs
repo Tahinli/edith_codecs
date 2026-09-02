@@ -45,6 +45,11 @@ fn main() {
         println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
         let (h84, h48) = ec_av1::decode::sub8_inter_rect_hits();
         println!("sub8_inter_rect: horz8x4={h84} vert4x8={h48}");
+        let si = ec_av1::stream::sub8_intra_rect_hits();
+        println!(
+            "sub8_intra_rect: horz8x4={} vert4x8={} chroma_ref={} mixed={}",
+            si.0, si.1, si.2, si.3
+        );
         let leaf = ec_av1::stream::vartx_rect_leaf_hits();
         println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
         // lane-inter16ab r1: the 16x16-level inter AB arms, so a recipe sweep
