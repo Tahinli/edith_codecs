@@ -93,7 +93,7 @@ Full suite: unit `intra64split-suite-r3-1788331800`, log
 `$HOME/.cache/intra64split-suite-r3.log` — `380 passed; 2 failed; 34 ignored`
 (the two failures = MEASURED 4). After the `#[ignore]`, re-run as unit
 `intra64split-suite-r3b-1788333053`, log `$HOME/.cache/intra64split-suite-r3b.log`
-— result line quoted in the final message.
+— `test result: ok. 380 passed; 0 failed; 36 ignored; 0 measured` in 921s.
 The r2 suite unit (`intra64split-suite-r2-1788331009`) was still running at the
 start of this round with 224 `test ...` lines and NO `test result` line; it was
 stopped before this one started, so r2 has no totals either.
