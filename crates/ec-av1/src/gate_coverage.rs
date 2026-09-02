@@ -226,10 +226,12 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
         "enable-dual-filter",
         "hole at both depths, see the 8-bit list",
     ),
-    (
-        "enable-flip-idtx",
-        "hole at both depths, see the 8-bit list",
-    ),
+    // `enable-flip-idtx` LEFT this list on 2026-09-02 (lane-rect1d r1):
+    // `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact`
+    // passes `=1` at both depths and pixel-compares six 10-bit decodes, so the
+    // flip/identity/1D transform types are proven to reach a real 10-bit stream
+    // this decoder reconstructs exactly (10 of its rect coefficient TUs carry a
+    // 1D tx class).
     ("enable-intrabc", "hole at both depths, see the 8-bit list"),
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
     (
