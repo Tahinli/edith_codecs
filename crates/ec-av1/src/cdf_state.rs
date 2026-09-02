@@ -118,6 +118,14 @@ pub(crate) enum TxbSet {
     /// block, so the encoder writes none (same reason
     /// [`LumaRect32x16`](TxbSet::LumaRect32x16) has none).
     LumaRect32x8,
+    /// lane-rectres r1: [`LumaRect32x8`](TxbSet::LumaRect32x8)'s INTER twin --
+    /// the 32x32-level 1:4 strip (`max_txsize_rect_lookup[BLOCK_32X8] ==
+    /// TX_32X8`). Same coefficient tables (`get_txsize_entropy_ctx` = TX_16X16,
+    /// `txsize_log2_minus4` = 4, 256 positions), but an inter unit DOES code a
+    /// `tx_type`: `av1_get_ext_tx_set_type` at `tx_size_sqr_up == TX_32X32` is
+    /// `EXT_TX_SET_DCT_IDTX` for inter regardless of `reduced_tx_set`, read at
+    /// the `txsize_sqr_map[TX_32X8] == TX_8X8` CDF row.
+    LumaRect32x8Inter,
     LumaRect32x16,
     /// lane-inter4 r2: [`LumaRect32x16`](TxbSet::LumaRect32x16)'s INTER twin --
     /// same coefficient tables (`get_txsize_entropy_ctx` reduces TX_32X16 and
@@ -1760,6 +1768,18 @@ impl Cdfs {
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
                 eob_pt_class1: Some(&mut self.eob_pt_1024_chroma_class1),
+            },
+            TxbSet::LumaRect32x8Inter => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_256_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_8.as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
             },
             TxbSet::LumaRect32x8 => TxbTables {
                 side: 16,
