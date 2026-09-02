@@ -2185,6 +2185,20 @@ pub(crate) fn obmc_rect_leaf_hits() -> usize {
     OBMC_RECT_LEAF_HITS.with(|c| c.get())
 }
 
+// lane-obmcrec r1: how many OBMC neighbours were taken from the SECOND half of
+// a 4-wide/4-tall (1:4 strip) chroma pair -- the case whose interp filter used
+// to be read from the pair's FIRST mi, which is a different block and, when
+// that half is intra, carries the `[3, 3]` "no filter" sentinel (the three
+// 1080p 10-bit film cuts refused there). The gate's proof the shape fired.
+thread_local! {
+    static OBMC_PAIR_FILTER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`OBMC_PAIR_FILTER_HITS`].
+pub(crate) fn obmc_pair_filter_hits() -> usize {
+    OBMC_PAIR_FILTER_HITS.with(|c| c.get())
+}
+
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.with(|c| c.get())
@@ -7386,9 +7400,20 @@ fn decode_intra_rect_in_inter(
         (8, 32) => (1, 2),
         (16, 64) => (2, 3),
         _ => {
-            return Err(unsupported(
-                "an intra-coded 16x4/4x16 strip on the inter block path (the 16x16-level 1:4 inter partition is refused before this point)",
-            ))
+            if std::env::var_os("EC_OBMCREC").is_some() {
+                eprintln!(
+                    "OBMCREC intra-in-inter shape bw={bw} bh={bh} mi=({mi_r},{mi_c}) skip={skip}"
+                );
+            }
+            // lane-obmcrec r1: the message used to name a 16x4/4x16 strip
+            // (class refusal-names-a-correlate). Measured with `EC_OBMCREC=1`
+            // on three 2 s cuts of the 10-bit 1920x792 128-superblock stream:
+            // every arrival here is a 128x64 block -- a PARTITION_HORZ half of
+            // a 128 superblock coded INTRA inside an inter frame, at mi
+            // (128,416) / (192,0) / (192,0) -- not a strip at all.
+            return Err(unsupported(format!(
+                "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)"
+            )));
         }
     };
     // [`read_intra_mode_rect`]'s own refusal: palette/intrabc syntax is
@@ -18144,7 +18169,7 @@ fn overlappable_above(
     bw4: usize,
     mi_cols: usize,
     max_neighbors: usize,
-) -> Vec<(usize, usize, MiInfo)> {
+) -> Vec<(usize, usize, MiInfo, usize)> {
     let mut out = Vec::new();
     if mi_row == 0 {
         return out;
@@ -18155,17 +18180,25 @@ fn overlappable_above(
         let cell = grid.get(mi_row - 1, col);
         let mut step = cell.map_or(1, |c| c.size).max(1).min(SB_MI as usize);
         let mut nb = cell;
+        // lane-obmcrec r1: the mi the neighbour's `MiInfo` is actually taken
+        // from -- the pair merge below moves it, and libaom reads that same
+        // `mbmi`'s `interp_filters` (`av1_setup_build_prediction_by_above_pred`).
+        let mut src = col;
         if step == 1 {
             // The pair merge: the walk snaps back to the pair's even column
             // and the ODD half (the chroma-carrying one) is the neighbour for
             // both -- a 4-wide 1:4 strip is never an OBMC source on its own.
             col &= !1;
-            nb = grid.get(mi_row - 1, col + 1);
+            src = col + 1;
+            nb = grid.get(mi_row - 1, src);
             step = 2;
         }
         if let Some(info) = nb {
             if info.is_inter {
-                out.push((col - mi_col, step.min(end_col - col), *info));
+                if src != col {
+                    OBMC_PAIR_FILTER_HITS.with(|c| c.set(c.get() + 1));
+                }
+                out.push((col - mi_col, step.min(end_col - col), *info, src - mi_col));
             }
         }
         col += step;
@@ -18182,7 +18215,7 @@ fn overlappable_left(
     bh4: usize,
     mi_rows: usize,
     max_neighbors: usize,
-) -> Vec<(usize, usize, MiInfo)> {
+) -> Vec<(usize, usize, MiInfo, usize)> {
     let mut out = Vec::new();
     if mi_col == 0 {
         return out;
@@ -18195,17 +18228,23 @@ fn overlappable_left(
         // width (8) would swallow the strip below it.
         let mut step = cell.map_or(1, |c| c.size_h).max(1).min(SB_MI as usize);
         let mut nb = cell;
+        // lane-obmcrec r1: see `overlappable_above`'s `src`.
+        let mut src = row;
         if step == 1 {
             // The pair merge, left-column mirror: a 4-TALL neighbour (a 16x4
             // strip) is half of a chroma pair and the pair's SECOND row is the
             // neighbour for both.
             row &= !1;
-            nb = grid.get(row + 1, mi_col - 1);
+            src = row + 1;
+            nb = grid.get(src, mi_col - 1);
             step = 2;
         }
         if let Some(info) = nb {
             if info.is_inter {
-                out.push((row - mi_row, step.min(end_row - row), *info));
+                if src != row {
+                    OBMC_PAIR_FILTER_HITS.with(|c| c.set(c.get() + 1));
+                }
+                out.push((row - mi_row, step.min(end_row - row), *info, src - mi_row));
             }
         }
         row += step;
@@ -18446,6 +18485,46 @@ fn neighbour_filter(
         mc::InterpFilterKind::from_switchable_symbol(sym[1] as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym[0] as usize),
     ))
+}
+
+/// lane-obmcrec r1 MEASUREMENT rung (`EC_OBMCREC=1`): every OBMC neighbour whose
+/// recorded switchable-filter symbols are the `[3, 3]` "never recorded" sentinel
+/// -- names the neighbour's own position/shape/reference so the decode path that
+/// failed to record its filter can be identified. Read-only, off by default.
+#[allow(clippy::too_many_arguments)]
+fn obmcrec_probe(
+    dir: &str,
+    mi_row: usize,
+    mi_col: usize,
+    write_w: usize,
+    write_h: usize,
+    off4: usize,
+    span4: usize,
+    nb: &MiInfo,
+    syms: [u8; 2],
+    cell: Option<MiInfo>,
+    fixed: bool,
+) {
+    if (syms[0] <= 2 && syms[1] <= 2) || std::env::var_os("EC_OBMCREC").is_none() {
+        return;
+    }
+    eprintln!(
+        "OBMCREC {dir} cur_mi=({mi_row},{mi_col}) cur_wh=({write_w}x{write_h}) off4={off4} \
+span4={span4} syms={syms:?} fixed={fixed} nb_size=({}x{}) nb_ref={} nb_ref1={:?} nb_mv=({},{}) \
+nb_newmv={} cell_size={:?} cell_inter={:?} cell_ref={:?} sb_row_off={} sb_col_off={}",
+        nb.size * 4,
+        nb.size_h * 4,
+        nb.ref_frame,
+        nb.ref_frame1,
+        nb.mv.0,
+        nb.mv.1,
+        nb.is_new_mv,
+        cell.map(|c| (c.size * 4, c.size_h * 4)),
+        cell.map(|c| c.is_inter),
+        cell.map(|c| c.ref_frame),
+        mi_row % 32,
+        mi_col % 32,
+    );
 }
 
 /// One neighbour's own re-prediction over a `w`x`h` region, MC'd fresh
@@ -18779,7 +18858,7 @@ fn obmc_blend(
     // ABOVE pass skips chroma entirely, the LEFT pass still blends it.
     let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
 
-    for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
+    for (off4, span4, nb, src4) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
         // `Neighbours::above_filter` is indexed in `SUB`(16px)-wide columns
         // (this decoder's own outer block-loop granularity), one step
@@ -18790,10 +18869,12 @@ fn obmc_blend(
         // `above_mbmi->interp_filters`); the 16px-granular `Neighbours` slot
         // stays as the fallback for paths that do not record one yet
         // (compound), which is what every earlier round used.
-        let (h_kind, v_kind) = neighbour_filter(
-            interp_fixed,
-            neighbours.above_filter[mi_col + off4],
-        )?;
+        let above_syms = neighbours.above_filter[mi_col + src4];
+        obmcrec_probe(
+            "above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, above_syms,
+            grid.get(mi_row - 1, mi_col + src4).copied(), interp_fixed.is_some(),
+        );
+        let (h_kind, v_kind) = neighbour_filter(interp_fixed, above_syms)?;
         ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
@@ -18809,11 +18890,14 @@ fn obmc_blend(
         }
     }
 
-    for (off4, span4, nb) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4)) {
-        let (h_kind, v_kind) = neighbour_filter(
-            interp_fixed,
-            neighbours.left_filter[mi_row + off4],
-        )?;
+    for (off4, span4, nb, src4) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4))
+    {
+        let left_syms = neighbours.left_filter[mi_row + src4];
+        obmcrec_probe(
+            "left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, left_syms,
+            grid.get(mi_row + src4, mi_col - 1).copied(), interp_fixed.is_some(),
+        );
+        let (h_kind, v_kind) = neighbour_filter(interp_fixed, left_syms)?;
         ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);

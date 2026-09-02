@@ -160,6 +160,12 @@ pub fn sb128_ab_counters() -> [usize; 4] {
     crate::decode::part128_ab_hits()
 }
 
+/// lane-obmcrec r1: OBMC neighbours taken from the second half of a 1:4-strip
+/// chroma pair -- the shape whose filter record the r1 fix re-sourced.
+pub fn obmc_pair_filter_hits() -> usize {
+    crate::decode::obmc_pair_filter_hits()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -4476,6 +4482,15 @@ mod tests {
     /// Seeds swept by the 10-bit LR gate (the 8-bit gate needs ~40 attempts
     /// to land a non-RESTORE_NONE frame; every attempt here still has to
     /// decode pixel-exact).
+    /// lane-obmcrec r1: the `LR_SEEDS` members whose 1:4-partition stream both
+    /// fires `obmc_pair_filter_hits` and decodes every frame pixel-exact.
+    /// Measured over seeds 42..=73 (32 encodes): 43/46/47/65/66 fire and are
+    /// exact; 70 and 73 fire and mismatch, but mismatch IDENTICALLY with
+    /// `--enable-obmc=0` (seed 73 frame 1 luma, seed 70 frame 16), so their
+    /// defect is in the `--min-partition-size=4` recipe, not in OBMC -- kept
+    /// out of this gate rather than papered over, and reported as open.
+    const OBMC_PAIR_SEEDS: [u32; 5] = [43, 46, 47, 65, 66];
+
     const LR_SEEDS: [u32; 16] = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
 
     /// Wiener + SGR + switchable loop-restoration firings, summed.
@@ -4613,6 +4628,70 @@ mod tests {
                 ("rect_partition_hits", decode::rect_partition_hits),
                 ("partab_hits", decode::partab_hits),
             ],
+        );
+    }
+
+    /// lane-obmcrec r1: OBMC whose above/left neighbour is a 4-wide/4-tall
+    /// 1:4-partition strip -- the shape the three 1080p 10-bit film cuts
+    /// refused on ("an OBMC neighbour whose switchable interp filter was never
+    /// recorded"). `overlappable_above`/`_left` snap such a neighbour to the
+    /// chroma pair's SECOND mi but used to read its interp filter from the
+    /// FIRST one, a different block whose filter record is the intra
+    /// `[3, 3]` sentinel whenever that half is intra. `obmc_pair_filter_hits`
+    /// counts exactly that neighbour shape, so a stream without 1:4 strips
+    /// next to an OBMC block cannot stand in for it.
+    #[test]
+    fn a_real_aomenc_10bit_obmc_over_1to4_strip_neighbours_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_obmc_over_1to4_strip_neighbours_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        ten_bit_tool_gate(
+            NAME,
+            128,
+            128,
+            24,
+            &[
+                "--ec-fixture-noise",
+                "--cq-level=45",
+                "--kf-max-dist=1000",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=0",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=1",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=4",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+            ],
+            &OBMC_PAIR_SEEDS,
+            &[("obmc_pair_filter_hits", decode::obmc_pair_filter_hits)],
         );
     }
 
