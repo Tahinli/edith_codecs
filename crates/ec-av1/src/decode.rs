@@ -5220,7 +5220,15 @@ fn merge_colors(transmitted: &[u16], cached: &[u16]) -> Vec<u16> {
     out
 }
 
-/// `read_palette_colors_y` (decodemv.c:478), bit_depth fixed at 8 (this
+/// `read_palette_colors_y` (decodemv.c:478), at the sequence's real
+/// `bit_depth` -- lane-kf900 r3: every raw literal here (the first colour,
+/// each delta's width, the `range` bound and the clamp) is sized by
+/// `bit_depth`, and hardcoding 8 read 2 bits too few per colour on every
+/// 10-bit palette block. Raw literals are EQUIPROBABLE, and at the ranges
+/// this stream reaches (e.g. 62728) an equiprobable read is a FIXED POINT of
+/// the msac range, so a cross-decoder range ladder stays bit-identical
+/// through the whole miscount -- only the decoded VALUE differs (class
+/// `compare-range-not-tell`'s blind spot). (this
 /// decoder is 8-bit only): accepts up to `n` colours straight from `cache`
 /// (one flag bit each, in cache order), then delta-codes the remainder
 /// (first value raw, each following delta `>= 1` off a shrinking bit width),
@@ -5235,20 +5243,22 @@ fn read_palette_colors_y(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> [u
             cached.push(c);
         }
     }
+    let bd = u32::from(bit_depth());
+    let max_val = (1i32 << bd) - 1;
     let mut colors = [0u16; 8];
     let n_cached = cached.len();
     if n_cached < n {
         let mut transmitted = Vec::with_capacity(n - n_cached);
-        let first = dec.literal(8) as u16;
+        let first = dec.literal(bd) as u16;
         transmitted.push(first);
         if n_cached + 1 < n {
-            let min_bits = 8u32 - 3;
+            let min_bits = bd - 3;
             let mut bits = min_bits + dec.literal(2);
-            let mut range = 255i32 - i32::from(first) - 1;
+            let mut range = (1i32 << bd) - i32::from(first) - 1;
             for _ in (n_cached + 1)..n {
                 let delta = dec.literal(bits) as i32 + 1;
                 let prev = *transmitted.last().unwrap();
-                let val = (i32::from(prev) + delta).clamp(0, 255) as u16;
+                let val = (i32::from(prev) + delta).clamp(0, max_val) as u16;
                 range -= i32::from(val) - i32::from(prev);
                 bits = bits.min(ceil_log2(range.max(0) as u32));
                 transmitted.push(val);
@@ -5262,7 +5272,8 @@ fn read_palette_colors_y(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> [u
     colors
 }
 
-/// `read_palette_colors_uv` (decodemv.c:509), bit_depth fixed at 8: U reads
+/// `read_palette_colors_uv` (decodemv.c:509), at the sequence's real
+/// `bit_depth` (see [`read_palette_colors_y`]): U reads
 /// exactly [`read_palette_colors_y`]'s cache/delta scheme (against the U-only
 /// cache, `range` starting at `255 - prev` with no `-1`, and each raw `delta`
 /// unbiased by `+1` -- both differences from Y's own reader, matching the C
@@ -5279,20 +5290,22 @@ fn read_palette_colors_uv(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> (
             cached.push(c);
         }
     }
+    let bd = u32::from(bit_depth());
+    let max_val = 1i32 << bd;
     let mut u_colors = [0u16; 8];
     let n_cached = cached.len();
     if n_cached < n {
         let mut transmitted = Vec::with_capacity(n - n_cached);
-        let first = dec.literal(8) as u16;
+        let first = dec.literal(bd) as u16;
         transmitted.push(first);
         if n_cached + 1 < n {
-            let min_bits = 8u32 - 3;
+            let min_bits = bd - 3;
             let mut bits = min_bits + dec.literal(2);
-            let mut range = 255i32 - i32::from(first);
+            let mut range = max_val - i32::from(first);
             for _ in (n_cached + 1)..n {
                 let delta = dec.literal(bits) as i32;
                 let prev = *transmitted.last().unwrap();
-                let val = (i32::from(prev) + delta).clamp(0, 255) as u16;
+                let val = (i32::from(prev) + delta).clamp(0, max_val - 1) as u16;
                 range -= i32::from(val) - i32::from(prev);
                 bits = bits.min(ceil_log2(range.max(0) as u32));
                 transmitted.push(val);
@@ -5305,9 +5318,9 @@ fn read_palette_colors_uv(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> (
     }
     let mut v_colors = [0u16; 8];
     if dec.literal(1) == 1 {
-        let min_bits_v = 8u32 - 4;
+        let min_bits_v = bd - 4;
         let bits = min_bits_v + dec.literal(2);
-        v_colors[0] = dec.literal(8) as u16;
+        v_colors[0] = dec.literal(bd) as u16;
         for i in 1..n {
             let mut delta = dec.literal(bits) as i32;
             if delta != 0 && dec.literal(1) == 1 {
@@ -5315,16 +5328,16 @@ fn read_palette_colors_uv(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> (
             }
             let mut val = i32::from(v_colors[i - 1]) + delta;
             if val < 0 {
-                val += 256;
+                val += max_val;
             }
-            if val >= 256 {
-                val -= 256;
+            if val >= max_val {
+                val -= max_val;
             }
             v_colors[i] = val as u16;
         }
     } else {
         for i in 0..n {
-            v_colors[i] = dec.literal(8) as u16;
+            v_colors[i] = dec.literal(bd) as u16;
         }
     }
     (u_colors, v_colors)
