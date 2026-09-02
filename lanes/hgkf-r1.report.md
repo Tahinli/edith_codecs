@@ -71,3 +71,16 @@ residue — needs a per-TU EC_PRED compare at mi(104,792) — unblocked by this
 round's entropy exactness, any agent can start at that block.`
 
 Suite: see `$HOME/.cache/hgkf-suite2.log` (`cargo test -p ec-av1 --lib`).
+
+## Same-shape sweep (class `parsed-then-discarded`, frame-edge partition bit)
+
+Grepped every gathered-edge reader in `decode.rs`. Fixed: the three key-frame
+ones (64/32/16-level). **Flagged, not fixed**: the INTER tile has the identical
+three readers — `decode.rs:18441` (64-level, `part64` match), `decode.rs:18590`
+(32-level) and `decode.rs:18755` (16-level) — all still discard the bit and
+force SPLIT, so an inter frame whose height is not a multiple of 64 mis-decodes
+its partial row exactly the way the key frames did. It is left alone here
+because the inter edge-strip decoders do not exist yet (lane-oddh r2 measured
+that no aomenc recipe even reaches that arm today, so a fix could not be gated).
+`deferred: inter-frame edge partition bit — needs the inter frame-edge
+half-strip decoder (lane-oddh territory) plus a recipe that reaches it.`
