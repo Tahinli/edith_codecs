@@ -81,6 +81,13 @@ pub fn vartx_rect_leaf_hits() -> [usize; 2] {
     crate::decode::vartx_rect_leaf_hits()
 }
 
+/// lane-inter16ab r4: RECTANGULAR var-tx leaves with a 4-px axis, `[8x4, 4x8]`
+/// -- what `sub_tx_size_map[TX_16X4] == TX_8X4` produces when a 16x16-level
+/// 1:4 inter strip splits its transform.
+pub fn vartx_rect_leaf4_hits() -> [usize; 2] {
+    crate::decode::vartx_rect_leaf4_hits()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -8025,11 +8032,18 @@ mod tests {
         let (width, height, frame_count) = (192usize, 128usize, 6usize);
         // Per arm, over both bit depths: how many pixel-exact attempts fired
         // it at least once.
-        let mut arms_total = [0u32; 4];
+        let mut arms_total = [0u32; 5];
         for bit_depth in [8u32, 10u32] {
             let (mut named_refusals, mut matched, mut out_of_scope, mut oos_mismatch) =
                 (0u32, 0u32, 0u32, 0u32);
-            let mut arms_proved = [0u32; 4];
+            let mut arms_proved = [0u32; 5];
+            // lane-inter16ab r4: a 4-recipe widening (fine `sin(X/3)` stripes
+            // at cq 8..14, both depths) was measured and REMOVED again -- every
+            // extra 1:4 partition it produced is in the KEY frame, and this
+            // gate's arms count INTER-frame strips. Frame-aware histogram
+            // script + table in lanes/inter16ab-r4.report.md; the only recipe
+            // in the whole sweep with an inter-frame `PARTITION_VERT_4` is
+            // attempt 1's, which refuses on the rect wedge-interintra mask.
             for attempt in 0..32u32 {
                 // Two sources (structure along X vs along Y -- an AB
                 // partition needs an L/T-shaped feature, so both orientations
@@ -8136,6 +8150,7 @@ mod tests {
                 );
                 let stream = out.stdout;
                 let before = decode::inter16_rect4_counters();
+                let leaf4_before = crate::stream::vartx_rect_leaf4_hits();
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
                         let msg = e.to_string();
@@ -8151,6 +8166,7 @@ mod tests {
                     Ok(frames) => frames,
                 };
                 let after = decode::inter16_rect4_counters();
+                let leaf4_after = crate::stream::vartx_rect_leaf4_hits();
                 // [16x4 strips, 4x16 strips, chroma pairs closed, chroma
                 // pairs built from two strips' motion vectors].
                 let fired = [
@@ -8158,6 +8174,11 @@ mod tests {
                     after.1 - before.1,
                     after.2 - before.2,
                     after.3 - before.3,
+                    // lane-inter16ab r4: the SPLIT-transform arm --
+                    // `sub_tx_size_map[TX_16X4] == TX_8X4`, so a 1:4 strip
+                    // that splits its transform codes 8x4/4x8 RECTANGULAR
+                    // var-tx leaves (`--enable-tx-size-search=1`).
+                    (leaf4_after[0] - leaf4_before[0]) + (leaf4_after[1] - leaf4_before[1]),
                 ];
                 let ffmpeg_frames = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
@@ -8204,7 +8225,7 @@ mod tests {
                     assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
                     assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
                 }
-                for a in 0..4 {
+                for a in 0..5 {
                     if fired[a] > 0 {
                         arms_proved[a] += 1;
                         arms_total[a] += 1;
@@ -8215,7 +8236,7 @@ mod tests {
             eprintln!(
                 "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
                  attempts carrying a 16-level inter 1:4 partition, per-arm attempts \
-                 HORZ_4/VERT_4/chroma-pair/sub8x8-chroma={arms_proved:?}, {out_of_scope} attempts carried \
+                 HORZ_4/VERT_4/chroma-pair/sub8x8-chroma/split-tx-8x4={arms_proved:?}, {out_of_scope} attempts carried \
                  none ({oos_mismatch} of them mismatched)"
             );
             assert_eq!(
@@ -8227,9 +8248,10 @@ mod tests {
         assert!(
             arms_total.iter().all(|&n| n > 0),
             "{NAME}: a 16-level inter 1:4 arm never fired on a pixel-exact attempt \
-             (HORZ_4/VERT_4/chroma-pairs/sub8x8-chroma-pairs={arms_total:?}) -- an arm at 0 is \
-             unproven; the last two are the odd-strip `is_chroma_reference` pair and the \
-             `build_inter_predictors_sub8x8` two-mv chroma build"
+             (HORZ_4/VERT_4/chroma-pairs/sub8x8-chroma-pairs/split-tx-8x4={arms_total:?}) -- an \
+             arm at 0 is unproven; arms 3/4 are the odd-strip `is_chroma_reference` pair and the \
+             `build_inter_predictors_sub8x8` two-mv chroma build, arm 5 the \
+             `sub_tx_size_map[TX_16X4] == TX_8X4` split-transform leaf"
         );
     }
 
