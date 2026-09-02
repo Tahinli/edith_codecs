@@ -6897,6 +6897,166 @@ mod tests {
             );
         }
     }
+    /// lane-sqdrift r2: the SQUARE-ONLY twin of the no-CFL `uv_mode` gate
+    /// above. With `--enable-rect-partitions=0` the encoder codes only
+    /// `PARTITION_NONE` and `PARTITION_SPLIT`, and on detailed content the RD
+    /// eventually hands one whole 64x64 superblock of an INTER frame to an
+    /// INTRA block -- `bsize == sb_size`, the one shape whose `uv_mode` must
+    /// come off the 13-symbol `uv_mode_no_cfl` alphabet because libaom's
+    /// `is_cfl_allowed` (`blockd.h`: `wide <= 32 && high <= 32`) excludes it.
+    ///
+    /// Before the fix this decoder read the 14-symbol CFL alphabet there: the
+    /// same `DC_PRED` value, a different interval, and the tile desynced from
+    /// that block on. r1 measured the damage on the pinned 192x128 stream
+    /// (sha256 `c6af4fb4...`): decode-order frames 0-3 pre-filter byte-exact,
+    /// frame 4 luma 3540 samples wrong over exactly the last superblock
+    /// (x 128..191, y 64..127), then 24k wrong by frame 7 -- and the decoder
+    /// did not even report a mismatch, it reported an intra-rect-strip refusal
+    /// read out of the already-desynced stream (class `refusal-from-own-desync`;
+    /// aomdec's own partition histogram over that stream is rect-free).
+    /// After the fix the same stream is byte-exact on all 8 frames.
+    ///
+    /// Distinct from the sibling gate: rect partitions OFF (so the 64x64 NONE
+    /// really is a whole superblock), `--min-partition-size=16`, natural
+    /// mandelbrot detail instead of a synthetic half-noise ramp, and 8 frames
+    /// of drift so a desync that survives one frame still fails here. Every
+    /// decode-order frame of every attempt is compared against ffmpeg, so a
+    /// mismatch of ANY shape fails; the gate never turns one into a SKIP.
+    #[test]
+    fn a_real_aomenc_square_only_inter_sequence_with_a_64x64_intra_superblock_decodes_pixel_exact()
+    {
+        const NAME: &str = "a_real_aomenc_square_only_inter_sequence_with_a_64x64_intra_superblock_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 8usize);
+        for bit_depth in [8u32, 10u32] {
+            let (mut named_refusals, mut matched, mut carried_none) = (0u32, 0u32, 0u32);
+            let mut total_hits = 0usize;
+            for attempt in 0..4u32 {
+                // r1's pinned recipe is (start_scale 4.76, cq 55); the other
+                // three points move the detail level and the quantiser, which
+                // is what moves WHICH superblock the RD codes intra.
+                let start_scale = ["4.76", "3.20"][(attempt % 2) as usize];
+                let cq = [55, 45][(attempt / 2) as usize];
+                let duration = frame_count as f64 / 25.0;
+                let source = format!(
+                    "mandelbrot=size={width}x{height}:start_scale={start_scale}:\
+                     end_scale=0.004:end_pts=8:rate=25"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-vf", "hue=s=0",
+                        "-t", &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
+                        "-f", "yuv4mpegpipe", "-strict", "-1", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=1",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--lag-in-frames=0", "--auto-alt-ref=0",
+                    "--kf-min-dist=1000", "--kf-max-dist=1000",
+                    "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0", "--min-partition-size=16",
+                    "--max-partition-size=64", "--enable-tx-size-search=0",
+                    "--enable-order-hint=0", "--enable-warped-motion=0", "--enable-obmc=0",
+                    "--enable-masked-comp=0", "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0", "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0", "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0", "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0", "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0", "--enable-angle-delta=0",
+                    "--enable-cdef=0", "--enable-restoration=0", "--enable-palette=0",
+                    "--enable-intrabc=0", "--enable-cfl-intra=0", "--enable-ref-frame-mvs=0",
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = crate::decode::nocfl_uv_mode_hits();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        named_refusals += 1;
+                        eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let hits = crate::decode::nocfl_uv_mode_hits() - before;
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                if hits == 0 {
+                    carried_none += 1;
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
+                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
+                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
+                }
+                if hits > 0 {
+                    matched += 1;
+                    total_hits += hits;
+                }
+            }
+            eprintln!(
+                "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
+                 attempts carrying a 64x64 intra superblock ({total_hits} no-CFL uv_mode reads), \
+                 {carried_none} attempts carried none"
+            );
+            assert!(
+                matched > 0 && total_hits > 0,
+                "{NAME} ({bit_depth}-bit): no square-only attempt decoded a 64x64 intra block \
+                 inside an inter frame, so the no-CFL uv_mode alphabet was never exercised -- \
+                 gate proved nothing ({named_refusals} refusals, {carried_none} carried none)"
+            );
+        }
+    }
 
     /// lane-inter4 r2: the 32x32-level inter `PARTITION_HORZ`/`PARTITION_VERT`
     /// strips (32x16 / 16x32) carrying a REAL residual -- the capability r1
