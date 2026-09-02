@@ -12202,10 +12202,16 @@ fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usiz
     let has_left = mi_c > n.tile_col0_mi;
     let mut above = usize::from(n.above_txfm[mi_c]) >= side;
     let mut left = usize::from(n.left_txfm[mi_r]) >= side;
-    if has_above && n.above_inter[mi_c / (SUB / MI)] {
+    // lane-mergefix: `above_inter`/`left_inter` are written per mi
+    // (`record_inter_rect_mi`), NOT per [`SUB`] cell -- reading them at
+    // `mi_c / (SUB / MI)` asked a block two mi rows/columns away whether it
+    // was inter, so a var-tx-split inter neighbour contributed its (smaller)
+    // transform size instead of its block size and the `tx_depth` CDF row
+    // came out one too low.
+    if has_above && n.above_inter[mi_c] {
         above = n.above_side_mi[mi_c] >= side;
     }
-    if has_left && n.left_inter[mi_r / (SUB / MI)] {
+    if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= side;
     }
     match (has_above, has_left) {
