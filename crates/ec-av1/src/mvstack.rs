@@ -585,6 +585,43 @@ fn scan_col(
     found
 }
 
+/// libaom `has_top_right` (mvref_common.c:264): whether the unit diagonally
+/// above-right of this block has been decoded *by the superblock's own
+/// recursion order*. The mask is `sb_size`-relative, so at a 128x128
+/// superblock the `while` loop runs one level further than at 64x64 and
+/// strips the top-right neighbour off blocks that DO sit in already-decoded
+/// memory -- an availability rule a plain "is the grid cell populated" probe
+/// (what this module did before lane-sb128 r2) cannot see. It cost frame 6 of
+/// the 128 inter gate 380 wrong luma bytes with the entropy stream in sync.
+///
+/// corner-cut: libaom's three shape refinements (`is_last_vertical_rect`,
+/// `is_first_horizontal_rect`, the `PARTITION_VERT_A` bottom-left square) are
+/// not ported -- the ceiling is rectangular and AB-partitioned INTER leaves,
+/// which this decoder refuses by name today; port them with the rect inter
+/// leaf.
+pub(crate) fn has_top_right(mi_row: usize, mi_col: usize, bw4: usize, bh4: usize) -> bool {
+    let sb_mi_size = crate::decode::sb_mi_cur() as usize;
+    let bs0 = bw4.max(bh4);
+    if bs0 > 16 {
+        return false;
+    }
+    let (mask_row, mask_col) = (mi_row & (sb_mi_size - 1), mi_col & (sb_mi_size - 1));
+    let mut has_tr = !(mask_row & bs0 != 0 && mask_col & bs0 != 0);
+    let mut bs = bs0;
+    while bs < sb_mi_size {
+        if mask_col & bs != 0 {
+            if mask_col & (2 * bs) != 0 && mask_row & (2 * bs) != 0 {
+                has_tr = false;
+                break;
+            }
+        } else {
+            break;
+        }
+        bs <<= 1;
+    }
+    has_tr
+}
+
 /// The single top-right probe this reduction keeps of spec 7.10.2.4's extra
 /// scan positions, at the unit diagonally above-right of the block. Its
 /// vote is folded into the row scan's candidates (it sits on the same row
@@ -780,15 +817,15 @@ pub fn find_mv_stack_with_sign_bias(
             &mut processed_cols,
         );
     let found_top_right = scan_top_right(
-        grid,
-        mi_row,
-        mi_col,
-        bw4,
-        ref_frame,
-        gm,
-        &mut candidates,
-        &mut newmv_count,
-    );
+            grid,
+            mi_row,
+            mi_col,
+            bw4,
+            ref_frame,
+            gm,
+            &mut candidates,
+            &mut newmv_count,
+        );
 
     // libaom's `row_match_count`/`col_match_count` (mvref_common.c) fold the
     // top-right probe into the row side, so "found above" for context
@@ -1539,15 +1576,15 @@ pub fn find_mv_stack_compound(
             &mut processed_cols,
         );
     let found_top_right = scan_top_right_compound(
-        grid,
-        mi_row,
-        mi_col,
-        bw4,
-        ref_frame,
-        gm,
-        &mut candidates,
-        &mut newmv_count,
-    );
+            grid,
+            mi_row,
+            mi_col,
+            bw4,
+            ref_frame,
+            gm,
+            &mut candidates,
+            &mut newmv_count,
+        );
 
     let row_matched = found_above || found_top_right;
     let nearest_match = usize::from(row_matched) + usize::from(found_left);
@@ -1622,6 +1659,47 @@ pub fn find_mv_stack_compound(
                 blk_col += step_w;
             }
             blk_row += step_h;
+        }
+        // lane-sb128 r3: libaom's three `tpl_sample_pos` EXTENSION samples
+        // (mvref_common.c:591), which the single-ref twin already ports and
+        // this compound path dropped. `check_sb_border`'s mask is libaom's
+        // hardcoded `mi_size_wide[BLOCK_64X64]` (16), NOT the sequence's
+        // superblock size. Missing them cost one weight-2 vote on a
+        // candidate, which reordered the stack and gave a NEW_NEWMV block a
+        // different predictor -- 957 wrong pixels on one 32x32 block of one
+        // frame with the entropy stream in sync.
+        let allow_extension = (2..16).contains(&bh4) && (2..16).contains(&bw4);
+        if allow_extension {
+            let (voffset, hoffset) = (bh4.max(2) as isize, bw4.max(2) as isize);
+            let sb_mask = 16isize;
+            for (row_off, col_off) in [
+                (voffset, -2isize),
+                (voffset, hoffset),
+                (voffset - 2, hoffset),
+            ] {
+                let row = (mi_row as isize & (sb_mask - 1)) + row_off;
+                let col = (mi_col as isize & (sb_mask - 1)) + col_off;
+                if row < 0 || row >= sb_mask || col < 0 || col >= sb_mask {
+                    continue;
+                }
+                let cand0 = crate::motion_field::add_tpl_ref_mv(
+                    field, mi_row, mi_col, row_off, col_off, cur_offset_0,
+                    allow_high_precision_mv,
+                );
+                let cand1 = crate::motion_field::add_tpl_ref_mv(
+                    field, mi_row, mi_col, row_off, col_off, cur_offset_1,
+                    allow_high_precision_mv,
+                );
+                if cand0.is_some() || cand1.is_some() {
+                    any_hit = true;
+                    add_compound_candidate(
+                        &mut candidates,
+                        cand0.map_or((0, 0), |c| c.mv),
+                        cand1.map_or((0, 0), |c| c.mv),
+                        2,
+                    );
+                }
+            }
         }
         if any_hit {
             TMV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
