@@ -46,6 +46,10 @@ fn main() {
         println!("interintra_rect: {}", ec_av1::decode::interintra_rect_hits());
         println!("gm_nontrans_small_side: {}", ec_av1::decode::gm_nontrans_small_side_hits());
         println!("tr_reach_longer_side: {}", ec_av1::decode::tr_reach_longer_side_hits());
+        println!(
+            "mv_clamp_edge_overhang: {}",
+            ec_av1::mvstack::mv_clamp_edge_overhang_hits()
+        );
         let (h84, h48) = ec_av1::decode::sub8_inter_rect_hits();
         println!("sub8_inter_rect: horz8x4={h84} vert4x8={h48}");
         let si = ec_av1::stream::sub8_intra_rect_hits();
