@@ -34,6 +34,14 @@ fn main() {
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
         println!("rect_intrabc_reads: {}", ec_av1::stream::rect_intrabc_reads());
+        // lane-intra64split r4: the 64-level intra strip witness counter, per
+        // orientation -- printed so a film-cut sweep can see it fire without a
+        // test-binary rebuild.
+        println!(
+            "rect64_corner_tu: 64x32={} 32x64={}",
+            ec_av1::stream::rect64_corner_tu_hits(0),
+            ec_av1::stream::rect64_corner_tu_hits(1)
+        );
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
