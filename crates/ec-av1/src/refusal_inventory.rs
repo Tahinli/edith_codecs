@@ -65,7 +65,11 @@ const REFUSALS: &[&str] = &[
     "a masked compound 64x64 inter block (compound_type is inferred, not coded, at this size)",
     "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
     "an intra mode this decoder does not code (round 2)",
-    "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
+    // lane-intrarect r1 lifted the whole-shape refusal that stood here (the
+    // inter path's intra arm now routes 2:1 strips through `decode_rect_split`);
+    // what is left is the 1:4 shape, whose `bsize_to_tx_size_cat` breaks the
+    // size-group/category diagonal the 2:1 shapes share.
+    "an intra-coded 1:4 (or other non-2:1) rect strip on the inter block path",
     // Lifted for the 16x8/8x16 leaf by lane-fistrip; still live one level
     // down, at the 4x8/8x4 sub-8 leaf (lane-tx4x8's `decode_leaf_rect8`).
     "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
