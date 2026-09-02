@@ -34,13 +34,14 @@ fn main() {
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
         println!("rect_intrabc_reads: {}", ec_av1::stream::rect_intrabc_reads());
+        println!(
+            "rect64_corner_tu: 64x32={} 32x64={}",
+            ec_av1::stream::rect64_corner_tu_hits(0),
+            ec_av1::stream::rect64_corner_tu_hits(1)
+        );
+        println!("leaf8_intrabc_hits: {}", ec_av1::stream::leaf8_intrabc_hits());
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
-        let i4 = ec_av1::stream::intra_rect4_in_inter_counters();
-        println!(
-            "intra_rect4_in_inter: 64x16={} 16x64={} 32x8={} 8x32={}",
-            i4.0, i4.1, i4.2, i4.3
-        );
         println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
         let (h84, h48) = ec_av1::decode::sub8_inter_rect_hits();
         println!("sub8_inter_rect: horz8x4={h84} vert4x8={h48}");
@@ -57,10 +58,14 @@ fn main() {
         // asserts -- printed here so a recipe sweep can see it fire without a
         // test-binary rebuild.
         println!("skip_split_tx: {}", ec_av1::decode::skip_split_tx_hits());
+        let es = ec_av1::decode::inter_edge_strip_hits();
+        println!(
+            "inter_edge_strip: h64={} v64={} h32={} v32={} h16={} v16={}",
+            es[0], es[1], es[2], es[3], es[4], es[5]
+
+        );
         let (h4, v4, pairs, sub8) = ec_av1::decode::inter16_rect4_counters();
         println!("inter16_1to4: horz4={h4} vert4={v4} chroma_pairs={pairs} sub8_pieces={sub8}");
-        let leaf = ec_av1::stream::vartx_rect_leaf_hits();
-        println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
         let leaf4 = ec_av1::stream::vartx_rect_leaf4_hits();
         println!("vartx_rect_leaf4: 8x4={} 4x8={}", leaf4[0], leaf4[1]);
         let rw = ec_av1::stream::rect_wedge_hits();
@@ -68,11 +73,43 @@ fn main() {
         println!(
             "rect_wedge(8x16,16x8,16x32,32x16,8x32,32x8): compound={rw:?} interintra={rwi:?}"
         );
+        let sb = ec_av1::stream::sb128_rect_counters();
+        println!(
+            "sb128_rect: edge_horz={} edge_vert={} inter_128x64={} inter_64x128={}",
+            sb.0, sb.1, sb.2, sb.3
+        );
+        // lane-sbab r1: the superblock-level inter AB arms.
+        let sbab = ec_av1::decode::sb_ab_inter_hits_by_arm();
+        println!(
+            "inter_ab64: horz_a={} horz_b={} vert_a={} vert_b={}",
+            sbab[0], sbab[1], sbab[2], sbab[3]
+        );
+        let i4 = ec_av1::stream::intra_rect4_in_inter_counters();
+        println!(
+            "intra_rect4_in_inter: 64x16={} 16x64={} 32x8={} 8x32={}",
+            i4.0, i4.1, i4.2, i4.3
+        );
+        // lane-cdefstrip r1: 8x8 CDEF units whose skip band no coded block
+        // wrote this frame -- non-zero means a decode arm forgot
+        // `fill_skip_grid_rect`, and CDEF filtered a unit libaom may skip.
+        println!(
+            "cdef_unwritten_skip_units: {}",
+            ec_av1::decode::cdef_unwritten_skip_units()
+        );
+        println!(
+            "cdef_band: rect_skip_writes={} mixed_skip_units={}",
+            ec_av1::decode::rect_skip_band_hits(),
+            ec_av1::decode::cdef_mixed_skip_units()
+        );
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
             ir.0, ir.1, ir.2, ir.3, ir.4, ir.5
         );
+        // lane-rectres r1: how many of those 32x8/8x32 strips coded a real
+        // rectangular residual transform unit (a skipped one codes none).
+        let r328 = ec_av1::stream::rect32x8_inter_tu_hits();
+        println!("rect32x8_inter_tu: 32x8={} 8x32={}", r328[0], r328[1]);
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
