@@ -1772,6 +1772,20 @@ pub(crate) fn wii_hits() -> usize {
     WII_HITS.with(|c| c.get())
 }
 
+// lane-sbrect10 r1: how many INTRA blocks read `uv_mode` off the 13-symbol
+// NO-CFL alphabet *because their size excludes CFL* (libaom `is_cfl_allowed`:
+// wide <= 32 && high <= 32). The witness that a gate stream really carries a
+// 64-axis intra block -- the shape whose 14-symbol read desynced every inter
+// frame carrying one.
+thread_local! {
+    static NOCFL_UV_MODE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`NOCFL_UV_MODE_HITS`].
+pub(crate) fn nocfl_uv_mode_hits() -> usize {
+    NOCFL_UV_MODE_HITS.with(|c| c.get())
+}
+
 // lane-inter4 r4: how many 16x8/8x16 INTER LEAVES actually ran the OBMC
 // blend -- the gate's proof that `--enable-obmc=1` reached this shape (the
 // r3 refusal's replacement: prefilt frames are bit-exact vs an instrumented
@@ -5361,6 +5375,17 @@ fn read_intra_mode_rect(
             }
         };
     }
+    // lane-sbrect10 r1: libaom `is_cfl_allowed` (blockd.h) is
+    // `block_size_wide <= 32 && block_size_high <= 32` -- enforce it HERE, at
+    // the one point every rect caller routes through, so no call site can
+    // offer the 14-symbol CFL alphabet on a 64-axis block (class
+    // wrong-alphabet-same-value: same value, wrong interval, silent desync).
+    let cfl = if cfl && bw.max(bh) > 32 {
+        NOCFL_UV_MODE_HITS.with(|c| c.set(c.get() + 1));
+        false
+    } else {
+        cfl
+    };
     // Same `intra_segment_id` placement as the square reader above.
     let (seg_w_mi, seg_h_mi) = (bw / 4, bh / 4);
     if seg_id_pre_skip() {
@@ -8296,6 +8321,14 @@ fn read_intra_mode(
             }
         };
     }
+    // lane-sbrect10 r1: `is_cfl_allowed`'s <=32 bound, enforced at the single
+    // point every square caller routes through (see `read_intra_mode_rect`).
+    let cfl = if cfl && side > 32 {
+        NOCFL_UV_MODE_HITS.with(|c| c.set(c.get() + 1));
+        false
+    } else {
+        cfl
+    };
     // spec 5.11.6 `intra_frame_mode_info`: `intra_segment_id` is read BEFORE
     // `skip` when `SegIdPreSkip`, and after it otherwise.
     let (seg_w_mi, seg_h_mi) = (side / 4, side / 4);
@@ -18038,13 +18071,27 @@ fn decode_inter_block(
         // directional intra-in-inter block was refused above.
         let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
         let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
-        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        // lane-sbrect10 r1 (class wrong-alphabet-same-value, second instance
+        // after lane-sbpart r3's rect strips): `is_cfl_allowed` (libaom
+        // `blockd.h` -- `block_size_wide[bsize] <= 32 && block_size_high[bsize]
+        // <= 32`, spec 5.11.5) caps CFL at 32x32, so a 64x64 intra block inside
+        // an INTER frame reads the 13-symbol `uv_mode_no_cfl` alphabet. Reading
+        // the 14-symbol CFL one gave the same DC_PRED VALUE but narrowed the
+        // arithmetic coder by the wrong interval, desyncing the tile from this
+        // block on.
+        let cfl_allowed = write_w.max(write_h) <= 32;
+        if !cfl_allowed {
+            NOCFL_UV_MODE_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let uv_mode = if cfl_allowed {
+            dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+        } else {
+            dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
+        };
         if (9..=12).contains(&uv_mode) {
             SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
         }
-        let alpha = if uv_mode == DC_PRED {
-            None
-        } else if uv_mode == UV_CFL_PRED {
+        let alpha = if cfl_allowed && uv_mode == UV_CFL_PRED {
             Some(read_cfl_alphas(dec, cdfs))
         } else {
             None
