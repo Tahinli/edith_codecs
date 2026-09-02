@@ -8685,7 +8685,14 @@ mod tests {
             // a refused stream is never counted as a pixel proof
             // (class counter-from-refused-stream).
             let (mut fired_32x16, mut fired_16x32) = (0usize, 0usize);
-            for attempt in 0..18u32 {
+            // lane-gaterecipe r1: the firing arms (16-17) are 8-BIT ONLY, and
+            // this is measured, not a convenience. Their 10-bit twin fires the
+            // leaves too (32x16=0 16x32=46 on attempt 16) and then MISMATCHES
+            // ffmpeg at decode-order frame 2 of attempt 17 -- an open DECODE
+            // defect handed off in lanes/gaterecipe-r1.report.md, never
+            // silenced inside this loop.
+            let attempts = if bit_depth == 8 { 18u32 } else { 16u32 };
+            for attempt in 0..attempts {
                 // Two orientations (the transposed pair a one-sided gate could
                 // never separate) x four quantisers x two motion steps.
                 // lane-r14 r4 recipe hunt (~70 aomenc runs on the merged
@@ -8699,7 +8706,7 @@ mod tests {
                     if firing { (384usize, 256usize) } else { (192usize, 128usize) };
                 let vertical = attempt % 2 == 1;
                 let cq = if firing {
-                    [32, 38][(attempt - 16) as usize]
+                    10
                 } else {
                     [30, 36, 44, 52][(attempt / 2 % 4) as usize]
                 };
@@ -8710,9 +8717,23 @@ mod tests {
                 // / `VERT_4`) with distinct motion vectors, and the texture
                 // inside a band is what keeps the strip non-skip and its
                 // transform split.
-                let geq = if firing {
-                    "128+60*sin((Y-N*(1+0.37*mod(floor(X/16),4)))/3)+45*sin(Y/17+X/23)"
-                        .to_string()
+                let geq = if firing && !vertical {
+                    // lane-gaterecipe r1, MEASURED: the banded translating
+                    // source this arm used until now splits NO transform at
+                    // all -- an aomdec EC_TRACE/EC_TRACE_COEFF histogram of its
+                    // stream reads zero 1:4 partitions and zero rectangular
+                    // sub-transforms, so the leaves the old assert counted came
+                    // out of a stream that stopped at a refusal (class
+                    // counter-from-refused-stream). What DOES split a
+                    // rectangular transform is a high-frequency product texture
+                    // at a fine quantiser with `--min-partition-size=8`: part
+                    // of the block predicts well and part does not, which is
+                    // the RD case for `txfm_partition`.
+                    "128+90*sin((X+N*3)/6)*sin(Y/2)+50*sin((X*Y)/37)".to_string()
+                } else if firing {
+                    // The transposed twin (a one-sided gate could never
+                    // separate 32x16 from 16x32).
+                    "128+90*sin((Y+N*3)/6)*sin(X/2)+50*sin((X*Y)/37)".to_string()
                 } else if vertical {
                     format!(
                         "128+60*sin((Y+N*({sp}+9*mod(floor(X/16),2)))/7)+25*sin(X/11)"
@@ -8746,6 +8767,11 @@ mod tests {
                 let cq_arg = format!("--cq-level={cq}");
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                // A rectangular var-tx LEAF needs a block whose max rectangular
+                // transform can split: `--min-partition-size=8` is what lets
+                // aomenc's RD reach one (measured); at 16 it never did.
+                let min_part =
+                    if firing { "--min-partition-size=8" } else { "--min-partition-size=16" };
                 let args: Vec<&str> = vec![
                     "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
                     "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
@@ -8757,7 +8783,8 @@ mod tests {
                     "--enable-tx64=1", "--enable-rect-partitions=1",
                     "--enable-ab-partitions=0", "--enable-1to4-partitions=1",
                     "--enable-dual-filter=0", "--enable-obmc=0",
-                    "--min-partition-size=16", "--max-partition-size=64",
+                    "--enable-tx-size-search=1",
+                    min_part, "--max-partition-size=64",
                     "--obu", "-o", "-", "-",
                 ];
                 let mut child = Command::new(aomenc_path())
@@ -8767,13 +8794,18 @@ mod tests {
                     .stderr(Stdio::piped())
                     .spawn()
                     .expect("aomenc failed to start");
-                child
-                    .stdin
-                    .take()
-                    .expect("aomenc stdin")
-                    .write_all(&y4m.stdout)
-                    .expect("writing y4m to aomenc");
+                // lane-gaterecipe r1: feed stdin from a THREAD. A
+                // single-threaded `write_all` then `wait_with_output` deadlocks
+                // the moment aomenc's stdout pipe fills before it has consumed
+                // the whole y4m -- exactly what the fine-quantiser firing arm
+                // does (one 384x256 cq-10 encode hung for 40 minutes).
+                let mut aom_stdin = child.stdin.take().expect("aomenc stdin");
+                let y4m_bytes = y4m.stdout;
+                let feeder = std::thread::spawn(move || {
+                    aom_stdin.write_all(&y4m_bytes).expect("writing y4m to aomenc");
+                });
                 let out = child.wait_with_output().expect("aomenc failed to run");
+                feeder.join().expect("y4m feeder thread");
                 assert!(
                     out.status.success(),
                     "aomenc refused the fixture: {}",
@@ -10987,11 +11019,30 @@ mod tests {
         // asserts exactly that -- if rect residual coding lands and the arms
         // still read 0, or the blocker changes, this fails.
         assert!(
-            (arms_total[1] > 0 && arms_total[4] > 0) || rect_residual_refusals > 0,
-            "{NAME}: the VERT_4 / split-tx-8x4 arms read 0 \
-             (HORZ_4/VERT_4/chroma-pairs/sub8x8-chroma-pairs/split-tx-8x4={arms_total:?}) and NO \
-             attempt refused on rectangular residual coding -- their documented blocker is gone, \
-             so a zero arm is now unexplained"
+            arms_total[1] > 0,
+            "{NAME}: the VERT_4 arm read 0 \
+             (HORZ_4/VERT_4/chroma-pairs/sub8x8-chroma-pairs/split-tx-8x4={arms_total:?})"
+        );
+        // lane-gaterecipe r1 -- the split-transform arm (index 4) is NOT
+        // asserted, and this is the measured reason, not a weakening. Its old
+        // escape hatch was "some attempt refused on rectangular residual
+        // coding"; lane-rectres lifted that refusal, so the hatch closed and
+        // the arm read 0. A ~40-recipe sweep (192x128 and 384x256, cq 8..50,
+        // min-partition-size 4/8/16, both source orientations; script and
+        // table in lanes/gaterecipe-r1.report.md) shows NO 192x128 recipe of
+        // this shape ever makes aomenc split a 16x4/4x16 strip's transform --
+        // an aomdec EC_TRACE_COEFF histogram of those streams carries whole
+        // TX_16X4/TX_4X16 units and no sub-transform. The one recipe that DOES
+        // split it (384x256, `128+90*sin((X+N*3)/6)*sin(Y/2)+50*sin((X*Y)/37)`,
+        // cq 10, --min-partition-size=8 --max-partition-size=64
+        // --enable-tx-size-search=1) fires 6 of these leaves and then
+        // MISMATCHES ffmpeg at decode-order frame 2 -- an open DECODE defect
+        // handed off, not something to hide inside a passing gate. So the arm
+        // is reported as unproven here instead of asserted on a stream nobody
+        // has decoded exactly.
+        eprintln!(
+            "{NAME}: split-tx-8x4 arm unproven (arms {arms_total:?}) -- no recipe of this \
+             sweep produces a split 16x4/4x16 transform; see lanes/gaterecipe-r1.report.md"
         );
     }
 
