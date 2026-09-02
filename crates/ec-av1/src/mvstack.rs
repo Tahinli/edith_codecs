@@ -251,6 +251,18 @@ impl MiGrid {
         (self.tile_row0, self.tile_col0)
     }
 
+    /// The current tile's mi-unit bounds, `row1`/`col1` exclusive and clamped
+    /// to the grid (libaom `TileInfo::mi_row_start/mi_row_end/...`, the four
+    /// values `is_inside` (mvref_common.h:68) tests).
+    pub fn tile_bounds(&self) -> (usize, usize, usize, usize) {
+        (
+            self.tile_row0,
+            self.tile_col0,
+            self.tile_row1.min(self.rows),
+            self.tile_col1.min(self.cols),
+        )
+    }
+
     /// The raw recorded unit at `(row, col)`, IGNORING the current tile
     /// bounds -- for the frame-wide consumers that run after the whole tile
     /// walk is finished (`decode::build_motion_field`, libaom
@@ -365,6 +377,29 @@ const MVREF_ROW_COLS: usize = 3;
 /// Adds one candidate MV with `weight` to `candidates`, merging it into an
 /// existing entry with the same MV rather than duplicating it (spec
 /// `add_ref_mv_candidate`, 7.10.2.5).
+
+/// libaom `is_inside` (mvref_common.h:68) as `add_tpl_ref_mv` applies it
+/// (mvref_common.c:340), on the sample's own odd/even-adjusted `mi_pos`
+/// (mvref_common.c:336-338): a temporal MV sample outside the CURRENT tile is
+/// skipped. The projected field itself stays frame-wide --
+/// `av1_setup_motion_field`/`motion_field_projection` write `tpl_mvs` for the
+/// whole frame and know nothing about tiles; the tile restriction lives only
+/// at READ time, here.
+fn tpl_sample_inside_tile(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    blk_row: isize,
+    blk_col: isize,
+) -> bool {
+    let pos_row = if mi_row & 1 != 0 { blk_row } else { blk_row + 1 };
+    let pos_col = if mi_col & 1 != 0 { blk_col } else { blk_col + 1 };
+    let (row0, col0, row1, col1) = grid.tile_bounds();
+    let row = mi_row as isize + pos_row;
+    let col = mi_col as isize + pos_col;
+    row >= row0 as isize && col >= col0 as isize && row < row1 as isize && col < col1 as isize
+}
+
 fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) {
     if let Some(entry) = candidates.iter_mut().find(|e| e.mv == mv) {
         entry.weight += weight;
@@ -950,6 +985,11 @@ pub fn find_mv_stack_with_sign_bias(
         while blk_row < blk_row_end {
             let mut blk_col = 0usize;
             while blk_col < blk_col_end {
+                if !tpl_sample_inside_tile(grid, mi_row, mi_col, blk_row as isize, blk_col as isize)
+                {
+                    blk_col += step_w;
+                    continue;
+                }
                 if let Some(cand) = crate::motion_field::add_tpl_ref_mv(
                     field,
                     mi_row,
@@ -987,6 +1027,9 @@ pub fn find_mv_stack_with_sign_bias(
                 let row = (mi_row as isize & (sb_mask - 1)) + row_off;
                 let col = (mi_col as isize & (sb_mask - 1)) + col_off;
                 if row < 0 || row >= sb_mask || col < 0 || col >= sb_mask {
+                    continue;
+                }
+                if !tpl_sample_inside_tile(grid, mi_row, mi_col, row_off, col_off) {
                     continue;
                 }
                 if let Some(cand) = crate::motion_field::add_tpl_ref_mv(
@@ -1733,6 +1776,11 @@ pub fn find_mv_stack_compound(
         while blk_row < blk_row_end {
             let mut blk_col = 0usize;
             while blk_col < blk_col_end {
+                if !tpl_sample_inside_tile(grid, mi_row, mi_col, blk_row as isize, blk_col as isize)
+                {
+                    blk_col += step_w;
+                    continue;
+                }
                 let cand0 = crate::motion_field::add_tpl_ref_mv(
                     field,
                     mi_row,
@@ -1790,6 +1838,9 @@ pub fn find_mv_stack_compound(
                 let row = (mi_row as isize & (sb_mask - 1)) + row_off;
                 let col = (mi_col as isize & (sb_mask - 1)) + col_off;
                 if row < 0 || row >= sb_mask || col < 0 || col >= sb_mask {
+                    continue;
+                }
+                if !tpl_sample_inside_tile(grid, mi_row, mi_col, row_off, col_off) {
                     continue;
                 }
                 let cand0 = crate::motion_field::add_tpl_ref_mv(

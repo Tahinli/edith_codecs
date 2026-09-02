@@ -2617,6 +2617,19 @@ pub(crate) fn build_motion_field(
             field.set(row, col, saved);
         }
     }
+    if std::env::var_os("EC_TRACE_TPL").is_some() {
+        eprintln!("EC_TPL_SRC oh={order_hint} mi_rows={mi_rows} mi_cols={mi_cols} rows={} cols={}", mi_rows.div_ceil(2), mi_cols.div_ceil(2));
+        for r in 0..mi_rows.div_ceil(2) {
+            let mut line = String::new();
+            for c in 0..mi_cols.div_ceil(2) {
+                match field.debug_get(r, c) {
+                    Some(s) => line.push_str(&format!("({},{})r{} ", s.mv.0, s.mv.1, s.ref_frame)),
+                    None => line.push_str(". "),
+                }
+            }
+            eprintln!("EC_TPL_SRC r{r} {line}");
+        }
+    }
     field
 }
 
