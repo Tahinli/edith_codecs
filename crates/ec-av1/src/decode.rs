@@ -997,6 +997,10 @@ thread_local! {
     // (64x32/32x64/64x16/16x64), whose coefficients are coded as the
     // truncated low-32 corner.
     static RECT64_INTER_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // lane-inter16ab r6: whole-block LUMA transform units of a 32-level 1:4
+    // inter strip, [32x8, 8x32] -- the film's blocker shape. A split 32x8
+    // strip's leaves are 16x8, so this counts genuine TX_32X8/TX_8X32 units.
+    static RECT32X8_INTER_TU_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
     // lane-r14 r3: rectangular var-tx LEAVES, [32x16, 16x32].
     static VARTX_RECT_LEAF_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
     // lane-inter16ab r4: rectangular var-tx leaves with a 4-px axis, [8x4, 4x8]
@@ -1052,6 +1056,12 @@ pub(crate) fn rect_inter_txsplit_hits() -> usize {
 /// Current value of [`RECT64_INTER_TU_HITS`] (lane-r14 r2).
 pub(crate) fn rect64_inter_tu_hits() -> usize {
     RECT64_INTER_TU_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT32X8_INTER_TU_HITS`] (lane-inter16ab r6): whole
+/// TX_32X8 / TX_8X32 inter luma transform units coded, `[32x8, 8x32]`.
+pub(crate) fn rect32x8_inter_tu_hits() -> [usize; 2] {
+    RECT32X8_INTER_TU_HITS.with(std::cell::Cell::get)
 }
 
 /// Current value of [`VARTX_RECT_LEAF_HITS`] (lane-r14 r3): how many
@@ -11804,6 +11814,12 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
             // Only reachable as a var-tx LEAF -- an 8x4/4x8 inter BLOCK is
             // refused earlier ("an inter partition below 8x8").
             | (8, 4) | (4, 8)
+            // lane-inter16ab r6: the 32-level 1:4 strips (the film's blocker).
+            // TX_32X8/TX_8X32 codes all 256 of its positions; its chroma pair
+            // is a 16x4/4x16 unit (`ss_size_lookup[BLOCK_32X8]` = BLOCK_16X4),
+            // and `sub_tx_size_map[TX_32X8] == TX_16X8` so a split leaf is the
+            // already-coded 16x8 rect one.
+            | (32, 8) | (8, 32)
     )
 }
 
@@ -11848,6 +11864,9 @@ fn rect_inter_luma_set(w: usize, h: usize) -> Result<TxbSet> {
         // `get_txsize_entropy_ctx`/`txsize_log2_minus4` agree with the
         // adjusted size, so the existing sets are bit-exact. Neither carries a
         // `tx_type` table (DCT_ONLY above), so the intra/inter split is moot.
+        // lane-inter16ab r6: DCT_IDTX at the TX_8X8 row, both `reduced_tx_set`
+        // values (`tx_size_sqr_up == TX_32X32`), 256-position `eob_pt`.
+        (32, 8) | (8, 32) => TxbSet::LumaRect32x8Inter,
         (64, 32) | (32, 64) => TxbSet::Luma64,
         (64, 16) | (16, 64) => TxbSet::LumaRect32x16,
         _ => {
@@ -11873,6 +11892,11 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> Result<TxbSet> {
         // `txsize_log2_minus4` = 4), same as the intra strip path uses.
         (32, 16) | (16, 32) => TxbSet::ChromaRect32x16,
         (32, 8) | (8, 32) => TxbSet::Chroma16,
+        // lane-inter16ab r6: chroma of a 32x8/8x32 strip. TX_16X4's
+        // `get_txsize_entropy_ctx` is the 8x8 class and its area is 64, so
+        // `Chroma8` is the exact set -- the same one the INTRA 1:4 strip path
+        // (`decode_block_rect4`) already uses for this shape.
+        (16, 4) | (4, 16) => TxbSet::Chroma8,
         _ => {
             return Err(unsupported(
                 "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
@@ -12077,6 +12101,14 @@ fn read_inter_plane_rect(
     let (cw, ch) = (w.min(32), h.min(32));
     if plane_idx == 0 && w.max(h) == 64 {
         RECT64_INTER_TU_HITS.with(|c| c.set(c.get() + 1));
+    }
+    if plane_idx == 0 && (w, h) == (32, 8) || plane_idx == 0 && (w, h) == (8, 32) {
+        let idx = usize::from(w == 8);
+        RECT32X8_INTER_TU_HITS.with(|c| {
+            let mut v = c.get();
+            v[idx] += 1;
+            c.set(v);
+        });
     }
     let (corner, tx_type) = if (cw, ch) == (32, 32) {
         let scan32 = default_scan(TX32);
