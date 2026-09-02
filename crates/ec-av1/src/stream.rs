@@ -7586,11 +7586,24 @@ mod tests {
         // 8x8 (two BLOCK_4X8 inter leaves, one shared 4x4 chroma unit predicted
         // from BOTH sub-blocks' mvs). The HORZ twin is still refused by name.
         let mut rect_fired = 0u32;
+        // lane-intersub8 r5: the two rect axes counted apart. Attempts 16..23
+        // are the same recipe family with the geq source TRANSPOSED (the sine
+        // that moves runs along Y, not X): measured over a 56-arm sweep
+        // (~/.cache/intersub8-sweep-r5.log, cq {8,12,14,16,20,26,32} x sp
+        // {3,6,9,12} x both depths, rect on), aomenc picks PARTITION_HORZ
+        // below 8x8 on that source and PARTITION_VERT on the untransposed one
+        // -- neither schedule reaches the other axis, so both are needed.
+        let (mut horz_fired, mut vert_fired) = (0u32, 0u32);
+        // Rect (non-square) masked-compound blocks on attempts that DECODED
+        // and were pixel-compared -- never off a refused stream (class
+        // counter-from-refused-stream). This is the shape whose
+        // `compound_type`/`wedge_idx` CDF row lane-intersub8 r4 fixed.
+        let mut rect_masked = 0usize;
         let mut refusals: Vec<String> = Vec::new();
         let mut out_of_scope_mismatch = 0u32;
         for bit_depth in [8u32, 10u32] {
-            for attempt in 0..16u32 {
-                let rect = attempt / 8;
+            for attempt in 0..24u32 {
+                let rect = if attempt >= 16 { 1 } else { attempt / 8 };
                 let rect_arg = format!("--enable-rect-partitions={rect}");
                 // lane-intersub8 r2, measured schedule (sweep of cq
                 // {8,10,12,14,16,18,20} x sp {3,6,9,12} x both depths,
@@ -7606,13 +7619,30 @@ mod tests {
                 // rather than hidden: cq 16..20 are all exact, so this gate
                 // is not selecting quantizers that hide a defect of its own
                 // shape.
-                let cq = [12, 14][(attempt % 2) as usize];
-                let sp = 3 + ((attempt % 8) / 2) * 3;
+                // Attempts 16..23: the (cq, sp) pairs the r5 sweep measured
+                // as HORZ-firing on the transposed source -- 8-bit
+                // (14,3)/(20,3)/(32,9), 10-bit (12,3)/(16,3); the rest of the
+                // eight are non-firing neighbours kept so a schedule that
+                // stops firing shows up as out-of-scope, not as a silent pass.
+                const HORZ_SCHEDULE: [(u32, u32); 8] =
+                    [(14, 3), (20, 3), (32, 9), (12, 3), (16, 3), (12, 9), (14, 9), (26, 3)];
+                let (cq, sp) = if attempt >= 16 {
+                    HORZ_SCHEDULE[(attempt - 16) as usize]
+                } else {
+                    ([12, 14][(attempt % 2) as usize], 3 + ((attempt % 8) / 2) * 3)
+                };
                 let duration = frame_count as f64 / 25.0;
-                let source = format!(
-                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
-                     geq=lum='128+58*sin((X+N*{sp})/6)+18*sin(Y/23)',format=yuv420p"
-                );
+                let source = if attempt >= 16 {
+                    format!(
+                        "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                         geq=lum='128+58*sin((Y+N*{sp})/6)+18*sin(X/23)',format=yuv420p"
+                    )
+                } else {
+                    format!(
+                        "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                         geq=lum='128+58*sin((X+N*{sp})/6)+18*sin(Y/23)',format=yuv420p"
+                    )
+                };
                 let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
                     .args([
@@ -7667,6 +7697,7 @@ mod tests {
                 let stream = out.stdout;
                 let before = decode::sub8_inter_split_hits();
                 let before_rect = decode::sub8_inter_rect_hits();
+                let before_masked = decode::rect_masked_compound_hits();
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
                         let msg = e.to_string();
@@ -7721,8 +7752,20 @@ mod tests {
                 if rect_groups > 0 {
                     rect_fired += 1;
                 }
+                if rect_now.0 - before_rect.0 > 0 {
+                    horz_fired += 1;
+                }
+                if rect_now.1 - before_rect.1 > 0 {
+                    vert_fired += 1;
+                }
+                // Only now, past the pixel compare, is this attempt's
+                // masked-compound count admissible.
+                rect_masked += decode::rect_masked_compound_hits() - before_masked;
             }
         }
+        eprintln!(
+            "{NAME}: fired={fired} horz={horz_fired} vert={vert_fired} rect_masked={rect_masked}"
+        );
         assert_eq!(
             out_of_scope_mismatch, 0,
             "{NAME}: attempts mismatched with no sub-8x8 inter group"
@@ -7736,6 +7779,27 @@ mod tests {
             rect_fired >= 2,
             "{NAME}: fewer than 2 firing+pixel-exact attempts with a RECTANGULAR sub-8x8 \
              inter leaf (4x8):\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            vert_fired >= 2,
+            "{NAME}: fewer than 2 firing+pixel-exact attempts with a sub-8x8 inter VERT \
+             pair (two BLOCK_4X8 leaves):\n{}",
+            refusals.join("\n")
+        );
+        // lane-intersub8 r5, measured `rect_masked=2` over the 48 attempts:
+        // the rect masked-compound blocks whose `compound_type`/`wedge_idx`
+        // CDF row r4 corrected, counted only on pixel-compared attempts.
+        assert!(
+            rect_masked >= 1,
+            "{NAME}: no RECTANGULAR masked-compound block on any pixel-compared attempt -- \
+             the r4 compound_type/wedge_idx CDF-row fix is unexercised:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            horz_fired >= 2,
+            "{NAME}: fewer than 2 firing+pixel-exact attempts with a sub-8x8 inter HORZ \
+             pair (two BLOCK_8X4 leaves):\n{}",
             refusals.join("\n")
         );
     }
