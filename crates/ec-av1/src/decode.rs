@@ -6598,6 +6598,12 @@ fn tx_size_context_rect(
     own_w: usize,
     own_h: usize,
 ) -> usize {
+    // `get_tx_size_context` compares against `max_txsize_rect_lookup[bsize]`,
+    // not the block's own side: no transform is wider or taller than 64, so a
+    // block with a 128 side resolves against 64 (the square path already caps
+    // this way, lane-sb128b r1). Without the cap the 64x128 half of a 128-root
+    // VERT reads the tx-depth symbol off row 0 where libaom uses row 1.
+    let (own_w, own_h) = (own_w.min(64), own_h.min(64));
     let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
     let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
     if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
@@ -15048,6 +15054,14 @@ thread_local! {
     /// only shape a 1080p (mi_rows = 270) stream reaches.
     pub(crate) static PART128_EDGE_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static PART128_EDGE_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-sb128c r9: 128 roots that resolved to one of the four AB shapes,
+    /// in `PARTITION_HORZ_A`, `_HORZ_B`, `_VERT_A`, `_VERT_B` order.
+    pub(crate) static PART128_AB_HITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// [`PART128_AB_HITS`], for a gate's own before/after delta.
+pub(crate) fn part128_ab_hits() -> [usize; 4] {
+    PART128_AB_HITS.with(std::cell::Cell::get)
 }
 
 /// [`PART128_NONE_HITS`], for a gate's own before/after delta.
@@ -15170,9 +15184,19 @@ fn read_sb128_root(
         PARTITION_NONE => PART128_NONE_HITS.with(|c| c.set(c.get() + 1)),
         PARTITION_HORZ => PART128_HORZ_HITS.with(|c| c.set(c.get() + 1)),
         PARTITION_VERT => PART128_VERT_HITS.with(|c| c.set(c.get() + 1)),
+        // lane-sb128c r9: the four AB shapes at the 128 root -- one
+        // 128x64/64x128 half plus two 64x64 quadrants, decoded by both tile
+        // paths below in libaom `decode_partition`'s own visit order.
+        p if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&p) => {
+            PART128_AB_HITS.with(|c| {
+                let mut h = c.get();
+                h[p - PARTITION_HORZ_A] += 1;
+                c.set(h);
+            });
+        }
         _ => {
             return Err(unsupported(
-                "a 128x128 superblock AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B at the 128 root)",
+                "a 128x128 superblock partition value outside the 8-symbol alphabet",
             ));
         }
     }
@@ -15387,6 +15411,131 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                     mi_cols,
                     mi_rows,
                 )?;
+                if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&part128) {
+                    // lane-sb128c r9: the four AB shapes at the 128 root.
+                    // libaom `decode_partition` (decodeframe.c) codes each as
+                    // two `bsize2` (64x64) squares plus one `subsize`
+                    // (128x64 / 64x128) half, visited HORZ_A = TL, TR, bottom
+                    // half; HORZ_B = top half, BL, BR; VERT_A = TL, BL, right
+                    // half; VERT_B = left half, TR, BR. AB values only come
+                    // from the FULL alphabet symbol, which is only read when
+                    // both halves of the root are inside the frame, so no
+                    // piece needs libaom's `i > 0` frame-edge break (a piece
+                    // may still overhang the bottom/right, which
+                    // `PlaneBuf::reconstruct`'s r8 clip handles).
+                    sb128_none = true;
+                    let at128 = ((sb_r & !1) as usize * 4, (sb_c & !1) as usize * 4);
+                    let (br, bc) = (at128.0 + 4, at128.1 + 4);
+                    let (q_r, q_c) = ((sb_r & !1) as usize, (sb_c & !1) as usize);
+                    // Only the VERTICAL arms reorder the squares (TL, BL, TR,
+                    // BR), so only they switch libaom's `has_tr_vert_*` /
+                    // `has_bl_vert_*` tables (lane-sb128c r6 visit order).
+                    let _vert_ab =
+                        (part128 == PARTITION_VERT_A || part128 == PARTITION_VERT_B)
+                            .then(crate::encode::Reach::vert_ab_partition);
+                    // One `cdef_idx` literal per CODED BLOCK, at the first
+                    // non-skip one of each 64x64 CDEF unit; the 128x64 /
+                    // 64x128 half covers two units and its read lands in the
+                    // unit holding its origin, so that value is copied to the
+                    // other one (libaom: every mi of the block points at the
+                    // same `MB_MODE_INFO`).
+                    let cdef_copy = |src: (usize, usize), dst: (usize, usize)| {
+                        CDEF_IDX_GRID.with(|g| {
+                            let mut g = g.borrow_mut();
+                            let cols = CDEF_SB_COLS.with(|c| c.get());
+                            if cols == 0 {
+                                return;
+                            }
+                            let (si, di) = (
+                                (q_r + src.0) * cols + q_c + src.1,
+                                (q_r + dst.0) * cols + q_c + dst.1,
+                            );
+                            if q_c + src.1 < cols
+                                && q_c + dst.1 < cols
+                                && si < g.len()
+                                && di < g.len()
+                            {
+                                g[di] = g[si];
+                            }
+                        });
+                    };
+                    macro_rules! square64 {
+                        ($at:expr) => {{
+                            CDEF_TRANSMITTED.with(|c| c.set(false));
+                            decode_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                $at,
+                                SB,
+                                TxbSet::Luma64,
+                                TxbSet::Chroma32,
+                                TX32,
+                                TX32,
+                                (&scan32, &scan32),
+                                false,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                base_q_idx,
+                                enable_filter_intra,
+                                allow_screen_content_tools,
+                                allow_intrabc,
+                                &scan32,
+                                &scan16,
+                                &scan8,
+                                &scan4,
+                                tx_select,
+                                reduced_tx_set,
+                            )?
+                        }};
+                    }
+                    macro_rules! half128 {
+                        ($at:expr, $bw:expr, $bh:expr, $src:expr, $dst:expr) => {{
+                            CDEF_TRANSMITTED.with(|c| c.set(false));
+                            decode_block_128rect(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                $at,
+                                $bw,
+                                $bh,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                base_q_idx,
+                                enable_filter_intra,
+                                allow_screen_content_tools,
+                                tx_select,
+                                reduced_tx_set,
+                            )?;
+                            cdef_copy($src, $dst);
+                        }};
+                    }
+                    match part128 {
+                        PARTITION_HORZ_A => {
+                            square64!(at128);
+                            square64!((at128.0, bc));
+                            half128!((br, at128.1), 128, 64, (1, 0), (1, 1));
+                        }
+                        PARTITION_HORZ_B => {
+                            half128!(at128, 128, 64, (0, 0), (0, 1));
+                            square64!((br, at128.1));
+                            square64!((br, bc));
+                        }
+                        PARTITION_VERT_A => {
+                            square64!(at128);
+                            square64!((br, at128.1));
+                            half128!((at128.0, bc), 64, 128, (0, 1), (1, 1));
+                        }
+                        _ => {
+                            half128!(at128, 64, 128, (0, 0), (1, 0));
+                            square64!((at128.0, bc));
+                            square64!((br, bc));
+                        }
+                    }
+                    continue;
+                }
                 if matches!(part128, PARTITION_HORZ | PARTITION_VERT) {
                     // lane-sb128c r8: libaom `decode_partition`
                     // (decodeframe.c:1554) codes PARTITION_HORZ at the 128
@@ -25263,6 +25412,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
         {
             let mut sb128_rect = None;
+            let mut sb128_ab = None;
             if sb128 && sb_start {
                 let part128 = read_sb128_root(
                     &mut dec,
@@ -25276,6 +25426,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     mi_cols,
                     mi_rows,
                 )?;
+                if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&part128) {
+                    // lane-sb128c r9: an AB shape at the 128 root -- one
+                    // 128x64/64x128 half plus two 64x64 quadrants, same visit
+                    // order as the key-frame path.
+                    sb128_none = true;
+                    sb128_ab = Some(part128);
+                }
                 if matches!(part128, PARTITION_HORZ | PARTITION_VERT) {
                     // Two 128x64 (HORZ) or two 64x128 (VERT) inter blocks; the
                     // whole 128x128 root is consumed here, so the remaining
@@ -25448,6 +25605,80 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         );
                                     }
                 }};
+            }
+            if let Some(part128) = sb128_ab {
+                // libaom `decode_partition` (decodeframe.c): HORZ_A = TL, TR,
+                // bottom half; HORZ_B = top half, BL, BR; VERT_A = TL, BL,
+                // right half; VERT_B = left half, TR, BR. AB only comes from
+                // the full alphabet symbol (both halves in frame), so there is
+                // no `i > 0` edge break to mirror.
+                let at128 = ((sb_r & !1) as usize * 4, (sb_c & !1) as usize * 4);
+                let base_mi = sub16_to_mi(at128);
+                let (br_mi, bc_mi) = (base_mi.0 + 16, base_mi.1 + 16);
+                let (q_r, q_c) = ((sb_r & !1) as usize, (sb_c & !1) as usize);
+                let _vert_ab = (part128 == PARTITION_VERT_A || part128 == PARTITION_VERT_B)
+                    .then(crate::encode::Reach::vert_ab_partition);
+                let cdef_copy = |src: (usize, usize), dst: (usize, usize)| {
+                    CDEF_IDX_GRID.with(|g| {
+                        let mut g = g.borrow_mut();
+                        let cols = CDEF_SB_COLS.with(|c| c.get());
+                        if cols == 0 {
+                            return;
+                        }
+                        let (si, di) = (
+                            (q_r + src.0) * cols + q_c + src.1,
+                            (q_r + dst.0) * cols + q_c + dst.1,
+                        );
+                        if q_c + src.1 < cols && q_c + dst.1 < cols && si < g.len() && di < g.len()
+                        {
+                            g[di] = g[si];
+                        }
+                    });
+                };
+                macro_rules! square64_inter {
+                    ($at_mi:expr) => {{
+                        CDEF_TRANSMITTED.with(|c| c.set(false));
+                        inter_piece!(
+                            $at_mi, SB,
+                            TxbSet::Luma64, TxbSet::Luma64, TxbSet::Chroma32, TX32, TX32,
+                            &scan32, &scan32, 3, SB, SB
+                        );
+                    }};
+                }
+                macro_rules! half128_inter {
+                    ($at_mi:expr, $bw:expr, $bh:expr, $src:expr, $dst:expr) => {{
+                        CDEF_TRANSMITTED.with(|c| c.set(false));
+                        inter_piece!(
+                            $at_mi, SB * 2,
+                            TxbSet::Luma64, TxbSet::Luma64, TxbSet::Chroma32, TX32, TX32,
+                            &scan32, &scan32, 3, $bw, $bh
+                        );
+                        cdef_copy($src, $dst);
+                    }};
+                }
+                match part128 {
+                    PARTITION_HORZ_A => {
+                        square64_inter!(base_mi);
+                        square64_inter!((base_mi.0, bc_mi));
+                        half128_inter!((br_mi, base_mi.1), 128, 64, (1, 0), (1, 1));
+                    }
+                    PARTITION_HORZ_B => {
+                        half128_inter!(base_mi, 128, 64, (0, 0), (0, 1));
+                        square64_inter!((br_mi, base_mi.1));
+                        square64_inter!((br_mi, bc_mi));
+                    }
+                    PARTITION_VERT_A => {
+                        square64_inter!(base_mi);
+                        square64_inter!((br_mi, base_mi.1));
+                        half128_inter!((base_mi.0, bc_mi), 64, 128, (0, 1), (1, 1));
+                    }
+                    _ => {
+                        half128_inter!(base_mi, 64, 128, (0, 0), (1, 0));
+                        square64_inter!((base_mi.0, bc_mi));
+                        square64_inter!((br_mi, bc_mi));
+                    }
+                }
+                continue;
             }
             if let Some(part128) = sb128_rect {
                 // lane-sb128c r7: libaom `decode_partition` (decodeframe.c:1554)

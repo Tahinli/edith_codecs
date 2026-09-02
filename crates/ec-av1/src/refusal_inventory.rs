@@ -43,7 +43,7 @@ const REFUSALS: &[&str] = &[
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
-    "a 128x128 superblock AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B at the 128 root)",
+    "a 128x128 superblock partition value outside the 8-symbol alphabet",
     "an inter var-tx tree with a leaf transform larger than 64x64",
     "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
