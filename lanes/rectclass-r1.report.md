@@ -102,8 +102,26 @@ cq sweep) cannot change that while those refusals stand, so it was not run.
 
 ## Test totals
 
-`cargo test -p ec-av1 --lib` (EC_AV1_REQUIRE_AOMENC=1): see
-`$HOME/.cache/rectclass-r1-suite.log` — result line at the tail.
+`cargo test -p ec-av1 --lib` (EC_AV1_REQUIRE_AOMENC=1, log
+`$HOME/.cache/rectclass-r1-suite.log`). Scoped runs, all green on the final tree:
+
+- new gate: 1 passed (numbers above).
+- `gate_coverage`: 9 passed, 0 failed.
+- `refusal_inventory` (3 tests incl. `the_decode_path_refuses_exactly_the_listed_cases`,
+  `capability_claims_are_declared_not_scattered`): passed.
+- sibling rect gates in the first full run (`a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact`,
+  `..._with_mandelbrot_fires_the_vert_b_partition_arm`, the tile/compound gates): ok.
+
+FULL-SUITE CAVEAT, stated rather than glossed: the whole-lib run did not reach its
+`test result:` line inside this round's budget. Three attempts were killed at ~10-16 min
+by SIGTERM (rc 144) — the cause is this repo's known class `monitor-kills-background-bash`:
+polling the background run's log with an `until` loop kills the run. The final attempt was
+detached with `setsid nohup` and was still running when the round closed; at the last
+in-band check it had 41 tests ok and the single expected failure
+`decode::tests::nz_map_ctx_offset_tables_match_the_rect_rule`, the pre-existing df5d630
+failure the charter tolerates. The earlier (pre-correction-commit) full run reached 289
+`ok` lines with no failure other than that one before it was killed.
+`fix-now for the verifier: re-run the suite once, undisturbed, on bc745fc.`
 
 ## Residue
 
