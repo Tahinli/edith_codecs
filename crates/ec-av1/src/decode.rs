@@ -9566,6 +9566,15 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// lane-hgkf r2: 16-bit cropped stage dump, the high-bitdepth twin of
 /// [`dump_stage`] (whose `as u8` truncation hides |delta| <= 2 defects) --
 /// matches aomdec's own `ec_dump16` rung byte for byte (crop dims, u16 LE).
+/// lane-mc64 r1: the decode-order index the stage dumps below key their file
+/// name on. `PREFILT_PICTURE_IDX` is bumped once per frame just BEFORE the
+/// deblock/CDEF stages run, so the frame being dumped here is `idx - 1` --
+/// without this every frame overwrote `.f0` and a per-frame bisection silently
+/// compared the LAST decoded frame (ledger, class stale-output-faked-measurement).
+fn stage_dump_idx() -> usize {
+    PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(1)
+}
+
 fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, fh: usize) {
     use std::io::Write;
     // lane-sbrect10 r2 / lane-cdef r1 (one shared helper): index the dump by
@@ -17570,6 +17579,9 @@ fn decode_inter_block(
         }
         _ => (write_w / 2, write_h / 2),
     };
+    if std::env::var_os("EC_MC_TRACE").is_some() {
+        eprintln!("EC_IB px={px} py={py} side={side} w={write_w} h={write_h}");
+    }
 
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
@@ -17627,9 +17639,10 @@ fn decode_inter_block(
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
     if std::env::var_os("EC_TRACE_MODE").is_some() {
         eprintln!(
-            "EC_MODE mi_row={} mi_col={} rng={}",
+            "EC_MODE mi_row={} mi_col={} is_inter={} skip={skip} rng={}",
             rmi,
             cmi,
+            is_inter as u8,
             dec.debug_state().0
         );
     }

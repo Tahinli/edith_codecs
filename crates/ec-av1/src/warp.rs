@@ -444,6 +444,9 @@ pub fn warp_affine(
     subsampling_x: i32,
     subsampling_y: i32,
 ) {
+    if std::env::var_os("EC_MC_TRACE").is_some() {
+        eprintln!("EC_MC_WARP x={p_col} y={p_row} w={p_width} h={p_height}");
+    }
     let bd = i32::from(crate::decode::bit_depth());
     // `reduce_bits_vert`, non-compound: `2 * FILTER_BITS - round_0`.
     let reduce_bits_vert = 2 * FILTER_BITS - REDUCE_BITS_HORIZ;
