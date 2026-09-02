@@ -17490,6 +17490,8 @@ mod tests {
         let (width, height, frames) = (192usize, 128usize, 6usize);
         let mut refusals: Vec<String> = Vec::new();
         let mut fired = 0u32;
+        let mut cdef_fired = 0u32;
+        let mut leaf_fired = 0u32;
         for (depth, cq, sp) in [(8u32, 8u32, 3u32), (8, 10, 3), (8, 12, 6), (10, 8, 3), (10, 12, 6)] {
             let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
             let src = format!(
@@ -17579,16 +17581,19 @@ mod tests {
                 }
             };
             assert_eq!(decoded.len(), frames, "frame count (depth={depth} cq={cq})");
-            assert!(
-                decode::cdef_skipped_units() > skipped_before,
-                "no 8x8 CDEF unit was excluded by the all-skip rule \
-                 (depth={depth} cq={cq})"
-            );
-            assert!(
-                decode::inter8_skip_band_hits() > leaves_before,
-                "no sub-16x16 inter leaf wrote the CDEF skip band \
-                 (depth={depth} cq={cq})"
-            );
+            // lane-leaf8tx r2: continue-and-sweep, not a per-attempt hard
+            // assert. Lifting a refusal reshuffles WHICH attempt this gate
+            // lands on (class [[parallel-flake-is-attempt-selection]]): the
+            // first decoded attempt need not carry a sub-16 leaf, and
+            // aborting there skipped the pixel compare entirely. Every
+            // decoded attempt is compared; the counters are asserted once,
+            // at the end, over the compared attempts.
+            if decode::cdef_skipped_units() > skipped_before {
+                cdef_fired += 1;
+            }
+            if decode::inter8_skip_band_hits() > leaves_before {
+                leaf_fired += 1;
+            }
             let reference = if depth == 10 {
                 ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
             } else {
@@ -17607,7 +17612,19 @@ mod tests {
         // hard-asserts both counters plus all six frames on all three planes.
         assert!(
             fired >= 2,
-            "fewer than 2 firing+pixel-exact attempts:\n{}",
+            "fewer than 2 decoded+pixel-exact attempts:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            cdef_fired > 0,
+            "no compared attempt excluded an 8x8 CDEF unit by the all-skip rule \
+             ({fired} compared):\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            leaf_fired > 0,
+            "no compared attempt had a sub-16x16 inter leaf write the CDEF skip band \
+             ({fired} compared):\n{}",
             refusals.join("\n")
         );
     }

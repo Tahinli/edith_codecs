@@ -3555,11 +3555,17 @@ fn read_coeffs(
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
+    let dbg_txbskip = if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        coding.txb_skip[skip_ctx]
+    } else {
+        [0; 3]
+    };
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if std::env::var_os("EC_TRACE_COEFF").is_some() {
         let (rng, _) = dec.debug_state();
         eprintln!(
-            "EC_COEFF_STEP tag=all_zero ctx={skip_ctx} all_zero={} rng={rng}",
+            "EC_COEFF_STEP tag=all_zero side={} ctx={skip_ctx} cdf={dbg_txbskip:?} all_zero={} rng={rng}",
+            coding.side,
             all_zero as i32
         );
     }
@@ -22576,12 +22582,13 @@ fn decode_inter_block8(
             skip,
         )?
         .1;
-        // lane-leaf8tx r1: the per-TU loop below is written and decodes the
-        // 8-bit arm's 150 split leaves pixel-exact, but a 10-bit stream
-        // (`EC_LEAF8TX_CONTROL=tx8`, seed 68, cq 19) still mismatches from
-        // the split leaf onwards (luma 1140 samples from (160, 96)), so the
-        // refusal stays until a gate is green -- no lift without one.
-        if intra_leaves.is_some() {
+        // lane-leaf8tx r2: the per-TU loop below is written and its ENTROPY is
+        // range-exact against aomdec for 1216 of 1217 luma 4x4 txb_skip reads
+        // on the 10-bit seed-68 stream, but the 1217th (the split leaf at
+        // mi(30,36) of frame 5) reads the same table/ctx with a DIFFERENT
+        // adapted CDF row, so the refusal stays until a gate is green.
+        // `EC_LEAF8TX_SPLIT=1` bypasses it for the ablation arms.
+        if intra_leaves.is_some() && std::env::var_os("EC_LEAF8TX_SPLIT").is_none() {
             return Err(unsupported(
                 "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 \
                  transform units",
