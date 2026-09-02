@@ -11750,8 +11750,8 @@ fn read_inter_plane_rect(
     // `av1_get_ext_tx_set_type`'s DCT-only clamp is on `tx_size_sqr_up`, i.e.
     // the *longer* side of this rect transform.
     let default_tx_type = match inherited_luma_tx_type {
-        Some(t) if w.max(h) < 32 => t,
-        _ => TxType::DctDct,
+        Some(t) => reduce_inherited_chroma_tx_type(t, w, h),
+        None => TxType::DctDct,
     };
     // lane-r14 r2: a 64-length axis codes only its low 32 coefficients
     // (`av1_get_max_eob`), so the coded unit is the `min(w,32) x min(h,32)`
@@ -11918,6 +11918,45 @@ fn read_inter_luma8(
 
 /// The [`TxbSet`] one leaf of an inter block's var-tx tree reads its
 /// coefficient tables from -- the inter counterpart of [`txbset_for`].
+/// `av1_get_tx_type`'s chroma tail (libaom `av1/common/blockd.h:1291-1305`):
+/// an inter block's chroma transform inherits the *colocated luma* unit's
+/// coded `tx_type`, then drops back to `DCT_DCT` unless that type is a member
+/// of the extended set the CHROMA transform size selects
+/// (`av1_ext_tx_used[av1_get_ext_tx_set_type(uv_tx, 1, reduced)][tx_type]`,
+/// `blockd.h:1036`/`1097`). lane-golomb r7: we used to force `DCT_DCT` at
+/// every chroma side >= 32, but `av1_get_ext_tx_set_type`'s DCT-only rung is
+/// `tx_size_sqr_up > TX_32X32`; at exactly TX_32X32 an inter block reads
+/// `EXT_TX_SET_DCT_IDTX`, so a 64x64 inter block whose first luma leaf coded
+/// `IDTX` inherits IDTX on its 32x32 chroma units. `IDTX` and `DCT_DCT` are
+/// both `TX_CLASS_2D`, so that mistake left the entropy stream perfectly in
+/// sync and only corrupted the inverse transform (one 64x64 superblock of
+/// high-frequency chroma noise, luma bit-exact).
+fn reduce_inherited_chroma_tx_type(t: TxType, w: usize, h: usize) -> TxType {
+    use TxType::*;
+    let sqr_up = w.max(h);
+    let sqr = w.min(h);
+    let reduced = REDUCED_TX_SET_INTER.with(std::cell::Cell::get);
+    // `av1_get_ext_tx_set_type(tx_size, is_inter = 1, reduced)`.
+    let allowed: &[TxType] = if sqr_up > 32 {
+        // EXT_TX_SET_DCTONLY
+        &[DctDct]
+    } else if sqr_up == 32 || reduced {
+        // EXT_TX_SET_DCT_IDTX
+        &[DctDct, Idtx]
+    } else if sqr == 16 {
+        // EXT_TX_SET_DTT9_IDTX_1DDCT -- TX_TYPES 0..=11, i.e. everything but
+        // the four 1D ADST/FLIPADST types.
+        &[
+            DctDct, AdstDct, DctAdst, AdstAdst, FlipAdstDct, DctFlipAdst, FlipAdstFlipAdst,
+            AdstFlipAdst, FlipAdstAdst, Idtx, VDct, HDct,
+        ]
+    } else {
+        // EXT_TX_SET_ALL16
+        return t;
+    };
+    if allowed.contains(&t) { t } else { DctDct }
+}
+
 fn inter_txbset_for(tx_px: usize, reduced_tx_set: bool) -> TxbSet {
     match tx_px {
         32 => TxbSet::Luma32Inter,
@@ -14973,10 +15012,9 @@ fn read_inter_plane(
     // `tx_type` -- `av1_get_tx_type` (libaom `blockd.h`): an inter block's
     // chroma plane never codes its own `tx_type` symbol, but (unlike an
     // intra block, which falls back to `Intra_Mode_To_Tx_Type`) it inherits
-    // the colocated luma transform's coded type verbatim, clamped back to
-    // `DCT_DCT` at the chroma tx sizes the spec forces DCT-only
-    // (`av1_get_ext_tx_set_type`: `tx_size_sqr_up >= TX_32X32`, i.e. this
-    // function's own `side >= 32`). `None` for the luma call itself
+    // the colocated luma transform's coded type, narrowed to the extended
+    // set the CHROMA size selects ([`reduce_inherited_chroma_tx_type`]).
+    // `None` for the luma call itself
     // (`plane_idx == 0`), where the `TxbSet`'s own symbol (or the true
     // `DCT_DCT` default at 32-point+) already resolves it without help.
     inherited_luma_tx_type: Option<TxType>,
@@ -14994,8 +15032,8 @@ fn read_inter_plane(
     };
     let mut coding = cdfs.txb(set, tx_mode);
     let default_tx_type = match inherited_luma_tx_type {
-        Some(t) if side < 32 => t,
-        _ => TxType::DctDct,
+        Some(t) => reduce_inherited_chroma_tx_type(t, side, side),
+        None => TxType::DctDct,
     };
     let (grid, tx_type) = read_coeffs(
         dec,
@@ -22472,6 +22510,36 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-golomb r7: [`reduce_inherited_chroma_tx_type`] must reproduce
+    /// `av1_ext_tx_used[av1_get_ext_tx_set_type(uv_tx, 1, reduced)]`
+    /// (libaom `av1/common/blockd.h:1036`/`1097`) exactly -- the g35 residue
+    /// was one 64x64 inter superblock whose 32x32 chroma units are
+    /// `EXT_TX_SET_DCT_IDTX`, where IDTX survives and we forced `DCT_DCT`.
+    #[test]
+    fn an_inter_chroma_transform_narrows_its_inherited_tx_type_to_its_own_set() {
+        use TxType::*;
+        // EXT_TX_SET_DCTONLY: `tx_size_sqr_up > TX_32X32`.
+        set_inter_tx_mode(true, false, true);
+        assert_eq!(reduce_inherited_chroma_tx_type(Idtx, 64, 64), DctDct);
+        // EXT_TX_SET_DCT_IDTX at exactly TX_32X32 -- the residue's case.
+        assert_eq!(reduce_inherited_chroma_tx_type(Idtx, 32, 32), Idtx);
+        assert_eq!(reduce_inherited_chroma_tx_type(AdstAdst, 32, 32), DctDct);
+        // EXT_TX_SET_DTT9_IDTX_1DDCT at `tx_size_sqr == TX_16X16`: the four
+        // 1D ADST/FLIPADST types (TX_TYPES 12..15) drop out, the rest stay.
+        assert_eq!(reduce_inherited_chroma_tx_type(HDct, 16, 16), HDct);
+        assert_eq!(reduce_inherited_chroma_tx_type(FlipAdstAdst, 16, 16), FlipAdstAdst);
+        assert_eq!(reduce_inherited_chroma_tx_type(HAdst, 16, 16), DctDct);
+        // EXT_TX_SET_ALL16 below that (`tx_size_sqr < TX_16X16`, so a 16x8
+        // chroma unit too).
+        assert_eq!(reduce_inherited_chroma_tx_type(HAdst, 16, 8), HAdst);
+        assert_eq!(reduce_inherited_chroma_tx_type(VFlipAdst, 8, 8), VFlipAdst);
+        // `reduced_tx_set` collapses every inter set to DCT_IDTX.
+        set_inter_tx_mode(true, true, true);
+        assert_eq!(reduce_inherited_chroma_tx_type(Idtx, 8, 8), Idtx);
+        assert_eq!(reduce_inherited_chroma_tx_type(HAdst, 8, 8), DctDct);
+        set_inter_tx_mode(true, false, true);
+    }
 
     /// lane-fistrip r1 (class `enumerate-the-table-domain`): every block
     /// shape this decoder can hand [`filter_intra_size_class_rect`], against
