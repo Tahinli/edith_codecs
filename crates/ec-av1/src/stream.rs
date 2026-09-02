@@ -8178,6 +8178,176 @@ mod tests {
         eprintln!("{NAME}: pixel-exact, mode_mi_override_hits={total_overrides}");
     }
 
+    /// lane-cfl r1: the chroma intra-edge FILTER TYPE is the neighbour's
+    /// `uv_mode` (libaom `get_filt_type`, reconintra.c: `chroma_above_mbmi`/
+    /// `chroma_left_mbmi` -> `is_smooth` on `uv_mode`), and two whole decode
+    /// paths passed a hardcoded `false` for it -- `decode_leaf_8x8` (every
+    /// 8x8 leaf of a SPLIT) and `decode_leaf_rect` (every rect strip below
+    /// 16x16), on a stale "chroma stays false (exact) until a smooth/paeth
+    /// uv_mode can reach decode at all" comment. On top of that the coarse
+    /// `above_uv_mode`/`left_uv_mode` cells are 16px-granular and their
+    /// `for cell in 0..w / SUB` write runs ZERO times for any block below
+    /// 16x16, so even the paths that DID read them saw whatever a
+    /// 16x16-or-larger block had left there (class: context read from one
+    /// cell / neighbour map at the wrong granularity). Result on this
+    /// recipe: luma byte-exact, entropy ladder identical, and 40 U + 86 V
+    /// chroma bytes wrong -- every one of them downstream of one 4x4 chroma
+    /// block at mi(8,12) whose D135 + `angle_delta_uv=-3` left edge was
+    /// filtered at the wrong strength (`ft=0` where the instrumented aomdec
+    /// prints `ft=1`, left edge `95,59,30,28` vs `90,61,37,29`).
+    ///
+    /// Both arms hard-assert per-attempt counters for the two chroma block
+    /// shapes involved (`UV_CFL_PRED` blocks, nonzero `angle_delta_uv`
+    /// blocks) plus the mi-exact UV-neighbour override, and are counted only
+    /// on an attempt that decoded AND is pixel-compared.
+    #[test]
+    fn a_real_aomenc_stream_whose_chroma_edge_filter_reads_a_sub16_neighbours_uv_mode_decodes_pixel_exact()
+    {
+        const NAME: &str = "a_real_aomenc_stream_whose_chroma_edge_filter_reads_a_sub16_neighbours_uv_mode_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let mut compared = 0usize;
+        let (width, height) = (64usize, 64usize);
+        // 8-bit arm = the r5 residue cell ("mandfi161"); 10-bit arm = its
+        // twin through the same recipe at `--bit-depth=10`.
+        for depth in [8usize, 10] {
+            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i",
+                    &format!("mandelbrot=size={width}x{height}:start_x=-0.6"),
+                    "-pix_fmt", pix, "-strict", "-1", "-t", "1", "-vframes", "1",
+                    "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg fixture (depth={depth}): {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let encode = || {
+                let mut child = Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=16",
+                        "--cpu-used=4", "--threads=1", "--row-mt=0", "--sb-size=64",
+                        "--kf-max-dist=0", "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
+                        "--enable-tx-size-search=0", "--enable-filter-intra=1",
+                        "--reduced-tx-type-set=1", "--min-partition-size=8",
+                        "--max-partition-size=32",
+                        &format!("--input-bit-depth={depth}"),
+                        &format!("--bit-depth={depth}"),
+                        "--obu", "-o", "-", "-",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture (depth={depth}): {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                out.stdout
+            };
+            let stream = encode();
+            assert_eq!(
+                stream,
+                encode(),
+                "{NAME}: aomenc output is not reproducible (depth={depth})"
+            );
+            let before_cfl = crate::decode::cfl_block_hits();
+            let before_angle = crate::decode::uv_angle_delta_hits();
+            let before_uv = crate::decode::uv_mode_mi_override_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                // Only a NAMED refusal is tolerated (COMMON rule): the 10-bit
+                // twin of this recipe still stops at another lane's open
+                // sub-16 AB-partition / strip-filter-intra refusals, so it
+                // cannot be compared yet. Any other error is a failure, and
+                // `compared` below keeps the test from passing vacuously.
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME}: decode failed (depth={depth}): {msg}"
+                    );
+                    eprintln!("{NAME}: depth={depth} arm refused (not compared): {msg}");
+                    continue;
+                }
+            };
+            compared += 1;
+            // Read only on an attempt that decoded AND is compared below.
+            let cfl_blocks = crate::decode::cfl_block_hits() - before_cfl;
+            let angle_blocks = crate::decode::uv_angle_delta_hits() - before_angle;
+            let uv_overrides = crate::decode::uv_mode_mi_override_hits() - before_uv;
+            let ffmpeg_frames = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames.len())
+            };
+            assert_eq!(frames.len(), 1, "{NAME}: expected one key frame (depth={depth})");
+            assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (depth={depth})");
+                assert_eq!(
+                    got.u, want.u,
+                    "{NAME} frame {i} U vs ffmpeg (depth={depth}, {cfl_blocks} CFL blocks, \
+                     {angle_blocks} nonzero-angle_delta_uv blocks, {uv_overrides} mi-exact UV \
+                     neighbour overrides)"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{NAME} frame {i} V vs ffmpeg (depth={depth}, {cfl_blocks} CFL blocks, \
+                     {angle_blocks} nonzero-angle_delta_uv blocks, {uv_overrides} mi-exact UV \
+                     neighbour overrides)"
+                );
+            }
+            assert!(
+                cfl_blocks > 0,
+                "{NAME}: no UV_CFL_PRED block decoded (depth={depth}) -- the gate proves nothing"
+            );
+            assert!(
+                angle_blocks > 0,
+                "{NAME}: no nonzero angle_delta_uv chroma block decoded (depth={depth}) -- \
+                 the chroma intra-edge filter path never ran"
+            );
+            assert!(
+                uv_overrides > 0,
+                "{NAME}: no chroma edge-filter read ever took a mi-exact UV neighbour that \
+                 disagreed with its coarse 16x16 slot (depth={depth}) -- the r1 defect is \
+                 not exercised"
+            );
+            eprintln!(
+                "{NAME}: pixel-exact at {depth}-bit, cfl_blocks={cfl_blocks} \
+                 angle_delta_uv_blocks={angle_blocks} uv_mi_overrides={uv_overrides}"
+            );
+        }
+        assert!(
+            compared > 0,
+            "{NAME}: every arm refused -- the gate compared no pixels at all"
+        );
+    }
+
     #[test]
     #[ignore = "lane-rectx r3 scratch sweep"]
     fn sweep_rectx_recipes() {
