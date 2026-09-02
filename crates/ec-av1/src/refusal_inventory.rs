@@ -68,7 +68,21 @@ const REFUSALS: &[&str] = &[
     "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
     "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
-    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
+    // lane-inter16ab r1 lifted the AB half and r2 the 1:4 half (four 16x4 /
+    // 4x16 inter strips, their 8x4/4x8 chroma pair built from BOTH strips'
+    // motion vectors -- gate
+    // `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact`).
+    // Two narrower refusals are what is left of that shape:
+    "an inter 16x16-level partition value outside NONE/HORZ/VERT/SPLIT/AB/1:4",
+    // r2 residue: `vartx_leaves` is a list of SQUARE units, and
+    // `sub_tx_size_map[TX_16X4]` is the rectangular TX_8X4 -- the split tree
+    // and its per-unit residual reader both need rect leaves.
+    "a COMPOUND_WEDGE mask on a rectangular inter block (the wedge codebook is square-only)",
+    "a wedge interintra mask on a rectangular inter block (the wedge codebook is square-only)",
+    // r2 residue: `decode_intra_rect_in_inter` codes chroma at the strip's own
+    // halved footprint, which for a 16x4 strip is an 8x2 transform libaom
+    // never wrote (its chroma is the PAIR's 8x4, coded by the odd strip).
+    "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
     "an intra mode this decoder does not code (round 2)",
     // lane-intrarect r1 lifted the whole-shape refusal that stood here (the
     // inter path's intra arm now routes 2:1 strips through `decode_rect_split`);
