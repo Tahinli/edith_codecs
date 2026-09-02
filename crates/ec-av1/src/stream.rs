@@ -7423,8 +7423,9 @@ mod tests {
     /// hard-asserted per firing attempt so neither orientation can ride along
     /// on the other ([[gate-blind-to-feature]]), and only leaves that coded
     /// REAL coefficients count -- a skipped leaf never runs the transform.
-    /// Arms: 8-bit 64x64, an 8-bit `--tile-columns=1` 128x64 (the mi-granular
-    /// mode maps are per tile), and a 10-bit 64x64.
+    /// Arms: 8-bit 16x16, an 8-bit `--tile-columns=1` 128x16 (the mi-granular
+    /// mode maps are per tile), and a 10-bit 16x16 -- 16-pixel fixtures, for
+    /// the reason the comment inside the loop gives.
     #[test]
     fn a_real_aomenc_stream_with_a_sub8_rect_leaf_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_stream_with_a_sub8_rect_leaf_decodes_pixel_exact";
@@ -7623,6 +7624,234 @@ mod tests {
                 split_tx > 0,
                 "no sub-8x8 rect leaf used a split (depth-1) transform in the \
                  {fired_runs} pixel-exact runs ({width}x{height} depth={bit_depth})"
+            );
+        }
+    }
+
+    /// lane-tx4x8 r3 ([[enumerate-table-domain]], [[tool-disabled-in-every-gate]]):
+    /// a 16x8/8x16 intra strip whose DIRECTIONAL mode reads above-right or
+    /// below-left samples. Which of those the decoder may read is
+    /// `Reach::of_rect`'s answer, and until this round `rect_reach_tables`
+    /// had no 16x8 row at all -- every 16x8 strip read libaom's `has_tr_32x16`
+    /// row instead of `has_tr_16x8`, wrong at 10 of the 21 reachable
+    /// superblock positions for above-right and 7 for below-left. No gate saw
+    /// it: the sibling strip gate (`coded_rect_strip_below_16x16`) runs with
+    /// smooth/paeth/DC modes, which never read past the block, so the wrong
+    /// bit changed no pixel there.
+    ///
+    /// So this gate turns every non-directional intra tool OFF
+    /// (`--enable-smooth-intra=0 --enable-paeth-intra=0
+    /// --enable-filter-intra=0`) at `--min-partition-size=8
+    /// --max-partition-size=16 --enable-rect-partitions=1`, and counts, per
+    /// attempt, the 16x8/8x16 strips whose prediction actually reached past
+    /// their own width or height ([`decode::rect_strip_reach_hits`], recorded
+    /// in the predictor's edge fetch). An attempt only counts when that
+    /// counter moved AND the frame is pixel-exact against ffmpeg.
+    ///
+    /// BLOCKED, and `#[ignore]`d for it, not skipped from inside
+    /// ([[gate-skips-on-its-own-failure]]): the 16x16-level strip decoder
+    /// refuses every NON-SKIP 16x8/8x16 strip ("a coded (non-skip) HORZ/VERT
+    /// rect strip below 16x16", `decode.rs`), and that is what real streams
+    /// contain -- measured on this exact recipe, 38 of 40 attempts died on
+    /// that refusal and 2 on a sub-16x16 AB partition, at cq 30/45/58 and at
+    /// `--min-partition-size=16` (which yields no 16x8 at all, aomenc bounds a
+    /// rect shape by its smaller side). What unblocks it: the lane that ports
+    /// the coded 16x16-level strip; then drop this attribute. Until then the
+    /// table routing is pinned by the domain test
+    /// `encode::tests::every_rect_shape_reaches_what_libaom_says_over_the_whole_superblock`
+    /// against libaom's own `has_tr_*`/`has_bl_*` arrays.
+    #[test]
+    #[ignore = "the coded 16x8/8x16 strip is a live refusal; see the doc above"]
+    fn a_directional_16x8_strip_reads_the_right_above_right_samples() {
+        const NAME: &str = "a_directional_16x8_strip_reads_the_right_above_right_samples";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            let msg = format!("no aomenc at {}", aomenc_path().display());
+            assert!(
+                std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+                "EC_AV1_REQUIRE_AOMENC is set but {msg}"
+            );
+            eprintln!("SKIP {NAME}: {msg}");
+            return;
+        }
+        // 64x16, not 64x64: a 16-tall frame is a single row of 16x16 blocks,
+        // so a HORZ arm is a 16x8 strip at column 0..3 of the superblock --
+        // exactly the positions whose `has_tr_16x8`/`has_bl_16x8` bit the old
+        // routing got wrong -- while the frame is too short for aomenc to
+        // build the deep sub-16x16 partitions other lanes still refuse. It
+        // must also be WIDER than one block: at width 16 the block is the
+        // frame, and `x + bw < width` kills above-right before any table.
+        for (width, height, bit_depth) in [(64usize, 16usize, 8u8), (64, 16, 10u8)] {
+            let mut refusals = Vec::new();
+            let mut fired_runs = 0u32;
+            let mut reach_hits = 0usize;
+            for attempt in 0..40u32 {
+                let seed = 700 + attempt;
+                // Coarse quantisers on lightly-dithered content: fine detail
+                // at low cq makes aomenc build the sub-16x16 partitions other
+                // lanes refuse, and 40/40 attempts died there.
+                let cq = 45 + (attempt % 4);
+                let half = height / 2;
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!("testsrc2=size={width}x{half}:rate=25"),
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!("color=c=gray:s={width}x{half}:rate=25"),
+                        "-filter_complex",
+                        &format!(
+                            "[0]noise=alls=8:allf=t:all_seed={seed}[t];[t][1]vstack,\
+                             format={pix_fmt}"
+                        ),
+                        "-strict",
+                        "-1",
+                        "-t",
+                        "0.04",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let mut child = Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        &format!("--cq-level={cq}"),
+                        "--cpu-used=0",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        // The tool under test: 16x8/8x16 strips, predicted by
+                        // a mode that reads beyond the block.
+                        // aomenc bounds a RECT shape by its smaller side, so
+                        // `--min-partition-size=16` yields no 16x8 at all
+                        // (measured: 0 strips in 40 attempts); 8 is the
+                        // smallest value that lets a 16x16 split HORZ/VERT.
+                        "--min-partition-size=8",
+                        "--max-partition-size=16",
+                        // Largest transform per block: a split (depth-1) rect
+                        // strip is a named refusal of another lane, and it
+                        // ate every attempt while it was on.
+                        "--enable-tx-size-search=0",
+                        "--enable-rect-partitions=1",
+                        "--enable-directional-intra=1",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-filter-intra=0",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-restoration=0",
+                        "--enable-cdef=0",
+                        "--loopfilter-control=0",
+                        "--enable-ref-frame-mvs=0",
+                        "--limit=1",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ])
+                    .args(if bit_depth == 10 {
+                        &["--input-bit-depth=10", "--bit-depth=10"][..]
+                    } else {
+                        &[][..]
+                    })
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                if !out.status.success() {
+                    refusals.push(format!(
+                        "seed={seed} cq={cq}: aomenc itself refused the fixture"
+                    ));
+                    continue;
+                }
+                let stream = out.stdout;
+                let reach_before = decode::rect_strip_reach_hits();
+                let pred_before = decode::rect_strip_pred_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.starts_with("unsupported: "),
+                            "decode error that is not a named refusal \
+                             (seed={seed} cq={cq} depth={bit_depth}): {msg}"
+                        );
+                        refusals.push(format!("seed={seed} cq={cq}: {msg}"));
+                        continue;
+                    }
+                };
+                let reached = decode::rect_strip_reach_hits() - reach_before;
+                let predicted = decode::rect_strip_pred_hits() - pred_before;
+                if predicted == 0 {
+                    refusals.push(format!(
+                        "seed={seed} cq={cq}: decoded, but no 16x8/8x16 strip in the frame"
+                    ));
+                    continue;
+                }
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, 1)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, 1)
+                };
+                assert_eq!(
+                    frames[0].y, ffmpeg_frames[0].y,
+                    "luma vs ffmpeg (seed={seed} cq={cq} depth={bit_depth}, {predicted} strips, \
+                     {reached} of them reaching)"
+                );
+                assert_eq!(
+                    frames[0].u, ffmpeg_frames[0].u,
+                    "U vs ffmpeg (seed={seed} cq={cq} depth={bit_depth})"
+                );
+                assert_eq!(
+                    frames[0].v, ffmpeg_frames[0].v,
+                    "V vs ffmpeg (seed={seed} cq={cq} depth={bit_depth})"
+                );
+                fired_runs += 1;
+                reach_hits += reached;
+                if fired_runs >= 4 {
+                    break;
+                }
+            }
+            assert!(
+                fired_runs >= 4,
+                "fewer than 4 firing+pixel-exact runs out of 40 attempts \
+                 ({width}x{height} depth={bit_depth}, {reach_hits} reaching strips):\n{}",
+                refusals.join("\n")
             );
         }
     }
