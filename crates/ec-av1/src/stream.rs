@@ -1945,10 +1945,10 @@ mod tests {
                     // masked compound, palette, ...) are other lanes' work;
                     // this gate is about hidden frames, not about them.
                     "--enable-warped-motion=0",
-                    // lane-inter4 r3: OBMC on a 16x8/8x16 leaf is a NAMED
-                    // REFUSAL (see decode.rs `obmc_blend`) -- it mismatches
-                    // the reference on this shape, so the gate spells the
-                    // tool off rather than counting its refusals as passes.
+                    // OBMC stays off HERE (this gate is about hidden frames);
+                    // the tool's own coverage is the `obmc*` gates and, on a
+                    // 16x8/8x16 leaf, the `--enable-obmc=1` arm of
+                    // `..._with_a_16_level_rect_leaf_...` (lane-inter4 r4).
                     "--enable-obmc=0",
                     "--enable-masked-comp=0",
                     "--enable-interintra-comp=0",
@@ -4891,7 +4891,15 @@ mod tests {
     // shape additionally needs `default_inter_ext_tx_cdf[2][TX_8X8]` (the
     // 12-symbol DTT9_IDTX_1DDCT row, only reachable through a rect
     // transform), which this round did not add. See lanes/inter4-r2.report.md.
-    #[ignore = "lane-inter4 r2: every real-content attempt stops at the 16x8/8x16 inter leaf or intra-rect-strip refusal before reaching a 32x16/16x32 strip; the rect residual path itself is unproven, not claimed"]
+    // lane-inter4 r4 re-measured after the 16-level rect inter leaf shipped
+    // (r3): STILL RED, and the blocker moved -- 12 named refusals over 16
+    // 8-bit attempts, 10 of them "an intra-coded HORZ/VERT strip needs
+    // rectangular intra prediction this decoder does not code yet" and 2 the
+    // 16-level AB/1:4 inter refusal; 4 attempts decoded with no rect inter
+    // residual at all and none of them mismatched (tu=0, split=0). Neither
+    // remaining blocker is this lane's: the gate un-ignores when the intra
+    // rect strip lands.
+    #[ignore = "lane-inter4 r4 (re-measured): 12/16 8-bit attempts stop at the intra-rect-strip (10) or 16-level inter AB/1:4 (2) refusal, the other 4 code no rect inter residual -- tu=0, split=0; blocked on rectangular INTRA prediction, not on this lane"]
     fn a_real_aomenc_inter_sequence_with_a_coded_rectangular_residual_decodes_pixel_exact() {
         const NAME: &str =
             "a_real_aomenc_inter_sequence_with_a_coded_rectangular_residual_decodes_pixel_exact";
@@ -5089,7 +5097,14 @@ mod tests {
                 (0u32, 0u32, 0u32, 0u32);
             let (mut tu_proved, mut split_proved) = (0usize, 0usize);
             let (mut horz_proved, mut vert_proved, mut sub16_split) = (0u32, 0u32, 0usize);
-            for attempt in 0..16u32 {
+            // lane-inter4 r4: attempts 16..32 repeat the same sweep with
+            // `--enable-obmc=1`. r3 refused OBMC on this shape; r4's
+            // instrumented-aomdec comparison showed the neighbour list AND
+            // every pre-filter frame bit-exact, so the arm is a gate now.
+            let mut obmc_leaf_proved = 0usize;
+            for attempt in 0..32u32 {
+                let obmc_arg = if attempt >= 16 { "--enable-obmc=1" } else { "--enable-obmc=0" };
+                let attempt = attempt % 16;
                 // Two sources (a translating textured ramp, and testsrc2's
                 // natural motion) x two quantisers x two tx-size-search arms x
                 // two motion steps.
@@ -5152,7 +5167,7 @@ mod tests {
                     "--enable-rect-partitions=1", "--enable-ab-partitions=0",
                     "--enable-1to4-partitions=0", "--min-partition-size=8",
                     "--max-partition-size=16",
-                    "--enable-obmc=0",
+                    obmc_arg,
                     "--obu", "-o", "-", "-",
                 ];
                 let mut child = Command::new(aomenc_path())
@@ -5176,6 +5191,7 @@ mod tests {
                 );
                 let stream = out.stdout;
                 let before = (decode::rect_inter_tu_hits(), decode::rect_inter_txsplit_hits());
+                let before_obmc_leaf = decode::obmc_rect_leaf_hits();
                 let before_leaf = (
                     decode::inter_leaf16_horz_hits(),
                     decode::inter_leaf16_vert_hits(),
@@ -5197,6 +5213,7 @@ mod tests {
                 };
                 let after = (decode::rect_inter_tu_hits(), decode::rect_inter_txsplit_hits());
                 let (tu, split) = (after.0 - before.0, after.1 - before.1);
+                let obmc_leaf = decode::obmc_rect_leaf_hits() - before_obmc_leaf;
                 let (horz, vert, splits16) = (
                     decode::inter_leaf16_horz_hits() - before_leaf.0,
                     decode::inter_leaf16_vert_hits() - before_leaf.1,
@@ -5253,6 +5270,7 @@ mod tests {
                     assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, tx_search={tx_search})");
                 }
                 tu_proved += tu;
+                obmc_leaf_proved += obmc_leaf;
                 split_proved += split;
                 sub16_split += splits16;
                 if horz > 0 {
@@ -5267,7 +5285,8 @@ mod tests {
                 "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
                  attempts carrying a 16-level rect inter leaf, 16x8-carrying={horz_proved}, \
                  8x16-carrying={vert_proved}, whole-block rect TUs={tu_proved}, rect trees that \
-                 split={split_proved}, 16x16 SPLITs={sub16_split}, {out_of_scope} attempts \
+                 split={split_proved}, 16x16 SPLITs={sub16_split}, OBMC blends on a rect \
+                 leaf={obmc_leaf_proved}, {out_of_scope} attempts \
                  carried none ({oos_mismatch} of them mismatched)"
             );
             assert_eq!(
@@ -5281,6 +5300,11 @@ mod tests {
                  axes (16x8={horz_proved}, 8x16={vert_proved}, tu={tu_proved}, 16x16 \
                  SPLITs={sub16_split}, {named_refusals} refusals, {out_of_scope} out of \
                  scope) -- gate proved nothing"
+            );
+            assert!(
+                obmc_leaf_proved > 0,
+                "{NAME} ({bit_depth}-bit): no pixel-exact attempt ever ran the OBMC blend on a \
+                 16x8/8x16 inter leaf -- the `--enable-obmc=1` arm proved nothing"
             );
             tu_total += tu_proved;
         }
