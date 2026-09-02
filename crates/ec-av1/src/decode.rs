@@ -2838,7 +2838,7 @@ fn read_coeffs_rect(
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if rect_trace {
         eprintln!(
-            "EC_COEFF_STEP tag=all_zero plane=0 ctx={skip_ctx} all_zero={} rng={}",
+            "EC_COEFF_STEP tag=all_zero plane=0 ctx={skip_ctx} entry={entry_rng} all_zero={} rng={}",
             all_zero as i32,
             dec.debug_state().0
         );
@@ -4998,7 +4998,19 @@ fn decode_rect_split(
                 // own (always DC_PRED) mode -- [`read_plane`] applies that
                 // for the square arm, so this one must too.
                 let tu_around = neighbours.around_mi_rect(tu_mi, tx_w, tx_h)[0];
-                let tu_skip_ctx = neighbours.luma_skip_ctx_rect(tu_mi, tx_w / MI, tx_h / MI);
+                // libaom `get_txb_ctx`: a LUMA transform that covers its whole
+                // block (`plane_bsize == txsize_to_bsize[tx_size]`, i.e. the
+                // unsplit depth-0 strip) reads txb_skip ctx 0 flat -- the
+                // neighbour-magnitude table is for a unit SMALLER than its
+                // block. [`decode_block_rect`]'s own unsplit read passes a
+                // literal 0 for the same reason; this arm applied the table
+                // unconditionally and desynced every depth-0 rect strip that
+                // reached it (lane-intrarect r2: ctx 5 where aomdec read 0).
+                let tu_skip_ctx = if tx_w == bw && tx_h == bh {
+                    0
+                } else {
+                    neighbours.luma_skip_ctx_rect(tu_mi, tx_w / MI, tx_h / MI)
+                };
                 let mut coding = cdfs.txb(rect_set, tx_type_mode_row(m.mode, m.filter_intra));
                 let (tu_grid, tu_tx_type) = read_coeffs_rect(
                     dec,
