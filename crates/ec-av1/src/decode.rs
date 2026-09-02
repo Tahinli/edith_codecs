@@ -22599,18 +22599,11 @@ fn decode_inter_block8(
             skip,
         )?
         .1;
-        // lane-leaf8tx r2: the per-TU loop below is written and its ENTROPY is
-        // range-exact against aomdec for 1216 of 1217 luma 4x4 txb_skip reads
-        // on the 10-bit seed-68 stream, but the 1217th (the split leaf at
-        // mi(30,36) of frame 5) reads the same table/ctx with a DIFFERENT
-        // adapted CDF row, so the refusal stays until a gate is green.
-        // `EC_LEAF8TX_SPLIT=1` bypasses it for the ablation arms.
-        if intra_leaves.is_some() && std::env::var_os("EC_LEAF8TX_SPLIT").is_none() {
-            return Err(unsupported(
-                "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 \
-                 transform units",
-            ));
-        }
+        // lane-leaf8tx r4: the per-TU loop below is entropy- and pixel-exact
+        // against aomdec once `tx_size_context_txfm` stopped reading
+        // `above_inter`/`left_inter` four mi away (r3), so the refusal that
+        // used to sit here is lifted; gate
+        // `a_real_aomenc_{,10bit_}inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact`.
         split8 = intra_leaves.is_some();
         let reach = Reach::of(SIDE, px, py, y.width, y.height);
         if let Some(leaves) = intra_leaves {
@@ -25672,7 +25665,7 @@ mod tests {
             neighbour_filter(None, [3, 3])
                 .unwrap_err()
                 .to_string()
-                .contains("an OBMC neighbour whose interp filter was never recorded"),
+                .contains("an OBMC neighbour whose switchable interp filter was never recorded"),
             "the [3, 3] sentinel must refuse by name, never panic"
         );
         assert!(neighbour_filter(None, [3, 0]).is_err());

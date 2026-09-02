@@ -6625,6 +6625,7 @@ mod tests {
         let (width, height, frame_count) = (192usize, 128usize, 6usize);
         let mut refusals = Vec::new();
         let mut uncounted_exact = 0u32;
+        let mut counted_exact = 0u32;
         let mut totals = (0usize, 0usize);
         for attempt in 0..30u32 {
             let seed = 42 + attempt;
@@ -6740,8 +6741,24 @@ mod tests {
                         "--max-partition-size=8",
                     ],
                     Ok(_) => vec!["--enable-tx-size-search=0", "--enable-angle-delta=0"],
-                    // Shipped recipe: only THIS lane's lifted tool is on.
-                    Err(_) => vec!["--enable-tx-size-search=0", "--enable-angle-delta=1"],
+                    // Shipped recipe (lane-leaf8tx r4): BOTH of this lane's
+                    // tools on -- the tx_depth split at an 8x8 intra-in-inter
+                    // leaf is what the lifted refusal covers, so
+                    // `--enable-tx-size-search=1` must survive the per-arm
+                    // override (aomenc keeps the LAST occurrence). Odd
+                    // attempts also cap the partition at 8x8, the shape that
+                    // produces the 2x2 TX_4X4 grid most often.
+                    Err(_) => {
+                        if attempt % 2 == 1 {
+                            vec![
+                                "--enable-tx-size-search=1",
+                                "--enable-angle-delta=1",
+                                "--max-partition-size=8",
+                            ]
+                        } else {
+                            vec!["--enable-tx-size-search=1", "--enable-angle-delta=1"]
+                        }
+                    }
                 })
                 .arg(&y4m_path)
                 .stdin(Stdio::null())
@@ -6829,24 +6846,35 @@ mod tests {
                 assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
             }
             if counted {
-                gate_buckets(
-                    &name,
-                    1,
-                    uncounted_exact,
-                    refusals.len() - uncounted_exact as usize,
-                );
-                return;
+                counted_exact += 1;
             }
         }
+        // lane-leaf8tx r4: continue-and-sweep -- every arm is encoded,
+        // decoded and pixel-compared on every plane of every decode-order
+        // frame above; the counters are asserted ONCE here. A decode error or
+        // a mismatch is a failure, never a SKIP, and `uncounted_exact`
+        // (decoded + compared but neither capability fired) is the
+        // out-of-scope-mismatch bucket that the sweep tolerates only while at
+        // least one attempt did fire.
         gate_buckets(
             &name,
-            0,
+            counted_exact,
             uncounted_exact,
             refusals.len() - uncounted_exact as usize,
         );
-        panic!(
-            "{name} never observed a nonzero angle delta on an 8x8 intra leaf in an inter \
-             frame (totals split/angle {totals:?}):\n{}",
+        assert!(
+            totals.0 > 0,
+            "{name}: no decoded+compared attempt carried an 8x8 intra-in-inter leaf with \
+             tx_depth split to 4x4 (split-tx per size {:?}, angle-delta {}):\n{}",
+            decode::intra_in_inter_split_tx_hits(),
+            totals.1,
+            refusals.join("\n")
+        );
+        assert!(
+            totals.1 > 0,
+            "{name}: no decoded+compared attempt carried a nonzero angle_delta_y on an 8x8 \
+             intra-in-inter leaf (split-tx {}):\n{}",
+            totals.0,
             refusals.join("\n")
         );
     }

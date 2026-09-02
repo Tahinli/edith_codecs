@@ -36,8 +36,6 @@ const REFUSALS: &[&str] = &[
     "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
     "an inter 8x8 HORZ partition (two BLOCK_8X4 inter leaves; entropy-exact now, but a measured sweep still drifts |d|<=2 in luma after the filters)",
     "a COMPOUND_WEDGE mask on a non-square inter block (rect wedge codebook unimplemented)",
-    "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
-    "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "an OBMC neighbour whose switchable interp filter was never recorded",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
@@ -68,8 +66,8 @@ const REFUSALS: &[&str] = &[
     // lane-intrainter r1 lifted the >=16x16 square case (per-TU intra
     // prediction + coefficients, gate
     // `a_real_aomenc_inter_sequence_with_a_split_transform_intra_block_decodes_pixel_exact`);
-    // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
-    "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
+    // lane-leaf8tx r4 lifted the 8x8 leaf's TX_4X4 2x2 grid (gate
+    // `a_real_aomenc_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact`).
     "an inter frame with no key frame before it",
     "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
     // lane-inter16ab r1 lifted the AB half (HORZ_A/HORZ_B/VERT_A/VERT_B at
