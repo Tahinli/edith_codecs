@@ -4528,6 +4528,198 @@ mod tests {
         );
     }
 
+    /// lane-eobc1 r1: an INTER sequence whose CHROMA coefficient blocks come
+    /// off the class-1 (`TX_CLASS_HORIZ`/`VERT`) `eob_pt` row. Chroma codes
+    /// no `tx_type` symbol of its own -- it inherits the colocated luma type
+    /// (`av1_get_tx_type`, `blockd.h:1291`) -- so an 8x8 inter leaf whose
+    /// luma picks `H_*`/`V_*` puts its 4x4 chroma on a CDF row this crate
+    /// wired for only some sizes until this round (`eob_pt_class1: None` in
+    /// 9 of 16 `TxbSet` arms, chroma 4x4/8x8 among them).
+    ///
+    /// The full tx set stays on (no `--reduced-tx-type-set=1`) and
+    /// `--enable-flip-idtx=1` is asked for explicitly; the sinusoidal-stripe
+    /// luma of the `tx_class1` key-frame gate is what actually resolves 1D
+    /// types, and the temporally-moving chroma ramp keeps chroma out of
+    /// `all_zero` so it has an `eob` to read at all. Attempts sweep cq and
+    /// stripe period; a run counts only when
+    /// [`decode::chroma_eob_class1_hits`] moved, and every shown frame is
+    /// compared pixel-exact vs ffmpeg (a decode error is a FAILURE, never a
+    /// SKIP -- class gate-skips-on-its-own-failure).
+    fn chroma_class1_eob_gate(name: &str, ten_bit: bool) {
+        if !have_ffmpeg() {
+            eprintln!("SKIP {name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 4usize);
+        let mut refusals = Vec::new();
+        for attempt in 0..12u32 {
+            let cq = 28 + (attempt % 4) * 10;
+            let period = [4u32, 6, 8][(attempt as usize / 4) % 3];
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("testsrc2=size={width}x{height}:rate=25"),
+                    "-vf",
+                    &format!(
+                        "geq=lum='128+80*sin(2*PI*Y/{period})':cb='128+60*sin(2*PI*(X+8*T)/{period})':cr='128+60*sin(2*PI*(Y+8*T)/{period})',noise=alls=6:allf=t:all_seed=7"
+                    ),
+                    "-t",
+                    "0.16",
+                    "-pix_fmt",
+                    if ten_bit { "yuv420p10le" } else { "yuv420p" },
+                    "-strict",
+                    "-1",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{name}: ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut args: Vec<String> = [
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cpu-used=0",
+                "--lag-in-frames=0",
+                "--auto-alt-ref=0",
+                "--kf-max-dist=1000",
+                "--error-resilient=1",
+                "--enable-flip-idtx=1",
+                "--reduced-tx-type-set=0",
+                "--min-partition-size=8",
+                "--max-partition-size=16",
+                // Motion tools this decoder refuses by name, kept off so a
+                // refusal here can only be about the coefficient path.
+                "--enable-global-motion=0",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--loopfilter-control=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+            args.insert(1, format!("--cq-level={cq}"));
+            if ten_bit {
+                args.insert(1, "--input-bit-depth=10".to_string());
+                args.insert(1, "--bit-depth=10".to_string());
+            }
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{name}: aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::chroma_eob_class1_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                // A named refusal ("unsupported: ...") is another lane's arm
+                // and moves this attempt on; anything else is a real decode
+                // failure and fails the gate on the spot.
+                Err(e) if e.to_string().contains("unsupported") => {
+                    refusals.push(format!("cq={cq} period={period}: {e}"));
+                    continue;
+                }
+                Err(e) => {
+                    let pin = std::env::temp_dir().join(format!("{name}-refused.obu"));
+                    let _ = std::fs::write(&pin, &stream);
+                    panic!(
+                        "{name}: decode_stream failed on a real aomenc stream (cq={cq} period={period}): {e} (pinned at {})",
+                        pin.display()
+                    );
+                }
+            };
+            if decode::chroma_eob_class1_hits() == before {
+                refusals.push(format!(
+                    "cq={cq} period={period}: decoded, but no chroma block read a class-1 eob_pt row"
+                ));
+                continue;
+            }
+            let ffmpeg_frames = if ten_bit {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count, "{name}: frame count");
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                if got.y != want.y || got.u != want.u || got.v != want.v {
+                    let pin = std::env::temp_dir().join(format!("{name}-mismatch.obu"));
+                    let _ = std::fs::write(&pin, &stream);
+                    panic!(
+                        "{name}: frame {i} mismatch vs ffmpeg (cq={cq} period={period}) -- stream pinned at {}",
+                        pin.display()
+                    );
+                }
+            }
+            return;
+        }
+        panic!("{name}: no attempt fired a class-1 chroma eob: {refusals:?}");
+    }
+
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_class1_chroma_eob_decodes_pixel_exact() {
+        chroma_class1_eob_gate(
+            "a_real_aomenc_inter_sequence_with_a_class1_chroma_eob_decodes_pixel_exact",
+            false,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_10bit_inter_sequence_with_a_class1_chroma_eob_decodes_pixel_exact() {
+        chroma_class1_eob_gate(
+            "a_real_aomenc_10bit_inter_sequence_with_a_class1_chroma_eob_decodes_pixel_exact",
+            true,
+        );
+    }
+
     #[test]
     fn a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact() {
         if !have_ffmpeg() {
