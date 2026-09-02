@@ -1838,6 +1838,21 @@ pub(crate) fn masked_compound_hits() -> usize {
     MASKED_COMPOUND_HITS.with(|c| c.get())
 }
 
+// lane-intersub8 r4/r5: the NON-SQUARE half of `MASKED_COMPOUND_HITS` -- a
+// masked-compound block whose true footprint is rectangular, i.e. the case
+// whose `compound_type`/`wedge_idx` CDF row r4 fixed (it used to read the
+// square envelope's `BLOCK_SIZES_ALL` index). Square blocks cannot show that
+// defect, so a gate asserting `masked_compound_hits` alone stays vacuous for it.
+thread_local! {
+    static RECT_MASKED_COMPOUND_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_MASKED_COMPOUND_HITS`].
+pub(crate) fn rect_masked_compound_hits() -> usize {
+    RECT_MASKED_COMPOUND_HITS.with(|c| c.get())
+}
+
 // How many blocks decoded a real `COMPOUND_WEDGE` block (`comp_group_idx ==
 // 1`, `compound_type == 0`) -- lane-wedge r3's proof a gate fixture
 // actually exercised the wedge blend, not just the DIFFWTD half of
@@ -16996,6 +17011,9 @@ fn decode_inter_block(
                     }
                 }
                 MASKED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+                if write_w != write_h {
+                    RECT_MASKED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+                }
             }
             // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): r16/r17
             // called this a `predict_compound_intermediate`/`combine_compound`
@@ -22836,38 +22854,17 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         )?;
                                         continue;
                                     }
-                                    if part8 == PARTITION_HORZ
-                                        && std::env::var_os("EC_AV1_SUB8_HORZ").is_none()
-                                    {
-                                        // lane-intersub8 r4: the r3 desync IS
-                                        // root-caused and fixed (rect masked
-                                        // compound read `BLOCK_16X16`'s
-                                        // `compound_type`/`wedge_idx` CDF row
-                                        // for a 16x8 block); every mode-info
-                                        // range on the 28-arm transposed
-                                        // sweep now matches aomdec element
-                                        // for element. What is left is a
-                                        // POST-ENTROPY pixel band: 3 of 28
-                                        // arms (8-bit cq32 sp9, 10-bit cq12
-                                        // sp3, 10-bit cq16 sp3) differ by
-                                        // |d| <= 2 in luma only, scattered
-                                        // over the bottom-left corner
-                                        // (x < 48, y >= 112) from the first
-                                        // frame that references an 8x4 group
-                                        // -- a filter/reconstruction defect,
-                                        // not a desync. Still refused by name
-                                        // rather than shipped as silent pixel
-                                        // drift; `EC_AV1_SUB8_HORZ=1` decodes
-                                        // it for the r5 bisect.
-                                        return Err(unsupported(
-                                            "an inter 8x8 HORZ partition (two BLOCK_8X4 inter leaves; entropy-exact now, but a measured sweep still drifts |d|<=2 in luma after the filters)",
-                                        ));
-                                    }
                                     if part8 == PARTITION_VERT || part8 == PARTITION_HORZ {
-                                        // lane-intersub8 r3/r4: two BLOCK_8X4
-                                        // (HORZ) / BLOCK_4X8 (VERT) inter
-                                        // leaves, chroma once per 8x8 on the
-                                        // second of them.
+                                        // lane-intersub8 r3/r4/r5: two
+                                        // BLOCK_8X4 (HORZ) / BLOCK_4X8 (VERT)
+                                        // inter leaves, chroma once per 8x8 on
+                                        // the second of them. HORZ was refused
+                                        // by name through r4 over a |d| <= 2
+                                        // luma band; r5 merged lane-cdef
+                                        // 8c6065e, whose `decode_inter_block8`
+                                        // skip-band write is that band's root
+                                        // cause, and the 56-arm sweep went 3
+                                        // mismatching arms -> 0.
                                         decode_inter_sub8_rect2(
                                             &mut dec,
                                             &mut cdfs,
