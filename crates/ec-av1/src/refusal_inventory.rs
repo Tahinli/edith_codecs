@@ -25,7 +25,6 @@
 #[cfg(test)]
 const CAPABILITY_CLAIMS: &[&str] = &[
     "filter intra on a superblock-level HORZ/VERT strip (never expected -- av1_filter_intra_allowed_bsize caps at 32x32)",
-    "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
 ];
 
 #[cfg(test)]
