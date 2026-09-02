@@ -334,6 +334,36 @@ pub fn predict_with_filters(
     v_kind: InterpFilterKind,
     dst: &mut [u16],
 ) {
+    predict_with_filters_kern(
+        reference, stride, true_width, true_height, x_q4, y_q4, block_w,
+        block_h, block_w, block_h, h_kind, v_kind, dst,
+    );
+}
+
+/// [`predict_with_filters`] with the 4-tap decision taken from the block's
+/// TRUE width/height (`kern_w`/`kern_h`) rather than the destination buffer's.
+/// libaom's `av1_get_interp_filter_params_with_block_size` (reconinter.h,
+/// called per axis from `inter_predictor` with `w` then `h`) picks the narrow
+/// kernel from the PREDICTION block's own dimensions; our inter path predicts
+/// a rectangular block over its enclosing square buffer, so a rect block whose
+/// chroma is 4 wide or 4 tall (luma 8x16 / 16x8 and taller kin) must still ask
+/// for the 4-tap kernel on that axis -- lane-rectchroma2 r1.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_with_filters_kern(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    block_w: usize,
+    block_h: usize,
+    kern_w: usize,
+    kern_h: usize,
+    h_kind: InterpFilterKind,
+    v_kind: InterpFilterKind,
+    dst: &mut [u16],
+) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
     INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
@@ -374,12 +404,13 @@ pub fn predict_with_filters(
 
     let (h_wide, h_narrow) = h_kind.tables();
     let (v_wide, v_narrow) = v_kind.tables();
-    let h_filter = if block_w <= 4 {
+    note_narrow_kern(block_w, block_h, kern_w, kern_h);
+    let h_filter = if kern_w <= 4 {
         &h_narrow[xfrac]
     } else {
         &h_wide[xfrac]
     };
-    let v_filter = if block_h <= 4 {
+    let v_filter = if kern_h <= 4 {
         &v_narrow[yfrac]
     } else {
         &v_wide[yfrac]
@@ -452,6 +483,32 @@ thread_local! {
     /// only intra blocks cannot pass it by construction (class
     /// `gate-blind-to-feature`).
     static INTER_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// lane-rectchroma2 r1: how often the 4-tap decision came out DIFFERENT
+    /// from what the destination buffer's own dimensions would have given --
+    /// i.e. how often a rectangular block predicted over its enclosing square
+    /// buffer asked for libaom's narrow kernel on an axis. Zero means a gate
+    /// never exercised the rect-chroma shape at all.
+    static RECT_NARROW_KERN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_NARROW_KERN_HITS`].
+pub fn rect_narrow_kern_hits() -> usize {
+    RECT_NARROW_KERN_HITS.with(|c| c.get())
+}
+
+/// Resets [`RECT_NARROW_KERN_HITS`] (per-attempt counting, class
+/// `counter-from-refused-stream`).
+pub fn reset_rect_narrow_kern_hits() {
+    RECT_NARROW_KERN_HITS.with(|c| c.set(0));
+}
+
+/// Bumps [`RECT_NARROW_KERN_HITS`] when the block's true dims pick a kernel
+/// the destination buffer's dims would not have.
+fn note_narrow_kern(block_w: usize, block_h: usize, kern_w: usize, kern_h: usize) {
+    if (kern_w <= 4) != (block_w <= 4) || (kern_h <= 4) != (block_h <= 4) {
+        RECT_NARROW_KERN_HITS.with(|c| c.set(c.get() + 1));
+    }
 }
 
 /// Current value of [`INTER_PRED_HITS`].
@@ -498,6 +555,7 @@ fn horizontal_scaled_pass(
     y0: i32,
     x_scale_fp: i64,
     block_w: usize,
+    kern_w: usize,
     rows: usize,
     h_kind: InterpFilterKind,
     intermediate: &mut [i32],
@@ -510,7 +568,7 @@ fn horizontal_scaled_pass(
         let x_qn = pos_x_q10 + c as i64 * x_step_qn;
         let int_pel = (x_qn >> 10) as i32;
         let filter_idx = ((x_qn & 1023) >> 6) as usize;
-        let h_filter = if block_w <= 4 {
+        let h_filter = if kern_w <= 4 {
             &h_narrow[filter_idx]
         } else {
             &h_wide[filter_idx]
@@ -556,6 +614,31 @@ pub fn predict_scaled(
     v_kind: InterpFilterKind,
     dst: &mut [u16],
 ) {
+    predict_scaled_kern(
+        reference, stride, true_width, true_height, x_q4, y_q4, x_scale_fp,
+        block_w, block_h, block_w, block_h, h_kind, v_kind, dst,
+    );
+}
+
+/// [`predict_scaled`] with the 4-tap decision from the block's true dims
+/// (see [`predict_with_filters_kern`]).
+#[allow(clippy::too_many_arguments)]
+pub fn predict_scaled_kern(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    x_scale_fp: i64,
+    block_w: usize,
+    block_h: usize,
+    kern_w: usize,
+    kern_h: usize,
+    h_kind: InterpFilterKind,
+    v_kind: InterpFilterKind,
+    dst: &mut [u16],
+) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
     INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
@@ -568,7 +651,8 @@ pub fn predict_scaled(
     // Q10; off/pos_x_q10 fold the block's own x_q4 (Q4) into that same Q10
     // grid (spec 7.11.3.3's `dec_calc_subpel_params`).
     let (v_wide, v_narrow) = v_kind.tables();
-    let v_filter = if block_h <= 4 {
+    note_narrow_kern(block_w, block_h, kern_w, kern_h);
+    let v_filter = if kern_h <= 4 {
         &v_narrow[yfrac]
     } else {
         &v_wide[yfrac]
@@ -585,6 +669,7 @@ pub fn predict_scaled(
         y0,
         x_scale_fp,
         block_w,
+        kern_w,
         rows,
         h_kind,
         &mut intermediate,
@@ -649,6 +734,31 @@ pub fn predict_compound_intermediate(
     v_kind: InterpFilterKind,
     dst: &mut [i32],
 ) {
+    predict_compound_intermediate_kern(
+        reference, stride, true_width, true_height, x_q4, y_q4, x_scale_fp,
+        block_w, block_h, block_w, block_h, h_kind, v_kind, dst,
+    );
+}
+
+/// [`predict_compound_intermediate`] with the 4-tap decision from the block's
+/// true dims (see [`predict_with_filters_kern`]).
+#[allow(clippy::too_many_arguments)]
+pub fn predict_compound_intermediate_kern(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    x_scale_fp: i64,
+    block_w: usize,
+    block_h: usize,
+    kern_w: usize,
+    kern_h: usize,
+    h_kind: InterpFilterKind,
+    v_kind: InterpFilterKind,
+    dst: &mut [i32],
+) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
     INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
@@ -661,7 +771,8 @@ pub fn predict_compound_intermediate(
     let yfrac = y_q4.rem_euclid(16) as usize;
 
     let (v_wide, v_narrow) = v_kind.tables();
-    let v_filter = if block_h <= 4 {
+    note_narrow_kern(block_w, block_h, kern_w, kern_h);
+    let v_filter = if kern_h <= 4 {
         &v_narrow[yfrac]
     } else {
         &v_wide[yfrac]
@@ -678,6 +789,7 @@ pub fn predict_compound_intermediate(
         y0,
         x_scale_fp,
         block_w,
+        kern_w,
         rows,
         h_kind,
         &mut intermediate,
