@@ -769,6 +769,11 @@ pub(crate) fn tx_depth_hits() -> usize {
 thread_local! {
     static TXFM_SPLIT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TXFM_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // lane-inter4 r2: rectangular INTER residual coding -- how many rect
+    // strips coded one whole-block rect transform unit, and how many split
+    // their rect max transform into square sub-transforms.
+    static RECT_INTER_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECT_INTER_TXSPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // This frame's own `tx_mode == TxMode::Select` and `reduced_tx_set` bits,
     // set once per inter tile by [`decode_inter_frame_tile_with_cdfs`] --
     // `decode_inter_block` already carries forty parameters and both are
@@ -785,6 +790,16 @@ pub(crate) fn txfm_split_reads() -> usize {
 /// Current value of [`TXFM_SPLIT_HITS`].
 pub(crate) fn txfm_split_hits() -> usize {
     TXFM_SPLIT_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT_INTER_TU_HITS`] (lane-inter4 r2).
+pub(crate) fn rect_inter_tu_hits() -> usize {
+    RECT_INTER_TU_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT_INTER_TXSPLIT_HITS`] (lane-inter4 r2).
+pub(crate) fn rect_inter_txsplit_hits() -> usize {
+    RECT_INTER_TXSPLIT_HITS.with(|c| c.get())
 }
 
 /// Sets the current thread's [`TX_SELECT_INTER`]/[`REDUCED_TX_SET_INTER`].
@@ -3874,12 +3889,21 @@ impl Neighbours {
         grids: &[Vec<i32>; 3],
     ) {
         let (r, c) = (at_mi.0 / (SUB / MI), at_mi.1 / (SUB / MI));
+        // lane-inter4 r2: a strip whose own footprint runs past the frame's
+        // last 16-px column/row stamps only the cells that exist (libaom's
+        // arrays are padded past the frame and those cells are never read).
         for cell in 0..w / SUB {
+            if c + cell >= self.above_mode.len() {
+                break;
+            }
             self.above_mode[c + cell] = mode;
             self.above_uv_mode[c + cell] = uv_mode;
             self.above_side[c + cell] = w;
         }
         for cell in 0..h / SUB {
+            if r + cell >= self.left_mode.len() {
+                break;
+            }
             self.left_mode[r + cell] = mode;
             self.left_uv_mode[r + cell] = uv_mode;
             self.left_side[r + cell] = h;
@@ -3910,10 +3934,14 @@ impl Neighbours {
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         let (w_mi, h_mi) = (w / MI, h / MI);
         for cell in 0..h_mi {
-            self.left_side_mi[mi_r + cell] = h;
+            if let Some(slot) = self.left_side_mi.get_mut(mi_r + cell) {
+                *slot = h;
+            }
         }
         for cell in 0..w_mi {
-            self.above_side_mi[mi_c + cell] = w;
+            if let Some(slot) = self.above_side_mi.get_mut(mi_c + cell) {
+                *slot = w;
+            }
         }
         // A chroma 4x4 unit straddling the true luma edge is still whole in
         // chroma's own halved grid, so libaom rounds the luma bound up to the
@@ -4018,11 +4046,17 @@ impl Neighbours {
     ) {
         let (r, c) = (at_mi.0 / (SUB / MI), at_mi.1 / (SUB / MI));
         for cell in 0..w / SUB {
+            if c + cell >= self.above_mode.len() {
+                break;
+            }
             self.above_mode[c + cell] = mode;
             self.above_uv_mode[c + cell] = uv_mode;
             self.above_side[c + cell] = w;
         }
         for cell in 0..h / SUB {
+            if r + cell >= self.left_mode.len() {
+                break;
+            }
             self.left_mode[r + cell] = mode;
             self.left_uv_mode[r + cell] = uv_mode;
             self.left_side[r + cell] = h;
@@ -4032,10 +4066,14 @@ impl Neighbours {
         self.record_mode_mi(mi_r, mi_c, w_mi, h_mi, mode);
         self.record_uv_mode_mi(mi_r, mi_c, w_mi, h_mi, uv_mode);
         for cell in 0..h_mi {
-            self.left_side_mi[mi_r + cell] = h;
+            if let Some(slot) = self.left_side_mi.get_mut(mi_r + cell) {
+                *slot = h;
+            }
         }
         for cell in 0..w_mi {
-            self.above_side_mi[mi_c + cell] = w;
+            if let Some(slot) = self.above_side_mi.get_mut(mi_c + cell) {
+                *slot = w;
+            }
         }
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
@@ -8705,8 +8743,25 @@ fn read_tx_size(
 /// the two neighbour terms (whether the transform last written above/left of
 /// this unit is narrower/shorter than the unit itself).
 fn txfm_partition_ctx(above_px: u8, left_px: u8, blk_max_px: usize, tx_px: usize) -> usize {
-    let above = usize::from(usize::from(above_px) < tx_px);
-    let left = usize::from(usize::from(left_px) < tx_px);
+    txfm_partition_ctx_rect(above_px, left_px, blk_max_px, tx_px, tx_px)
+}
+
+/// [`txfm_partition_ctx`] for a *rectangular* transform (lane-inter4 r2):
+/// libaom's `txfm_partition_context` compares the above context against
+/// `tx_size_wide` and the left one against `tx_size_high`, and takes its
+/// category from `txsize_sqr_up_map[tx_size]` -- all three collapse to one
+/// side for a square transform, which is why the square form above is a
+/// special case of this one.
+fn txfm_partition_ctx_rect(
+    above_px: u8,
+    left_px: u8,
+    blk_max_px: usize,
+    tx_w: usize,
+    tx_h: usize,
+) -> usize {
+    let above = usize::from(usize::from(above_px) < tx_w);
+    let left = usize::from(usize::from(left_px) < tx_h);
+    let tx_px = tx_w.max(tx_h);
     // `get_sqr_tx_size(max(block_size_wide, block_size_high))`, capped at the
     // largest transform (`TX_64X64`); `TX_4X4`..`TX_64X64` index as
     // `log2(px) - 2`.
@@ -8721,16 +8776,30 @@ fn txfm_partition_ctx(above_px: u8, left_px: u8, blk_max_px: usize, tx_px: usize
 /// resolved transform's own size.
 fn txfm_partition_update(
     n: &mut Neighbours,
-    (mi_r, mi_c): (usize, usize),
+    at_mi: (usize, usize),
     tx_px: usize,
     txb_px: usize,
 ) {
-    for i in 0..txb_px / MI {
+    txfm_partition_update_rect(n, at_mi, (tx_px, tx_px), (txb_px, txb_px));
+}
+
+/// [`txfm_partition_update`] for a rectangular transform (lane-inter4 r2):
+/// the left column records `tx_size_high` over the parent's own height and
+/// the above row records `tx_size_wide` over its width.
+fn txfm_partition_update_rect(
+    n: &mut Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    (tx_w, tx_h): (usize, usize),
+    (txb_w, txb_h): (usize, usize),
+) {
+    for i in 0..txb_h / MI {
         if let Some(cell) = n.left_txfm.get_mut(mi_r + i) {
-            *cell = tx_px as u8;
+            *cell = tx_h as u8;
         }
+    }
+    for i in 0..txb_w / MI {
         if let Some(cell) = n.above_txfm.get_mut(mi_c + i) {
-            *cell = tx_px as u8;
+            *cell = tx_w as u8;
         }
     }
 }
@@ -8937,6 +9006,198 @@ fn read_block_tx_size(
     };
     set_txfm_ctxs(n, at_mi, tx, side_mi, side_mi, skip && is_inter);
     Ok((tx, None))
+}
+
+/// lane-inter4 r2: the shapes whose *rectangular inter* residual this
+/// decoder codes -- a 2:1 strip whose own max rect transform
+/// (`max_txsize_rect_lookup[BLOCK_32X16] == TX_32X16`) has both a
+/// coefficient table set ([`TxbSet::LumaRect32x16Inter`], 512-coefficient
+/// `eob_pt`) and a `tx_type` alphabet here. 64x32/64x16 strips would need a
+/// 64-point rect transform, and 16x8/8x16 needs
+/// `default_inter_ext_tx_cdf[2][TX_8X8]` (the 12-symbol
+/// `DTT9_IDTX_1DDCT` row at `tx_size_sqr == TX_8X8`, only reachable through a
+/// rect transform), neither of which exists yet -- both stay refused by name.
+fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
+    matches!((w, h), (32, 16) | (16, 32))
+}
+
+/// The default (2D) coefficient scan of a rectangular transform.
+fn rect_scan(w: usize, h: usize) -> &'static [u16] {
+    match (w, h) {
+        (32, 16) => &SCAN_32X16,
+        (16, 32) => &SCAN_16X32,
+        (16, 8) => &SCAN_16X8,
+        (8, 16) => &SCAN_8X16,
+        (8, 4) => &SCAN_8X4,
+        (4, 8) => &SCAN_4X8,
+        _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
+    }
+}
+
+/// [`read_block_tx_size`] for a rectangular inter block (lane-inter4 r2):
+/// spec 5.11.17 / libaom `read_tx_size_vartx` starting from the block's own
+/// `max_txsize_rect_lookup` entry, which for a 2:1 strip IS rectangular. The
+/// depth-0 `txfm_partition` symbol reads its context off the rect transform's
+/// own width/height; a `0` leaves one whole-block rect transform unit
+/// (`None`), and a `1` splits it into `sub_tx_size_map`'s two SQUARE
+/// sub-transforms (`sub_tx_size_map[TX_32X16] == TX_16X16`), from which the
+/// ordinary square [`read_var_tx_size`] recursion continues at depth 1 -- so
+/// every leaf of a split rect block is square and the existing square leaf
+/// loop reconstructs it unchanged.
+#[allow(clippy::too_many_arguments)]
+fn read_block_tx_size_rect(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    n: &mut Neighbours,
+    at_mi: (usize, usize),
+    (bw, bh): (usize, usize),
+    (mi_cols, mi_rows): (usize, usize),
+    skip: bool,
+) -> Result<Option<Vec<(usize, usize, usize)>>> {
+    if skip {
+        // `set_txfm_ctxs(.., skip && is_inter)`: a skipped inter block records
+        // its own BLOCK size -- width above, height left -- not a transform.
+        txfm_partition_update_rect(n, at_mi, (bw, bh), (bw, bh));
+        return Ok(None);
+    }
+    // `max_txsize_rect_lookup` is the block's own size, capped at 64 -- and
+    // `rect_inter_residual_supported` has already excluded everything above 32.
+    let (tx_w, tx_h) = (bw, bh);
+    if !TX_SELECT_INTER.with(std::cell::Cell::get) {
+        // `TX_MODE_LARGEST`: no symbol at all, the whole block is one
+        // transform, and `set_txfm_ctxs` records exactly what
+        // `txfm_partition_update` would for that same unit.
+        txfm_partition_update_rect(n, at_mi, (tx_w, tx_h), (bw, bh));
+        RECT_INTER_TU_HITS.with(|c| c.set(c.get() + 1));
+        return Ok(None);
+    }
+    let ctx = txfm_partition_ctx_rect(
+        n.above_txfm[at_mi.1],
+        n.left_txfm[at_mi.0],
+        bw.max(bh),
+        tx_w,
+        tx_h,
+    );
+    let split = dec.symbol(&mut cdfs.txfm_partition[ctx]) == 1;
+    TXFM_SPLIT_READS.with(|c| c.set(c.get() + 1));
+    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+        let (rng, _) = dec.debug_state();
+        eprintln!(
+            "EC_ISTEP mi_row={} mi_col={} name=txfm_split_rect val={} ctx={ctx} rng={rng}",
+            at_mi.0,
+            at_mi.1,
+            u8::from(split)
+        );
+    }
+    if !split {
+        txfm_partition_update_rect(n, at_mi, (tx_w, tx_h), (bw, bh));
+        RECT_INTER_TU_HITS.with(|c| c.set(c.get() + 1));
+        return Ok(None);
+    }
+    TXFM_SPLIT_HITS.with(|c| c.set(c.get() + 1));
+    RECT_INTER_TXSPLIT_HITS.with(|c| c.set(c.get() + 1));
+    let sub = tx_w.min(tx_h);
+    let max_w_mi = (bw / MI).min(mi_cols.saturating_sub(at_mi.1));
+    let max_h_mi = (bh / MI).min(mi_rows.saturating_sub(at_mi.0));
+    let mut leaves = Vec::new();
+    for row in (0..bh / MI).step_by(sub / MI) {
+        for col in (0..bw / MI).step_by(sub / MI) {
+            read_var_tx_size(
+                dec,
+                cdfs,
+                n,
+                at_mi,
+                bw.max(bh),
+                (max_w_mi, max_h_mi),
+                sub,
+                1,
+                row,
+                col,
+                &mut leaves,
+            );
+        }
+    }
+    Ok(Some(leaves))
+}
+
+/// [`read_inter_plane`] for a rectangular transform unit (lane-inter4 r2):
+/// the coefficients are read with the rect coefficient machinery
+/// ([`read_coeffs_rect`], whose `TxClass` handling covers the 1D `V_*`/`H_*`
+/// types), inverted with the rect inverse transform
+/// ([`dequant_and_inverse_typed_wh`], which carries the 2:1 `sqrt2` scale),
+/// and added onto the top-left `w x h` of the block's own square-strided
+/// motion-compensated prediction buffer. Returns the *rect* coefficient grid
+/// and the coded `tx_type`.
+///
+/// `txb_skip_ctx` is 0 for luma: this unit covers the whole block, i.e.
+/// `get_txb_ctx`'s `plane_bsize == txsize_to_bsize[tx_size]` branch.
+#[allow(clippy::too_many_arguments)]
+fn read_inter_plane_rect(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    set: TxbSet,
+    (w, h): (usize, usize),
+    stride: usize,
+    plane_idx: usize,
+    around: (bool, bool, i32),
+    tx_mode: usize,
+    plane: &mut PlaneBuf,
+    x: usize,
+    y: usize,
+    prediction: &[u16],
+    inherited_luma_tx_type: Option<TxType>,
+) -> Result<(Vec<i32>, TxType)> {
+    let skip_ctx = if plane_idx == 0 {
+        0
+    } else {
+        usize::from(around.0) + usize::from(around.1)
+    };
+    let mut coding = cdfs.txb(set, tx_mode);
+    // `av1_get_ext_tx_set_type`'s DCT-only clamp is on `tx_size_sqr_up`, i.e.
+    // the *longer* side of this rect transform.
+    let default_tx_type = match inherited_luma_tx_type {
+        Some(t) if w.max(h) < 32 => t,
+        _ => TxType::DctDct,
+    };
+    let (grid, tx_type) = read_coeffs_rect(
+        dec,
+        &mut coding,
+        rect_scan(w, h),
+        w,
+        h,
+        skip_ctx,
+        dc_sign_ctx(around.2),
+        default_tx_type,
+    )?;
+    let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
+    let residual = dequant_and_inverse_typed_wh(
+        &grid,
+        w,
+        h,
+        bit_depth(),
+        block_q_idx(),
+        dc_delta,
+        ac_delta,
+        tx_type,
+    );
+    // `reconstruct_mc_rect` reads both buffers at the square prediction
+    // stride, so the dense `w x h` residual is re-laid at that stride first.
+    let mut strided = vec![0i32; stride * stride];
+    for row in 0..h {
+        strided[row * stride..][..w].copy_from_slice(&residual[row * w..][..w]);
+    }
+    plane.reconstruct_mc_rect(x, y, stride, w, h, prediction, &strided);
+    Ok((grid, tx_type))
+}
+
+/// A rect coefficient grid re-laid into the square `stride x stride` grid the
+/// neighbour/deblock stamps downstream of the residual expect.
+fn embed_rect_grid(grid: &[i32], w: usize, h: usize, stride: usize) -> Vec<i32> {
+    let mut full = vec![0i32; stride * stride];
+    for row in 0..h {
+        full[row * stride..][..w].copy_from_slice(&grid[row * w..][..w]);
+    }
+    full
 }
 
 /// One 8x8 inter leaf's luma residual (lane-txselect): either the whole-8x8
@@ -13019,7 +13280,10 @@ fn decode_inter_block(
     // lane-warp r5: see `reject_residual` -- a square-block decode of a
     // HORZ_B strip is symbol-exact only for `skip` (no residual, no
     // motion_mode/warp symbol), so gate here before any further read.
-    if reject_residual && !skip {
+    if reject_residual && !skip && !rect_inter_residual_supported(write_w, write_h) {
+        if std::env::var_os("EC_AV1_RECT_DUMP").is_some() {
+            eprintln!("EC_RECT_REFUSE mi_row={rmi} mi_col={cmi} w={write_w} h={write_h} side={side}");
+        }
         return Err(unsupported(
             "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
         ));
@@ -13823,17 +14087,32 @@ fn decode_inter_block(
                 mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v);
             }
 
-            vartx_leaves = read_block_tx_size(
-                dec,
-                cdfs,
-                neighbours,
-                at_mi,
-                side,
-                (mi_cols as usize, mi_rows as usize),
-                true,
-                skip,
-            )?
-            .1;
+            // lane-inter4 r2: a rectangular strip's transform tree starts from
+            // its own rect `max_txsize_rect_lookup` entry, not a square one.
+            let rect_tu = (write_w, write_h) != (side, side);
+            vartx_leaves = if rect_tu {
+                read_block_tx_size_rect(
+                    dec,
+                    cdfs,
+                    neighbours,
+                    at_mi,
+                    (write_w, write_h),
+                    (mi_cols as usize, mi_rows as usize),
+                    skip,
+                )?
+            } else {
+                read_block_tx_size(
+                    dec,
+                    cdfs,
+                    neighbours,
+                    at_mi,
+                    side,
+                    (mi_cols as usize, mi_rows as usize),
+                    true,
+                    skip,
+                )?
+                .1
+            };
             if skip {
                 y.reconstruct_mc_rect(
                     px,
@@ -13866,7 +14145,14 @@ fn decode_inter_block(
                 u_grid = vec![0i32; chroma_side * chroma_side];
                 v_grid = vec![0i32; chroma_side * chroma_side];
             } else {
-                let around = neighbours.around_mi(at, side);
+                // lane-inter4 r2: a rect strip's coefficient context spans its
+                // OWN width above and height left -- reading `side` cells both
+                // ways indexes past the tile's last mi row for a bottom strip.
+                let around = if rect_tu {
+                    neighbours.around_mi_rect(at_mi, write_w, write_h)
+                } else {
+                    neighbours.around_mi(at, side)
+                };
                 let luma_tx_type;
                 if let Some(leaves) = vartx_leaves.clone() {
                     // spec 5.11.17's transform tree, leaf by leaf in the order
@@ -13913,6 +14199,26 @@ fn decode_inter_block(
                     // inherits the *first* (top-left) luma unit's coded type.
                     luma_tx_type = first_tx_type;
                     luma_grid = vec![0i32; side * side];
+                } else if rect_tu {
+                    // The whole-block rectangular transform unit
+                    // (`txfm_partition` said 0 at depth 0).
+                    let (grid, tx_type) = read_inter_plane_rect(
+                        dec,
+                        cdfs,
+                        TxbSet::LumaRect32x16Inter,
+                        (write_w, write_h),
+                        side,
+                        0,
+                        around[0],
+                        mode_for_tx,
+                        y,
+                        px,
+                        py,
+                        &pred_y,
+                        None,
+                    )?;
+                    luma_tx_type = tx_type;
+                    luma_grid = embed_rect_grid(&grid, write_w, write_h, side);
                 } else {
                     (luma_grid, luma_tx_type) = read_inter_plane(
                         dec,
@@ -13932,6 +14238,55 @@ fn decode_inter_block(
                         None,
                     )?;
                 }
+                if rect_tu {
+                    // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
+                    // 2:1 strip is the strip's own rect chroma size (16x8 /
+                    // 8x16), one unit for the whole block, and it codes no
+                    // `tx_type` symbol -- it inherits the luma unit's.
+                    let (uw, uh) = (write_chroma_w, write_chroma_h);
+                    u_grid = embed_rect_grid(
+                        &read_inter_plane_rect(
+                            dec,
+                            cdfs,
+                            TxbSet::ChromaRect16x8,
+                            (uw, uh),
+                            chroma_side,
+                            1,
+                            around[1],
+                            mode_for_tx,
+                            u,
+                            cpx,
+                            cpy,
+                            &pred_u,
+                            Some(luma_tx_type),
+                        )?
+                        .0,
+                        uw,
+                        uh,
+                        chroma_side,
+                    );
+                    v_grid = embed_rect_grid(
+                        &read_inter_plane_rect(
+                            dec,
+                            cdfs,
+                            TxbSet::ChromaRect16x8,
+                            (uw, uh),
+                            chroma_side,
+                            2,
+                            around[2],
+                            mode_for_tx,
+                            v,
+                            cpx,
+                            cpy,
+                            &pred_v,
+                            Some(luma_tx_type),
+                        )?
+                        .0,
+                        uw,
+                        uh,
+                        chroma_side,
+                    );
+                } else {
                 u_grid = read_inter_plane(
                     dec,
                     cdfs,
@@ -13968,6 +14323,7 @@ fn decode_inter_block(
                     None,
                 )?
                 .0;
+                }
             }
         } else {
             let ref_frame =
@@ -14663,17 +15019,32 @@ fn decode_inter_block(
                 interintra_blend(v, cpx, cpy, chroma_side, ii, wedge_mask, &mut pred_v);
             }
 
-            vartx_leaves = read_block_tx_size(
-                dec,
-                cdfs,
-                neighbours,
-                at_mi,
-                side,
-                (mi_cols as usize, mi_rows as usize),
-                true,
-                skip,
-            )?
-            .1;
+            // lane-inter4 r2: a rectangular strip's transform tree starts from
+            // its own rect `max_txsize_rect_lookup` entry, not a square one.
+            let rect_tu = (write_w, write_h) != (side, side);
+            vartx_leaves = if rect_tu {
+                read_block_tx_size_rect(
+                    dec,
+                    cdfs,
+                    neighbours,
+                    at_mi,
+                    (write_w, write_h),
+                    (mi_cols as usize, mi_rows as usize),
+                    skip,
+                )?
+            } else {
+                read_block_tx_size(
+                    dec,
+                    cdfs,
+                    neighbours,
+                    at_mi,
+                    side,
+                    (mi_cols as usize, mi_rows as usize),
+                    true,
+                    skip,
+                )?
+                .1
+            };
             if skip {
                 y.reconstruct_mc_rect(
                     px,
@@ -14706,7 +15077,14 @@ fn decode_inter_block(
                 u_grid = vec![0i32; chroma_side * chroma_side];
                 v_grid = vec![0i32; chroma_side * chroma_side];
             } else {
-                let around = neighbours.around_mi(at, side);
+                // lane-inter4 r2: a rect strip's coefficient context spans its
+                // OWN width above and height left -- reading `side` cells both
+                // ways indexes past the tile's last mi row for a bottom strip.
+                let around = if rect_tu {
+                    neighbours.around_mi_rect(at_mi, write_w, write_h)
+                } else {
+                    neighbours.around_mi(at, side)
+                };
                 let luma_tx_type;
                 if let Some(leaves) = vartx_leaves.clone() {
                     // spec 5.11.17's transform tree, leaf by leaf in the order
@@ -14753,6 +15131,26 @@ fn decode_inter_block(
                     // inherits the *first* (top-left) luma unit's coded type.
                     luma_tx_type = first_tx_type;
                     luma_grid = vec![0i32; side * side];
+                } else if rect_tu {
+                    // The whole-block rectangular transform unit
+                    // (`txfm_partition` said 0 at depth 0).
+                    let (grid, tx_type) = read_inter_plane_rect(
+                        dec,
+                        cdfs,
+                        TxbSet::LumaRect32x16Inter,
+                        (write_w, write_h),
+                        side,
+                        0,
+                        around[0],
+                        mode_for_tx,
+                        y,
+                        px,
+                        py,
+                        &pred_y,
+                        None,
+                    )?;
+                    luma_tx_type = tx_type;
+                    luma_grid = embed_rect_grid(&grid, write_w, write_h, side);
                 } else {
                     (luma_grid, luma_tx_type) = read_inter_plane(
                         dec,
@@ -14772,6 +15170,55 @@ fn decode_inter_block(
                         None,
                     )?;
                 }
+                if rect_tu {
+                    // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
+                    // 2:1 strip is the strip's own rect chroma size (16x8 /
+                    // 8x16), one unit for the whole block, and it codes no
+                    // `tx_type` symbol -- it inherits the luma unit's.
+                    let (uw, uh) = (write_chroma_w, write_chroma_h);
+                    u_grid = embed_rect_grid(
+                        &read_inter_plane_rect(
+                            dec,
+                            cdfs,
+                            TxbSet::ChromaRect16x8,
+                            (uw, uh),
+                            chroma_side,
+                            1,
+                            around[1],
+                            mode_for_tx,
+                            u,
+                            cpx,
+                            cpy,
+                            &pred_u,
+                            Some(luma_tx_type),
+                        )?
+                        .0,
+                        uw,
+                        uh,
+                        chroma_side,
+                    );
+                    v_grid = embed_rect_grid(
+                        &read_inter_plane_rect(
+                            dec,
+                            cdfs,
+                            TxbSet::ChromaRect16x8,
+                            (uw, uh),
+                            chroma_side,
+                            2,
+                            around[2],
+                            mode_for_tx,
+                            v,
+                            cpx,
+                            cpy,
+                            &pred_v,
+                            Some(luma_tx_type),
+                        )?
+                        .0,
+                        uw,
+                        uh,
+                        chroma_side,
+                    );
+                } else {
                 u_grid = read_inter_plane(
                     dec,
                     cdfs,
@@ -14808,6 +15255,7 @@ fn decode_inter_block(
                     None,
                 )?
                 .0;
+                }
             }
         }
     } else {
