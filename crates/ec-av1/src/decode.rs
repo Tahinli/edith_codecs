@@ -171,6 +171,26 @@ pub(crate) fn intra_in_inter_angle_delta_uv_hits() -> usize {
     INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.get())
 }
 
+// lane-uv8 r1: the three non-DC chroma mode classes an INTRA 8x8 leaf inside
+// an INTER frame ([`decode_inter_block8`]'s intra arm) can carry -- the arm
+// read `uv_mode` and then refused everything but `DC_PRED`. Counted here and
+// nowhere else so the gate's assert cannot be satisfied by a >=16x16 block.
+thread_local! {
+    static INTRA_IN_INTER8_UV_DIR_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTRA_IN_INTER8_UV_SMOOTH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTRA_IN_INTER8_UV_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(directional, smooth/paeth, CfL)` chroma modes coded by an intra 8x8 leaf
+/// inside an inter frame -- see [`INTRA_IN_INTER8_UV_DIR_HITS`].
+pub(crate) fn intra_in_inter8_uv_hits() -> (usize, usize, usize) {
+    (
+        INTRA_IN_INTER8_UV_DIR_HITS.with(|c| c.get()),
+        INTRA_IN_INTER8_UV_SMOOTH_HITS.with(|c| c.get()),
+        INTRA_IN_INTER8_UV_CFL_HITS.with(|c| c.get()),
+    )
+}
+
 // lane-realworld r1: this frame's `cdef.bits` (spec 5.9.19), threaded into
 // [`maybe_read_cdef_idx`] the same way [`ENABLE_EDGE_FILTER`] threads a
 // frame-level flag through the recursive block decode -- `0` (the default)
@@ -19242,7 +19262,6 @@ fn decode_inter_block8(
     const CHROMA_SIDE: usize = 4;
 
     let (r, c) = outer_at;
-    let _ = (r, c);
     // lane-inter8 r2: this leaf's OWN mi cell, not the enclosing 16x16's --
     // leaf (mi_r, mi_c + 2)'s left neighbour is leaf (mi_r, mi_c), and the
     // left column of a 16x16's second leaf ROW is the previous 16x16 block's
@@ -19297,6 +19316,10 @@ fn decode_inter_block8(
     }
 
     let mode_for_tx;
+    // lane-uv8 r1: this leaf's chroma prediction mode (`get_uv_mode` of the
+    // coded `uv_mode`), for the neighbour bands at the tail. An INTER leaf
+    // stores `UV_DC_PRED`, exactly as [`decode_inter_block`] one level up.
+    let mut uv_predict_mode = DC_PRED;
     let (luma_grid, u_grid, v_grid);
     let mut compound_ctx8: Option<(i8, i8, u8, u8)> = None;
     // lane-inter8 r1: this leaf's own resolved references, handed back so the
@@ -20376,12 +20399,53 @@ fn decode_inter_block8(
                  this leaf with one; the >=16x16 arm decodes deltas)",
             ));
         }
+        // lane-uv8 r1: the delta'd angle decides the intra edge filter, and a
+        // directional luma mode is already legal on this leaf -- the arm
+        // passed a hardcoded `false` where [`decode_leaf8`] reads the
+        // mi-exact neighbour modes (`get_intra_edge_filter_type`, spec
+        // 7.11.2).
+        let (above_mode, left_mode) =
+            neighbours.modes_above_left_mi(leaf_mi.0, leaf_mi.1, neighbours.modes_above_left(r, c));
+        let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
+        // lane-uv8 r1: libaom `read_intra_block_mode_info` (decodemv.c:1198-1207)
+        // -- `uv_mode` over the CFL-allowed alphabet (`is_cfl_allowed`: a
+        // BLOCK_8X8 leaf is inside the 32x32 bound), then `read_cfl_alphas`
+        // for `UV_CFL_PRED`, then `angle_delta_uv` off the MAPPED uv mode's
+        // row (`get_uv_mode`, identity over `V_PRED..=D67_PRED`). Every value
+        // but `DC_PRED` was refused here, which is what blocked the low-cq
+        // CDEF arms and the 10-bit gates.
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
-        if uv_mode != DC_PRED {
-            return Err(unsupported(
-                "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
-            ));
+        if (9..=12).contains(&uv_mode) {
+            SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER8_UV_SMOOTH_HITS.with(|c| c.set(c.get() + 1));
         }
+        let alpha = if uv_mode == UV_CFL_PRED {
+            INTRA_IN_INTER8_UV_CFL_HITS.with(|c| c.set(c.get() + 1));
+            Some(read_cfl_alphas(dec, cdfs))
+        } else {
+            None
+        };
+        let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+            DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER8_UV_DIR_HITS.with(|c| c.set(c.get() + 1));
+            read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
+        } else {
+            0
+        };
+        if angle_delta_uv != 0 {
+            UV_ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.set(c.get() + 1));
+        }
+        // `get_uv_mode` (spec 9.3): `UV_CFL_PRED` predicts as `DC_PRED`.
+        uv_predict_mode = if uv_mode == UV_CFL_PRED {
+            DC_PRED
+        } else {
+            uv_mode
+        };
+        // The CHROMA neighbour's own `uv_mode` decides the chroma edge filter
+        // strength (`get_intra_edge_filter_type`, reconintra.c:974), never the
+        // luma one -- same read [`decode_leaf8`] does.
+        let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
         // lane-screen r2: see [`decode_inter_block`]'s own copy -- `mode`/
         // `uv_mode` are both effectively `DC_PRED`-gated already on this
         // leaf (a nonzero `mode` still passes, but `uv_mode` is forced
@@ -20393,7 +20457,10 @@ fn decode_inter_block8(
                     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
                 ));
             }
-            if dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+            // lane-uv8 r1: `read_palette_mode_info` reads the UV symbol only
+            // when `uv_mode == UV_DC_PRED` (decodemv.c) -- unconditional here
+            // while every non-DC uv_mode was refused a few lines above.
+            if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
                 return Err(unsupported(
                     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
                 ));
@@ -20474,31 +20541,34 @@ fn decode_inter_block8(
                 &vec![0i32; SIDE * SIDE],
                 None,
                 filter_intra,
-                false,
+                smooth_neighbor,
             );
+            // CfL's AC contribution is the luma this leaf just reconstructed,
+            // averaged over the 4x4 chroma block (`cfl_ac_q3`, spec 7.11.5).
+            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
             u.reconstruct(
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             );
             v.reconstruct(
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             );
             luma_grid = vec![0i32; SIDE * SIDE];
             u_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -20525,8 +20595,9 @@ fn decode_inter_block8(
                 None,
                 filter_intra,
                 None,
-                false,
+                smooth_neighbor,
             )?;
+            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
             u_grid = read_plane(
                 dec,
                 cdfs,
@@ -20535,8 +20606,8 @@ fn decode_inter_block8(
                 1,
                 around[1],
                 mode,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 u,
                 cpx,
@@ -20544,10 +20615,10 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
+                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             )?;
             v_grid = read_plane(
                 dec,
@@ -20557,8 +20628,8 @@ fn decode_inter_block8(
                 2,
                 around[2],
                 mode,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 v,
                 cpx,
@@ -20566,10 +20637,10 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
+                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
                 None,
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             )?;
         }
     }
@@ -20591,6 +20662,16 @@ fn decode_inter_block8(
         )
     });
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    // lane-uv8 r1: this leaf never stamped a mode band at all, so the block
+    // below/right of it read whatever block last wrote the coarse [`SUB`]
+    // slot -- now that an intra leaf here can code a smooth/directional
+    // `uv_mode`, its chroma neighbours must see it (and an inter leaf must
+    // stamp `DC_PRED`, what libaom stores for a non-intra block). Same pair
+    // [`decode_leaf8`] writes, plus the coarse fallback slots.
+    neighbours.above_uv_mode[c] = uv_predict_mode;
+    neighbours.left_uv_mode[r] = uv_predict_mode;
+    neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode_for_tx);
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     if let Some((left, above)) = saved_luma_ctx {
         for (cell, state) in left.into_iter().enumerate() {
             neighbours.left[leaf_mi.0 + cell][0] = state;
