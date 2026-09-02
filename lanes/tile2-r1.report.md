@@ -60,3 +60,37 @@ EVIDENCE: ~/.cache/tile2-tmp/{enc.sh,enc2.sh,a.obu,e.obu} | aomenc with/without 
   EC_TRACE_MODE range ladder on that frame's first chroma TU.
 - accepted: the two txfm-context resets are libaom-cited but stream-inert here (no gate can
   currently show them; the only var-tx multi-tile arm is red for the unrelated reason above).
+
+## r1 close-out (after merging main 1176a16)
+
+VERDICT: **RED — do not merge as-is.** The chartered defect is fixed and gated, but the fix
+REDDENS a sibling gate (class `fix-trades-sibling-gate`).
+
+Full suite, tip ee24353: `test result: FAILED. 400 passed; 1 failed; 34 ignored`
+(`$HOME/.cache/tile2-suite-r1b.log`, one systemd unit, MemoryMax=10G, 1143 s).
+The single failure is `stream::tests::a_frame_edge_straddling_band_decodes_pixel_exact`:
+`192x68 cq35 frames=5 10bit=false tile_cols=1 frame 1 plane Y: 164 pixels differ, first at
+row 59 col 146 (ours 113 vs ffmpeg 114)`.
+
+ABLATION (three builds of that one test, this worktree, decode.rs edited in place and restored):
+- both this round's decode changes removed (`get_any` -> `get`, both txfm resets dropped): **PASS**
+- `get_any` kept, both txfm resets dropped: FAIL, 3939 pixels differ, first at row 0 col 129
+- tip (both): FAIL, 164 pixels differ, first at row 59 col 146
+
+Reading: `build_motion_field`'s `get_any` is what flips this gate. Before it, a second tile
+column's motion field was EMPTY, so frame 1's temporal MV candidates there were all zero — and
+that emptiness happened to match the oracle on this 192x68 two-tile-column stream, while the
+two-tile-column compound MV-stack reproducer needed the real data. So the real temporal-MV
+projection for cells coming from another tile is still wrong somewhere downstream
+(`motion_field.rs` projection / `mvstack` temporal candidate), and the old `get` narrowing was
+masking it. The txfm resets are NOT inert on this stream (3939 -> 164 pixels), which also means
+this gate exercises `TxMode::Select` across tile columns — the var-tx arm's chroma residual and
+this luma band may share a cause.
+
+EVIDENCE: $HOME/.cache/tile2-suite-r1b.log | one systemd unit on tip ee24353 | test result: FAILED. 400 passed; 1 failed; 34 ignored
+EVIDENCE: ablation runs above | decode.rs edited in place, single test by name, file restored from ~/.cache/tile2-tmp/decode.rs.tip | PASS / 3939 px / 164 px
+
+NEXT STEP for r2: pin the 192x68 `tile_cols=1` stream that gate builds, and range-ladder frame 1
+against aomdec from the first block of tile column 1 whose temporal candidate list is non-empty
+(`EC_TRACE_MODE`, compare msac RANGE) — the first diverging element decides whether the defect is
+the temporal projection or the var-tx context after the reset.
