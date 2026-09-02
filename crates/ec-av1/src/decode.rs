@@ -19407,6 +19407,22 @@ fn decode_inter_block8(
                     SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
                 }
 
+                // lane-interp3 r2 (class twin-functions-drift): both slots
+                // used to be stamped `false`, while [`decode_inter_block`]'s
+                // compound arm computes libaom's PER-SLOT `is_global_mv_block`
+                // (blockd.h:421-429 -- mode GLOBAL_GLOBALMV, block >= 8x8
+                // (always true for this leaf) and THAT slot's own gm model >
+                // TRANSLATION). A neighbour carrying the flag makes
+                // `setup_ref_mv_list` substitute the READER's global mv for
+                // the neighbour's stored one, so a cleared flag fed the next
+                // block's stack a stored mv where libaom has the global
+                // candidate -- a wrong mv stack, wrong mode contexts, and a
+                // desync one block later.
+                let is_globalmv_c = compound_mode == 6;
+                let is_global_mv0_c = is_globalmv_c
+                    && global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1;
+                let is_global_mv1_c = is_globalmv_c
+                    && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1;
                 for dr in 0..2 {
                     for dc in 0..2 {
                         grid.set(
@@ -19421,8 +19437,8 @@ fn decode_inter_block8(
                                 is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                                 size: 2,
                                 size_h: 2,
-                                is_global_mv0: false,
-                                is_global_mv1: false,
+                                is_global_mv0: is_global_mv0_c,
+                                is_global_mv1: is_global_mv1_c,
                             },
                         );
                     }
@@ -19724,6 +19740,17 @@ fn decode_inter_block8(
             &gm_table,
             tpl,
         );
+        // lane-interp3 r2: same per-entry EC_STACK ladder
+        // [`decode_inter_block`]'s single-ref arm prints, so this leaf's stack
+        // diffs line for line against the oracle's.
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            for (i, e) in stack.entries.iter().enumerate() {
+                eprintln!(
+                    "EC_STACK mi_row={mi_row} mi_col={mi_col} ref={ref_frame} i={i} this=({},{}) comp=(0,0) w={}",
+                    e.mv.0, e.mv.1, e.weight
+                );
+            }
+        }
 
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let mut is_globalmv = false;

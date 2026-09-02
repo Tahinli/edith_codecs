@@ -6312,19 +6312,22 @@ mod tests {
     /// arrived: a compound 8x8 leaf that really read the filter, a block whose
     /// two dual-filter directions DIFFER (impossible with dual filter off),
     /// and an 8x8 OBMC blend.
-    // lane-interp3 r1: RED, and ignored rather than deleted -- MEASURED, not
-    // assumed. At `EC_INTERP3_FRAMES=4` (the other arms' length) aomenc codes
-    // no compound block at all and the stream decodes; from 5 frames on it
-    // does, and the decode then stops at "an inter 16x16-level AB or 1:4
-    // partition" WITH this round's filter read and at "an inter partition
-    // below 8x8" WITHOUT it (measured by ablating the read) -- both are
-    // impossible on a `--enable-ab-partitions=0 --enable-1to4-partitions=0
-    // --min-partition-size=8` recipe, so BOTH are our own desync
-    // (class refusal-from-own-desync) and the compound 8x8 leaf carries at
-    // least one more missing/misplaced symbol beyond the interp filter this
-    // round added. Next round: EC_TRACE range ladder vs aomdec on the first
-    // compound leaf of frame 5.
-    #[ignore = "lane-interp3 r1: the compound 8x8 leaf still desyncs past the interp-filter read (surfaces as a bogus AB/1:4 refusal); the panic it used to end in is now a named refusal"]
+    // lane-interp3 r2: the ENTROPY desync r1 measured is CLOSED -- the full
+    // 16-frame stream now parses end to end and every `EC_MODE`/`EC_MODE_VAL`
+    // element's msac RANGE matches the instrumented aomdec's line for line
+    // (570/570 mode elements, 0 diff). Two twin-drift root causes, both in
+    // `decode_inter_block8`'s compound arm: `read_compound_ref_frames` was
+    // passed a hard-coded `LAST_FRAME` for every inter neighbour instead of
+    // the real per-mi band, and the grid stamp cleared both per-slot
+    // `is_global_mv_block` flags. This gate stays RED and ignored on a
+    // RECONSTRUCTION residue, not an entropy one: luma-only, |delta| <= 8,
+    // first at decode frame 7 pixel (42,15) -- the 8x8 leaf at mi (10,4),
+    // spilling one pixel across its left/bottom deblock edges -- growing to
+    // 222 Y + 4 U + 1 V samples by frame 15 (pure propagation; chroma stays
+    // exact until frame 14). Next round: the OBMC blend over a compound
+    // neighbour (the oracle's `EC_OBMC` rung prints `filt=` per neighbour;
+    // this decoder has no `EC_OBMC` emitter yet -- build it first).
+    #[ignore = "lane-interp3 r2: entropy is now exact on the whole stream (range ladder 570/570); RED on a luma-only reconstruction residue from decode frame 7 (|delta| <= 8, first at the 8x8 leaf mi (10,4))"]
     #[test]
     fn a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact() {
         const NAME: &str =
