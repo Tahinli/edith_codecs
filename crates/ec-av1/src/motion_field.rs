@@ -442,6 +442,15 @@ pub fn setup_motion_field(
         );
     }
 
+    if std::env::var_os("EC_TRACE_TPL").is_some() {
+        eprintln!("EC_TPL_FIELD oh={cur_order_hint} rows={rows} cols={cols}");
+        for r in 0..rows {
+            let row: String = (0..cols)
+                .map(|c| if cells[r * cols + c].is_some() { '#' } else { '.' })
+                .collect();
+            eprintln!("EC_TPL_FIELD r{r} {row}");
+        }
+    }
     TplField { cols, rows, cells }
 }
 
