@@ -12154,6 +12154,13 @@ fn apply_deblock(
     if std::env::var_os("EC_AV1_DEBUG_SKIP_DEBLOCK").is_some() {
         return;
     }
+    // lane-mergefix r4 debug rung: frame-level loop filter parameters.
+    if std::env::var_os("EC_LFPARAMS").is_some() {
+        eprintln!(
+            "EC_LFPARAMS level={:?} sharpness={} delta_enabled={} delta_update={} ref_deltas={:?} mode_deltas={:?}",
+            lf.level, lf.sharpness, lf.delta_enabled, lf.delta_update, lf.ref_deltas, lf.mode_deltas
+        );
+    }
     if lf.level[0] != 0 || lf.level[1] != 0 {
         deblock_plane(y, 0, lf, n, frame_width, frame_height);
     }
