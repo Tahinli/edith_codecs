@@ -73,7 +73,7 @@ const REFUSALS: &[&str] = &[
     // inter path's intra arm now routes 2:1 strips through `decode_rect_split`);
     // what is left is the 1:4 shape, whose `bsize_to_tx_size_cat` breaks the
     // size-group/category diagonal the 2:1 shapes share.
-    "an intra-coded 1:4 (or other non-2:1) rect strip on the inter block path",
+    "an intra-coded 16x4/4x16 strip on the inter block path (the 16x16-level 1:4 inter partition is refused before this point)",
     "a split (nonzero tx_depth) transform on an intra HORZ/VERT strip in an inter frame",
     // The same arm's screen-content gate: palette/intrabc syntax is consumed
     // for square blocks only, so a strip in such a frame would skip symbols.
