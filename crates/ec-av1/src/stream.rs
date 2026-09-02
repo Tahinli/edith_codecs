@@ -16655,6 +16655,151 @@ mod tests {
         );
     }
 
+    /// lane-cdef r1: CDEF's per-8x8 skip band under sub-16x16 inter leaves.
+    ///
+    /// `apply_cdef` excludes an 8x8 luma unit whose four mi cells are all
+    /// `skip_txfm` (libaom `cdef.c:29-38 is_8x8_block_skip`, called from
+    /// `av1_cdef_compute_sb_list`'s dlist loop). `decode_inter_block8` -- the
+    /// leaf path `--min-partition-size=4` makes aomenc pick for a 16x16 group
+    /// -- wrote the loop-filter grid but never that skip band, so an all-skip
+    /// group kept the PREVIOUS frame's flags and got filtered where libaom
+    /// skips it (3 luma samples, decode-order frames 3 and 4 of the 192x128
+    /// cq-8 stream below, at the frame's last 8x8 column).
+    ///
+    /// Both counters are hard asserts per compared attempt: `cdef_skipped_units`
+    /// proves the all-skip dlist exclusion was actually reached, and
+    /// `inter8_skip_band_hits` proves the 8x8 leaf path (the writer that used
+    /// to be missing) ran on the same stream.
+    #[test]
+    fn a_real_aomenc_stream_with_cdef_and_sub16_inter_leaves_decodes_pixel_exact() {
+        if !have_aomenc() {
+            return;
+        }
+        let (width, height, frames) = (192usize, 128usize, 6usize);
+        let mut refusals: Vec<String> = Vec::new();
+        let mut fired = 0u32;
+        for (depth, cq, sp) in [(8u32, 8u32, 3u32), (8, 10, 3), (8, 12, 6), (10, 8, 3), (10, 12, 6)] {
+            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let src = format!(
+                "color=c=gray:s={width}x{height}:d=0.24:r=25,format=gray,\
+                 geq=lum='128+58*sin((X+N*{sp})/6)+18*sin(Y/23)',format=yuv420p"
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &src, "-t", "0.24", "-pix_fmt", pix,
+                    "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &format!("--cq-level={cq}"),
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &format!("--bit-depth={depth}"),
+                    &format!("--input-bit-depth={depth}"),
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    "--enable-obmc=0",
+                    "--enable-tx-size-search=1",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=4",
+                    "--max-partition-size=16",
+                    // Last occurrence of a repeated --enable-* flag wins
+                    // (aomenc-last-flag-wins): CDEF stays ON, and the two
+                    // counters below prove the filter really ran.
+                    "--enable-cdef=1",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture (depth={depth} cq={cq})"
+            );
+            let stream = out.stdout;
+            let skipped_before = decode::cdef_skipped_units();
+            let leaves_before = decode::inter8_skip_band_hits();
+            let decoded = match decode_stream(&stream) {
+                Ok(f) => f,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.starts_with("unsupported: "),
+                        "decode error that is not a named refusal \
+                         (depth={depth} cq={cq}): {msg}"
+                    );
+                    refusals.push(format!("depth={depth} cq={cq}: {msg}"));
+                    continue;
+                }
+            };
+            assert_eq!(decoded.len(), frames, "frame count (depth={depth} cq={cq})");
+            assert!(
+                decode::cdef_skipped_units() > skipped_before,
+                "no 8x8 CDEF unit was excluded by the all-skip rule \
+                 (depth={depth} cq={cq})"
+            );
+            assert!(
+                decode::inter8_skip_band_hits() > leaves_before,
+                "no sub-16x16 inter leaf wrote the CDEF skip band \
+                 (depth={depth} cq={cq})"
+            );
+            let reference = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames)
+            };
+            for (i, (ours, theirs)) in decoded.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(ours.y, theirs.y, "luma frame {i} (depth={depth} cq={cq})");
+                assert_eq!(ours.u, theirs.u, "U frame {i} (depth={depth} cq={cq})");
+                assert_eq!(ours.v, theirs.v, "V frame {i} (depth={depth} cq={cq})");
+            }
+            fired += 1;
+        }
+        // Three of the five arms land on OTHER open refusals (a non-DC chroma
+        // mode on an 8x8 inter leaf; inter partitions below 8x8) -- the two
+        // 8-bit cq 8/10 arms ARE the streams the defect was found on, and each
+        // hard-asserts both counters plus all six frames on all three planes.
+        assert!(
+            fired >= 2,
+            "fewer than 2 firing+pixel-exact attempts:\n{}",
+            refusals.join("\n")
+        );
+    }
+
     /// lane-sub8 r1: `--min-partition-size=4` on fine-detail noisy gradients
     /// at low cq reliably makes aomenc split an 8x8 block all the way to
     /// four `BLOCK_4X4` leaves (`PARTITION_SPLIT` below 8x8, spec
@@ -20578,10 +20723,36 @@ mod tests {
     ///   `frame_width` clip, is correct.
     /// * The divergence therefore enters in CDEF, at the last 8x8 CDEF block
     ///   column/row, which is the one that straddles the crop edge.
-    /// `#[ignore]` so the suite stays green; run it with
-    /// `cargo test -p ec-av1 --lib -- --ignored a_frame_edge_straddling_band`.
+    /// lane-cdef r2: CLOSED, and un-ignored. r1 rooted the luma half in
+    /// `apply_cdef`'s direction search, which clamped at the CROPPED frame
+    /// edge while libaom runs `cdef_find_dir` over `cdef_prepare_fb`'s buffer
+    /// -- whose columns/rows past the MI-ROUNDED extent (`hsize = nhb <<
+    /// mi_wide_l2`, `cdef.c:164-167`, and the `frame_boundary[RIGHT]`
+    /// CDEF_VERY_LARGE fill at `cdef.c:249-256`) are CDEF_VERY_LARGE, not the
+    /// last real sample. The chroma half was lane-golomb r8's loop-restoration
+    /// plane size (LR is the one post-decode filter sized by the CROP, not the
+    /// mi grid) plus its reference-size fix; merging both branches takes all
+    /// four arms to 0 differing pixels on Y, U and V.
+    ///
+    /// Arms: 192x68 and 68x192 (a 4-px straddling band on one axis), 5 frames,
+    /// 8-bit and 10-bit, plus a `--tile-columns=1` twin of each (COMMON's
+    /// neighbour-map rule -- the skip band CDEF reads is a per-mi side band).
+    /// MEASURED 2026-09-02: all 32 multi-tile attempts refuse BY NAME today,
+    /// so that half of the gate compares nothing yet (class
+    /// `counter-from-refused-stream`); the census is 10x "an inter SB-level AB
+    /// partition", 6x "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
+    /// rectangular residual coding", 6x "an 8x8 intra leaf in an inter frame
+    /// whose tx_depth splits it into 4x4 transform units", 5x "an inter
+    /// partition below 8x8", 3x "an inter 16x16-level AB or 1:4 partition",
+    /// 1x "a split intra strip whose transform unit is 32x64", 1x "an
+    /// intra-coded 1:4 (or other non-2:1) rect strip on the inter block path".
+    /// The arms stay so the coverage appears the day those lift; every assert
+    /// below is carried by the single-tile arms.
+    /// Hard-asserts `decode::cdef_straddle_units()` grew: a FILTERED 8x8 CDEF
+    /// unit whose extent crosses the crop edge is the only shape for which
+    /// clamping and padding differ, so a zero delta would make these arms
+    /// vacuous for this defect.
     #[test]
-    #[ignore = "open r9 defect: CDEF at the last straddling 8x8 block column/row"]
     fn a_frame_edge_straddling_band_decodes_pixel_exact() {
         edge32_gate(
             "a_frame_edge_straddling_band_decodes_pixel_exact",
@@ -20600,15 +20771,15 @@ mod tests {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        // (width, height, frames, ten_bit)
-        let mut arms: Vec<(usize, usize, usize, bool)> = Vec::new();
+        // (width, height, frames, ten_bit, tile_columns_log2)
+        let mut arms: Vec<(usize, usize, usize, bool, u32)> = Vec::new();
         for &(w, h) in &[(192usize, 80usize), (80usize, 192usize)] {
-            arms.push((w, h, 1, false));
-            arms.push((w, h, 1, true));
+            arms.push((w, h, 1, false, 0));
+            arms.push((w, h, 1, true, 0));
         }
         // The inter arm: >= 4 frames so the 32-level edge path in the INTER
         // tile walk is exercised too.
-        arms.push((192, 80, 5, false));
+        arms.push((192, 80, 5, false, 0));
         // lane-golomb r9: the straddling-band arms, only under the ignored
         // `a_frame_edge_straddling_band_decodes_pixel_exact` name (they are
         // RED -- see that test's own comment for the stage bisection). Naming
@@ -20616,10 +20787,12 @@ mod tests {
         // recipe, the counters and the refusal handling identical.
         if name == "a_frame_edge_straddling_band_decodes_pixel_exact" {
             arms.clear();
-            arms.push((192, 68, 5, false));
-            arms.push((192, 68, 5, true));
-            arms.push((68, 192, 5, false));
-            arms.push((68, 192, 5, true));
+            for &tile_cols in &[0u32, 1] {
+                arms.push((192, 68, 5, false, tile_cols));
+                arms.push((192, 68, 5, true, tile_cols));
+                arms.push((68, 192, 5, false, tile_cols));
+                arms.push((68, 192, 5, true, tile_cols));
+            }
         }
         // lane-golomb r8 MEASURED, arm STILL NOT added (every cq level is
         // vacuous, panicking or red -- each measured this round with
@@ -20660,7 +20833,9 @@ mod tests {
         let mut totals = [0usize; 8];
         let mut compared = 0usize;
         let mut refusals: Vec<String> = Vec::new();
-        for &(width, height, frame_count, ten_bit) in &arms {
+        let straddle = name == "a_frame_edge_straddling_band_decodes_pixel_exact";
+        let mut straddle_units = 0usize;
+        for &(width, height, frame_count, ten_bit, tile_cols) in &arms {
             for &cq in &cqs {
                 let duration = frame_count as f64 / 25.0;
                 // `noise` (explicit seed) both defeats aomenc's
@@ -20735,6 +20910,10 @@ mod tests {
                 if ten_bit {
                     args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
                 }
+                let tile_arg = format!("--tile-columns={tile_cols}");
+                if tile_cols > 0 {
+                    args.push(&tile_arg);
+                }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
                 let mut child = Command::new(aomenc_path())
                     .args(&args)
@@ -20763,8 +20942,12 @@ mod tests {
                         "{NAME}: aomenc did not write a 10-bit sequence header"
                     );
                 }
-                let tag = format!("{width}x{height} cq{cq} frames={frame_count} 10bit={ten_bit}");
+                let tag = format!(
+                    "{width}x{height} cq{cq} frames={frame_count} 10bit={ten_bit} \
+                     tile_cols={tile_cols}"
+                );
                 let before = crate::decode::edge32_hits();
+                let straddle_before = crate::decode::cdef_straddle_units();
                 // lane-golomb r8: name the attempt BEFORE decoding it -- a
                 // desync surfaces as a panic deep in mc.rs with no arm in the
                 // message, and r8 spent a run bisecting arms by hand.
@@ -20826,6 +21009,7 @@ mod tests {
                     }
                 }
                 compared += 1;
+                straddle_units += crate::decode::cdef_straddle_units() - straddle_before;
                 for i in 0..8 {
                     totals[i] += delta[i];
                 }
@@ -20835,6 +21019,11 @@ mod tests {
             compared > 0,
             "{NAME}: every attempt hit a named refusal:\n{}",
             refusals.join("\n")
+        );
+        assert!(
+            !straddle || straddle_units > 0,
+            "{NAME}: no FILTERED 8x8 CDEF unit crossed the cropped frame edge over \
+             {compared} compared attempts -- the straddling arms proved nothing"
         );
         assert!(
             totals[0] + totals[1] + totals[4] + totals[5] > 0,
@@ -20861,7 +21050,8 @@ mod tests {
         eprintln!(
             "{NAME}: {compared} pixel-exact attempts, 32-level edge bits \
              [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, 64-level edge bits \
-             [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, {} named refusals",
+             [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, \
+             {straddle_units} straddling CDEF units, {} named refusals",
             totals[0],
             totals[1],
             totals[2],
