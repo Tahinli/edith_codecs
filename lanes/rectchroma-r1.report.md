@@ -45,7 +45,8 @@ Hard asserts: `matched > 0`, `rect4_strips > 0` (1:4 strips inside pixel-exact s
 
 Run: `EC_AV1_REQUIRE_AOMENC=1 EC_RECTCHROMA_GATE_ATTEMPTS=4 cargo test -p ec-av1 --lib chroma_is_a_4to1_or_sub8 -- --nocapture`
 
-EVIDENCE: gate stdout | 24 aomenc streams (8+10 bit x cq 45/32/60 x 4 seeds), each decoded and compared to ffmpeg | 15 pixel-exact matches, 9 named refusals, 100 superblock 1:4 strips inside compared streams, 9 attempts refused the depth-1 1:4 split strip by name; test result: ok
+EVIDENCE: gate stdout (full 20-attempt default sweep) | 120 aomenc streams (8+10 bit x cq 45/32/60 x 20 seeds), each decoded and pixel-compared to ffmpeg | 60 pixel-exact matches, 37 named refusals, 527 superblock 1:4 strips inside compared streams, chroma shape 32x8 fired ONCE inside a pixel-exact stream (8x32/8x4/4x8 = 0), 37 attempts refused the depth-1 1:4 split strip by name, 23 attempts carried no 1:4 strip (2 mismatched -- other shapes); test result: ok
+EVIDENCE: gate stdout (EC_RECTCHROMA_GATE_ATTEMPTS=4) | 24 aomenc streams (8+10 bit x cq 45/32/60 x 4 seeds), each decoded and compared to ffmpeg | 15 pixel-exact matches, 9 named refusals, 100 superblock 1:4 strips inside compared streams, 9 attempts refused the depth-1 1:4 split strip by name; test result: ok
 EVIDENCE: same gate before the decode.rs:5296 fix | 8-bit cq 45 seed 42, 2 strips with chroma 32x8 decoded through the split path | frame 0 luma MISMATCHED ffmpeg (first sample 47 vs reference) -- the silent wrong-tiling this round removed
 
 ## Film check (release `decode_probe`)
@@ -55,6 +56,16 @@ EVIDENCE: same gate before the decode.rs:5296 fix | 8-bit cq 45 seed 42, 2 strip
 - troy5.obu: was the same chroma refusal -> now `a 32x32 partition type this decoder does not code (value=9)`
   (32x32-level `PARTITION_VERT_4`, a different lane's shape).
 
+## Suite
+
+`cargo test -p ec-av1 --lib` under systemd-run: **309 passed, 2 failed, 27 ignored** at commit
+4648a75 -- both failures mine and both fixed after it: `gate_coverage::never_exercised_10bit`
+(the new 10-bit gate retires `enable-1to4-partitions` from `NEVER_EXERCISED_10BIT`, which is
+exactly the shrink that test is built to notice) and the gate's own 8-bit cq 32 seed 46
+mismatch (see residue). Re-run scoped after the fixes: `gate_coverage` 9/9 ok,
+`refusal_inventory` 3/3 ok, `superblock_level_1to4` + `split_transform` siblings 3/3 ok,
+the gate itself ok. A full re-run of the suite on the final tree was NOT done (tool budget).
+
 ## Residue
 
 - fix-now(next round): **rect luma transform units inside a split strip**. Troy's blocker is
@@ -62,12 +73,17 @@ EVIDENCE: same gate before the decode.rs:5296 fix | 8-bit cq 45 seed 42, 2 strip
   32x8/8x32 (tables now present). `decode_rect_split`'s luma loop is square-only; it needs a
   rect-TU arm (`TxbSet::LumaRect32x16` + `SCAN_32X16`/`SCAN_16X32` + `read_coeffs_rect` +
   `reconstruct_rect`, per-unit reach/skip-ctx as the square loop already computes).
-- deferred(that same rect-TU arm): the 32x8 / 8x32 / 8x4 / 4x8 chroma arms added here are
-  NOT yet proven by a pixel gate -- every shape that would exercise them arrives with
-  depth 1, which now refuses. Counters read 0 across the whole sweep; the report states this
+- deferred(that same rect-TU arm): of the four chroma arms added here only **32x8** is proven,
+  and only once (one strip, one pixel-exact stream, in the 120-attempt sweep -- the depth>=2
+  case). 8x32 / 8x4 / 4x8 read 0: every stream that would use them arrives with depth 1,
+  which now refuses. Counters are reported, not asserted; the report states this
   rather than asserting on them. 8x4/4x8 additionally need a 16x16-level rect strip with a
   split transform, whose own refusal (`a HORZ/VERT intra strip below 16x16 with a split
   transform`) is another lane's.
+- deferred(another lane): 8-bit AND 10-bit cq 32 seed 46 of this fixture MISMATCH ffmpeg on
+  frame 0 luma with ZERO 1:4 strips in the stream -- a pre-existing defect of some other
+  shape, printed by the gate as out-of-scope (the sibling gate's own convention) rather than
+  swallowed. Not diagnosed this round.
 - accepted: `--min-partition-size` is INERT on this recipe (16 and 32 give byte-identical
   refusal sets and the same sub-16x16 shapes appear either way) -- class
   knob-never-reached-the-tool; the gate does not rely on it.
