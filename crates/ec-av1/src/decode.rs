@@ -20260,6 +20260,44 @@ fn decode_inter_block8(
                     (8, 8, 1u8)
                 };
                 compound_ctx8 = Some((ref0, ref1, comp_group_idx as u8, compound_idx));
+                // lane-tile2 r3: `read_mb_interp_filter` (decodemv.c) runs for a
+                // COMPOUND leaf too -- skipping it here read no
+                // `switchable_interp` symbol at all, so every 8x8 compound leaf
+                // of a SWITCHABLE-filter frame desynced the entropy stream from
+                // the next block on (8x8 leaves only occur at a frame edge, so
+                // it showed up as the bottom straddling mi row alone).
+                // `av1_is_interp_needed`: skip_mode, or GLOBAL_GLOBALMV (6)
+                // with BOTH refs' models non-TRANSLATION, needs no symbol.
+                let above_filter_ctx8 = if neighbours.above_ref[cmi] == ref0
+                    || neighbours.above_ref1[cmi] == Some(ref0)
+                {
+                    neighbours.above_filter[cmi]
+                } else {
+                    [3, 3]
+                };
+                let left_filter_ctx8 = if neighbours.left_ref[rmi] == ref0
+                    || neighbours.left_ref1[rmi] == Some(ref0)
+                {
+                    neighbours.left_filter[rmi]
+                } else {
+                    [3, 3]
+                };
+                let gm_nontrans_c = compound_mode == 6
+                    && global_motion[(ref0 - LAST_FRAME) as usize].model
+                        != ec_av1_syntax::WarpModel::Translation
+                    && global_motion[(ref1 - LAST_FRAME) as usize].model
+                        != ec_av1_syntax::WarpModel::Translation;
+                let (h_filter_c, v_filter_c, resolved_filter_c) = resolve_interp_filter(
+                    dec,
+                    cdfs,
+                    interp_fixed,
+                    enable_dual_filter,
+                    skip_mode || gm_nontrans_c,
+                    above_filter_ctx8,
+                    left_filter_ctx8,
+                    true,
+                );
+                leaf_filter_syms = resolved_filter_c;
                 if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
                     eprintln!(
                         "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize=8 mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
@@ -20298,11 +20336,10 @@ fn decode_inter_block8(
                 }
                 mode_for_tx = 0;
 
-                // lane-av1comp corner-cut, matching this leaf's single-ref
-                // arm below (`mc::predict`'s own fixed-Regular default):
-                // `decode_inter_block8` never resolves a switchable filter,
-                // so both compound taps use `Regular` too.
-                use mc::InterpFilterKind::Regular;
+                // lane-tile2 r3: both compound taps use the filter pair
+                // `read_mb_interp_filter` just resolved above (this used to be
+                // a fixed `Regular`, which also meant the symbol was never
+                // read -- see the comment at that read).
                 let mut inter0_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py0.data,
@@ -20314,8 +20351,8 @@ fn decode_inter_block8(
                     scale0,
                     SIDE,
                     SIDE,
-                    Regular,
-                    Regular,
+                    h_filter_c,
+                    v_filter_c,
                     &mut inter0_y,
                 );
                 let mut inter1_y = vec![0i32; SIDE * SIDE];
@@ -20329,8 +20366,8 @@ fn decode_inter_block8(
                     scale1,
                     SIDE,
                     SIDE,
-                    Regular,
-                    Regular,
+                    h_filter_c,
+                    v_filter_c,
                     &mut inter1_y,
                 );
                 let mut pred_y = vec![0u16; SIDE * SIDE];
@@ -20362,8 +20399,8 @@ fn decode_inter_block8(
                     scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter_c,
+                    v_filter_c,
                     &mut inter0_u,
                 );
                 let mut inter1_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -20377,8 +20414,8 @@ fn decode_inter_block8(
                     scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter_c,
+                    v_filter_c,
                     &mut inter1_u,
                 );
                 let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
@@ -20408,8 +20445,8 @@ fn decode_inter_block8(
                     scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter_c,
+                    v_filter_c,
                     &mut inter0_v,
                 );
                 let mut inter1_v = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -20423,8 +20460,8 @@ fn decode_inter_block8(
                     scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter_c,
+                    v_filter_c,
                     &mut inter1_v,
                 );
                 let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
@@ -20836,6 +20873,12 @@ fn decode_inter_block8(
         );
         leaf_filter_syms = resolved_filter;
         if std::env::var_os("EC_TRACE_MODE").is_some() {
+            for (i, e) in stack.entries.iter().enumerate() {
+                eprintln!(
+                    "EC_STACK mi_row={} mi_col={} ref={ref_frame} i={i} this=({},{}) comp=(0,0) w={}",
+                    leaf_mi.0, leaf_mi.1, e.mv.0, e.mv.1, e.weight
+                );
+            }
             eprintln!(
                 "EC_MODE_VAL8 mi_row={} mi_col={} newmv={is_new_mv} globalmv={is_globalmv} ref0={ref_frame} mv0=({},{}) stack={} rng={}",
                 leaf_mi.0,
