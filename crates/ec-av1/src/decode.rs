@@ -680,6 +680,48 @@ pub(crate) fn smooth_luma_hits() -> usize {
     SMOOTH_LUMA_HITS.with(|c| c.get())
 }
 
+thread_local! {
+    /// lane-band46 r1: how many split-transform units answered their intra
+    /// reach DIFFERENTLY under libaom's per-unit rules ([`Reach::of_tu`], the
+    /// palette2 r12 fix) than the standalone-block lookup this decoder used to
+    /// apply to them (class reach-is-per-transform-unit). Every hit is a
+    /// transform unit whose above-right / below-left reference samples would
+    /// be wrong without that fix.
+    static SPLIT_TU_REACH_FIX_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SPLIT_TU_REACH_FIX_HITS`].
+pub(crate) fn split_tu_reach_fix_hits() -> usize {
+    SPLIT_TU_REACH_FIX_HITS.with(|c| c.get())
+}
+
+/// [`Reach::of_tu`] for one transform unit, counting how often that per-unit
+/// answer differs from the standalone-block answer the call sites used before
+/// lane-palette2 r12 -- the counter a gate asserts on to prove a stream really
+/// exercised the fix. `col_off`/`row_off` are in SAMPLES from the parent
+/// block's top-left `(px, py)`.
+#[allow(clippy::too_many_arguments)]
+fn tu_reach(
+    bw: usize,
+    bh: usize,
+    col_off: usize,
+    row_off: usize,
+    tx: usize,
+    block: Reach,
+    px: usize,
+    py: usize,
+    width: usize,
+    height: usize,
+) -> Reach {
+    let fixed = Reach::of_tu(bw, bh, col_off, row_off, tx, block);
+    let standalone = Reach::of(tx, px + col_off, py + row_off, width, height);
+    if fixed != standalone {
+        SPLIT_TU_REACH_FIX_HITS.with(|c| c.set(c.get() + 1));
+    }
+    fixed
+}
+
 // How many `uv_mode` reads resolved to `SMOOTH_PRED..=PAETH_PRED` (9..=12),
 // across every call on the current thread -- lane-chroma r3's own before/after
 // counter, proving a stream actually exercised chroma's smooth/paeth
@@ -7859,13 +7901,17 @@ fn decode_block(
                 // top-right 8x8 unit of a 16x16 D203 block bottom-left
                 // pixels libaom refuses outright (`col_off > 0`), which is
                 // the diagonal wedge seed 46 reconstructed wrong.
-                let tu_reach = Reach::of_tu(
+                let tu_reach = tu_reach(
                     side,
                     side,
                     tu_col * logical_tx,
                     tu_row * logical_tx,
                     logical_tx,
                     reach,
+                    px,
+                    py,
+                    y.width,
+                    y.height,
                 );
                 // This transform unit's own bsize (`logical_tx`) is smaller
                 // than the block it sits in (`side`), so `txb_skip_ctx` is
@@ -8251,7 +8297,18 @@ fn decode_leaf8(
                 if crate::encode::Reach::in_vert_ab() {
                     VERT_AB_TX4_HITS.with(|c| c.set(c.get() + 1));
                 }
-                let tu_reach = Reach::of_tu(8, 8, tu_col * 4, tu_row * 4, 4, reach);
+                let tu_reach = tu_reach(
+                    8,
+                    8,
+                    tu_col * 4,
+                    tu_row * 4,
+                    4,
+                    reach,
+                    px,
+                    py,
+                    y.width,
+                    y.height,
+                );
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
                 let tu_grid = read_plane(
                     dec,
@@ -8799,8 +8856,18 @@ fn decode_leaf_rect8(
                 // (lane-palette2 r12): a transform unit inside a block is not
                 // a block at that position, so its reach comes from the
                 // block's own row, offset by the unit's position.
-                let tu_reach =
-                    Reach::of_tu(bw, bh, tu_px - px, tu_py - py, 4, reach);
+                let tu_reach = tu_reach(
+                    bw,
+                    bh,
+                    tu_px - px,
+                    tu_py - py,
+                    4,
+                    reach,
+                    px,
+                    py,
+                    y.width,
+                    y.height,
+                );
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
                 if skip {
                     // A skipped leaf still predicts per transform unit: the

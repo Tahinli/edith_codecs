@@ -17637,13 +17637,10 @@ mod tests {
     fn a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact()
     {
         const NAME: &str = "a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact";
-        // Seed 46 mismatches ffmpeg at cq 32 on BOTH depths while carrying
-        // ZERO 1:4 strips -- an open defect of another shape, being diagnosed
-        // by lane-band46. Excluded here by name so this gate's
-        // `out_of_scope_mismatch` assert stays a hard 0 instead of swallowing
-        // it; the pin below decodes exactly that seed and is what un-ignoring
-        // will prove.
-        const EXCLUDED_SEEDS: &[u32] = &[46];
+        // No seed is excluded any more: seed 46's cq-32 mismatch was the
+        // per-transform-unit reach (lane-band46 / palette2 r12), and the pin
+        // below decodes it pixel-exact at both depths.
+        const EXCLUDED_SEEDS: &[u32] = &[];
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -17795,7 +17792,7 @@ mod tests {
             out_of_scope_mismatch, 0,
             "{NAME}: {out_of_scope_mismatch} attempts carrying no 1:4 strip mismatched \
              ffmpeg -- a defect of another shape, not out of scope for the suite (the one \
-             known case, seed 46, is in EXCLUDED_SEEDS and pinned separately)"
+             known case, seed 46, was the per-TU reach and is fixed)"
         );
         assert!(
             matched > 0,
@@ -17932,13 +17929,11 @@ mod tests {
         out.stdout
     }
 
-    /// PIN for the one stream the chroma-rect gate excludes: cq 32 seed 46
-    /// mismatches ffmpeg at BOTH bit depths while carrying zero 1:4 strips,
-    /// so the defect belongs to some other shape -- the stream decodes, the
-    /// pixels are wrong. Undiagnosed; lane-band46 owns it. Un-ignoring this
-    /// test is the proof that it is fixed.
+    /// PIN for the stream the chroma-rect gate used to exclude: cq 32 seed 46
+    /// mismatched ffmpeg at BOTH bit depths while carrying zero 1:4 strips.
+    /// The defect was the per-transform-unit intra reach (lane-band46 /
+    /// palette2 r12); un-ignored 2026-09-02 once it decoded pixel-exact.
     #[test]
-    #[ignore = "band fixture cq32 seed 46 mismatches ffmpeg with zero 1:4 strips (8- and 10-bit) -- undiagnosed, lane-band46"]
     fn the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact() {
         const NAME: &str = "the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
@@ -17970,4 +17965,196 @@ mod tests {
         }
     }
 
+
+    /// lane-band46 r1: a real `aomenc` band stream whose 16x16 (and 8x8)
+    /// intra blocks SPLIT their transform, so every unit but the first
+    /// answers `has_top_right`/`has_bottom_left` from its `row_off`/`col_off`
+    /// inside the parent block rather than from the standalone-block tables
+    /// (libaom `reconintra.c`; class reach-is-per-transform-unit).
+    ///
+    /// Seed 46 of the sibling 1:4-strip recipe is the stream that found it:
+    /// it carries ZERO 1:4 strips, so that gate skipped it as out of scope
+    /// while frame 0 luma mismatched ffmpeg over 916 samples -- the first at
+    /// (x 14, y 18), the second 8x8 transform unit of the D203_PRED block at
+    /// mi (4, 0), whose bottom-left samples sit in a unit that is not
+    /// reconstructed yet (`col_off > 0` => `has_bottom_left` is 0). The full
+    /// mode-info range ladder matched aomdec element for element, so the
+    /// defect was reconstruction, never entropy.
+    ///
+    /// The gate asserts the fix FIRED (`split_tu_reach_fix_hits`, transform
+    /// units whose reach differs from the old standalone answer) on 8 AND 10
+    /// bit, and that seed 46 itself decodes pixel-exact.
+    #[test]
+    fn a_real_aomenc_band_stream_seed46_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_band_stream_seed46_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        let mut matched = 0u32;
+        let mut refusals = 0u32;
+        let mut fixed_tus = 0usize;
+        let mut fixed_tus_10bit = 0usize;
+        let mut seed46_compared = [false; 2];
+        for (di, bit_depth) in [8u32, 10].into_iter().enumerate() {
+            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            for seed in 42u32..=51 {
+                // Byte-identical recipe to the 1:4-strip sibling gate, whose
+                // seed-46 attempt is what exposed this defect (that gate
+                // classes a no-1:4 stream as out of scope; this one compares
+                // it).
+                let bands = format!(
+                    "geq=lum='mod(floor(Y/16),2)*160+48':cb=128:cr=128,noise=alls=10:all_seed={seed}"
+                );
+                let source = if seed % 2 == 0 {
+                    format!("color=c=black:size={width}x{height}:duration=0.04:rate=25,{bands}")
+                } else {
+                    format!(
+                        "color=c=black:size={height}x{width}:duration=0.04:rate=25,{bands},transpose=1"
+                    )
+                };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
+                        pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let mut child = Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cq-level=32",
+                        "--cpu-used=0",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        &depth_arg,
+                        &input_depth_arg,
+                        "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=1",
+                        "--min-partition-size=16",
+                        "--max-partition-size=64",
+                        // Left ON: this is what makes a 16x16 block code four
+                        // 8x8 transform units, the shape the fix is about.
+                        "--enable-tx-size-search=1",
+                        "--enable-restoration=0",
+                        "--enable-palette=0",
+                        "--deltaq-mode=0",
+                        "--enable-filter-intra=0",
+                        "--enable-cfl-intra=0",
+                        "--enable-intrabc=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "{NAME}: aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = crate::decode::split_tu_reach_fix_hits();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit seed \
+                             {seed}): {msg}"
+                        );
+                        assert!(
+                            seed != 46,
+                            "{NAME}: seed 46 ({bit_depth}-bit) must decode -- it is this gate's \
+                             pinned stream, and it refused: {msg}"
+                        );
+                        refusals += 1;
+                        eprintln!("{NAME}: {bit_depth}-bit seed {seed} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let reference = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frames.len())
+                };
+                assert_eq!(frames.len(), reference.len(), "{NAME}: frame count");
+                for (i, (got, want)) in frames.iter().zip(&reference).enumerate() {
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg ({bit_depth}-bit seed {seed})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg ({bit_depth}-bit seed {seed})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg ({bit_depth}-bit seed {seed})"
+                    );
+                }
+                let fixed = crate::decode::split_tu_reach_fix_hits() - before;
+                fixed_tus += fixed;
+                if bit_depth == 10 {
+                    fixed_tus_10bit += fixed;
+                }
+                if seed == 46 {
+                    seed46_compared[di] = true;
+                }
+                matched += 1;
+            }
+        }
+        eprintln!(
+            "{NAME}: {matched} pixel-exact streams, {refusals} named refusals out of 20; \
+             {fixed_tus} split transform units took the per-TU reach ({fixed_tus_10bit} of them \
+             10-bit)"
+        );
+        assert!(
+            seed46_compared[0] && seed46_compared[1],
+            "{NAME}: seed 46 was not compared on both depths (8-bit {}, 10-bit {})",
+            seed46_compared[0], seed46_compared[1]
+        );
+        assert!(
+            fixed_tus > 0,
+            "{NAME}: no split transform unit answered its reach from its offset inside the \
+             parent block -- the recipe lost the shape this gate pins"
+        );
+        assert!(
+            fixed_tus_10bit > 0,
+            "{NAME}: the shape never appeared in a 10-BIT pixel-exact stream (his films are \
+             yuv420p10le)"
+        );
+    }
 }
