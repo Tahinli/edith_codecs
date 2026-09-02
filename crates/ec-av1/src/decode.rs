@@ -5848,6 +5848,12 @@ fn tx_size_context_rect(
     own_w: usize,
     own_h: usize,
 ) -> usize {
+    // `get_tx_size_context` compares against `max_txsize_rect_lookup[bsize]`,
+    // not the block's own side: no transform is wider or taller than 64, so a
+    // block with a 128 side resolves against 64 (the square path already caps
+    // this way, lane-sb128b r1). Without the cap the 64x128 half of a 128-root
+    // VERT reads the tx-depth symbol off row 0 where libaom uses row 1.
+    let (own_w, own_h) = (own_w.min(64), own_h.min(64));
     let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
     let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
     usize::from(above) + usize::from(left)
