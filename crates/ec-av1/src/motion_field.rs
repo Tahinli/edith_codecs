@@ -75,6 +75,10 @@ impl MotionField {
         }
     }
 
+    pub(crate) fn debug_get(&self, row8: usize, col8: usize) -> Option<SavedMv> {
+        self.get(row8, col8)
+    }
+
     fn get(&self, row8: usize, col8: usize) -> Option<SavedMv> {
         if row8 < self.rows && col8 < self.cols {
             self.cells[row8 * self.cols + col8]
