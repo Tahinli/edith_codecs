@@ -173,7 +173,7 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     ),
     (
         "enable-ref-frame-mvs",
-        "off in 27 gates, on in none: temporal MV projection is unimplemented",
+        "off in 27 8-bit gates, on in none: the gate that spells it =1 (lane-refstamp's forward-keyframe temporal-MV gate) encodes both depths and so counts as 10-bit here",
     ),
     (
         "enable-tx64",
@@ -217,10 +217,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     ),
     ("enable-intrabc", "hole at both depths, see the 8-bit list"),
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
-    (
-        "enable-ref-frame-mvs",
-        "hole at both depths, see the 8-bit list",
-    ),
     ("enable-tx64", "hole at both depths, see the 8-bit list"),
 ];
 
@@ -245,7 +241,7 @@ const NEVER_ON_8BIT: &[(&str, &str)] = &[
     ),
     (
         "enable-fwd-kf",
-        "on in no 8-bit gate: 11 pin =0, 30 default (aomenc's default is off), so forward keyframes are never coded",
+        "on in no 8-bit-only gate: 11 pin =0, 30 default (aomenc's default is off); lane-refstamp's forward-keyframe gate spells =1 at both depths and counts as 10-bit here",
     ),
     (
         "enable-onesided-comp",
@@ -267,10 +263,6 @@ const NEVER_ON_10BIT: &[(&str, &str)] = &[
     (
         "enable-diff-wtd-comp",
         "hole at both depths, see the 8-bit list (1 pinned off, 14 defaulted)",
-    ),
-    (
-        "enable-fwd-kf",
-        "hole at both depths, see the 8-bit list (3 pinned off, 12 defaulted)",
     ),
     (
         "enable-interintra-wedge",
