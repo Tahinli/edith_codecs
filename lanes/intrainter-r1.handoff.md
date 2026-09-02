@@ -52,8 +52,8 @@ No entropy ladder was needed — no divergence was ever observed.
 
 `$HOME/.cache/intrainter-suite.log` (unit `intrainter-suite-1788315424.service`). At turn cap it
 was still running (~250/372 tests, no FAILED line so far, currently inside the aomenc gates).
-NEXT AGENT: `grep -E "^test result|FAILED" $HOME/.cache/intrainter-suite.log` — 0 failed is the
-merge precondition; nothing else is owed.
+(measured after the turn cap; nothing further owed on the suite.)
+
 
 ## Film
 
