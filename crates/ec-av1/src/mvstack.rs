@@ -804,6 +804,19 @@ const MV_BORDER: i32 = 16 << 3;
 /// a `mi_cols`-by-`mi_rows` frame: the distance from the block's own edge to
 /// the matching frame edge, plus the block's own span and [`MV_BORDER`] of
 /// slack, in every direction.
+// lane-t900 r11: stack entries whose clamp window is narrowed by a NEGATIVE
+// `mb_to_right_edge`/`mb_to_bottom_edge` -- i.e. blocks overhanging the frame's
+// right/bottom edge whose predictor the frame-edge clamp actually moves. Zero
+// of these before the r11 fix, because the window was computed in `usize`.
+thread_local! {
+    static MV_CLAMP_EDGE_OVERHANG_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`MV_CLAMP_EDGE_OVERHANG_HITS`].
+pub fn mv_clamp_edge_overhang_hits() -> usize {
+    MV_CLAMP_EDGE_OVERHANG_HITS.with(std::cell::Cell::get)
+}
+
 fn clamp_mv_ref(
     mv: (i32, i32),
     mi_row: usize,
@@ -817,9 +830,24 @@ fn clamp_mv_ref(
     let to_subpel = |mi_units: usize| (mi_units as i32) * 4 * 8;
     let (bw8, bh8) = (to_subpel(bw4), to_subpel(bh4));
     let to_left = -to_subpel(mi_col);
-    let to_right = to_subpel(mi_cols.saturating_sub(bw4).saturating_sub(mi_col));
+    // lane-t900 r11: libaom's `mb_to_right_edge`/`mb_to_bottom_edge`
+    // (`set_mi_row_col`, av1_common_int.h) are SIGNED and go NEGATIVE for a
+    // block that overhangs the frame's right/bottom edge -- the block keeps
+    // its full `bw4`/`bh4` there, so `mi_cols - bw4 - mi_col < 0`. Saturating
+    // in `usize` clipped that to 0 and left the clamp window ~2 blocks too
+    // wide, so an edge block's stack entry was never clamped.
+    let signed = |a: usize, b: usize, c: usize| (a as i32 - b as i32 - c as i32) * 4 * 8;
+    let to_right = signed(mi_cols, bw4, mi_col);
     let to_top = -to_subpel(mi_row);
-    let to_bottom = to_subpel(mi_rows.saturating_sub(bh4).saturating_sub(mi_row));
+    let to_bottom = signed(mi_rows, bh4, mi_row);
+    if to_right < 0 || to_bottom < 0 {
+        let (row, col) = mv;
+        let clamped_row = row.clamp(to_top - bh8 - MV_BORDER, to_bottom + bh8 + MV_BORDER);
+        let clamped_col = col.clamp(to_left - bw8 - MV_BORDER, to_right + bw8 + MV_BORDER);
+        if clamped_row != row || clamped_col != col {
+            MV_CLAMP_EDGE_OVERHANG_HITS.with(|c| c.set(c.get() + 1));
+        }
+    }
 
     let (row, col) = mv;
     (
@@ -3182,4 +3210,23 @@ mod tests {
         assert_eq!(whole_frame, REF_CAT_LEVEL + 2 * 4 + CORNER_WEIGHT);
         assert_ne!(tiled, whole_frame);
     }
+
+    /// lane-t900 r11 regression: the frame-edge clamp window is SIGNED.
+    ///
+    /// Numbers taken straight off the cross-decoder ladder on a 10-bit
+    /// 3840x1608 stream (`mi_cols=960`, `mi_rows=402`): the 64x64 NEWMV block
+    /// at mi(400,368) overhangs the bottom edge by 14 mi units, so libaom's
+    /// `mb_to_bottom_edge = (402 - 16 - 400) * 4 * 8 = -448` and the stack
+    /// entry's row is clamped to `-448 + 512 + 128 = 192`. Computing that in
+    /// `usize` saturated the term to 0 and let a row of 384 through, which is
+    /// 24 px of extra downward motion -- the block's MC then read the
+    /// replicated last row of the reference.
+    #[test]
+    fn clamp_mv_ref_window_is_signed_at_the_frame_bottom_edge() {
+        let clamped = clamp_mv_ref((384, -320), 400, 368, 16, 16, 960, 402);
+        assert_eq!(clamped, (192, -320));
+        // A block fully inside the frame keeps the wide window.
+        assert_eq!(clamp_mv_ref((384, -320), 100, 368, 16, 16, 960, 402), (384, -320));
+    }
+
 }
