@@ -99,3 +99,20 @@ fixture pinned. Inputs are in place: `~/.cache/hg-0.obu`, `~/.cache/hg-300.obu`,
    the two walls the r1 film sweep hit, so the refusal STRING each cut stops at has moved.
 3. The multi-tile defect above (own lane; it is not sub-8x8 specific and it blocks the
    neighbour-map arm COMMON asks every lane for).
+
+## ADDENDUM (measured after the handoff above, while the suite ran)
+
+The suite's first failure is `a_frame_edge_straddling_band_decodes_pixel_exact`, and it is
+NOT a regression: `git log --oneline main --not HEAD` shows this branch is missing main's
+`1d2259c` ("the saved motion field kept only the LAST tile's columns --
+`av1_copy_frame_mvs` read the mi grid through the per-tile reach clamp") and its merge
+`9cca16e`. That gate is green on main only because of that commit; the charter forbids
+rebasing this lane onto it.
+
+**Strong lead:** that same missing commit is the most likely cause of THIS lane's
+multi-tile desync too -- a 2-tile-column stream whose temporal MV candidates come from the
+saved motion field, going wrong only from decode-order frame 3/4 (i.e. the first frames
+that read a motion field saved by a MULTI-TILE frame), with tile 1's pixels exact. Before
+spending a round on it: merge main into the lane (or cherry-pick `1d2259c`), then re-run
+`~/.cache/sub8x4-tmp/tiles.obu` + `t16.obu` and, if clean, restore the one commented-out
+`arms.push((8, 63, 192, 128, true));` line in the gate.
