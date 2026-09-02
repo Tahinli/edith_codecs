@@ -45,7 +45,6 @@ const REFUSALS: &[&str] = &[
     "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
     "a 128x128 superblock HORZ/VERT or AB partition (only SPLIT and NONE are decoded at the 128 root)",
     "a 128x128 superblock PARTITION_NONE root on an inter frame (only the key-frame path codes a whole 128x128 block)",
-    "a 128x128 PARTITION_NONE block's chroma (its 64x64 uv plane block is four TX_32X32 units, and this decoder codes one whole-plane chroma unit per block)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "an inter frame under a 128x128 superblock (this decoder's inter tile path recurses a 64x64 superblock root only)",
     "a palette block on a HORZ/VERT intra strip below 16x16 (reconstruction not ported)",
