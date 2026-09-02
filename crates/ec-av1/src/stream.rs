@@ -12119,6 +12119,13 @@ mod tests {
         let (width, height) = (128usize, 64usize);
         let mut matched = 0u32;
         let mut named_refusals = 0u32;
+        // lane-modectx r1: luma `kf_y_mode` neighbour reads whose coarse
+        // fallback band held a previous tile's mode at a tile edge. Measured 0
+        // -- `above_mode` is cleared per tile and `left_mode` per superblock
+        // row -- and that is exactly why the coarse fallback is safe where
+        // lane-mtfix's chroma one was not. Accumulated only for attempts that
+        // then compared pixel-exact (class counter-from-refused-stream).
+        let mut mode_edge_leaks = 0usize;
         for attempt in 0..20u32 {
             let seed = 42 + attempt;
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
@@ -12261,6 +12268,7 @@ mod tests {
                 .is_some_and(|seq| seq.enable_intra_edge_filter);
 
             let before = crate::decode::tile_hits();
+            let before_edge = crate::decode::mode_tile_edge_coarse_leaks();
             let picture = match decode_key_frame_tile_with_cdfs(
                 &tile_bufs,
                 &header.tile_info,
@@ -12311,6 +12319,7 @@ mod tests {
             assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
             assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
             assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            mode_edge_leaks += crate::decode::mode_tile_edge_coarse_leaks() - before_edge;
             matched += 1;
         }
         assert!(
@@ -12318,8 +12327,15 @@ mod tests {
             "{NAME}: every attempt refused ({named_refusals} refusals); the gate never decoded \
              a two-tile-column stream"
         );
+        assert_eq!(
+            mode_edge_leaks, 0,
+            "{NAME}: a luma mode neighbour read at a tile edge saw a NON-DC coarse band -- the \
+             per-tile `above_mode` / per-superblock-row `left_mode` reset that makes the coarse \
+             fallback safe has regressed"
+        );
         eprintln!(
-            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20, \
+             {mode_edge_leaks} tile-edge coarse leaks"
         );
     }
 
