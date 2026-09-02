@@ -4614,6 +4614,14 @@ impl Neighbours {
             self.sub8_mode_col[i] = (usize::MAX, 0);
             self.uv_mode_col[i] = (usize::MAX, 0);
         }
+        // lane-mergefix r2: `av1_zero_above_context` also memsets the txfm row
+        // over the tile's own column span (to `tx_size_wide[TX_SIZES_LARGEST]`,
+        // not zero) -- without it a second tile column reads the first one's
+        // resolved transform sizes as its own above context.
+        let tend = col1_mi.min(self.above_txfm.len());
+        for i in col0_mi.min(tend)..tend {
+            self.above_txfm[i] = TXFM_CTX_INIT;
+        }
     }
 
     /// Writes a just-decoded block's own palette-Y size/colours (`size == 0`
@@ -5041,6 +5049,12 @@ impl Neighbours {
         self.left_palette_colors.iter_mut().for_each(|c| *c = [0u16; 8]);
         self.left_palette_uv_size.iter_mut().for_each(|s| *s = 0);
         self.left_palette_uv_colors.iter_mut().for_each(|c| *c = [0u16; 8]);
+        // lane-mergefix r2: `av1_zero_left_context` memsets
+        // `left_txfm_context_buffer` to `tx_size_high[TX_SIZES_LARGEST]` at
+        // every superblock row of every tile -- the var-tx left context does
+        // NOT carry over a tile boundary (its `txfm_partition` ctx read the
+        // previous tile column's last block otherwise).
+        self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
     }
 
     /// Records a block's `skip`/`is_inter`/`interp_filter` state for the next
@@ -25487,6 +25501,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                     // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                     // (libaom `ec_read_partition_impl`).
+                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=12 ctx={} rng={}", sb_r as usize * SB_MI as usize, sb_c as usize * SB_MI as usize, sb_ctx, dec.debug_state().0); }
                     if bump_edge32_bit(
                         4,
                         dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE)),
@@ -25813,6 +25828,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                             // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                             // (libaom `ec_read_partition_impl`).
+                            if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=9 ctx={} rng={}", r32 as usize * BLOCK_MI as usize, c32 as usize * BLOCK_MI as usize, ctx32, dec.debug_state().0); }
                             if {
                                         let b = dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE));
                                         bump_edge32(b.min(1) as usize);
@@ -25938,6 +25954,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                                     // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                                     // (libaom `ec_read_partition_impl`).
+                                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=6 ctx={} rng={}", sr as usize * SUB_MI as usize, sc as usize * SUB_MI as usize, ctx16, dec.debug_state().0); }
                                     if dec.symbol_fixed(&gather(&cdfs.partition_w16[ctx16], VERT_ALIKE)) == 1 {
                                         PARTITION_SPLIT
                                     } else {
