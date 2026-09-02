@@ -92,6 +92,24 @@ decodes clean reports `rect64_corner_tu: 64x32=0 32x64=0`; every rect64 hit (22 
 inside the frame that still refuses on the intra 16x4/4x16 wall. Confirms the ledger dead-end
 `lane-rect64port r1`. Unblocked by: the intra-16x4/4x16-in-inter-1:4 lane.
 
-## Suite
+## Suite — INCOMPLETE at the turn cap
 
-See the r1 handoff/report tail for `cargo test -p ec-av1 --lib` totals.
+`systemd-run --user --unit=rectres-suite-r1-... -p MemoryMax=10G ... cargo test -p ec-av1 --lib -j3`
+(log `$HOME/.cache/rectres-suite-r1.log`) was still running when the cap hit: 1259 log lines,
+no `^test result` line yet. **The full-suite result is UNKNOWN — not claimed green.**
+What DID run and pass: `cargo test -p ec-av1 --lib --no-run` (compiles) and the new gate alone,
+`test result: ok. 1 passed; 0 failed; 457 filtered out`.
+
+## Exact next step
+
+1. `grep -E "^test result|^failures:" -A20 $HOME/.cache/rectres-suite-r1.log` — the unit is still
+   live; if it died, re-arm the same command. Expected known reds (from main 7e6d60b, unrelated
+   to this lane): `a_frame_edge_straddling_band`,
+   `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions`,
+   `real_aomenc_1to4_streams_..._rect_vartx_leaves_fire`. Anything else is this commit's.
+   Re-run the two SIBLING gates by name first (they share `rect_inter_luma_set` /
+   `rect_inter_chroma_set` / `read_inter_plane_rect`): `real_aomenc_1to4_streams_...` and
+   `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions`.
+2. Then the next film wall is a DIFFERENT lane's shape: `an intra 16x4/4x16 strip inside an
+   inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only
+   the inter path implements that pairing)` — all six cuts now stop there.
