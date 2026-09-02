@@ -8,6 +8,17 @@
 
 /// `Default_Partition_W64_Cdf` (spec 9.4): the ten partition types of a
 /// 64x64 block, indexed by the context the blocks above and left give.
+/// `default_partition_cdf`'s last four contexts (entropymode.c:154, the
+/// `AOM_CDF8` rows): the `BLOCK_128X128` root's alphabet is
+/// `EXT_PARTITION_TYPES - 2 = 8` -- `PARTITION_HORZ_4`/`_VERT_4` do not exist
+/// at 128 (spec `partition_cdf_length`).
+pub const PARTITION_W128: [[u16; 9]; 4] = [
+    [27899, 28219, 28529, 32484, 32539, 32619, 32639, 32768, 0],
+    [6607, 6990, 8268, 32060, 32219, 32338, 32371, 32768, 0],
+    [5429, 6676, 7122, 32027, 32227, 32531, 32582, 32768, 0],
+    [711, 966, 1172, 32448, 32538, 32617, 32664, 32768, 0],
+];
+
 pub const PARTITION_W64: [[u16; 11]; 4] = [
     [
         20137, 21547, 23078, 29566, 29837, 30261, 30524, 30892, 31724, 32768, 0,
