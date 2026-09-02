@@ -85,3 +85,9 @@ EVIDENCE: /tmp/.../scratchpad/{ours,aom}-mode.txt + tell.txt | `EC_TRACE_MODE` /
   straddling-TU counter): **deferred — turn budget spent on the cross-product
   isolation above — unblocked by a fresh round; nothing about it is contradicted
   by this round's findings.**
+
+## Suite
+
+`cargo test -p ec-av1 --lib` (systemd unit, log `$HOME/.cache/golomb-suite-r4.log`): **364 passed, 2 failed, 31 ignored** in 547 s.
+Failure 1 = the stale golomb refusal string `"a 16x16 block at the true frame edge coded as a rect strip rather than SPLIT"` still listed in `refusal_inventory.rs` after the merge took oddh_s lifted strip -- deleted in the follow-up commit (refusal_inventory 3/3 green after).
+Failure 2 = the open cross-product above.
