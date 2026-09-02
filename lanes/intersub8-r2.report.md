@@ -54,6 +54,11 @@ EVIDENCE: ~/.cache/intersub8-tmp/a1_8.obu + ours.if.log + oracle.mode.log | aome
 EVIDENCE: ~/.cache/intersub8-tmp/sweep.sh output (56 encodes) | cq×sp×depth sweep, decode_probe counter + ffmpeg compare | 2 firing attempts both EXACT, all cq≥12 attempts EXACT or named-refusal, cq 8/10 carry the CDEF ±1
 EVIDENCE: fixtures/realworld/hunger-games.obu | decode_probe on the merged tree | now stops at "an inter 8x8 HORZ/VERT partition (8x4/4x8 inter leaves...)" — the sub-8x8 SPLIT refusal no longer blocks it
 
+## 4b. Suite
+`intersub8-suite-1788328909.service`, log `$HOME/.cache/intersub8-suite-r2.log`:
+`test result: ok. 382 passed; 0 failed; 33 ignored; 0 measured; 0 filtered out; finished in 1018.88s`.
+This is the sibling sweep the interp-filter fix owes: it touches every compound 8x8 inter leaf.
+
 ## 5. Not done this round
 `deferred: 8x4/4x8 inter leaves (charter step 3) — the turn budget went to the root-cause
 hunt and the gate schedule — unblocked by a fresh round on this branch; r14's general
