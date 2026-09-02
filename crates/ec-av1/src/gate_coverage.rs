@@ -140,10 +140,6 @@ const ALIASES: &[(&str, &str)] = &[("superres-mode", "enable-superres")];
 #[cfg(test)]
 const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     (
-        "enable-1to4-partitions",
-        "off in 42 gates, on in none: PARTITION_HORZ_4/VERT_4 at 64x64 needs TX_64X16 luma plus 32x8 chroma scans (lane-part32 r5)",
-    ),
-    (
         "enable-angle-delta",
         "off in 36 gates, on in none: the directional-intra gates pin it off to isolate the base modes",
     ),
@@ -203,7 +199,7 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // gate passes `=1` for both.
     (
         "enable-1to4-partitions",
-        "hole at both depths, see the 8-bit list",
+        "10-bit hole only: lane-tx64x16's 8-bit SB-level 1:4 gate passes `=1` and asserts both arms, but no 10-bit gate does",
     ),
     (
         "enable-angle-delta",
