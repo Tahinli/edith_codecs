@@ -20564,7 +20564,7 @@ fn decode_inter_block(
             // lane-cwarp r1: this reference's own GLOBAL warp replaces the
             // translational tap (libaom `av1_warp_plane` with
             // `conv_params->is_compound`); the blend below is unchanged.
-            if let Some(wp) = &warp0 {
+            if let Some(wp) = warp0.as_ref().filter(|_| write_w >= 8 && write_h >= 8) {
                 crate::warp::warp_affine_compound(
                     wp, &py0.data, py0.true_width as i32, py0.true_height as i32,
                     py0.width as i32, &mut inter0_y, px as i32, py as i32, side as i32,
@@ -20591,7 +20591,7 @@ fn decode_inter_block(
             // lane-cwarp r1: this reference's own GLOBAL warp replaces the
             // translational tap (libaom `av1_warp_plane` with
             // `conv_params->is_compound`); the blend below is unchanged.
-            if let Some(wp) = &warp1 {
+            if let Some(wp) = warp1.as_ref().filter(|_| write_w >= 8 && write_h >= 8) {
                 crate::warp::warp_affine_compound(
                     wp, &py1.data, py1.true_width as i32, py1.true_height as i32,
                     py1.width as i32, &mut inter1_y, px as i32, py as i32, side as i32,
@@ -20641,7 +20641,7 @@ fn decode_inter_block(
             // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
             // block of an 8x8 luma block stays translational.
             if let Some(wp) = &warp0 {
-                if chroma_side >= 8 {
+                if write_chroma_w >= 8 && write_chroma_h >= 8 {
                     crate::warp::warp_affine_compound(
                         wp, &pu0.data, pu0.true_width as i32, pu0.true_height as i32,
                         pu0.width as i32, &mut inter0_u, cpx as i32, cpy as i32,
@@ -20670,7 +20670,7 @@ fn decode_inter_block(
             // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
             // block of an 8x8 luma block stays translational.
             if let Some(wp) = &warp1 {
-                if chroma_side >= 8 {
+                if write_chroma_w >= 8 && write_chroma_h >= 8 {
                     crate::warp::warp_affine_compound(
                         wp, &pu1.data, pu1.true_width as i32, pu1.true_height as i32,
                         pu1.width as i32, &mut inter1_u, cpx as i32, cpy as i32,
@@ -20715,7 +20715,7 @@ fn decode_inter_block(
             // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
             // block of an 8x8 luma block stays translational.
             if let Some(wp) = &warp0 {
-                if chroma_side >= 8 {
+                if write_chroma_w >= 8 && write_chroma_h >= 8 {
                     crate::warp::warp_affine_compound(
                         wp, &pv0.data, pv0.true_width as i32, pv0.true_height as i32,
                         pv0.width as i32, &mut inter0_v, cpx as i32, cpy as i32,
@@ -20744,7 +20744,7 @@ fn decode_inter_block(
             // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
             // block of an 8x8 luma block stays translational.
             if let Some(wp) = &warp1 {
-                if chroma_side >= 8 {
+                if write_chroma_w >= 8 && write_chroma_h >= 8 {
                     crate::warp::warp_affine_compound(
                         wp, &pv1.data, pv1.true_width as i32, pv1.true_height as i32,
                         pv1.width as i32, &mut inter1_v, cpx as i32, cpy as i32,
@@ -21840,19 +21840,28 @@ fn decode_inter_block(
             // motion_mode symbol was still read and warp_params still
             // resolved. Suppress the warp, keep every symbol read.
             if let Some(params) = warp_params.as_ref().filter(|_| luma_scale == mc::REF_NO_SCALE) {
-                crate::warp::warp_affine(
-                    params, &py_ref.data, py_ref.true_width as i32, py_ref.true_height as i32,
-                    py_ref.width as i32, &mut pred_y, px as i32, py as i32, side as i32,
-                    side as i32, side as i32, 0, 0,
-                );
+                // `av1_init_warp_params` is per PLANE: the luma plane's
+                // own block is `write_w`x`write_h` (a PARTITION_HORZ/VERT
+                // strip is not `side`x`side`), so a strip under 8 px in
+                // either direction keeps the translational prediction too.
+                if write_w >= 8 && write_h >= 8 {
+                    crate::warp::warp_affine(
+                        params, &py_ref.data, py_ref.true_width as i32, py_ref.true_height as i32,
+                        py_ref.width as i32, &mut pred_y, px as i32, py as i32, side as i32,
+                        side as i32, side as i32, 0, 0,
+                    );
+                }
                 // libaom `av1_init_warp_params` (reconinter.c): warp is
                 // per PLANE and bails out at `block_width < 8 ||
                 // block_height < 8`, so a plane whose own block is under
                 // 8x8 keeps the translational prediction built above --
-                // in 420 that is every chroma plane of a luma block below
-                // 16x16 (lane-gmaffine r4: chroma-only mismatch of a few
-                // levels on both 8x8-leaf motion gates).
-                if chroma_side >= 8 {
+                // in 420 that is every chroma plane whose own width or
+                // height is under 8 -- `write_chroma_w`/`write_chroma_h`,
+                // NOT the square `chroma_side` (lane-t900 r5: an 8x16 luma
+                // block has `chroma_side == 8` but a 4x8 chroma block, so
+                // the square side warped chroma libaom predicts
+                // translationally; lane-gmaffine r4 for the 8x8 leaf).
+                if write_chroma_w >= 8 && write_chroma_h >= 8 {
                     crate::warp::warp_affine(
                         params, &pu_ref.data, pu_ref.true_width as i32, pu_ref.true_height as i32,
                         pu_ref.width as i32, &mut pred_u, cpx as i32, cpy as i32, chroma_side as i32,
