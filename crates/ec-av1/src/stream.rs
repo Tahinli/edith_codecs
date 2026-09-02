@@ -21515,6 +21515,45 @@ mod tests {
         }
     }
 
+    /// lane-kf900 r1: a SKIPPED 8x8 intra leaf whose `tx_depth` symbol
+    /// resolved to TX_4X4 must publish 4 -- not its 8-px block side -- to the
+    /// next block's `get_tx_size_context` (libaom `set_txfm_ctxs(mbmi->tx_size,
+    /// ..., skip_txfm && is_inter_block(mbmi), xd)`; that skip term is always 0
+    /// for an intra block). `decode_leaf8`'s tail wrote the literal 8, so the
+    /// rect strip below such a leaf read `tx_size_cat1` row 2 where libaom
+    /// reads row 1 -- same alphabet, wrong CDF row, the msac range diverged
+    /// mid-frame with NO refusal. `skip_split_tx_hits` was `pub` and asserted
+    /// by no gate at all before this one (class `tool-disabled-in-every-gate`).
+    #[test]
+    fn a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_decodes_pixel_exact";
+        crate::decode::reset_skip_split_tx_hits();
+        run_multi_tile_gate(NAME, 0, 0, 8, 1, &[], false, None);
+        if have_ffmpeg() && have_aomenc() {
+            assert!(
+                crate::decode::skip_split_tx_hits() > 0,
+                "{NAME}: no skipped 8x8 intra leaf split its transform -- the gate proves nothing"
+            );
+        }
+    }
+
+    /// [`a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_decodes_pixel_exact`]'s
+    /// 10-bit arm -- the film that exposed the defect is yuv420p10le.
+    #[test]
+    fn a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_10bit_decodes_pixel_exact()
+    {
+        const NAME: &str = "a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_10bit_decodes_pixel_exact";
+        crate::decode::reset_skip_split_tx_hits();
+        run_multi_tile_gate(NAME, 0, 0, 10, 1, &[], false, None);
+        if have_ffmpeg() && have_aomenc() {
+            assert!(
+                crate::decode::skip_split_tx_hits() > 0,
+                "{NAME}: no skipped 8x8 intra leaf split its transform -- the gate proves nothing"
+            );
+        }
+    }
+
     #[test]
     fn a_real_aomenc_multi_tile_intra_10bit_stream_decodes_pixel_exact() {
         run_multi_tile_gate(

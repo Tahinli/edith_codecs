@@ -4140,6 +4140,9 @@ impl Neighbours {
         // TX_32X32 -- independent of this block's luma `tx_depth`.
         let uv_tx_w = ((w_mi * MI / 2).max(4).min(32)) as u8;
         let uv_tx_h = ((h_mi * MI / 2).max(4).min(32)) as u8;
+        if std::env::var_os("EC_TXGRID_TRACE").is_some() {
+            eprintln!("EC_LFGRID mi_row={mi_r} mi_col={mi_c} w_mi={w_mi} h_mi={h_mi} tx_px={tx_px} tx_h_px={tx_h_px}");
+        }
         let cur = CURRENT_DELTA_LF.with(|c| c.get());
         let snapshot: [i8; 4] = if DELTA_LF_MULTI.with(|c| c.get()) {
             std::array::from_fn(|i| cur[i].clamp(-63, 63) as i8)
@@ -5435,6 +5438,13 @@ fn read_intra_mode_rect(
     Option<PaletteUv>,
 )> {
     let ec_istep = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    if ec_istep {
+        // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
+        // (decodemv.c:818), printed at the same point: before the first
+        // mode-info symbol of the block, so a cross-decoder range ladder can
+        // be keyed on the BLOCK, not just on the symbol sequence.
+        eprintln!("EC_IMODE mi_row={mi_r} mi_col={mi_c} fn=rect bw={bw} bh={bh} efi={} cls={:?} rng={}", enable_filter_intra as i32, filter_intra_size_class_rect(bw, bh), dec.debug_state().0);
+    }
     macro_rules! istep {
         ($name:literal, $val:expr) => {
             if ec_istep {
@@ -5561,9 +5571,11 @@ fn read_intra_mode_rect(
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!("TRACE_RECT_USEFI value={}", use_filter_intra as i32);
         }
+        istep!("use_filter_intra", use_filter_intra as i32);
         if use_filter_intra {
             FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
             let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
+            istep!("filter_intra_mode", fi_mode as i32);
             filter_intra = Some(fi_mode);
         }
     }
@@ -5606,6 +5618,14 @@ fn tx_size_context_rect(
 ) -> usize {
     let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
     let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
+    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+        eprintln!(
+            "EC_TXCTX mi_row={mi_r} mi_col={mi_c} w={own_w} h={own_h} above_px={} left_px={} ctx={}",
+            if mi_r > n.tile_row0_mi { tx_px_at(n, false, mi_r - 1, mi_c) } else { 0 },
+            if mi_c > n.tile_col0_mi { tx_h_px_at(n, false, mi_r, mi_c - 1) } else { 0 },
+            usize::from(above) + usize::from(left)
+        );
+    }
     usize::from(above) + usize::from(left)
 }
 
@@ -8370,6 +8390,13 @@ fn read_intra_mode(
     // under `EC_TRACE_MODE_STEP`) so a range ladder can be diffed line for
     // line against the instrumented aomdec, not just `tell()`.
     let ec_istep = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    if ec_istep {
+        // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
+        // (decodemv.c:818), printed at the same point: before the first
+        // mode-info symbol of the block, so a cross-decoder range ladder can
+        // be keyed on the BLOCK, not just on the symbol sequence.
+        eprintln!("EC_IMODE mi_row={mi_r} mi_col={mi_c} fn=sq side={side} rng={}", dec.debug_state().0);
+    }
     macro_rules! istep {
         ($name:literal, $val:expr) => {
             if ec_istep {
@@ -10170,7 +10197,17 @@ fn decode_leaf8(
         neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
     }
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
-    neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
+    // lane-kf900 r1: the leaf's own RESOLVED transform size, never the literal
+    // block side. libaom calls `set_txfm_ctxs(mbmi->tx_size, ..., skip_txfm &&
+    // is_inter_block(mbmi), xd)` (decodemv.c) -- for an INTRA block that skip
+    // term is always 0, so a skipped 8x8 leaf whose `tx_depth` resolved to
+    // TX_4X4 still publishes 4 to the next block's `get_tx_size_context`
+    // (pred_common.h:342). Writing 8 here made the 8x16 strip below the leaf
+    // read `tx_size_cat1` row 2 where libaom reads row 1 -- same alphabet,
+    // wrong CDF row, so the msac range diverged mid-frame with no refusal
+    // (class `wrong-alphabet-same-value`; the Hunger Games key frame at
+    // -ss 900, first bad luma sample row 186 col 1803).
+    neighbours.fill_lf_grid(leaf_mi, 2, resolved as u8, 0);
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
     Ok(mode)
 }
@@ -10202,6 +10239,9 @@ fn read_intra_mode_sub8(
     mi_c: usize,
 ) -> Result<(bool, usize, i32, Option<(usize, i32, Option<(i32, i32)>)>, Option<usize>)> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
+    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+        eprintln!("EC_IMODE mi_row={mi_r} mi_col={mi_c} fn=sub8 rng={}", dec.debug_state().0);
+    }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
         eprintln!("TRACE sub8 skip mi=({mi_r},{mi_c}) ctx={skip_ctx} value={} rng={}", skip as i32, dec.debug_state().0);

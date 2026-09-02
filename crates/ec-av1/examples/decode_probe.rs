@@ -33,6 +33,10 @@ fn main() {
         println!("rect4_32: horz={h} vert={v} coded={c}");
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
+        // lane-kf900 r1: the counter the skipped-8x8-split-transform gate
+        // asserts -- printed here so a recipe sweep can see it fire without a
+        // test-binary rebuild.
+        println!("skip_split_tx: {}", ec_av1::decode::skip_split_tx_hits());
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
