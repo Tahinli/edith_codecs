@@ -35,6 +35,15 @@ fn main() {
         println!("rect4_32: horz={h} vert={v} coded={c}");
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
+        // lane-inter16ab r1: the 16x16-level inter AB arms, so a recipe sweep
+        // can tell "aomenc never picked one" from "it did and we decoded it".
+        let ab = ec_av1::decode::ab16_inter_hits_by_arm();
+        println!(
+            "inter_ab16: horz_a={} horz_b={} vert_a={} vert_b={}",
+            ab[0], ab[1], ab[2], ab[3]
+        );
+        let (h4, v4, pairs, sub8) = ec_av1::decode::inter16_rect4_counters();
+        println!("inter16_1to4: horz4={h4} vert4={v4} chroma_pairs={pairs} sub8_pieces={sub8}");
         let leaf = ec_av1::stream::vartx_rect_leaf_hits();
         println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
         let ir = ec_av1::stream::inter_rect_counters();
