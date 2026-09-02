@@ -21,6 +21,8 @@
 #       two lanes stalled on 2026-08-30 because this rung did not exist.
 #   EC_TRACE_MODE=1 -> "EC_MODE mi_row=.. mi_col=.. rng=.." before every inter
 #       block's mode info, "EC_MODE_VAL .. mode=.. ref0/1=.. mv0=.. rng=.."
+#       (rung 13 adds "stack=" to that line and an "EC_MODE_MV" line right
+#       after assign_mv)
 #       after -- the mv-stack/DRL/mv reads EC_PART cannot see. The same flag
 #       also emits "EC_IMODE .. rng=.." / "EC_IMODE_VAL .. mode=.. uv_mode=..
 #       skip=.. tx=.. rng=.." around every INTRA key-frame block: without it
@@ -705,3 +707,57 @@ s = s.replace(anchor, dump + anchor, 1)
 open(path, "w").write(s)
 print("final dump instrumented")
 PYF
+
+# --- rung 13: MV ground truth inside the inter mode ladder (lane-inter8 r3) --
+# lane-inter8 r3 patched the live oracle tree BY HAND and rebuilt aomdec, so
+# these two probes existed only in ~/.cache/aom-oracle/src and any rebuild
+# from this script would have silently dropped them (class: instrument that
+# lives only in a build tree). Both extend rung 4 and are gated by the same
+# EC_TRACE_MODE:
+#   * EC_MODE_MV .. mode=.. mv0=(..,..) rng=..  -- printed immediately after
+#     assign_mv, i.e. the MV as decoded, BEFORE interintra/motion-mode/
+#     interp-filter syntax moves the range further; lets a lane separate an
+#     MV defect from a later-symbol defect on the same block.
+#   * stack=<ref_mv_count[ref_frame_type]> added to rung 4's EC_MODE_VAL --
+#     the reference's own mv-stack depth for the block's reference pair.
+H="$SRC/av1/decoder/decodemv.c"
+[ -f "$H" ] || { echo "no oracle source at $H" >&2; exit 1; }
+
+python3 - "$H" <<'PYMV'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_MODE_MV" in s:
+    print("decodemv rung 13 already applied (no-op)")
+    sys.exit(0)
+assert "EC_INSTRUMENTED" in s, "rung 13 needs rung 4 (run this script top to bottom)"
+
+# (a) stack= on rung 4's EC_MODE_VAL
+old_val = """            "mv0=(%d,%d) rng=%u\\n",
+            ec_xd->mi_row, ec_xd->mi_col, (int)mbmi->mode,
+            (int)mbmi->ref_frame[0], (int)mbmi->ref_frame[1],
+            mbmi->mv[0].as_mv.row, mbmi->mv[0].as_mv.col,
+            (unsigned)r->ec.rng);"""
+new_val = """            "mv0=(%d,%d) stack=%d rng=%u\\n",
+            ec_xd->mi_row, ec_xd->mi_col, (int)mbmi->mode,
+            (int)mbmi->ref_frame[0], (int)mbmi->ref_frame[1],
+            mbmi->mv[0].as_mv.row, mbmi->mv[0].as_mv.col,
+            /* EC_STACK */ (int)dcb->ref_mv_count[av1_ref_frame_type(mbmi->ref_frame)],
+            (unsigned)r->ec.rng);"""
+assert old_val in s, "rung 4's EC_MODE_VAL body moved"
+s = s.replace(old_val, new_val, 1)
+
+# (b) EC_MODE_MV right after assign_mv's corrupted-flag merge
+anchor = "  aom_merge_corrupted_flag(&dcb->corrupted, mv_corrupted_flag);\n"
+assert s.count(anchor) == 1, "assign_mv corrupted-flag merge is no longer unique"
+probe = """  if (getenv("EC_TRACE_MODE") != NULL) {
+    fprintf(stderr,
+            "EC_MODE_MV mi_row=%d mi_col=%d mode=%d mv0=(%d,%d) rng=%u\\n",
+            xd->mi_row, xd->mi_col, (int)mbmi->mode, mbmi->mv[0].as_mv.row,
+            mbmi->mv[0].as_mv.col, (unsigned)r->ec.rng);
+  }
+"""
+s = s.replace(anchor, anchor + probe, 1)
+open(path, "w").write(s)
+print("decodemv rung 13 (EC_MODE_MV + EC_MODE_VAL stack=) instrumented")
+PYMV
