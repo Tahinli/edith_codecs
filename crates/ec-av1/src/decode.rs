@@ -8633,7 +8633,12 @@ fn read_plane(
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
-        usize::from(around.0) + usize::from(around.1)
+        // libaom `get_txb_ctx`: a chroma unit's context is
+        // `combine_entropy_contexts(above, left)` plus 7, or plus 10 when the
+        // plane block is bigger than the transform. Our chroma tables hold the
+        // offset-7 rows first, so the caller adds 3 for the bigger-block case
+        // (only a 128x128 block's TX_32X32 chroma units, lane-sb128b r3).
+        usize::from(around.0) + usize::from(around.1) + luma_skip_ctx.unwrap_or(0)
     };
     // spec 5.11.47/libaom `av1_read_tx_type`: a filter-intra luma block's
     // `intra_ext_tx_cdf` row is indexed by `fimode_to_intradir[filter_intra_mode]`,
@@ -9135,8 +9140,27 @@ fn decode_block(
         // the earlier tiles in this same block already wrote -- the same
         // per-TU pattern [`decode_leaf8`] already runs for an 8x8 leaf.
         let n_axis = side / logical_tx;
-        for tu_row in 0..n_axis {
-            for tu_col in 0..n_axis {
+        let cn = (chroma_side / chroma_tx).max(1);
+        // libaom's transform-block loop is over 64x64 luma "mu" chunks
+        // (`decode_token_recon_block`: `mu_blocks_wide/high` =
+        // `mi_size_wide[BLOCK_64X64]`), and it codes EVERY PLANE of a chunk
+        // before moving to the next one. Below 128 a block is a single chunk,
+        // so this is byte-for-byte the all-luma-then-all-chroma order that has
+        // always run; at 128 the four quadrants interleave Y,U,V per quadrant
+        // and reading all four luma units first desyncs the tile at the second
+        // one (lane-sb128b r3, measured against aomdec's `EC_TRACE_COEFF`).
+        let nchunk = (side / 64).max(1);
+        // `cn > 1` means the uv plane block is larger than the uv transform,
+        // which moves libaom's chroma `txb_skip_ctx` offset from 7 to 10.
+        let chroma_ctx_offset = if cn > 1 { Some(3) } else { None };
+        let tpc = (n_axis / nchunk).max(1);
+        let cpc = (cn / nchunk).max(1);
+        let mut last_grids = [Vec::new(), Vec::new()];
+        let mut units: Vec<((usize, usize), usize, Vec<i32>, Vec<i32>)> = Vec::new();
+        for ch_row in 0..nchunk {
+        for ch_col in 0..nchunk {
+        for tu_row in ch_row * tpc..(ch_row + 1) * tpc {
+            for tu_col in ch_col * tpc..(ch_col + 1) * tpc {
                 let tu_mi = (
                     mi_r + tu_row * (logical_tx / MI),
                     mi_c + tu_col * (logical_tx / MI),
@@ -9219,19 +9243,17 @@ fn decode_block(
                 neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
             }
         }
+        // CfL is only allowed up to 32x32, i.e. only at `nchunk == 1`, where
+        // this still runs after every luma unit of the block.
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         // The block's uv plane block is `chroma_side` across but its uv
         // transform is `chroma_tx` (`av1_get_max_uv_txsize` =
         // `av1_get_adjusted_tx_size(max_txsize_rect_lookup[uv_plane_bsize])`):
         // identical at every size up to 64x64, but a 128x128 block's 64x64 uv
         // plane block adjusts TX_64X64 down to TX_32X32, so each plane is
-        // FOUR units (lane-sb128b r2). `cn == 1` is byte-for-byte the single
-        // whole-plane read this always did.
-        let cn = (chroma_side / chroma_tx).max(1);
-        let mut last_grids = [Vec::new(), Vec::new()];
-        let mut units: Vec<((usize, usize), usize, Vec<i32>, Vec<i32>)> = Vec::new();
-        for cu_row in 0..cn {
-            for cu_col in 0..cn {
+        // FOUR units (lane-sb128b r2) -- one per mu chunk.
+        for cu_row in ch_row * cpc..(ch_row + 1) * cpc {
+            for cu_col in ch_col * cpc..(ch_col + 1) * cpc {
                 // The chroma context arrays are indexed in LUMA mi, so this
                 // unit's anchor is its own luma quadrant: `chroma_tx` chroma
                 // pixels span `2 * chroma_tx` luma ones.
@@ -9259,7 +9281,7 @@ fn decode_block(
                     uv_predict_mode, angle_delta_uv, cu_reach, u, cu_x, cu_y,
                     chroma_tx, chroma_tx, base_q_idx,
                     alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
-                    None, None, smooth_neighbor_uv,
+                    None, chroma_ctx_offset, smooth_neighbor_uv,
                 )?;
                 if let Some((_, vb)) = &palette_uv_bufs {
                     set_palette_pred(vb.clone());
@@ -9269,14 +9291,24 @@ fn decode_block(
                     uv_predict_mode, angle_delta_uv, cu_reach, v, cu_x, cu_y,
                     chroma_tx, chroma_tx, base_q_idx,
                     alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
-                    None, None, smooth_neighbor_uv,
+                    None, chroma_ctx_offset, smooth_neighbor_uv,
                 )?;
                 if cn > 1 {
                     CHROMA_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                    // Immediately, so the NEXT unit of this same block reads
+                    // this one's coefficient context (libaom's chroma
+                    // `txb_skip_ctx` for the second quadrant is 11, i.e. base
+                    // 1 from this left neighbour -- measured against aomdec).
+                    // The same writes are replayed after `record_split_luma`
+                    // below, which would otherwise clobber them whole-block.
+                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, 1, &u_grid);
+                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, 2, &v_grid);
                     units.push((cu_mi, luma_span, u_grid.clone(), v_grid.clone()));
                 }
                 last_grids = [u_grid, v_grid];
             }
+        }
+        }
         }
         // Mode/side bookkeeping plus, at `cn == 1`, the whole-plane chroma
         // context write; at `cn > 1` the per-unit writes above are what the
@@ -12342,18 +12374,6 @@ fn read_sb128_root(
         PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
     } else {
         PART128_NONE_HITS.with(|c| c.set(c.get() + 1));
-        // lane-sb128b r2 RESIDUAL, measured (gate
-        // `a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact`,
-        // 384x384 cq63 seed 42, a 76-byte near-flat frame): the chroma TU loop
-        // landed and the tile decodes end to end, but frame 0 luma differs from
-        // ffmpeg at 139162/147456 samples -- ffmpeg's row 0 is a constant 115
-        // where ours ramps 115 -> 112 across the first TX_64X64 unit, i.e. our
-        // first luma unit reads AC coefficients libaom never wrote. The DC and
-        // the mode agree; the divergence is inside that unit's coefficient
-        // read. Refuse rather than emit wrong pixels.
-        return Err(unsupported(
-            "a 128x128 PARTITION_NONE block (four TX_64X64 luma and four TX_32X32 chroma units all decode, but the first unit's coefficients already carry AC where libaom has DC only -- lane-sb128b r2's open entropy residual)",
-        ));
     }
     Ok(part128)
 }

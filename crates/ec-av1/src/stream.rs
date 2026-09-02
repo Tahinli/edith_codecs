@@ -18014,9 +18014,6 @@ mod tests {
     /// Smooth gradients at a high `--cq-level` are what make the RD search
     /// keep a whole 128x128 block; `part128_none_hits` HARD-asserts it did.
     #[test]
-    #[ignore = "lane-sb128b r2 reproducer: the 128 NONE luma AND chroma units all \
-                 decode, the first luma unit still reads AC libaom never wrote, so the \
-                 product path refuses the arm by name"]
     fn a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact() {
         const NAME: &str =
             "a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact";
