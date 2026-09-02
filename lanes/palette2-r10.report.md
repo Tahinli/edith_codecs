@@ -1,7 +1,10 @@
-# lane-palette2 r10 — GREEN: merged main 06d856d, root-caused the U-plane palette defect it exposed
+# lane-palette2 r10 — merged main 06d856d, fixed the U-plane palette defect; full suite finds ONE lane regression
 
-VERDICT: GREEN. The chartered failing cell decodes pixel-exact; both palette gates,
-split_transform, tx_select, refusal_inventory and gate_coverage pass on the merged tree.
+VERDICT: AMBER (corrected after the full suite ran; the first draft said GREEN off a 6-test
+filter run). The chartered work is done — the failing cell decodes pixel-exact and both palette
+gates, split_transform, tx_select, refusal_inventory and gate_coverage pass — but the full
+`cargo test -p ec-av1 --lib` is 294 passed / 2 failed / 27 ignored, and one of those two
+failures is a gate this lane REGRESSES. See STEP 4.
 
 ## STEP 1 — merge main 06d856d (commit 29bbbcd)
 Two conflicts, resolved exactly as chartered:
@@ -71,3 +74,40 @@ EVIDENCE: scratchpad/r10.obu (211 B, sha256 d1baf9503c5787d1005d358d36767195279c
 EVIDENCE: scratchpad/pal.log (EC_DEBUG_PAL=1 trace of the same stream) | 32 PALSET / 32 PALTAKE lines | every arm `stale=false` — the charter's stale-thread-local suspect disproved, not patched around
 EVIDENCE: scratchpad/pal4.log + pal5.log | per-block `palette_uv_cache` and palette-record trace | block r=0 c=6 (luma 96,0) read cache [44,156] stamped by luma (48,0); the strip at luma (64,0) has NO record line — the missing stamp
 EVIDENCE: cargo test -p ec-av1 --lib -j3 (EC_AV1_REQUIRE_AOMENC=1), 6 filters | full 70-attempt sweep on both palette gates | 14 passed, 0 failed, 1 ignored, 133.29s
+
+
+## STEP 4 — full suite on the merged tree (the r10 restart's only new work)
+```
+cd /home/tahinli/Documents/Code/Rust/edith_codecs-palette2
+EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib -j3 -- --test-threads=1
+# log: $HOME/.cache/palette2-suite.log
+```
+→ **294 passed; 2 failed; 27 ignored** (1390.10s).
+
+Both failures were attributed against the merge base by building 06d856d in a detached
+worktree (own CARGO_TARGET_DIR) and running the same two test names there:
+
+1. `decode::tests::nz_map_ctx_offset_tables_match_the_rect_rule` — **INHERITED, not this lane.**
+   FAILS identically at 06d856d (`32x64 nz_map offset at display (row 0, col 2)  left: 6 right: 11`).
+   `git diff 06d856d HEAD` touches neither `cdf.rs` (0 lines) nor this test. Diagnosis: the test
+   reads `table[col][row]` while the live consumer (`decode.rs:1804`) reads
+   `table[row.min(4)][col.min(4)]`; commit 44e8768 transposed the two tables and left the test on
+   the old layout, so **the test is the stale half** — 24 of the 50 cells disagree, exactly a
+   transposition. NOT fixed here: this lane owns neither the table nor the orientation question
+   (decode.rs:1785-1795 records the orientation as still unproven), and flipping the test to
+   `[row][col]` would only pin the current storage. `deferred: nz_map test/consumer layout —
+   inherited from main, orientation itself unproven — needs the lane that owns the rect nz_map
+   orientation`.
+2. `stream::tests::a_real_aomenc_stream_with_filter_intra_on_a_horz_vert_strip_decodes_pixel_exact`
+   — **THIS LANE REGRESSES IT.** PASSES at 06d856d, FAILS on lane-palette2 HEAD:
+   `seed 46 first luma mismatch at (188, 62) ours=116 ffmpeg=115 -- 2242 mismatching samples,
+   bbox x 135..=191 y 62..=127` (stream.rs:12360). Values differ by 1 over a contiguous region =
+   a prediction/reconstruction difference, not an entropy desync. The gate is new on main
+   (lane-fistrip), so it never ran against this lane's rect-strip work until the r10 merge; the
+   suspects are the lane's `read_intra_mode_rect` / `decode_block_rect` / `reconstruct_rect`
+   changes (492 inserted lines vs the base), starting with the merge-resolved `PALETTE_PRED`
+   override wrapper in `reconstruct_rect` and the r7 per-TU palette window.
+   `fix-now: r11 — do not merge this lane into main until seed 46 is exact.`
+
+EVIDENCE: $HOME/.cache/palette2-suite.log | `EC_AV1_REQUIRE_AOMENC=1 ec_av1 --test-threads=1` on lane-palette2 HEAD (merged tree) | test result: FAILED. 294 passed; 2 failed; 27 ignored; 1390.10s
+EVIDENCE: detached worktree at 06d856d (scratchpad/base06d, CARGO_TARGET_DIR=~/.cache/cargo-target-palette2-base) | same binary run with the two failing test names | `nz_map... FAILED` (identical message) + `filter_intra_on_a_horz_vert_strip ... ok` — 1 passed; 1 failed
