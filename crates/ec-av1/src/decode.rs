@@ -2199,6 +2199,24 @@ thread_local! {
     static RECT4_16_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-troykf r1: the two chroma defects Troy's key frames exposed --
+// CHROMA_SKIP_CFL counts skipped intra blocks whose chroma is `UV_CFL_PRED`
+// (prediction still runs, libaom `predict_and_reconstruct_intra_block`), and
+// RECT4_16_CHROMA_DIR counts 1:4 chroma pairs predicted directionally (whose
+// intra-edge filter type must come from the chroma-reference position).
+thread_local! {
+    static CHROMA_SKIP_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECT4_16_CHROMA_DIR_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(skipped UV_CFL_PRED blocks, directional 1:4 chroma pairs)` -- lane-troykf.
+pub fn troy_chroma_counters() -> (usize, usize) {
+    (
+        CHROMA_SKIP_CFL_HITS.with(|c| c.get()),
+        RECT4_16_CHROMA_DIR_HITS.with(|c| c.get()),
+    )
+}
+
 /// Current values of the 16x16-level 1:4 counters: `(16x4 strips, 4x16
 /// strips, chroma-reference strips, strips with a coded residual, strips
 /// whose luma transform is split)`.
@@ -7709,11 +7727,30 @@ fn decode_rect4_16(
             let (cpx, cpy) = (ppx / 2, ppy / 2);
             let (cw, ch) = (pw / 2, ph / 2);
             let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+            if (V_PRED..=D67_PRED).contains(&uv_predict_mode) {
+                RECT4_16_CHROMA_DIR_HITS.with(|h| h.set(h.get() + 1));
+            }
             let pair_reach = Reach::of_rect(pw, ph, ppx, ppy, y.width, y.height);
-            let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c);
+            // libaom `get_intra_edge_filter_type` reads `chroma_above_mbmi` /
+            // `chroma_left_mbmi` -- the neighbours of the CHROMA REFERENCE
+            // position, not of the closing strip. At `lmi` the above cell is
+            // the pair's own first strip, so the mi-exact map missed and the
+            // coarse fallback answered; the filter type then flipped the
+            // `use_intra_edge_upsample` decision (blk_wh 12 <= 16 for type 0,
+            // no upsample for type 1) on directional chroma.
+            let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c);
             let (u_levels, v_levels) = if skip {
                 let zeros = vec![0i32; cw * ch];
-                for (buf, _plane) in [(&mut *u, 1usize), (&mut *v, 2)] {
+                // libaom `predict_and_reconstruct_intra_block` (decodeframe.c
+                // ~1000) predicts EVERY plane and only guards the residual on
+                // `mbmi->skip_txfm`, so a skipped `UV_CFL_PRED` block is still
+                // DC + alpha * luma-AC. Dropping the CfL term here left a
+                // chroma-only bounded box on Troy's key frames.
+                let ac = alpha.map(|_| cfl_ac_q3_rect(y, ppx, ppy, pw, ph));
+                if alpha.is_some() {
+                    CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
+                }
+                for (buf, plane) in [(&mut *u, 1usize), (&mut *v, 2)] {
                     buf.reconstruct_rect(
                         cpx,
                         cpy,
@@ -7723,7 +7760,9 @@ fn decode_rect4_16(
                         angle_delta_uv,
                         pair_reach,
                         &zeros,
-                        None,
+                        alpha
+                            .zip(ac.as_deref())
+                            .map(|((au, av), ac)| (if plane == 1 { au } else { av }, ac)),
                         None,
                         smooth_neighbor_uv,
                     );
@@ -10512,8 +10551,14 @@ fn decode_leaf_split4(
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[3] {
-        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
-        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        // As the rect4 pair above: a skipped block still predicts, and CfL is
+        // prediction (libaom `predict_and_reconstruct_intra_block`).
+        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        if alpha.is_some() {
+            CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
+        }
+        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv);
+        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
@@ -10865,8 +10910,14 @@ fn decode_leaf_rect8(
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[1] {
-        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
-        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        // As the rect4 pair above: a skipped block still predicts, and CfL is
+        // prediction (libaom `predict_and_reconstruct_intra_block`).
+        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        if alpha.is_some() {
+            CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
+        }
+        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv);
+        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
