@@ -1627,6 +1627,23 @@ pub(crate) fn uv_mode_mi_override_hits() -> usize {
     UV_MODE_MI_OVERRIDE_HITS.with(|c| c.get())
 }
 
+// lane-mtfix r1: how many times a chroma intra-edge filter-type read was
+// suppressed at a TILE edge that is not a frame edge -- the above/left
+// `uv_mode` neighbour of a block on a tile's first mi row/column lives in
+// another tile, so libaom's `above_mbmi`/`left_mbmi` are NULL there. The
+// coarse [`SUB`] maps are frame-sized and (`above_uv_mode`) not cleared per
+// tile, so without the guard in [`Neighbours::smooth_uv_neighbour`] the tile
+// above would decide this tile's chroma edge filter strength.
+thread_local! {
+    static UV_TILE_EDGE_SUPPRESSED_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`UV_TILE_EDGE_SUPPRESSED_HITS`].
+pub(crate) fn uv_tile_edge_suppressed_hits() -> usize {
+    UV_TILE_EDGE_SUPPRESSED_HITS.with(|c| c.get())
+}
+
 // lane-cfl r1 gate counters: `UV_CFL_PRED` blocks (every `cfl_alpha_signs`
 // read) and chroma blocks with a NONZERO `angle_delta_uv` -- the two block
 // shapes the r1 chroma defect showed up on.
@@ -4048,13 +4065,29 @@ impl Neighbours {
     /// planes 1/2. Falls back to the coarse [`SUB`] slot on whichever axis no
     /// block has recorded the exact neighbouring mi.
     fn smooth_uv_neighbour(&self, mi_r: usize, mi_c: usize, r: usize, c: usize) -> bool {
+        // lane-mtfix r1: availability is TILE-relative on BOTH axes and on the
+        // coarse fallback too. `above_uv_mode` is a frame-wide [`SUB`]-grid
+        // array that `start_tile` does not clear, so a block on a tile's first
+        // mi row used to read the uv_mode of the block above it in the tile
+        // ABOVE and filter its chroma edge at that neighbour's strength
+        // (2x2-tile intra gate, seed 46: chroma-only +-1..2 over the 8x8 block
+        // at chroma (120, 32), the top-right tile's first block).
+        let have_above = mi_r > self.tile_row0_mi;
+        let have_left = mi_c > self.tile_col0_mi;
+        if self.tile_row0_mi > 0 && !have_above && self.above_uv_mode[c] != DC_PRED
+            || self.tile_col0_mi > 0 && !have_left && self.left_uv_mode[r] != DC_PRED
+        {
+            UV_TILE_EDGE_SUPPRESSED_HITS.with(|h| h.set(h.get() + 1));
+        }
         let above = match self.uv_mode_col.get(mi_c) {
-            Some(&(row, m)) if mi_r > self.tile_row0_mi && row == mi_r - 1 => m,
-            _ => self.above_uv_mode[c],
+            Some(&(row, m)) if have_above && row == mi_r - 1 => m,
+            _ if have_above => self.above_uv_mode[c],
+            _ => DC_PRED,
         };
         let left = match self.uv_mode_row.get(mi_r) {
-            Some(&(col, m)) if mi_c > self.tile_col0_mi && col == mi_c - 1 => m,
-            _ => self.left_uv_mode[r],
+            Some(&(col, m)) if have_left && col == mi_c - 1 => m,
+            _ if have_left => self.left_uv_mode[r],
+            _ => DC_PRED,
         };
         // lane-cfl r1 counter: how often the mi-exact chroma neighbour differs
         // from the coarse [`SUB`] slot -- i.e. how often a chroma edge would
