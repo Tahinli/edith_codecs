@@ -2597,6 +2597,20 @@ pub(crate) fn uv_mode_mi_override_hits() -> usize {
     UV_MODE_MI_OVERRIDE_HITS.with(|c| c.get())
 }
 
+// lane-t900 r12: how many chroma edge-filter-type reads took their above/left
+// `uv_mode` from the mi GRID where the one-slot-per-column map would have
+// answered differently -- the sub-8x8 pair case where the pair's own first
+// half had already overwritten the column slot the chroma-ref half reads.
+thread_local! {
+    static UV_MODE_GRID_OVERRIDE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`UV_MODE_GRID_OVERRIDE_HITS`].
+pub fn uv_mode_grid_override_hits() -> usize {
+    UV_MODE_GRID_OVERRIDE_HITS.with(|c| c.get())
+}
+
 // lane-t900 r8: how many intra edge-filter-type reads (luma + chroma) the
 // INTER neighbour stamp saved: the coarse SUB band still held a SMOOTH mode
 // from an earlier block in that pixel row/column while the mi-exact map --
@@ -4633,6 +4647,18 @@ struct Neighbours {
     /// the leaf above writes the same row slot the block to the left owns.
     uv_mode_col: Vec<(usize, usize)>,
     uv_mode_row: Vec<(usize, usize)>,
+    /// Every mi cell's own `uv_mode`, the mi grid libaom's
+    /// `chroma_above_mbmi`/`chroma_left_mbmi` read directly (`set_mi_row_col`,
+    /// blockd.h). lane-t900 r12: the one-slot-per-column
+    /// `uv_mode_col`/`uv_mode_row` maps above hold only the LAST block written
+    /// in that column, so a sub-8x8 pair's own first (non-chroma-ref) half
+    /// overwrote the row the pair's chroma-ref half then wanted to read --
+    /// the mi-exact match failed and the coarse [`SUB`] band answered instead.
+    /// `u8::MAX` = no block has written this cell yet (fall back to the maps).
+    uv_mode_grid: Vec<u8>,
+    /// [`Self::uv_mode_grid`]'s stride, in mi units (superblock-padded, like
+    /// every other band here).
+    uv_grid_cols: usize,
     /// Whether the block above/left of this column/row was coded `skip` --
     /// an inter frame's own `skip` context (spec `SkipContext`), which the
     /// key-frame writer never tracks (its skip context is always zero); a
@@ -4811,6 +4837,8 @@ impl Neighbours {
             sub8_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
             uv_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
             uv_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
+            uv_mode_grid: vec![u8::MAX; cols * (SUB / MI) * rows * (SUB / MI)],
+            uv_grid_cols: cols * (SUB / MI),
             above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
             left_txfm: vec![TXFM_CTX_INIT; rows * (SUB / MI)],
             // lane-inter8 r2: mi(4px)-granular, not [`SUB`]-granular -- an
@@ -5749,6 +5777,18 @@ impl Neighbours {
                 *slot = (last_c, uv_mode);
             }
         }
+        // libaom writes one `MB_MODE_INFO` pointer into every mi cell a block
+        // covers, so the chroma neighbour read below is a plain grid read.
+        let stride = self.uv_grid_cols;
+        for row in mi_r..=last_r {
+            for col in mi_c..=last_c {
+                if col < stride
+                    && let Some(cell) = self.uv_mode_grid.get_mut(row * stride + col)
+                {
+                    *cell = uv_mode as u8;
+                }
+            }
+        }
     }
 
     /// Whether either mi-exact chroma neighbour of the block at `(mi_r, mi_c)`
@@ -5801,16 +5841,34 @@ impl Neighbours {
         {
             UV_TILE_EDGE_SUPPRESSED_HITS.with(|h| h.set(h.get() + 1));
         }
+        // The mi grid is libaom's own read; the two maps below stay as the
+        // fallback for cells no block has written (see [`Self::uv_mode_grid`]).
+        let cell = |grid: &Vec<u8>, row: usize, col: usize| -> Option<usize> {
+            (col < self.uv_grid_cols)
+                .then(|| grid.get(row * self.uv_grid_cols + col).copied())
+                .flatten()
+                .filter(|&m| m != u8::MAX)
+                .map(usize::from)
+        };
         let above = match self.uv_mode_col.get(mi_c) {
+            _ if have_above && let Some(m) = cell(&self.uv_mode_grid, mi_r - 1, mi_c) => m,
             Some(&(row, m)) if have_above && row == mi_r - 1 => m,
             _ if have_above => self.above_uv_mode[c],
             _ => DC_PRED,
         };
         let left = match self.uv_mode_row.get(mi_r) {
+            _ if have_left && let Some(m) = cell(&self.uv_mode_grid, mi_r, mi_c - 1) => m,
             Some(&(col, m)) if have_left && col == mi_c - 1 => m,
             _ if have_left => self.left_uv_mode[r],
             _ => DC_PRED,
         };
+        if have_above && cell(&self.uv_mode_grid, mi_r - 1, mi_c).is_some_and(|m| {
+            !matches!(self.uv_mode_col.get(mi_c), Some(&(row, cm)) if row == mi_r - 1 && cm == m)
+        }) || have_left && cell(&self.uv_mode_grid, mi_r, mi_c - 1).is_some_and(|m| {
+            !matches!(self.uv_mode_row.get(mi_r), Some(&(col, cm)) if col == mi_c - 1 && cm == m)
+        }) {
+            UV_MODE_GRID_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
+        }
         // lane-cfl r1 counter: how often the mi-exact chroma neighbour differs
         // from the coarse [`SUB`] slot -- i.e. how often a chroma edge would
         // have been filtered at the wrong strength by the coarse map alone.
@@ -18110,7 +18168,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
     // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
-    if std::env::var_os("EC_OBMC").is_some() || std::env::var_os("EC_TRACE_MODE").is_some() {
+    if std::env::var_os("EC_OBMC").is_some()
+        || std::env::var_os("EC_TRACE_MODE").is_some()
+        || std::env::var_os("EC_PRED").is_some()
+    {
         eprintln!(
             "EC_PICT idx={}",
             PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst)
@@ -29678,7 +29739,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
     // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
-    if std::env::var_os("EC_OBMC").is_some() || std::env::var_os("EC_TRACE_MODE").is_some() {
+    if std::env::var_os("EC_OBMC").is_some()
+        || std::env::var_os("EC_TRACE_MODE").is_some()
+        || std::env::var_os("EC_PRED").is_some()
+    {
         eprintln!(
             "EC_PICT idx={}",
             PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst)
