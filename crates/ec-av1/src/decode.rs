@@ -3121,16 +3121,19 @@ thread_local! {
     /// HORZ/VERT partition -- `[0]` 8x4, `[1]` 4x8, `[2]` of those that were
     /// the chroma reference (so coded the group's 4x4 chroma intra), `[3]`
     /// MIXED groups whose chroma reference is INTER while its sibling is
-    /// intra (the `is_sub8x8_inter` false path).
-    static SUB8_INTRA_RECT_HITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+    /// intra (the `is_sub8x8_inter` false path), `[4]` INTRA `BLOCK_4X4`
+    /// leaves of an inter frame's sub-8x8 `PARTITION_SPLIT` (lane-sub8x4 r2 --
+    /// the second lifted refusal's own witness; `[0]`/`[1]` count those too,
+    /// so only this cell separates the split arm from the HORZ/VERT one).
+    static SUB8_INTRA_RECT_HITS: std::cell::Cell<[usize; 5]> = const { std::cell::Cell::new([0; 5]) };
 }
 
 /// Current value of [`SUB8_INTRA_RECT_HITS`]: `(8x4, 4x8, chroma-reference,
-/// mixed groups)`.
-pub fn sub8_intra_rect_hits() -> (usize, usize, usize, usize) {
+/// mixed groups, split 4x4 leaves)`.
+pub fn sub8_intra_rect_hits() -> (usize, usize, usize, usize, usize) {
     SUB8_INTRA_RECT_HITS.with(|c| {
         let h = c.get();
-        (h[0], h[1], h[2], h[3])
+        (h[0], h[1], h[2], h[3], h[4])
     })
 }
 
@@ -22717,15 +22720,15 @@ fn decode_inter_sub8_split4(
                     TX_SELECT_INTER.with(std::cell::Cell::get),
                 );
             }
-            // lane-sub8intra: same `EC_SUB8INTRA_DECODE` switch as the
-            // HORZ/VERT arm; the refusal is the default until the gate is
-            // green.
-            if std::env::var_os("EC_SUB8INTRA_DECODE").is_none() {
-                return Err(unsupported(
-                    "an intra 4x4 block inside an inter frame's sub-8x8 split (this decoder codes \
-                     only inter 4x4 sub-blocks there)",
-                ));
-            }
+            // lane-sub8x4 r2: the refusal and its `EC_SUB8INTRA_DECODE` bypass
+            // are gone -- `a_real_aomenc_inter_sequence_with_intra_sub8x8_
+            // leaves_decodes_pixel_exact` (stream.rs) decodes 12 real aomenc
+            // streams carrying this arm pixel-exact vs ffmpeg.
+            SUB8_INTRA_RECT_HITS.with(|h| {
+                let mut st = h.get();
+                st[4] += 1;
+                h.set(st);
+            });
             // lane-sub8intra: the `BLOCK_4X4` twin of the HORZ/VERT arm --
             // same [`decode_intra_sub8_leaf`], no tx-depth symbol, chroma on
             // the LAST sub-block (`is_chroma_reference` under 4:2:0).
@@ -23660,17 +23663,8 @@ fn decode_inter_sub8_rect2(
                     TX_SELECT_INTER.with(std::cell::Cell::get),
                 );
             }
-            // lane-sub8intra: the leaf decodes ([`decode_intra_sub8_leaf`])
-            // only under `EC_SUB8INTRA_DECODE` -- the r1 gate is RED (a
-            // 128x128 8-bit witness desyncs a few blocks later), so the
-            // refusal stays the default behaviour (class
-            // `refusal-lifted-without-a-gate`).
-            if std::env::var_os("EC_SUB8INTRA_DECODE").is_none() {
-                return Err(unsupported(
-                    "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition \
-                     (this decoder codes only inter sub-blocks there)",
-                ));
-            }
+            // lane-sub8x4 r2: refusal and bypass lifted -- see the split arm's
+            // note above for the gate that proves this leaf.
             // Its chroma rule is `is_sub8x8_inter`'s: when the
             // chroma-reference (second) sub-block is the intra one, the
             // group's 4x4 chroma is coded and predicted INTRA there and the
