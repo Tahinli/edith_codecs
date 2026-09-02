@@ -33,6 +33,7 @@ fn main() {
         println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
+        println!("rect_intrabc_reads: {}", ec_av1::stream::rect_intrabc_reads());
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         let i4 = ec_av1::stream::intra_rect4_in_inter_counters();
@@ -40,6 +41,19 @@ fn main() {
             "intra_rect4_in_inter: 64x16={} 16x64={} 32x8={} 8x32={}",
             i4.0, i4.1, i4.2, i4.3
         );
+        let leaf = ec_av1::stream::vartx_rect_leaf_hits();
+        println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
+        // lane-inter16ab r1: the 16x16-level inter AB arms, so a recipe sweep
+        // can tell "aomenc never picked one" from "it did and we decoded it".
+        let ab = ec_av1::decode::ab16_inter_hits_by_arm();
+        println!(
+            "inter_ab16: horz_a={} horz_b={} vert_a={} vert_b={}",
+            ab[0], ab[1], ab[2], ab[3]
+        );
+        // lane-kf900 r1: the counter the skipped-8x8-split-transform gate
+        // asserts -- printed here so a recipe sweep can see it fire without a
+        // test-binary rebuild.
+        println!("skip_split_tx: {}", ec_av1::decode::skip_split_tx_hits());
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",

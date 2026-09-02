@@ -34,7 +34,7 @@ const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
-    "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
+    "an OBMC neighbour whose switchable interp filter was never recorded",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
@@ -45,10 +45,10 @@ const REFUSALS: &[&str] = &[
     "a 128x128 superblock HORZ/VERT or AB partition (only SPLIT and NONE are decoded at the 128 root)",
     "a 128x128 superblock PARTITION_NONE root on an inter frame (only the key-frame path codes a whole 128x128 block)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
-    "a palette block on a HORZ/VERT intra strip below 16x16 (reconstruction not ported)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+    "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
     "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
@@ -68,7 +68,14 @@ const REFUSALS: &[&str] = &[
     "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
     "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
-    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
+    // lane-inter16ab r1 lifted the AB half (HORZ_A/HORZ_B/VERT_A/VERT_B at
+    // the 16x16 level of an inter frame: two 8x8 inter leaves plus one true
+    // 16x8/8x16 inter strip, gate
+    // `a_real_aomenc_inter_sequence_with_16x16_level_ab_partitions_decodes_pixel_exact`).
+    // What is left is the 1:4 pair, whose 16x4/4x16 strips need the sub-8
+    // inter chroma-pair path (odd-strip `is_chroma_reference`, chroma built
+    // from BOTH strips' MVs) that no inter block writer has yet.
+    "an inter 16x16-level 1:4 partition (HORZ_4/VERT_4 -- four 16x4 or 4x16 inter strips; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT, SPLIT or AB)",
     "an intra mode this decoder does not code (round 2)",
     // lane-intrarect r1 lifted the whole-shape refusal that stood here (the
     // inter path's intra arm now routes 2:1 strips through `decode_rect_split`);
@@ -82,10 +89,6 @@ const REFUSALS: &[&str] = &[
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
     "a motion_mode symbol for a block shape with no CDF row here",
-    // lane-r14 r2: the whole-transform case of every 64-axis inter strip is
-    // coded; only the SPLIT of a 1:4 strip with a 64-px axis is left, whose
-    // `sub_tx_size_map` entry is rectangular (TX_64X16 -> TX_32X16).
-    "a split transform on a 1:4 inter strip with a 64-px axis",
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
