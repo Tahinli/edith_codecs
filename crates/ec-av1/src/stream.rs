@@ -74,6 +74,12 @@ pub fn rect64_inter_tu_hits() -> usize {
     crate::decode::rect64_inter_tu_hits()
 }
 
+/// lane-rectres r1: whole-block luma transform units of a 32x32-level 1:4
+/// inter strip (`TX_32X8`/`TX_8X32`), `[32x8, 8x32]`.
+pub fn rect32x8_inter_tu_hits() -> [usize; 2] {
+    crate::decode::rect32x8_inter_tu_hits()
+}
+
 /// lane-r14 r3: RECTANGULAR var-tx leaf transform units, `[32x16, 16x32]` --
 /// the leaves `sub_tx_size_map` produces when a 1:4 strip with a 64-px axis
 /// splits its transform (`[TX_64X16] == TX_32X16`, `[TX_16X64] == TX_16X32`).
@@ -8862,6 +8868,236 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// lane-rectres r1: a 32x32-level 1:4 INTER strip (32x8 / 8x32) that codes
+    /// a REAL rectangular residual. THIS is the shape both 10-bit 3840x1608
+    /// film cuts and every measured 1080p offset stopped on -- six of six
+    /// `decode_probe` runs refused at "a non-skip rectangular (HORZ/VERT/
+    /// HORZ_B) strip needs rectangular residual coding" with `w=32 h=8` or
+    /// `w=8 h=32`, nothing else.
+    ///
+    /// `max_txsize_rect_lookup[BLOCK_32X8] == TX_32X8` codes all 256 of its
+    /// positions ([`TxbSet::LumaRect32x8Inter`]: `get_txsize_entropy_ctx` =
+    /// TX_16X16 so the coefficient tables are the luma-16 ones,
+    /// `txsize_log2_minus4` = 4 so `eob_pt` is the 256-position alphabet), and
+    /// unlike the INTRA twin it DOES code a `tx_type`:
+    /// `av1_get_ext_tx_set_type` at `tx_size_sqr_up == TX_32X32` is
+    /// `EXT_TX_SET_DCT_IDTX` for inter with or without `reduced_tx_set`, read
+    /// at the `txsize_sqr_map[TX_32X8] == TX_8X8` CDF row (class
+    /// table-indexed-by-raw-size: the coefficient tables follow the ADJUSTED
+    /// size, the `tx_type` row the SQUARE one -- they disagree here).
+    /// Its chroma pair is one 16x4 / 4x16 unit (`ss_size_lookup[BLOCK_32X8]`
+    /// = BLOCK_16X4, `Chroma8`'s tables, 64-position `eob_pt`), and a split
+    /// transform gives 16x8 / 8x16 leaves (`sub_tx_size_map[TX_32X8] ==
+    /// TX_16X8`) the rect var-tx path already reads.
+    ///
+    /// `--enable-1to4-partitions=1 --min-partition-size=8
+    /// --max-partition-size=32 --enable-tx-size-search=1` (each spelled once,
+    /// last occurrence wins -- aomenc keeps the LAST `--enable-*`) is what
+    /// lets aomenc pick a 32x32-level HORZ_4 / VERT_4; the 8-pixel banded
+    /// translating source is what makes those strips the RD winner and keeps
+    /// them non-skip so the residual is really coded. Both orientations, 8-bit
+    /// AND 10-bit, every decode-order frame compared to ffmpeg on Y/U/V,
+    /// refusals counted (never SKIPped), attempts that carried no 32x8/8x32
+    /// residual unit counted separately and still required pixel-exact.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_32x32_level_1to4_strips_codes_their_rect_residual() {
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_32x32_level_1to4_strips_codes_their_rect_residual";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let frame_count = 6usize;
+        let (mut proved_32x8, mut proved_8x32) = (0usize, 0usize);
+        let (mut fired_32x8, mut fired_8x32) = (0usize, 0usize);
+        for bit_depth in [8u32, 10u32] {
+            let (mut named_refusals, mut compared, mut out_of_scope, mut oos_mismatch) =
+                (0u32, 0u32, 0u32, 0u32);
+            for attempt in 0..16u32 {
+                // Two orientations (the transposed pair a one-sided gate could
+                // never separate) x four quantisers x two motion steps.
+                let vertical = attempt % 2 == 1;
+                let (width, height) = (192usize, 128usize);
+                let cq = [48, 52, 56, 60][(attempt / 2 % 4) as usize];
+                let sp = 3 + (attempt / 8) * 4;
+                // 32-pixel bands, each translating at its OWN speed across the
+                // other axis: that is what makes aomenc's RD split a 32x32
+                // block into four 32x8 (or 8x32) strips with distinct motion
+                // vectors, and the texture inside a band is what keeps a strip
+                // non-skip. MEASURED (72-run recipe sweep, 192x128..256x192,
+                // cq 24..60, bands 8/16/32/64): only 32-pixel bands at cq >= 48
+                // make aomenc code a NON-SKIP one -- attempt 0 (cq 48,
+                // horizontal source) codes an 8x32 residual unit, attempt 7
+                // (cq 60, the transposed source) five 32x8 ones. Narrower
+                // bands give the same strips with `skip` set, which proves the
+                // partition symbol and nothing about the residual.
+                let geq = if vertical {
+                    format!("128+62*sin((Y+N*({sp}+7*mod(floor(X/32),4)))/6)+28*sin(X/9)")
+                } else {
+                    format!("128+62*sin((X+N*({sp}+7*mod(floor(Y/32),4)))/6)+28*sin(Y/9)")
+                };
+                let duration = frame_count as f64 / 25.0;
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='{geq}',format=yuv420p"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
+                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    // Per-arm overrides go LAST: aomenc keeps the last
+                    // occurrence of a repeated --enable-* flag.
+                    "--enable-tx64=0", "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0", "--enable-1to4-partitions=1",
+                    "--enable-tx-size-search=1",
+                    "--enable-dual-filter=0", "--enable-obmc=0",
+                    // aomenc's min-partition-size bounds the SMALLER side of a
+                    // 1:4 strip, so 32x8 needs 8 (memory
+                    // aomenc-min-partition-bounds-smaller-side).
+                    "--min-partition-size=8", "--max-partition-size=32",
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = crate::stream::rect32x8_inter_tu_hits();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        let after = crate::stream::rect32x8_inter_tu_hits();
+                        // Firing counted on a refused stream is kept apart from
+                        // the pixel-proved tally (class
+                        // counter-from-refused-stream).
+                        fired_32x8 += after[0] - before[0];
+                        fired_8x32 += after[1] - before[1];
+                        named_refusals += 1;
+                        eprintln!(
+                            "{NAME} {bit_depth}-bit attempt {attempt} refusal (32x8 residual \
+                             units decoded before it: {}, 8x32: {}): {msg}",
+                            after[0] - before[0],
+                            after[1] - before[1]
+                        );
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let after = crate::stream::rect32x8_inter_tu_hits();
+                let (h, v) = (after[0] - before[0], after[1] - before[1]);
+                fired_32x8 += h;
+                fired_8x32 += v;
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if h + v == 0 {
+                    out_of_scope += 1;
+                    if mismatched {
+                        oos_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit attempt {attempt} MISMATCHES with zero \
+                             32x8/8x32 inter residual units -- another shape's defect"
+                        );
+                    }
+                    continue;
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                }
+                proved_32x8 += h;
+                proved_8x32 += v;
+                compared += 1;
+            }
+            eprintln!(
+                "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {compared} \
+                 pixel-exact attempts carrying the arm, {out_of_scope} attempts carried none \
+                 ({oos_mismatch} of them mismatched)"
+            );
+            assert_eq!(
+                oos_mismatch, 0,
+                "{NAME}: {oos_mismatch} attempt(s) with no 32x8/8x32 inter residual unit \
+                 decoded but mismatched ffmpeg -- a defect of another shape, not a pass"
+            );
+            assert!(
+                compared + out_of_scope > 0,
+                "{NAME} ({bit_depth}-bit): every attempt refused -- the gate compared no pixels"
+            );
+        }
+        eprintln!(
+            "{NAME}: pixel-compared 32x32-level 1:4 inter residual units 32x8={proved_32x8} \
+             8x32={proved_8x32} (decoded anywhere in the sweep 32x8={fired_32x8} \
+             8x32={fired_8x32})"
+        );
+        // The firing half, one assert per lifted shape. Both orientations must
+        // be PIXEL-PROVED: a transposed table passes one and fails the other
+        // (class reference-layout-not-spec).
+        assert!(
+            proved_32x8 > 0,
+            "{NAME}: no 32x8 inter residual transform unit was decoded inside a pixel-exact \
+             attempt (decoded anywhere: {fired_32x8}) -- the lift is unproved"
+        );
+        assert!(
+            proved_8x32 > 0,
+            "{NAME}: no 8x32 inter residual transform unit was decoded inside a pixel-exact \
+             attempt (decoded anywhere: {fired_8x32}) -- the lift is unproved"
+        );
     }
 
     /// lane-sbrect10 r1: a 64x64 INTRA block inside an INTER frame, whose

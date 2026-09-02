@@ -1027,6 +1027,9 @@ thread_local! {
     // (64x32/32x64/64x16/16x64), whose coefficients are coded as the
     // truncated low-32 corner.
     static RECT64_INTER_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // lane-rectres r1: whole-block luma transform units of a 32x32-level 1:4
+    // inter strip, `[32x8, 8x32]`.
+    static RECT32X8_INTER_TU_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
     // lane-r14 r3: rectangular var-tx LEAVES, [32x16, 16x32].
     static VARTX_RECT_LEAF_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
     // lane-inter16ab r4: rectangular var-tx leaves with a 4-px axis, [8x4, 4x8]
@@ -1082,6 +1085,12 @@ pub(crate) fn rect_inter_txsplit_hits() -> usize {
 /// Current value of [`RECT64_INTER_TU_HITS`] (lane-r14 r2).
 pub(crate) fn rect64_inter_tu_hits() -> usize {
     RECT64_INTER_TU_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT32X8_INTER_TU_HITS`] (lane-rectres r1): `[32x8, 8x32]`
+/// whole-block luma units of a 32x32-level 1:4 inter strip.
+pub(crate) fn rect32x8_inter_tu_hits() -> [usize; 2] {
+    RECT32X8_INTER_TU_HITS.with(|c| c.get())
 }
 
 /// Current value of [`VARTX_RECT_LEAF_HITS`] (lane-r14 r3): how many
@@ -13622,6 +13631,13 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
             // TX_64X64 units read through the mu-chunk loop, same as the
             // 128x128 NONE block's four.
             | (128, 64) | (64, 128)
+            // lane-rectres r1: the 32x32-level 1:4 strips -- THE shape both
+            // 10-bit film cuts and every measured 1080p offset stop on
+            // (measured: 6/6 probes refuse at 32x8 or 8x32, nothing else).
+            // `max_txsize_rect_lookup[BLOCK_32X8] == TX_32X8` codes all 256
+            // positions, and its chroma pair is a 16x4 / 4x16 unit
+            // (`ss_size_lookup[BLOCK_32X8]` = BLOCK_16X4).
+            | (32, 8) | (8, 32)
     )
 }
 
@@ -13666,6 +13682,11 @@ fn rect_inter_luma_set(w: usize, h: usize) -> Result<TxbSet> {
         // `get_txsize_entropy_ctx`/`txsize_log2_minus4` agree with the
         // adjusted size, so the existing sets are bit-exact. Neither carries a
         // `tx_type` table (DCT_ONLY above), so the intra/inter split is moot.
+        // lane-rectres r1: `tx_size_sqr_up[TX_32X8] == TX_32X32`, so
+        // `av1_get_ext_tx_set_type` is `EXT_TX_SET_DCT_IDTX` for inter with or
+        // without `reduced_tx_set` -- one set, no `REDUCED_TX_SET_INTER`
+        // branch, read at the `txsize_sqr_map[TX_32X8] == TX_8X8` row.
+        (32, 8) | (8, 32) => TxbSet::LumaRect32x8Inter,
         (64, 32) | (32, 64) => TxbSet::Luma64,
         (64, 16) | (16, 64) => TxbSet::LumaRect32x16,
         _ => {
@@ -13691,6 +13712,10 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> Result<TxbSet> {
         // `txsize_log2_minus4` = 4), same as the intra strip path uses.
         (32, 16) | (16, 32) => TxbSet::ChromaRect32x16,
         (32, 8) | (8, 32) => TxbSet::Chroma16,
+        // lane-rectres r1: chroma of a 32x8/8x32 strip. `Chroma8` is the exact
+        // set for TX_16X4/TX_4X16 (`get_txsize_entropy_ctx` = TX_8X8,
+        // `txsize_log2_minus4` = 2, 64-coefficient `eob_pt`).
+        (16, 4) | (4, 16) => TxbSet::Chroma8,
         _ => {
             return Err(unsupported(
                 "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
@@ -13944,6 +13969,13 @@ fn read_inter_plane_rect(
     let (cw, ch) = (w.min(32), h.min(32));
     if plane_idx == 0 && w.max(h) == 64 {
         RECT64_INTER_TU_HITS.with(|c| c.set(c.get() + 1));
+    }
+    if plane_idx == 0 && (w, h) == (32, 8) || plane_idx == 0 && (w, h) == (8, 32) {
+        RECT32X8_INTER_TU_HITS.with(|c| {
+            let mut v = c.get();
+            v[usize::from(w == 8)] += 1;
+            c.set(v);
+        });
     }
     let (corner, tx_type) = if (cw, ch) == (32, 32) {
         let scan32 = default_scan(TX32);
@@ -19192,6 +19224,13 @@ fn decode_inter_block(
         && !rect_inter_residual_supported(write_w, write_h)
         && (is_inter || (write_w == side && write_h == side))
     {
+        if std::env::var_os("EC_RECTRES").is_some() {
+            eprintln!(
+                "EC_RECTRES w={write_w} h={write_h} side={side} skip={} is_inter={} mi_row={rmi} mi_col={cmi}",
+                u8::from(skip),
+                u8::from(is_inter)
+            );
+        }
         return Err(unsupported(
             "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
         ));
