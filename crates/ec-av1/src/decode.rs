@@ -5396,7 +5396,8 @@ impl Neighbours {
         let ctx = SKIP_CONTEXTS[(top as usize).min(4)][(left as usize).min(4)];
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
-                "TRACE luma_skip_ctx mi=({mi_r},{mi_c}) side_mi={side_mi} top={top} left={left} ctx={ctx}"
+                "TRACE luma_skip_ctx mi=({mi_r},{mi_c}) side_mi={side_mi} top={top} left={left} ctx={ctx} band={:?}",
+                self.left.iter().map(|e| e[0].level).collect::<Vec<_>>()
             );
         }
         ctx
@@ -24942,7 +24943,36 @@ fn decode_inter_block8(
                 // there before. Every leaf of the gate's stream is compound,
                 // so the 16x16 below a split block read partition ctx 0
                 // instead of 1 and mis-read PARTITION_SPLIT as NONE.
+                // lane-sub8x4 r1: the same plane-0 save/restore the fall-through
+                // (single-ref) path runs below -- a `split8` leaf's plane-0
+                // neighbour context is per 4x4 transform unit (written by
+                // `record_mi_luma` inside `read_inter_luma8`), and `record_mi`
+                // rewrites all three planes from the whole-block grid, which is
+                // all-zero in the split case. Missing here, a compound var-tx 8x8
+                // leaf published level 0 to its right/below neighbours: the next
+                // block's first TU read `skip_contexts[4][0] = 3` where aomdec
+                // reads `[4][4] = 6` (class early-return-skips-tail).
+                let saved_luma_ctx = split8.then(|| {
+                    (
+                        [
+                            neighbours.left[leaf_mi.0][0],
+                            neighbours.left[leaf_mi.0 + 1][0],
+                        ],
+                        [
+                            neighbours.above[leaf_mi.1][0],
+                            neighbours.above[leaf_mi.1 + 1][0],
+                        ],
+                    )
+                });
                 neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+                if let Some((left, above)) = saved_luma_ctx {
+                    for (cell, state) in left.into_iter().enumerate() {
+                        neighbours.left[leaf_mi.0 + cell][0] = state;
+                    }
+                    for (cell, state) in above.into_iter().enumerate() {
+                        neighbours.above[leaf_mi.1 + cell][0] = state;
+                    }
+                }
                 // lane-cdef r1: ... and the CDEF skip band too. `apply_cdef`'s
                 // `is_8x8_block_skip` (libaom `cdef.c:29-38`) reads all four mi
                 // cells of the 8x8; this leaf wrote none of them, so a 64x64
