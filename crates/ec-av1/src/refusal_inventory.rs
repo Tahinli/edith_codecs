@@ -85,6 +85,12 @@ const REFUSALS: &[&str] = &[
     // r2 residue: `decode_intra_rect_in_inter` codes chroma at the strip's own
     // halved footprint, which for a 16x4 strip is an 8x2 transform libaom
     // never wrote (its chroma is the PAIR's 8x4, coded by the odd strip).
+    // lane-sub8x4 r3 narrowed this to "a strip with no chroma-pair record";
+    // lane-wit16x4 r1 put it back at FULL width: r3's witness counters were
+    // phantoms of a desync, no stream on this tree decodes pixel-exact while
+    // the arm fires, and the decode path now needs `EC_INTRA16X4_DECODE`
+    // (class `refusal-lifted-without-a-gate`; numbers in decode.rs's `strip16`
+    // note and lanes/wit16x4-r1.report.md).
     "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
     "an intra mode this decoder does not code (round 2)",
     // lane-intrarect r1 lifted the whole-shape refusal that stood here (the

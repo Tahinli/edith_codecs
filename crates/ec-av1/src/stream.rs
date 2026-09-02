@@ -11180,14 +11180,18 @@ mod tests {
 
 
     #[test]
-    #[ignore = "RED at lane-intra16x4 r2, but NOT on this lane's shape: the r2 OBMC \
-                pair-merge fix makes the decode entropy-exact through the intra 16x4 strips \
-                (620/620 all_zero symbols match aomdec, value and range), and the new arm 4 \
-                (bar_h, cq63, --min-partition-size=8, 192x128, 5 strips) decodes 6 frames \
-                bit-exact vs ffmpeg outside the harness. Attempt 0 (noise, cq60, 128x128) \
-                still mismatches from (122, 13) -- 99 rows ABOVE its first strip, measured in \
-                r1 as another shape's defect -- and panics before arm 4 runs. Un-ignore once \
-                attempt 0's defect is owned -- lanes/intra16x4-r2.handoff.md"]
+    #[ignore = "RED, RE-MEASURED lane-wit16x4 r1 on the merged tip (with sub-8x8 intra, \
+                the mvstack/OBMC and the lane-frame36 r2 txfm-band fixes all in): \
+                `cargo test -p ec-av1 --lib ..._1to4_partitions -- --include-ignored` \
+                FAILS at stream.rs's arm assert with `0 named refusals, 0 pixel-exact \
+                attempts carrying an intra 1:4 strip, per-arm attempts \
+                16x4/4x16/chroma-reference=[0, 0, 0], 2 attempts carried none (2 of them \
+                mismatched)`; attempts 1..3 mismatch ffmpeg from frame 1 or 2 (max |delta| \
+                up to 248) and attempts 0/4 mismatch while carrying NO 1:4 strip at all -- \
+                another shape's defect, unchanged since r2. The 16x4/4x16-in-inter refusal \
+                is re-added this round, so the shape now refuses by name unless \
+                `EC_INTRA16X4_DECODE` is set: un-ignore only together with a witness \
+                (lanes/wit16x4-r1.report.md)"]
     // lane-intra16x4 r1: an INTRA-coded 16x4 / 4x16 strip inside an INTER
     // frame's 16x16-level 1:4 partition -- the wall all six of his film cuts
     // stopped at once lane-rectres landed. The shape's chroma is the pair's:
@@ -30038,7 +30042,26 @@ mod tests {
     /// lane-sub8x4 r3: un-`#[ignore]`d. The sibling refusal it waited on (the
     /// un-split TX_64X32/TX_32X64 corner unit) is lifted in this round, so the
     /// frame this gate exists for now finishes.
+    ///
+    /// lane-wit16x4 r1, MEASURED: this gate is blind to the frame it counts
+    /// (class `gate-blind-to-hidden-frames`). The fixture has two frame OBUs
+    /// and ONE shown frame, and `decode_probe` on the fixture truncated to its
+    /// first frame OBU reads `intra_rect4_in_inter 0/0/0/0` and
+    /// `intra16x4_in_inter 0/0/0` while matching ffmpeg exactly -- so all of
+    /// 4/23/28/72 (and the 4 intra 16x4 strips with them) live in the SECOND,
+    /// NO-SHOW frame, whose pixels ffmpeg never emits and this gate never
+    /// compares. Since that hidden frame also carries the intra 16x4/4x16
+    /// strip whose refusal this round re-adds (no stream anywhere decodes
+    /// pixel-exact while that arm fires -- lanes/wit16x4-r1.report.md), the
+    /// decode now stops by name here. Un-`#[ignore]` it together with the
+    /// witness: a prefix of the same film whose LATER frame displays this ARF
+    /// makes both counters pixel-backed at once.
     #[test]
+    #[ignore = "lane-wit16x4 r1: every strip this gate counts is in the fixture's NO-SHOW \
+                second frame (truncated to one frame OBU the counters read 0/0/0/0 and the \
+                shown frame is exact), and that frame now stops at the re-added intra \
+                16x4/4x16-in-inter refusal -- needs a prefix that DISPLAYS the frame, \
+                lanes/wit16x4-r1.report.md"]
     fn a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact() {
         const NAME: &str = "a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact";
         if !have_ffmpeg() {
@@ -30090,9 +30113,18 @@ mod tests {
         eprintln!("{NAME}: {fired} intra 1:4 strips in an inter frame, the shown frame pixel-exact");
     }
 
-    /// lane-sub8x4 r3: the FILM witness that lifts BOTH the intra 16x4/4x16
-    /// strip inside an inter 16x16-level 1:4 partition and the un-split
+    /// lane-sub8x4 r3 / lane-wit16x4 r1: the FILM witness for the un-split
     /// TX_64X32/TX_32X64 corner unit of a split intra strip.
+    ///
+    /// r3 wrote this gate as a witness for TWO arms; its intra 16x4/4x16
+    /// numbers were PHANTOMS (class `counter-from-refused-stream`), counted
+    /// while decode-order frame 33 of this very prefix was desynced. On the
+    /// merged tip (lane-frame36 r2 fixed that desync) the fixture decodes all
+    /// 33 frames pixel-exact and `intra16x4_in_inter` reads 0/0/0, so the gate
+    /// panicked "the intra 16x4/4x16 strip arm did not fire". lane-wit16x4 r1
+    /// re-measured every counter, split the claim, and re-added the
+    /// 16x4/4x16-in-inter refusal (no stream on this tree decodes exactly
+    /// while that arm fires -- see the note at `decode.rs`'s `strip16`).
     ///
     /// `crates/ec-av1/fixtures/hg_rect64_intra16x4_witness.obu`, 23472 bytes,
     /// sha256 `c9e721088766163b9dbeb9fa8dd8b257ff0ec7f9157fc350de4d3c33cd9ec4e4`:
@@ -30100,25 +30132,20 @@ mod tests {
     /// 10-bit AV1 HDR10 mkv> -c:v copy -f obu`, cut twice from independent
     /// ffmpeg runs that hashed identically. 33 decode-order frames.
     ///
-    /// MEASURED, and why no earlier round had this: r1/r2 of two lanes
-    /// reported "no firing witness exists" because every film frame that fires
-    /// these two arms ALSO carries a sub-8x8 intra leaf, which refused until
-    /// this lane's r2 lifted it. On that tip the whole 33-frame prefix decodes
-    /// with no refusal and matches ffmpeg on every plane of every frame, while
-    /// both arms fire: `intra16x4_in_inter` 16x4=31 4x16=17 chroma_ref=23 and
-    /// `rect64_corner_tu` 64x32=90 32x64=5. (The full 48-frame 2 s segment
-    /// diverges at decode-order frame 36, which is a separate wall; the
-    /// fixture is the exact prefix, not a truncation chosen to hide it.)
+    /// MEASURED on the merged tip (`decode_probe`, EC_PROBE_OUT16 vs
+    /// `ffmpeg -pix_fmt yuv420p10le`): all 33 frames 0 differing bytes, and
+    /// `rect64_corner_tu` fires 64x32=148 32x64=123 (r3's 90/5 came out of the
+    /// desynced decode). `intra16x4_in_inter` reads 0/0/0 here and is asserted
+    /// as such -- if a later change makes that arm fire on this stream, the
+    /// refusal that now guards it moved and this gate says so.
     ///
-    /// Both refusal strings stay in `refusal_inventory` because both are
-    /// NARROWED, not deleted: "a split intra strip whose transform unit is
-    /// {tx_w}x{tx_h}" still stands for every shape other than 64x32/32x64, and
-    /// "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition"
-    /// still stands for a strip with no chroma-pair record.
+    /// Refusal strings: "a split intra strip whose transform unit is
+    /// {tx_w}x{tx_h}" stays NARROWED (every shape other than 64x32/32x64 --
+    /// that is what this gate lifts), and "an intra 16x4/4x16 strip inside an
+    /// inter 16x16-level 1:4 partition" is back to its FULL width.
     #[test]
-    fn a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact() {
-        const NAME: &str =
-            "a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact";
+    fn a_10bit_film_frames_with_rect64_corner_tus_decode_pixel_exact() {
+        const NAME: &str = "a_10bit_film_frames_with_rect64_corner_tus_decode_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -30147,14 +30174,14 @@ mod tests {
             crate::decode::rect64_corner_tu_hits(0) - before64.0,
             crate::decode::rect64_corner_tu_hits(1) - before64.1,
         );
-        // Hard counter asserts: neither lift may rest on a stream that stopped
+        // Hard counter asserts: the lift may not rest on a stream that stopped
         // carrying its shape (class `tool-disabled-in-every-gate`).
-        assert!(
-            fired16.0 > 0 && fired16.1 > 0 && fired16.2 > 0,
-            "{NAME}: the intra 16x4/4x16 strip arm did not fire (16x4={} 4x16={} chroma_ref={})",
-            fired16.0,
-            fired16.1,
-            fired16.2
+        assert_eq!(
+            fired16,
+            (0, 0, 0),
+            "{NAME}: this stream carries NO intra 16x4/4x16 strip in an inter 1:4 \
+             partition (r3's 31/17/23 were phantoms of the frame-33 desync); a \
+             non-zero count here means the refusal guarding that arm moved"
         );
         assert!(
             fired64.0 > 0 && fired64.1 > 0,
@@ -30178,9 +30205,9 @@ mod tests {
             assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
         }
         eprintln!(
-            "{NAME}: 33 frames pixel-exact, intra16x4_in_inter 16x4={} 4x16={} chroma_ref={}, \
-             rect64_corner_tu 64x32={} 32x64={}",
-            fired16.0, fired16.1, fired16.2, fired64.0, fired64.1
+            "{NAME}: 33 frames pixel-exact, rect64_corner_tu 64x32={} 32x64={} \
+             (intra16x4_in_inter {} {} {}, refused shape)",
+            fired64.0, fired64.1, fired16.0, fired16.1, fired16.2
         );
     }
 
