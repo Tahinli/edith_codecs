@@ -2638,6 +2638,18 @@ pub(crate) fn sub16_split_hits() -> usize {
     SUB16_SPLIT_HITS.with(|c| c.get())
 }
 
+// lane-frame36 r2: superblock-level strips ([`decode_block_rect64`]) whose
+// luma transform is SPLIT and which therefore leave through that fn's early
+// return -- the arm that published no `TXFM_CONTEXT` band until this round.
+thread_local! {
+    static RECT64_SPLIT_TXFM_PUBLISH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `RECT64_SPLIT_TXFM_PUBLISH_HITS`.
+pub(crate) fn rect64_split_txfm_publish_hits() -> usize {
+    RECT64_SPLIT_TXFM_PUBLISH_HITS.with(|c| c.get())
+}
+
 /// Current value of `RECT4_COEFF_HITS`.
 pub(crate) fn rect4_coeff_hits() -> usize {
     RECT4_COEFF_HITS.with(|c| c.get())
@@ -8610,6 +8622,13 @@ fn decode_block_rect4(
         if !skip {
             RECT4_COEFF_HITS.with(|c| c.set(c.get() + 1));
         }
+        // lane-frame36 r2 (same shape as `decode_block_rect64`'s split arm,
+        // swept this round): `set_txfm_ctxs` runs for EVERY block of an inter
+        // frame, so this 1:4 strip -- which is also the INTER frame's reader
+        // for 32x8/8x32 ([`decode_intra_rect4_in_inter`]) -- publishes its
+        // transform size in both TXFM_CONTEXT bands. Without it the next block
+        // reads the row's stale value.
+        txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
         return Ok((mode, uv_predict_mode));
     }
     // The coarse (16-px [`SUB`] cell) mode/side arrays cannot name a strip
@@ -8760,6 +8779,13 @@ fn decode_block_rect4(
         } else {
             RECT4_32_VERT_HITS.with(|c| c.set(c.get() + 1));
         }
+        // lane-frame36 r2 (same shape as `decode_block_rect64`'s split arm,
+        // swept this round): `set_txfm_ctxs` runs for EVERY block of an inter
+        // frame, so this 1:4 strip -- which is also the INTER frame's reader
+        // for 32x8/8x32 ([`decode_intra_rect4_in_inter`]) -- publishes its
+        // transform size in both TXFM_CONTEXT bands. Without it the next block
+        // reads the row's stale value.
+        txfm_partition_update_rect(neighbours, (mi_r, mi_c), (bw, bh), (bw, bh));
         return Ok((mode, uv_predict_mode));
     };
     if let Some(b) = &palette_y_buf {
@@ -8822,6 +8848,13 @@ fn decode_block_rect4(
     } else {
         RECT4_32_VERT_HITS.with(|c| c.set(c.get() + 1));
     }
+    // lane-frame36 r2 (same shape as `decode_block_rect64`'s split arm,
+    // swept this round): `set_txfm_ctxs` runs for EVERY block of an inter
+    // frame, so this 1:4 strip -- which is also the INTER frame's reader
+    // for 32x8/8x32 ([`decode_intra_rect4_in_inter`]) -- publishes its
+    // transform size in both TXFM_CONTEXT bands. Without it the next block
+    // reads the row's stale value.
+    txfm_partition_update_rect(neighbours, (mi_r, mi_c), (bw, bh), (bw, bh));
     Ok((mode, uv_predict_mode))
 }
 
@@ -9600,6 +9633,7 @@ fn decode_block_rect64(
         // mi(192,144) took `tx_size_cat3` row 2 where libaom takes row 1. The
         // bands carry the SPLIT unit's size, not the block's.
         txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
+        RECT64_SPLIT_TXFM_PUBLISH_HITS.with(|c| c.set(c.get() + 1));
         RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
         return Ok(());
     }
