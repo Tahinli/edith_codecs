@@ -11800,7 +11800,12 @@ fn read_block_tx_size(
             }
         }
         let single = leaves.len() == 1 && leaves[0].2 == side && leaves[0].3 == side;
-        if !single && leaves.iter().any(|leaf| leaf.2.max(leaf.3) > 64) {
+        // lane-sb128c r6: below the 128 root the ceiling is main's TX_32X32
+        // ([`inter_txbset_for`] has no 64-point *inter* table set); a 128x128
+        // block's own var-tx tree legitimately bottoms out at TX_64X64 leaves,
+        // which the mu-chunk reader above codes as their 32x32 coded corner.
+        let leaf_ceiling = if side > 64 { 64 } else { 32 };
+        if !single && leaves.iter().any(|leaf| leaf.2.max(leaf.3) > leaf_ceiling) {
             // Only a block wider than a superblock's own 64x64 max transform
             // reaches here; this crate has no 64-point *inter* coefficient
             // table set ([`inter_txbset_for`] stops at 32).
@@ -19651,10 +19656,15 @@ fn decode_inter_block(
     // reaches here skipped is the 128 root (`read_block_tx_size` hands back
     // four TX_64X64 leaves for `side > 64` regardless of `skip`); leaving its
     // block-level 128 publication in place is exactly that suppression.
-    if skip && is_inter {
+    // lane-sb128c r6: narrowed to the 128 root. Below it `read_block_tx_size`
+    // hands a skipped inter block a single leaf equal to the block, so the
+    // per-leaf write is the block-level one and this branch is a no-op either
+    // way; only the 128 root gets four TX_64X64 leaves regardless of `skip`.
+    let skip_inter_128 = skip && is_inter && write_w.max(write_h) > 64;
+    if skip_inter_128 {
         neighbours.suppress_internal_lf_edges((rmi, cmi), write_w / MI, write_h / MI);
     }
-    if let Some(leaves) = (!(skip && is_inter)).then_some(()).and(vartx_leaves.as_ref()) {
+    if let Some(leaves) = (!skip_inter_128).then_some(()).and(vartx_leaves.as_ref()) {
         for &(row, col, tw, th) in leaves {
             neighbours.fill_lf_grid_leaf_luma(
                 (at_mi.0 + row, at_mi.1 + col),
