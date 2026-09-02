@@ -8753,8 +8753,13 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// matches aomdec's own `ec_dump16` rung byte for byte (crop dims, u16 LE).
 fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, fh: usize) {
     use std::io::Write;
+    // lane-sbrect10 r2: index the dump by decode-order picture like
+    // EC_AV1_PREFILT_DUMP already does -- a fixed `.f0` name kept only the
+    // LAST frame, so a mid-sequence divergence could not be read out at all.
+    static STAGE16_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let idx = STAGE16_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}"))
     {
         for (p, w, h) in [(y, fw, fh), (u, fw.div_ceil(2), fh.div_ceil(2)), (v, fw.div_ceil(2), fh.div_ceil(2))] {
             for row in 0..h {

@@ -6586,10 +6586,20 @@ mod tests {
                 let vertical_split = attempt % 2 == 1;
                 let cq = [58, 52, 45, 61][(attempt / 2 % 4) as usize];
                 let sp = 8 + (attempt / 8) * 4;
+                // Half ramp, half deterministic pseudo-noise: the flat "200"
+                // half of r1's source made aomenc code the right-hand
+                // superblocks skip, so at 8 bit no >32 intra block ever
+                // appeared (probed cq 45/52/58/61/63 = 0 hits). The textured
+                // half forces intra above 32x32 in an inter frame at BOTH
+                // depths, so both arms carry the shape.
                 let geq = if vertical_split {
-                    format!("if(lt(Y,64), 40+mod(floor((X+N*{sp})/32)*90,200), 200)")
+                    format!(
+                        "if(lt(Y,64), 40+mod(floor((X+N*{sp})/32)*90,200),                          mod((X*7+Y*13+N*97)*31,256))"
+                    )
                 } else {
-                    format!("if(lt(X,64), 40+mod(floor((Y+N*{sp})/32)*90,200), 200)")
+                    format!(
+                        "if(lt(X,128), 40+mod(floor((Y+N*{sp})/32)*90,200),                          mod((X*7+Y*13+N*97)*31,256))"
+                    )
                 };
                 let duration = frame_count as f64 / 25.0;
                 let source = format!(
@@ -6739,6 +6749,16 @@ mod tests {
     /// The counter `nocfl_uv_mode_hits` proves the shape fired in EVERY
     /// compared attempt, and every decode-order frame is compared against
     /// ffmpeg -- an attempt that mismatches fails, it never SKIPs.
+    ///
+    /// lane-sbrect10 r2: with the half-random source below this gate also
+    /// covers a SECOND defect it exposed at 10-bit cq 58/61 -- the compound
+    /// MV stack's extension pass zero-filled the `comp_list` tail slots
+    /// libaom fills with each side's GLOBAL MOTION vector
+    /// (`combine_compound_candidates`, mvref_common.c:723-729). A compound
+    /// block with no usable neighbour pair (frame top row, intra block to
+    /// its left, empty temporal field) then took a `(0, 0)` predictor
+    /// instead of the frame's translation: 32890/39907 wrong luma samples
+    /// on decode-order frame 2 with the entropy stream still in sync.
     #[test]
     fn a_real_aomenc_inter_frame_with_a_64x64_intra_block_reads_the_no_cfl_uv_alphabet() {
         const NAME: &str =
