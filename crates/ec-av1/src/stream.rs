@@ -98,6 +98,13 @@ pub fn intra_sb128_counters() -> (usize, usize, [usize; 3]) {
     crate::decode::intra_sb128_hits()
 }
 
+/// lane-sb128c r9: the four AB shapes at the 128 root, in `PARTITION_HORZ_A`,
+/// `_HORZ_B`, `_VERT_A`, `_VERT_B` order (key and inter tile paths share the
+/// counter -- it is bumped where the root symbol resolves).
+pub fn sb128_ab_counters() -> [usize; 4] {
+    crate::decode::part128_ab_hits()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -19307,6 +19314,179 @@ mod tests {
             "{NAME}: no depth-0 (TX_64X64) intra 128-rect block: {depth_seen:?}"
         );
     }
+
+    /// lane-sb128c r9 GATE: the four AB shapes at the 128 root
+    /// (`PARTITION_HORZ_A`/`_HORZ_B`/`_VERT_A`/`_VERT_B`), each one
+    /// 128x64/64x128 half plus two 64x64 quadrants in libaom
+    /// `decode_partition`'s visit order. The recipe is r8's measured one
+    /// (`--sb-size=128 --min-partition-size=64 --enable-ab-partitions=1` over
+    /// a 512x512 `geq` sinusoid), which is what made aomenc pick the shapes at
+    /// all; arms cover cq 18/45, 8 and 10 bit, and one INTER arm
+    /// (`--kf-max-dist=100`) so the shapes are exercised on both tile paths.
+    /// Continue-and-sweep: an arm that stops on ANOTHER lane's named refusal
+    /// is counted and skipped, a decode failure or a pixel mismatch is a hard
+    /// failure, and the end-of-sweep assert names which of the four fired.
+    #[test]
+    fn a_real_aomenc_sb128_ab_partition_at_the_128_root_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_sb128_ab_partition_at_the_128_root_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // (tag, cq, width, height, 10-bit, inter)
+        let arms: Vec<(u32, &str, usize, usize, bool, bool)> = vec![
+            (18, "--cq-level=18", 512, 512, false, false),
+            (45, "--cq-level=45", 512, 512, false, false),
+            (32, "--cq-level=32", 512, 512, true, false),
+            (55, "--cq-level=55", 384, 320, false, false),
+            (91, "--cq-level=45", 512, 512, false, true),
+            (92, "--cq-level=18", 512, 512, false, true),
+        ];
+        let (mut matched, mut named_refusals, mut out_of_scope) = (0u32, 0u32, 0u32);
+        let mut ab_seen = [0usize; 4];
+        let mut ab_inter = [0usize; 4];
+        for (tag, cq, width, height, ten_bit, inter) in arms {
+            let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i",
+                    // Same DETERMINISTIC sinusoid source that made aomenc pick
+                    // the AB shapes in the r8 sweep (lavfi `gradients` ignores
+                    // its seed and is not reproducible -- never use it here).
+                    &format!(
+                        "nullsrc=size={width}x{height}:rate=25,format=yuv420p,\
+                         geq=lum='128+80*sin((X+3*N)/17)+50*sin(Y/29)+30*sin((X+Y)/13)':\
+                         cb='128+30*sin(X/23)':cr='128+30*sin((Y+N)/19)'"
+                    ),
+                    "-pix_fmt", pix, "-strict", "-1", "-t", "0.2",
+                    "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut args: Vec<&str> = vec![
+                "--codec=av1", "--passes=1", "--end-usage=q", cq,
+                "--cpu-used=0", "--threads=1", "--row-mt=0",
+                "--sb-size=128", "--min-partition-size=64",
+                "--enable-rect-partitions=1", "--enable-ab-partitions=1",
+                "--enable-1to4-partitions=0", "--enable-palette=0",
+                "--enable-intrabc=0", "--deltaq-mode=0", "--limit=5",
+            ];
+            // AOMENC FLAG PRECEDENCE: last occurrence wins, so the per-arm
+            // key-frame cadence goes AFTER the base recipe.
+            args.push(if inter { "--kf-max-dist=100" } else { "--kf-max-dist=1" });
+            if ten_bit {
+                args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+            }
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = sb128_ab_counters();
+            if let Err(e) = decode_stream(&stream) {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unsupported"),
+                    "{NAME} failed outright, not a named refusal \
+                     (arm {tag} {width}x{height}): {msg}"
+                );
+                named_refusals += 1;
+                eprintln!("{NAME}: arm {tag} {width}x{height} refusal: {msg}");
+                continue;
+            }
+            let (frames, hidden) = decode_all_frames_vs_oracle(
+                &stream,
+                &format!("sb128c-ab-{tag}-{width}x{height}"),
+            );
+            assert!(frames > 0, "{NAME}: no frames decoded at {width}x{height}");
+            let after = sb128_ab_counters();
+            let ab: Vec<usize> = (0..4).map(|i| after[i] - before[i]).collect();
+            eprintln!(
+                "{NAME}: arm {tag} cq {cq} {width}x{height} {}bit {}: {frames} frames \
+                 pixel-exact ({hidden} hidden), AB[HORZ_A,HORZ_B,VERT_A,VERT_B] {ab:?}",
+                if ten_bit { 10 } else { 8 },
+                if inter { "INTER" } else { "KEY" },
+            );
+            if ab.iter().sum::<usize>() == 0 {
+                out_of_scope += 1;
+            }
+            for i in 0..4 {
+                ab_seen[i] += ab[i];
+                if inter {
+                    ab_inter[i] += ab[i];
+                }
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals}); the gate never \
+             decoded a stream"
+        );
+        assert!(
+            ab_seen.iter().sum::<usize>() > 0,
+            "{NAME}: {matched} stream(s) decoded pixel-exact ({out_of_scope} carried \
+             no 128-root AB partition at all) but NOT ONE AB shape fired -- the \
+             shapes this gate exists for"
+        );
+        // Which of the four this sweep actually reaches, hard-asserted so a
+        // later change that stops reaching one of them fails here instead of
+        // silently narrowing the gate (class `gate-blind-to-feature`).
+        for (i, name) in ["HORZ_A", "HORZ_B", "VERT_A", "VERT_B"].iter().enumerate() {
+            if AB_ARMS_REACHED[i] {
+                assert!(
+                    ab_seen[i] > 0,
+                    "{NAME}: PARTITION_{name} at the 128 root fired in the round that \
+                     pinned this gate but not now: {ab_seen:?}"
+                );
+            } else {
+                eprintln!(
+                    "{NAME}: PARTITION_{name} NOT reached by this sweep (aomenc never \
+                     picked it): {ab_seen:?}"
+                );
+            }
+        }
+        assert!(
+            ab_inter.iter().sum::<usize>() > 0,
+            "{NAME}: the AB shapes fired only on KEY frames -- the inter tile path's \
+             own AB arm was never exercised: key {ab_seen:?} inter {ab_inter:?}"
+        );
+    }
+
+    /// Which of the four 128-root AB shapes the gate above MEASURED aomenc
+    /// picking (lane-sb128c r9). An arm that is `false` is not reachable from
+    /// this sweep's recipes and stays unasserted rather than weakening the
+    /// asserts of the ones that are.
+    const AB_ARMS_REACHED: [bool; 4] = [true, true, true, true];
 
     #[test]
     #[ignore = "lane-sb128 r2 diagnostic: is the frame-6 mismatch sb128-specific?"]
