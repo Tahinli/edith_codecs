@@ -1008,7 +1008,7 @@ struct At {
 /// block whose transform covers it whole, whether the samples above its right
 /// (or below its left) are decoded depends only on where the block sits inside
 /// its 64x64 superblock, which is a pinned table per block size.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Reach {
     pub(crate) above_right: bool,
     pub(crate) below_left: bool,
@@ -1276,6 +1276,66 @@ impl Reach {
     /// [`tests::rect_reach_tables_are_indexed_with_a_32_mi_row_stride`] pins it.
     fn rect_table_index(bw_log2: usize, blk_row: usize, blk_col: usize) -> usize {
         (blk_row << (5 - bw_log2)) + blk_col
+    }
+
+    /// libaom `has_top_right`/`has_bottom_left` for ONE TRANSFORM UNIT inside
+    /// a block whose transform split (`reconintra.c`, the `row_off`/`col_off`
+    /// branches that [`Self::of`]/[`Self::of_rect`] never see because they
+    /// answer at `row_off == col_off == 0`). class reach-is-per-transform-unit:
+    /// a split unit is NOT a standalone block, so asking [`Self::of`] with the
+    /// unit's own size and position reads a table row for a block that is not
+    /// there -- libaom instead answers from the unit's offset within its
+    /// parent, and only the (0, 0) unit ever reaches the table.
+    ///
+    /// `row_off`/`col_off` are in 4-sample units, `px`/`py` are the PARENT
+    /// block's top-left sample.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn of_tu(
+        bw: usize,
+        bh: usize,
+        tx: usize,
+        row_off: usize,
+        col_off: usize,
+        px: usize,
+        py: usize,
+        width: usize,
+        height: usize,
+    ) -> Self {
+        let (tu_x, tu_y) = (px + col_off * 4, py + row_off * 4);
+        let unit = tx / 4;
+        let square = bw == bh;
+        Self {
+            above_right: (row_off > 0 || py > 0)
+                && tu_x + tx < width
+                && if row_off > 0 {
+                    // The top-right samples are inside the row of units
+                    // above, already reconstructed -- provided they stay
+                    // within the parent block.
+                    col_off + unit < bw / 4
+                } else if col_off + unit < bw / 4 {
+                    true
+                } else if square {
+                    Self::top_right(bw, px, py)
+                } else {
+                    Self::top_right_rect(bw, bh, px, py)
+                },
+            below_left: (px > 0)
+                && tu_y + tx < height
+                // "Bottom-left pixels are in the bottom-left block, which is
+                // not available" -- any unit but the leftmost column.
+                && col_off == 0
+                && (row_off + unit < bh / 4
+                    || if (px % SUPERBLOCK) / bw == 0 {
+                        // Leftmost column of the superblock: the samples are
+                        // in the left superblock iff they stay inside its
+                        // height -- counted from THIS unit, not the block.
+                        (tu_y % SUPERBLOCK) + tx < SUPERBLOCK
+                    } else if square {
+                        Self::bottom_left(bw, px, py)
+                    } else {
+                        Self::bottom_left_rect(bw, bh, px, py)
+                    }),
+        }
     }
 
     /// libaom `has_bottom_left`, same granularity as [`Self::top_right_rect`].
