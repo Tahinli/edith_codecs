@@ -10995,10 +10995,14 @@ mod tests {
 
 
     #[test]
-    #[ignore = "RED at lane-intra16x4 r1: the decode path is behind \
-                EC_INTRA16X4_DECODE=1 and still mismatches ffmpeg (attempt 1, 8-bit, 192x128 \
-                cq60: frame 1 luma differs from (175, 0), 8400 px, with the two intra 16x4 \
-                strips at mi(1,40)/(3,40) themselves exact) -- lanes/intra16x4-r1.report.md"]
+    #[ignore = "RED at lane-intra16x4 r2, but NOT on this lane's shape: the r2 OBMC \
+                pair-merge fix makes the decode entropy-exact through the intra 16x4 strips \
+                (620/620 all_zero symbols match aomdec, value and range), and the new arm 4 \
+                (bar_h, cq63, --min-partition-size=8, 192x128, 5 strips) decodes 6 frames \
+                bit-exact vs ffmpeg outside the harness. Attempt 0 (noise, cq60, 128x128) \
+                still mismatches from (122, 13) -- 99 rows ABOVE its first strip, measured in \
+                r1 as another shape's defect -- and panics before arm 4 runs. Un-ignore once \
+                attempt 0's defect is owned -- lanes/intra16x4-r2.handoff.md"]
     // lane-intra16x4 r1: an INTRA-coded 16x4 / 4x16 strip inside an INTER
     // frame's 16x16-level 1:4 partition -- the wall all six of his film cuts
     // stopped at once lane-rectres landed. The shape's chroma is the pair's:
@@ -11036,11 +11040,18 @@ mod tests {
         // aomenc's RD pick intra at 16x4), `prod` an `X*Y` product sinusoid
         // under temporal noise; `_v` transposes the structure so the RD picks
         // PARTITION_VERT_4.
-        const RECIPES: [(&str, u32, usize, usize); 4] = [
-            ("noise", 60, 128, 128),
-            ("bar", 60, 192, 128),
-            ("prod_v", 56, 128, 128),
-            ("prod", 56, 160, 128),
+        // lane-intra16x4 r2: the last field is `--min-partition-size` -- the
+        // `bar_h` recipe (a horizontal bar sweeping DOWN the frame) at
+        // `--min-partition-size=8` is the one recipe of the r2 96-run sweep
+        // (`~/.cache/intra16x4-tmp/sweep_r2.sh`) that fires intra 16x4 strips
+        // WITHOUT also carrying the sub-8x8 intra block another lane refuses,
+        // so it is the arm that can be pixel-compared at all.
+        const RECIPES: [(&str, u32, usize, usize, u32); 5] = [
+            ("noise", 60, 128, 128, 4),
+            ("bar", 60, 192, 128, 4),
+            ("prod_v", 56, 128, 128, 4),
+            ("prod", 56, 160, 128, 4),
+            ("bar_h", 63, 192, 128, 8),
         ];
         // [16x4 intra strips, 4x16 intra strips, of which chroma-reference]:
         // how many pixel-exact attempts fired each, over both bit depths.
@@ -11054,7 +11065,7 @@ mod tests {
                 (0u32, 0u32, 0u32, 0u32);
             let mut arms_proved = [0u32; 3];
             for attempt in 0..RECIPES.len() as u32 {
-                let (kind, cq, width, height) = RECIPES[attempt as usize];
+                let (kind, cq, width, height, min_part) = RECIPES[attempt as usize];
                 let duration = frame_count as f64 / 25.0;
                 // Both sources are deterministic (two identical y4m hashes,
                 // report): `random()` here is geq's own indexed PRNG and the
@@ -11067,6 +11078,12 @@ mod tests {
                     "bar" => (
                         format!(
                             "if(lt(mod(X+N*37,{width}),24),random(N*100+X+Y)*255,128+50*sin(Y/7))"
+                        ),
+                        "",
+                    ),
+                    "bar_h" => (
+                        format!(
+                            "if(lt(mod(Y+N*37,{height}),24),random(N*100+X+Y)*255,128+50*sin(X/7))"
                         ),
                         "",
                     ),
@@ -11100,6 +11117,7 @@ mod tests {
                     String::from_utf8_lossy(&y4m.stderr)
                 );
                 let cq_arg = format!("--cq-level={cq}");
+                let min_part_arg = format!("--min-partition-size={min_part}");
                 let depth_arg = format!("--bit-depth={bit_depth}");
                 let input_depth_arg = format!("--input-bit-depth={bit_depth}");
                 let args: Vec<&str> = vec![
@@ -11113,7 +11131,7 @@ mod tests {
                     "--enable-tx-size-search=1", "--enable-rect-partitions=1",
                     "--enable-ab-partitions=1", "--enable-1to4-partitions=1",
                     "--enable-intra-edge-filter=1",
-                    "--min-partition-size=4", "--max-partition-size=16",
+                    &min_part_arg, "--max-partition-size=16",
                     "--obu", "-o", "-", "-",
                 ];
                 let mut child = Command::new(aomenc_path())
