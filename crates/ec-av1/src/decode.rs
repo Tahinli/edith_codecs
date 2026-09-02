@@ -1922,6 +1922,19 @@ thread_local! {
     /// lane-sb128c r1: how many 128x128 `PARTITION_NONE` roots this INTER tile
     /// path decoded as one whole block (its gate's own witness).
     pub(crate) static INTER_SB128_NONE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 128x64 / 64x128 INTER blocks decoded at the 128 root (lane-sb128c r7).
+    pub(crate) static INTER_SB128_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static INTER_SB128_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTER_SB128_HORZ_HITS`], for a gate's before/after delta.
+pub(crate) fn inter_sb128_horz_hits() -> usize {
+    INTER_SB128_HORZ_HITS.with(std::cell::Cell::get)
+}
+
+/// Current value of [`INTER_SB128_VERT_HITS`], for a gate's before/after delta.
+pub(crate) fn inter_sb128_vert_hits() -> usize {
+    INTER_SB128_VERT_HITS.with(std::cell::Cell::get)
 }
 
 /// Current value of [`INTER_SB128_NONE_HITS`], for a gate's before/after delta.
@@ -11881,6 +11894,12 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
             // `TX_64X64`, so `av1_get_ext_tx_set_type` is `DCT_ONLY` and no
             // `tx_type` symbol is coded at all.
             | (64, 32) | (32, 64) | (64, 16) | (16, 64)
+            // lane-sb128c r7: the 128 root's HORZ/VERT halves. These are NOT
+            // one rectangular transform -- `max_txsize_rect_lookup
+            // [BLOCK_128X64]` is TX_64X64, so the block tiles into two square
+            // TX_64X64 units read through the mu-chunk loop, same as the
+            // 128x128 NONE block's four.
+            | (128, 64) | (64, 128)
     )
 }
 
@@ -12007,6 +12026,55 @@ fn read_block_tx_size_rect(
     }
     // `max_txsize_rect_lookup` is the block's own size, capped at 64 -- and
     // `rect_inter_residual_supported` has already excluded everything above 32.
+    // lane-sb128c r7: except at the 128 root. `max_txsize_rect_lookup
+    // [BLOCK_128X64] == TX_64X64` (libaom `common_data.h`), so a 128x64 block
+    // is TWO square top-level transform units side by side and a 64x128 one is
+    // two stacked -- exactly what libaom `read_block_tx_size`
+    // (decodeframe.c:1140) codes with its `idy/idx` loop over
+    // `tx_size_high_unit/tx_size_wide_unit[max_tx_size]`. Each unit reads its
+    // own `txfm_partition` symbol at depth 0.
+    if bw.max(bh) > 64 {
+        let tx = 64usize;
+        let (max_w_mi, max_h_mi) = (
+            (bw / MI).min(mi_cols.saturating_sub(at_mi.1)),
+            (bh / MI).min(mi_rows.saturating_sub(at_mi.0)),
+        );
+        let mut leaves = Vec::new();
+        if !TX_SELECT_INTER.with(std::cell::Cell::get) {
+            for row in (0..bh / MI).step_by(tx / MI) {
+                for col in (0..bw / MI).step_by(tx / MI) {
+                    leaves.push((row, col, tx, tx));
+                }
+            }
+            for &(row, col, tw, th) in &leaves {
+                txfm_partition_update_rect(n, (at_mi.0 + row, at_mi.1 + col), (tw, th), (tw, th));
+            }
+            return Ok(Some(leaves));
+        }
+        for row in (0..bh / MI).step_by(tx / MI) {
+            for col in (0..bw / MI).step_by(tx / MI) {
+                read_var_tx_size(
+                    dec,
+                    cdfs,
+                    n,
+                    at_mi,
+                    bw.max(bh),
+                    (max_w_mi, max_h_mi),
+                    (tx, tx),
+                    0,
+                    row,
+                    col,
+                    &mut leaves,
+                );
+            }
+        }
+        if leaves.iter().any(|l| l.2.max(l.3) > 64) {
+            return Err(unsupported(
+                "an inter var-tx tree with a leaf transform larger than 64x64",
+            ));
+        }
+        return Ok(Some(leaves));
+    }
     let (tx_w, tx_h) = (bw, bh);
     if !TX_SELECT_INTER.with(std::cell::Cell::get) {
         // `TX_MODE_LARGEST`: no symbol at all, the whole block is one
@@ -13260,11 +13328,40 @@ thread_local! {
     /// How many 128x128 superblock roots resolved to `PARTITION_NONE` -- one
     /// whole 128x128 block (lane-sb128b r1's gate counter).
     pub(crate) static PART128_NONE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 128 roots that resolved to PARTITION_HORZ (two 128x64 pieces, or one
+    /// when the bottom half is out of frame) -- lane-sb128c r7.
+    pub(crate) static PART128_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 128 roots that resolved to PARTITION_VERT (two 64x128 pieces).
+    pub(crate) static PART128_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Of those, the ones decided by the GATHERED bit at a frame edge -- the
+    /// only shape a 1080p (mi_rows = 270) stream reaches.
+    pub(crate) static PART128_EDGE_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static PART128_EDGE_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`PART128_NONE_HITS`], for a gate's own before/after delta.
 pub(crate) fn part128_none_hits() -> usize {
     PART128_NONE_HITS.with(std::cell::Cell::get)
+}
+
+/// [`PART128_HORZ_HITS`], for a gate's own before/after delta.
+pub(crate) fn part128_horz_hits() -> usize {
+    PART128_HORZ_HITS.with(std::cell::Cell::get)
+}
+
+/// [`PART128_VERT_HITS`], for a gate's own before/after delta.
+pub(crate) fn part128_vert_hits() -> usize {
+    PART128_VERT_HITS.with(std::cell::Cell::get)
+}
+
+/// [`PART128_EDGE_HORZ_HITS`] -- gathered-bit HORZ at the bottom frame edge.
+pub(crate) fn part128_edge_horz_hits() -> usize {
+    PART128_EDGE_HORZ_HITS.with(std::cell::Cell::get)
+}
+
+/// [`PART128_EDGE_VERT_HITS`] -- gathered-bit VERT at the right frame edge.
+pub(crate) fn part128_edge_vert_hits() -> usize {
+    PART128_EDGE_VERT_HITS.with(std::cell::Cell::get)
 }
 
 thread_local! {
@@ -13328,6 +13425,7 @@ fn read_sb128_root(
                 if dec.symbol_fixed(&gather_of(&cdfs.partition_w128[ctx128], &VERT_ALIKE128)) == 1 {
                     PARTITION_SPLIT
                 } else {
+                    PART128_EDGE_HORZ_HITS.with(|c| c.set(c.get() + 1));
                     PARTITION_HORZ
                 }
             }
@@ -13335,6 +13433,7 @@ fn read_sb128_root(
                 if dec.symbol_fixed(&gather_of(&cdfs.partition_w128[ctx128], &HORZ_ALIKE128)) == 1 {
                     PARTITION_SPLIT
                 } else {
+                    PART128_EDGE_VERT_HITS.with(|c| c.set(c.get() + 1));
                     PARTITION_VERT
                 }
             }
@@ -13347,15 +13446,23 @@ fn read_sb128_root(
     // lane-sb128b r1: `PARTITION_NONE` -- one 128x128 block -- is decoded by
     // the key-frame caller below. The six remaining arms (HORZ/VERT and the
     // four AB shapes) still need the rect/AB machinery at this size.
-    if part128 != PARTITION_SPLIT && part128 != PARTITION_NONE {
-        return Err(unsupported(
-            "a 128x128 superblock HORZ/VERT or AB partition (only SPLIT and NONE are decoded at the 128 root)",
-        ));
-    }
-    if part128 == PARTITION_SPLIT {
-        PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
-    } else {
-        PART128_NONE_HITS.with(|c| c.set(c.get() + 1));
+    // lane-sb128c r7: HORZ (two 128x64) and VERT (two 64x128) now decode on
+    // both tile paths. The four AB shapes (libaom `decode_partition`'s
+    // PARTITION_HORZ_A..VERT_B, decodeframe.c) still need the mixed
+    // 128x64 + 64x64 + 64x64 visit order and stay refused by name; a 128
+    // root has no 1:4 arm at all (`PARTITION_HORZ_4`/`VERT_4` are excluded
+    // for BLOCK_128X128 by `av1_get_partition_cdf`'s 8-symbol alphabet,
+    // which stops at VERT_B).
+    match part128 {
+        PARTITION_SPLIT => PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1)),
+        PARTITION_NONE => PART128_NONE_HITS.with(|c| c.set(c.get() + 1)),
+        PARTITION_HORZ => PART128_HORZ_HITS.with(|c| c.set(c.get() + 1)),
+        PARTITION_VERT => PART128_VERT_HITS.with(|c| c.set(c.get() + 1)),
+        _ => {
+            return Err(unsupported(
+                "a 128x128 superblock AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B at the 128 root)",
+            ));
+        }
     }
     Ok(part128)
 }
@@ -15476,6 +15583,12 @@ impl PlaneBuf {
         prediction: &[u16],
         residual: &[i32],
     ) {
+        // lane-sb128c r7: a 128x64 half of a 128 root at the BOTTOM frame edge
+        // is the first block shape whose true footprint overhangs the padded
+        // coding surface (mi_rows = 198 -> a plane 800 rows tall, block rows
+        // 768..832). libaom reconstructs those rows into the frame buffer's
+        // border; nothing reads them back, so they are simply dropped here.
+        let (h, w) = (h.min(self.height.saturating_sub(y)), w.min(self.width.saturating_sub(x)));
         for row in 0..h {
             for col in 0..w {
                 let sample = (i32::from(prediction[row * side + col]) + residual[row * side + col])
@@ -16775,7 +16888,10 @@ fn decode_inter_block(
     maybe_read_cdef_idx(dec, rmi, cmi, skip);
     // lane-inter4 r1: spec 5.11.6's `bSize == sbSize` -- a 64x32/64x16 strip
     // is NOT the whole superblock, so its `skip` never suppresses the read.
-    let whole_sb = side == 64 && write_w == 64 && write_h == 64;
+    // lane-sb128c r7: `sbSize` is 128 under `--sb-size=128`, so the whole-block
+    // test is against the sequence's own superblock side, not a hardcoded 64.
+    let sb_px = sb_mi_cur() as usize * 4;
+    let whole_sb = side == sb_px && write_w == sb_px && write_h == sb_px;
     maybe_read_delta_q(dec, cdfs, rmi, cmi, whole_sb, skip);
     maybe_read_delta_lf(dec, cdfs, rmi, cmi, whole_sb, skip);
     let (has_above, has_left) = (
@@ -17886,7 +18002,13 @@ fn decode_inter_block(
                         None,
                     )?;
                 }
-                if rect_tu {
+                if side > 64 {
+                    // Already read inside the mu-chunk loop above -- at the 128
+                    // root a rect (128x64/64x128) block's chroma is per mu
+                    // chunk too, so this test comes BEFORE the `rect_tu` one.
+                    u_grid = std::mem::take(&mut u_units);
+                    v_grid = std::mem::take(&mut v_units);
+                } else if rect_tu {
                     // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
                     // 2:1 strip is the strip's own rect chroma size (16x8 /
                     // 8x16), one unit for the whole block, and it codes no
@@ -17936,10 +18058,6 @@ fn decode_inter_block(
                         uh,
                         chroma_side,
                     );
-                } else if side > 64 {
-                    // Already read inside the mu-chunk loop above.
-                    u_grid = std::mem::take(&mut u_units);
-                    v_grid = std::mem::take(&mut v_units);
                 } else {
                 u_grid = read_inter_plane(
                     dec,
@@ -18985,7 +19103,13 @@ fn decode_inter_block(
                         None,
                     )?;
                 }
-                if rect_tu {
+                if side > 64 {
+                    // Already read inside the mu-chunk loop above -- at the 128
+                    // root a rect (128x64/64x128) block's chroma is per mu
+                    // chunk too, so this test comes BEFORE the `rect_tu` one.
+                    u_grid = std::mem::take(&mut u_units);
+                    v_grid = std::mem::take(&mut v_units);
+                } else if rect_tu {
                     // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
                     // 2:1 strip is the strip's own rect chroma size (16x8 /
                     // 8x16), one unit for the whole block, and it codes no
@@ -19035,10 +19159,6 @@ fn decode_inter_block(
                         uh,
                         chroma_side,
                     );
-                } else if side > 64 {
-                    // Already read inside the mu-chunk loop above.
-                    u_grid = std::mem::take(&mut u_units);
-                    v_grid = std::mem::take(&mut v_units);
                 } else {
                 u_grid = read_inter_plane(
                     dec,
@@ -21648,8 +21768,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             continue;
         }
         {
+            let mut sb128_rect = None;
             if sb128 && sb_start {
-                if read_sb128_root(
+                let part128 = read_sb128_root(
                     &mut dec,
                     &mut cdfs,
                     &neighbours,
@@ -21660,8 +21781,17 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     sb_c,
                     mi_cols,
                     mi_rows,
-                )? == PARTITION_NONE
-                {
+                )?;
+                if matches!(part128, PARTITION_HORZ | PARTITION_VERT) {
+                    // Two 128x64 (HORZ) or two 64x128 (VERT) inter blocks; the
+                    // whole 128x128 root is consumed here, so the remaining
+                    // three 64-quadrant visits of this superblock carry no
+                    // syntax (same skip the NONE arm runs).
+                    sb128_none = true;
+                    sb128_rect = Some(part128);
+                    CDEF_TRANSMITTED.with(|c| c.set(false));
+                }
+                if part128 == PARTITION_NONE {
                     // One 128x128 inter block. Its luma transform is
                     // `max_txsize_rect_lookup[BLOCK_128X128]` = TX_64X64 (four
                     // units, read as var-tx leaves), its uv plane block is
@@ -21747,6 +21877,65 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         frame_width as usize,
                     )?
                 };
+            }
+            if let Some(part128) = sb128_rect {
+                // lane-sb128c r7: libaom `decode_partition` (decodeframe.c:1554)
+                // codes PARTITION_HORZ at the 128 root as `subsize =
+                // BLOCK_128X64` at (mi_row, mi_col) and a second one at
+                // (mi_row + hbs, mi_col) only `if (mi_row + hbs < mi_rows)`;
+                // PARTITION_VERT mirrors it on the column. `hbs` here is
+                // `mi_size_high[BLOCK_128X128] / 2` = 16 mi.
+                let horz = part128 == PARTITION_HORZ;
+                let at128 = ((sb_r & !1) as usize * 4, (sb_c & !1) as usize * 4);
+                let base_mi = sub16_to_mi(at128);
+                let (bw, bh) = if horz { (128usize, 64usize) } else { (64, 128) };
+                for i in 0..2 {
+                    let at_mi = if horz {
+                        (base_mi.0 + i * 16, base_mi.1)
+                    } else {
+                        (base_mi.0, base_mi.1 + i * 16)
+                    };
+                    if i > 0 && (at_mi.0 >= mi_rows as usize || at_mi.1 >= mi_cols as usize) {
+                        break;
+                    }
+                    inter_piece!(
+                        at_mi, SB * 2,
+                        TxbSet::Luma64, TxbSet::Luma64, TxbSet::Chroma32, TX32, TX32,
+                        &scan32, &scan32, 3, bw, bh
+                    );
+                    if horz {
+                        INTER_SB128_HORZ_HITS.with(|c| c.set(c.get() + 1));
+                    } else {
+                        INTER_SB128_VERT_HITS.with(|c| c.set(c.get() + 1));
+                    }
+                }
+                // One `cdef_idx` per BLOCK, copied to every 64x64 CDEF unit it
+                // covers -- both halves of the root read their own, and the
+                // first one's read lands in the top-left unit while the
+                // second's lands in the bottom-left (HORZ) / top-right (VERT).
+                let (q_r, q_c) = ((sb_r & !1) as usize, (sb_c & !1) as usize);
+                CDEF_IDX_GRID.with(|g| {
+                    let mut g = g.borrow_mut();
+                    let cols = CDEF_SB_COLS.with(|c| c.get());
+                    if cols == 0 {
+                        return;
+                    }
+                    for (src, dst) in if horz {
+                        [((0, 0), (0, 1)), ((1, 0), (1, 1))]
+                    } else {
+                        [((0, 0), (1, 0)), ((0, 1), (1, 1))]
+                    } {
+                        let (si, di) = (
+                            (q_r + src.0) * cols + q_c + src.1,
+                            (q_r + dst.0) * cols + q_c + dst.1,
+                        );
+                        if q_c + src.1 < cols && q_c + dst.1 < cols && si < g.len() && di < g.len()
+                        {
+                            g[di] = g[si];
+                        }
+                    }
+                });
+                continue;
             }
             if sb128_none {
                 INTER_SB128_NONE_HITS.with(|c| c.set(c.get() + 1));
