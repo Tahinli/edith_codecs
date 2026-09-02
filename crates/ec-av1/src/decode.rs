@@ -4428,6 +4428,12 @@ struct Neighbours {
     /// unobservable from the pixels alone. Counted by
     /// [`cdef_unwritten_skip_units`].
     skip_written: Vec<bool>,
+    /// Per-4x4-mi origin `(mi_row, mi_col)` of the coded (prediction) block
+    /// covering that cell -- spec 7.14.2's `isBlockEdge`/libaom `pu_edge`,
+    /// which re-enables the loop filter at a prediction boundary between two
+    /// skipped inter blocks (lane-mergefix r4). Written by
+    /// [`Self::fill_skip_grid_rect`], whose `at_mi` IS that origin.
+    blk_org_grid: Vec<[u16; 2]>,
     skip_grid_cols_mi: usize,
     /// Per-4x4-mi luma transform width in pixels (8/16/32/64) -- this decoder
     /// never splits a coded block's transform below its own size (round 2:
@@ -4548,6 +4554,7 @@ impl Neighbours {
             mi_rows,
             skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
             skip_written: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
+            blk_org_grid: vec![[0u16; 2]; cols * (SUB / MI) * rows * (SUB / MI)],
             skip_grid_cols_mi: cols * (SUB / MI),
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
@@ -4981,6 +4988,9 @@ impl Neighbours {
                 }
                 if let Some(cell) = self.skip_written.get_mut(idx) {
                     *cell = true;
+                }
+                if let Some(org) = self.blk_org_grid.get_mut(idx) {
+                    *org = [mi_r as u16, mi_c as u16];
                 }
             }
         }
@@ -14211,6 +14221,27 @@ fn edge_params(
     let cur_delta_lf = i32::from(n.delta_lf_grid[mi_r * n.skip_grid_cols_mi + mi_c][delta_idx]);
     let pv_delta_lf = i32::from(n.delta_lf_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c][delta_idx]);
 
+    // spec 7.14.2 / libaom `set_lpf_parameters`: a transform edge between two
+    // SKIPPED INTER blocks is filtered only when it is also a prediction
+    // (coded-block) edge -- `!pv_skip || !curr_skipped || pu_edge`. The
+    // omission of this term (on the stale invariant "a coded block's transform
+    // is always its own full size", which var-tx broke) had us filtering an
+    // interior 8-px lattice the reference never touches: on the pinned 192x68
+    // inter stream frame 1 went from 7244 wrong post-deblock luma px to 0.
+    let cur_org = n.blk_org_grid[mi_r * n.skip_grid_cols_mi + mi_c];
+    let pu_edge = if dir == 0 {
+        mi_c == usize::from(cur_org[1])
+    } else {
+        mi_r == usize::from(cur_org[0])
+    };
+    if !pu_edge
+        && cur_ref != 0
+        && pv_ref != 0
+        && n.skip_at(mi_r, mi_c)
+        && n.skip_at(pv_mi_r, pv_mi_c)
+    {
+        return None;
+    }
     let cur_level = lf_level(lf, plane_idx, dir, cur_ref, cur_delta_lf, segment_id_at(mi_r, mi_c));
     let pv_level = lf_level(
         lf,
