@@ -64,7 +64,8 @@ const REFUSALS: &[&str] = &[
     "an inter frame with no key frame before it",
     "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
     "a masked compound 64x64 inter block (compound_type is inferred, not coded, at this size)",
-    "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
+    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
+    "OBMC on a 16x8/8x16 inter leaf (blend mismatches the reference on this shape)",
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
     // Lifted for the 16x8/8x16 leaf by lane-fistrip; still live one level

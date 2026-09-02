@@ -1610,7 +1610,7 @@ pub const SKIP_MODE: [[u16; 3]; 3] = [[32621, 32768, 0], [20708, 32768, 0], [812
 /// `motion_mode_allowed` (spec 5.11.24's `read_motion_mode`) offers
 /// `OBMC_CAUSAL` rather than `WARPED_CAUSAL` -- lane-motionmode round 1
 /// never reaches the three-way `motion_mode_cdf`, see `decode.rs`.
-pub const OBMC: [[u16; 3]; 12] = [
+pub const OBMC: [[u16; 3]; 14] = [
     [10437, 32768, 0],
     [17432, 32768, 0],
     [25817, 32768, 0],
@@ -1630,6 +1630,10 @@ pub const OBMC: [[u16; 3]; 12] = [
     [20901, 32768, 0],
     [24008, 32768, 0],
     [26879, 32768, 0],
+    // lane-inter4 r3: the 16x16-level rect inter leaves' own rows --
+    // BLOCK_8X16 (4) and BLOCK_16X8 (5) of libaom's `default_obmc_cdf`.
+    [9371, 32768, 0],
+    [9301, 32768, 0],
 ];
 
 /// `default_motion_mode_cdf` (spec 9.4, `entropymode.c`), the square-bsize
@@ -1639,7 +1643,7 @@ pub const OBMC: [[u16; 3]; 12] = [
 /// `read_motion_mode` reads instead of [`OBMC`] whenever `motion_mode_allowed`
 /// (spec 5.11.24) resolves to `WARPED_CAUSAL`-eligible (`num_proj_ref >= 1`
 /// under `allow_warped_motion`) -- lane-warp round 1.
-pub const MOTION_MODE: [[u16; 4]; 12] = [
+pub const MOTION_MODE: [[u16; 4]; 14] = [
     [7651, 24760, 32768, 0],
     [19419, 26810, 32768, 0],
     [26260, 29116, 32768, 0],
@@ -1655,6 +1659,10 @@ pub const MOTION_MODE: [[u16; 4]; 12] = [
     [26431, 30774, 32768, 0],
     [28973, 31594, 32768, 0],
     [29742, 31203, 32768, 0],
+    // lane-inter4 r3: BLOCK_8X16 / BLOCK_16X8 rows (libaom
+    // `default_motion_mode_cdf` indices 4 and 5).
+    [4738, 24765, 32768, 0],
+    [5391, 25528, 32768, 0],
 ];
 
 /// `default_interintra_cdf` (spec 9.4): `interintra`, indexed by
@@ -5214,6 +5222,31 @@ pub const EOB_PT_16_CHROMA_CLASS1: [u16; 6] = [3192, 5032, 10297, 19755, 32768, 
 pub const EOB_PT_16_CHROMA_CLASS1_Q3: [u16; 6] = [7297, 10767, 19273, 28194, 32768, 0];
 
 /// `EOB_PT_128_CHROMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][1][1]`).
+/// `EOB_PT_128_LUMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][0][1]`,
+/// token_cdfs.h:830-848) -- the `TX_CLASS_HORIZ`/`TX_CLASS_VERT` (`V_DCT`/
+/// `H_DCT`) eob group of a 128-position LUMA transform, i.e. a true 16x8/8x16
+/// one. lane-inter4 r3: an inter 16x8 leaf reads `EXT_TX_SET_ALL16`, so 1D
+/// types are common there; the intra rect leaf could reach them too and was
+/// falling back to the 2D table.
+pub const EOB_PT_128_LUMA_CLASS1_Q0: [u16; 9] = [371, 699, 1254, 4830, 9479, 12562, 17497, 32768, 0];
+/// [`EOB_PT_128_LUMA_CLASS1_Q0`]'s q-context 1 sibling.
+pub const EOB_PT_128_LUMA_CLASS1_Q1: [u16; 9] = [217, 352, 618, 2303, 5261, 9969, 17472, 32768, 0];
+/// [`EOB_PT_128_LUMA_CLASS1_Q0`]'s q-context 2 sibling.
+pub const EOB_PT_128_LUMA_CLASS1: [u16; 9] = [354, 558, 944, 2760, 7287, 14037, 21779, 32768, 0];
+/// [`EOB_PT_128_LUMA_CLASS1_Q0`]'s q-context 3 sibling.
+pub const EOB_PT_128_LUMA_CLASS1_Q3: [u16; 9] = [886, 1731, 3271, 8469, 15569, 22126, 28383, 32768, 0];
+
+/// `EOB_PT_32_CHROMA`'s class-1 sibling (`av1_default_eob_multi32_cdfs[q][1][1]`,
+/// token_cdfs.h:792-808) -- the chroma 8x4/4x8 transform under a rect leaf
+/// inherits its luma unit's `tx_type`, so it reaches the 1D classes too.
+pub const EOB_PT_32_CHROMA_CLASS1_Q0: [u16; 7] = [1786, 3179, 6902, 11357, 19054, 32768, 0];
+/// [`EOB_PT_32_CHROMA_CLASS1_Q0`]'s q-context 1 sibling.
+pub const EOB_PT_32_CHROMA_CLASS1_Q1: [u16; 7] = [2578, 4124, 8181, 13670, 24234, 32768, 0];
+/// [`EOB_PT_32_CHROMA_CLASS1_Q0`]'s q-context 2 sibling.
+pub const EOB_PT_32_CHROMA_CLASS1: [u16; 7] = [3542, 5502, 10415, 16760, 25644, 32768, 0];
+/// [`EOB_PT_32_CHROMA_CLASS1_Q0`]'s q-context 3 sibling.
+pub const EOB_PT_32_CHROMA_CLASS1_Q3: [u16; 7] = [7699, 10897, 20891, 26926, 31628, 32768, 0];
+
 pub const EOB_PT_128_CHROMA_CLASS1_Q0: [u16; 9] = [2054, 3472, 5869, 14232, 18242, 20590, 26752, 32768, 0];
 pub const EOB_PT_128_CHROMA_CLASS1_Q1: [u16; 9] = [2310, 4160, 7471, 14997, 17931, 20768, 30240, 32768, 0];
 pub const EOB_PT_128_CHROMA_CLASS1: [u16; 9] = [6275, 9889, 14769, 23164, 27988, 30493, 32272, 32768, 0];
