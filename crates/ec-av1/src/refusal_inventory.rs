@@ -33,7 +33,8 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 const REFUSALS: &[&str] = &[
     "a coded (non-skip) HORZ_B/VERT_B rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
-    "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect prediction is not ported)",
+    "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
+    "a split intra strip whose transform unit is the rect {tx_w}x{tx_h} (the depth-1 step of a 1:4 strip; measured wrong pixels, refused rather than shipped)",
     "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
