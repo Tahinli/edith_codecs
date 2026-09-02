@@ -999,6 +999,9 @@ thread_local! {
     static RECT64_INTER_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // lane-r14 r3: rectangular var-tx LEAVES, [32x16, 16x32].
     static VARTX_RECT_LEAF_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+    // lane-inter16ab r4: rectangular var-tx leaves with a 4-px axis, [8x4, 4x8]
+    // -- the `sub_tx_size_map[TX_16X4]` split leaves of a 16x16-level 1:4 strip.
+    static VARTX_RECT_LEAF4_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
     // lane-inter4 r3: 16x16-level PARTITION_HORZ / PARTITION_VERT on an inter
     // frame -- 16x8 and 8x16 inter leaves.
     static INTER_LEAF16_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1057,9 +1060,16 @@ pub(crate) fn vartx_rect_leaf_hits() -> [usize; 2] {
     VARTX_RECT_LEAF_HITS.with(|c| c.get())
 }
 
+/// Current value of [`VARTX_RECT_LEAF4_HITS`] (lane-inter16ab r4): 8x4/4x8
+/// split leaves of a 16x4/4x16 strip, `[8x4, 4x8]`.
+pub(crate) fn vartx_rect_leaf4_hits() -> [usize; 2] {
+    VARTX_RECT_LEAF4_HITS.with(|c| c.get())
+}
+
 /// Records one rectangular var-tx leaf.
 fn vartx_rect_leaf_hit(tw: usize, th: usize) {
-    VARTX_RECT_LEAF_HITS.with(|c| {
+    let cell = if tw.min(th) == 4 { &VARTX_RECT_LEAF4_HITS } else { &VARTX_RECT_LEAF_HITS };
+    cell.with(|c| {
         let mut h = c.get();
         h[usize::from(th > tw)] += 1;
         c.set(h);
@@ -11761,6 +11771,11 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
             // `TX_64X64`, so `av1_get_ext_tx_set_type` is `DCT_ONLY` and no
             // `tx_type` symbol is coded at all.
             | (64, 32) | (32, 64) | (64, 16) | (16, 64)
+            // lane-inter16ab r4: `sub_tx_size_map[TX_16X4] == TX_8X4`, so a
+            // split-transform 16x4/4x16 strip has RECTANGULAR 8x4/4x8 leaves.
+            // Only reachable as a var-tx LEAF -- an 8x4/4x8 inter BLOCK is
+            // refused earlier ("an inter partition below 8x8").
+            | (8, 4) | (4, 8)
     )
 }
 
@@ -11772,9 +11787,20 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
 /// `tx_size_sqr == TX_8X8`, so it reads `EXT_TX_SET_DCT_IDTX` when reduced
 /// and the 16-symbol `EXT_TX_SET_ALL16` otherwise -- both at the *8x8* CDF
 /// row (`txsize_sqr_map`), never the 16x16 one.
-fn rect_inter_luma_set(w: usize, h: usize) -> TxbSet {
-    match (w, h) {
+fn rect_inter_luma_set(w: usize, h: usize) -> Result<TxbSet> {
+    Ok(match (w, h) {
         (32, 16) | (16, 32) => TxbSet::LumaRect32x16Inter,
+        // lane-inter16ab r4: the 8x4/4x8 split leaf of a 16x4/4x16 strip.
+        // `av1_get_ext_tx_set_type` (blockd.h:1097) at `tx_size_sqr_up ==
+        // TX_8X8`, `tx_size_sqr == TX_4X4`, inter: DCT_IDTX when reduced,
+        // ALL16 otherwise -- both at the TX_4X4 row.
+        (8, 4) | (4, 8) => {
+            if REDUCED_TX_SET_INTER.with(std::cell::Cell::get) {
+                TxbSet::LumaRect8x4Inter
+            } else {
+                TxbSet::LumaRect8x4Inter1
+            }
+        }
         (16, 4) | (4, 16) => {
             if REDUCED_TX_SET_INTER.with(std::cell::Cell::get) {
                 TxbSet::LumaRect16x4Inter
@@ -11796,16 +11822,20 @@ fn rect_inter_luma_set(w: usize, h: usize) -> TxbSet {
         // `tx_type` table (DCT_ONLY above), so the intra/inter split is moot.
         (64, 32) | (32, 64) => TxbSet::Luma64,
         (64, 16) | (16, 64) => TxbSet::LumaRect32x16,
-        _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
-    }
+        _ => {
+            return Err(unsupported(
+                "a rectangular inter luma transform unit whose shape has no coefficient table set here",
+            ));
+        }
+    })
 }
 
 /// The chroma table set of the same block's single rectangular chroma unit
 /// (`av1_get_max_uv_txsize`): 16x8/8x16 under a 32x16/16x32 strip, 8x4/4x8
 /// under a 16x8/8x16 one. Neither codes a `tx_type` symbol -- both inherit
 /// the luma unit's.
-fn rect_inter_chroma_set(w: usize, h: usize) -> TxbSet {
-    match (w, h) {
+fn rect_inter_chroma_set(w: usize, h: usize) -> Result<TxbSet> {
+    Ok(match (w, h) {
         (16, 8) | (8, 16) => TxbSet::ChromaRect16x8,
         (8, 4) | (4, 8) => TxbSet::ChromaRect8x4,
         // lane-r14 r2: chroma of a 64-axis strip -- 32x16/16x32 under a
@@ -11815,8 +11845,12 @@ fn rect_inter_chroma_set(w: usize, h: usize) -> TxbSet {
         // `txsize_log2_minus4` = 4), same as the intra strip path uses.
         (32, 16) | (16, 32) => TxbSet::ChromaRect32x16,
         (32, 8) | (8, 32) => TxbSet::Chroma16,
-        _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
-    }
+        _ => {
+            return Err(unsupported(
+                "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
+            ));
+        }
+    })
 }
 
 /// libaom `size_group_lookup[bsize]` for the block shapes this decoder's
@@ -11852,8 +11886,8 @@ fn size_group_wh_matches_libaom_size_group_lookup() {
 }
 
 /// The default (2D) coefficient scan of a rectangular transform.
-fn rect_scan(w: usize, h: usize) -> &'static [u16] {
-    match (w, h) {
+fn rect_scan(w: usize, h: usize) -> Result<&'static [u16]> {
+    Ok(match (w, h) {
         (32, 16) => &SCAN_32X16,
         (16, 32) => &SCAN_16X32,
         (16, 8) => &SCAN_16X8,
@@ -11864,8 +11898,12 @@ fn rect_scan(w: usize, h: usize) -> &'static [u16] {
         (4, 8) => &SCAN_4X8,
         (32, 8) => &SCAN_32X8,
         (8, 32) => &SCAN_8X32,
-        _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
-    }
+        _ => {
+            return Err(unsupported(
+                "a rectangular transform unit whose shape has no coefficient scan table here",
+            ));
+        }
+    })
 }
 
 /// [`read_block_tx_size`] for a rectangular inter block (lane-inter4 r2):
@@ -12027,7 +12065,7 @@ fn read_inter_plane_rect(
         read_coeffs_rect(
             dec,
             &mut coding,
-            rect_scan(cw, ch),
+            rect_scan(cw, ch)?,
             cw,
             ch,
             skip_ctx,
@@ -16048,8 +16086,13 @@ fn obmc_blend(
 /// always `is_interinter_compound_used`, so the function is always `true`
 /// for `side` -- kept as a named call (rather than inlined `true`) so a
 /// future sub-8 block size does not silently misdecode a real stream.
-fn is_any_masked_compound_used_here(side: usize) -> bool {
-    side.min(side) >= 8
+fn is_any_masked_compound_used_here(bw: usize, bh: usize) -> bool {
+    // lane-inter16ab r4 (class sweep of the r3 CDF-row defect):
+    // `is_comp_ref_allowed(bsize)` is `AOMMIN(block_size_wide, block_size_high)
+    // >= 8` on the block's TRUE footprint -- a 16x4/4x16 strip is NOT allowed,
+    // so libaom writes no `comp_group_idx` symbol there at all. Keyed off the
+    // square `side` we read one the reference never wrote.
+    bw.min(bh) >= 8
 }
 
 /// The `BLOCK_SIZES_ALL` index of a `bw x bh` block (libaom `enum BLOCK_SIZE`,
@@ -16917,7 +16960,7 @@ fn decode_inter_block(
             let group_ctx = get_comp_group_idx_context(neighbours, (rmi, cmi), side);
             let comp_group_idx = if !skip_mode
                 && enable_masked_compound
-                && is_any_masked_compound_used_here(side)
+                && is_any_masked_compound_used_here(write_w, write_h)
             {
                 dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
             } else {
@@ -17589,7 +17632,7 @@ fn decode_inter_block(
                             read_inter_plane_rect(
                                 dec,
                                 cdfs,
-                                rect_inter_luma_set(tw, th),
+                                rect_inter_luma_set(tw, th)?,
                                 (tw, th),
                                 side,
                                 0,
@@ -17619,7 +17662,7 @@ fn decode_inter_block(
                     let (grid, tx_type) = read_inter_plane_rect(
                         dec,
                         cdfs,
-                        rect_inter_luma_set(write_w, write_h),
+                        rect_inter_luma_set(write_w, write_h)?,
                         (write_w, write_h),
                         side,
                         0,
@@ -17663,7 +17706,7 @@ fn decode_inter_block(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
-                            rect_inter_chroma_set(write_chroma_w, write_chroma_h),
+                            rect_inter_chroma_set(write_chroma_w, write_chroma_h)?,
                             (uw, uh),
                             chroma_side,
                             1,
@@ -17685,7 +17728,7 @@ fn decode_inter_block(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
-                            rect_inter_chroma_set(write_chroma_w, write_chroma_h),
+                            rect_inter_chroma_set(write_chroma_w, write_chroma_h)?,
                             (uw, uh),
                             chroma_side,
                             2,
@@ -18674,7 +18717,7 @@ fn decode_inter_block(
                             read_inter_plane_rect(
                                 dec,
                                 cdfs,
-                                rect_inter_luma_set(tw, th),
+                                rect_inter_luma_set(tw, th)?,
                                 (tw, th),
                                 side,
                                 0,
@@ -18704,7 +18747,7 @@ fn decode_inter_block(
                     let (grid, tx_type) = read_inter_plane_rect(
                         dec,
                         cdfs,
-                        rect_inter_luma_set(write_w, write_h),
+                        rect_inter_luma_set(write_w, write_h)?,
                         (write_w, write_h),
                         side,
                         0,
@@ -18757,7 +18800,7 @@ fn decode_inter_block(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
-                            rect_inter_chroma_set(write_chroma_w, write_chroma_h),
+                            rect_inter_chroma_set(write_chroma_w, write_chroma_h)?,
                             (uw, uh),
                             chroma_side,
                             1,
@@ -18779,7 +18822,7 @@ fn decode_inter_block(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
-                            rect_inter_chroma_set(write_chroma_w, write_chroma_h),
+                            rect_inter_chroma_set(write_chroma_w, write_chroma_h)?,
                             (uw, uh),
                             chroma_side,
                             2,
@@ -18984,8 +19027,12 @@ fn decode_inter_block(
         // -- `palette_mode_ctx`/`palette_uv_mode_ctx` hardcoded 0, provably
         // safe since a nonzero neighbour `palette_size` would already have
         // refused the decode that produced it.
+        // lane-inter16ab r4 (class sweep): `av1_get_palette_bsize_ctx` is keyed
+        // by the block's TRUE footprint -- a rect strip's row is not its
+        // enclosing square's, and a 16x4 strip (64 pixels) reads no palette
+        // symbol at all.
         if allow_screen_content_tools
-            && let Some(bsize_ctx) = palette_bsize_ctx(side)
+            && let Some(bsize_ctx) = palette_bsize_ctx_wh(write_w, write_h)
         {
             if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
                 return Err(unsupported(
@@ -19009,7 +19056,9 @@ fn decode_inter_block(
         let mut filter_intra = None;
         if mode == DC_PRED
             && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
-            && let Some(class) = filter_intra_size_class(side)
+            // lane-inter16ab r4 (class sweep): `cdf::FILTER_INTRA`'s row is the
+            // true `BLOCK_SIZES_ALL` class of this strip, not its square side's.
+            && let Some(class) = filter_intra_size_class_rect(write_w, write_h)
             && dec.symbol(&mut cdfs.filter_intra[class]) != 0
         {
             FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
@@ -19706,7 +19755,7 @@ fn decode_inter_block8(
                 let group_ctx = get_comp_group_idx_context(neighbours, leaf_mi, SIDE);
                 let comp_group_idx = if !skip_mode
                     && enable_masked_compound
-                    && is_any_masked_compound_used_here(SIDE)
+                    && is_any_masked_compound_used_here(SIDE, SIDE)
                 {
                     dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
                 } else {
