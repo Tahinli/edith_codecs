@@ -119,7 +119,18 @@ EVIDENCE: ~/.cache/rectres-tmp/{t900,t5400,t6300,t8100}.obu | decode_probe with 
 
 `cargo test -p ec-av1 --lib` under systemd unit
 `inter128intra-suite-r1-1788367879` (MemoryMax=10G),
-log `$HOME/.cache/inter128intra-suite.log`: SUITE_TOTALS_PLACEHOLDER
+log `$HOME/.cache/inter128intra-suite.log`: **424 passed; 1 failed; 37 ignored** in 702 s.
+
+The single failure is
+`real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal`
+("the rectangular var-tx leaf arm never fired 32x16=0 16x32=0, 0 refusals") --
+PRE-EXISTING and already recorded on the base of the previous lane
+(lanes/obmcrec-r1.report.md, verified there in a detached worktree on
+`beecb64`); the totals here are byte-identical to that round's. This lane's
+whole diff is inert without `EC_INTRA128_IN_INTER=1`, which no test sets, so it
+cannot move any counter. Every gate named in the charter (`sb128`,
+`intra_rect_block`, `gathered_edge`, `refusal_inventory`, `gate_coverage`) is
+inside those 424 passes.
 
 ## Residue
 
