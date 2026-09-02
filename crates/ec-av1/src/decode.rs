@@ -1130,6 +1130,42 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+// lane-fimv r1 (class wrong-alphabet-same-value): how many blocks took the
+// 2-symbol `obmc_cdf` alphabet *because* `force_integer_mv` (or a scaled
+// reference) vetoed `WARPED_CAUSAL` in libaom `motion_mode_allowed`, while
+// `allow_warped_motion == 1` and `num_proj_ref >= 1` would otherwise have
+// picked the 3-symbol `motion_mode_cdf`. These are exactly the blocks this
+// decoder used to read with the wrong alphabet, so a gate that asserts this
+// counter advanced proves the fixed path fired (class
+// `gate-blind-to-feature`).
+thread_local! {
+    static FIMV_ALPHABET_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FIMV_ALPHABET_HITS`].
+pub fn fimv_alphabet_hits() -> usize {
+    FIMV_ALPHABET_HITS.with(|c| c.get())
+}
+
+// lane-fimv r1: how many frame headers this decoder has decoded with
+/// `force_integer_mv == 1` (bumped by `stream.rs` per frame). Lets a gate
+// prove the encoder really produced the header state under test rather than
+// assume it.
+thread_local! {
+    static FIMV_FRAME_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FIMV_FRAME_HITS`].
+pub fn fimv_frame_hits() -> usize {
+    FIMV_FRAME_HITS.with(|c| c.get())
+}
+
+/// Bump [`FIMV_FRAME_HITS`] -- called once per decoded frame header whose
+/// `force_integer_mv` bit is set.
+pub fn note_force_integer_mv_frame() {
+    FIMV_FRAME_HITS.with(|c| c.set(c.get() + 1));
+}
+
 /// Current value of [`OBMC_HITS`].
 pub(crate) fn obmc_hits() -> usize {
     OBMC_HITS.with(|c| c.get())
@@ -14192,26 +14228,45 @@ fn decode_inter_block(
                 // `motion_mode_allowed` reads the 3-symbol `motion_mode_cdf`
                 // instead of the 2-symbol `obmc_cdf` exactly when
                 // `num_proj_ref >= 1` under `allow_warped_motion`.
-                // lane-scaledref r2: libaom `motion_mode_allowed`
-                // (`blockd.h:1484`) requires
-                // `!av1_is_scaled(block_ref_scale_factors[0])` for
-                // WARPED_CAUSAL -- under a scaled reference (superres) the
-                // block reads the 2-symbol `obmc_cdf`, never the 3-symbol
+                // lane-scaledref r2 + lane-fimv r1: libaom
+                // `motion_mode_allowed` (`blockd.h:1484`) requires BOTH
+                // `!av1_is_scaled(block_ref_scale_factors[0])` and
+                // `!xd->cur_frame_force_integer_mv` for WARPED_CAUSAL --
+                // under a scaled reference (superres) OR on a frame whose
+                // header set `force_integer_mv` (screen content) the block
+                // reads the 2-symbol `obmc_cdf`, never the 3-symbol
                 // `motion_mode_cdf`. Reading the wrong alphabet here narrows
                 // the arithmetic coder by the wrong amount and predicts the
-                // rest of the tile off a diverged state: it was silently
-                // wrong pixels (r1's `--enable-warped-motion=1` superres
-                // mismatch), not a desync error.
+                // rest of the tile off a diverged state: silently wrong
+                // pixels, not a desync error. `force_integer_mv` is the
+                // per-frame value (spec 5.9.2: coded per frame only when
+                // `seq_force_integer_mv == SELECT_INTEGER_MV`, threaded from
+                // `FrameHeader::force_integer_mv`).
+                // libaom `av1_is_scaled` is `x_scale_fp != REF_NO_SCALE ||
+                // y_scale_fp != REF_NO_SCALE`; the y half is unreachable here
+                // because a reference whose height differs from this frame's
+                // true size is refused before any tile decodes ("a reference
+                // picture whose height does not match this frame's own true
+                // size", ~14681). Whoever lifts that refusal adds the y term.
                 let ref_is_scaled =
                     mc::scale_factor(py_ref.width, frame_width) != mc::REF_NO_SCALE;
-                let warp_eligible = allow_warped_motion
-                    && !ref_is_scaled
-                    && num_proj_ref(grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
-                if allow_warped_motion
-                    && ref_is_scaled
-                    && num_proj_ref(grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1
-                {
+                let proj_ok = num_proj_ref(
+                    grid,
+                    mi_row,
+                    mi_col,
+                    bw4,
+                    bh4,
+                    mi_cols as usize,
+                    mi_rows as usize,
+                    ref_frame,
+                ) >= 1;
+                let warp_eligible =
+                    allow_warped_motion && !ref_is_scaled && !force_integer_mv && proj_ok;
+                if allow_warped_motion && proj_ok && ref_is_scaled {
                     SCALED_WARP_SUPPRESSED_HITS.with(|c| c.set(c.get() + 1));
+                }
+                if allow_warped_motion && proj_ok && !ref_is_scaled && force_integer_mv {
+                    FIMV_ALPHABET_HITS.with(|c| c.set(c.get() + 1));
                 }
                 if warp_eligible {
                     let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
@@ -15924,8 +15979,16 @@ fn decode_inter_block8(
             // leaf under a scaled reference is refused before this function
             // runs (see the block8 refusal below, ~12500) -- whoever lifts
             // that refusal must add `&& !ref_is_scaled` here too.
-            let warp_eligible = allow_warped_motion
-                && num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
+            // lane-fimv r1: libaom `motion_mode_allowed` also requires
+            // `!xd->cur_frame_force_integer_mv`, so a screen-content frame
+            // that set `force_integer_mv` reads the 2-symbol `obmc_cdf` here
+            // (class wrong-alphabet-same-value).
+            let proj_ok =
+                num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
+            let warp_eligible = allow_warped_motion && !force_integer_mv && proj_ok;
+            if allow_warped_motion && proj_ok && force_integer_mv {
+                FIMV_ALPHABET_HITS.with(|c| c.set(c.get() + 1));
+            }
             if warp_eligible {
                 let mode = dec.symbol(&mut cdfs.motion_mode[0]);
                 match mode {
