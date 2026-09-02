@@ -118,6 +118,10 @@ fn main() {
         );
         // lane-rectres r1: how many of those 32x8/8x32 strips coded a real
         // rectangular residual transform unit (a skipped one codes none).
+        println!(
+            "sub8_chroma_tx_from_ref: {}",
+            ec_av1::stream::sub8_chroma_tx_from_ref_hits()
+        );
         let r328 = ec_av1::stream::rect32x8_inter_tu_hits();
         println!("rect32x8_inter_tu: 32x8={} 8x32={}", r328[0], r328[1]);
         // lane-intra16x4: INTRA strips of an inter 16x16-level 1:4 partition.
