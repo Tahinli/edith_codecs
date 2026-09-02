@@ -5685,6 +5685,283 @@ mod tests {
         );
     }
 
+    /// lane-uv8 r1 (classes [[refusal-strings-are-claims]] +
+    /// [[tool-disabled-in-every-gate]]): a real aomenc inter sequence with
+    /// 8x8 partitions and full chroma intra tooling
+    /// (`--enable-cfl-intra=1 --enable-smooth-intra=1 --enable-paeth-intra=1
+    /// --enable-directional-intra=1`), in which the RD gives an INTRA 8x8
+    /// leaf inside an inter frame a NON-DC `uv_mode`. That leaf
+    /// ([`decode::decode_inter_block8`]'s intra arm) read the `uv_mode`
+    /// symbol and refused every value but `DC_PRED` -- "this encoder never
+    /// writes one" was a claim, and this gate is what contradicts it. Hard-
+    /// asserts `decode::intra_in_inter8_uv_hits` (directional, smooth/paeth,
+    /// CfL, counted on THIS leaf only); an attempt that never produced one
+    /// proves nothing, and exhausting every attempt is a FAILURE, not a SKIP.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_non_dc_chroma_8x8_intra_leaf_decodes_pixel_exact() {
+        uv_mode_in_inter8_gate(8, 1);
+    }
+
+    /// The 10-bit arm (both of the user's films are `yuv420p10le`).
+    #[test]
+    fn a_real_aomenc_10bit_inter_sequence_with_a_non_dc_chroma_8x8_intra_leaf_decodes_pixel_exact() {
+        uv_mode_in_inter8_gate(10, 1);
+    }
+
+    /// The multi-tile arm (class [[new-map-ignores-tile-edge]]): this round
+    /// stamps a new `uv_mode` band from the 8x8 leaf, whose availability must
+    /// be tile-relative.
+    #[test]
+    fn a_real_aomenc_two_tile_inter_sequence_with_a_non_dc_chroma_8x8_intra_leaf_decodes_pixel_exact()
+     {
+        uv_mode_in_inter8_gate(8, 2);
+    }
+
+    fn uv_mode_in_inter8_gate(bit_depth: u32, tile_columns: u32) {
+        let name = format!("uv_mode_in_inter8_gate({bit_depth}, tiles={tile_columns})");
+        if !have_ffmpeg() {
+            eprintln!("SKIP {name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 8usize);
+        let mut refusals = Vec::new();
+        let mut uncounted_exact = 0u32;
+        let mut totals = (0usize, 0usize, 0usize);
+        for attempt in 0..30u32 {
+            let seed = 42 + attempt;
+            // A zooming fractal with a hard CUT at frame 4 (`overlay`
+            // switching a second, unrelated fractal on): after the cut a block
+            // is unpredictable from the reference, which is what makes aomenc
+            // code INTRA blocks inside an inter frame. Chroma is NOT
+            // desaturated here (every sibling inter gate passes `hue=s=0`) --
+            // real chroma detail is exactly what pushes the chroma RD off
+            // DC_PRED. `noise` carries its own explicit seed (lavfi
+            // `gradients` ignores its seed; class [[seeded-fixture-not-reproducible]]).
+            let source = format!(
+                "mandelbrot=size={width}x{height}:start_scale={}:rate=25[a];\
+                 mandelbrot=size={width}x{height}:start_scale={}:rate=25[b];\
+                 [a][b]overlay=enable='gte(n,4)',noise=alls=12:allf=t+u:all_seed={seed}",
+                5.0 - f64::from(attempt) * 0.06,
+                0.9 + f64::from(attempt) * 0.11
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.32",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            // A coarser quantiser is what pushes the chroma RD to a cheap
+            // non-DC mode on a small block; sweep 12..40 (the low end is what
+            // lane-cdef's cq12 arm needs).
+            let cq = format!("--cq-level={}", 12 + (attempt % 5) * 7);
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            let tiles = format!("--tile-columns={}", tile_columns - 1);
+            // The y4m goes through a FILE, not aomenc's stdin: this gate's
+            // stream is ~100 KB, bigger than a pipe buffer, so an aomenc that
+            // is still being fed on stdin blocks writing its stdout and the
+            // test blocks writing its stdin -- a hard deadlock (measured
+            // here, 3 min into attempt 0, class [[gate-loader-slurps-whole-file]]).
+            // The path is PID-keyed (class [[pid-keyed-temp-path]]).
+            let y4m_path = std::env::temp_dir().join(format!(
+                "ec-av1-uv8-{}-{bit_depth}-{tile_columns}-{seed}.y4m",
+                std::process::id()
+            ));
+            std::fs::write(&y4m_path, &y4m.stdout).expect("writing the y4m fixture");
+            let child = Command::new(aomenc_path())
+                .args(depth_args)
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq,
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-max-dist=9999",
+                    "--kf-min-dist=9999",
+                    "--threads=1",
+                    "--row-mt=0",
+                    &tiles,
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-ref-frame-mvs=0",
+                    // Per-arm overrides go LAST (aomenc keeps the LAST
+                    // occurrence of a repeated --enable-* flag). The three
+                    // chroma intra tools this gate is about, plus the fences
+                    // that keep the leaf's SIBLING refusals (its TX_4X4
+                    // split, a nonzero angle delta, sub-16 rect inter leaves)
+                    // out of the way.
+                    "--enable-cfl-intra=1",
+                    "--enable-smooth-intra=1",
+                    "--enable-paeth-intra=1",
+                    "--enable-directional-intra=1",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-rect-partitions=0",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--obu",
+                    "-o",
+                    "-",
+                ])
+                .arg(&y4m_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            let _ = std::fs::remove_file(&y4m_path);
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::intra_in_inter8_uv_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{name} decode failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+            };
+            let now = decode::intra_in_inter8_uv_hits();
+            // class [[counter-from-refused-stream]]: per-attempt deltas, and
+            // only for an attempt that decoded to the end and is pixel-
+            // compared below.
+            let fired = (now.0 - before.0, now.1 - before.1, now.2 - before.2);
+            totals = (
+                totals.0 + fired.0,
+                totals.1 + fired.1,
+                totals.2 + fired.2,
+            );
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared; the counter only decides whether the
+            // attempt counts as firing.
+            // lane-uv8 r3: every one of the three chroma classes this gate
+            // exists for (directional, smooth/paeth, CfL) must fire on the
+            // SAME pixel-compared attempt -- a sum-nonzero predicate would
+            // pass on an attempt that only ever hit DC-adjacent CfL.
+            let counted = fired.0 > 0 && fired.1 > 0 && fired.2 > 0;
+            if !counted {
+                uncounted_exact += 1;
+                refusals.push(format!(
+                    "seed {seed}: decoded and pixel-compared, but no 8x8 intra leaf in an inter \
+                     frame carried a non-DC uv_mode"
+                ));
+            }
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            eprintln!(
+                "{name} seed={seed} {cq}: 8x8 intra-in-inter leaves with a non-DC uv_mode -- \
+                 directional {}, smooth/paeth {}, CfL {}",
+                fired.0, fired.1, fired.2
+            );
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                for (plane, (g, w)) in [
+                    ("Y", (&got.y, &want.y)),
+                    ("U", (&got.u, &want.u)),
+                    ("V", (&got.v, &want.v)),
+                ] {
+                    let stride = if plane == "Y" { width } else { width / 2 };
+                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                        eprintln!(
+                            "{name} seed={seed}: frame {i} {plane} first diff at ({}, {}) got {} \
+                             want {} ({} samples differ)",
+                            at % stride,
+                            at / stride,
+                            g[at],
+                            w[at],
+                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
+                        );
+                    }
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
+            }
+            if counted {
+                gate_buckets(
+                    &name,
+                    1,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
+                return;
+            }
+        }
+        gate_buckets(
+            &name,
+            0,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
+        panic!(
+            "{name} never observed a non-DC uv_mode on an 8x8 intra leaf in an inter frame \
+             (totals dir/smooth/cfl {totals:?}):\n{}",
+            refusals.join("\n")
+        );
+    }
+
+
     /// lane-chroma r2 stage 1: a real aomenc key frame with
     /// `--enable-smooth-intra=1` (opposite of every sibling recipe's `=0`)
     /// and `--enable-paeth-intra=0` -- paeth chroma stays off so the still-
@@ -6193,6 +6470,9 @@ mod tests {
         // aomenc silently codes one tile column and the arm is vacuous.
         extra: &[&str],
         width: usize,
+        // lane-interp3 r1: sequence length -- a compound block needs several
+        // already-coded references, which a 4-frame sequence never has.
+        frame_count: usize,
     ) {
         if !have_ffmpeg() {
             eprintln!("SKIP {name}: no ffmpeg");
@@ -6202,7 +6482,8 @@ mod tests {
             eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (height, frame_count) = (64usize, 4usize);
+        let height = 64usize;
+        let duration = format!("{:.2}", frame_count as f64 / 25.0);
         // A deterministic synthetic source with real motion (a static source
         // codes every inter frame as skip and never exercises the residual
         // path); bounded with `-t` (class gate-loader-slurps-whole-file).
@@ -6215,7 +6496,7 @@ mod tests {
                 "-i",
                 &format!("mandelbrot=size={width}x{height}:rate=25"),
                 "-t",
-                "0.16",
+                &duration,
                 "-pix_fmt",
                 if ten_bit { "yuv420p10le" } else { "yuv420p" },
                 // y4m calls 10-bit unofficial (same as the 10-bit key-frame
@@ -6342,6 +6623,7 @@ mod tests {
             "whole-superblock inter PARTITION_NONE",
             &[],
             64,
+            4,
         );
     }
 
@@ -6356,6 +6638,7 @@ mod tests {
             "whole-superblock inter PARTITION_NONE",
             &[],
             64,
+            4,
         );
     }
 
@@ -6398,6 +6681,88 @@ mod tests {
             "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
             &["--tile-columns=1"],
             128,
+            4,
+        );
+    }
+
+    /// lane-interp3 r1: the same 8x8-leaf recipe with DUAL FILTER, OBMC and
+    /// warped motion on. `read_mb_interp_filter` runs for every inter block
+    /// (libaom `decodemv.c` 1575), compound ones included; the compound 8x8
+    /// leaf skipped it entirely, so a SWITCHABLE-filter stream lost a symbol
+    /// per compound leaf and stamped the `[3, 3]` "no filter" sentinel, which
+    /// made a neighbouring OBMC block's `neighbour_filter` PANIC (a crash on
+    /// his data, not a named refusal). The three hard asserts prove the flags
+    /// arrived: a compound 8x8 leaf that really read the filter, a block whose
+    /// two dual-filter directions DIFFER (impossible with dual filter off),
+    /// and an 8x8 OBMC blend.
+    // lane-interp3 r2: the ENTROPY desync r1 measured is CLOSED -- the full
+    // 16-frame stream now parses end to end and every `EC_MODE`/`EC_MODE_VAL`
+    // element's msac RANGE matches the instrumented aomdec's line for line
+    // (570/570 mode elements, 0 diff). Two twin-drift root causes, both in
+    // `decode_inter_block8`'s compound arm: `read_compound_ref_frames` was
+    // passed a hard-coded `LAST_FRAME` for every inter neighbour instead of
+    // the real per-mi band, and the grid stamp cleared both per-slot
+    // `is_global_mv_block` flags.
+    // lane-interp3 r3: the luma reconstruction residue r2 left open is CLOSED
+    // and this gate is GREEN. Third instance of the same twin-drift class:
+    // libaom applies `allow_warp`'s GLOBAL branch to every
+    // `is_global_mv_block` reference slot, compound included and independent
+    // of `motion_mode` (`av1_init_warp_params` inside
+    // `build_inter_predictors_8x8_and_bigger`'s per-`ref` loop) -- the 16x16+
+    // compound arm has warped since lane-cwarp r1, the 8x8 leaf's compound arm
+    // predicted BOTH taps translationally, so a GLOBAL_GLOBALMV 8x8 compound
+    // leaf under a non-TRANSLATION model drifted a few luma levels, growing
+    // away from the block origin. It was NOT OBMC: the `EC_OBMC` emitter this
+    // round added to `decode.rs` diffs 325/325 lines against the instrumented
+    // aomdec's own rung (position, span, neighbour mv/ref/bsize/filter) with
+    // zero differences.
+    #[test]
+    fn a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let before_dual = decode::dual_filter_diff_hits();
+        let before_obmc = decode::obmc_hits_8();
+        let before_cwarp8 = decode::compound_warp_hits_8();
+        inter_sb_none_gate(
+            NAME,
+            false,
+            "8",
+            "16",
+            decode::compound8_filter_hits,
+            "a compound 8x8 leaf reading its own switchable interp_filter",
+            &[
+                "--enable-dual-filter=1",
+                "--enable-obmc=1",
+                "--enable-warped-motion=1",
+                "--enable-onesided-comp=1",
+            ],
+            64,
+            // Recipe search hook (same shape as EC_OBMC8_ATTEMPTS): a compound
+            // block needs several coded references, so the sequence is longer
+            // than the other arms' 4 frames.
+            std::env::var("EC_INTERP3_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16),
+        );
+        assert!(
+            decode::dual_filter_diff_hits() > before_dual,
+            "{NAME}: no block read two DIFFERENT dual-filter directions -- \
+             --enable-dual-filter=1 did not arrive or aomenc declined it"
+        );
+        assert!(
+            decode::obmc_hits_8() > before_obmc,
+            "{NAME}: no 8x8 OBMC blend fired -- --enable-obmc=1 did not arrive"
+        );
+        assert!(
+            decode::compound_warp_hits_8() > before_cwarp8,
+            "{NAME}: no 8x8 COMPOUND leaf was predicted through the per-ref GLOBAL \
+             warp -- the r3 root-cause path never fired, so this stream no longer \
+             proves it"
         );
     }
 
@@ -6412,6 +6777,7 @@ mod tests {
             "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
             &[],
             64,
+            4,
         );
     }
 
@@ -6435,6 +6801,7 @@ mod tests {
             "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
             &[],
             64,
+            4,
         );
     }
 
@@ -7237,6 +7604,166 @@ mod tests {
             );
         }
     }
+    /// lane-sqdrift r2: the SQUARE-ONLY twin of the no-CFL `uv_mode` gate
+    /// above. With `--enable-rect-partitions=0` the encoder codes only
+    /// `PARTITION_NONE` and `PARTITION_SPLIT`, and on detailed content the RD
+    /// eventually hands one whole 64x64 superblock of an INTER frame to an
+    /// INTRA block -- `bsize == sb_size`, the one shape whose `uv_mode` must
+    /// come off the 13-symbol `uv_mode_no_cfl` alphabet because libaom's
+    /// `is_cfl_allowed` (`blockd.h`: `wide <= 32 && high <= 32`) excludes it.
+    ///
+    /// Before the fix this decoder read the 14-symbol CFL alphabet there: the
+    /// same `DC_PRED` value, a different interval, and the tile desynced from
+    /// that block on. r1 measured the damage on the pinned 192x128 stream
+    /// (sha256 `c6af4fb4...`): decode-order frames 0-3 pre-filter byte-exact,
+    /// frame 4 luma 3540 samples wrong over exactly the last superblock
+    /// (x 128..191, y 64..127), then 24k wrong by frame 7 -- and the decoder
+    /// did not even report a mismatch, it reported an intra-rect-strip refusal
+    /// read out of the already-desynced stream (class `refusal-from-own-desync`;
+    /// aomdec's own partition histogram over that stream is rect-free).
+    /// After the fix the same stream is byte-exact on all 8 frames.
+    ///
+    /// Distinct from the sibling gate: rect partitions OFF (so the 64x64 NONE
+    /// really is a whole superblock), `--min-partition-size=16`, natural
+    /// mandelbrot detail instead of a synthetic half-noise ramp, and 8 frames
+    /// of drift so a desync that survives one frame still fails here. Every
+    /// decode-order frame of every attempt is compared against ffmpeg, so a
+    /// mismatch of ANY shape fails; the gate never turns one into a SKIP.
+    #[test]
+    fn a_real_aomenc_square_only_inter_sequence_with_a_64x64_intra_superblock_decodes_pixel_exact()
+    {
+        const NAME: &str = "a_real_aomenc_square_only_inter_sequence_with_a_64x64_intra_superblock_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 8usize);
+        for bit_depth in [8u32, 10u32] {
+            let (mut named_refusals, mut matched, mut carried_none) = (0u32, 0u32, 0u32);
+            let mut total_hits = 0usize;
+            for attempt in 0..4u32 {
+                // r1's pinned recipe is (start_scale 4.76, cq 55); the other
+                // three points move the detail level and the quantiser, which
+                // is what moves WHICH superblock the RD codes intra.
+                let start_scale = ["4.76", "3.20"][(attempt % 2) as usize];
+                let cq = [55, 45][(attempt / 2) as usize];
+                let duration = frame_count as f64 / 25.0;
+                let source = format!(
+                    "mandelbrot=size={width}x{height}:start_scale={start_scale}:\
+                     end_scale=0.004:end_pts=8:rate=25"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-vf", "hue=s=0",
+                        "-t", &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
+                        "-f", "yuv4mpegpipe", "-strict", "-1", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=1",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--lag-in-frames=0", "--auto-alt-ref=0",
+                    "--kf-min-dist=1000", "--kf-max-dist=1000",
+                    "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0", "--min-partition-size=16",
+                    "--max-partition-size=64", "--enable-tx-size-search=0",
+                    "--enable-order-hint=0", "--enable-warped-motion=0", "--enable-obmc=0",
+                    "--enable-masked-comp=0", "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0", "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0", "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0", "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0", "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0", "--enable-angle-delta=0",
+                    "--enable-cdef=0", "--enable-restoration=0", "--enable-palette=0",
+                    "--enable-intrabc=0", "--enable-cfl-intra=0", "--enable-ref-frame-mvs=0",
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = crate::decode::nocfl_uv_mode_hits();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        named_refusals += 1;
+                        eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let hits = crate::decode::nocfl_uv_mode_hits() - before;
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                if hits == 0 {
+                    carried_none += 1;
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
+                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
+                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, hits={hits})");
+                }
+                if hits > 0 {
+                    matched += 1;
+                    total_hits += hits;
+                }
+            }
+            eprintln!(
+                "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
+                 attempts carrying a 64x64 intra superblock ({total_hits} no-CFL uv_mode reads), \
+                 {carried_none} attempts carried none"
+            );
+            assert!(
+                matched > 0 && total_hits > 0,
+                "{NAME} ({bit_depth}-bit): no square-only attempt decoded a 64x64 intra block \
+                 inside an inter frame, so the no-CFL uv_mode alphabet was never exercised -- \
+                 gate proved nothing ({named_refusals} refusals, {carried_none} carried none)"
+            );
+        }
+    }
 
     /// lane-inter4 r2: the 32x32-level inter `PARTITION_HORZ`/`PARTITION_VERT`
     /// strips (32x16 / 16x32) carrying a REAL residual -- the capability r1
@@ -7724,6 +8251,194 @@ mod tests {
                  {out_of_scope} out of scope) -- gate proved nothing"
             );
         }
+    }
+
+    /// lane-intersub8: `PARTITION_SPLIT` below 8x8 on an INTER frame -- four
+    /// `BLOCK_4X4` inter sub-blocks with one shared 4x4 chroma unit per plane,
+    /// predicted the sub8x8 way (2x2 chroma piece per luma sub-block mv,
+    /// `dec_build_inter_predictors`' `is_sub8x8` branch). Reality of the shape
+    /// was established BEFORE the code (class refusal-from-own-desync): the
+    /// oracle `aomdec`'s `EC_TRACE` prints `EC_PART_VAL ... bsize=3 value=3`
+    /// on this recipe's inter frames.
+    ///
+    /// Attempts 0..7 run `--enable-rect-partitions=0`, where aomenc can only
+    /// pick SPLIT below 8x8; attempts 8..15 repeat the schedule with rect on,
+    /// where it picks HORZ/VERT below 8x8 far more often than SPLIT -- the VERT
+    /// arm (two `BLOCK_4X8` inter leaves, `decode_inter_sub8_rect2`) is what the
+    /// `rect_fired` assert pins. The HORZ twin decodes but is refused by name
+    /// (lane-intersub8 r3: a measured sweep desyncs the block to its right).
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_sub8x8_inter_split_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_a_sub8x8_inter_split_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 6usize);
+        let mut fired = 0u32;
+        // lane-intersub8 r3: attempts 8..15 repeat the same schedule with
+        // `--enable-rect-partitions=1`, where aomenc picks PARTITION_VERT below
+        // 8x8 (two BLOCK_4X8 inter leaves, one shared 4x4 chroma unit predicted
+        // from BOTH sub-blocks' mvs). The HORZ twin is still refused by name.
+        let mut rect_fired = 0u32;
+        let mut refusals: Vec<String> = Vec::new();
+        let mut out_of_scope_mismatch = 0u32;
+        for bit_depth in [8u32, 10u32] {
+            for attempt in 0..16u32 {
+                let rect = attempt / 8;
+                let rect_arg = format!("--enable-rect-partitions={rect}");
+                // lane-intersub8 r2, measured schedule (sweep of cq
+                // {8,10,12,14,16,18,20} x sp {3,6,9,12} x both depths,
+                // `decode_probe`'s `sub8_inter_split:` counter vs an ffmpeg
+                // rawvideo compare): sub-8x8 inter SPLIT groups fire at
+                // (8-bit, cq 12, sp 3) = 1 group and (10-bit, cq 12, sp 6) =
+                // 3 groups, both pixel-exact. cq 8 and 10 are NOT used: at
+                // those quantizers this recipe also carries a CDEF defect of
+                // another shape -- three luma samples of |d| = 1 on
+                // decode-order frames 3/4, zero sub-8x8 inter split groups,
+                // and the identical recipe re-encoded with `--enable-cdef=0`
+                // decodes all six frames exact. Deferred to a CDEF lane
+                // rather than hidden: cq 16..20 are all exact, so this gate
+                // is not selecting quantizers that hide a defect of its own
+                // shape.
+                let cq = [12, 14][(attempt % 2) as usize];
+                let sp = 3 + ((attempt % 8) / 2) * 3;
+                let duration = frame_count as f64 / 25.0;
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='128+58*sin((X+N*{sp})/6)+18*sin(Y/23)',format=yuv420p"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
+                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--lag-in-frames=0", "--enable-obmc=0", "--enable-tx-size-search=1",
+                    // Per-arm overrides last (aomenc keeps the LAST occurrence).
+                    "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0", "--min-partition-size=4",
+                    "--max-partition-size=16",
+                    &rect_arg,
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "{NAME}: aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = decode::sub8_inter_split_hits();
+                let before_rect = decode::sub8_inter_rect_hits();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        refusals.push(format!("{bit_depth}-bit attempt {attempt}: {msg}"));
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let split_groups = decode::sub8_inter_split_hits() - before;
+                let rect_now = decode::sub8_inter_rect_hits();
+                let rect_groups = (rect_now.0 - before_rect.0) + (rect_now.1 - before_rect.1);
+                let groups = split_groups + rect_groups;
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if groups == 0 {
+                    // Out of scope: no sub-8x8 inter split in this attempt.
+                    if mismatched {
+                        out_of_scope_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit attempt {attempt} MISMATCHES with zero \
+                             sub-8x8 inter group -- another shape's defect"
+                        );
+                    }
+                    refusals.push(format!(
+                        "{bit_depth}-bit attempt {attempt}: decoded, but no sub-8x8 inter split"
+                    ));
+                    continue;
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(
+                        got.y, want.y,
+                        "luma frame {i} ({bit_depth}-bit attempt {attempt}, {groups} sub-8x8 \
+                         inter split groups)"
+                    );
+                    assert_eq!(got.u, want.u, "U frame {i} ({bit_depth}-bit attempt {attempt})");
+                    assert_eq!(got.v, want.v, "V frame {i} ({bit_depth}-bit attempt {attempt})");
+                }
+                fired += 1;
+                if rect_groups > 0 {
+                    rect_fired += 1;
+                }
+            }
+        }
+        assert_eq!(
+            out_of_scope_mismatch, 0,
+            "{NAME}: attempts mismatched with no sub-8x8 inter group"
+        );
+        assert!(
+            fired >= 2,
+            "{NAME}: fewer than 2 firing+pixel-exact attempts:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            rect_fired >= 2,
+            "{NAME}: fewer than 2 firing+pixel-exact attempts with a RECTANGULAR sub-8x8 \
+             inter leaf (4x8):\n{}",
+            refusals.join("\n")
+        );
     }
 
     #[test]
@@ -15859,6 +16574,151 @@ mod tests {
         );
         panic!(
             "fewer than 4 firing+pixel-exact runs out of 60 attempts:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-cdef r1: CDEF's per-8x8 skip band under sub-16x16 inter leaves.
+    ///
+    /// `apply_cdef` excludes an 8x8 luma unit whose four mi cells are all
+    /// `skip_txfm` (libaom `cdef.c:29-38 is_8x8_block_skip`, called from
+    /// `av1_cdef_compute_sb_list`'s dlist loop). `decode_inter_block8` -- the
+    /// leaf path `--min-partition-size=4` makes aomenc pick for a 16x16 group
+    /// -- wrote the loop-filter grid but never that skip band, so an all-skip
+    /// group kept the PREVIOUS frame's flags and got filtered where libaom
+    /// skips it (3 luma samples, decode-order frames 3 and 4 of the 192x128
+    /// cq-8 stream below, at the frame's last 8x8 column).
+    ///
+    /// Both counters are hard asserts per compared attempt: `cdef_skipped_units`
+    /// proves the all-skip dlist exclusion was actually reached, and
+    /// `inter8_skip_band_hits` proves the 8x8 leaf path (the writer that used
+    /// to be missing) ran on the same stream.
+    #[test]
+    fn a_real_aomenc_stream_with_cdef_and_sub16_inter_leaves_decodes_pixel_exact() {
+        if !have_aomenc() {
+            return;
+        }
+        let (width, height, frames) = (192usize, 128usize, 6usize);
+        let mut refusals: Vec<String> = Vec::new();
+        let mut fired = 0u32;
+        for (depth, cq, sp) in [(8u32, 8u32, 3u32), (8, 10, 3), (8, 12, 6), (10, 8, 3), (10, 12, 6)] {
+            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let src = format!(
+                "color=c=gray:s={width}x{height}:d=0.24:r=25,format=gray,\
+                 geq=lum='128+58*sin((X+N*{sp})/6)+18*sin(Y/23)',format=yuv420p"
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &src, "-t", "0.24", "-pix_fmt", pix,
+                    "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &format!("--cq-level={cq}"),
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &format!("--bit-depth={depth}"),
+                    &format!("--input-bit-depth={depth}"),
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    "--enable-obmc=0",
+                    "--enable-tx-size-search=1",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--min-partition-size=4",
+                    "--max-partition-size=16",
+                    // Last occurrence of a repeated --enable-* flag wins
+                    // (aomenc-last-flag-wins): CDEF stays ON, and the two
+                    // counters below prove the filter really ran.
+                    "--enable-cdef=1",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture (depth={depth} cq={cq})"
+            );
+            let stream = out.stdout;
+            let skipped_before = decode::cdef_skipped_units();
+            let leaves_before = decode::inter8_skip_band_hits();
+            let decoded = match decode_stream(&stream) {
+                Ok(f) => f,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.starts_with("unsupported: "),
+                        "decode error that is not a named refusal \
+                         (depth={depth} cq={cq}): {msg}"
+                    );
+                    refusals.push(format!("depth={depth} cq={cq}: {msg}"));
+                    continue;
+                }
+            };
+            assert_eq!(decoded.len(), frames, "frame count (depth={depth} cq={cq})");
+            assert!(
+                decode::cdef_skipped_units() > skipped_before,
+                "no 8x8 CDEF unit was excluded by the all-skip rule \
+                 (depth={depth} cq={cq})"
+            );
+            assert!(
+                decode::inter8_skip_band_hits() > leaves_before,
+                "no sub-16x16 inter leaf wrote the CDEF skip band \
+                 (depth={depth} cq={cq})"
+            );
+            let reference = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames)
+            };
+            for (i, (ours, theirs)) in decoded.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(ours.y, theirs.y, "luma frame {i} (depth={depth} cq={cq})");
+                assert_eq!(ours.u, theirs.u, "U frame {i} (depth={depth} cq={cq})");
+                assert_eq!(ours.v, theirs.v, "V frame {i} (depth={depth} cq={cq})");
+            }
+            fired += 1;
+        }
+        // Three of the five arms land on OTHER open refusals (a non-DC chroma
+        // mode on an 8x8 inter leaf; inter partitions below 8x8) -- the two
+        // 8-bit cq 8/10 arms ARE the streams the defect was found on, and each
+        // hard-asserts both counters plus all six frames on all three planes.
+        assert!(
+            fired >= 2,
+            "fewer than 2 firing+pixel-exact attempts:\n{}",
             refusals.join("\n")
         );
     }
