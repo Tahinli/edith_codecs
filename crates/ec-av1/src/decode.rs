@@ -1511,6 +1511,22 @@ pub(crate) fn rect_leaf_coeff_hits() -> usize {
     RECT_LEAF_COEFF_HITS.with(|c| c.get())
 }
 
+// lane-intrarect r1: how many intra-coded HORZ/VERT strips decoded on the
+// INTER block path ([`decode_intra_rect_in_inter`]), per shape class --
+// [0] the superblock-level 64x32/32x64, [1] 32x16/16x32, [2] 16x8/8x16.
+// Every one of them was the named refusal "an intra-coded HORZ/VERT strip
+// needs rectangular intra prediction" before this round.
+thread_local! {
+    static INTRA_RECT_IN_INTER_HITS: std::cell::Cell<[usize; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
+}
+
+/// Current value of [`INTRA_RECT_IN_INTER_HITS`] for one shape class
+/// (0 = 64x32/32x64, 1 = 32x16/16x32, 2 = 16x8/8x16).
+pub(crate) fn intra_rect_strip_in_inter_hits(class: usize) -> usize {
+    INTRA_RECT_IN_INTER_HITS.with(|c| c.get()[class])
+}
+
 // lane-rectx r5: how many times a NON-strip `kf_y_mode` reader
 // ([`decode_block`], [`decode_block_rect`], [`decode_block_rect64`]) took an
 // above/left mode from the mi-exact map that DIFFERS from its coarse 16x16
@@ -5147,6 +5163,175 @@ fn decode_rect_split(
              tx={tx_w}x{tx_h} rng={rng}"
         );
     }
+    Ok(())
+}
+
+/// One intra-coded HORZ/VERT strip on the INTER block path (lane-intrarect
+/// r1) -- the shape [`decode_inter_block`]'s intra arm refused by name
+/// because it predicts squares only. Every pixel here goes through the rect
+/// machinery the key-frame paths already prove: [`decode_rect_split`], which
+/// at `depth == 0` is the unsplit strip as a single transform unit and
+/// beyond it the per-unit walk of [`depth_to_tx_wh`].
+///
+/// What is genuinely different from [`decode_block_rect`] is the mode
+/// syntax: on an inter frame an intra block reads `y_mode[size_group]` and
+/// `uv_mode` (libaom `read_intra_block_mode_info`, decodemv.c:1065), never
+/// the key frame's `kf_y_mode` above/left pair. This mirrors the square
+/// intra-in-inter arm's own reads at the rect footprint, including its
+/// inherited gaps -- no `use_filter_intra` symbol (every inter gate recipe
+/// pins `--enable-filter-intra=0`; lane-fiinter owns that read for both the
+/// square and this arm) and a nonzero luma angle delta refused by name.
+///
+/// The strip's own neighbour records (luma per transform unit, chroma, skip
+/// grid, deblock grid) are [`decode_rect_split`]'s; the caller adds the
+/// inter-side bands and the mi map.
+#[allow(clippy::too_many_arguments)]
+fn decode_intra_rect_in_inter(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    at: (usize, usize),
+    bw: usize,
+    bh: usize,
+    skip: bool,
+    allow_screen_content_tools: bool,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    base_q_idx: u8,
+) -> Result<()> {
+    let (r, c) = at;
+    let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+    // `size_group_lookup` (libaom common_data.h) and `bsize_to_tx_size_cat`
+    // (blockd.h) for the three 2:1 strip shapes: BLOCK_16X8 -> group 1 /
+    // cat 1, BLOCK_32X16 -> 2 / 2, BLOCK_64X32 -> 3 / 3 (the rectsplitx
+    // finding -- the category is NOT the same for every strip size).
+    // A 1:4 strip breaks that diagonal (BLOCK_32X8 is group 1 but cat 2), so
+    // it is refused by name rather than read from the wrong CDF row.
+    let (size_group, tx_cat) = match (bw.min(bh), bw.max(bh)) {
+        (8, 16) => (1usize, 1usize),
+        (16, 32) => (2, 2),
+        (32, 64) => (3, 3),
+        _ => {
+            return Err(unsupported(
+                "an intra-coded 1:4 (or other non-2:1) rect strip on the inter block path",
+            ))
+        }
+    };
+    // [`read_intra_mode_rect`]'s own refusal: palette/intrabc syntax is
+    // consumed for square blocks only, so a strip in a screen-content frame
+    // would skip symbols the encoder wrote.
+    if allow_screen_content_tools {
+        return Err(unsupported(
+            "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
+             is consumed for square blocks only)",
+        ));
+    }
+    let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
+    if mode >= 13 {
+        return Err(unsupported(
+            "an intra mode this decoder does not code (round 2)",
+        ));
+    }
+    if (V_PRED..=D67_PRED).contains(&mode) {
+        let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
+        if angle != ANGLE_DELTA_ZERO {
+            return Err(unsupported(
+                "a nonzero angle delta (this encoder never writes one)",
+            ));
+        }
+    }
+    // `is_cfl_allowed` (spec 5.11.5) caps CFL at 32x32, so the
+    // superblock-level strip reads the no-CFL alphabet -- the same split
+    // [`read_intra_mode_rect`] makes for [`decode_block_rect64`].
+    let cfl_allowed = bw.max(bh) <= 32;
+    let uv_mode = if cfl_allowed {
+        dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+    } else {
+        dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
+    };
+    if (9..=12).contains(&uv_mode) {
+        SMOOTH_UV_HITS.with(|h| h.set(h.get() + 1));
+    }
+    let alpha = if cfl_allowed && uv_mode == UV_CFL_PRED {
+        Some(read_cfl_alphas(dec, cdfs))
+    } else {
+        None
+    };
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED {
+        DC_PRED
+    } else {
+        uv_mode
+    };
+    let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+        DIRECTIONAL_UV_HITS.with(|h| h.set(h.get() + 1));
+        read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
+    } else {
+        0
+    };
+    if angle_delta_uv != 0 {
+        UV_ANGLE_DELTA_HITS.with(|h| h.set(h.get() + 1));
+    }
+    // The intra-edge filter type is the NEIGHBOUR's mode (libaom
+    // `get_filt_type`), luma's off the luma neighbours and chroma's off the
+    // chroma ones -- [`decode_block_rect`]'s own pair.
+    let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
+    let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
+    if smooth_neighbor {
+        SMOOTH_LUMA_HITS.with(|h| h.set(h.get() + 1));
+    }
+    let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(mi_r, mi_c, r, c);
+    let depth = if TX_SELECT_INTER.with(std::cell::Cell::get) {
+        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+        match tx_cat {
+            1 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
+            2 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
+            _ => dec.symbol(&mut cdfs.tx_size_cat3[ctx]),
+        }
+    } else {
+        0
+    };
+    if depth != 0 {
+        TX_DEPTH_HITS.with(|h| h.set(h.get() + 1));
+    }
+    let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+    let modes = RectStripModes {
+        skip,
+        mode,
+        angle_delta_y: 0,
+        uv_predict_mode,
+        angle_delta_uv,
+        alpha,
+        filter_intra: None,
+        smooth_neighbor,
+        smooth_neighbor_uv,
+    };
+    decode_rect_split(
+        dec,
+        cdfs,
+        neighbours,
+        (mi_r, mi_c),
+        bw,
+        bh,
+        tx_w,
+        tx_h,
+        &modes,
+        y,
+        u,
+        v,
+        base_q_idx,
+        REDUCED_TX_SET_INTER.with(std::cell::Cell::get),
+    )?;
+    let class = match bw.max(bh) {
+        64 => 0,
+        32 => 1,
+        _ => 2,
+    };
+    INTRA_RECT_IN_INTER_HITS.with(|h| {
+        let mut v = h.get();
+        v[class] += 1;
+        h.set(v);
+    });
     Ok(())
 }
 
@@ -13458,15 +13643,6 @@ fn decode_inter_block(
     maybe_read_cdef_idx(dec, r * SUB_MI as usize, c * SUB_MI as usize, skip);
     maybe_read_delta_q(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
     maybe_read_delta_lf(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
-    // lane-warp r5: see `reject_residual` -- a square-block decode of a
-    // HORZ_B strip is symbol-exact only for `skip` (no residual, no
-    // motion_mode/warp symbol), so gate here before any further read.
-    if reject_residual && !skip {
-        return Err(unsupported(
-            "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
-        ));
-    }
-
     let (has_above, has_left) = (
         r > neighbours.tile_row0_mi / (SUB / MI),
         c > neighbours.tile_col0_mi / (SUB / MI),
@@ -13481,6 +13657,21 @@ fn decode_inter_block(
             c * SUB_MI as usize,
             dec.debug_state().0
         );
+    }
+    // lane-warp r5: see `reject_residual` -- a square-block decode of a
+    // HORZ_B strip is symbol-exact only for `skip` (no residual, no
+    // motion_mode/warp symbol). lane-intrarect r1 MOVED this gate from just
+    // after the `skip` read to here, past `is_inter` (class
+    // [[refusal-short-circuits-its-own-code]]: at the old place it refused
+    // 24/24 attempts of this lane's own gate before the intra arm below
+    // could run). An INTRA strip with its true `write_w`x`write_h` footprint
+    // now codes its residual rectangularly ([`decode_intra_rect_in_inter`]);
+    // an INTER one, and a strip decoded with square dimensions anyway, still
+    // cannot.
+    if reject_residual && !skip && (is_inter || (write_w == side && write_h == side)) {
+        return Err(unsupported(
+            "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
+        ));
     }
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
@@ -15255,10 +15446,51 @@ fn decode_inter_block(
         // already-square-predicted buffer). Named refusal instead of a
         // silently wrong square-shaped intra prediction.
         if write_w != side || write_h != side {
-            return Err(unsupported(
-                "an intra-coded HORZ/VERT strip needs rectangular intra prediction \
-                 this decoder does not code yet",
-            ));
+            // lane-intrarect r1: the strip decodes through its own rect
+            // machinery ([`decode_intra_rect_in_inter`] -> the key-frame
+            // paths' [`decode_rect_split`]) instead of refusing. That call
+            // already writes everything the shared tail below would for a
+            // square block EXCEPT the inter-side bands and the mi map, so
+            // this arm returns rather than falling through (a second
+            // `record_rect`/`fill_lf_grid_rect` at block granularity would
+            // overwrite the per-transform-unit records it just made).
+            decode_intra_rect_in_inter(
+                dec,
+                cdfs,
+                neighbours,
+                at,
+                write_w,
+                write_h,
+                skip,
+                allow_screen_content_tools,
+                y,
+                u,
+                v,
+                base_q_idx,
+            )?;
+            let (mi_r0, mi_c0) = (r * SUB_MI as usize, c * SUB_MI as usize);
+            for dr in 0..write_h / MI {
+                for dc in 0..write_w / MI {
+                    grid.set(
+                        mi_r0 + dr,
+                        mi_c0 + dc,
+                        MiInfo {
+                            is_inter: false,
+                            ref_frame: -1,
+                            ref_frame1: None,
+                            mv1: None,
+                            mv: (0, 0),
+                            is_new_mv: false,
+                            size: write_w / MI,
+                            size_h: write_h / MI,
+                            is_global_mv0: false,
+                            is_global_mv1: false,
+                        },
+                    );
+                }
+            }
+            neighbours.record_inter_rect(at, write_w, write_h, skip, false, 0, [3, 3], skip_mode);
+            return Ok(());
         }
         let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
         if mode >= 13 {
