@@ -14616,6 +14616,22 @@ fn decode_inter_block(
                 force_integer_mv,
                 (gm_table[(ref0 - LAST_FRAME) as usize], gm_table[(ref1 - LAST_FRAME) as usize]),
             );
+            if std::env::var_os("EC_TRACE_MODE").is_some() {
+                eprintln!(
+                    "EC_MODE_VAL mi_row={mi_row} mi_col={mi_col} mode={} ref0={ref0} ref1={ref1} mv0=({},{}) stack={} rng={}",
+                    compound_mode + 17,
+                    mv0.0,
+                    mv0.1,
+                    comp_stack.entries.len(),
+                    dec.debug_state().0
+                );
+                for (i, e) in comp_stack.entries.iter().enumerate() {
+                    eprintln!(
+                        "EC_STACK mi_row={mi_row} mi_col={mi_col} i={i} this=({},{}) comp=({},{}) w={}",
+                        e.mv0.0, e.mv0.1, e.mv1.0, e.mv1.1, e.weight
+                    );
+                }
+            }
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
             // spec `is_nontrans_global_motion`: ALL active refs' models must
             // be non-TRANSLATION (IDENTITY counts) for the compound block's

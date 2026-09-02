@@ -492,19 +492,6 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             .is_some_and(|seq| seq.use_128x128_superblock);
         let sb128_active = use_sb128 && (header.mi_cols > 16 || header.mi_rows > 16);
         crate::decode::set_sb128(sb128_active);
-        // lane-sb128 r2 RESIDUAL: the inter tile loop now reads the 128 root
-        // and walks libaom's quadrant order, and 8 of the 9 decode-order
-        // frames of the r2 gate stream are pixel-exact -- but frame 6 still
-        // differs (996 luma bytes, entropy in sync), and the SAME content at
-        // `--sb-size=64` is exact (`sb128_r2_control_sb64`), so the residual is
-        // sb128-specific. The refusal stays until that frame is exact: silent
-        // wrong pixels on his films are worse than a named stop.
-        if sb128_active && header.frame_type != FrameType::Key {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "an inter frame under a 128x128 superblock (this decoder's inter tile path recurses a 64x64 superblock root only)",
-            ));
-        }
         // lane-hbd r5: `BIT_DEPTH` (decode.rs) drives `crate::decode::sample_max`,
         // which every dequant/inverse-transform clamp reads -- set per frame,
         // not once per process, for the same cross-sequence-on-one-thread
@@ -16224,8 +16211,6 @@ mod tests {
     /// superblock), and temporal MV candidates (the inter-only path). Both bit
     /// depths -- his films are `yuv420p10le`. Only a missing tool SKIPs.
     #[test]
-    #[ignore = "lane-sb128 r2: reproducer for the residual frame-6 mismatch; the \
-                product path still refuses inter frames at sb128 (see decode_stream)"]
     fn a_real_aomenc_inter_sequence_with_128x128_superblocks_decodes_pixel_exact() {
         const NAME: &str =
             "a_real_aomenc_inter_sequence_with_128x128_superblocks_decodes_pixel_exact";
