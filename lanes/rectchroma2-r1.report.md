@@ -78,7 +78,7 @@ already-accepted path). `refusal_inventory.rs`/`gate_coverage.rs` untouched by i
 in the suite below.
 
 ## Suite
-`$HOME/.cache/rectchroma2-suite-r1.log`: SUITE_RESULT
+`$HOME/.cache/rectchroma2-suite-r1.log`: **388 passed, 0 failed, 35 ignored** (1668s), including the new gate. Baseline before this round on the same tree shape was 387/0/35 (this round adds one gate).
 
 ## Residue
 - accepted: `predict_scaled_kern` (scaled reference / superres) got the same fix by construction
