@@ -1125,6 +1125,15 @@ mod tests {
                         "{NAME}: {width}x{height} {bit_depth}-bit cq {cq}: {luma_bad} of {frames} \
                          frames differ from ffmpeg in LUMA (edge hits {hits:?})"
                     );
+                    // merge J, after lane-rectchroma2: the chroma residue this
+                    // gate used to tolerate WAS this decoder's -- the per-axis
+                    // narrow-block MC kernel decision read side x side instead
+                    // of the block's true dims. Full-plane now.
+                    assert_eq!(
+                        chroma_bad, 0,
+                        "{NAME}: {width}x{height} {bit_depth}-bit cq {cq}: {chroma_bad} of \
+                         {frames} frames differ from ffmpeg in CHROMA (edge hits {hits:?})"
+                    );
                     for (t, h) in totals.iter_mut().zip(hits) {
                         *t += h;
                     }
@@ -1150,9 +1159,9 @@ mod tests {
         // rather than about this lane's code.
         let (chits, cluma, cchroma) = inter_edge_strip_attempt(NAME, 192, 128, 8, 32, frames);
         assert_eq!(
-            (chits, cluma),
-            ([0usize; 6], 0usize),
-            "{NAME}: control 192x128 (no frame-edge node) must be luma-exact with no edge hits"
+            (chits, cluma, cchroma),
+            ([0usize; 6], 0usize, 0usize),
+            "{NAME}: control 192x128 (no frame-edge node) must be pixel-exact with no edge hits"
         );
         eprintln!(
             "{NAME}: {compared} attempts luma-exact over {} sizes, edge hits \
@@ -25213,5 +25222,203 @@ mod tests {
         // `the_hunger_games_ss600_key_frame_skipped_split_tx_decodes_pixel_exact`
         // instead; this counter is reported, not gated.
         eprintln!("{NAME}: {skip_split_tx_total} skipped 8x8 TX_4X4 leaves across compared attempts");
+    }
+
+    /// lane-rectchroma2 r1, the defect this gate exists for: our inter path
+    /// predicts a RECTANGULAR block over its enclosing SQUARE buffer
+    /// (`side`x`side`, `chroma_side`x`chroma_side` -- see
+    /// [`crate::decode`]'s `write_w`/`write_h` corner-cut), and
+    /// [`crate::mc::predict_with_filters`] took libaom's narrow-block 4-tap
+    /// decision from that buffer's dimensions. libaom
+    /// (`av1_get_interp_filter_params_with_block_size`, called per axis from
+    /// `inter_predictor` with `w` then `h`) takes it from the PREDICTION
+    /// block's own dimensions, so an 8x16 / 16x8 inter block -- whose chroma
+    /// is 4x8 / 8x4 -- must use the 4-tap kernel on the short axis. Luma is
+    /// never <= 4 wide here, which is exactly why every such stream decoded
+    /// LUMA EXACT and differed by +-1 on scattered chroma samples of those
+    /// blocks (lane-interedge r1's 192x128 control, a size with no frame-edge
+    /// node at all).
+    ///
+    /// Full-plane (Y+U+V) compare of EVERY decode-order frame
+    /// (`--lag-in-frames=0`), both orientations (192x128 and its transposed
+    /// twin, so the 4x8 and 8x4 chroma shapes both fire -- class
+    /// `scan-weights-cross-axis`), 8 AND 10 bit (his films are yuv420p10le),
+    /// cq 20/32/45, CDEF and loop restoration left ON. The counter is reset
+    /// per attempt and read only on an attempt that decoded and compared
+    /// (class `counter-from-refused-stream`); it counts predictions whose
+    /// kernel choice DIFFERS from what the square buffer would have given, so
+    /// a zero means the recipe lost the shape this gate pins.
+    #[test]
+    fn a_real_aomenc_rect_inter_block_predicts_chroma_with_the_narrow_kernel_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_rect_inter_block_predicts_chroma_with_the_narrow_kernel_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        const FRAMES: usize = 6;
+        let mut compared = 0usize;
+        let mut narrow_by_depth = [0usize; 2];
+        let mut narrow_by_shape = [0usize; 2];
+        for (si, (width, height)) in [(192usize, 128usize), (128usize, 192usize)]
+            .into_iter()
+            .enumerate()
+        {
+            for (di, depth) in [8usize, 10].into_iter().enumerate() {
+                let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i",
+                        &format!("mandelbrot=size={width}x{height}:rate=25"),
+                        "-pix_fmt", pix, "-strict", "-1", "-vframes", &FRAMES.to_string(),
+                        "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg fixture ({width}x{height}, depth={depth}): {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                for cq in [20usize, 32, 45] {
+                    let encode = || {
+                        let mut child = Command::new(aomenc_path())
+                            .args([
+                                "--codec=av1", "--passes=1", "--end-usage=q",
+                                &format!("--cq-level={cq}"),
+                                "--cpu-used=4", "--threads=1", "--row-mt=0",
+                                "--kf-max-dist=9999", &format!("--limit={FRAMES}"),
+                                "--lag-in-frames=0",
+                                &format!("--bit-depth={depth}"),
+                                &format!("--input-bit-depth={depth}"),
+                                // Rect partitions ON is the whole point; every
+                                // other tool below is another lane's open gap
+                                // that would refuse before a pixel compare.
+                                "--enable-rect-partitions=1", "--enable-ab-partitions=0",
+                                "--enable-1to4-partitions=0", "--min-partition-size=8",
+                                "--max-partition-size=64", "--enable-palette=0",
+                                "--enable-intrabc=0", "--enable-warped-motion=0",
+                                "--enable-obmc=0", "--enable-masked-comp=0",
+                                "--enable-interintra-comp=0", "--enable-onesided-comp=0",
+                                "--enable-interintra-wedge=0", "--enable-smooth-interintra=0",
+                                "--enable-ref-frame-mvs=0", "--enable-angle-delta=0",
+                                "--enable-cfl-intra=0", "--enable-directional-intra=0",
+                                "--enable-smooth-intra=0", "--enable-paeth-intra=0",
+                                "--enable-filter-intra=0", "--enable-tx-size-search=0",
+                                "--obu", "-o", "-", "-",
+                            ])
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(Stdio::piped())
+                            .spawn()
+                            .expect("aomenc failed to start");
+                        child
+                            .stdin
+                            .take()
+                            .expect("aomenc stdin")
+                            .write_all(&y4m.stdout)
+                            .expect("writing y4m to aomenc");
+                        let out = child.wait_with_output().expect("aomenc failed to run");
+                        assert!(
+                            out.status.success(),
+                            "aomenc refused the fixture ({width}x{height}, depth={depth}, \
+                             cq={cq}): {}",
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                        out.stdout
+                    };
+                    let stream = encode();
+                    assert_eq!(
+                        stream,
+                        encode(),
+                        "{NAME}: aomenc output is not reproducible ({width}x{height}, \
+                         depth={depth}, cq={cq})"
+                    );
+                    crate::mc::reset_rect_narrow_kern_hits();
+                    let frames = match decode_stream(&stream) {
+                        Ok(frames) => frames,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            assert!(
+                                msg.contains("unsupported"),
+                                "{NAME}: decode failed ({width}x{height}, depth={depth}, \
+                                 cq={cq}): {msg}"
+                            );
+                            eprintln!(
+                                "{NAME}: {width}x{height} depth={depth} cq={cq} arm refused \
+                                 (not compared): {msg}"
+                            );
+                            continue;
+                        }
+                    };
+                    let narrow = crate::mc::rect_narrow_kern_hits();
+                    let ffmpeg_frames = if depth == 10 {
+                        ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+                    } else {
+                        ffmpeg_decode_sequence(&stream, width, height, frames.len())
+                    };
+                    assert_eq!(
+                        ffmpeg_frames.len(),
+                        frames.len(),
+                        "{NAME}: ffmpeg frame count ({width}x{height}, depth={depth}, cq={cq})"
+                    );
+                    assert_eq!(
+                        frames.len(),
+                        FRAMES,
+                        "{NAME}: not every coded frame was decoded ({width}x{height}, \
+                         depth={depth}, cq={cq})"
+                    );
+                    for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                        assert_eq!(
+                            got.y, want.y,
+                            "{NAME} frame {i} luma vs ffmpeg ({width}x{height}, depth={depth}, \
+                             cq={cq}, narrow-kernel hits {narrow})"
+                        );
+                        assert_eq!(
+                            got.u, want.u,
+                            "{NAME} frame {i} U vs ffmpeg ({width}x{height}, depth={depth}, \
+                             cq={cq}, narrow-kernel hits {narrow})"
+                        );
+                        assert_eq!(
+                            got.v, want.v,
+                            "{NAME} frame {i} V vs ffmpeg ({width}x{height}, depth={depth}, \
+                             cq={cq}, narrow-kernel hits {narrow})"
+                        );
+                    }
+                    compared += 1;
+                    narrow_by_depth[di] += narrow;
+                    narrow_by_shape[si] += narrow;
+                    eprintln!(
+                        "{NAME}: {width}x{height} depth={depth} cq={cq} {} frames full-plane \
+                         exact, narrow-kernel hits {narrow}",
+                        frames.len()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            compared, 12,
+            "{NAME}: only {compared} of 12 arms were pixel-compared -- a refusal makes this \
+             gate vacuous"
+        );
+        assert!(
+            narrow_by_depth[0] > 0 && narrow_by_depth[1] > 0,
+            "{NAME}: no rect-chroma narrow kernel fired at 8-bit ({}) or 10-bit ({}) -- the \
+             recipe lost the shape this gate pins",
+            narrow_by_depth[0], narrow_by_depth[1]
+        );
+        assert!(
+            narrow_by_shape[0] > 0 && narrow_by_shape[1] > 0,
+            "{NAME}: the shape fired in only one orientation (192x128 {}, 128x192 {})",
+            narrow_by_shape[0], narrow_by_shape[1]
+        );
     }
 }
