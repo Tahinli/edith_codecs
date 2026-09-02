@@ -16901,6 +16901,25 @@ fn is_any_masked_compound_used_here(side: usize) -> bool {
     side.min(side) >= 8
 }
 
+/// The `BLOCK_SIZES_ALL` index libaom's `compound_type_cdf`/`wedge_idx_cdf`
+/// are keyed by, for the block sizes `av1_wedge_params_lookup`
+/// (reconinter.c) gives a non-zero `wedge_types` -- `None` is libaom's
+/// "no `compound_type` symbol, `COMPOUND_DIFFWTD` inferred" arm.
+fn wedge_bsize_index(w: usize, h: usize) -> Option<usize> {
+    Some(match (w, h) {
+        (8, 8) => 3,
+        (8, 16) => 4,
+        (16, 8) => 5,
+        (16, 16) => 6,
+        (16, 32) => 7,
+        (32, 16) => 8,
+        (32, 32) => 9,
+        (8, 32) => 18,
+        (32, 8) => 19,
+        _ => return None,
+    })
+}
+
 /// Whether a compound reference pair is unidirectional (both references on
 /// the same temporal side of the current frame) -- `has_uni_comp_refs`
 /// (libaom `av1_reference_frame_utils.h`/`pred_common.c`'s own definition:
@@ -17717,12 +17736,15 @@ fn decode_inter_block(
                 // writes NO `compound_type` symbol there and INFERS
                 // `COMPOUND_DIFFWTD` -- only the 1-bit `mask_type` literal
                 // follows. `None` here is exactly that inferred arm.
-                let wedge_bsize = match side {
-                    8 => Some(3),
-                    16 => Some(6),
-                    32 => Some(9),
-                    _ => None,
-                };
+                // lane-lastframe8 r1: the CDF row is the block's TRUE bsize
+                // (libaom `compound_type_cdf[bsize]`/`wedge_idx_cdf[bsize]`,
+                // decodemv.c 1618-1634), NOT the enclosing square `side` a
+                // rect strip is decoded at. A 16x32 VERT half read
+                // `compound_type_cdf[BLOCK_32X32]` instead of
+                // `[BLOCK_16X32]`: same value, different interval, and the
+                // tile desynced at the next block (class
+                // price-the-narrowing-not-the-table).
+                let wedge_bsize = wedge_bsize_index(write_w, write_h);
                 let compound_type = match wedge_bsize {
                     Some(b) => dec.symbol(&mut cdfs.compound_type[b]),
                     None => 1,
@@ -17730,6 +17752,14 @@ fn decode_inter_block(
                 if let Some(wedge_bsize) = wedge_bsize.filter(|_| compound_type == 0) {
                     // COMPOUND_WEDGE: lane-wedge r3, codebook checksum-
                     // verified vs independent C dump (wedge.rs).
+                    // lane-lastframe8 r1: `wedge::codebook` is square-only, so
+                    // a rect block's mask cannot be built -- refuse by name
+                    // rather than blend with the wrong codebook.
+                    if write_w != write_h {
+                        return Err(unsupported(
+                            "a COMPOUND_WEDGE mask on a non-square inter block",
+                        ));
+                    }
                     let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
                     let wedge_sign = dec.literal(1);
                     WEDGE_HITS.with(|c| c.set(c.get() + 1));

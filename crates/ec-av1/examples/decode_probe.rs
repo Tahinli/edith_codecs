@@ -92,6 +92,25 @@ fn main() {
             _ => continue,
         };
         frames_seen += 1;
+        // lane-lastframe8 r1: the display/refresh state of every frame, so a
+        // "only the last decode-order frame mismatches" report can separate a
+        // show_existing / no-show ordering defect from a coding defect.
+        if std::env::var_os("EC_PROBE_HDR").is_some() {
+            println!(
+                "HDR {}: type={:?} show={} showable={} show_existing={} idx={} refresh={:#04x} order_hint={} primary_ref={} base_q={} ref_idx={:?}",
+                frames_seen - 1,
+                header.frame_type,
+                header.show_frame,
+                header.showable_frame,
+                header.show_existing_frame,
+                header.frame_to_show_map_idx,
+                header.refresh_frame_flags,
+                header.order_hint,
+                header.primary_ref_frame,
+                header.quantization.base_q_idx,
+                header.ref_frame_idx,
+            );
+        }
         let t = &header.tile_info;
         let entry = (t.cols, t.rows, t.uniform_spacing, t.context_update_tile_id);
         if !seen.contains(&entry) {
