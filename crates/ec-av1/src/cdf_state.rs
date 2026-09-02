@@ -108,6 +108,16 @@ pub(crate) enum TxbSet {
     /// `Luma32`'s 1024-position one. Never carries a `tx_type` symbol: both
     /// orientations use one variant (`get_tx_set` is `EXT_TX_SET_DCTONLY` at
     /// `tx_size_sqr_up == TX_32X32` regardless of which axis is longer).
+    /// The 32x8/8x32 luma transform of a 32x32-level `PARTITION_HORZ_4`/
+    /// `PARTITION_VERT_4` strip (lane-tx64x16 r3). `get_txsize_entropy_ctx`
+    /// averages the two log2 sides ((5 + 3) / 2 = 4), so the coefficient CDF
+    /// set is the 16x16 one [`Luma16`](TxbSet::Luma16) reads -- 256 coded
+    /// positions, `eob_pt_256`. Unlike `Luma16` it carries NO `tx_type`
+    /// symbol: `tx_size_sqr_up` of a 4:1 32-wide strip is `TX_32X32`, where
+    /// `av1_get_ext_tx_set_type` returns `EXT_TX_SET_DCTONLY` for an intra
+    /// block, so the encoder writes none (same reason
+    /// [`LumaRect32x16`](TxbSet::LumaRect32x16) has none).
+    LumaRect32x8,
     LumaRect32x16,
     /// The chroma 16x8/8x16 transform under the same strip (lane-rectwire):
     /// [`Chroma16`](TxbSet::Chroma16)'s tables except `eob_pt`, which reads
@@ -1605,6 +1615,18 @@ impl Cdfs {
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
                 eob_pt_class1: Some(&mut self.eob_pt_1024_chroma_class1),
+            },
+            TxbSet::LumaRect32x8 => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_256_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: None,
+                eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
             },
             TxbSet::LumaRect32x16 => TxbTables {
                 side: 32,
