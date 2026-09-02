@@ -1107,6 +1107,9 @@ pub(crate) fn vartx_rect_leaf4_hits() -> [usize; 2] {
 
 /// Records one rectangular var-tx leaf.
 fn vartx_rect_leaf_hit(tw: usize, th: usize) {
+    if std::env::var_os("EC_VARTXLEAF").is_some() {
+        eprintln!("EC_VARTXLEAF tw={tw} th={th}");
+    }
     let cell = if tw.min(th) == 4 { &VARTX_RECT_LEAF4_HITS } else { &VARTX_RECT_LEAF_HITS };
     cell.with(|c| {
         let mut h = c.get();
@@ -4338,7 +4341,7 @@ fn read_coeffs_rect(
         };
         if rect_trace {
             let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=sign_rect pos={pos} sign={} rng={rng}", u8::from(negative));
+            eprintln!("EC_COEFF_STEP tag=sign_rect pos={pos} sign={} dcctx={sign_ctx} rng={rng}", u8::from(negative));
         }
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
             let g = read_golomb(dec)?;
@@ -5397,6 +5400,15 @@ impl Neighbours {
                 let left = &self.left[mi_r + cell][plane];
                 left_coded |= left.level != 0;
                 vote += dc_vote(left.dc);
+            }
+            if plane == 0 && std::env::var_os("EC_DCDUMP").is_some() {
+                let ab: Vec<String> = (0..w_mi)
+                    .map(|k| format!("{:?}/{}", self.above[mi_c + k][0].dc, self.above[mi_c + k][0].level))
+                    .collect();
+                let lf: Vec<String> = (0..h_mi)
+                    .map(|k| format!("{:?}/{}", self.left[mi_r + k][0].dc, self.left[mi_r + k][0].level))
+                    .collect();
+                eprintln!("EC_DCDUMP mi=({mi_r},{mi_c}) wh=({w},{h}) vote={vote} above=[{}] left=[{}]", ab.join(","), lf.join(","));
             }
             (above_coded, left_coded, vote)
         })
