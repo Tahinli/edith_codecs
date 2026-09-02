@@ -688,11 +688,13 @@ fn top_right_scan_allowed(bw4: usize, bh4: usize) -> bool {
 /// (what this module did before lane-sb128 r2) cannot see. It cost frame 6 of
 /// the 128 inter gate 380 wrong luma bytes with the entropy stream in sync.
 ///
-/// corner-cut: libaom's three shape refinements (`is_last_vertical_rect`,
-/// `is_first_horizontal_rect`, the `PARTITION_VERT_A` bottom-left square) are
-/// not ported -- the ceiling is rectangular and AB-partitioned INTER leaves,
-/// which this decoder refuses by name today; port them with the rect inter
-/// leaf.
+/// lane-t900 r10 ports `is_last_vertical_rect` and `is_first_horizontal_rect`
+/// (both derivable from `mi_row`/`mi_col`/`bw4`/`bh4` alone).
+/// corner-cut: libaom's third refinement (the `PARTITION_VERT_A` bottom-left
+/// SQUARE, which needs the parent partition type this port does not thread
+/// here) is still missing -- ceiling is a square INTER leaf inside a VERT_A
+/// partition whose warp-sample top-right probe may answer 1 where libaom says
+/// 0; upgrade path = thread `partition` into this call.
 pub(crate) fn has_top_right(mi_row: usize, mi_col: usize, bw4: usize, bh4: usize) -> bool {
     let sb_mi_size = crate::decode::sb_mi_cur() as usize;
     let bs0 = bw4.max(bh4);
@@ -712,6 +714,24 @@ pub(crate) fn has_top_right(mi_row: usize, mi_col: usize, bw4: usize, bh4: usize
             break;
         }
         bs <<= 1;
+    }
+    // lane-t900 r10: two of libaom's three shape refinements, computed from
+    // the block's own position and side (`av1_common_int.h:1419-1428` sets
+    // `is_last_vertical_rect` / `is_first_horizontal_rect` from exactly these
+    // terms, no partition context). They only bite when `bw4 != bh4`, which is
+    // also the only case where `bs0` differs from the block's width -- probing
+    // at the longer side WITHOUT them is half a port and moved the first
+    // divergence of the 10-bit 1080p cut EARLIER (r9).
+    if bw4 < bh4 {
+        let is_last_vertical_rect = (mi_col + bw4) & (bh4 - 1) == 0;
+        if !is_last_vertical_rect {
+            has_tr = true;
+        }
+    } else if bw4 > bh4 {
+        let is_first_horizontal_rect = mi_row & (bw4 - 1) == 0;
+        if !is_first_horizontal_rect {
+            has_tr = false;
+        }
     }
     has_tr
 }
