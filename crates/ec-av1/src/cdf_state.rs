@@ -412,7 +412,10 @@ pub(crate) struct Cdfs {
     /// The all-zero flag of a 16x16 chroma transform.
     pub txb_skip_chroma_16: [[u16; 3]; 3],
     /// The all-zero flag of a 32x32 chroma transform.
-    pub txb_skip_chroma_32: [[u16; 3]; 3],
+    /// SIX contexts, not three: rows 0..3 are libaom's `txb_skip_ctx` 7..9
+    /// (chroma transform == its plane block) and rows 3..6 its 10..12 (plane
+    /// block larger, i.e. a 128x128 block's four TX_32X32 chroma units).
+    pub txb_skip_chroma_32: [[u16; 3]; 6],
     /// The end-of-block group of a luma transform of 1024 positions.
     pub eob_pt_1024_luma: [u16; 12],
     /// The same, for chroma.
@@ -1266,13 +1269,23 @@ impl Cdfs {
                 cdf::TXB_SKIP_CHROMA_16,
                 cdf::TXB_SKIP_CHROMA_16_Q3,
             ),
-            txb_skip_chroma_32: pick(
-                q_ctx,
-                cdf::TXB_SKIP_CHROMA_32_Q0,
-                cdf::TXB_SKIP_CHROMA_32_Q1,
-                cdf::TXB_SKIP_CHROMA_32,
-                cdf::TXB_SKIP_CHROMA_32_Q3,
-            ),
+            txb_skip_chroma_32: {
+                let small = pick(
+                    q_ctx,
+                    cdf::TXB_SKIP_CHROMA_32_Q0,
+                    cdf::TXB_SKIP_CHROMA_32_Q1,
+                    cdf::TXB_SKIP_CHROMA_32,
+                    cdf::TXB_SKIP_CHROMA_32_Q3,
+                );
+                let big = pick(
+                    q_ctx,
+                    cdf::TXB_SKIP_CHROMA_32_BIG_Q0,
+                    cdf::TXB_SKIP_CHROMA_32_BIG_Q1,
+                    cdf::TXB_SKIP_CHROMA_32_BIG,
+                    cdf::TXB_SKIP_CHROMA_32_BIG_Q3,
+                );
+                [small[0], small[1], small[2], big[0], big[1], big[2]]
+            },
             eob_pt_1024_luma: pick(
                 q_ctx,
                 cdf::EOB_PT_1024_LUMA_Q0,
