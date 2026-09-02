@@ -7386,6 +7386,56 @@ fn decode_intra_rect_in_inter(
         });
         return Ok(());
     }
+    // lane-inter128intra r1: the 128 superblock's PARTITION_HORZ/VERT half
+    // coded INTRA inside an inter frame. `size_group_lookup` (common_data.h:61)
+    // puts BLOCK_128X64/64X128/128X128 in group 3 and
+    // `max_txsize_rect_lookup` caps them at TX_64X64, i.e. the same
+    // `tx_size_cat3` row [`decode_block_128rect`] already reads -- so the whole
+    // block decodes through the very body the KEY FRAME path proves for this
+    // shape (square 64x64 luma units, one TX_32X32 chroma unit per 64x64 mu
+    // chunk on the offset-10 txb_skip rows, per-TU prediction, the mu-chunk
+    // `Reach` rule and the frame-edge write clip). The only inter-frame
+    // differences live inside that body: the mode-info read
+    // ([`INTRA_IN_INTER_MODE`] -> `y_mode[3]` plus the `skip` this caller
+    // already read), the `tx_depth` context (the real TXFM_CONTEXT bands) and
+    // the `set_txfm_ctxs` publication. CfL (>32), filter intra (>32) and
+    // palette (>64) do not exist at this size and are refused by name there.
+    // lane-inter128intra r1: OPT-IN ONLY (`EC_INTRA128_IN_INTER=1`) until a
+    // gate exists. The body below is believed right (it is the key frame's own
+    // proven body plus the three inter-frame differences), but the three 1080p
+    // cuts that reach this shape reach it AFTER a pre-existing desync (see the
+    // lane report: their frame 2 diverges from aomdec inside the superblock at
+    // mi(0,320), long before mi(128,416)), and no aomenc recipe found so far
+    // emits a 128-root HORZ/VERT half coded intra in an inter frame -- so
+    // nothing can currently prove this arm. A refusal is lifted only with a
+    // gate (COMMON), so the default path still refuses by name below.
+    if bw.max(bh) == 128 && std::env::var_os("EC_INTRA128_IN_INTER").is_some() {
+        if allow_screen_content_tools {
+            return Err(unsupported(
+                "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
+                 is consumed for square blocks only)",
+            ));
+        }
+        INTRA_IN_INTER_MODE.with(|c| c.set(Some((3, skip))));
+        let res = decode_block_128rect(
+            dec,
+            cdfs,
+            neighbours,
+            (r, c),
+            bw,
+            bh,
+            y,
+            u,
+            v,
+            base_q_idx,
+            ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+            allow_screen_content_tools,
+            TX_SELECT_INTER.with(std::cell::Cell::get),
+            REDUCED_TX_SET_INTER.with(std::cell::Cell::get),
+        );
+        INTRA_IN_INTER_MODE.with(|c| c.set(None));
+        return res;
+    }
     let (size_group, tx_cat) = match (bw.min(bh), bw.max(bh)) {
         (8, 16) => (1usize, 1usize),
         (16, 32) => (2, 2),
@@ -11517,6 +11567,15 @@ thread_local! {
     /// Those blocks by resolved intra `tx_depth` (0 = TX_64X64 units,
     /// 1 = TX_32X32, 2 = TX_16X16) -- proof the depth symbol is really read.
     pub(crate) static INTRA_SB128_DEPTH_HITS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// lane-inter128intra r1: the same shapes decoded on the INTER block path
+    /// (an intra-coded PARTITION_HORZ/VERT half of a 128 superblock inside an
+    /// inter frame) -- (128x64, 64x128).
+    pub(crate) static INTRA128_IN_INTER_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// [`INTRA128_IN_INTER_HITS`], for a gate's own before/after delta.
+pub(crate) fn intra128_in_inter_hits() -> [usize; 2] {
+    INTRA128_IN_INTER_HITS.with(std::cell::Cell::get)
 }
 
 /// [`INTRA_SB128_HORZ_HITS`] / [`INTRA_SB128_VERT_HITS`] /
@@ -11608,8 +11667,17 @@ fn decode_block_128rect(
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(mi_r, mi_c, r, c);
     // spec 5.11.16 `read_tx_size`: read for every intra block, skipped or
     // not. `bsize_to_tx_size_cat(BLOCK_128X64)` is 3 (see this fn's doc).
+    let in_inter = INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some();
     let depth = if tx_select {
-        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+        // lane-inter128intra r1: on an INTER frame `get_tx_size_context` reads
+        // the real `TXFM_CONTEXT` bands, and compares them against
+        // `tx_size_wide/high[max_txsize_rect_lookup[bsize]]` -- TX_64X64 for
+        // every 128-axis block, hence the `min(64)`.
+        let ctx = if in_inter {
+            tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw.min(64), bh.min(64))
+        } else {
+            tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh)
+        };
         dec.symbol(&mut cdfs.tx_size_cat3[ctx])
     } else {
         0
@@ -11801,7 +11869,25 @@ fn decode_block_128rect(
         logical_tx as u8,
         0,
     );
-    if bw > bh {
+    if in_inter {
+        // `set_txfm_ctxs(tx_size, n4_w, n4_h, skip && is_inter, xd)`
+        // (libaom `decodeframe.c` `decode_block`) runs for EVERY block of an
+        // inter frame, intra ones included: an intra block stamps its
+        // TRANSFORM size over its own footprint in both TXFM_CONTEXT bands.
+        // A key frame has no var-tx tree and its readers use the deblock grid,
+        // so this is the inter path's alone.
+        txfm_partition_update_rect(
+            neighbours,
+            (mi_r, mi_c),
+            (logical_tx, logical_tx),
+            (bw, bh),
+        );
+        INTRA128_IN_INTER_HITS.with(|c| {
+            let mut h = c.get();
+            h[usize::from(bw < bh)] += 1;
+            c.set(h);
+        });
+    } else if bw > bh {
         INTRA_SB128_HORZ_HITS.with(|c| c.set(c.get() + 1));
     } else {
         INTRA_SB128_VERT_HITS.with(|c| c.set(c.get() + 1));
