@@ -2608,6 +2608,14 @@ thread_local! {
 thread_local! {
     static CDEF_SKIPPED_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INTER8_SKIP_BAND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // lane-cdef r2: (c) 8x8 CDEF units that are FILTERED and whose extent
+    // crosses the cropped frame edge -- the only units for which "clamp at
+    // the crop" and "pad past the mi-rounded extent with CDEF_VERY_LARGE"
+    // (libaom `cdef.c:249-256`, `cdef_prepare_fb`'s hsize/vsize are
+    // `nhb << mi_wide_l2` off the MI grid, not the crop) differ. A frame
+    // whose width or height is not a multiple of 8 is the only shape that
+    // produces one; the straddling-band gate arms assert it grew.
+    static CDEF_STRADDLE_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Current value of `CDEF_SKIPPED_UNITS`.
@@ -2618,6 +2626,11 @@ pub(crate) fn cdef_skipped_units() -> usize {
 /// Current value of `INTER8_SKIP_BAND_HITS`.
 pub(crate) fn inter8_skip_band_hits() -> usize {
     INTER8_SKIP_BAND_HITS.with(|c| c.get())
+}
+
+/// Current value of `CDEF_STRADDLE_UNITS`.
+pub(crate) fn cdef_straddle_units() -> usize {
+    CDEF_STRADDLE_UNITS.with(|c| c.get())
 }
 
 /// Current value of [`SUB8_SPLIT_HITS`].
@@ -12844,6 +12857,9 @@ fn apply_cdef(
     v: &mut PlaneBuf,
     cdef: &CdefParams,
     skip_grid: &Neighbours,
+    // This frame header's own CROPPED luma size, for the straddling-unit
+    // counter only -- CDEF itself walks the mi-rounded plane.
+    (frame_w, frame_h): (usize, usize),
 ) {
     // lane-part32 r2 debug rung, env-gated: see `apply_deblock`'s sibling.
     if std::env::var_os("EC_AV1_DEBUG_SKIP_CDEF").is_some() {
@@ -12928,6 +12944,14 @@ fn apply_cdef(
                 }
                 let enable_primary = t != 0;
                 let enable_secondary = y_sec_strength != 0;
+                if (ox + 8 > frame_w || oy + 8 > frame_h)
+                    && (enable_primary
+                        || enable_secondary
+                        || cdef.uv_pri_strength[sidx] != 0
+                        || cdef.uv_sec_strength[sidx] != 0)
+                {
+                    CDEF_STRADDLE_UNITS.with(|c| c.set(c.get() + 1));
+                }
                 if enable_primary || enable_secondary {
                     cdef_filter_block(
                         sample_y,
@@ -15061,7 +15085,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // dump above these bisect WHICH filter stage introduced a mismatch.
     dump_stage("EC_AV1_POSTDEBLOCK_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTDEBLOCK_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+    apply_cdef(
+        &mut y,
+        &mut u,
+        &mut v,
+        cdef,
+        &neighbours,
+        (frame_width as usize, frame_height as usize),
+    );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     apply_loop_restoration(
@@ -22992,7 +23023,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // dump above these bisect WHICH filter stage introduced a mismatch.
     dump_stage("EC_AV1_POSTDEBLOCK_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTDEBLOCK_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+    apply_cdef(
+        &mut y,
+        &mut u,
+        &mut v,
+        cdef,
+        &neighbours,
+        (frame_width as usize, frame_height as usize),
+    );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     apply_loop_restoration(
