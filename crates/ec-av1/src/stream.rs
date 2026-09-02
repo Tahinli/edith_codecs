@@ -18188,10 +18188,10 @@ mod tests {
     /// transposed scan or nz-map table cannot pass (class
     /// scan-weights-cross-axis), plus an explicit-seed noise layer that keeps
     /// aomenc out of screen-content mode. `--enable-filter-intra=1` and
-    /// `--enable-cfl-intra=1` are ON: this shape reads `use_filter_intra` off
-    /// its own CDF rows (classes 12/13) and its CfL averages the whole 16x8
-    /// (8x16) luma PAIR, not the strip. `--enable-tx-size-search=0`: a split
-    /// transform at this shape is still refused by name.
+    /// is ON: this shape reads `use_filter_intra` off its own CDF rows
+    /// (classes 12/13). The `--enable-tx-size-search=1` half of the window
+    /// splits the strip's transform (depth 1 = TX_8X4/TX_4X8, depth 2 =
+    /// TX_4X4).
     ///
     /// Counters: 16x4 strips, 4x16 strips, chroma-reference strips (the odd
     /// strip of each 4:2:0 pair, the only one that codes chroma) and strips
@@ -18221,8 +18221,14 @@ mod tests {
             let mut matched = 0u32;
             let (mut horz_proved, mut vert_proved) = (0usize, 0usize);
             let (mut chroma_proved, mut coeff_proved) = (0usize, 0usize);
+            let mut split_proved = 0usize;
             let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
-            for attempt in 0..n_attempts {
+            // The second half of the window turns `--enable-tx-size-search` on:
+            // that is what makes a 16x4 strip SPLIT its transform (depth 1 =
+            // TX_8X4, depth 2 = TX_4X4), the arm the first half never reaches.
+            for attempt in 0..n_attempts * 2 {
+                let tx_search = attempt >= n_attempts;
+                let attempt = attempt % n_attempts;
                 let seed = 42 + attempt;
                 let duration = frame_count as f64 / 25.0;
                 let axis = if attempt % 2 == 0 { "Y" } else { "X" };
@@ -18272,9 +18278,19 @@ mod tests {
                     "--enable-palette=0",
                     "--deltaq-mode=0",
                     "--enable-filter-intra=1",
-                    "--enable-cfl-intra=1",
+                    // lane-r14: CfL stays OFF here. This shape's CfL averages
+                    // the luma of the whole PAIR and is written, but no gate
+                    // asserts a CfL hit counter (there is none), and passing
+                    // `=1` would retire `enable-cfl-intra` from
+                    // `gate_coverage::NEVER_EXERCISED_*` on a flag alone --
+                    // exactly the false coverage that list exists to prevent.
+                    "--enable-cfl-intra=0",
                     "--enable-intrabc=0",
-                    "--enable-tx-size-search=0",
+                    if tx_search {
+                        "--enable-tx-size-search=1"
+                    } else {
+                        "--enable-tx-size-search=0"
+                    },
                     "--obu",
                     "-o",
                     "-",
@@ -18316,11 +18332,12 @@ mod tests {
                     Ok(frames) => frames,
                 };
                 let now = crate::decode::rect4_16_counters();
-                let (horz, vert, chroma, coeff) = (
+                let (horz, vert, chroma, coeff, split) = (
                     now.0 - before.0,
                     now.1 - before.1,
                     now.2 - before.2,
                     now.3 - before.3,
+                    now.4 - before.4,
                 );
                 let ffmpeg_frames = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
@@ -18368,6 +18385,7 @@ mod tests {
                 vert_proved += vert;
                 chroma_proved += chroma;
                 coeff_proved += coeff;
+                split_proved += split;
                 matched += 1;
             }
             assert!(
@@ -18394,10 +18412,16 @@ mod tests {
                 coeff_proved > 0,
                 "{NAME}: {bit_depth}-bit compared attempts coded no residual on any strip"
             );
+            assert!(
+                split_proved > 0,
+                "{NAME}: {bit_depth}-bit compared attempts never split a strip's transform -- \
+                 the `--enable-tx-size-search=1` half of the window proved nothing"
+            );
             eprintln!(
                 "{NAME}: {bit_depth}-bit {matched} compared attempts, {horz_proved} 16x4 / \
                  {vert_proved} 4x16 strips, {chroma_proved} chroma pairs, {coeff_proved} coded \
-                 strips, {named_refusals} refusals, {out_of_scope} out of scope"
+                 units, {split_proved} split-transform strips, {named_refusals} refusals, \
+                 {out_of_scope} out of scope"
             );
         }
     }
