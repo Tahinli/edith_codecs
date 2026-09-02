@@ -2202,6 +2202,15 @@ thread_local! {
     /// the shape that made 4 chroma samples of the Hunger Games `-ss 1200`
     /// key frame miss by 1. Zero here means a gate never exercised the fix.
     static RECT4_16_UV_PAIR_FILT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-kf1200 r2: sub-8x8 chroma blocks that are `skip_txfm` AND
+    /// `UV_CFL_PRED` -- the arm that used to drop the CfL alpha entirely.
+    static SKIP_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
+/// that reconstructed as flat DC before lane-kf1200 r2).
+pub fn skip_cfl_hits() -> usize {
+    SKIP_CFL_HITS.with(|c| c.get())
 }
 
 /// How many 16x4/4x16 chroma pairs took a different `intra_edge_filter_type`
@@ -10538,8 +10547,17 @@ fn decode_leaf_split4(
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[3] {
-        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
-        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        // A skipped chroma block still gets its CfL contribution: libaom's
+        // `predict_and_reconstruct_intra_block` calls `cfl_predict_block`
+        // from `av1_predict_intra_block_facade` (av1/common/reconintra.c:1719)
+        // whenever `mbmi->uv_mode == UV_CFL_PRED`, before any residual is
+        // added -- `skip_txfm` only drops the residual, never the alpha.
+        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        if alpha.is_some() {
+            SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
+        }
+        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv);
+        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
@@ -10891,8 +10909,17 @@ fn decode_leaf_rect8(
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[1] {
-        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
-        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        // A skipped chroma block still gets its CfL contribution: libaom's
+        // `predict_and_reconstruct_intra_block` calls `cfl_predict_block`
+        // from `av1_predict_intra_block_facade` (av1/common/reconintra.c:1719)
+        // whenever `mbmi->uv_mode == UV_CFL_PRED`, before any residual is
+        // added -- `skip_txfm` only drops the residual, never the alpha.
+        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        if alpha.is_some() {
+            SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
+        }
+        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv);
+        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
