@@ -4078,6 +4078,7 @@ fn is_smooth_mode(mode: usize) -> bool {
     (crate::intra::SMOOTH_PRED as usize..=crate::intra::SMOOTH_H_PRED as usize).contains(&mode)
 }
 
+#[track_caller]
 fn read_coeffs(
     dec: &mut SymbolDecoder,
     coding: &mut TxbTables,
@@ -4183,7 +4184,7 @@ fn read_coeffs(
     if ec_trace_coeff {
         let (rng, _) = dec.debug_state();
         let cls = match class { TxClass::TwoD => "2d", TxClass::Horiz => "horiz", TxClass::Vert => "vert" };
-        eprintln!("EC_COEFF_STEP tag=eob eob={eob} tx={tx_type:?} class={cls} rng={rng}");
+        eprintln!("EC_COEFF_STEP tag=eob eob={eob} tx={tx_type:?} class={cls} rng={rng} from={}", std::panic::Location::caller());
     }
     let class_scan;
     let scan: &[u16] = if class == TxClass::TwoD {
@@ -18429,6 +18430,7 @@ impl PlaneBuf {
 /// `side`-square with no oversized-64 case, so there is no padded-grid
 /// branch to mirror).
 #[allow(clippy::too_many_arguments)]
+#[track_caller]
 fn read_inter_plane(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -18476,6 +18478,9 @@ fn read_inter_plane(
         Some(t) => reduce_inherited_chroma_tx_type(t, side, side),
         None => TxType::DctDct,
     };
+    if coeff_trace_on() {
+        eprintln!("EC_INTERPLANE plane={plane_idx} side={side} inh={inherited_luma_tx_type:?} from={}", std::panic::Location::caller());
+    }
     let (grid, tx_type) = read_coeffs(
         dec,
         &mut coding,
@@ -23600,16 +23605,14 @@ fn decode_inter_sub8_split4(
                 None,
                 None,
             )?;
-            if i == 0 || piece[0].is_none() {
-                // `av1_get_tx_type`: an inter block's chroma inherits the
-                // tx_type of the CO-LOCATED luma position, which for the
-                // group's one chroma unit is luma (0, 0) -- the FIRST
-                // sub-block, not the last. lane-sub8intra: an INTRA first
-                // sub-block writes no inter tx_type there at all, so the
-                // later inter sub-blocks' own is what `xd->tx_type_map`
-                // holds.
-                first_tx_type = tx_type;
-            }
+            // lane-frame80 r2: `av1_get_tx_type` reads `xd->tx_type_map`,
+            // and `set_mi_offsets` anchors that pointer at the CURRENT
+            // block's mi (`av1_common_int.h:1680`) -- for a sub-8x8 group
+            // the block coding chroma is the chroma-REFERENCE sub-block
+            // (the last one, `is_chroma_reference`), so scaling the chroma
+            // unit back to luma (0, 0) lands on that sub-block's first
+            // transform unit, not the group's first sub-block.
+            first_tx_type = tx_type;
             neighbours.record_mi_luma_rect(lmi, B4, B4, &luma_grid);
         }
         neighbours.record_mode_mi(rmi, cmi, 1, 1, DC_PRED);
@@ -24576,13 +24579,14 @@ fn decode_inter_sub8_rect2(
                         None,
                     )?
                 };
-                if idx == 0 && (i == 0 || piece[0].is_none()) {
-                    // `av1_get_tx_type`: the group's one chroma unit scales
-                    // back to luma (0, 0), i.e. the FIRST sub-block's first
-                    // transform unit -- unless that sub-block is INTRA
-                    // (lane-sub8intra), in which case it wrote no inter
-                    // tx_type at all and `xd->tx_type_map[0]` of the
-                    // chroma-reference block is this one's.
+                if idx == 0 {
+                    // lane-frame80 r2: `xd->tx_type_map` is anchored at the
+                    // mi of the block that codes chroma -- the chroma
+                    // REFERENCE (last) sub-block -- so the group's chroma
+                    // unit scales back to THAT sub-block's first transform
+                    // unit; every sub-block overwrites and the last one
+                    // decoded wins (the mixed-intra case never reaches here:
+                    // an INTRA chroma reference codes the unit itself).
                     first_tx_type = tu_tx_type;
                 }
                 neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
