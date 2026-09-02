@@ -18085,10 +18085,17 @@ fn ref_planes<'a>(
 /// unit at a time, and does not itself count as a step). `max_neighbors`
 /// caller-bounds the scan: `1` for the eligibility check (any hit at all),
 /// `av1_build_obmc_inter_prediction`'s own `max_neighbor_obmc` table for the
-/// real blend pass. Round 1 corner-cut: libaom's own "4-wide block, treat as
-/// half of a chroma pair" merge (`obmc.h`'s `mi_step == 1` special case) is
-/// not ported -- no block this decoder codes is narrower than 8px, so it
-/// never fires here regardless of what a neighbour's own decoder was.
+/// real blend pass. lane-intra16x4 r2: libaom's own "4-wide block, treat as
+/// half of a chroma pair" merge (`obmc.h`'s `mi_step == 1` special case) IS
+/// ported below -- the round-1 note that no block is narrower than 8px stopped
+/// being true when the 1:4 partitions landed. A 16x4 / 4x16 strip has
+/// `mi_size_high`/`mi_size_wide` 1, so libaom snaps the walk back to the pair's
+/// even index, reads the ODD (chroma-carrying) half as the neighbour and steps
+/// by 2. Measured: the 16x16 block right of a 16x16-level HORZ_4 partition
+/// whose strip 0 is inter and strips 1..3 intra counted that inter strip as
+/// overlappable here, while libaom's pair merge reads the INTRA strip 1 and
+/// counts none -- so we read a `motion_mode` symbol libaom never wrote (class
+/// `symbol-consumption-gap`), desyncing the tile at the next coefficient.
 fn overlappable_above(
     grid: &MiGrid,
     mi_row: usize,
@@ -18105,8 +18112,17 @@ fn overlappable_above(
     let mut col = mi_col;
     while col < end_col && out.len() < max_neighbors {
         let cell = grid.get(mi_row - 1, col);
-        let step = cell.map_or(1, |c| c.size).max(1);
-        if let Some(info) = cell {
+        let mut step = cell.map_or(1, |c| c.size).max(1).min(SB_MI as usize);
+        let mut nb = cell;
+        if step == 1 {
+            // The pair merge: the walk snaps back to the pair's even column
+            // and the ODD half (the chroma-carrying one) is the neighbour for
+            // both -- a 4-wide 1:4 strip is never an OBMC source on its own.
+            col &= !1;
+            nb = grid.get(mi_row - 1, col + 1);
+            step = 2;
+        }
+        if let Some(info) = nb {
             if info.is_inter {
                 out.push((col - mi_col, step.min(end_col - col), *info));
             }
@@ -18136,8 +18152,17 @@ fn overlappable_left(
         let cell = grid.get(row, mi_col - 1);
         // Vertical walk steps by the neighbour's HEIGHT -- a 32x16 strip's
         // width (8) would swallow the strip below it.
-        let step = cell.map_or(1, |c| c.size_h).max(1);
-        if let Some(info) = cell {
+        let mut step = cell.map_or(1, |c| c.size_h).max(1).min(SB_MI as usize);
+        let mut nb = cell;
+        if step == 1 {
+            // The pair merge, left-column mirror: a 4-TALL neighbour (a 16x4
+            // strip) is half of a chroma pair and the pair's SECOND row is the
+            // neighbour for both.
+            row &= !1;
+            nb = grid.get(row + 1, mi_col - 1);
+            step = 2;
+        }
+        if let Some(info) = nb {
             if info.is_inter {
                 out.push((row - mi_row, step.min(end_row - row), *info));
             }
