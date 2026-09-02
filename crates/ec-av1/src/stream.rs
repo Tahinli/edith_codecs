@@ -571,16 +571,6 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // is inside the frame. Every sibling inter gate at 64x64 and
         // `--cpu-used=0` is exactly that case. The divergence starts the
         // moment a superblock has a second child in frame.
-        if parser
-            .sequence_header()
-            .is_some_and(|seq| seq.use_128x128_superblock)
-            && (header.mi_cols > 16 || header.mi_rows > 16)
-        {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a sequence using 128x128 superblocks on a frame larger than 64x64 (this decoder's whole partition/CDEF/LR grid is 64x64-superblock only; aomenc picks 128x128 at --cpu-used=0)",
-            ));
-        }
         crate::decode::set_bit_depth(bit_depth);
         // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
         let enable_masked_compound = parser
@@ -1137,7 +1127,7 @@ mod tests {
     /// half: without it, an aomenc that ignored `--sb-size=128` would leave
     /// the gate asserting a refusal that never fires.
     #[test]
-    fn a_real_aomenc_128x128_superblock_stream_is_refused_by_name() {
+    fn a_real_aomenc_128x128_superblock_stream_decodes_pixel_exact() {
         if !have_ffmpeg() || !have_aomenc() {
             eprintln!("SKIP: no ffmpeg/aomenc");
             return;
@@ -1188,11 +1178,19 @@ mod tests {
         }
         assert!(sb128, "aomenc ignored --sb-size=128: this stream is 64x64-superblock");
 
-        let err = decode_stream(&stream).unwrap_err().to_string();
-        assert!(
-            err.contains("a sequence using 128x128 superblocks"),
-            "expected the 128x128-superblock refusal for {width}x{height}, got: {err}"
-        );
+        // lane-sb128b: the blanket refusal this gate was written against is
+        // gone -- the 128 root now decodes (SPLIT and NONE). The gate keeps
+        // its stream and its `--sb-size=128` knob assert and asserts pixels.
+        let decoded = decode_stream(&stream).expect("decode the 64x72 sb128 stream");
+        let reference = ffmpeg_decode_sequence(&stream, width, height, decoded.len());
+        for (i, (ours, theirs)) in decoded.iter().zip(&reference).enumerate() {
+            let nd = |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+            assert_eq!(
+                (nd(&ours.y, &theirs.y), nd(&ours.u, &theirs.u), nd(&ours.v, &theirs.v)),
+                (0, 0, 0),
+                "{width}x{height} sb128 cpu-used=0: frame {i} differs from ffmpeg"
+            );
+        }
     }
 
     /// `decode_stream` on a lone key frame's stream matches both the tile
