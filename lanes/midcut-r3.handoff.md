@@ -98,11 +98,14 @@ the cap -- RE-RUN THEM at the tip. Full suite NOT run (coordinator: no suite).
 ## 24-offset decode-order table (`~/.cache/midcut-tmp/cen/after_r3.tsv`)
 
 Written by `~/.cache/midcut-tmp/cen/run_r3.sh` (adds `EC_INTRA16X4_DECODE=1`,
-which the r2 script lacked). Was still filling at the cap; through offset 4200
-every offset has frame 0 EXACT and frame 1 improved by 2-4 orders of magnitude
-(e.g. 1800 s: 11612125 -> 1151; 2400 s: 11010633 -> 126; 3900 s frame 3: 495313
--> 0). Only offset 0 is fully exact so far. Read the finished file before
-quoting numbers.
+which the r2 script lacked). FINISHED: 24 offsets, frame 0 EXACT at all 24,
+frame 1 EXACT at **2** (0 s and 5100 s -- 5100 s went 2300495 -> 0), 12 of 24
+offsets improved on frame 1, the rest unchanged (their frame-1 defect is not
+warp-shaped). Best movers: 1800 s 11612125 -> 1151, 2400 s 11010633 -> 126,
+3300 s 10663109 -> 27, 3900 s 4665360 -> 522 (its frame 3 is now 0). One offset
+(1500 s) still REFUSES on the Golomb tail. Nine offsets still carry a
+multi-million-sample frame among f1..f3 (300/900/2100/6000/6300/6600 ...), i.e.
+at least one more entropy-level defect remains off this cut.
 
 ## Artifacts
 
