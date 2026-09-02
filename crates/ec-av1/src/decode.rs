@@ -14988,6 +14988,12 @@ fn resolve_interp_filter(
     } else {
         sym0
     };
+    if std::env::var_os("EC_TRACE_MODE").is_some() {
+        eprintln!(
+            "EC_IF ctx0={ctx0} above={above:?} left={left:?} sym0={sym0} sym1={sym1} rng={}",
+            dec.debug_state().0
+        );
+    }
     (
         mc::InterpFilterKind::from_switchable_symbol(sym1 as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym0 as usize),
@@ -15976,6 +15982,67 @@ fn is_any_masked_compound_used_here(side: usize) -> bool {
     side.min(side) >= 8
 }
 
+/// libaom's `BLOCK_SIZES_ALL` index of a `w`x`h` block (`common_data.h`'s own
+/// enum order) -- the row every bsize-indexed CDF (`compound_type_cdf`,
+/// `wedge_idx_cdf`) is read at. lane-intersub8 r4: these two used to be
+/// indexed by the caller's SQUARE envelope, so a 16x8 compound block read
+/// `BLOCK_16X16`'s row (class table-indexed-by-raw-size) and desynced the
+/// tile at its first masked-compound rect block.
+fn bsize_index(w: usize, h: usize) -> Option<usize> {
+    Some(match (w, h) {
+        (4, 4) => 0,
+        (4, 8) => 1,
+        (8, 4) => 2,
+        (8, 8) => 3,
+        (8, 16) => 4,
+        (16, 8) => 5,
+        (16, 16) => 6,
+        (16, 32) => 7,
+        (32, 16) => 8,
+        (32, 32) => 9,
+        (32, 64) => 10,
+        (64, 32) => 11,
+        (64, 64) => 12,
+        (64, 128) => 13,
+        (128, 64) => 14,
+        (128, 128) => 15,
+        (4, 16) => 16,
+        (16, 4) => 17,
+        (8, 32) => 18,
+        (32, 8) => 19,
+        (16, 64) => 20,
+        (64, 16) => 21,
+        _ => return None,
+    })
+}
+
+/// `is_any_masked_compound_used` (libaom `reconinter.h`) on the block's TRUE
+/// footprint: `is_comp_ref_allowed` is `AOMMIN(bw, bh) >= 8`, and every
+/// shape that clears it has either a wedge or a DIFFWTD compound available.
+fn masked_compound_used_wh(w: usize, h: usize) -> bool {
+    w.min(h) >= 8
+}
+
+/// `av1_wedge_params_lookup[bsize].wedge_types > 0` (libaom `reconinter.c`):
+/// the shapes whose `compound_type` symbol is really coded. Everything else
+/// with a compound mask infers `COMPOUND_DIFFWTD` without a symbol.
+fn wedge_used_wh(w: usize, h: usize) -> bool {
+    matches!(
+        (w, h),
+        (8, 8)
+            | (8, 16)
+            | (16, 8)
+            | (16, 16)
+            | (16, 32)
+            | (32, 16)
+            | (32, 32)
+            | (8, 32)
+            | (32, 8)
+            | (16, 64)
+            | (64, 16)
+    )
+}
+
 /// Whether a compound reference pair is unidirectional (both references on
 /// the same temporal side of the current frame) -- `has_uni_comp_refs`
 /// (libaom `av1_reference_frame_utils.h`/`pred_common.c`'s own definition:
@@ -16765,12 +16832,18 @@ fn decode_inter_block(
             let group_ctx = get_comp_group_idx_context(neighbours, (rmi, cmi), side);
             let comp_group_idx = if !skip_mode
                 && enable_masked_compound
-                && is_any_masked_compound_used_here(side)
+                && masked_compound_used_wh(write_w, write_h)
             {
                 dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
             } else {
                 0
             };
+            if std::env::var_os("EC_TRACE_MODE").is_some() {
+                eprintln!(
+                    "EC_CGI mi_row={rmi} mi_col={cmi} ctx={group_ctx} val={comp_group_idx} rng={}",
+                    dec.debug_state().0
+                );
+            }
             // lane-maskcomp r2 / lane-wedge r3: `Some(mask_type)` for a
             // `COMPOUND_DIFFWTD` block, `Some(mask)` (wedge codebook lookup)
             // for a `COMPOUND_WEDGE` block -- exactly one of the two is set
@@ -16792,12 +16865,11 @@ fn decode_inter_block(
                 // writes NO `compound_type` symbol there and INFERS
                 // `COMPOUND_DIFFWTD` -- only the 1-bit `mask_type` literal
                 // follows. `None` here is exactly that inferred arm.
-                let wedge_bsize = match side {
-                    8 => Some(3),
-                    16 => Some(6),
-                    32 => Some(9),
-                    _ => None,
-                };
+                // lane-intersub8 r4: the block's TRUE footprint, not the
+                // square envelope -- `compound_type_cdf`/`wedge_idx_cdf` are
+                // `BLOCK_SIZES_ALL`-indexed.
+                let wedge_bsize =
+                    bsize_index(write_w, write_h).filter(|_| wedge_used_wh(write_w, write_h));
                 let compound_type = match wedge_bsize {
                     Some(b) => dec.symbol(&mut cdfs.compound_type[b]),
                     None => 1,
@@ -16805,6 +16877,14 @@ fn decode_inter_block(
                 if let Some(wedge_bsize) = wedge_bsize.filter(|_| compound_type == 0) {
                     // COMPOUND_WEDGE: lane-wedge r3, codebook checksum-
                     // verified vs independent C dump (wedge.rs).
+                    if write_w != write_h {
+                        // lane-intersub8 r4: the wedge codebook here is built
+                        // per SQUARE side only; a rect block's own codebook
+                        // (BLOCK_16X8 etc.) is a different mask set.
+                        return Err(unsupported(
+                            "a COMPOUND_WEDGE mask on a non-square inter block (rect wedge codebook unimplemented)",
+                        ));
+                    }
                     let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
                     let wedge_sign = dec.literal(1);
                     WEDGE_HITS.with(|c| c.set(c.get() + 1));
@@ -17036,6 +17116,12 @@ fn decode_inter_block(
                     ref_order_hints[(ref1 - LAST_FRAME) as usize],
                 );
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
+                if std::env::var_os("EC_TRACE_MODE").is_some() {
+                    eprintln!(
+                        "EC_CIDX mi_row={rmi} mi_col={cmi} ctx={idx_ctx} val={idx} rng={}",
+                        dec.debug_state().0
+                    );
+                }
                 if idx == 1 {
                     (8, 8, 1u8)
                 } else {
@@ -22644,39 +22730,45 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         )?;
                                         continue;
                                     }
-                                    if part8 == PARTITION_HORZ {
-                                        // lane-intersub8 r3: the two-BLOCK_8X4
-                                        // shape IS implemented below
-                                        // ([`decode_inter_sub8_rect2`], same
-                                        // function as the 4x8 one), and it
-                                        // decodes most streams exact -- but a
-                                        // measured 4-of-28-attempt sweep
-                                        // (transposed-structure source, cq
-                                        // 12..32, both depths) desyncs in the
-                                        // MODE INFO of the 16x8 inter block
-                                        // immediately to its right: entry
-                                        // ranges match at that block's
-                                        // `EC_MODE` print and differ by its
-                                        // first coefficient TU, so some
-                                        // per-row neighbour band this group
-                                        // leaves behind is wrong. Refused by
-                                        // name rather than shipped as silent
-                                        // pixel drift; the 4x8 twin is gated.
+                                    if part8 == PARTITION_HORZ
+                                        && std::env::var_os("EC_AV1_SUB8_HORZ").is_none()
+                                    {
+                                        // lane-intersub8 r4: the r3 desync IS
+                                        // root-caused and fixed (rect masked
+                                        // compound read `BLOCK_16X16`'s
+                                        // `compound_type`/`wedge_idx` CDF row
+                                        // for a 16x8 block); every mode-info
+                                        // range on the 28-arm transposed
+                                        // sweep now matches aomdec element
+                                        // for element. What is left is a
+                                        // POST-ENTROPY pixel band: 3 of 28
+                                        // arms (8-bit cq32 sp9, 10-bit cq12
+                                        // sp3, 10-bit cq16 sp3) differ by
+                                        // |d| <= 2 in luma only, scattered
+                                        // over the bottom-left corner
+                                        // (x < 48, y >= 112) from the first
+                                        // frame that references an 8x4 group
+                                        // -- a filter/reconstruction defect,
+                                        // not a desync. Still refused by name
+                                        // rather than shipped as silent pixel
+                                        // drift; `EC_AV1_SUB8_HORZ=1` decodes
+                                        // it for the r5 bisect.
                                         return Err(unsupported(
-                                            "an inter 8x8 HORZ partition (two BLOCK_8X4 inter leaves; decoded, but a measured sweep desyncs the block to its right)",
+                                            "an inter 8x8 HORZ partition (two BLOCK_8X4 inter leaves; entropy-exact now, but a measured sweep still drifts |d|<=2 in luma after the filters)",
                                         ));
                                     }
-                                    if part8 == PARTITION_VERT {
-                                        // lane-intersub8 r3: two BLOCK_8X4 /
-                                        // BLOCK_4X8 inter leaves, chroma once
-                                        // per 8x8 on the second of them.
+                                    if part8 == PARTITION_VERT || part8 == PARTITION_HORZ {
+                                        // lane-intersub8 r3/r4: two BLOCK_8X4
+                                        // (HORZ) / BLOCK_4X8 (VERT) inter
+                                        // leaves, chroma once per 8x8 on the
+                                        // second of them.
                                         decode_inter_sub8_rect2(
                                             &mut dec,
                                             &mut cdfs,
                                             &mut neighbours,
                                             &mut grid,
                                             leaf_mi,
-                                            true,
+                                            part8 == PARTITION_VERT,
                                             mi_cols,
                                             mi_rows,
                                             &mut y,
