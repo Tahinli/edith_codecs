@@ -7542,11 +7542,18 @@ fn decode_intra_rect_in_inter(
         // The INTER frame's own `TXFM_CONTEXT` bands, not the key frame's
         // deblock-grid approximation -- [`tx_size_context_txfm_rect`].
         let ctx = tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw.min(64), bh.min(64));
-        match tx_cat {
+        let d = match tx_cat {
             1 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
             2 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
             _ => dec.symbol(&mut cdfs.tx_size_cat3[ctx]),
+        };
+        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            eprintln!(
+                "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat={tx_cat} rng={}",
+                dec.debug_state().0
+            );
         }
+        d
     } else {
         0
     };
@@ -9584,6 +9591,15 @@ fn decode_block_rect64(
         let (puv_size, puv_colors) =
             palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
         neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, puv_size, puv_colors);
+        // lane-frame36 r2: `set_txfm_ctxs` runs for EVERY block and this early
+        // return skips the fn's own tail, so a SPLIT superblock-level strip
+        // published no TXFM_CONTEXT band and the next block read the row's init
+        // value 64 as its left transform height. Measured on the 10-bit
+        // 3840x1608 stream, decode-order frame 33: after the split 16x64 strip
+        // at mi(192,140) (`tx_depth=1` -> TX_16X32) the 32x64 block at
+        // mi(192,144) took `tx_size_cat3` row 2 where libaom takes row 1. The
+        // bands carry the SPLIT unit's size, not the block's.
+        txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
         RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
         return Ok(());
     }
