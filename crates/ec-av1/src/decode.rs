@@ -8344,7 +8344,13 @@ fn decode_leaf_rect(
     // a constant `false`.
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
     let depth = if tx_select {
-        let ctx = tx_size_context_rect(neighbours, leaf_mi, bw, bh);
+        // lane-t900 r2 (sibling sweep): the in-inter `TXFM_CONTEXT` band read
+        // every other rect reader now does -- a no-op on a key frame.
+        let ctx = if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+            tx_size_context_txfm_rect(neighbours, leaf_mi, bw, bh)
+        } else {
+            tx_size_context_rect(neighbours, leaf_mi, bw, bh)
+        };
         // lane-rectsplitx r1: `bsize_to_tx_size_cat` (libaom `blockd.h`,
         // `bsize_to_tx_size_depth_table`) is 2 for BLOCK_16X8/BLOCK_8X16, so
         // the category is 1 -- NOT the 2 the 32x16 strips read. Same symbol
@@ -13084,7 +13090,13 @@ fn decode_leaf_rect8(
         // and desynced the tile at the very first rect leaf (class
         // `symbol-consumption-gap`).
         let depth = if tx_select {
-            let ctx = tx_size_context_rect(neighbours, lmi, bw, bh);
+            // lane-t900 r2 (sibling sweep): the in-inter `TXFM_CONTEXT` band
+            // read every other rect reader now does -- a no-op on a key frame.
+            let ctx = if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+                tx_size_context_txfm_rect(neighbours, lmi, bw, bh)
+            } else {
+                tx_size_context_rect(neighbours, lmi, bw, bh)
+            };
             dec.symbol(&mut cdfs.tx_size_cat0[ctx])
         } else {
             0
