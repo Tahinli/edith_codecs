@@ -1008,7 +1008,7 @@ struct At {
 /// block whose transform covers it whole, whether the samples above its right
 /// (or below its left) are decoded depends only on where the block sits inside
 /// its 64x64 superblock, which is a pinned table per block size.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Reach {
     pub(crate) above_right: bool,
     pub(crate) below_left: bool,
@@ -1215,6 +1215,48 @@ fn rect_reach_tables(bw: usize, bh: usize) -> (&'static [u8], &'static [u8]) {
 }
 
 impl Reach {
+    /// `has_top_right`/`has_bottom_left` (libaom `reconintra.c`) for a
+    /// transform unit at `(col_off, row_off)` INSIDE a `bw`x`bh` block whose
+    /// own answer is `block` -- a different rule from the standalone-block
+    /// tables, because a unit's neighbours are mostly its own block's
+    /// already-reconstructed units:
+    ///  * top-right: available while the unit to the right is still inside
+    ///    the block (`col_off + tx < bw`); otherwise only the block's top row
+    ///    of units reaches past it, through the block-level answer
+    ///    (libaom's `row_off > 0` branch returns exactly
+    ///    `col_off + txw < plane_bw`).
+    ///  * bottom-left: a unit outside the block's left column has none
+    ///    (libaom returns 0 for `col_off > 0`); inside the block
+    ///    (`row_off + tx < bh`) they are the left unit's, already
+    ///    reconstructed; the bottom row falls back to the block-level answer.
+    pub(crate) fn of_tu(
+        bw: usize,
+        bh: usize,
+        col_off: usize,
+        row_off: usize,
+        // The unit's own width and height in pixels; equal for a square
+        // transform, different for the rect unit a 1:4 strip's first split
+        // produces (lane-rectsplitx r1).
+        tx_w: usize,
+        tx_h: usize,
+        block: Self,
+    ) -> Self {
+        Self {
+            above_right: if col_off + tx_w < bw {
+                true
+            } else {
+                row_off == 0 && block.above_right
+            },
+            below_left: if col_off > 0 {
+                false
+            } else if row_off + tx_h < bh {
+                true
+            } else {
+                block.below_left
+            },
+        }
+    }
+
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
     /// in a frame of `width` by `height`.
     pub(crate) fn of(side: usize, x: usize, y: usize, width: usize, height: usize) -> Self {
@@ -1243,7 +1285,18 @@ impl Reach {
         }
     }
 
-    /// libaom `has_top_right` at block granularity (`row_off`/`col_off` 0,
+    /// [`Self::of`] for one transform unit of a square block whose transform
+    /// is smaller than itself (libaom `has_top_right`/`has_bottom_left` with
+    /// non-zero `row_off`/`col_off`): interior units answer from the block's
+    /// own geometry, and only a unit on the block's top row (resp. left
+    /// column) reaches the table -- which is the BLOCK's table read at the
+    /// BLOCK's position, never a table row for the transform's size. Letting
+    /// the unit stand in for a block of its own size agrees with libaom for
+    /// the ordinary tables, but the `has_tr_vert_*`/`has_bl_vert_*` pair has
+    /// no 4x4 row at all (`has_tr_vert_tables[BLOCK_4X4]` is NULL), so a TX4
+    /// unit inside an 8x8 square of a `PARTITION_VERT_A`/`_B` panicked on a
+    /// real `--enable-tx-size-search=1` stream (lane-ab16 r2).
+     /// libaom `has_top_right` at block granularity (`row_off`/`col_off` 0,
     /// the transform covering the whole block, luma): everything before the
     /// table lookup is that function's own early-exit ladder.
     fn top_right_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
@@ -1305,6 +1358,13 @@ impl Reach {
     /// `get_has_bl_table` partition argument). Rectangular sub-blocks are
     /// unaffected: libaom's own comment says vertical rectangles keep their
     /// non-vert table, which is what [`Reach::of_rect`] already reads.
+    /// Whether a `PARTITION_VERT_A`/`_B`'s sub-blocks are being decoded
+    /// right now ([`Self::vert_ab_partition`]'s guard is alive), so a caller
+    /// can count the sub-block work that partition creates (lane-ab16).
+    pub(crate) fn in_vert_ab() -> bool {
+        VERT_AB_PARTITION.with(std::cell::Cell::get)
+    }
+
     pub(crate) fn vert_ab_partition() -> VertAbGuard {
         VertAbGuard(VERT_AB_PARTITION.with(|c| c.replace(true)))
     }
@@ -3784,6 +3844,49 @@ mod tests {
         assert_eq!(decoded.v, encoded.reconstruction.v, "854x480: V");
     }
 
+    /// [`Reach::of_tu`] against libaom's `has_top_right`/`has_bottom_left`
+    /// transform-unit path, for every 4x4 unit of every 8x8 block of a
+    /// superblock, both partition tables:
+    ///
+    /// 1. outside a `PARTITION_VERT_A`/`_B` it must answer exactly what the
+    ///    unit-as-its-own-block `Reach::of(4, ..)` answered before r2, so
+    ///    wiring the TU sites onto it changes no existing stream;
+    /// 2. inside one it must not panic -- `has_tr_vert_tables[BLOCK_4X4]` is
+    ///    NULL in libaom because that lookup never happens, and reading a
+    ///    4x4 row out of the three-row vert tables is what crashed a real
+    ///    `--enable-tx-size-search=1` stream (r2);
+    /// 3. and it must be the BLOCK's vert answer where the two tables
+    ///    disagree: the top-right 4x4 unit of the 8x8 block at superblock
+    ///    row 1, column 0 reads its above-right samples from the 8x8 to its
+    ///    upper right, which a vertical AB partition codes AFTER it
+    ///    (`has_tr_vert_8x8` bit 16 = 0, ordinary `has_tr_8x8` bit 16 = 1).
+    #[test]
+    fn of_tu_follows_the_block_row_including_under_vert_ab() {
+        // The 8x8 square at superblock row 1, column 0, and the TX4 unit in
+        // its top-right corner (`col_off = 4`, `row_off = 0`): that unit's
+        // above-right answer is the BLOCK's, which is the whole reason a unit
+        // asks the block instead of looking itself up (the
+        // `has_tr_vert_*` tables have no 4x4 row at all, lane-ab16 r2).
+        let plain = Reach::of(8, 0, 8, SUPERBLOCK, SUPERBLOCK);
+        assert_eq!(
+            Reach::of_tu(8, 8, 4, 0, 4, 4, plain).above_right,
+            plain.above_right,
+            "ordinary table: the top-right TX4 unit takes the block's row"
+        );
+        let guard = Reach::vert_ab_partition();
+        let vert = Reach::of(8, 0, 8, SUPERBLOCK, SUPERBLOCK);
+        assert_eq!(
+            Reach::of_tu(8, 8, 4, 0, 4, 4, vert).above_right,
+            vert.above_right,
+            "vert AB: the unit follows the vert row the block just picked"
+        );
+        assert_ne!(
+            plain.above_right, vert.above_right,
+            "this position is the cell where the vert tables disagree; pick another if libaom's tables change"
+        );
+        drop(guard);
+    }
+
     /// `Reach::top_right`/`bottom_left` against a from-scratch transcription
     /// of libaom's `has_top_right`/`has_bottom_left` (`av1/common/
     /// reconintra.c`), for every 16x16 and 32x32 block position across three
@@ -3875,6 +3978,66 @@ mod tests {
     /// swept in r6 produced a decodable 16x16-level VERT_B stream (every
     /// stream that partitions that small first hits the still-refused
     /// HORZ_A/HORZ_B/VERT_A-below-16 or coded-rect-strip-below-16 arms).
+    /// [`Reach::of_tu`] against a from-scratch transcription of libaom's
+    /// `has_top_right`/`has_bottom_left` TU branches (`reconintra.c`, luma,
+    /// `ss_x = ss_y = 0`), which work in MI units where `of_tu` works in
+    /// pixels -- lane-palette2 r12: the square multi-TU path used the
+    /// standalone-block tables instead of this rule and granted a 16x16
+    /// D203 block's top-right 8x8 unit bottom-left pixels libaom refuses.
+    #[test]
+    fn of_tu_matches_libaom_has_top_right_and_has_bottom_left_per_unit() {
+        // libaom, in MI units: bw_unit/bh_unit = block size / 4,
+        // *_count_unit = tx size / 4.
+        fn libaom_tr(bw: usize, bh: usize, col_off: usize, row_off: usize, tx: usize, blk: bool) -> bool {
+            let (plane_bw_unit, count) = (bw / 4, tx / 4);
+            let (col_off_u, row_off_u) = (col_off / 4, row_off / 4);
+            let _ = bh;
+            if row_off_u > 0 {
+                col_off_u + count < plane_bw_unit
+            } else if col_off_u + count < plane_bw_unit {
+                true
+            } else {
+                blk
+            }
+        }
+        fn libaom_bl(bw: usize, bh: usize, col_off: usize, row_off: usize, tx: usize, blk: bool) -> bool {
+            let (plane_bh_unit, count) = (bh / 4, tx / 4);
+            let (col_off_u, row_off_u) = (col_off / 4, row_off / 4);
+            let _ = bw;
+            if col_off_u > 0 {
+                false
+            } else if row_off_u + count < plane_bh_unit {
+                true
+            } else {
+                blk
+            }
+        }
+        for &(bw, bh) in &[(8, 8), (16, 16), (32, 32), (64, 64), (16, 8), (8, 16), (32, 16), (16, 32), (64, 32), (32, 64)] {
+            for &tx in &[4usize, 8, 16, 32] {
+                if tx > bw.min(bh) {
+                    continue;
+                }
+                for row_off in (0..bh).step_by(tx) {
+                    for col_off in (0..bw).step_by(tx) {
+                        for &blk in &[Reach { above_right: false, below_left: false }, Reach { above_right: true, below_left: true }] {
+                            let got = Reach::of_tu(bw, bh, col_off, row_off, tx, tx, blk);
+                            assert_eq!(
+                                got.above_right,
+                                libaom_tr(bw, bh, col_off, row_off, tx, blk.above_right),
+                                "above_right bw={bw} bh={bh} tx={tx} row_off={row_off} col_off={col_off} blk={blk:?}"
+                            );
+                            assert_eq!(
+                                got.below_left,
+                                libaom_bl(bw, bh, col_off, row_off, tx, blk.below_left),
+                                "below_left bw={bw} bh={bh} tx={tx} row_off={row_off} col_off={col_off} blk={blk:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn vert_ab_partition_flips_below_left_for_the_top_right_8x8() {
         let (width, height) = (SUPERBLOCK * 3, SUPERBLOCK * 3);
