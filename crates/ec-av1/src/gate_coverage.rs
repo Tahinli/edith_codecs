@@ -168,10 +168,6 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
         "enable-rect-tx",
         "never spelled; rect transforms reach the decoder only through partition shape, never through a gate that names the tool",
     ),
-    (
-        "enable-tx64",
-        "never spelled; TX_64X64 appears only where aomenc's default picks it, which is unknown per stream",
-    ),
 ];
 
 #[cfg(test)]
@@ -214,7 +210,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // decoded and pixel-compared at 10 bit as well as 8, so the tool reaches a
     // real 10-bit stream this decoder reconstructs exactly.
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
-    ("enable-tx64", "hole at both depths, see the 8-bit list"),
 ];
 
 /// [`DEFAULT_ON_TOOLS`] entries no 8-bit gate spells on, with the reason.
