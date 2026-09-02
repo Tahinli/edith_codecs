@@ -2652,6 +2652,18 @@ pub(crate) fn sub16_split_hits() -> usize {
     SUB16_SPLIT_HITS.with(|c| c.get())
 }
 
+// lane-frame36 r2: superblock-level strips ([`decode_block_rect64`]) whose
+// luma transform is SPLIT and which therefore leave through that fn's early
+// return -- the arm that published no `TXFM_CONTEXT` band until this round.
+thread_local! {
+    static RECT64_SPLIT_TXFM_PUBLISH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `RECT64_SPLIT_TXFM_PUBLISH_HITS`.
+pub(crate) fn rect64_split_txfm_publish_hits() -> usize {
+    RECT64_SPLIT_TXFM_PUBLISH_HITS.with(|c| c.get())
+}
+
 /// Current value of `RECT4_COEFF_HITS`.
 pub(crate) fn rect4_coeff_hits() -> usize {
     RECT4_COEFF_HITS.with(|c| c.get())
@@ -7567,11 +7579,18 @@ fn decode_intra_rect_in_inter(
         // The INTER frame's own `TXFM_CONTEXT` bands, not the key frame's
         // deblock-grid approximation -- [`tx_size_context_txfm_rect`].
         let ctx = tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw.min(64), bh.min(64));
-        match tx_cat {
+        let d = match tx_cat {
             1 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
             2 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
             _ => dec.symbol(&mut cdfs.tx_size_cat3[ctx]),
+        };
+        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            eprintln!(
+                "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat={tx_cat} rng={}",
+                dec.debug_state().0
+            );
         }
+        d
     } else {
         0
     };
@@ -8628,6 +8647,13 @@ fn decode_block_rect4(
         if !skip {
             RECT4_COEFF_HITS.with(|c| c.set(c.get() + 1));
         }
+        // lane-frame36 r2 (same shape as `decode_block_rect64`'s split arm,
+        // swept this round): `set_txfm_ctxs` runs for EVERY block of an inter
+        // frame, so this 1:4 strip -- which is also the INTER frame's reader
+        // for 32x8/8x32 ([`decode_intra_rect4_in_inter`]) -- publishes its
+        // transform size in both TXFM_CONTEXT bands. Without it the next block
+        // reads the row's stale value.
+        txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
         return Ok((mode, uv_predict_mode));
     }
     // The coarse (16-px [`SUB`] cell) mode/side arrays cannot name a strip
@@ -8778,6 +8804,13 @@ fn decode_block_rect4(
         } else {
             RECT4_32_VERT_HITS.with(|c| c.set(c.get() + 1));
         }
+        // lane-frame36 r2 (same shape as `decode_block_rect64`'s split arm,
+        // swept this round): `set_txfm_ctxs` runs for EVERY block of an inter
+        // frame, so this 1:4 strip -- which is also the INTER frame's reader
+        // for 32x8/8x32 ([`decode_intra_rect4_in_inter`]) -- publishes its
+        // transform size in both TXFM_CONTEXT bands. Without it the next block
+        // reads the row's stale value.
+        txfm_partition_update_rect(neighbours, (mi_r, mi_c), (bw, bh), (bw, bh));
         return Ok((mode, uv_predict_mode));
     };
     if let Some(b) = &palette_y_buf {
@@ -8840,6 +8873,13 @@ fn decode_block_rect4(
     } else {
         RECT4_32_VERT_HITS.with(|c| c.set(c.get() + 1));
     }
+    // lane-frame36 r2 (same shape as `decode_block_rect64`'s split arm,
+    // swept this round): `set_txfm_ctxs` runs for EVERY block of an inter
+    // frame, so this 1:4 strip -- which is also the INTER frame's reader
+    // for 32x8/8x32 ([`decode_intra_rect4_in_inter`]) -- publishes its
+    // transform size in both TXFM_CONTEXT bands. Without it the next block
+    // reads the row's stale value.
+    txfm_partition_update_rect(neighbours, (mi_r, mi_c), (bw, bh), (bw, bh));
     Ok((mode, uv_predict_mode))
 }
 
@@ -9404,6 +9444,17 @@ fn decode_rect4_16_strip(
         record_strip_palette(
             neighbours, lmi, bw, bh, pal_y_size, pal_y_colors, pal_uv_size, pal_uv_colors,
         );
+    // `set_txfm_ctxs(mbmi->tx_size, n4_w, n4_h, skip && is_inter, xd)`
+    // (libaom `decode_token_recon_block`, run for EVERY block of an inter
+    // frame): the above row records `tx_size_wide` over the block's width and
+    // the left column `tx_size_high` over its height. This 1:4 strip reader is
+    // also the INTER frame's reader for the shape ([`decode_intra_rect4_in_inter`]),
+    // and it published neither band -- so the block after a 64x16 strip read
+    // the row's init value 64 as its left transform height and took
+    // `tx_size_cat3` row 1 where libaom takes row 0 (lane-frame36 r1: the
+    // 3840x1608 10-bit stream's first silent wall, decode-order frame 33 at
+    // mi(16,480)). Same write as [`set_txfm_ctxs`], rect-aware.
+    txfm_partition_update_rect(neighbours, lmi, (tx_w, tx_h), (bw, bh));
     Ok((mode, last_uv_mode, (tx_w, tx_h)))
 }
 
@@ -9598,6 +9649,16 @@ fn decode_block_rect64(
         let (puv_size, puv_colors) =
             palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
         neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, puv_size, puv_colors);
+        // lane-frame36 r2: `set_txfm_ctxs` runs for EVERY block and this early
+        // return skips the fn's own tail, so a SPLIT superblock-level strip
+        // published no TXFM_CONTEXT band and the next block read the row's init
+        // value 64 as its left transform height. Measured on the 10-bit
+        // 3840x1608 stream, decode-order frame 33: after the split 16x64 strip
+        // at mi(192,140) (`tx_depth=1` -> TX_16X32) the 32x64 block at
+        // mi(192,144) took `tx_size_cat3` row 2 where libaom takes row 1. The
+        // bands carry the SPLIT unit's size, not the block's.
+        txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
+        RECT64_SPLIT_TXFM_PUBLISH_HITS.with(|c| c.set(c.get() + 1));
         RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
         return Ok(());
     }
@@ -9915,6 +9976,17 @@ fn decode_block_rect64(
     neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, puv_size, puv_colors);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
+    // `set_txfm_ctxs(mbmi->tx_size, n4_w, n4_h, skip && is_inter, xd)`
+    // (libaom `decode_token_recon_block`, run for EVERY block of an inter
+    // frame): the above row records `tx_size_wide` over the block's width and
+    // the left column `tx_size_high` over its height. This 1:4 strip reader is
+    // also the INTER frame's reader for the shape ([`decode_intra_rect4_in_inter`]),
+    // and it published neither band -- so the block after a 64x16 strip read
+    // the row's init value 64 as its left transform height and took
+    // `tx_size_cat3` row 1 where libaom takes row 0 (lane-frame36 r1: the
+    // 3840x1608 10-bit stream's first silent wall, decode-order frame 33 at
+    // mi(16,480)). Same write as [`set_txfm_ctxs`], rect-aware.
+    txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
     SB_RECT_HITS.with(|c| c.set(c.get() + 1));
     match (bw, bh) {
         (64, 16) => SB_RECT4_HORZ_HITS.with(|c| c.set(c.get() + 1)),
@@ -13411,6 +13483,19 @@ fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usiz
     }
     if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= side;
+    }
+    if std::env::var_os("EC_TXCTX").is_some() {
+        eprintln!(
+            "EC_TXCTX mi={mi_r},{mi_c} own={side} ha={has_above} hl={has_left} \
+             above_txfm={} left_txfm={} above_inter={} left_inter={} above_side={} left_side={} \
+             above={above} left={left}",
+            n.above_txfm[mi_c],
+            n.left_txfm[mi_r],
+            n.above_inter[mi_c],
+            n.left_inter[mi_r],
+            n.above_side_mi[mi_c],
+            n.left_side_mi[mi_r],
+        );
     }
     match (has_above, has_left) {
         (true, true) => usize::from(above) + usize::from(left),
