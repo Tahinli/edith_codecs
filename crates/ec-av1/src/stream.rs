@@ -6466,6 +6466,9 @@ mod tests {
         // aomenc silently codes one tile column and the arm is vacuous.
         extra: &[&str],
         width: usize,
+        // lane-interp3 r1: sequence length -- a compound block needs several
+        // already-coded references, which a 4-frame sequence never has.
+        frame_count: usize,
     ) {
         if !have_ffmpeg() {
             eprintln!("SKIP {name}: no ffmpeg");
@@ -6475,7 +6478,8 @@ mod tests {
             eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (height, frame_count) = (64usize, 4usize);
+        let height = 64usize;
+        let duration = format!("{:.2}", frame_count as f64 / 25.0);
         // A deterministic synthetic source with real motion (a static source
         // codes every inter frame as skip and never exercises the residual
         // path); bounded with `-t` (class gate-loader-slurps-whole-file).
@@ -6488,7 +6492,7 @@ mod tests {
                 "-i",
                 &format!("mandelbrot=size={width}x{height}:rate=25"),
                 "-t",
-                "0.16",
+                &duration,
                 "-pix_fmt",
                 if ten_bit { "yuv420p10le" } else { "yuv420p" },
                 // y4m calls 10-bit unofficial (same as the 10-bit key-frame
@@ -6615,6 +6619,7 @@ mod tests {
             "whole-superblock inter PARTITION_NONE",
             &[],
             64,
+            4,
         );
     }
 
@@ -6629,6 +6634,7 @@ mod tests {
             "whole-superblock inter PARTITION_NONE",
             &[],
             64,
+            4,
         );
     }
 
@@ -6671,6 +6677,88 @@ mod tests {
             "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
             &["--tile-columns=1"],
             128,
+            4,
+        );
+    }
+
+    /// lane-interp3 r1: the same 8x8-leaf recipe with DUAL FILTER, OBMC and
+    /// warped motion on. `read_mb_interp_filter` runs for every inter block
+    /// (libaom `decodemv.c` 1575), compound ones included; the compound 8x8
+    /// leaf skipped it entirely, so a SWITCHABLE-filter stream lost a symbol
+    /// per compound leaf and stamped the `[3, 3]` "no filter" sentinel, which
+    /// made a neighbouring OBMC block's `neighbour_filter` PANIC (a crash on
+    /// his data, not a named refusal). The three hard asserts prove the flags
+    /// arrived: a compound 8x8 leaf that really read the filter, a block whose
+    /// two dual-filter directions DIFFER (impossible with dual filter off),
+    /// and an 8x8 OBMC blend.
+    // lane-interp3 r2: the ENTROPY desync r1 measured is CLOSED -- the full
+    // 16-frame stream now parses end to end and every `EC_MODE`/`EC_MODE_VAL`
+    // element's msac RANGE matches the instrumented aomdec's line for line
+    // (570/570 mode elements, 0 diff). Two twin-drift root causes, both in
+    // `decode_inter_block8`'s compound arm: `read_compound_ref_frames` was
+    // passed a hard-coded `LAST_FRAME` for every inter neighbour instead of
+    // the real per-mi band, and the grid stamp cleared both per-slot
+    // `is_global_mv_block` flags.
+    // lane-interp3 r3: the luma reconstruction residue r2 left open is CLOSED
+    // and this gate is GREEN. Third instance of the same twin-drift class:
+    // libaom applies `allow_warp`'s GLOBAL branch to every
+    // `is_global_mv_block` reference slot, compound included and independent
+    // of `motion_mode` (`av1_init_warp_params` inside
+    // `build_inter_predictors_8x8_and_bigger`'s per-`ref` loop) -- the 16x16+
+    // compound arm has warped since lane-cwarp r1, the 8x8 leaf's compound arm
+    // predicted BOTH taps translationally, so a GLOBAL_GLOBALMV 8x8 compound
+    // leaf under a non-TRANSLATION model drifted a few luma levels, growing
+    // away from the block origin. It was NOT OBMC: the `EC_OBMC` emitter this
+    // round added to `decode.rs` diffs 325/325 lines against the instrumented
+    // aomdec's own rung (position, span, neighbour mv/ref/bsize/filter) with
+    // zero differences.
+    #[test]
+    fn a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let before_dual = decode::dual_filter_diff_hits();
+        let before_obmc = decode::obmc_hits_8();
+        let before_cwarp8 = decode::compound_warp_hits_8();
+        inter_sb_none_gate(
+            NAME,
+            false,
+            "8",
+            "16",
+            decode::compound8_filter_hits,
+            "a compound 8x8 leaf reading its own switchable interp_filter",
+            &[
+                "--enable-dual-filter=1",
+                "--enable-obmc=1",
+                "--enable-warped-motion=1",
+                "--enable-onesided-comp=1",
+            ],
+            64,
+            // Recipe search hook (same shape as EC_OBMC8_ATTEMPTS): a compound
+            // block needs several coded references, so the sequence is longer
+            // than the other arms' 4 frames.
+            std::env::var("EC_INTERP3_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16),
+        );
+        assert!(
+            decode::dual_filter_diff_hits() > before_dual,
+            "{NAME}: no block read two DIFFERENT dual-filter directions -- \
+             --enable-dual-filter=1 did not arrive or aomenc declined it"
+        );
+        assert!(
+            decode::obmc_hits_8() > before_obmc,
+            "{NAME}: no 8x8 OBMC blend fired -- --enable-obmc=1 did not arrive"
+        );
+        assert!(
+            decode::compound_warp_hits_8() > before_cwarp8,
+            "{NAME}: no 8x8 COMPOUND leaf was predicted through the per-ref GLOBAL \
+             warp -- the r3 root-cause path never fired, so this stream no longer \
+             proves it"
         );
     }
 
@@ -6685,6 +6773,7 @@ mod tests {
             "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
             &[],
             64,
+            4,
         );
     }
 
@@ -6708,6 +6797,7 @@ mod tests {
             "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
             &[],
             64,
+            4,
         );
     }
 
