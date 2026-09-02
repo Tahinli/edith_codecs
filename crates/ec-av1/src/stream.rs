@@ -11060,7 +11060,13 @@ mod tests {
         // frame -- a DIFFERENT lane's shape, and the measured blocker of every
         // VERT_4-carrying recipe in the sweep.
         let mut sub8_intra_refusals = 0u32;
-        for bit_depth in [8u32, 10u32] {
+        // Every failure the sweep sees, asserted ONCE at the end.
+        let mut failures: Vec<String> = Vec::new();
+        // Per bit depth: attempts that decoded at all, and attempts that fired an
+        // intra 1:4 strip AND compared pixel-exact.
+        let mut decoded_per_depth = [0u32; 2];
+        let mut fired_exact_per_depth = [0u32; 2];
+        for (depth_idx, bit_depth) in [8u32, 10u32].into_iter().enumerate() {
             let (mut named_refusals, mut matched, mut out_of_scope, mut oos_mismatch) =
                 (0u32, 0u32, 0u32, 0u32);
             let mut arms_proved = [0u32; 3];
@@ -11158,11 +11164,23 @@ mod tests {
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
                         let msg = e.to_string();
-                        assert!(
-                            msg.contains("unsupported"),
-                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
-                             attempt {attempt}): {msg}"
-                        );
+                        // lane-intra16x4 r3: the ONLY refusals the 120-run sweep
+                        // (`~/.cache/intra16x4-tmp/sweep_r3.sh`, table in the
+                        // report) reaches over these recipes -- each another
+                        // lane's shape. A refusal outside this list is a new wall
+                        // and fails the gate rather than being counted.
+                        const MEASURED_REFUSALS: [&str; 3] = [
+                            "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition",
+                            "an intra 4x4 block inside an inter frame's sub-8x8 split",
+                            "an OBMC neighbour whose switchable interp filter was never recorded",
+                        ];
+                        if !MEASURED_REFUSALS.iter().any(|r| msg.contains(r)) {
+                            failures.push(format!(
+                                "{bit_depth}-bit attempt {attempt}: refusal outside the measured \
+                                 list: {msg}"
+                            ));
+                            continue;
+                        }
                         if msg.contains("sub-8x8") {
                             sub8_intra_refusals += 1;
                         }
@@ -11172,6 +11190,7 @@ mod tests {
                     }
                     Ok(frames) => frames,
                 };
+                decoded_per_depth[depth_idx] += 1;
                 let after = crate::stream::intra16x4_in_inter_hits();
                 let fired = [
                     (after.0 - before.0) as u32,
@@ -11218,10 +11237,15 @@ mod tests {
                         }
                     }
                 }
-                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
-                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
-                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                // lane-intra16x4 r3: continue-and-sweep -- a mismatching attempt is
+                // RECORDED and the sweep goes on, so one arm's defect can no longer
+                // hide every later arm (r2's attempt 0 panicked before arm 4 ran).
+                // The end-of-sweep assert below fails on any recorded mismatch.
+                if mismatched {
+                    failures.push(format!(
+                        "{bit_depth}-bit attempt {attempt} (arms {fired:?}) mismatched ffmpeg"
+                    ));
+                    continue;
                 }
                 for a in 0..3 {
                     if fired[a] > 0 {
@@ -11230,6 +11254,7 @@ mod tests {
                     }
                 }
                 matched += 1;
+                fired_exact_per_depth[depth_idx] += 1;
             }
             eprintln!(
                 "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
@@ -11237,10 +11262,26 @@ mod tests {
                  16x4/4x16/chroma-reference={arms_proved:?}, {out_of_scope} attempts carried none \
                  ({oos_mismatch} of them mismatched)"
             );
-            assert_eq!(
-                oos_mismatch, 0,
-                "{NAME}: {oos_mismatch} attempt(s) with no intra 1:4 strip decoded but mismatched \
-                 ffmpeg -- a defect of another shape, not a pass"
+            if oos_mismatch > 0 {
+                failures.push(format!(
+                    "{bit_depth}-bit: {oos_mismatch} attempt(s) with no intra 1:4 strip decoded \
+                     but mismatched ffmpeg -- another shape's defect, not a pass"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{NAME}: {} sweep failure(s): {failures:#?}",
+            failures.len()
+        );
+        // The counter must have fired on a pixel-exact attempt at every bit depth
+        // the sweep actually decoded at.
+        for (depth_idx, bit_depth) in [8u32, 10u32].into_iter().enumerate() {
+            assert!(
+                decoded_per_depth[depth_idx] == 0 || fired_exact_per_depth[depth_idx] > 0,
+                "{NAME}: {bit_depth}-bit decoded {} attempt(s) but none of them fired an intra \
+                 1:4 strip on a pixel-exact compare",
+                decoded_per_depth[depth_idx]
             );
         }
         // MEASURED (48-run sweep, report table): every recipe that makes
