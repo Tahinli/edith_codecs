@@ -8437,7 +8437,16 @@ mod tests {
         let mut other_refusals = Vec::new();
         for attempt in 0..n_attempts {
             let seed = 42 + attempt;
-            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            // Diagnosis knob: which content makes RD pick an 8x16/16x8 strip
+            // AND filter intra on it is a search (see lanes/fistrip-r1.report.md).
+            let source = match std::env::var("EC_FISTRIP_SRC").unwrap_or_default().as_str() {
+                "bars" => format!("smptebars=size={width}x{height}:duration=0.04:rate=25"),
+                "src2" => format!("testsrc2=size={width}x{height}:duration=0.04:rate=25"),
+                "noise" => format!(
+                    "nullsrc=size={width}x{height}:duration=0.04:rate=25,geq=random(1)*255:128:128"
+                ),
+                _ => gradients_source(seed, width, height, "duration=0.04:rate=25"),
+            };
             let y4m = Command::new("ffmpeg")
                 .args(["-v", "error", "-f", "lavfi", "-i"])
                 .arg(&source)
@@ -12766,6 +12775,294 @@ mod tests {
         eprintln!(
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals, \
              filter_intra_rect_hits delta={fi_hits} out of {n_attempts} attempts"
+        );
+    }
+
+    /// lane-fistrip r1, the 10-bit arm of the strip gate (his films are
+    /// yuv420p10le). Same ceiling as its 8-bit twin -- kept `#[ignore]`d
+    /// with the measurement rather than weakened: MEASURED over seeds
+    /// 42..61 the 8x16/16x8 strips aomenc writes filter intra on are
+    /// `skip=0`, which `decode_leaf_rect` refuses, so
+    /// `filter_intra_rect_sub16_hits` never reaches a pixel compare.
+    #[ignore = "blocked on the coded (non-skip) rect strip below 16x16 refusal -- see doc"]
+    #[test]
+    fn a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let seeds: Vec<u32> = (42..62).collect();
+        ten_bit_tool_gate(
+            NAME,
+            192,
+            128,
+            1,
+            &[
+                "--limit=1",
+                "--cq-level=25",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=8",
+                "--max-partition-size=32",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-filter-intra=1",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+            ],
+            &seeds,
+            &[(
+                "filter_intra_rect_sub16_hits",
+                crate::decode::filter_intra_rect_sub16_hits as fn() -> usize,
+            )],
+        );
+    }
+
+    /// lane-fistrip r1, the pinned half of this lane's proof: one real
+    /// `aomenc` stream (recipe below, byte-reproducible -- md5
+    /// ac3a64773e5454ee9b5d8650507063cd, hashed twice) whose key frame
+    /// carries four `BLOCK_16X8` DC_PRED leaves, one of which sets
+    /// `use_filter_intra`. `av1_filter_intra_allowed_bsize` allows 16x8, so
+    /// aomenc writes that flag; before this round `filter_intra_size_class_rect`
+    /// had no row for the shape, the symbol was never read, and the tile
+    /// desynced ON THAT BLOCK -- observable as a DIFFERENT named refusal
+    /// ("a HORZ/VERT intra strip below 16x16 with a split transform", a
+    /// `tx_depth` read out of a desynced stream) instead of this one.
+    ///
+    /// The stream cannot be pixel-compared yet: the 16x8 strip that carries
+    /// the flag is `skip=0`, and a coded rect strip below 16x16 has no
+    /// residual path here (its own refusal, another lane's ceiling). What
+    /// this test pins is the SYMBOL: the flag is read, the counter fires
+    /// once, and the decode stops at the coded-strip ceiling rather than
+    /// wandering off a desynced stream.
+    ///
+    /// Fixture recipe (`crates/ec-av1/fixtures/filter_intra_8x16_strip_seed49.obu`):
+    /// `ffmpeg -f lavfi -i gradients=size=192x128:c0=0x986ae1:c1=0xd3e49a:
+    /// c2=0x0b1e53:c3=0x42980c:seed=49:duration=0.04:rate=25 -pix_fmt yuv420p`
+    /// into `aomenc --codec=av1 --passes=1 --end-usage=q --cq-level=25
+    /// --cpu-used=0 --threads=1 --row-mt=0 --sb-size=64
+    /// --enable-rect-partitions=1 --enable-ab-partitions=0
+    /// --enable-1to4-partitions=0 --min-partition-size=8
+    /// --max-partition-size=32 --enable-restoration=0 --enable-palette=0
+    /// --deltaq-mode=0 --enable-filter-intra=1 --enable-cfl-intra=0
+    /// --enable-intrabc=0 --obu`.
+    #[test]
+    fn a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag() {
+        const NAME: &str = "a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag";
+        let _gate_lock = lock_gate_counters();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/filter_intra_8x16_strip_seed49.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let before = crate::decode::filter_intra_rect_sub16_hits();
+        let err = decode_stream(&stream).expect_err(
+            "{NAME}: this stream's 16x8 filter-intra strip is skip=0, which this decoder \
+             still refuses -- a clean decode means the coded-strip ceiling moved and this \
+             test should become a pixel compare",
+        );
+        let hits = crate::decode::filter_intra_rect_sub16_hits() - before;
+        assert_eq!(
+            hits, 1,
+            "{NAME}: expected exactly one 16x8 strip to read use_filter_intra=1 (aomdec's own \
+             EC_TRACE_MODE shows four BLOCK_16X8 DC_PRED leaves here); got {hits}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("a coded (non-skip) HORZ/VERT rect strip below 16x16"),
+            "{NAME}: decode must reach the coded-strip ceiling ON that block, not wander off a \
+             desynced stream; got: {msg}"
+        );
+    }
+
+    /// lane-fistrip r1: the filter-intra strip gate above, one partition
+    /// level DOWN (`--min-partition-size=8`, so a 16x16 HORZ/VERT splits
+    /// into 8x16/16x8 leaves). `av1_filter_intra_allowed_bsize` is
+    /// `wide <= 32 && high <= 32`, which both of those satisfy, so aomenc
+    /// writes a `use_filter_intra` flag on every DC_PRED one of them --
+    /// `filter_intra_size_class_rect` had no row for either shape and
+    /// [`crate::decode::read_intra_mode_rect`] therefore never READ that
+    /// symbol (class `symbol-consumption-gap`, a silent desync rather than
+    /// a refusal). Hard-asserts
+    /// [`crate::decode::filter_intra_rect_sub16_hits`], not the wider
+    /// `filter_intra_rect_hits`: a 32x16 strip firing filter intra would
+    /// satisfy that one and prove nothing about the new shapes.
+    /// MEASURED THIS ROUND (lane-fistrip r1), which is why it is `#[ignore]`d
+    /// rather than green: over 200 seeds at cq 25 aomenc put filter intra on
+    /// an 8x16/16x8 strip TWICE, and both times that strip was `skip=0`, so
+    /// the attempt refused at the coded-rect-strip-below-16x16 ceiling before
+    /// any pixel compare (177 pixel-exact matches, 23 refusals, compared
+    /// sub16 delta 0, all-attempt delta 2). Un-ignore this the round that
+    /// ceiling lifts; the symbol itself is pinned by
+    /// [`a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag`].
+    #[ignore = "blocked on the coded (non-skip) rect strip below 16x16 refusal -- see doc"]
+    #[test]
+    fn a_real_aomenc_stream_with_filter_intra_on_a_sub16_horz_vert_strip_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_filter_intra_on_a_sub16_horz_vert_strip_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let mut compared_hits = 0usize;
+        let n_attempts: u32 = std::env::var("EC_FISTRIP_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let cq = format!(
+            "--cq-level={}",
+            std::env::var("EC_FISTRIP_CQ").unwrap_or_else(|_| "25".into())
+        );
+        // Diagnosis: the counter over EVERY attempt, refused ones included --
+        // a filter-intra 8x16 strip inside an attempt that later refused
+        // (non-skip, split transform) fires this but never reaches
+        // `compared_hits`, and the two numbers differing is what says the
+        // recipe reaches the feature but this decoder's other ceilings hide
+        // it.
+        let all_before = crate::decode::filter_intra_rect_sub16_hits();
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                &cq,
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                // The point of this gate: one level below the 32x16/16x32
+                // strips the sibling gate covers.
+                "--min-partition-size=8",
+                "--max-partition-size=32",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-filter-intra=1",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            // Diagnosis knob only (default: every intra mode on) -- the same
+            // subset search the 32x16/16x32 sibling gate carries.
+            let mut args = args;
+            let off = std::env::var("EC_FISTRIP_OFF").unwrap_or_default();
+            for tool in off.split(',').filter(|t| !t.is_empty()) {
+                args.push(match tool {
+                    "smooth" => "--enable-smooth-intra=0",
+                    "paeth" => "--enable-paeth-intra=0",
+                    "dir" => "--enable-directional-intra=0",
+                    "angle" => "--enable-angle-delta=0",
+                    other => panic!("unknown EC_FISTRIP_OFF entry {other}"),
+                });
+            }
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            let attempt_before = crate::decode::filter_intra_rect_sub16_hits();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    // Diagnosis: a refused attempt that DID fire the feature
+                    // says which other ceiling of this decoder hides it.
+                    eprintln!(
+                        "{NAME}: seed {seed} refused with sub16 filter-intra delta {}: {msg}",
+                        crate::decode::filter_intra_rect_sub16_hits() - attempt_before
+                    );
+                    named_refusals += 1;
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(frames.len(), 1, "{NAME}: expected one frame (seed {seed})");
+            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            compared_hits += crate::decode::filter_intra_rect_sub16_hits() - attempt_before;
+            matched += 1;
+        }
+        eprintln!(
+            "{NAME}: filter_intra_rect_sub16_hits over ALL attempts (refused included) = {}",
+            crate::decode::filter_intra_rect_sub16_hits() - all_before
+        );
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} named refusals) -- gate decoded nothing"
+        );
+        assert!(
+            compared_hits > 0,
+            "{NAME}: no 8x16/16x8 strip used filter intra ({matched} pixel-exact matches, \
+             {named_refusals} refusals out of {n_attempts}) -- gate proved nothing this run"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals, \
+             filter_intra_rect_sub16_hits delta={compared_hits} (all attempts including \
+             refused: {}) out of {n_attempts} attempts",
+            crate::decode::filter_intra_rect_sub16_hits() - all_before
         );
     }
 
