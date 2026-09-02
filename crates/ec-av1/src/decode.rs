@@ -12232,10 +12232,18 @@ fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usiz
     let has_left = mi_c > n.tile_col0_mi;
     let mut above = usize::from(n.above_txfm[mi_c]) >= side;
     let mut left = usize::from(n.left_txfm[mi_r]) >= side;
-    if has_above && n.above_inter[mi_c / (SUB / MI)] {
+    // lane-angledelta r1 (class [[context-read-from-one-cell]]): both
+    // `above_inter`/`left_inter` bands are written per MI unit
+    // (`record_inter_rect_mi`), so they are read per MI too -- the `/ (SUB /
+    // MI)` here read the 16-px cell's FIRST mi instead, i.e. a different
+    // block whenever the neighbour column/row is not the cell's first. A
+    // 16x16 intra block whose left neighbour is an inter block at mi row 4
+    // then missed libaom's "an inter neighbour contributes its BLOCK size"
+    // override and read `tx_size_cat1` row 1 where aomdec reads row 2.
+    if has_above && n.above_inter[mi_c] {
         above = n.above_side_mi[mi_c] >= side;
     }
-    if has_left && n.left_inter[mi_r / (SUB / MI)] {
+    if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= side;
     }
     match (has_above, has_left) {
