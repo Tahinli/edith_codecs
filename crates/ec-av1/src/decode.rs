@@ -8836,10 +8836,19 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// lane-hgkf r2: 16-bit cropped stage dump, the high-bitdepth twin of
 /// [`dump_stage`] (whose `as u8` truncation hides |delta| <= 2 defects) --
 /// matches aomdec's own `ec_dump16` rung byte for byte (crop dims, u16 LE).
+/// lane-mc64 r1: the decode-order index the stage dumps below key their file
+/// name on. `PREFILT_PICTURE_IDX` is bumped once per frame just BEFORE the
+/// deblock/CDEF stages run, so the frame being dumped here is `idx - 1` --
+/// without this every frame overwrote `.f0` and a per-frame bisection silently
+/// compared the LAST decoded frame (ledger, class stale-output-faked-measurement).
+fn stage_dump_idx() -> usize {
+    PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(1)
+}
+
 fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, fh: usize) {
     use std::io::Write;
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", stage_dump_idx()))
     {
         for (p, w, h) in [(y, fw, fh), (u, fw.div_ceil(2), fh.div_ceil(2)), (v, fw.div_ceil(2), fh.div_ceil(2))] {
             for row in 0..h {
@@ -8856,7 +8865,7 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", stage_dump_idx()))
     {
         for p in [y, u, v] {
             let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
@@ -16450,6 +16459,9 @@ fn decode_inter_block(
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
     let (write_chroma_w, write_chroma_h) = (write_w / 2, write_h / 2);
+    if std::env::var_os("EC_MC_TRACE").is_some() {
+        eprintln!("EC_IB px={px} py={py} side={side} w={write_w} h={write_h}");
+    }
 
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
@@ -16502,9 +16514,10 @@ fn decode_inter_block(
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
     if std::env::var_os("EC_TRACE_MODE").is_some() {
         eprintln!(
-            "EC_MODE mi_row={} mi_col={} rng={}",
+            "EC_MODE mi_row={} mi_col={} is_inter={} skip={skip} rng={}",
             rmi,
             cmi,
+            is_inter as u8,
             dec.debug_state().0
         );
     }
