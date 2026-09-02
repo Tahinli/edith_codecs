@@ -92,24 +92,46 @@ decodes clean reports `rect64_corner_tu: 64x32=0 32x64=0`; every rect64 hit (22 
 inside the frame that still refuses on the intra 16x4/4x16 wall. Confirms the ledger dead-end
 `lane-rect64port r1`. Unblocked by: the intra-16x4/4x16-in-inter-1:4 lane.
 
-## Suite — INCOMPLETE at the turn cap
+## Suite — COMPLETE
 
 `systemd-run --user --unit=rectres-suite-r1-... -p MemoryMax=10G ... cargo test -p ec-av1 --lib -j3`
-(log `$HOME/.cache/rectres-suite-r1.log`) was still running when the cap hit: 1259 log lines,
-no `^test result` line yet. **The full-suite result is UNKNOWN — not claimed green.**
-What DID run and pass: `cargo test -p ec-av1 --lib --no-run` (compiles) and the new gate alone,
-`test result: ok. 1 passed; 0 failed; 457 filtered out`.
+(log `$HOME/.cache/rectres-suite-r1.log`, 646.93 s):
+
+```
+test result: FAILED. 418 passed; 3 failed; 37 ignored; 0 measured; 0 filtered out
+failures:
+    stream::tests::a_frame_edge_straddling_band_decodes_pixel_exact
+    stream::tests::a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact
+    stream::tests::real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal
+```
+
+Exactly the charter's three known reds from main 7e6d60b (417/3/37 -> 418/3/37; the extra pass
+is this lane's new gate). **No new failure.** But the two 1:4 reds now fail for a CHANGED
+reason, and that is this lane's doing, so it is stated rather than waved through as "known":
+
+* `..._16x16_level_1to4_partitions...` — still the same zero arm (`split-tx-8x4` = 0,
+  `[1, 1, 2, 2, 0]`, 0 mismatches), but its assert message now reads *"NO attempt refused on
+  rectangular residual coding -- their documented blocker is gone, so a zero arm is now
+  unexplained"*. That sentence is literally true because of this commit: the streams that used
+  to stop on the rect-residual refusal now decode through. The arm was already 0 before
+  (ledger `merge-L`), so the RED is not new — its explanation is.
+* `real_aomenc_1to4_streams_..._rect_vartx_leaves_fire` — was red with *"2 attempts stop at
+  non-skip rectangular residual coding"* (ledger `lane-mergefix r3`); now **0 refusals** and
+  still 0 leaves. The lift removed those two refusals and revealed that the gate's recipe never
+  produced a 64-axis SPLIT transform in the first place. Same red, recipe defect, now unmasked.
+* `a_frame_edge_straddling_band` — pixel mismatch, untouched by this lane.
+
+Both 1:4 reds are therefore now pure GATE-RECIPE defects with no refusal left to hide behind:
+their firing recipes need a re-sweep of the kind this lane ran (see the 32-pixel-band /
+cq >= 48 constraint above). `fix-now` was out of scope at the turn cap.
+deferred: re-sweeping those two gates' aomenc recipes — turn cap — the recipe method is in this
+report and the sweep scripts are at `~/.cache/rectres-tmp/{probe,sweep,sweep2}.sh`.
 
 ## Exact next step
 
-1. `grep -E "^test result|^failures:" -A20 $HOME/.cache/rectres-suite-r1.log` — the unit is still
-   live; if it died, re-arm the same command. Expected known reds (from main 7e6d60b, unrelated
-   to this lane): `a_frame_edge_straddling_band`,
-   `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions`,
-   `real_aomenc_1to4_streams_..._rect_vartx_leaves_fire`. Anything else is this commit's.
-   Re-run the two SIBLING gates by name first (they share `rect_inter_luma_set` /
-   `rect_inter_chroma_set` / `read_inter_plane_rect`): `real_aomenc_1to4_streams_...` and
-   `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions`.
-2. Then the next film wall is a DIFFERENT lane's shape: `an intra 16x4/4x16 strip inside an
+1. Merge `c36cc99` — the suite is clean apart from the three pre-existing reds (see above).
+2. Re-sweep the aomenc recipes of the two 1:4 gates whose zero arms are now unmasked
+   (32-pixel motion bands, cq >= 48 is what worked here).
+3. The next film wall is a DIFFERENT lane's shape: `an intra 16x4/4x16 strip inside an
    inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only
    the inter path implements that pairing)` — all six cuts now stop there.
