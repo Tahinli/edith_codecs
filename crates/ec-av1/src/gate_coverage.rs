@@ -208,7 +208,11 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // flip/identity/1D transform types are proven to reach a real 10-bit stream
     // this decoder reconstructs exactly (10 of its rect coefficient TUs carry a
     // 1D tx class).
-    ("enable-intrabc", "hole at both depths, see the 8-bit list"),
+    // `enable-intrabc` LEFT this 10-bit list on 2026-09-02 (lane-kf900 r6):
+    // `a_real_aomenc_rect_strip_palette_decodes_pixel_exact`'s new
+    // `smptebars-screen-txs-cq40/cq55` arms spell `--enable-intrabc=1` and are
+    // decoded and pixel-compared at 10 bit as well as 8, so the tool reaches a
+    // real 10-bit stream this decoder reconstructs exactly.
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
     ("enable-tx64", "hole at both depths, see the 8-bit list"),
 ];
