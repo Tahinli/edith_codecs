@@ -11929,6 +11929,18 @@ fn read_sb128_root(
         PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
     } else {
         PART128_NONE_HITS.with(|c| c.set(c.get() + 1));
+        // lane-sb128b r2 RESIDUAL, measured (gate
+        // `a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact`,
+        // 384x384 cq63 seed 42, a 76-byte near-flat frame): the chroma TU loop
+        // landed and the tile decodes end to end, but frame 0 luma differs from
+        // ffmpeg at 139162/147456 samples -- ffmpeg's row 0 is a constant 115
+        // where ours ramps 115 -> 112 across the first TX_64X64 unit, i.e. our
+        // first luma unit reads AC coefficients libaom never wrote. The DC and
+        // the mode agree; the divergence is inside that unit's coefficient
+        // read. Refuse rather than emit wrong pixels.
+        return Err(unsupported(
+            "a 128x128 PARTITION_NONE block (four TX_64X64 luma and four TX_32X32 chroma units all decode, but the first unit's coefficients already carry AC where libaom has DC only -- lane-sb128b r2's open entropy residual)",
+        ));
     }
     Ok(part128)
 }
