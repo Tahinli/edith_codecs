@@ -949,11 +949,29 @@ thread_local! {
     /// counter from [`TX_DEPTH_HITS`] (which every square path also bumps) so
     /// the gate can prove THIS path fired.
     static RECT8_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 16x8/8x16 intra strips whose prediction actually read past the block's
+    /// own width (above-right) or height (below-left) -- the samples
+    /// `Reach::of_rect` decides on, and the only ones a wrong `has_tr_*`/
+    /// `has_bl_*` table row can corrupt (lane-tx4x8 r3).
+    static RECT_STRIP_REACH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Every 16x8/8x16 intra strip predicted, reaching or not -- the
+    /// denominator [`RECT_STRIP_REACH_HITS`] is a fraction of.
+    static RECT_STRIP_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Current value of [`RECT8_SPLIT_TX_HITS`].
 pub(crate) fn rect8_split_tx_hits() -> usize {
     RECT8_SPLIT_TX_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT_STRIP_PRED_HITS`].
+pub(crate) fn rect_strip_pred_hits() -> usize {
+    RECT_STRIP_PRED_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT_STRIP_REACH_HITS`].
+pub(crate) fn rect_strip_reach_hits() -> usize {
+    RECT_STRIP_REACH_HITS.with(|c| c.get())
 }
 
 /// Current value of [`TX4X8_CODED_HITS`].
@@ -4766,6 +4784,12 @@ impl PlaneBuf {
         });
         let corner =
             (x > self.tile_x0 && y > self.tile_y0).then(|| self.data[(y - 1) * self.width + x - 1]);
+        if matches!((bw, bh), (16, 8) | (8, 16)) {
+            RECT_STRIP_PRED_HITS.with(|h| h.set(h.get() + 1));
+            if across > own_across || down > own_down {
+                RECT_STRIP_REACH_HITS.with(|h| h.set(h.get() + 1));
+            }
+        }
         (above, left, corner)
     }
 
