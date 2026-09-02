@@ -67,7 +67,14 @@ const REFUSALS: &[&str] = &[
     "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
     "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
-    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
+    // lane-inter16ab r1 lifted the AB half (HORZ_A/HORZ_B/VERT_A/VERT_B at
+    // the 16x16 level of an inter frame: two 8x8 inter leaves plus one true
+    // 16x8/8x16 inter strip, gate
+    // `a_real_aomenc_inter_sequence_with_16x16_level_ab_partitions_decodes_pixel_exact`).
+    // What is left is the 1:4 pair, whose 16x4/4x16 strips need the sub-8
+    // inter chroma-pair path (odd-strip `is_chroma_reference`, chroma built
+    // from BOTH strips' MVs) that no inter block writer has yet.
+    "an inter 16x16-level 1:4 partition (HORZ_4/VERT_4 -- four 16x4 or 4x16 inter strips; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT, SPLIT or AB)",
     "an intra mode this decoder does not code (round 2)",
     // lane-intrarect r1 lifted the whole-shape refusal that stood here (the
     // inter path's intra arm now routes 2:1 strips through `decode_rect_split`);
