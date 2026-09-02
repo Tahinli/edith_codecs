@@ -5662,7 +5662,10 @@ fn decode_leaf_rect(
             alpha,
             filter_intra,
             smooth_neighbor,
-            smooth_neighbor_uv: false,
+            // lane-rectsplitx r3: the split arm hard-coded `false` here while
+            // the unsplit arm below passes the real neighbour answer -- chroma
+            // of a tx-split 16x8/8x16 leaf lost its intra-edge filter type.
+            smooth_neighbor_uv,
         };
         decode_rect_split(
             dec,
