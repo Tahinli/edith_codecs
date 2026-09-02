@@ -1565,13 +1565,20 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("ffmpeg failed to start");
-        child
-            .stdin
-            .take()
-            .expect("ffmpeg stdin")
-            .write_all(stream)
-            .expect("writing the stream to ffmpeg");
+        // lane-t900 r10: the stream goes down stdin on ITS OWN THREAD. Writing
+        // it inline deadlocks the moment ffmpeg's stdout pipe buffer (64 KiB)
+        // fills before the last input byte is written -- which is exactly what
+        // a 1.1 MB fixture decoding to 150 MB of raw 10-bit frames does
+        // (measured: 45 min, both processes at 0% CPU). A write error here is
+        // swallowed on purpose: ffmpeg's own exit status and stderr, asserted
+        // below, are the real diagnosis.
+        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
+        let payload = stream.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
         let out = child.wait_with_output().expect("ffmpeg failed to run");
+        writer.join().expect("ffmpeg stdin writer thread");
         assert!(
             out.status.success(),
             "ffmpeg refused the stream: {}",
@@ -1620,13 +1627,20 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("ffmpeg failed to start");
-        child
-            .stdin
-            .take()
-            .expect("ffmpeg stdin")
-            .write_all(stream)
-            .expect("writing the stream to ffmpeg");
+        // lane-t900 r10: the stream goes down stdin on ITS OWN THREAD. Writing
+        // it inline deadlocks the moment ffmpeg's stdout pipe buffer (64 KiB)
+        // fills before the last input byte is written -- which is exactly what
+        // a 1.1 MB fixture decoding to 150 MB of raw 10-bit frames does
+        // (measured: 45 min, both processes at 0% CPU). A write error here is
+        // swallowed on purpose: ffmpeg's own exit status and stderr, asserted
+        // below, are the real diagnosis.
+        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
+        let payload = stream.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
         let out = child.wait_with_output().expect("ffmpeg failed to run");
+        writer.join().expect("ffmpeg stdin writer thread");
         assert!(
             out.status.success(),
             "ffmpeg refused the stream: {}",
@@ -30455,6 +30469,8 @@ mod tests {
         // lane-t900 r8: the intra edge-filter type an INTER neighbour keeps
         // non-smooth (the coarse SUB band still holds an older SMOOTH mode).
         let notsmooth_before = crate::decode::inter_neighbour_not_smooth_hits();
+        // lane-t900 r10: the rect warp top-right reach (600 blocks here).
+        let tr_before = crate::decode::tr_reach_longer_side_hits();
         let i16_before = crate::decode::intra16x4_in_inter_hits();
         let frames = match decode_stream(&stream) {
             Ok(frames) => frames,
@@ -30471,6 +30487,7 @@ mod tests {
         );
         let sub8tx = crate::decode::sub8_chroma_tx_from_ref_hits() - sub8tx_before;
         let notsmooth = crate::decode::inter_neighbour_not_smooth_hits() - notsmooth_before;
+        let tr = crate::decode::tr_reach_longer_side_hits() - tr_before;
         let i16_now = crate::decode::intra16x4_in_inter_hits();
         let i16 = (
             i16_now.0 - i16_before.0,
@@ -30490,6 +30507,7 @@ mod tests {
             ("intra16x4_in_inter chroma_ref", i16.2),
             ("sub8_chroma_tx_from_ref", sub8tx),
             ("inter_neighbour_not_smooth", notsmooth),
+            ("tr_reach_longer_side", tr),
         ] {
             assert!(
                 n > 0,
@@ -30515,8 +30533,84 @@ mod tests {
             "{NAME}: 15 shown frames pixel-exact on every plane; warp_plane_suppress={} \
              cdef_idx={} inter_sb128_vert={} interintra_rect={} non_chroma_ref_ctx_skip={} \
              intra_in_inter_txctx={} edge_filter_mi_fix={} intra16x4_in_inter={:?} \
-             sub8_chroma_tx_from_ref={sub8tx} inter_neighbour_not_smooth={notsmooth}",
+             sub8_chroma_tx_from_ref={sub8tx} inter_neighbour_not_smooth={notsmooth} \
+             tr_reach_longer_side={tr}",
             fired.0, fired.1, fired.2, fired.3, fired.4, fired.5, fired.6, i16
+        );
+    }
+
+    /// lane-t900 r10: the small-side GLOBALMV / rect warp-reach witness.
+    /// `crates/ec-av1/fixtures/gm_small_side_witness.obu`, 1158066 bytes,
+    /// sha256 `f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca`:
+    /// the first 50 frame-carrying OBUs of a 2 s cut taken 5400 s into a 10-bit
+    /// 1920x792 AV1 stream with `use_128x128_superblock=1` -- 34 decode-order
+    /// frames, 33 shown, every ARF in it coded with `allow_warped_motion=1`.
+    /// Truncated twice independently from the same source, both cuts hash
+    /// identically. All 34 DECODE-order frames (the hidden ARF included) were
+    /// compared byte-exact against instrumented aomdec with `EC_AV1_FINAL_DUMP`
+    /// -- see the lane report's EVIDENCE line; the gate itself compares the 33
+    /// shown frames on every plane, which is all ffmpeg hands back.
+    ///
+    /// It is the only stream in this repository that fires BOTH r9/r10 paths:
+    ///
+    /// * `gm_nontrans_small_side_hits` -- libaom `is_nontrans_global_motion`
+    ///   returns 0 at `AOMMIN(mi_size_wide, mi_size_high) < 2` BEFORE it looks
+    ///   at any warp model, so a GLOBALMV block with a 4-px side still reads
+    ///   its interp filter. We suppressed that symbol before r9.
+    /// * `tr_reach_longer_side_hits` -- `av1_findSamples` probes the top-right
+    ///   warp sample at `AOMMAX(xd->width, xd->height)` (mvref_common.c:1235)
+    ///   with libaom's two rect shape refinements
+    ///   (`is_last_vertical_rect` / `is_first_horizontal_rect`,
+    ///   av1_common_int.h:1419-1428) applied; probing at the block's WIDTH
+    ///   instead picks the 3-symbol `motion_mode` alphabet where libaom reads
+    ///   the 2-symbol `obmc` one -- same value, different narrowing.
+    #[test]
+    fn a_10bit_film_frames_with_small_side_globalmv_and_rect_warp_reach_decode_pixel_exact() {
+        const NAME: &str =
+            "a_10bit_film_frames_with_small_side_globalmv_and_rect_warp_reach_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/gm_small_side_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (1920usize, 792usize);
+        let gm_before = crate::decode::gm_nontrans_small_side_hits();
+        let tr_before = crate::decode::tr_reach_longer_side_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let gm = crate::decode::gm_nontrans_small_side_hits() - gm_before;
+        let tr = crate::decode::tr_reach_longer_side_hits() - tr_before;
+        assert!(
+            gm > 0,
+            "{NAME}: gm_nontrans_small_side never fired -- the gate would be vacuous for it"
+        );
+        assert!(
+            tr > 0,
+            "{NAME}: tr_reach_longer_side never fired -- the gate would be vacuous for it"
+        );
+        assert_eq!(frames.len(), 33, "{NAME}: 33 shown frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg returned {} frames, we decoded {}",
+            ffmpeg_frames.len(),
+            frames.len()
+        );
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: 33 shown frames pixel-exact on every plane; \
+             gm_nontrans_small_side={gm} tr_reach_longer_side={tr}"
         );
     }
 
