@@ -122,3 +122,6 @@ r1 exist.
    proven there), and `--sb-size=64` with `--tune=ssim` / very high cq on a
    source that is flat except for one horizontal band edge per superblock.
 3. Only then run the gate detached to `$HOME/.cache/intra64split-gate-r3.log`.
+
+## Suite state at handoff
+Unit `intra64split-suite-r2-1788331009.service`, log `$HOME/.cache/intra64split-suite-r2.log`. STILL RUNNING (164 tests ok, no `test result` line yet). Stop it before starting another suite on the same target dir. The 64-level gate inside it is expected RED.
