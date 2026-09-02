@@ -1123,43 +1123,94 @@ impl Drop for VertAbGuard {
     }
 }
 
-/// libaom `reconintra.c`'s `has_tr_*`/`has_bl_*` for the four rectangular
-/// block sizes this decoder codes, transcribed verbatim (lane-rectx r4).
-/// The 16x8/8x16 rows are what the 32x16/16x32 pair above cannot stand in
-/// for: they are 16 bytes, not 4, and their bit pattern is a different
-/// coding order entirely -- reading the 16x32 table for a 16x8 block gave
-/// the wrong bottom-left availability and a directional (D203) strip whose
-/// prediction diverged exactly where it starts reading below its own height.
-/// `has_tr_vert_tables`/`has_bl_vert_tables` hold the SAME pointers as these
-/// for every W<H entry, and are NULL for W>H (no VERT_A/B ever produces one),
-/// so the partition type does not select a different table at these sizes.
-fn has_tr_rect_table(bw: usize, bh: usize) -> &'static [u8] {
-    match (bw, bh) {
-        (16, 8) => &[255, 0, 85, 0, 119, 0, 85, 0, 127, 0, 85, 0, 119, 0, 85, 0],
-        (8, 16) => &[255, 255, 119, 119, 127, 127, 119, 119, 255, 127, 119, 119, 127, 127, 119, 119],
-        (32, 16) => &[15, 5, 7, 5],
-        (16, 32) => &[255, 119, 127, 119],
-        (64, 32) => &[19],
-        // lane-tx64x16 r3: `has_tr_32x8` / `has_tr_8x32`
-        // (`reconintra.c:122-127`), the 4:1 strips of a 32x32-level
-        // `PARTITION_HORZ_4`/`VERT_4`.
-        (32, 8) => &[15, 0, 5, 0, 7, 0, 5, 0],
-        (8, 32) => &[255, 255, 127, 127, 255, 127, 127, 127],
-        _ => &[127],
-    }
-}
+/// The `has_tr_*` / `has_bl_*` tables for every rectangular shape this
+/// decoder codes (libaom `reconintra.c`, generated from the oracle's source
+/// so no byte is retyped). Each is indexed by
+/// `(blk_row_in_sb << (5 - log2(bw / 4))) + blk_col_in_sb`, i.e. row stride
+/// `128 / bw` bits ([`Reach::table_stride`]) on libaom's 128-pixel
+/// superblock grid; on this crate's 64-pixel superblock the highest index a
+/// shape can reach stays inside its own table, so no wrap is involved.
+///
+/// lane-tx4x8 r3: the previous two-row `HAS_TOP_RIGHT_RECT`/
+/// `HAS_BOTTOM_LEFT_RECT` pair held 32x16/16x32 only and a `_` arm routed
+/// every other shape -- 16x8 strips among them -- to the 32x16 row, wrong at
+/// 10 of the 21 reachable superblock positions for above-right and 7 for
+/// below-left.
+/// `has_tr_4x8` (`reconintra.c`), transcribed verbatim: 64 bytes, row stride 32 bits (`128 / 4`).
+const HAS_TR_4X8: [u8; 64] = [255, 255, 255, 255, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 127, 255, 127, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 255, 255, 127, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 127, 255, 127, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119];
+/// `has_bl_4x8` (`reconintra.c`), transcribed verbatim: 64 bytes, row stride 32 bits (`128 / 4`).
+const HAS_BL_4X8: [u8; 64] = [16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 1, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 0, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 1, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 0, 0];
+/// `has_tr_8x4` (`reconintra.c`), transcribed verbatim: 64 bytes, row stride 16 bits (`128 / 8`).
+const HAS_TR_8X4: [u8; 64] = [255, 255, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 127, 127, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 255, 127, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 127, 127, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0];
+/// `has_bl_8x4` (`reconintra.c`), transcribed verbatim: 64 bytes, row stride 16 bits (`128 / 8`).
+const HAS_BL_8X4: [u8; 64] = [254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 1, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 0, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 1, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 0];
+/// `has_tr_8x16` (`reconintra.c`), transcribed verbatim: 16 bytes, row stride 16 bits (`128 / 8`).
+const HAS_TR_8X16: [u8; 16] = [255, 255, 119, 119, 127, 127, 119, 119, 255, 127, 119, 119, 127, 127, 119, 119];
+/// `has_bl_8x16` (`reconintra.c`), transcribed verbatim: 16 bytes, row stride 16 bits (`128 / 8`).
+const HAS_BL_8X16: [u8; 16] = [16, 17, 0, 1, 16, 17, 0, 0, 16, 17, 0, 1, 16, 17, 0, 0];
+/// `has_tr_16x8` (`reconintra.c`), transcribed verbatim: 16 bytes, row stride 8 bits (`128 / 16`).
+const HAS_TR_16X8: [u8; 16] = [255, 0, 85, 0, 119, 0, 85, 0, 127, 0, 85, 0, 119, 0, 85, 0];
+/// `has_bl_16x8` (`reconintra.c`), transcribed verbatim: 16 bytes, row stride 8 bits (`128 / 16`).
+const HAS_BL_16X8: [u8; 16] = [254, 84, 254, 16, 254, 84, 254, 0, 254, 84, 254, 16, 254, 84, 254, 0];
+/// `has_tr_16x32` (`reconintra.c`), transcribed verbatim: 4 bytes, row stride 8 bits (`128 / 16`).
+const HAS_TR_16X32: [u8; 4] = [255, 119, 127, 119];
+/// `has_bl_16x32` (`reconintra.c`), transcribed verbatim: 4 bytes, row stride 8 bits (`128 / 16`).
+const HAS_BL_16X32: [u8; 4] = [16, 0, 16, 0];
+/// `has_tr_32x16` (`reconintra.c`), transcribed verbatim: 4 bytes, row stride 4 bits (`128 / 32`).
+const HAS_TR_32X16: [u8; 4] = [15, 5, 7, 5];
+/// `has_bl_32x16` (`reconintra.c`), transcribed verbatim: 4 bytes, row stride 4 bits (`128 / 32`).
+const HAS_BL_32X16: [u8; 4] = [78, 14, 78, 14];
+/// `has_tr_32x64` (`reconintra.c`), transcribed verbatim: 1 bytes, row stride 4 bits (`128 / 32`).
+const HAS_TR_32X64: [u8; 1] = [127];
+/// `has_bl_32x64` (`reconintra.c`), transcribed verbatim: 1 bytes, row stride 4 bits (`128 / 32`).
+const HAS_BL_32X64: [u8; 1] = [0];
+/// `has_tr_64x32` (`reconintra.c`), transcribed verbatim: 1 bytes, row stride 2 bits (`128 / 64`).
+const HAS_TR_64X32: [u8; 1] = [19];
+/// `has_bl_64x32` (`reconintra.c`), transcribed verbatim: 1 bytes, row stride 2 bits (`128 / 64`).
+const HAS_BL_64X32: [u8; 1] = [34];
+/// `has_tr_4x16` (`reconintra.c`), transcribed verbatim: 32 bytes, row stride 32 bits (`128 / 4`).
+const HAS_TR_4X16: [u8; 32] = [255, 255, 255, 255, 127, 127, 127, 127, 255, 127, 255, 127, 127, 127, 127, 127, 255, 255, 255, 127, 127, 127, 127, 127, 255, 127, 255, 127, 127, 127, 127, 127];
+/// `has_bl_4x16` (`reconintra.c`), transcribed verbatim: 32 bytes, row stride 32 bits (`128 / 4`).
+const HAS_BL_4X16: [u8; 32] = [0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 1, 1, 1, 0, 0, 0, 0];
+/// `has_tr_16x4` (`reconintra.c`), transcribed verbatim: 32 bytes, row stride 8 bits (`128 / 16`).
+const HAS_TR_16X4: [u8; 32] = [255, 0, 0, 0, 85, 0, 0, 0, 119, 0, 0, 0, 85, 0, 0, 0, 127, 0, 0, 0, 85, 0, 0, 0, 119, 0, 0, 0, 85, 0, 0, 0];
+/// `has_bl_16x4` (`reconintra.c`), transcribed verbatim: 32 bytes, row stride 8 bits (`128 / 16`).
+const HAS_BL_16X4: [u8; 32] = [254, 254, 254, 84, 254, 254, 254, 16, 254, 254, 254, 84, 254, 254, 254, 0, 254, 254, 254, 84, 254, 254, 254, 16, 254, 254, 254, 84, 254, 254, 254, 0];
+/// `has_tr_8x32` (`reconintra.c`), transcribed verbatim: 8 bytes, row stride 16 bits (`128 / 8`).
+const HAS_TR_8X32: [u8; 8] = [255, 255, 127, 127, 255, 127, 127, 127];
+/// `has_bl_8x32` (`reconintra.c`), transcribed verbatim: 8 bytes, row stride 16 bits (`128 / 8`).
+const HAS_BL_8X32: [u8; 8] = [0, 1, 0, 0, 0, 1, 0, 0];
+/// `has_tr_32x8` (`reconintra.c`), transcribed verbatim: 8 bytes, row stride 4 bits (`128 / 32`).
+const HAS_TR_32X8: [u8; 8] = [15, 0, 5, 0, 7, 0, 5, 0];
+/// `has_bl_32x8` (`reconintra.c`), transcribed verbatim: 8 bytes, row stride 4 bits (`128 / 32`).
+const HAS_BL_32X8: [u8; 8] = [238, 78, 238, 14, 238, 78, 238, 14];
+/// `has_tr_16x64` (`reconintra.c`), transcribed verbatim: 2 bytes, row stride 8 bits (`128 / 16`).
+const HAS_TR_16X64: [u8; 2] = [255, 127];
+/// `has_bl_16x64` (`reconintra.c`), transcribed verbatim: 2 bytes, row stride 8 bits (`128 / 16`).
+const HAS_BL_16X64: [u8; 2] = [0, 0];
+/// `has_tr_64x16` (`reconintra.c`), transcribed verbatim: 2 bytes, row stride 2 bits (`128 / 64`).
+const HAS_TR_64X16: [u8; 2] = [3, 1];
+/// `has_bl_64x16` (`reconintra.c`), transcribed verbatim: 2 bytes, row stride 2 bits (`128 / 64`).
+const HAS_BL_64X16: [u8; 2] = [42, 42];
 
-fn has_bl_rect_table(bw: usize, bh: usize) -> &'static [u8] {
+/// The `has_tr_*`/`has_bl_*` row for one rectangular block shape.
+fn rect_reach_tables(bw: usize, bh: usize) -> (&'static [u8], &'static [u8]) {
     match (bw, bh) {
-        (16, 8) => &[254, 84, 254, 16, 254, 84, 254, 0, 254, 84, 254, 16, 254, 84, 254, 0],
-        (8, 16) => &[16, 17, 0, 1, 16, 17, 0, 0, 16, 17, 0, 1, 16, 17, 0, 0],
-        (32, 16) => &[78, 14, 78, 14],
-        (16, 32) => &[16, 0, 16, 0],
-        (64, 32) => &[34],
-        // `has_bl_32x8` / `has_bl_8x32` (`reconintra.c:305-310`).
-        (32, 8) => &[238, 78, 238, 14, 238, 78, 238, 14],
-        (8, 32) => &[0, 1, 0, 0, 0, 1, 0, 0],
-        _ => &[0],
+        (4, 8) => (&HAS_TR_4X8, &HAS_BL_4X8),
+        (8, 4) => (&HAS_TR_8X4, &HAS_BL_8X4),
+        (8, 16) => (&HAS_TR_8X16, &HAS_BL_8X16),
+        (16, 8) => (&HAS_TR_16X8, &HAS_BL_16X8),
+        (16, 32) => (&HAS_TR_16X32, &HAS_BL_16X32),
+        (32, 16) => (&HAS_TR_32X16, &HAS_BL_32X16),
+        (32, 64) => (&HAS_TR_32X64, &HAS_BL_32X64),
+        (64, 32) => (&HAS_TR_64X32, &HAS_BL_64X32),
+        (4, 16) => (&HAS_TR_4X16, &HAS_BL_4X16),
+        (16, 4) => (&HAS_TR_16X4, &HAS_BL_16X4),
+        (8, 32) => (&HAS_TR_8X32, &HAS_BL_8X32),
+        (32, 8) => (&HAS_TR_32X8, &HAS_BL_32X8),
+        (16, 64) => (&HAS_TR_16X64, &HAS_BL_16X64),
+        (64, 16) => (&HAS_TR_64X16, &HAS_BL_64X16),
+        _ => unreachable!("no libaom has_tr/has_bl table for a {bw}x{bh} block"),
     }
 }
 
@@ -1211,7 +1262,7 @@ impl Reach {
         if ((blk_col + 1) << bw_log2) >= SB_MI {
             return false;
         }
-        let table = has_tr_rect_table(bw, bh);
+        let table = rect_reach_tables(bw, bh).0;
         Self::bit(table, Self::rect_table_index(bw_log2, blk_row, blk_col))
     }
 
@@ -1245,7 +1296,7 @@ impl Reach {
         if ((blk_row + 1) << bh_log2) >= SB_MI {
             return false;
         }
-        let table = has_bl_rect_table(bw, bh);
+        let table = rect_reach_tables(bw, bh).1;
         Self::bit(table, Self::rect_table_index(bw_log2, blk_row, blk_col))
     }
 
@@ -3242,7 +3293,7 @@ mod tests {
                 ((bw / 4).trailing_zeros() as usize, (bh / 4).trailing_zeros() as usize);
             let (rows, cols) = (32 >> bh_log2, 32 >> bw_log2);
             for (name, table) in
-                [("has_tr", has_tr_rect_table(bw, bh)), ("has_bl", has_bl_rect_table(bw, bh))]
+                [("has_tr", rect_reach_tables(bw, bh).0), ("has_bl", rect_reach_tables(bw, bh).1)]
             {
                 assert_eq!(
                     table.len() * 8,
@@ -3272,6 +3323,118 @@ mod tests {
     use crate::intra::{D45_PRED, D135_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
     use std::io::Write;
     use std::process::{Command, Stdio};
+
+    /// Every rectangular shape this decoder codes, at every position a block
+    /// of that shape can sit inside a 64x64 superblock: [`Reach::of_rect`]
+    /// must answer exactly what libaom's `has_top_right`/`has_bottom_left`
+    /// (`reconintra.c`) answer, whose bodies are ported below.
+    ///
+    /// lane-tx4x8 r3 ([[enumerate-table-domain]], [[tool-disabled-in-every-gate]]):
+    /// `rect_reach_tables` used to route every shape but 4x8/8x4/16x32 to the
+    /// 32x16 row, so live 16x8 strips read the wrong bit at 10 (above-right)
+    /// and 7 (below-left) of the 21 reachable positions with no gate seeing
+    /// it. The per-shape `(len, byte sum)` fingerprints below come from the
+    /// oracle's own arrays, so a re-routed or truncated table fails here even
+    /// where the two rows happen to agree.
+    ///
+    /// Not covered (no parameter for either on `of_rect`): chroma `ss_x`/
+    /// `ss_y`, and sub-block transforms (`row_off`/`col_off` > 0), which the
+    /// callers handle by predicting each transform unit as its own block.
+    /// `PARTITION_VERT_A`/`VERT_B` need no arm either: libaom's
+    /// `has_tr_vert_tables`/`has_bl_vert_tables` entry for every RECT bsize is
+    /// either the plain table itself (4x8, 8x16, 16x32, 32x64) or NULL
+    /// (the horizontal shapes, which those partitions never produce).
+    #[test]
+    fn every_rect_shape_reaches_what_libaom_says_over_the_whole_superblock() {
+        // (bw, bh, has_tr len, has_tr byte sum, has_bl len, has_bl byte sum).
+        const SHAPES: [(usize, usize, usize, u32, usize, u32); 14] = [
+        (4, 8, 64, 9280, 64, 550),
+        (8, 4, 64, 3712, 64, 9630),
+        (8, 16, 16, 2352, 16, 134),
+        (16, 8, 16, 960, 16, 2400),
+        (16, 32, 4, 620, 4, 32),
+        (32, 16, 4, 32, 4, 184),
+        (32, 64, 1, 127, 1, 0),
+        (64, 32, 1, 19, 1, 34),
+        (4, 16, 32, 5472, 32, 14),
+        (16, 4, 32, 960, 32, 6464),
+        (8, 32, 8, 1400, 8, 2),
+        (32, 8, 8, 32, 8, 1136),
+        (16, 64, 2, 382, 2, 0),
+        (64, 16, 2, 4, 2, 84),
+        ];
+        /// libaom `reconintra.c` `has_top_right`/`has_bottom_left`, ported for
+        /// a block whose transform covers it whole (`row_off == col_off == 0`,
+        /// `tx_size == bsize`) and luma (`ss_x == ss_y == 0`) on a 64-pixel
+        /// superblock (`sb_mi_size == 16`).
+        fn libaom_reach(
+            bw: usize,
+            bh: usize,
+            x: usize,
+            y: usize,
+            width: usize,
+            height: usize,
+        ) -> (bool, bool) {
+            let (bw_log2, bh_log2) = ((bw / 4).ilog2() as usize, (bh / 4).ilog2() as usize);
+            let (_bw_unit, bh_unit) = (bw / 4, bh / 4);
+            let sb_mi_size = 16usize;
+            let blk_row_in_sb = ((y / 4) & (sb_mi_size - 1)) >> bh_log2;
+            let blk_col_in_sb = ((x / 4) & (sb_mi_size - 1)) >> bw_log2;
+            let this_blk_index = (blk_row_in_sb << (5 - bw_log2)) + blk_col_in_sb;
+            let (tr_table, bl_table) = rect_reach_tables(bw, bh);
+            let bit = |t: &[u8]| (t[this_blk_index / 8] >> (this_blk_index % 8)) & 1 != 0;
+            // has_top_right: top_available && right_available, then row_off == 0.
+            let top_right = if y == 0 || x + bw >= width {
+                false
+            } else if blk_row_in_sb == 0 {
+                // (`col_off + tx_wide_unit < plane_bw_unit` above this is
+                // `bw_unit < bw_unit`, false for a whole-block transform.)
+                true
+            } else if ((blk_col_in_sb + 1) << bw_log2) >= sb_mi_size {
+                false
+            } else {
+                bit(tr_table)
+            };
+            // has_bottom_left: bottom_available && left_available, col_off == 0.
+            let bottom_left = if x == 0 || y + bh >= height {
+                false
+            } else if blk_col_in_sb == 0 {
+                // (`row_off + tx_high_unit < plane_bh_unit` is likewise false.)
+                (blk_row_in_sb << bh_log2) + bh_unit < sb_mi_size
+            } else if ((blk_row_in_sb + 1) << bh_log2) >= sb_mi_size {
+                false
+            } else {
+                bit(bl_table)
+            };
+            (top_right, bottom_left)
+        }
+        for (bw, bh, tr_len, tr_sum, bl_len, bl_sum) in SHAPES {
+            let (tr, bl) = rect_reach_tables(bw, bh);
+            let sum = |t: &[u8]| t.iter().map(|&b| u32::from(b)).sum::<u32>();
+            assert_eq!(
+                (tr.len(), sum(tr), bl.len(), sum(bl)),
+                (tr_len, tr_sum, bl_len, bl_sum),
+                "rect_reach_tables({bw}, {bh}) is not libaom's has_tr_{bw}x{bh}/has_bl_{bw}x{bh}"
+            );
+            // Two superblocks across and down, so the superblock-relative
+            // position (and not the frame position) is what decides.
+            for sb_y in [0usize, 64] {
+                for sb_x in [0usize, 64] {
+                    for y in (sb_y..sb_y + 64).step_by(bh) {
+                        for x in (sb_x..sb_x + 64).step_by(bw) {
+                            let got = Reach::of_rect(bw, bh, x, y, 256, 256);
+                            let want = libaom_reach(bw, bh, x, y, 256, 256);
+                            assert_eq!(
+                                (got.above_right, got.below_left),
+                                want,
+                                "{bw}x{bh} at ({x}, {y})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Whether ffmpeg is on PATH. Absence normally SKIPs, but
     /// `EC_AV1_REQUIRE_FFMPEG=1` -- or `EC_AV1_REQUIRE_AOMENC=1`, since every

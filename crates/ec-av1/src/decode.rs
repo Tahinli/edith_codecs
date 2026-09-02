@@ -1713,6 +1713,54 @@ thread_local! {
 pub(crate) fn sub8_split_hits() -> usize {
     SUB8_SPLIT_HITS.with(|c| c.get())
 }
+
+// How many 4x8 / 8x4 leaves (lane-tx4x8's `PARTITION_VERT`/`PARTITION_HORZ`
+// of an 8x8 block) this thread's decode reconstructed with REAL coefficients
+// -- a skipped leaf exercises the prediction and the mi bookkeeping but never
+// the rect transform, the 32-position `eob_pt` or the rect scan, so the gate
+// asserts on these two rather than a plain leaf count.
+thread_local! {
+    static TX4X8_CODED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TX8X4_CODED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Sub-8x8 rect leaves whose `tx_depth` symbol resolved to 1 -- the leaf's
+    /// two 4x4 transform units, predicted one after the other. A separate
+    /// counter from [`TX_DEPTH_HITS`] (which every square path also bumps) so
+    /// the gate can prove THIS path fired.
+    static RECT8_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 16x8/8x16 intra strips whose prediction actually read past the block's
+    /// own width (above-right) or height (below-left) -- the samples
+    /// `Reach::of_rect` decides on, and the only ones a wrong `has_tr_*`/
+    /// `has_bl_*` table row can corrupt (lane-tx4x8 r3).
+    static RECT_STRIP_REACH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Every 16x8/8x16 intra strip predicted, reaching or not -- the
+    /// denominator [`RECT_STRIP_REACH_HITS`] is a fraction of.
+    static RECT_STRIP_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT8_SPLIT_TX_HITS`].
+pub(crate) fn rect8_split_tx_hits() -> usize {
+    RECT8_SPLIT_TX_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT_STRIP_PRED_HITS`].
+pub(crate) fn rect_strip_pred_hits() -> usize {
+    RECT_STRIP_PRED_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT_STRIP_REACH_HITS`].
+pub(crate) fn rect_strip_reach_hits() -> usize {
+    RECT_STRIP_REACH_HITS.with(|c| c.get())
+}
+
+/// Current value of [`TX4X8_CODED_HITS`].
+pub(crate) fn tx4x8_coded_hits() -> usize {
+    TX4X8_CODED_HITS.with(|c| c.get())
+}
+
+/// Current value of [`TX8X4_CODED_HITS`].
+pub(crate) fn tx8x4_coded_hits() -> usize {
+    TX8X4_CODED_HITS.with(|c| c.get())
+}
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
 const SB: usize = 64;
@@ -1808,10 +1856,20 @@ fn default_scan(side: usize) -> Vec<u16> {
 /// `0..side*side` in our own indexing — and `Mcol_Scan` is that walk
 /// transposed (column 0 down every row, then column 1, ...).
 fn class_scan_table(side: usize, class: TxClass) -> Vec<u16> {
+    class_scan_table_wh(side, side, class)
+}
+
+/// [`class_scan_table`] widened to `(w, h)` (lane-tx4x8). Checked against
+/// libaom's own `mrow_scan_4x8`/`mcol_scan_4x8`/`mrow_scan_8x4`/
+/// `mcol_scan_8x4` (`scan.c`) converted out of their column-major encoding
+/// by `(p % h) * w + p / h`, the same conversion [`SCAN_16X8`] was
+/// transcribed with -- `mrow` is the plain row-major raster in our indexing
+/// and `mcol` its transpose, at rect sizes exactly as at square ones.
+fn class_scan_table_wh(w: usize, h: usize, class: TxClass) -> Vec<u16> {
     match class {
-        TxClass::Vert => (0..(side * side) as u16).collect(),
-        TxClass::Horiz => (0..side)
-            .flat_map(|col| (0..side).map(move |row| (row * side + col) as u16))
+        TxClass::Vert => (0..(w * h) as u16).collect(),
+        TxClass::Horiz => (0..w)
+            .flat_map(|col| (0..h).map(move |row| (row * w + col) as u16))
             .collect(),
         TxClass::TwoD => unreachable!("class_scan is only for V_DCT/H_DCT"),
     }
@@ -2025,6 +2083,21 @@ const SCAN_16X32: [u16; 512] = [
     491, 506, 447, 462, 477, 492, 507, 463, 478, 493, 508, 479, 494, 509, 495, 510, 511,
 ];
 
+/// `Default_Scan_4x8` (libaom `scan.c`), this decoder's own row-major
+/// transcription (see [`SCAN_32X16`]'s doc comment for the conversion, which
+/// was re-verified this lane by regenerating [`SCAN_16X8`]/[`SCAN_8X16`] from
+/// the same source).
+const SCAN_4X8: [u16; 32] = [
+    0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 16, 11, 14, 17, 20, 15, 18, 21, 24, 19, 22, 25, 28,
+    23, 26, 29, 27, 30, 31,
+];
+
+/// `Default_Scan_8x4`, same source and conversion as [`SCAN_4X8`].
+const SCAN_8X4: [u16; 32] = [
+    0, 8, 1, 16, 9, 2, 24, 17, 10, 3, 25, 18, 11, 4, 26, 19, 12, 5, 27, 20, 13, 6, 28, 21, 14, 7,
+    29, 22, 15, 30, 23, 31,
+];
+
 /// `Default_Scan_16x8`, this decoder's own row-major transcription (see
 /// [`SCAN_32X16`]'s doc comment).
 const SCAN_16X8: [u16; 128] = [
@@ -2086,26 +2159,6 @@ const SCAN_8X32: [u16; 256] = [
     228, 235, 242, 249, 215, 222, 229, 236, 243, 250, 223, 230, 237, 244, 251, 231, 238, 245, 252,
     239, 246, 253, 247, 254, 255,
 ];
-/// `Default_Scan_8x4` (lane-rectx, see [`SCAN_32X16`]'s doc comment for the
-/// transposition rule this repo's `SCAN_WxH` names follow): this repo's
-/// `(w=8, h=4)` reads libaom's own `default_scan_4x8` verbatim -- the same
-/// axis swap [`SCAN_16X8`]/[`SCAN_8X16`] already carry one size class up
-/// (repo `SCAN_16X8` == libaom `default_scan_8x16`, repo `SCAN_8X16` ==
-/// libaom `default_scan_16x8`), checked against `scan.c` before landing
-/// rather than re-deriving the zigzag formula.
-const SCAN_8X4: [u16; 32] = [
-    0, 8, 1, 16, 9, 2, 24, 17, 10, 3, 25, 18, 11, 4, 26, 19, 12, 5, 27, 20, 13, 6, 28, 21, 14, 7,
-    29, 22, 15, 30, 23, 31,
-];
-
-/// `Default_Scan_4x8` (lane-rectx): this repo's `(w=4, h=8)` reads libaom's
-/// own `default_scan_8x4` verbatim, the same transposition [`SCAN_8X4`]'s
-/// doc comment explains.
-const SCAN_4X8: [u16; 32] = [
-    0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 16, 11, 14, 17, 20, 15, 18, 21, 24, 19, 22, 25, 28,
-    23, 26, 29, 27, 30, 31,
-];
-
 /// `Default_Scan_16x4`, this decoder's own row-major transcription of
 /// libaom's column-major `default_scan_16x4` (`scan.c:66`) -- the CHROMA
 /// plane of a 32x8 `PARTITION_HORZ_4` strip at the 32x32 level
@@ -2144,30 +2197,63 @@ fn neighbour_rect(grid: &[i32], w: usize, h: usize, row: usize, col: usize) -> i
 /// same [`cdf::NZ_MAP_CTX_OFFSET_32`] table when `w == h`. Never called for
 /// `V_DCT`/`H_DCT` -- geometrically impossible at the two size pairs
 /// [`decode_block_rect`] codes (see that function's own doc comment).
-fn base_ctx_rect(grid: &[i32], w: usize, h: usize, row: usize, col: usize) -> usize {
-    if row == 0 && col == 0 {
+fn base_ctx_rect(
+    grid: &[i32],
+    w: usize,
+    h: usize,
+    row: usize,
+    col: usize,
+    class: TxClass,
+) -> usize {
+    // Same `(tx_class | coeff_idx) == 0` guard [`base_ctx`] documents: only
+    // the 2D class short-circuits the DC position.
+    if class == TxClass::TwoD && row == 0 && col == 0 {
         return 0;
     }
-    const OFFSETS: [(usize, usize); 5] = [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)];
-    let mag: i32 = OFFSETS
+    let offsets: [(usize, usize); 5] = match class {
+        TxClass::TwoD => [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)],
+        TxClass::Horiz => [(1, 0), (0, 1), (0, 2), (0, 3), (0, 4)],
+        TxClass::Vert => [(1, 0), (0, 1), (2, 0), (3, 0), (4, 0)],
+    };
+    let mag: i32 = offsets
         .iter()
         .map(|&(dr, dc)| neighbour_rect(grid, w, h, row + dr, col + dc).abs().min(3))
         .sum();
     let ctx = ((mag + 1) >> 1).min(4) as usize;
-    if w < h && row < 2 {
-        return ctx + 11;
+    match class {
+        TxClass::TwoD => {
+            if w < h && row < 2 {
+                return ctx + 11;
+            }
+            if w > h && col < 2 {
+                return ctx + 16;
+            }
+            ctx + cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize
+        }
+        // Shape-independent in libaom too (`get_nz_map_ctx_from_stats`'s
+        // `TX_CLASS_HORIZ`/`VERT` arms index `nz_map_ctx_offset_1d` by the
+        // position along one axis only).
+        TxClass::Horiz => ctx + nz_map_ctx_offset_1d(col.min(31)),
+        TxClass::Vert => ctx + nz_map_ctx_offset_1d(row.min(31)),
     }
-    if w > h && col < 2 {
-        return ctx + 16;
-    }
-    ctx + cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize
 }
 
 /// [`br_ctx`]'s `TxClass::TwoD` arm widened to `(w, h)` (lane-rectwire): the
 /// neighbour-offset math itself is shape-independent, only the boundary
 /// clamp needs the real bound in each axis.
-fn br_ctx_rect(grid: &[i32], w: usize, h: usize, row: usize, col: usize) -> usize {
-    let extra = neighbour_rect(grid, w, h, row + 1, col + 1).abs();
+fn br_ctx_rect(
+    grid: &[i32],
+    w: usize,
+    h: usize,
+    row: usize,
+    col: usize,
+    class: TxClass,
+) -> usize {
+    let extra = match class {
+        TxClass::TwoD => neighbour_rect(grid, w, h, row + 1, col + 1).abs(),
+        TxClass::Horiz => neighbour_rect(grid, w, h, row, col + 2).abs(),
+        TxClass::Vert => neighbour_rect(grid, w, h, row + 2, col).abs(),
+    };
     let mag = neighbour_rect(grid, w, h, row + 1, col).abs()
         + neighbour_rect(grid, w, h, row, col + 1).abs()
         + extra;
@@ -2175,7 +2261,12 @@ fn br_ctx_rect(grid: &[i32], w: usize, h: usize, row: usize, col: usize) -> usiz
     if row == 0 && col == 0 {
         return mag;
     }
-    if row < 2 && col < 2 { mag + 7 } else { mag + 14 }
+    let near_origin = match class {
+        TxClass::TwoD => row < 2 && col < 2,
+        TxClass::Horiz => col == 0,
+        TxClass::Vert => row == 0,
+    };
+    if near_origin { mag + 7 } else { mag + 14 }
 }
 
 fn dc_vote(dc: Option<bool>) -> i32 {
@@ -2530,30 +2621,28 @@ fn read_coeffs_rect(
     sign_ctx: usize,
     default_tx_type: TxType,
 ) -> Result<(Vec<i32>, TxType)> {
-    let ec_trace_coeff = std::env::var_os("EC_TRACE_COEFF").is_some();
+    let rect_trace = std::env::var_os("EC_TRACE_COEFF").is_some();
     let mut grid = vec![0i32; w * h];
     let entry_rng = dec.debug_state().0;
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
-    if ec_trace_coeff {
-        let (rng, _) = dec.debug_state();
+    if rect_trace {
         eprintln!(
-            "EC_COEFF_STEP tag=all_zero ctx={skip_ctx} all_zero={} rng={rng}",
-            all_zero as i32
+            "EC_COEFF_STEP tag=all_zero plane=0 ctx={skip_ctx} all_zero={} rng={}",
+            all_zero as i32,
+            dec.debug_state().0
         );
     }
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
-    let trace = std::env::var_os("EC_TRACE_COEFF").is_some();
-    if trace {
-        let (rng, _) = dec.debug_state();
-        eprintln!("EC_COEFF_STEP tag=all_zero ctx={skip_ctx} all_zero=0 rng={rng}");
-    }
+    // lane-tx4x8: a 4x8/8x4 luma TU DOES carry a `tx_type` symbol (its set is
+    // `EXT_TX_SET_DTT4_IDTX(_1DDCT)`, `tx_size_sqr_up == TX_8X8`), including
+    // the `V_DCT`/`H_DCT` members whose 1D tx class needs its own scan and
+    // context offsets -- both of which now have rect forms
+    // ([`class_scan_table_wh`], [`base_ctx_rect`]/[`br_ctx_rect`]'s `class`).
+    // The rect sets that carry no symbol at all still pass `None` here.
     let mut tx_type = default_tx_type;
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
-        // Mirrors [`read_coeffs`]'s own `tx_type` read: the CDF row's width
-        // names its set (lane-rectx, `TxbSet::LumaRect16x8` -- the one rect
-        // set here that carries a `tx_type` symbol at all).
         let len = tx_type_cdf.len();
         let t = dec.symbol(tx_type_cdf);
         tx_type = match len {
@@ -2563,21 +2652,25 @@ fn read_coeffs_rect(
             _ => TxType::from_symbol(t),
         }
         .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
+        if rect_trace {
+            eprintln!("EC_COEFF_STEP tag=tx_type plane=0 rng={}", dec.debug_state().0);
+        }
     }
-    if TxClass::of(tx_type) != TxClass::TwoD {
-        return Err(unsupported(
-            "a non-2D tx class on a rectangular transform (never expected at this size)",
-        ));
+    let class = TxClass::of(tx_type);
+    if class != TxClass::TwoD {
+        TX_CLASS1_HITS.with(|c| c.set(c.get() + 1));
     }
-    if trace {
-        let (rng, _) = dec.debug_state();
-        eprintln!("EC_COEFF_STEP tag=tx_type rng={rng}");
+    let eob = read_eob(dec, coding, class);
+    if rect_trace {
+        eprintln!("EC_COEFF_STEP tag=eob eob={eob} rng={}", dec.debug_state().0);
     }
-    let eob = read_eob(dec, coding, TxClass::TwoD);
-    if ec_trace_coeff {
-        let (rng, _) = dec.debug_state();
-        eprintln!("EC_COEFF_STEP tag=eob eob={eob} rng={rng}");
-    }
+    let class_scan;
+    let scan: &[u16] = if class == TxClass::TwoD {
+        scan
+    } else {
+        class_scan = class_scan_table_wh(w, h, class);
+        &class_scan
+    };
     let mut levels = vec![0i32; w * h];
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
@@ -2586,36 +2679,35 @@ fn read_coeffs_rect(
         let apos = col * h + row;
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, w * h);
-            let l = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
-            if ec_trace_coeff {
-                let (rng, _) = dec.debug_state();
+            let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
+            if rect_trace {
                 eprintln!(
-                    "EC_COEFF_STEP tag=base_eob c={scan_idx} pos={pos} ctx={ctx} level={} rng={rng}",
-                    l - 1
+                    "EC_COEFF_STEP tag=base_eob c={scan_idx} pos={pos} ctx={ctx} level={v} rng={}",
+                    dec.debug_state().0
                 );
             }
-            l
+            v
         } else {
-            let ctx = base_ctx_rect(&levels, w, h, row, col);
-            let l = dec.symbol(&mut coding.base[ctx]) as i32;
-            if ec_trace_coeff {
-                let (rng, _) = dec.debug_state();
+            let ctx = base_ctx_rect(&levels, w, h, row, col, class);
+            let v = dec.symbol(&mut coding.base[ctx]) as i32;
+            if rect_trace {
                 eprintln!(
-                    "EC_COEFF_STEP tag=base c={scan_idx} pos={pos} ctx={ctx} level={l} rng={rng}"
+                    "EC_COEFF_STEP tag=base c={scan_idx} pos={pos} ctx={ctx} level={v} rng={}",
+                    dec.debug_state().0
                 );
             }
-            l
+            v
         };
         let level = if level > NUM_BASE_LEVELS {
-            let ctx = br_ctx_rect(&levels, w, h, row, col);
+            let ctx = br_ctx_rect(&levels, w, h, row, col, class);
             let mut level = level;
             let mut sent = 0;
             loop {
                 let k = dec.symbol(&mut coding.br[ctx]) as i32;
-                if ec_trace_coeff {
-                    let (rng, _) = dec.debug_state();
+                if rect_trace {
                     eprintln!(
-                        "EC_COEFF_STEP tag=br c={scan_idx} pos={pos} ctx={ctx} k={k} rng={rng}"
+                        "EC_COEFF_STEP tag=br c={scan_idx} pos={pos} ctx={ctx} k={k} rng={}",
+                        dec.debug_state().0
                     );
                 }
                 level += k;
@@ -2629,12 +2721,12 @@ fn read_coeffs_rect(
             level
         };
         levels[pos] = level;
-        if trace {
+        if rect_trace {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=base c={scan_idx} pos={pos} level={level} rng={rng}");
         }
     }
-    if ec_trace_coeff {
+    if rect_trace {
         let (rng, _) = dec.debug_state();
         eprintln!("EC_COEFF_STEP tag=after_bases rng={rng}");
     }
@@ -2648,7 +2740,7 @@ fn read_coeffs_rect(
         } else {
             dec.literal(1) == 1
         };
-        if trace {
+        if rect_trace {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=sign_rect pos={pos} sign={} rng={rng}", u8::from(negative));
         }
@@ -6430,6 +6522,12 @@ impl PlaneBuf {
         });
         let corner =
             (x > self.tile_x0 && y > self.tile_y0).then(|| self.data[(y - 1) * self.width + x - 1]);
+        if matches!((bw, bh), (16, 8) | (8, 16)) {
+            RECT_STRIP_PRED_HITS.with(|h| h.set(h.get() + 1));
+            if across > own_across || down > own_down {
+                RECT_STRIP_REACH_HITS.with(|h| h.set(h.get() + 1));
+            }
+        }
         (above, left, corner)
     }
 
@@ -7801,6 +7899,327 @@ fn decode_leaf_split4(
         }
     }
     Ok((leaf_modes[2], leaf_modes[1]))
+}
+
+/// Decodes a `PARTITION_VERT`/`PARTITION_HORZ` of one 8x8 block into two
+/// `BLOCK_4X8`/`BLOCK_8X4` leaves (lane-tx4x8), the last partition shape
+/// below 8x8 this decoder refused. Mirrors [`decode_leaf_split4`] element for
+/// element -- same mode reads ([`read_intra_mode_sub8`]: no angle delta, no
+/// tx-depth symbol below 8x8), same "chroma once, on the last sub-block, at
+/// the whole 8x8 group's 4x4 unit" rule (`is_chroma_reference` is false for
+/// every sub-block one mi wide or high but the last) -- differing only where
+/// the shape does:
+///
+/// * the transform is a true `TX_4X8`/`TX_8X4`
+///   ([`dequant_and_inverse_typed_wh`], whose `abs(rect_type) == 1` scale and
+///   `av1_inv_txfm_shift_ls` row already cover this size pair);
+/// * the CDF set is [`TxbSet::LumaRect4x8`] (`get_txsize_entropy_ctx` squares
+///   up to `TX_8X8`) with a 32-position `eob_pt` and the `TX_4X4` `tx_type`
+///   row -- see that variant's doc comment;
+/// * the scan is [`SCAN_4X8`]/[`SCAN_8X4`], or their `mrow`/`mcol` siblings
+///   ([`class_scan_table_wh`]) when the coded `tx_type` is `V_DCT`/`H_DCT`;
+/// * `Reach` comes from libaom's own `has_tr_4x8`/`has_bl_8x4` rows
+///   ([`Reach::of_rect`]);
+/// * `update_partition_context` writes `partition_context_lookup[BLOCK_4X8]`
+///   = `{31, 30}` (width 4 above, height 8 left), not the `{31, 31}` a
+///   `BLOCK_4X4` split writes.
+///
+/// Filter intra on one of these leaves is refused by name: `predict_filter_intra`
+/// is square-only in this decoder (the same refusal the 16x16-level rect
+/// strips already carry).
+#[allow(clippy::too_many_arguments)]
+fn decode_leaf_rect8(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    outer_at: (usize, usize),
+    leaf_mi: (usize, usize),
+    vert: bool,
+    scan4: &[u16],
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    base_q_idx: u8,
+    enable_filter_intra: bool,
+    allow_intrabc: bool,
+    tx_select: bool,
+    reduced_tx_set: bool,
+) -> Result<(usize, usize)> {
+    let (r, c) = outer_at;
+    let above_mode = neighbours.above_mode[c];
+    let left_mode = neighbours.left_mode[r];
+    let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
+    let (bw, bh) = if vert { (4, 8) } else { (8, 4) };
+    let (w_mi, h_mi) = (bw / MI, bh / MI);
+    let scan: &[u16] = if vert { &SCAN_4X8 } else { &SCAN_8X4 };
+    let mut leaf_modes = [0usize; 2];
+    let mut leaf_skips = [false; 2];
+    let mut last_uv: Option<(usize, i32, Option<(i32, i32)>)> = None;
+    for i in 0..2usize {
+        let lmi = if vert {
+            (leaf_mi.0, leaf_mi.1 + i)
+        } else {
+            (leaf_mi.0 + i, leaf_mi.1)
+        };
+        // Inside the pair the sibling is the neighbour on the split axis;
+        // outside it the mi-granular map, else the coarse 16x16 slot.
+        let leaf_above = if !vert && i == 1 {
+            leaf_modes[0]
+        } else {
+            neighbours.mode_above_mi(lmi.0, lmi.1).unwrap_or(above_mode)
+        };
+        let leaf_left = if vert && i == 1 {
+            leaf_modes[0]
+        } else {
+            neighbours.mode_left_mi(lmi.0, lmi.1).unwrap_or(left_mode)
+        };
+        let has_chroma = i == 1;
+        let skip_ctx = neighbours.skip_txfm_ctx(lmi.0, lmi.1);
+        let (skip, mode, angle_delta_y, chroma, filter_intra) = read_intra_mode_sub8(
+            dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra, skip_ctx,
+            allow_intrabc, lmi.0, lmi.1,
+        )?;
+        if filter_intra.is_some() {
+            return Err(unsupported(
+                "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
+            ));
+        }
+        // `TxMode::Select`'s `tx_depth` (spec 5.11.16) exists at a 4x8/8x4
+        // leaf too, and is read for every intra block, skipped or not. Its
+        // category is libaom's `bsize_to_tx_size_cat(BLOCK_4X8) == 0` --
+        // `sub_tx_size_map[TX_4X8] == TX_4X4` is a single step, so it is the
+        // same 2-symbol `tx_size_cat0` an 8x8 uses, not the 3-symbol
+        // `tx_size_cat2` the 32x16 strips read -- with the rect context
+        // (`get_tx_size_context`'s `max_tx_wide`/`max_tx_high` = bw/bh).
+        // Missing this read consumed one symbol fewer than the encoder wrote
+        // and desynced the tile at the very first rect leaf (class
+        // `symbol-consumption-gap`).
+        let depth = if tx_select {
+            let ctx = tx_size_context_rect(neighbours, lmi, bw, bh);
+            dec.symbol(&mut cdfs.tx_size_cat0[ctx])
+        } else {
+            0
+        };
+        if depth != 0 {
+            TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
+            RECT8_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+        }
+        leaf_modes[i] = mode;
+        leaf_skips[i] = skip;
+        neighbours.record_mode_mi(lmi.0, lmi.1, w_mi, h_mi, mode);
+        let smooth_neighbor = is_smooth_mode(leaf_above) || is_smooth_mode(leaf_left);
+        if smooth_neighbor {
+            SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let (px, py) = (lmi.1 * MI, lmi.0 * MI);
+        let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+        // `sub_tx_size_map[TX_4X8] == TX_4X4`: depth 1 splits the leaf into
+        // two 4x4 transform units along its long axis, each predicted from
+        // the previous unit's reconstruction and reading its own `txb_skip`
+        // context -- `decode_leaf8`'s own depth-1 loop, two units instead of
+        // four. The per-TU path writes its own neighbour state, so the
+        // block-level write below is skipped for it.
+        let split = depth != 0;
+        if split {
+            let mut done = 0usize;
+            for tu in 0..2usize {
+                let tu_mi = if vert {
+                    (lmi.0 + tu, lmi.1)
+                } else {
+                    (lmi.0, lmi.1 + tu)
+                };
+                let (tu_px, tu_py) = (tu_mi.1 * MI, tu_mi.0 * MI);
+                let tu_around = neighbours.around_mi(tu_mi, 4)[0];
+                let tu_reach = Reach::of(4, tu_px, tu_py, y.width, y.height);
+                let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
+                if skip {
+                    // A skipped leaf still predicts per transform unit: the
+                    // second 4x4 takes its above/left edge from the first
+                    // one's reconstruction, which is NOT what a single 4x8
+                    // prediction of the same mode produces.
+                    let zeros = vec![0i32; 16];
+                    y.reconstruct(
+                        tu_px, tu_py, 4, mode, angle_delta_y, tu_reach, &zeros, None, None,
+                        smooth_neighbor,
+                    );
+                    neighbours.record_mi_luma(tu_mi, 4, &zeros);
+                    continue;
+                }
+                let tu_grid = read_plane(
+                    dec,
+                    cdfs,
+                    if reduced_tx_set {
+                        TxbSet::Luma4
+                    } else {
+                        TxbSet::Luma4Set1
+                    },
+                    scan4,
+                    0,
+                    tu_around,
+                    mode,
+                    mode,
+                    angle_delta_y,
+                    tu_reach,
+                    y,
+                    tu_px,
+                    tu_py,
+                    4,
+                    TX4,
+                    base_q_idx,
+                    None,
+                    None,
+                    Some(tu_skip_ctx),
+                    smooth_neighbor,
+                )?;
+                if tu_grid.iter().any(|&l| l != 0) {
+                    done += 1;
+                }
+                neighbours.record_mi_luma(tu_mi, 4, &tu_grid);
+            }
+            if done > 0 {
+                if vert {
+                    TX4X8_CODED_HITS.with(|h| h.set(h.get() + 1));
+                } else {
+                    TX8X4_CODED_HITS.with(|h| h.set(h.get() + 1));
+                }
+            }
+            neighbours.fill_skip_grid_rect(lmi, w_mi, h_mi, skip);
+            neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, 4, 4, 0);
+            if has_chroma {
+                last_uv = chroma;
+            }
+            continue;
+        }
+        let grid = if skip {
+            let zeros = vec![0i32; bw * bh];
+            y.reconstruct_rect(
+                px, py, bw, bh, mode, angle_delta_y, reach, &zeros, None, None, smooth_neighbor,
+            );
+            zeros
+        } else {
+            // `plane_bsize == txsize_to_bsize[tx_size]` here too (the leaf's
+            // luma TU *is* the leaf), so `get_txb_ctx` fixes `txb_skip_ctx`
+            // at 0 -- see `decode_leaf_split4`'s own note.
+            let around = neighbours.around_mi_rect(lmi, bw, bh)[0];
+            let set = if reduced_tx_set {
+                TxbSet::LumaRect4x8
+            } else {
+                TxbSet::LumaRect4x8Set1
+            };
+            let mut coding = cdfs.txb(set, mode);
+            let (levels, tx_type) = read_coeffs_rect(
+                dec,
+                &mut coding,
+                scan,
+                bw,
+                bh,
+                0,
+                dc_sign_ctx(around.2),
+                TxType::DctDct,
+            )?;
+            if levels.iter().any(|&l| l != 0) {
+                if vert {
+                    TX4X8_CODED_HITS.with(|h| h.set(h.get() + 1));
+                } else {
+                    TX8X4_CODED_HITS.with(|h| h.set(h.get() + 1));
+                }
+            }
+            let residual = dequant_and_inverse_typed_wh(
+                &levels,
+                bw,
+                bh,
+                crate::decode::bit_depth(),
+                CURRENT_Q_IDX.with(|q| q.get()),
+                plane_q_delta(0).0,
+                plane_q_delta(0).1,
+                tx_type,
+            );
+            y.reconstruct_rect(
+                px, py, bw, bh, mode, angle_delta_y, reach, &residual, None, None, smooth_neighbor,
+            );
+            levels
+        };
+        // Plane 0's per-TU coefficient context over this leaf's own mi span
+        // (`record_mi_luma`'s rect twin -- the chroma planes are written once
+        // for the whole 8x8 group below).
+        let state = neighbour_state(&grid);
+        for cell in 0..h_mi {
+            if lmi.0 + cell < neighbours.mi_rows {
+                neighbours.left[lmi.0 + cell][0] = state;
+            }
+        }
+        for cell in 0..w_mi {
+            if lmi.1 + cell < neighbours.mi_cols {
+                neighbours.above[lmi.1 + cell][0] = state;
+            }
+        }
+        neighbours.fill_skip_grid_rect(lmi, w_mi, h_mi, skip);
+        let (tx_w, tx_h) = if split { (4, 4) } else { (bw as u8, bh as u8) };
+        neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, tx_w, tx_h, 0);
+        if has_chroma {
+            last_uv = chroma;
+        }
+    }
+    let (gpx, gpy) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
+    let (cpx, cpy) = (gpx / 2, gpy / 2);
+    let group_reach = Reach::of(8, gpx, gpy, y.width, y.height);
+    let (uv_mode, angle_delta_uv, alpha) =
+        last_uv.expect("i==1 always sets has_chroma, so chroma is always Some");
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+    neighbours.above_uv_mode[c] = uv_predict_mode;
+    neighbours.left_uv_mode[r] = uv_predict_mode;
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
+    let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[1] {
+        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        (vec![0i32; 16], vec![0i32; 16])
+    } else {
+        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        let chroma_around = neighbours.around_mi(leaf_mi, 8);
+        let ug = read_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], uv_mode, uv_predict_mode,
+            angle_delta_uv, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv,
+        )?;
+        let vg = read_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], uv_mode, uv_predict_mode,
+            angle_delta_uv, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv,
+        )?;
+        (ug, vg)
+    };
+    // `update_partition_context` at the 8x8 level writes
+    // `partition_context_lookup[subsize]` over the whole 8x8 span: BLOCK_4X8
+    // is `{31, 30}` (bit0 set on the above half only), BLOCK_8X4 `{30, 31}`
+    // -- the mirror of `decode_leaf_split4`'s `{31, 31}`, which
+    // `partition_ctx_mi` reads back off these side values.
+    for cell in 0..2 {
+        neighbours.above_side_mi[leaf_mi.1 + cell] = bw;
+        neighbours.left_side_mi[leaf_mi.0 + cell] = bh;
+    }
+    let round_up_even = |n: usize| n.div_ceil(2) * 2;
+    let bound_h = round_up_even(neighbours.mi_rows);
+    let bound_w = round_up_even(neighbours.mi_cols);
+    let u_state = neighbour_state(&u_grid);
+    let v_state = neighbour_state(&v_grid);
+    for cell in 0..2usize {
+        if cell < 2usize.min(bound_h.saturating_sub(leaf_mi.0)) {
+            neighbours.left[leaf_mi.0 + cell][1] = u_state;
+            neighbours.left[leaf_mi.0 + cell][2] = v_state;
+        }
+        if cell < 2usize.min(bound_w.saturating_sub(leaf_mi.1)) {
+            neighbours.above[leaf_mi.1 + cell][1] = u_state;
+            neighbours.above[leaf_mi.1 + cell][2] = v_state;
+        }
+    }
+    // `(below_mode, right_mode)`: the sub-block a neighbour below sees is the
+    // bottom one (the second under HORZ, the left one under VERT), the one a
+    // neighbour to the right sees is the top-right (the second under VERT).
+    Ok(if vert {
+        (leaf_modes[0], leaf_modes[1])
+    } else {
+        (leaf_modes[1], leaf_modes[0])
+    })
 }
 
 /// Spec 7.15.3's `Cdef_Directions`: `(row, col)` offsets for the two primary
@@ -9965,10 +10384,28 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     allow_intrabc,
                                                     reduced_tx_set,
                                                 )?
+                                            } else if part8 == PARTITION_HORZ
+                                                || part8 == PARTITION_VERT
+                                            {
+                                                decode_leaf_rect8(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    leaf_mi,
+                                                    part8 == PARTITION_VERT,
+                                                    &scan4,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    base_q_idx,
+                                                    enable_filter_intra,
+                                                    allow_intrabc,
+                                                    tx_select,
+                                                    reduced_tx_set,
+                                                )?
                                             } else {
-                                                return Err(unsupported(
-                                                    "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
-                                                ));
+                                                unreachable!("partition_w8 is a 4-symbol CDF: NONE/HORZ/VERT/SPLIT only");
                                             };
                                             neighbours.above_mode[sc] = saved_modes.0;
                                             neighbours.left_mode[sr] = saved_modes.1;
@@ -10074,10 +10511,28 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 allow_intrabc,
                                                 reduced_tx_set,
                                             )?
+                                        } else if part8 == PARTITION_HORZ
+                                            || part8 == PARTITION_VERT
+                                        {
+                                            decode_leaf_rect8(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                leaf_mi,
+                                                part8 == PARTITION_VERT,
+                                                &scan4,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                base_q_idx,
+                                                enable_filter_intra,
+                                                allow_intrabc,
+                                                tx_select,
+                                                reduced_tx_set,
+                                            )?
                                         } else {
-                                            return Err(unsupported(
-                                                "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
-                                            ));
+                                            unreachable!("partition_w8 is a 4-symbol CDF: NONE/HORZ/VERT/SPLIT only");
                                         };
                                         neighbours.above_mode[sc] = saved_modes.0;
                                         neighbours.left_mode[sr] = saved_modes.1;
@@ -18808,5 +19263,93 @@ mod tests {
             assert_eq!(decoded.v, ffmpeg_frames[i].v, "frame {i} V vs ffmpeg");
             reference = decoded;
         }
+    }
+}
+
+#[cfg(test)]
+mod tx4x8_table_tests {
+    use super::*;
+
+    /// Asymmetric gate on the two new scan tables (class
+    /// `reference-layout-not-spec`): a transposed pair of tables passes any
+    /// "is a permutation" check, so this pins the pair AGAINST each other --
+    /// `SCAN_8X4[k]` must be `SCAN_4X8[k]` reflected across the diagonal, and
+    /// both must be bijections of `0..32` in our own row-major indexing.
+    #[test]
+    fn the_rect_4x8_scans_are_each_other_transposed() {
+        let mut seen_a = [false; 32];
+        let mut seen_b = [false; 32];
+        for k in 0..32usize {
+            let a = SCAN_4X8[k] as usize;
+            let b = SCAN_8X4[k] as usize;
+            assert!(!seen_a[a] && !seen_b[b], "scan position {k} repeats");
+            seen_a[a] = true;
+            seen_b[b] = true;
+            let (row, col) = (a / 4, a % 4);
+            assert_eq!(b, col * 8 + row, "SCAN_8X4[{k}] is not SCAN_4X8[{k}] transposed");
+        }
+        assert!(seen_a.iter().all(|&s| s) && seen_b.iter().all(|&s| s));
+    }
+
+    /// `mrow_scan_4x8`/`mcol_scan_4x8`/`mrow_scan_8x4`/`mcol_scan_8x4`
+    /// (libaom `scan.c`), converted out of their column-major encoding by
+    /// `(p % h) * w + p / h` -- the head of each, pinned so the rect
+    /// `V_DCT`/`H_DCT` walk cannot silently transpose.
+    #[test]
+    fn the_rect_class1_scans_match_libaom() {
+        assert_eq!(
+            class_scan_table_wh(4, 8, TxClass::Vert),
+            (0..32u16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &class_scan_table_wh(4, 8, TxClass::Horiz)[..8],
+            &[0u16, 4, 8, 12, 16, 20, 24, 28]
+        );
+        assert_eq!(
+            class_scan_table_wh(8, 4, TxClass::Vert),
+            (0..32u16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            &class_scan_table_wh(8, 4, TxClass::Horiz)[..8],
+            &[0u16, 8, 16, 24, 1, 9, 17, 25]
+        );
+    }
+
+    /// The 32-position `eob_pt` alphabet: six symbols (one more than the
+    /// 16-position table, one fewer than the 64-position one), strictly
+    /// increasing, terminated at 32768 with the adaptation counter after it.
+    #[test]
+    fn the_32_position_eob_tables_are_well_formed() {
+        for table in [
+            &cdf::EOB_PT_32_LUMA_Q0,
+            &cdf::EOB_PT_32_LUMA_Q1,
+            &cdf::EOB_PT_32_LUMA,
+            &cdf::EOB_PT_32_LUMA_Q3,
+            &cdf::EOB_PT_32_LUMA_CLASS1_Q0,
+            &cdf::EOB_PT_32_LUMA_CLASS1_Q1,
+            &cdf::EOB_PT_32_LUMA_CLASS1,
+            &cdf::EOB_PT_32_LUMA_CLASS1_Q3,
+        ] {
+            assert_eq!(table.len(), 7);
+            assert_eq!(table[5], 32768);
+            assert_eq!(table[6], 0);
+            for w in table[..6].windows(2) {
+                assert!(w[0] < w[1], "{table:?} is not increasing");
+            }
+        }
+    }
+
+    /// `Reach::of_rect` must read libaom's own `has_tr_4x8`/`has_tr_8x4`
+    /// rows, not the 32x16 pair the two existing rect strips use: the two
+    /// shapes disagree at a position inside the superblock, which is what
+    /// makes this an asymmetric check rather than a tautology.
+    #[test]
+    fn the_sub8_rect_reach_tables_are_shape_specific() {
+        let a = Reach::of_rect(4, 8, 4, 8, 64, 64);
+        let b = Reach::of_rect(8, 4, 8, 4, 64, 64);
+        assert!(
+            a.above_right != b.above_right || a.below_left != b.below_left,
+            "4x8 and 8x4 reach identically at mirrored positions -- one table is unused"
+        );
     }
 }
