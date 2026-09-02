@@ -15779,6 +15779,11 @@ mod tests {
         height: usize,
         tile_columns: u32,
         tile_rows: u32,
+        // Per-arm aomenc overrides, passed AFTER the base recipe so they win
+        // (measured: aomenc keeps the LAST occurrence of a repeated flag).
+        // Arrival is proven decoder-side: the var-tx arm asserts
+        // `txfm_partition` symbols were actually read.
+        extra: &[&str],
     ) {
         let _gate_lock = lock_gate_counters();
         if !have_aomenc() {
@@ -15874,8 +15879,7 @@ mod tests {
                         "--enable-paeth-intra=0",
                         "--enable-directional-intra=0",
                         "--enable-angle-delta=0",
-                        "--enable-tx-size-search=0",
-                        "--enable-cdef=0",
+                                                "--enable-cdef=0",
                         "--enable-restoration=0",
                         "--max-partition-size=32",
                         "--min-partition-size=32",
@@ -15883,6 +15887,11 @@ mod tests {
                         "--enable-palette=0",
                         "--enable-intrabc=0",
                         "--enable-cfl-intra=0",
+                    ])
+                    // AFTER the base list: a repeated flag keeps its LAST
+                    // occurrence (measured 2026-09-02).
+                    .args(extra)
+                    .args([
                         "--obu",
                         "-o",
                         "-",
@@ -15912,6 +15921,7 @@ mod tests {
             // named refusal fails the gate).
             let before_clips = crate::mvstack::tile_reach_clips();
             let before_tiles = decode::tile_hits();
+            let before_vartx = decode::txfm_split_reads();
             if let Err(e) = decode_stream(&stream) {
                 let msg = e.to_string();
                 assert!(
@@ -15923,6 +15933,16 @@ mod tests {
             }
             let clips = crate::mvstack::tile_reach_clips() - before_clips;
             let tiles = decode::tile_hits() - before_tiles;
+            let vartx = decode::txfm_split_reads() - before_vartx;
+            // The var-tx arm is the only one that exercises the per-tile
+            // `above_txfm` / per-SB-row `left_txfm` reset: with
+            // `--enable-tx-size-search=0` the tx mode is LARGEST and the
+            // txfm_partition symbol is never read at all.
+            assert!(
+                !extra.contains(&"--enable-tx-size-search=1") || vartx > 0,
+                "{gate_name} seed {seed}: --enable-tx-size-search=1 did not arrive -- \
+                 0 txfm_partition symbols read"
+            );
             assert!(
                 tiles >= 2 * frame_count,
                 "{gate_name} seed {seed}: only {tiles} tiles decoded over {frame_count} frames -- \
@@ -15949,7 +15969,7 @@ mod tests {
             compared += 1;
             eprintln!(
                 "{gate_name} seed {seed}: {frames} decode-order frames exact ({hidden} hidden), \
-                 tile_reach_clips +{clips}, tiles {tiles}"
+                 tile_reach_clips +{clips}, tiles {tiles}, txfm_partition reads {vartx}"
             );
         }
         assert!(
@@ -15970,6 +15990,7 @@ mod tests {
             128,
             1,
             0,
+            &["--enable-tx-size-search=0"],
         );
     }
 
@@ -15984,6 +16005,7 @@ mod tests {
             128,
             0,
             1,
+            &["--enable-tx-size-search=0"],
         );
     }
 
@@ -15998,6 +16020,7 @@ mod tests {
             128,
             1,
             1,
+            &["--enable-tx-size-search=0"],
         );
     }
 
@@ -16012,6 +16035,51 @@ mod tests {
             128,
             1,
             1,
+            &["--enable-tx-size-search=0"],
+        );
+    }
+
+    /// The var-tx arm of the multi-tile gate: same 2x2 tile grid, but with
+    /// `--enable-tx-size-search=1` so `TxMode::Select` is on and every inter
+    /// block reads `txfm_partition` symbols whose context comes from the
+    /// `above_txfm`/`left_txfm` bands. Those two bands were the ones missing
+    /// their per-tile / per-SB-row reset (libaom `av1_zero_above_context`,
+    /// `av1_zero_left_context`), and no other arm of this gate can see it.
+    ///
+    /// RED, and PRE-EXISTING: decode-order frame 3 differs from the oracle at
+    /// byte 35079 (ours 111, oracle 112), 16 bytes, all in the U plane
+    /// (luma is the first 32768 bytes) -- reproduced byte-identically twice,
+    /// and ABLATION-PROVEN independent of this round's two context resets
+    /// (removing both reproduces exactly the same byte and count). The
+    /// var-tx + multi-tile chroma residual is left open for the next round;
+    /// the four tile arms above are green.
+    #[test]
+    #[ignore = "open var-tx multi-tile chroma residual, see doc comment (lane-tile2 r1)"]
+    fn a_real_aomenc_stream_in_a_tile_grid_with_var_tx_decodes_every_frame_exact() {
+        a_real_aomenc_multi_tile_gate(
+            "a_real_aomenc_stream_in_a_tile_grid_with_var_tx_decodes_every_frame_exact",
+            340,
+            3,
+            8,
+            256,
+            128,
+            1,
+            1,
+            // Measured (~/.cache/tile2-tmp/enc2.sh): aomenc emits
+            // `tx_mode == TX_MODE_SELECT` on this content only once the
+            // alt-ref/lag structure is off and 16x16 leaves are allowed --
+            // with the base recipe's lag-25 alt-ref every frame is
+            // TX_MODE_LARGEST and the var-tx bands are never read.
+            &[
+                "--enable-tx-size-search=1",
+                "--cq-level=55",
+                "--min-partition-size=16",
+                "--lag-in-frames=0",
+                "--auto-alt-ref=0",
+                "--enable-ref-frame-mvs=0",
+                "--enable-order-hint=0",
+                "--enable-obmc=0",
+            ],
         );
     }
 
