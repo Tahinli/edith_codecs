@@ -668,6 +668,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             })?)
         };
         let started_from = initial_cdfs.clone();
+        // lane-frame80: narrow the EC_TRACE_COEFF rungs to one DECODE-order frame.
+        decode::set_coeff_trace_frame(pictures_decoded);
 
         let order_hint_bits = parser
             .sequence_header()
