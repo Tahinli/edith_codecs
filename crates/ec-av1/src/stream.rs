@@ -4743,6 +4743,144 @@ mod tests {
     /// 8-bit AND 10-bit. Every decoded frame is compared to ffmpeg on Y, U and
     /// V; a refusal is counted, never SKIPped; an attempt that carried no rect
     /// inter residual is counted separately and still required pixel-exact.
+    /// Temporal (MFMV) motion-vector candidates, on a real aomenc stream
+    /// whose compound blocks feed the next frame's motion field
+    /// (`av1_copy_frame_mvs` -> `av1_setup_motion_field` -> `add_tpl_ref_mv`).
+    ///
+    /// lane-interbis r1 pinned this recipe because it is the one the rect
+    /// gate's attempt 1 decoded FULLY and still mismatched ffmpeg (a
+    /// 32x32 NEARESTMV block at mi (24, 40) of decode-order frame 5 took its
+    /// nearest candidate from a temporal cell holding the wrong reference:
+    /// `build_motion_field` stored a compound block's FIRST reference where
+    /// libaom stores its second). Every fully decoded attempt is compared
+    /// plane by plane; a refusal is counted, never SKIPped; the temporal
+    /// candidate counter must fire on a compared attempt, or the gate proves
+    /// nothing.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_temporal_mv_candidates_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_temporal_mv_candidates_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 6usize);
+        for bit_depth in [8u32, 10u32] {
+            let (mut named_refusals, mut compared, mut tmv_proved) = (0u32, 0u32, 0usize);
+            for attempt in 0..2u32 {
+                let tx_search = if attempt == 0 { "0" } else { "1" };
+                let duration = frame_count as f64 / 25.0;
+                // The pinned source: horizontal structure translating along X
+                // at 3 px/frame, which makes aomenc code compound LAST+GOLDEN
+                // blocks whose stored motion field the last frame reads back.
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='128+58*sin((X+N*3)/6)+18*sin(Y/23)',format=yuv420p"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let tx_arg = format!("--enable-tx-size-search={tx_search}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=34", "--cpu-used=0",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
+                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--lag-in-frames=0",
+                    // Per-arm overrides go LAST (aomenc keeps the last
+                    // occurrence of a repeated --enable-* flag).
+                    &tx_arg,
+                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0", "--min-partition-size=16",
+                    "--max-partition-size=32",
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = decode::tmv_hits();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        named_refusals += 1;
+                        eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let tmv = decode::tmv_hits() - before;
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                }
+                compared += 1;
+                tmv_proved += tmv;
+            }
+            eprintln!(
+                "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {compared} \
+                 pixel-exact attempts, blocks with a temporal MV candidate={tmv_proved}"
+            );
+            assert!(
+                compared > 0,
+                "{NAME} ({bit_depth}-bit): every attempt refused -- gate proved nothing"
+            );
+            assert!(
+                tmv_proved > 0,
+                "{NAME} ({bit_depth}-bit): no compared attempt ever folded a temporal MV \
+                 candidate into a block's stack -- gate proved nothing"
+            );
+        }
+    }
+
     #[test]
     // lane-inter4 r2: RED, kept (not weakened, not deleted) -- the rect inter
     // residual path IS implemented and reached, but no aomenc recipe swept

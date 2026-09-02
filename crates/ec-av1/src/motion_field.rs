@@ -420,7 +420,17 @@ pub fn add_tpl_ref_mv(
     if row8 < 0 || col8 < 0 {
         return None;
     }
-    let (fwd_mv, ref_frame_offset) = tpl.get(row8 as usize / 2, col8 as usize / 2)?;
+    let probe = tpl.get(row8 as usize / 2, col8 as usize / 2);
+    if std::env::var_os("EC_TRACE_TPL").is_some() {
+        match probe {
+            None => eprintln!("EC_TPL mi_row={mi_row} mi_col={mi_col} blk=({blk_row},{blk_col}) INVALID"),
+            Some((m, rfo)) => eprintln!(
+                "EC_TPL mi_row={mi_row} mi_col={mi_col} blk=({blk_row},{blk_col}) mfmv0=({},{}) rfo={rfo}",
+                m.0, m.1
+            ),
+        }
+    }
+    let (fwd_mv, ref_frame_offset) = probe?;
     let projected = get_mv_projection(fwd_mv, cur_offset_0, ref_frame_offset);
     let mv = lower_mv_precision(projected, allow_high_precision_mv);
     Some(TplCandidate { mv })
