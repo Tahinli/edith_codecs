@@ -2973,6 +2973,54 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
     }
 
+    /// lane-kf900 r2: the film's key frame at -ss 900, one frame
+    /// (`crates/ec-av1/fixtures/hg_kf900.obu`, 484640 bytes, sha256
+    /// `a273ae99328388be14a1ff8fa1c5a6d391a9948159eaef120e1b50e02015eb83`,
+    /// extracted twice from independent
+    /// `ffmpeg -ss 900 -t 2 -i <2160p AV1 HDR10 mkv> -c:v copy -f obu` runs and
+    /// truncated to the first frame; both extracts hashed identically).
+    ///
+    /// This is the ONLY stream that reaches the r1 defect: a SKIPPED 8x8 intra
+    /// leaf whose `tx_depth` symbol resolved to `TX_4X4` still publishes 4 --
+    /// not its 8-pixel block side -- to the next block's `get_tx_size_context`
+    /// (`set_txfm_ctxs(mbmi->tx_size, bw, bh, skip_txfm && is_inter_block(...))`,
+    /// `decodemv.c`; the skip term is 0 for intra). It fires 15 times here and
+    /// zero times across 108 measured aomenc recipes, so the counter is
+    /// asserted against the film rather than against a synthesised stream.
+    ///
+    /// LUMA only. U/V still differ (open residue, lane-kf900 r2: 221 U and
+    /// 47912 V samples, max |d| 23/2, first at chroma (195, 640) -- chroma
+    /// RESIDUAL, the prediction there is bit-exact against aomdec's
+    /// `EC_PREDOUT`), so this gate pins what is proven and no more.
+    #[test]
+    fn a_10bit_key_frame_with_skipped_8x8_intra_leaves_that_split_their_transform_decodes_luma_exact()
+    {
+        const NAME: &str = "a_10bit_key_frame_with_skipped_8x8_intra_leaves_that_split_their_transform_decodes_luma_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/hg_kf900.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        crate::decode::reset_skip_split_tx_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert_eq!(frames.len(), 1, "{NAME}: one key frame");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        assert!(
+            crate::decode::skip_split_tx_hits() >= 15,
+            "{NAME}: skip_split_tx_hits() == {} -- the stream that carries the tx-context \
+             defect stopped carrying it, so this gate proves nothing",
+            crate::decode::skip_split_tx_hits()
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+    }
+
     /// lane-hbd10 r1: a real `aomenc --bit-depth=10 --superres-mode=1
     /// --superres-denominator=12` key frame, decoded pixel-exact against
     /// ffmpeg's own 10-bit decode. Proves `superres::upscale_row`'s
@@ -21530,12 +21578,20 @@ mod tests {
             "a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_decodes_pixel_exact";
         crate::decode::reset_skip_split_tx_hits();
         run_multi_tile_gate(NAME, 0, 0, 8, 1, &[], false, None);
-        if have_ffmpeg() && have_aomenc() {
-            assert!(
-                crate::decode::skip_split_tx_hits() > 0,
-                "{NAME}: no skipped 8x8 intra leaf split its transform -- the gate proves nothing"
-            );
-        }
+        // lane-kf900 r2: the counter assert that used to sit here is
+        // UNREACHABLE from aomenc. 108 measured recipes (72 at 8-bit, 36 at
+        // 10-bit: `geq` half-flat/half-noise, `mandelbrot`, `testsrc2`,
+        // `noise=all_seed=49`, cq 55/59/63, `--cpu-used=0..2`,
+        // `--enable-tx-size-search=1 --min-partition-size=8
+        // --enable-rect-partitions=1`; log
+        // `$HOME/.cache/kf900/sweep/results{,10}.tsv`) produced
+        // `skip_split_tx_hits() == 0` on every stream that decoded, because
+        // libaom's own encoder forces `tx_size` to the block maximum once it
+        // decides `skip_txfm` -- so no aomenc stream carries a SKIPPED 8x8
+        // intra leaf whose `tx_depth` resolved to `TX_4X4`. The film's
+        // encoder does; the counter is hard-asserted on the real stream in
+        // [`a_10bit_key_frame_with_skipped_8x8_intra_leaves_that_split_their_transform_decodes_luma_exact`].
+        // These two arms stay as the pixel-exact multi-tile control.
     }
 
     /// [`a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_decodes_pixel_exact`]'s
@@ -21546,12 +21602,20 @@ mod tests {
         const NAME: &str = "a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_10bit_decodes_pixel_exact";
         crate::decode::reset_skip_split_tx_hits();
         run_multi_tile_gate(NAME, 0, 0, 10, 1, &[], false, None);
-        if have_ffmpeg() && have_aomenc() {
-            assert!(
-                crate::decode::skip_split_tx_hits() > 0,
-                "{NAME}: no skipped 8x8 intra leaf split its transform -- the gate proves nothing"
-            );
-        }
+        // lane-kf900 r2: the counter assert that used to sit here is
+        // UNREACHABLE from aomenc. 108 measured recipes (72 at 8-bit, 36 at
+        // 10-bit: `geq` half-flat/half-noise, `mandelbrot`, `testsrc2`,
+        // `noise=all_seed=49`, cq 55/59/63, `--cpu-used=0..2`,
+        // `--enable-tx-size-search=1 --min-partition-size=8
+        // --enable-rect-partitions=1`; log
+        // `$HOME/.cache/kf900/sweep/results{,10}.tsv`) produced
+        // `skip_split_tx_hits() == 0` on every stream that decoded, because
+        // libaom's own encoder forces `tx_size` to the block maximum once it
+        // decides `skip_txfm` -- so no aomenc stream carries a SKIPPED 8x8
+        // intra leaf whose `tx_depth` resolved to `TX_4X4`. The film's
+        // encoder does; the counter is hard-asserted on the real stream in
+        // [`a_10bit_key_frame_with_skipped_8x8_intra_leaves_that_split_their_transform_decodes_luma_exact`].
+        // These two arms stay as the pixel-exact multi-tile control.
     }
 
     #[test]
