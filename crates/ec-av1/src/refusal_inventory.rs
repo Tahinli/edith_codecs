@@ -43,7 +43,6 @@ const REFUSALS: &[&str] = &[
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
-    "a 128x128 PARTITION_NONE block (four TX_64X64 luma and four TX_32X32 chroma units all decode, but the first unit's coefficients already carry AC where libaom has DC only -- lane-sb128b r2's open entropy residual)",
     "a 128x128 superblock HORZ/VERT or AB partition (only SPLIT and NONE are decoded at the 128 root)",
     "a 128x128 superblock PARTITION_NONE root on an inter frame (only the key-frame path codes a whole 128x128 block)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
