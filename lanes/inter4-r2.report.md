@@ -85,6 +85,16 @@ EVIDENCE: `cargo test -p ec-av1 --lib superblock_level_rect_partition -- --nocap
 ## Suite
 
     $HOME/.cache/inter4-suite-r2.log (systemd-run, unit inter4-suite-r2)
+    test result: ok. 323 passed; 0 failed; 31 ignored; finished in 410.27s
+
+Same 323 passing as the 59ccb01 baseline; the one extra ignored test is this
+round's red gate.
+
+EVIDENCE: $HOME/.cache/inter4-suite-r2.log | ec-av1 --lib under systemd-run at b9dec1f | 323 passed / 0 failed / 31 ignored
+
+Sibling gates inside that run: inter_sequence*, 8x8_leaf_split, tx_select,
+superblock_level_*, obmc, warp, globalmv, force_integer_mv, refusal_inventory,
+gate_coverage -- all green.
 
 ## Residue
 
@@ -107,6 +117,11 @@ EVIDENCE: `cargo test -p ec-av1 --lib superblock_level_rect_partition -- --nocap
   square grid** the downstream neighbour/deblock stamps expect (top-left
   placement). The split-leaf path already hands those stamps an all-zero square
   grid, so this is strictly more information than the shipping behaviour.
+- **open (not this lane's shape): 1-2 attempts per recipe decode fully with
+  ZERO rect inter transform units and still MISMATCH ffmpeg** on 192x128
+  rect-partition inter content. Proven pre-existing for the banded recipe: with
+  r1's square skip-context recording restored the same three attempts mismatch
+  identically, so it is not this round's change. Not bisected (budget).
 - **DO NOT MERGE as a capability claim**: rectangular inter residual coding is
   implemented and compiles, and is exercised by no green gate (class
   refusal-lifted-without-a-gate). The refusal itself is still in place for every
