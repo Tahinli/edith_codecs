@@ -86,6 +86,12 @@ pub fn rect_intrabc_reads() -> usize {
     crate::decode::rect_intrabc_reads()
 }
 
+/// lane-rect64port r1: coded 64-level HORZ/VERT intra strips whose luma
+/// transform unit is the un-split TX_64X32 (orient 0) / TX_32X64 (orient 1).
+pub fn rect64_corner_tu_hits(orient: usize) -> usize {
+    crate::decode::rect64_corner_tu_hits(orient)
+}
+
 /// lane-inter16ab r4: RECTANGULAR var-tx leaves with a 4-px axis, `[8x4, 4x8]`
 /// -- what `sub_tx_size_map[TX_16X4] == TX_8X4` produces when a 16x16-level
 /// 1:4 inter strip splits its transform.
