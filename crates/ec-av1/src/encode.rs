@@ -1008,7 +1008,7 @@ struct At {
 /// block whose transform covers it whole, whether the samples above its right
 /// (or below its left) are decoded depends only on where the block sits inside
 /// its 64x64 superblock, which is a pinned table per block size.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Reach {
     pub(crate) above_right: bool,
     pub(crate) below_left: bool,
