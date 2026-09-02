@@ -34,6 +34,7 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 const REFUSALS: &[&str] = &[
     "a coded (non-skip) HORZ_B/VERT_B rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
+    "a coded 1:4 HORZ_4/VERT_4 strip whose transform splits only once (the unit is still a 2:1 rect, not a square)",
     "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect prediction is not ported)",
     "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
     "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
