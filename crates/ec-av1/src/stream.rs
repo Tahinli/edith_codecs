@@ -18868,6 +18868,33 @@ mod tests {
         );
     }
 
+    /// lane-golomb r9 OPEN DEFECT, pinned as a runnable test: a frame whose
+    /// height (192x68) or width (68x192) is not a multiple of 8 leaves a 4-px
+    /// straddling band inside the mi-rounded plane, and every INTER frame's
+    /// output is +-1 wrong across that band and the columns/rows next to it
+    /// (`68x192 cq35 8-bit: frame 1 plane Y: 145 pixels differ, first at row 0
+    /// col 64`, mass in columns 64..67). r9 bisected it stage by stage against
+    /// the instrumented aomdec on that exact stream:
+    /// * `EC_AV1_PREFILT_DUMP` frame 1 is BYTE-IDENTICAL over the cropped
+    ///   68 columns -- reconstruction and inter prediction are exact, so the
+    ///   charter's "MC reads past the crop" hypothesis is refuted a second time.
+    /// * `EC_AV1_POSTDEBLOCK_DUMP` with `EC_AV1_DEBUG_SKIP_CDEF=1` also matches
+    ///   aomdec's own post-deblock dump (which is 72 columns wide, i.e. it
+    ///   exposes the straddling band) -- the deblock, including its
+    ///   `frame_width` clip, is correct.
+    /// * The divergence therefore enters in CDEF, at the last 8x8 CDEF block
+    ///   column/row, which is the one that straddles the crop edge.
+    /// `#[ignore]` so the suite stays green; run it with
+    /// `cargo test -p ec-av1 --lib -- --ignored a_frame_edge_straddling_band`.
+    #[test]
+    #[ignore = "open r9 defect: CDEF at the last straddling 8x8 block column/row"]
+    fn a_frame_edge_straddling_band_decodes_pixel_exact() {
+        edge32_gate(
+            "a_frame_edge_straddling_band_decodes_pixel_exact",
+            false,
+        );
+    }
+
     fn edge32_gate(name: &str, flat_band: bool) {
         let NAME = name;
         let _gate_lock = lock_gate_counters();
@@ -18888,6 +18915,18 @@ mod tests {
         // The inter arm: >= 4 frames so the 32-level edge path in the INTER
         // tile walk is exercised too.
         arms.push((192, 80, 5, false));
+        // lane-golomb r9: the straddling-band arms, only under the ignored
+        // `a_frame_edge_straddling_band_decodes_pixel_exact` name (they are
+        // RED -- see that test's own comment for the stage bisection). Naming
+        // them here rather than in a second copy of this gate keeps the
+        // recipe, the counters and the refusal handling identical.
+        if name == "a_frame_edge_straddling_band_decodes_pixel_exact" {
+            arms.clear();
+            arms.push((192, 68, 5, false));
+            arms.push((192, 68, 5, true));
+            arms.push((68, 192, 5, false));
+            arms.push((68, 192, 5, true));
+        }
         // lane-golomb r8 MEASURED, arm STILL NOT added (every cq level is
         // vacuous, panicking or red -- each measured this round with
         // `arms.push((192, 68, 5, false))`, log
