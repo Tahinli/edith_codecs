@@ -64,6 +64,46 @@ const BLOCK_MI: u32 = 8;
 // grid is indexed by (libaom `read_cdef` reads one `cdef_idx` per 64x64
 // inside a 128 superblock).
 thread_local! {
+    /// lane-frame80: `EC_TRACE_COEFF_FRAME=<decode idx>` narrows the
+    /// `EC_TRACE_COEFF` rungs to a single frame in DECODE order (a 4K stream
+    /// prints gigabytes otherwise). Unset = every frame, as before.
+    static COEFF_TRACE_FRAME: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static COEFF_TRACE_CUR: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Called by [`crate::stream::decode_stream`] before each frame's tiles with
+/// that frame's DECODE-order index.
+pub fn set_coeff_trace_frame(idx: usize) {
+    COEFF_TRACE_FRAME.with(|c| {
+        if c.get().is_none() {
+            let want = match std::env::var("EC_TRACE_COEFF_FRAME") {
+                Ok(v) => v.parse::<usize>().unwrap_or(usize::MAX),
+                // unset: keep tracing every frame, as before this rung existed
+                Err(_) => usize::MAX - 1,
+            };
+            c.set(Some(want));
+        }
+    });
+    COEFF_TRACE_CUR.with(|c| c.set(idx));
+    if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        eprintln!("EC_COEFF_FRAME decode_idx={idx}");
+    }
+}
+
+pub(crate) fn coeff_trace_on() -> bool {
+    if std::env::var_os("EC_TRACE_COEFF").is_none() {
+        return false;
+    }
+    match COEFF_TRACE_FRAME.with(|c| c.get()) {
+        // no `set_coeff_trace_frame` caller (direct tile-decode tests), or the
+        // env var unset: trace every frame.
+        None => true,
+        Some(w) if w >= usize::MAX - 1 => true,
+        Some(w) => COEFF_TRACE_CUR.with(|c| c.get()) == w,
+    }
+}
+
+thread_local! {
     static SB128: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -2094,6 +2134,35 @@ pub(crate) fn affine_gm_hits() -> usize {
     AFFINE_GM_HITS.with(|c| c.get())
 }
 
+// lane-t900 r9: rect blocks whose warp-sample top-right probe answers
+// differently at the block's WIDTH than at libaom's
+// `AOMMAX(xd->width, xd->height)` -- each one is a `num_proj_ref` that could
+// pick the wrong motion_mode alphabet.
+thread_local! {
+    static TR_REACH_LONGER_SIDE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`TR_REACH_LONGER_SIDE_HITS`].
+pub fn tr_reach_longer_side_hits() -> usize {
+    TR_REACH_LONGER_SIDE_HITS.with(std::cell::Cell::get)
+}
+
+// lane-t900 r9: libaom `is_nontrans_global_motion` (mvref_common.h) returns 0
+// for `AOMMIN(mi_size_wide[bsize], mi_size_high[bsize]) < 2`, i.e. any block
+// with a 4-px side is NEVER "non-translational global" and therefore ALWAYS
+// reads its interp-filter symbol. Counts the blocks where that guard flips
+// our answer -- a GLOBALMV/GLOBAL_GLOBALMV block with a non-TRANSLATION model
+// and a 4-px side, which we used to suppress the interp read on (a pre-mode
+// entropy desync one symbol wide).
+thread_local! {
+    static GM_NONTRANS_SMALL_SIDE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`GM_NONTRANS_SMALL_SIDE_HITS`].
+pub fn gm_nontrans_small_side_hits() -> usize {
+    GM_NONTRANS_SMALL_SIDE_HITS.with(std::cell::Cell::get)
+}
+
 // lane-gmaffine r1: 8x8-leaf-only counters -- how many `BLOCK_8X8` leaves
 // coded `GLOBALMV` (`GLOBALMV_HITS_8`) and how many built a real
 // `WARPED_CAUSAL` local-warp prediction there (`WARP_HITS_8`, incremented
@@ -2442,6 +2511,19 @@ pub(crate) fn intra_rect_in_inter_split_tx_hits() -> [usize; 3] {
     INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
 
+// lane-midcut r2: rect intra blocks inside an inter frame whose `tx_depth` CDF
+// ROW moved when libaom's inter-neighbour override was applied -- i.e. exactly
+// the blocks the key frame's deblock-grid approximation used to mis-read.
+thread_local! {
+    static INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS`].
+pub(crate) fn intra_rect_in_inter_txctx_override_hits() -> usize {
+    INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS.with(std::cell::Cell::get)
+}
+
 // lane-intra14 r1: how many intra-coded 1:4 strips decoded on the INTER
 // block path, per shape -- [0] 64x16, [1] 16x64, [2] 32x8, [3] 8x32. Every
 // one of them was the named refusal "an intra-coded 1:4 (or other non-2:1)
@@ -2513,6 +2595,22 @@ thread_local! {
 /// Current value of [`UV_MODE_MI_OVERRIDE_HITS`].
 pub(crate) fn uv_mode_mi_override_hits() -> usize {
     UV_MODE_MI_OVERRIDE_HITS.with(|c| c.get())
+}
+
+// lane-t900 r8: how many intra edge-filter-type reads (luma + chroma) the
+// INTER neighbour stamp saved: the coarse SUB band still held a SMOOTH mode
+// from an earlier block in that pixel row/column while the mi-exact map --
+// which an inter block only started writing this round -- correctly says the
+// neighbour is not smooth (libaom `is_smooth`: an inter neighbour's `mode` is
+// an INTER mode, and its `uv_mode` "is not set for inter blocks").
+thread_local! {
+    static INTER_NEIGHBOUR_NOT_SMOOTH_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTER_NEIGHBOUR_NOT_SMOOTH_HITS`].
+pub(crate) fn inter_neighbour_not_smooth_hits() -> usize {
+    INTER_NEIGHBOUR_NOT_SMOOTH_HITS.with(|c| c.get())
 }
 
 // lane-mtfix r1: how many times a chroma intra-edge filter-type read was
@@ -4093,13 +4191,13 @@ fn read_coeffs(
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
-    let dbg_txbskip = if std::env::var_os("EC_TRACE_COEFF").is_some() {
+    let dbg_txbskip = if coeff_trace_on() {
         coding.txb_skip[skip_ctx]
     } else {
         [0; 3]
     };
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
-    if std::env::var_os("EC_TRACE_COEFF").is_some() {
+    if coeff_trace_on() {
         let (rng, _) = dec.debug_state();
         eprintln!(
             "EC_COEFF_STEP tag=all_zero side={} ctx={skip_ctx} cdf={dbg_txbskip:?} all_zero={} rng={rng}",
@@ -4138,7 +4236,7 @@ fn read_coeffs(
             eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
         }
         let t = dec.symbol(tx_type_cdf);
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=tx_type len={len} rng={rng}");
         }
@@ -4167,7 +4265,7 @@ fn read_coeffs(
     if trace {
         eprintln!("TRACE eob value={eob}");
     }
-    let ec_trace_coeff = std::env::var_os("EC_TRACE_COEFF").is_some();
+    let ec_trace_coeff = coeff_trace_on();
     if ec_trace_coeff {
         let (rng, _) = dec.debug_state();
         let cls = match class { TxClass::TwoD => "2d", TxClass::Horiz => "horiz", TxClass::Vert => "vert" };
@@ -4309,7 +4407,7 @@ fn read_coeffs_rect(
     sign_ctx: usize,
     default_tx_type: TxType,
 ) -> Result<(Vec<i32>, TxType)> {
-    let rect_trace = std::env::var_os("EC_TRACE_COEFF").is_some();
+    let rect_trace = coeff_trace_on();
     let mut grid = vec![0i32; w * h];
     let entry_rng = dec.debug_state().0;
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
@@ -5322,6 +5420,23 @@ impl Neighbours {
         skip_mode: bool,
     ) {
         let (r, c) = at_mi;
+        // lane-t900 r8 (class new-map-ignores-tile-edge's twin: a map NOBODY
+        // writes for a whole block class): an INTER block left the luma mode
+        // map untouched, so a later intra block's `get_intra_edge_filter_type`
+        // (spec 7.11.2, libaom `reconintra.h`'s `is_smooth`) fell back to the
+        // coarse SUB-row band, which still held a SMOOTH mode from an earlier
+        // block in that pixel row -- the directional edge filter then ran at
+        // strength 3 instead of 2. libaom reads `mbmi->mode` of the neighbour,
+        // which for an inter block is an INTER mode (>= NEARESTMV) and is
+        // never smooth; DC_PRED is this map's equivalent (the sub-8x8 groups
+        // already stamped it).
+        // The chroma twin: `is_smooth(mbmi, plane > 0)` returns 0 outright for
+        // an inter neighbour ("uv_mode is not set for inter blocks"), so the
+        // uv map must read DC_PRED over an inter block's cells too.
+        if is_inter {
+            self.record_mode_mi(r, c, w_mi, h_mi, DC_PRED);
+            self.record_uv_mode_mi(r, c, w_mi, h_mi, DC_PRED);
+        }
         let altref = is_inter && ref_frame == crate::mvstack::ALTREF_FRAME;
         for cell in 0..w_mi {
             self.above_skip[c + cell] = skip;
@@ -5702,6 +5817,11 @@ impl Neighbours {
         if above != self.above_uv_mode[c] || left != self.left_uv_mode[r] {
             UV_MODE_MI_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
         }
+        if (is_smooth_mode(self.above_uv_mode[c]) && !is_smooth_mode(above))
+            || (is_smooth_mode(self.left_uv_mode[r]) && !is_smooth_mode(left))
+        {
+            INTER_NEIGHBOUR_NOT_SMOOTH_HITS.with(|h| h.set(h.get() + 1));
+        }
         is_smooth_mode(above) || is_smooth_mode(left)
     }
 
@@ -5756,6 +5876,11 @@ impl Neighbours {
             self.modes_above_left_mi(mi_r, mi_c, (self.above_mode[c], self.left_mode[r]));
         if above != self.above_mode[c] || left != self.left_mode[r] {
             MODE_MI_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
+        }
+        if (is_smooth_mode(self.above_mode[c]) && !is_smooth_mode(above))
+            || (is_smooth_mode(self.left_mode[r]) && !is_smooth_mode(left))
+        {
+            INTER_NEIGHBOUR_NOT_SMOOTH_HITS.with(|h| h.set(h.get() + 1));
         }
         // A neighbour the coarse band offered where the tile edge makes it
         // unavailable -- must never happen (see `MODE_TILE_EDGE_COARSE_LEAKS`).
@@ -10011,7 +10136,7 @@ fn decode_block_rect64(
         // 32x16/16x32 under a 64x16/16x64 1:4 strip (lane-tx64x16).
         let (luma_cw, luma_ch) = (bw.min(32), bh.min(32));
         let scan32 = default_scan(TX32);
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=0 row={mi_r} col={mi_c} tx_size={luma_cw}x{luma_ch} rng={rng}");
         }
@@ -10053,7 +10178,7 @@ fn decode_block_rect64(
                 TxType::DctDct,
             )?
         };
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=0 row={mi_r} col={mi_c} rng={rng}");
         }
@@ -10127,7 +10252,7 @@ fn decode_block_rect64(
         };
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
         let mut u_coding = cdfs.txb(chroma_set, uv_predict_mode);
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=1 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
         }
@@ -10141,7 +10266,7 @@ fn decode_block_rect64(
             dc_sign_ctx(around[1].2),
             TxType::DctDct,
         )?;
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=1 row={mi_r} col={mi_c} rng={rng}");
         }
@@ -10181,7 +10306,7 @@ fn decode_block_rect64(
         );
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
         let mut v_coding = cdfs.txb(chroma_set, uv_predict_mode);
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=2 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
         }
@@ -10195,7 +10320,7 @@ fn decode_block_rect64(
             dc_sign_ctx(around[2].2),
             TxType::DctDct,
         )?;
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=2 row={mi_r} col={mi_c} rng={rng}");
         }
@@ -11052,7 +11177,7 @@ impl PlaneBuf {
             let row0: Vec<u16> = prediction[..side.min(8)].to_vec();
             let col0: Vec<u16> = (0..side.min(8)).map(|r| prediction[r * side]).collect();
             eprintln!(
-                "@{} OUR_PRED x={x} y={y} side={side} side={side} mode={mode} ad={angle_delta} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller()
+                "@{} OUR_PRED x={x} y={y} side={side} side={side} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller(), i32::from(smooth_neighbor)
             );
         }
         for row in 0..side {
@@ -13761,12 +13886,26 @@ fn tx_size_context_txfm_rect(
             n.left_side_mi[mi_r],
         );
     }
-    match (has_above, has_left) {
+    let ctx = match (has_above, has_left) {
         (true, true) => usize::from(above) + usize::from(left),
         (true, false) => usize::from(above),
         (false, true) => usize::from(left),
         (false, false) => 0,
+    };
+    // lane-midcut r3: count only the blocks the KEY FRAME deblock-grid
+    // approximation ([`tx_size_context_rect`]) would have read off a DIFFERENT
+    // CDF row, i.e. exactly the blocks this band read fixes -- a plain "rect
+    // intra in an inter frame" tally is green on the buggy code too (class
+    // gate-blind-to-feature).
+    if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+        let (cw, ch) = (own_w.min(64), own_h.min(64));
+        let stale = usize::from(has_above && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= cw)
+            + usize::from(has_left && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= ch);
+        if ctx != stale {
+            INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
     }
+    ctx
 }
 
 /// lane-intrasplit r3: `above_inter`/`left_inter` are mi-granular bands (they
@@ -16061,6 +16200,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // function is ever called.
     delta: DeltaParams,
 ) -> Result<(Picture, Cdfs)> {
+    // lane-frame80: [`TX_SELECT_INTER`] is set by the INTER tile decoder
+    // only, so a key frame decoded after an inter frame on this thread would
+    // otherwise inherit it and read its `tx_depth` context off the inter
+    // frame's stale `TXFM_CONTEXT` bands.
+    TX_SELECT_INTER.with(|c| c.set(false));
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }
@@ -18729,7 +18873,22 @@ fn find_samples(
     let up_available = mi_row > 0;
     let left_available = mi_col > 0;
     let mut samples = Vec::with_capacity(MAX);
-    let single_ref_match = |info: &MiInfo| info.ref_frame == ref_frame && info.ref_frame1.is_none();
+    // lane-t900 r9: `EC_PROJ_MI=<mi_row>,<mi_col>` lists this block's warp
+    // sample candidates in libaom's own order (above, left, top-left,
+    // top-right) -- `num_proj_ref >= 1` is what picks the 3-symbol
+    // motion_mode alphabet over the 2-symbol obmc one.
+    let proj_dbg = std::env::var("EC_PROJ_MI")
+        .is_ok_and(|v| v == format!("{mi_row},{mi_col}"));
+    let single_ref_match = |info: &MiInfo| {
+        let m = info.ref_frame == ref_frame && info.ref_frame1.is_none();
+        if proj_dbg {
+            eprintln!(
+                "EC_PROJ cand ref={} ref1={:?} size={} size_h={} is_inter={} want={ref_frame} match={m}",
+                info.ref_frame, info.ref_frame1, info.size, info.size_h, info.is_inter
+            );
+        }
+        m
+    };
     let mut do_tl = true;
     let mut do_tr = true;
     let rec = |info: &MiInfo, row_offset: i32, sign_r: i32, col_offset: i32, sign_c: i32| {
@@ -18826,7 +18985,18 @@ fn find_samples(
             }
         }
 
-        if do_tr && has_top_right(mi_row, mi_col, bw4) {
+        // lane-t900 r9: libaom passes `AOMMAX(xd->width, xd->height)` here
+        // (`mvref_common.c:1235`), NOT the block's width -- a rect block's
+        // top-right reach is probed at its LONGER side. With `bw4` a 64x128
+        // block found a top-right sample libaom never sees, so
+        // `num_proj_ref >= 1` picked the 3-symbol `motion_mode_cdf` where
+        // libaom reads the 2-symbol `obmc_cdf` (class
+        // wrong-alphabet-same-value).
+        let tr_reach = crate::mvstack::has_top_right(mi_row, mi_col, bw4, bh4);
+        if do_tr && bw4 != bh4 && tr_reach != has_top_right(mi_row, mi_col, bw4) {
+            TR_REACH_LONGER_SIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
+        if do_tr && tr_reach {
             let tr_col = mi_col + bw4;
             if mi_row > 0 && tr_col < mi_cols {
                 if let Some(info) = grid.get(mi_row - 1, tr_col) {
@@ -19896,6 +20066,11 @@ fn decode_inter_block(
         }
         _ => (write_w / 2, write_h / 2),
     };
+    // lane-midcut r3 (same rule as lane-t900 r5's `warp_plane_allowed`, one
+    // copy kept at the merge): `av1_init_warp_params` (libaom reconinter.c)
+    // bails per PLANE at `block_width < 8 || block_height < 8` -- on the
+    // block's own dims, never on the square prediction buffer this reader
+    // allocates.
     if std::env::var_os("EC_MC_TRACE").is_some() {
         eprintln!("EC_IB px={px} py={py} side={side} w={write_w} h={write_h}");
     }
@@ -20157,9 +20332,16 @@ fn decode_inter_block(
             // spec `is_nontrans_global_motion`: ALL active refs' models must
             // be non-TRANSLATION (IDENTITY counts) for the compound block's
             // interp-filter read to be suppressed.
-            let gm_nontrans = is_globalmv
+            let gm_nontrans_models = is_globalmv
                 && global_motion[(ref0 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation
                 && global_motion[(ref1 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation;
+            // lane-t900 r9: `is_nontrans_global_motion` bails at
+            // `AOMMIN(mi_size_wide, mi_size_high) < 2` before it looks at any
+            // model, so a 4-px-sided block still reads its interp filter.
+            let gm_nontrans = gm_nontrans_models && bw4.min(bh4) >= 2;
+            if gm_nontrans_models && !gm_nontrans {
+                GM_NONTRANS_SMALL_SIDE_HITS.with(|c| c.set(c.get() + 1));
+            }
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
             let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
             // lane-cwarp r1: `is_global_mv_block` (blockd.h:421-429) is
@@ -21510,6 +21692,24 @@ fn decode_inter_block(
                 // mv reads no motion_mode/obmc symbol at all -- implicit
                 // SIMPLE_TRANSLATION.
                 && !(is_global_mv_block && !force_integer_mv);
+            // lane-t900 r9: the eligibility terms themselves, on the same rung
+            // as aomdec's `EC_ISTEP2 name=motion_mode` -- an eligibility
+            // mismatch is otherwise invisible (a skipped symbol prints
+            // nothing).
+            if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+                eprintln!(
+                    "EC_MM mi_row={mi_row} mi_col={mi_col} w={write_w} h={write_h} elig={} \
+                     ab={} lf={} sw={} skipmode={} ii={} gmb={} rng={}",
+                    motion_mode_eligible as u8,
+                    overlappable_above(grid, mi_row, mi_col, bw4, mi_cols as usize, 1).len(),
+                    overlappable_left(grid, mi_row, mi_col, bh4, mi_rows as usize, 1).len(),
+                    switchable_motion_mode as u8,
+                    skip_mode as u8,
+                    interintra_mode.is_some() as u8,
+                    is_global_mv_block as u8,
+                    dec.debug_state().0,
+                );
+            }
             let mut obmc_selected = false;
             // lane-warp round 2: `Some` when motion_mode == WARPED_CAUSAL
             // *and* the local warp estimate is valid (`!wm_params.invalid`,
@@ -21668,6 +21868,22 @@ fn decode_inter_block(
                     if obmc_selected {
                         OBMC_HITS.with(|c| c.set(c.get() + 1));
                     }
+                }
+                // lane-t900 r9: which ALPHABET this block read (3-symbol
+                // motion_mode vs 2-symbol obmc) and the range after -- the
+                // two give the same value with a different narrowing (class
+                // wrong-alphabet-same-value).
+                if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+                    eprintln!(
+                        "EC_MM2 mi_row={mi_row} mi_col={mi_col} row={bsize_idx} warp_elig={} \
+                         scaled={} fimv={} obmc={} warped={} rng={}",
+                        warp_eligible as u8,
+                        ref_is_scaled as u8,
+                        force_integer_mv as u8,
+                        obmc_selected as u8,
+                        warped_selected as u8,
+                        dec.debug_state().0,
+                    );
                 }
             }
             // lane-gm r4: `allow_warp`'s `global_warp_allowed` branch
@@ -23526,7 +23742,14 @@ fn decode_inter_sub8_split4(
                 neighbours.left_filter[rmi],
             );
         }
-        let gm_nontrans = is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
+        // lane-t900 r9: this reader's sub-blocks have a 4-px side, and libaom
+        // `is_nontrans_global_motion` returns 0 for
+        // `AOMMIN(mi_size_wide, mi_size_high) < 2` BEFORE testing any model --
+        // so a GLOBALMV sub-block here always reads its interp filter.
+        if is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation {
+            GM_NONTRANS_SMALL_SIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let gm_nontrans = false;
         let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
             dec,
             cdfs,
@@ -24452,7 +24675,14 @@ fn decode_inter_sub8_rect2(
         } else {
             [3, 3]
         };
-        let gm_nontrans = is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
+        // lane-t900 r9: this reader's sub-blocks have a 4-px side, and libaom
+        // `is_nontrans_global_motion` returns 0 for
+        // `AOMMIN(mi_size_wide, mi_size_high) < 2` BEFORE testing any model --
+        // so a GLOBALMV sub-block here always reads its interp filter.
+        if is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation {
+            GM_NONTRANS_SMALL_SIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let gm_nontrans = false;
         let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
             dec,
             cdfs,
@@ -30194,13 +30424,20 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("ffmpeg failed to start");
-        child
-            .stdin
-            .take()
-            .expect("ffmpeg stdin")
-            .write_all(stream)
-            .expect("writing the stream to ffmpeg");
+        // lane-t900 r10: the stream goes down stdin on ITS OWN THREAD. Writing
+        // it inline deadlocks the moment ffmpeg's stdout pipe buffer (64 KiB)
+        // fills before the last input byte is written -- which is exactly what
+        // a 1.1 MB fixture decoding to 150 MB of raw 10-bit frames does
+        // (measured: 45 min, both processes at 0% CPU). A write error here is
+        // swallowed on purpose: ffmpeg's own exit status and stderr, asserted
+        // below, are the real diagnosis.
+        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
+        let payload = stream.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
         let out = child.wait_with_output().expect("ffmpeg failed to run");
+        writer.join().expect("ffmpeg stdin writer thread");
         assert!(
             out.status.success(),
             "ffmpeg refused the stream: {}",
@@ -30237,13 +30474,20 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("ffmpeg failed to start");
-        child
-            .stdin
-            .take()
-            .expect("ffmpeg stdin")
-            .write_all(stream)
-            .expect("writing the stream to ffmpeg");
+        // lane-t900 r10: the stream goes down stdin on ITS OWN THREAD. Writing
+        // it inline deadlocks the moment ffmpeg's stdout pipe buffer (64 KiB)
+        // fills before the last input byte is written -- which is exactly what
+        // a 1.1 MB fixture decoding to 150 MB of raw 10-bit frames does
+        // (measured: 45 min, both processes at 0% CPU). A write error here is
+        // swallowed on purpose: ffmpeg's own exit status and stderr, asserted
+        // below, are the real diagnosis.
+        let mut stdin = child.stdin.take().expect("ffmpeg stdin");
+        let payload = stream.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
         let out = child.wait_with_output().expect("ffmpeg failed to run");
+        writer.join().expect("ffmpeg stdin writer thread");
         assert!(
             out.status.success(),
             "ffmpeg refused the stream: {}",
