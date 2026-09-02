@@ -72,7 +72,7 @@ const REFUSALS: &[&str] = &[
     "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
-    "a motion_mode symbol for a block shape this decoder has no CDF row for",
+    "a motion_mode symbol for a block shape with no CDF row here",
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than

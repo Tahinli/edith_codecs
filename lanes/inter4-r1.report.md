@@ -78,7 +78,7 @@ no rect strip is still required to be pixel-exact.
 
     EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib superblock_level_rect_partition -- --nocapture
 
-EVIDENCE: $HOME/.cache/inter4-suite.log + the command above | 16 aomenc encodes, decode + ffmpeg pixel compare | 8-bit: 4 named refusals, 2 pixel-exact attempts carrying the arm, 64x32 strips=4, 32x64 strips=0, 10 out-of-scope (0 mismatched); test result: ok
+EVIDENCE: $HOME/.cache/inter4-suite.log + `cargo test -p ec-av1 --lib superblock_level_rect_partition` | 16 aomenc encodes, decode + ffmpeg Y/U/V pixel compare over 6 frames each | 8-bit: 4 named refusals, 2 pixel-exact attempts carrying the arm, 64x32 strips=4, 32x64 strips=0, 10 out-of-scope (0 mismatched); gate ok. Full suite at commit 754a7dd: 321 passed / 2 failed / 30 ignored; both failures were stale pins of MINE (the SB refusal string and a line-continuation in a new refusal literal) and are fixed in the follow-up commit -- the suite has NOT been re-run end to end since.
 
 ## Open residue (nothing here is claimed done)
 
