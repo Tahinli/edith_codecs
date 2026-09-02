@@ -799,6 +799,21 @@ pub(crate) fn diffwtd_hits() -> usize {
     DIFFWTD_HITS.with(|c| c.get())
 }
 
+// lane-mcomp64 r1: how many blocks took the INFERRED `COMPOUND_DIFFWTD` arm --
+// a block size where `av1_is_wedge_used` is false (64x64 is the only such size
+// this decoder's square inter path reaches), so no `compound_type` symbol is
+// coded at all. Strictly narrower than `DIFFWTD_HITS`, which also counts the
+// coded-symbol DIFFWTD blocks at 8x8/16x16/32x32.
+thread_local! {
+    static DIFFWTD_INFERRED_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DIFFWTD_INFERRED_HITS`].
+pub(crate) fn diffwtd_inferred_hits() -> usize {
+    DIFFWTD_INFERRED_HITS.with(|c| c.get())
+}
+
 // lane-defon r1: how many FORWARD KEYFRAMES were decoded -- a KEY frame coded
 // with `show_frame == 0`, output later by a `show_existing_frame` header
 // (aomenc `--enable-fwd-kf=1 --fwd-kf-dist=N`). Counted from
@@ -14040,24 +14055,23 @@ fn decode_inter_block(
                 // `wedge_types > 0`), so `compound_type` always reads a real
                 // symbol here -- no alphabet collapse to worry about at this
                 // block-size family.
+                // lane-mcomp64 r1: `av1_is_wedge_used` is false at 64x64
+                // (`av1_wedge_params_lookup[BLOCK_64X64].wedge_types == 0`),
+                // so libaom's `read_compound_type` (decodemv.c 1634-1656)
+                // writes NO `compound_type` symbol there and INFERS
+                // `COMPOUND_DIFFWTD` -- only the 1-bit `mask_type` literal
+                // follows. `None` here is exactly that inferred arm.
                 let wedge_bsize = match side {
-                    8 => 3,
-                    16 => 6,
-                    32 => 9,
-                    // lane-inter8 r1: `av1_is_wedge_used` is false at 64x64
-                    // (`av1_wedge_params_lookup[BLOCK_64X64].wedge_types ==
-                    // 0`), so a real encoder writes NO `compound_type` symbol
-                    // there -- COMPOUND_DIFFWTD is inferred. Reading one
-                    // would desync, so refuse by name rather than guess the
-                    // inferred-DIFFWTD blend this round.
-                    _ => {
-                        return Err(unsupported(
-                            "a masked compound 64x64 inter block (compound_type is inferred, not coded, at this size)",
-                        ))
-                    }
+                    8 => Some(3),
+                    16 => Some(6),
+                    32 => Some(9),
+                    _ => None,
                 };
-                let compound_type = dec.symbol(&mut cdfs.compound_type[wedge_bsize]);
-                if compound_type == 0 {
+                let compound_type = match wedge_bsize {
+                    Some(b) => dec.symbol(&mut cdfs.compound_type[b]),
+                    None => 1,
+                };
+                if let Some(wedge_bsize) = wedge_bsize.filter(|_| compound_type == 0) {
                     // COMPOUND_WEDGE: lane-wedge r3, codebook checksum-
                     // verified vs independent C dump (wedge.rs).
                     let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
@@ -14072,6 +14086,9 @@ fn decode_inter_block(
                     // COMPOUND_DIFFWTD: `mask_type`, MAX_DIFFWTD_MASK_BITS==1.
                     let mask_type = dec.literal(1);
                     diffwtd_mask_type = Some(mask_type as u8);
+                    if wedge_bsize.is_none() {
+                        DIFFWTD_INFERRED_HITS.with(|c| c.set(c.get() + 1));
+                    }
                 }
                 MASKED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
             }
