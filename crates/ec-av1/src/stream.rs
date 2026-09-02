@@ -7915,6 +7915,194 @@ mod tests {
         }
     }
 
+    /// lane-intersub8: `PARTITION_SPLIT` below 8x8 on an INTER frame -- four
+    /// `BLOCK_4X4` inter sub-blocks with one shared 4x4 chroma unit per plane,
+    /// predicted the sub8x8 way (2x2 chroma piece per luma sub-block mv,
+    /// `dec_build_inter_predictors`' `is_sub8x8` branch). Reality of the shape
+    /// was established BEFORE the code (class refusal-from-own-desync): the
+    /// oracle `aomdec`'s `EC_TRACE` prints `EC_PART_VAL ... bsize=3 value=3`
+    /// on this recipe's inter frames.
+    ///
+    /// Attempts 0..7 run `--enable-rect-partitions=0`, where aomenc can only
+    /// pick SPLIT below 8x8; attempts 8..15 repeat the schedule with rect on,
+    /// where it picks HORZ/VERT below 8x8 far more often than SPLIT -- the VERT
+    /// arm (two `BLOCK_4X8` inter leaves, `decode_inter_sub8_rect2`) is what the
+    /// `rect_fired` assert pins. The HORZ twin decodes but is refused by name
+    /// (lane-intersub8 r3: a measured sweep desyncs the block to its right).
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_sub8x8_inter_split_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_a_sub8x8_inter_split_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 6usize);
+        let mut fired = 0u32;
+        // lane-intersub8 r3: attempts 8..15 repeat the same schedule with
+        // `--enable-rect-partitions=1`, where aomenc picks PARTITION_VERT below
+        // 8x8 (two BLOCK_4X8 inter leaves, one shared 4x4 chroma unit predicted
+        // from BOTH sub-blocks' mvs). The HORZ twin is still refused by name.
+        let mut rect_fired = 0u32;
+        let mut refusals: Vec<String> = Vec::new();
+        let mut out_of_scope_mismatch = 0u32;
+        for bit_depth in [8u32, 10u32] {
+            for attempt in 0..16u32 {
+                let rect = attempt / 8;
+                let rect_arg = format!("--enable-rect-partitions={rect}");
+                // lane-intersub8 r2, measured schedule (sweep of cq
+                // {8,10,12,14,16,18,20} x sp {3,6,9,12} x both depths,
+                // `decode_probe`'s `sub8_inter_split:` counter vs an ffmpeg
+                // rawvideo compare): sub-8x8 inter SPLIT groups fire at
+                // (8-bit, cq 12, sp 3) = 1 group and (10-bit, cq 12, sp 6) =
+                // 3 groups, both pixel-exact. cq 8 and 10 are NOT used: at
+                // those quantizers this recipe also carries a CDEF defect of
+                // another shape -- three luma samples of |d| = 1 on
+                // decode-order frames 3/4, zero sub-8x8 inter split groups,
+                // and the identical recipe re-encoded with `--enable-cdef=0`
+                // decodes all six frames exact. Deferred to a CDEF lane
+                // rather than hidden: cq 16..20 are all exact, so this gate
+                // is not selecting quantizers that hide a defect of its own
+                // shape.
+                let cq = [12, 14][(attempt % 2) as usize];
+                let sp = 3 + ((attempt % 8) / 2) * 3;
+                let duration = frame_count as f64 / 25.0;
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='128+58*sin((X+N*{sp})/6)+18*sin(Y/23)',format=yuv420p"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
+                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--lag-in-frames=0", "--enable-obmc=0", "--enable-tx-size-search=1",
+                    // Per-arm overrides last (aomenc keeps the LAST occurrence).
+                    "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0", "--min-partition-size=4",
+                    "--max-partition-size=16",
+                    &rect_arg,
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "{NAME}: aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = decode::sub8_inter_split_hits();
+                let before_rect = decode::sub8_inter_rect_hits();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        refusals.push(format!("{bit_depth}-bit attempt {attempt}: {msg}"));
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let split_groups = decode::sub8_inter_split_hits() - before;
+                let rect_now = decode::sub8_inter_rect_hits();
+                let rect_groups = (rect_now.0 - before_rect.0) + (rect_now.1 - before_rect.1);
+                let groups = split_groups + rect_groups;
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if groups == 0 {
+                    // Out of scope: no sub-8x8 inter split in this attempt.
+                    if mismatched {
+                        out_of_scope_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit attempt {attempt} MISMATCHES with zero \
+                             sub-8x8 inter group -- another shape's defect"
+                        );
+                    }
+                    refusals.push(format!(
+                        "{bit_depth}-bit attempt {attempt}: decoded, but no sub-8x8 inter split"
+                    ));
+                    continue;
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(
+                        got.y, want.y,
+                        "luma frame {i} ({bit_depth}-bit attempt {attempt}, {groups} sub-8x8 \
+                         inter split groups)"
+                    );
+                    assert_eq!(got.u, want.u, "U frame {i} ({bit_depth}-bit attempt {attempt})");
+                    assert_eq!(got.v, want.v, "V frame {i} ({bit_depth}-bit attempt {attempt})");
+                }
+                fired += 1;
+                if rect_groups > 0 {
+                    rect_fired += 1;
+                }
+            }
+        }
+        assert_eq!(
+            out_of_scope_mismatch, 0,
+            "{NAME}: attempts mismatched with no sub-8x8 inter group"
+        );
+        assert!(
+            fired >= 2,
+            "{NAME}: fewer than 2 firing+pixel-exact attempts:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            rect_fired >= 2,
+            "{NAME}: fewer than 2 firing+pixel-exact attempts with a RECTANGULAR sub-8x8 \
+             inter leaf (4x8):\n{}",
+            refusals.join("\n")
+        );
+    }
+
     #[test]
     // lane-inter4 r3: the 16x16-level rect INTER leaf -- PARTITION_HORZ /
     // PARTITION_VERT at 16x16 on an inter frame, i.e. two 16x8 / 8x16 inter
