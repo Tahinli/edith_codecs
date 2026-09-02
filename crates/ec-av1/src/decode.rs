@@ -14267,7 +14267,7 @@ fn decode_inter_block(
                     (64, 16) => 11,
                     _ => {
                         return Err(unsupported(
-                            "a motion_mode symbol for a block shape this decoder has no                              CDF row for",
+                            "a motion_mode symbol for a block shape with no CDF row here",
                         ));
                     }
                 };
@@ -19085,8 +19085,13 @@ mod tests {
         )
         .unwrap_err();
         let msg = err.to_string();
+        // lane-inter4 r1: this fixture's SB value is PARTITION_HORZ, now
+        // DECODED rather than refused outright; its first 64x32 strip is
+        // non-skip, so the named refusal is the rectangular-inter-residual
+        // one. Either string proves what the pin was written for: a non-SPLIT
+        // superblock never silently decodes as SPLIT.
         assert!(
-            msg.contains("SPLIT"),
+            msg.contains("SPLIT") || msg.contains("rectangular residual coding"),
             "expected the named inter-SB-partition refusal, got: {msg}"
         );
     }
