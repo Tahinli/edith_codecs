@@ -31,6 +31,13 @@ fn main() {
     let report = || {
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
+        let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
+        println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
+        let ir = ec_av1::stream::inter_rect_counters();
+        println!(
+            "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
+            ir.0, ir.1, ir.2, ir.3, ir.4, ir.5
+        );
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
