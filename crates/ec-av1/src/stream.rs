@@ -29,6 +29,13 @@ use crate::decode::{
 };
 use crate::encode::Picture;
 
+/// lane-midcut r1: `EC_AV1_NO_GRAIN=1` skips film grain synthesis at output, so a
+/// mid-film mismatch splits into "reconstruction" (compare against
+/// `ffmpeg -c:v libdav1d -filmgrain 0`) and "grain synthesis" in one run.
+fn no_grain() -> bool {
+    std::env::var_os("EC_AV1_NO_GRAIN").is_some()
+}
+
 /// lane-hidden r1: where `EC_AV1_FINAL_DUMP`'s per-frame dump goes for the
 /// current thread, overriding the environment variable. Every ffmpeg/aomdec
 /// pixel gate in this repo compares SHOWN frames only (class
@@ -151,6 +158,12 @@ pub fn leaf8_intrabc_hits() -> usize {
 /// blocks, 64x128 blocks, blocks per resolved intra `tx_depth` 0/1/2).
 pub fn intra_sb128_counters() -> (usize, usize, [usize; 3]) {
     crate::decode::intra_sb128_hits()
+}
+
+/// lane-inter128intra r1: the 128 root's HORZ/VERT half coded INTRA inside an
+/// INTER frame -- (128x64 blocks, 64x128 blocks).
+pub fn intra128_in_inter_counters() -> [usize; 2] {
+    crate::decode::intra128_in_inter_hits()
 }
 
 /// lane-sb128c r9: the four AB shapes at the 128 root, in `PARTITION_HORZ_A`,
@@ -291,7 +304,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                     order_hint_slots[i] = order_hint_slots[slot];
                 }
             }
-            let output = if header.film_grain.apply_grain {
+            let output = if header.film_grain.apply_grain && !no_grain() {
                 // lane-hbd10 r1: grain synthesis is bit-depth generic
                 // (`film_grain.rs`'s `grain_range`/`scale_lut`, spec 7.18.3).
                 let bit_depth = parser
@@ -973,7 +986,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             decode::note_fwd_kf();
         }
         if header.show_frame {
-            let output = if header.film_grain.apply_grain {
+            let output = if header.film_grain.apply_grain && !no_grain() {
                 let mc_identity = parser
                     .sequence_header()
                     .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
