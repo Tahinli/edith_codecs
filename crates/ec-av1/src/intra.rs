@@ -865,6 +865,198 @@ mod tests {
             .sum()
     }
 
+    /// libaom `av1_filter_intra_taps` (reconintra.c:807-858), transcribed
+    /// here INDEPENDENTLY of [`FILTER_INTRA_TAPS`] -- the point of the test
+    /// below is that two transcriptions of the reference agree, so it must
+    /// not read the table it is checking. (libaom's rows are 8 wide with the
+    /// 8th tap always 0; only seven are used.)
+    const LIBAOM_FILTER_INTRA_TAPS: [[[i32; 7]; 8]; 5] = [
+        [
+            [-6, 10, 0, 0, 0, 12, 0],
+            [-5, 2, 10, 0, 0, 9, 0],
+            [-3, 1, 1, 10, 0, 7, 0],
+            [-3, 1, 1, 2, 10, 5, 0],
+            [-4, 6, 0, 0, 0, 2, 12],
+            [-3, 2, 6, 0, 0, 2, 9],
+            [-3, 2, 2, 6, 0, 2, 7],
+            [-3, 1, 2, 2, 6, 3, 5],
+        ],
+        [
+            [-10, 16, 0, 0, 0, 10, 0],
+            [-6, 0, 16, 0, 0, 6, 0],
+            [-4, 0, 0, 16, 0, 4, 0],
+            [-2, 0, 0, 0, 16, 2, 0],
+            [-10, 16, 0, 0, 0, 0, 10],
+            [-6, 0, 16, 0, 0, 0, 6],
+            [-4, 0, 0, 16, 0, 0, 4],
+            [-2, 0, 0, 0, 16, 0, 2],
+        ],
+        [
+            [-8, 8, 0, 0, 0, 16, 0],
+            [-8, 0, 8, 0, 0, 16, 0],
+            [-8, 0, 0, 8, 0, 16, 0],
+            [-8, 0, 0, 0, 8, 16, 0],
+            [-4, 4, 0, 0, 0, 0, 16],
+            [-4, 0, 4, 0, 0, 0, 16],
+            [-4, 0, 0, 4, 0, 0, 16],
+            [-4, 0, 0, 0, 4, 0, 16],
+        ],
+        [
+            [-2, 8, 0, 0, 0, 10, 0],
+            [-1, 3, 8, 0, 0, 6, 0],
+            [-1, 2, 3, 8, 0, 4, 0],
+            [0, 1, 2, 3, 8, 2, 0],
+            [-1, 4, 0, 0, 0, 3, 10],
+            [-1, 3, 4, 0, 0, 4, 6],
+            [-1, 2, 3, 4, 0, 4, 4],
+            [-1, 2, 2, 3, 4, 3, 3],
+        ],
+        [
+            [-12, 14, 0, 0, 0, 14, 0],
+            [-10, 0, 14, 0, 0, 12, 0],
+            [-9, 0, 0, 14, 0, 11, 0],
+            [-8, 0, 0, 0, 14, 10, 0],
+            [-10, 12, 0, 0, 0, 0, 14],
+            [-9, 1, 12, 0, 0, 0, 12],
+            [-8, 0, 0, 12, 0, 1, 11],
+            [-7, 0, 0, 1, 12, 1, 9],
+        ],
+    ];
+
+    /// A straight port of `av1_filter_intra_predictor_c` /
+    /// `highbd_filter_intra_predictor` (reconintra.c:860-905 / 908-955 --
+    /// identical except for the clip), written from the C rather than from
+    /// [`predict_filter_intra`]. `above` is the C `&above[-1]`, i.e. the
+    /// corner followed by `bw` samples; `left` is `bh` samples.
+    fn libaom_filter_intra_predictor(
+        dst: &mut [u16],
+        bw: usize,
+        bh: usize,
+        above: &[u16],
+        left: &[u16],
+        mode: usize,
+        bd: u32,
+    ) {
+        assert!(bw <= 32 && bh <= 32);
+        let mut buffer = [[0i32; 33]; 33];
+        for r in 0..bh {
+            buffer[r + 1][0] = i32::from(left[r]);
+        }
+        for c in 0..bw + 1 {
+            buffer[0][c] = i32::from(above[c]);
+        }
+        let max = (1i32 << bd) - 1;
+        let mut r = 1;
+        while r < bh + 1 {
+            let mut c = 1;
+            while c < bw + 1 {
+                let p = [
+                    buffer[r - 1][c - 1],
+                    buffer[r - 1][c],
+                    buffer[r - 1][c + 1],
+                    buffer[r - 1][c + 2],
+                    buffer[r - 1][c + 3],
+                    buffer[r][c - 1],
+                    buffer[r + 1][c - 1],
+                ];
+                for k in 0..8 {
+                    let mut pr = 0i32;
+                    for t in 0..7 {
+                        pr += LIBAOM_FILTER_INTRA_TAPS[mode][k][t] * p[t];
+                    }
+                    // ROUND_POWER_OF_TWO(pr, 4) then clip_pixel[_highbd].
+                    let v = ((pr + 8) >> 4).clamp(0, max);
+                    buffer[r + (k >> 2)][c + (k & 3)] = v;
+                }
+                c += 4;
+            }
+            r += 2;
+        }
+        for row in 0..bh {
+            for col in 0..bw {
+                dst[row * bw + col] = buffer[row + 1][col + 1] as u16;
+            }
+        }
+    }
+
+    /// lane-fistrip r2: [`predict_filter_intra`] had NO unit test at all --
+    /// the 8x16/16x8 strips r1 unblocked read their `use_filter_intra` flag
+    /// with zero pixel evidence behind it (every firing strip is `skip=0`
+    /// and refuses, see `stream.rs`'s ignored gate). This compares it
+    /// bit-exact against the independent C port above for every filter-intra
+    /// mode, every shape `av1_filter_intra_allowed_bsize` allows (both sides
+    /// <= 32, squares and both orientations of 1:2 and 1:4), 8- and 10-bit,
+    /// on three seeded random edges.
+    #[test]
+    fn filter_intra_matches_the_libaom_predictor_for_every_mode_and_shape() {
+        // xorshift64*: a seeded stream, so a failure names one (shape, mode,
+        // seed) triple that reproduces.
+        let mut rng = |state: &mut u64| {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        };
+        let shapes = [
+            (4usize, 4usize),
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (4, 8),
+            (8, 4),
+            (8, 16),
+            (16, 8),
+            (16, 32),
+            (32, 16),
+            (4, 16),
+            (16, 4),
+            (8, 32),
+            (32, 8),
+        ];
+        let mut compared = 0u32;
+        for bd in [8u32, 10] {
+            crate::decode::set_bit_depth(bd as u8);
+            let max = (1u32 << bd) - 1;
+            for &(bw, bh) in &shapes {
+                for mode in 0..5usize {
+                    for seed in [1u64, 0x5eed_5eed, 0xdead_beef_cafe] {
+                        let mut state = seed
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            .wrapping_add((bw * 97 + bh * 7 + mode) as u64)
+                            | 1;
+                        let sample = |state: &mut u64| (rng(state) % u64::from(max + 1)) as u16;
+                        let corner = sample(&mut state);
+                        let above: Vec<u16> = (0..bw).map(|_| sample(&mut state)).collect();
+                        let left: Vec<u16> = (0..bh).map(|_| sample(&mut state)).collect();
+                        let mut want = vec![0u16; bw * bh];
+                        let mut c_above = vec![corner];
+                        c_above.extend_from_slice(&above);
+                        libaom_filter_intra_predictor(
+                            &mut want, bw, bh, &c_above, &left, mode, bd,
+                        );
+                        let mut got = vec![0u16; bw * bh];
+                        predict_filter_intra(
+                            mode,
+                            Some(&above),
+                            Some(&left),
+                            Some(corner),
+                            bw,
+                            bh,
+                            &mut got,
+                        );
+                        assert_eq!(
+                            got, want,
+                            "filter intra mode {mode}, {bw}x{bh}, {bd}-bit, seed {seed:#x}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        crate::decode::set_bit_depth(8);
+        assert_eq!(compared, 2 * 14 * 5 * 3, "every shape/mode/seed was compared");
+    }
+
     /// lane-intrarect r1: checksum-verify DC/SMOOTH/PAETH and a directional
     /// sweep across all three zones, `enable_edge_filter`/`smooth_neighbor`
     /// on and off, for eight rect shapes (both 1:2 and 1:4, both
