@@ -2214,6 +2214,26 @@ thread_local! {
     static RECT4_16_CHROMA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT4_16_COEFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT4_16_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-kf1200: pairs whose chroma edge-filter type read from the PAIR's
+    /// base mi differs from what the strip's own (odd) mi would have said --
+    /// the shape that made 4 chroma samples of the Hunger Games `-ss 1200`
+    /// key frame miss by 1. Zero here means a gate never exercised the fix.
+    static RECT4_16_UV_PAIR_FILT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-kf1200 r2: sub-8x8 chroma blocks that are `skip_txfm` AND
+    /// `UV_CFL_PRED` -- the arm that used to drop the CfL alpha entirely.
+    static SKIP_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many skipped sub-8x8 chroma blocks carried a CfL alpha (the shape
+/// that reconstructed as flat DC before lane-kf1200 r2).
+pub fn skip_cfl_hits() -> usize {
+    SKIP_CFL_HITS.with(|c| c.get())
+}
+
+/// How many 16x4/4x16 chroma pairs took a different `intra_edge_filter_type`
+/// from the pair's base mi than the strip's own mi would have given.
+pub fn rect4_16_uv_pair_filt_hits() -> usize {
+    RECT4_16_UV_PAIR_FILT_HITS.with(|c| c.get())
 }
 
 // lane-troykf r1: the two chroma defects Troy's key frames exposed --
@@ -2553,6 +2573,28 @@ pub fn sub8_inter_rect_hits() -> (usize, usize) {
         let h = c.get();
         (h[0], h[1])
     })
+}
+
+// lane-cdef r1: (a) how many 8x8 CDEF units `apply_cdef` EXCLUDED because all
+// four of their mi cells are `skip_txfm` (libaom `cdef.c:29-38`
+// `is_8x8_block_skip` / `av1_cdef_compute_sb_list`'s dlist test), and (b) how
+// many 8x8 inter leaves (`decode_inter_block8`) wrote that skip band at all.
+// (b) was 0 for every stream before this round -- the leaf path never touched
+// the band, so an all-skip 8x8 group kept the PREVIOUS frame's flags and got
+// filtered where libaom skips it. A gate asserts both are non-zero.
+thread_local! {
+    static CDEF_SKIPPED_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER8_SKIP_BAND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `CDEF_SKIPPED_UNITS`.
+pub(crate) fn cdef_skipped_units() -> usize {
+    CDEF_SKIPPED_UNITS.with(|c| c.get())
+}
+
+/// Current value of `INTER8_SKIP_BAND_HITS`.
+pub(crate) fn inter8_skip_band_hits() -> usize {
+    INTER8_SKIP_BAND_HITS.with(|c| c.get())
 }
 
 /// Current value of [`SUB8_SPLIT_HITS`].
@@ -7768,14 +7810,22 @@ fn decode_rect4_16(
                 RECT4_16_CHROMA_DIR_HITS.with(|h| h.set(h.get() + 1));
             }
             let pair_reach = Reach::of_rect(pw, ph, ppx, ppy, y.width, y.height);
-            // libaom `get_intra_edge_filter_type` reads `chroma_above_mbmi` /
-            // `chroma_left_mbmi` -- the neighbours of the CHROMA REFERENCE
-            // position, not of the closing strip. At `lmi` the above cell is
-            // the pair's own first strip, so the mi-exact map missed and the
-            // coarse fallback answered; the filter type then flipped the
-            // `use_intra_edge_upsample` decision (blk_wh 12 <= 16 for type 0,
-            // no upsample for type 1) on directional chroma.
-            let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c);
+            // lane-kf1200 r1: the chroma edge-filter type reads the neighbours
+            // of the CHROMA block, which for a 16x4/4x16 pair is `pair_mi`'s
+            // 16x8/8x16 region -- libaom builds `chroma_above_mbmi`/
+            // `chroma_left_mbmi` from `mi[-((mi_row & ss_y) * stride + (mi_col
+            // & ss_x))]` (`set_mi_offsets`, av1/common/blockd.h ~1050), i.e.
+            // the pair's top-left luma mi, never this leaf's odd row/column.
+            // Reading `lmi` here named the leaf directly above (a non-chroma
+            // -reference 4-row block, `uv_mode == UV_DC_PRED`) and so lost a
+            // SMOOTH neighbour: filt_type 0 instead of 1 turned
+            // `av1_use_intra_edge_upsample` on (blk_wh 12 <= 16) for a
+            // directional chroma strip, moving 4 samples by 1.
+            let smooth_neighbor_uv =
+                neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c);
+            if smooth_neighbor_uv != neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c) {
+                RECT4_16_UV_PAIR_FILT_HITS.with(|h| h.set(h.get() + 1));
+            }
             let (u_levels, v_levels) = if skip {
                 let zeros = vec![0i32; cw * ch];
                 // libaom `predict_and_reconstruct_intra_block` (decodeframe.c
@@ -8831,7 +8881,7 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, fh: usize) {
     use std::io::Write;
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for (p, w, h) in [(y, fw, fh), (u, fw.div_ceil(2), fh.div_ceil(2)), (v, fw.div_ceil(2), fh.div_ceil(2))] {
             for row in 0..h {
@@ -8845,10 +8895,25 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
     }
 }
 
+/// Decode-order index of the next [`dump_stage`]/[`dump_stage16`] file for a
+/// given env var -- lane-cdef r1: both used to write `.f0` unconditionally, so
+/// every frame overwrote the previous one and only the LAST frame survived,
+/// which silently defeats any per-frame filter-stage bisection.
+fn dump_stage_idx(var: &str) -> usize {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static IDX: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    let mut m = IDX.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let e = m.entry(var.to_string()).or_insert(0);
+    let i = *e;
+    *e += 1;
+    i
+}
+
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for p in [y, u, v] {
             let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
@@ -10361,6 +10426,7 @@ fn decode_leaf8(
         neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
         neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
     }
+    INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
@@ -10588,11 +10654,18 @@ fn decode_leaf_split4(
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[3] {
-        // As the rect4 pair above: a skipped block still predicts, and CfL is
-        // prediction (libaom `predict_and_reconstruct_intra_block`).
+        // A skipped chroma block still gets its CfL contribution: libaom's
+        // `predict_and_reconstruct_intra_block` calls `cfl_predict_block`
+        // from `av1_predict_intra_block_facade` (av1/common/reconintra.c:1719)
+        // whenever `mbmi->uv_mode == UV_CFL_PRED`, before any residual is
+        // added -- `skip_txfm` only drops the residual, never the alpha.
+        // lane-troykf and lane-kf1200 fixed THIS SAME arm independently; the
+        // merge keeps one fix and feeds both lanes' counters so neither of
+        // their gates goes vacuous.
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
         if alpha.is_some() {
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
+            SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
         u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv);
         v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv);
@@ -10947,11 +11020,18 @@ fn decode_leaf_rect8(
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[1] {
-        // As the rect4 pair above: a skipped block still predicts, and CfL is
-        // prediction (libaom `predict_and_reconstruct_intra_block`).
+        // A skipped chroma block still gets its CfL contribution: libaom's
+        // `predict_and_reconstruct_intra_block` calls `cfl_predict_block`
+        // from `av1_predict_intra_block_facade` (av1/common/reconintra.c:1719)
+        // whenever `mbmi->uv_mode == UV_CFL_PRED`, before any residual is
+        // added -- `skip_txfm` only drops the residual, never the alpha.
+        // lane-troykf and lane-kf1200 fixed THIS SAME arm independently; the
+        // merge keeps one fix and feeds both lanes' counters so neither of
+        // their gates goes vacuous.
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
         if alpha.is_some() {
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
+            SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
         u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv);
         v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv);
@@ -12702,6 +12782,9 @@ fn apply_cdef(
     while mi_r < skip_grid.mi_rows {
         let mut mi_c = 0usize;
         while mi_c < skip_grid.mi_cols {
+            if skip_grid.is_skip_txfm(mi_r, mi_c) {
+                CDEF_SKIPPED_UNITS.with(|c| c.set(c.get() + 1));
+            }
             if !skip_grid.is_skip_txfm(mi_r, mi_c) {
                 let sidx = strength_idx(mi_r, mi_c);
                 let (ox, oy) = (mi_c * 4, mi_r * 4);
@@ -12714,10 +12797,15 @@ fn apply_cdef(
                         i32::from(src_y[ny as usize * y_stride + nx as usize])
                     }
                 };
-                let (dir, var) = cdef_find_dir(coeff_shift, |r, c| {
-                    let (ny, nx) = ((oy + r).min(y_true_h - 1), (ox + c).min(y_true_w - 1));
-                    i32::from(src_y[ny * y_stride + nx])
-                });
+                // lane-cdef r1: the direction search reads the SAME padded
+                // block the taps do -- libaom runs `cdef_find_dir` on the
+                // prepared filter block (`cdef_block.c:296-320` over
+                // `cdef_prepare_fb`'s buffer, `cdef.c:249-256`), whose columns
+                // and rows past the mi-rounded frame extent are CDEF_VERY_LARGE.
+                // Clamping to the last real sample instead made every straddling
+                // edge 8x8 (odd `mi_cols`/`mi_rows`) pick a different var, hence
+                // a different `adjust_strength`, hence a +-1 band at the crop edge.
+                let (dir, var) = cdef_find_dir(coeff_shift, |r, c| sample_y(r as i32, c as i32));
 
                 // libaom `av1_cdef_filter_fb` passes `pri_strength ? dir : 0`
                 // -- each plane zeroes the shared direction when *its own*
@@ -12727,6 +12815,12 @@ fn apply_cdef(
                 let y_sec_strength = i32::from(cdef.y_sec_strength[sidx]) << coeff_shift;
                 let y_dir = if y_pri_strength != 0 { dir } else { 0 };
                 let t = cdef_adjust_strength(y_pri_strength, var);
+                // lane-cdef r1 rung: one line per filtered 8x8 luma CDEF unit.
+                if std::env::var_os("EC_AV1_CDEF_DBG").is_some() {
+                    eprintln!(
+                        "EC_CDEF mi_r={mi_r} mi_c={mi_c} x={ox} y={oy} sidx={sidx} dir={dir} var={var} t={t} pri={y_pri_strength} sec={y_sec_strength} damp={damping}"
+                    );
+                }
                 let enable_primary = t != 0;
                 let enable_secondary = y_sec_strength != 0;
                 if enable_primary || enable_secondary {
@@ -20828,6 +20922,14 @@ fn decode_inter_block8(
                 // so the 16x16 below a split block read partition ctx 0
                 // instead of 1 and mis-read PARTITION_SPLIT as NONE.
                 neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+                // lane-cdef r1: ... and the CDEF skip band too. `apply_cdef`'s
+                // `is_8x8_block_skip` (libaom `cdef.c:29-38`) reads all four mi
+                // cells of the 8x8; this leaf wrote none of them, so a 64x64
+                // whose bottom-right 16x16 is an all-skip 8x8-leaf group kept
+                // the PREVIOUS frame's flags and got filtered where libaom's
+                // dlist excludes it (3 luma samples on a 192x128 inter frame).
+                INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
+                neighbours.fill_skip_grid(leaf_mi, 2, skip);
                 neighbours.fill_lf_grid(
                     leaf_mi,
                     2,
@@ -21633,6 +21735,10 @@ fn decode_inter_block8(
     // lane-gmaffine r2: the deblock grid's ref id is the leaf's OWN reference
     // (r1 taught this leaf non-LAST refs; the hardcoded LAST_FRAME made every
     // GOLDEN/ALTREF leaf read as LAST at the loop-filter's ref/mv edge test).
+    // lane-cdef r1: the fall-through twin of the compound arm's skip-band
+    // write above -- `skip` is one flag for the whole 8x8 leaf (read at
+    // `decode.rs`'s `skip_ctx` site), `split8` only splits its transform.
+    neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(
         leaf_mi,
         2,
