@@ -86,11 +86,16 @@ const REFUSALS: &[&str] = &[
     // halved footprint, which for a 16x4 strip is an 8x2 transform libaom
     // never wrote (its chroma is the PAIR's 8x4, coded by the odd strip).
     // lane-sub8x4 r3 narrowed this to "a strip with no chroma-pair record";
-    // lane-wit16x4 r1 put it back at FULL width: r3's witness counters were
-    // phantoms of a desync, no stream on this tree decodes pixel-exact while
-    // the arm fires, and the decode path now needs `EC_INTRA16X4_DECODE`
-    // (class `refusal-lifted-without-a-gate`; numbers in decode.rs's `strip16`
-    // note and lanes/wit16x4-r1.report.md).
+    // lane-wit16x4 r1 put it back at FULL width (r3's witness counters were
+    // phantoms of a desync, class `refusal-lifted-without-a-gate`) behind
+    // `EC_INTRA16X4_DECODE`. lane-t900 r6 NARROWED it again -- the opt-in is
+    // gone -- on a real 10-bit 1920x792 128-superblock film witness that
+    // decodes 14/14 decode-order frames exact vs aomdec and 12/12 shown frames
+    // exact vs ffmpeg while the arm fires 78 16x4 + 149 4x16 (108 chroma-
+    // paired): gate
+    // `a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_decode_pixel_exact`.
+    // What still refuses is a 16x4/4x16 strip with NO chroma-pair record and
+    // every other sub-8 shape.
     "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
     "an intra mode this decoder does not code (round 2)",
     // lane-intrarect r1 lifted the whole-shape refusal that stood here (the
