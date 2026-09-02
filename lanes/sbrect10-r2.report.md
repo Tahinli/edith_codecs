@@ -110,6 +110,13 @@ under the existing `EC_TRACE_TPL` rung (this is what proved frame 2's empty temp
 None lifted this round (r1 lifted none either; this lane's work is two silent-miscode fixes).
 `refusal_inventory.rs` is byte-identical to main.
 
+## Suite (step 4) -- RED
+`test result: FAILED. 368 passed; 3 failed; 32 ignored; finished in 1049.95s`
+(`$HOME/.cache/sbrect10-suite-r2.log`). film_grain is a shared-`fixtures`-symlink flake and
+passes alone; the other two are open and triaged in `lanes/sbrect10-r2.handoff.md` section 5c.
+Section 2's probe table proves only the 6 probed points -- it does NOT prove the gate's own
+counter, which still reads 0 on the 8-bit arm.
+
 ## EVIDENCE
 EVIDENCE: $HOME/.cache/sbrect10/b58.obu (sha256 00b9253b...dcd2, hashed twice) | probe.sh half-random geq, 6 arms (8/10-bit x cq 52/58/61), decode + compare vs ffmpeg | pixel diffs 0/0/0/0/0/0 (was 0/32890/39907 on the 10-bit arms), >32 intra-in-inter hits 5/2/3 (8-bit) and 6/7/7 (10-bit)
 EVIDENCE: $HOME/.cache/sbrect10/{a.az,o.az} | EC_TRACE_COEFF all_zero ladder, instrumented aomdec vs ours, whole stream | 180 TUs, `diff` empty -> entropy in sync, defect is reconstruction-side

@@ -124,3 +124,52 @@ Triage order for the next round:
 3. The other two are this lane's own gates; the rect-partition sibling gate shares the compound
    stack path, so it is the expected place for a gm-fill regression to show.
 4. Only after the three are green: fill the N/0 totals into `lanes/sbrect10-r2.report.md`.
+
+## 5c. SUITE FINISHED -- final result and per-failure triage (supersedes 5b)
+`test result: FAILED. 368 passed; 3 failed; 32 ignored; finished in 1049.95s`
+(`$HOME/.cache/sbrect10-suite-r2.log`).
+
+### (a) `a_real_aomenc_stream_with_film_grain_decodes_pixel_exact` -- FLAKE, not a defect. CLOSED.
+Panic was `Result::unwrap()` on `Err(Os { code: 2, NotFound })` at stream.rs:15680, i.e. the
+`concat!(CARGO_MANIFEST_DIR, "/../../fixtures/golden6-mismatch.obu")` READ failed -- the shared
+`fixtures` symlink (`-> /home/tahinli/Documents/Code/Rust/edith_codecs/fixtures`) was transiently
+gone mid-run, the known concurrent-lane merge hazard. The file is present now and the gate passes
+on its own:
+`cargo test -p ec-av1 --lib a_real_aomenc_stream_with_film_grain_decodes_pixel_exact`
+-> `test result: ok. 1 passed; 0 failed`. Nothing to fix here; it is NOT a gm-fill regression.
+
+### (b) `a_real_aomenc_inter_frame_with_a_64x64_intra_block_reads_the_no_cfl_uv_alphabet` -- REAL, MINE, OPEN.
+    8-bit: 2 named refusals, 0 pixel-exact attempts carrying a >32 intra block
+           (0 no-CFL uv_mode reads), 14 attempts carried none
+    (the two refusals are "an inter SB-level AB partition" and "a split intra strip whose
+     transform unit is 32x64" -- both other lanes' gaps, correctly named, not mismatches)
+10-bit arm passes. **My step-2 claim that the half-random fixture makes the 8-bit arm carry the
+shape is DISPROVEN by the gate itself.** The probe (`probe.sh`) counted a DIFFERENT quantity than
+the gate: it greps `EC_AV1_TELL` for `post_is_inter is_inter=false` with `side>32`, whereas the
+gate asserts `crate::decode::nocfl_uv_mode_hits()` moved. On the very same stream (8-bit cq58,
+horizontal, sp=12 == gate attempt 8) the probe reports 2 and the counter reports 0, so those
+8-bit >32 intra-in-inter blocks reach a decode path that never touches the counter.
+NEXT: the three `NOCFL_UV_MODE_HITS` increment sites are `decode.rs:5499`, `decode.rs:8442`,
+`decode.rs:18544`; instrument which intra-in-inter path an 8-bit 64x64 block actually takes
+(the 10-bit ones clearly hit one of the three), then either fix the missing counter site or, if
+the 8-bit path genuinely never offers CFL, narrow the gate's 8-bit assertion and say so.
+No pixel mismatch is involved -- every decoded attempt compared exact.
+
+### (c) `a_real_aomenc_inter_sequence_with_a_superblock_level_rect_partition_decodes_pixel_exact` -- REAL, OPEN, UNATTRIBUTED.
+    8-bit:  4 named refusals, 3 carrying, 64x32=8, 32x64=2, 64-axis residual TUs=1, 9 none (0 mismatched)
+    10-bit: 0 named refusals, 1 carrying, 64x32=2, 32x64=0, 64-axis residual TUs=0, 15 none (0 mismatched)
+    panic at stream.rs:6725: "(10-bit): no superblock-level rect strip carried a coded 64-axis
+    residual transform unit inside a pixel-exact attempt (horz=2, vert=0)"
+This is a VACUOUS-ARM assert, NOT a pixel mismatch (`0 of them mismatched` on both depths). r1
+recorded this same gate GREEN with 10-bit `64-axis TUs=2` and `2 carrying`; it is now `0` and `1`.
+Two candidate causes, NOT separated this round: (i) the `main` 18bf7dc merge (sb128 + r14 changed
+partition/var-tx handling and neither r1 nor this lane ever suite-tested the merge), or (ii) this
+round's gm-fill changing which attempts come out pixel-exact (only pixel-exact attempts count
+toward the arm). Separate them by running this gate alone at `3a9e83e` (merge, pre-fix) in a
+DETACHED worktree with its own CARGO_TARGET_DIR, then at `2b9709c`.
+
+### Corrected disposition
+- fix-now next round: (b) the 8-bit no-CFL counter, (c) the 10-bit 64-axis vacuous arm.
+- accepted/closed: (a) film_grain fixture flake.
+- The gm-fill fix itself is NOT contradicted by anything in this suite: no gate reported a pixel
+  mismatch, and the pinned stream `b58.obu` plus all 6 probe arms are byte-exact vs ffmpeg.
