@@ -29,6 +29,8 @@ fn main() {
         }
     };
     let report = || {
+        let (sc, dp) = ec_av1::decode::troy_chroma_counters();
+        println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
