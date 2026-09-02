@@ -71,6 +71,18 @@ fn main() {
         }
     }
     println!("TILING: {frames_seen} frame headers parsed");
+    // lane-sb128 r4: the superblock size decides the whole partition tree, so
+    // report it next to the tiling -- it is the first thing a film blocker
+    // triage needs.
+    if let Some(seq) = parser.sequence_header() {
+        println!(
+            "SEQ: use_128x128_superblock={} bit_depth={} max_frame={}x{}",
+            seq.use_128x128_superblock,
+            seq.color_config.bit_depth,
+            seq.max_frame_width,
+            seq.max_frame_height
+        );
+    }
     for (cols, rows, uniform, ctx_id) in &seen {
         println!(
             "TILING: cols={cols} rows={rows} uniform_spacing={uniform} context_update_tile_id={ctx_id}"
