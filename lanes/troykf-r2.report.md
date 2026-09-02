@@ -72,3 +72,9 @@ cluster) and are not in the table.
   SPLIT and NONE are decoded at the 128 root))`.
 * A synthetic aomenc recipe for a skipped CfL block — accepted as unreachable at
   48 recipes; the pinned film frame is the gate instead.
+
+## Full suite (merged tree, tip 735c80e)
+`systemd-run --user --unit=troykf-suite-1788326584 -p MemoryMax=10G ... cargo test -p ec-av1 --lib -j3`
+-> `test result: ok. 379 passed; 0 failed; 33 ignored; 0 measured; 0 filtered out;
+finished in 1055.41s`. Log: `$HOME/.cache/troykf-suite-r2.log`.
+**GREEN 379/0.**
