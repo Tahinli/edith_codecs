@@ -97,4 +97,4 @@ fix-now residue, NOT done this round:
 
 ## Suite
 
-`cargo test -p ec-av1 --lib` -> see `$HOME/.cache/golomb-suite-r9.log` (totals in the round report line).
+`cargo test -p ec-av1 --lib` -> **379 passed; 0 failed; 35 ignored** (`$HOME/.cache/golomb-suite-r9.log`; the extra ignored test vs r8 is the new pinned straddle gate).
