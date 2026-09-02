@@ -74,6 +74,12 @@ pub fn rect64_inter_tu_hits() -> usize {
     crate::decode::rect64_inter_tu_hits()
 }
 
+/// lane-inter16ab r6: whole TX_32X8/TX_8X32 inter luma transform units coded,
+/// `[32x8, 8x32]` -- the 32-level 1:4 inter strip's rectangular residual.
+pub fn rect32x8_inter_tu_hits() -> [usize; 2] {
+    crate::decode::rect32x8_inter_tu_hits()
+}
+
 /// lane-r14 r3: RECTANGULAR var-tx leaf transform units, `[32x16, 16x32]` --
 /// the leaves `sub_tx_size_map` produces when a 1:4 strip with a 64-px axis
 /// splits its transform (`[TX_64X16] == TX_32X16`, `[TX_16X64] == TX_16X32`).

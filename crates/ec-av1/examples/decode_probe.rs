@@ -53,6 +53,8 @@ fn main() {
         println!(
             "rect_wedge(8x16,16x8,16x32,32x16,8x32,32x8): compound={rw:?} interintra={rwi:?}"
         );
+        let r328 = ec_av1::stream::rect32x8_inter_tu_hits();
+        println!("rect32x8_inter_tu: 32x8={} 8x32={}", r328[0], r328[1]);
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",

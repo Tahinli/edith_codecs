@@ -118,6 +118,16 @@ pub(crate) enum TxbSet {
     /// block, so the encoder writes none (same reason
     /// [`LumaRect32x16`](TxbSet::LumaRect32x16) has none).
     LumaRect32x8,
+    /// lane-inter16ab r6: [`LumaRect32x8`](TxbSet::LumaRect32x8)'s INTER twin
+    /// -- same coefficient tables (`get_txsize_entropy_ctx(TX_32X8)` is the
+    /// 16x16 class, `txsize_log2_minus4` = 4, i.e. the 256-position `eob_pt`),
+    /// but a `tx_type` alphabet: `av1_get_ext_tx_set_type` (blockd.h:1097) at
+    /// `tx_size_sqr_up == TX_32X32` and `is_inter` is `EXT_TX_SET_DCT_IDTX`
+    /// REGARDLESS of `reduced_tx_set`, read at the `txsize_sqr_map[TX_32X8] ==
+    /// TX_8X8` CDF row -- the very table
+    /// [`LumaRect16x8Inter`](TxbSet::LumaRect16x8Inter) reads, so there is one
+    /// variant here, not a reduced/non-reduced pair.
+    LumaRect32x8Inter,
     LumaRect32x16,
     /// lane-inter4 r2: [`LumaRect32x16`](TxbSet::LumaRect32x16)'s INTER twin --
     /// same coefficient tables (`get_txsize_entropy_ctx` reduces TX_32X16 and
@@ -1772,6 +1782,18 @@ impl Cdfs {
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: None,
+                eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
+            },
+            TxbSet::LumaRect32x8Inter => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_256_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_8.as_mut_slice()),
                 eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
             },
             TxbSet::LumaRect32x16Inter => TxbTables {
