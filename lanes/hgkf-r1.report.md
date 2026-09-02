@@ -70,7 +70,7 @@ CDEF/deblock strength on those blocks. `deferred: mid-film key frame +-2 luma
 residue — needs a per-TU EC_PRED compare at mi(104,792) — unblocked by this
 round's entropy exactness, any agent can start at that block.`
 
-Suite: see `$HOME/.cache/hgkf-suite2.log` (`cargo test -p ec-av1 --lib`).
+Suite: `cargo test -p ec-av1 --lib` (systemd unit, log `$HOME/.cache/hgkf-suite2.log`) -- **356 passed / 0 failed / 29 ignored**, 683s.
 
 ## Same-shape sweep (class `parsed-then-discarded`, frame-edge partition bit)
 
