@@ -469,13 +469,13 @@ pub(crate) struct Cdfs {
     /// `BLOCK_8X8`, 1 = `BLOCK_16X16`, 2 = `BLOCK_32X32`, 3 = `BLOCK_64X64`
     /// (`default_obmc_cdf`'s own `BLOCK_SIZES_ALL` indices 3/6/9/12 --
     /// this decoder only ever codes those four square sizes).
-    pub obmc: [[u16; 3]; 6],
+    pub obmc: [[u16; 3]; 12],
     /// `motion_mode` (spec 5.11.24's `read_motion_mode`), the 3-symbol
     /// `SIMPLE_TRANSLATION`/`OBMC_CAUSAL`/`WARPED_CAUSAL` alphabet read
     /// instead of [`Self::obmc`] whenever `motion_mode_allowed` resolves to
     /// `WARPED_CAUSAL`-eligible -- same square-bsize indexing as `obmc`.
     /// lane-warp round 1.
-    pub motion_mode: [[u16; 4]; 6],
+    pub motion_mode: [[u16; 4]; 12],
     /// `interintra`, indexed by `size_group_lookup[bsize]` -- see
     /// `cdf::INTERINTRA`'s own doc.
     pub interintra: [[u16; 3]; 4],

@@ -1521,6 +1521,17 @@ pub(crate) fn sb_rect4_vert_hits() -> usize {
 thread_local! {
     static RECT4_32_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT4_32_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-inter4 r1: the INTER-frame twins of the two counters above --
+    /// four 32x8 / 8x32 inter strips of a 32x32-level `PARTITION_HORZ_4` /
+    /// `PARTITION_VERT_4`.
+    static RECT4_32_HORZ_INTER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECT4_32_VERT_INTER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-inter4 r1: superblock-level inter `PARTITION_HORZ`/`PARTITION_VERT`
+    /// strips (64x32 / 32x64) and their 1:4 pair (64x16 / 16x64).
+    static INTER_SB_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER_SB_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER_SB_HORZ4_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER_SB_VERT4_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How many 32x32-level 1:4 strips actually read coefficients (non-skip):
@@ -1543,6 +1554,36 @@ pub(crate) fn rect4_32_horz_hits() -> usize {
 /// Current value of `RECT4_32_VERT_HITS` (8x32 strips decoded).
 pub(crate) fn rect4_32_vert_hits() -> usize {
     RECT4_32_VERT_HITS.with(|c| c.get())
+}
+
+/// Current value of `RECT4_32_HORZ_INTER_HITS` (32x8 inter strips decoded).
+pub(crate) fn rect4_32_horz_inter_hits() -> usize {
+    RECT4_32_HORZ_INTER_HITS.with(|c| c.get())
+}
+
+/// Current value of `RECT4_32_VERT_INTER_HITS` (8x32 inter strips decoded).
+pub(crate) fn rect4_32_vert_inter_hits() -> usize {
+    RECT4_32_VERT_INTER_HITS.with(|c| c.get())
+}
+
+/// Current value of `INTER_SB_HORZ_HITS` (64x32 inter strips decoded).
+pub(crate) fn inter_sb_horz_hits() -> usize {
+    INTER_SB_HORZ_HITS.with(|c| c.get())
+}
+
+/// Current value of `INTER_SB_VERT_HITS` (32x64 inter strips decoded).
+pub(crate) fn inter_sb_vert_hits() -> usize {
+    INTER_SB_VERT_HITS.with(|c| c.get())
+}
+
+/// Current value of `INTER_SB_HORZ4_HITS` (64x16 inter strips decoded).
+pub(crate) fn inter_sb_horz4_hits() -> usize {
+    INTER_SB_HORZ4_HITS.with(|c| c.get())
+}
+
+/// Current value of `INTER_SB_VERT4_HITS` (16x64 inter strips decoded).
+pub(crate) fn inter_sb_vert4_hits() -> usize {
+    INTER_SB_VERT4_HITS.with(|c| c.get())
 }
 
 // lane-rect64q r1: how many of [`decode_block_rect64`]'s three per-plane
@@ -3815,7 +3856,24 @@ impl Neighbours {
         uv_mode: usize,
         grids: &[Vec<i32>; 3],
     ) {
-        let (r, c) = at;
+        self.record_rect_mi(sub16_to_mi(at), w, h, mode, uv_mode, grids);
+    }
+
+    /// [`Self::record_rect`] in mi (4 px) units -- lane-inter4 r1: a
+    /// 32x8/8x32 strip of a 32-level 1:4 partition sits at an 8-px offset the
+    /// [`SUB`]-unit `at` cannot name. The coarse 16-px bands are still keyed
+    /// by the enclosing cell (a sub-16 extent writes none of them, exactly as
+    /// the [`SUB`]-unit path does).
+    fn record_rect_mi(
+        &mut self,
+        at_mi: (usize, usize),
+        w: usize,
+        h: usize,
+        mode: usize,
+        uv_mode: usize,
+        grids: &[Vec<i32>; 3],
+    ) {
+        let (r, c) = (at_mi.0 / (SUB / MI), at_mi.1 / (SUB / MI));
         for cell in 0..w / SUB {
             self.above_mode[c + cell] = mode;
             self.above_uv_mode[c + cell] = uv_mode;
@@ -3826,9 +3884,9 @@ impl Neighbours {
             self.left_uv_mode[r + cell] = uv_mode;
             self.left_side[r + cell] = h;
         }
-        self.record_mode_mi(r * (SUB / MI), c * (SUB / MI), w / MI, h / MI, mode);
-        self.record_uv_mode_mi(r * (SUB / MI), c * (SUB / MI), w / MI, h / MI, uv_mode);
-        self.record_mi_rect((r * (SUB / MI), c * (SUB / MI)), w, h, grids);
+        self.record_mode_mi(at_mi.0, at_mi.1, w / MI, h / MI, mode);
+        self.record_uv_mode_mi(at_mi.0, at_mi.1, w / MI, h / MI, uv_mode);
+        self.record_mi_rect(at_mi, w, h, grids);
     }
 
     /// The coefficient-context half of [`Self::record`], taking the block's
@@ -3944,7 +4002,21 @@ impl Neighbours {
         uv_mode: usize,
         chroma_grids: [&[i32]; 2],
     ) {
-        let (r, c) = at;
+        self.record_split_luma_rect_mi(sub16_to_mi(at), w, h, mode, uv_mode, chroma_grids);
+    }
+
+    /// [`Self::record_split_luma_rect`] in mi (4 px) units (lane-inter4 r1,
+    /// same reason as [`Self::record_rect_mi`]).
+    fn record_split_luma_rect_mi(
+        &mut self,
+        at_mi: (usize, usize),
+        w: usize,
+        h: usize,
+        mode: usize,
+        uv_mode: usize,
+        chroma_grids: [&[i32]; 2],
+    ) {
+        let (r, c) = (at_mi.0 / (SUB / MI), at_mi.1 / (SUB / MI));
         for cell in 0..w / SUB {
             self.above_mode[c + cell] = mode;
             self.above_uv_mode[c + cell] = uv_mode;
@@ -3955,7 +4027,7 @@ impl Neighbours {
             self.left_uv_mode[r + cell] = uv_mode;
             self.left_side[r + cell] = h;
         }
-        let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+        let (mi_r, mi_c) = at_mi;
         let (w_mi, h_mi) = (w / MI, h / MI);
         self.record_mode_mi(mi_r, mi_c, w_mi, h_mi, mode);
         self.record_uv_mode_mi(mi_r, mi_c, w_mi, h_mi, uv_mode);
@@ -12768,6 +12840,12 @@ fn build_gm_mv_table(
 /// mode/tx-type outside what [`read_intra_mode`]/[`read_coeffs`] already
 /// refuse.
 #[allow(clippy::too_many_arguments)]
+/// lane-inter4 r1: 16-px-cell coordinates -> MI (4-px) coordinates, the unit
+/// [`decode_inter_block`]'s `at` now takes.
+const fn sub16_to_mi(t: (usize, usize)) -> (usize, usize) {
+    (t.0 * (SUB / MI), t.1 * (SUB / MI))
+}
+
 fn decode_inter_block(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -12882,13 +12960,16 @@ fn decode_inter_block(
     // combinations that don't implement scaled MC yet.
     frame_width: usize,
 ) -> Result<()> {
-    let (r, c) = at;
+    // lane-inter4 r1: `at` is in MI units (4 px) so a 32-level 1:4 strip can
+    // name an 8-px offset; `(r, c)` stays the enclosing 16-px cell for the
+    // few 16-px-granular uses below.
+    let (r, c) = (at.0 / (SUB / MI), at.1 / (SUB / MI));
     // lane-inter8 r2: the inter side bands are mi-granular; this block's own
     // above/left neighbour is the mi cell at its top-left corner (libaom
     // `above_mbmi` = mi(mi_row - 1, mi_col)), so a SUB-aligned block reads
     // exactly what it read before.
-    let (rmi, cmi) = (r * (SUB / MI), c * (SUB / MI));
-    let (px, py) = (c * SUB, r * SUB);
+    let (rmi, cmi) = at;
+    let (px, py) = (at.1 * MI, at.0 * MI);
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
     let (write_chroma_w, write_chroma_h) = (write_w / 2, write_h / 2);
@@ -12896,7 +12977,7 @@ fn decode_inter_block(
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
             "TELL mi_row={} mi_col={} label=block_entry side={side} tell={} range={}",
-            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+            rmi, cmi, dec.debug_bitpos(), dec.debug_state().0
         );
     }
     let skip_mode_ctx =
@@ -12912,7 +12993,7 @@ fn decode_inter_block(
     }
     // spec 5.11.5 `inter_frame_mode_info`: `inter_segment_id(1)` before
     // `skip_mode`/`skip`, `inter_segment_id(0)` after them.
-    let (seg_mi_r, seg_mi_c) = (r * SUB_MI as usize, c * SUB_MI as usize);
+    let (seg_mi_r, seg_mi_c) = (rmi, cmi);
     let (seg_w_mi, seg_h_mi) = (write_w / 4, write_h / 4);
     inter_segment_id(dec, cdfs, seg_mi_r, seg_mi_c, seg_w_mi, seg_h_mi, false, true);
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
@@ -12929,9 +13010,12 @@ fn decode_inter_block(
     let skip_ctx = usize::from(neighbours.above_skip[cmi]) + usize::from(neighbours.left_skip[rmi]);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
     inter_segment_id(dec, cdfs, seg_mi_r, seg_mi_c, seg_w_mi, seg_h_mi, skip, false);
-    maybe_read_cdef_idx(dec, r * SUB_MI as usize, c * SUB_MI as usize, skip);
-    maybe_read_delta_q(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
-    maybe_read_delta_lf(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
+    maybe_read_cdef_idx(dec, rmi, cmi, skip);
+    // lane-inter4 r1: spec 5.11.6's `bSize == sbSize` -- a 64x32/64x16 strip
+    // is NOT the whole superblock, so its `skip` never suppresses the read.
+    let whole_sb = side == 64 && write_w == 64 && write_h == 64;
+    maybe_read_delta_q(dec, cdfs, rmi, cmi, whole_sb, skip);
+    maybe_read_delta_lf(dec, cdfs, rmi, cmi, whole_sb, skip);
     // lane-warp r5: see `reject_residual` -- a square-block decode of a
     // HORZ_B strip is symbol-exact only for `skip` (no residual, no
     // motion_mode/warp symbol), so gate here before any further read.
@@ -12942,8 +13026,8 @@ fn decode_inter_block(
     }
 
     let (has_above, has_left) = (
-        r > neighbours.tile_row0_mi / (SUB / MI),
-        c > neighbours.tile_col0_mi / (SUB / MI),
+        rmi > neighbours.tile_row0_mi,
+        cmi > neighbours.tile_col0_mi,
     );
     let (above_inter, left_inter) = (neighbours.above_inter[cmi], neighbours.left_inter[rmi]);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
@@ -12951,15 +13035,15 @@ fn decode_inter_block(
     if std::env::var_os("EC_TRACE_MODE").is_some() {
         eprintln!(
             "EC_MODE mi_row={} mi_col={} rng={}",
-            r * SUB_MI as usize,
-            c * SUB_MI as usize,
+            rmi,
+            cmi,
             dec.debug_state().0
         );
     }
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
             "TELL mi_row={} mi_col={} label=post_is_inter skip_mode={skip_mode} skip={skip} is_inter={is_inter} tell={} range={}",
-            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+            rmi, cmi, dec.debug_bitpos(), dec.debug_state().0
         );
     }
 
@@ -12979,7 +13063,7 @@ fn decode_inter_block(
     // than one luma transform -- read back by the residual loop, the
     // coefficient-context write-back and the loop-filter grid fill below.
     let mut vartx_leaves: Option<Vec<(usize, usize, usize)>> = None;
-    let at_mi = (r * (SUB / MI), c * (SUB / MI));
+    let at_mi = at;
     if is_inter {
         let above_nbr = has_above.then(|| NeighbourRef {
             is_inter: above_inter,
@@ -13024,7 +13108,7 @@ fn decode_inter_block(
                     neighbours.left_ref[rmi],
                 )
             };
-            let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+            let (mi_row, mi_col) = (rmi, cmi);
             // lane-rect r2: true footprint, mirroring the single-ref path below.
             let bw4 = write_w / 4;
             let bh4 = write_h / 4;
@@ -13782,7 +13866,7 @@ fn decode_inter_block(
                 u_grid = vec![0i32; chroma_side * chroma_side];
                 v_grid = vec![0i32; chroma_side * chroma_side];
             } else {
-                let around = neighbours.around(at, side);
+                let around = neighbours.around_mi(at, side);
                 let luma_tx_type;
                 if let Some(leaves) = vartx_leaves.clone() {
                     // spec 5.11.17's transform tree, leaf by leaf in the order
@@ -13897,7 +13981,7 @@ fn decode_inter_block(
                 );
             ref_frame_for_lf = ref_frame;
             if std::env::var_os("EC_AV1_TELL").is_some() {
-                let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+                let (mi_row, mi_col) = (rmi, cmi);
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_ref_frame ref={ref_frame} tell={} range={}",
                     dec.debug_bitpos(), dec.debug_state().0
@@ -13925,7 +14009,7 @@ fn decode_inter_block(
                 }
             };
 
-            let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+            let (mi_row, mi_col) = (rmi, cmi);
             // lane-rect r2: the mv stack must be queried with the block's
             // REAL extent (libaom `av1_get_mv_refs` gets bw4/bh4 from
             // xd->width/xd->height, not a square guess) -- `write_w`/
@@ -14059,7 +14143,18 @@ fn decode_inter_block(
             // `size_group_lookup`: BLOCK_16X16 -> 2, BLOCK_32X32 -> 3.
             let mut interintra_mode: Option<u8> = None;
             let mut wedge_mask: Option<(&'static [u8], usize)> = None;
-            if enable_interintra_compound && !skip_mode && (side == 16 || side == 32) {
+            // lane-inter4 r1: `is_interintra_allowed_bsize` is
+            // `BLOCK_8X8..=BLOCK_32X32` in libaom's enum ORDER, which excludes
+            // every 1:4 shape (BLOCK_8X32 = 18, BLOCK_32X8 = 19) even though
+            // both dimensions are in range -- reading this symbol on a 1:4
+            // strip is a symbol the reference never wrote.
+            let interintra_shape =
+                write_w.max(write_h) <= 32 && write_w.max(write_h) / write_w.min(write_h) <= 2;
+            if enable_interintra_compound
+                && !skip_mode
+                && (side == 16 || side == 32)
+                && interintra_shape
+            {
                 let bsize_group = if side == 16 { 2 } else { 3 };
                 let interintra = dec.symbol(&mut cdfs.interintra[bsize_group]) == 1;
                 if interintra {
@@ -14155,12 +14250,26 @@ fn decode_inter_block(
                 // (libaom `motion_mode_cdf[mbmi->bsize]`: BLOCK_16X32 -> 4,
                 // BLOCK_32X16 -> 5 in our packed table) -- rect-flake-1's
                 // strip motion_mode read diverged on the square row.
-                let bsize_idx = if write_w == write_h {
-                    (write_w.trailing_zeros() - 3) as usize
-                } else if write_w == 16 {
-                    4
-                } else {
-                    5
+                // lane-inter4 r1: every rect shape this decoder can now
+                // reach reads its OWN libaom bsize row (the packed order is
+                // documented on `cdf::MOTION_MODE`); a wrong row is a wrong
+                // interval narrowing, not a wrong value (class
+                // wrong-alphabet-same-value).
+                let bsize_idx = match (write_w, write_h) {
+                    (w, h) if w == h => (w.trailing_zeros() - 3) as usize,
+                    (16, 32) => 4,
+                    (32, 16) => 5,
+                    (32, 64) => 6,
+                    (64, 32) => 7,
+                    (8, 32) => 8,
+                    (32, 8) => 9,
+                    (16, 64) => 10,
+                    (64, 16) => 11,
+                    _ => {
+                        return Err(unsupported(
+                            "a motion_mode symbol for a block shape this decoder has no                              CDF row for",
+                        ));
+                    }
                 };
                 // `motion_mode_allowed` reads the 3-symbol `motion_mode_cdf`
                 // instead of the 2-symbol `obmc_cdf` exactly when
@@ -14597,7 +14706,7 @@ fn decode_inter_block(
                 u_grid = vec![0i32; chroma_side * chroma_side];
                 v_grid = vec![0i32; chroma_side * chroma_side];
             } else {
-                let around = neighbours.around(at, side);
+                let around = neighbours.around_mi(at, side);
                 let luma_tx_type;
                 if let Some(leaves) = vartx_leaves.clone() {
                     // spec 5.11.17's transform tree, leaf by leaf in the order
@@ -14786,7 +14895,7 @@ fn decode_inter_block(
         block_filter = [3, 3];
         ref_frame_for_lf = 0;
         globalmv_for_lf = false;
-        let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+        let (mi_row, mi_col) = (rmi, cmi);
         for dr in 0..side / 4 {
             for dc in 0..side / 4 {
                 grid.set(
@@ -14861,7 +14970,7 @@ fn decode_inter_block(
             u_grid = vec![0i32; chroma_side * chroma_side];
             v_grid = vec![0i32; chroma_side * chroma_side];
         } else {
-            let around = neighbours.around(at, side);
+            let around = neighbours.around_mi(at, side);
             luma_grid = read_plane(
                 dec,
                 cdfs,
@@ -14940,7 +15049,7 @@ fn decode_inter_block(
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
             "TELL mi_row={} mi_col={} label=block_end tell={} range={}",
-            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+            rmi, cmi, dec.debug_bitpos(), dec.debug_state().0
         );
     }
     if vartx_leaves.is_some() {
@@ -14948,9 +15057,9 @@ fn decode_inter_block(
         // ([`Neighbours::record_mi_luma`] above); this writes everything else
         // [`Neighbours::record_rect`] would (a var-tx block is always square,
         // so `write_w == write_h == side`).
-        neighbours.record_split_luma(at, side, mode_for_tx, uv_predict_mode, [&u_grid, &v_grid]);
+        neighbours.record_split_luma_rect_mi(at, side, side, mode_for_tx, uv_predict_mode, [&u_grid, &v_grid]);
     } else {
-        neighbours.record_rect(
+        neighbours.record_rect_mi(
             at,
             write_w,
             write_h,
@@ -14959,10 +15068,10 @@ fn decode_inter_block(
             &[luma_grid, u_grid, v_grid],
         );
     }
-    neighbours.record_inter_rect(
+    neighbours.record_inter_rect_mi(
         at,
-        write_w,
-        write_h,
+        write_w / MI,
+        write_h / MI,
         skip,
         is_inter,
         ref_frame_for_lf,
@@ -14970,16 +15079,16 @@ fn decode_inter_block(
         skip_mode,
     );
     if let Some((ref1, group_idx, idx)) = compound_ctx {
-        neighbours.record_compound_ctx_rect(at, write_w, write_h, ref1, group_idx, idx);
+        neighbours.record_compound_ctx_rect_mi(at, write_w / MI, write_h / MI, ref1, group_idx, idx);
     }
     neighbours.fill_skip_grid_rect(
-        (r * (SUB / MI), c * (SUB / MI)),
+        (rmi, cmi),
         write_w / MI,
         write_h / MI,
         skip,
     );
     neighbours.fill_lf_grid_rect(
-        (r * (SUB / MI), c * (SUB / MI)),
+        (rmi, cmi),
         write_w / MI,
         write_h / MI,
         // lane-rect r2: the strip's true TX_32X16/TX_16X32 dims -- the
@@ -16899,6 +17008,64 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             );
             CDEF_TRANSMITTED.with(|c| c.set(false));
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
+            // lane-inter4 r1: every rect inter piece below is the same
+            // `decode_inter_block` call with only position / true footprint /
+            // transform-set differing; the macro keeps the new arms readable
+            // instead of six more 60-line copies of the argument list.
+            macro_rules! inter_piece {
+                ($at_mi:expr, $side:expr, $li:expr, $lt:expr, $ch:expr, $ltx:expr,
+                 $ctx:expr, $sl:expr, $sc:expr, $sg:expr, $ww:expr, $wh:expr) => {
+                    decode_inter_block(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        &mut grid,
+                        $at_mi,
+                        $side,
+                        mi_cols,
+                        mi_rows,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        &ref_y,
+                        &ref_u,
+                        &ref_v,
+                        &ref_slots,
+                        &sign_bias_table,
+                        &global_motion,
+                        base_q_idx,
+                        $li,
+                        $lt,
+                        $ch,
+                        $ltx,
+                        $ctx,
+                        $sl,
+                        $sc,
+                        $sg,
+                        allow_high_precision_mv,
+                        force_integer_mv,
+                        interp_fixed,
+                        enable_dual_filter,
+                        tpl_frame.as_ref(),
+                        reference_select,
+                        enable_masked_compound,
+                        enable_interintra_compound,
+                        enable_jnt_comp,
+                        order_hint_bits,
+                        order_hint,
+                        ref_order_hints,
+                        skip_mode_present,
+                        skip_mode_frame,
+                        switchable_motion_mode,
+                        allow_warped_motion,
+                        true,
+                        $ww,
+                        $wh,
+                        allow_screen_content_tools,
+                        frame_width as usize,
+                    )?
+                };
+            }
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             let (has_cols, has_rows) = (
                 sb_c * SB_MI + SB_MI / 2 < mi_cols,
@@ -16949,7 +17116,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     &mut cdfs,
                     &mut neighbours,
                     &mut grid,
-                    sb_at,
+                    sub16_to_mi(sb_at),
                     SB,
                     mi_cols,
                     mi_rows,
@@ -16995,10 +17162,73 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 )?;
                 continue;
             }
+            if matches!(
+                part64,
+                PARTITION_HORZ | PARTITION_VERT | PARTITION_HORZ_4 | PARTITION_VERT_4
+            ) {
+                // lane-inter4 r1: the superblock-level rect + 1:4 pairs as
+                // inter blocks -- two 64x32 / 32x64 strips, or four 64x16 /
+                // 16x64 ones. Each piece keeps `side = SB` for every
+                // syntax/CDF/prediction-buffer decision (the square-context
+                // corner-cut PARTITION_HORZ already ships at the 32 level)
+                // but names its own true footprint through `write_w`/
+                // `write_h`, which is what `motion_mode`'s bsize row, the
+                // mv-stack's bw4/bh4, the delta-q `bSize == sbSize` test and
+                // every neighbour stamp read. `reject_residual = true`: a
+                // non-skip strip refuses by name rather than over-read a
+                // square residual (rectangular inter residual coding is not
+                // ported -- see lanes/inter4-r1.report.md).
+                let horz = matches!(part64, PARTITION_HORZ | PARTITION_HORZ_4);
+                let four = matches!(part64, PARTITION_HORZ_4 | PARTITION_VERT_4);
+                let base_mi = (
+                    sb_r as usize * SB_MI as usize,
+                    sb_c as usize * SB_MI as usize,
+                );
+                let (n_pieces, step_mi) = if four { (4usize, 4usize) } else { (2usize, 8usize) };
+                let (bw, bh) = match (horz, four) {
+                    (true, false) => (64usize, 32usize),
+                    (false, false) => (32, 64),
+                    (true, true) => (64, 16),
+                    (false, true) => (16, 64),
+                };
+                for i in 0..n_pieces {
+                    let at_mi = if horz {
+                        (base_mi.0 + i * step_mi, base_mi.1)
+                    } else {
+                        (base_mi.0, base_mi.1 + i * step_mi)
+                    };
+                    // libaom `decode_partition`'s own `i > 0` frame-edge break.
+                    if i > 0 && (at_mi.0 >= mi_rows as usize || at_mi.1 >= mi_cols as usize) {
+                        break;
+                    }
+                    inter_piece!(
+                        at_mi,
+                        SB,
+                        TxbSet::Luma64,
+                        TxbSet::Luma64,
+                        TxbSet::Chroma32,
+                        TX32,
+                        TX32,
+                        &scan32,
+                        &scan32,
+                        3,
+                        bw,
+                        bh
+                    );
+                    match (horz, four) {
+                        (true, false) => INTER_SB_HORZ_HITS.with(|c| c.set(c.get() + 1)),
+                        (false, false) => INTER_SB_VERT_HITS.with(|c| c.set(c.get() + 1)),
+                        (true, true) => INTER_SB_HORZ4_HITS.with(|c| c.set(c.get() + 1)),
+                        (false, true) => INTER_SB_VERT4_HITS.with(|c| c.set(c.get() + 1)),
+                    }
+                }
+                continue;
+            }
             if part64 != PARTITION_SPLIT {
                 return Err(unsupported(
-                    "an inter SB-level partition type other than NONE or SPLIT (this decoder's \
-                     inter tile path recurses a superblock only as SPLIT)",
+                    "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this \
+                     decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, \
+                     VERT, HORZ_4 or VERT_4)",
                 ));
             }
 
@@ -17050,7 +17280,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            at,
+                            sub16_to_mi(at),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -17151,7 +17381,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &mut cdfs,
                                     &mut neighbours,
                                     &mut grid,
-                                    at16,
+                                    sub16_to_mi(at16),
                                     SUB,
                                     mi_cols,
                                     mi_rows,
@@ -17357,7 +17587,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            at32,
+                            sub16_to_mi(at32),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -17410,7 +17640,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 &mut cdfs,
                                 &mut neighbours,
                                 &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2),
+                            sub16_to_mi((r32 as usize * 2 + 1, c32 as usize * 2)),
                                 SUB,
                                 mi_cols,
                                 mi_rows,
@@ -17464,7 +17694,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &mut cdfs,
                                     &mut neighbours,
                                     &mut grid,
-                                    (r32 as usize * 2 + 1, c32 as usize * 2 + 1),
+                                    sub16_to_mi((r32 as usize * 2 + 1, c32 as usize * 2 + 1)),
                                     SUB,
                                     mi_cols,
                                     mi_rows,
@@ -17528,7 +17758,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            at,
+                            sub16_to_mi(at),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -17577,7 +17807,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2),
+                            sub16_to_mi((r32 as usize * 2 + 1, c32 as usize * 2)),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -17631,7 +17861,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            at,
+                            sub16_to_mi(at),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -17680,7 +17910,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            (r32 as usize * 2, c32 as usize * 2 + 1),
+                            sub16_to_mi((r32 as usize * 2, c32 as usize * 2 + 1)),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -17735,7 +17965,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            at,
+                            sub16_to_mi(at),
                             SUB,
                             mi_cols,
                             mi_rows,
@@ -17788,7 +18018,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            (r32 as usize * 2, c32 as usize * 2 + 1),
+                            sub16_to_mi((r32 as usize * 2, c32 as usize * 2 + 1)),
                             SUB,
                             mi_cols,
                             mi_rows,
@@ -17841,7 +18071,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2),
+                            sub16_to_mi((r32 as usize * 2 + 1, c32 as usize * 2)),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -17896,7 +18126,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            at,
+                            sub16_to_mi(at),
                             SUB,
                             mi_cols,
                             mi_rows,
@@ -17949,7 +18179,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2),
+                            sub16_to_mi((r32 as usize * 2 + 1, c32 as usize * 2)),
                             SUB,
                             mi_cols,
                             mi_rows,
@@ -18002,7 +18232,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            (r32 as usize * 2, c32 as usize * 2 + 1),
+                            sub16_to_mi((r32 as usize * 2, c32 as usize * 2 + 1)),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -18058,7 +18288,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            at,
+                            sub16_to_mi(at),
                             BLOCK,
                             mi_cols,
                             mi_rows,
@@ -18107,7 +18337,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            (r32 as usize * 2, c32 as usize * 2 + 1),
+                            sub16_to_mi((r32 as usize * 2, c32 as usize * 2 + 1)),
                             SUB,
                             mi_cols,
                             mi_rows,
@@ -18160,7 +18390,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut cdfs,
                             &mut neighbours,
                             &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2 + 1),
+                            sub16_to_mi((r32 as usize * 2 + 1, c32 as usize * 2 + 1)),
                             SUB,
                             mi_cols,
                             mi_rows,
@@ -18208,6 +18438,49 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             allow_screen_content_tools,
                             frame_width as usize,
                         )?;
+                    }
+                    PARTITION_HORZ_4 | PARTITION_VERT_4 => {
+                        // lane-inter4 r1: four 32x8 / 8x32 inter strips,
+                        // `quarter_step` = 2 mi -- the arm Troy's first inter
+                        // frame stops at (`value=9` = PARTITION_VERT_4).
+                        // `at` is in 16-px cells and cannot name an 8-px
+                        // offset, which is why `decode_inter_block` takes mi
+                        // coordinates now.
+                        let horz = part32 == PARTITION_HORZ_4;
+                        let base_mi = (at.0 * (SUB / MI), at.1 * (SUB / MI));
+                        let (bw, bh) = if horz { (32usize, 8usize) } else { (8, 32) };
+                        for i in 0..4 {
+                            let strip_mi = if horz {
+                                (base_mi.0 + i * 2, base_mi.1)
+                            } else {
+                                (base_mi.0, base_mi.1 + i * 2)
+                            };
+                            if i > 0
+                                && (strip_mi.0 >= mi_rows as usize
+                                    || strip_mi.1 >= mi_cols as usize)
+                            {
+                                break;
+                            }
+                            inter_piece!(
+                                strip_mi,
+                                BLOCK,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                bw,
+                                bh
+                            );
+                            if horz {
+                                RECT4_32_HORZ_INTER_HITS.with(|c| c.set(c.get() + 1));
+                            } else {
+                                RECT4_32_VERT_INTER_HITS.with(|c| c.set(c.get() + 1));
+                            }
+                        }
                     }
                     _ => {
                         return Err(unsupported(format!(
@@ -19296,7 +19569,7 @@ mod tests {
             &mut cdfs,
             &mut neighbours,
             &mut grid,
-            (r, c),
+            sub16_to_mi((r, c)),
             side,
             mi_cols,
             mi_rows,
