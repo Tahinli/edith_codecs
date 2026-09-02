@@ -47,6 +47,26 @@ const SUB: usize = 16;
 /// The side of a superblock, which is what the partition tree starts from.
 pub(crate) const SUPERBLOCK: usize = 64;
 
+// lane-sb128 r1: the superblock size in samples the intra-reach rules
+// (`has_top_right`/`has_bottom_left`) are answered against. libaom masks the
+// block's mi position with `mi_size_wide[cm->seq_params->sb_size] - 1` and
+// tests the "top row"/"rightmost column" of THAT superblock, so a 128x128
+// superblock changes every answer inside it (the tables themselves are
+// already laid out 128-relative -- see `Reach::table_stride`). [`SUPERBLOCK`]
+// stays the encoder's own fixed 64.
+thread_local! {
+    static REACH_SB_PX: std::cell::Cell<usize> = const { std::cell::Cell::new(SUPERBLOCK) };
+}
+
+/// Sets the superblock size [`Reach`] answers against (64 or 128).
+pub(crate) fn set_reach_superblock_px(px: usize) {
+    REACH_SB_PX.with(|c| c.set(px));
+}
+
+fn reach_sb_px() -> usize {
+    REACH_SB_PX.with(|c| c.get())
+}
+
 /// How heavily the mode search weighs rate against squared error, in units of
 /// the quantizer's reconstruction step squared per bit.
 ///
@@ -1300,19 +1320,19 @@ impl Reach {
     /// the transform covering the whole block, luma): everything before the
     /// table lookup is that function's own early-exit ladder.
     fn top_right_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
-        const SB_MI: usize = SUPERBLOCK / 4;
+        let sb_mi: usize = reach_sb_px() / 4;
         let (mi_row, mi_col) = (y / 4, x / 4);
         let bw_log2 = (bw / 4).trailing_zeros() as usize;
         let bh_log2 = (bh / 4).trailing_zeros() as usize;
-        let blk_row = (mi_row & (SB_MI - 1)) >> bh_log2;
-        let blk_col = (mi_col & (SB_MI - 1)) >> bw_log2;
+        let blk_row = (mi_row & (sb_mi - 1)) >> bh_log2;
+        let blk_col = (mi_col & (sb_mi - 1)) >> bw_log2;
         // Top row of the superblock: the top-right pixels are in the (already
         // decoded) superblock above.
         if blk_row == 0 {
             return true;
         }
         // Rightmost column: they fall in the superblock to the right.
-        if ((blk_col + 1) << bw_log2) >= SB_MI {
+        if ((blk_col + 1) << bw_log2) >= sb_mi {
             return false;
         }
         let table = rect_reach_tables(bw, bh).0;
@@ -1333,20 +1353,20 @@ impl Reach {
 
     /// libaom `has_bottom_left`, same granularity as [`Self::top_right_rect`].
     fn bottom_left_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
-        const SB_MI: usize = SUPERBLOCK / 4;
+        let sb_mi: usize = reach_sb_px() / 4;
         let (mi_row, mi_col) = (y / 4, x / 4);
         let bw_log2 = (bw / 4).trailing_zeros() as usize;
         let bh_log2 = (bh / 4).trailing_zeros() as usize;
-        let blk_row = (mi_row & (SB_MI - 1)) >> bh_log2;
-        let blk_col = (mi_col & (SB_MI - 1)) >> bw_log2;
+        let blk_row = (mi_row & (sb_mi - 1)) >> bh_log2;
+        let blk_col = (mi_col & (sb_mi - 1)) >> bw_log2;
         // Leftmost column of the superblock: the bottom-left pixels are in
         // the left superblock iff they stay inside its height.
         if blk_col == 0 {
-            return (blk_row << bh_log2) + (bh / 4) < SB_MI;
+            return (blk_row << bh_log2) + (bh / 4) < sb_mi;
         }
         // Bottom row (and not the leftmost column): they fall in the
         // superblock below, which is not decoded yet.
-        if ((blk_row + 1) << bh_log2) >= SB_MI {
+        if ((blk_row + 1) << bh_log2) >= sb_mi {
             return false;
         }
         let table = rect_reach_tables(bw, bh).1;
@@ -1420,7 +1440,7 @@ impl Reach {
     fn bottom_left(side: usize, x: usize, y: usize) -> bool {
         let (row, col, per_side) = Self::position(side, x, y);
         if col == 0 {
-            return row * side + side < SUPERBLOCK;
+            return row * side + side < reach_sb_px();
         }
         if row + 1 == per_side {
             return false;
@@ -1451,11 +1471,8 @@ impl Reach {
     /// Where a block sits inside its superblock, in blocks of its own size,
     /// and how many of them a superblock is across.
     fn position(side: usize, x: usize, y: usize) -> (usize, usize, usize) {
-        (
-            (y % SUPERBLOCK) / side,
-            (x % SUPERBLOCK) / side,
-            SUPERBLOCK / side,
-        )
+        let sb = reach_sb_px();
+        ((y % sb) / side, (x % sb) / side, sb / side)
     }
 
     /// The row stride `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` index by: libaom pins
