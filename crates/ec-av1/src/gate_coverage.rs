@@ -249,12 +249,7 @@ const NEVER_ON_8BIT: &[(&str, &str)] = &[];
 
 /// [`DEFAULT_ON_TOOLS`] entries no 10-bit gate spells on, with the reason.
 #[cfg(test)]
-const NEVER_ON_10BIT: &[(&str, &str)] = &[
-    (
-        "enable-diff-wtd-comp",
-        "on in no 10-bit gate: 1 pinned off, 14 defaulted -- lane-defon r1 closed the 8-bit hole on the masked-compound gate (diffwtd_hits) and added a 10-bit one-sided-compound gate, but the 10-bit fixture source is `gradients`, whose smooth content never wins a difference-weighted mask (measured 8/8 pixel-exact, diffwtd_hits == 0); it needs a mandelbrot fixture in ten_bit_tool_gate",
-    ),
-];
+const NEVER_ON_10BIT: &[(&str, &str)] = &[];
 
 #[cfg(test)]
 mod tests {
