@@ -816,8 +816,7 @@ pub fn find_mv_stack_with_sign_bias(
             &mut newmv_count,
             &mut processed_cols,
         );
-    let found_top_right = has_top_right(mi_row, mi_col, bw4, bh4)
-        && scan_top_right(
+    let found_top_right = scan_top_right(
             grid,
             mi_row,
             mi_col,
@@ -1576,8 +1575,7 @@ pub fn find_mv_stack_compound(
             &mut newmv_count,
             &mut processed_cols,
         );
-    let found_top_right = has_top_right(mi_row, mi_col, bw4, bh4)
-        && scan_top_right_compound(
+    let found_top_right = scan_top_right_compound(
             grid,
             mi_row,
             mi_col,
