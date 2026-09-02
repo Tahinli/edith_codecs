@@ -2543,6 +2543,28 @@ thread_local! {
     static SUB8_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-cdef r1: (a) how many 8x8 CDEF units `apply_cdef` EXCLUDED because all
+// four of their mi cells are `skip_txfm` (libaom `cdef.c:29-38`
+// `is_8x8_block_skip` / `av1_cdef_compute_sb_list`'s dlist test), and (b) how
+// many 8x8 inter leaves (`decode_inter_block8`) wrote that skip band at all.
+// (b) was 0 for every stream before this round -- the leaf path never touched
+// the band, so an all-skip 8x8 group kept the PREVIOUS frame's flags and got
+// filtered where libaom skips it. A gate asserts both are non-zero.
+thread_local! {
+    static CDEF_SKIPPED_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER8_SKIP_BAND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `CDEF_SKIPPED_UNITS`.
+pub(crate) fn cdef_skipped_units() -> usize {
+    CDEF_SKIPPED_UNITS.with(|c| c.get())
+}
+
+/// Current value of `INTER8_SKIP_BAND_HITS`.
+pub(crate) fn inter8_skip_band_hits() -> usize {
+    INTER8_SKIP_BAND_HITS.with(|c| c.get())
+}
+
 /// Current value of [`SUB8_SPLIT_HITS`].
 pub(crate) fn sub8_split_hits() -> usize {
     SUB8_SPLIT_HITS.with(|c| c.get())
@@ -8822,7 +8844,7 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, fh: usize) {
     use std::io::Write;
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for (p, w, h) in [(y, fw, fh), (u, fw.div_ceil(2), fh.div_ceil(2)), (v, fw.div_ceil(2), fh.div_ceil(2))] {
             for row in 0..h {
@@ -8836,10 +8858,25 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
     }
 }
 
+/// Decode-order index of the next [`dump_stage`]/[`dump_stage16`] file for a
+/// given env var -- lane-cdef r1: both used to write `.f0` unconditionally, so
+/// every frame overwrote the previous one and only the LAST frame survived,
+/// which silently defeats any per-frame filter-stage bisection.
+fn dump_stage_idx(var: &str) -> usize {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static IDX: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    let mut m = IDX.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let e = m.entry(var.to_string()).or_insert(0);
+    let i = *e;
+    *e += 1;
+    i
+}
+
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for p in [y, u, v] {
             let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
@@ -10352,6 +10389,7 @@ fn decode_leaf8(
         neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
         neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
     }
+    INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
@@ -12664,6 +12702,9 @@ fn apply_cdef(
     while mi_r < skip_grid.mi_rows {
         let mut mi_c = 0usize;
         while mi_c < skip_grid.mi_cols {
+            if skip_grid.is_skip_txfm(mi_r, mi_c) {
+                CDEF_SKIPPED_UNITS.with(|c| c.set(c.get() + 1));
+            }
             if !skip_grid.is_skip_txfm(mi_r, mi_c) {
                 let sidx = strength_idx(mi_r, mi_c);
                 let (ox, oy) = (mi_c * 4, mi_r * 4);
@@ -12676,10 +12717,15 @@ fn apply_cdef(
                         i32::from(src_y[ny as usize * y_stride + nx as usize])
                     }
                 };
-                let (dir, var) = cdef_find_dir(coeff_shift, |r, c| {
-                    let (ny, nx) = ((oy + r).min(y_true_h - 1), (ox + c).min(y_true_w - 1));
-                    i32::from(src_y[ny * y_stride + nx])
-                });
+                // lane-cdef r1: the direction search reads the SAME padded
+                // block the taps do -- libaom runs `cdef_find_dir` on the
+                // prepared filter block (`cdef_block.c:296-320` over
+                // `cdef_prepare_fb`'s buffer, `cdef.c:249-256`), whose columns
+                // and rows past the mi-rounded frame extent are CDEF_VERY_LARGE.
+                // Clamping to the last real sample instead made every straddling
+                // edge 8x8 (odd `mi_cols`/`mi_rows`) pick a different var, hence
+                // a different `adjust_strength`, hence a +-1 band at the crop edge.
+                let (dir, var) = cdef_find_dir(coeff_shift, |r, c| sample_y(r as i32, c as i32));
 
                 // libaom `av1_cdef_filter_fb` passes `pri_strength ? dir : 0`
                 // -- each plane zeroes the shared direction when *its own*
@@ -12689,6 +12735,12 @@ fn apply_cdef(
                 let y_sec_strength = i32::from(cdef.y_sec_strength[sidx]) << coeff_shift;
                 let y_dir = if y_pri_strength != 0 { dir } else { 0 };
                 let t = cdef_adjust_strength(y_pri_strength, var);
+                // lane-cdef r1 rung: one line per filtered 8x8 luma CDEF unit.
+                if std::env::var_os("EC_AV1_CDEF_DBG").is_some() {
+                    eprintln!(
+                        "EC_CDEF mi_r={mi_r} mi_c={mi_c} x={ox} y={oy} sidx={sidx} dir={dir} var={var} t={t} pri={y_pri_strength} sec={y_sec_strength} damp={damping}"
+                    );
+                }
                 let enable_primary = t != 0;
                 let enable_secondary = y_sec_strength != 0;
                 if enable_primary || enable_secondary {
@@ -19669,6 +19721,14 @@ fn decode_inter_block8(
                 // so the 16x16 below a split block read partition ctx 0
                 // instead of 1 and mis-read PARTITION_SPLIT as NONE.
                 neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+                // lane-cdef r1: ... and the CDEF skip band too. `apply_cdef`'s
+                // `is_8x8_block_skip` (libaom `cdef.c:29-38`) reads all four mi
+                // cells of the 8x8; this leaf wrote none of them, so a 64x64
+                // whose bottom-right 16x16 is an all-skip 8x8-leaf group kept
+                // the PREVIOUS frame's flags and got filtered where libaom's
+                // dlist excludes it (3 luma samples on a 192x128 inter frame).
+                INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
+                neighbours.fill_skip_grid(leaf_mi, 2, skip);
                 neighbours.fill_lf_grid(
                     leaf_mi,
                     2,
@@ -20474,6 +20534,10 @@ fn decode_inter_block8(
     // lane-gmaffine r2: the deblock grid's ref id is the leaf's OWN reference
     // (r1 taught this leaf non-LAST refs; the hardcoded LAST_FRAME made every
     // GOLDEN/ALTREF leaf read as LAST at the loop-filter's ref/mv edge test).
+    // lane-cdef r1: the fall-through twin of the compound arm's skip-band
+    // write above -- `skip` is one flag for the whole 8x8 leaf (read at
+    // `decode.rs`'s `skip_ctx` site), `split8` only splits its transform.
+    neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(
         leaf_mi,
         2,
