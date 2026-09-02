@@ -92,6 +92,36 @@ pub(crate) fn tmv_hits() -> usize {
     TMV_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// lane-mvtwin r1 firing counters, one per divergence this round closed.
+/// `COMP_GM_FILL_HITS`: compound extension candidates whose `comp_list` slot
+/// came from `gm_mv_candidates[side]` rather than a scanned neighbour, and
+/// where that global mv was NOT `(0, 0)` (the only case the old zero fill
+/// could not fake). `STACK_FULL_DROPS`: distinct candidates libaom drops at
+/// `MAX_REF_MV_STACK_SIZE` on insertion. `TILE_REACH_CLIPS`: row/col reaches
+/// shortened by a tile origin past mi 0, which the old frame-edge clamp
+/// missed entirely.
+static COMP_GM_FILL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static STACK_FULL_DROPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static TILE_REACH_CLIPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// [`COMP_GM_FILL_HITS`].
+pub(crate) fn comp_gm_fill_hits() -> usize {
+    COMP_GM_FILL_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`STACK_FULL_DROPS`].
+pub(crate) fn stack_full_drops() -> usize {
+    STACK_FULL_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`TILE_REACH_CLIPS`].
+pub(crate) fn tile_reach_clips() -> usize {
+    TILE_REACH_CLIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Everything [`find_mv_stack_with_sign_bias`] needs to fold temporal MV
 /// candidates into a block's stack (spec 7.10.2.8, only reached when the
 /// frame header's own `use_ref_frame_mvs` is set): the current frame's own
@@ -213,6 +243,14 @@ impl MiGrid {
         self.tile_col1 = col1;
     }
 
+    /// The current tile's top-left mi-unit origin ([`Self::set_tile_bounds`]).
+    /// libaom's `tile->mi_row_start`/`mi_col_start`, which every availability
+    /// and reach clamp in `setup_ref_mv_list` is written against
+    /// (`xd->up_available`, `find_valid_row_offset`, mvref_common.c:512-528).
+    pub fn tile_origin(&self) -> (usize, usize) {
+        (self.tile_row0, self.tile_col0)
+    }
+
     /// Records the unit at `(row, col)`. Out-of-range coordinates are a
     /// no-op — the caller only ever addresses units inside the grid it built.
     pub fn set(&mut self, row: usize, col: usize, info: MiInfo) {
@@ -313,7 +351,15 @@ const MVREF_ROW_COLS: usize = 3;
 fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) {
     if let Some(entry) = candidates.iter_mut().find(|e| e.mv == mv) {
         entry.weight += weight;
+    } else if candidates.len() >= MAX_STACK_SIZE {
+        STACK_FULL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
+        // libaom `add_ref_mv_candidate` (mvref_common.c:100) and
+        // `add_tpl_ref_mv` (:388) only push when
+        // `*refmv_count < MAX_REF_MV_STACK_SIZE` -- the 9th distinct MV is
+        // DROPPED AT INSERTION, never "kept if it outweighs an earlier one".
+        // Sorting first and truncating afterwards (what this did) keeps a
+        // different set whenever more than 8 distinct candidates are seen.
         candidates.push(StackEntry { mv, weight });
     }
 }
@@ -773,22 +819,35 @@ pub fn find_mv_stack_with_sign_bias(
     // nothing here relies on that.
     let row_adj = bh4 < 2 && mi_row % 2 == 1;
     let col_adj = bw4 < 2 && mi_col % 2 == 1;
-    let max_row_offset: isize = if mi_row > 0 {
+    // r1 (lane-mvtwin): availability and reach are TILE-relative, never
+    // frame-relative -- libaom's `xd->up_available`/`left_available` are
+    // `mi_row > tile->mi_row_start` / `mi_col > tile->mi_col_start`, and
+    // `find_valid_row_offset`/`find_valid_col_offset` (mvref_common.c:512-528)
+    // clamp the reach to `tile->mi_row_start - mi_row`. Clamping to the FRAME
+    // edge left `max_row_offset`/`max_col_offset` too long inside every tile
+    // that does not start at 0, which changes the row/col scan's `inc` weight
+    // (and so the stack ORDER) even though `MiGrid::get` already returns
+    // `None` for the cells outside the tile.
+    let (tile_row0, tile_col0) = grid.tile_origin();
+    if tile_row0 > 0 || tile_col0 > 0 {
+        TILE_REACH_CLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let max_row_offset: isize = if mi_row > tile_row0 {
         let reach = if bh4 < 2 { -4 } else { -6 } + isize::from(row_adj);
-        reach.max(-(mi_row as isize))
+        reach.max(tile_row0 as isize - mi_row as isize)
     } else {
         0
     };
-    let max_col_offset: isize = if mi_col > 0 {
+    let max_col_offset: isize = if mi_col > tile_col0 {
         let reach = if bw4 < 2 { -4 } else { -6 } + isize::from(col_adj);
-        reach.max(-(mi_col as isize))
+        reach.max(tile_col0 as isize - mi_col as isize)
     } else {
         0
     };
 
     let mut processed_rows = 0usize;
     let mut processed_cols = 0usize;
-    let found_above = mi_row > 0
+    let found_above = max_row_offset.unsigned_abs() >= 1
         && scan_row(
             grid,
             mi_row,
@@ -802,7 +861,7 @@ pub fn find_mv_stack_with_sign_bias(
             &mut newmv_count,
             &mut processed_rows,
         );
-    let found_left = mi_col > 0
+    let found_left = max_col_offset.unsigned_abs() >= 1
         && scan_col(
             grid,
             mi_row,
@@ -1227,7 +1286,12 @@ fn add_compound_candidate(
 ) {
     if let Some(entry) = candidates.iter_mut().find(|e| e.mv0 == mv0 && e.mv1 == mv1) {
         entry.weight += weight;
+    } else if candidates.len() >= MAX_STACK_SIZE {
+        STACK_FULL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else {
+        // Same insertion cap as [`add_candidate`]: libaom's compound branch
+        // of `add_ref_mv_candidate` (mvref_common.c:128) and `add_tpl_ref_mv`
+        // (:425) both gate the push on `*refmv_count < MAX_REF_MV_STACK_SIZE`.
         candidates.push(CompoundStackEntry { mv0, mv1, weight });
     }
 }
@@ -1477,22 +1541,18 @@ fn process_compound_ref_mv_candidate(
 /// libaom's combine step (`setup_ref_mv_list`, `mvref_common.c` ~696-720):
 /// zips each side's `ref_id` (exact matches) then `ref_diff` (borrowed,
 /// sign-flipped) entries, position-wise and independently per side, into up
-/// to two full `(mv0, mv1)` pair candidates — missing slots default to
-/// `(0, 0)`, matching libaom's zero-initialized `combined_mvs`.
+/// to two full `(mv0, mv1)` pair candidates. r1 (lane-mvtwin): slots past
+/// both lists are filled with THAT SIDE's own global motion vector
+/// (`gm_mv_candidates[idx]`, mvref_common.c:718-719), never `(0, 0)` — the
+/// exact gap the single-reference twin closed in r6 for its own
+/// `mv_ref_list` tail, still open on this side. Invisible while every live
+/// reference's global motion is IDENTITY (an unclamped gm mv of exactly
+/// `(0,0)`), wrong the moment a compound pair names a ROTZOOM/AFFINE
+/// reference and the scans leave the stack short.
 fn combine_compound_candidates(
     lists: &CompoundRefLists,
     gm_mv_candidates: [(i32, i32); 2],
 ) -> [((i32, i32), (i32, i32)); 2] {
-    // lane-sbrect10 r2: the tail slots libaom leaves after `ref_id` and
-    // `ref_diff` are filled with that side's GLOBAL MOTION vector, never with
-    // zero (`setup_ref_mv_list`, mvref_common.c:723-729:
-    // `for (; comp_idx < MAX_MV_REF_CANDIDATES; ++comp_idx)
-    //      comp_list[comp_idx][idx] = gm_mv_candidates[idx];`).
-    // Zero-filling was right only under IDENTITY global motion, which the
-    // module doc's original reduction assumed; aomenc turns global motion on
-    // by default, so a compound block with no usable neighbour pair took a
-    // (0, 0) predictor where libaom took the frame's translation -- silently
-    // wrong pixels with the entropy stream still in sync.
     let side_slots = |side: usize| -> [(i32, i32); 2] {
         let merged: Vec<(i32, i32)> = lists.ref_id[side]
             .iter()
@@ -1500,7 +1560,14 @@ fn combine_compound_candidates(
             .take(2)
             .copied()
             .collect();
-        std::array::from_fn(|i| merged.get(i).copied().unwrap_or(gm_mv_candidates[side]))
+        std::array::from_fn(|i| {
+            merged.get(i).copied().unwrap_or_else(|| {
+                if gm_mv_candidates[side] != (0, 0) {
+                    COMP_GM_FILL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                gm_mv_candidates[side]
+            })
+        })
     };
     let side0 = side_slots(0);
     let side1 = side_slots(1);
@@ -1545,22 +1612,35 @@ pub fn find_mv_stack_compound(
 
     let row_adj = bh4 < 2 && mi_row % 2 == 1;
     let col_adj = bw4 < 2 && mi_col % 2 == 1;
-    let max_row_offset: isize = if mi_row > 0 {
+    // r1 (lane-mvtwin): availability and reach are TILE-relative, never
+    // frame-relative -- libaom's `xd->up_available`/`left_available` are
+    // `mi_row > tile->mi_row_start` / `mi_col > tile->mi_col_start`, and
+    // `find_valid_row_offset`/`find_valid_col_offset` (mvref_common.c:512-528)
+    // clamp the reach to `tile->mi_row_start - mi_row`. Clamping to the FRAME
+    // edge left `max_row_offset`/`max_col_offset` too long inside every tile
+    // that does not start at 0, which changes the row/col scan's `inc` weight
+    // (and so the stack ORDER) even though `MiGrid::get` already returns
+    // `None` for the cells outside the tile.
+    let (tile_row0, tile_col0) = grid.tile_origin();
+    if tile_row0 > 0 || tile_col0 > 0 {
+        TILE_REACH_CLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let max_row_offset: isize = if mi_row > tile_row0 {
         let reach = if bh4 < 2 { -4 } else { -6 } + isize::from(row_adj);
-        reach.max(-(mi_row as isize))
+        reach.max(tile_row0 as isize - mi_row as isize)
     } else {
         0
     };
-    let max_col_offset: isize = if mi_col > 0 {
+    let max_col_offset: isize = if mi_col > tile_col0 {
         let reach = if bw4 < 2 { -4 } else { -6 } + isize::from(col_adj);
-        reach.max(-(mi_col as isize))
+        reach.max(tile_col0 as isize - mi_col as isize)
     } else {
         0
     };
 
     let mut processed_rows = 0usize;
     let mut processed_cols = 0usize;
-    let found_above = mi_row > 0
+    let found_above = max_row_offset.unsigned_abs() >= 1
         && scan_row_compound(
             grid,
             mi_row,
@@ -1574,7 +1654,7 @@ pub fn find_mv_stack_compound(
             &mut newmv_count,
             &mut processed_rows,
         );
-    let found_left = mi_col > 0
+    let found_left = max_col_offset.unsigned_abs() >= 1
         && scan_col_compound(
             grid,
             mi_row,
@@ -1815,10 +1895,8 @@ pub fn find_mv_stack_compound(
         // bump) — otherwise append `comp_list[0]` as a brand-new entry. When
         // the stack is empty, both `comp_list[0]` and `comp_list[1]` are
         // appended unconditionally, with no dedup check at all.
-        let comp_list = combine_compound_candidates(
-            &lists,
-            [gm_mv(gm, ref_frame.0), gm_mv(gm, ref_frame.1)],
-        );
+        let comp_list =
+            combine_compound_candidates(&lists, [gm_mv(gm, ref_frame.0), gm_mv(gm, ref_frame.1)]);
         if candidates.len() == 1 {
             let (mv0, mv1) = if comp_list[0] == (candidates[0].mv0, candidates[0].mv1) {
                 comp_list[1]
@@ -2926,5 +3004,92 @@ mod tests {
         // ref_id match.
         assert_eq!(stack.entries[1].mv0, (-3, -3));
         assert_eq!(stack.entries[1].mv1, (7, 7));
+    }
+
+    /// lane-mvtwin r1, defect 1 (twin drift, compound only): libaom fills a
+    /// `comp_list` slot past both `ref_id`/`ref_diff` lists with THAT SIDE's
+    /// own `gm_mv_candidates[idx]` (mvref_common.c:718-719). This module
+    /// filled it with `(0, 0)`, which is only accidentally right while every
+    /// live reference's global motion is IDENTITY -- the single-ref twin had
+    /// already closed the same gap on its own `mv_ref_list` tail in r6.
+    #[test]
+    fn a_missing_compound_combine_slot_takes_that_sides_global_mv_not_zero() {
+        let lists = CompoundRefLists::default();
+        let combined = combine_compound_candidates(&lists, [(9, -5), (-11, 3)]);
+        assert_eq!(combined[0], ((9, -5), (-11, 3)));
+        assert_eq!(combined[1], ((9, -5), (-11, 3)));
+        // One side supplied, the other short: only the short side falls back.
+        let mut half = CompoundRefLists::default();
+        half.ref_id[0].push((1, 2));
+        let combined = combine_compound_candidates(&half, [(9, -5), (-11, 3)]);
+        assert_eq!(combined[0], ((1, 2), (-11, 3)));
+        assert_eq!(combined[1], ((9, -5), (-11, 3)));
+    }
+
+    /// lane-mvtwin r1, defect 2 (both twins): libaom drops the 9th distinct
+    /// candidate AT INSERTION (`*refmv_count < MAX_REF_MV_STACK_SIZE`,
+    /// mvref_common.c:100/128/388/425). Pushing everything and truncating
+    /// after the weight sort keeps a different set: here the heavy 9th
+    /// candidate would survive and evict a scanned one.
+    #[test]
+    fn the_ninth_distinct_candidate_is_dropped_at_insertion_not_after_sorting() {
+        let mut candidates = Vec::new();
+        for i in 0..MAX_STACK_SIZE as i32 {
+            add_candidate(&mut candidates, (i, i), 2);
+        }
+        let before = stack_full_drops();
+        add_candidate(&mut candidates, (99, 99), 10_000);
+        assert_eq!(candidates.len(), MAX_STACK_SIZE);
+        assert!(!candidates.iter().any(|e| e.mv == (99, 99)));
+        assert_eq!(stack_full_drops(), before + 1);
+        // A full stack still takes the dedup weight bump libaom applies
+        // before the cap check.
+        add_candidate(&mut candidates, (0, 0), 6);
+        assert_eq!(candidates[0].weight, 8);
+
+        let mut comp = Vec::new();
+        for i in 0..MAX_STACK_SIZE as i32 {
+            add_compound_candidate(&mut comp, (i, i), (i, -i), 2);
+        }
+        add_compound_candidate(&mut comp, (99, 99), (99, 99), 10_000);
+        assert_eq!(comp.len(), MAX_STACK_SIZE);
+    }
+
+    /// lane-mvtwin r1, defect 3 (both twins): the row/col reach is clamped to
+    /// the TILE origin (`find_valid_row_offset`, mvref_common.c:512-528), not
+    /// the frame edge. `MiGrid::get` already hides the out-of-tile cells, so
+    /// the only visible symptom is the scan WEIGHT (`inc`) -- and through it
+    /// the stack order. Query at mi_row 9 with the tile starting at row 8:
+    /// the real reach is -1, so `inc = 1` and the weight stays at the floor
+    /// 2; the frame-edge clamp gave -6, `inc = min(6, size_h) = 4`, doubling
+    /// the vote.
+    #[test]
+    fn the_row_reach_is_clamped_to_the_tile_origin_not_the_frame_edge() {
+        let weight_with_tile_origin = |row0: usize| {
+            // A neighbour at least as wide as the query block (`bw4 <= n4`)
+            // is what makes libaom compute `inc` at all.
+            let wide = MiInfo {
+                size: 4,
+                size_h: 4,
+                ..inter((5, 5))
+            };
+            let mut grid = MiGrid::new(16, 16);
+            grid.set(8, 4, wide);
+            grid.set(8, 6, wide);
+            grid.set_tile_bounds(row0, 0, 16, 16);
+            let stack = find_mv_stack(&grid, 9, 4, 2, 2, LAST_FRAME, 16, 16);
+            assert_eq!(stack.entries.len(), 1);
+            stack.entries[0].weight
+        };
+        let tiled = weight_with_tile_origin(8);
+        let whole_frame = weight_with_tile_origin(0);
+        // One scanned row cell (`end_mi == bw4 == 2`, `len == 2`) plus the
+        // top-right probe's own flat `CORNER_WEIGHT`, which the reach never
+        // touches -- so the whole delta below is the row scan's `inc`.
+        // reach -1 -> inc 1 -> weight stays at the floor 2.
+        assert_eq!(tiled, REF_CAT_LEVEL + 2 * 2 + CORNER_WEIGHT);
+        // frame-edge clamp: reach -6 -> inc min(6, size_h) = 4.
+        assert_eq!(whole_frame, REF_CAT_LEVEL + 2 * 4 + CORNER_WEIGHT);
+        assert_ne!(tiled, whole_frame);
     }
 }
