@@ -761,3 +761,74 @@ s = s.replace(anchor, anchor + probe, 1)
 open(path, "w").write(s)
 print("decodemv rung 13 (EC_MODE_MV + EC_MODE_VAL stack=) instrumented")
 PYMV
+
+# --- rung 14: temporal-MV (MFMV) ground truth (lane-interbis, scripted by ----
+# --- lane-refstamp r1) -----------------------------------------------------
+# lane-interbis patched the live oracle tree BY HAND for its motion-field hunt,
+# so these two probes lived only in ~/.cache/aom-oracle/src and a rebuild from
+# this script would have dropped them (class: instrument that lives only in a
+# build tree -- same reason rung 13 exists).
+#   * EC_TRACE_TPL=1 -> "EC_TPL mi_row=.. mi_col=.. blk=(..,..) mfmv0=(..,..)
+#     rfo=.." (or ".. INVALID") for every temporal candidate `add_tpl_ref_mv`
+#     probes -- the reference's own projected motion field, cell by cell, to
+#     compare against ours (EC_TRACE_TPL on our side).
+#   * the resolved MV STACK itself, one "EC_STACK mi_row=.. mi_col=.. ref=..
+#     i=.. this=(..,..) comp=(..,..) w=.." line per entry, printed under rung
+#     4's EC_TRACE_MODE right after EC_MODE_VAL (rung 13 only prints the
+#     stack DEPTH).
+python3 - "$SRC/av1/common/mvref_common.c" <<'PYT'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_TRACE_TPL" in s:
+    print("mvref_common rung 14 already applied (no-op)")
+    sys.exit(0)
+old = "  if (prev_frame_mvs->mfmv0.as_int == INVALID_MV) return 0;\n"
+assert old in s, "add_tpl_ref_mv's INVALID_MV early return moved"
+new = """  if (prev_frame_mvs->mfmv0.as_int == INVALID_MV) {
+    if (getenv("EC_TRACE_TPL"))
+      fprintf(stderr, "EC_TPL mi_row=%d mi_col=%d blk=(%d,%d) INVALID\\n",
+              mi_row, mi_col, blk_row, blk_col);
+    return 0;
+  }
+  if (getenv("EC_TRACE_TPL"))
+    fprintf(stderr,
+            "EC_TPL mi_row=%d mi_col=%d blk=(%d,%d) mfmv0=(%d,%d) rfo=%d\\n",
+            mi_row, mi_col, blk_row, blk_col, prev_frame_mvs->mfmv0.as_mv.row,
+            prev_frame_mvs->mfmv0.as_mv.col, prev_frame_mvs->ref_frame_offset);
+"""
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("mvref_common rung 14 (EC_TPL) instrumented")
+PYT
+
+python3 - "$SRC/av1/decoder/decodemv.c" <<'PYST'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_STACK mi_row" in s:
+    print("decodemv rung 14 already applied (no-op)")
+    sys.exit(0)
+assert "EC_MODE_MV" in s, "rung 14 needs rung 13 (run this script top to bottom)"
+anchor = """            /* EC_STACK */ (int)dcb->ref_mv_count[av1_ref_frame_type(mbmi->ref_frame)],
+            (unsigned)r->ec.rng);
+"""
+assert s.count(anchor) == 1, "rung 13's EC_MODE_VAL body moved"
+dump = """    /* EC_INSTRUMENTED lane-interbis: the resolved mv stack itself */
+    const MV_REFERENCE_FRAME ec_rt = av1_ref_frame_type(mbmi->ref_frame);
+    for (int ec_i = 0; ec_i < dcb->ref_mv_count[ec_rt]; ec_i++) {
+      fprintf(stderr,
+              "EC_STACK mi_row=%d mi_col=%d ref=%d i=%d this=(%d,%d) "
+              "comp=(%d,%d) w=%d\\n",
+              ec_xd->mi_row, ec_xd->mi_col, (int)ec_rt, ec_i,
+              ec_xd->ref_mv_stack[ec_rt][ec_i].this_mv.as_mv.row,
+              ec_xd->ref_mv_stack[ec_rt][ec_i].this_mv.as_mv.col,
+              ec_xd->ref_mv_stack[ec_rt][ec_i].comp_mv.as_mv.row,
+              ec_xd->ref_mv_stack[ec_rt][ec_i].comp_mv.as_mv.col,
+              ec_xd->weight[ec_rt][ec_i]);
+    }
+"""
+s = s.replace(anchor, anchor + dump, 1)
+open(path, "w").write(s)
+print("decodemv rung 14 (per-entry EC_STACK) instrumented")
+PYST

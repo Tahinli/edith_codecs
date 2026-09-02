@@ -149,10 +149,6 @@ const ALIASES: &[(&str, &str)] = &[("superres-mode", "enable-superres")];
 #[cfg(test)]
 const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     (
-        "enable-angle-delta",
-        "off in 36 gates, on in none: the directional-intra gates pin it off to isolate the base modes",
-    ),
-    (
         "enable-cfl-intra",
         "off in 41 gates, on in none: chroma-from-luma prediction is unimplemented",
     ),
@@ -179,10 +175,6 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     (
         "enable-rect-tx",
         "never spelled; rect transforms reach the decoder only through partition shape, never through a gate that names the tool",
-    ),
-    (
-        "enable-ref-frame-mvs",
-        "off in 27 gates, on in none: temporal MV projection is unimplemented",
     ),
     (
         "enable-tx64",
@@ -215,10 +207,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // lane-tx64x16 r4's 32-level 1:4 gate has a 10-bit arm that asserts both
     // orientations and coded strips inside pixel-exact attempts.
     (
-        "enable-angle-delta",
-        "hole at both depths, see the 8-bit list",
-    ),
-    (
         "enable-cfl-intra",
         "hole at both depths, see the 8-bit list",
     ),
@@ -234,10 +222,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // 1D tx class).
     ("enable-intrabc", "hole at both depths, see the 8-bit list"),
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
-    (
-        "enable-ref-frame-mvs",
-        "hole at both depths, see the 8-bit list",
-    ),
     ("enable-tx64", "hole at both depths, see the 8-bit list"),
 ];
 
