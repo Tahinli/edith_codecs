@@ -2232,6 +2232,89 @@ pub(crate) fn rect4_coeff_hits() -> usize {
     RECT4_COEFF_HITS.with(|c| c.get())
 }
 
+// lane-inter16ab r1: how many 16x16-level AB partitions fired IN AN INTER
+// frame, per arm, in `PARTITION_HORZ_A`, `_HORZ_B`, `_VERT_A`, `_VERT_B`
+// order (the intra-frame counterpart is `AB16_HITS`). Each arm is two 8x8
+// inter leaves (`decode_inter_block8`) plus one true 16x8/8x16 inter strip
+// (`decode_inter_block` with `write_w`/`write_h`); the gate asserts every
+// arm separately so a run whose RD only picked one cannot pass as proof of
+// four.
+thread_local! {
+    static AB16_INTER_HITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// [`AB16_INTER_HITS`] per arm (HORZ_A, HORZ_B, VERT_A, VERT_B at 16x16 in an
+/// inter frame).
+pub fn ab16_inter_hits_by_arm() -> [usize; 4] {
+    AB16_INTER_HITS.with(std::cell::Cell::get)
+}
+
+// lane-inter16ab r2: the 16x16-level 1:4 pair as INTER blocks -- four 16x4
+// (`PARTITION_HORZ_4`) or 4x16 (`PARTITION_VERT_4`) strips. `CHROMA_PAIRS`
+// counts the odd strips that close a 4:2:0 chroma pair
+// (`is_chroma_reference`, av1_common_int.h:1454: bh == 1 mi => odd mi_row),
+// `SUB8_PIECES` the pair chroma blocks whose TOP (LEFT) half was built from
+// the PREVIOUS strip's own mv/ref/filters -- libaom
+// `build_inter_predictors_sub8x8` (reconinter_template.inc:87-160), reached
+// through `is_sub8x8_inter` (same file, :54).
+thread_local! {
+    static INTER16_HORZ4_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER16_VERT4_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER16_CHROMA_PAIR_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER16_SUB8_PIECE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current values of the inter 16x16-level 1:4 counters: `(16x4 strips, 4x16
+/// strips, chroma pairs closed, chroma pairs built from two different
+/// strips' motion vectors)`.
+pub fn inter16_rect4_counters() -> (usize, usize, usize, usize) {
+    (
+        INTER16_HORZ4_HITS.with(std::cell::Cell::get),
+        INTER16_VERT4_HITS.with(std::cell::Cell::get),
+        INTER16_CHROMA_PAIR_HITS.with(std::cell::Cell::get),
+        INTER16_SUB8_PIECE_HITS.with(std::cell::Cell::get),
+    )
+}
+
+/// One 16x4 / 4x16 inter strip's chroma situation, handed to
+/// [`decode_inter_block`] out of band (the same one-shot thread-local idiom
+/// `REDUCED_TX_SET_INTER` uses) rather than through twenty-three call sites
+/// that all mean "an ordinary block, chroma of its own".
+#[derive(Clone, Copy)]
+struct InterStripChroma {
+    /// `is_chroma_reference` for this strip: false on strips 0 and 2, which
+    /// read and reconstruct NO chroma at all.
+    has_chroma: bool,
+    /// `PARTITION_HORZ_4` (16x4 strips) rather than `PARTITION_VERT_4`.
+    horz: bool,
+    /// The mi position of the EVEN strip of this pair -- `setup_pred_plane`'s
+    /// `if (ss_y && (mi_row & 1) && mi_size_high[bsize] == 1) mi_row -= 1`,
+    /// i.e. the origin of the 8x4 (4x8) chroma transform.
+    pair_mi: (usize, usize),
+    /// The previous (even) strip's single-reference MC parameters, `None`
+    /// when it was intra or compound -- `is_sub8x8_inter` then returns false
+    /// and the whole chroma block is predicted from THIS strip's mv.
+    prev: Option<(i8, (i32, i32), mc::InterpFilterKind, mc::InterpFilterKind)>,
+}
+
+thread_local! {
+    static INTER_STRIP_CHROMA: std::cell::Cell<Option<InterStripChroma>> =
+        const { std::cell::Cell::new(None) };
+    /// The single-reference MC parameters of the inter block that decoded
+    /// last -- read by the next 1:4 strip to build its pair's chroma.
+    static INTER_LAST_MC: std::cell::Cell<
+        Option<(i8, (i32, i32), mc::InterpFilterKind, mc::InterpFilterKind)>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+fn bump_ab16_inter(arm: usize) {
+    AB16_INTER_HITS.with(|c| {
+        let mut v = c.get();
+        v[arm] += 1;
+        c.set(v);
+    });
+}
+
 // lane-r14: the 16x16-level 1:4 pair -- four 16x4 (`PARTITION_HORZ_4`) or
 // 4x16 (`PARTITION_VERT_4`) strips, `CHROMA` counting the odd strips that
 // close a 4:2:0 chroma pair and `COEFF` the strips with a coded residual.
@@ -11808,6 +11891,10 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
         (w, h),
         // 2:1 strips whose transform is coded in full (lane-inter4).
         (32, 16) | (16, 32) | (16, 8) | (8, 16)
+            // lane-inter16ab r2: the 16x16-level 1:4 strips. TX_16X4/TX_4X16
+            // codes all 64 of its positions, and its chroma pair is an 8x4 /
+            // 4x8 unit (`ss_size_lookup[BLOCK_16X4]` = BLOCK_8X4).
+            | (16, 4) | (4, 16)
             // lane-r14 r2: strips with a 64-px axis. `av1_get_max_eob` codes
             // only the low 32 coefficients of a 64-length axis, so these read
             // exactly the truncated corner the INTRA superblock-strip path
@@ -11830,6 +11917,13 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
 fn rect_inter_luma_set(w: usize, h: usize) -> TxbSet {
     match (w, h) {
         (32, 16) | (16, 32) => TxbSet::LumaRect32x16Inter,
+        (16, 4) | (4, 16) => {
+            if REDUCED_TX_SET_INTER.with(std::cell::Cell::get) {
+                TxbSet::LumaRect16x4Inter
+            } else {
+                TxbSet::LumaRect16x4Inter1
+            }
+        }
         (16, 8) | (8, 16) => {
             if REDUCED_TX_SET_INTER.with(std::cell::Cell::get) {
                 TxbSet::LumaRect16x8Inter
@@ -11906,6 +12000,8 @@ fn rect_scan(w: usize, h: usize) -> &'static [u16] {
         (16, 32) => &SCAN_16X32,
         (16, 8) => &SCAN_16X8,
         (8, 16) => &SCAN_8X16,
+        (16, 4) => &SCAN_16X4,
+        (4, 16) => &SCAN_4X16,
         (8, 4) => &SCAN_8X4,
         (4, 8) => &SCAN_4X8,
         (32, 8) => &SCAN_32X8,
@@ -16098,6 +16194,54 @@ fn is_any_masked_compound_used_here(side: usize) -> bool {
     side.min(side) >= 8
 }
 
+/// The `BLOCK_SIZES_ALL` index of a `bw x bh` block (libaom `enum BLOCK_SIZE`,
+/// `blockd.h`) -- the row every size-indexed inter CDF table
+/// (`compound_type_cdf`, `wedge_idx_cdf`) is keyed by. Our `decode_inter_block`
+/// carries the enclosing SQUARE `side` for context purposes (the accepted
+/// strip corner-cut), so a 16x8 / 8x16 PARTITION_HORZ/VERT strip that reads
+/// one of those symbols off `side` alone takes BLOCK_16X16's row and desyncs
+/// (lane-inter16ab r3: a real 16x8 compound strip with `comp_group_idx == 1`,
+/// decode-order frame 5, our range 64901 vs the oracle's 47271 at the very
+/// next block's mode read).
+fn bsize_all_index(bw: usize, bh: usize) -> Option<usize> {
+    Some(match (bw, bh) {
+        (4, 4) => 0,
+        (4, 8) => 1,
+        (8, 4) => 2,
+        (8, 8) => 3,
+        (8, 16) => 4,
+        (16, 8) => 5,
+        (16, 16) => 6,
+        (16, 32) => 7,
+        (32, 16) => 8,
+        (32, 32) => 9,
+        (32, 64) => 10,
+        (64, 32) => 11,
+        (64, 64) => 12,
+        (64, 128) => 13,
+        (128, 64) => 14,
+        (128, 128) => 15,
+        (4, 16) => 16,
+        (16, 4) => 17,
+        (8, 32) => 18,
+        (32, 8) => 19,
+        (16, 64) => 20,
+        (64, 16) => 21,
+        _ => return None,
+    })
+}
+
+/// `av1_wedge_params_lookup[bsize].wedge_types > 0` (libaom `reconinter.c`):
+/// the block sizes that carry a wedge codebook at all. A `compound_type`
+/// symbol is written only for these; every other size infers
+/// `COMPOUND_DIFFWTD`.
+fn wedge_used_bsize(bw: usize, bh: usize) -> bool {
+    matches!(
+        (bw, bh),
+        (8, 8) | (8, 16) | (16, 8) | (16, 16) | (16, 32) | (32, 16) | (32, 32) | (8, 32) | (32, 8)
+    )
+}
+
 /// Whether a compound reference pair is unidirectional (both references on
 /// the same temporal side of the current frame) -- `has_uni_comp_refs`
 /// (libaom `av1_reference_frame_utils.h`/`pred_common.c`'s own definition:
@@ -16547,9 +16691,27 @@ fn decode_inter_block(
     // exactly what it read before.
     let (rmi, cmi) = at;
     let (px, py) = (at.1 * MI, at.0 * MI);
-    let (cpx, cpy) = (px / 2, py / 2);
+    // lane-inter16ab r2: a 16x4 / 4x16 inter strip's chroma is the PAIR's
+    // (8x4 / 4x8 at the even strip's origin) and is coded only by the odd
+    // strip (`is_chroma_reference`); every other block keeps its own.
+    let strip_chroma = INTER_STRIP_CHROMA.with(std::cell::Cell::take);
+    INTER_LAST_MC.with(|c| c.set(None));
+    let has_chroma = strip_chroma.is_none_or(|s| s.has_chroma);
+    let (cpx, cpy) = match strip_chroma {
+        Some(s) if s.has_chroma => (s.pair_mi.1 * MI / 2, s.pair_mi.0 * MI / 2),
+        _ => (px / 2, py / 2),
+    };
     let chroma_side = side / 2;
-    let (write_chroma_w, write_chroma_h) = (write_w / 2, write_h / 2);
+    let (write_chroma_w, write_chroma_h) = match strip_chroma {
+        Some(s) if s.has_chroma => {
+            if s.horz {
+                (8, 4)
+            } else {
+                (4, 8)
+            }
+        }
+        _ => (write_w / 2, write_h / 2),
+    };
 
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
@@ -16573,7 +16735,12 @@ fn decode_inter_block(
     let (seg_mi_r, seg_mi_c) = (rmi, cmi);
     let (seg_w_mi, seg_h_mi) = (write_w / 4, write_h / 4);
     inter_segment_id(dec, cdfs, seg_mi_r, seg_mi_c, seg_w_mi, seg_h_mi, false, true);
-    let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
+    // libaom `read_skip_mode` (decodemv.c): `if (!is_comp_ref_allowed(bsize))
+    // return 0` -- a 16x4 / 4x16 strip (min(bw, bh) == 4, blockd.h:65) reads
+    // no `skip_mode` symbol at all.
+    let comp_allowed = write_w.min(write_h) >= 8;
+    let skip_mode =
+        skip_mode_present && comp_allowed && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
     if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
         eprintln!(
             "EC_SKIPMODE r={r} c={c} result={skip_mode} tell_after={}",
@@ -16685,7 +16852,12 @@ fn decode_inter_block(
             );
         }
         let is_compound =
-            skip_mode || (reference_select && read_comp_mode(dec, cdfs, above_nbr, left_nbr));
+            skip_mode
+                || (reference_select
+                    // `is_comp_ref_allowed` (blockd.h:65) gates the
+                    // `comp_mode` read exactly as it gates `skip_mode`.
+                    && comp_allowed
+                    && read_comp_mode(dec, cdfs, above_nbr, left_nbr));
         if is_compound {
             let (ref0, ref1) = if skip_mode {
                 (skip_mode_frame[0] as i8, skip_mode_frame[1] as i8)
@@ -16914,16 +17086,23 @@ fn decode_inter_block(
                 // writes NO `compound_type` symbol there and INFERS
                 // `COMPOUND_DIFFWTD` -- only the 1-bit `mask_type` literal
                 // follows. `None` here is exactly that inferred arm.
-                let wedge_bsize = match side {
-                    8 => Some(3),
-                    16 => Some(6),
-                    32 => Some(9),
-                    _ => None,
-                };
+                // lane-inter16ab r3: the row is this block's TRUE
+                // `BLOCK_SIZES_ALL` index, not the enclosing square `side`'s
+                // -- a 16x8 strip reads `compound_type_cdf[BLOCK_16X8]`.
+                let wedge_bsize =
+                    bsize_all_index(write_w, write_h).filter(|_| wedge_used_bsize(write_w, write_h));
                 let compound_type = match wedge_bsize {
                     Some(b) => dec.symbol(&mut cdfs.compound_type[b]),
                     None => 1,
                 };
+                if wedge_bsize.is_some() && compound_type == 0 && write_w != write_h {
+                    // The wedge mask codebook (`wedge.rs`) is built for the
+                    // square sizes only; a rect wedge block is refused by
+                    // name rather than blended with the wrong mask.
+                    return Err(unsupported(
+                        "a COMPOUND_WEDGE mask on a rectangular inter block (the wedge codebook is square-only)",
+                    ));
+                }
                 if let Some(wedge_bsize) = wedge_bsize.filter(|_| compound_type == 0) {
                     // COMPOUND_WEDGE: lane-wedge r3, codebook checksum-
                     // verified vs independent C dump (wedge.rs).
@@ -17923,8 +18102,19 @@ fn decode_inter_block(
                     // `enable_interintra_wedge` seq bit -- the wedge flag
                     // (`av1_is_wedge_used(bsize)` holds for 16x16/32x32).
                     let ii = dec.symbol(&mut cdfs.interintra_mode[bsize_group]) as u8;
-                    let wedge_bsize = if side == 16 { 6 } else { 9 };
+                    // lane-inter16ab r3 (same class as the compound
+                    // `compound_type` row below): the row is the block's TRUE
+                    // `BLOCK_SIZES_ALL` index -- a 16x8 / 32x16 interintra
+                    // strip is BLOCK_16X8 / BLOCK_32X16, not its square
+                    // `side`'s BLOCK_16X16 / BLOCK_32X32.
+                    let wedge_bsize = bsize_all_index(write_w, write_h)
+                        .expect("interintra shape is a BLOCK_SIZES_ALL size");
                     let wedge = dec.symbol(&mut cdfs.wedge_interintra[wedge_bsize]) == 1;
+                    if wedge && write_w != write_h {
+                        return Err(unsupported(
+                            "a wedge interintra mask on a rectangular inter block (the wedge codebook is square-only)",
+                        ));
+                    }
                     if wedge {
                         // lane-wii r2 (spec 5.11.25): `wedge_index` is an
                         // ADAPTING CDF symbol over the same `wedge_bsize` row;
@@ -17976,6 +18166,9 @@ fn decode_inter_block(
             // motion_mode symbol is NOT read (SIMPLE_TRANSLATION implied).
             let motion_mode_eligible = switchable_motion_mode
                 && !skip_mode
+                // `is_motion_variation_allowed_bsize` (blockd.h:1455):
+                // min(bw, bh) >= 8, false for a 16x4 / 4x16 strip.
+                && write_w.min(write_h) >= 8
                 && interintra_mode.is_none()
                 && (!overlappable_above(grid, mi_row, mi_col, bw4, mi_cols as usize, 1).is_empty()
                     || !overlappable_left(grid, mi_row, mi_col, bh4, mi_rows as usize, 1)
@@ -18284,6 +18477,11 @@ fn decode_inter_block(
                 }
             }
 
+            // lane-inter16ab r2: `is_sub8x8_inter`'s neighbour walk reads the
+            // PREVIOUS strip's `mv`/`ref_frame`/`interp_filters`
+            // (reconinter_template.inc:75-82); record them for the next 1:4
+            // strip, which is the only reader.
+            INTER_LAST_MC.with(|c| c.set(Some((ref_frame, mv, h_filter, v_filter))));
             let mut pred_y = vec![0u16; side * side];
             let mut pred_u = vec![0u16; chroma_side * chroma_side];
             let mut pred_v = vec![0u16; chroma_side * chroma_side];
@@ -18445,6 +18643,46 @@ fn decode_inter_block(
                 interintra_blend(v, cpx, cpy, chroma_side, ii, wedge_mask, &mut pred_v);
             }
 
+            // lane-inter16ab r2: libaom `build_inter_predictors_sub8x8`
+            // (reconinter_template.inc:87-160). A 4:2:0 chroma block under a
+            // 16x4 (4x16) luma pair covers TWO luma blocks, so it is built in
+            // `b4_w x b4_h` = 8x2 (2x8) pieces, each from its own strip's
+            // mv/ref/filters. The bottom (right) piece is this strip's own mv
+            // over its own rows, which the whole-block prediction above
+            // already wrote there (MC is position-invariant for a fixed mv),
+            // so only the FIRST piece has to be rebuilt -- and only when
+            // `is_sub8x8_inter` holds, i.e. the previous strip was itself a
+            // single-reference inter block (`prev`), else libaom falls
+            // through to the ordinary whole-block predictor.
+            if let Some(s) = strip_chroma.filter(|s| s.has_chroma)
+                && let Some((prev_ref, prev_mv, prev_h, prev_v)) = s.prev
+                && luma_scale == mc::REF_NO_SCALE
+            {
+                let (piece_w, piece_h) = if s.horz { (8usize, 2usize) } else { (2usize, 8usize) };
+                let (_, prev_u, prev_v_plane) = ref_planes(prev_ref, ref_y, ref_u, ref_v, other_refs)?;
+                for (src, dst) in [(prev_u, &mut pred_u), (prev_v_plane, &mut pred_v)] {
+                    let mut piece = vec![0u16; piece_w * piece_h];
+                    mc::predict_with_filters(
+                        &src.data,
+                        src.width,
+                        src.true_width,
+                        src.true_height,
+                        mv_to_q4(cpx, prev_mv.1, false),
+                        mv_to_q4(cpy, prev_mv.0, false),
+                        piece_w,
+                        piece_h,
+                        prev_h,
+                        prev_v,
+                        &mut piece,
+                    );
+                    for row in 0..piece_h {
+                        dst[row * chroma_side..row * chroma_side + piece_w]
+                            .copy_from_slice(&piece[row * piece_w..(row + 1) * piece_w]);
+                    }
+                }
+                INTER16_SUB8_PIECE_HITS.with(|c| c.set(c.get() + 1));
+            }
+
             // lane-inter4 r2: a rectangular strip's transform tree starts from
             // its own rect `max_txsize_rect_lookup` entry, not a square one.
             let rect_tu = (write_w, write_h) != (side, side);
@@ -18481,24 +18719,26 @@ fn decode_inter_block(
                     &pred_y,
                     &vec![0i32; side * side],
                 );
-                u.reconstruct_mc_rect(
-                    cpx,
-                    cpy,
-                    chroma_side,
-                    write_chroma_w,
-                    write_chroma_h,
-                    &pred_u,
-                    &vec![0i32; chroma_side * chroma_side],
-                );
-                v.reconstruct_mc_rect(
-                    cpx,
-                    cpy,
-                    chroma_side,
-                    write_chroma_w,
-                    write_chroma_h,
-                    &pred_v,
-                    &vec![0i32; chroma_side * chroma_side],
-                );
+                if has_chroma {
+                    u.reconstruct_mc_rect(
+                        cpx,
+                        cpy,
+                        chroma_side,
+                        write_chroma_w,
+                        write_chroma_h,
+                        &pred_u,
+                        &vec![0i32; chroma_side * chroma_side],
+                    );
+                    v.reconstruct_mc_rect(
+                        cpx,
+                        cpy,
+                        chroma_side,
+                        write_chroma_w,
+                        write_chroma_h,
+                        &pred_v,
+                        &vec![0i32; chroma_side * chroma_side],
+                    );
+                }
                 luma_grid = vec![0i32; side * side];
                 u_grid = vec![0i32; chroma_side * chroma_side];
                 v_grid = vec![0i32; chroma_side * chroma_side];
@@ -18510,6 +18750,18 @@ fn decode_inter_block(
                     neighbours.around_mi_rect(at_mi, write_w, write_h)
                 } else {
                     neighbours.around_mi(at, side)
+                };
+                // lane-inter16ab r2: the pair's chroma transform sits at the
+                // EVEN strip's mi origin and spans both strips, so its
+                // above/left coefficient context is the pair's, not this
+                // strip's row.
+                let around_c = match strip_chroma {
+                    Some(s) if s.has_chroma => neighbours.around_mi_rect(
+                        s.pair_mi,
+                        if s.horz { 16 } else { 8 },
+                        if s.horz { 8 } else { 16 },
+                    ),
+                    _ => around,
                 };
                 let luma_tx_type;
                 if let Some(leaves) = vartx_leaves.clone() {
@@ -18628,7 +18880,16 @@ fn decode_inter_block(
                         None,
                     )?;
                 }
-                if rect_tu {
+                if !has_chroma {
+                    // `is_chroma_reference` is false for this strip: libaom's
+                    // plane loop (decodeframe.c
+                    // `predict_and_reconstruct_intra_block`/
+                    // `reconstruct_inter_block`'s `for (plane...)` guarded by
+                    // `xd->is_chroma_ref`) codes NO chroma transform here, so
+                    // neither symbol nor context exists.
+                    u_grid = vec![0i32; chroma_side * chroma_side];
+                    v_grid = vec![0i32; chroma_side * chroma_side];
+                } else if rect_tu {
                     // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
                     // 2:1 strip is the strip's own rect chroma size (16x8 /
                     // 8x16), one unit for the whole block, and it codes no
@@ -18642,7 +18903,7 @@ fn decode_inter_block(
                             (uw, uh),
                             chroma_side,
                             1,
-                            around[1],
+                            around_c[1],
                             mode_for_tx,
                             u,
                             cpx,
@@ -18664,7 +18925,7 @@ fn decode_inter_block(
                             (uw, uh),
                             chroma_side,
                             2,
-                            around[2],
+                            around_c[2],
                             mode_for_tx,
                             v,
                             cpx,
@@ -18725,6 +18986,16 @@ fn decode_inter_block(
         // skip path above (which only needed a clipped write of an
         // already-square-predicted buffer). Named refusal instead of a
         // silently wrong square-shaped intra prediction.
+        // lane-inter16ab r2: `decode_intra_rect_in_inter` has no chroma-pair
+        // path (it predicts and codes chroma at the strip's own halved
+        // footprint), so an INTRA 16x4 / 4x16 strip inside a 1:4 partition is
+        // refused by name rather than decoded with a 8x2 chroma transform
+        // libaom never coded.
+        if write_w.min(write_h) < 8 {
+            return Err(unsupported(
+                "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
+            ));
+        }
         if write_w != side || write_h != side {
             // lane-intrarect r1: the strip decodes through its own rect
             // machinery ([`decode_intra_rect_in_inter`] -> the key-frame
@@ -19141,6 +19412,14 @@ fn decode_inter_block(
             rmi, cmi, dec.debug_bitpos(), dec.debug_state().0
         );
     }
+    // lane-inter16ab r2: the pair's chroma coefficient context spans BOTH
+    // strips (mirroring the intra `decode_rect4_16` path), and the even
+    // strip's own record wrote empty chroma state over those cells -- this
+    // rewrite is what libaom's single `av1_set_contexts` call for the 8x4
+    // (4x8) chroma unit leaves behind.
+    let pair_chroma = strip_chroma
+        .filter(|s| s.has_chroma)
+        .map(|s| (s, neighbour_state(&u_grid), neighbour_state(&v_grid)));
     if vartx_leaves.is_some() {
         // Plane 0 is already correct per transform unit
         // ([`Neighbours::record_mi_luma`] above); this writes everything else
@@ -19156,6 +19435,32 @@ fn decode_inter_block(
             uv_predict_mode,
             &[luma_grid, u_grid, v_grid],
         );
+    }
+    if let Some((s, u_state, v_state)) = pair_chroma {
+        let (pw, ph) = if s.horz { (16usize, 8usize) } else { (8, 16) };
+        let round_up_even = |n: usize| n.div_ceil(2) * 2;
+        let (bound_h, bound_w) = (
+            round_up_even(neighbours.mi_rows),
+            round_up_even(neighbours.mi_cols),
+        );
+        for cell in 0..(ph / MI) {
+            if s.pair_mi.0 + cell < bound_h
+                && let Some(slot) = neighbours.left.get_mut(s.pair_mi.0 + cell)
+            {
+                slot[1] = u_state;
+                slot[2] = v_state;
+            }
+        }
+        for cell in 0..(pw / MI) {
+            if s.pair_mi.1 + cell < bound_w
+                && let Some(slot) = neighbours.above.get_mut(s.pair_mi.1 + cell)
+            {
+                slot[1] = u_state;
+                slot[2] = v_state;
+            }
+        }
+        neighbours.record_uv_mode_mi(s.pair_mi.0, s.pair_mi.1, pw / MI, ph / MI, uv_predict_mode);
+        INTER16_CHROMA_PAIR_HITS.with(|c| c.set(c.get() + 1));
     }
     neighbours.record_inter_rect_mi(
         at,
@@ -21257,6 +21562,83 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     )?
                 };
             }
+            // lane-inter16ab r1: one 8x8 inter leaf of a 16x16-level AB
+            // partition (libaom `decode_partition` PARTITION_HORZ_A/_B/
+            // VERT_A/_B at BLOCK_16X16 code `bsize2` = BLOCK_8X8 for two of
+            // their three pieces, decodeframe.c ~1900). Same body the
+            // PARTITION_SPLIT arm runs per leaf, minus its own partition
+            // symbol (an AB piece carries none) and its `prev_leaves`
+            // bookkeeping.
+            macro_rules! inter_leaf8 {
+                ($outer:expr, $leaf:expr) => {{
+                    let leaf_mi = $leaf;
+                                    let (
+                                        skip,
+                                        is_inter,
+                                        skip_mode_leaf,
+                                        compound_ctx8,
+                                        leaf_filter,
+                                        leaf_refs,
+                                    ) = decode_inter_block8(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            &mut grid,
+                                            mi_cols,
+                                            mi_rows,
+                                            $outer,
+                                            leaf_mi,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            &ref_y,
+                                            &ref_u,
+                                            &ref_v,
+                                            &ref_slots,
+                                            base_q_idx,
+                                            &scan8,
+                                            &scan4,
+                                            allow_high_precision_mv,
+                                            force_integer_mv,
+                                            &global_motion,
+                                            enable_dual_filter,
+                                            reference_select,
+                                            enable_masked_compound,
+                                            enable_interintra_compound,
+                                            enable_jnt_comp,
+                                            order_hint_bits,
+                                            order_hint,
+                                            ref_order_hints,
+                                            skip_mode_present,
+                                            skip_mode_frame,
+                                            reduced_tx_set,
+                                            interp_fixed,
+                                            switchable_motion_mode,
+                                            allow_warped_motion,
+                                            allow_screen_content_tools,
+                                            &sign_bias_table,
+                                            tpl_frame.as_ref(),
+                                            frame_width as usize,
+                                        )?;
+                                    neighbours.record_inter_rect_mi(
+                                        leaf_mi,
+                                        2,
+                                        2,
+                                        skip,
+                                        is_inter,
+                                        leaf_refs.0,
+                                        leaf_filter,
+                                        skip_mode_leaf,
+                                    );
+                                    if let Some(ref1) = leaf_refs.1
+                                        && let Some((_, _, group_idx, idx)) = compound_ctx8
+                                    {
+                                        neighbours.record_compound_ctx_rect_mi(
+                                            leaf_mi, 2, 2, ref1, group_idx, idx,
+                                        );
+                                    }
+                }};
+            }
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             let (has_cols, has_rows) = (
                 sb_c * SB_MI + SB_MI / 2 < mi_cols,
@@ -21740,9 +22122,191 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         frame_width as usize,
                                     )?;
                                 }
+                            } else if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&part16) {
+                                // lane-inter16ab r1: the four AB (T-shaped)
+                                // partitions at the 16x16 level of an INTER
+                                // frame -- two 8x8 inter leaves plus one true
+                                // 16x8/8x16 inter strip. libaom
+                                // `decode_partition` (decodeframe.c ~5040,
+                                // `bsize2 = get_partition_subsize(bsize,
+                                // PARTITION_SPLIT)` = BLOCK_8X8 here) visits:
+                                //   HORZ_A: TL 8x8, TR 8x8, bottom 16x8
+                                //   HORZ_B: top 16x8, BL 8x8, BR 8x8
+                                //   VERT_A: TL 8x8, BL 8x8, right 8x16
+                                //   VERT_B: left 8x16, TR 8x8, BR 8x8
+                                // Every piece is inside the frame by
+                                // construction: an AB value can only be read
+                                // from the (has_cols16 && has_rows16) branch
+                                // above, i.e. mi_row+2 < mi_rows and
+                                // mi_col+2 < mi_cols, which is exactly
+                                // libaom's own `has_rows`/`has_cols`.
+                                //
+                                // VERT_A/VERT_B visit TL,BL,TR,BR, so a
+                                // bottom-left square's top-right neighbour is
+                                // the partition's own not-yet-decoded
+                                // rectangle: libaom switches those squares
+                                // onto `has_tr_vert_*`/`has_bl_vert_*`
+                                // (`reconintra.c get_has_tr_table`) --
+                                // `Reach::vert_ab_partition()`, the same
+                                // guard the intra 16-level arm and the
+                                // 32-level inter AB arms take (class
+                                // `visit-order-changes-availability`).
+                                //
+                                // OBMC/warp and compound stay legal here:
+                                // every piece is >= 8x8, so libaom's
+                                // `is_motion_variation_allowed_bsize`
+                                // (min(bw,bh) >= 8, blockd.h) and
+                                // `is_comp_ref_allowed` (block_size_wide +
+                                // block_size_high >= 16, blockd.h) both hold
+                                // and the leaf/strip decoders' own gates
+                                // apply unchanged.
+                                bump_ab16_inter(part16 - PARTITION_HORZ_A);
+                                let _vert_guard = if part16 == PARTITION_VERT_A
+                                    || part16 == PARTITION_VERT_B
+                                {
+                                    Some(crate::encode::Reach::vert_ab_partition())
+                                } else {
+                                    None
+                                };
+                                let (mi_row0, mi_col0) = sub16_to_mi(at16);
+                                let tl = (mi_row0, mi_col0);
+                                let tr = (mi_row0, mi_col0 + 2);
+                                let bl = (mi_row0 + 2, mi_col0);
+                                let br = (mi_row0 + 2, mi_col0 + 2);
+                                macro_rules! ab_strip16 {
+                                    ($mi:expr, $ww:expr, $wh:expr) => {
+                                        inter_piece!(
+                                            $mi,
+                                            SUB,
+                                            TxbSet::Luma16,
+                                            if reduced_tx_set {
+                                                TxbSet::Luma16Inter
+                                            } else {
+                                                TxbSet::Luma16InterSet1
+                                            },
+                                            TxbSet::Chroma8,
+                                            TX16,
+                                            TX8,
+                                            &scan16,
+                                            &scan8,
+                                            1,
+                                            $ww,
+                                            $wh
+                                        )
+                                    };
+                                }
+                                match part16 {
+                                    PARTITION_HORZ_A => {
+                                        inter_leaf8!(at16, tl);
+                                        inter_leaf8!(at16, tr);
+                                        ab_strip16!(bl, 16, 8);
+                                    }
+                                    PARTITION_HORZ_B => {
+                                        ab_strip16!(tl, 16, 8);
+                                        inter_leaf8!(at16, bl);
+                                        inter_leaf8!(at16, br);
+                                    }
+                                    PARTITION_VERT_A => {
+                                        inter_leaf8!(at16, tl);
+                                        inter_leaf8!(at16, bl);
+                                        ab_strip16!(tr, 8, 16);
+                                    }
+                                    _ => {
+                                        ab_strip16!(tl, 8, 16);
+                                        inter_leaf8!(at16, tr);
+                                        inter_leaf8!(at16, br);
+                                    }
+                                }
+                            } else if part16 == PARTITION_HORZ_4
+                                || part16 == PARTITION_VERT_4
+                            {
+                                // lane-inter16ab r2: four 16x4 (4x16) INTER
+                                // strips. libaom `decode_partition`
+                                // (decodeframe.c, PARTITION_HORZ_4/VERT_4)
+                                // walks them top to bottom (left to right)
+                                // with its own `i > 0` frame-edge break.
+                                //
+                                // Each strip is >= 8 in one dimension only,
+                                // so `is_comp_ref_allowed`,
+                                // `is_motion_variation_allowed_bsize`
+                                // (blockd.h:65/1455, min(bw, bh) >= 8) and
+                                // `is_interintra_allowed_bsize` (BLOCK_8X8..
+                                // BLOCK_32X32 in enum order, which excludes
+                                // BLOCK_16X4 = 17) are all false: no
+                                // skip_mode, no comp_mode, no OBMC/warp and
+                                // no interintra symbol is read -- gated in
+                                // `decode_inter_block` off `write_w`/
+                                // `write_h`.
+                                //
+                                // CHROMA is the pair's:
+                                // `is_chroma_reference`
+                                // (av1_common_int.h:1454) is false on the
+                                // even strips, and the odd one codes one 8x4
+                                // (4x8) chroma transform at the pair's
+                                // origin, built from BOTH strips' motion
+                                // (`is_sub8x8_inter`).
+                                let horz = part16 == PARTITION_HORZ_4;
+                                let (mi_row0, mi_col0) = sub16_to_mi(at16);
+                                let (bw, bh) = if horz { (16usize, 4usize) } else { (4usize, 16usize) };
+                                for i in 0..4usize {
+                                    let at_mi = if horz {
+                                        (mi_row0 + i, mi_col0)
+                                    } else {
+                                        (mi_row0, mi_col0 + i)
+                                    };
+                                    if i > 0
+                                        && (at_mi.0 >= mi_rows as usize
+                                            || at_mi.1 >= mi_cols as usize)
+                                    {
+                                        break;
+                                    }
+                                    let strip_has_chroma = i % 2 == 1;
+                                    let pair_mi = if !strip_has_chroma {
+                                        at_mi
+                                    } else if horz {
+                                        (at_mi.0 - 1, at_mi.1)
+                                    } else {
+                                        (at_mi.0, at_mi.1 - 1)
+                                    };
+                                    INTER_STRIP_CHROMA.with(|c| {
+                                        c.set(Some(InterStripChroma {
+                                            has_chroma: strip_has_chroma,
+                                            horz,
+                                            pair_mi,
+                                            prev: if strip_has_chroma {
+                                                INTER_LAST_MC.with(std::cell::Cell::get)
+                                            } else {
+                                                None
+                                            },
+                                        }))
+                                    });
+                                    inter_piece!(
+                                        at_mi,
+                                        SUB,
+                                        TxbSet::Luma16,
+                                        if reduced_tx_set {
+                                            TxbSet::Luma16Inter
+                                        } else {
+                                            TxbSet::Luma16InterSet1
+                                        },
+                                        TxbSet::Chroma8,
+                                        TX16,
+                                        TX8,
+                                        &scan16,
+                                        &scan8,
+                                        1,
+                                        bw,
+                                        bh
+                                    );
+                                    if horz {
+                                        INTER16_HORZ4_HITS.with(|c| c.set(c.get() + 1));
+                                    } else {
+                                        INTER16_VERT4_HITS.with(|c| c.set(c.get() + 1));
+                                    }
+                                }
                             } else if part16 != PARTITION_SPLIT {
                                 return Err(unsupported(
-                                    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
+                                    "an inter 16x16-level partition value outside NONE/HORZ/VERT/SPLIT/AB/1:4",
                                 ));
                             } else {
                                 if has_cols16 && has_rows16 {
