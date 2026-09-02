@@ -85,6 +85,27 @@ pub(crate) fn intra_in_inter_filter_intra_hits() -> usize {
     INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.get())
 }
 
+// lane-angleinter r1: how many INTRA blocks inside an INTER frame carried a
+// nonzero `angle_delta_y` / `angle_delta_uv` (`read_intra_angle_info`). Both
+// arms refused a nonzero luma delta before this round, and no inter gate
+// enabled `--enable-angle-delta` (aomenc's own default is 1).
+thread_local! {
+    static INTRA_IN_INTER_ANGLE_DELTA_Y_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static INTRA_IN_INTER_ANGLE_DELTA_UV_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_IN_INTER_ANGLE_DELTA_Y_HITS`].
+pub(crate) fn intra_in_inter_angle_delta_y_hits() -> usize {
+    INTRA_IN_INTER_ANGLE_DELTA_Y_HITS.with(|c| c.get())
+}
+
+/// Current value of [`INTRA_IN_INTER_ANGLE_DELTA_UV_HITS`].
+pub(crate) fn intra_in_inter_angle_delta_uv_hits() -> usize {
+    INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.get())
+}
+
 // lane-realworld r1: this frame's `cdef.bits` (spec 5.9.19), threaded into
 // [`maybe_read_cdef_idx`] the same way [`ENABLE_EDGE_FILTER`] threads a
 // frame-level flag through the recursive block decode -- `0` (the default)
@@ -15510,14 +15531,29 @@ fn decode_inter_block(
                 "an intra mode this decoder does not code (round 2)",
             ));
         }
-        if (V_PRED..=D67_PRED).contains(&mode) {
-            let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
-            if angle != ANGLE_DELTA_ZERO {
-                return Err(unsupported(
-                    "a nonzero angle delta (this encoder never writes one)",
-                ));
-            }
+        // lane-angleinter r1: `read_intra_angle_info` (libaom `decodemv.c`,
+        // inside `read_intra_block_mode_info`) -- an intra block in an inter
+        // frame reads `angle_delta_y` off the same
+        // `angle_delta_cdf[mode - V_PRED]` row a key-frame block does, and
+        // the delta feeds the directional predictor (and the edge
+        // filter/upsample decision derived from the delta'd angle) unchanged.
+        // The symbol was read and then refused before this round even though
+        // aomenc enables `--enable-angle-delta` by default.
+        let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
+            read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED])
+        } else {
+            0
+        };
+        if angle_delta_y != 0 {
+            INTRA_IN_INTER_ANGLE_DELTA_Y_HITS.with(|c| c.set(c.get() + 1));
         }
+        // The delta'd angle decides whether the intra edge filter runs at
+        // all, so this block needs the same luma edge-filter-type neighbour
+        // check a key-frame block does (`get_intra_edge_filter_type`, spec
+        // 7.11.2) -- this arm passed a hardcoded `false` while every
+        // directional intra-in-inter block was refused above.
+        let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
+        let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
         if (9..=12).contains(&uv_mode) {
             SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
@@ -15541,6 +15577,7 @@ fn decode_inter_block(
         };
         if angle_delta_uv != 0 {
             UV_ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.set(c.get() + 1));
         }
         uv_predict_mode = if uv_mode == UV_CFL_PRED {
             DC_PRED
@@ -15652,12 +15689,12 @@ fn decode_inter_block(
                         tu_py,
                         tx_px,
                         mode,
-                        0,
+                        angle_delta_y,
                         tu_reach,
                         &vec![0i32; tx_px * tx_px],
                         None,
                         filter_intra,
-                        false,
+                        smooth_neighbor,
                     );
                     vec![0i32; tx_px * tx_px]
                 } else {
@@ -15674,7 +15711,7 @@ fn decode_inter_block(
                         neighbours.around_mi(tu_mi, tx_px)[0],
                         mode,
                         mode,
-                        0,
+                        angle_delta_y,
                         tu_reach,
                         y,
                         tu_px,
@@ -15685,7 +15722,7 @@ fn decode_inter_block(
                         None,
                         filter_intra,
                         Some(tu_skip_ctx),
-                        false,
+                        smooth_neighbor,
                     )?
                 };
                 neighbours.record_mi_luma(tu_mi, tx_px, &tu_grid);
@@ -15698,12 +15735,12 @@ fn decode_inter_block(
                     py,
                     side,
                     mode,
-                    0,
+                    angle_delta_y,
                     reach,
                     &vec![0i32; side * side],
                     None,
                     filter_intra,
-                    false,
+                    smooth_neighbor,
                 );
             }
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
@@ -15751,7 +15788,7 @@ fn decode_inter_block(
                     around[0],
                     mode,
                     mode,
-                    0,
+                    angle_delta_y,
                     reach,
                     y,
                     px,
@@ -15762,7 +15799,7 @@ fn decode_inter_block(
                     None,
                     filter_intra,
                     None,
-                    false,
+                    smooth_neighbor,
                 )?
             };
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
@@ -17151,13 +17188,33 @@ fn decode_inter_block8(
                 "an intra mode this decoder does not code (round 2)",
             ));
         }
-        if (V_PRED..=D67_PRED).contains(&mode) {
-            let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
-            if angle != ANGLE_DELTA_ZERO {
-                return Err(unsupported(
-                    "a nonzero angle delta (this encoder never writes one)",
-                ));
-            }
+        // lane-angleinter r1: `read_intra_angle_info` (libaom `decodemv.c`,
+        // inside `read_intra_block_mode_info`) -- an intra block in an inter
+        // frame reads `angle_delta_y` off the same
+        // `angle_delta_cdf[mode - V_PRED]` row a key-frame block does, and
+        // the delta feeds the directional predictor (and the edge
+        // filter/upsample decision derived from the delta'd angle) unchanged.
+        // The symbol was read and then refused before this round even though
+        // aomenc enables `--enable-angle-delta` by default.
+        let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
+            read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED])
+        } else {
+            0
+        };
+        if angle_delta_y != 0 {
+            INTRA_IN_INTER_ANGLE_DELTA_Y_HITS.with(|c| c.set(c.get() + 1));
+            // lane-angleinter r1: the >=16x16 arm's lift is gated by a real
+            // aomenc stream; this leaf's is NOT -- 80 attempts across two
+            // sizes and five quantisers never produced an 8x8 intra leaf with
+            // a nonzero delta (the leaf's own sibling refusals -- non-DC
+            // chroma, the TX_4X4 split, sub-16 rect inter leaves -- fire
+            // first). The prediction below would handle it; refusing keeps
+            // the rule that no lift ships ungated. Note the claim is about
+            // THIS DECODER's gate coverage, not about what an encoder writes.
+            return Err(unsupported(
+                "a nonzero angle delta on an 8x8 intra leaf in an inter frame (no gate reaches \
+                 this leaf with one; the >=16x16 arm decodes deltas)",
+            ));
         }
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
         if uv_mode != DC_PRED {
@@ -17252,7 +17309,7 @@ fn decode_inter_block8(
                 py,
                 SIDE,
                 mode,
-                0,
+                angle_delta_y,
                 reach,
                 &vec![0i32; SIDE * SIDE],
                 None,
@@ -17297,7 +17354,7 @@ fn decode_inter_block8(
                 around[0],
                 mode,
                 mode,
-                0,
+                angle_delta_y,
                 reach,
                 y,
                 px,
