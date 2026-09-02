@@ -501,6 +501,37 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
             ));
         }
+        // lane-oddh r2: `use_128x128_superblock` reaches every level of the
+        // decode -- the partition tree starts at BLOCK_128X128, `SB_MI` is 32
+        // mi units, and the CDEF/LR/deblock grids are per-128 -- and this
+        // decoder is written for 64x64 superblocks throughout (`SB_MI = 16`,
+        // no BLOCK_128X128 partition read at all). Until r1 that was SILENT:
+        // a 64x72 aomenc key frame at `--cpu-used=0` (libaom picks 128x128
+        // whenever speed is 0, `av1_select_sb_size`) desynced at the very
+        // first symbol -- aomdec reads a gathered 2-symbol
+        // BLOCK_128X128 partition (has_cols false at mi_cols=16,
+        // has_rows true at mi_rows=18) where we read a 10-symbol
+        // BLOCK_64X64 one from the same byte, giving PARTITION_VERT_4 (9)
+        // against SPLIT (3). Refuse by name rather than decode wrong pixels.
+        //
+        // Scoped, not blanket (measured: a blanket refusal red-lined 29
+        // previously pixel-exact gates): on a frame of at most 64x64 a
+        // 128x128 superblock decodes IDENTICALLY to a 64x64 one -- mi (0,0)
+        // has neither `has_rows` nor `has_cols`, so BLOCK_128X128 is a forced
+        // SPLIT that reads no symbol, and only one of its four 64x64 children
+        // is inside the frame. Every sibling inter gate at 64x64 and
+        // `--cpu-used=0` is exactly that case. The divergence starts the
+        // moment a superblock has a second child in frame.
+        if parser
+            .sequence_header()
+            .is_some_and(|seq| seq.use_128x128_superblock)
+            && (header.mi_cols > 16 || header.mi_rows > 16)
+        {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a sequence using 128x128 superblocks on a frame larger than 64x64 (this decoder's whole partition/CDEF/LR grid is 64x64-superblock only; aomenc picks 128x128 at --cpu-used=0)",
+            ));
+        }
         crate::decode::set_bit_depth(bit_depth);
         // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
         let enable_masked_compound = parser
@@ -905,6 +936,209 @@ mod tests {
                  warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)"
             ),
             "expected the 12-bit refusal, got: {err}"
+        );
+    }
+
+    /// lane-oddh r2 GATE: the frame-edge half-strip arms r1 added (a 64x32 /
+    /// 32x64 superblock-level or 16x8 / 8x16 16-level INTER block where the
+    /// frame's true edge cuts the strip in half) actually fire and decode
+    /// pixel-exact, at both bit depths. 160 = two full superblock rows plus
+    /// 32 pixels, so every superblock in the last row is a half strip; without
+    /// r1's arms these attempts refused outright, which is why this gate
+    /// asserts a nonzero `edge_rect_strip_hits` DELTA on attempts that were
+    /// actually compared -- a refused attempt's hits would prove nothing
+    /// (class "counter from refused stream").
+    #[test]
+    #[ignore = "2026-09-02 lane-oddh r2: no aomenc recipe reaches the INTER edge half-strip arm yet -- rect partitions OFF makes the encoder answer the forced gathered edge symbol SPLIT every time (both bit depths decode 192x160 pixel-exact, edge_rect_strip_hits=0), and rect ON stops at three other lanes' gaps first: at cq 40 'a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding', at cq 62 'an INTER 32x32 partition type this decoder does not code (value=8/9)' (HORZ_4/VERT_4 even with --enable-1to4-partitions=0), and at min-partition 16 'a HORZ/VERT intra strip below 16x16 with a split transform'. The KEY-frame half of the same edge is gated: the tiny size sweep now covers 64x72/72x64/64x136/136x64/192x136"]
+    fn a_real_aomenc_inter_frame_edge_half_strip_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_inter_frame_edge_half_strip_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let (width, height, frames) = (192usize, 160usize, 6usize);
+        let mut compared = 0u32;
+        let mut strip_hits = 0usize;
+        let mut refused = 0u32;
+        for bit_depth in [8u32, 10u32] {
+            let duration = frames as f64 / 25.0;
+            let source = format!("testsrc2=size={width}x{height}:duration={duration}:rate=25");
+            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                    "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_arg = format!("--bit-depth={bit_depth}");
+            let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=62",
+                    // cpu-used >= 1 keeps libaom on 64x64 superblocks at this
+                    // size (`av1_select_sb_size`: speed >= 1 and <= 480p).
+                    "--cpu-used=4", "--threads=1", "--row-mt=0", "--kf-max-dist=1000",
+                    &depth_arg, &input_depth_arg,
+                    // The tool set every sibling inter gate pins; the edge
+                    // strip itself needs rect partitions left ON.
+                    "--enable-warped-motion=0", "--enable-obmc=0", "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0", "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0", "--enable-smooth-interintra=0",
+                    // Rect partitions stay ON: the edge strip is a FORCED
+                    // (gathered) HORZ at the boundary, but with rect coding
+                    // off the encoder answers that gathered symbol SPLIT every
+                    // time and the arm never fires (measured, r2).
+                    "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
+                    "--enable-palette=0", "--enable-intrabc=0", "--enable-cdef=0",
+                    "--enable-restoration=0", "--enable-ref-frame-mvs=0",
+                    "--enable-tx-size-search=0", "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0", "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0", "--enable-angle-delta=0",
+                    "--enable-cfl-intra=0",
+                    // 16 is the smallest leaf this decoder codes rect strips
+                    // at; below it the sub-16 strip/1:4 refusals fire first
+                    // and the gate never reaches the edge arm.
+                    // 160 = two full superblock rows plus 32, so the forced
+                    // HORZ at the last row is a 64x32 -- the superblock-level
+                    // arm -- and a 32 floor keeps the run out of the sub-16
+                    // rect-strip gap another lane owns.
+                    "--min-partition-size=32", "--max-partition-size=64",
+                    "--obu", "-o", "-", "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
+            let stream = out.stdout;
+
+            let before = crate::decode::edge_rect_strip_hits();
+            let decoded = match decode_stream(&stream) {
+                Ok(f) => f,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME}: {bit_depth}-bit failed outright, not a named refusal: {msg}"
+                    );
+                    eprintln!("{NAME}: {bit_depth}-bit REFUSED {msg}");
+                    refused += 1;
+                    continue;
+                }
+            };
+            let reference = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames)
+            };
+            assert_eq!(
+                decoded.len(),
+                reference.len(),
+                "{NAME}: {bit_depth}-bit frame count"
+            );
+            for (i, (ours, theirs)) in decoded.iter().zip(&reference).enumerate() {
+                let nd = |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+                assert_eq!(
+                    (nd(&ours.y, &theirs.y), nd(&ours.u, &theirs.u), nd(&ours.v, &theirs.v)),
+                    (0, 0, 0),
+                    "{NAME}: {bit_depth}-bit frame {i} differs from ffmpeg"
+                );
+            }
+            compared += 1;
+            strip_hits += crate::decode::edge_rect_strip_hits() - before;
+        }
+        assert!(compared > 0, "{NAME}: every attempt refused ({refused}) -- gate proved nothing");
+        assert!(
+            strip_hits > 0,
+            "{NAME}: {compared} attempts decoded pixel-exact but not one frame-edge half strip \
+             fired -- the recipe no longer reaches the arm this gate exists for"
+        );
+        eprintln!("{NAME}: {compared} attempts pixel-exact, edge_rect_strip_hits={strip_hits}, {refused} refusals");
+    }
+
+    /// lane-oddh r2 GATE: a REAL aomenc stream that uses 128x128 superblocks
+    /// is refused by name, not silently mis-decoded. This is the root cause of
+    /// r1's pinned 64x72 first-symbol desync: libaom's `av1_select_sb_size`
+    /// returns BLOCK_128X128 whenever speed is 0, so a tiny frame encoded at
+    /// `--cpu-used=0` carries 128x128 superblocks, and this 64x64-only
+    /// decoder read a 10-symbol BLOCK_64X64 partition (value 9, VERT_4) where
+    /// aomdec read a gathered 2-symbol BLOCK_128X128 one (value 3, SPLIT) from
+    /// the same byte -- the uncompressed header parse was byte-identical
+    /// (49 bits, tile data at file offset 20; hand-verified against spec
+    /// 5.9.2 field by field).
+    ///
+    /// The `use_128x128_superblock` assert is the "knob reached the tool"
+    /// half: without it, an aomenc that ignored `--sb-size=128` would leave
+    /// the gate asserting a refusal that never fires.
+    #[test]
+    fn a_real_aomenc_128x128_superblock_stream_is_refused_by_name() {
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP: no ffmpeg/aomenc");
+            return;
+        }
+        let (width, height) = (64usize, 72usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i",
+                "mandelbrot=size=64x72:rate=25:start_x=-0.6:start_y=-0.4", "-t", "0.04",
+                "-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
+                "--cpu-used=0", "--sb-size=128", "--kf-max-dist=0", "--limit=1",
+                "--threads=1", "--row-mt=0", "--obu", "-o", "-", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
+        let stream = out.stdout;
+
+        // The knob actually arrived: this stream's sequence header codes
+        // `use_128x128_superblock = 1`.
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut sb128 = false;
+        while pos < stream.len() {
+            let Ok(obu) = parser.parse_obu(&stream[pos..]) else {
+                break;
+            };
+            pos += obu.total_size.max(1);
+            if let Some(seq) = parser.sequence_header() {
+                sb128 = seq.use_128x128_superblock;
+                break;
+            }
+        }
+        assert!(sb128, "aomenc ignored --sb-size=128: this stream is 64x64-superblock");
+
+        let err = decode_stream(&stream).unwrap_err().to_string();
+        assert!(
+            err.contains("a sequence using 128x128 superblocks"),
+            "expected the 128x128-superblock refusal for {width}x{height}, got: {err}"
         );
     }
 
@@ -11259,8 +11493,26 @@ mod tests {
             eprintln!("SKIP: no ffmpeg/aomenc");
             return;
         }
-        let sizes: &[(usize, usize)] =
-            &[(8, 8), (16, 16), (32, 32), (16, 32), (32, 16), (64, 64), (48, 48), (24, 24)];
+        // lane-oddh r2: the second half of this list is the odd-height /
+        // odd-width ladder -- frame sizes whose last superblock row or column
+        // is a partial 64 (72 = one full SB plus 8 rows, 136 = two plus 8),
+        // which is where the frame-edge half-strip path r1 added is the only
+        // way to code the edge. 192x136 is the inter-sized member.
+        let sizes: &[(usize, usize)] = &[
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (16, 32),
+            (32, 16),
+            (64, 64),
+            (48, 48),
+            (24, 24),
+            (64, 72),
+            (72, 64),
+            (64, 136),
+            (136, 64),
+            (192, 136),
+        ];
         let mut total_exact = 0u32;
         for &(width, height) in sizes {
             let mut ok = 0u32;
@@ -11378,12 +11630,12 @@ mod tests {
         }
         // Hit counter: the sweep proved nothing unless every size x seed
         // attempt really ran end to end (aomenc -> us -> ffmpeg compare).
-        // Floor (hit counter): 7 of the 8 sizes must decode all 10 seeds
+        // Floor (hit counter): 12 of the 13 sizes must decode all 10 seeds
         // pixel-exact -- only 8x8 is allowed to refuse outright today. If a
         // future change makes sizes refuse instead of decode, this fails
         // rather than passing on refusals alone.
         assert!(
-            total_exact >= 70,
+            total_exact >= 120,
             "tiny sweep only reached {total_exact} pixel-exact attempts (floor 70) -- \
              refusals cannot substitute for decodes"
         );
