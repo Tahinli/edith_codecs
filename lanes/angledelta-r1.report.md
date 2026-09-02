@@ -49,3 +49,6 @@ sites that convert to genuine SUB-granular arrays (`above_mode`/`left_side`, dec
 ## Refusals
 None lifted this round (pure entropy-context fix); refusal_inventory.rs / gate_coverage.rs
 unchanged.
+
+## Wider scoped run
+`cargo test -p ec-av1 --lib -j3 inter`: 58 passed, 0 failed, 7 ignored (215s).
