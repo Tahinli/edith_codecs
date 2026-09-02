@@ -93,7 +93,7 @@ EVIDENCE: /tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/b6d8a0
 EVIDENCE: same dir, pf_a/f.f0..15 vs pf_o/f.f0..15 | `EC_AV1_PREFILT_DUMP` on both decoders, byte compare per decode-order frame BEFORE the fix | frames 0-6 identical, frame 7 35 bytes differ (all inside luma rows 42-47, cols 16-23 = the 8x8 leaf at mi (10,4)), growing to 224 at frame 15
 EVIDENCE: same dir, pf_a vs pf_o2 | identical command AFTER the fix | all 16 decode-order frames byte-identical pre-filter (0 differing bytes)
 EVIDENCE: $HOME/.cache/interp3-gate-r3.log | `cargo test -p ec-av1 --lib a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact -- --nocapture` | `test result: ok. 1 passed; 0 failed` with all four counter asserts live (the run would panic if `compound_warp_hits_8` had not moved)
-EVIDENCE: SUITE_LINE_PLACEHOLDER
+EVIDENCE: $HOME/.cache/interp3-suite-r3.log | `EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-interp3 cargo test -p ec-av1 --lib -j3` under systemd unit `interp3-suite-r3-1788328778.service`, armed at f36be26 | `test result: ok. 379 passed; 0 failed; 33 ignored; 0 measured; 0 filtered out; finished in 1031.33s` (r2 baseline was 378 passed / 34 ignored -- the delta is exactly this gate leaving `#[ignore]`)
 
 ## Residue
 
