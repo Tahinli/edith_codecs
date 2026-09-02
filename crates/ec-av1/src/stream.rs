@@ -2855,6 +2855,235 @@ mod tests {
         }
     }
 
+    /// lane-pal8 r1, the gate for a palette on a SQUARE 8x8 LEAF.
+    ///
+    /// `read_palette_mode_info` (decodemv.c:567) reads `palette_y_mode` for
+    /// every `DC_PRED` block whose `av1_get_palette_bsize_ctx`
+    /// (`num_pels_log2 - num_pels_log2[BLOCK_8X8]`, 0 at 8x8) exists, and
+    /// `av1_decode_palette_tokens` (decodeframe.c:1135, `av1_visit_palette`)
+    /// reads the colour-index map after the WHOLE mode-info read. Ours passed
+    /// `None`/`&[]` from [`decode::decode_leaf8`], reading the mode symbol off
+    /// CDF row 0 and refusing "a block that actually uses a palette (Y) --
+    /// reconstruction is out of scope" the moment it fired -- and at 8 bit
+    /// aomenc palettes SQUARE blocks, so with `--min-partition-size=8` every
+    /// 8-bit screen-content stream stopped there (lane-kf900 r4's measurement).
+    ///
+    /// Sweeps both bit depths x cq 30/40/55 x `--enable-tx-size-search` 0/1 x
+    /// two lavfi sources (+ a `--tile-columns=1` arm, per the neighbour-map
+    /// rule: the palette bands are per-mi and tile-guarded). Key frame only
+    /// (`--limit=1`): the inter frames of these recipes stop on OTHER lanes'
+    /// open refusals (8x8 inter leaf chroma mode, inter 1:4 partitions).
+    /// HARD-asserts the 8x8-leaf palette counter moved on the compared arms
+    /// and that no arm mismatched, in or out of scope.
+    #[test]
+    fn a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (128usize, 128usize);
+        let (mut leaf8_total, mut fired_arms, mut compared, mut frames_compared) =
+            (0usize, 0u32, 0u32, 0usize);
+        let (mut out_of_scope, mut out_of_scope_mismatch, mut refusals) = (0u32, 0u32, 0u32);
+        let (mut sb_strip_total, mut sb_strip_arms) = (0usize, 0u32);
+        // The one palette shape this round did NOT lift (measured: lifting it
+        // mismatches -- see [`decode_block_rect64`]'s own comment).
+        let mut sb_strip_refusals = 0u32;
+        for src in ["testsrc2", "smptebars"] {
+            for depth in [8usize, 10usize] {
+                for cq in [30usize, 40, 55] {
+                    for txs in [0usize, 1] {
+                        for tiles in [0usize, 1] {
+                            let arm = format!("{src}-{depth}bit-cq{cq}-txs{txs}-tc{tiles}");
+                            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                            let size = format!("{src}=size={width}x{height}:rate=25");
+                            let render = || {
+                                let out = Command::new("ffmpeg")
+                                    .args([
+                                        "-v", "error", "-f", "lavfi", "-i", &size, "-t", "0.04",
+                                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f",
+                                        "yuv4mpegpipe", "-",
+                                    ])
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::piped())
+                                    .stderr(Stdio::piped())
+                                    .output()
+                                    .expect("ffmpeg failed to run");
+                                assert!(out.status.success(), "{NAME}: ffmpeg failed for {arm}");
+                                out.stdout
+                            };
+                            let y4m_a = render();
+                            let y4m_b = render();
+                            assert_eq!(
+                                y4m_a, y4m_b,
+                                "{NAME}: {arm} must render byte-identical across two runs"
+                            );
+                            let y4m = y4m_a;
+                            let depth_arg = format!("--bit-depth={depth}");
+                            let input_depth_arg = format!("--input-bit-depth={depth}");
+                            let cq_arg = format!("--cq-level={cq}");
+                            let txs_arg = format!("--enable-tx-size-search={txs}");
+                            let tiles_arg = format!("--tile-columns={tiles}");
+                            let mut child = Command::new(aomenc_path())
+                                .args([
+                                    "--codec=av1",
+                                    "--passes=1",
+                                    "--end-usage=q",
+                                    "--cpu-used=0",
+                                    "--threads=1",
+                                    "--row-mt=0",
+                                    "--lag-in-frames=0",
+                                    "--limit=1",
+                                    "--sb-size=64",
+                                    "--tune-content=screen",
+                                    "--enable-palette=1",
+                                    "--enable-intrabc=0",
+                                    "--min-partition-size=8",
+                                    "--enable-cdef=0",
+                                    "--enable-restoration=0",
+                                    "--loopfilter-control=0",
+                                ])
+                                // aomenc keeps the LAST occurrence of a repeated flag,
+                                // so per-arm overrides go after the base recipe.
+                                .args([&depth_arg, &input_depth_arg, &cq_arg, &txs_arg, &tiles_arg])
+                                .args(["--obu", "-o", "-", "-"])
+                                .stdin(Stdio::piped())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::piped())
+                                .spawn()
+                                .expect("aomenc failed to start");
+                            child
+                                .stdin
+                                .take()
+                                .expect("aomenc stdin")
+                                .write_all(&y4m)
+                                .or_else(|e| match e.kind() {
+                                    std::io::ErrorKind::BrokenPipe => Ok(()),
+                                    _ => Err(e),
+                                })
+                                .expect("writing y4m to aomenc");
+                            let out = child.wait_with_output().expect("aomenc failed to run");
+                            assert!(
+                                out.status.success(),
+                                "{NAME}: aomenc refused {arm}: {}",
+                                String::from_utf8_lossy(&out.stderr)
+                            );
+                            let stream = out.stdout;
+                            decode::reset_palette_leaf8_hits();
+                            decode::reset_palette_sb_strip_hits();
+                            let decoded = decode_stream(&stream);
+                            let leaf8 = decode::palette_leaf8_hits();
+                            let sb_strip = decode::palette_sb_strip_hits();
+                            leaf8_total += leaf8;
+                            sb_strip_total += sb_strip;
+                            match decoded {
+                                Ok(frames) => {
+                                    assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
+                                    let theirs = if depth == 10 {
+                                        ffmpeg_decode_sequence_10bit(
+                                            &stream,
+                                            width,
+                                            height,
+                                            frames.len(),
+                                        )
+                                    } else {
+                                        ffmpeg_decode_sequence(&stream, width, height, frames.len())
+                                    };
+                                    assert_eq!(
+                                        frames.len(),
+                                        theirs.len(),
+                                        "{NAME}: {arm} frame count"
+                                    );
+                                    let mut same = true;
+                                    for (i, (ours, ref_f)) in
+                                        frames.iter().zip(theirs.iter()).enumerate()
+                                    {
+                                        let ok = ours.y == ref_f.y
+                                            && ours.u == ref_f.u
+                                            && ours.v == ref_f.v;
+                                        if !ok {
+                                            eprintln!("{NAME}: {arm} MISMATCH at frame {i}");
+                                        }
+                                        same &= ok;
+                                        frames_compared += 1;
+                                    }
+                                    compared += 1;
+                                    if sb_strip > 0 {
+                                        sb_strip_arms += 1;
+                                        assert!(
+                                            same,
+                                            "{NAME}: {arm} decoded {sb_strip} non-skip palette \
+                                             block(s) on a superblock-level strip and did not \
+                                             match ffmpeg"
+                                        );
+                                    }
+                                    if leaf8 > 0 || sb_strip > 0 {
+                                        fired_arms += 1;
+                                        assert!(
+                                            same,
+                                            "{NAME}: {arm} decoded {leaf8} 8x8-leaf palette \
+                                             block(s) and did not match ffmpeg"
+                                        );
+                                    } else {
+                                        out_of_scope += 1;
+                                        if !same {
+                                            out_of_scope_mismatch += 1;
+                                        }
+                                    }
+                                    eprintln!(
+                                        "{NAME}: {arm} {} frame(s), {leaf8} 8x8-leaf palette \
+                                         block(s), {sb_strip} superblock-strip palette \
+                                         block(s), exact={same}",
+                                        frames.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    let msg = e.to_string();
+                                    assert!(
+                                        msg.contains("unsupported"),
+                                        "{NAME}: {arm} decode failed: {e}"
+                                    );
+                                    // Named, counted, never turned into a skip.
+                                    if msg.contains("superblock-level HORZ/VERT strip") {
+                                        sb_strip_refusals += 1;
+                                    }
+                                    eprintln!("{NAME}: {arm} REFUSED: {e}");
+                                    refusals += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{NAME}: {leaf8_total} 8x8-leaf palette block(s) across {fired_arms} arm(s), \
+             {compared} arms compared ({frames_compared} frames), {sb_strip_total} \
+             superblock-strip palette block(s) across {sb_strip_arms} arm(s), \
+             {out_of_scope} out of scope ({out_of_scope_mismatch} mismatched), \
+             {refusals} refused ({sb_strip_refusals} superblock-strip palette)"
+        );
+        assert!(
+            leaf8_total > 0 && fired_arms > 0,
+            "{NAME}: gate is vacuous -- no compared arm decoded an 8x8-leaf palette block"
+        );
+        assert!(
+            sb_strip_refusals > 0,
+            "{NAME}: no arm reached the superblock-strip palette refusal -- the open residue \
+             this gate documents is no longer exercised"
+        );
+        assert_eq!(
+            out_of_scope_mismatch, 0,
+            "{NAME}: an out-of-scope arm mismatched ffmpeg -- a defect, never a skip"
+        );
+        assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+    }
+
     /// lane-kf900 r5, the gate for the rect-strip `use_intrabc` read.
     ///
     /// `av1_allow_intrabc` is a FRAME-level test (`decodemv.c:892`,
