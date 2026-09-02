@@ -6555,11 +6555,12 @@ fn decode_intra_rect_in_inter(
             v[depth.min(2)] += 1;
             h.set(v);
         });
-        if std::env::var_os("EC_SPLITSTRIP").is_some() {
-            eprintln!(
-                "EC_SPLITSTRIP mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} depth={depth}"
-            );
-        }
+    }
+    // lane-intrasplit r3: print EVERY intra strip with its depth, not only the
+    // split ones -- a `depth=0`-only stream is a witness gap in the SOURCE, and
+    // the two are indistinguishable when the diagnostic fires on splits alone.
+    if std::env::var_os("EC_SPLITSTRIP").is_some() {
+        eprintln!("EC_SPLITSTRIP mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} depth={depth}");
     }
     let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
     let modes = RectStripModes {
@@ -11584,10 +11585,10 @@ fn tx_size_context_txfm_rect(
     let has_left = mi_c > n.tile_col0_mi;
     let mut above = usize::from(n.above_txfm[mi_c]) >= own_w;
     let mut left = usize::from(n.left_txfm[mi_r]) >= own_h;
-    if has_above && n.above_inter[mi_c / (SUB / MI)] {
+    if has_above && n.above_inter[mi_c] {
         above = n.above_side_mi[mi_c] >= own_w;
     }
-    if has_left && n.left_inter[mi_r / (SUB / MI)] {
+    if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= own_h;
     }
     match (has_above, has_left) {
@@ -11598,15 +11599,21 @@ fn tx_size_context_txfm_rect(
     }
 }
 
+/// lane-intrasplit r3: `above_inter`/`left_inter` are mi-granular bands (they
+/// are written and read everywhere else with a raw mi index); the SUB-cell
+/// division this pair used read a cell four blocks away, so the inter-neighbour
+/// override above fired on the wrong neighbour -- the first divergence of the
+/// 10-bit gate's stream was exactly this (`tx_depth` ctx 0 where libaom has 1,
+/// at the intra block right of an inter one).
 fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usize) -> usize {
     let has_above = mi_r > n.tile_row0_mi;
     let has_left = mi_c > n.tile_col0_mi;
     let mut above = usize::from(n.above_txfm[mi_c]) >= side;
     let mut left = usize::from(n.left_txfm[mi_r]) >= side;
-    if has_above && n.above_inter[mi_c / (SUB / MI)] {
+    if has_above && n.above_inter[mi_c] {
         above = n.above_side_mi[mi_c] >= side;
     }
-    if has_left && n.left_inter[mi_r / (SUB / MI)] {
+    if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= side;
     }
     match (has_above, has_left) {

@@ -5533,7 +5533,16 @@ mod tests {
             eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (width, height, frame_count) = (192usize, 128usize, 8usize);
+        // lane-intrasplit r3, MEASURED (probe3, 20 attempts x 2 depths): at
+        // 192x128 with `--min/--max-partition-size=32` a correctly decoded
+        // stream contains ZERO intra HORZ/VERT strips in an inter frame -- the
+        // r1/r2 "firing" counters were read off our own desynced decode (class
+        // counter-from-refused-stream). The merged unsplit-strip gate's own
+        // geometry (96x96, min 16 / max 64) is the one that makes aomenc's RD
+        // pick intra strips here, and at `--enable-tx-size-search=1` it splits
+        // their transforms: 10-bit attempt 0 = 8 strips, 3 split; 8-bit
+        // attempt 0 = 5 strips, 1 split.
+        let (width, height, frame_count) = (96usize, 96usize, 8usize);
         let mut refusals = Vec::new();
         let mut uncounted_exact = 0u32;
         let mut counted_exact = 0u32;
@@ -5547,7 +5556,7 @@ mod tests {
             // 1..4, and the quantiser with it (a hard-cut overlay source at
             // cpu-used=0 stopped 38/40 attempts on other lanes' refusals).
             let cpu = attempt % 5;
-            let cq = [30u32, 20, 12, 63][((attempt / 5) % 4) as usize];
+            let cq = [30u32, 20, 12, 4][((attempt / 5) % 4) as usize];
             // A FAST ZOOM: consecutive frames share almost no content, so
             // aomenc's RD codes blocks INTRA inside INTER frames
             // (`--kf-min-dist` forbids a new key frame) -- the only way a
@@ -5636,8 +5645,8 @@ mod tests {
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
                     "--enable-ref-frame-mvs=0",
-                    "--min-partition-size=32",
-                    "--max-partition-size=32",
+                    "--min-partition-size=16",
+                    "--max-partition-size=64",
                     // Per-arm overrides go LAST (aomenc keeps the last
                     // occurrence of a repeated --enable-* flag): this gate
                     // needs the rect partitions the strip lives in and the
