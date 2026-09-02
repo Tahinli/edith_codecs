@@ -53,11 +53,17 @@ then `cargo run -p ec-av1 --example decode_probe` | new stops:
   reached on this segment.
 
 ## Suite
-`cargo test -p ec-av1 --lib` (systemd unit, MemoryMax=10G) — see
-`$HOME/.cache/intrasplit-suite-r1.log`; totals in the handoff line below.
-The two new gate tests FAIL by construction (never fired). One further failure,
-`a_real_aomenc_stream_with_film_grain_decodes_pixel_exact`, is being triaged against the
-base commit (`$HOME/.cache/intrasplit-base-filmgrain.log`).
+`cargo test -p ec-av1 --lib` (systemd unit, MemoryMax=10G, log
+`$HOME/.cache/intrasplit-suite-r1.log`): **370 passed, 2 failed, 32 ignored** in 1183 s.
+The 2 failures are exactly the two new gate arms (never fired, see above); every merged
+gate — including the two `split_transform_intra_block` arms the refusal was originally
+protecting, and every rect/strip/txselect gate — stays green with both fixes in.
+
+A first suite run also showed `a_real_aomenc_stream_with_film_grain_decodes_pixel_exact`
+FAILED; that was MY setup error (the worktree had no top-level `fixtures` symlink, so
+`fs::read(../../fixtures/golden6-mismatch.obu).unwrap()` panicked), not a regression —
+`$HOME/.cache/intrasplit-base-filmgrain.log` shows the same test green at base 18bf7dc, and
+it is green in the rerun above after `ln -s`.
 
 ## Residue
 - fix-now (next round): make the gate fire. The only untried levers are a content family
