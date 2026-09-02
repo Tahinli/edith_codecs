@@ -80,6 +80,12 @@ pub fn rect32x8_inter_tu_hits() -> [usize; 2] {
     crate::decode::rect32x8_inter_tu_hits()
 }
 
+/// lane-intra16x4: `(16x4, 4x16, chroma-reference)` INTRA strips decoded inside
+/// an inter 16x16-level 1:4 partition.
+pub fn intra16x4_in_inter_hits() -> (usize, usize, usize) {
+    crate::decode::intra16x4_in_inter_hits()
+}
+
 /// lane-r14 r3: RECTANGULAR var-tx leaf transform units, `[32x16, 16x32]` --
 /// the leaves `sub_tx_size_map` produces when a 1:4 strip with a 64-px axis
 /// splits its transform (`[TX_64X16] == TX_32X16`, `[TX_16X64] == TX_16X32`).
@@ -10985,6 +10991,262 @@ mod tests {
              attempt refused on rectangular residual coding -- their documented blocker is gone, \
              so a zero arm is now unexplained"
         );
+    }
+
+
+    #[test]
+    #[ignore = "RED at lane-intra16x4 r1: the decode path is behind \
+                EC_INTRA16X4_DECODE=1 and still mismatches ffmpeg (attempt 1, 8-bit, 192x128 \
+                cq60: frame 1 luma differs from (175, 0), 8400 px, with the two intra 16x4 \
+                strips at mi(1,40)/(3,40) themselves exact) -- lanes/intra16x4-r1.report.md"]
+    // lane-intra16x4 r1: an INTRA-coded 16x4 / 4x16 strip inside an INTER
+    // frame's 16x16-level 1:4 partition -- the wall all six of his film cuts
+    // stopped at once lane-rectres landed. The shape's chroma is the pair's:
+    // `is_chroma_reference` (av1_common_int.h:1454) is false on the even
+    // strips (which read no `uv_mode` and code no chroma at all) and the odd
+    // one codes ONE 8x4 (4x8) chroma unit at the pair's origin -- and when the
+    // pair mixes an intra and an inter strip, the chroma is predicted per the
+    // strip that CARRIES it, which is exactly what routing the intra strip
+    // through the key frame's own proven per-strip body
+    // (`decode_rect4_16_strip`) gives.
+    //
+    // Recipes found by a 24 + 24 run sweep (three sources x cq 16..63 x two
+    // sizes, `~/.cache/intra16x4-tmp/sweep*.sh`): aomenc only picks an INTRA
+    // 1:4 strip on an inter frame at HIGH cq over content its MC cannot
+    // predict -- a per-frame-random bright bar sweeping the frame (HORZ_4
+    // strips) and a `X*Y` product sinusoid under temporal noise (VERT_4).
+    // Both sources hash identically twice (report).
+    fn a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let frame_count = 6usize;
+        // (source kind, cq, width, height) -- the four recipes of the 48-run
+        // sweep (`~/.cache/intra16x4-tmp/sweep*.sh`, table in the report) that
+        // reach an INTRA 1:4 strip on an inter frame. `bar` is a per-frame
+        // random bright bar sweeping the frame (its MC failure is what makes
+        // aomenc's RD pick intra at 16x4), `prod` an `X*Y` product sinusoid
+        // under temporal noise; `_v` transposes the structure so the RD picks
+        // PARTITION_VERT_4.
+        const RECIPES: [(&str, u32, usize, usize); 4] = [
+            ("noise", 60, 128, 128),
+            ("bar", 60, 192, 128),
+            ("prod_v", 56, 128, 128),
+            ("prod", 56, 160, 128),
+        ];
+        // [16x4 intra strips, 4x16 intra strips, of which chroma-reference]:
+        // how many pixel-exact attempts fired each, over both bit depths.
+        let mut arms_total = [0u32; 3];
+        // Attempts that refused on the sub-8x8 intra block inside an inter
+        // frame -- a DIFFERENT lane's shape, and the measured blocker of every
+        // VERT_4-carrying recipe in the sweep.
+        let mut sub8_intra_refusals = 0u32;
+        for bit_depth in [8u32, 10u32] {
+            let (mut named_refusals, mut matched, mut out_of_scope, mut oos_mismatch) =
+                (0u32, 0u32, 0u32, 0u32);
+            let mut arms_proved = [0u32; 3];
+            for attempt in 0..RECIPES.len() as u32 {
+                let (kind, cq, width, height) = RECIPES[attempt as usize];
+                let duration = frame_count as f64 / 25.0;
+                // Both sources are deterministic (two identical y4m hashes,
+                // report): `random()` here is geq's own indexed PRNG and the
+                // noise filter carries an explicit `all_seed`.
+                let (lum, noise) = match kind {
+                    "noise" => (
+                        format!("128+58*sin((X+N*3)/6)+40*sin(Y/11)"),
+                        ",noise=alls=40:allf=t+u:all_seed=7",
+                    ),
+                    "bar" => (
+                        format!(
+                            "if(lt(mod(X+N*37,{width}),24),random(N*100+X+Y)*255,128+50*sin(Y/7))"
+                        ),
+                        "",
+                    ),
+                    "prod_v" => (
+                        "128+60*sin((X*Y+N*97)/13)+50*sin((Y+N*11)/5)".to_string(),
+                        ",noise=alls=25:allf=t:all_seed=11",
+                    ),
+                    _ => (
+                        "128+60*sin((X*Y+N*97)/13)+50*sin((X+N*11)/5)".to_string(),
+                        ",noise=alls=25:allf=t:all_seed=11",
+                    ),
+                };
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='{lum}',format=yuv420p{noise}"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
+                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--lag-in-frames=0", "--kf-max-dist=9999", "--tile-columns=0",
+                    // Per-arm overrides go LAST (aomenc keeps the last
+                    // occurrence of a repeated --enable-* flag).
+                    "--enable-tx-size-search=1", "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=1", "--enable-1to4-partitions=1",
+                    "--enable-intra-edge-filter=1",
+                    "--min-partition-size=4", "--max-partition-size=16",
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = crate::stream::intra16x4_in_inter_hits();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        if msg.contains("sub-8x8") {
+                            sub8_intra_refusals += 1;
+                        }
+                        named_refusals += 1;
+                        eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let after = crate::stream::intra16x4_in_inter_hits();
+                let fired = [
+                    (after.0 - before.0) as u32,
+                    (after.1 - before.1) as u32,
+                    (after.2 - before.2) as u32,
+                ];
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if fired[0] + fired[1] == 0 {
+                    out_of_scope += 1;
+                    if mismatched {
+                        oos_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit attempt {attempt} MISMATCHES with zero \
+                             intra 1:4 strip -- another shape's defect"
+                        );
+                    }
+                    continue;
+                }
+                if mismatched {
+                    for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                        let bad: Vec<usize> =
+                            (0..got.y.len()).filter(|&k| got.y[k] != want.y[k]).collect();
+                        if !bad.is_empty() {
+                            eprintln!(
+                                "{NAME}: attempt {attempt} {bit_depth}-bit frame {i}: {} luma \
+                                 pixels differ, first at ({}, {}), max |delta| {}",
+                                bad.len(),
+                                bad[0] % width,
+                                bad[0] / width,
+                                bad.iter()
+                                    .map(|&k| (got.y[k] as i32 - want.y[k] as i32).abs())
+                                    .max()
+                                    .unwrap_or(0)
+                            );
+                        }
+                    }
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit, arms {fired:?})");
+                }
+                for a in 0..3 {
+                    if fired[a] > 0 {
+                        arms_proved[a] += 1;
+                        arms_total[a] += 1;
+                    }
+                }
+                matched += 1;
+            }
+            eprintln!(
+                "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
+                 attempts carrying an intra 1:4 strip, per-arm attempts \
+                 16x4/4x16/chroma-reference={arms_proved:?}, {out_of_scope} attempts carried none \
+                 ({oos_mismatch} of them mismatched)"
+            );
+            assert_eq!(
+                oos_mismatch, 0,
+                "{NAME}: {oos_mismatch} attempt(s) with no intra 1:4 strip decoded but mismatched \
+                 ffmpeg -- a defect of another shape, not a pass"
+            );
+        }
+        // MEASURED (48-run sweep, report table): every recipe that makes
+        // aomenc pick an intra PARTITION_VERT_4 strip ALSO contains an intra
+        // 8x4/4x8 or 4x4 block inside a sub-8x8 partition, a refusal this lane
+        // does not own -- so the 4x16 orientation is blocked on THAT and the
+        // gate asserts exactly that. If the sub-8x8 lane lands and this arm
+        // still reads 0, or the blocker changes, this fails.
+        assert!(
+            arms_total[1] > 0 || sub8_intra_refusals > 0,
+            "{NAME}: the 4x16 (PARTITION_VERT_4) arm read 0 \
+             (16x4/4x16/chroma-reference={arms_total:?}) and NO attempt refused on the sub-8x8 \
+             intra block -- its documented blocker is gone, so a zero arm is now unexplained"
+        );
+        for (a, what) in [
+            (0usize, "intra 16x4 strips (PARTITION_HORZ_4)"),
+            (2, "chroma-reference (odd) intra strips carrying the pair's 8x4/4x8 chroma"),
+        ] {
+            assert!(
+                arms_total[a] > 0,
+                "{NAME}: arm {a} ({what}) never fired on a pixel-exact attempt \
+                 (16x4/4x16/chroma-reference={arms_total:?}) -- unproven"
+            );
+        }
     }
 
 

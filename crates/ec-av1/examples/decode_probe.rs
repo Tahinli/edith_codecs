@@ -110,6 +110,12 @@ fn main() {
         // rectangular residual transform unit (a skipped one codes none).
         let r328 = ec_av1::stream::rect32x8_inter_tu_hits();
         println!("rect32x8_inter_tu: 32x8={} 8x32={}", r328[0], r328[1]);
+        // lane-intra16x4: INTRA strips of an inter 16x16-level 1:4 partition.
+        let i164 = ec_av1::stream::intra16x4_in_inter_hits();
+        println!(
+            "intra16x4_in_inter: 16x4={} 4x16={} chroma_ref={}",
+            i164.0, i164.1, i164.2
+        );
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
