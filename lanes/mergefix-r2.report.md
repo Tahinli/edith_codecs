@@ -72,8 +72,16 @@ and 16-level ctx (0/0) already agree with aomdec, so this is a single-site defec
 
 fix-now (handed off): see `lanes/mergefix-r2.handoff.md`.
 
+## Sibling gates (run AFTER the fix, one invocation)
+
+`cargo test -p ec-av1 --lib -j3 -- <9 names>` -> **ok. 9 passed; 0 failed** in 162.65s:
+split_transform_intra_block (8-bit + 10-bit), intra_rect_strip (8-bit + 10-bit),
+split_transform_horz_vert_strip, split_transform_superblock_strip,
+coded_strip_whose_chroma_is_a_4to1_or_sub8_rect, sub8x8_inter_split,
+16x16_level_ab_partitions.
+
+EVIDENCE: cargo test output | the 9 gates above re-run on the fixed tree | 9 passed 0 failed
+
 ## Test totals
-Not run to completion this round (hard 50-minute deadline). The one gate above was run by
-name. Sibling gates (split-transform, sb128c intra_rect_block/gathered_edge_horz,
-uv8/intersub8/inter16ab/rectchroma2) are NOT yet re-run --
-deferred(one `cargo test -p ec-av1 --lib` invocation with those names).
+Full `cargo test -p ec-av1 --lib` NOT run this round (hard 50-minute deadline):
+deferred(one suite run) -- the 9 sibling gates plus the lane's own gate were run by name.
