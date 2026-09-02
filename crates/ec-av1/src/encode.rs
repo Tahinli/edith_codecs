@@ -1234,18 +1234,22 @@ impl Reach {
         bh: usize,
         col_off: usize,
         row_off: usize,
-        tx: usize,
+        // The unit's own width and height in pixels; equal for a square
+        // transform, different for the rect unit a 1:4 strip's first split
+        // produces (lane-rectsplitx r1).
+        tx_w: usize,
+        tx_h: usize,
         block: Self,
     ) -> Self {
         Self {
-            above_right: if col_off + tx < bw {
+            above_right: if col_off + tx_w < bw {
                 true
             } else {
                 row_off == 0 && block.above_right
             },
             below_left: if col_off > 0 {
                 false
-            } else if row_off + tx < bh {
+            } else if row_off + tx_h < bh {
                 true
             } else {
                 block.below_left
@@ -3865,14 +3869,14 @@ mod tests {
         // `has_tr_vert_*` tables have no 4x4 row at all, lane-ab16 r2).
         let plain = Reach::of(8, 0, 8, SUPERBLOCK, SUPERBLOCK);
         assert_eq!(
-            Reach::of_tu(8, 8, 4, 0, 4, plain).above_right,
+            Reach::of_tu(8, 8, 4, 0, 4, 4, plain).above_right,
             plain.above_right,
             "ordinary table: the top-right TX4 unit takes the block's row"
         );
         let guard = Reach::vert_ab_partition();
         let vert = Reach::of(8, 0, 8, SUPERBLOCK, SUPERBLOCK);
         assert_eq!(
-            Reach::of_tu(8, 8, 4, 0, 4, vert).above_right,
+            Reach::of_tu(8, 8, 4, 0, 4, 4, vert).above_right,
             vert.above_right,
             "vert AB: the unit follows the vert row the block just picked"
         );
@@ -4016,7 +4020,7 @@ mod tests {
                 for row_off in (0..bh).step_by(tx) {
                     for col_off in (0..bw).step_by(tx) {
                         for &blk in &[Reach { above_right: false, below_left: false }, Reach { above_right: true, below_left: true }] {
-                            let got = Reach::of_tu(bw, bh, col_off, row_off, tx, blk);
+                            let got = Reach::of_tu(bw, bh, col_off, row_off, tx, tx, blk);
                             assert_eq!(
                                 got.above_right,
                                 libaom_tr(bw, bh, col_off, row_off, tx, blk.above_right),

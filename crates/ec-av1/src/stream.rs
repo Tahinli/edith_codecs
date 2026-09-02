@@ -9282,22 +9282,26 @@ mod tests {
             attempts.iter().filter(|a| !a.tx_size_search).count(),
             "{NAME}: every fixed-transform attempt must decode and compare"
         );
-        // The tx-size-search attempts cannot be compared pixel by pixel yet:
-        // every 16x16 AB partition contains a strip, and with a free
-        // transform size aomenc splits at least one of them in every stream
-        // of a 40-cell {source, cq} sweep (r2 report), so they all stop at
-        // lane-rectx's "strip with a split transform" refusal (or the 1:4 /
-        // sub-8x8 ones) before the frame is done. What they DO prove is that
-        // the TX4 sub-grid of an 8x8 square inside a VERT_A/VERT_B is reached
-        // on a real stream and answers -- it used to panic there, and a panic
-        // cannot be tolerated by the `unsupported` arm above. The values it
-        // answers are pinned separately against libaom in
-        // `of_tu_keeps_the_ordinary_answer_and_uses_the_block_row_under_vert_ab`.
-        let _ = tx4_compared;
-        assert!(
-            tx4_reached > 0,
-            "{NAME}: no --enable-tx-size-search=1 attempt reached a TX4 unit inside a \
-             vertical AB partition -- the r2 panic path is unproven"
+        // Until the lane-rectsplitx merge every tx-size-search attempt stopped
+        // at "a HORZ/VERT intra strip below 16x16 with a split transform", so
+        // this gate could only claim that the TX4 sub-grid of an 8x8 square
+        // inside a VERT_A/VERT_B was REACHED (`tx4_reached`, counted even on a
+        // refused attempt). With per-TU rect prediction those same attempts now
+        // decode to the end and compare pixel-exact, and they carry no vert-AB
+        // TX4 unit at all -- the pre-merge nonzero count came from decodes that
+        // were still desynced when they hit the refusal (class
+        // counter-from-refused-stream). The full pixel compare is the stronger
+        // claim and replaces it; the lookup's VALUES stay pinned against libaom
+        // in `of_tu_keeps_the_ordinary_answer_and_uses_the_block_row_under_vert_ab`.
+        eprintln!("{NAME}: vert-AB TX4 units reached across tx-size-search attempts: {tx4_reached}");
+        let _ = tx4_reached;
+        assert_eq!(
+            tx4_compared,
+            attempts.iter().filter(|a| a.tx_size_search).count(),
+            "{NAME}: every --enable-tx-size-search=1 attempt must now decode to the end and \
+             compare pixel-exact (the split-transform strip refusal these used to stop at is \
+             lifted); the vert-AB TX4 lookup values stay pinned by \
+             `of_tu_keeps_the_ordinary_answer_and_uses_the_block_row_under_vert_ab`"
         );
         for (i, arm) in ["HORZ_A", "HORZ_B", "VERT_A", "VERT_B"].iter().enumerate() {
             assert!(arms[i] > 0, "{NAME}: PARTITION_{arm} at 16x16 never fired across {compared} \
@@ -12927,7 +12931,7 @@ mod tests {
     /// `encode::tests::every_rect_shape_reaches_what_libaom_says_over_the_whole_superblock`
     /// against libaom's own `has_tr_*`/`has_bl_*` arrays.
     #[test]
-    #[ignore = "the coded 16x8/8x16 strip is a live refusal; see the doc above"]
+    #[ignore = "lane-rectsplitx r2 (re-measured after the neighbour-mode fix): every seed 700..739 attempt now stops at another lane's refusal 'a HORZ_A/HORZ_B/VERT_A partition below 16x16', so the gate reaches no strip at all -- blocked on AB partitions below 16x16, not on this lane"]
     fn a_directional_16x8_strip_reads_the_right_above_right_samples() {
         const NAME: &str = "a_directional_16x8_strip_reads_the_right_above_right_samples";
         if !have_ffmpeg() {
@@ -16180,17 +16184,15 @@ mod tests {
     }
 
     /// lane-fistrip r1, the 10-bit arm of the strip gate (his films are
-    /// yuv420p10le). Same ceiling as its 8-bit twin -- kept `#[ignore]`d
-    /// with the measurement rather than weakened: MEASURED over seeds
+    /// yuv420p10le). Same ceiling as its 8-bit twin, lifted in lane-rectsplitx
+    /// r3 (the split arm's `smooth_neighbor_uv`); before that, MEASURED over seeds
     /// 42..61 the 8x16/16x8 strips aomenc writes filter intra on are
     /// `skip=0`, which `decode_leaf_rect` refuses, so
     /// `filter_intra_rect_sub16_hits` never reaches a pixel compare.
     /// lane-fistrip r2 adds seeds 49 and 213 to the window: those are the two
     /// seeds measured to fire the feature on the 8-BIT twin's recipe (this
     /// arm's 10-bit encode is a different stream, so they are a widening, not
-    /// a measured firing set for this recipe -- the round that un-ignores
-    /// this gate must re-measure which 10-bit seeds fire it).
-    #[ignore = "2026-09-02, re-measured on the merged tree: the coded-strip refusal is lifted, but every firing 10-bit seed now stops at the sub16 SPLIT-TRANSFORM refusal (49, 55) or palette-in-screen-content (45, 46); 16 attempts decode pixel-exact with 0 hits, so the gate would prove nothing"]
+    /// a measured firing set for this recipe). Green since r3.
     #[test]
     fn a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact";
@@ -16273,29 +16275,40 @@ mod tests {
             .join("fixtures/filter_intra_8x16_strip_seed49.obu");
         let stream = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
         let before = crate::decode::filter_intra_rect_sub16_hits();
-        let err = decode_stream(&stream).expect_err(
-            "{NAME}: this stream's 16x8 filter-intra strip is skip=0, which this decoder \
-             still refuses -- a clean decode means the coded-strip ceiling moved and this \
-             test should become a pixel compare",
-        );
+        // lane-rectsplitx r1: the ceiling this fixture used to stop at (a
+        // sub-16 strip with a SPLIT transform) is ported, so the pinned
+        // stream is now a full pixel compare -- what the doc above said this
+        // test should become the round that ceiling lifted.
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: decode refused: {e}"));
         let hits = crate::decode::filter_intra_rect_sub16_hits() - before;
+        // TWO now, not the one the truncated decode used to see: the frame
+        // no longer stops at the first filter-intra strip, so the second one
+        // later in the tile is reached as well (and the pixel compare below
+        // proves both reconstructed right).
         assert_eq!(
-            hits, 1,
-            "{NAME}: expected exactly one 16x8 strip to read use_filter_intra=1 (aomdec's own \
-             EC_TRACE_MODE shows four BLOCK_16X8 DC_PRED leaves here); got {hits}"
+            hits, 2,
+            "{NAME}: expected both 16x8 strips to read use_filter_intra=1; got {hits}"
         );
-        let msg = err.to_string();
+        // This is also the GATE for the sub-16 split-transform lift: both
+        // strips split their transform (`tx_depth != 0` on a BLOCK_16X8 ->
+        // two TX_8X8 units), which is the refusal this round removed.
+        let splits = crate::decode::sub16_split_hits();
         assert!(
-            // 2026-09-02, merging lane-fistrip onto a main that already carries
-            // lane-rectx: the coded-strip ceiling this fixture used to hit is
-            // gone, and the very next one on the SAME block is the split
-            // transform under a sub-16 strip (per-unit rect prediction is not
-            // ported). Still a refusal ON that block, still not a desync.
-            msg.contains("a HORZ/VERT intra strip below 16x16 with a split transform"),
-            "{NAME}: decode must reach the sub16 split-transform ceiling ON that block, not \
-             wander off a desynced stream; got: {msg}"
+            splits > 0,
+            "{NAME}: no sub-16 strip split its transform -- the fixture no longer proves the \
+             per-unit path this test gates"
         );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 192, 128, 1);
+        assert_eq!(frames.len(), 1, "{NAME}: expected one frame");
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
     }
 
     /// lane-fistrip r1: the filter-intra strip gate above, one partition
@@ -16311,19 +16324,20 @@ mod tests {
     /// `filter_intra_rect_hits`: a 32x16 strip firing filter intra would
     /// satisfy that one and prove nothing about the new shapes.
     /// MEASURED (lane-fistrip r1, seeds 42..=241; r2 re-ran 50..=241), which
-    /// is why it is `#[ignore]`d rather than green: over those 200 seeds at
+    /// is why the window carries the two firing seeds: over those 200 seeds at
     /// cq 25 aomenc put filter intra on an 8x16/16x8 strip exactly TWICE --
     /// **seed 49 and seed 213** -- and both times that strip was `skip=0`, so
     /// the attempt refused at the coded-rect-strip-below-16x16 ceiling before
     /// any pixel compare (r1: 177 pixel-exact matches, 23 refusals, compared
     /// sub16 delta 0, all-attempt delta 2; r2 seeds 50..=241: 172 matches, 20
     /// refusals, the one all-attempt hit at seed 213). BOTH firing seeds are
-    /// appended to this gate's seed window below, so the un-ignore compares
-    /// two real hits. Un-ignore this the round that ceiling lifts; the symbol
-    /// itself is pinned by
-    /// [`a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag`], whose
-    /// `expect_err` must become a pixel compare in that same round.
-    #[ignore = "2026-09-02, re-measured on the merged tree: 35 of 41 attempts decode pixel-exact with ZERO mismatches, but both firing seeds (49, 213) stop at the sub16 split-transform / HORZ_A-B refusals, so no filter-intra 8x16/16x8 strip is compared yet"]
+    /// appended to this gate's seed window below, so it compares two real
+    /// hits. UN-IGNORED lane-rectsplitx r3: the ceiling lifted with the split
+    /// refusal, and the residual chroma defect was the split arm of
+    /// [`crate::decode::decode_leaf_rect`] passing `smooth_neighbor_uv: false`
+    /// where the unsplit arm passes the neighbour's real answer. The symbol
+    /// itself stays pinned by
+    /// [`a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag`].
     #[test]
     fn a_real_aomenc_stream_with_filter_intra_on_a_sub16_horz_vert_strip_decodes_pixel_exact() {
         const NAME: &str =
@@ -17408,8 +17422,18 @@ mod tests {
             let mut named_refusals = 0u32;
             let mut matched = 0u32;
             let (mut horz_proved, mut vert_proved, mut coeff_proved) = (0usize, 0usize, 0usize);
+            let (mut depth1_proved, mut depth2_proved) = (0usize, 0usize);
             let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
-            for attempt in 0..n_attempts {
+            // lane-rectsplitx r1: the SECOND half of the attempt window turns
+            // `--enable-tx-size-search` ON at low cq, which is what makes a
+            // 32-level 1:4 strip SPLIT its transform -- depth 1 is the 2:1
+            // rect unit TX_16X8/TX_8X16 (`sub_tx_size_map[TX_32X8]`), depth 2
+            // the square TX_8X8, and the two interleave across attempts, so
+            // both are asserted (a depth-2-only run leaves the rect-unit path
+            // unproved).
+            for attempt in 0..n_attempts * 2 {
+                let tx_search = attempt >= n_attempts;
+                let attempt = attempt % n_attempts;
                 let seed = 42 + attempt;
                 let duration = frame_count as f64 / 25.0;
                 // 8-pixel bands: a 32x8 strip is flat, a 32x16 one is not, so
@@ -17428,7 +17452,13 @@ mod tests {
                      geq=lum='mod(floor({axis}/8)*{step},256)',\
                      noise=alls={noise}:all_seed={seed},format=yuv420p"
                 );
-                let cq_level = format!("--cq-level={}", if attempt % 4 < 2 { 32 } else { 45 });
+                let cq_level = if tx_search {
+                    // 12..28: the window measured to fire both split depths on
+                    // this fixture (lanes/tx64x16-r4.handoff.md).
+                    format!("--cq-level={}", 12 + (attempt % 4) * 5)
+                } else {
+                    format!("--cq-level={}", if attempt % 4 < 2 { 32 } else { 45 })
+                };
                 let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
                     .args([
@@ -17469,7 +17499,11 @@ mod tests {
                     "--enable-filter-intra=0",
                     "--enable-cfl-intra=0",
                     "--enable-intrabc=0",
-                    "--enable-tx-size-search=0",
+                    if tx_search {
+                        "--enable-tx-size-search=1"
+                    } else {
+                        "--enable-tx-size-search=0"
+                    },
                     "--obu",
                     "-o",
                     "-",
@@ -17500,6 +17534,7 @@ mod tests {
                     crate::decode::rect4_32_vert_hits(),
                     crate::decode::rect4_coeff_hits(),
                 );
+                let split_before = crate::decode::rect4_split_depth_hits();
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
                         let msg = e.to_string();
@@ -17519,6 +17554,8 @@ mod tests {
                     crate::decode::rect4_32_vert_hits() - before.1,
                     crate::decode::rect4_coeff_hits() - before.2,
                 );
+                let split_now = crate::decode::rect4_split_depth_hits();
+                let (d1, d2) = (split_now.0 - split_before.0, split_now.1 - split_before.1);
                 let ffmpeg_frames = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
                 } else {
@@ -17569,6 +17606,8 @@ mod tests {
                 horz_proved += horz;
                 vert_proved += vert;
                 coeff_proved += coeff;
+                depth1_proved += d1;
+                depth2_proved += d2;
                 matched += 1;
             }
             assert!(
@@ -17591,6 +17630,25 @@ mod tests {
                  matches out of {n_attempts}, horz_4 strips={horz_proved}, vert_4 \
                  strips={vert_proved}, coded strips={coeff_proved}, {out_of_scope} attempts \
                  carried no 32-level 1:4 block ({out_of_scope_mismatch} mismatched)"
+            );
+            // The split-transform halves of the window: both tx depths must
+            // have fired inside an attempt that then compared pixel-exact
+            // (class counter-from-refused-stream -- a global counter would
+            // count strips of attempts that later refused).
+            // lane-rectsplitx r2: BOTH depths are now decoded, so both are
+            // HARD-asserted -- depth 1 is the 2:1 rect unit
+            // (`sub_tx_size_map[TX_32X8] == TX_16X8`), depth 2 the square
+            // TX_8X8, and they interleave across the window; a run that only
+            // reached one of them proves half the walk.
+            assert!(
+                depth1_proved > 0 && depth2_proved > 0,
+                "{NAME}: {bit_depth}-bit: a 1:4 split-transform depth never fired inside a \
+                 pixel-exact attempt (depth1={depth1_proved}, depth2={depth2_proved}) -- the \
+                 tx-size-search half of the window proved nothing"
+            );
+            eprintln!(
+                "{NAME}: {bit_depth}-bit split-transform 1:4 strips: depth1={depth1_proved}, \
+                 depth2={depth2_proved}"
             );
             assert_eq!(
                 out_of_scope_mismatch, 0,
@@ -18305,9 +18363,14 @@ mod tests {
         // 10-bit half has to carry the shape on its own.
         let mut rect4_strips_10bit = 0usize;
         let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
-        // Attempts that stopped at the new named refusal for a 1:4 strip
-        // whose transform splits once (see the assert at the end).
-        let mut depth1_refusals = 0u32;
+        // 1:4 strips whose transform splits ONCE (the unit is still a 2:1
+        // rect) that decoded and compared pixel-exact. Until the rectsplitx
+        // merge this shape was refused by name and the gate counted the
+        // REFUSALS; counting the decoded hits instead keeps the same
+        // territory claim now that the capability landed (class
+        // counter-from-refused-stream: only attempts that compared exact
+        // count).
+        let mut depth1_decoded = 0usize;
         for (bit_depth, cq) in [(8u32, 45u32), (8, 32), (8, 60), (10, 45), (10, 32), (10, 60)] {
             for attempt in 0..n_attempts {
                 let seed = 42 + attempt;
@@ -18317,6 +18380,7 @@ mod tests {
                 let stream = rectchroma_stream(bit_depth, cq, attempt, width, height);
                 let before = crate::decode::rect_split_chroma_shape_hits();
                 let split_before = crate::decode::rect_split_tx_hits();
+                let depth1_before = crate::decode::rect4_split_depth_hits().0;
                 let rect4_before = (
                     crate::decode::sb_rect4_horz_hits(),
                     crate::decode::sb_rect4_vert_hits(),
@@ -18330,9 +18394,6 @@ mod tests {
                              {seed}): {msg}"
                         );
                         refusals += 1;
-                        if msg.contains("splits only once") {
-                            depth1_refusals += 1;
-                        }
                         all_rect4 += (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
                             + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
                         let r4 = (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
@@ -18402,6 +18463,7 @@ mod tests {
                     proved[k] += after[k] - before[k];
                 }
                 split_strips += crate::decode::rect_split_tx_hits() - split_before;
+                depth1_decoded += crate::decode::rect4_split_depth_hits().0 - depth1_before;
                 let rect4 = (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
                     + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
                 rect4_strips += rect4;
@@ -18454,11 +18516,11 @@ mod tests {
         // tables this round wired are in place for it). This assert is what
         // keeps that from silently regressing to a wrong-pixel decode.
         assert!(
-            depth1_refusals > 0,
-            "{NAME}: no attempt reached a depth-1 1:4 split strip -- the recipe no longer \
+            depth1_decoded > 0,
+            "{NAME}: no attempt decoded a depth-1 1:4 split strip -- the recipe no longer \
              covers the shape this round fixed"
         );
-        eprintln!("{NAME}: {depth1_refusals} attempts refused the depth-1 1:4 split strip by name");
+        eprintln!("{NAME}: {depth1_decoded} depth-1 1:4 split strips decoded pixel-exact");
     }
 
     /// The chroma-rect gate's fixture + aomenc recipe for one attempt, shared
