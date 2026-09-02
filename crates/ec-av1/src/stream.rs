@@ -16754,7 +16754,16 @@ mod tests {
                      geq=lum='mod(floor({axis}/8)*{step},256)',\
                      noise=alls={noise}:all_seed={seed},format=yuv420p"
                 );
-                let cq_level = format!("--cq-level={}", if attempt % 4 < 2 { 32 } else { 45 });
+                // lane-band63: the second cq is 63, not 45 -- a near-max
+                // quantiser is where deblock/CDEF do the most work and where a
+                // 1:4 strip is most often skip, and the stale premise "the band
+                // fixture mismatches at --cq-level=63 even with filter intra
+                // off" stood for a round because no gate coded one. All 16
+                // streams of this family at cq 63 (8- and 10-bit) decode
+                // pixel-exact (lanes/band63-r1.report.md). The cq-32 attempts
+                // keep their exact seeds/streams: this rotation only replaces
+                // 45 with 63, so no attempt changes stream by accident.
+                let cq_level = format!("--cq-level={}", if attempt % 4 < 2 { 32 } else { 63 });
                 let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
                     .args([
@@ -16989,7 +16998,11 @@ mod tests {
                      geq=lum='mod(floor({axis}/8)*{step},256)',\
                      noise=alls={noise}:all_seed={seed},format=yuv420p"
                 );
-                let cq_level = format!("--cq-level={}", [32, 45, 55][(attempt / 2 % 3) as usize]);
+                // lane-band63: 63 joins the rotation -- filter intra ON at a
+                // near-max quantiser is exactly the configuration the stale
+                // cq-63 premise blamed, and it decodes exact.
+                let cq_level =
+                    format!("--cq-level={}", [32, 45, 55, 63][(attempt / 2 % 4) as usize]);
                 let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
                     .args([
