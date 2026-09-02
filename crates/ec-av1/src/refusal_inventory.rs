@@ -25,7 +25,6 @@
 #[cfg(test)]
 const CAPABILITY_CLAIMS: &[&str] = &[
     "filter intra on a superblock-level HORZ/VERT strip (never expected -- av1_filter_intra_allowed_bsize caps at 32x32)",
-    "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
 ];
 
 #[cfg(test)]
@@ -33,7 +32,12 @@ const REFUSALS: &[&str] = &[
     "a nonzero angle delta on an 8x8 intra leaf in an inter frame (no gate reaches this leaf with one; the >=16x16 arm decodes deltas)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
-    "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
+    "an OBMC neighbour whose interp filter was never recorded (no switchable symbol for that block)",
+    "an intra 4x4 block inside an inter frame's sub-8x8 split (this decoder codes only inter 4x4 sub-blocks there)",
+    "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition (this decoder codes only inter sub-blocks there)",
+    "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
+    "an inter 8x8 HORZ partition (two BLOCK_8X4 inter leaves; entropy-exact now, but a measured sweep still drifts |d|<=2 in luma after the filters)",
+    "a COMPOUND_WEDGE mask on a non-square inter block (rect wedge codebook unimplemented)",
     "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",

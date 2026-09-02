@@ -171,6 +171,26 @@ pub(crate) fn intra_in_inter_angle_delta_uv_hits() -> usize {
     INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.get())
 }
 
+// lane-uv8 r1: the three non-DC chroma mode classes an INTRA 8x8 leaf inside
+// an INTER frame ([`decode_inter_block8`]'s intra arm) can carry -- the arm
+// read `uv_mode` and then refused everything but `DC_PRED`. Counted here and
+// nowhere else so the gate's assert cannot be satisfied by a >=16x16 block.
+thread_local! {
+    static INTRA_IN_INTER8_UV_DIR_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTRA_IN_INTER8_UV_SMOOTH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTRA_IN_INTER8_UV_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(directional, smooth/paeth, CfL)` chroma modes coded by an intra 8x8 leaf
+/// inside an inter frame -- see [`INTRA_IN_INTER8_UV_DIR_HITS`].
+pub(crate) fn intra_in_inter8_uv_hits() -> (usize, usize, usize) {
+    (
+        INTRA_IN_INTER8_UV_DIR_HITS.with(|c| c.get()),
+        INTRA_IN_INTER8_UV_SMOOTH_HITS.with(|c| c.get()),
+        INTRA_IN_INTER8_UV_CFL_HITS.with(|c| c.get()),
+    )
+}
+
 // lane-realworld r1: this frame's `cdef.bits` (spec 5.9.19), threaded into
 // [`maybe_read_cdef_idx`] the same way [`ENABLE_EDGE_FILTER`] threads a
 // frame-level flag through the recursive block decode -- `0` (the default)
@@ -1743,6 +1763,32 @@ thread_local! {
     static OBMC_HITS_8: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-interp3 r1: how many inter blocks read a SWITCHABLE `interp_filter`
+// pair whose two directions differ (`enable_dual_filter` only -- with dual
+// filter off both directions take the single symbol, so this can never fire).
+// A gate asserting it proves the stream really carries dual-filter blocks.
+thread_local! {
+    static DUAL_FILTER_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// lane-interp3 r1: how many COMPOUND 8x8 leaves read their own
+// `read_mb_interp_filter` symbol(s) -- the read this round added (the leaf
+// used to skip it entirely, losing a symbol and stamping the `[3, 3]`
+// no-filter sentinel that made a neighbouring OBMC block panic).
+thread_local! {
+    static COMPOUND8_FILTER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DUAL_FILTER_DIFF_HITS`].
+pub(crate) fn dual_filter_diff_hits() -> usize {
+    DUAL_FILTER_DIFF_HITS.with(|c| c.get())
+}
+
+/// Current value of [`COMPOUND8_FILTER_HITS`].
+pub(crate) fn compound8_filter_hits() -> usize {
+    COMPOUND8_FILTER_HITS.with(|c| c.get())
+}
+
 // lane-warp round 1: how many blocks resolved `motion_mode_allowed` to
 // `WARPED_CAUSAL`-eligible (3-symbol read, `num_proj_ref >= 1` under
 // `allow_warped_motion`) AND the symbol actually decoded to `WARPED_CAUSAL`
@@ -1772,6 +1818,20 @@ thread_local! {
 /// Current value of [`COMPOUND_WARP_HITS`].
 pub(crate) fn compound_warp_hits() -> usize {
     COMPOUND_WARP_HITS.with(|c| c.get())
+}
+
+// lane-interp3 r3: the same proof narrowed to the 8x8 LEAF's own compound
+// arm ([`decode_inter_block8`]) -- that arm predicted both taps
+// translationally until r3, so a gate needs to tell a warped 8x8 compound
+// leaf apart from a warped 16x16+ one (both bump [`COMPOUND_WARP_HITS`]).
+thread_local! {
+    static COMPOUND_WARP_HITS_8: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`COMPOUND_WARP_HITS_8`].
+pub(crate) fn compound_warp_hits_8() -> usize {
+    COMPOUND_WARP_HITS_8.with(|c| c.get())
 }
 
 // lane-gmaffine r1: how many blocks built their prediction from a
@@ -2597,11 +2657,53 @@ pub(crate) fn tx_class1_hits() -> usize {
 // coincidentally landing on `PARTITION_NONE`.
 thread_local! {
     static SUB8_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many 8x8 groups an INTER frame split into four BLOCK_4X4 inter
+    /// sub-blocks (lane-intersub8).
+    static SUB8_INTER_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many 8x8 groups an INTER frame split into two rectangular sub-8x8
+    /// inter leaves (lane-intersub8 r3), indexed `[0] = HORZ` (two BLOCK_8X4),
+    /// `[1] = VERT` (two BLOCK_4X8).
+    static SUB8_INTER_RECT_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// Current value of [`SUB8_INTER_RECT_HITS`]: `(8x4 groups, 4x8 groups)`.
+pub fn sub8_inter_rect_hits() -> (usize, usize) {
+    SUB8_INTER_RECT_HITS.with(|c| {
+        let h = c.get();
+        (h[0], h[1])
+    })
+}
+
+// lane-cdef r1: (a) how many 8x8 CDEF units `apply_cdef` EXCLUDED because all
+// four of their mi cells are `skip_txfm` (libaom `cdef.c:29-38`
+// `is_8x8_block_skip` / `av1_cdef_compute_sb_list`'s dlist test), and (b) how
+// many 8x8 inter leaves (`decode_inter_block8`) wrote that skip band at all.
+// (b) was 0 for every stream before this round -- the leaf path never touched
+// the band, so an all-skip 8x8 group kept the PREVIOUS frame's flags and got
+// filtered where libaom skips it. A gate asserts both are non-zero.
+thread_local! {
+    static CDEF_SKIPPED_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER8_SKIP_BAND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `CDEF_SKIPPED_UNITS`.
+pub(crate) fn cdef_skipped_units() -> usize {
+    CDEF_SKIPPED_UNITS.with(|c| c.get())
+}
+
+/// Current value of `INTER8_SKIP_BAND_HITS`.
+pub(crate) fn inter8_skip_band_hits() -> usize {
+    INTER8_SKIP_BAND_HITS.with(|c| c.get())
 }
 
 /// Current value of [`SUB8_SPLIT_HITS`].
 pub(crate) fn sub8_split_hits() -> usize {
     SUB8_SPLIT_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SUB8_INTER_SPLIT_HITS`].
+pub fn sub8_inter_split_hits() -> usize {
+    SUB8_INTER_SPLIT_HITS.with(|c| c.get())
 }
 
 // How many 4x8 / 8x4 leaves (lane-tx4x8's `PARTITION_VERT`/`PARTITION_HORZ`
@@ -8901,8 +9003,7 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
     // LAST frame, so a mid-sequence divergence could not be read out at all.
     static STAGE16_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if let Ok(path) = std::env::var(var)
-        && let idx = STAGE16_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for (p, w, h) in [(y, fw, fh), (u, fw.div_ceil(2), fh.div_ceil(2)), (v, fw.div_ceil(2), fh.div_ceil(2))] {
             for row in 0..h {
@@ -8916,10 +9017,25 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
     }
 }
 
+/// Decode-order index of the next [`dump_stage`]/[`dump_stage16`] file for a
+/// given env var -- lane-cdef r1: both used to write `.f0` unconditionally, so
+/// every frame overwrote the previous one and only the LAST frame survived,
+/// which silently defeats any per-frame filter-stage bisection.
+fn dump_stage_idx(var: &str) -> usize {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static IDX: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    let mut m = IDX.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let e = m.entry(var.to_string()).or_insert(0);
+    let i = *e;
+    *e += 1;
+    i
+}
+
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for p in [y, u, v] {
             let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
@@ -10432,6 +10548,7 @@ fn decode_leaf8(
         neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
         neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
     }
+    INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
@@ -12787,6 +12904,9 @@ fn apply_cdef(
     while mi_r < skip_grid.mi_rows {
         let mut mi_c = 0usize;
         while mi_c < skip_grid.mi_cols {
+            if skip_grid.is_skip_txfm(mi_r, mi_c) {
+                CDEF_SKIPPED_UNITS.with(|c| c.set(c.get() + 1));
+            }
             if !skip_grid.is_skip_txfm(mi_r, mi_c) {
                 let sidx = strength_idx(mi_r, mi_c);
                 let (ox, oy) = (mi_c * 4, mi_r * 4);
@@ -12799,10 +12919,15 @@ fn apply_cdef(
                         i32::from(src_y[ny as usize * y_stride + nx as usize])
                     }
                 };
-                let (dir, var) = cdef_find_dir(coeff_shift, |r, c| {
-                    let (ny, nx) = ((oy + r).min(y_true_h - 1), (ox + c).min(y_true_w - 1));
-                    i32::from(src_y[ny * y_stride + nx])
-                });
+                // lane-cdef r1: the direction search reads the SAME padded
+                // block the taps do -- libaom runs `cdef_find_dir` on the
+                // prepared filter block (`cdef_block.c:296-320` over
+                // `cdef_prepare_fb`'s buffer, `cdef.c:249-256`), whose columns
+                // and rows past the mi-rounded frame extent are CDEF_VERY_LARGE.
+                // Clamping to the last real sample instead made every straddling
+                // edge 8x8 (odd `mi_cols`/`mi_rows`) pick a different var, hence
+                // a different `adjust_strength`, hence a +-1 band at the crop edge.
+                let (dir, var) = cdef_find_dir(coeff_shift, |r, c| sample_y(r as i32, c as i32));
 
                 // libaom `av1_cdef_filter_fb` passes `pri_strength ? dir : 0`
                 // -- each plane zeroes the shared direction when *its own*
@@ -12812,6 +12937,12 @@ fn apply_cdef(
                 let y_sec_strength = i32::from(cdef.y_sec_strength[sidx]) << coeff_shift;
                 let y_dir = if y_pri_strength != 0 { dir } else { 0 };
                 let t = cdef_adjust_strength(y_pri_strength, var);
+                // lane-cdef r1 rung: one line per filtered 8x8 luma CDEF unit.
+                if std::env::var_os("EC_AV1_CDEF_DBG").is_some() {
+                    eprintln!(
+                        "EC_CDEF mi_r={mi_r} mi_c={mi_c} x={ox} y={oy} sidx={sidx} dir={dir} var={var} t={t} pri={y_pri_strength} sec={y_sec_strength} damp={damping}"
+                    );
+                }
                 let enable_primary = t != 0;
                 let enable_secondary = y_sec_strength != 0;
                 if enable_primary || enable_secondary {
@@ -14869,6 +15000,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // that isolate whether a decode-order frame's mismatch already exists
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
+    if std::env::var_os("EC_OBMC").is_some() || std::env::var_os("EC_TRACE_MODE").is_some() {
+        eprintln!(
+            "EC_PICT idx={}",
+            PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
     dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
@@ -15073,6 +15211,15 @@ fn resolve_interp_filter(
     } else {
         sym0
     };
+    if enable_dual_filter && sym0 != sym1 {
+        DUAL_FILTER_DIFF_HITS.with(|c| c.set(c.get() + 1));
+    }
+    if std::env::var_os("EC_TRACE_MODE").is_some() {
+        eprintln!(
+            "EC_IF ctx0={ctx0} above={above:?} left={left:?} sym0={sym0} sym1={sym1} rng={}",
+            dec.debug_state().0
+        );
+    }
     (
         mc::InterpFilterKind::from_switchable_symbol(sym1 as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym0 as usize),
@@ -15732,14 +15879,25 @@ fn obmc_mask(len: usize) -> &'static [u8] {
 fn neighbour_filter(
     interp_fixed: Option<mc::InterpFilterKind>,
     sym: [u8; 2],
-) -> (mc::InterpFilterKind, mc::InterpFilterKind) {
+) -> Result<(mc::InterpFilterKind, mc::InterpFilterKind)> {
     if let Some(kind) = interp_fixed {
-        return (kind, kind);
+        return Ok((kind, kind));
     }
-    (
+    // lane-interp3 r1: the `[3, 3]` sentinel reaching here is a DEFECT in
+    // whatever path recorded the neighbour (an inter block that never stored
+    // its own switchable symbols), and it used to abort the process through
+    // `from_switchable_symbol`'s panic. A decoder must never crash on a real
+    // stream: it stops by name instead, so the frame is refused and the
+    // stream is pinned like every other unsupported case.
+    if sym[0] > 2 || sym[1] > 2 {
+        return Err(unsupported(
+            "an OBMC neighbour whose interp filter was never recorded (no switchable symbol for that block)",
+        ));
+    }
+    Ok((
         mc::InterpFilterKind::from_switchable_symbol(sym[1] as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym[0] as usize),
-    )
+    ))
 }
 
 /// One neighbour's own re-prediction over a `w`x`h` region, MC'd fresh
@@ -15919,6 +16077,71 @@ fn obmc_blend_h(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, 
     }
 }
 
+/// libaom's own `BLOCK_SIZE` enum index for a `w4`x`h4` (mi-unit) block --
+/// only for the `EC_OBMC` trace rung below, so it reads byte-identical to
+/// the instrumented aomdec's `backup_mbmi.bsize`.
+fn ec_obmc_bsize(w4: usize, h4: usize) -> i32 {
+    match (w4, h4) {
+        (1, 1) => 0,
+        (1, 2) => 1,
+        (2, 1) => 2,
+        (2, 2) => 3,
+        (2, 4) => 4,
+        (4, 2) => 5,
+        (4, 4) => 6,
+        (4, 8) => 7,
+        (8, 4) => 8,
+        (8, 8) => 9,
+        (8, 16) => 10,
+        (16, 8) => 11,
+        (16, 16) => 12,
+        (1, 4) => 16,
+        (4, 1) => 17,
+        (2, 8) => 18,
+        (8, 2) => 19,
+        (4, 16) => 20,
+        (16, 4) => 21,
+        _ => -1,
+    }
+}
+
+/// The `EC_OBMC` rung: one line per blended neighbour, in the instrumented
+/// aomdec's own byte format (`decodeframe.c`
+/// `dec_build_prediction_by_{above,left}_pred`), so the two decoders' OBMC
+/// neighbour lists diff line for line. `filt` is libaom's packed
+/// `interp_filters.as_int` = `y_filter | (x_filter << 16)`.
+#[allow(clippy::too_many_arguments)]
+fn ec_obmc_trace(
+    dir: &str,
+    mi_row: usize,
+    mi_col: usize,
+    write_w: usize,
+    write_h: usize,
+    rel: usize,
+    op: usize,
+    nb: &MiInfo,
+    h_kind: mc::InterpFilterKind,
+    v_kind: mc::InterpFilterKind,
+) {
+    if std::env::var_os("EC_OBMC").is_none() {
+        return;
+    }
+    let sym = |k: mc::InterpFilterKind| match k {
+        mc::InterpFilterKind::Smooth => 1u32,
+        mc::InterpFilterKind::Sharp => 2,
+        _ => 0,
+    };
+    eprintln!(
+        "EC_OBMC {dir} mi=({mi_row},{mi_col}) wh=({write_w}x{write_h}) rel={rel} op={op} \
+nbmv=({},{}) nbref={} nbbsize={} filt={}",
+        nb.mv.0,
+        nb.mv.1,
+        nb.ref_frame,
+        ec_obmc_bsize(nb.size, nb.size_h),
+        sym(v_kind) | (sym(h_kind) << 16),
+    );
+}
+
 /// `av1_build_obmc_inter_prediction` (libaom `reconinter.c`): re-predicts
 /// the overlap strip against each bordering above/left inter neighbour's own
 /// mv/ref/filter and blends it into this block's just-built single-reference
@@ -16017,7 +16240,8 @@ fn obmc_blend(
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.above_filter[mi_col + off4],
-        );
+        )?;
+        ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
@@ -16036,7 +16260,8 @@ fn obmc_blend(
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.left_filter[mi_row + off4],
-        );
+        )?;
+        ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
@@ -16059,6 +16284,67 @@ fn obmc_blend(
 /// future sub-8 block size does not silently misdecode a real stream.
 fn is_any_masked_compound_used_here(side: usize) -> bool {
     side.min(side) >= 8
+}
+
+/// libaom's `BLOCK_SIZES_ALL` index of a `w`x`h` block (`common_data.h`'s own
+/// enum order) -- the row every bsize-indexed CDF (`compound_type_cdf`,
+/// `wedge_idx_cdf`) is read at. lane-intersub8 r4: these two used to be
+/// indexed by the caller's SQUARE envelope, so a 16x8 compound block read
+/// `BLOCK_16X16`'s row (class table-indexed-by-raw-size) and desynced the
+/// tile at its first masked-compound rect block.
+fn bsize_index(w: usize, h: usize) -> Option<usize> {
+    Some(match (w, h) {
+        (4, 4) => 0,
+        (4, 8) => 1,
+        (8, 4) => 2,
+        (8, 8) => 3,
+        (8, 16) => 4,
+        (16, 8) => 5,
+        (16, 16) => 6,
+        (16, 32) => 7,
+        (32, 16) => 8,
+        (32, 32) => 9,
+        (32, 64) => 10,
+        (64, 32) => 11,
+        (64, 64) => 12,
+        (64, 128) => 13,
+        (128, 64) => 14,
+        (128, 128) => 15,
+        (4, 16) => 16,
+        (16, 4) => 17,
+        (8, 32) => 18,
+        (32, 8) => 19,
+        (16, 64) => 20,
+        (64, 16) => 21,
+        _ => return None,
+    })
+}
+
+/// `is_any_masked_compound_used` (libaom `reconinter.h`) on the block's TRUE
+/// footprint: `is_comp_ref_allowed` is `AOMMIN(bw, bh) >= 8`, and every
+/// shape that clears it has either a wedge or a DIFFWTD compound available.
+fn masked_compound_used_wh(w: usize, h: usize) -> bool {
+    w.min(h) >= 8
+}
+
+/// `av1_wedge_params_lookup[bsize].wedge_types > 0` (libaom `reconinter.c`):
+/// the shapes whose `compound_type` symbol is really coded. Everything else
+/// with a compound mask infers `COMPOUND_DIFFWTD` without a symbol.
+fn wedge_used_wh(w: usize, h: usize) -> bool {
+    matches!(
+        (w, h),
+        (8, 8)
+            | (8, 16)
+            | (16, 8)
+            | (16, 16)
+            | (16, 32)
+            | (32, 16)
+            | (32, 32)
+            | (8, 32)
+            | (32, 8)
+            | (16, 64)
+            | (64, 16)
+    )
 }
 
 /// Whether a compound reference pair is unidirectional (both references on
@@ -16850,12 +17136,18 @@ fn decode_inter_block(
             let group_ctx = get_comp_group_idx_context(neighbours, (rmi, cmi), side);
             let comp_group_idx = if !skip_mode
                 && enable_masked_compound
-                && is_any_masked_compound_used_here(side)
+                && masked_compound_used_wh(write_w, write_h)
             {
                 dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
             } else {
                 0
             };
+            if std::env::var_os("EC_TRACE_MODE").is_some() {
+                eprintln!(
+                    "EC_CGI mi_row={rmi} mi_col={cmi} ctx={group_ctx} val={comp_group_idx} rng={}",
+                    dec.debug_state().0
+                );
+            }
             // lane-maskcomp r2 / lane-wedge r3: `Some(mask_type)` for a
             // `COMPOUND_DIFFWTD` block, `Some(mask)` (wedge codebook lookup)
             // for a `COMPOUND_WEDGE` block -- exactly one of the two is set
@@ -16877,12 +17169,11 @@ fn decode_inter_block(
                 // writes NO `compound_type` symbol there and INFERS
                 // `COMPOUND_DIFFWTD` -- only the 1-bit `mask_type` literal
                 // follows. `None` here is exactly that inferred arm.
-                let wedge_bsize = match side {
-                    8 => Some(3),
-                    16 => Some(6),
-                    32 => Some(9),
-                    _ => None,
-                };
+                // lane-intersub8 r4: the block's TRUE footprint, not the
+                // square envelope -- `compound_type_cdf`/`wedge_idx_cdf` are
+                // `BLOCK_SIZES_ALL`-indexed.
+                let wedge_bsize =
+                    bsize_index(write_w, write_h).filter(|_| wedge_used_wh(write_w, write_h));
                 let compound_type = match wedge_bsize {
                     Some(b) => dec.symbol(&mut cdfs.compound_type[b]),
                     None => 1,
@@ -16890,6 +17181,14 @@ fn decode_inter_block(
                 if let Some(wedge_bsize) = wedge_bsize.filter(|_| compound_type == 0) {
                     // COMPOUND_WEDGE: lane-wedge r3, codebook checksum-
                     // verified vs independent C dump (wedge.rs).
+                    if write_w != write_h {
+                        // lane-intersub8 r4: the wedge codebook here is built
+                        // per SQUARE side only; a rect block's own codebook
+                        // (BLOCK_16X8 etc.) is a different mask set.
+                        return Err(unsupported(
+                            "a COMPOUND_WEDGE mask on a non-square inter block (rect wedge codebook unimplemented)",
+                        ));
+                    }
                     let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
                     let wedge_sign = dec.literal(1);
                     WEDGE_HITS.with(|c| c.set(c.get() + 1));
@@ -17121,6 +17420,12 @@ fn decode_inter_block(
                     ref_order_hints[(ref1 - LAST_FRAME) as usize],
                 );
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
+                if std::env::var_os("EC_TRACE_MODE").is_some() {
+                    eprintln!(
+                        "EC_CIDX mi_row={rmi} mi_col={cmi} ctx={idx_ctx} val={idx} rng={}",
+                        dec.debug_state().0
+                    );
+                }
                 if idx == 1 {
                     (8, 8, 1u8)
                 } else {
@@ -18749,6 +19054,12 @@ fn decode_inter_block(
             return Ok(());
         }
         let mode = dec.symbol(&mut cdfs.y_mode[size_group_wh(write_w, write_h)]);
+        if std::env::var_os("EC_IIS").is_some() {
+            eprintln!(
+                "TRACE iis px={px} py={py} side={side} w={write_w} h={write_h} sg={} mode={mode} skip={skip}",
+                size_group_wh(write_w, write_h)
+            );
+        }
         if mode >= 13 {
             return Err(unsupported(
                 "an intra mode this decoder does not code (round 2)",
@@ -19172,6 +19483,941 @@ fn decode_inter_block(
     Ok(())
 }
 
+/// Decodes one 8x8 group that an inter frame's `partition_w8` symbol split
+/// into four `BLOCK_4X4` inter blocks (lane-intersub8: `PARTITION_SPLIT`
+/// below 8x8 -- traced live against the oracle `aomdec`'s own `EC_PART_VAL`,
+/// which reads `bsize=3 value=3` on real inter frames, so the refusal this
+/// replaces was NOT our own desync).
+///
+/// The inter counterpart of [`decode_leaf_split4`], and a `BLOCK_4X4`-only
+/// cut of [`decode_inter_block8`]: at `min(bw, bh) < 8` libaom switches off
+/// half the inter syntax, and every one of those is a symbol NOT read here
+/// (`decodemv.c` / `blockd.h`, oracle tree):
+/// * `skip_mode`: `read_skip_mode` returns 0 without a symbol when
+///   `!is_comp_ref_allowed(bsize)` (`AOMMIN(bw, bh) >= 8`, blockd.h).
+/// * `comp_mode`: `read_block_reference_mode` returns `SINGLE_REFERENCE` on
+///   the same predicate, so a sub-8x8 block is always single-reference.
+/// * `interintra`: `is_interintra_allowed_bsize` starts at `BLOCK_8X8`.
+/// * `motion_mode` / `obmc`: `motion_mode_allowed` returns
+///   `SIMPLE_TRANSLATION` for `block_size_wide < 8 || block_size_high < 8`,
+///   and `is_global_mv_block`'s own size term fails, so no warp either.
+/// * tx size: `block_signals_txsize(bsize)` is `bsize > BLOCK_4X4`
+///   (blockd.h:1027), so a `BLOCK_4X4` reads neither `tx_depth` nor a
+///   `txfm_partition` bit even in `TX_MODE_SELECT` -- the transform is
+///   `max_txsize_rect_lookup[BLOCK_4X4]` = `TX_4X4`
+///   (`decodeframe.c:1164-1177`).
+///
+/// Chroma is coded ONCE for the whole 8x8 group, on the last sub-block
+/// (`is_chroma_reference`: `(mi_row & 1) && (mi_col & 1)` in 4:2:0), as one
+/// `TX_4X4` unit per plane -- same rule and same neighbour-context tail as
+/// [`decode_leaf_split4`]. Its PREDICTION is the sub8x8 one
+/// (`dec_build_inter_predictors`'s `is_sub8x8` branch, `decodeframe.c`; spec
+/// 7.11.3.1's `candRow`/`candCol` loop): four 2x2 chroma pieces, each built
+/// from its own luma sub-block's reference, motion vector and interpolation
+/// filters, never from the last sub-block's mv alone.
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_sub8_split4(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    grid: &mut MiGrid,
+    group_mi: (usize, usize),
+    mi_cols: u32,
+    mi_rows: u32,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    ref_y: &PlaneBuf,
+    ref_u: &PlaneBuf,
+    ref_v: &PlaneBuf,
+    other_refs: &RefSlots,
+    sign_bias_table: &SignBiasTable,
+    global_motion: &[ec_av1_syntax::WarpParams; 7],
+    base_q_idx: u8,
+    scan4: &[u16],
+    allow_high_precision_mv: bool,
+    force_integer_mv: bool,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    enable_dual_filter: bool,
+    tpl_frame: Option<&TplFrameArgs>,
+    reduced_tx_set: bool,
+    frame_width: usize,
+) -> Result<()> {
+    const LAST_FRAME: i8 = 1;
+    const B4: usize = 4;
+    SUB8_INTER_SPLIT_HITS.with(|c| c.set(c.get() + 1));
+    let (gr, gc) = group_mi;
+    let (gpx, gpy) = (gc * MI, gr * MI);
+    let (cpx, cpy) = (gpx / 2, gpy / 2);
+    // Per-sub-block state the group's chroma prediction needs (spec
+    // 7.11.3.1's candRow/candCol loop reads each sub-block's OWN mv/ref/
+    // filters), indexed `dr * 2 + dc`.
+    let mut piece: [Option<(i8, (i32, i32), mc::InterpFilterKind, mc::InterpFilterKind)>; 4] =
+        [None; 4];
+    let mut first_tx_type = TxType::DctDct;
+    let mut last_skip = true;
+    for i in 0..4usize {
+        let (dr, dc) = (i / 2, i % 2);
+        let lmi = (gr + dr, gc + dc);
+        if lmi.0 >= mi_rows as usize || lmi.1 >= mi_cols as usize {
+            continue;
+        }
+        let (rmi, cmi) = lmi;
+        let (px, py) = (cmi * MI, rmi * MI);
+        inter_segment_id(dec, cdfs, rmi, cmi, 1, 1, false, true);
+        // No `skip_mode` symbol: `is_comp_ref_allowed(BLOCK_4X4)` is false.
+        let skip_ctx = usize::from(neighbours.above_skip[cmi]) + usize::from(neighbours.left_skip[rmi]);
+        let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+        inter_segment_id(dec, cdfs, rmi, cmi, 1, 1, skip, false);
+        maybe_read_cdef_idx(dec, rmi, cmi, skip);
+        maybe_read_delta_q(dec, cdfs, rmi, cmi, false, skip);
+        maybe_read_delta_lf(dec, cdfs, rmi, cmi, false, skip);
+        let (has_above, has_left) = (
+            rmi > neighbours.tile_row0_mi,
+            cmi > neighbours.tile_col0_mi,
+        );
+        let ii_ctx = intra_inter_ctx(
+            has_above,
+            has_left,
+            neighbours.above_inter[cmi],
+            neighbours.left_inter[rmi],
+        );
+        let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+        if !is_inter {
+            return Err(unsupported(
+                "an intra 4x4 block inside an inter frame's sub-8x8 split (this decoder codes \
+                 only inter 4x4 sub-blocks there)",
+            ));
+        }
+        // Same print point as the oracle's `EC_MODE` (entry of
+        // `read_inter_block_mode_info`, i.e. after skip / is_inter), so the
+        // two range ladders line up element for element.
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE mi_row={rmi} mi_col={cmi} rng={}",
+                dec.debug_state().0
+            );
+        }
+        let ref_frame = read_single_ref(
+            dec,
+            cdfs,
+            neighbours.above_ref[cmi],
+            neighbours.above_ref1[cmi],
+            neighbours.left_ref[rmi],
+            neighbours.left_ref1[rmi],
+        );
+        let (sref_y, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        if mc::scale_factor(sref_y.width, frame_width) != mc::REF_NO_SCALE {
+            return Err(unsupported(
+                "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
+            ));
+        }
+        let gm_table = build_gm_mv_table(
+            global_motion,
+            rmi,
+            cmi,
+            1,
+            1,
+            allow_high_precision_mv,
+            force_integer_mv,
+        );
+        let tpl = tpl_frame.map(|t| crate::mvstack::TplArgs {
+            field: t.field,
+            cur_offset_0: crate::motion_field::get_relative_dist(
+                t.order_hint_bits,
+                t.order_hint,
+                t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
+            ),
+            allow_high_precision_mv,
+        });
+        let stack = crate::mvstack::find_mv_stack_with_sign_bias(
+            grid,
+            rmi,
+            cmi,
+            1,
+            1,
+            ref_frame,
+            mi_cols as usize,
+            mi_rows as usize,
+            sign_bias_table,
+            &gm_table,
+            tpl,
+        );
+        let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        let mut is_globalmv = false;
+        let (mv, is_new_mv) = if !not_new {
+            let mut idx = 0usize;
+            while idx < 2 && stack.entries.len() > idx + 1 {
+                if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                    break;
+                }
+                idx += 1;
+            }
+            let base_mv = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+            (
+                read_mv(
+                    dec,
+                    &mut cdfs.mv_comp,
+                    &mut cdfs.mv_joint,
+                    base_mv,
+                    allow_high_precision_mv,
+                    force_integer_mv,
+                ),
+                true,
+            )
+        } else {
+            let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            is_globalmv = !not_zero;
+            let mv = if !not_zero {
+                gm_table[(ref_frame - LAST_FRAME) as usize]
+            } else {
+                let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                if nearest {
+                    stack.nearest_mv
+                } else {
+                    let mut idx = 1usize;
+                    while idx < 3 && stack.entries.len() > idx + 1 {
+                        if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
+                }
+            };
+            (mv, false)
+        };
+        // Same print point as the oracle's `EC_MODE_MV` (right after
+        // `assign_mv`), the second rung of the sub-8x8 range ladder.
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE_MV mi_row={rmi} mi_col={cmi} mv0=({},{}) rng={}",
+                mv.0,
+                mv.1,
+                dec.debug_state().0
+            );
+        }
+        // No `interintra` and no `motion_mode`/`obmc` symbol below 8x8 (see
+        // this function's own doc); `read_mb_interp_filter` still runs.
+        let gm_ref = &global_motion[(ref_frame - LAST_FRAME) as usize];
+        let above_filter_ctx = if neighbours.above_ref[cmi] == ref_frame
+            || neighbours.above_ref1[cmi] == Some(ref_frame)
+        {
+            neighbours.above_filter[cmi]
+        } else {
+            [3, 3]
+        };
+        let left_filter_ctx = if neighbours.left_ref[rmi] == ref_frame
+            || neighbours.left_ref1[rmi] == Some(ref_frame)
+        {
+            neighbours.left_filter[rmi]
+        } else {
+            [3, 3]
+        };
+        if std::env::var_os("EC_AV1_IFDBG").is_some() {
+            eprintln!(
+                "IFDBG4 mi=({rmi},{cmi}) ref={ref_frame} above_ref={} above_ref1={:?} \
+                 above_filt={:?} left_ref={} left_ref1={:?} left_filt={:?}",
+                neighbours.above_ref[cmi],
+                neighbours.above_ref1[cmi],
+                neighbours.above_filter[cmi],
+                neighbours.left_ref[rmi],
+                neighbours.left_ref1[rmi],
+                neighbours.left_filter[rmi],
+            );
+        }
+        let gm_nontrans = is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
+        let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+            dec,
+            cdfs,
+            interp_fixed,
+            enable_dual_filter,
+            gm_nontrans,
+            above_filter_ctx,
+            left_filter_ctx,
+            false,
+        );
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE_VAL4 mi_row={rmi} mi_col={cmi} newmv={is_new_mv} globalmv={is_globalmv} \
+                 ref0={ref_frame} mv0=({},{}) stack={} rng={}",
+                mv.0,
+                mv.1,
+                stack.entries.len(),
+                dec.debug_state().0
+            );
+        }
+        grid.set(
+            rmi,
+            cmi,
+            MiInfo {
+                is_inter: true,
+                ref_frame,
+                ref_frame1: None,
+                mv1: None,
+                mv,
+                is_new_mv,
+                size: 1,
+                size_h: 1,
+                is_global_mv0: false,
+                is_global_mv1: false,
+            },
+        );
+        piece[i] = Some((ref_frame, mv, h_filter, v_filter));
+        let mut pred_y = vec![0u16; B4 * B4];
+        mc::predict_with_filters(
+            &sref_y.data,
+            sref_y.width,
+            sref_y.true_width,
+            sref_y.true_height,
+            mv_to_q4(px, mv.1, true),
+            mv_to_q4(py, mv.0, true),
+            B4,
+            B4,
+            h_filter,
+            v_filter,
+            &mut pred_y,
+        );
+        // `BLOCK_4X4` never signals a transform size, so the luma unit is the
+        // whole block and `get_txb_ctx` takes its `plane_bsize ==
+        // txsize_to_bsize[tx_size]` branch (`txb_skip_ctx = 0`, which
+        // `read_inter_plane`'s `plane_idx == 0` arm already assumes).
+        if skip {
+            y.reconstruct_mc(px, py, B4, &pred_y, &vec![0i32; B4 * B4]);
+            neighbours.record_mi_luma_rect(lmi, B4, B4, &vec![0i32; B4 * B4]);
+        } else {
+            let around = neighbours.around_mi(lmi, B4);
+            let (luma_grid, tx_type) = read_inter_plane(
+                dec,
+                cdfs,
+                if reduced_tx_set {
+                    TxbSet::Luma4Inter
+                } else {
+                    TxbSet::Luma4InterSet1
+                },
+                scan4,
+                0,
+                around[0],
+                0,
+                y,
+                px,
+                py,
+                B4,
+                base_q_idx,
+                &pred_y,
+                None,
+                None,
+            )?;
+            if i == 0 {
+                // `av1_get_tx_type`: an inter block's chroma inherits the
+                // tx_type of the CO-LOCATED luma position, which for the
+                // group's one chroma unit is luma (0, 0) -- the FIRST
+                // sub-block, not the last.
+                first_tx_type = tx_type;
+            }
+            neighbours.record_mi_luma_rect(lmi, B4, B4, &luma_grid);
+        }
+        neighbours.record_mode_mi(rmi, cmi, 1, 1, DC_PRED);
+        neighbours.record_inter_rect_mi(lmi, 1, 1, skip, true, ref_frame, resolved_filter, false);
+        neighbours.fill_skip_grid_rect(lmi, 1, 1, skip);
+        neighbours.fill_lf_grid_rect(lmi, 1, 1, B4 as u8, B4 as u8, ref_frame.max(LAST_FRAME));
+        last_skip = skip;
+    }
+    // Chroma, once for the whole group, on the last sub-block's own `skip`
+    // flag -- prediction from all four sub-blocks (2x2 pieces), residual as
+    // one TX_4X4 unit per plane.
+    let mut pred_u = vec![0u16; B4 * B4];
+    let mut pred_v = vec![0u16; B4 * B4];
+    for i in 0..4usize {
+        let (dr, dc) = (i / 2, i % 2);
+        let Some((ref_frame, mv, h_filter, v_filter)) = piece[i] else {
+            continue;
+        };
+        let (_, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (ox, oy) = (cpx + dc * 2, cpy + dr * 2);
+        for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
+            let mut buf = vec![0u16; 4];
+            mc::predict_with_filters(
+                &plane.data,
+                plane.width,
+                plane.true_width,
+                plane.true_height,
+                mv_to_q4(ox, mv.1, false),
+                mv_to_q4(oy, mv.0, false),
+                2,
+                2,
+                h_filter,
+                v_filter,
+                &mut buf,
+            );
+            for row in 0..2 {
+                for col in 0..2 {
+                    dst[(dr * 2 + row) * B4 + dc * 2 + col] = buf[row * 2 + col];
+                }
+            }
+        }
+    }
+    let (u_grid, v_grid) = if last_skip {
+        u.reconstruct_mc(cpx, cpy, B4, &pred_u, &vec![0i32; B4 * B4]);
+        v.reconstruct_mc(cpx, cpy, B4, &pred_v, &vec![0i32; B4 * B4]);
+        (vec![0i32; B4 * B4], vec![0i32; B4 * B4])
+    } else {
+        let around = neighbours.around_mi(group_mi, 8);
+        let ug = read_inter_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 1, around[1], 0, u, cpx, cpy, B4, base_q_idx,
+            &pred_u, Some(first_tx_type), None,
+        )?
+        .0;
+        let vg = read_inter_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 2, around[2], 0, v, cpx, cpy, B4, base_q_idx,
+            &pred_v, Some(first_tx_type), None,
+        )?
+        .0;
+        (ug, vg)
+    };
+    neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+    // Same two neighbour tails [`decode_leaf_split4`] runs: the partition
+    // context of a `BLOCK_4X4` subsize (`partition_context_lookup` bit 0 = 1,
+    // reached by `side_mi = 4` here) and the group's chroma coefficient state.
+    for cell in 0..2usize {
+        neighbours.left_side_mi[gr + cell] = 4;
+        neighbours.above_side_mi[gc + cell] = 4;
+    }
+    let round_up_even = |n: usize| n.div_ceil(2) * 2;
+    let bound_h = round_up_even(neighbours.mi_rows);
+    let bound_w = round_up_even(neighbours.mi_cols);
+    let u_state = neighbour_state(&u_grid);
+    let v_state = neighbour_state(&v_grid);
+    for cell in 0..2usize {
+        if cell < 2usize.min(bound_h.saturating_sub(gr)) {
+            neighbours.left[gr + cell][1] = u_state;
+            neighbours.left[gr + cell][2] = v_state;
+        }
+        if cell < 2usize.min(bound_w.saturating_sub(gc)) {
+            neighbours.above[gc + cell][1] = u_state;
+            neighbours.above[gc + cell][2] = v_state;
+        }
+    }
+    Ok(())
+}
+
+/// Decodes a `PARTITION_HORZ`/`PARTITION_VERT` of one 8x8 INTER block into two
+/// `BLOCK_8X4`/`BLOCK_4X8` inter leaves (lane-intersub8 r3) -- the inter twin of
+/// [`decode_leaf_rect8`] and the rectangular sibling of
+/// [`decode_inter_sub8_split4`], whose element order it follows exactly.
+/// Per sub-block, in libaom `decodemv.c` `read_inter_frame_mode_info` order:
+///
+/// * `segment_id`, `skip`, `cdef`/`delta_q`/`delta_lf`, `intra_inter`;
+/// * NO `skip_mode` symbol: `is_comp_ref_allowed(BLOCK_8X4)` is false
+///   (`av1_is_comp_ref_allowed` needs both sides >= 8), so
+///   `read_skip_mode` returns 0 without reading and `comp_mode` is never read
+///   either (`read_ref_frames`' `is_comp_ref_allowed` guard) -- single
+///   reference only;
+/// * NO `interintra` and NO `motion_mode`/OBMC/warp symbol: every one of those
+///   gates needs `block_size_wide >= 8 && block_size_high >= 8`
+///   (`is_interintra_allowed_bsize`, `motion_mode_allowed`), and one side is 4;
+/// * `read_mb_interp_filter` DOES run for both sub-blocks.
+///
+/// The shape's own differences from the four-way split:
+///
+/// * `block_signals_txsize(BLOCK_8X4)` is true (`bsize > BLOCK_4X4`,
+///   blockd.h:1027), so a non-skipped sub-block reads ONE `txfm_partition`
+///   symbol under `TX_MODE_SELECT` at `max_txsize_rect_lookup[BLOCK_8X4] ==
+///   TX_8X4` ([`read_var_tx_size`]); split resolves to two `TX_4X4` units
+///   (`sub_tx_size_map[TX_8X4] == TX_4X4`, libaom's early return), no split to
+///   the whole-leaf `TX_8X4`;
+/// * the luma coefficient set is [`TxbSet::LumaRect8x4Inter`] (the 8x8
+///   coefficient class with a 32-position `eob_pt` and the INTER `TX_4X4`
+///   `tx_type` row) for the whole-leaf unit, and the square
+///   [`TxbSet::Luma4Inter`] for a split `TX_4X4` unit;
+/// * chroma is coded ONCE, on the sub-block that is the chroma reference:
+///   `is_chroma_reference` (`av1_common_int.h`) is
+///   `((mi_row & 1) || !(bh4 & 1) || !ss_y) && ((mi_col & 1) || !(bw4 & 1) ||
+///   !ss_x)`, i.e. under 4:2:0 the BOTTOM 8x4 (`bh4 == 1`, odd) and the RIGHT
+///   4x8 (`bw4 == 1`) -- always the second sub-block here;
+/// * that chroma unit's prediction is the sub8x8 one (`reconinter.c`
+///   `build_inter_predictors_sub8x8`: `row_start = -(block_size_high == 4 &&
+///   ss_y)`, `col_start = -(block_size_wide == 4 && ss_x)`), two 4x2 (HORZ) or
+///   2x4 (VERT) chroma pieces, each from its OWN sub-block's reference, mv and
+///   interpolation filters.
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_sub8_rect2(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    grid: &mut MiGrid,
+    group_mi: (usize, usize),
+    vert: bool,
+    mi_cols: u32,
+    mi_rows: u32,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    ref_y: &PlaneBuf,
+    ref_u: &PlaneBuf,
+    ref_v: &PlaneBuf,
+    other_refs: &RefSlots,
+    sign_bias_table: &SignBiasTable,
+    global_motion: &[ec_av1_syntax::WarpParams; 7],
+    base_q_idx: u8,
+    scan4: &[u16],
+    allow_high_precision_mv: bool,
+    force_integer_mv: bool,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    enable_dual_filter: bool,
+    tpl_frame: Option<&TplFrameArgs>,
+    reduced_tx_set: bool,
+    frame_width: usize,
+) -> Result<()> {
+    const LAST_FRAME: i8 = 1;
+    // The 8x8 group's own square stride: both leaves' prediction buffers are
+    // laid out at it, as every other rect inter unit here is.
+    const SIDE: usize = 8;
+    let (bw, bh) = if vert { (4usize, 8usize) } else { (8usize, 4usize) };
+    let (w_mi, h_mi) = (bw / MI, bh / MI);
+    SUB8_INTER_RECT_HITS.with(|c| {
+        let mut h = c.get();
+        h[usize::from(vert)] += 1;
+        c.set(h);
+    });
+    let (gr, gc) = group_mi;
+    let (gpx, gpy) = (gc * MI, gr * MI);
+    let (cpx, cpy) = (gpx / 2, gpy / 2);
+    // Per-sub-block state the group's one chroma unit predicts from.
+    let mut piece: [Option<(i8, (i32, i32), mc::InterpFilterKind, mc::InterpFilterKind)>; 2] =
+        [None; 2];
+    let mut first_tx_type = TxType::DctDct;
+    let mut last_skip = true;
+    for i in 0..2usize {
+        let lmi = if vert { (gr, gc + i) } else { (gr + i, gc) };
+        if lmi.0 >= mi_rows as usize || lmi.1 >= mi_cols as usize {
+            continue;
+        }
+        let (rmi, cmi) = lmi;
+        let (px, py) = (cmi * MI, rmi * MI);
+        inter_segment_id(dec, cdfs, rmi, cmi, w_mi, h_mi, false, true);
+        let skip_ctx =
+            usize::from(neighbours.above_skip[cmi]) + usize::from(neighbours.left_skip[rmi]);
+        let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+        inter_segment_id(dec, cdfs, rmi, cmi, w_mi, h_mi, skip, false);
+        maybe_read_cdef_idx(dec, rmi, cmi, skip);
+        maybe_read_delta_q(dec, cdfs, rmi, cmi, false, skip);
+        maybe_read_delta_lf(dec, cdfs, rmi, cmi, false, skip);
+        let (has_above, has_left) = (
+            rmi > neighbours.tile_row0_mi,
+            cmi > neighbours.tile_col0_mi,
+        );
+        let ii_ctx = intra_inter_ctx(
+            has_above,
+            has_left,
+            neighbours.above_inter[cmi],
+            neighbours.left_inter[rmi],
+        );
+        let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+        if !is_inter {
+            return Err(unsupported(
+                "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition \
+                 (this decoder codes only inter sub-blocks there)",
+            ));
+        }
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE mi_row={rmi} mi_col={cmi} rng={}",
+                dec.debug_state().0
+            );
+        }
+        let ref_frame = read_single_ref(
+            dec,
+            cdfs,
+            neighbours.above_ref[cmi],
+            neighbours.above_ref1[cmi],
+            neighbours.left_ref[rmi],
+            neighbours.left_ref1[rmi],
+        );
+        let (sref_y, _, _) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        if mc::scale_factor(sref_y.width, frame_width) != mc::REF_NO_SCALE {
+            return Err(unsupported(
+                "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
+            ));
+        }
+        let gm_table = build_gm_mv_table(
+            global_motion,
+            rmi,
+            cmi,
+            w_mi,
+            h_mi,
+            allow_high_precision_mv,
+            force_integer_mv,
+        );
+        let tpl = tpl_frame.map(|t| crate::mvstack::TplArgs {
+            field: t.field,
+            cur_offset_0: crate::motion_field::get_relative_dist(
+                t.order_hint_bits,
+                t.order_hint,
+                t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
+            ),
+            allow_high_precision_mv,
+        });
+        let stack = crate::mvstack::find_mv_stack_with_sign_bias(
+            grid,
+            rmi,
+            cmi,
+            w_mi,
+            h_mi,
+            ref_frame,
+            mi_cols as usize,
+            mi_rows as usize,
+            sign_bias_table,
+            &gm_table,
+            tpl,
+        );
+        let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        let mut is_globalmv = false;
+        let (mv, is_new_mv) = if !not_new {
+            let mut idx = 0usize;
+            while idx < 2 && stack.entries.len() > idx + 1 {
+                if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                    break;
+                }
+                idx += 1;
+            }
+            let base_mv = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+            (
+                read_mv(
+                    dec,
+                    &mut cdfs.mv_comp,
+                    &mut cdfs.mv_joint,
+                    base_mv,
+                    allow_high_precision_mv,
+                    force_integer_mv,
+                ),
+                true,
+            )
+        } else {
+            let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            is_globalmv = !not_zero;
+            let mv = if !not_zero {
+                gm_table[(ref_frame - LAST_FRAME) as usize]
+            } else {
+                let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                if nearest {
+                    stack.nearest_mv
+                } else {
+                    let mut idx = 1usize;
+                    while idx < 3 && stack.entries.len() > idx + 1 {
+                        if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
+                }
+            };
+            (mv, false)
+        };
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE_MV mi_row={rmi} mi_col={cmi} mv0=({},{}) rng={}",
+                mv.0,
+                mv.1,
+                dec.debug_state().0
+            );
+        }
+        let gm_ref = &global_motion[(ref_frame - LAST_FRAME) as usize];
+        let above_filter_ctx = if neighbours.above_ref[cmi] == ref_frame
+            || neighbours.above_ref1[cmi] == Some(ref_frame)
+        {
+            neighbours.above_filter[cmi]
+        } else {
+            [3, 3]
+        };
+        let left_filter_ctx = if neighbours.left_ref[rmi] == ref_frame
+            || neighbours.left_ref1[rmi] == Some(ref_frame)
+        {
+            neighbours.left_filter[rmi]
+        } else {
+            [3, 3]
+        };
+        let gm_nontrans = is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
+        let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+            dec,
+            cdfs,
+            interp_fixed,
+            enable_dual_filter,
+            gm_nontrans,
+            above_filter_ctx,
+            left_filter_ctx,
+            false,
+        );
+        // `read_block_tx_size` (libaom `decodeframe.c`): unlike a `BLOCK_4X4`,
+        // this shape signals its transform size. A non-skipped inter block
+        // walks the var-tx tree from `max_txsize_rect_lookup[BLOCK_8X4]`; a
+        // skipped one codes nothing and records its BLOCK size in both txfm
+        // contexts (`set_txfm_ctxs`' `skip_inter` arm).
+        let mut leaves: Vec<(usize, usize, usize, usize)> = Vec::new();
+        if TX_SELECT_INTER.with(std::cell::Cell::get) && !skip {
+            let max_w_mi = w_mi.min((mi_cols as usize).saturating_sub(cmi));
+            let max_h_mi = h_mi.min((mi_rows as usize).saturating_sub(rmi));
+            read_var_tx_size(
+                dec,
+                cdfs,
+                neighbours,
+                lmi,
+                SIDE,
+                (max_w_mi, max_h_mi),
+                (bw, bh),
+                0,
+                0,
+                0,
+                &mut leaves,
+            );
+        } else {
+            leaves.push((0, 0, bw, bh));
+            set_txfm_ctxs(neighbours, lmi, bw.max(bh), w_mi, h_mi, skip);
+        }
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE_VALR mi_row={rmi} mi_col={cmi} newmv={is_new_mv} globalmv={is_globalmv} \
+                 ref0={ref_frame} mv0=({},{}) stack={} leaves={} rng={}",
+                mv.0,
+                mv.1,
+                stack.entries.len(),
+                leaves.len(),
+                dec.debug_state().0
+            );
+        }
+        grid_stamp_rect(grid, rmi, cmi, w_mi, h_mi, ref_frame, mv, is_new_mv);
+        piece[i] = Some((ref_frame, mv, h_filter, v_filter));
+        // Prediction over the leaf's true footprint, laid out at the group's
+        // square stride (what `reconstruct_mc_rect` and `read_inter_plane_rect`
+        // index with).
+        let mut pred_y = vec![0u16; SIDE * SIDE];
+        {
+            let mut dense = vec![0u16; bw * bh];
+            mc::predict_with_filters(
+                &sref_y.data,
+                sref_y.width,
+                sref_y.true_width,
+                sref_y.true_height,
+                mv_to_q4(px, mv.1, true),
+                mv_to_q4(py, mv.0, true),
+                bw,
+                bh,
+                h_filter,
+                v_filter,
+                &mut dense,
+            );
+            for row in 0..bh {
+                pred_y[row * SIDE..][..bw].copy_from_slice(&dense[row * bw..][..bw]);
+            }
+        }
+        if skip {
+            y.reconstruct_mc_rect(px, py, SIDE, bw, bh, &pred_y, &vec![0i32; SIDE * SIDE]);
+            neighbours.record_mi_luma_rect(lmi, bw, bh, &vec![0i32; bw * bh]);
+            neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, bw as u8, bh as u8, ref_frame.max(LAST_FRAME));
+        } else {
+            let (mut last_tw, mut last_th) = (bw, bh);
+            for (idx, &(row, col, tw, th)) in leaves.iter().enumerate() {
+                let tu_mi = (rmi + row, cmi + col);
+                let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+                let (tu_grid, tu_tx_type) = if tw == th {
+                    // A split `TX_4X4` unit: square reader, its own
+                    // `get_txb_ctx_general` neighbour context (the unit is
+                    // smaller than its plane block, so the lone-TU 0 does not
+                    // apply).
+                    let mut tu_pred = Vec::with_capacity(tw * th);
+                    for rr in 0..th {
+                        let start = (row * MI + rr) * SIDE + col * MI;
+                        tu_pred.extend_from_slice(&pred_y[start..start + tw]);
+                    }
+                    let tu_skip_ctx = neighbours.luma_skip_ctx_rect(tu_mi, tw / MI, th / MI);
+                    read_inter_plane(
+                        dec,
+                        cdfs,
+                        if reduced_tx_set {
+                            TxbSet::Luma4Inter
+                        } else {
+                            TxbSet::Luma4InterSet1
+                        },
+                        scan4,
+                        0,
+                        neighbours.around_mi(tu_mi, tw)[0],
+                        0,
+                        y,
+                        tu_px,
+                        tu_py,
+                        tw,
+                        base_q_idx,
+                        &tu_pred,
+                        None,
+                        Some(tu_skip_ctx),
+                    )?
+                } else {
+                    // The whole leaf as one `TX_8X4`/`TX_4X8` unit: it IS the
+                    // plane block, so `get_txb_ctx_general` fixes `txb_skip_ctx`
+                    // at 0 (`luma_skip_ctx: None`).
+                    let start = row * MI * SIDE + col * MI;
+                    read_inter_plane_rect(
+                        dec,
+                        cdfs,
+                        if reduced_tx_set {
+                            TxbSet::LumaRect8x4Inter
+                        } else {
+                            TxbSet::LumaRect8x4InterSet1
+                        },
+                        (tw, th),
+                        SIDE,
+                        0,
+                        neighbours.around_mi_rect(tu_mi, tw, th)[0],
+                        0,
+                        y,
+                        tu_px,
+                        tu_py,
+                        &pred_y[start..],
+                        None,
+                        None,
+                    )?
+                };
+                if idx == 0 {
+                    // `av1_get_tx_type`: the group's one chroma unit scales
+                    // back to luma (0, 0), i.e. the FIRST sub-block's first
+                    // transform unit.
+                    first_tx_type = tu_tx_type;
+                }
+                neighbours.record_mi_luma_rect(tu_mi, tw, th, &tu_grid);
+                (last_tw, last_th) = (tw, th);
+            }
+            neighbours.fill_lf_grid_rect(
+                lmi,
+                w_mi,
+                h_mi,
+                last_tw as u8,
+                last_th as u8,
+                ref_frame.max(LAST_FRAME),
+            );
+        }
+        neighbours.record_mode_mi(rmi, cmi, w_mi, h_mi, DC_PRED);
+        neighbours.record_inter_rect_mi(lmi, w_mi, h_mi, skip, true, ref_frame, resolved_filter, false);
+        neighbours.fill_skip_grid_rect(lmi, w_mi, h_mi, skip);
+        last_skip = skip;
+    }
+    // The group's single 4x4 chroma unit per plane, on the chroma-reference
+    // (second) sub-block's own skip flag.
+    const B4: usize = 4;
+    let mut pred_u = vec![0u16; B4 * B4];
+    let mut pred_v = vec![0u16; B4 * B4];
+    let (piece_w, piece_h) = if vert { (2usize, 4usize) } else { (4usize, 2usize) };
+    for i in 0..2usize {
+        let Some((ref_frame, mv, h_filter, v_filter)) = piece[i] else {
+            continue;
+        };
+        let (_, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (ox, oy) = if vert {
+            (cpx + i * piece_w, cpy)
+        } else {
+            (cpx, cpy + i * piece_h)
+        };
+        let (dc, dr) = if vert { (i * piece_w, 0) } else { (0, i * piece_h) };
+        for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
+            let mut buf = vec![0u16; piece_w * piece_h];
+            mc::predict_with_filters(
+                &plane.data,
+                plane.width,
+                plane.true_width,
+                plane.true_height,
+                mv_to_q4(ox, mv.1, false),
+                mv_to_q4(oy, mv.0, false),
+                piece_w,
+                piece_h,
+                h_filter,
+                v_filter,
+                &mut buf,
+            );
+            for row in 0..piece_h {
+                for col in 0..piece_w {
+                    dst[(dr + row) * B4 + dc + col] = buf[row * piece_w + col];
+                }
+            }
+        }
+    }
+    let (u_grid, v_grid) = if last_skip {
+        u.reconstruct_mc(cpx, cpy, B4, &pred_u, &vec![0i32; B4 * B4]);
+        v.reconstruct_mc(cpx, cpy, B4, &pred_v, &vec![0i32; B4 * B4]);
+        (vec![0i32; B4 * B4], vec![0i32; B4 * B4])
+    } else {
+        let around = neighbours.around_mi(group_mi, 8);
+        let ug = read_inter_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 1, around[1], 0, u, cpx, cpy, B4, base_q_idx,
+            &pred_u, Some(first_tx_type), None,
+        )?
+        .0;
+        let vg = read_inter_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 2, around[2], 0, v, cpx, cpy, B4, base_q_idx,
+            &pred_v, Some(first_tx_type), None,
+        )?
+        .0;
+        (ug, vg)
+    };
+    neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+    // `update_partition_context` writes `partition_context_lookup[subsize]`
+    // over the whole 8x8 span -- BLOCK_4X8's width above and height left, the
+    // same values [`decode_leaf_rect8`] writes for the intra shape.
+    for cell in 0..2usize {
+        neighbours.above_side_mi[gc + cell] = bw;
+        neighbours.left_side_mi[gr + cell] = bh;
+    }
+    let round_up_even = |n: usize| n.div_ceil(2) * 2;
+    let bound_h = round_up_even(neighbours.mi_rows);
+    let bound_w = round_up_even(neighbours.mi_cols);
+    let u_state = neighbour_state(&u_grid);
+    let v_state = neighbour_state(&v_grid);
+    for cell in 0..2usize {
+        if cell < 2usize.min(bound_h.saturating_sub(gr)) {
+            neighbours.left[gr + cell][1] = u_state;
+            neighbours.left[gr + cell][2] = v_state;
+        }
+        if cell < 2usize.min(bound_w.saturating_sub(gc)) {
+            neighbours.above[gc + cell][1] = u_state;
+            neighbours.above[gc + cell][2] = v_state;
+        }
+    }
+    Ok(())
+}
+
+/// Stamps one sub-8x8 inter leaf into every mi cell of its true `w_mi`x`h_mi`
+/// footprint (class: a rect block's grid span is its own, never a square guess).
+fn grid_stamp_rect(
+    grid: &mut MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    w_mi: usize,
+    h_mi: usize,
+    ref_frame: i8,
+    mv: (i32, i32),
+    is_new_mv: bool,
+) {
+    for dr in 0..h_mi {
+        for dc in 0..w_mi {
+            grid.set(
+                mi_row + dr,
+                mi_col + dc,
+                MiInfo {
+                    is_inter: true,
+                    ref_frame,
+                    ref_frame1: None,
+                    mv1: None,
+                    mv,
+                    is_new_mv,
+                    size: w_mi,
+                    size_h: h_mi,
+                    is_global_mv0: false,
+                    is_global_mv1: false,
+                },
+            );
+        }
+    }
+}
+
 /// Decodes one 8x8 leaf of a straddling 16x16 inter-frame block
 /// (lane-av1inter8), mirroring [`crate::tile::write_inter_frame_leaf8`]'s
 /// exact symbol order: its own skip flag, intra/inter choice and (when
@@ -19319,7 +20565,6 @@ fn decode_inter_block8(
     const CHROMA_SIDE: usize = 4;
 
     let (r, c) = outer_at;
-    let _ = (r, c);
     // lane-inter8 r2: this leaf's OWN mi cell, not the enclosing 16x16's --
     // leaf (mi_r, mi_c + 2)'s left neighbour is leaf (mi_r, mi_c), and the
     // left column of a 16x16's second leaf ROW is the previous 16x16 block's
@@ -19374,6 +20619,10 @@ fn decode_inter_block8(
     }
 
     let mode_for_tx;
+    // lane-uv8 r1: this leaf's chroma prediction mode (`get_uv_mode` of the
+    // coded `uv_mode`), for the neighbour bands at the tail. An INTER leaf
+    // stores `UV_DC_PRED`, exactly as [`decode_inter_block`] one level up.
+    let mut uv_predict_mode = DC_PRED;
     let (luma_grid, u_grid, v_grid);
     let mut compound_ctx8: Option<(i8, i8, u8, u8)> = None;
     // lane-inter8 r1: this leaf's own resolved references, handed back so the
@@ -19406,21 +20655,24 @@ fn decode_inter_block8(
                 let (ref0, ref1) = if skip_mode {
                     (skip_mode_frame[0] as i8, skip_mode_frame[1] as i8)
                 } else {
+                    // lane-interp3 r2 (class twin-functions-drift): this leaf
+                    // passed a hard-coded `LAST_FRAME` for every inter
+                    // neighbour -- the old "coarse LAST_FRAME-or-intra"
+                    // approximation -- while the side bands have carried the
+                    // neighbour's REAL reference per mi since lane-inter8 r2.
+                    // Every `av1_collect_neighbors_ref_counts` vote below
+                    // (`uni_comp_ref_p1`, `comp_ref`, `comp_bwdref`, ...) was
+                    // therefore taken off the wrong CDF row. Same two args
+                    // [`decode_inter_block`]'s own compound arm passes
+                    // (`-1` when the band is unavailable is start_tile's /
+                    // start_row's own reset value, so no `has_above` guard).
                     read_compound_ref_frames(
                         dec,
                         cdfs,
                         above_nbr,
                         left_nbr,
-                        if has_above && above_inter {
-                            LAST_FRAME
-                        } else {
-                            -1
-                        },
-                        if has_left && left_inter {
-                            LAST_FRAME
-                        } else {
-                            -1
-                        },
+                        above_ref0,
+                        left_ref0,
                     )
                 };
                 leaf_refs = (ref0, Some(ref1));
@@ -19601,6 +20853,58 @@ fn decode_inter_block8(
                     );
                 }
 
+                // lane-interp3 r1: `read_mb_interp_filter` (libaom
+                // `decodemv.c` 1575, the tail of
+                // `read_inter_block_mode_info`) runs for EVERY inter block,
+                // compound included, right AFTER `read_compound_type` -- this
+                // leaf read no filter symbol at all, so a SWITCHABLE-filter
+                // stream lost one symbol (two under `enable_dual_filter`) at
+                // every compound 8x8 leaf, and the leaf recorded the `[3, 3]`
+                // "no filter" sentinel, which made a neighbouring OBMC block's
+                // `neighbour_filter` PANIC instead of blending.
+                // `av1_is_interp_needed` suppression terms for this arm:
+                // `skip_mode`, and `is_nontrans_global_motion` (mode
+                // GLOBAL_GLOBALMV with BOTH refs' models non-TRANSLATION) --
+                // WARPED_CAUSAL cannot occur on a compound block.
+                let gm_nontrans_c = compound_mode == 6
+                    && global_motion[(ref0 - LAST_FRAME) as usize].model
+                        != ec_av1_syntax::WarpModel::Translation
+                    && global_motion[(ref1 - LAST_FRAME) as usize].model
+                        != ec_av1_syntax::WarpModel::Translation;
+                // spec `get_ref_filter_type`, keyed on this block's ref0 and
+                // matching EITHER of the neighbour's references -- same shape
+                // as [`decode_inter_block`]'s compound arm. Same corner-cut as
+                // this leaf's single-ref arm below: the context comes from the
+                // enclosing 16x16's coarse slot.
+                let above_filter_ctx = if neighbours.above_ref[cmi] == ref0
+                    || neighbours.above_ref1[cmi] == Some(ref0)
+                {
+                    neighbours.above_filter[cmi]
+                } else {
+                    [3, 3]
+                };
+                let left_filter_ctx = if neighbours.left_ref[rmi] == ref0
+                    || neighbours.left_ref1[rmi] == Some(ref0)
+                {
+                    neighbours.left_filter[rmi]
+                } else {
+                    [3, 3]
+                };
+                let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+                    dec,
+                    cdfs,
+                    interp_fixed,
+                    enable_dual_filter,
+                    gm_nontrans_c || skip_mode,
+                    above_filter_ctx,
+                    left_filter_ctx,
+                    true,
+                );
+                leaf_filter_syms = resolved_filter;
+                if interp_fixed.is_none() && !(gm_nontrans_c || skip_mode) {
+                    COMPOUND8_FILTER_HITS.with(|c| c.set(c.get() + 1));
+                }
+
                 let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
                 let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
                 let scale0 = mc::scale_factor(py0.width, frame_width);
@@ -19610,6 +20914,54 @@ fn decode_inter_block8(
                     SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
                 }
 
+                // lane-interp3 r2 (class twin-functions-drift): both slots
+                // used to be stamped `false`, while [`decode_inter_block`]'s
+                // compound arm computes libaom's PER-SLOT `is_global_mv_block`
+                // (blockd.h:421-429 -- mode GLOBAL_GLOBALMV, block >= 8x8
+                // (always true for this leaf) and THAT slot's own gm model >
+                // TRANSLATION). A neighbour carrying the flag makes
+                // `setup_ref_mv_list` substitute the READER's global mv for
+                // the neighbour's stored one, so a cleared flag fed the next
+                // block's stack a stored mv where libaom has the global
+                // candidate -- a wrong mv stack, wrong mode contexts, and a
+                // desync one block later.
+                let is_globalmv_c = compound_mode == 6;
+                let is_global_mv0_c = is_globalmv_c
+                    && global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1;
+                let is_global_mv1_c = is_globalmv_c
+                    && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1;
+                // lane-interp3 r3 (class twin-functions-drift, second
+                // instance): libaom applies `allow_warp`'s GLOBAL branch
+                // (`reconinter.c:33-55`, reached from `av1_init_warp_params`
+                // inside `build_inter_predictors_8x8_and_bigger`'s per-`ref`
+                // loop) to EVERY `is_global_mv_block` slot, compound
+                // included and independently of `motion_mode` -- the 16x16+
+                // compound arm has done this since lane-cwarp r1, this leaf
+                // predicted both taps translationally, so a GLOBAL_GLOBALMV
+                // 8x8 compound leaf under a non-TRANSLATION model drifted by
+                // a few luma levels, growing away from the block origin.
+                // `force_integer_mv` short-circuits `av1_init_warp_params`
+                // before `allow_warp`; chroma is 4x4 here, below
+                // `av1_init_warp_params`'s own 8px per-plane bound, so only
+                // luma warps (same rule as this leaf's single-ref arm).
+                let leaf_compound_warp = |ref_frame: i8, eligible: bool| {
+                    if eligible
+                        && !force_integer_mv
+                        && !global_motion[(ref_frame - LAST_FRAME) as usize].invalid
+                    {
+                        crate::warp::global_warp_params(
+                            global_motion[(ref_frame - LAST_FRAME) as usize].params,
+                        )
+                    } else {
+                        None
+                    }
+                };
+                let warp0_c = leaf_compound_warp(ref0, is_global_mv0_c);
+                let warp1_c = leaf_compound_warp(ref1, is_global_mv1_c);
+                if warp0_c.is_some() || warp1_c.is_some() {
+                    COMPOUND_WARP_HITS.with(|c| c.set(c.get() + 1));
+                    COMPOUND_WARP_HITS_8.with(|c| c.set(c.get() + 1));
+                }
                 for dr in 0..2 {
                     for dc in 0..2 {
                         grid.set(
@@ -19624,19 +20976,14 @@ fn decode_inter_block8(
                                 is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                                 size: 2,
                                 size_h: 2,
-                                is_global_mv0: false,
-                                is_global_mv1: false,
+                                is_global_mv0: is_global_mv0_c,
+                                is_global_mv1: is_global_mv1_c,
                             },
                         );
                     }
                 }
                 mode_for_tx = 0;
 
-                // lane-av1comp corner-cut, matching this leaf's single-ref
-                // arm below (`mc::predict`'s own fixed-Regular default):
-                // `decode_inter_block8` never resolves a switchable filter,
-                // so both compound taps use `Regular` too.
-                use mc::InterpFilterKind::Regular;
                 let mut inter0_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py0.data,
@@ -19648,10 +20995,17 @@ fn decode_inter_block8(
                     scale0,
                     SIDE,
                     SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_y,
                 );
+                if let Some(wp) = &warp0_c {
+                    crate::warp::warp_affine_compound(
+                        wp, &py0.data, py0.true_width as i32, py0.true_height as i32,
+                        py0.width as i32, &mut inter0_y, px as i32, py as i32, SIDE as i32,
+                        SIDE as i32, SIDE as i32, 0, 0,
+                    );
+                }
                 let mut inter1_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py1.data,
@@ -19663,10 +21017,17 @@ fn decode_inter_block8(
                     scale1,
                     SIDE,
                     SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_y,
                 );
+                if let Some(wp) = &warp1_c {
+                    crate::warp::warp_affine_compound(
+                        wp, &py1.data, py1.true_width as i32, py1.true_height as i32,
+                        py1.width as i32, &mut inter1_y, px as i32, py as i32, SIDE as i32,
+                        SIDE as i32, SIDE as i32, 0, 0,
+                    );
+                }
                 let mut pred_y = vec![0u16; SIDE * SIDE];
                 let mut diffwtd_mask_y = Vec::new();
                 let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
@@ -19696,8 +21057,8 @@ fn decode_inter_block8(
                     scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_u,
                 );
                 let mut inter1_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -19711,8 +21072,8 @@ fn decode_inter_block8(
                     scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_u,
                 );
                 let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
@@ -19742,8 +21103,8 @@ fn decode_inter_block8(
                     scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_v,
                 );
                 let mut inter1_v = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -19757,8 +21118,8 @@ fn decode_inter_block8(
                     scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_v,
                 );
                 let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
@@ -19874,6 +21235,14 @@ fn decode_inter_block8(
                 // so the 16x16 below a split block read partition ctx 0
                 // instead of 1 and mis-read PARTITION_SPLIT as NONE.
                 neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+                // lane-cdef r1: ... and the CDEF skip band too. `apply_cdef`'s
+                // `is_8x8_block_skip` (libaom `cdef.c:29-38`) reads all four mi
+                // cells of the 8x8; this leaf wrote none of them, so a 64x64
+                // whose bottom-right 16x16 is an all-skip 8x8-leaf group kept
+                // the PREVIOUS frame's flags and got filtered where libaom's
+                // dlist excludes it (3 luma samples on a 192x128 inter frame).
+                INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
+                neighbours.fill_skip_grid(leaf_mi, 2, skip);
                 neighbours.fill_lf_grid(
                     leaf_mi,
                     2,
@@ -19932,6 +21301,17 @@ fn decode_inter_block8(
             &gm_table,
             tpl,
         );
+        // lane-interp3 r2: same per-entry EC_STACK ladder
+        // [`decode_inter_block`]'s single-ref arm prints, so this leaf's stack
+        // diffs line for line against the oracle's.
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            for (i, e) in stack.entries.iter().enumerate() {
+                eprintln!(
+                    "EC_STACK mi_row={mi_row} mi_col={mi_col} ref={ref_frame} i={i} this=({},{}) comp=(0,0) w={}",
+                    e.mv.0, e.mv.1, e.weight
+                );
+            }
+        }
 
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let mut is_globalmv = false;
@@ -20453,12 +21833,62 @@ fn decode_inter_block8(
                  this leaf with one; the >=16x16 arm decodes deltas)",
             ));
         }
+        // lane-uv8 r1: the delta'd angle decides the intra edge filter, and a
+        // directional luma mode is already legal on this leaf -- the arm
+        // passed a hardcoded `false` where [`decode_leaf8`] reads the
+        // mi-exact neighbour modes (`get_intra_edge_filter_type`, spec
+        // 7.11.2).
+        let (above_mode, left_mode) =
+            neighbours.modes_above_left_mi(leaf_mi.0, leaf_mi.1, neighbours.modes_above_left(r, c));
+        let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
+        // lane-uv8 r1: libaom `read_intra_block_mode_info` (decodemv.c:1198-1207)
+        // -- `uv_mode` over the CFL-allowed alphabet (`is_cfl_allowed`: a
+        // BLOCK_8X8 leaf is inside the 32x32 bound), then `read_cfl_alphas`
+        // for `UV_CFL_PRED`, then `angle_delta_uv` off the MAPPED uv mode's
+        // row (`get_uv_mode`, identity over `V_PRED..=D67_PRED`). Every value
+        // but `DC_PRED` was refused here, which is what blocked the low-cq
+        // CDEF arms and the 10-bit gates.
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
-        if uv_mode != DC_PRED {
-            return Err(unsupported(
-                "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
-            ));
+        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            eprintln!(
+                "EC_ISTEP8 mi_row={} mi_col={} name=modes y={mode} uv={uv_mode} fi_enabled={} rng={}",
+                leaf_mi.0,
+                leaf_mi.1,
+                ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+                dec.debug_state().0
+            );
         }
+        if (9..=12).contains(&uv_mode) {
+            SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER8_UV_SMOOTH_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let alpha = if uv_mode == UV_CFL_PRED {
+            INTRA_IN_INTER8_UV_CFL_HITS.with(|c| c.set(c.get() + 1));
+            Some(read_cfl_alphas(dec, cdfs))
+        } else {
+            None
+        };
+        let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+            DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER8_UV_DIR_HITS.with(|c| c.set(c.get() + 1));
+            read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
+        } else {
+            0
+        };
+        if angle_delta_uv != 0 {
+            UV_ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.set(c.get() + 1));
+        }
+        // `get_uv_mode` (spec 9.3): `UV_CFL_PRED` predicts as `DC_PRED`.
+        uv_predict_mode = if uv_mode == UV_CFL_PRED {
+            DC_PRED
+        } else {
+            uv_mode
+        };
+        // The CHROMA neighbour's own `uv_mode` decides the chroma edge filter
+        // strength (`get_intra_edge_filter_type`, reconintra.c:974), never the
+        // luma one -- same read [`decode_leaf8`] does.
+        let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
         // lane-screen r2: see [`decode_inter_block`]'s own copy -- `mode`/
         // `uv_mode` are both effectively `DC_PRED`-gated already on this
         // leaf (a nonzero `mode` still passes, but `uv_mode` is forced
@@ -20470,7 +21900,10 @@ fn decode_inter_block8(
                     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
                 ));
             }
-            if dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+            // lane-uv8 r1: `read_palette_mode_info` reads the UV symbol only
+            // when `uv_mode == UV_DC_PRED` (decodemv.c) -- unconditional here
+            // while every non-DC uv_mode was refused a few lines above.
+            if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
                 return Err(unsupported(
                     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
                 ));
@@ -20485,14 +21918,39 @@ fn decode_inter_block8(
         // `av1_filter_intra_allowed`'s `palette_size[0] == 0` term is implied:
         // a real palette-Y block already returned above.
         let mut filter_intra = None;
+        // lane-uv8 r2: the oracle's `EC_ISTEP` ladder (`EC_TRACE_MODE_STEP`)
+        // prints `use_filter_intra` for an intra block inside an INTER frame
+        // and nothing else, so this leaf needs the same two lines for a
+        // range-ladder diff against it.
+        let ec_istep8 = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
         if mode == DC_PRED
             && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
             && let Some(class) = filter_intra_size_class(SIDE)
-            && dec.symbol(&mut cdfs.filter_intra[class]) != 0
         {
-            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
-            INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
-            filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
+            let use_fi = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
+            if ec_istep8 {
+                eprintln!(
+                    "EC_ISTEP mi_row={} mi_col={} name=use_filter_intra val={} rng={}",
+                    leaf_mi.0,
+                    leaf_mi.1,
+                    u8::from(use_fi),
+                    dec.debug_state().0
+                );
+            }
+            if use_fi {
+                FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                let fi = dec.symbol(&mut cdfs.filter_intra_mode);
+                if ec_istep8 {
+                    eprintln!(
+                        "EC_ISTEP mi_row={} mi_col={} name=filter_intra_mode val={fi} rng={}",
+                        leaf_mi.0,
+                        leaf_mi.1,
+                        dec.debug_state().0
+                    );
+                }
+                filter_intra = Some(fi);
+            }
         }
         mode_for_tx = mode;
         let (mi_row, mi_col) = leaf_mi;
@@ -20551,31 +22009,34 @@ fn decode_inter_block8(
                 &vec![0i32; SIDE * SIDE],
                 None,
                 filter_intra,
-                false,
+                smooth_neighbor,
             );
+            // CfL's AC contribution is the luma this leaf just reconstructed,
+            // averaged over the 4x4 chroma block (`cfl_ac_q3`, spec 7.11.5).
+            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
             u.reconstruct(
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             );
             v.reconstruct(
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             );
             luma_grid = vec![0i32; SIDE * SIDE];
             u_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -20585,7 +22046,15 @@ fn decode_inter_block8(
             luma_grid = read_plane(
                 dec,
                 cdfs,
-                TxbSet::Luma8,
+                // lane-uv8 r3: an intra leaf inside an inter frame is
+                // `is_inter == 0` in `av1_get_ext_tx_set_type`, so its 8x8
+                // luma reads the INTRA set -- seven-type
+                // `EXT_TX_SET_DTT4_IDTX_1DDCT` when `reduced_tx_set == 0`,
+                // five-type `EXT_TX_SET_DTT4_IDTX` when it is 1. Hardcoding
+                // the reduced set read the wrong ALPHABET (class
+                // [[wrong-alphabet-same-value]]) and desynced at the leaf's
+                // first `tx_type`.
+                txbset_for(8, reduced_tx_set),
                 scan8,
                 0,
                 around[0],
@@ -20602,8 +22071,9 @@ fn decode_inter_block8(
                 None,
                 filter_intra,
                 None,
-                false,
+                smooth_neighbor,
             )?;
+            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
             u_grid = read_plane(
                 dec,
                 cdfs,
@@ -20612,8 +22082,8 @@ fn decode_inter_block8(
                 1,
                 around[1],
                 mode,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 u,
                 cpx,
@@ -20621,10 +22091,10 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
+                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             )?;
             v_grid = read_plane(
                 dec,
@@ -20634,8 +22104,8 @@ fn decode_inter_block8(
                 2,
                 around[2],
                 mode,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 v,
                 cpx,
@@ -20643,10 +22113,10 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
+                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
                 None,
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             )?;
         }
     }
@@ -20668,6 +22138,16 @@ fn decode_inter_block8(
         )
     });
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    // lane-uv8 r1: this leaf never stamped a mode band at all, so the block
+    // below/right of it read whatever block last wrote the coarse [`SUB`]
+    // slot -- now that an intra leaf here can code a smooth/directional
+    // `uv_mode`, its chroma neighbours must see it (and an inter leaf must
+    // stamp `DC_PRED`, what libaom stores for a non-intra block). Same pair
+    // [`decode_leaf8`] writes, plus the coarse fallback slots.
+    neighbours.above_uv_mode[c] = uv_predict_mode;
+    neighbours.left_uv_mode[r] = uv_predict_mode;
+    neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode_for_tx);
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     if let Some((left, above)) = saved_luma_ctx {
         for (cell, state) in left.into_iter().enumerate() {
             neighbours.left[leaf_mi.0 + cell][0] = state;
@@ -20679,6 +22159,10 @@ fn decode_inter_block8(
     // lane-gmaffine r2: the deblock grid's ref id is the leaf's OWN reference
     // (r1 taught this leaf non-LAST refs; the hardcoded LAST_FRAME made every
     // GOLDEN/ALTREF leaf read as LAST at the loop-filter's ref/mv edge test).
+    // lane-cdef r1: the fall-through twin of the compound arm's skip-band
+    // write above -- `skip` is one flag for the whole 8x8 leaf (read at
+    // `decode.rs`'s `skip_ctx` site), `split8` only splits its transform.
+    neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(
         leaf_mi,
         2,
@@ -21305,10 +22789,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             // instead of silently decoding as SPLIT and desyncing.
             let part64 = match (has_cols, has_rows) {
                 (true, true) => {
+                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PART mi_row={} mi_col={} bsize=12 ctx={} rng={}", sb_r as usize * SB_MI as usize, sb_c as usize * SB_MI as usize, sb_ctx, dec.debug_state().0); }
+                    let pre_rng = dec.debug_state().0;
                     let p = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
                     if std::env::var_os("EC_AV1_TRACE").is_some() {
                         eprintln!(
-                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p}",
+                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p} pre_rng={pre_rng}",
                             sb_r * SB_MI,
                             sb_c * SB_MI
                         );
@@ -21489,6 +22975,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             dec.debug_state().0
                         );
                     }
+                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PART mi_row={} mi_col={} bsize=9 ctx={} rng={}", (r32 as usize), (c32 as usize), ctx32, dec.debug_state().0); }
                     let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
                     if std::env::var_os("EC_AV1_TRACE").is_some() {
                         eprintln!(
@@ -21601,6 +23088,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             // inter leaves through the very same loop the
                             // straddling case has always used.
                             let part16 = if has_cols16 && has_rows16 {
+                                if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PART mi_row={} mi_col={} bsize=6 ctx={} rng={}", (sr as usize*SUB_MI as usize), (sc as usize*SUB_MI as usize), ctx16, dec.debug_state().0); }
                                 let p = dec.symbol(&mut cdfs.partition_w16[ctx16]);
                                 if std::env::var_os("EC_AV1_TRACE").is_some() {
                                     let (rng, _) = dec.debug_state();
@@ -21911,12 +23399,104 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 for (mr, mc) in leaf_positions {
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PART mi_row={} mi_col={} bsize=3 ctx={} rng={}", leaf_mi.0, leaf_mi.1, leaf_ctx, dec.debug_state().0); }
                                     let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
-                                    if part8 != PARTITION_NONE {
+                                    if part8 == PARTITION_SPLIT {
+                                        // lane-intersub8: four BLOCK_4X4 inter
+                                        // sub-blocks, chroma once per 8x8.
+                                        decode_inter_sub8_split4(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            &mut grid,
+                                            leaf_mi,
+                                            mi_cols,
+                                            mi_rows,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            &ref_y,
+                                            &ref_u,
+                                            &ref_v,
+                                            &ref_slots,
+                                            &sign_bias_table,
+                                            &global_motion,
+                                            base_q_idx,
+                                            &scan4,
+                                            allow_high_precision_mv,
+                                            force_integer_mv,
+                                            interp_fixed,
+                                            enable_dual_filter,
+                                            tpl_frame.as_ref(),
+                                            reduced_tx_set,
+                                            frame_width as usize,
+                                        )?;
+                                        continue;
+                                    }
+                                    if part8 == PARTITION_HORZ
+                                        && std::env::var_os("EC_AV1_SUB8_HORZ").is_none()
+                                    {
+                                        // lane-intersub8 r4: the r3 desync IS
+                                        // root-caused and fixed (rect masked
+                                        // compound read `BLOCK_16X16`'s
+                                        // `compound_type`/`wedge_idx` CDF row
+                                        // for a 16x8 block); every mode-info
+                                        // range on the 28-arm transposed
+                                        // sweep now matches aomdec element
+                                        // for element. What is left is a
+                                        // POST-ENTROPY pixel band: 3 of 28
+                                        // arms (8-bit cq32 sp9, 10-bit cq12
+                                        // sp3, 10-bit cq16 sp3) differ by
+                                        // |d| <= 2 in luma only, scattered
+                                        // over the bottom-left corner
+                                        // (x < 48, y >= 112) from the first
+                                        // frame that references an 8x4 group
+                                        // -- a filter/reconstruction defect,
+                                        // not a desync. Still refused by name
+                                        // rather than shipped as silent pixel
+                                        // drift; `EC_AV1_SUB8_HORZ=1` decodes
+                                        // it for the r5 bisect.
                                         return Err(unsupported(
-                                            "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
+                                            "an inter 8x8 HORZ partition (two BLOCK_8X4 inter leaves; entropy-exact now, but a measured sweep still drifts |d|<=2 in luma after the filters)",
                                         ));
                                     }
+                                    if part8 == PARTITION_VERT || part8 == PARTITION_HORZ {
+                                        // lane-intersub8 r3/r4: two BLOCK_8X4
+                                        // (HORZ) / BLOCK_4X8 (VERT) inter
+                                        // leaves, chroma once per 8x8 on the
+                                        // second of them.
+                                        decode_inter_sub8_rect2(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            &mut grid,
+                                            leaf_mi,
+                                            part8 == PARTITION_VERT,
+                                            mi_cols,
+                                            mi_rows,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            &ref_y,
+                                            &ref_u,
+                                            &ref_v,
+                                            &ref_slots,
+                                            &sign_bias_table,
+                                            &global_motion,
+                                            base_q_idx,
+                                            &scan4,
+                                            allow_high_precision_mv,
+                                            force_integer_mv,
+                                            interp_fixed,
+                                            enable_dual_filter,
+                                            tpl_frame.as_ref(),
+                                            reduced_tx_set,
+                                            frame_width as usize,
+                                        )?;
+                                        continue;
+                                    }
+                                    // `partition_w8` is a 4-symbol alphabet
+                                    // (NONE/HORZ/VERT/SPLIT), all four handled.
                                     let (
                                         skip,
                                         is_inter,
@@ -22941,6 +24521,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // that isolate whether a decode-order frame's mismatch already exists
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
+    if std::env::var_os("EC_OBMC").is_some() || std::env::var_os("EC_TRACE_MODE").is_some() {
+        eprintln!(
+            "EC_PICT idx={}",
+            PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
     dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
@@ -23311,6 +24898,30 @@ mod tests {
     /// always cleared to `None` by `record_inter`, so the next block's own
     /// `NeighbourRef::uni` -- and `comp_reference_type_ctx` downstream of it
     /// -- could never see a real compound neighbour).
+    /// lane-interp3 r1: a decoder must never abort the process on
+    /// stream-derived state. `neighbour_filter` used to feed the `[3, 3]`
+    /// "no filter recorded" sentinel straight into
+    /// `InterpFilterKind::from_switchable_symbol`, whose `panic!` ("...alphabet
+    /// is exactly 3 symbols") crashed on a real aomenc dual-filter + OBMC
+    /// stream. It now refuses by name; the real symbols still decode.
+    #[test]
+    fn an_obmc_neighbour_with_no_recorded_filter_refuses_instead_of_panicking() {
+        assert!(
+            neighbour_filter(None, [3, 3])
+                .unwrap_err()
+                .to_string()
+                .contains("an OBMC neighbour whose interp filter was never recorded"),
+            "the [3, 3] sentinel must refuse by name, never panic"
+        );
+        assert!(neighbour_filter(None, [3, 0]).is_err());
+        let (h, v) = neighbour_filter(None, [0, 2]).expect("real symbols decode");
+        assert_eq!(h, mc::InterpFilterKind::Sharp, "sym[1] is the horizontal kernel");
+        assert_eq!(v, mc::InterpFilterKind::Regular, "sym[0] is the vertical kernel");
+        let (h, v) = neighbour_filter(Some(mc::InterpFilterKind::Smooth), [3, 3])
+            .expect("a fixed-filter frame never reads a symbol");
+        assert_eq!((h, v), (mc::InterpFilterKind::Smooth, mc::InterpFilterKind::Smooth));
+    }
+
     #[test]
     fn record_compound_ctx_stamps_ref1_for_the_next_block_to_read() {
         let mut n = Neighbours::new(4, 4, 16, 16);
