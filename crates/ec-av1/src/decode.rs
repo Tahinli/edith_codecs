@@ -51,6 +51,8 @@ const PARTITION_HORZ_A: usize = 4;
 const PARTITION_HORZ_B: usize = 5;
 const PARTITION_VERT_A: usize = 6;
 const PARTITION_VERT_B: usize = 7;
+const PARTITION_HORZ_4: usize = 8;
+const PARTITION_VERT_4: usize = 9;
 const SB_MI: u32 = 16;
 const BLOCK_MI: u32 = 8;
 
@@ -1419,6 +1421,26 @@ pub(crate) fn sb_ab_hits_by_arm() -> [usize; 4] {
     SB_AB_HITS.with(std::cell::Cell::get)
 }
 
+// lane-tx64x16: the two 1:4 superblock arms, counted per orientation --
+// `PARTITION_HORZ_4` (four 64x16 strips) and `PARTITION_VERT_4` (four 16x64
+// strips). Two counters, not one, because a gate that only proved "some 1:4
+// strip fired" would pass on a stream that never coded the other axis, and
+// every scan/context table this round added comes in a transposed pair.
+thread_local! {
+    static SB_RECT4_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SB_RECT4_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `SB_RECT4_HORZ_HITS` (64x16 strips decoded).
+pub(crate) fn sb_rect4_horz_hits() -> usize {
+    SB_RECT4_HORZ_HITS.with(|c| c.get())
+}
+
+/// Current value of `SB_RECT4_VERT_HITS` (16x64 strips decoded).
+pub(crate) fn sb_rect4_vert_hits() -> usize {
+    SB_RECT4_VERT_HITS.with(|c| c.get())
+}
+
 // lane-rect64q r1: how many of [`decode_block_rect64`]'s three per-plane
 // dequant calls actually observed `CURRENT_Q_IDX != base_q_idx` -- proof the
 // running-vs-stale-snapshot bug this round fixed is exercised by a gate, not
@@ -1951,6 +1973,46 @@ const SCAN_8X16: [u16; 128] = [
     89, 96, 55, 62, 69, 76, 83, 90, 97, 104, 63, 70, 77, 84, 91, 98, 105, 112, 71, 78, 85, 92, 99,
     106, 113, 120, 79, 86, 93, 100, 107, 114, 121, 87, 94, 101, 108, 115, 122, 95, 102, 109, 116,
     123, 103, 110, 117, 124, 111, 118, 125, 119, 126, 127,
+];
+
+/// `Default_Scan_32x8`, this decoder's own row-major transcription (see
+/// [`SCAN_32X16`]'s doc comment) -- the chroma plane of a 64x16
+/// `PARTITION_HORZ_4` superblock strip (lane-tx64x16). libaom stores its
+/// scans column-major (`p = col * height + row`), so a naive copy of
+/// `default_scan_32x8` would silently install the TRANSPOSED 8x32 order
+/// (class reference-layout-not-spec): `default_scan_16x8`'s literal bytes
+/// are byte-identical to this decoder's [`SCAN_8X16`].
+const SCAN_32X8: [u16; 256] = [
+    0, 32, 1, 64, 33, 2, 96, 65, 34, 3, 128, 97, 66, 35, 4, 160, 129, 98, 67, 36, 5, 192, 161, 130,
+    99, 68, 37, 6, 224, 193, 162, 131, 100, 69, 38, 7, 225, 194, 163, 132, 101, 70, 39, 8, 226, 195,
+    164, 133, 102, 71, 40, 9, 227, 196, 165, 134, 103, 72, 41, 10, 228, 197, 166, 135, 104, 73, 42,
+    11, 229, 198, 167, 136, 105, 74, 43, 12, 230, 199, 168, 137, 106, 75, 44, 13, 231, 200, 169,
+    138, 107, 76, 45, 14, 232, 201, 170, 139, 108, 77, 46, 15, 233, 202, 171, 140, 109, 78, 47, 16,
+    234, 203, 172, 141, 110, 79, 48, 17, 235, 204, 173, 142, 111, 80, 49, 18, 236, 205, 174, 143,
+    112, 81, 50, 19, 237, 206, 175, 144, 113, 82, 51, 20, 238, 207, 176, 145, 114, 83, 52, 21, 239,
+    208, 177, 146, 115, 84, 53, 22, 240, 209, 178, 147, 116, 85, 54, 23, 241, 210, 179, 148, 117,
+    86, 55, 24, 242, 211, 180, 149, 118, 87, 56, 25, 243, 212, 181, 150, 119, 88, 57, 26, 244, 213,
+    182, 151, 120, 89, 58, 27, 245, 214, 183, 152, 121, 90, 59, 28, 246, 215, 184, 153, 122, 91,
+    60, 29, 247, 216, 185, 154, 123, 92, 61, 30, 248, 217, 186, 155, 124, 93, 62, 31, 249, 218, 187,
+    156, 125, 94, 63, 250, 219, 188, 157, 126, 95, 251, 220, 189, 158, 127, 252, 221, 190, 159, 253,
+    222, 191, 254, 223, 255,
+];
+/// `Default_Scan_8x32`, [`SCAN_32X8`]'s transpose (the chroma plane of a
+/// 16x64 `PARTITION_VERT_4` strip).
+const SCAN_8X32: [u16; 256] = [
+    0, 1, 8, 2, 9, 16, 3, 10, 17, 24, 4, 11, 18, 25, 32, 5, 12, 19, 26, 33, 40, 6, 13, 20, 27, 34,
+    41, 48, 7, 14, 21, 28, 35, 42, 49, 56, 15, 22, 29, 36, 43, 50, 57, 64, 23, 30, 37, 44, 51, 58,
+    65, 72, 31, 38, 45, 52, 59, 66, 73, 80, 39, 46, 53, 60, 67, 74, 81, 88, 47, 54, 61, 68, 75, 82,
+    89, 96, 55, 62, 69, 76, 83, 90, 97, 104, 63, 70, 77, 84, 91, 98, 105, 112, 71, 78, 85, 92, 99,
+    106, 113, 120, 79, 86, 93, 100, 107, 114, 121, 128, 87, 94, 101, 108, 115, 122, 129, 136, 95,
+    102, 109, 116, 123, 130, 137, 144, 103, 110, 117, 124, 131, 138, 145, 152, 111, 118, 125, 132,
+    139, 146, 153, 160, 119, 126, 133, 140, 147, 154, 161, 168, 127, 134, 141, 148, 155, 162, 169,
+    176, 135, 142, 149, 156, 163, 170, 177, 184, 143, 150, 157, 164, 171, 178, 185, 192, 151, 158,
+    165, 172, 179, 186, 193, 200, 159, 166, 173, 180, 187, 194, 201, 208, 167, 174, 181, 188, 195,
+    202, 209, 216, 175, 182, 189, 196, 203, 210, 217, 224, 183, 190, 197, 204, 211, 218, 225, 232,
+    191, 198, 205, 212, 219, 226, 233, 240, 199, 206, 213, 220, 227, 234, 241, 248, 207, 214, 221,
+    228, 235, 242, 249, 215, 222, 229, 236, 243, 250, 223, 230, 237, 244, 251, 231, 238, 245, 252,
+    239, 246, 253, 247, 254, 255,
 ];
 
 /// [`neighbour`] with independent `w` (row stride)/`h` (row-bound) extents
@@ -4973,30 +5035,63 @@ fn decode_block_rect64(
         );
     } else {
         let around = neighbours.around_rect(at, bw, bh);
-        // LUMA: a real 32x32 corner, embedded top-left of the true bw x bh
-        // grid (see this function's own doc comment).
+        // LUMA: the coded corner, embedded top-left of the true bw x bh grid
+        // (see this function's own doc comment). A 64-length axis codes only
+        // its low 32 coefficients, so the corner is `min(bw, 32)` x
+        // `min(bh, 32)`: 32x32 under a 64x32/32x64 HORZ/VERT strip, and
+        // 32x16/16x32 under a 64x16/16x64 1:4 strip (lane-tx64x16).
+        let (luma_cw, luma_ch) = (bw.min(32), bh.min(32));
         let scan32 = default_scan(TX32);
-        let mut luma_coding = cdfs.txb(TxbSet::Luma64, mode);
         if std::env::var_os("EC_TRACE_COEFF").is_some() {
             let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF plane=0 row={mi_r} col={mi_c} tx_size=64corner rng={rng}");
+            eprintln!("EC_COEFF plane=0 row={mi_r} col={mi_c} tx_size={luma_cw}x{luma_ch} rng={rng}");
         }
-        let (luma_corner, luma_tx_type) = read_coeffs(
-            dec,
-            &mut luma_coding,
-            &scan32,
-            0,
-            dc_sign_ctx(around[0].2),
-            TxType::DctDct,
-            Some((bw, bh)),
-        )?;
+        let (luma_corner, luma_tx_type) = if (luma_cw, luma_ch) == (32, 32) {
+            let mut luma_coding = cdfs.txb(TxbSet::Luma64, mode);
+            read_coeffs(
+                dec,
+                &mut luma_coding,
+                &scan32,
+                0,
+                dc_sign_ctx(around[0].2),
+                TxType::DctDct,
+                Some((bw, bh)),
+            )?
+        } else {
+            // `av1_get_adjusted_tx_size` (`blockd.h:1361`) maps TX_64X16 ->
+            // TX_32X16 and TX_16X64 -> TX_16X32, and `av1_scan_orders`
+            // (`scan.c`) gives both the very same `default_scan_32x16` /
+            // `default_scan_16x32` the 2:1 sizes use ("Half of the
+            // coefficients of tx64 at higher frequencies are set to zeros. So
+            // tx32's scan order is used"). `get_txsize_entropy_ctx` is
+            // (txsize_sqr + txsize_sqr_up + 1) >> 1 = (TX_16X16 + TX_64X64 +
+            // 1) >> 1 = TX_32X32 and `txsize_log2_minus4[TX_64X16]` is 5 (a
+            // 512-position eob group) -- BOTH identical to TX_32X16, so the
+            // 2:1 CDF set `LumaRect32x16` is bit-exact here and no new table
+            // is owed. `av1_nz_map_ctx_offset[TX_64X16]` is literally
+            // `av1_nz_map_ctx_offset_32x16` (`txb_common.c:340`), which is
+            // what `base_ctx_rect` computes at (32, 16).
+            let luma_scan: &[u16] = if bw == 64 { &SCAN_32X16 } else { &SCAN_16X32 };
+            let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, mode);
+            read_coeffs_rect(
+                dec,
+                &mut luma_coding,
+                luma_scan,
+                luma_cw,
+                luma_ch,
+                0,
+                dc_sign_ctx(around[0].2),
+                TxType::DctDct,
+            )?
+        };
         if std::env::var_os("EC_TRACE_COEFF").is_some() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=0 row={mi_r} col={mi_c} rng={rng}");
         }
         let mut luma_levels = vec![0i32; bw * bh];
-        for row in 0..32 {
-            luma_levels[row * bw..][..32].copy_from_slice(&luma_corner[row * 32..][..32]);
+        for row in 0..luma_ch {
+            luma_levels[row * bw..][..luma_cw]
+                .copy_from_slice(&luma_corner[row * luma_cw..][..luma_cw]);
         }
         {
             let cur = block_q_idx();
@@ -5049,9 +5144,20 @@ fn decode_block_rect64(
         // CHROMA: a real, untruncated chroma_w x chroma_h transform -- no
         // corner crop needed (see doc comment).
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
-        let chroma_scan: &[u16] = if bw == 64 { &SCAN_32X16 } else { &SCAN_16X32 };
+        // The chroma plane is never truncated (both axes <= 32 after
+        // subsampling). Under a 1:4 strip it is a true 32x8/8x32:
+        // `get_txsize_entropy_ctx(TX_32X8)` = (TX_8X8 + TX_32X32 + 1) >> 1 =
+        // TX_16X16 and `txsize_log2_minus4[TX_32X8]` = 4 (256 positions),
+        // both identical to TX_16X16 -- so [`TxbSet::Chroma16`] is the exact
+        // set, and only the scan is new (lane-tx64x16).
+        let (chroma_set, chroma_scan): (TxbSet, &[u16]) = match (bw, bh) {
+            (64, 16) => (TxbSet::Chroma16, &SCAN_32X8),
+            (16, 64) => (TxbSet::Chroma16, &SCAN_8X32),
+            (64, _) => (TxbSet::ChromaRect32x16, &SCAN_32X16),
+            _ => (TxbSet::ChromaRect32x16, &SCAN_16X32),
+        };
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
-        let mut u_coding = cdfs.txb(TxbSet::ChromaRect32x16, uv_predict_mode);
+        let mut u_coding = cdfs.txb(chroma_set, uv_predict_mode);
         if std::env::var_os("EC_TRACE_COEFF").is_some() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=1 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
@@ -5105,7 +5211,7 @@ fn decode_block_rect64(
             smooth_neighbor_uv,
         );
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
-        let mut v_coding = cdfs.txb(TxbSet::ChromaRect32x16, uv_predict_mode);
+        let mut v_coding = cdfs.txb(chroma_set, uv_predict_mode);
         if std::env::var_os("EC_TRACE_COEFF").is_some() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=2 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
@@ -5164,6 +5270,11 @@ fn decode_block_rect64(
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     SB_RECT_HITS.with(|c| c.set(c.get() + 1));
+    match (bw, bh) {
+        (64, 16) => SB_RECT4_HORZ_HITS.with(|c| c.set(c.get() + 1)),
+        (16, 64) => SB_RECT4_VERT_HITS.with(|c| c.set(c.get() + 1)),
+        _ => {}
+    }
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         let (rng, _) = dec.debug_state();
         eprintln!("TRACE_RECT64_END mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} rng={rng}");
@@ -9506,10 +9617,49 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         }
                     }
                 }
+                PARTITION_HORZ_4 | PARTITION_VERT_4 => {
+                    // lane-tx64x16: the 1:4 pair at 64x64 -- four 64x16 (or
+                    // 16x64) strips in raster order. `decode_partition`
+                    // (`decodeframe.c`) steps by `quarter_step = mi_size / 4`
+                    // (4 mi = 16 px = one SUB unit here) and BREAKS at the
+                    // frame edge for `i > 0`, so a partial superblock codes
+                    // only the strips whose origin is inside the frame.
+                    let horz = part == PARTITION_HORZ_4;
+                    for i in 0..4 {
+                        let step_mi = i * (SB_MI as usize / 4);
+                        let (this_r_mi, this_c_mi) = if horz {
+                            (sb_r as usize * SB_MI as usize + step_mi, sb_c as usize * SB_MI as usize)
+                        } else {
+                            (sb_r as usize * SB_MI as usize, sb_c as usize * SB_MI as usize + step_mi)
+                        };
+                        if i > 0
+                            && (this_r_mi >= mi_rows as usize || this_c_mi >= mi_cols as usize)
+                        {
+                            break;
+                        }
+                        let strip_at = if horz { (at.0 + i, at.1) } else { (at.0, at.1 + i) };
+                        let (bw, bh) = if horz { (64, 16) } else { (16, 64) };
+                        decode_block_rect64(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            strip_at,
+                            bw,
+                            bh,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            enable_filter_intra,
+                            allow_screen_content_tools,
+                            base_q_idx,
+                            tx_select,
+                            reduced_tx_set,
+                        )?;
+                    }
+                }
                 _ => {
                     return Err(unsupported(
-                        "a superblock-level 1:4 partition (PARTITION_HORZ_4/VERT_4 at 64x64, \
-                         four 64x16/16x64 strips)",
+                        "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
                     ));
                 }
             }
