@@ -30358,6 +30358,9 @@ mod tests {
             crate::decode::edge_filter_mi_fix_hits(),
         );
         let sub8tx_before = crate::decode::sub8_chroma_tx_from_ref_hits();
+        // lane-t900 r8: the intra edge-filter type an INTER neighbour keeps
+        // non-smooth (the coarse SUB band still holds an older SMOOTH mode).
+        let notsmooth_before = crate::decode::inter_neighbour_not_smooth_hits();
         let i16_before = crate::decode::intra16x4_in_inter_hits();
         let frames = match decode_stream(&stream) {
             Ok(frames) => frames,
@@ -30373,6 +30376,7 @@ mod tests {
             crate::decode::edge_filter_mi_fix_hits() - before.6,
         );
         let sub8tx = crate::decode::sub8_chroma_tx_from_ref_hits() - sub8tx_before;
+        let notsmooth = crate::decode::inter_neighbour_not_smooth_hits() - notsmooth_before;
         let i16_now = crate::decode::intra16x4_in_inter_hits();
         let i16 = (
             i16_now.0 - i16_before.0,
@@ -30391,6 +30395,7 @@ mod tests {
             ("intra16x4_in_inter 4x16", i16.1),
             ("intra16x4_in_inter chroma_ref", i16.2),
             ("sub8_chroma_tx_from_ref", sub8tx),
+            ("inter_neighbour_not_smooth", notsmooth),
         ] {
             assert!(
                 n > 0,
@@ -30416,7 +30421,7 @@ mod tests {
             "{NAME}: 15 shown frames pixel-exact on every plane; warp_plane_suppress={} \
              cdef_idx={} inter_sb128_vert={} interintra_rect={} non_chroma_ref_ctx_skip={} \
              intra_in_inter_txctx={} edge_filter_mi_fix={} intra16x4_in_inter={:?} \
-             sub8_chroma_tx_from_ref={sub8tx}",
+             sub8_chroma_tx_from_ref={sub8tx} inter_neighbour_not_smooth={notsmooth}",
             fired.0, fired.1, fired.2, fired.3, fired.4, fired.5, fired.6, i16
         );
     }
