@@ -345,6 +345,11 @@ pub fn predict_with_filters(
     let xfrac = x_q4.rem_euclid(16) as usize;
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
+    if std::env::var_os("EC_MC_TRACE").is_some() && block_w >= 4 {
+        eprintln!(
+            "EC_MC_CALL x_q4={x_q4} y_q4={y_q4} w={block_w} h={block_h} xfrac={xfrac} yfrac={yfrac} hk={h_kind:?} vk={v_kind:?} tw={true_width} th={true_height} stride={stride}"
+        );
+    }
 
     // Whole-pel fast path: `SUBPEL_FILTERS[0]` is the identity tap (`128` at
     // its centre, everything else `0`), and both rounding shifts are exactly
@@ -659,6 +664,9 @@ pub fn predict_compound_intermediate(
 
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
+    if std::env::var_os("EC_MC_TRACE").is_some() {
+        eprintln!("EC_MC_COMP x_q4={x_q4} y_q4={y_q4} w={block_w} h={block_h} hk={h_kind:?} vk={v_kind:?}");
+    }
 
     let (v_wide, v_narrow) = v_kind.tables();
     let v_filter = if block_h <= 4 {
