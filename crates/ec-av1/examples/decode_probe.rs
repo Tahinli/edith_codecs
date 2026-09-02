@@ -31,6 +31,13 @@ fn main() {
     let report = || {
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
+        let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
+        println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
+        let ir = ec_av1::stream::inter_rect_counters();
+        println!(
+            "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
+            ir.0, ir.1, ir.2, ir.3, ir.4, ir.5
+        );
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
@@ -76,6 +83,19 @@ fn main() {
             // Optional second arg, or EC_PROBE_OUT=<path>: dump the decoded
             // planes as raw yuv420p so a pixel diff against `ffmpeg -i s.obu
             // -f rawvideo` needs no test harness.
+            // 10-bit streams: EC_PROBE_OUT16 dumps the planes as little-endian
+            // u16 (yuv420p10le), the only form a pixel diff against
+            // `ffmpeg -pix_fmt yuv420p10le` can use (lane-band63).
+            if let Ok(out) = std::env::var("EC_PROBE_OUT16") {
+                let mut buf: Vec<u8> = Vec::new();
+                for f in &frames {
+                    for p in [&f.y, &f.u, &f.v] {
+                        buf.extend(p.iter().flat_map(|&s| s.to_le_bytes()));
+                    }
+                }
+                std::fs::write(&out, &buf).expect("writing raw planes");
+                println!("wrote {} bytes of yuv420p10le to {out}", buf.len());
+            }
             let out = std::env::args().nth(2).or_else(|| std::env::var("EC_PROBE_OUT").ok());
             if let Some(out) = out {
                 // 8-bit only: planes are u16, take the low byte.
