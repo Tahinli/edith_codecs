@@ -74,6 +74,11 @@ pub fn rect64_inter_tu_hits() -> usize {
     crate::decode::rect64_inter_tu_hits()
 }
 
+/// How many rect intra strips read the `use_intrabc` symbol on the last decode.
+pub fn rect_intrabc_reads() -> usize {
+    crate::decode::rect_intrabc_reads()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -2711,6 +2716,195 @@ mod tests {
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U at {depth}-bit");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V at {depth}-bit");
         }
+    }
+
+    /// lane-kf900 r5, the gate for the rect-strip `use_intrabc` read.
+    ///
+    /// `av1_allow_intrabc` is a FRAME-level test (`decodemv.c:892`,
+    /// `read_intra_frame_mode_info`): on an intra frame whose header set
+    /// `allow_intrabc`, EVERY intra block reads a `use_intrabc` symbol right
+    /// after `skip`/`cdef`/`delta_q` and before `mbmi->mode`. There is no
+    /// block-shape term, so rect strips read it exactly like square leaves --
+    /// `read_intra_mode_rect` never did, and the arithmetic decoder desynced
+    /// at the FIRST symbol of the first rect block of every
+    /// `--tune-content=screen` key frame (measured: `testsrc2` 256x192 cq59
+    /// 8-bit decoded "OK" with all 49152 luma samples wrong).
+    ///
+    /// Arm 0 is that recipe at cq50 without palette: its rect strips really do
+    /// use intrabc, which this decoder cannot reconstruct, so it must stop on
+    /// the NAMED refusal instead of emitting a wrong frame -- and it must have
+    /// read the symbol to get there.
+    /// Arm 1 is the same recipe without palette and without tx-size search --
+    /// it decodes the whole frame, reading the symbol dozens of times.
+    /// Arm 2 is a screen-tools key frame whose header does NOT set
+    /// `allow_intrabc` (cq63): it stays pixel-exact, proving the new read is
+    /// not taken when libaom does not write it.
+    ///
+    /// PIXEL RESIDUE (open, lane-kf900 r5): arm 1's frame is entropy-exact
+    /// against the instrumented aomdec for 429 mode-ladder elements and then
+    /// diverges inside the DV read of a SQUARE intrabc block at mi(32,44), so
+    /// its pixels are not compared here. That is a separate defect in
+    /// `read_intrabc_dv`, not in the read this gate covers.
+    #[test]
+    fn a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips() {
+        const NAME: &str = "a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (256usize, 192usize);
+        // (arm, source, per-arm overrides AFTER the base recipe, expect_refusal,
+        //  must_read_use_intrabc)
+        let arms: [(&str, &str, &[&str], bool, bool); 3] = [
+            (
+                "testsrc2-screen-nopalette-cq50",
+                "testsrc2=s=256x192:r=25",
+                &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"],
+                true,
+                true,
+            ),
+            (
+                "smptebars-screen-nopalette-cq45",
+                "smptebars=size=256x192:rate=25",
+                &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"],
+                false,
+                true,
+            ),
+            (
+                "testsrc2-screen-nopalette-cq63",
+                "testsrc2=s=256x192:r=25",
+                &["--cq-level=63", "--enable-palette=0", "--enable-tx-size-search=1"],
+                false,
+                false,
+            ),
+        ];
+        let (mut reads_total, mut refused, mut frames_compared) = (0usize, 0u32, 0usize);
+        for (arm, src, extra, expect_refusal, must_read) in &arms {
+            let render = || {
+                let out = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", *src, "-t", "0.2", "-pix_fmt",
+                        "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(out.status.success(), "{NAME}: ffmpeg failed for {arm}");
+                out.stdout
+            };
+            let y4m_a = render();
+            let y4m_b = render();
+            assert_eq!(y4m_a, y4m_b, "{NAME}: {arm} must render byte-identical across two runs");
+            let y4m = y4m_a;
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--bit-depth=8",
+                    "--input-bit-depth=8",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--kf-max-dist=1",
+                    "--limit=1",
+                    "--threads=1",
+                    "--tile-columns=0",
+                    "--enable-rect-partitions=1",
+                    "--enable-1to4-partitions=1",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--sb-size=64",
+                    // `allow_screen_content_tools` (and with it the frame
+                    // header's `allow_intrabc` bit) comes from here.
+                    "--tune-content=screen",
+                ])
+                // aomenc keeps the LAST occurrence of a repeated flag.
+                .args(*extra)
+                .args(["--obu", "-o", "-", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m)
+                .or_else(|e| match e.kind() {
+                    std::io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(e),
+                })
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused {arm}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            decode::reset_rect_intrabc_reads();
+            let decoded = decode_stream(&stream);
+            let reads = decode::rect_intrabc_reads();
+            reads_total += reads;
+            if *must_read {
+                assert!(
+                    reads > 0,
+                    "{NAME}: {arm} read no use_intrabc symbol on a rect strip -- the \
+                     arm no longer exercises the fix (allow_intrabc not set?)"
+                );
+            }
+            match decoded {
+                Ok(frames) => {
+                    assert!(
+                        !*expect_refusal,
+                        "{NAME}: {arm} decoded a frame whose rect strips use intrabc -- \
+                         reconstruction is not ported, it must refuse by name"
+                    );
+                    assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
+                    if *must_read {
+                        // Arm 1: entropy coverage only (see PIXEL RESIDUE above).
+                        eprintln!("{NAME}: {arm} decoded {} frame(s), {reads} rect use_intrabc reads", frames.len());
+                        continue;
+                    }
+                    let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+                    assert_eq!(frames.len(), ffmpeg_frames.len(), "{NAME}: {arm} frame count");
+                    for (i, (ours, theirs)) in frames.iter().zip(ffmpeg_frames.iter()).enumerate() {
+                        assert_eq!(ours.y, theirs.y, "{NAME}: {arm} luma, frame {i}");
+                        assert_eq!(ours.u, theirs.u, "{NAME}: {arm} U, frame {i}");
+                        assert_eq!(ours.v, theirs.v, "{NAME}: {arm} V, frame {i}");
+                        frames_compared += 1;
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains("unsupported"), "{NAME}: {arm} decode failed: {e}");
+                    assert!(
+                        *expect_refusal,
+                        "{NAME}: {arm} was expected to decode, it refused: {e}"
+                    );
+                    assert!(
+                        msg.contains("intra block copy") || msg.contains("intrabc"),
+                        "{NAME}: {arm} refused for an unrelated reason: {e}"
+                    );
+                    eprintln!("{NAME}: {arm} REFUSED (expected): {e}");
+                    refused += 1;
+                }
+            }
+        }
+        eprintln!(
+            "{NAME}: {reads_total} rect-strip use_intrabc symbol(s) read, \
+             {refused} refused by name, {frames_compared} frames compared pixel-exact"
+        );
+        assert!(reads_total > 0, "{NAME}: gate is vacuous -- no arm read the symbol");
+        assert_eq!(refused, 1, "{NAME}: expected exactly one named intrabc refusal");
+        assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
     }
 
     /// lane-kf900 r4, the gate for the two lifted palette refusals ("a 1:4
