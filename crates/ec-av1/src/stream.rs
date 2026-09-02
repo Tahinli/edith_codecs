@@ -18391,7 +18391,10 @@ mod tests {
     // transform unit is 32x64" -- an intra rect strip aomenc cannot have coded
     // with `--enable-rect-partitions=0`, so our own 128 inter block desyncs
     // first (class refusal-from-own-desync). r2 owns the range ladder.
-    #[ignore = "lane-sb128c r1: the 128 inter NONE block still desyncs; see lanes/sb128c-r1.report.md"]
+    #[ignore = "lane-sb128c r2: the 128 inter NONE block is now in sync (the uv_mode alphabet fix); \
+                 this stream also carries ONE intra-coded 128x128 block inside an inter frame \
+                 (aomdec EC_PART_VAL mi_row=32 mi_col=32 bsize=15 value=0 with no EC_MODE), which \
+                 is still refused by name -- see lanes/sb128c-r2.report.md"]
     fn a_real_aomenc_inter_128x128_none_root_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_inter_128x128_none_root_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
