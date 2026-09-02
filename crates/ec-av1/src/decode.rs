@@ -3975,6 +3975,33 @@ impl Neighbours {
     /// strip path ([`decode_leaf_rect`] took this override in r4; a 32x16 strip
     /// whose left neighbour was a 16x8 leaf still read the stale row and picked
     /// a different CDF for the same mode value).
+    /// lane-rectsplitx r2: availability-correct above/left luma modes for a
+    /// block whose top-left mi is `(mi_r, mi_c)`. libaom reads `above_mbmi`
+    /// only when `up_available` and `left_mbmi` only when `left_available`;
+    /// the coarse [`SUB`] bands cannot express that, and with 8-px strips they
+    /// actively lie -- four 32x8 strips of one `HORZ_4` share ONE 16x16
+    /// `left_mode` cell, so the second strip at tile column 0 read the FIRST
+    /// strip's mode as its "left neighbour" (measured on the band fixture at
+    /// mi(10,0): mode 2 where libaom has DC, a different `kf_y_mode` row).
+    fn modes_above_left_mi(
+        &self,
+        mi_r: usize,
+        mi_c: usize,
+        fallback: (usize, usize),
+    ) -> (usize, usize) {
+        let above = if mi_r > self.tile_row0_mi {
+            self.mode_above_mi(mi_r, mi_c).unwrap_or(fallback.0)
+        } else {
+            DC_PRED
+        };
+        let left = if mi_c > self.tile_col0_mi {
+            self.mode_left_mi(mi_r, mi_c).unwrap_or(fallback.1)
+        } else {
+            DC_PRED
+        };
+        (above, left)
+    }
+
     fn modes_above_left(&self, r: usize, c: usize) -> (usize, usize) {
         let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
         let above = self.mode_above_mi(mi_r, mi_c).unwrap_or(self.above_mode[c]);
@@ -4892,12 +4919,6 @@ fn decode_rect_split(
     // 32-level 1:4 band fixture (8-bit, cq 12, seed 42). The tables and the
     // per-unit rect walk stay wired above/below; the round that finds that
     // defect deletes this refusal and nothing else.
-    if tx_w != tx_h {
-        return Err(unsupported(format!(
-            "a split intra strip whose transform unit is the rect {tx_w}x{tx_h} (the depth-1 \
-             step of a 1:4 strip; measured wrong pixels, refused rather than shipped)"
-        )));
-    }
     let luma_set = txbset_for(tx_w.min(tx_h), reduced_tx_set);
     let luma_scan = default_scan(tx_w.min(tx_h));
     let zero_tu = vec![0i32; tx_w * tx_h];
@@ -5572,12 +5593,12 @@ fn decode_leaf_rect(
     // cannot hold the modes a split (or a pair of strips) leaves behind, so
     // when the map holds the block at exactly this strip's above/left mi it
     // is the neighbour libaom's `above_mi`/`left_mi` reads.
-    if let Some(m) = neighbours.mode_above_mi(leaf_mi.0, leaf_mi.1) {
-        above_mode = m;
-    }
-    if let Some(m) = neighbours.mode_left_mi(leaf_mi.0, leaf_mi.1) {
-        left_mode = m;
-    }
+    // lane-rectsplitx r2 (same class as the 1:4 fix): mi-exact AND
+    // availability-correct -- four 16x8 strips share one coarse 16x16
+    // `left_mode` cell too, so the fallback must not stand in for an absent
+    // tile-edge neighbour.
+    let (above_mode, left_mode) =
+        neighbours.modes_above_left_mi(leaf_mi.0, leaf_mi.1, (above_mode, left_mode));
     let smooth_neighbor =
         is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
     if smooth_neighbor {
@@ -5813,6 +5834,12 @@ fn decode_block_rect4(
             left_mode = pmode;
         }
     }
+    // lane-rectsplitx r2, ROOT CAUSE of the 1:4 mismatch: mi-exact +
+    // availability-correct neighbour modes (see
+    // [`Neighbours::modes_above_left_mi`]). The coarse 16x16 bands alias every
+    // 8-px strip of a `HORZ_4`/`VERT_4` onto one cell.
+    let (above_mode, left_mode) =
+        neighbours.modes_above_left_mi(mi_r, mi_c, (above_mode, left_mode));
     let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
         read_intra_mode_rect(
             dec,
@@ -5832,8 +5859,13 @@ fn decode_block_rect4(
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
-    let smooth_neighbor_uv =
-        neighbours.smooth_uv_neighbour(r * (SUB / MI), c * (SUB / MI), r, c);
+    // lane-rectsplitx r2: this strip's REAL mi, not the [`SUB`] cell's
+    // top-left -- a 1:4 strip starts 8 px into a 16-px cell, so
+    // `r * (SUB / MI)` names a different mi column and the chroma
+    // edge-filter strength was read from the wrong neighbour (measured:
+    // seed 43, the last 8x32 strip at luma (152,32), chroma-only mismatch
+    // with luma bit-exact).
+    let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(mi_r, mi_c, r, c);
     if filter_intra.is_some() {
         FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -5856,20 +5888,11 @@ fn decode_block_rect4(
         // both interleave in every real stream.
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
         let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
-        // lane-rectsplitx r1 MEASURED (gate below, 8-bit band fixture, cq
-        // 12..28): depth 1 -- the 2:1 RECT unit -- fires FIRST in every
-        // attempt that splits at all, and its per-unit walk mismatched
-        // ffmpeg, so no attempt ever reaches a pixel-compared depth-2 strip.
-        // A depth-2-only lift is therefore ungatable (the handoff predicted
-        // exactly this: the two depths interleave and must land together),
-        // and an ungated lift is not a lift -- both refuse by name until the
-        // rect-unit defect is found.
-        if tx_w != tx_h {
-            return Err(unsupported(format!(
-                "a 32x32-level 1:4 strip with a split transform (per-unit 4:1 prediction is \
-                 not ported, depth={depth})"
-            )));
-        }
+        // lane-rectsplitx r2: both depths ship together, as the r1 handoff
+        // predicted -- depth 1 fires FIRST in every attempt that splits at
+        // all, so a depth-2-only lift could never be gated. The r1 mismatch
+        // was never the rect unit: it was the neighbour MODE the strip reads
+        // (see `modes_above_left_mi`).
         let which = if depth == 1 {
             &RECT4_SPLIT_DEPTH1_HITS
         } else {
@@ -5928,6 +5951,14 @@ fn decode_block_rect4(
         neighbours.left_uv_mode[r + cell] = uv_predict_mode;
         neighbours.left_side[r + cell] = bh;
     }
+    // ...and the mi-EXACT maps the coarse cells alias away, exactly as
+    // [`decode_leaf_rect`] does (the split arm above records these through
+    // `record_mi_luma_rect`). Without this an unsplit 32x8 strip left
+    // `sub8_mode_row` holding the previous block, and the next 32x32's
+    // strips read a stale `kf_y_mode` row (measured: mi(4,8) on the band
+    // fixture).
+    neighbours.record_mode_mi(mi_r, mi_c, mi_w, mi_h, mode);
+    neighbours.record_uv_mode_mi(mi_r, mi_c, mi_w, mi_h, uv_predict_mode);
     let (px, py) = (mi_c * MI, mi_r * MI);
     let (cpx, cpy) = (px / 2, py / 2);
     let (chroma_w, chroma_h) = (bw / 2, bh / 2);
@@ -7878,12 +7909,12 @@ fn decode_leaf8(
     // `prev_leaf`: one 16x16 slot cannot hold the two different modes its
     // two 8x8 (or four 4x4) columns leave behind, so a leaf whose above/left
     // neighbour sits in a split cell read the wrong `kf_y_mode` row.
-    if let Some(m) = neighbours.mode_above_mi(leaf_mi.0, leaf_mi.1) {
-        above_mode = m;
-    }
-    if let Some(m) = neighbours.mode_left_mi(leaf_mi.0, leaf_mi.1) {
-        left_mode = m;
-    }
+    // lane-rectsplitx r2 swept this arm into
+    // [`Neighbours::modes_above_left_mi`]: the mi-exact map ALSO has to answer
+    // "no neighbour" at a tile edge, where the coarse cell holds the block
+    // above/left of it inside the same 16x16.
+    let (above_mode, left_mode) =
+        neighbours.modes_above_left_mi(leaf_mi.0, leaf_mi.1, (above_mode, left_mode));
     let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
     // Chroma's edge-filter type reads the CHROMA neighbour's `uv_mode`
     // (`get_intra_edge_filter_type`, reconintra.c:974), never the luma mode
