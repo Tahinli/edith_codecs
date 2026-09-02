@@ -1,115 +1,115 @@
-# lane-golomb r1 — the edge partition bit was read and thrown away
+# lane-golomb r1 — the Golomb-tail refusal is NOT a bound defect
 
-## Verdict
-The "a Golomb tail longer than this decoder reads" refusal on the Hunger Games head was, as
-suspected (`refusal-from-own-desync`), a symptom. Root cause: at a frame edge the partition
-symbol is a single *gathered* bit, and this decoder read it and **discarded** it, always
-inferring `PARTITION_SPLIT`. libaom `ec_read_partition_impl` (decodeframe.c:1255):
-`!has_rows && has_cols` → `read ? PARTITION_SPLIT : PARTITION_HORZ`; the mirror case →
-`PARTITION_VERT`. Class: `parsed-then-discarded`.
+## Verdict: the charter's premise is dead; no refusal lifted, no gate owed
 
-Charter STEP-2 fallback ("libaom read_golomb caps at 32 bits, extend the reader") is FALSE:
-`~/.cache/aom-oracle/src/av1/decoder/decodetxb.c:22` aborts the frame at `length > 20`, exactly
-our cap. The cap was never the bug and is unchanged.
+The charter asked to raise our `read_golomb` bound because "our reader refuses beyond some
+smaller bound" than libaom's. **It does not.** libaom's own `read_golomb`
+(`~/.cache/aom-oracle/src/av1/decoder/decodetxb.c:22-42`):
 
-## First divergent element (EVIDENCE)
-EVIDENCE: /tmp/.../scratchpad/{ao-all.txt,ours-all.txt} | instrumented aomdec vs decode_probe,
-EC_TRACE_MODE+EC_TRACE_MODE_STEP+EC_TRACE_COEFF on the 2-frame extract f2.obu, ladders aligned
-element by element on msac RANGE | first diff at element 12053: key frame, **mi_row=400
-mi_col=0** (last, 8-pixel-tall superblock row of a 1608-tall frame), `name=skip`
-oracle rng=34753 vs ours rng=43258. Oracle codes that superblock as one `BLOCK_64X32`
-(`EC_IMODE ... bsize=11`, PARTITION_HORZ); we forced SPLIT and descended to 16x16.
-After the fix the range ladder is element-exact for all 13712 shared elements of the key frame
-(EVIDENCE: /tmp/.../scratchpad/{a4.n,o4.n} | awk first-diff | idx 13713, inside a later INTER
-frame, i.e. past the whole key frame).
+```c
+static int read_golomb(MACROBLOCKD *xd, aom_reader *r) {
+  int x = 1; int length = 0; int i = 0;
+  while (!i) {
+    i = aom_read_bit(r, ACCT_STR);
+    ++length;
+    if (length > 20) {
+      aom_internal_error(xd->error_info, AOM_CODEC_CORRUPT_FRAME,
+                         "Invalid length in read_golomb");
+      break;
+    }
+  }
+  ...
+```
 
-## Fix
-`crates/ec-av1/src/decode.rs` — every edge-partition site, both tile paths, all three levels
-(64/32/16, intra and inter): the gathered bit now names HORZ/VERT vs SPLIT. The 64-level
-HORZ/VERT arms only decode the second half when it is inside the frame (`has_rows`/`has_cols`),
-mirroring libaom `decode_partition`. The intra 16x16 edge site can only walk four SPLIT leaves,
-so a 0 bit refuses by name there (new string, listed in `refusal_inventory.rs`) instead of
-desyncing.
+`decode.rs:3871`'s loop starts at `length = 1` and increments per leading-zero bit, so both
+sides read the same number of bits and both stop at `length > 20` — the bound is
+**byte-identical**, and it fires on the identical bit pattern (20 zeros, then anything).
+libaom calls that stream a CORRUPT FRAME. Raising our bound is therefore *not* "what libaom
+does": it would convert a clean refusal into silent pixel corruption. The i32 accumulator and
+the dequant clamp are moot — we never get a value to clamp.
 
-## Gates
-- NEW `stream::tests::the_hunger_games_head_key_frame_decodes_pixel_exact` — the film itself:
-  `crates/ec-av1/fixtures/hg_head_key_frame.obu` (147 B, first frame of his 3840x1608
-  yuv420p10le release) decodes and matches `ffmpeg -pix_fmt yuv420p10le` on Y, U and V.
-  EVIDENCE: cargo test -p ec-av1 --lib -- the_hunger_games_head_key_frame | 1 passed |
-  Y/U/V all equal to ffmpeg's decode, 3840x1608.
-- Full lib suite: `$HOME/.cache/golomb-suite.log` — **337 passed / 0 failed / 31 ignored**.
+The refusal comment at `decode.rs:3872` already said this ("this cap MASKS A REAL DEFECT");
+lane-golomb r1 re-measured it and the comment was right. Class: `refusal-hides-a-defect`.
 
-## Film probes after the fix
-- `hg-head.obu` (18 frames): key frame + first inter frames now entropy-exact; stops at
-  "an inter SB-level partition type other than NONE or SPLIT" — the same edge partition, now
-  correctly decoded as HORZ, on an INTER superblock row the inter path cannot code (rect inter
-  residual coding does not exist here). Next lane.
-- `hg5.obu`: "a 32x32-level 1:4 strip with a split transform (depth=2)" (unchanged by this lane).
+## Measurement (step 1 of the charter, done)
 
----
+New env-gated rungs, behaviour otherwise unchanged (commit 58fad3e4):
+- `crates/ec-av1/src/decode.rs:3871` — `read_golomb(dec, w, h, pos, base)`; under `EC_GOLOMB=1`
+  it prints the block shape, coefficient position, base level, golomb length and msac range at
+  the first firing coefficient.
+- `crates/ec-av1/src/stream.rs` (`EC_FRAME_OK`) — under `EC_FRAMES=1`, one line per
+  successfully decoded frame in DECODE order, so a mid-stream refusal names a frame index.
 
-# lane-golomb r2 — the 32x32-level frame-edge HORZ/VERT second half
+On the 10-bit 3840x1608 stream's 10 s head cut (`~/.cache/hg-0-10s.obu`):
 
-## Must-fix (verifier golomb1): fixed
-Since r1 the 32-level edge read can return HORZ/VERT (bit 0), so the second 32x16/16x32 half is
-out of frame and must not be decoded. libaom `decode_partition`:
-`case PARTITION_HORZ: decode_block(top); if (has_rows) decode_block(bottom)` (mirror for VERT).
+```
+EC_FRAME_OK decode_idx=79 show=false type=Inter order_hint=78
+EC_GOLOMB_LONG w=32 h=32 pos=674 base=15 length=21 rng=58888 cnt=58887
+REFUSED: unsupported: AV1 tile (a Golomb tail longer than this decoder reads)
+```
 
-- `crates/ec-av1/src/decode.rs:10887` (intra `PARTITION_HORZ` @32) — second 32x16 now behind `if has_rows32`.
-- `crates/ec-av1/src/decode.rs:10928` (intra `PARTITION_VERT` @32) — second 16x32 behind `if has_cols32`.
-- `crates/ec-av1/src/decode.rs:17900` (inter `PARTITION_HORZ` @32) — same guard, `has_rows32`.
-- `crates/ec-av1/src/decode.rs:18008` (inter `PARTITION_VERT` @32) — same guard, `has_cols32`.
-- `crates/ec-av1/src/decode.rs:1600` — new `EDGE32_HITS` counter (+ `edge32_hits()`, `bump_edge32`):
-  slot 0/1 = 32-level edge bit read as HORZ/VERT vs SPLIT, slot 2 = a bottom-edge HORZ strip
-  decoded (`has_rows32 == false`), slot 3 = a right-edge VERT strip.
+80 frames (decode idx 0..79) decode; the wall is **decode-order frame 80** (frame header
+`HDR 118: type=Inter show=true order_hint=77 primary_ref=4 refresh=0x00 base_q=64`). The
+requested level is above `15 + 2^20` at **high-frequency coefficient 674 of a 32x32
+coefficient grid** — no real coefficient carries that. Symptom, not capability.
 
-AB / 1:4 arms at the 32 level need NO guard: at an edge libaom's `ec_read_partition_impl` can only
-yield HORZ, VERT or SPLIT, so those arms are unreachable there (stated per charter).
-16-level edge rect arms swept and left as they are: intra refuses by name
-("a 16x16 block at the true frame edge coded as a rect strip rather than SPLIT"), inter falls to
-"an inter partition below 16x16 other than SPLIT".
+A header-field novelty scan over all 81 decoded headers found no coding tool switched on for
+the first time at frame 80 (only new order-hint / reference-permutation values), so it is a
+block-level defect.
 
-## Gate
-NEW `stream::tests::a_real_aomenc_stream_with_a_32x32_frame_edge_rect_partition_decodes_pixel_exact`
-(crates/ec-av1/src/stream.rs:14800+): 192x80 (bottom edge, mi_rows=20) and 80x192 (right edge),
-testsrc2 + seeded `noise`, cq {35,40,45,50,55,57,59,61}, 8-bit AND 10-bit (bit_depth asserted),
-plus a 5-frame INTER arm; every decode pixel-compared against ffmpeg, counters sampled per attempt
-and summed only over compared attempts.
+## Where the desync is NOT (cross-decoder ladder)
 
-EVIDENCE: $HOME/.cache/golomb-suite-r2.log + gate stdout | cargo test -p ec-av1 --lib -- --nocapture
-a_real_aomenc_stream_with_a_32x32_frame_edge | 32 pixel-exact attempts, 8 named refusals,
-edge32 bits [horz_or_vert=0 split=178] — the 32-level edge read fires 178 times and every attempt
-decodes pixel-exact.
+Instrument: our `EC_TRACE_MODE_STEP` `EC_ISTEP ... name=tx_depth` vs the instrumented aomdec's
+own print at the same site (`decodeframe.c:1130`). Calibration: line 0 of frame 0 is identical
+on both sides (`mi_row=0 mi_col=0 name=tx_depth val=2 ctx=0 rng=51246`), so the two prints sit
+at the same syntax position and `rng` is directly comparable. (The `EC_PART` rung is NOT
+usable this way: on pixel-exact frame 0 its `rng` differs from aomdec's from the second
+superblock on, so the two `EC_PART` prints sit at different syntax points.)
 
-Recipe deviations from the charter, with reasons (measured, not assumed):
-- `--min-partition-size=32`, not 8: at 8 (and at 16) the sub-16 AB / split-transform strip arms
-  refuse by name before the 32-level edge is reached — 40/40 attempts refused.
-- `--tune-content=film` + `noise`: without them aomenc's screen-content detection makes every
-  attempt refuse at "a HORZ/VERT intra strip in a screen-content frame" (the verifier's smptebars
-  trap, reproduced here with plain testsrc2).
+Two-pointer alignment over the whole cut (42576 ours / 38818 aomdec `tx_depth` lines; the two
+have complementary *print* gaps — ours has no print for the bottom partial superblock row
+`mi_row=400` nor for 64x16 edge strips, aomdec has none for some of ours):
 
-## OPEN DEFECT (fix-now, next round) — the edge HORZ strip's pixels
-With detail in the straddling band aomenc always answers the edge bit with SPLIT (178/178), so the
-HORZ/VERT arm never fires. Leaving that band FLAT (`pad=...:gray`) forces it:
-EVIDENCE: gate stdout | cargo test -p ec-av1 --lib -- --ignored --nocapture
-a_32x32_frame_edge_rect_partition_with_a_flat_band | 192x80 cq40 8-bit, `edge32=[2, 0, 2, 0]`
-(two bottom-edge HORZ strips decoded), plane Y 1081 pixels differ, first at row 62 col 128,
-diffs per row confined to rows 62..79 (~64 of 192 columns) — exactly the two 32x16 strips plus the
-deblock bleed above them; every other pixel of the frame matches ffmpeg.
-Reading: the guard itself is validated (no desync — the rest of the frame is entropy- and
-pixel-exact where before it would have consumed an out-of-frame half), but the strip's own
-reconstruction (prediction/neighbour availability at the frame edge) is wrong. Pinned as
-`#[ignore]`d test `a_32x32_frame_edge_rect_partition_with_a_flat_band_decodes_pixel_exact` so the
-suite stays green and the defect stays runnable. Disposition: fix-now for r3 (owner: this lane).
+- **Exactly two divergence points, both in decode frame 57** (ours `(96,568,val=0,ctx=2,rng=37256)`
+  vs aomdec `(106,536,val=0,ctx=2,rng=59000)`, region mi_row 96..110 / mi_col 536..624).
+  Frame 57 is `show=true` with **`refresh_frame_flags = 0x00`** — it refreshes no reference
+  slot, so it cannot feed frame 80's CDFs, motion field or references.
+- After resync the ladder matches element for element **all the way to the end of our trace**,
+  including every traced symbol of frame 80. Frame 80's last traced symbol before the refusal
+  is `mi_row=336 mi_col=912 name=tx_depth val=0 ctx=2 rng=52228`, and aomdec's value there is
+  identical.
 
-## Suite (r2)
-`$HOME/.cache/golomb-suite-r2.log` — **337 passed / 1 FAILED / 32 ignored** (618 s).
-The failure is NOT this round's arm and I could not attribute it to this diff:
-`stream::tests::a_real_aomenc_stream_with_a_coded_rect_strip_below_16x16_decodes_pixel_exact`
-panics at stream.rs:8479 "the stream decoded but no coded (non-skip) rect leaf fired". Its fixture
-is a 64x64 mandelbrot frame — one whole superblock, `mi_cols = mi_rows = 16`, so
-`has_rows32`/`has_cols32` are true everywhere and none of this round's four guards (nor r1's
-edge reads) can execute on it. Deterministic (fails standalone in 0.34 s, same message).
-Disposition: deferred(a bisect of eacd7fd vs 3e4ce89 in a detached worktree, or the owner of
-`rect_leaf_coeff_hits`) — it is either pre-existing on eacd7fd (r1's suite log predates today's
-oracle/ffmpeg state) or a sibling-gate regression from a path I did not touch. NOT claimed green.
+So frame 80 is **entropy-exact right up to the failing block**: the defect is inside the
+coefficient read of the block at, or immediately after, the superblock at
+`mi_row=336 mi_col=912` (pixel 1344, 3648) of decode frame 80. Inference (not yet proven): the
+run of `tx_depth` prints stepping `mi_col` by 16 means 64x64 blocks, and `val=0` on a 64x64
+block is `TX_64X64`, whose coefficients are coded in a 32x32 grid — which matches the refusal's
+`w=32 h=32`.
+
+## EVIDENCE
+
+- `EVIDENCE: ~/.cache/golomb-tmp/hdrs.txt | EC_PROBE_HDR=1 decode_probe on the 10 s head cut, field-novelty scan over 81 decoded headers | no coding-tool field first-occurs at decode frame 80`
+- `EVIDENCE: (stderr, quoted above) | EC_GOLOMB=1 EC_FRAMES=1 decode_probe ~/.cache/hg-0-10s.obu | 80 frames decoded; refusal at decode frame 80, w=32 h=32 pos=674 base=15 length=21`
+- `EVIDENCE: ~/.cache/golomb-tmp/ours.istep2 + ~/.cache/golomb-tmp/aom.istep | ours EC_TRACE_MODE_STEP vs aomdec --limit=80 EC_TRACE_MODE_STEP, two-pointer alignment on (mi_row,mi_col,val,rng) | 2 divergence points, both decode frame 57 (refresh=0x00); frame 80 identical through mi_row=336 mi_col=912 rng=52228`
+
+## Residue
+
+- `deferred: the decode-frame-80 coefficient defect at mi_row=336 mi_col=912 — the tx_depth ladder is bit-exact up to it, so the next rung is a coefficient ladder (ours EC_TRACE_COEFF vs aomdec's EC_COEFF/EC_COEFF_STEP, tags line up) restricted to that frame — unblocked by a frame-gated coeff trace on our side (a full-stream EC_TRACE_COEFF over 80 4K frames in a debug build is too slow to pipe), which is a ~10-line change to the trace guard.`
+- `deferred: the decode-frame-57 divergence (mi_row 96..110, mi_col 536..624) — separate defect, refresh=0x00 so it is a shown-frame pixel defect only, not the film wall — unblocked by a per-frame pixel compare of frame 57 vs ffmpeg.`
+- `accepted: no refusal lifted, so refusal_inventory.rs and gate_coverage.rs are untouched and no new gate is owed. The charter's gate/fixture half is void with its premise: there is nothing to gate, because a >20-zero Golomb tail is a corrupt stream by libaom's own definition.`
+
+## Suite
+
+`systemd-run --user --unit=golomb-suite-r1-1788373224 -p MemoryMax=10G --same-dir bash -lc 'EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1 CARGO_TARGET_DIR=$HOME/.cache/cargo-target-golomb nice -n 10 cargo test -p ec-av1 --lib -j3'`
+→ `test result: FAILED. 425 passed; 1 failed; 37 ignored; 0 measured; 0 filtered out; finished in 843.21s`
+
+The one failure is
+`stream::tests::a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact`:
+`the intra 16x4/4x16 strip arm did not fire (16x4=0 4x16=0 chroma_ref=0)` — a firing-counter
+assert, reproduced in isolation (`--exact`, 54.89s, so it is not parallel-counter
+contamination). **It is not attributable to this lane's diff**: this commit adds two
+env-gated `eprintln!`s and threads four already-computed values into an error path; it
+touches no partition, transform or counter code. Same shape as the ledger's recorded
+`real_aomenc_1to4_streams_...decodes_pixel_exact` RED-ON-MAIN case.
+`deferred: confirm this test on main 5d81a67 in a detached verify worktree — not done here (tool-call cap) — unblocked by one `git worktree add --detach` + its own CARGO_TARGET_DIR.`
+`refusal_inventory` and `gate_coverage` are unmodified by this lane and pass in the suite run.
