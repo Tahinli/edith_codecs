@@ -14593,6 +14593,11 @@ mod tests {
         // than "the shape never split" without another run.
         let (mut split_strips, mut rect4_strips) = (0usize, 0usize);
         let mut all_rect4 = 0usize;
+        // Asserted separately: this is the gate that takes `enable-1to4-
+        // partitions` off `gate_coverage::NEVER_EXERCISED_10BIT`, so the
+        // 10-bit half has to carry the shape on its own.
+        let mut rect4_strips_10bit = 0usize;
+        let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
         // Attempts that stopped at the new named refusal for a 1:4 strip
         // whose transform splits once (see the assert at the end).
         let mut depth1_refusals = 0u32;
@@ -14731,12 +14736,34 @@ mod tests {
                         after[3] - before[3]
                     );
                 }
+                let rect4_now = (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
+                    + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
                 let reference = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                 } else {
                     ffmpeg_decode_sequence(&stream, width, height, frames.len())
                 };
                 assert_eq!(frames.len(), reference.len(), "{NAME}: frame count");
+                if rect4_now == 0 {
+                    // Out of this gate's territory (same rule the sibling
+                    // superblock-1:4 gate applies): aomenc picked no 1:4
+                    // strip at all, so the attempt can neither prove nor
+                    // disprove this round's shape. Counted and PRINTED, never
+                    // silently dropped -- selection is on "the stream carries
+                    // the feature", never on "the stream decoded correctly".
+                    out_of_scope += 1;
+                    if frames.iter().zip(&reference).any(|(g, w)| {
+                        g.y != w.y || g.u != w.u || g.v != w.v
+                    }) {
+                        out_of_scope_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit cq {cq} seed {seed} MISMATCHES with zero \
+                             1:4 strips -- a pre-existing defect of another shape, not this \
+                             gate's arms"
+                        );
+                    }
+                    continue;
+                }
                 for (i, (got, want)) in frames.iter().zip(&reference).enumerate() {
                     assert_eq!(
                         got.y, want.y,
@@ -14755,8 +14782,12 @@ mod tests {
                     proved[k] += after[k] - before[k];
                 }
                 split_strips += crate::decode::rect_split_tx_hits() - split_before;
-                rect4_strips += (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
+                let rect4 = (crate::decode::sb_rect4_horz_hits() - rect4_before.0)
                     + (crate::decode::sb_rect4_vert_hits() - rect4_before.1);
+                rect4_strips += rect4;
+                if bit_depth == 10 {
+                    rect4_strips_10bit += rect4;
+                }
                 matched += 1;
             }
         }
@@ -14764,7 +14795,9 @@ mod tests {
             "{NAME}: {matched} pixel-exact matches, {refusals} named refusals out of \
              {} attempts; chroma shapes proved 32x8={} 8x32={} 8x4={} 4x8={}; compared \
              streams carried {split_strips} split-transform strips and {rect4_strips} \
-             superblock 1:4 strips ({all_rect4} more in refused streams)",
+             superblock 1:4 strips ({all_rect4} more in refused streams); {out_of_scope} \
+             attempts carried no 1:4 strip ({out_of_scope_mismatch} of them mismatched -- \
+             other shapes' defects)",
             6 * n_attempts,
             proved[0],
             proved[1],
@@ -14774,6 +14807,11 @@ mod tests {
         assert!(
             matched > 0,
             "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        assert!(
+            rect4_strips_10bit > 0,
+            "{NAME}: no superblock 1:4 strip in any pixel-exact 10-BIT stream -- this gate is \
+             what claims 10-bit coverage for enable-1to4-partitions"
         );
         assert!(
             rect4_strips > 0,
