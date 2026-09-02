@@ -6,6 +6,9 @@ Tip: `f36be26` on branch `lane-interp3` (fix) + this handoff/report commit.
 - r2 suite (unit `interp3-suite-r2-1788327820.service`, log `$HOME/.cache/interp3-suite-r2.log`),
   armed at the r2 commit, FINISHED:
   `test result: ok. 378 passed; 0 failed; 34 ignored; 0 measured; 0 filtered out; finished in 742.50s`
+- r3 suite FINISHED GREEN at f36be26 (unit `interp3-suite-r3-1788328778.service`):
+  `test result: ok. 379 passed; 0 failed; 33 ignored; 0 measured; 0 filtered out; finished in 1031.33s`
+  (old text below is superseded)
 - r3 suite armed at f36be26: unit `interp3-suite-r3-1788328778.service`,
   log `$HOME/.cache/interp3-suite-r3.log`. At the cap it had 258 `... ok`, ZERO
   `FAILED`/`panicked`, no `test result:` line yet. READ THAT LINE, do not re-run
@@ -79,9 +82,7 @@ filter read, differing dual-filter directions, 8x8 OBMC blend, 8x8 compound
 GLOBAL warp). `$HOME/.cache/interp3-gate-r3.log`: `1 passed; 0 failed`.
 
 ## EXACT NEXT STEP
-1. Read the r3 suite `test result:` line, fill the placeholder in the report,
-   commit. If any test failed, it is a sibling of the warp change: re-run it
-   alone and bisect against f36be26^.
+1. DONE (suite green, report filled). Nothing owed here.
 2. Then the lane's open residue is only the two deferrals in the report
    (10-bit arm blocked by lane-inter8's 10-bit 8x8-leaf desync; `--tile-columns=1`
    arm blocked by the SB-level rect-partition refusal).
