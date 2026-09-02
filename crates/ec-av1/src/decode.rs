@@ -942,6 +942,22 @@ pub(crate) fn rect_split_sb_interior_tu_hits() -> usize {
     RECT_SPLIT_SB_INTERIOR_TU_HITS.with(|c| c.get())
 }
 
+// Per-shape hit counts for the rect chroma transforms lane-rectchroma r1
+// wired into [`decode_rect_split`] -- the shapes a split-transform strip's
+// chroma half takes that had no coefficient tables before (index order:
+// 32x8, 8x32, 8x4, 4x8). One counter per shape because a gate that only
+// proves the pair it happens to hit cannot catch a transposed scan/context
+// table (class scan-weights-cross-axis).
+thread_local! {
+    static RECT_SPLIT_CHROMA_SHAPE_HITS: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
+}
+
+/// Current value of [`RECT_SPLIT_CHROMA_SHAPE_HITS`] (32x8, 8x32, 8x4, 4x8).
+pub(crate) fn rect_split_chroma_shape_hits() -> [usize; 4] {
+    RECT_SPLIT_CHROMA_SHAPE_HITS.with(|c| c.get())
+}
+
 // How many HORZ/VERT intra strips actually predicted with filter intra
 // (lane-rectsplit r1) -- the case `decode_block_rect` refused by name
 // ("this decoder predicts square-only") until `predict_filter_intra` took
@@ -4967,8 +4983,41 @@ fn decode_rect_split(
         (8, 16) => Some((TxbSet::ChromaRect16x8, &SCAN_8X16[..])),
         (32, 16) => Some((TxbSet::ChromaRect32x16, &SCAN_32X16[..])),
         (16, 32) => Some((TxbSet::ChromaRect32x16, &SCAN_16X32[..])),
+        // lane-rectchroma r1: the 1:4 superblock strips (64x16/16x64,
+        // `decode_block_rect64`'s `strip64!` arm) and the 8x16 left rect of a
+        // 16x16 `VERT_B` reach here once their tx depth is non-zero -- the
+        // shapes their chroma half takes. `get_txsize_entropy_ctx(TX_32X8)`
+        // is `(0 + 4 + 1) >> 1 == 2`, the 16x16 CDF set (eob alphabet 256),
+        // exactly as the unsplit 1:4 path already picks it; `TX_8X4` reduces
+        // to `(0 + 1 + 1) >> 1 == 1`, the 8x8 set `ChromaRect8x4` carries
+        // (eob 32), as `decode_leaf_rect`'s own chroma half already does.
+        (32, 8) => Some((TxbSet::Chroma16, &SCAN_32X8[..])),
+        (8, 32) => Some((TxbSet::Chroma16, &SCAN_8X32[..])),
+        (8, 4) => Some((TxbSet::ChromaRect8x4, &SCAN_8X4[..])),
+        (4, 8) => Some((TxbSet::ChromaRect8x4, &SCAN_4X8[..])),
         _ => None,
     };
+    if !m.skip {
+        if let Some(i) = match (chroma_w, chroma_h) {
+            (32, 8) => Some(0),
+            (8, 32) => Some(1),
+            (8, 4) => Some(2),
+            (4, 8) => Some(3),
+            _ => None,
+        } {
+            RECT_SPLIT_CHROMA_SHAPE_HITS.with(|c| {
+                let mut hits = c.get();
+                hits[i] += 1;
+                c.set(hits);
+            });
+        }
+        if chroma.is_none() {
+            // Diagnostic for the next caller that lands here (class
+            // refusal-names-a-correlate: the message names the tool, not the
+            // shape); the refusal below keeps its inventory-pinned wording.
+            eprintln!("EC_RECTCHROMA_GAP luma={bw}x{bh} tx={tx} chroma={chroma_w}x{chroma_h}");
+        }
+    }
     // lane-rectsplit r2 (verifier finding): with both callers wired
     // (`decode_block_rect`'s 32x16/16x32 and `decode_block_rect64`'s
     // 64x32/32x64) every shape that reaches here has a table above, so this
@@ -6243,7 +6292,25 @@ fn decode_block_rect64(
         // transform through the very same per-unit path as its 32x32-level
         // sibling (`sub_tx_size_map[TX_64X32] == TX_32X32`, square from the
         // first step on, so `bw.min(bh) >> (depth - 1)` names the unit).
-        let tx = bw.min(bh) >> (depth - 1);
+        // lane-rectchroma r1: `sub_tx_size_map[TX_64X16] == TX_32X16`, NOT a
+        // square -- a 4:1 strip's first transform split is still a 2:1 RECT
+        // unit, and only the SECOND step reaches a square (TX_16X16). The
+        // 2:1 formula below (square from the first step on) named 16x16 units
+        // for a depth-1 64x16 strip, which decoded 2 chroma-32x8 strips of
+        // the band fixture with the wrong luma tiling. depth 1 on a 4:1 strip
+        // is refused by name; depth >= 2 is square, one step later.
+        let is_1to4 = bw.max(bh) / bw.min(bh) == 4;
+        if is_1to4 && depth == 1 && !skip {
+            return Err(unsupported(
+                "a coded 1:4 HORZ_4/VERT_4 strip whose transform splits only once (the unit is \
+                 still a 2:1 rect, not a square)",
+            ));
+        }
+        let tx = if is_1to4 {
+            bw.min(bh) >> (depth - 2)
+        } else {
+            bw.min(bh) >> (depth - 1)
+        };
         if std::env::var_os("EC_SBPART_DUMP64").is_some() {
             eprintln!(
                 "DUMP64SPLIT mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} \

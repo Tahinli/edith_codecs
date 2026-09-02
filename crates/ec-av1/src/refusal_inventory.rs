@@ -32,6 +32,7 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
+    "a coded 1:4 HORZ_4/VERT_4 strip whose transform splits only once (the unit is still a 2:1 rect, not a square)",
     "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect prediction is not ported)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "a 1:4 partition below 16x16 (PARTITION_HORZ_4/VERT_4, four 16x4/4x16 strips -- this decoder codes NONE, HORZ, VERT, the four AB arms and a clean split at 16x16)",
