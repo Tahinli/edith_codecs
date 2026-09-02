@@ -48,6 +48,11 @@ fn main() {
         println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
         let leaf4 = ec_av1::stream::vartx_rect_leaf4_hits();
         println!("vartx_rect_leaf4: 8x4={} 4x8={}", leaf4[0], leaf4[1]);
+        let rw = ec_av1::stream::rect_wedge_hits();
+        let rwi = ec_av1::stream::rect_wii_hits();
+        println!(
+            "rect_wedge(8x16,16x8,16x32,32x16,8x32,32x8): compound={rw:?} interintra={rwi:?}"
+        );
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
