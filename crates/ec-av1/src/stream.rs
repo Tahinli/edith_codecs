@@ -7398,6 +7398,48 @@ mod tests {
         }
     }
 
+    /// lane-mc64 r2: the RECT-ON twin of the square-only gate above, pinned
+    /// as a stream fixture because its aomenc recipe is not reproducible
+    /// (the r2 recipe re-encoded to a different file, measured md5
+    /// `278be00...` vs the fixture's `add55f6...`; class
+    /// `seeded-fixture-not-reproducible`).
+    ///
+    /// `crates/ec-av1/fixtures/av1_192x128_8bit_intra64_in_inter.obu`
+    /// (sha256 `e4cff46cb1700527c68efc866db27a2835705e949d646f73f0c9df577d594bd6`)
+    /// carries a 64x64 `PARTITION_NONE` INTRA block inside an INTER frame at
+    /// decode-order frame 2, mi(16,32), in a stream whose OTHER superblocks
+    /// are rect-partitioned -- so the 64-axis `is_cfl_allowed` narrowing
+    /// (`blockd.h`: `wide <= 32 && high <= 32`) has to hold on the intra
+    /// arm that the rect recipe reaches, not only on the whole-superblock
+    /// one. Before lane-sbrect10's fix this frame reconstructed with 3720
+    /// wrong luma samples (delta -12..+9, chroma bit-exact) and the decode
+    /// then died at frame 3 on a phantom refusal of its own desync (class
+    /// `refusal-from-own-desync`); all 6 decode-order frames are byte-exact
+    /// against the oracle now.
+    #[test]
+    fn a_pinned_rect_stream_with_a_64x64_intra_block_in_an_inter_frame_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_pinned_rect_stream_with_a_64x64_intra_block_in_an_inter_frame_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc/aomdec oracle at {}", aomenc_path().display());
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/av1_192x128_8bit_intra64_in_inter.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let before = crate::decode::nocfl_uv_mode_hits();
+        let (frames, hidden) = decode_all_frames_vs_oracle(&stream, NAME);
+        let hits = crate::decode::nocfl_uv_mode_hits() - before;
+        assert_eq!(frames, 6, "{NAME}: expected 6 decode-order frames ({hidden} hidden)");
+        assert!(
+            hits > 0,
+            "{NAME}: no 64-axis intra block read the no-CFL uv_mode alphabet -- the fixture no \
+             longer carries the shape this test gates"
+        );
+    }
+
     /// lane-inter4 r2: the 32x32-level inter `PARTITION_HORZ`/`PARTITION_VERT`
     /// strips (32x16 / 16x32) carrying a REAL residual -- the capability r1
     /// found missing ("a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
