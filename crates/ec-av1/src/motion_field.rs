@@ -75,6 +75,18 @@ impl MotionField {
         }
     }
 
+    /// lane-mergefix r5 rung (`EC_TRACE_TPL`): occupancy map of the SAVED
+    /// field, the input side of [`setup_motion_field`]'s projection.
+    pub fn occupancy(&self) -> Vec<String> {
+        (0..self.rows)
+            .map(|r| {
+                (0..self.cols)
+                    .map(|c| if self.cells[r * self.cols + c].is_some() { '#' } else { '.' })
+                    .collect()
+            })
+            .collect()
+    }
+
     fn get(&self, row8: usize, col8: usize) -> Option<SavedMv> {
         if row8 < self.rows && col8 < self.cols {
             self.cells[row8 * self.cols + col8]
@@ -95,6 +107,13 @@ pub struct TplField {
 }
 
 impl TplField {
+    /// lane-mergefix r5 rung (`EC_TPL`): how many 8x8 cells the projection
+    /// actually filled -- an empty field means every temporal candidate is
+    /// silently absent while the entropy stream still matches.
+    pub fn filled_cells(&self) -> usize {
+        self.cells.iter().filter(|c| c.is_some()).count()
+    }
+
     fn get(&self, row8: usize, col8: usize) -> Option<((i32, i32), i32)> {
         if row8 < self.rows && col8 < self.cols {
             self.cells[row8 * self.cols + col8]

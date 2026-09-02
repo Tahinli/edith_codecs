@@ -2997,7 +2997,7 @@ pub(crate) fn build_motion_field(
     const REFMVS_LIMIT: i32 = (1 << 12) - 1;
     for row in 0..mi_rows {
         for col in 0..mi_cols {
-            let Some(info) = grid.get(row, col) else {
+            let Some(info) = grid.get_frame(row, col) else {
                 continue;
             };
             // `av1_copy_frame_mvs` runs for EVERY block of an inter frame and
@@ -3034,6 +3034,12 @@ pub(crate) fn build_motion_field(
                 saved = Some(crate::motion_field::SavedMv { mv, ref_frame: rf });
             }
             field.set(row, col, saved);
+        }
+    }
+    if std::env::var_os("EC_TRACE_TPL").is_some() {
+        eprintln!("EC_TPL_SAVED oh={order_hint}");
+        for (r, row) in field.occupancy().iter().enumerate() {
+            eprintln!("EC_TPL_SAVED r{r} {row}");
         }
     }
     field
