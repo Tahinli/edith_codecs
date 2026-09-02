@@ -17,7 +17,7 @@ This closes r1's open item: defect 1 (a skipped intra block must still predict
 with CfL) now has a gate that fails if the fix is reverted.
 
 ## Gate hunt for a synthetic recipe: 18 more recipes, still zero
-r1 swept 20 aomenc recipes without producing a skipped CfL block. r2 swept 18
+r1 swept 20 aomenc recipes without producing a skipped CfL block. r2 swept 28
 more, detecting the block **oracle-side** (`EC_TRACE_MODE=1 aomdec` →
 `EC_IMODE_VAL ... uv_mode=13 skip=1`), which needs no decode of ours:
 
@@ -26,6 +26,7 @@ more, detecting the block **oracle-side** (`EC_TRACE_MODE=1 aomdec` →
 | `geq` sin/X chroma-correlated stripes, cq 40..63, 8+10 bit | 6 | 0..3 | 0 |
 | mandelbrot/testsrc2 with `cb=128+0.35*(lum(2X,2Y)-128)`, cq 40..63 | 6 | 1..117 | 0 |
 | smooth ramp / low-frequency `sin(X/60)cos(Y/70)`, cq 45..63 | 6 | 0 | 0 |
+| blurred mandelbrot/testsrc2/gradients/cellauto/life, 0.6 chroma gain, cq 55..63, 8+10 bit | 10 | 0..10 | 0 |
 
 Result (measured, not inferred): aomenc DOES pick CfL freely on
 chroma-correlated content (117 blocks at cq 40), but never with `skip=1` — the
@@ -66,5 +67,8 @@ cluster) and are not in the table.
 
 ## Residue
 * ss=8100 / ss=9000 — deferred(lane-sb128c's 128-root non-SPLIT partition).
+  Re-measured on the merged tree, both still stop at exactly
+  `unsupported: AV1 tile (a 128x128 superblock HORZ/VERT or AB partition (only
+  SPLIT and NONE are decoded at the 128 root))`.
 * A synthetic aomenc recipe for a skipped CfL block — accepted as unreachable at
-  38 recipes; the pinned film frame is the gate instead.
+  48 recipes; the pinned film frame is the gate instead.
