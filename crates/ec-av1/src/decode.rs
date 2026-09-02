@@ -1426,6 +1426,38 @@ pub(crate) fn mode_mi_override_hits() -> usize {
     MODE_MI_OVERRIDE_HITS.with(|c| c.get())
 }
 
+// lane-cfl r1: how many times a chroma intra-edge filter-type read
+// (`get_filt_type`, libaom reconintra.c) took an above/left UV mode from the
+// mi-exact map that DIFFERS from its coarse 16x16 slot -- i.e. how often the
+// r1 defect would have filtered a chroma edge with the wrong strength.
+thread_local! {
+    static UV_MODE_MI_OVERRIDE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`UV_MODE_MI_OVERRIDE_HITS`].
+pub(crate) fn uv_mode_mi_override_hits() -> usize {
+    UV_MODE_MI_OVERRIDE_HITS.with(|c| c.get())
+}
+
+// lane-cfl r1 gate counters: `UV_CFL_PRED` blocks (every `cfl_alpha_signs`
+// read) and chroma blocks with a NONZERO `angle_delta_uv` -- the two block
+// shapes the r1 chroma defect showed up on.
+thread_local! {
+    static CFL_BLOCK_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static UV_ANGLE_DELTA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CFL_BLOCK_HITS`].
+pub(crate) fn cfl_block_hits() -> usize {
+    CFL_BLOCK_HITS.with(|c| c.get())
+}
+
+/// Current value of [`UV_ANGLE_DELTA_HITS`].
+pub(crate) fn uv_angle_delta_hits() -> usize {
+    UV_ANGLE_DELTA_HITS.with(|c| c.get())
+}
+
 // lane-sbpart r2: how many superblock-level `PARTITION_HORZ`/`PARTITION_VERT`
 // blocks (two true 64x32/32x64 strips, [`decode_block_rect64`]) fired -- the
 // gate's proof this round's arms actually reached a real block, not just
@@ -3671,7 +3703,14 @@ impl Neighbours {
     /// block to the right reads via `mi(row, col-1)`). Only sub-8x8 leaves
     /// read these back, and only when the recorded position is exactly their
     /// own neighbour -- see [`Self::sub8_mode_col`]'s doc.
-    fn record_mode_mi(&mut self, mi_r: usize, mi_c: usize, mi_w: usize, mi_h: usize, mode: usize) {
+    fn record_mode_mi(
+        &mut self,
+        mi_r: usize,
+        mi_c: usize,
+        mi_w: usize,
+        mi_h: usize,
+        mode: usize,
+    ) {
         let (last_r, last_c) = (mi_r + mi_h - 1, mi_c + mi_w - 1);
         for cell in 0..mi_w {
             if let Some(slot) = self.sub8_mode_col.get_mut(mi_c + cell) {
@@ -3739,6 +3778,12 @@ impl Neighbours {
             Some(&(col, m)) if mi_c > self.tile_col0_mi && col == mi_c - 1 => m,
             _ => self.left_uv_mode[r],
         };
+        // lane-cfl r1 counter: how often the mi-exact chroma neighbour differs
+        // from the coarse [`SUB`] slot -- i.e. how often a chroma edge would
+        // have been filtered at the wrong strength by the coarse map alone.
+        if above != self.above_uv_mode[c] || left != self.left_uv_mode[r] {
+            UV_MODE_MI_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
+        }
         is_smooth_mode(above) || is_smooth_mode(left)
     }
 
@@ -4390,6 +4435,9 @@ fn read_intra_mode_rect(
         0
     };
     istep!("angle_uv", angle_delta_uv);
+    if angle_delta_uv != 0 {
+        UV_ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
+    }
     let mut filter_intra = None;
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         let (rng, _) = dec.debug_state();
@@ -4777,7 +4825,7 @@ fn decode_block_rect(
     // (spec `get_intra_edge_filter_type`) reads the CHROMA neighbour's
     // `uv_mode`, not the luma one.
     let smooth_neighbor_uv =
-        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+        neighbours.smooth_uv_neighbour(r * (SUB / MI), c * (SUB / MI), r, c);
     // lane-rectsplit r1: `predict_filter_intra` now takes the block's own
     // `bw`x`bh` (`av1_filter_intra_predictor_c` walks its 4x2 patches over a
     // rectangle just as happily), so a `use_filter_intra` strip at this level
@@ -5193,6 +5241,10 @@ fn decode_leaf_rect(
         FILTER_INTRA_RECT_SUB16_HITS.with(|c| c.set(c.get() + 1));
     }
     let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+    // lane-cfl r1, same defect as [`decode_leaf_8x8`]: chroma's intra-edge
+    // filter type is the NEIGHBOUR's `uv_mode` (libaom `get_filt_type`), not
+    // a constant `false`.
+    let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
     let depth = if tx_select {
         let ctx = tx_size_context_rect(neighbours, leaf_mi, bw, bh);
         dec.symbol(&mut cdfs.tx_size_cat2[ctx])
@@ -5221,11 +5273,11 @@ fn decode_leaf_rect(
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
         u.reconstruct_rect(
             cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &u_levels,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, false,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv,
         );
         v.reconstruct_rect(
             cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &v_levels,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, false,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv,
         );
     } else {
         // lane-rectx: a genuine 16x8/8x16 luma transform (`TxbSet::LumaRect16x8`,
@@ -5277,7 +5329,7 @@ fn decode_leaf_rect(
         );
         u.reconstruct_rect(
             cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &u_residual,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, false,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv,
         );
         let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
@@ -5293,7 +5345,7 @@ fn decode_leaf_rect(
         );
         v.reconstruct_rect(
             cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &v_residual,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, false,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv,
         );
         RECT_LEAF_COEFF_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -5377,7 +5429,7 @@ fn decode_block_rect4(
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
     let smooth_neighbor_uv =
-        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+        neighbours.smooth_uv_neighbour(r * (SUB / MI), c * (SUB / MI), r, c);
     if filter_intra.is_some() {
         FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -5651,7 +5703,7 @@ fn decode_block_rect64(
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
     let smooth_neighbor_uv =
-        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+        neighbours.smooth_uv_neighbour(r * (SUB / MI), c * (SUB / MI), r, c);
     if filter_intra.is_some() {
         // `filter_intra_size_class_rect` already returns `None` for both
         // `(64, 32)` and `(32, 64)` (`av1_filter_intra_allowed_bsize` caps at
@@ -6191,6 +6243,9 @@ fn read_intra_mode(
         0
     };
     istep!("angle_uv", angle_delta_uv);
+    if angle_delta_uv != 0 {
+        UV_ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
+    }
     // `read_palette_mode_info` (spec 5.11.13, libaom decodemv.c:567, called
     // at :840 right after `xd->cfl.store_y` and before `read_filter_intra_mode_info`):
     // gated by `av1_allow_palette` (blockd.h -- size bound only,
@@ -6342,6 +6397,7 @@ const UV_CFL_PRED: usize = 13;
 /// joint sign the same way. Returns each plane's final signed `alpha_q3`
 /// (`cfl_idx_to_alpha`, cfl.c): magnitude `idx + 1`, sign-zero collapsing to 0.
 fn read_cfl_alphas(dec: &mut SymbolDecoder, cdfs: &mut Cdfs) -> (i32, i32) {
+    CFL_BLOCK_HITS.with(|c| c.set(c.get() + 1));
     let joint_sign = dec.symbol(&mut cdfs.cfl_sign) as i32;
     let sign_u = ((joint_sign + 1) * 11) >> 5;
     let sign_v = (joint_sign + 1) - 3 * sign_u;
@@ -6904,7 +6960,7 @@ fn decode_block(
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
     let smooth_neighbor_uv =
-        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+        neighbours.smooth_uv_neighbour(r * (SUB / MI), c * (SUB / MI), r, c);
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE block px={px} py={py} side={side} mode={mode} uv_mode={uv_mode} \
@@ -14693,6 +14749,9 @@ fn decode_inter_block(
         } else {
             0
         };
+        if angle_delta_uv != 0 {
+            UV_ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
+        }
         uv_predict_mode = if uv_mode == UV_CFL_PRED {
             DC_PRED
         } else {
@@ -14702,7 +14761,7 @@ fn decode_inter_block(
         // as [`read_intra_mode`]/[`read_intra_mode_rect`] -- the CHROMA
         // neighbour's own `uv_mode`, not the luma one.
         let smooth_neighbor_uv =
-            is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+            neighbours.smooth_uv_neighbour(r * (SUB / MI), c * (SUB / MI), r, c);
         // `read_palette_mode_info` (decodemv.c:567, called from
         // `read_intra_block_mode_info` right after `xd->cfl.store_y`, same
         // gating and same corner-cut as `read_intra_mode`'s own copy above
