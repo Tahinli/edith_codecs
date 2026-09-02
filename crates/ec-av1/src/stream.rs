@@ -12784,6 +12784,11 @@ mod tests {
     /// 42..61 the 8x16/16x8 strips aomenc writes filter intra on are
     /// `skip=0`, which `decode_leaf_rect` refuses, so
     /// `filter_intra_rect_sub16_hits` never reaches a pixel compare.
+    /// lane-fistrip r2 adds seeds 49 and 213 to the window: those are the two
+    /// seeds measured to fire the feature on the 8-BIT twin's recipe (this
+    /// arm's 10-bit encode is a different stream, so they are a widening, not
+    /// a measured firing set for this recipe -- the round that un-ignores
+    /// this gate must re-measure which 10-bit seeds fire it).
     #[ignore = "blocked on the coded (non-skip) rect strip below 16x16 refusal -- see doc"]
     #[test]
     fn a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact() {
@@ -12797,7 +12802,8 @@ mod tests {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let seeds: Vec<u32> = (42..62).collect();
+        let mut seeds: Vec<u32> = (42..62).collect();
+        seeds.push(213);
         ten_bit_tool_gate(
             NAME,
             192,
@@ -12898,15 +12904,20 @@ mod tests {
     /// [`crate::decode::filter_intra_rect_sub16_hits`], not the wider
     /// `filter_intra_rect_hits`: a 32x16 strip firing filter intra would
     /// satisfy that one and prove nothing about the new shapes.
-    /// MEASURED THIS ROUND (lane-fistrip r1), which is why it is `#[ignore]`d
-    /// rather than green: over 200 seeds at cq 25 aomenc put filter intra on
-    /// an 8x16/16x8 strip TWICE, and both times that strip was `skip=0`, so
+    /// MEASURED (lane-fistrip r1, seeds 42..=241; r2 re-ran 50..=241), which
+    /// is why it is `#[ignore]`d rather than green: over those 200 seeds at
+    /// cq 25 aomenc put filter intra on an 8x16/16x8 strip exactly TWICE --
+    /// **seed 49 and seed 213** -- and both times that strip was `skip=0`, so
     /// the attempt refused at the coded-rect-strip-below-16x16 ceiling before
-    /// any pixel compare (177 pixel-exact matches, 23 refusals, compared
-    /// sub16 delta 0, all-attempt delta 2). Un-ignore this the round that
-    /// ceiling lifts; the symbol itself is pinned by
-    /// [`a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag`].
-    #[ignore = "blocked on the coded (non-skip) rect strip below 16x16 refusal -- see doc"]
+    /// any pixel compare (r1: 177 pixel-exact matches, 23 refusals, compared
+    /// sub16 delta 0, all-attempt delta 2; r2 seeds 50..=241: 172 matches, 20
+    /// refusals, the one all-attempt hit at seed 213). BOTH firing seeds are
+    /// appended to this gate's seed window below, so the un-ignore compares
+    /// two real hits. Un-ignore this the round that ceiling lifts; the symbol
+    /// itself is pinned by
+    /// [`a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag`], whose
+    /// `expect_err` must become a pixel compare in that same round.
+    #[ignore = "blocked on the coded (non-skip) rect strip below 16x16 refusal -- both firing seeds (49, 213) put filter intra on a skip=0 strip; see doc"]
     #[test]
     fn a_real_aomenc_stream_with_filter_intra_on_a_sub16_horz_vert_strip_decodes_pixel_exact() {
         const NAME: &str =
@@ -12928,6 +12939,22 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(40);
+        // lane-fistrip r2: the two seeds that MEASURABLY fire filter intra on
+        // an 8x16/16x8 strip are 49 and 213 -- the only two in seeds 42..=241
+        // (r1 measured 42..=241 and reported "all-attempt delta 2" with seed
+        // 49; r2 re-ran seeds 50..=241 and found the second, log
+        // `$HOME/.cache/fistrip-seedscan-r2.log`: "seed 213 refused with sub16
+        // filter-intra delta 1"). Both are appended to whatever window
+        // `EC_FISTRIP_GATE_ATTEMPTS` asks for, so the un-ignore after the
+        // coded-rect-strip ceiling lifts compares TWO real hits instead of
+        // depending on the default window happening to contain one.
+        const FIRING_SEEDS: [u32; 2] = [49, 213];
+        let mut seeds: Vec<u32> = (0..n_attempts).map(|a| 42 + a).collect();
+        for s in FIRING_SEEDS {
+            if !seeds.contains(&s) {
+                seeds.push(s);
+            }
+        }
         let cq = format!(
             "--cq-level={}",
             std::env::var("EC_FISTRIP_CQ").unwrap_or_else(|_| "25".into())
@@ -12939,8 +12966,7 @@ mod tests {
         // recipe reaches the feature but this decoder's other ceilings hide
         // it.
         let all_before = crate::decode::filter_intra_rect_sub16_hits();
-        for attempt in 0..n_attempts {
-            let seed = 42 + attempt;
+        for &seed in &seeds {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
@@ -13056,13 +13082,15 @@ mod tests {
         assert!(
             compared_hits > 0,
             "{NAME}: no 8x16/16x8 strip used filter intra ({matched} pixel-exact matches, \
-             {named_refusals} refusals out of {n_attempts}) -- gate proved nothing this run"
+             {named_refusals} refusals out of {} attempts) -- gate proved nothing this run",
+            seeds.len()
         );
         eprintln!(
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals, \
              filter_intra_rect_sub16_hits delta={compared_hits} (all attempts including \
-             refused: {}) out of {n_attempts} attempts",
-            crate::decode::filter_intra_rect_sub16_hits() - all_before
+             refused: {}) out of {} attempts",
+            crate::decode::filter_intra_rect_sub16_hits() - all_before,
+            seeds.len()
         );
     }
 
