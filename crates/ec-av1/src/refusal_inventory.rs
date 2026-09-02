@@ -63,7 +63,6 @@ const REFUSALS: &[&str] = &[
     "an intra block in an inter frame whose tx_depth splits its luma transform (round 1)",
     "an inter frame with no key frame before it",
     "an inter SB-level partition type other than NONE or SPLIT (this decoder's inter tile path recurses a superblock only as SPLIT)",
-    "a masked compound 64x64 inter block (compound_type is inferred, not coded, at this size)",
     "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",

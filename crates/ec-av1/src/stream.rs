@@ -9680,6 +9680,215 @@ mod tests {
         );
     }
 
+    /// lane-mcomp64 r1: at 64x64 `av1_is_wedge_used` is false
+    /// (`av1_wedge_params_lookup[BLOCK_64X64].wedge_types == 0`), so libaom's
+    /// `read_compound_type` codes NO `compound_type` symbol and INFERS
+    /// `COMPOUND_DIFFWTD`; only the 1-bit `mask_type` literal follows. This
+    /// decoder used to refuse such a block by name ("a masked compound 64x64
+    /// inter block..."), because reading the symbol would have desynced.
+    ///
+    /// The recipe pins every block to 64x64 (`--sb-size=64
+    /// --max-partition-size=64 --min-partition-size=64`) with masked compound
+    /// on and distance-weighted compound off, so the only way a
+    /// `comp_group_idx == 1` block can be coded is through the inferred arm.
+    /// `diffwtd_inferred_hits` is snapshotted PER ATTEMPT and only accumulated
+    /// for attempts that decoded AND pixel-compared (class
+    /// `counter-from-refused-stream`), and is hard-asserted at the end. A
+    /// decode error or a pixel mismatch is a FAILURE, never a skip.
+    #[track_caller]
+    fn run_diffwtd_inferred_64x64_gate(name: &str, ten_bit: bool) {
+        let _gate_lock = lock_gate_counters();
+        assert!(have_ffmpeg(), "{name}: ffmpeg required");
+        assert!(have_aomenc(), "{name}: no aomenc at {}", aomenc_path().display());
+        let (width, height, frame_count) = (128usize, 128usize, 16usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        let mut attempts = 0u32;
+        let mut fired = 0usize;
+        let mut refusals: Vec<String> = Vec::new();
+        for cq in [32u32, 45, 55] {
+            for (i, zoom) in [0.004f64, 0.010].iter().enumerate() {
+                attempts += 1;
+                let attempt_before = crate::decode::diffwtd_inferred_hits();
+                let duration = frame_count as f64 / 25.0;
+                // Hard-edged, moving content: a difference-weighted mask only
+                // wins where the two references genuinely disagree over part
+                // of a 64x64 block (a smooth `gradients` source measured
+                // diffwtd_hits == 0, memory `gate-blind-to-feature`).
+                let source = format!(
+                    "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y=-0.4:\
+                     end_scale=0.3:maxiter=200,\
+                     noise=alls=6:allf=t+u:all_seed={seed}",
+                    sx = -0.6 + zoom * (i as f64 + 1.0),
+                    seed = 1000 + cq,
+                );
+                let pix_fmt = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t",
+                        &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
+                        "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let mut args: Vec<&str> = vec![
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq_arg,
+                    "--cpu-used=0",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--auto-alt-ref=1",
+                    "--lag-in-frames=16",
+                    "--enable-fwd-kf=0",
+                    "--enable-order-hint=1",
+                    // the tools this gate exists for: masked compound on, the
+                    // difference-weighted arm on, the distance-weighted
+                    // competitor off so comp_group_idx==1 is the encoder's
+                    // only masked choice at a size where wedge does not exist.
+                    "--enable-masked-comp=1",
+                    "--enable-diff-wtd-comp=1",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-global-motion=0",
+                    "--enable-warped-motion=1",
+                    "--enable-obmc=1",
+                    "--tune-content=default",
+                    // partition/intra tools this decoder does not code yet --
+                    // same exclusion list every compound gate carries.
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    // every block is a whole 64x64 superblock: the ONLY size
+                    // where compound_type is inferred rather than coded.
+                    "--sb-size=64",
+                    "--max-partition-size=64",
+                    "--min-partition-size=64",
+                ];
+                if ten_bit {
+                    args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+                }
+                args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{name} failed outright, not a named refusal (cq {cq}): {msg}"
+                        );
+                        assert!(
+                            !msg.contains("masked compound 64x64"),
+                            "{name} refused the inferred-DIFFWTD 64x64 block (cq {cq}) -- \
+                             that refusal is lifted, this is forbidden: {msg}"
+                        );
+                        named_refusals += 1;
+                        refusals.push(msg.clone());
+                        eprintln!("{name} cq {cq} variant {i} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let want = if ten_bit {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
+                    && frames
+                        .iter()
+                        .zip(&want)
+                        .any(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v)
+                {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (cq {cq}) to {path}");
+                }
+                for (f, (got, want)) in frames.iter().zip(&want).enumerate() {
+                    assert_eq!(got.y, want.y, "{name} frame {f} luma vs ffmpeg (cq {cq})");
+                    assert_eq!(got.u, want.u, "{name} frame {f} U vs ffmpeg (cq {cq})");
+                    assert_eq!(got.v, want.v, "{name} frame {f} V vs ffmpeg (cq {cq})");
+                }
+                // decoded AND compared: only now does this attempt's own
+                // inferred-DIFFWTD count mean anything.
+                fired += crate::decode::diffwtd_inferred_hits() - attempt_before;
+                matched += 1;
+            }
+        }
+        eprintln!(
+            "{name}: {matched}/{attempts} pixel-exact, {named_refusals} named refusals, \
+             diffwtd_inferred_hits (decoded+compared attempts only)={fired}"
+        );
+        assert!(matched > 0, "{name}: every attempt refused ({refusals:?}) -- no pixel compare ran");
+        assert!(
+            fired > 0,
+            "{name}: no inferred-DIFFWTD 64x64 block fired on a compared attempt \
+             ({matched} matches, {named_refusals} refusals of {attempts}) -- gate vacuous"
+        );
+    }
+
+    /// 8-bit arm of [`run_diffwtd_inferred_64x64_gate`].
+    #[test]
+    fn a_real_aomenc_stream_with_a_diffwtd_compound_64x64_block_decodes_pixel_exact() {
+        run_diffwtd_inferred_64x64_gate(
+            "a_real_aomenc_stream_with_a_diffwtd_compound_64x64_block_decodes_pixel_exact",
+            false,
+        );
+    }
+
+    /// 10-bit arm of [`run_diffwtd_inferred_64x64_gate`] -- both of his films
+    /// are `yuv420p10le`.
+    #[test]
+    fn a_real_aomenc_10bit_stream_with_a_diffwtd_compound_64x64_block_decodes_pixel_exact() {
+        run_diffwtd_inferred_64x64_gate(
+            "a_real_aomenc_10bit_stream_with_a_diffwtd_compound_64x64_block_decodes_pixel_exact",
+            true,
+        );
+    }
+
     /// lane-maskcomp r2 / lane-wedge r3: `--enable-masked-comp=1` streams
     /// must consume `compound_type`/`wedge_idx`/`wedge_sign`/`mask_type`
     /// entropy-exact AND build the real blend, DIFFWTD or WEDGE --
