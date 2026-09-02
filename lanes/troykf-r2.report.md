@@ -42,3 +42,29 @@ already pins against a live `ffmpeg` decode. I used that same helper. Vacuity is
 covered the other way round: the decode and the `skip_cfl > 0` assert run
 unconditionally, only the pixel compare is behind `have_ffmpeg()`.
 
+## Ten real key frames, re-measured on the MERGED tree (main 85887c7 in)
+`$HOME/.cache/troykf-work/one.sh <ss>` per point: 2 s `-c:v copy -f obu` extract,
+truncated to one temporal unit, decoded with `EC_PROBE_OUT16` under a 6G scope,
+compared sample-by-sample against `ffmpeg -pix_fmt yuv420p10le`.
+
+| ss | bytes | decode | samples differing (of 2 280 960) |
+|----|-------|--------|----------------------------------|
+| 0    | 74     | OK 1920x792 | 0 |
+| 900  | 50350  | OK | 0 |
+| 1800 | 98871  | OK | 0 |
+| 2700 | 36785  | OK | 0 |
+| 3600 | 39883  | OK | 0 |
+| 4500 | 44734  | OK | 0 |
+| 5400 | 287497 | OK | 0 |
+| 6300 | 124067 | OK | 0 |
+| 7200 | 82748  | OK | 0 |
+| 9900 | 161573 | OK | 0 |
+
+10/10 Y=U=V=0, `max|d|=0`. The merge of lane-mvtwin changed nothing here.
+ss=8100 and ss=9000 still refuse at a 128-root non-SPLIT partition (lane-sb128c's
+cluster) and are not in the table.
+
+## Residue
+* ss=8100 / ss=9000 — deferred(lane-sb128c's 128-root non-SPLIT partition).
+* A synthetic aomenc recipe for a skipped CfL block — accepted as unreachable at
+  38 recipes; the pinned film frame is the gate instead.
