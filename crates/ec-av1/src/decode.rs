@@ -171,6 +171,26 @@ pub(crate) fn intra_in_inter_angle_delta_uv_hits() -> usize {
     INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.get())
 }
 
+// lane-uv8 r1: the three non-DC chroma mode classes an INTRA 8x8 leaf inside
+// an INTER frame ([`decode_inter_block8`]'s intra arm) can carry -- the arm
+// read `uv_mode` and then refused everything but `DC_PRED`. Counted here and
+// nowhere else so the gate's assert cannot be satisfied by a >=16x16 block.
+thread_local! {
+    static INTRA_IN_INTER8_UV_DIR_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTRA_IN_INTER8_UV_SMOOTH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTRA_IN_INTER8_UV_CFL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(directional, smooth/paeth, CfL)` chroma modes coded by an intra 8x8 leaf
+/// inside an inter frame -- see [`INTRA_IN_INTER8_UV_DIR_HITS`].
+pub(crate) fn intra_in_inter8_uv_hits() -> (usize, usize, usize) {
+    (
+        INTRA_IN_INTER8_UV_DIR_HITS.with(|c| c.get()),
+        INTRA_IN_INTER8_UV_SMOOTH_HITS.with(|c| c.get()),
+        INTRA_IN_INTER8_UV_CFL_HITS.with(|c| c.get()),
+    )
+}
+
 // lane-realworld r1: this frame's `cdef.bits` (spec 5.9.19), threaded into
 // [`maybe_read_cdef_idx`] the same way [`ENABLE_EDGE_FILTER`] threads a
 // frame-level flag through the recursive block decode -- `0` (the default)
@@ -1779,6 +1799,32 @@ thread_local! {
     static OBMC_HITS_8: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-interp3 r1: how many inter blocks read a SWITCHABLE `interp_filter`
+// pair whose two directions differ (`enable_dual_filter` only -- with dual
+// filter off both directions take the single symbol, so this can never fire).
+// A gate asserting it proves the stream really carries dual-filter blocks.
+thread_local! {
+    static DUAL_FILTER_DIFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// lane-interp3 r1: how many COMPOUND 8x8 leaves read their own
+// `read_mb_interp_filter` symbol(s) -- the read this round added (the leaf
+// used to skip it entirely, losing a symbol and stamping the `[3, 3]`
+// no-filter sentinel that made a neighbouring OBMC block panic).
+thread_local! {
+    static COMPOUND8_FILTER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DUAL_FILTER_DIFF_HITS`].
+pub(crate) fn dual_filter_diff_hits() -> usize {
+    DUAL_FILTER_DIFF_HITS.with(|c| c.get())
+}
+
+/// Current value of [`COMPOUND8_FILTER_HITS`].
+pub(crate) fn compound8_filter_hits() -> usize {
+    COMPOUND8_FILTER_HITS.with(|c| c.get())
+}
+
 // lane-warp round 1: how many blocks resolved `motion_mode_allowed` to
 // `WARPED_CAUSAL`-eligible (3-symbol read, `num_proj_ref >= 1` under
 // `allow_warped_motion`) AND the symbol actually decoded to `WARPED_CAUSAL`
@@ -1808,6 +1854,20 @@ thread_local! {
 /// Current value of [`COMPOUND_WARP_HITS`].
 pub(crate) fn compound_warp_hits() -> usize {
     COMPOUND_WARP_HITS.with(|c| c.get())
+}
+
+// lane-interp3 r3: the same proof narrowed to the 8x8 LEAF's own compound
+// arm ([`decode_inter_block8`]) -- that arm predicted both taps
+// translationally until r3, so a gate needs to tell a warped 8x8 compound
+// leaf apart from a warped 16x16+ one (both bump [`COMPOUND_WARP_HITS`]).
+thread_local! {
+    static COMPOUND_WARP_HITS_8: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`COMPOUND_WARP_HITS_8`].
+pub(crate) fn compound_warp_hits_8() -> usize {
+    COMPOUND_WARP_HITS_8.with(|c| c.get())
 }
 
 // lane-gmaffine r1: how many blocks built their prediction from a
@@ -15614,6 +15674,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // that isolate whether a decode-order frame's mismatch already exists
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
+    if std::env::var_os("EC_OBMC").is_some() || std::env::var_os("EC_TRACE_MODE").is_some() {
+        eprintln!(
+            "EC_PICT idx={}",
+            PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
     dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
@@ -15828,6 +15895,9 @@ fn resolve_interp_filter(
     } else {
         sym0
     };
+    if enable_dual_filter && sym0 != sym1 {
+        DUAL_FILTER_DIFF_HITS.with(|c| c.set(c.get() + 1));
+    }
     if std::env::var_os("EC_TRACE_MODE").is_some() {
         eprintln!(
             "EC_IF ctx0={ctx0} above={above:?} left={left:?} sym0={sym0} sym1={sym1} rng={}",
@@ -16496,15 +16566,15 @@ fn neighbour_filter(
     if let Some(kind) = interp_fixed {
         return Ok((kind, kind));
     }
-    // lane-golomb r9: this used to hand the sentinel straight to
-    // `from_switchable_symbol`, which PANICS on any value above 2 -- a crash
-    // on stream data (measured on a real 192x68 cq40 aomenc stream, where an
-    // inter leaf below 8x8 desyncs upstream and leaves an unrecorded filter
-    // behind). A decoder must refuse such a stream by name, never abort the
-    // process; the desync that produces the sentinel belongs to lane-intersub8.
+    // lane-interp3 r1: the `[3, 3]` sentinel reaching here is a DEFECT in
+    // whatever path recorded the neighbour (an inter block that never stored
+    // its own switchable symbols), and it used to abort the process through
+    // `from_switchable_symbol`'s panic. A decoder must never crash on a real
+    // stream: it stops by name instead, so the frame is refused and the
+    // stream is pinned like every other unsupported case.
     if sym[0] > 2 || sym[1] > 2 {
         return Err(unsupported(
-            "an OBMC neighbour whose switchable interp filter was never recorded",
+            "an OBMC neighbour whose interp filter was never recorded (no switchable symbol for that block)",
         ));
     }
     Ok((
@@ -16690,6 +16760,71 @@ fn obmc_blend_h(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, 
     }
 }
 
+/// libaom's own `BLOCK_SIZE` enum index for a `w4`x`h4` (mi-unit) block --
+/// only for the `EC_OBMC` trace rung below, so it reads byte-identical to
+/// the instrumented aomdec's `backup_mbmi.bsize`.
+fn ec_obmc_bsize(w4: usize, h4: usize) -> i32 {
+    match (w4, h4) {
+        (1, 1) => 0,
+        (1, 2) => 1,
+        (2, 1) => 2,
+        (2, 2) => 3,
+        (2, 4) => 4,
+        (4, 2) => 5,
+        (4, 4) => 6,
+        (4, 8) => 7,
+        (8, 4) => 8,
+        (8, 8) => 9,
+        (8, 16) => 10,
+        (16, 8) => 11,
+        (16, 16) => 12,
+        (1, 4) => 16,
+        (4, 1) => 17,
+        (2, 8) => 18,
+        (8, 2) => 19,
+        (4, 16) => 20,
+        (16, 4) => 21,
+        _ => -1,
+    }
+}
+
+/// The `EC_OBMC` rung: one line per blended neighbour, in the instrumented
+/// aomdec's own byte format (`decodeframe.c`
+/// `dec_build_prediction_by_{above,left}_pred`), so the two decoders' OBMC
+/// neighbour lists diff line for line. `filt` is libaom's packed
+/// `interp_filters.as_int` = `y_filter | (x_filter << 16)`.
+#[allow(clippy::too_many_arguments)]
+fn ec_obmc_trace(
+    dir: &str,
+    mi_row: usize,
+    mi_col: usize,
+    write_w: usize,
+    write_h: usize,
+    rel: usize,
+    op: usize,
+    nb: &MiInfo,
+    h_kind: mc::InterpFilterKind,
+    v_kind: mc::InterpFilterKind,
+) {
+    if std::env::var_os("EC_OBMC").is_none() {
+        return;
+    }
+    let sym = |k: mc::InterpFilterKind| match k {
+        mc::InterpFilterKind::Smooth => 1u32,
+        mc::InterpFilterKind::Sharp => 2,
+        _ => 0,
+    };
+    eprintln!(
+        "EC_OBMC {dir} mi=({mi_row},{mi_col}) wh=({write_w}x{write_h}) rel={rel} op={op} \
+nbmv=({},{}) nbref={} nbbsize={} filt={}",
+        nb.mv.0,
+        nb.mv.1,
+        nb.ref_frame,
+        ec_obmc_bsize(nb.size, nb.size_h),
+        sym(v_kind) | (sym(h_kind) << 16),
+    );
+}
+
 /// `av1_build_obmc_inter_prediction` (libaom `reconinter.c`): re-predicts
 /// the overlap strip against each bordering above/left inter neighbour's own
 /// mv/ref/filter and blends it into this block's just-built single-reference
@@ -16789,6 +16924,7 @@ fn obmc_blend(
             interp_fixed,
             neighbours.above_filter[mi_col + off4],
         )?;
+        ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
@@ -16808,6 +16944,7 @@ fn obmc_blend(
             interp_fixed,
             neighbours.left_filter[mi_row + off4],
         )?;
+        ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
@@ -21114,7 +21251,6 @@ fn decode_inter_block8(
     const CHROMA_SIDE: usize = 4;
 
     let (r, c) = outer_at;
-    let _ = (r, c);
     // lane-inter8 r2: this leaf's OWN mi cell, not the enclosing 16x16's --
     // leaf (mi_r, mi_c + 2)'s left neighbour is leaf (mi_r, mi_c), and the
     // left column of a 16x16's second leaf ROW is the previous 16x16 block's
@@ -21169,6 +21305,10 @@ fn decode_inter_block8(
     }
 
     let mode_for_tx;
+    // lane-uv8 r1: this leaf's chroma prediction mode (`get_uv_mode` of the
+    // coded `uv_mode`), for the neighbour bands at the tail. An INTER leaf
+    // stores `UV_DC_PRED`, exactly as [`decode_inter_block`] one level up.
+    let mut uv_predict_mode = DC_PRED;
     let (luma_grid, u_grid, v_grid);
     let mut compound_ctx8: Option<(i8, i8, u8, u8)> = None;
     // lane-inter8 r1: this leaf's own resolved references, handed back so the
@@ -21201,21 +21341,24 @@ fn decode_inter_block8(
                 let (ref0, ref1) = if skip_mode {
                     (skip_mode_frame[0] as i8, skip_mode_frame[1] as i8)
                 } else {
+                    // lane-interp3 r2 (class twin-functions-drift): this leaf
+                    // passed a hard-coded `LAST_FRAME` for every inter
+                    // neighbour -- the old "coarse LAST_FRAME-or-intra"
+                    // approximation -- while the side bands have carried the
+                    // neighbour's REAL reference per mi since lane-inter8 r2.
+                    // Every `av1_collect_neighbors_ref_counts` vote below
+                    // (`uni_comp_ref_p1`, `comp_ref`, `comp_bwdref`, ...) was
+                    // therefore taken off the wrong CDF row. Same two args
+                    // [`decode_inter_block`]'s own compound arm passes
+                    // (`-1` when the band is unavailable is start_tile's /
+                    // start_row's own reset value, so no `has_above` guard).
                     read_compound_ref_frames(
                         dec,
                         cdfs,
                         above_nbr,
                         left_nbr,
-                        if has_above && above_inter {
-                            LAST_FRAME
-                        } else {
-                            -1
-                        },
-                        if has_left && left_inter {
-                            LAST_FRAME
-                        } else {
-                            -1
-                        },
+                        above_ref0,
+                        left_ref0,
                     )
                 };
                 leaf_refs = (ref0, Some(ref1));
@@ -21396,49 +21539,29 @@ fn decode_inter_block8(
                     );
                 }
 
-                let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
-                let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
-                let scale0 = mc::scale_factor(py0.width, frame_width);
-                let scale1 = mc::scale_factor(py1.width, frame_width);
-                if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
-                    SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
-                    SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
-                }
-
-                for dr in 0..2 {
-                    for dc in 0..2 {
-                        grid.set(
-                            mi_row + dr,
-                            mi_col + dc,
-                            MiInfo {
-                                is_inter: true,
-                                ref_frame: ref0,
-                                ref_frame1: Some(ref1),
-                                mv1: Some(mv1),
-                                mv: mv0,
-                                is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
-                                size: 2,
-                                size_h: 2,
-                                is_global_mv0: false,
-                                is_global_mv1: false,
-                            },
-                        );
-                    }
-                }
-                mode_for_tx = 0;
-
-                // lane-intersub8 r2: the compound 8x8 leaf used to hard-code
-                // `Regular` and leave `leaf_filter_syms` at the `[3, 3]`
-                // "no filter" sentinel. libaom reads `read_mb_interp_filter`
-                // here for EVERY inter block (`decodemv.c`
-                // `read_inter_block_mode_info`, right after
-                // `read_compound_type`), and when `av1_is_interp_needed` is 0
-                // -- `skip_mode`, or a non-translational GLOBALMV --
-                // `set_default_interp_filters` stores EIGHTTAP_REGULAR (0),
-                // NOT a sentinel. A later block whose ref matches this one
-                // then reads `av1_get_pred_context_switchable_interp` off
-                // that stored 0, so recording `[3, 3]` shifted its
-                // `switchable_interp` context and desynced the tile.
+                // lane-interp3 r1: `read_mb_interp_filter` (libaom
+                // `decodemv.c` 1575, the tail of
+                // `read_inter_block_mode_info`) runs for EVERY inter block,
+                // compound included, right AFTER `read_compound_type` -- this
+                // leaf read no filter symbol at all, so a SWITCHABLE-filter
+                // stream lost one symbol (two under `enable_dual_filter`) at
+                // every compound 8x8 leaf, and the leaf recorded the `[3, 3]`
+                // "no filter" sentinel, which made a neighbouring OBMC block's
+                // `neighbour_filter` PANIC instead of blending.
+                // `av1_is_interp_needed` suppression terms for this arm:
+                // `skip_mode`, and `is_nontrans_global_motion` (mode
+                // GLOBAL_GLOBALMV with BOTH refs' models non-TRANSLATION) --
+                // WARPED_CAUSAL cannot occur on a compound block.
+                let gm_nontrans_c = compound_mode == 6
+                    && global_motion[(ref0 - LAST_FRAME) as usize].model
+                        != ec_av1_syntax::WarpModel::Translation
+                    && global_motion[(ref1 - LAST_FRAME) as usize].model
+                        != ec_av1_syntax::WarpModel::Translation;
+                // spec `get_ref_filter_type`, keyed on this block's ref0 and
+                // matching EITHER of the neighbour's references -- same shape
+                // as [`decode_inter_block`]'s compound arm. Same corner-cut as
+                // this leaf's single-ref arm below: the context comes from the
+                // enclosing 16x16's coarse slot.
                 let above_filter_ctx = if neighbours.above_ref[cmi] == ref0
                     || neighbours.above_ref1[cmi] == Some(ref0)
                 {
@@ -21458,12 +21581,95 @@ fn decode_inter_block8(
                     cdfs,
                     interp_fixed,
                     enable_dual_filter,
-                    skip_mode,
+                    gm_nontrans_c || skip_mode,
                     above_filter_ctx,
                     left_filter_ctx,
                     true,
                 );
                 leaf_filter_syms = resolved_filter;
+                if interp_fixed.is_none() && !(gm_nontrans_c || skip_mode) {
+                    COMPOUND8_FILTER_HITS.with(|c| c.set(c.get() + 1));
+                }
+
+                let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
+                let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
+                let scale0 = mc::scale_factor(py0.width, frame_width);
+                let scale1 = mc::scale_factor(py1.width, frame_width);
+                if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
+                    SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+                    SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
+                }
+
+                // lane-interp3 r2 (class twin-functions-drift): both slots
+                // used to be stamped `false`, while [`decode_inter_block`]'s
+                // compound arm computes libaom's PER-SLOT `is_global_mv_block`
+                // (blockd.h:421-429 -- mode GLOBAL_GLOBALMV, block >= 8x8
+                // (always true for this leaf) and THAT slot's own gm model >
+                // TRANSLATION). A neighbour carrying the flag makes
+                // `setup_ref_mv_list` substitute the READER's global mv for
+                // the neighbour's stored one, so a cleared flag fed the next
+                // block's stack a stored mv where libaom has the global
+                // candidate -- a wrong mv stack, wrong mode contexts, and a
+                // desync one block later.
+                let is_globalmv_c = compound_mode == 6;
+                let is_global_mv0_c = is_globalmv_c
+                    && global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1;
+                let is_global_mv1_c = is_globalmv_c
+                    && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1;
+                // lane-interp3 r3 (class twin-functions-drift, second
+                // instance): libaom applies `allow_warp`'s GLOBAL branch
+                // (`reconinter.c:33-55`, reached from `av1_init_warp_params`
+                // inside `build_inter_predictors_8x8_and_bigger`'s per-`ref`
+                // loop) to EVERY `is_global_mv_block` slot, compound
+                // included and independently of `motion_mode` -- the 16x16+
+                // compound arm has done this since lane-cwarp r1, this leaf
+                // predicted both taps translationally, so a GLOBAL_GLOBALMV
+                // 8x8 compound leaf under a non-TRANSLATION model drifted by
+                // a few luma levels, growing away from the block origin.
+                // `force_integer_mv` short-circuits `av1_init_warp_params`
+                // before `allow_warp`; chroma is 4x4 here, below
+                // `av1_init_warp_params`'s own 8px per-plane bound, so only
+                // luma warps (same rule as this leaf's single-ref arm).
+                let leaf_compound_warp = |ref_frame: i8, eligible: bool| {
+                    if eligible
+                        && !force_integer_mv
+                        && !global_motion[(ref_frame - LAST_FRAME) as usize].invalid
+                    {
+                        crate::warp::global_warp_params(
+                            global_motion[(ref_frame - LAST_FRAME) as usize].params,
+                        )
+                    } else {
+                        None
+                    }
+                };
+                let warp0_c = leaf_compound_warp(ref0, is_global_mv0_c);
+                let warp1_c = leaf_compound_warp(ref1, is_global_mv1_c);
+                if warp0_c.is_some() || warp1_c.is_some() {
+                    COMPOUND_WARP_HITS.with(|c| c.set(c.get() + 1));
+                    COMPOUND_WARP_HITS_8.with(|c| c.set(c.get() + 1));
+                }
+                for dr in 0..2 {
+                    for dc in 0..2 {
+                        grid.set(
+                            mi_row + dr,
+                            mi_col + dc,
+                            MiInfo {
+                                is_inter: true,
+                                ref_frame: ref0,
+                                ref_frame1: Some(ref1),
+                                mv1: Some(mv1),
+                                mv: mv0,
+                                is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
+                                size: 2,
+                                size_h: 2,
+                                is_global_mv0: is_global_mv0_c,
+                                is_global_mv1: is_global_mv1_c,
+                            },
+                        );
+                    }
+                }
+                mode_for_tx = 0;
+
                 let mut inter0_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py0.data,
@@ -21479,6 +21685,13 @@ fn decode_inter_block8(
                     v_filter,
                     &mut inter0_y,
                 );
+                if let Some(wp) = &warp0_c {
+                    crate::warp::warp_affine_compound(
+                        wp, &py0.data, py0.true_width as i32, py0.true_height as i32,
+                        py0.width as i32, &mut inter0_y, px as i32, py as i32, SIDE as i32,
+                        SIDE as i32, SIDE as i32, 0, 0,
+                    );
+                }
                 let mut inter1_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py1.data,
@@ -21494,6 +21707,13 @@ fn decode_inter_block8(
                     v_filter,
                     &mut inter1_y,
                 );
+                if let Some(wp) = &warp1_c {
+                    crate::warp::warp_affine_compound(
+                        wp, &py1.data, py1.true_width as i32, py1.true_height as i32,
+                        py1.width as i32, &mut inter1_y, px as i32, py as i32, SIDE as i32,
+                        SIDE as i32, SIDE as i32, 0, 0,
+                    );
+                }
                 let mut pred_y = vec![0u16; SIDE * SIDE];
                 let mut diffwtd_mask_y = Vec::new();
                 let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
@@ -21767,6 +21987,17 @@ fn decode_inter_block8(
             &gm_table,
             tpl,
         );
+        // lane-interp3 r2: same per-entry EC_STACK ladder
+        // [`decode_inter_block`]'s single-ref arm prints, so this leaf's stack
+        // diffs line for line against the oracle's.
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            for (i, e) in stack.entries.iter().enumerate() {
+                eprintln!(
+                    "EC_STACK mi_row={mi_row} mi_col={mi_col} ref={ref_frame} i={i} this=({},{}) comp=(0,0) w={}",
+                    e.mv.0, e.mv.1, e.weight
+                );
+            }
+        }
 
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let mut is_globalmv = false;
@@ -22288,12 +22519,62 @@ fn decode_inter_block8(
                  this leaf with one; the >=16x16 arm decodes deltas)",
             ));
         }
+        // lane-uv8 r1: the delta'd angle decides the intra edge filter, and a
+        // directional luma mode is already legal on this leaf -- the arm
+        // passed a hardcoded `false` where [`decode_leaf8`] reads the
+        // mi-exact neighbour modes (`get_intra_edge_filter_type`, spec
+        // 7.11.2).
+        let (above_mode, left_mode) =
+            neighbours.modes_above_left_mi(leaf_mi.0, leaf_mi.1, neighbours.modes_above_left(r, c));
+        let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
+        // lane-uv8 r1: libaom `read_intra_block_mode_info` (decodemv.c:1198-1207)
+        // -- `uv_mode` over the CFL-allowed alphabet (`is_cfl_allowed`: a
+        // BLOCK_8X8 leaf is inside the 32x32 bound), then `read_cfl_alphas`
+        // for `UV_CFL_PRED`, then `angle_delta_uv` off the MAPPED uv mode's
+        // row (`get_uv_mode`, identity over `V_PRED..=D67_PRED`). Every value
+        // but `DC_PRED` was refused here, which is what blocked the low-cq
+        // CDEF arms and the 10-bit gates.
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
-        if uv_mode != DC_PRED {
-            return Err(unsupported(
-                "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
-            ));
+        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            eprintln!(
+                "EC_ISTEP8 mi_row={} mi_col={} name=modes y={mode} uv={uv_mode} fi_enabled={} rng={}",
+                leaf_mi.0,
+                leaf_mi.1,
+                ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get),
+                dec.debug_state().0
+            );
         }
+        if (9..=12).contains(&uv_mode) {
+            SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER8_UV_SMOOTH_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let alpha = if uv_mode == UV_CFL_PRED {
+            INTRA_IN_INTER8_UV_CFL_HITS.with(|c| c.set(c.get() + 1));
+            Some(read_cfl_alphas(dec, cdfs))
+        } else {
+            None
+        };
+        let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+            DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER8_UV_DIR_HITS.with(|c| c.set(c.get() + 1));
+            read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
+        } else {
+            0
+        };
+        if angle_delta_uv != 0 {
+            UV_ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.set(c.get() + 1));
+        }
+        // `get_uv_mode` (spec 9.3): `UV_CFL_PRED` predicts as `DC_PRED`.
+        uv_predict_mode = if uv_mode == UV_CFL_PRED {
+            DC_PRED
+        } else {
+            uv_mode
+        };
+        // The CHROMA neighbour's own `uv_mode` decides the chroma edge filter
+        // strength (`get_intra_edge_filter_type`, reconintra.c:974), never the
+        // luma one -- same read [`decode_leaf8`] does.
+        let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
         // lane-screen r2: see [`decode_inter_block`]'s own copy -- `mode`/
         // `uv_mode` are both effectively `DC_PRED`-gated already on this
         // leaf (a nonzero `mode` still passes, but `uv_mode` is forced
@@ -22305,7 +22586,10 @@ fn decode_inter_block8(
                     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
                 ));
             }
-            if dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+            // lane-uv8 r1: `read_palette_mode_info` reads the UV symbol only
+            // when `uv_mode == UV_DC_PRED` (decodemv.c) -- unconditional here
+            // while every non-DC uv_mode was refused a few lines above.
+            if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
                 return Err(unsupported(
                     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
                 ));
@@ -22320,14 +22604,39 @@ fn decode_inter_block8(
         // `av1_filter_intra_allowed`'s `palette_size[0] == 0` term is implied:
         // a real palette-Y block already returned above.
         let mut filter_intra = None;
+        // lane-uv8 r2: the oracle's `EC_ISTEP` ladder (`EC_TRACE_MODE_STEP`)
+        // prints `use_filter_intra` for an intra block inside an INTER frame
+        // and nothing else, so this leaf needs the same two lines for a
+        // range-ladder diff against it.
+        let ec_istep8 = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
         if mode == DC_PRED
             && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
             && let Some(class) = filter_intra_size_class(SIDE)
-            && dec.symbol(&mut cdfs.filter_intra[class]) != 0
         {
-            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
-            INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
-            filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
+            let use_fi = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
+            if ec_istep8 {
+                eprintln!(
+                    "EC_ISTEP mi_row={} mi_col={} name=use_filter_intra val={} rng={}",
+                    leaf_mi.0,
+                    leaf_mi.1,
+                    u8::from(use_fi),
+                    dec.debug_state().0
+                );
+            }
+            if use_fi {
+                FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                let fi = dec.symbol(&mut cdfs.filter_intra_mode);
+                if ec_istep8 {
+                    eprintln!(
+                        "EC_ISTEP mi_row={} mi_col={} name=filter_intra_mode val={fi} rng={}",
+                        leaf_mi.0,
+                        leaf_mi.1,
+                        dec.debug_state().0
+                    );
+                }
+                filter_intra = Some(fi);
+            }
         }
         mode_for_tx = mode;
         let (mi_row, mi_col) = leaf_mi;
@@ -22386,31 +22695,34 @@ fn decode_inter_block8(
                 &vec![0i32; SIDE * SIDE],
                 None,
                 filter_intra,
-                false,
+                smooth_neighbor,
             );
+            // CfL's AC contribution is the luma this leaf just reconstructed,
+            // averaged over the 4x4 chroma block (`cfl_ac_q3`, spec 7.11.5).
+            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
             u.reconstruct(
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             );
             v.reconstruct(
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             );
             luma_grid = vec![0i32; SIDE * SIDE];
             u_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -22420,7 +22732,15 @@ fn decode_inter_block8(
             luma_grid = read_plane(
                 dec,
                 cdfs,
-                TxbSet::Luma8,
+                // lane-uv8 r3: an intra leaf inside an inter frame is
+                // `is_inter == 0` in `av1_get_ext_tx_set_type`, so its 8x8
+                // luma reads the INTRA set -- seven-type
+                // `EXT_TX_SET_DTT4_IDTX_1DDCT` when `reduced_tx_set == 0`,
+                // five-type `EXT_TX_SET_DTT4_IDTX` when it is 1. Hardcoding
+                // the reduced set read the wrong ALPHABET (class
+                // [[wrong-alphabet-same-value]]) and desynced at the leaf's
+                // first `tx_type`.
+                txbset_for(8, reduced_tx_set),
                 scan8,
                 0,
                 around[0],
@@ -22437,8 +22757,9 @@ fn decode_inter_block8(
                 None,
                 filter_intra,
                 None,
-                false,
+                smooth_neighbor,
             )?;
+            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
             u_grid = read_plane(
                 dec,
                 cdfs,
@@ -22447,8 +22768,8 @@ fn decode_inter_block8(
                 1,
                 around[1],
                 mode,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 u,
                 cpx,
@@ -22456,10 +22777,10 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
+                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             )?;
             v_grid = read_plane(
                 dec,
@@ -22469,8 +22790,8 @@ fn decode_inter_block8(
                 2,
                 around[2],
                 mode,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 v,
                 cpx,
@@ -22478,10 +22799,10 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
+                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
                 None,
                 None,
-                None,
-                false,
+                smooth_neighbor_uv,
             )?;
         }
     }
@@ -22503,6 +22824,16 @@ fn decode_inter_block8(
         )
     });
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    // lane-uv8 r1: this leaf never stamped a mode band at all, so the block
+    // below/right of it read whatever block last wrote the coarse [`SUB`]
+    // slot -- now that an intra leaf here can code a smooth/directional
+    // `uv_mode`, its chroma neighbours must see it (and an inter leaf must
+    // stamp `DC_PRED`, what libaom stores for a non-intra block). Same pair
+    // [`decode_leaf8`] writes, plus the coarse fallback slots.
+    neighbours.above_uv_mode[c] = uv_predict_mode;
+    neighbours.left_uv_mode[r] = uv_predict_mode;
+    neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode_for_tx);
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     if let Some((left, above)) = saved_luma_ctx {
         for (cell, state) in left.into_iter().enumerate() {
             neighbours.left[leaf_mi.0 + cell][0] = state;
@@ -24902,6 +25233,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // that isolate whether a decode-order frame's mismatch already exists
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
+    if std::env::var_os("EC_OBMC").is_some() || std::env::var_os("EC_TRACE_MODE").is_some() {
+        eprintln!(
+            "EC_PICT idx={}",
+            PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
     dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
@@ -25312,6 +25650,30 @@ mod tests {
     /// always cleared to `None` by `record_inter`, so the next block's own
     /// `NeighbourRef::uni` -- and `comp_reference_type_ctx` downstream of it
     /// -- could never see a real compound neighbour).
+    /// lane-interp3 r1: a decoder must never abort the process on
+    /// stream-derived state. `neighbour_filter` used to feed the `[3, 3]`
+    /// "no filter recorded" sentinel straight into
+    /// `InterpFilterKind::from_switchable_symbol`, whose `panic!` ("...alphabet
+    /// is exactly 3 symbols") crashed on a real aomenc dual-filter + OBMC
+    /// stream. It now refuses by name; the real symbols still decode.
+    #[test]
+    fn an_obmc_neighbour_with_no_recorded_filter_refuses_instead_of_panicking() {
+        assert!(
+            neighbour_filter(None, [3, 3])
+                .unwrap_err()
+                .to_string()
+                .contains("an OBMC neighbour whose interp filter was never recorded"),
+            "the [3, 3] sentinel must refuse by name, never panic"
+        );
+        assert!(neighbour_filter(None, [3, 0]).is_err());
+        let (h, v) = neighbour_filter(None, [0, 2]).expect("real symbols decode");
+        assert_eq!(h, mc::InterpFilterKind::Sharp, "sym[1] is the horizontal kernel");
+        assert_eq!(v, mc::InterpFilterKind::Regular, "sym[0] is the vertical kernel");
+        let (h, v) = neighbour_filter(Some(mc::InterpFilterKind::Smooth), [3, 3])
+            .expect("a fixed-filter frame never reads a symbol");
+        assert_eq!((h, v), (mc::InterpFilterKind::Smooth, mc::InterpFilterKind::Smooth));
+    }
+
     #[test]
     fn record_compound_ctx_stamps_ref1_for_the_next_block_to_read() {
         let mut n = Neighbours::new(4, 4, 16, 16);
