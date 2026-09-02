@@ -190,17 +190,15 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // paeth-intra, intra-edge-filter, rect-partitions, ab-partitions); its
     // seventh, the 10-bit LR gate, was `#[ignore]`d on that branch and passes
     // un-ignored on main, which carries the fix.
-    // `enable-1to4-partitions` LEFT this list on 2026-09-02 (lane-rectchroma
-    // r1): the chroma-rect gate encodes at 8 AND 10 bits with `=1` and
-    // asserts `rect4_strips_10bit > 0`, i.e. a superblock 1:4 strip inside a
-    // pixel-exact 10-bit stream.
     // `enable-restoration` LEFT this list on 2026-09-01: lane-hbdinter's
     // 10-bit inter gate passes `--enable-restoration=1` and asserts a real
     // Wiener/SGR unit fired, which is what caught the two defects (SGR box
     // sums never brought back to the 8-bit scale, Wiener clamp at the wrong
     // bound). `enable-dist-wtd-comp` and `enable-global-motion` left it the
     // same day for the same reason: lane-cwarp's 10-bit compound global-warp
-    // gate passes `=1` for both.
+    // gate passes `=1` for both. `enable-1to4-partitions` left it on 2026-09-02:
+    // lane-tx64x16 r4's 32-level 1:4 gate has a 10-bit arm that asserts both
+    // orientations and coded strips inside pixel-exact attempts.
     (
         "enable-angle-delta",
         "hole at both depths, see the 8-bit list",
