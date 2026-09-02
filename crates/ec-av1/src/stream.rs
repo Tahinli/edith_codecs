@@ -6586,20 +6586,10 @@ mod tests {
                 let vertical_split = attempt % 2 == 1;
                 let cq = [58, 52, 45, 61][(attempt / 2 % 4) as usize];
                 let sp = 8 + (attempt / 8) * 4;
-                // Half ramp, half deterministic pseudo-noise: the flat "200"
-                // half of r1's source made aomenc code the right-hand
-                // superblocks skip, so at 8 bit no >32 intra block ever
-                // appeared (probed cq 45/52/58/61/63 = 0 hits). The textured
-                // half forces intra above 32x32 in an inter frame at BOTH
-                // depths, so both arms carry the shape.
                 let geq = if vertical_split {
-                    format!(
-                        "if(lt(Y,64), 40+mod(floor((X+N*{sp})/32)*90,200),                          mod((X*7+Y*13+N*97)*31,256))"
-                    )
+                    format!("if(lt(Y,64), 40+mod(floor((X+N*{sp})/32)*90,200), 200)")
                 } else {
-                    format!(
-                        "if(lt(X,128), 40+mod(floor((Y+N*{sp})/32)*90,200),                          mod((X*7+Y*13+N*97)*31,256))"
-                    )
+                    format!("if(lt(X,64), 40+mod(floor((Y+N*{sp})/32)*90,200), 200)")
                 };
                 let duration = frame_count as f64 / 25.0;
                 let source = format!(
@@ -6786,10 +6776,20 @@ mod tests {
                 let vertical_split = attempt % 2 == 1;
                 let cq = [58, 52, 45, 61][(attempt / 2 % 4) as usize];
                 let sp = 8 + (attempt / 8) * 4;
+                // Half ramp, half deterministic pseudo-noise: the flat "200"
+                // half of r1's source made aomenc code the right-hand
+                // superblocks skip, so at 8 bit no >32 intra block ever
+                // appeared (probed cq 45/52/58/61/63 = 0 hits). The textured
+                // half forces intra above 32x32 in an inter frame at BOTH
+                // depths, so both arms carry the shape.
                 let geq = if vertical_split {
-                    format!("if(lt(Y,64), 40+mod(floor((X+N*{sp})/32)*90,200), 200)")
+                    format!(
+                        "if(lt(Y,64), 40+mod(floor((X+N*{sp})/32)*90,200),                          mod((X*7+Y*13+N*97)*31,256))"
+                    )
                 } else {
-                    format!("if(lt(X,64), 40+mod(floor((Y+N*{sp})/32)*90,200), 200)")
+                    format!(
+                        "if(lt(X,128), 40+mod(floor((Y+N*{sp})/32)*90,200),                          mod((X*7+Y*13+N*97)*31,256))"
+                    )
                 };
                 let duration = frame_count as f64 / 25.0;
                 let source = format!(
