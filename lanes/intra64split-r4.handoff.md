@@ -83,11 +83,22 @@ probe's own `rect64_corner_tu: 64x32=.. 32x64=..` line. Truncate with
 `python3 <scratchpad>/census4/trunc.py <in>.obu <N> <out>.obu`.
 
 ## Suite
-NOT COMPLETE. `intra64split-suite-r4b-1788350949` was still running at the turn
-cap: `$HOME/.cache/intra64split-suite-r4.log` has ~175 `test ...` lines and NO
-`test result` line. The two failures the first (pre-fix) run found are both
-fixed and re-run green in isolation:
-`refusal_inventory::tests::the_decode_path_refuses_exactly_the_listed_cases`
-and `decode::tests::an_obmc_neighbour_with_no_recorded_filter_refuses_instead_of_panicking`
-(`test result: ok` for each, scoped runs). A successor must re-arm the full
-suite before claiming totals.
+COMPLETE, RED. `intra64split-suite-r4b-1788350949`,
+`$HOME/.cache/intra64split-suite-r4.log`:
+`test result: FAILED. 405 passed; 3 failed; 39 ignored; 0 measured` in 798s.
+The two failures the FIRST (pre-fix) run exposed are fixed and green.
+The three remaining are merge cross-product reds owned by the merged lanes, not
+by this one -- full attribution in `lanes/intra64split-r4.report.md`:
+
+1. `a_frame_edge_straddling_band_decodes_pixel_exact` -- 192x68 cq61 8-bit,
+   frame 1 Y 6859 px, first (row 0, col 64), ours 56 vs ffmpeg 178.
+2. `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact`
+   -- firing assert, split-tx-8x4 arm 0 of `[1,1,2,2,0]`, no attempt refuses on
+   rectangular residual coding any more.
+3. `a_real_aomenc_stream_with_a_rectangular_compound_wedge_decodes_pixel_exact`
+   -- all 8-bit cq50 attempts still refuse "a COMPOUND_WEDGE mask on a
+   non-square inter block".
+
+A successor merging this branch anywhere must fix or explicitly own these three
+first; they are the price of the eight-lane cross-product, and each is a gate
+that is GREEN on its own lane tip.

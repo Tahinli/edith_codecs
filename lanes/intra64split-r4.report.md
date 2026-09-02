@@ -94,8 +94,30 @@ None lifted, none added by this round. The inventory is the union produced by
 the eight-lane merge.
 
 ## Test totals
-`cargo test -p ec-av1 --lib` as user unit `intra64split-suite-1788350854`,
-log `$HOME/.cache/intra64split-suite-r4.log` — NOT COMPLETE at the turn cap (~175 `test ...` lines, no `test result` line). The two failures the first run exposed are fixed and re-run green in isolation; see `lanes/intra64split-r4.handoff.md`.
+`cargo test -p ec-av1 --lib` as user unit `intra64split-suite-r4b-1788350949`,
+log `$HOME/.cache/intra64split-suite-r4.log` --
+**`test result: FAILED. 405 passed; 3 failed; 39 ignored; 0 measured` in 798s.**
+RED. All three failures are MERGE CROSS-PRODUCT reds (class
+`merge-cross-product-defect` / `fix-trades-sibling-gate`), none of them in code
+this lane wrote; each one is a gate of a MERGED lane meeting another merged
+lane's lift:
+
+* `a_frame_edge_straddling_band_decodes_pixel_exact` (lane-cdef/golomb gate) --
+  192x68 cq61 8-bit, frame 1 plane Y 6859 pixels differ, first at row 0 col 64
+  (ours 56 vs ffmpeg 178), `edge32=[4,20,4,0,6,12,2,0]`. Green on main; the
+  stream now decodes further because merged lanes lifted its earlier stop.
+* `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact`
+  (lane-intra14/r14 gate) -- firing assert: `split-tx-8x4` arm reads 0 in
+  `[1,1,2,2,0]` and NO attempt refuses on rectangular residual coding any more,
+  so the arm's documented blocker is gone and a zero arm is unexplained. The
+  ledger already records this exact red for merging `a37a4bc`.
+* `a_real_aomenc_stream_with_a_rectangular_compound_wedge_decodes_pixel_exact`
+  (lane-inter16ab gate) -- every 8-bit cq50 attempt still stops at "a
+  COMPOUND_WEDGE mask on a non-square inter block (rect wedge codebook
+  unimplemented)", i.e. on this merged tree the refusal inter16ab lifted is
+  reachable again through another lane's path.
+
+Nothing was ignored or weakened to hide these; they are reported as RED.
 
 ## Residue
 * fix-now (not this lane): the `-ss 0` frontier is now an inter SB-level AB
