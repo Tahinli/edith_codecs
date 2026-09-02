@@ -14675,8 +14675,11 @@ mod tests {
     /// `mvstack::tile_reach_clips` advanced to 60 on this stream. Defect 3
     /// itself is proven deterministically by
     /// `mvstack::tests::the_row_reach_is_clamped_to_the_tile_origin_not_the_frame_edge`.
+    /// CLOSED by lane-tile2 r1 (`decode::build_motion_field` read the frame's
+    /// mi grid through `MiGrid::get`, which still carried the LAST tile's
+    /// bounds, so every other tile's motion field stayed empty and the next
+    /// frame's temporal MV candidates there were all `(0, 0)`).
     #[test]
-    #[ignore = "known pre-existing multi-tile-column decode defect, see doc comment"]
     fn a_real_aomenc_compound_mv_stack_across_two_tile_columns_decodes_pixel_exact() {
         let name = "a_real_aomenc_compound_mv_stack_across_two_tile_columns_decodes_pixel_exact";
         let before = crate::mvstack::tile_reach_clips();
@@ -14685,6 +14688,262 @@ mod tests {
             crate::mvstack::tile_reach_clips() > before,
             "{name}: no block was ever built inside a tile past mi 0 -- \
              --tile-columns=1 did not produce a second tile column"
+        );
+    }
+
+    /// lane-tile2 r1's own gate: a real `aomenc` stream cut into MULTIPLE
+    /// TILES (columns, rows, or both) with real compound references, a real
+    /// temporal MV field (`--enable-ref-frame-mvs=1`) and OBMC on, decoded
+    /// and compared against the instrumented oracle `aomdec` in DECODE order
+    /// -- every frame, hidden alt-refs included (class
+    /// gate-blind-to-hidden-frames), all three planes, 8- and 10-bit.
+    ///
+    /// The counter assert is what makes it a TILE gate: `tile_reach_clips`
+    /// only advances for a block whose MV-candidate scan reach was clamped to
+    /// a tile origin past mi 0, i.e. a block inside the second tile
+    /// column/row reading a TILE-GUARDED neighbour. A zero delta means the
+    /// `--tile-columns`/`--tile-rows` flag never arrived (class
+    /// aomenc-last-flag-wins) and the arm proved nothing, so it FAILS rather
+    /// than passing quietly. Any out-of-scope mismatch is impossible to hide:
+    /// `decode_all_frames_vs_oracle` panics on the FIRST differing byte of
+    /// any decode-order frame, so an attempt that returns has matched
+    /// everywhere.
+    fn a_real_aomenc_multi_tile_gate(
+        gate_name: &str,
+        seed_base: u32,
+        attempts: u32,
+        bit_depth: u32,
+        width: usize,
+        height: usize,
+        tile_columns: u32,
+        tile_rows: u32,
+    ) {
+        let _gate_lock = lock_gate_counters();
+        if !have_aomenc() {
+            eprintln!("SKIP {gate_name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        if !have_ffmpeg() {
+            eprintln!("SKIP {gate_name}: no ffmpeg");
+            return;
+        }
+        let frame_count = 16usize;
+        let (mut compared, mut guarded_attempts) = (0u32, 0u32);
+        let mut refusals = Vec::new();
+        for attempt in 0..attempts {
+            let seed = seed_base + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.64",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            let cq = format!("--cq-level={}", [45u32, 55, 35][(attempt % 3) as usize]);
+            // `--tile-columns`/`--tile-rows` are log2 counts.
+            let tcols = format!("--tile-columns={tile_columns}");
+            let trows = format!("--tile-rows={tile_rows}");
+            let out = {
+                let mut child = Command::new(aomenc_path())
+                    .args(depth_args)
+                    .arg(&cq)
+                    .arg(&tcols)
+                    .arg(&trows)
+                    .args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cpu-used=0",
+                        "--kf-max-dist=1000",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        "--enable-ref-frame-mvs=1",
+                        "--enable-order-hint=1",
+                        "--auto-alt-ref=1",
+                        "--lag-in-frames=25",
+                        "--enable-fwd-kf=0",
+                        "--enable-obmc=1",
+                        "--enable-global-motion=0",
+                        "--enable-warped-motion=0",
+                        "--enable-masked-comp=0",
+                        "--enable-interintra-comp=0",
+                        "--enable-dist-wtd-comp=0",
+                        "--enable-diff-wtd-comp=0",
+                        "--enable-onesided-comp=0",
+                        "--enable-interintra-wedge=0",
+                        "--enable-smooth-interintra=0",
+                        "--enable-rect-partitions=0",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-filter-intra=0",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-tx-size-search=0",
+                        "--enable-cdef=0",
+                        "--enable-restoration=0",
+                        "--max-partition-size=32",
+                        "--min-partition-size=32",
+                        // palette/intrabc-free content, per the charter.
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-cfl-intra=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                child.wait_with_output().expect("aomenc failed to run")
+            };
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            // A named refusal is the only tolerated non-comparison (class
+            // gate-skips-on-its-own-failure: a decode error that is NOT a
+            // named refusal fails the gate).
+            let before_clips = crate::mvstack::tile_reach_clips();
+            let before_tiles = decode::tile_hits();
+            if let Err(e) = decode_stream(&stream) {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unsupported"),
+                    "{gate_name} failed outright (seed {seed}): {msg}"
+                );
+                refusals.push(format!("seed {seed}: {msg}"));
+                continue;
+            }
+            let clips = crate::mvstack::tile_reach_clips() - before_clips;
+            let tiles = decode::tile_hits() - before_tiles;
+            assert!(
+                tiles >= 2 * frame_count,
+                "{gate_name} seed {seed}: only {tiles} tiles decoded over {frame_count} frames -- \
+                 --tile-columns={tile_columns} --tile-rows={tile_rows} did not arrive"
+            );
+            assert!(
+                clips > 0,
+                "{gate_name} seed {seed}: no block in a tile past mi 0 ever read a \
+                 tile-guarded neighbour (tile_reach_clips delta 0)"
+            );
+            guarded_attempts += 1;
+            let name = format!("{gate_name}-s{seed}");
+            let (frames, hidden) = decode_all_frames_vs_oracle(&stream, &name);
+            assert_eq!(
+                frames, frame_count,
+                "{gate_name} seed {seed}: {frames} decode-order frames, expected {frame_count}"
+            );
+            compared += 1;
+            eprintln!(
+                "{gate_name} seed {seed}: {frames} decode-order frames exact ({hidden} hidden), \
+                 tile_reach_clips +{clips}, tiles {tiles}"
+            );
+        }
+        assert!(
+            compared > 0 && guarded_attempts > 0,
+            "{gate_name}: nothing was compared -- refusals: {refusals:?}"
+        );
+        gate_buckets(gate_name, compared, 0, refusals.len());
+    }
+
+    #[test]
+    fn a_real_aomenc_stream_in_two_tile_columns_decodes_every_frame_exact() {
+        a_real_aomenc_multi_tile_gate(
+            "a_real_aomenc_stream_in_two_tile_columns_decodes_every_frame_exact",
+            300,
+            3,
+            8,
+            256,
+            128,
+            1,
+            0,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_stream_in_two_tile_rows_decodes_every_frame_exact() {
+        a_real_aomenc_multi_tile_gate(
+            "a_real_aomenc_stream_in_two_tile_rows_decodes_every_frame_exact",
+            310,
+            3,
+            8,
+            256,
+            128,
+            0,
+            1,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_stream_in_a_two_by_two_tile_grid_decodes_every_frame_exact() {
+        a_real_aomenc_multi_tile_gate(
+            "a_real_aomenc_stream_in_a_two_by_two_tile_grid_decodes_every_frame_exact",
+            320,
+            3,
+            8,
+            256,
+            128,
+            1,
+            1,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_10bit_stream_in_a_two_by_two_tile_grid_decodes_every_frame_exact() {
+        a_real_aomenc_multi_tile_gate(
+            "a_real_aomenc_10bit_stream_in_a_two_by_two_tile_grid_decodes_every_frame_exact",
+            330,
+            3,
+            10,
+            256,
+            128,
+            1,
+            1,
         );
     }
 
