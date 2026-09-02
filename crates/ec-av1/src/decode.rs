@@ -7540,6 +7540,16 @@ fn decode_intra_rect_in_inter(
         return Ok(());
     }
     let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
+    // lane-t900 r1: this arm read six mode symbols with no ladder rung of its
+    // own, so a cross-decoder bisection could only see the block's first
+    // coefficient. Same names/format as [`read_tx_size`]'s rung.
+    let step_trace = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    if step_trace {
+        eprintln!(
+            "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=y_mode val={mode} grp={size_group} rng={}",
+            dec.debug_state().0
+        );
+    }
     if mode >= 13 {
         return Err(unsupported(
             "an intra mode this decoder does not code (round 2)",
@@ -7565,6 +7575,13 @@ fn decode_intra_rect_in_inter(
     } else {
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
+    if step_trace {
+        eprintln!(
+            "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=uv_mode val={uv_mode} cfl={} rng={}",
+            u8::from(cfl_allowed),
+            dec.debug_state().0
+        );
+    }
     if (9..=12).contains(&uv_mode) {
         SMOOTH_UV_HITS.with(|h| h.set(h.get() + 1));
     }
@@ -7617,11 +7634,18 @@ fn decode_intra_rect_in_inter(
         // The INTER frame's own `TXFM_CONTEXT` bands, not the key frame's
         // deblock-grid approximation -- [`tx_size_context_txfm_rect`].
         let ctx = tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw.min(64), bh.min(64));
-        match tx_cat {
+        let d = match tx_cat {
             1 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
             2 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
             _ => dec.symbol(&mut cdfs.tx_size_cat3[ctx]),
+        };
+        if step_trace {
+            eprintln!(
+                "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat={tx_cat} rng={}",
+                dec.debug_state().0
+            );
         }
+        d
     } else {
         0
     };
@@ -8615,6 +8639,14 @@ fn decode_block_rect4(
     } else {
         0
     };
+    // lane-t900 r1: this strip's own `set_txfm_ctxs` when it is an intra
+    // block of an INTER frame -- see [`publish_txfm_bands_if_in_inter`].
+    publish_txfm_bands_if_in_inter(
+        neighbours,
+        (mi_r, mi_c),
+        depth_to_tx_wh(bw, bh, depth),
+        (bw, bh),
+    );
     if depth != 0 {
         // lane-rectsplitx r1: the per-transform-unit walk, at this strip's
         // real mi position (strips 1 and 3 of a HORZ_4 start 8 px into a
@@ -9577,6 +9609,14 @@ fn decode_block_rect64(
     } else {
         0
     };
+    // lane-t900 r1: this strip's own `set_txfm_ctxs` when it is an intra
+    // block of an INTER frame -- see [`publish_txfm_bands_if_in_inter`].
+    publish_txfm_bands_if_in_inter(
+        neighbours,
+        (mi_r, mi_c),
+        depth_to_tx_wh(bw, bh, depth),
+        (bw, bh),
+    );
     if depth != 0 {
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
         // lane-rectsplit r1/r4: the superblock-level strip splits its
@@ -13606,6 +13646,46 @@ fn txfm_partition_update(
 /// [`txfm_partition_update`] for a rectangular transform (lane-inter4 r2):
 /// the left column records `tx_size_high` over the parent's own height and
 /// the above row records `tx_size_wide` over its width.
+/// libaom `set_txfm_ctxs` + `txfm_partition_update` (`decodeframe.c`, end of
+/// `decode_token_recon_block`): EVERY block of an inter frame publishes its
+/// TRANSFORM size into both `TXFM_CONTEXT` bands, intra blocks included. The
+/// key frame writes neither (its readers use the deblock grid), so the
+/// key-frame bodies reused by [`decode_intra_rect_in_inter`] have to do it
+/// themselves when they run inside an inter frame. The 2:1 and 16x4 arms do it
+/// at the call site (the transform size comes back to them); the 1:4 arms
+/// ([`decode_block_rect4`] / [`decode_block_rect64`]) keep their size inside,
+/// so they call this where their own depth resolves. A no-op on a key frame
+/// ([`INTRA_IN_INTER_MODE`] unset), where those bands are not read at all.
+///
+/// lane-t900 r1 root cause: the HORZ_4 32x8 intra strip at mi(0,312) of an
+/// inter frame left `left_txfm[0]` at a stale 32 where libaom's own
+/// `set_txfm_ctxs` writes 8, so the intra 8x16 block at mi(0,320) read
+/// `tx_size_cat1` row 1 instead of row 0 -- same depth VALUE, different CDF,
+/// range 39156 where the reference has 54736 (class tx-grid-published-block-side
+/// / early-return-skips-tail).
+fn publish_txfm_bands_if_in_inter(
+    n: &mut Neighbours,
+    at_mi: (usize, usize),
+    (tx_w, tx_h): (usize, usize),
+    (bw, bh): (usize, usize),
+) {
+    if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_none() {
+        return;
+    }
+    let (mi_r, mi_c) = at_mi;
+    txfm_partition_update_rect(n, at_mi, (tx_w, tx_h), (bw, bh));
+    for i in 0..bw / MI {
+        if let Some(cell) = n.above_txfm.get_mut(mi_c + i) {
+            *cell = tx_w as u8;
+        }
+    }
+    for i in 0..bh / MI {
+        if let Some(cell) = n.left_txfm.get_mut(mi_r + i) {
+            *cell = tx_h as u8;
+        }
+    }
+}
+
 fn txfm_partition_update_rect(
     n: &mut Neighbours,
     (mi_r, mi_c): (usize, usize),
