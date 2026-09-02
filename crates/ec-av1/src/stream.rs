@@ -13983,6 +13983,10 @@ mod tests {
             return;
         }
         let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        // lane-midcut r1: rect interintra (`write_w != write_h`) built its
+        // intra predictor at the square `side`; this gate passed with that
+        // bug, so the shape gets its own delta-counted assert below.
+        let rect_before = crate::decode::interintra_rect_hits();
         let mut named_refusals = 0u32;
         let mut matched = 0u32;
         let n_attempts: u32 = std::env::var("EC_INTERINTRA_GATE_ATTEMPTS")
@@ -14157,9 +14161,15 @@ mod tests {
             "{NAME}: {matched} matches but zero UNIDIR_COMP_REFERENCE pairs read -- \
              --enable-onesided-comp=1 never reached the uni_comp_ref alphabet"
         );
+        assert!(
+            crate::decode::interintra_rect_hits() > rect_before,
+            "{NAME}: {matched} matches but zero RECTANGULAR interintra blocks fired -- the \
+             square-only blend defect (lane-midcut r1) would pass this gate unseen"
+        );
         eprintln!(
-            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, interintra_hits={} uni_comp_hits={}",
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, interintra_hits={} interintra_rect_hits={} uni_comp_hits={}",
             crate::decode::interintra_hits(),
+            crate::decode::interintra_rect_hits() - rect_before,
             crate::decode::uni_comp_hits()
         );
     }
