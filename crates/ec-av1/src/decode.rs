@@ -71,6 +71,20 @@ pub(crate) fn filter_intra_hits() -> usize {
     FILTER_INTRA_HITS.with(|c| c.get())
 }
 
+// lane-fiinter r1: how many of those `use_filter_intra == 1` symbols belonged
+// to an INTRA block inside an INTER frame (`read_intra_block_mode_info`'s own
+// `read_filter_intra_mode_info` call), which no gate exercised before this
+// round -- every inter gate recipe passed `--enable-filter-intra=0`.
+thread_local! {
+    static INTRA_IN_INTER_FILTER_INTRA_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_IN_INTER_FILTER_INTRA_HITS`].
+pub(crate) fn intra_in_inter_filter_intra_hits() -> usize {
+    INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.get())
+}
+
 // lane-realworld r1: this frame's `cdef.bits` (spec 5.9.19), threaded into
 // [`maybe_read_cdef_idx`] the same way [`ENABLE_EDGE_FILTER`] threads a
 // frame-level flag through the recursive block decode -- `0` (the default)
@@ -882,6 +896,11 @@ thread_local! {
     // frame-constant.
     static TX_SELECT_INTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REDUCED_TX_SET_INTER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    // lane-fiinter r1: this sequence header's own `enable_filter_intra` bit,
+    // frame-constant like the two above and stashed the same way -- an intra
+    // block inside an inter frame reads `use_filter_intra` under it.
+    static ENABLE_FILTER_INTRA_INTER: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Current value of [`TXFM_SPLIT_READS`].
@@ -894,10 +913,16 @@ pub(crate) fn txfm_split_hits() -> usize {
     TXFM_SPLIT_HITS.with(|c| c.get())
 }
 
-/// Sets the current thread's [`TX_SELECT_INTER`]/[`REDUCED_TX_SET_INTER`].
-pub(crate) fn set_inter_tx_mode(tx_select: bool, reduced_tx_set: bool) {
+/// Sets the current thread's [`TX_SELECT_INTER`]/[`REDUCED_TX_SET_INTER`]/
+/// [`ENABLE_FILTER_INTRA_INTER`].
+pub(crate) fn set_inter_tx_mode(
+    tx_select: bool,
+    reduced_tx_set: bool,
+    enable_filter_intra: bool,
+) {
     TX_SELECT_INTER.with(|c| c.set(tx_select));
     REDUCED_TX_SET_INTER.with(|c| c.set(reduced_tx_set));
+    ENABLE_FILTER_INTRA_INTER.with(|c| c.set(enable_filter_intra));
 }
 
 // How many `partition_w16` reads (a 16x16 block's own partition symbol, key
@@ -1260,6 +1285,19 @@ thread_local! {
 /// Current value of [`PALETTE_SPLIT_TX_HITS`].
 pub(crate) fn palette_split_tx_hits() -> usize {
     PALETTE_SPLIT_TX_HITS.with(|c| c.get())
+}
+
+// lane-intrainter r1: intra blocks inside an INTER frame whose `tx_depth`
+// symbol split their luma transform, bucketed by block side (8, 16, 32, 64) --
+// the gate's proof that the lifted path actually ran, per size.
+thread_local! {
+    static INTRA_IN_INTER_SPLIT_TX_HITS: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
+}
+
+/// Current value of [`INTRA_IN_INTER_SPLIT_TX_HITS`], indexed 8/16/32/64.
+pub(crate) fn intra_in_inter_split_tx_hits() -> [usize; 4] {
+    INTRA_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
 
 thread_local! {
@@ -10036,27 +10074,40 @@ fn read_block_tx_size(
     let tx = if is_inter {
         side.min(64)
     } else {
-        let resolved = read_tx_size(
+        read_tx_size(
             dec,
             cdfs,
             n,
             at_mi,
             side,
             Some(tx_size_context_txfm(n, at_mi, side)),
-        );
-        if resolved != side {
-            // An intra block inside an inter frame whose `tx_depth` splits its
-            // luma transform needs the per-transform-unit intra prediction
-            // loop `decode_block` runs for a key frame; this path predicts the
-            // whole block at once, so refuse rather than mis-reconstruct.
-            return Err(unsupported(
-                "an intra block in an inter frame whose tx_depth splits its luma transform \
-                 (round 1)",
-            ));
-        }
-        resolved
+        )
     };
     set_txfm_ctxs(n, at_mi, tx, side_mi, side_mi, skip && is_inter);
+    if !is_inter && tx != side {
+        // lane-intrainter r1: an intra block inside an inter frame whose
+        // `tx_depth` split its luma transform codes exactly the key-frame
+        // split path's transform units (`decode_block`'s multi-TU loop),
+        // raster order over the block. Handed back in the same leaf shape the
+        // inter var-tx tree uses, so the caller's per-TU luma loop, the
+        // `record_split_luma` neighbour write-back and the per-TU deblock
+        // edges are the ones it already runs for a var-tx inter block. A
+        // caller that has no per-TU intra loop (the 8x8 leaf) refuses on
+        // seeing `Some` here.
+        let step = tx / MI;
+        let mut leaves = Vec::new();
+        for row in (0..side_mi).step_by(step) {
+            for col in (0..side_mi).step_by(step) {
+                leaves.push((row, col, tx));
+            }
+        }
+        INTRA_IN_INTER_SPLIT_TX_HITS.with(|c| {
+            let mut h = c.get();
+            h[(side.trailing_zeros() as usize).saturating_sub(3).min(3)] += 1;
+            c.set(h);
+        });
+        return Ok((tx, Some(leaves)));
+    }
     Ok((tx, None))
 }
 
@@ -16020,6 +16071,24 @@ fn decode_inter_block(
                 ));
             }
         }
+        // lane-fiinter r1: `read_filter_intra_mode_info` (libaom `decodemv.c`,
+        // the tail of `read_intra_block_mode_info`) -- an intra block inside
+        // an INTER frame reads `use_filter_intra` in exactly the same place a
+        // key-frame block does, right after the palette syntax. Nothing read
+        // it here before this round, and aomenc enables filter intra by
+        // default, so every inter frame carrying one desynced at this symbol.
+        // `av1_filter_intra_allowed`'s `palette_size[0] == 0` term is implied:
+        // a real palette-Y block already returned above.
+        let mut filter_intra = None;
+        if mode == DC_PRED
+            && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
+            && let Some(class) = filter_intra_size_class(side)
+            && dec.symbol(&mut cdfs.filter_intra[class]) != 0
+        {
+            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
+        }
         mode_for_tx = mode;
         block_filter = [3, 3];
         ref_frame_for_lf = 0;
@@ -16046,7 +16115,14 @@ fn decode_inter_block(
             }
         }
 
-        read_block_tx_size(
+        // lane-intrainter r1: an intra block in an inter frame reads the same
+        // `tx_depth` symbol a key-frame block does, and when it splits, the
+        // block codes one intra prediction + one coefficient set PER
+        // transform unit (`decode_block`'s multi-TU branch), not one for the
+        // whole block. The leaf list rides the existing `vartx_leaves` slot,
+        // whose tail already does the split-block neighbour write-back
+        // (`record_split_luma`) and the per-TU deblock edges.
+        vartx_leaves = read_block_tx_size(
             dec,
             cdfs,
             neighbours,
@@ -16055,21 +16131,80 @@ fn decode_inter_block(
             (mi_cols as usize, mi_rows as usize),
             false,
             skip,
-        )?;
+        )?
+        .1;
         let reach = Reach::of(side, px, py, y.width, y.height);
+        let split_luma = vartx_leaves.is_some();
+        if let Some(leaves) = vartx_leaves.clone() {
+            let reduced = REDUCED_TX_SET_INTER.with(std::cell::Cell::get);
+            for &(row, col, tx_px) in &leaves {
+                let tu_mi = (at_mi.0 + row, at_mi.1 + col);
+                let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+                // A transform unit inside a block is not a block at that
+                // position (class from lane-palette2 r12): top-right /
+                // bottom-left availability is the block's, narrowed by the
+                // unit's own offset inside it.
+                let tu_reach = Reach::of_tu(side, side, col * MI, row * MI, tx_px, tx_px, reach);
+                let tu_grid = if skip {
+                    y.reconstruct(
+                        tu_px,
+                        tu_py,
+                        tx_px,
+                        mode,
+                        0,
+                        tu_reach,
+                        &vec![0i32; tx_px * tx_px],
+                        None,
+                        filter_intra,
+                        false,
+                    );
+                    vec![0i32; tx_px * tx_px]
+                } else {
+                    // The unit's bsize is smaller than the block it sits in,
+                    // so `txb_skip_ctx` is the neighbour-magnitude table, not
+                    // the lone-TU 0 (`get_txb_ctx_general`).
+                    let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tx_px / MI);
+                    read_plane(
+                        dec,
+                        cdfs,
+                        txbset_for(tx_px, reduced),
+                        &default_scan(tx_px),
+                        0,
+                        neighbours.around_mi(tu_mi, tx_px)[0],
+                        mode,
+                        mode,
+                        0,
+                        tu_reach,
+                        y,
+                        tu_px,
+                        tu_py,
+                        tx_px,
+                        tx_px,
+                        base_q_idx,
+                        None,
+                        filter_intra,
+                        Some(tu_skip_ctx),
+                        false,
+                    )?
+                };
+                neighbours.record_mi_luma(tu_mi, tx_px, &tu_grid);
+            }
+        }
         if skip {
-            y.reconstruct(
-                px,
-                py,
-                side,
-                mode,
-                0,
-                reach,
-                &vec![0i32; side * side],
-                None,
-                None,
-                false,
-            );
+            if !split_luma {
+                y.reconstruct(
+                    px,
+                    py,
+                    side,
+                    mode,
+                    0,
+                    reach,
+                    &vec![0i32; side * side],
+                    None,
+                    filter_intra,
+                    false,
+                );
+            }
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
             u.reconstruct(
                 cpx,
@@ -16100,28 +16235,35 @@ fn decode_inter_block(
             v_grid = vec![0i32; chroma_side * chroma_side];
         } else {
             let around = neighbours.around(at, side);
-            luma_grid = read_plane(
-                dec,
-                cdfs,
-                luma_set_intra,
-                scan_luma,
-                0,
-                around[0],
-                mode,
-                mode,
-                0,
-                reach,
-                y,
-                px,
-                py,
-                side,
-                luma_tx,
-                base_q_idx,
-                None,
-                None,
-                None,
-                false,
-            )?;
+            luma_grid = if split_luma {
+                // Already coded and reconstructed unit by unit above; the
+                // block-level grid is only the neighbour write-back's input,
+                // which `record_split_luma` ignores for plane 0.
+                vec![0i32; side * side]
+            } else {
+                read_plane(
+                    dec,
+                    cdfs,
+                    luma_set_intra,
+                    scan_luma,
+                    0,
+                    around[0],
+                    mode,
+                    mode,
+                    0,
+                    reach,
+                    y,
+                    px,
+                    py,
+                    side,
+                    luma_tx,
+                    base_q_idx,
+                    None,
+                    filter_intra,
+                    None,
+                    false,
+                )?
+            };
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
             u_grid = read_plane(
                 dec,
@@ -17539,6 +17681,24 @@ fn decode_inter_block8(
                 ));
             }
         }
+        // lane-fiinter r1: `read_filter_intra_mode_info` (libaom `decodemv.c`,
+        // the tail of `read_intra_block_mode_info`) -- an intra block inside
+        // an INTER frame reads `use_filter_intra` in exactly the same place a
+        // key-frame block does, right after the palette syntax. Nothing read
+        // it here before this round, and aomenc enables filter intra by
+        // default, so every inter frame carrying one desynced at this symbol.
+        // `av1_filter_intra_allowed`'s `palette_size[0] == 0` term is implied:
+        // a real palette-Y block already returned above.
+        let mut filter_intra = None;
+        if mode == DC_PRED
+            && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
+            && let Some(class) = filter_intra_size_class(SIDE)
+            && dec.symbol(&mut cdfs.filter_intra[class]) != 0
+        {
+            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
+        }
         mode_for_tx = mode;
         let (mi_row, mi_col) = leaf_mi;
         for dr in 0..2 {
@@ -17562,7 +17722,11 @@ fn decode_inter_block8(
             }
         }
 
-        read_block_tx_size(
+        // lane-intrainter r1: the 8x8 leaf's own intra `tx_depth` can only
+        // resolve to TX_4X4, whose 2x2 unit grid this leaf path has no
+        // prediction loop for (the >=16x16 square path above does). Refuse by
+        // name rather than mis-reconstruct.
+        if read_block_tx_size(
             dec,
             cdfs,
             neighbours,
@@ -17571,7 +17735,15 @@ fn decode_inter_block8(
             (mi_cols as usize, mi_rows as usize),
             false,
             skip,
-        )?;
+        )?
+        .1
+        .is_some()
+        {
+            return Err(unsupported(
+                "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 \
+                 transform units",
+            ));
+        }
         let reach = Reach::of(SIDE, px, py, y.width, y.height);
         if skip {
             y.reconstruct(
@@ -17583,7 +17755,7 @@ fn decode_inter_block8(
                 reach,
                 &vec![0i32; SIDE * SIDE],
                 None,
-                None,
+                filter_intra,
                 false,
             );
             u.reconstruct(
@@ -17633,7 +17805,7 @@ fn decode_inter_block8(
                 TX8,
                 base_q_idx,
                 None,
-                None,
+                filter_intra,
                 None,
                 false,
             )?;
@@ -17802,6 +17974,10 @@ pub fn decode_inter_frame_tile(
         false,
         false,
         DeltaParams::default(),
+        // `enable_filter_intra`: this crate's own encoder never writes the
+        // sequence bit (`encode.rs`), so no intra-in-inter block of a stream
+        // reaching this entry point reads a `use_filter_intra` symbol.
+        false,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -17885,8 +18061,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // same contract as [`decode_key_frame_tile_with_cdfs`]'s own `delta`
     // param -- only `q_present`/`q_res` are read.
     delta: DeltaParams,
+    // lane-fiinter r1: this sequence header's own `enable_filter_intra` bit
+    // (spec 5.5.2), stashed in a thread-local with `tx_select` rather than
+    // threaded through `decode_inter_block`'s fifty parameters -- read by the
+    // intra-in-inter arms' `read_filter_intra_mode_info`.
+    enable_filter_intra: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
-    set_inter_tx_mode(tx_select, reduced_tx_set);
+    set_inter_tx_mode(tx_select, reduced_tx_set, enable_filter_intra);
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
         order_hint_bits,
