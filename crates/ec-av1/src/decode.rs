@@ -22002,6 +22002,17 @@ fn decode_inter_block8(
             skip,
         )?
         .1;
+        // lane-leaf8tx r1: the per-TU loop below is written and decodes the
+        // 8-bit arm's 150 split leaves pixel-exact, but a 10-bit stream
+        // (`EC_LEAF8TX_CONTROL=tx8`, seed 68, cq 19) still mismatches from
+        // the split leaf onwards (luma 1140 samples from (160, 96)), so the
+        // refusal stays until a gate is green -- no lift without one.
+        if intra_leaves.is_some() {
+            return Err(unsupported(
+                "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 \
+                 transform units",
+            ));
+        }
         split8 = intra_leaves.is_some();
         let reach = Reach::of(SIDE, px, py, y.width, y.height);
         if let Some(leaves) = intra_leaves {
