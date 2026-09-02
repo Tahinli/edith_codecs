@@ -119,6 +119,16 @@ pub(crate) enum TxbSet {
     /// [`LumaRect32x16`](TxbSet::LumaRect32x16) has none).
     LumaRect32x8,
     LumaRect32x16,
+    /// lane-inter4 r2: [`LumaRect32x16`](TxbSet::LumaRect32x16)'s INTER twin --
+    /// same coefficient tables (`get_txsize_entropy_ctx` reduces TX_32X16 and
+    /// TX_16X32 alike to the 32x32 set, 512-coefficient `eob_pt`), but an
+    /// inter block DOES code a `tx_type` symbol here: `av1_get_ext_tx_set_type`
+    /// with `tx_size_sqr_up == TX_32X32` and `is_inter` returns
+    /// `EXT_TX_SET_DCT_IDTX` (2 symbols), whose CDF is
+    /// `default_inter_ext_tx_cdf[3][txsize_sqr_map[TX_32X16] == TX_16X16]`,
+    /// i.e. exactly [`INTER_TX_TYPE_SET3_16`](crate::cdf::INTER_TX_TYPE_SET3_16)
+    /// -- the same table the square `Luma16Inter` set reads.
+    LumaRect32x16Inter,
     /// The chroma 16x8/8x16 transform under the same strip (lane-rectwire):
     /// [`Chroma16`](TxbSet::Chroma16)'s tables except `eob_pt`, which reads
     /// the true 128-position [`crate::cdf::EOB_PT_128_CHROMA`] instead of
@@ -1662,6 +1672,18 @@ impl Cdfs {
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: None,
                 eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
+            },
+            TxbSet::LumaRect32x16Inter => TxbTables {
+                side: 32,
+                txb_skip: &mut self.txb_skip_luma_32,
+                eob_pt: &mut self.eob_pt_512_luma,
+                eob_extra: &mut self.eob_extra_luma_32,
+                base: &mut self.base_luma_32,
+                base_eob: &mut self.base_eob_luma_32,
+                br: &mut self.br_luma_32,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_16.as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_512_luma_class1),
             },
             TxbSet::LumaRect32x16 => TxbTables {
                 side: 32,
