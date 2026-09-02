@@ -1162,6 +1162,34 @@ pub(crate) fn edge_rect_strip_hits() -> usize {
     EDGE_RECT_STRIP_HITS.with(|c| c.get())
 }
 
+// lane-edgeboth r1: how many partition nodes were coded as the BOTH-AXES-CUT
+// forced split -- libaom `decode_partition` (decodeframe.c):
+// `else if (!has_rows && !has_cols) partition = PARTITION_SPLIT;`, the one
+// straddle case that reads NO symbol at all. Indexed by level:
+// 0 = 16x16, 1 = 32x32, 2 = 64x64, 3 = 128x128; intra and inter share it.
+thread_local! {
+    static EDGE_BOTH_CUT_HITS: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
+}
+
+fn bump_edge_both_cut(level: usize) {
+    EDGE_BOTH_CUT_HITS.with(|c| {
+        let mut v = c.get();
+        v[level] += 1;
+        c.set(v);
+    });
+}
+
+/// Current value of [`EDGE_BOTH_CUT_HITS`] (`[16, 32, 64, 128]` levels).
+pub(crate) fn edge_both_cut_hits() -> [usize; 4] {
+    EDGE_BOTH_CUT_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`EDGE_BOTH_CUT_HITS`] so a gate can measure a per-attempt delta.
+pub(crate) fn reset_edge_both_cut_hits() {
+    EDGE_BOTH_CUT_HITS.with(|c| c.set([0; 4]));
+}
+
 // How many HORZ/VERT intra strips resolved a SPLIT luma transform
 // (`tx_depth != 0`) and decoded it per transform unit (lane-rectsplit r1) --
 // the case every rect path here refused by name before, and the first
@@ -13095,6 +13123,7 @@ fn read_sb128_root(
             }
             _ => {
                 PART128_GATHERED_SYMBOLS.with(|c| c.set(c.get() - 1));
+                bump_edge_both_cut(3);
                 PARTITION_SPLIT
             }
         }
@@ -13432,7 +13461,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         bump_edge_part(b.min(1) as usize);
                         if b == 1 { PARTITION_SPLIT } else { PARTITION_VERT }
                     }
-                    _ => PARTITION_SPLIT,
+                    _ => {
+                        bump_edge_both_cut(2);
+                        PARTITION_SPLIT
+                    }
                 }
             };
             match part {
@@ -13508,7 +13540,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     bump_edge_part(2 + b.min(1) as usize);
                                     if b == 1 { PARTITION_SPLIT } else { PARTITION_VERT }
                                 }
-                                _ => PARTITION_SPLIT,
+                                _ => {
+                                    bump_edge_both_cut(1);
+                                    PARTITION_SPLIT
+                                }
                             }
                         };
                         match part32 {
@@ -13964,13 +13999,23 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     // leaf never itself straddles, so the
                                     // block splits cleanly along whichever
                                     // axis is short.
+                                    // lane-edgeboth r1: when the true frame
+                                    // edge cuts BOTH axes libaom's
+                                    // `decode_partition` takes
+                                    // `else if (!has_rows && !has_cols)
+                                    // partition = PARTITION_SPLIT;` -- no
+                                    // symbol of any kind is read, and the four
+                                    // 8x8 children are then visited by the
+                                    // same loop below, whose
+                                    // `mr < mi_rows && mc < mi_cols` filter IS
+                                    // libaom's own
+                                    // `if (mi_row >= mi_rows || mi_col >= mi_cols) return;`
+                                    // early return, so the three out-of-frame
+                                    // quadrants get no neighbour or tx-grid
+                                    // write.
                                     if !has_cols16 && !has_rows16 {
-                                        return Err(unsupported(
-                                            "a 16x16 block whose true edge cuts through both \
-                                             axes needs a rectangular transform this decoder \
-                                             does not code yet",
-                                        ));
-                                    }
+                                        bump_edge_both_cut(0);
+                                    } else {
                                     // lane-golomb r1 (class
                                     // `parsed-then-discarded`): the gathered
                                     // bit IS the partition -- 0 names
@@ -14032,6 +14077,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         neighbours.above_mode[sc] = mode;
                                         neighbours.left_mode[sr] = mode;
                                         continue;
+                                    }
                                     }
                                     let (mi_row0, mi_col0) =
                                         (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
@@ -21181,7 +21227,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         PARTITION_VERT
                     }
                 }
-                (false, false) => PARTITION_SPLIT,
+                (false, false) => {
+                    bump_edge_both_cut(2);
+                    PARTITION_SPLIT
+                }
             };
             if part64 == PARTITION_NONE {
                 // lane-inter8 r1: the whole superblock as one 64x64 inter
@@ -21366,7 +21415,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 PARTITION_VERT
                             }
                         }
-                        _ => PARTITION_SPLIT,
+                        _ => {
+                            bump_edge_both_cut(1);
+                            PARTITION_SPLIT
+                        }
                     }
                 };
                 match part32 {
@@ -21431,13 +21483,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
                                 has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
                             );
-                            if !has_cols16 && !has_rows16 {
-                                return Err(unsupported(
-                                    "a 16x16 inter block whose true edge cuts through both \
-                                     axes needs a rectangular transform this decoder does \
-                                     not code yet",
-                                ));
-                            }
                             let at16 = (sr, sc);
                             let ctx16 = neighbours.partition_ctx(at16, SUB);
                             // lane-inter8 r1: a straddling 16x16 cannot name a
@@ -21457,6 +21502,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     );
                                 }
                                 p
+                            } else if !has_cols16 && !has_rows16 {
+                                // lane-edgeboth r1: both axes cut by the true
+                                // frame edge -- libaom `decode_partition`
+                                // forces PARTITION_SPLIT and reads NO symbol;
+                                // the leaf loop below already drops the
+                                // out-of-frame quadrants.
+                                bump_edge_both_cut(0);
+                                PARTITION_SPLIT
                             } else {
                                 if has_cols16 {
                                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
