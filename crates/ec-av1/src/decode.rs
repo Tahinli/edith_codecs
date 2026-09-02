@@ -88,6 +88,14 @@ pub(crate) fn sb_mi_cur() -> u32 {
 thread_local! {
     static PART128_SYMBOLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PART128_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PART128_GATHERED_SYMBOLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of `PART128_GATHERED_SYMBOLS`: 128 roots that read the
+/// half-out-of-frame gathered split_or_horz/split_or_vert symbol (spec
+/// 5.11.4), which this decoder used to read and throw away.
+pub(crate) fn part128_gathered_symbols() -> usize {
+    PART128_GATHERED_SYMBOLS.with(|c| c.get())
 }
 
 /// Current value of [`PART128_SYMBOLS`].
@@ -11778,16 +11786,33 @@ fn read_sb128_root(
         }
         p
     } else {
+        // lane-sb128 r4: the gathered half-out-of-frame reads DECIDE the
+        // partition, they are not a forced split -- exactly the discarded-bit
+        // defect the 64 root carries a comment about at `partition_w64`'s
+        // gathered arm. Value 1 is SPLIT; 0 is HORZ (rows out of frame) or
+        // VERT (cols out of frame), which the refusal below then names
+        // instead of silently reconstructing a split.
+        PART128_GATHERED_SYMBOLS.with(|c| c.set(c.get() + 1));
         match (has_cols128, has_rows128) {
             (true, false) => {
-                dec.symbol_fixed(&gather_of(&cdfs.partition_w128[ctx128], &VERT_ALIKE128));
+                if dec.symbol_fixed(&gather_of(&cdfs.partition_w128[ctx128], &VERT_ALIKE128)) == 1 {
+                    PARTITION_SPLIT
+                } else {
+                    PARTITION_HORZ
+                }
             }
             (false, true) => {
-                dec.symbol_fixed(&gather_of(&cdfs.partition_w128[ctx128], &HORZ_ALIKE128));
+                if dec.symbol_fixed(&gather_of(&cdfs.partition_w128[ctx128], &HORZ_ALIKE128)) == 1 {
+                    PARTITION_SPLIT
+                } else {
+                    PARTITION_VERT
+                }
             }
-            _ => {}
+            _ => {
+                PART128_GATHERED_SYMBOLS.with(|c| c.set(c.get() - 1));
+                PARTITION_SPLIT
+            }
         }
-        PARTITION_SPLIT
     };
     if part128 != PARTITION_SPLIT {
         return Err(unsupported(
