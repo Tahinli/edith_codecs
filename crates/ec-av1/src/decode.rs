@@ -956,6 +956,31 @@ pub(crate) fn filter_intra_rect_hits() -> usize {
     FILTER_INTRA_RECT_HITS.with(|c| c.get())
 }
 
+// As [`FILTER_INTRA_RECT_HITS`], counting only the 32x32-level 1:4 strips
+// (32x8/8x32, lane-fi32x8 r1) -- the shapes whose `use_filter_intra` symbol
+// was never read at all before that round, so a gate needs to prove the flag
+// fired at THAT shape and not at a 16x8 one somewhere else in the frame.
+// Split by ORIENTATION: rows 8 (32x8) and 9 (8x32) of `cdf::FILTER_INTRA`
+// carry different probabilities (18101 vs 20229), so a transposed pair is
+// only caught by a gate that sees the flag fire on BOTH shapes (class
+// scan-weights-cross-axis).
+thread_local! {
+    static FILTER_INTRA_RECT4_HORZ_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static FILTER_INTRA_RECT4_VERT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FILTER_INTRA_RECT4_HORZ_HITS`] (32x8 strips).
+pub(crate) fn filter_intra_rect4_horz_hits() -> usize {
+    FILTER_INTRA_RECT4_HORZ_HITS.with(|c| c.get())
+}
+
+/// Current value of [`FILTER_INTRA_RECT4_VERT_HITS`] (8x32 strips).
+pub(crate) fn filter_intra_rect4_vert_hits() -> usize {
+    FILTER_INTRA_RECT4_VERT_HITS.with(|c| c.get())
+}
+
 // As [`FILTER_INTRA_RECT_HITS`], counting only the strips BELOW 16x16
 // (8x16/16x8 leaves of a 16x16 HORZ/VERT partition, lane-fistrip r1) -- the
 // shapes whose `use_filter_intra` symbol had no CDF class before this round.
@@ -4300,6 +4325,14 @@ fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
         // identical mode/uv_mode values, range 34808 vs the oracle's 40668).
         (16, 8) => Some(6),
         (8, 16) => Some(7),
+        // lane-fi32x8 r1: same bound, the 32x32-level 1:4 pair
+        // (`decode_block_rect4`'s 32x8/8x32 strips). `None` here read no
+        // `use_filter_intra` symbol on those strips although aomenc writes
+        // one for every DC_PRED block of that shape with
+        // `--enable-filter-intra=1` (its default), silently desyncing the
+        // tile (class symbol-consumption-gap).
+        (32, 8) => Some(8),
+        (8, 32) => Some(9),
         _ if bw == bh => filter_intra_size_class(bw),
         _ => None,
     }
@@ -5887,6 +5920,11 @@ fn decode_block_rect4(
         neighbours.smooth_uv_neighbour(r * (SUB / MI), c * (SUB / MI), r, c);
     if filter_intra.is_some() {
         FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
+        if bw > bh {
+            FILTER_INTRA_RECT4_HORZ_HITS.with(|c| c.set(c.get() + 1));
+        } else {
+            FILTER_INTRA_RECT4_VERT_HITS.with(|c| c.set(c.get() + 1));
+        }
     }
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
@@ -19004,7 +19042,6 @@ mod tests {
             "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)";
         const PART16: &str = "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes \
              only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)";
-        const PART32: &str = "a 32x32 partition type this decoder does not code (value={part32})";
         let libaom: &[(usize, usize, u16, Option<&str>)] = &[
             (4, 4, 4621, None),
             (4, 8, 6743, Some(BELOW_8X8)),
@@ -19017,12 +19054,15 @@ mod tests {
             (32, 16, 12756, None),
             (32, 32, 22343, None),
             // The 1:4 strips: a 16x16-level PARTITION_HORZ_4/VERT_4 gives
-            // 4x16/16x4, a 32x32-level one 8x32/32x8, and both partition
-            // values refuse by name before any leaf is coded.
+            // 4x16/16x4 (still refused by name before any leaf is coded),
+            // a 32x32-level one 8x32/32x8.
             (4, 16, 12770, Some(PART16)),
             (16, 4, 10368, Some(PART16)),
-            (8, 32, 20229, Some(PART32)),
-            (32, 8, 18101, Some(PART32)),
+            // lane-fi32x8 r1: the 32-level pair is coded (four 32x8/8x32
+            // strips per `PARTITION_HORZ_4`/`VERT_4`) and now owns classes
+            // 8/9; only the 16-level pair is still refused before any leaf.
+            (8, 32, 20229, None),
+            (32, 8, 18101, None),
         ];
         let mut classes_seen = std::collections::BTreeSet::new();
         for &(bw, bh, default, refused_by) in libaom {
