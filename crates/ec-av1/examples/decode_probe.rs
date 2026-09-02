@@ -43,6 +43,7 @@ fn main() {
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
+        println!("interintra_rect: {}", ec_av1::decode::interintra_rect_hits());
         let (h84, h48) = ec_av1::decode::sub8_inter_rect_hits();
         println!("sub8_inter_rect: horz8x4={h84} vert4x8={h48}");
         let si = ec_av1::stream::sub8_intra_rect_hits();
