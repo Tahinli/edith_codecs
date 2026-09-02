@@ -3680,6 +3680,17 @@ fn read_coeffs(
             let mut sent = 0;
             loop {
                 let k = dec.symbol(&mut coding.br[ctx]) as i32;
+                if ec_trace_coeff {
+                    // lane-leaf8tx r3: the `br` rung was missing from THIS
+                    // path's trace, so the cross-decoder range ladder was
+                    // blind to every base-range symbol and mis-reported the
+                    // first divergence (class [[gate-blind-to-feature]]).
+                    let (rng, _) = dec.debug_state();
+                    let apos = col * side + row;
+                    eprintln!(
+                        "EC_COEFF_STEP tag=br c={scan_idx} pos={apos} ctx={ctx} k={k} rng={rng}"
+                    );
+                }
                 if trace {
                     eprintln!(
                         "TRACE br scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={k}"
@@ -11929,10 +11940,16 @@ fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usiz
     let has_left = mi_c > n.tile_col0_mi;
     let mut above = usize::from(n.above_txfm[mi_c]) >= side;
     let mut left = usize::from(n.left_txfm[mi_r]) >= side;
-    if has_above && n.above_inter[mi_c / (SUB / MI)] {
+    // lane-leaf8tx r3: `above_inter`/`left_inter` are per-MI bands (written
+    // by `record_inter` as `[c + cell]`, read everywhere else as `[cmi]`),
+    // so dividing the mi index by `SUB / MI` read a column four mi to the
+    // left -- an intra neighbour whose tx_depth split to 4x4 then read as an
+    // inter neighbour contributing its 8-px BLOCK size, flipping this ctx
+    // 1 -> 2 and adapting the wrong `tx_size_cat0` row.
+    if has_above && n.above_inter[mi_c] {
         above = n.above_side_mi[mi_c] >= side;
     }
-    if has_left && n.left_inter[mi_r / (SUB / MI)] {
+    if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= side;
     }
     match (has_above, has_left) {
