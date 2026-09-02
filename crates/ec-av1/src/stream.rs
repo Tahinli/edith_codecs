@@ -76,6 +76,17 @@ pub fn rect4_32_counters() -> (usize, usize, usize) {
     )
 }
 
+/// lane-inter4 r4: rectangular inter transform units coded whole, rect
+/// var-tx trees that split, and OBMC blends run on a 16x8/8x16 leaf -- the
+/// three counters a recipe sweep needs to see from outside the crate.
+pub fn rect_inter_tu_counters() -> (usize, usize, usize) {
+    (
+        crate::decode::rect_inter_tu_hits(),
+        crate::decode::rect_inter_txsplit_hits(),
+        crate::decode::obmc_rect_leaf_hits(),
+    )
+}
+
 /// Decode every frame in a raw AV1 OBU stream, in coding order.
 ///
 /// A key frame becomes the reference for the inter frames that follow it,
@@ -5097,6 +5108,15 @@ mod tests {
                 (0u32, 0u32, 0u32, 0u32);
             let (mut tu_proved, mut split_proved) = (0usize, 0usize);
             let (mut horz_proved, mut vert_proved, mut sub16_split) = (0u32, 0u32, 0usize);
+            // lane-inter4 r4, measured residue of this recipe family (sweep
+            // over cq {8,12,16,22} x {both axes} x both depths, tx-size-search
+            // on, via `decode_probe`'s `rect_inter:` counters): the rect
+            // var-tx SPLIT arm never fires (txsplit=0 everywhere) and a 10-bit
+            // rect leaf is always `skip` (tu=0 at every cq that decodes) --
+            // below cq 22 every attempt stops at another lane's intra refusal
+            // ("a HORZ/VERT intra strip below 16x16 with a split transform").
+            // Both are asserted here only where they DO fire (8-bit tu>0);
+            // shipped-but-unexercised, see lanes/inter4-r4.report.md.
             // lane-inter4 r4: attempts 16..32 repeat the same sweep with
             // `--enable-obmc=1`. r3 refused OBMC on this shape; r4's
             // instrumented-aomdec comparison showed the neighbour list AND

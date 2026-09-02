@@ -5221,7 +5221,6 @@ pub const EOB_PT_16_CHROMA_CLASS1_Q1: [u16; 6] = [2497, 4096, 8866, 16993, 32768
 pub const EOB_PT_16_CHROMA_CLASS1: [u16; 6] = [3192, 5032, 10297, 19755, 32768, 0];
 pub const EOB_PT_16_CHROMA_CLASS1_Q3: [u16; 6] = [7297, 10767, 19273, 28194, 32768, 0];
 
-/// `EOB_PT_128_CHROMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][1][1]`).
 /// `EOB_PT_128_LUMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][0][1]`,
 /// token_cdfs.h:830-848) -- the `TX_CLASS_HORIZ`/`TX_CLASS_VERT` (`V_DCT`/
 /// `H_DCT`) eob group of a 128-position LUMA transform, i.e. a true 16x8/8x16
@@ -5247,6 +5246,7 @@ pub const EOB_PT_32_CHROMA_CLASS1: [u16; 7] = [3542, 5502, 10415, 16760, 25644, 
 /// [`EOB_PT_32_CHROMA_CLASS1_Q0`]'s q-context 3 sibling.
 pub const EOB_PT_32_CHROMA_CLASS1_Q3: [u16; 7] = [7699, 10897, 20891, 26926, 31628, 32768, 0];
 
+/// `EOB_PT_128_CHROMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][1][1]`).
 pub const EOB_PT_128_CHROMA_CLASS1_Q0: [u16; 9] = [2054, 3472, 5869, 14232, 18242, 20590, 26752, 32768, 0];
 pub const EOB_PT_128_CHROMA_CLASS1_Q1: [u16; 9] = [2310, 4160, 7471, 14997, 17931, 20768, 30240, 32768, 0];
 pub const EOB_PT_128_CHROMA_CLASS1: [u16; 9] = [6275, 9889, 14769, 23164, 27988, 30493, 32272, 32768, 0];
