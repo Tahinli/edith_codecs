@@ -26,11 +26,11 @@
 const CAPABILITY_CLAIMS: &[&str] = &[
     "filter intra on a superblock-level HORZ/VERT strip (never expected -- av1_filter_intra_allowed_bsize caps at 32x32)",
     "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
-    "a nonzero angle delta (this encoder never writes one)",
 ];
 
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
+    "a nonzero angle delta on an 8x8 intra leaf in an inter frame (no gate reaches this leaf with one; the >=16x16 arm decodes deltas)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
