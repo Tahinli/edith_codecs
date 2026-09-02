@@ -69,6 +69,9 @@ EVIDENCE: /home/tahinli/.cache/cdef-strad2-r2.log | `cargo test -p ec-av1 --lib 
 Sibling gate (same tables/paths -- `apply_cdef`, the skip band, `fill_skip_grid`):
 EVIDENCE: /home/tahinli/.cache/cdef-sib-r2.log | `cargo test -p ec-av1 --lib -- --nocapture cdef_and_sub16` | a_real_aomenc_stream_with_cdef_and_sub16_inter_leaves_decodes_pixel_exact ok, 1 passed / 0 failed
 
+## Suite
+EVIDENCE: /home/tahinli/.cache/cdef-suite-r2.log | `systemd-run --user --unit=cdef-suite-r2-... -p MemoryMax=10G ... cargo test -p ec-av1 --lib -j3` on `646f2d3`'s tree | **386 passed, 0 failed, 34 ignored** in 1009.29s (r1's tree had 385/0/35 -- one test moved out of `ignored` and into `passed`: this round's un-ignored straddling gate)
+
 ## Refusals
 None lifted this round, so `refusal_inventory.rs` is unchanged. `gate_coverage.rs` needs no entry
 either: its derivation deliberately excludes `--tile-columns` (see its header comment) and this
