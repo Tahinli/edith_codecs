@@ -34,7 +34,6 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
-    "GLOBALMV (round 3)",
     "a coded (non-skip) HORZ_B/VERT_B rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a coded (non-skip) HORZ/VERT rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
@@ -44,10 +43,9 @@ const REFUSALS: &[&str] = &[
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
     "a Golomb tail longer than this decoder reads",
-    "a superblock-level HORZ/VERT strip with a split transform (per-unit rect prediction is not ported)",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
-    "a superblock-level 1:4 partition (PARTITION_HORZ_4/VERT_4 at 64x64, four 64x16/16x64 strips)",
+    "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
     "a palette block on a HORZ/VERT intra strip below 16x16 (reconstruction not ported)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
@@ -59,14 +57,11 @@ const REFUSALS: &[&str] = &[
     "a frame with no mode-info grid",
     "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
-    "a reference frame other than LAST_FRAME (round 2)",
     "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
     "a reference picture whose height does not match this frame's own true size",
     "a show_existing_frame header naming an empty reference slot",
-    "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): av1_find_projection/the affine warp filter are not ported, only motion_mode_allowed's alphabet choice is",
     "an inter var-tx tree with a leaf transform larger than 32x32",
     "an intra block in an inter frame whose tx_depth splits its luma transform (round 1)",
-    "an inter frame whose global motion for a single-reference frame is AFFINE (unverified this round; ROTZOOM/TRANSLATION/IDENTITY are proven)",
     "an inter frame with no key frame before it",
     "an inter SB-level partition type other than NONE or SPLIT (this decoder's inter tile path recurses a superblock only as SPLIT)",
     "a masked compound 64x64 inter block (compound_type is inferred, not coded, at this size)",
@@ -74,8 +69,7 @@ const REFUSALS: &[&str] = &[
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
     "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
-    "a compound-reference block with a scaled reference (superres, unimplemented)",
-    "warp/OBMC/interintra prediction with a scaled reference (superres, unimplemented)",
+    "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
 ];
 
