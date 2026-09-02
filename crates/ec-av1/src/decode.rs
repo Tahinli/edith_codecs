@@ -2318,6 +2318,24 @@ pub(crate) fn intra_rect_strip_in_inter_hits(class: usize) -> usize {
     INTRA_RECT_IN_INTER_HITS.with(|c| c.get()[class])
 }
 
+// lane-rect64port r1 (ported by hand from lane-intra64split 5ffbaf3): coded
+// (non-skip) 64-level HORZ/VERT intra strips whose luma transform is the
+// un-split TX_64X32/TX_32X64 -- the corner-cropped 32x32 coefficient read of
+// [`decode_rect_split`], the shape both 10-bit 3840x1608 film cuts stop on.
+// Split by ORIENTATION (index 0 = 64x32 wide / HORZ, 1 = 32x64 tall / VERT):
+// a single counter cannot tell an axis swap from a working arm
+// (class [[scan-weights-cross-axis]]), so the gate asserts both cells.
+thread_local! {
+    static RECT64_CORNER_TU_HITS: std::cell::Cell<[usize; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+}
+
+/// Current value of [`RECT64_CORNER_TU_HITS`] for one orientation
+/// (0 = 64x32, 1 = 32x64).
+pub(crate) fn rect64_corner_tu_hits(orient: usize) -> usize {
+    RECT64_CORNER_TU_HITS.with(|c| c.get()[orient])
+}
+
 // lane-intrasplit r1: intra HORZ/VERT strips inside an INTER frame whose luma
 // transform is SPLIT, bucketed by the read `tx_depth` (index 1 and 2; index 0
 // is never incremented) -- the gate's proof that the lifted path ran per depth.
@@ -6817,6 +6835,21 @@ fn decode_rect_split(
         )),
         (32, 16) => Some((TxbSet::LumaRect32x16, &SCAN_32X16[..])),
         (16, 32) => Some((TxbSet::LumaRect32x16, &SCAN_16X32[..])),
+        // lane-rect64port r1: the un-split TX_64X32/TX_32X64 of a 64-level
+        // strip, read through the `luma_64corner` arm below instead of a rect
+        // table -- a 64-length axis codes only its low 32 coefficients
+        // (`av1_get_max_eob` / the zero-out of `av1_get_adjusted_tx_size`), so
+        // the coded unit is the 32x32 corner [`decode_block_rect64`]'s own
+        // depth-0 arm already reads on the key-frame path.
+        //
+        // NO WITNESS YET (r1, measured): on both 10-bit 3840x1608 film cuts
+        // this arm fires (16x 64x32 + 2x 32x64 / 2x 32x64) but the SAME frame
+        // then stops at "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
+        // rectangular residual coding", so no frame containing it ever
+        // finishes and no pixel comparison is possible. A refusal is lifted
+        // only with a gate (COMMON charter), so the arm stays behind
+        // `EC_RECT64_SPLIT=1` and the refusal below is still the default.
+        (64, 32) | (32, 64) if std::env::var_os("EC_RECT64_SPLIT").is_some() => None,
         _ => {
             return Err(unsupported(format!(
                 "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma \
@@ -6824,6 +6857,8 @@ fn decode_rect_split(
             )))
         }
     };
+    // The `None` above that is NOT the square arm.
+    let luma_64corner = tx_w != tx_h;
     // lane-rectsplitx r1, MEASURED: the SQUARE-unit walk below is pixel-exact
     // on a real stream (the pinned 16x8 filter-intra fixture decodes its whole
     // frame exactly, two sub-16 split strips in it), but the RECT-unit arm --
@@ -6893,6 +6928,64 @@ fn decode_rect_split(
                     m.smooth_neighbor,
                 );
                 neighbours.record_mi_luma_rect(tu_mi, tx_w, tx_h, &zero_tu);
+            } else if luma_64corner && luma_rect.is_none() {
+                // The un-split 64-level luma transform: `read_coeffs` on the
+                // 32x32 CDF set [`TxbSet::Luma64`] with `default_scan(TX32)`
+                // and the real rect shape passed through for
+                // `av1_nz_map_ctx_offset` -- byte for byte
+                // [`decode_block_rect64`]'s depth-0 read, which the key-frame
+                // 64-level strip gate already proves. `tx_type` is not coded
+                // (`av1_get_ext_tx_set_type` resolves EXT_TX_SET_DCTONLY once
+                // the square-up size is TX_64X64), and this unit covers its
+                // whole block, so `get_txb_ctx` gives txb_skip ctx 0 flat.
+                if std::env::var_os("EC_RECT64TU").is_some() {
+                    eprintln!("EC_RECT64TU mi={tu_mi:?} tx={tx_w}x{tx_h} mode={}", m.mode);
+                }
+                RECT64_CORNER_TU_HITS.with(|c| {
+                    let mut v = c.get();
+                    v[usize::from(tx_h > tx_w)] += 1;
+                    c.set(v);
+                });
+                let tu_around = neighbours.around_mi_rect(tu_mi, tx_w, tx_h)[0];
+                let mut coding = cdfs.txb(TxbSet::Luma64, fi_tx_row(m.mode, m.filter_intra));
+                let (corner, tu_tx_type) = read_coeffs(
+                    dec,
+                    &mut coding,
+                    &default_scan(TX32),
+                    0,
+                    dc_sign_ctx(tu_around.2),
+                    TxType::DctDct,
+                    Some((tx_w, tx_h)),
+                )?;
+                let (cw, ch) = (tx_w.min(TX32), tx_h.min(TX32));
+                let mut tu_grid = vec![0i32; tx_w * tx_h];
+                for row in 0..ch {
+                    tu_grid[row * tx_w..][..cw].copy_from_slice(&corner[row * cw..][..cw]);
+                }
+                let residual = dequant_and_inverse_typed_wh(
+                    &tu_grid,
+                    tx_w,
+                    tx_h,
+                    crate::decode::bit_depth(),
+                    block_q_idx(),
+                    plane_q_delta(0).0,
+                    plane_q_delta(0).1,
+                    tu_tx_type,
+                );
+                y.reconstruct_rect(
+                    tu_px,
+                    tu_py,
+                    tx_w,
+                    tx_h,
+                    m.mode,
+                    m.angle_delta_y,
+                    tu_reach,
+                    &residual,
+                    None,
+                    m.filter_intra,
+                    m.smooth_neighbor,
+                );
+                neighbours.record_mi_luma_rect(tu_mi, tx_w, tx_h, &tu_grid);
             } else if let Some((rect_set, rect_scan)) = luma_rect {
                 // The rect-unit twin of the square arm below: same contexts,
                 // same order, through the rect coefficient reader. The
