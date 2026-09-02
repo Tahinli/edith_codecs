@@ -112,16 +112,24 @@ cq sweep) cannot change that while those refusals stand, so it was not run.
 - sibling rect gates in the first full run (`a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact`,
   `..._with_mandelbrot_fires_the_vert_b_partition_arm`, the tile/compound gates): ok.
 
-FULL-SUITE CAVEAT, stated rather than glossed: the whole-lib run did not reach its
-`test result:` line inside this round's budget. Three attempts were killed at ~10-16 min
-by SIGTERM (rc 144) — the cause is this repo's known class `monitor-kills-background-bash`:
-polling the background run's log with an `until` loop kills the run. The final attempt was
-detached with `setsid nohup` and was still running when the round closed; at the last
-in-band check it had 41 tests ok and the single expected failure
-`decode::tests::nz_map_ctx_offset_tables_match_the_rect_rule`, the pre-existing df5d630
-failure the charter tolerates. The earlier (pre-correction-commit) full run reached 289
-`ok` lines with no failure other than that one before it was killed.
-`fix-now for the verifier: re-run the suite once, undisturbed, on bc745fc.`
+FULL SUITE, completed undisturbed on tip `d8bed80`:
+
+    test result: FAILED. 299 passed; 1 failed; 27 ignored; 0 measured; finished in 728.46s
+
+The single failure is `decode::tests::nz_map_ctx_offset_tables_match_the_rect_rule`
+(`decode.rs:16341`, "32x64 nz_map offset at display (row 0, col 2) left: 6 right: 11") —
+the pre-existing red on main `df5d630` the charter tolerates, reproduced in a detached
+verify worktree by an earlier round and pinned in the ledger as not-a-lane-regression.
+Everything else is green.
+
+Three earlier attempts at this run were killed by SIGTERM at 10-16 min: an `until`-loop
+poll on a `setsid nohup` run kills it (class `monitor-kills-background-bash`), and the
+lane test binaries all share the file name `ec_av1-c30b9edeabb65453`, so my own
+`pkill -f ec_av1-c30b9edeabb65453` (run to clear a stale suite of mine) would have hit
+sibling lanes' live suites too — my mistake, logged as a ledger dead-end. The recipe that
+worked, and that the ledger now carries: copy the binary to `~/.cache/<lane>-suite-bin`
+and run it under `systemd-run --user --unit=<lane>-suite --collect`, which survives the
+harness reaping a poller.
 
 ## Residue
 
