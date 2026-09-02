@@ -310,10 +310,12 @@ fn maybe_read_delta_q(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_
     if mi_r % sb_mi != 0 || mi_c % sb_mi != 0 {
         return;
     }
-    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag, which
-    // it computes against the 64x64 root; under a 128 superblock no leaf this
-    // decoder codes can be the whole superblock (the root is always SPLIT).
-    if is_whole_sb && !sb128() && skip {
+    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag,
+    // computed against the sequence's own superblock size (lane-sb128b r1:
+    // it used to be hardcoded against 64 and disabled under `sb128`, which a
+    // `PARTITION_NONE` 128x128 root -- itself the whole superblock -- makes
+    // wrong).
+    if is_whole_sb && skip {
         return;
     }
     let mut abs = dec.symbol(&mut cdfs.delta_q) as i32;
@@ -369,10 +371,12 @@ fn maybe_read_delta_lf(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi
     if mi_r % sb_mi != 0 || mi_c % sb_mi != 0 {
         return;
     }
-    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag, which
-    // it computes against the 64x64 root; under a 128 superblock no leaf this
-    // decoder codes can be the whole superblock (the root is always SPLIT).
-    if is_whole_sb && !sb128() && skip {
+    // `is_whole_sb` is the caller's "this leaf IS the superblock" flag,
+    // computed against the sequence's own superblock size (lane-sb128b r1:
+    // it used to be hardcoded against 64 and disabled under `sb128`, which a
+    // `PARTITION_NONE` 128x128 root -- itself the whole superblock -- makes
+    // wrong).
+    if is_whole_sb && skip {
         return;
     }
     let multi = DELTA_LF_MULTI.with(|c| c.get());
@@ -4859,6 +4863,32 @@ impl Neighbours {
         self.record_mi_luma_rect(at_mi, tx_px, tx_px, grid);
     }
 
+    /// [`Self::record_mi_luma`] for ONE CHROMA transform unit of a block whose
+    /// uv plane block is several units (lane-sb128b r2: a 128x128 block's
+    /// 64x64 uv plane block is four TX_32X32 units, `av1_get_max_uv_txsize`).
+    /// `w_px`/`h_px` are the unit's extent in LUMA pixels -- the chroma
+    /// coefficient-context arrays are indexed by luma mi, the convention
+    /// [`Self::record_split_luma_rect_mi`] already writes them in, frame-edge
+    /// clamp included.
+    fn record_mi_chroma(
+        &mut self,
+        (mi_r, mi_c): (usize, usize),
+        w_px: usize,
+        h_px: usize,
+        plane: usize,
+        grid: &[i32],
+    ) {
+        let round_up_even = |n: usize| n.div_ceil(2) * 2;
+        let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
+        let state = neighbour_state(grid);
+        for cell in 0..(h_px / MI).min(bound_h.saturating_sub(mi_r)) {
+            self.left[mi_r + cell][plane] = state;
+        }
+        for cell in 0..(w_px / MI).min(bound_w.saturating_sub(mi_c)) {
+            self.above[mi_c + cell][plane] = state;
+        }
+    }
+
     /// [`Self::record_mi_luma`] for a RECTANGULAR transform unit (lane-rectsplitx
     /// r1): the above context spans the unit's width, the left context its
     /// height, which for a square unit is the same loop it always was.
@@ -8399,8 +8429,12 @@ fn read_intra_mode(
     // `segment_id`, `cdef`, `delta_q` -- `cdef` lands right here.
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
     istep!("cdef", 0);
-    maybe_read_delta_q(dec, cdfs, mi_r, mi_c, side == 64, skip);
-    maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, side == 64, skip);
+    // lane-sb128b r1: "this leaf IS the superblock" is `side == sb_size`, not
+    // a hardcoded 64 -- a `PARTITION_NONE` 128x128 root is the whole
+    // superblock and skips `delta_q` exactly like a 64 one under a 64 root.
+    let whole_sb = side == sb_mi_cur() as usize * 4;
+    maybe_read_delta_q(dec, cdfs, mi_r, mi_c, whole_sb, skip);
+    maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, whole_sb, skip);
     istep!("dq", 0);
     // `read_intrabc_info` (spec 5.11.13, libaom decodemv.c:693, called at
     // :811 right after `skip_txfm`/`segment_id`/`cdef`/`delta_q` and before
@@ -9094,7 +9128,12 @@ fn read_plane(
     let skip_ctx = if plane_idx == 0 {
         luma_skip_ctx.unwrap_or(0)
     } else {
-        usize::from(around.0) + usize::from(around.1)
+        // libaom `get_txb_ctx`: a chroma unit's context is
+        // `combine_entropy_contexts(above, left)` plus 7, or plus 10 when the
+        // plane block is bigger than the transform. Our chroma tables hold the
+        // offset-7 rows first, so the caller adds 3 for the bigger-block case
+        // (only a 128x128 block's TX_32X32 chroma units, lane-sb128b r3).
+        usize::from(around.0) + usize::from(around.1) + luma_skip_ctx.unwrap_or(0)
     };
     // spec 5.11.47/libaom `av1_read_tx_type`: a filter-intra luma block's
     // `intra_ext_tx_cdf` row is indexed by `fimode_to_intradir[filter_intra_mode]`,
@@ -9279,7 +9318,11 @@ fn decode_block(
         let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side, None);
         (resolved, if resolved == 64 { 32 } else { resolved })
     } else {
-        (side, luma_tx)
+        // lane-sb128b r1: `max_txsize_rect_lookup[BLOCK_128X128]` is
+        // TX_64X64, so a 128x128 block is always FOUR luma transform units
+        // even with `tx_select` off -- the TU loop below, never the
+        // single-unit path.
+        (side.min(64), luma_tx)
     };
     if tx_select && logical_tx < side && uv_mode != DC_PRED {
         SQ_CHROMA_TX_HITS.with(|c| c.set(c.get() + 1));
@@ -9384,10 +9427,17 @@ fn decode_block(
         // The palette/intrabc override path keeps the single-call shape (its
         // per-TU windowing is the non-skip loop's own `palette_y_buf` slice,
         // untested for skip and unreachable in these streams).
+        // lane-sb128b r2: a 128x128 block's transform is TX_64X64 even with
+        // `tx_select` off (`max_txsize_rect_lookup[BLOCK_128X128]`), so the
+        // per-unit prediction is keyed on the transform being smaller than
+        // the block, not on the tx-depth syntax. The counter keeps lane-hgkf's
+        // narrower meaning (a READ split tx depth).
         let split_tx_skip =
-            tx_select && logical_tx < side && palette_y_buf.is_none() && intrabc_bufs.is_none();
+            logical_tx < side && palette_y_buf.is_none() && intrabc_bufs.is_none();
         if split_tx_skip {
-            SKIP_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+            if tx_select {
+                SKIP_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+            }
             let n_axis = side / logical_tx;
             for tu_row in 0..n_axis {
                 for tu_col in 0..n_axis {
@@ -9437,41 +9487,62 @@ fn decode_block(
             );
         }
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
-        if let Some((ub, _)) = &palette_uv_bufs {
-            set_palette_pred(ub.clone());
+        let cn = (chroma_side / chroma_tx).max(1);
+        for cu_row in 0..cn {
+            for cu_col in 0..cn {
+                let luma_span = chroma_tx * 2;
+                let cu_r = if cn == 1 {
+                    reach
+                } else {
+                    tu_reach(
+                        side, side,
+                        cu_col * luma_span, cu_row * luma_span, luma_span,
+                        reach, px, py, y.width, y.height,
+                    )
+                };
+                let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx);
+                if let Some((ub, _)) = &palette_uv_bufs {
+                    set_palette_pred(ub.clone());
+                }
+                u.reconstruct(
+                    cu_x,
+                    cu_y,
+                    chroma_tx,
+                    uv_predict_mode,
+                    angle_delta_uv,
+                    cu_r,
+                    &vec![0i32; chroma_tx * chroma_tx],
+                    alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                    None,
+                    smooth_neighbor_uv,
+                );
+                if let Some((_, vb)) = &palette_uv_bufs {
+                    set_palette_pred(vb.clone());
+                }
+                v.reconstruct(
+                    cu_x,
+                    cu_y,
+                    chroma_tx,
+                    uv_predict_mode,
+                    angle_delta_uv,
+                    cu_r,
+                    &vec![0i32; chroma_tx * chroma_tx],
+                    alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                    None,
+                    smooth_neighbor_uv,
+                );
+            }
         }
-        u.reconstruct(
-            cpx,
-            cpy,
-            chroma_side,
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            &vec![0i32; chroma_side * chroma_side],
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
-            None,
-            smooth_neighbor_uv,
-        );
-        if let Some((_, vb)) = &palette_uv_bufs {
-            set_palette_pred(vb.clone());
-        }
-        v.reconstruct(
-            cpx,
-            cpy,
-            chroma_side,
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            &vec![0i32; chroma_side * chroma_side],
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
-            None,
-            smooth_neighbor_uv,
-        );
         let luma_grid = vec![0i32; side * side];
         let u_grid = vec![0i32; chroma_side * chroma_side];
         let v_grid = vec![0i32; chroma_side * chroma_side];
         neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
-    } else if !tx_select || logical_tx == side {
+    } else if logical_tx == side {
+        // lane-sb128b r1: the test used to be `!tx_select || logical_tx == side`.
+        // Without `tx_select` `logical_tx` IS `side` at every size <= 64, so
+        // that arm was redundant -- and wrong at 128, where
+        // `max_txsize_rect_lookup` caps the block's transform at 64 and the
+        // block is four units whether or not `tx_select` is on.
         // A single luma transform unit -- the old path, unchanged (including
         // the 64x64 corner case, `logical_tx == side == 64` with
         // `coeff_tx_side == 32`).
@@ -9564,8 +9635,27 @@ fn decode_block(
         // the earlier tiles in this same block already wrote -- the same
         // per-TU pattern [`decode_leaf8`] already runs for an 8x8 leaf.
         let n_axis = side / logical_tx;
-        for tu_row in 0..n_axis {
-            for tu_col in 0..n_axis {
+        let cn = (chroma_side / chroma_tx).max(1);
+        // libaom's transform-block loop is over 64x64 luma "mu" chunks
+        // (`decode_token_recon_block`: `mu_blocks_wide/high` =
+        // `mi_size_wide[BLOCK_64X64]`), and it codes EVERY PLANE of a chunk
+        // before moving to the next one. Below 128 a block is a single chunk,
+        // so this is byte-for-byte the all-luma-then-all-chroma order that has
+        // always run; at 128 the four quadrants interleave Y,U,V per quadrant
+        // and reading all four luma units first desyncs the tile at the second
+        // one (lane-sb128b r3, measured against aomdec's `EC_TRACE_COEFF`).
+        let nchunk = (side / 64).max(1);
+        // `cn > 1` means the uv plane block is larger than the uv transform,
+        // which moves libaom's chroma `txb_skip_ctx` offset from 7 to 10.
+        let chroma_ctx_offset = if cn > 1 { Some(3) } else { None };
+        let tpc = (n_axis / nchunk).max(1);
+        let cpc = (cn / nchunk).max(1);
+        let mut last_grids = [Vec::new(), Vec::new()];
+        let mut units: Vec<((usize, usize), usize, Vec<i32>, Vec<i32>)> = Vec::new();
+        for ch_row in 0..nchunk {
+        for ch_col in 0..nchunk {
+        for tu_row in ch_row * tpc..(ch_row + 1) * tpc {
+            for tu_col in ch_col * tpc..(ch_col + 1) * tpc {
                 let tu_mi = (
                     mi_r + tu_row * (logical_tx / MI),
                     mi_c + tu_col * (logical_tx / MI),
@@ -9626,7 +9716,11 @@ fn decode_block(
                     tu_px,
                     tu_py,
                     logical_tx,
-                    logical_tx,
+                    // The unit's own COEFFICIENT grid, half its side at
+                    // TX_64X64 (a 64-point transform codes nothing past 32);
+                    // identical to `logical_tx` at every smaller size
+                    // (lane-sb128b r1).
+                    coeff_tx_side,
                     base_q_idx,
                     None,
                     filter_intra,
@@ -9644,59 +9738,81 @@ fn decode_block(
                 neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
             }
         }
+        // CfL is only allowed up to 32x32, i.e. only at `nchunk == 1`, where
+        // this still runs after every luma unit of the block.
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
-        let chroma_around = neighbours.around(at, side);
-        if let Some((ub, _)) = &palette_uv_bufs {
-            set_palette_pred(ub.clone());
+        // The block's uv plane block is `chroma_side` across but its uv
+        // transform is `chroma_tx` (`av1_get_max_uv_txsize` =
+        // `av1_get_adjusted_tx_size(max_txsize_rect_lookup[uv_plane_bsize])`):
+        // identical at every size up to 64x64, but a 128x128 block's 64x64 uv
+        // plane block adjusts TX_64X64 down to TX_32X32, so each plane is
+        // FOUR units (lane-sb128b r2) -- one per mu chunk.
+        for cu_row in ch_row * cpc..(ch_row + 1) * cpc {
+            for cu_col in ch_col * cpc..(ch_col + 1) * cpc {
+                // The chroma context arrays are indexed in LUMA mi, so this
+                // unit's anchor is its own luma quadrant: `chroma_tx` chroma
+                // pixels span `2 * chroma_tx` luma ones.
+                let luma_span = chroma_tx * 2;
+                let cu_mi = (
+                    mi_r + cu_row * (luma_span / MI),
+                    mi_c + cu_col * (luma_span / MI),
+                );
+                let cu_around = neighbours.around_mi(cu_mi, luma_span);
+                let cu_reach = if cn == 1 {
+                    reach
+                } else {
+                    tu_reach(
+                        side, side,
+                        cu_col * luma_span, cu_row * luma_span, luma_span,
+                        reach, px, py, y.width, y.height,
+                    )
+                };
+                let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx);
+                if let Some((ub, _)) = &palette_uv_bufs {
+                    set_palette_pred(ub.clone());
+                }
+                let u_grid = read_plane(
+                    dec, cdfs, chroma_set, scans.1, 1, cu_around[1], mode,
+                    uv_predict_mode, angle_delta_uv, cu_reach, u, cu_x, cu_y,
+                    chroma_tx, chroma_tx, base_q_idx,
+                    alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                    None, chroma_ctx_offset, smooth_neighbor_uv,
+                )?;
+                if let Some((_, vb)) = &palette_uv_bufs {
+                    set_palette_pred(vb.clone());
+                }
+                let v_grid = read_plane(
+                    dec, cdfs, chroma_set, scans.1, 2, cu_around[2], mode,
+                    uv_predict_mode, angle_delta_uv, cu_reach, v, cu_x, cu_y,
+                    chroma_tx, chroma_tx, base_q_idx,
+                    alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                    None, chroma_ctx_offset, smooth_neighbor_uv,
+                )?;
+                if cn > 1 {
+                    CHROMA_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                    // Immediately, so the NEXT unit of this same block reads
+                    // this one's coefficient context (libaom's chroma
+                    // `txb_skip_ctx` for the second quadrant is 11, i.e. base
+                    // 1 from this left neighbour -- measured against aomdec).
+                    // The same writes are replayed after `record_split_luma`
+                    // below, which would otherwise clobber them whole-block.
+                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, 1, &u_grid);
+                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, 2, &v_grid);
+                    units.push((cu_mi, luma_span, u_grid.clone(), v_grid.clone()));
+                }
+                last_grids = [u_grid, v_grid];
+            }
         }
-        let u_grid = read_plane(
-            dec,
-            cdfs,
-            chroma_set,
-            scans.1,
-            1,
-            chroma_around[1],
-            mode,
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            u,
-            cpx,
-            cpy,
-            chroma_side,
-            chroma_tx,
-            base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
-            None,
-            None,
-            smooth_neighbor_uv,
-        )?;
-        if let Some((_, vb)) = &palette_uv_bufs {
-            set_palette_pred(vb.clone());
         }
-        let v_grid = read_plane(
-            dec,
-            cdfs,
-            chroma_set,
-            scans.1,
-            2,
-            chroma_around[2],
-            mode,
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            v,
-            cpx,
-            cpy,
-            chroma_side,
-            chroma_tx,
-            base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
-            None,
-            None,
-            smooth_neighbor_uv,
-        )?;
-        neighbours.record_split_luma(at, side, mode, uv_predict_mode, [&u_grid, &v_grid]);
+        }
+        // Mode/side bookkeeping plus, at `cn == 1`, the whole-plane chroma
+        // context write; at `cn > 1` the per-unit writes above are what the
+        // next block reads, so they run after this (last writer wins).
+        neighbours.record_split_luma(at, side, mode, uv_predict_mode, [&last_grids[0], &last_grids[1]]);
+        for (cu_mi, luma_span, u_grid, v_grid) in &units {
+            neighbours.record_mi_chroma(*cu_mi, *luma_span, *luma_span, 1, u_grid);
+            neighbours.record_mi_chroma(*cu_mi, *luma_span, *luma_span, 2, v_grid);
+        }
     }
     // Unconditional, `size == 0` for a non-palette block: clears any stale
     // neighbour palette state the same way [`Neighbours::record`] always
@@ -11103,8 +11219,14 @@ fn read_tx_size(
     // key-frame path's own deblock-grid approximation.
     ctx_override: Option<usize>,
 ) -> usize {
-    let ctx = ctx_override.unwrap_or_else(|| tx_size_context(n, at_mi, side));
-    let depth = match side {
+    // `max_txsize_rect_lookup[bsize]` (libaom `read_selected_tx_size` /
+    // `get_tx_size_context`): a block wider than 64 still tops out at
+    // TX_64X64, so BLOCK_128X128 reads BLOCK_64X64's own category (its depth
+    // chain 64->32->16->8->4 is the same four steps) and resolves against 64,
+    // never against its own 128 side (lane-sb128b r1).
+    let max_tx = side.min(64);
+    let ctx = ctx_override.unwrap_or_else(|| tx_size_context(n, at_mi, max_tx));
+    let depth = match max_tx {
         8 => {
             dec.symbol(&mut cdfs.tx_size_cat0[ctx])
         }
@@ -11117,7 +11239,7 @@ fn read_tx_size(
         64 => {
             dec.symbol(&mut cdfs.tx_size_cat3[ctx])
         }
-        _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64"),
+        _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64/128"),
     };
     if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
         let (rng, _) = dec.debug_state();
@@ -11129,7 +11251,7 @@ fn read_tx_size(
     if depth != 0 {
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
     }
-    side >> depth
+    max_tx >> depth
 }
 
 /// `txfm_partition_context` (libaom `av1_common_int.h`): an inter block's
@@ -12736,6 +12858,29 @@ fn sb_visit_order(r0: u32, r1: u32, c0: u32, c1: u32, sb128: bool) -> Vec<(u32, 
 /// decides the root -- only SPLIT recurses into the four 64x64 quadrants this
 /// decoder codes, the other seven arms refuse by name.
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// How many 128x128 superblock roots resolved to `PARTITION_NONE` -- one
+    /// whole 128x128 block (lane-sb128b r1's gate counter).
+    pub(crate) static PART128_NONE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`PART128_NONE_HITS`], for a gate's own before/after delta.
+pub(crate) fn part128_none_hits() -> usize {
+    PART128_NONE_HITS.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// How many CHROMA transform units were coded inside a block whose uv
+    /// plane block is more than one unit (lane-sb128b r2 -- only a 128x128
+    /// block, four per plane).
+    pub(crate) static CHROMA_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`CHROMA_SPLIT_TX_HITS`], for a gate's own before/after delta.
+pub(crate) fn chroma_split_tx_hits() -> usize {
+    CHROMA_SPLIT_TX_HITS.with(std::cell::Cell::get)
+}
+
 fn read_sb128_root(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -12750,7 +12895,7 @@ fn read_sb128_root(
     sb_c: u32,
     mi_cols: u32,
     mi_rows: u32,
-) -> Result<()> {
+) -> Result<usize> {
     let (mi_r128, mi_c128) = ((sb_r & !1) * SB_MI, (sb_c & !1) * SB_MI);
     crate::restoration::read_lr(
         dec,
@@ -12801,13 +12946,20 @@ fn read_sb128_root(
             }
         }
     };
-    if part128 != PARTITION_SPLIT {
+    // lane-sb128b r1: `PARTITION_NONE` -- one 128x128 block -- is decoded by
+    // the key-frame caller below. The six remaining arms (HORZ/VERT and the
+    // four AB shapes) still need the rect/AB machinery at this size.
+    if part128 != PARTITION_SPLIT && part128 != PARTITION_NONE {
         return Err(unsupported(
-            "a 128x128 superblock partition other than SPLIT (NONE/HORZ/VERT and the four AB arms at the 128 root are not decoded)",
+            "a 128x128 superblock HORZ/VERT or AB partition (only SPLIT and NONE are decoded at the 128 root)",
         ));
     }
-    PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
-    Ok(())
+    if part128 == PARTITION_SPLIT {
+        PART128_SPLIT_HITS.with(|c| c.set(c.get() + 1));
+    } else {
+        PART128_NONE_HITS.with(|c| c.set(c.get() + 1));
+    }
+    Ok(part128)
 }
 
 pub(crate) fn decode_key_frame_tile_with_cdfs(
@@ -12985,9 +13137,19 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         );
         TILE_HITS.with(|c| c.set(c.get() + 1));
 
+    // lane-sb128b r1: set when the 128 root resolved to `PARTITION_NONE` --
+    // its one block covers all four 64x64 quadrants, so the remaining three
+    // visits of this superblock code nothing at all.
+    let mut sb128_none = false;
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
         if row_start {
             neighbours.start_row();
+        }
+        if sb_start {
+            sb128_none = false;
+        }
+        if sb128_none {
+            continue;
         }
         {
             // lane-sb128 r1: the 128 root. Its loop-restoration units are read
@@ -12996,7 +13158,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             // `BLOCK_128X128` CDF (8 symbols) decides the root -- only SPLIT
             // recurses into the four 64x64 quadrants this decoder codes.
             if sb128 && sb_start {
-                read_sb128_root(
+                let part128 = read_sb128_root(
                     &mut dec,
                     &mut cdfs,
                     &neighbours,
@@ -13008,6 +13170,62 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                     mi_cols,
                     mi_rows,
                 )?;
+                if part128 == PARTITION_NONE {
+                    // One 128x128 intra block: four TX_64X64 luma units and a
+                    // single 64x64 chroma unit per plane (`av1_get_max_uv_txsize`
+                    // of a 128x128 block is TX_64X64 over its 64x64 uv plane
+                    // block). No CfL, no filter intra, no palette at this size --
+                    // [`read_intra_mode`]'s own size gates already say so.
+                    sb128_none = true;
+                    CDEF_TRANSMITTED.with(|c| c.set(false));
+                    let at128 = ((sb_r & !1) as usize * 4, (sb_c & !1) as usize * 4);
+                    decode_block(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        at128,
+                        SB * 2,
+                        TxbSet::Luma64,
+                        TxbSet::Chroma32,
+                        TX32,
+                        TX32,
+                        (&scan32, &scan32),
+                        false,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        base_q_idx,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        allow_intrabc,
+                        &scan32,
+                        &scan16,
+                        &scan8,
+                        &scan4,
+                        tx_select,
+                        reduced_tx_set,
+                    )?;
+                    // libaom writes one `cdef_strength` into the block's own
+                    // `MB_MODE_INFO`, which every mi cell of the block --
+                    // hence all four 64x64 CDEF units -- points at; our grid
+                    // is per-unit, so the read (which only ever lands in the
+                    // top-left unit, `read_cdef`'s index 0) is copied across.
+                    let (q_r, q_c) = ((sb_r & !1) as usize, (sb_c & !1) as usize);
+                    CDEF_IDX_GRID.with(|g| {
+                        let mut g = g.borrow_mut();
+                        let cols = CDEF_SB_COLS.with(|c| c.get());
+                        if cols > 0 && q_r * cols + q_c < g.len() {
+                            let idx = g[q_r * cols + q_c];
+                            for (dr, dc) in [(0, 1), (1, 0), (1, 1)] {
+                                let i = (q_r + dr) * cols + q_c + dc;
+                                if q_c + dc < cols && i < g.len() {
+                                    g[i] = idx;
+                                }
+                            }
+                        }
+                    });
+                    continue;
+                }
             }
             if !sb128 {
                 crate::restoration::read_lr(
@@ -20605,7 +20823,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
         {
             if sb128 && sb_start {
-                read_sb128_root(
+                if read_sb128_root(
                     &mut dec,
                     &mut cdfs,
                     &neighbours,
@@ -20616,7 +20834,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     sb_c,
                     mi_cols,
                     mi_rows,
-                )?;
+                )? != PARTITION_SPLIT
+                {
+                    // lane-sb128b r1 decodes a `PARTITION_NONE` 128 root on
+                    // KEY frames only; an inter 128x128 leaf needs whole-block
+                    // MC, OBMC and compound at a size this path has never run.
+                    return Err(unsupported(
+                        "a 128x128 superblock PARTITION_NONE root on an inter frame (only the key-frame path codes a whole 128x128 block)",
+                    ));
+                }
             }
             if !sb128 {
                 crate::restoration::read_lr(
