@@ -966,17 +966,142 @@ mod tests {
         );
     }
 
-    /// lane-oddh r2 GATE: the frame-edge half-strip arms r1 added (a 64x32 /
-    /// 32x64 superblock-level or 16x8 / 8x16 16-level INTER block where the
-    /// frame's true edge cuts the strip in half) actually fire and decode
-    /// pixel-exact, at both bit depths. 160 = two full superblock rows plus
-    /// 32 pixels, so every superblock in the last row is a half strip; without
-    /// r1's arms these attempts refused outright, which is why this gate
-    /// asserts a nonzero `edge_rect_strip_hits` DELTA on attempts that were
-    /// actually compared -- a refused attempt's hits would prove nothing
-    /// (class "counter from refused stream").
+    /// lane-interedge r1: one attempt of the inter frame-edge half-strip gate --
+    /// encode `width x height` with real aomenc (rect partitions ON, every other
+    /// lane's open tool pinned off), decode it, and return
+    /// `(inter_edge_strip hits, frames whose LUMA differs, frames whose CHROMA
+    /// differs)` against ffmpeg. A refusal or a decode error is a hard failure:
+    /// this recipe reached every size without one (measured r1).
+    fn inter_edge_strip_attempt(
+        name: &str,
+        width: usize,
+        height: usize,
+        bit_depth: u32,
+        cq: u32,
+        frames: usize,
+    ) -> ([usize; 6], usize, usize) {
+        let duration = format!("{}", frames as f64 / 25.0);
+        let source = format!("mandelbrot=size={width}x{height}:rate=25");
+        let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration, "-pix_fmt",
+                pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{name}: ffmpeg refused the {width}x{height} {bit_depth}-bit fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let depth_arg = format!("--bit-depth={bit_depth}");
+        let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+        let cq_arg = format!("--cq-level={cq}");
+        let limit_arg = format!("--limit={frames}");
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg,
+                // cpu-used >= 1 keeps libaom on 64x64 superblocks at these
+                // sizes (`av1_select_sb_size`).
+                "--cpu-used=4", "--threads=1", "--row-mt=0", "--kf-max-dist=9999",
+                &limit_arg,
+                // decode order == display order, so the compare below covers
+                // every frame the stream carries (class gate-blind-to-hidden-frames).
+                "--lag-in-frames=0", &depth_arg, &input_depth_arg,
+                // Rect partitions stay ON: the frame-edge strip is a FORCED
+                // (gathered) HORZ/VERT, but with rect coding off the encoder
+                // answers that gathered symbol SPLIT every time and no edge
+                // strip ever fires (lane-oddh r2's finding, re-measured r1).
+                "--enable-rect-partitions=1", "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0", "--min-partition-size=8",
+                "--max-partition-size=64",
+                // Other lanes' open gaps this recipe must not trip.
+                "--enable-palette=0", "--enable-intrabc=0", "--enable-warped-motion=0",
+                "--enable-obmc=0", "--enable-masked-comp=0", "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0", "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0", "--enable-ref-frame-mvs=0",
+                "--enable-angle-delta=0", "--enable-cfl-intra=0",
+                "--enable-directional-intra=0", "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0", "--enable-filter-intra=0",
+                "--enable-tx-size-search=0",
+                "--obu", "-o", "-", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("write y4m");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+
+        // Reset, never a delta: a refused attempt's hits must not leak into the
+        // next one (class counter-from-refused-stream).
+        crate::decode::reset_inter_edge_strip_hits();
+        let decoded = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{name}: {width}x{height} {bit_depth}-bit cq {cq} did not decode: {e}")
+        });
+        let hits = crate::decode::inter_edge_strip_hits();
+        let reference = if bit_depth == 10 {
+            ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
+        } else {
+            ffmpeg_decode_sequence(&stream, width, height, frames)
+        };
+        assert_eq!(
+            decoded.len(),
+            reference.len(),
+            "{name}: {width}x{height} {bit_depth}-bit cq {cq} frame count"
+        );
+        assert!(
+            decoded.len() >= frames,
+            "{name}: {width}x{height} {bit_depth}-bit cq {cq} decoded only {} frames",
+            decoded.len()
+        );
+        let (mut luma_bad, mut chroma_bad) = (0usize, 0usize);
+        for (ours, theirs) in decoded.iter().zip(&reference) {
+            if ours.y != theirs.y {
+                luma_bad += 1;
+            }
+            if ours.u != theirs.u || ours.v != theirs.v {
+                chroma_bad += 1;
+            }
+        }
+        (hits, luma_bad, chroma_bad)
+    }
+
+    /// lane-interedge r1 GATE (was lane-oddh r2's `#[ignore]`d twin): the INTER
+    /// frame-edge half strips -- a `PARTITION_HORZ`/`PARTITION_VERT` forced by
+    /// the gathered edge symbol at the 64, 32 or 16 level whose second half lies
+    /// outside the true frame. Both of the user's films are height mod 16 == 8
+    /// (1920x792, 3840x1608), so every inter frame crosses these nodes.
+    ///
+    /// r1 root cause: the inter tile's 32-level `PARTITION_HORZ`/`PARTITION_VERT`
+    /// decoded the SECOND strip unconditionally, while libaom `decode_partition`
+    /// (decodeframe.c, PARTITION_HORZ) guards it with `has_rows`/`has_cols` --
+    /// so at the edge we read symbols the encoder never wrote. With that guard
+    /// removed this gate's 72x192 cq 32 arm refuses outright and its 104x192 arm
+    /// decodes luma rows 127..191 of frame 5 wrong (measured r1).
+    ///
+    /// The compare is LUMA-exact per frame plus a CONTROL size with no edge node
+    /// at all: chroma is excluded because a chroma-only inter residue that has
+    /// nothing to do with the frame edge is open on main (lanes/tiny-r3,
+    /// lanes/gmaffine-r4, lanes/palette2-r8) and the control below reproduces it
+    /// with `inter_edge_strip_hits` all zero.
     #[test]
-    #[ignore = "2026-09-02 lane-oddh r2: no aomenc recipe reaches the INTER edge half-strip arm yet -- rect partitions OFF makes the encoder answer the forced gathered edge symbol SPLIT every time (both bit depths decode 192x160 pixel-exact, edge_rect_strip_hits=0), and rect ON stops at three other lanes' gaps first: at cq 40 'a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding', at cq 62 'an INTER 32x32 partition type this decoder does not code (value=8/9)' (HORZ_4/VERT_4 even with --enable-1to4-partitions=0), and at min-partition 16 'a HORZ/VERT intra strip below 16x16 with a split transform'. The KEY-frame half of the same edge is gated: the tiny size sweep now covers 64x72/72x64/64x136/136x64/192x136"]
     fn a_real_aomenc_inter_frame_edge_half_strip_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_inter_frame_edge_half_strip_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
@@ -984,116 +1109,57 @@ mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
             return;
         }
-        let (width, height, frames) = (192usize, 160usize, 6usize);
+        let frames = 6usize;
+        // h mod 16 == 8 (bottom edge) and w mod 16 == 8 (right edge).
+        let sizes: &[(usize, usize)] = &[(192, 72), (192, 88), (72, 192), (88, 192), (104, 192)];
+        let mut totals = [0usize; 6];
         let mut compared = 0u32;
-        let mut strip_hits = 0usize;
-        let mut refused = 0u32;
-        for bit_depth in [8u32, 10u32] {
-            let duration = frames as f64 / 25.0;
-            let source = format!("testsrc2=size={width}x{height}:duration={duration}:rate=25");
-            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
-            let y4m = Command::new("ffmpeg")
-                .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
-                    "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("ffmpeg failed to run");
-            assert!(
-                y4m.status.success(),
-                "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
-                String::from_utf8_lossy(&y4m.stderr)
-            );
-            let depth_arg = format!("--bit-depth={bit_depth}");
-            let input_depth_arg = format!("--input-bit-depth={bit_depth}");
-            let mut child = Command::new(aomenc_path())
-                .args([
-                    "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=62",
-                    // cpu-used >= 1 keeps libaom on 64x64 superblocks at this
-                    // size (`av1_select_sb_size`: speed >= 1 and <= 480p).
-                    "--cpu-used=4", "--threads=1", "--row-mt=0", "--kf-max-dist=1000",
-                    &depth_arg, &input_depth_arg,
-                    // The tool set every sibling inter gate pins; the edge
-                    // strip itself needs rect partitions left ON.
-                    "--enable-warped-motion=0", "--enable-obmc=0", "--enable-masked-comp=0",
-                    "--enable-interintra-comp=0", "--enable-onesided-comp=0",
-                    "--enable-interintra-wedge=0", "--enable-smooth-interintra=0",
-                    // Rect partitions stay ON: the edge strip is a FORCED
-                    // (gathered) HORZ at the boundary, but with rect coding
-                    // off the encoder answers that gathered symbol SPLIT every
-                    // time and the arm never fires (measured, r2).
-                    "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
-                    "--enable-palette=0", "--enable-intrabc=0", "--enable-cdef=0",
-                    "--enable-restoration=0", "--enable-ref-frame-mvs=0",
-                    "--enable-tx-size-search=0", "--enable-filter-intra=0",
-                    "--enable-smooth-intra=0", "--enable-paeth-intra=0",
-                    "--enable-directional-intra=0", "--enable-angle-delta=0",
-                    "--enable-cfl-intra=0",
-                    // 16 is the smallest leaf this decoder codes rect strips
-                    // at; below it the sub-16 strip/1:4 refusals fire first
-                    // and the gate never reaches the edge arm.
-                    // 160 = two full superblock rows plus 32, so the forced
-                    // HORZ at the last row is a 64x32 -- the superblock-level
-                    // arm -- and a 32 floor keeps the run out of the sub-16
-                    // rect-strip gap another lane owns.
-                    "--min-partition-size=32", "--max-partition-size=64",
-                    "--obu", "-o", "-", "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
-            let out = child.wait_with_output().expect("aomenc failed to run");
-            assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
-            let stream = out.stdout;
-
-            let before = crate::decode::edge_rect_strip_hits();
-            let decoded = match decode_stream(&stream) {
-                Ok(f) => f,
-                Err(e) => {
-                    let msg = e.to_string();
-                    assert!(
-                        msg.contains("unsupported"),
-                        "{NAME}: {bit_depth}-bit failed outright, not a named refusal: {msg}"
+        let mut chroma_frames = 0usize;
+        for &(width, height) in sizes {
+            for bit_depth in [8u32, 10] {
+                for cq in [20u32, 32, 45] {
+                    let (hits, luma_bad, chroma_bad) =
+                        inter_edge_strip_attempt(NAME, width, height, bit_depth, cq, frames);
+                    assert_eq!(
+                        luma_bad, 0,
+                        "{NAME}: {width}x{height} {bit_depth}-bit cq {cq}: {luma_bad} of {frames} \
+                         frames differ from ffmpeg in LUMA (edge hits {hits:?})"
                     );
-                    eprintln!("{NAME}: {bit_depth}-bit REFUSED {msg}");
-                    refused += 1;
-                    continue;
+                    for (t, h) in totals.iter_mut().zip(hits) {
+                        *t += h;
+                    }
+                    chroma_frames += chroma_bad;
+                    compared += 1;
                 }
-            };
-            let reference = if bit_depth == 10 {
-                ffmpeg_decode_sequence_10bit(&stream, width, height, frames)
-            } else {
-                ffmpeg_decode_sequence(&stream, width, height, frames)
-            };
-            assert_eq!(
-                decoded.len(),
-                reference.len(),
-                "{NAME}: {bit_depth}-bit frame count"
-            );
-            for (i, (ours, theirs)) in decoded.iter().zip(&reference).enumerate() {
-                let nd = |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
-                assert_eq!(
-                    (nd(&ours.y, &theirs.y), nd(&ours.u, &theirs.u), nd(&ours.v, &theirs.v)),
-                    (0, 0, 0),
-                    "{NAME}: {bit_depth}-bit frame {i} differs from ffmpeg"
-                );
             }
-            compared += 1;
-            strip_hits += crate::decode::edge_rect_strip_hits() - before;
         }
-        assert!(compared > 0, "{NAME}: every attempt refused ({refused}) -- gate proved nothing");
+        // Every level x axis this recipe reaches must have fired on a COMPARED
+        // attempt. h32 (a bottom-edge HORZ at the 32 level) is not asserted: no
+        // recipe found in r1 makes libaom answer that gathered symbol HORZ
+        // (sweep ~/.cache/interedge-tmp/h32.sh, 3 sizes x 6 cq, all SPLIT); it
+        // is the transposed twin of v32, which this gate does fire.
         assert!(
-            strip_hits > 0,
-            "{NAME}: {compared} attempts decoded pixel-exact but not one frame-edge half strip \
-             fired -- the recipe no longer reaches the arm this gate exists for"
+            totals[0] > 0 && totals[1] > 0 && totals[3] > 0 && totals[4] > 0 && totals[5] > 0,
+            "{NAME}: {compared} attempts luma-exact but the edge strips did not all fire \
+             (h64,v64,h32,v32,h16,v16 = {totals:?}) -- the recipe no longer reaches the arms \
+             this gate exists for"
         );
-        eprintln!("{NAME}: {compared} attempts pixel-exact, edge_rect_strip_hits={strip_hits}, {refused} refusals");
+        // CONTROL: a size with no frame-edge node anywhere (192x128, both axes
+        // 0 mod 64). It must be luma-exact with ZERO edge hits -- that is what
+        // makes the chroma exclusion above a statement about a foreign defect
+        // rather than about this lane's code.
+        let (chits, cluma, cchroma) = inter_edge_strip_attempt(NAME, 192, 128, 8, 32, frames);
+        assert_eq!(
+            (chits, cluma),
+            ([0usize; 6], 0usize),
+            "{NAME}: control 192x128 (no frame-edge node) must be luma-exact with no edge hits"
+        );
+        eprintln!(
+            "{NAME}: {compared} attempts luma-exact over {} sizes, edge hits \
+             (h64,v64,h32,v32,h16,v16)={totals:?}, 0 refusals; chroma-only frames {chroma_frames} \
+             (control 192x128: hits {chits:?}, chroma-only frames {cchroma} -- foreign defect)",
+            sizes.len()
+        );
     }
 
     /// lane-sb128 r4 GATE (was lane-oddh r2's refusal gate): the SAME real

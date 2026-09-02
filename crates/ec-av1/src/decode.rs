@@ -1162,6 +1162,36 @@ pub(crate) fn edge_rect_strip_hits() -> usize {
     EDGE_RECT_STRIP_HITS.with(|c| c.get())
 }
 
+// lane-interedge r1: frame-edge half strips on the INTER path, per partition
+// level (64/32/16) x axis (HORZ at a bottom edge, VERT at a right edge). The
+// index is `level_idx * 2 + axis` with `level_idx` 0=64, 1=32, 2=16 and
+// `axis` 0=HORZ (`!has_rows`), 1=VERT (`!has_cols`). Both of the user's films
+// are height mod 16 == 8, so every inter frame crosses these nodes.
+thread_local! {
+    static INTER_EDGE_STRIP_HITS: std::cell::Cell<[usize; 6]> =
+        const { std::cell::Cell::new([0; 6]) };
+}
+
+/// Bumps one bucket of [`INTER_EDGE_STRIP_HITS`].
+pub(crate) fn bump_inter_edge_strip(idx: usize) {
+    INTER_EDGE_STRIP_HITS.with(|c| {
+        let mut v = c.get();
+        v[idx] += 1;
+        c.set(v);
+    });
+}
+
+/// Current value of [`INTER_EDGE_STRIP_HITS`] (`[h64, v64, h32, v32, h16, v16]`).
+pub fn inter_edge_strip_hits() -> [usize; 6] {
+    INTER_EDGE_STRIP_HITS.with(|c| c.get())
+}
+
+/// Resets [`INTER_EDGE_STRIP_HITS`] -- a refused attempt must not carry hits
+/// into the next one (class `counter-from-refused-stream`).
+pub fn reset_inter_edge_strip_hits() {
+    INTER_EDGE_STRIP_HITS.with(|c| c.set([0; 6]));
+}
+
 // How many HORZ/VERT intra strips resolved a SPLIT luma transform
 // (`tx_depth != 0`) and decoded it per transform unit (lane-rectsplit r1) --
 // the case every rect path here refused by name before, and the first
@@ -22100,6 +22130,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         bw,
                         bh
                     );
+                    if !four && i == 0 && ((horz && !has_rows) || (!horz && !has_cols)) {
+                        bump_inter_edge_strip(if horz { 0 } else { 1 });
+                    }
                     match (horz, four) {
                         (true, false) => INTER_SB_HORZ_HITS.with(|c| c.set(c.get() + 1)),
                         (false, false) => INTER_SB_VERT_HITS.with(|c| c.set(c.get() + 1)),
@@ -22373,6 +22406,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         && (piece_mi.0 >= mi_rows as usize
                                             || piece_mi.1 >= mi_cols as usize)
                                     {
+                                        bump_inter_edge_strip(if horz { 4 } else { 5 });
                                         break;
                                     }
                                     decode_inter_block(
@@ -22953,6 +22987,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 allow_screen_content_tools,
                                 frame_width as usize,
                             )?;
+                        } else {
+                            bump_inter_edge_strip(2);
                         }
                     }
                     PARTITION_VERT => {
@@ -23064,6 +23100,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 allow_screen_content_tools,
                                 frame_width as usize,
                             )?;
+                        } else {
+                            bump_inter_edge_strip(3);
                         }
                     }
                     PARTITION_HORZ_A => {
