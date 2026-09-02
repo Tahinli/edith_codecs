@@ -42,16 +42,13 @@
 /// its tool is now covered by a real stream.
 #[cfg(test)]
 const NEVER_EXERCISED: &[(&str, &str)] = &[
-    // lane-intrabc r1: the DV itself (mv stack against INTRA_FRAME, `ndvc`
-    // full-pel read, `av1_find_ref_dv` fallback) and the block-copy
-    // prediction are now decoded, but every real aomenc intrabc block this
-    // lane could produce sits under TX_MODE_SELECT, whose inter var-tx
-    // partition tree is unread -- so no stream reconstructs one end to end
-    // yet and this entry stays.
-    (
-        "enable-intrabc",
-        "the block vector is decoded and predicted from, but every real stream's intrabc block needs the unread inter var-tx transform tree",
-    ),
+    // `enable-intrabc` LEFT this list on 2026-09-02 (lane-kf900 r6). The
+    // premise it carried -- "every real stream's intrabc block sits under
+    // TX_MODE_SELECT" -- was false: with `--enable-tx-size-search=0` aomenc
+    // codes intrabc blocks under TX_MODE_LARGEST, and
+    // `a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips`
+    // spells `--enable-intrabc=1` and decodes three such 8-bit streams whole-
+    // frame pixel-exact against ffmpeg, with the block counter asserted > 0.
 ];
 
 /// The `--enable-*` tools this decoder cares about, whether or not any gate
@@ -166,10 +163,6 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     (
         "enable-global-motion",
         "off in 5 gates, on in none at 8 bits; lane-gm owns the global-warp prediction that is still missing",
-    ),
-    (
-        "enable-intrabc",
-        "the block vector is decoded and predicted from, but every real stream's intrabc block needs the unread inter var-tx transform tree",
     ),
     (
         "enable-rect-tx",

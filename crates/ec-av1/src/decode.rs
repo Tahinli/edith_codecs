@@ -1569,6 +1569,21 @@ thread_local! {
     static INTRABC_DV: std::cell::Cell<Option<(i32, i32)>> = const { std::cell::Cell::new(None) };
     /// How many blocks decoded `use_intrabc == 1` -- the gate's hit counter.
     static INTRABC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The `tx_type` the last plane-0 [`read_plane`] actually coded, kept so
+    /// an intrabc block's chroma reads can inherit it (see
+    /// [`INTRABC_CHROMA_TX`]). Written on every luma read; only ever read
+    /// through that one arming site.
+    static LUMA_TX_TYPE: std::cell::Cell<TxType> = const { std::cell::Cell::new(TxType::DctDct) };
+    /// libaom `av1_get_tx_type` (`blockd.h:1350`): for `PLANE_TYPE_UV` it
+    /// branches on `is_inter_block(mbmi)` -- which `is_intrabc_block` also
+    /// satisfies (`blockd.h:373`) -- and takes the *colocated luma
+    /// transform's coded* `tx_type` (`mbmi->txk_type[...]`), never
+    /// `intra_mode_to_tx_type` of the chroma mode. `Some` only across an
+    /// intrabc block's two chroma [`read_plane`] calls; the type decides the
+    /// `TX_CLASS`, hence the scan order, `eob_multi_ctx` and every nz context
+    /// -- getting it wrong desyncs the chroma coefficients, it is not a
+    /// reconstruction-only detail.
+    static INTRABC_CHROMA_TX: std::cell::Cell<Option<TxType>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether this frame's header set `allow_intrabc` -- [`INTRABC_MI_GRID`] is
@@ -9515,6 +9530,13 @@ fn read_plane(
     // narrows there — only `Chroma32` and up do).
     let default_tx_type = if plane_idx == 0 || side >= 32 {
         TxType::DctDct
+    } else if let Some(inherited) = INTRABC_CHROMA_TX.with(std::cell::Cell::get) {
+        // See [`INTRABC_CHROMA_TX`]: an intrabc block is an inter block for
+        // `av1_get_tx_type`, so chroma inherits luma's coded type (the
+        // `side >= 32` arm above is already libaom's `EXT_TX_SET_DCTONLY`
+        // clamp at `tx_size_sqr_up >= TX_32X32`, matching
+        // [`read_inter_plane`]'s own `side < 32` guard).
+        inherited
     } else {
         default_intra_tx_type(predict_mode as u8)
     };
@@ -9528,6 +9550,9 @@ fn read_plane(
         None,
     )?;
     note_chroma_class1(plane_idx, tx_type);
+    if plane_idx == 0 {
+        LUMA_TX_TYPE.with(|c| c.set(tx_type));
+    }
     // A 64x64 luma block's transform covers the whole 64x64 area, but only its
     // top-left 32x32 of frequencies are coded (spec 5.11.40); the rest of the
     // dequantized grid stays zero, which `inverse_transform_2d`'s own `< 32`
@@ -9928,6 +9953,12 @@ fn decode_block(
             smooth_neighbor,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+        // Armed for exactly this block's two chroma reads (see
+        // [`INTRABC_CHROMA_TX`]); the luma call above just set
+        // [`LUMA_TX_TYPE`] to the type it coded.
+        if intrabc_dv.is_some() {
+            INTRABC_CHROMA_TX.with(|c| c.set(Some(LUMA_TX_TYPE.with(std::cell::Cell::get))));
+        }
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone());
         }
@@ -9984,6 +10015,7 @@ fn decode_block(
             None,
             smooth_neighbor_uv,
         )?;
+        INTRABC_CHROMA_TX.with(|c| c.set(None));
         neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
     } else {
         // Several luma transform units, raster order (spec
