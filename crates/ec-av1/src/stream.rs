@@ -29864,8 +29864,11 @@ mod tests {
     /// here)". The moment TX_64X32/TX_32X64 luma coefficient tables land, drop
     /// the `#[ignore]` -- everything else this gate needs (the reader, the
     /// counter, the two-frame pixel compare) is in place and runs.
+    ///
+    /// lane-sub8x4 r3: un-`#[ignore]`d. The sibling refusal it waited on (the
+    /// un-split TX_64X32/TX_32X64 corner unit) is lifted in this round, so the
+    /// frame this gate exists for now finishes.
     #[test]
-    #[ignore = "blocked on a SIBLING refusal, not on this lane: the film frame that carries the intra 1:4 strips (16x64=3) stops at \"a split intra strip whose transform unit is 64x32 (no luma coefficient tables for that shape here)\" -- un-ignore when the 64x32/32x64 luma coefficient tables land"]
     fn a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact() {
         const NAME: &str = "a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact";
         if !have_ffmpeg() {
@@ -29893,15 +29896,122 @@ mod tests {
             now.2 - before.2,
             now.3 - before.3
         );
-        assert_eq!(frames.len(), 2, "{NAME}: key frame + one inter frame");
+        // lane-sub8x4 r3, MEASURED when this gate first RAN: the fixture has
+        // TWO frame OBUs but only ONE SHOWN frame -- a raw
+        // `ffmpeg -i <fixture> -pix_fmt yuv420p10le -f rawvideo` writes exactly
+        // 18524160 bytes, one 3840x1608 10-bit frame, so the second is a
+        // no-show frame and `frames.len() == 2` was never true. The compare is
+        // not vacuous: ffmpeg's own frame count is asserted equal to ours.
+        assert_eq!(frames.len(), 1, "{NAME}: one shown frame (the second frame OBU is a no-show)");
         assert_eq!((frames[0].width, frames[0].height), (width, height));
         let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg returned {} frames, we decoded {}",
+            ffmpeg_frames.len(),
+            frames.len()
+        );
         for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
             assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
             assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
         }
-        eprintln!("{NAME}: {fired} intra 1:4 strips in an inter frame, both frames pixel-exact");
+        eprintln!("{NAME}: {fired} intra 1:4 strips in an inter frame, the shown frame pixel-exact");
+    }
+
+    /// lane-sub8x4 r3: the FILM witness that lifts BOTH the intra 16x4/4x16
+    /// strip inside an inter 16x16-level 1:4 partition and the un-split
+    /// TX_64X32/TX_32X64 corner unit of a split intra strip.
+    ///
+    /// `crates/ec-av1/fixtures/hg_rect64_intra16x4_witness.obu`, 23472 bytes,
+    /// sha256 `c9e721088766163b9dbeb9fa8dd8b257ff0ec7f9157fc350de4d3c33cd9ec4e4`:
+    /// the first 50 frame-carrying OBUs of `ffmpeg -ss 0 -t 2 -i <3840x1608
+    /// 10-bit AV1 HDR10 mkv> -c:v copy -f obu`, cut twice from independent
+    /// ffmpeg runs that hashed identically. 33 decode-order frames.
+    ///
+    /// MEASURED, and why no earlier round had this: r1/r2 of two lanes
+    /// reported "no firing witness exists" because every film frame that fires
+    /// these two arms ALSO carries a sub-8x8 intra leaf, which refused until
+    /// this lane's r2 lifted it. On that tip the whole 33-frame prefix decodes
+    /// with no refusal and matches ffmpeg on every plane of every frame, while
+    /// both arms fire: `intra16x4_in_inter` 16x4=31 4x16=17 chroma_ref=23 and
+    /// `rect64_corner_tu` 64x32=90 32x64=5. (The full 48-frame 2 s segment
+    /// diverges at decode-order frame 36, which is a separate wall; the
+    /// fixture is the exact prefix, not a truncation chosen to hide it.)
+    ///
+    /// Both refusal strings stay in `refusal_inventory` because both are
+    /// NARROWED, not deleted: "a split intra strip whose transform unit is
+    /// {tx_w}x{tx_h}" still stands for every shape other than 64x32/32x64, and
+    /// "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition"
+    /// still stands for a strip with no chroma-pair record.
+    #[test]
+    fn a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact() {
+        const NAME: &str =
+            "a_10bit_film_frames_with_intra_16x4_strips_and_rect64_corner_tus_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/hg_rect64_intra16x4_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        let before16 = crate::decode::intra16x4_in_inter_hits();
+        let before64 = (
+            crate::decode::rect64_corner_tu_hits(0),
+            crate::decode::rect64_corner_tu_hits(1),
+        );
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let now16 = crate::decode::intra16x4_in_inter_hits();
+        let fired16 = (
+            now16.0 - before16.0,
+            now16.1 - before16.1,
+            now16.2 - before16.2,
+        );
+        let fired64 = (
+            crate::decode::rect64_corner_tu_hits(0) - before64.0,
+            crate::decode::rect64_corner_tu_hits(1) - before64.1,
+        );
+        // Hard counter asserts: neither lift may rest on a stream that stopped
+        // carrying its shape (class `tool-disabled-in-every-gate`).
+        assert!(
+            fired16.0 > 0 && fired16.1 > 0 && fired16.2 > 0,
+            "{NAME}: the intra 16x4/4x16 strip arm did not fire (16x4={} 4x16={} chroma_ref={})",
+            fired16.0,
+            fired16.1,
+            fired16.2
+        );
+        assert!(
+            fired64.0 > 0 && fired64.1 > 0,
+            "{NAME}: the un-split TX_64X32/TX_32X64 corner arm did not fire (64x32={} 32x64={})",
+            fired64.0,
+            fired64.1
+        );
+        assert_eq!(frames.len(), 33, "{NAME}: 33 decode-order frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg returned {} frames, we decoded {}",
+            ffmpeg_frames.len(),
+            frames.len()
+        );
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: 33 frames pixel-exact, intra16x4_in_inter 16x4={} 4x16={} chroma_ref={}, \
+             rect64_corner_tu 64x32={} 32x64={}",
+            fired16.0, fired16.1, fired16.2, fired64.0, fired64.1
+        );
     }
 
 
