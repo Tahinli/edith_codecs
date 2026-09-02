@@ -19560,6 +19560,13 @@ fn obmc_blend(
         let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
         obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
         if !skip_chroma_above {
+            // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
+            // (`dec_build_prediction_by_above_pred`) sizes only the OBMC
+            // PREDICTION buffer; the blend length is the plain half
+            // (`build_obmc_inter_pred_above`: `overlap >> ss_y`), so flooring
+            // this at 4 blends rows libaom never blends -- on a 10-bit
+            // 1920x792 cut that went 36 differing frames -> 266, worst
+            // 13 B -> 11007 B.
             let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
             let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
