@@ -54,6 +54,16 @@ fn final_dump_prefix() -> Option<String> {
         .or_else(|| std::env::var("EC_AV1_FINAL_DUMP").ok())
 }
 
+/// 32x32-level 1:4 strip counters, for `decode_probe`'s fixture search:
+/// (HORZ_4 strips, VERT_4 strips, strips that read coefficients).
+pub fn rect4_32_counters() -> (usize, usize, usize) {
+    (
+        crate::decode::rect4_32_horz_hits(),
+        crate::decode::rect4_32_vert_hits(),
+        crate::decode::rect4_coeff_hits(),
+    )
+}
+
 /// Decode every frame in a raw AV1 OBU stream, in coding order.
 ///
 /// A key frame becomes the reference for the inter frames that follow it,
@@ -69,16 +79,6 @@ fn final_dump_prefix() -> Option<String> {
 /// [`Av1Parser`] reports it), when a frame header names anything this
 /// crate's tile decoders do not reconstruct (see their own docs), or when an
 /// inter frame appears before any key frame has supplied a reference.
-/// 32x32-level 1:4 strip counters, for `decode_probe`'s fixture search:
-/// (HORZ_4 strips, VERT_4 strips, strips that read coefficients).
-pub fn rect4_32_counters() -> (usize, usize, usize) {
-    (
-        crate::decode::rect4_32_horz_hits(),
-        crate::decode::rect4_32_vert_hits(),
-        crate::decode::rect4_coeff_hits(),
-    )
-}
-
 pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let final_dump = final_dump_prefix();
     let mut parser = Av1Parser::new();
@@ -13141,6 +13141,15 @@ mod tests {
              {out_of_scope} attempts carried no 1:4 block ({out_of_scope_mismatch} of them \
              mismatched -- other lanes' shapes)"
         );
+        // Class gate-skips-on-its-own-failure: an attempt that decoded but
+        // does not carry this gate's shape is still a decode this crate got
+        // wrong. Counted separately so the message names the other shape,
+        // never tolerated.
+        assert_eq!(
+            out_of_scope_mismatch, 0,
+            "{NAME}: {out_of_scope_mismatch} attempt(s) with no 1:4 block decoded but \
+             mismatched ffmpeg -- a defect of another shape, not a pass"
+        );
     }
 
     /// lane-tx64x16 r3: the 32x32-LEVEL 1:4 pair -- `PARTITION_HORZ_4` /
@@ -13368,6 +13377,11 @@ mod tests {
                  matches out of {n_attempts}, horz_4 strips={horz_proved}, vert_4 \
                  strips={vert_proved}, coded strips={coeff_proved}, {out_of_scope} attempts \
                  carried no 32-level 1:4 block ({out_of_scope_mismatch} mismatched)"
+            );
+            assert_eq!(
+                out_of_scope_mismatch, 0,
+                "{NAME}: {bit_depth}-bit: {out_of_scope_mismatch} attempt(s) with zero 32-level \
+                 1:4 blocks decoded but mismatched ffmpeg -- a defect of another shape, not a pass"
             );
         }
     }
