@@ -97,3 +97,30 @@ gate alone before touching code (another lane rebuilding the shared aomdec shows
 (section 4 is otherwise complete) and the lane is done.
 
 Nothing else is in flight; the worktree is clean at 2b9709c.
+
+## 5b. CORRECTION at handoff time -- THE SUITE IS RED (3 gates), details not yet printed
+The suite unit was still running when this handoff was written; at 343 tests it had THREE
+FAILED lines (cargo buffers the panic bodies to the end of the run, so no message text yet):
+
+    stream::tests::a_real_aomenc_inter_frame_with_a_64x64_intra_block_reads_the_no_cfl_uv_alphabet ... FAILED
+    stream::tests::a_real_aomenc_inter_sequence_with_a_superblock_level_rect_partition_decodes_pixel_exact ... FAILED
+    stream::tests::a_real_aomenc_stream_with_film_grain_decodes_pixel_exact ... FAILED
+
+So the lane is RED, not green. Do NOT treat section 4's probe table as a suite result: it proves
+only the 6 probed (geq, cq, depth) points, not the gates' own 16-attempt grids.
+
+Triage order for the next round:
+1. `grep -A 30 "^failures:" $HOME/.cache/sbrect10-suite-r2.log` for the three panic bodies.
+2. `a_real_aomenc_stream_with_film_grain_decodes_pixel_exact` is the loudest signal: it touches
+   NEITHER the CFL alphabet nor the compound stack's fixture, so if it is a pixel mismatch it is
+   most likely a REGRESSION from this round's `combine_compound_candidates` gm-fill (a compound
+   block that previously got (0,0) and now gets a global-motion vector). Check it first, alone:
+   `CARGO_TARGET_DIR=$HOME/.cache/cargo-target-sbrect10 cargo test -p ec-av1 --lib
+    a_real_aomenc_stream_with_film_grain_decodes_pixel_exact -- --nocapture`
+   and if it is red, re-run it at `3a9e83e` (the merge commit, fix not yet in) in a DETACHED
+   worktree to separate "regression from the gm-fill" from "already red after the merge".
+   Note the merge itself was never suite-tested -- r1 never ran a suite either (its handoff says
+   so), so an inherited red from main's sb128/r14 merge is equally possible.
+3. The other two are this lane's own gates; the rect-partition sibling gate shares the compound
+   stack path, so it is the expected place for a gm-fill regression to show.
+4. Only after the three are green: fill the N/0 totals into `lanes/sbrect10-r2.report.md`.
