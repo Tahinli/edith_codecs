@@ -5010,6 +5010,9 @@ impl Neighbours {
         tx_h_px: u8,
     ) {
         let (mi_r, mi_c) = at_mi;
+        if std::env::var_os("EC_TXGRID_TRACE").is_some() {
+            eprintln!("EC_LFLEAF mi_row={mi_r} mi_col={mi_c} w_mi={w_mi} h_mi={h_mi} tx_px={tx_px} tx_h_px={tx_h_px}");
+        }
         for rr in 0..h_mi {
             for cc in 0..w_mi {
                 let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
@@ -24981,10 +24984,18 @@ fn decode_inter_block8(
                 // dlist excludes it (3 luma samples on a 192x128 inter frame).
                 INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
                 neighbours.fill_skip_grid(leaf_mi, 2, skip);
+                // lane-sub8x4 r2: `split8` is this leaf's OWN var-tx split, so
+                // the deblock grid must publish the TX_4X4 leaves' width the
+                // same way the fall-through arm below does (libaom
+                // `get_transform_size`, av1_loopfilter.c:207, reads the per-TU
+                // `inter_tx_size` for a non-skip inter luma block). Hardcoding
+                // 8 here left a compound var-tx 8x8 leaf's interior vertical
+                // edge at x % 8 == 4 unfiltered -- class early-return-skips-tail,
+                // third instance in this same arm.
                 neighbours.fill_lf_grid(
                     leaf_mi,
                     2,
-                    8,
+                    if split8 { 4 } else { 8 },
                     if is_inter { leaf_refs.0.max(LAST_FRAME) } else { 0 },
                 );
                 return Ok((
