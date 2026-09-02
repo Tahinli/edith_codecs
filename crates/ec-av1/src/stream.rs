@@ -18,7 +18,6 @@
 use ec_av1_syntax::{
     Av1Parser, FrameHeader, FrameType, MAX_SEGMENTS, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE,
     SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, Tile, TxMode,
-    WarpModel,
 };
 use ec_core::{Error, Result};
 
@@ -375,16 +374,20 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // needed). AFFINE is untested this round (no aomenc fixture in the
         // wedge gate reached a 6-parameter model) -- keep refusing it by
         // name rather than shipping an unverified decode.
-        if header.frame_type != FrameType::Key
-            && header.global_motion[..7]
-                .iter()
-                .any(|gm| gm.model == WarpModel::Affine)
-        {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "an inter frame whose global motion for a single-reference frame is AFFINE (unverified this round; ROTZOOM/TRANSLATION/IDENTITY are proven)",
-            ));
-        }
+        // lane-gmaffine r1: AFFINE is now GATED, not refused. Stock libaom
+        // can never write a 6-parameter model -- its encoder-side search is
+        // pinned to ROTZOOM (`av1/encoder/global_motion_facade.c:24`,
+        // `FIRST_GLOBAL_TRANS_TYPE == LAST_GLOBAL_TRANS_TYPE == ROTZOOM`) --
+        // which is why four rounds of `--enable-global-motion=1` recipes
+        // never reached the case. `scripts/build-aom-affine-oracle.sh` widens
+        // exactly that search range in a side build, and
+        // `a_real_affine_global_motion_stream_decodes_pixel_exact` below
+        // decodes its output pixel-exact against ffmpeg with
+        // `affine_gm_hits() > 0`, i.e. real blocks predicted through the
+        // 6-parameter warp. Nothing in the decoder needed changing: the
+        // header reader already reads params 4/5 with their own subexp refs
+        // (`ec-av1-syntax` `read_global_motion_params`) and `warp.rs`'s
+        // shear-validity check + `warp_affine` are model-agnostic.
         // lane-gm r4/r5/r6: r4 found a NEW mismatch on frames with two
         // concurrently active ROTZOOM/AFFINE ref slots (GOLDEN + BWDREF) and
         // refused the shape by name rather than guess-fix it. r5 localized
@@ -6300,8 +6303,11 @@ mod tests {
             }
         }
         gate_buckets(NAME, 0, never_fired, refusals.len());
-        eprintln!(
-            "SKIP {NAME}: {never_fired} attempts decoded but never fired an 8x8 obmc block \
+        // lane-gmaffine r2: this gate fired for three rounds only as a SKIP
+        // (gate-skips-on-its-own-failure); the 8x8 leaf is reachable now, so a
+        // sweep that never lands one firing pixel-exact attempt is a FAILURE.
+        panic!(
+            "{NAME}: {never_fired} attempts decoded but never fired an 8x8 obmc block \
              ({total_obmc8} total 8x8 obmc hits across all attempts), and every other attempt \
              hit a named refusal:\n{}",
             refusals.join("\n")
@@ -7401,6 +7407,401 @@ mod tests {
             "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, wii_hits={}",
             crate::decode::wii_hits()
         );
+    }
+
+    /// The affine-capable encoder (`scripts/build-aom-affine-oracle.sh`),
+    /// separate from the shared oracle because stock libaom's global-motion
+    /// model search is pinned to ROTZOOM and can never emit AFFINE.
+    fn affine_aomenc_path() -> std::path::PathBuf {
+        if let Some(p) = std::env::var_os("EC_AV1_AFFINE_AOMENC") {
+            return std::path::PathBuf::from(p);
+        }
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        std::path::PathBuf::from(home).join(".cache/aom-affine/build/aomenc")
+    }
+
+    fn have_affine_aomenc() -> bool {
+        let present = affine_aomenc_path().is_file();
+        assert!(
+            present || std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+            "EC_AV1_REQUIRE_AOMENC is set but no affine-capable aomenc at {} -- run \
+             scripts/build-aom-affine-oracle.sh",
+            affine_aomenc_path().display()
+        );
+        present
+    }
+
+    /// lane-gmaffine r1: an inter frame whose `global_motion_params` carries a
+    /// SIX-parameter (`AFFINE`) model for a single-reference frame -- refused
+    /// by name since lane-gm r4 because no aomenc recipe ever reached it.
+    /// The reason it never did is in libaom's own encoder, not in the
+    /// content: `av1/encoder/global_motion_facade.c:24` pins the model search
+    /// to `ROTZOOM` at both ends, so *no* `--enable-global-motion=1` command
+    /// line over any source can produce the case. The decoder must still
+    /// handle it (the bitstream allows it, `read_global_motion_params` reads
+    /// params 4/5 with their own subexp references, and ffmpeg decodes it),
+    /// so this gate widens exactly that one encoder-side search range in a
+    /// side build and encodes with it. Everything downstream is ordinary
+    /// libaom and the pixel oracle is still ffmpeg.
+    ///
+    /// Content: rotation composed with a progressive *anisotropic* stretch --
+    /// a similarity transform plus unequal axis scaling is precisely what a
+    /// 4-parameter ROTZOOM model cannot express, which is what makes the
+    /// encoder's RD pick AFFINE. `affine_gm_hits()` hard-asserts that real
+    /// blocks were predicted through the 6-parameter warp, not merely that a
+    /// header parsed one (class `gate-blind-to-feature`).
+    #[test]
+    fn a_real_affine_global_motion_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_affine_global_motion_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_affine_aomenc() {
+            eprintln!(
+                "SKIP {NAME}: no affine-capable aomenc at {} (scripts/build-aom-affine-oracle.sh)",
+                affine_aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let duration = frame_count as f64 / 25.0;
+        // Both depths: his own AV1 library is yuv420p10le throughout, and a
+        // 10-bit AFFINE warp runs the same `warp_affine` over wider samples.
+        for depth in [8u32, 10u32] {
+            // `-t` is the real bound on mandelbrot (it ignores `end_pts` and
+            // has hung a gate for an hour); the 96x96 source is rotated and
+            // then stretched horizontally only, and cropped back to 64x64.
+            let source = format!(
+                "mandelbrot=size=96x96:rate=25,rotate=a=0.12*t:c=black,\
+                 scale=w='ceil(96*(1+0.03*n)/2)*2':h=96:eval=frame,crop={width}:{height}"
+            );
+            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let mut ff_args: Vec<&str> =
+                vec!["-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt];
+            // y4m has no official 10-bit tag, same as the 10-bit gate above.
+            if depth == 10 {
+                ff_args.extend(["-strict", "-1"]);
+            }
+            let duration_arg = duration.to_string();
+            ff_args.extend(["-t", &duration_arg, "-f", "yuv4mpegpipe", "-"]);
+            let y4m = Command::new("ffmpeg")
+                .args(&ff_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let bit_depth = format!("--bit-depth={depth}");
+            let input_bit_depth = format!("--input-bit-depth={depth}");
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=0",
+                "--lag-in-frames=0",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-global-motion=1",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                &bit_depth,
+                &input_bit_depth,
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(affine_aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("affine aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = crate::decode::affine_gm_hits();
+            let frames =
+                decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} ({depth}-bit): {e}"));
+            let ffmpeg_frames = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} {depth}-bit frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "{NAME} {depth}-bit frame {i} U vs ffmpeg");
+                assert_eq!(got.v, want.v, "{NAME} {depth}-bit frame {i} V vs ffmpeg");
+            }
+            let hits = crate::decode::affine_gm_hits() - before;
+            assert!(
+                hits > 0,
+                "{NAME} ({depth}-bit): decoded pixel-exact but no block was predicted through a \
+                 6-parameter global-motion warp -- the AFFINE path is unexercised"
+            );
+            eprintln!("{NAME}: {depth}-bit, {frame_count} frames pixel-exact, affine_gm_hits={hits}");
+        }
+    }
+
+    /// lane-gmaffine r1: the two 8x8-LEAF motion gates. `decode_inter_block8`
+    /// is a separate function from [`decode_inter_block`], and until this
+    /// round it refused both `GLOBALMV` ("GLOBALMV (round 3)") and
+    /// `WARPED_CAUSAL` at that size while the 16x16+ leaf had implemented
+    /// both for rounds. The reason no earlier gate caught it: the existing
+    /// 8x8 OBMC gate clamps `--max-partition-size=32` and aomenc's RD then
+    /// never splits down to a clean 8x8 leaf (that gate has never fired in
+    /// 80 attempts). `--min-partition-size=8 --max-partition-size=8` removes
+    /// the choice entirely -- every inter leaf in the stream IS an 8x8 one,
+    /// so the leaf path is exercised by construction rather than by luck.
+    ///
+    /// Content is the affine gate's rotating/zooming mandelbrot (global
+    /// motion the encoder can actually model), and the hit counters
+    /// (`globalmv_hits_8` / `warp_hits_8`) are 8x8-leaf-specific: a
+    /// 16x16-leaf GLOBALMV or warp cannot satisfy them.
+    fn run_8x8_leaf_motion_gate(
+        name: &str,
+        global_motion: bool,
+        counter: fn() -> usize,
+    ) {
+        // 72x64: `decode_inter_block8` is reached ONLY through the
+        // true-edge-straddling 16x16 path (an interior 16x16
+        // PARTITION_SPLIT is still refused by name), so the frame is 8
+        // luma columns wider than its last whole superblock -- every 16x16
+        // block in that right-hand strip is cut on ONE axis and decodes as
+        // four 8x8 leaves by construction. `--min-partition-size=16` keeps
+        // the interior out of the still-refused sub-16x16 case.
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let duration = frame_count as f64 / 25.0;
+        // The encoder's own RD still chooses WHICH 8x8 leaf codes GLOBALMV /
+        // WARPED_CAUSAL, and at some quantisers it picks a rect partition at
+        // 16x16 (still refused) or a non-LAST reference (still refused at the
+        // 8x8 leaf) before ever reaching one. So sweep a few quantisers and
+        // require at least one attempt, at each depth, that BOTH decodes
+        // pixel-exact AND fires the counter -- a refusing attempt is recorded,
+        // never a pass (class `gate-skips-on-its-own-failure`).
+        let mut fired_any = [false; 2];
+        let mut notes: Vec<String> = Vec::new();
+        for (di, depth) in [8u32, 10u32].into_iter().enumerate() {
+          for cq in [32u32, 45, 55] {
+            let cq_arg = format!("--cq-level={cq}");
+            let max_part_arg = format!(
+                "--max-partition-size={}",
+                std::env::var("EC_8X8_MAXPART").unwrap_or_else(|_| "8".into())
+            );
+            let source = format!(
+                "mandelbrot=size=96x96:rate=25,rotate=a=0.12*t:c=black,\
+                 scale=w='ceil(96*(1+0.03*n)/2)*2':h=96:eval=frame,crop={width}:{height}"
+            );
+            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let mut ff_args: Vec<&str> =
+                vec!["-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt];
+            if depth == 10 {
+                ff_args.extend(["-strict", "-1"]);
+            }
+            let duration_arg = duration.to_string();
+            ff_args.extend(["-t", &duration_arg, "-f", "yuv4mpegpipe", "-"]);
+            let y4m = Command::new("ffmpeg")
+                .args(&ff_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let bit_depth = format!("--bit-depth={depth}");
+            let input_bit_depth = format!("--input-bit-depth={depth}");
+            let gm_arg = format!("--enable-global-motion={}", u8::from(global_motion));
+            let warp_arg = format!("--enable-warped-motion={}", u8::from(!global_motion));
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                &cq_arg,
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=0",
+                "--lag-in-frames=0",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                &gm_arg,
+                &warp_arg,
+                "--enable-obmc=0",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                &max_part_arg,
+                "--min-partition-size=8",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                &bit_depth,
+                &input_bit_depth,
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = counter();
+            let frames = match decode_stream(&stream) {
+                Ok(f) => f,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{name} ({depth}-bit, cq {cq}) failed outright: {msg}"
+                    );
+                    notes.push(format!("{depth}-bit cq {cq}: {msg}"));
+                    continue;
+                }
+            };
+            let ffmpeg_frames = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            let hits = counter() - before;
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{name} {depth}-bit frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "{name} {depth}-bit frame {i} U vs ffmpeg");
+                assert_eq!(got.v, want.v, "{name} {depth}-bit frame {i} V vs ffmpeg");
+            }
+            if hits == 0 {
+                notes.push(format!(
+                    "{depth}-bit cq {cq}: {frame_count} frames pixel-exact but 0 8x8-leaf hits"
+                ));
+                continue;
+            }
+            fired_any[di] = true;
+            eprintln!(
+                "{name}: {depth}-bit cq {cq}, {frame_count} frames pixel-exact, 8x8 hits={hits}"
+            );
+          }
+        }
+        assert!(
+            fired_any[0] && fired_any[1],
+            "{name}: no attempt both decoded pixel-exact and fired the 8x8 leaf \
+             (8-bit fired {}, 10-bit fired {}):\n{}",
+            fired_any[0], fired_any[1], notes.join("\n")
+        );
+    }
+
+    /// lane-gmaffine r1 item (3): `GLOBALMV` at an 8x8 leaf, ROTZOOM global
+    /// motion, warp built from the frame's own model.
+    #[test]
+    fn a_real_globalmv_8x8_leaf_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_globalmv_8x8_leaf_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        run_8x8_leaf_motion_gate(NAME, true, crate::decode::globalmv_hits_8);
+    }
+
+    /// lane-gmaffine r1 item (2): `WARPED_CAUSAL` at an 8x8 leaf --
+    /// findSamples + `av1_find_projection` + the warp filter at BLOCK_8X8.
+    #[test]
+    fn a_real_warped_causal_8x8_leaf_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_warped_causal_8x8_leaf_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        run_8x8_leaf_motion_gate(NAME, false, crate::decode::warp_hits_8);
     }
 
     /// lane-rect16 r1/r2: a plain default-settings aomenc run over lavfi
