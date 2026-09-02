@@ -90,3 +90,33 @@ above), it would make the gate's own `oos_mismatch` assert red.
 `EC_VARTXLEAF=1` (decode.rs `vartx_rect_leaf_hit`): prints `tw=`/`th=` per rectangular
 var-tx leaf — this is what separated "our counter moved" from "the recipe never coded the
 shape" in one run.
+
+## Gate + suite results (merged tree, `335ccdc` + this lane's two commits)
+
+```
+real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal
+ (8-bit): 0 named refusals, 2 pixel-exact attempts carrying the arm,
+ pixel-compared rect var-tx leaves 32x16=6 16x32=2, leaves decoded anywhere 32x16=6 16x32=2,
+ 16 attempts carried none (0 of them mismatched)
+ (10-bit): 0 named refusals, ... 16 attempts carried none (0 of them mismatched)
+a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact
+ (8-bit): 0 named refusals, 2 pixel-exact attempts, per-arm
+ HORZ_4/VERT_4/chroma-pair/sub8x8-chroma/split-tx-8x4=[1, 1, 2, 2, 0], 30 carried none (0 mismatched)
+ split-tx-8x4 arm unproven (arms [1, 1, 2, 2, 0])
+named gates + refusal_inventory + gate_coverage + sub8 + obmc:
+ test result: ok. 26 passed; 0 failed; 0 ignored; 435 filtered out; 135.30s
+full suite: test result: ok. 424 passed; 0 failed; 37 ignored; 0 measured; 855.00s
+```
+
+EVIDENCE: /home/tahinli/.cache/vartxsplit-gates.log + /home/tahinli/.cache/vartxsplit-suite.log | cargo test -p ec-av1 --lib (named gates, then whole lib, both as systemd user units) | 26/26 named green, suite 424 passed 0 failed 37 ignored
+
+## Residue
+- deferred: the 8-pixel-wide-column reconstruction defect (section 4) — entropy proved
+  exact, so it is a prediction/filter-stage bug — unblocked by a lane that owns the
+  8xN inter reconstruction path; it is what keeps a 10-bit firing arm out of gate A.
+- deferred: the split-tx-8x4 hard assert — unblocked by that same defect (it is what
+  makes every `--min-partition-size=4` product-texture stream red).
+- accepted: gate A's leaves are 16x8/8x16 (`TX_32X8`/`TX_8X32` splits), not the 32x16/16x32
+  its variable names say; no `TX_64X16`/`TX_16X64` split exists in any recipe measured in
+  ~70 aomenc runs across r1+r2. The counter is one generic "rect var-tx leaf with both
+  sides >= 8" pair; renaming it is churn this lane did not spend.
