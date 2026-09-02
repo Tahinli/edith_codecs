@@ -74,7 +74,17 @@ const REFUSALS: &[&str] = &[
     // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
     "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
-    "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
+    // lane-sbab r1 lifted the superblock-level AB refusal that stood here
+    // (HORZ_A/HORZ_B/VERT_A/VERT_B at 64x64 of an inter frame: two 32x32
+    // inter squares plus one true 64x32/32x64 inter strip, gate
+    // `a_real_aomenc_inter_sequence_with_superblock_level_ab_partitions_decodes_pixel_exact`).
+    // lane-inter16ab r1 lifted the AB half (HORZ_A/HORZ_B/VERT_A/VERT_B at
+    // the 16x16 level of an inter frame: two 8x8 inter leaves plus one true
+    // 16x8/8x16 inter strip, gate
+    // `a_real_aomenc_inter_sequence_with_16x16_level_ab_partitions_decodes_pixel_exact`).
+    // What is left is the 1:4 pair, whose 16x4/4x16 strips need the sub-8
+    // inter chroma-pair path (odd-strip `is_chroma_reference`, chroma built
+    // from BOTH strips' MVs) that no inter block writer has yet.
     // lane-inter16ab r1 lifted the AB half and r2 the 1:4 half (four 16x4 /
     // 4x16 inter strips, their 8x4/4x8 chroma pair built from BOTH strips'
     // motion vectors -- gate
