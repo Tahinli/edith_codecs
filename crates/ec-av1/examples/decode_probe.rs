@@ -33,6 +33,7 @@ fn main() {
         println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
+        println!("rect_intrabc_reads: {}", ec_av1::stream::rect_intrabc_reads());
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         // lane-kf900 r1: the counter the skipped-8x8-split-transform gate
