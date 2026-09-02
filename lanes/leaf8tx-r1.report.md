@@ -60,3 +60,22 @@ aomenc keeps the last occurrence of a repeated `--enable-*` flag.
   (`EC_LEAF8TX_CONTROL=tx8`, 10-bit, seed 68, cq 19, frame 5, mi around
   (24, 40)) with the aomdec range ladder; the implementation is already in the
   tree behind the refusal.
+
+## Suite (RED, one failure, caused by this lift)
+EVIDENCE: /home/tahinli/.cache/leaf8tx-suite-r1.log | `cargo test -p ec-av1 --lib -j3` under a systemd unit | 393 passed / 1 failed / 33 ignored in 1609 s
+
+Failure: `stream::tests::a_real_aomenc_stream_with_cdef_and_sub16_inter_leaves_decodes_pixel_exact`,
+`stream.rs:16955` — "no sub-16x16 inter leaf wrote the CDEF skip band (depth=8 cq=12)".
+Not a pixel mismatch: the gate's FIRST attempt (depth 8, cq 12) used to hit the
+now-lifted angle-delta refusal and be pushed onto its refusal list, so the sweep
+moved to a later attempt that did fire `inter8_skip_band_hits`. With the refusal
+gone that first attempt decodes, and its hard per-attempt counter assert fires
+before any comparison (class [[counter-from-refused-stream]] /
+[[parallel-flake-is-attempt-selection]] — a lifted refusal reshuffles which
+attempt a sibling gate lands on).
+
+- fix-now for r2 (owner: whoever merges this lane): that gate must keep sweeping
+  when a decoded attempt carries no sub-16 leaf (continue + a single
+  end-of-sweep assert that at least one compared attempt fired), instead of
+  asserting on the first decoded attempt. Whether that attempt is pixel-exact is
+  UNKNOWN — the assert precedes the ffmpeg compare.
