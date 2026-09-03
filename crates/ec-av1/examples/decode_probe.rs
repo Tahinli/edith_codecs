@@ -136,6 +136,12 @@ fn main() {
             "intra16x4_in_inter: 16x4={} 4x16={} chroma_ref={}",
             i164.0, i164.1, i164.2
         );
+        // lane-t900 r12: chroma edge-filter neighbour answered from the mi-granular
+        // uv_mode grid instead of the coarse one-slot-per-column map.
+        println!(
+            "uv_mode_grid_override: {}",
+            ec_av1::decode::uv_mode_grid_override_hits()
+        );
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
     // (every gate in `stream.rs` picks its own `--tile-columns`), so report it
