@@ -19742,16 +19742,14 @@ mod tests {
         );
     }
 
-    /// KNOWN OPEN DEFECT, found by lane-mvtwin r1 and NOT caused by it: a
-    /// real aomenc stream 128 px wide with `--tile-columns=1` (two 64-px tile
-    /// columns) mis-decodes frame 1's luma against ffmpeg, at seed 200 with
-    /// this exact recipe. ABLATION-PROVEN pre-existing: the same arm fails
-    /// identically with r1's tile-origin reach clamp
-    /// (`MiGrid::tile_origin`) forced back to `(0, 0)`, so the cause is
-    /// somewhere else in the multi-tile path, not in `mvstack`. Kept as the
-    /// exact reproducer for the lane that owns tiles -- it is `#[ignore]`d
-    /// rather than deleted so the repro command survives:
-    /// `cargo test -p ec-av1 --lib across_two_tile_columns -- --ignored --nocapture`.
+    /// Was a KNOWN OPEN DEFECT (found by lane-mvtwin r1, `#[ignore]`d for it):
+    /// a real aomenc stream 128 px wide with `--tile-columns=1` (two 64-px
+    /// tile columns) mis-decoded frame 1's luma against ffmpeg at seed 200
+    /// with this exact recipe. lane-t900 r15 RE-MEASURED it on the merged tip
+    /// (after the motion-field tile clamp, the per-tile txfm/mode band resets
+    /// and the 8x8-compound interp-filter read landed): the arm decodes
+    /// pixel-exact, so the `#[ignore]` is removed and the multi-tile mv-stack
+    /// coverage is live.
     ///
     /// It is also the ONLY arm that reaches r1 defect 3 (the col reach is
     /// clamped to `tile_col0`, not the frame edge): the counter
@@ -19759,7 +19757,6 @@ mod tests {
     /// itself is proven deterministically by
     /// `mvstack::tests::the_row_reach_is_clamped_to_the_tile_origin_not_the_frame_edge`.
     #[test]
-    #[ignore = "known pre-existing multi-tile-column decode defect, see doc comment"]
     fn a_real_aomenc_compound_mv_stack_across_two_tile_columns_decodes_pixel_exact() {
         let name = "a_real_aomenc_compound_mv_stack_across_two_tile_columns_decodes_pixel_exact";
         let before = crate::mvstack::tile_reach_clips();
@@ -25033,17 +25030,13 @@ mod tests {
     /// Arms: 192x68 and 68x192 (a 4-px straddling band on one axis), 5 frames,
     /// 8-bit and 10-bit, plus a `--tile-columns=1` twin of each (COMMON's
     /// neighbour-map rule -- the skip band CDEF reads is a per-mi side band).
-    /// MEASURED 2026-09-02: all 32 multi-tile attempts refuse BY NAME today,
-    /// so that half of the gate compares nothing yet (class
-    /// `counter-from-refused-stream`); the census is 10x "an inter SB-level AB
-    /// partition", 6x "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
-    /// rectangular residual coding", 6x "an 8x8 intra leaf in an inter frame
-    /// whose tx_depth splits it into 4x4 transform units", 5x "an inter
-    /// partition below 8x8", 3x "an inter 16x16-level AB or 1:4 partition",
-    /// 1x "a split intra strip whose transform unit is 32x64", 1x "an
-    /// intra-coded 1:4 (or other non-2:1) rect strip on the inter block path".
-    /// The arms stay so the coverage appears the day those lift; every assert
-    /// below is carried by the single-tile arms.
+    /// RE-MEASURED lane-t900 r15 on the merged tip: all 64 attempts (8 arms x
+    /// 8 cq levels, single- and multi-tile alike) decode pixel-exact with ZERO
+    /// named refusals -- on 2026-09-02 all 32 multi-tile attempts still refused
+    /// by name, so that half compared nothing (class
+    /// `counter-from-refused-stream`). `compared_multi_tile` is asserted below
+    /// so the multi-tile twins can never silently go back to comparing
+    /// nothing.
     /// Hard-asserts `decode::cdef_straddle_units()` grew: a FILTERED 8x8 CDEF
     /// unit whose extent crosses the crop edge is the only shape for which
     /// clamping and padding differ, so a zero delta would make these arms
@@ -25128,6 +25121,11 @@ mod tests {
         let cqs: [u32; 8] = [35, 40, 45, 50, 55, 57, 59, 61];
         let mut totals = [0usize; 8];
         let mut compared = 0usize;
+        // lane-t900 r15 (class `counter-from-refused-stream`): the aggregate
+        // `compared` counter is carried by the single-tile arms alone, so the
+        // `--tile-columns=1` twins were free to refuse every attempt and keep
+        // the gate green. Counted separately and asserted below.
+        let mut compared_multi_tile = 0usize;
         let mut refusals: Vec<String> = Vec::new();
         let straddle = name == "a_frame_edge_straddling_band_decodes_pixel_exact";
         let mut straddle_units = 0usize;
@@ -25305,6 +25303,9 @@ mod tests {
                     }
                 }
                 compared += 1;
+                if tile_cols > 0 {
+                    compared_multi_tile += 1;
+                }
                 straddle_units += crate::decode::cdef_straddle_units() - straddle_before;
                 for i in 0..8 {
                     totals[i] += delta[i];
@@ -25314,6 +25315,12 @@ mod tests {
         assert!(
             compared > 0,
             "{NAME}: every attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            !straddle || compared_multi_tile > 0,
+            "{NAME}: every `--tile-columns=1` attempt hit a named refusal -- the \
+             multi-tile twins compared nothing:\n{}",
             refusals.join("\n")
         );
         assert!(
