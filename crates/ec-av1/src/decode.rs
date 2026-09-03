@@ -2338,6 +2338,21 @@ pub(crate) fn obmc_pair_filter_hits() -> usize {
     OBMC_PAIR_FILTER_HITS.with(|c| c.get())
 }
 
+// lane-t900 r14: how many OBMC neighbour predictions run PAST the frame edge
+// -- libaom's `op_mi_size` is `AOMMIN(xd->width|height, mi_step)`, the block's
+// own side, so a block overhanging the bottom/right still predicts the full
+// neighbour strip (the destination write is what clips). We used to shrink the
+// prediction to the visible part, which at 4 chroma rows/cols also swaps the
+// vertical/horizontal kernel to the 4-tap one. The gate's proof the shape fired.
+thread_local! {
+    static OBMC_EDGE_SPAN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`OBMC_EDGE_SPAN_HITS`].
+pub(crate) fn obmc_edge_span_hits() -> usize {
+    OBMC_EDGE_SPAN_HITS.with(|c| c.get())
+}
+
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.with(|c| c.get())
@@ -19598,6 +19613,9 @@ fn obmc_blend(
         ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
+        if mi_col + off4 + span4 > mi_cols {
+            OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
+        }
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
         // lane-t900 r14: the prediction is `op_mi_size` wide (kernel choice
         // included); only the WRITE is clipped to this block's own buffer.
@@ -19631,6 +19649,9 @@ fn obmc_blend(
         ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
+        if mi_row + off4 + span4 > mi_rows {
+            OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
+        }
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
         let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh.min(write_h - oy), &tmp_y);
