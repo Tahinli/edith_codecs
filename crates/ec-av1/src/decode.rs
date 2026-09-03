@@ -19536,6 +19536,36 @@ fn obmc_blend(
     // ABOVE pass skips chroma entirely, the LEFT pass still blends it.
     let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
 
+    // lane-t900 r13 rung: EC_MCB="<plane>:<px>:<py>[:<frame>]" (chroma plane
+    // 1 only) prints this block's chroma prediction rows before and after the
+    // OBMC blend, matching the instrumented aomdec's EC_MCB dump.
+    let ec_mcb: Option<(usize, usize, i64)> = std::env::var("EC_MCB").ok().and_then(|v| {
+        let f: Vec<&str> = v.split(':').collect();
+        if f.len() < 3 || f[0] != "1" {
+            return None;
+        }
+        let (x, y) = (f[1].parse::<usize>().ok()?, f[2].parse::<usize>().ok()?);
+        let fr = f.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(-1);
+        let idx = PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst) as i64;
+        if x >= cpx && x < cpx + write_w / 2 && y >= cpy && y < cpy + write_h / 2
+            && (fr < 0 || fr == idx)
+        {
+            Some((x, y, idx))
+        } else {
+            None
+        }
+    });
+    if let Some((_, _, idx)) = ec_mcb {
+        eprintln!(
+            "OUR_MCB pre f={idx} cpx={cpx} cpy={cpy} cw={} ch={}",
+            write_w / 2,
+            write_h / 2
+        );
+        for r in 0..write_h / 2 {
+            let row: Vec<u16> = (0..write_w / 2).map(|c| pred_u[r * chroma_side + c]).collect();
+            eprintln!("OUR_MCB prerow{r}: {row:?}");
+        }
+    }
     for (off4, span4, nb, src4) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
         // `Neighbours::above_filter` is indexed in `SUB`(16px)-wide columns
@@ -19560,6 +19590,13 @@ fn obmc_blend(
         let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
         obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
         if !skip_chroma_above {
+            // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
+            // (`dec_build_prediction_by_above_pred`) sizes only the OBMC
+            // PREDICTION buffer; the blend length is the plain half
+            // (`build_obmc_inter_pred_above`: `overlap >> ss_y`), so flooring
+            // this at 4 blends rows libaom never blends -- on a 10-bit
+            // 1920x792 cut that went 36 differing frames -> 266, worst
+            // 13 B -> 11007 B.
             let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
             let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
@@ -19587,6 +19624,12 @@ fn obmc_blend(
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, cbh, &tmp_u);
         let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, cbh, &tmp_v);
+    }
+    if let Some((_, _, idx)) = ec_mcb {
+        for r in 0..write_h / 2 {
+            let row: Vec<u16> = (0..write_w / 2).map(|c| pred_u[r * chroma_side + c]).collect();
+            eprintln!("OUR_MCB post f={idx} row{r}: {row:?}");
+        }
     }
     Ok(())
 }
