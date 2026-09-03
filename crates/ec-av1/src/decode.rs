@@ -18844,7 +18844,13 @@ fn overlappable_above(
                 if src != col {
                     OBMC_PAIR_FILTER_HITS.with(|c| c.set(c.get() + 1));
                 }
-                out.push((col - mi_col, step.min(end_col - col), *info, src - mi_col));
+                // lane-t900 r14: libaom passes `AOMMIN(xd->width, mi_step)`
+                // as `op_mi_size` -- the block's OWN width, never the
+                // frame-edge clamp `end_col` carries. Clamping here shrank the
+                // neighbour PREDICTION at a frame edge, which picks the
+                // 4-tap kernel below 8 px (class narrow-block-sharp-kernel);
+                // the destination clip stays in `obmc_blend`.
+                out.push((col - mi_col, step.min(bw4), *info, src - mi_col));
             }
         }
         col += step;
@@ -18890,7 +18896,9 @@ fn overlappable_left(
                 if src != row {
                     OBMC_PAIR_FILTER_HITS.with(|c| c.set(c.get() + 1));
                 }
-                out.push((row - mi_row, step.min(end_row - row), *info, src - mi_row));
+                // lane-t900 r14: `AOMMIN(xd->height, mi_step)` -- see
+                // `overlappable_above`.
+                out.push((row - mi_row, step.min(bh4), *info, src - mi_row));
             }
         }
         row += step;
@@ -19356,13 +19364,17 @@ fn interintra_blend(
     }
 }
 
-fn obmc_blend_v(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u16]) {
+/// `w` is the number of columns actually written (clipped to the block's own
+/// buffer at a frame edge); `ts` is `tmp`'s own stride, the neighbour
+/// prediction's full width.
+#[allow(clippy::too_many_arguments)]
+fn obmc_blend_v(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize, ts: usize, tmp: &[u16]) {
     let mask = obmc_mask(h);
     for row in 0..h {
         let m = u32::from(mask[row]);
         for col in 0..w {
             let d = &mut dst[(oy + row) * stride + ox + col];
-            let t = u32::from(tmp[row * w + col]);
+            let t = u32::from(tmp[row * ts + col]);
             *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u16;
         }
     }
@@ -19587,8 +19599,10 @@ fn obmc_blend(
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
+        // lane-t900 r14: the prediction is `op_mi_size` wide (kernel choice
+        // included); only the WRITE is clipped to this block's own buffer.
         let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
-        obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
+        obmc_blend_v(pred_y, side, ox, 0, bw.min(write_w - ox), bh, bw, &tmp_y);
         if !skip_chroma_above {
             // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
             // (`dec_build_prediction_by_above_pred`) sizes only the OBMC
@@ -19598,10 +19612,11 @@ fn obmc_blend(
             // 1920x792 cut that went 36 differing frames -> 266, worst
             // 13 B -> 11007 B.
             let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
+            let cw = cbw.min(write_w / 2 - cox);
             let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
-            obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
+            obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
             let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
-            obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
+            obmc_blend_v(pred_v, chroma_side, cox, 0, cw, cbh, cbw, &tmp_v);
         }
     }
 
@@ -19618,12 +19633,23 @@ fn obmc_blend(
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
         let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
-        obmc_blend_h(pred_y, side, 0, oy, bw, bh, &tmp_y);
+        obmc_blend_h(pred_y, side, 0, oy, bw, bh.min(write_h - oy), &tmp_y);
         let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
         let tmp_u = obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
-        obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, cbh, &tmp_u);
+        if let Some((_, _, idx)) = ec_mcb {
+            eprintln!(
+                "OUR_MCB left f={idx} off4={off4} span4={span4} cbw={cbw} cbh={cbh} coy={coy} mv=({},{}) ref0={}",
+                nb.mv.0, nb.mv.1, nb.ref_frame
+            );
+            for r in 0..cbh {
+                let row: Vec<u16> = (0..cbw).map(|c| tmp_u[r * cbw + c]).collect();
+                eprintln!("OUR_MCB lrow{r}: {row:?}");
+            }
+        }
+        let ch = cbh.min(write_h / 2 - coy);
+        obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
         let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
-        obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, cbh, &tmp_v);
+        obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
         for r in 0..write_h / 2 {
