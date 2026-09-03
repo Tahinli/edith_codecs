@@ -30472,10 +30472,15 @@ mod tests {
         // lane-t900 r10: the rect warp top-right reach (600 blocks here).
         let tr_before = crate::decode::tr_reach_longer_side_hits();
         let i16_before = crate::decode::intra16x4_in_inter_hits();
+        // lane-t900 r14: OBMC neighbour strips that run past the frame edge
+        // (792 luma rows = 198 mi rows, so every bottom-row 32x32 block
+        // overhangs) -- the shape whose prediction size used to be clamped.
+        let edge_before = crate::decode::obmc_edge_span_hits();
         let frames = match decode_stream(&stream) {
             Ok(frames) => frames,
             Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
         };
+        let obmc_edge_span = crate::decode::obmc_edge_span_hits() - edge_before;
         let fired = (
             crate::decode::warp_plane_suppress_hits() - before.0,
             crate::decode::cdef_idx_hits() - before.1,
@@ -30508,6 +30513,7 @@ mod tests {
             ("sub8_chroma_tx_from_ref", sub8tx),
             ("inter_neighbour_not_smooth", notsmooth),
             ("tr_reach_longer_side", tr),
+            ("obmc_edge_span", obmc_edge_span),
         ] {
             assert!(
                 n > 0,
@@ -30534,7 +30540,7 @@ mod tests {
              cdef_idx={} inter_sb128_vert={} interintra_rect={} non_chroma_ref_ctx_skip={} \
              intra_in_inter_txctx={} edge_filter_mi_fix={} intra16x4_in_inter={:?} \
              sub8_chroma_tx_from_ref={sub8tx} inter_neighbour_not_smooth={notsmooth} \
-             tr_reach_longer_side={tr}",
+             tr_reach_longer_side={tr} obmc_edge_span={obmc_edge_span}",
             fired.0, fired.1, fired.2, fired.3, fired.4, fired.5, fired.6, i16
         );
     }
