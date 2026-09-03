@@ -221,9 +221,39 @@ pub fn rect_inter_tu_counters() -> (usize, usize, usize) {
 /// crate's tile decoders do not reconstruct (see their own docs), or when an
 /// inter frame appears before any key frame has supplied a reference.
 pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
+    let mut pictures = Vec::new();
+    decode_stream_with(data, |picture, _decode_idx, shown| {
+        if shown {
+            pictures.push(picture.clone());
+        }
+        Ok(())
+    })?;
+    Ok(pictures)
+}
+
+/// Streaming form of [`decode_stream`]: hand every completed picture to
+/// `sink` the moment it exists and drop it right after, so peak memory is one
+/// output picture plus the 8-slot DPB instead of the whole decoded stream --
+/// a 4K long-GOP segment costs the same as a short one. `decode_stream`
+/// itself is this function collecting into a `Vec`.
+///
+/// `sink` is called with the picture, the decode-order index of the coded
+/// frame it came from, and whether it is output: a hidden reference frame
+/// (`show_frame == 0`) is reported with `shown == false` and is NOT part of
+/// `decode_stream`'s output, a `show_existing_frame` output with `true`.
+/// The grain-synthesised picture is what a shown frame's sink sees; the
+/// reference bank keeps the clean one (spec 7.18.3.1). An `Err` the sink
+/// returns aborts the decode and is returned unchanged.
+///
+/// # Errors
+/// As [`decode_stream`], plus whatever `sink` returns.
+pub fn decode_stream_with(
+    data: &[u8],
+    mut sink: impl FnMut(&Picture, usize, bool) -> Result<()>,
+) -> Result<()> {
     let final_dump = final_dump_prefix();
     let mut parser = Av1Parser::new();
-    let mut pictures = Vec::new();
+    let mut pictures_shown: usize = 0;
     let mut pictures_decoded: usize = 0;
     // Spec 7.20/7.4: each of the 8 reference slots remembers the picture a
     // previous frame's `refresh_frame_flags` stored into it, exactly like the
@@ -329,7 +359,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             } else {
                 picture
             };
-            pictures.push(output);
+            sink(&output, pictures_decoded, true)?;
+            pictures_shown += 1;
             continue;
         }
         // `tiles_base_offset` is added to every `Tile::offset` below to reach
@@ -931,7 +962,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 .append(true)
                 .open(&path)
             {
-                let _ = writeln!(f, "=== frame idx={} ===", pictures.len());
+                let _ = writeln!(f, "=== frame idx={} ===", pictures_shown);
                 let _ = writeln!(f, "partition_w64 {:?}", stored_cdfs.partition_w64);
                 let _ = writeln!(f, "partition_w32 {:?}", stored_cdfs.partition_w32);
                 let _ = writeln!(f, "partition_w16 {:?}", stored_cdfs.partition_w16);
@@ -1023,10 +1054,17 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             } else {
                 picture
             };
-            pictures.push(output);
+            sink(&output, pictures_decoded - 1, true)?;
+            pictures_shown += 1;
+        } else {
+            // Hidden (alt-ref/forward-key) frames never reach
+            // `decode_stream`'s output, but a decode-order consumer -- the
+            // `EC_AV1_FINAL_DUMP` comparison against aomdec, say -- needs
+            // them, so they are reported too, with `shown == false`.
+            sink(&picture, pictures_decoded - 1, false)?;
         }
     }
-    Ok(pictures)
+    Ok(())
 }
 
 
@@ -1480,6 +1518,53 @@ mod tests {
     #[test]
     fn decode_stream_round_trips_an_odd_size_gop() {
         gop_round_trips(216, 96);
+    }
+
+    /// lane-streamsink r1: `decode_stream_with` emits exactly the pictures
+    /// `decode_stream` collects, in the same order -- the streaming path is
+    /// the decoder now (`decode_stream` is a collecting wrapper), so an
+    /// equivalence check here is what keeps every gate's Vec-shaped assert
+    /// meaningful. Also pins the sink contract: one call per shown picture,
+    /// decode indices non-decreasing, and an `Err` from the sink aborting.
+    #[test]
+    fn streaming_decode_matches_the_collecting_one() {
+        let pictures: Vec<_> = (0..4).map(|i| panned_test_card(128, 64, i * 3)).collect();
+        let stream = encode_sequence(&pictures, 100, 0.5).unwrap().stream;
+        let collected = decode_stream(&stream).unwrap();
+
+        let mut shown = Vec::new();
+        let mut idxs = Vec::new();
+        let mut live = 0usize;
+        decode_stream_with(&stream, |p, idx, is_shown| {
+            live += 1;
+            if is_shown {
+                idxs.push(idx);
+                shown.push(p.clone());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(shown.len(), collected.len(), "callback count vs shown frames");
+        assert!(live >= shown.len(), "every shown picture is also a callback");
+        assert!(
+            idxs.windows(2).all(|w| w[0] <= w[1]),
+            "decode indices out of order: {idxs:?}"
+        );
+        for (i, (got, want)) in shown.iter().zip(&collected).enumerate() {
+            assert_eq!(got.y, want.y, "frame {i} luma");
+            assert_eq!(got.u, want.u, "frame {i} U");
+            assert_eq!(got.v, want.v, "frame {i} V");
+        }
+
+        // A sink error stops the decode and comes back unchanged.
+        let mut seen = 0usize;
+        let err = decode_stream_with(&stream, |_, _, _| {
+            seen += 1;
+            Err(Error::corrupt("sink says stop"))
+        })
+        .unwrap_err();
+        assert_eq!(seen, 1, "decode continued past a failing sink");
+        assert!(format!("{err}").contains("sink says stop"), "{err}");
     }
 
     use std::io::Write;

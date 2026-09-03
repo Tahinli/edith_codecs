@@ -257,40 +257,71 @@ fn main() {
         println!("TILING: no frame header parsed");
     }
 
-    match ec_av1::stream::decode_stream(&data) {
-        Ok(frames) if frames.is_empty() => {
+    // lane-streamsink r1: decode through the streaming entry point and write
+    // each shown frame out as it completes. The old path collected every
+    // picture in a Vec and then built a second full copy of the raw dump
+    // before one `fs::write`, so peak RSS was 2x the whole decoded segment (a
+    // 4K 8 s window needed >20 GiB, a whole film terabytes). Here at most one
+    // frame is held beyond the decoder's own DPB, and the printed lines are
+    // byte-identical to the old ones.
+    // `EC_PROBE_OUT16` is yuv420p10le (u16 LE); `EC_PROBE_OUT` / argv[2] is
+    // 8-bit (planes are u16, low byte taken). Either target may be a FIFO.
+    use std::io::Write;
+    let open = |path: &str| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("opening {path}: {e}"))
+    };
+    let out16 = std::env::var("EC_PROBE_OUT16").ok();
+    let out8 = std::env::args().nth(2).or_else(|| std::env::var("EC_PROBE_OUT").ok());
+    let mut f16 = out16.as_deref().map(open);
+    let mut f8 = out8.as_deref().map(open);
+    let mut written16 = 0usize;
+    let mut written8 = 0usize;
+    let mut shown = 0usize;
+    let mut dims = (0usize, 0usize);
+    let mut buf: Vec<u8> = Vec::new();
+    let result = ec_av1::stream::decode_stream_with(&data, |f, _idx, is_shown| {
+        if !is_shown {
+            return Ok(());
+        }
+        shown += 1;
+        if shown == 1 {
+            dims = (f.width, f.height);
+        }
+        if let Some(w) = f16.as_mut() {
+            buf.clear();
+            for p in [&f.y, &f.u, &f.v] {
+                buf.extend(p.iter().flat_map(|&s| s.to_le_bytes()));
+            }
+            w.write_all(&buf).expect("writing raw planes");
+            written16 += buf.len();
+        }
+        if let Some(w) = f8.as_mut() {
+            buf.clear();
+            for p in [&f.y, &f.u, &f.v] {
+                buf.extend(p.iter().map(|&s| s as u8));
+            }
+            w.write_all(&buf).expect("writing raw planes");
+            written8 += buf.len();
+        }
+        Ok(())
+    });
+    match result {
+        Ok(()) if shown == 0 => {
             println!("OK but EMPTY: no frames -- is {path} an IVF rather than a raw OBU stream?");
         }
-        Ok(frames) => {
-            // Optional second arg, or EC_PROBE_OUT=<path>: dump the decoded
-            // planes as raw yuv420p so a pixel diff against `ffmpeg -i s.obu
-            // -f rawvideo` needs no test harness.
-            // 10-bit streams: EC_PROBE_OUT16 dumps the planes as little-endian
-            // u16 (yuv420p10le), the only form a pixel diff against
-            // `ffmpeg -pix_fmt yuv420p10le` can use (lane-band63).
-            if let Ok(out) = std::env::var("EC_PROBE_OUT16") {
-                let mut buf: Vec<u8> = Vec::new();
-                for f in &frames {
-                    for p in [&f.y, &f.u, &f.v] {
-                        buf.extend(p.iter().flat_map(|&s| s.to_le_bytes()));
-                    }
-                }
-                std::fs::write(&out, &buf).expect("writing raw planes");
-                println!("wrote {} bytes of yuv420p10le to {out}", buf.len());
+        Ok(()) => {
+            if let Some(out) = &out16 {
+                println!("wrote {written16} bytes of yuv420p10le to {out}");
             }
-            let out = std::env::args().nth(2).or_else(|| std::env::var("EC_PROBE_OUT").ok());
-            if let Some(out) = out {
-                // 8-bit only: planes are u16, take the low byte.
-                let mut buf: Vec<u8> = Vec::new();
-                for f in &frames {
-                    for p in [&f.y, &f.u, &f.v] {
-                        buf.extend(p.iter().map(|&s| s as u8));
-                    }
-                }
-                std::fs::write(&out, &buf).expect("writing raw planes");
-                println!("wrote {} bytes of yuv420p to {out}", buf.len());
+            if let Some(out) = &out8 {
+                println!("wrote {written8} bytes of yuv420p to {out}");
             }
-            println!("OK: {} frames decoded, {}x{}", frames.len(), frames[0].width, frames[0].height);
+            println!("OK: {shown} frames decoded, {}x{}", dims.0, dims.1);
         }
         Err(e) => println!("REFUSED: {e}"),
     }
