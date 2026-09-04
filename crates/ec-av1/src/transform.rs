@@ -904,6 +904,11 @@ pub fn inverse_transform_2d_typed_wh(
         }
         let residual = &mut scratch[..w * h];
         let mut t = [0i32; 64];
+        // lane-perf10: rows the row pass left non-zero, and whether the first
+        // of them came out constant along the row -- see the fast path below.
+        let mut nz_rows = 0usize;
+        let mut nz_row = 0usize;
+        let mut const_row = false;
         for i in 0..h {
             let dst = &mut residual[i * w..(i + 1) * w];
             // Rows at or past 32 carry no coefficients (the spec zeroes them
@@ -930,6 +935,26 @@ pub fn inverse_transform_2d_typed_wh(
             for (d, &v) in dst.iter_mut().zip(t[..w].iter()) {
                 *d = clamp_range(round2(v, shift), col_clamp);
             }
+            nz_rows += 1;
+            nz_row = i;
+            const_row = nz_rows == 1 && dst.iter().all(|&v| v == dst[0]);
+        }
+
+        // A block whose row pass left exactly one non-zero row, constant along
+        // that row, feeds every column of the column pass the same vector --
+        // the DC-only case, which dominates inter residuals. `inverse_1d` is a
+        // pure function of its input, so one column transform broadcast across
+        // the block is byte-identical to `w` of them, and the per-column gather
+        // disappears with it.
+        if nz_rows <= 1 && const_row {
+            t[..h].fill(0);
+            t[nz_row] = residual[nz_row * w];
+            inverse_1d(&mut t, log2h, col_clamp, col_kind);
+            for i in 0..h {
+                let dst_row = if ud_flip { h - 1 - i } else { i };
+                out[dst_row * w..dst_row * w + w].fill(round2(t[i], 4));
+            }
+            return;
         }
 
         for j in 0..w {
