@@ -422,25 +422,33 @@ impl SlotPromise {
     }
 }
 
-/// One finished leaf frame from a worker: its output position, and either the
-/// (grain-synthesised) picture with the decode index to report or the error
-/// that aborts the stream.
-type LeafResult = (usize, Result<(Picture, usize, bool)>);
+/// One finished frame from a worker: its output position, whether the job was
+/// a frame DECODE (as opposed to a `show_existing_frame` output, which only
+/// waits for a slot and synthesises grain -- lane-thread3 counts the two
+/// against separate in-flight bounds, since a waiting output job costs no
+/// CPU), and either the (grain-synthesised) picture with the decode index to
+/// report or the error that aborts the stream.
+type LeafResult = (usize, bool, Result<(Picture, usize, bool)>);
 
-/// Waits for one in-flight leaf frame and emits whatever that unblocks.
+/// Waits for one in-flight job and emits whatever that unblocks.
 fn collect_one(
     rx: &std::sync::mpsc::Receiver<LeafResult>,
-    in_flight: &mut usize,
+    decodes: &mut usize,
+    shows: &mut usize,
     reorder: &mut Reorder,
     sink: &mut impl FnMut(&Picture, usize, bool) -> Result<()>,
 ) -> Result<()> {
     // Every dispatched worker answers exactly once, panic included (it is
     // caught and turned into an error below), so the sender count cannot
     // reach zero while `in_flight > 0`.
-    let (seq, result) = rx
+    let (seq, decode_job, result) = rx
         .recv()
         .map_err(|_| Error::corrupt("AV1 decode_stream: a worker thread vanished"))?;
-    *in_flight -= 1;
+    if decode_job {
+        *decodes -= 1;
+    } else {
+        *shows -= 1;
+    }
     let (picture, decode_idx, shown) = result?;
     reorder.push(seq, picture, decode_idx, shown);
     reorder.drain(sink)
@@ -513,7 +521,12 @@ pub fn decode_stream_with_threads(
     // pushed).
     let mut emit_seq = 0usize;
     let mut reorder = Reorder::default();
-    let mut in_flight = 0usize;
+    // lane-thread3: frame decodes and `show_existing_frame` outputs are
+    // bounded separately -- an output job is a promise wait plus a memcpy, so
+    // letting it eat a decode's budget just idles a core (measured: sharing
+    // one bound cost 4K 18.7 s at 244% CPU against 17.7 s at 287%).
+    let mut in_flight_decodes = 0usize;
+    let mut in_flight_shows = 0usize;
     let in_flight_cap = threads + 2;
     let (tx, rx) = std::sync::mpsc::channel::<LeafResult>();
     // lane-thread3: at `threads > 1` THIS is the reference bank -- one
@@ -569,20 +582,75 @@ pub fn decode_stream_with_threads(
                     "a show_existing_frame header naming an empty reference slot",
                 )
             };
-            let picture = if threads > 1 {
+            if threads > 1 {
                 // lane-thread3: the named slot may still be decoding on a
-                // worker. This is the parsing thread's ONLY promise wait, and
-                // it points at an earlier coded frame (see [`SlotPromise`]);
-                // the copy into the refreshed slots is then just the promise.
+                // worker, and the copy into the slots this header refreshes
+                // is then just the promise -- no value needed. The OUTPUT
+                // does need the picture, so it is produced on a worker too:
+                // waiting for it here would stall the parsing thread, and a
+                // stalled parser dispatches nothing (measured before this
+                // arm existed: 7.9 s of an 8.8 s 1080p decode, 18.9 s of
+                // 23.3 s at 4K, spent in this one wait). The wait still
+                // points at an earlier coded frame, so the argument in
+                // [`SlotPromise`] is unchanged.
                 let promise = slot_promises[slot].clone().ok_or_else(empty_slot)?;
-                let value = promise.wait()?;
                 for i in 0..NUM_REF_FRAMES {
                     if header.refresh_frame_flags & (1 << i) != 0 {
                         slot_promises[i] = Some(promise.clone());
                     }
                 }
-                value.picture.as_ref().clone()
-            } else {
+                while in_flight_shows >= in_flight_cap {
+                    collect_one(
+                    &rx,
+                    &mut in_flight_decodes,
+                    &mut in_flight_shows,
+                    &mut reorder,
+                    &mut sink,
+                )?;
+                }
+                let (job_seq, decode_idx) = (emit_seq, pictures_decoded);
+                emit_seq += 1;
+                pictures_shown += 1;
+                let grain = header.film_grain;
+                let seq = SeqFlags::read(&parser);
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let value = promise.wait()?;
+                        let output = if grain.apply_grain && !no_grain() {
+                            crate::film_grain::apply_grain(
+                                &value.picture,
+                                &grain,
+                                seq.mc_identity,
+                                u32::from(seq.bit_depth),
+                                &crate::decode::FrameCtx::new(),
+                            )
+                        } else {
+                            value.picture.as_ref().clone()
+                        };
+                        Ok((output, decode_idx, true))
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(Error::corrupt(
+                            "AV1 decode_stream: a worker thread panicked on a show_existing_frame output",
+                        ))
+                    });
+                    let _ = tx.send((job_seq, false, reply));
+                });
+                in_flight_shows += 1;
+                while let Ok((seq, decode_job, result)) = rx.try_recv() {
+                    if decode_job {
+                        in_flight_decodes -= 1;
+                    } else {
+                        in_flight_shows -= 1;
+                    }
+                    let (picture, decode_idx, shown) = result?;
+                    reorder.push(seq, picture, decode_idx, shown);
+                    reorder.drain(&mut sink)?;
+                }
+                continue;
+            }
+            let picture = {
                 let picture = ref_slots[slot].clone().ok_or_else(empty_slot)?;
                 for i in 0..NUM_REF_FRAMES {
                     if header.refresh_frame_flags & (1 << i) != 0 {
@@ -730,8 +798,14 @@ pub fn decode_stream_with_threads(
         // deadlock argument). A key frame stays inline: it resets the whole
         // bank and reads nothing, so there is nothing to gain.
         if threads > 1 && header.frame_type != FrameType::Key && !header.show_existing_frame {
-            while in_flight >= in_flight_cap {
-                collect_one(&rx, &mut in_flight, &mut reorder, &mut sink)?;
+            while in_flight_decodes >= in_flight_cap {
+                collect_one(
+                    &rx,
+                    &mut in_flight_decodes,
+                    &mut in_flight_shows,
+                    &mut reorder,
+                    &mut sink,
+                )?;
             }
             // Exactly the slots this frame reads: `ref_frame_idx` names its
             // references, and its `primary_ref_frame` CDFs/segment map, its
@@ -843,13 +917,17 @@ pub fn decode_stream_with_threads(
                 {
                     promise.fail();
                 }
-                let _ = tx.send((job_seq, reply));
+                let _ = tx.send((job_seq, true, reply));
             });
-            in_flight += 1;
+            in_flight_decodes += 1;
             FRAMES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Anything that finished while this frame was being set up.
-            while let Ok((seq, result)) = rx.try_recv() {
-                in_flight -= 1;
+            while let Ok((seq, decode_job, result)) = rx.try_recv() {
+                if decode_job {
+                    in_flight_decodes -= 1;
+                } else {
+                    in_flight_shows -= 1;
+                }
                 let (picture, decode_idx, shown) = result?;
                 reorder.push(seq, picture, decode_idx, shown);
                 reorder.drain(&mut sink)?;
@@ -949,8 +1027,14 @@ pub fn decode_stream_with_threads(
             reorder.drain(&mut sink)?;
         }
     }
-    while in_flight > 0 {
-        collect_one(&rx, &mut in_flight, &mut reorder, &mut sink)?;
+    while in_flight_decodes + in_flight_shows > 0 {
+        collect_one(
+            &rx,
+            &mut in_flight_decodes,
+            &mut in_flight_shows,
+            &mut reorder,
+            &mut sink,
+        )?;
     }
     debug_assert!(reorder.pending.is_empty(), "a frame was never emitted");
     Ok(())
