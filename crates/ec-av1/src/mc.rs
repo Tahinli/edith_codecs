@@ -243,6 +243,111 @@ fn sample(
     i32::from(reference[cy * stride + cx])
 }
 
+/// lane-perf2: one row of the separable filter's horizontal pass, dav1d
+/// style. When the row's whole 8-tap footprint (`x0-3 .. x0+block_w+4`) lies
+/// inside the reference's true extent -- the overwhelmingly common case --
+/// the row is one contiguous slice and the taps are a fixed `[i32; 8]`, so
+/// the per-sample `Clip3` and the per-tap table load both leave the inner
+/// loop and it auto-vectorises. The edge case keeps the exact spec form
+/// (`sample`'s clamp per tap); both arms compute the same sums.
+#[inline]
+fn hpass_row(reference: &[u16], row_base: usize, true_width: usize, x0: i32, taps: &[i32; 8], out: &mut [i32]) {
+    let block_w = out.len();
+    let start = x0 - 3;
+    if start >= 0 && start as usize + block_w + 7 <= true_width {
+        let s = row_base + start as usize;
+        if let Some(src) = reference.get(s..s + block_w + 7) {
+            for (o, w) in out.iter_mut().zip(src.windows(8)) {
+                let mut sum = 0i32;
+                for t in 0..8 {
+                    sum += taps[t] * i32::from(w[t]);
+                }
+                *o = round2(sum, INTER_ROUND_0);
+            }
+            return;
+        }
+    }
+    for (c, o) in out.iter_mut().enumerate() {
+        let mut sum = 0i32;
+        for (t, &tap) in taps.iter().enumerate() {
+            let x = (x0 + c as i32 + t as i32 - 3).clamp(0, true_width as i32 - 1) as usize;
+            sum += tap * i32::from(reference[row_base + x]);
+        }
+        *o = round2(sum, INTER_ROUND_0);
+    }
+}
+
+/// lane-perf2: the unscaled horizontal pass, `block_h + 7` rows of
+/// [`hpass_row`] with the vertical clamp hoisted out of the row.
+#[allow(clippy::too_many_arguments)]
+fn horizontal_pass_unscaled(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x0: i32,
+    y0: i32,
+    taps: &[i32; 8],
+    block_w: usize,
+    rows: usize,
+    intermediate: &mut [i32],
+) {
+    for r in 0..rows {
+        let y = (y0 - 3 + r as i32).clamp(0, true_height as i32 - 1) as usize;
+        hpass_row(
+            reference,
+            y * stride,
+            true_width,
+            x0,
+            taps,
+            &mut intermediate[r * block_w..(r + 1) * block_w],
+        );
+    }
+}
+
+/// lane-perf2: one output row of the vertical pass, accumulated tap-major so
+/// the inner loop walks two contiguous `i32` slices (vectorisable) instead of
+/// striding the intermediate by `block_w` per tap. A zero tap is skipped --
+/// adding `0 * x` is exactly nothing, and the 4-tap kernels zero four of the
+/// eight slots. `acc` is left holding the unrounded sums.
+#[inline]
+fn vpass_row(intermediate: &[i32], block_w: usize, row: usize, taps: &[i32; 8], acc: &mut [i32]) {
+    acc.fill(0);
+    for (t, &tap) in taps.iter().enumerate() {
+        if tap == 0 {
+            continue;
+        }
+        let base = (row + t) * block_w;
+        for (a, &s) in acc.iter_mut().zip(&intermediate[base..base + block_w]) {
+            *a += tap * s;
+        }
+    }
+}
+
+thread_local! {
+    /// lane-perf2: the separable filter's intermediate buffer, reused across
+    /// calls -- a 4K inter frame runs `predict*` hundreds of thousands of
+    /// times and each call used to `vec![0i32; (block_h+7) * block_w]`. The
+    /// horizontal pass writes every element it later reads, so no clearing is
+    /// needed; the tail `block_w` elements are the vertical pass's row
+    /// accumulator.
+    static MC_SCRATCH: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on a scratch slice of `rows * block_w` intermediate elements plus
+/// a `block_w` accumulator (see [`MC_SCRATCH`]).
+fn with_scratch<R>(rows: usize, block_w: usize, f: impl FnOnce(&mut [i32], &mut [i32]) -> R) -> R {
+    MC_SCRATCH.with(|s| {
+        let mut buf = s.borrow_mut();
+        let need = rows * block_w + block_w;
+        if buf.len() < need {
+            buf.resize(need, 0);
+        }
+        let (inter, acc) = buf[..need].split_at_mut(rows * block_w);
+        f(inter, acc)
+    })
+}
+
 /// Predicts one `block_w * block_h` block into `dst`, row-major, from
 /// `reference` (row-major, stride `stride`, true content
 /// `true_width` x `true_height` -- a reference frame's decoded picture
@@ -395,11 +500,19 @@ pub fn predict_with_filters_kern(
     // it whole-pel candidates from stage 1).
     if xfrac == 0 && yfrac == 0 {
         for row in 0..block_h {
-            let y = y0 + row as i32;
-            for col in 0..block_w {
-                let x = x0 + col as i32;
-                dst[row * block_w + col] =
-                    sample(reference, stride, true_width, true_height, x, y) as u16;
+            let y = (y0 + row as i32).clamp(0, true_height as i32 - 1) as usize;
+            let row_base = y * stride;
+            let out = &mut dst[row * block_w..(row + 1) * block_w];
+            // lane-perf2: an interior row is one contiguous copy.
+            if x0 >= 0 && x0 as usize + block_w <= true_width {
+                if let Some(src) = reference.get(row_base + x0 as usize..row_base + x0 as usize + block_w) {
+                    out.copy_from_slice(src);
+                    continue;
+                }
+            }
+            for (col, o) in out.iter_mut().enumerate() {
+                let x = (x0 + col as i32).clamp(0, true_width as i32 - 1) as usize;
+                *o = reference[row_base + x];
             }
         }
         #[cfg(test)]
@@ -424,28 +537,19 @@ pub fn predict_with_filters_kern(
     // The vertical pass reads 3 rows above and 4 below the block, so the
     // horizontal pass must produce that many extra intermediate rows.
     let rows = block_h + 7;
-    let mut intermediate = vec![0i32; rows * block_w];
-    for r in 0..rows {
-        let y = y0 - 3 + r as i32;
-        for c in 0..block_w {
-            let mut sum = 0;
-            for (t, &tap) in h_filter.iter().enumerate() {
-                let x = x0 + c as i32 + t as i32 - 3;
-                sum += tap * sample(reference, stride, true_width, true_height, x, y);
+    let max = crate::decode::sample_max();
+    with_scratch(rows, block_w, |intermediate, acc| {
+        horizontal_pass_unscaled(
+            reference, stride, true_width, true_height, x0, y0, h_filter, block_w, rows,
+            intermediate,
+        );
+        for row in 0..block_h {
+            vpass_row(intermediate, block_w, row, v_filter, acc);
+            for (d, &a) in dst[row * block_w..(row + 1) * block_w].iter_mut().zip(acc.iter()) {
+                *d = round2(a, INTER_ROUND_1).clamp(0, max) as u16;
             }
-            intermediate[r * block_w + c] = round2(sum, INTER_ROUND_0);
         }
-    }
-
-    for row in 0..block_h {
-        for col in 0..block_w {
-            let mut sum = 0;
-            for (t, &tap) in v_filter.iter().enumerate() {
-                sum += tap * intermediate[(row + t) * block_w + col];
-            }
-            dst[row * block_w + col] = round2(sum, INTER_ROUND_1).clamp(0, crate::decode::sample_max()) as u16;
-        }
-    }
+    });
 
     #[cfg(test)]
     crate::encode::stage_add(1, stage_t.elapsed());
