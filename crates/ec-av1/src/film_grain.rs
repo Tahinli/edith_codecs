@@ -297,6 +297,20 @@ fn scale_lut(lut: &[i32; 256], index: i32, bit_depth: u32) -> i32 {
     }
 }
 
+/// [`scale_lut`] evaluated over its whole index domain once per frame.
+///
+/// The scaling LUT is fixed for the frame, so the interpolation the spec
+/// writes per sample is a pure function of the sample value with at most
+/// `256 << (bit_depth - 8)` distinct answers -- 1024 entries at 10 bit. This
+/// is the same function, tabulated: `add_noise_to_block` was 9.0% self time
+/// and ran that branchy interpolation once per luma sample and twice per
+/// chroma sample.
+fn expand_scaling_lut(lut: &[i32; 256], bit_depth: u32) -> Vec<i32> {
+    (0..(256i32 << (bit_depth - 8)))
+        .map(|i| scale_lut(lut, i, bit_depth))
+        .collect()
+}
+
 /// `add_noise_to_block` (spec 7.18.3.5), 4:2:0 only. `(py0, px0)` is
 /// the luma-plane pixel origin; the matching chroma origin is `(py0/2,
 /// px0/2)`. Grain is read from `(grain, stride, row0, col0)` triples so the
@@ -306,9 +320,9 @@ fn scale_lut(lut: &[i32; 256], index: i32, bit_depth: u32) -> i32 {
 fn add_noise_to_block(
     fg: &FilmGrainParams,
     mc_identity: bool,
-    scaling_y: &[i32; 256],
-    scaling_cb: &[i32; 256],
-    scaling_cr: &[i32; 256],
+    scaling_y: &[i32],
+    scaling_cb: &[i32],
+    scaling_cr: &[i32],
     picture: &mut Picture,
     py0: i32,
     px0: i32,
@@ -386,9 +400,9 @@ fn add_noise_to_block(
                     >> 6)
                     + cb_offset)
                     .clamp(0, index_max);
-                let delta = (scale_lut(scaling_cb, scaled, bit_depth) * cb_grain[gidx]
-                    + rounding_offset)
-                    >> scaling_shift;
+                let delta =
+                    (scaling_cb[scaled as usize] * cb_grain[gidx] + rounding_offset)
+                        >> scaling_shift;
                 picture.u[cidx] =
                     ((picture.u[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
             }
@@ -397,25 +411,27 @@ fn add_noise_to_block(
                     >> 6)
                     + cr_offset)
                     .clamp(0, index_max);
-                let delta = (scale_lut(scaling_cr, scaled, bit_depth) * cr_grain[gidx]
-                    + rounding_offset)
-                    >> scaling_shift;
+                let delta =
+                    (scaling_cr[scaled as usize] * cr_grain[gidx] + rounding_offset)
+                        >> scaling_shift;
                 picture.v[cidx] =
                     ((picture.v[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
             }
         }
     }
     if apply_y {
+        // Both operands are contiguous along a row, so the row bases are
+        // computed once instead of a multiply-add per sample.
+        let width = (half_w * 2) as usize;
         for i in 0..half_h * 2 {
-            for j in 0..half_w * 2 {
-                let pidx = ((py0 + i) * y_stride + (px0 + j)) as usize;
-                let gidx = ((lg_row0 + i) * lg_stride + (lg_col0 + j)) as usize;
-                let delta = (scale_lut(scaling_y, picture.y[pidx] as i32, bit_depth)
-                    * luma_grain[gidx]
-                    + rounding_offset)
-                    >> scaling_shift;
-                picture.y[pidx] =
-                    ((picture.y[pidx] as i32 + delta).clamp(min_luma, max_luma)) as u16;
+            let prow = ((py0 + i) * y_stride + px0) as usize;
+            let grow = ((lg_row0 + i) * lg_stride + lg_col0) as usize;
+            let pixels = &mut picture.y[prow..prow + width];
+            let grain = &luma_grain[grow..grow + width];
+            for (p, &g) in pixels.iter_mut().zip(grain) {
+                let delta =
+                    (scaling_y[*p as usize] * g + rounding_offset) >> scaling_shift;
+                *p = ((*p as i32 + delta).clamp(min_luma, max_luma)) as u16;
             }
         }
     }
@@ -608,6 +624,11 @@ pub(crate) fn apply_grain(
             ),
         )
     };
+
+    let expand_bd = grain_bit_depth();
+    let scaling_y = expand_scaling_lut(&scaling_y, expand_bd);
+    let scaling_cb = expand_scaling_lut(&scaling_cb, expand_bd);
+    let scaling_cr = expand_scaling_lut(&scaling_cr, expand_bd);
 
     let overlap = fg.overlap_flag;
 
