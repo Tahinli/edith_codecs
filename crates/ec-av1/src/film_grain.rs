@@ -880,342 +880,374 @@ pub(crate) fn apply_grain(
 
     let overlap = fg.overlap_flag;
 
-    let mut y_line_buf = vec![0i32; (y_stride * 2).max(1) as usize];
-    let mut cb_line_buf = vec![0i32; c_stride.max(1) as usize];
-    let mut cr_line_buf = vec![0i32; c_stride.max(1) as usize];
-    let mut y_col_buf = vec![0i32; ((LUMA_SUBBLOCK + 2) * 2) as usize];
-    let mut cb_col_buf = vec![0i32; (CHROMA_SUBBLOCK + 1) as usize];
-    let mut cr_col_buf = vec![0i32; (CHROMA_SUBBLOCK + 1) as usize];
+    // lane-filt1: 32-pixel block ROWS are the parallel axis. A row's noise
+    // offsets come from `Rng::line(y * 2, grain_seed)` -- a function of the
+    // row and the frame seed alone -- and a row writes only luma rows
+    // `y*2 .. y*2+31` (chroma `y .. y+15`), so rows are write-disjoint. The
+    // one carry ACROSS rows is `*_line_buf` (the row above's bottom lines,
+    // blended into this row's top lines when `overlap_flag`), and its final
+    // content is written by that row's own blocks out of the grain templates
+    // and `*_col_buf` -- never out of the row above it. So a band replays
+    // exactly ONE preceding row with its pixel writes suppressed (`prelude`)
+    // to rebuild the line buffers, then codes its own rows exactly as the
+    // single-threaded walk does.
+    let row_step = LUMA_SUBBLOCK >> 1;
+    let nrows = ((height / 2).max(0) as usize).div_ceil(row_step as usize);
+    let so = crate::par::Shared::new(&mut out);
+    let gbands = crate::par::bands(nrows, crate::par::filter_threads());
+    crate::par::run_bands(&gbands, fctx, |b_lo, b_hi, fctx| {
+        // SAFETY: this band writes only the picture rows its own block rows
+        // cover, disjoint from every other band's.
+        #[allow(unsafe_code)]
+        let out = unsafe { so.get() };
+        let y_lo = (b_lo * row_step as usize) as i32;
+        let y_hi = ((b_hi * row_step as usize) as i32).min(height / 2);
+        let y_first = if b_lo > 0 { y_lo - row_step } else { y_lo };
+        let mut y_line_buf = vec![0i32; (y_stride * 2).max(1) as usize];
+        let mut cb_line_buf = vec![0i32; c_stride.max(1) as usize];
+        let mut cr_line_buf = vec![0i32; c_stride.max(1) as usize];
+        let mut y_col_buf = vec![0i32; ((LUMA_SUBBLOCK + 2) * 2) as usize];
+        let mut cb_col_buf = vec![0i32; (CHROMA_SUBBLOCK + 1) as usize];
+        let mut cr_col_buf = vec![0i32; (CHROMA_SUBBLOCK + 1) as usize];
 
-    let mut y = 0;
-    while y < height / 2 {
-        let mut row_rng = Rng::line(y * 2, fg.grain_seed);
-        let mut x = 0;
-        while x < width / 2 {
-            let raw = row_rng.get(8);
-            let offset_x = (raw >> 4) & 15;
-            let offset_y = raw & 15;
+        let mut y = y_first;
+        while y < y_hi {
+            let prelude = y < y_lo;
+            let mut row_rng = Rng::line(y * 2, fg.grain_seed);
+            let mut x = 0;
+            while x < width / 2 {
+                let raw = row_rng.get(8);
+                let offset_x = (raw >> 4) & 15;
+                let offset_y = raw & 15;
 
-            let luma_off_y = LEFT_PAD + 2 * AR_PADDING + (offset_y << 1);
-            let luma_off_x = TOP_PAD + 2 * AR_PADDING + (offset_x << 1);
-            let chroma_off_y = TOP_PAD + AR_PADDING + offset_y;
-            let chroma_off_x = LEFT_PAD + AR_PADDING + offset_x;
+                let luma_off_y = LEFT_PAD + 2 * AR_PADDING + (offset_y << 1);
+                let luma_off_x = TOP_PAD + 2 * AR_PADDING + (offset_x << 1);
+                let chroma_off_y = TOP_PAD + AR_PADDING + offset_y;
+                let chroma_off_x = LEFT_PAD + AR_PADDING + offset_x;
 
-            if overlap && x != 0 {
-                let h_count = (LUMA_SUBBLOCK + 2).min(height - (y << 1));
-                ver_overlap_inplace(
-                    &mut y_col_buf,
-                    2,
-                    0,
-                    0,
-                    &luma_template,
-                    LUMA_BLOCK_W,
-                    luma_off_y,
-                    luma_off_x,
-                    2,
-                    h_count, fctx,
-                );
-                let hc_count = (CHROMA_SUBBLOCK + 1).min((height - (y << 1)) >> 1);
-                ver_overlap_inplace(
-                    &mut cb_col_buf,
-                    1,
-                    0,
-                    0,
-                    &cb_template,
-                    CHROMA_BLOCK_W,
-                    chroma_off_y,
-                    chroma_off_x,
-                    1,
-                    hc_count, fctx,
-                );
-                ver_overlap_inplace(
-                    &mut cr_col_buf,
-                    1,
-                    0,
-                    0,
-                    &cr_template,
-                    CHROMA_BLOCK_W,
-                    chroma_off_y,
-                    chroma_off_x,
-                    1,
-                    hc_count, fctx,
-                );
+                if overlap && x != 0 {
+                    let h_count = (LUMA_SUBBLOCK + 2).min(height - (y << 1));
+                    ver_overlap_inplace(
+                        &mut y_col_buf,
+                        2,
+                        0,
+                        0,
+                        &luma_template,
+                        LUMA_BLOCK_W,
+                        luma_off_y,
+                        luma_off_x,
+                        2,
+                        h_count, fctx,
+                    );
+                    let hc_count = (CHROMA_SUBBLOCK + 1).min((height - (y << 1)) >> 1);
+                    ver_overlap_inplace(
+                        &mut cb_col_buf,
+                        1,
+                        0,
+                        0,
+                        &cb_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y,
+                        chroma_off_x,
+                        1,
+                        hc_count, fctx,
+                    );
+                    ver_overlap_inplace(
+                        &mut cr_col_buf,
+                        1,
+                        0,
+                        0,
+                        &cr_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y,
+                        chroma_off_x,
+                        1,
+                        hc_count, fctx,
+                    );
 
-                let i = if y != 0 { 1 } else { 0 };
-                add_noise_to_block(
-                    fg,
-                    mc_identity,
-                    &scaling_y,
-                    &scaling_cb,
-                    &scaling_cr,
-                    &mut out,
-                    (y + i) << 1,
-                    x << 1,
-                    &y_col_buf,
-                    2,
-                    i * 2,
-                    0,
-                    &cb_col_buf,
-                    &cr_col_buf,
-                    1,
-                    i,
-                    0,
-                    (LUMA_SUBBLOCK >> 1).min(height / 2 - y) - i,
-                    1, fctx,
-                );
-            }
+                    let i = if y != 0 { 1 } else { 0 };
+                    if !prelude {
+                        add_noise_to_block(
+                            fg,
+                            mc_identity,
+                            &scaling_y,
+                            &scaling_cb,
+                            &scaling_cr,
+                            &mut *out,
+                            (y + i) << 1,
+                            x << 1,
+                            &y_col_buf,
+                            2,
+                            i * 2,
+                            0,
+                            &cb_col_buf,
+                            &cr_col_buf,
+                            1,
+                            i,
+                            0,
+                            (LUMA_SUBBLOCK >> 1).min(height / 2 - y) - i,
+                            1, fctx,
+                        );
+                    }
+                }
 
-            if overlap && y != 0 {
-                if x != 0 {
+                if overlap && y != 0 {
+                    if x != 0 {
+                        hor_overlap_inplace(
+                            &mut y_line_buf,
+                            y_stride,
+                            0,
+                            x << 1,
+                            &y_col_buf,
+                            2,
+                            0,
+                            0,
+                            2,
+                            2, fctx,
+                        );
+                        hor_overlap_inplace(
+                            &mut cb_line_buf,
+                            c_stride,
+                            0,
+                            x,
+                            &cb_col_buf,
+                            1,
+                            0,
+                            0,
+                            1,
+                            1, fctx,
+                        );
+                        hor_overlap_inplace(
+                            &mut cr_line_buf,
+                            c_stride,
+                            0,
+                            x,
+                            &cr_col_buf,
+                            1,
+                            0,
+                            0,
+                            1,
+                            1, fctx,
+                        );
+                    }
+                    let lcol0 = if x != 0 { (x + 1) << 1 } else { 0 };
+                    let ccol0 = if x != 0 { x + 1 } else { 0 };
+                    let lw = (LUMA_SUBBLOCK - (if x != 0 { 2 } else { 0 })).min(width - lcol0);
                     hor_overlap_inplace(
                         &mut y_line_buf,
                         y_stride,
                         0,
-                        x << 1,
-                        &y_col_buf,
-                        2,
-                        0,
-                        0,
-                        2,
+                        lcol0,
+                        &luma_template,
+                        LUMA_BLOCK_W,
+                        luma_off_y,
+                        luma_off_x + if x != 0 { 2 } else { 0 },
+                        lw,
                         2, fctx,
                     );
+                    let cw = (CHROMA_SUBBLOCK - (if x != 0 { 1 } else { 0 })).min((width - lcol0) >> 1);
                     hor_overlap_inplace(
                         &mut cb_line_buf,
                         c_stride,
                         0,
-                        x,
-                        &cb_col_buf,
-                        1,
-                        0,
-                        0,
-                        1,
+                        ccol0,
+                        &cb_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y,
+                        chroma_off_x + if x != 0 { 1 } else { 0 },
+                        cw,
                         1, fctx,
                     );
                     hor_overlap_inplace(
                         &mut cr_line_buf,
                         c_stride,
                         0,
-                        x,
-                        &cr_col_buf,
-                        1,
-                        0,
-                        0,
-                        1,
+                        ccol0,
+                        &cr_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y,
+                        chroma_off_x + if x != 0 { 1 } else { 0 },
+                        cw,
                         1, fctx,
                     );
+
+                    if !prelude {
+                        add_noise_to_block(
+                            fg,
+                            mc_identity,
+                            &scaling_y,
+                            &scaling_cb,
+                            &scaling_cr,
+                            &mut *out,
+                            y << 1,
+                            x << 1,
+                            &y_line_buf,
+                            y_stride,
+                            0,
+                            x << 1,
+                            &cb_line_buf,
+                            &cr_line_buf,
+                            c_stride,
+                            0,
+                            x,
+                            1,
+                            (LUMA_SUBBLOCK >> 1).min(width / 2 - x), fctx,
+                        );
+                    }
                 }
-                let lcol0 = if x != 0 { (x + 1) << 1 } else { 0 };
-                let ccol0 = if x != 0 { x + 1 } else { 0 };
-                let lw = (LUMA_SUBBLOCK - (if x != 0 { 2 } else { 0 })).min(width - lcol0);
-                hor_overlap_inplace(
-                    &mut y_line_buf,
-                    y_stride,
-                    0,
-                    lcol0,
-                    &luma_template,
-                    LUMA_BLOCK_W,
-                    luma_off_y,
-                    luma_off_x + if x != 0 { 2 } else { 0 },
-                    lw,
-                    2, fctx,
-                );
-                let cw = (CHROMA_SUBBLOCK - (if x != 0 { 1 } else { 0 })).min((width - lcol0) >> 1);
-                hor_overlap_inplace(
-                    &mut cb_line_buf,
-                    c_stride,
-                    0,
-                    ccol0,
-                    &cb_template,
-                    CHROMA_BLOCK_W,
-                    chroma_off_y,
-                    chroma_off_x + if x != 0 { 1 } else { 0 },
-                    cw,
-                    1, fctx,
-                );
-                hor_overlap_inplace(
-                    &mut cr_line_buf,
-                    c_stride,
-                    0,
-                    ccol0,
-                    &cr_template,
-                    CHROMA_BLOCK_W,
-                    chroma_off_y,
-                    chroma_off_x + if x != 0 { 1 } else { 0 },
-                    cw,
-                    1, fctx,
-                );
 
-                add_noise_to_block(
-                    fg,
-                    mc_identity,
-                    &scaling_y,
-                    &scaling_cb,
-                    &scaling_cr,
-                    &mut out,
-                    y << 1,
-                    x << 1,
-                    &y_line_buf,
-                    y_stride,
-                    0,
-                    x << 1,
-                    &cb_line_buf,
-                    &cr_line_buf,
-                    c_stride,
-                    0,
-                    x,
-                    1,
-                    (LUMA_SUBBLOCK >> 1).min(width / 2 - x), fctx,
-                );
-            }
+                let i = if overlap && y != 0 { 1 } else { 0 };
+                let j = if overlap && x != 0 { 1 } else { 0 };
+                if !prelude {
+                    add_noise_to_block(
+                        fg,
+                        mc_identity,
+                        &scaling_y,
+                        &scaling_cb,
+                        &scaling_cr,
+                        &mut *out,
+                        (y + i) << 1,
+                        (x + j) << 1,
+                        &luma_template,
+                        LUMA_BLOCK_W,
+                        luma_off_y + (i << 1),
+                        luma_off_x + (j << 1),
+                        &cb_template,
+                        &cr_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y + i,
+                        chroma_off_x + j,
+                        (LUMA_SUBBLOCK >> 1).min(height / 2 - y) - i,
+                        (LUMA_SUBBLOCK >> 1).min(width / 2 - x) - j, fctx,
+                    );
+                }
 
-            let i = if overlap && y != 0 { 1 } else { 0 };
-            let j = if overlap && x != 0 { 1 } else { 0 };
-            add_noise_to_block(
-                fg,
-                mc_identity,
-                &scaling_y,
-                &scaling_cb,
-                &scaling_cr,
-                &mut out,
-                (y + i) << 1,
-                (x + j) << 1,
-                &luma_template,
-                LUMA_BLOCK_W,
-                luma_off_y + (i << 1),
-                luma_off_x + (j << 1),
-                &cb_template,
-                &cr_template,
-                CHROMA_BLOCK_W,
-                chroma_off_y + i,
-                chroma_off_x + j,
-                (LUMA_SUBBLOCK >> 1).min(height / 2 - y) - i,
-                (LUMA_SUBBLOCK >> 1).min(width / 2 - x) - j, fctx,
-            );
-
-            if overlap {
-                if x != 0 {
+                if overlap {
+                    if x != 0 {
+                        copy_area(
+                            &mut y_line_buf,
+                            y_stride,
+                            0,
+                            x << 1,
+                            &y_col_buf,
+                            2,
+                            LUMA_SUBBLOCK,
+                            0,
+                            2,
+                            2, fctx,
+                        );
+                        copy_area(
+                            &mut cb_line_buf,
+                            c_stride,
+                            0,
+                            x,
+                            &cb_col_buf,
+                            1,
+                            CHROMA_SUBBLOCK,
+                            0,
+                            1,
+                            1, fctx,
+                        );
+                        copy_area(
+                            &mut cr_line_buf,
+                            c_stride,
+                            0,
+                            x,
+                            &cr_col_buf,
+                            1,
+                            CHROMA_SUBBLOCK,
+                            0,
+                            1,
+                            1, fctx,
+                        );
+                    }
+                    let lcol0 = if x != 0 { (x + 1) << 1 } else { 0 };
+                    let ccol0 = if x != 0 { x + 1 } else { 0 };
+                    let lcut = if x != 0 { 2 } else { 0 };
+                    let ccut = if x != 0 { 1 } else { 0 };
                     copy_area(
                         &mut y_line_buf,
                         y_stride,
                         0,
-                        x << 1,
-                        &y_col_buf,
-                        2,
-                        LUMA_SUBBLOCK,
-                        0,
-                        2,
+                        lcol0,
+                        &luma_template,
+                        LUMA_BLOCK_W,
+                        luma_off_y + LUMA_SUBBLOCK,
+                        luma_off_x + lcut,
+                        LUMA_SUBBLOCK.min(width - (x << 1)) - lcut,
                         2, fctx,
                     );
                     copy_area(
                         &mut cb_line_buf,
                         c_stride,
                         0,
-                        x,
-                        &cb_col_buf,
-                        1,
-                        CHROMA_SUBBLOCK,
-                        0,
-                        1,
+                        ccol0,
+                        &cb_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y + CHROMA_SUBBLOCK,
+                        chroma_off_x + ccut,
+                        CHROMA_SUBBLOCK.min((width - (x << 1)) >> 1) - ccut,
                         1, fctx,
                     );
                     copy_area(
                         &mut cr_line_buf,
                         c_stride,
                         0,
-                        x,
-                        &cr_col_buf,
-                        1,
-                        CHROMA_SUBBLOCK,
-                        0,
-                        1,
+                        ccol0,
+                        &cr_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y + CHROMA_SUBBLOCK,
+                        chroma_off_x + ccut,
+                        CHROMA_SUBBLOCK.min((width - (x << 1)) >> 1) - ccut,
                         1, fctx,
                     );
+
+                    let h_count = (LUMA_SUBBLOCK + 2).min(height - (y << 1));
+                    copy_area(
+                        &mut y_col_buf,
+                        2,
+                        0,
+                        0,
+                        &luma_template,
+                        LUMA_BLOCK_W,
+                        luma_off_y,
+                        luma_off_x + LUMA_SUBBLOCK,
+                        2,
+                        h_count, fctx,
+                    );
+                    let hc_count = (CHROMA_SUBBLOCK + 1).min((height - (y << 1)) >> 1);
+                    copy_area(
+                        &mut cb_col_buf,
+                        1,
+                        0,
+                        0,
+                        &cb_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y,
+                        chroma_off_x + CHROMA_SUBBLOCK,
+                        1,
+                        hc_count, fctx,
+                    );
+                    copy_area(
+                        &mut cr_col_buf,
+                        1,
+                        0,
+                        0,
+                        &cr_template,
+                        CHROMA_BLOCK_W,
+                        chroma_off_y,
+                        chroma_off_x + CHROMA_SUBBLOCK,
+                        1,
+                        hc_count, fctx,
+                    );
                 }
-                let lcol0 = if x != 0 { (x + 1) << 1 } else { 0 };
-                let ccol0 = if x != 0 { x + 1 } else { 0 };
-                let lcut = if x != 0 { 2 } else { 0 };
-                let ccut = if x != 0 { 1 } else { 0 };
-                copy_area(
-                    &mut y_line_buf,
-                    y_stride,
-                    0,
-                    lcol0,
-                    &luma_template,
-                    LUMA_BLOCK_W,
-                    luma_off_y + LUMA_SUBBLOCK,
-                    luma_off_x + lcut,
-                    LUMA_SUBBLOCK.min(width - (x << 1)) - lcut,
-                    2, fctx,
-                );
-                copy_area(
-                    &mut cb_line_buf,
-                    c_stride,
-                    0,
-                    ccol0,
-                    &cb_template,
-                    CHROMA_BLOCK_W,
-                    chroma_off_y + CHROMA_SUBBLOCK,
-                    chroma_off_x + ccut,
-                    CHROMA_SUBBLOCK.min((width - (x << 1)) >> 1) - ccut,
-                    1, fctx,
-                );
-                copy_area(
-                    &mut cr_line_buf,
-                    c_stride,
-                    0,
-                    ccol0,
-                    &cr_template,
-                    CHROMA_BLOCK_W,
-                    chroma_off_y + CHROMA_SUBBLOCK,
-                    chroma_off_x + ccut,
-                    CHROMA_SUBBLOCK.min((width - (x << 1)) >> 1) - ccut,
-                    1, fctx,
-                );
 
-                let h_count = (LUMA_SUBBLOCK + 2).min(height - (y << 1));
-                copy_area(
-                    &mut y_col_buf,
-                    2,
-                    0,
-                    0,
-                    &luma_template,
-                    LUMA_BLOCK_W,
-                    luma_off_y,
-                    luma_off_x + LUMA_SUBBLOCK,
-                    2,
-                    h_count, fctx,
-                );
-                let hc_count = (CHROMA_SUBBLOCK + 1).min((height - (y << 1)) >> 1);
-                copy_area(
-                    &mut cb_col_buf,
-                    1,
-                    0,
-                    0,
-                    &cb_template,
-                    CHROMA_BLOCK_W,
-                    chroma_off_y,
-                    chroma_off_x + CHROMA_SUBBLOCK,
-                    1,
-                    hc_count, fctx,
-                );
-                copy_area(
-                    &mut cr_col_buf,
-                    1,
-                    0,
-                    0,
-                    &cr_template,
-                    CHROMA_BLOCK_W,
-                    chroma_off_y,
-                    chroma_off_x + CHROMA_SUBBLOCK,
-                    1,
-                    hc_count, fctx,
-                );
+                x += LUMA_SUBBLOCK >> 1;
             }
-
-            x += LUMA_SUBBLOCK >> 1;
+            y += row_step;
         }
-        y += LUMA_SUBBLOCK >> 1;
-    }
+    });
+    drop(so);
 
     out
 }
