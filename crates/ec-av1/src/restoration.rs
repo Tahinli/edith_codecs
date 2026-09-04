@@ -751,30 +751,52 @@ fn compute_ab(
     let mut col_b = vec![0i64; ncols];
     // Hoisted out of the per-point body: one thread-local read per call.
     let bd_shift = u32::from(crate::decode::bit_depth()).saturating_sub(8);
+    let base_col = h_start as i64 - 1 - r as i64;
+    // lane-perf9: the column sums slide down the grid too. Grid row `gi+1`'s
+    // window is row `gi`'s minus its top source row plus one new bottom row,
+    // so each source sample is read once per grid row instead of (2r+1)
+    // times -- the same exactness argument as the separable split above
+    // (i64 addition is associative, and subtracting a row that was added is
+    // exact), and `lr_sample`'s stripe-boundary test, which is what makes a
+    // sample read expensive, is a pure function of `(row, col)`.
     for gi in 0..gh {
         let i = gi as i64 - 1;
-        let base_col = h_start as i64 - 1 - r as i64;
-        for k in 0..ncols {
-            let col = base_col + k as i64;
-            let (mut ca, mut cb) = (0i64, 0i64);
-            for dr in -r..=r {
-                let row = v_start as i64 + i + dr as i64;
-                let px = lr_sample(
-                    cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col,
-                ) as i64;
-                ca += px * px;
-                cb += px;
+        {
+            let mut accumulate = |row: i64, sign: i64| {
+                for k in 0..ncols {
+                    let px = lr_sample(
+                        cdef,
+                        deblocked,
+                        stride,
+                        plane_w,
+                        plane_h,
+                        v_start,
+                        v_end,
+                        row,
+                        base_col + k as i64,
+                    ) as i64;
+                    col_a[k] += sign * px * px;
+                    col_b[k] += sign * px;
+                }
+            };
+            if gi == 0 {
+                for dr in -r..=r {
+                    accumulate(v_start as i64 + i + dr as i64, 1);
+                }
+            } else {
+                accumulate(v_start as i64 + i - 1 - r as i64, -1);
+                accumulate(v_start as i64 + i + r as i64, 1);
             }
-            col_a[k] = ca;
-            col_b[k] = cb;
         }
+        // The horizontal sum slides the same way (one add and one subtract
+        // per grid point instead of 2r+1 adds).
+        let mut a = col_a[..2 * ru + 1].iter().sum::<i64>();
+        let mut b = col_b[..2 * ru + 1].iter().sum::<i64>();
         for gj in 0..gw {
             let j = gj as i64 - 1;
-            let mut a = 0i64;
-            let mut b = 0i64;
-            for k in gj..gj + 2 * ru + 1 {
-                a += col_a[k];
-                b += col_b[k];
+            if gj > 0 {
+                a += col_a[gj + 2 * ru] - col_a[gj - 1];
+                b += col_b[gj + 2 * ru] - col_b[gj - 1];
             }
             // libaom `restoration.c:660` -- the box sums are brought back
             // to the 8-bit scale before `p` is formed (`a` is a sum of
