@@ -88,6 +88,7 @@ static TMV_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// The number of query blocks that received at least one temporal MV
 /// candidate so far, across every [`find_mv_stack_with_sign_bias`] call in
 /// this process.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tmv_hits() -> usize {
     TMV_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -108,16 +109,19 @@ static TILE_REACH_CLIPS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// [`COMP_GM_FILL_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn comp_gm_fill_hits() -> usize {
     COMP_GM_FILL_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// [`STACK_FULL_DROPS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn stack_full_drops() -> usize {
     STACK_FULL_DROPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// [`TILE_REACH_CLIPS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tile_reach_clips() -> usize {
     TILE_REACH_CLIPS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -799,11 +803,11 @@ fn scan_corner(
 /// frame.
 const MV_BORDER: i32 = 16 << 3;
 
-/// Clamps one candidate MV to the range spec 7.10.2.14 (libaom's
-/// `clamp_mv_ref`) allows for a `bw4`-by-`bh4` block at `(mi_row, mi_col)` in
-/// a `mi_cols`-by-`mi_rows` frame: the distance from the block's own edge to
-/// the matching frame edge, plus the block's own span and [`MV_BORDER`] of
-/// slack, in every direction.
+// Clamps one candidate MV to the range spec 7.10.2.14 (libaom's
+// `clamp_mv_ref`) allows for a `bw4`-by-`bh4` block at `(mi_row, mi_col)` in
+// a `mi_cols`-by-`mi_rows` frame: the distance from the block's own edge to
+// the matching frame edge, plus the block's own span and [`MV_BORDER`] of
+// slack, in every direction.
 // lane-t900 r11: stack entries whose clamp window is narrowed by a NEGATIVE
 // `mb_to_right_edge`/`mb_to_bottom_edge` -- i.e. blocks overhanging the frame's
 // right/bottom edge whose predictor the frame-edge clamp actually moves. Zero

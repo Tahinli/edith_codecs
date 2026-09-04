@@ -243,9 +243,9 @@ pub(crate) fn sb_mi_cur(fctx: &crate::decode::FrameCtx) -> u32 {
     if sb128(fctx) { SB_MI * 2 } else { SB_MI }
 }
 
-/// How many real 128-level partition symbols this decoder has read, and how
-/// many superblocks resolved to `PARTITION_SPLIT` (coded or forced) -- the
-/// gate's proof a `--sb-size=128` stream exercised the 128 partition root.
+// How many real 128-level partition symbols this decoder has read, and how
+// many superblocks resolved to `PARTITION_SPLIT` (coded or forced) -- the
+// gate's proof a `--sb-size=128` stream exercised the 128 partition root.
 thread_local! {
     static PART128_SYMBOLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PART128_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -255,16 +255,19 @@ thread_local! {
 /// Current value of `PART128_GATHERED_SYMBOLS`: 128 roots that read the
 /// half-out-of-frame gathered split_or_horz/split_or_vert symbol (spec
 /// 5.11.4), which this decoder used to read and throw away.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn part128_gathered_symbols() -> usize {
     PART128_GATHERED_SYMBOLS.with(|c| c.get())
 }
 
 /// Current value of [`PART128_SYMBOLS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn part128_symbols() -> usize {
     PART128_SYMBOLS.with(|c| c.get())
 }
 
 /// Current value of [`PART128_SPLIT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn part128_split_hits() -> usize {
     PART128_SPLIT_HITS.with(|c| c.get())
 }
@@ -293,6 +296,7 @@ thread_local! {
 }
 
 /// Current value of [`FILTER_INTRA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn filter_intra_hits() -> usize {
     FILTER_INTRA_HITS.with(|c| c.get())
 }
@@ -307,6 +311,7 @@ thread_local! {
 }
 
 /// Current value of [`INTRA_IN_INTER_FILTER_INTRA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_in_inter_filter_intra_hits() -> usize {
     INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.get())
 }
@@ -323,11 +328,13 @@ thread_local! {
 }
 
 /// Current value of [`INTRA_IN_INTER_ANGLE_DELTA_Y_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_in_inter_angle_delta_y_hits() -> usize {
     INTRA_IN_INTER_ANGLE_DELTA_Y_HITS.with(|c| c.get())
 }
 
 /// Current value of [`INTRA_IN_INTER_ANGLE_DELTA_UV_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_in_inter_angle_delta_uv_hits() -> usize {
     INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|c| c.get())
 }
@@ -348,12 +355,14 @@ thread_local! {
 
 /// Nonzero luma angle deltas coded by an intra 8x8 leaf inside an inter frame
 /// (lane-leaf8tx r1) -- counted only in [`decode_inter_block8`]'s intra arm.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_in_inter8_angle_delta_y_hits() -> usize {
     INTRA_IN_INTER8_ANGLE_DELTA_Y_HITS.with(|c| c.get())
 }
 
 /// `(directional, smooth/paeth, CfL)` chroma modes coded by an intra 8x8 leaf
 /// inside an inter frame -- see [`INTRA_IN_INTER8_UV_DIR_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_in_inter8_uv_hits() -> (usize, usize, usize) {
     (
         INTRA_IN_INTER8_UV_DIR_HITS.with(|c| c.get()),
@@ -442,6 +451,7 @@ thread_local! {
 }
 
 /// Current value of [`WARP_PLANE_SUPPRESS_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn warp_plane_suppress_hits() -> usize {
     WARP_PLANE_SUPPRESS_HITS.with(|c| c.get())
 }
@@ -460,6 +470,7 @@ fn warp_plane_allowed(w: usize, h: usize) -> bool {
 }
 
 /// Current value of [`CDEF_IDX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn cdef_idx_hits() -> usize {
     CDEF_IDX_HITS.with(|c| c.get())
 }
@@ -476,16 +487,19 @@ thread_local! {
 }
 
 /// Current value of [`INTRA_IN_INTER_TXCTX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_in_inter_txctx_hits() -> usize {
     INTRA_IN_INTER_TXCTX_HITS.with(|c| c.get())
 }
 
 /// Current value of [`NON_CHROMA_REF_CTX_SKIP_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn non_chroma_ref_ctx_skip_hits() -> usize {
     NON_CHROMA_REF_CTX_SKIP_HITS.with(|c| c.get())
 }
 
 /// Current value of [`EDGE_FILTER_MI_FIX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn edge_filter_mi_fix_hits() -> usize {
     EDGE_FILTER_MI_FIX_HITS.with(|c| c.get())
 }
@@ -512,6 +526,7 @@ thread_local! {
 }
 
 /// Current value of [`DELTA_Q_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn delta_q_hits() -> usize {
     DELTA_Q_HITS.with(|c| c.get())
 }
@@ -581,6 +596,7 @@ thread_local! {
 }
 
 /// Current value of [`DELTA_LF_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn delta_lf_hits() -> usize {
     DELTA_LF_HITS.with(|c| c.get())
 }
@@ -720,21 +736,25 @@ pub(crate) fn take_segment_ids(fctx: &crate::decode::FrameCtx) -> Vec<u8> {
 }
 
 /// How many `segment_id` symbols have been read (never reset per frame).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn segment_id_hits() -> usize {
     SEG_ID_HITS.with(|c| c.get())
 }
 
 /// How many distinct segment ids any decoded block has carried.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn segment_ids_seen() -> usize {
     SEG_IDS_SEEN.with(|c| c.get().count_ones() as usize)
 }
 
 /// How many `seg_id_predicted` symbols have been read (temporal update).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn segment_pred_hits() -> usize {
     SEG_PRED_HITS.with(|c| c.get())
 }
 
 /// Resets the segmentation hit counters (gate setup).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_segment_hits() {
     SEG_ID_HITS.with(|c| c.set(0));
     SEG_IDS_SEEN.with(|c| c.set(0));
@@ -1006,6 +1026,7 @@ thread_local! {
 }
 
 /// Current value of [`SMOOTH_LUMA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn smooth_luma_hits() -> usize {
     SMOOTH_LUMA_HITS.with(|c| c.get())
 }
@@ -1022,6 +1043,7 @@ thread_local! {
 }
 
 /// Current value of [`SPLIT_TU_REACH_FIX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn split_tu_reach_fix_hits() -> usize {
     SPLIT_TU_REACH_FIX_HITS.with(|c| c.get())
 }
@@ -1063,6 +1085,7 @@ thread_local! {
 }
 
 /// Current value of [`SMOOTH_UV_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn smooth_uv_hits() -> usize {
     SMOOTH_UV_HITS.with(|c| c.get())
 }
@@ -1077,6 +1100,7 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 /// Current value of [`TILE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tile_hits() -> usize {
     TILE_HITS.with(|c| c.get())
 }
@@ -1096,6 +1120,7 @@ static PREFILT_PICTURE_IDX: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Current value of [`DEBLOCK_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn deblock_hits() -> usize {
     DEBLOCK_HITS.with(|c| c.get())
 }
@@ -1111,6 +1136,7 @@ thread_local! {
 }
 
 /// Current value of [`UNI_COMP_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn uni_comp_hits() -> usize {
     UNI_COMP_HITS.with(|c| c.get())
 }
@@ -1125,6 +1151,7 @@ thread_local! {
 }
 
 /// Current value of [`DIFFWTD_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn diffwtd_hits() -> usize {
     DIFFWTD_HITS.with(|c| c.get())
 }
@@ -1140,6 +1167,7 @@ thread_local! {
 }
 
 /// Current value of [`DIFFWTD_INFERRED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn diffwtd_inferred_hits() -> usize {
     DIFFWTD_INFERRED_HITS.with(|c| c.get())
 }
@@ -1156,6 +1184,7 @@ thread_local! {
 }
 
 /// Current value of [`FWD_KF_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn fwd_kf_hits() -> usize {
     FWD_KF_HITS.with(|c| c.get())
 }
@@ -1189,11 +1218,13 @@ thread_local! {
 }
 
 /// Current value of [`SQ_CHROMA_TX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sq_chroma_tx_hits() -> usize {
     SQ_CHROMA_TX_HITS.with(|c| c.get())
 }
 
 /// Current value of [`TX_DEPTH_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tx_depth_hits() -> usize {
     TX_DEPTH_HITS.with(|c| c.get())
 }
@@ -1237,21 +1268,25 @@ thread_local! {
 }
 
 /// Current value of [`TXFM_SPLIT_READS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn txfm_split_reads() -> usize {
     TXFM_SPLIT_READS.with(|c| c.get())
 }
 
 /// Current value of [`TXFM_SPLIT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn txfm_split_hits() -> usize {
     TXFM_SPLIT_HITS.with(|c| c.get())
 }
 
 /// Current value of [`INTER_LEAF16_HORZ_HITS`] (lane-inter4 r3).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn inter_leaf16_horz_hits() -> usize {
     INTER_LEAF16_HORZ_HITS.with(|c| c.get())
 }
 
 /// Current value of [`INTER_LEAF16_VERT_HITS`] (lane-inter4 r3).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn inter_leaf16_vert_hits() -> usize {
     INTER_LEAF16_VERT_HITS.with(|c| c.get())
 }
@@ -1328,6 +1363,7 @@ thread_local! {
 }
 
 /// Current value of [`VERT_B_INTRA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn vert_b_intra_hits() -> usize {
     VERT_B_INTRA_HITS.with(|c| c.get())
 }
@@ -1342,7 +1378,7 @@ thread_local! {
     static AB16_HITS: std::cell::Cell<[usize; 4]> = const { std::cell::Cell::new([0; 4]) };
 }
 
-/// [`AB16_HITS`] per arm (HORZ_A, HORZ_B, VERT_A, VERT_B at 16x16).
+// [`AB16_HITS`] per arm (HORZ_A, HORZ_B, VERT_A, VERT_B at 16x16).
 thread_local! {
     /// 4x4 transform units decoded inside an 8x8 square of a
     /// `PARTITION_VERT_A`/`_B` -- the exact call that panicked before
@@ -1351,10 +1387,12 @@ thread_local! {
     static VERT_AB_TX4_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn vert_ab_tx4_hits() -> usize {
     VERT_AB_TX4_HITS.with(std::cell::Cell::get)
 }
 
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn ab16_hits_by_arm() -> [usize; 4] {
     AB16_HITS.with(std::cell::Cell::get)
 }
@@ -1379,6 +1417,7 @@ thread_local! {
 }
 
 /// Current value of [`HORZ_VERT_INTRA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn horz_vert_intra_hits() -> usize {
     HORZ_VERT_INTRA_HITS.with(|c| c.get())
 }
@@ -1394,6 +1433,7 @@ thread_local! {
 }
 
 /// Current value of [`EDGE_RECT_STRIP_HITS`].
+#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 pub(crate) fn edge_rect_strip_hits() -> usize {
     EDGE_RECT_STRIP_HITS.with(|c| c.get())
 }
@@ -1447,11 +1487,13 @@ pub fn reset_inter_edge_strip_hits() {
 }
 
 /// Current value of [`EDGE_BOTH_CUT_HITS`] (`[16, 32, 64, 128]` levels).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn edge_both_cut_hits() -> [usize; 4] {
     EDGE_BOTH_CUT_HITS.with(|c| c.get())
 }
 
 /// Zeroes [`EDGE_BOTH_CUT_HITS`] so a gate can measure a per-attempt delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_edge_both_cut_hits() {
     EDGE_BOTH_CUT_HITS.with(|c| c.set([0; 4]));
 }
@@ -1466,6 +1508,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_SPLIT_TX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_split_tx_hits() -> usize {
     RECT_SPLIT_TX_HITS.with(|c| c.get())
 }
@@ -1482,6 +1525,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_SPLIT_SB_INTERIOR_TU_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_split_sb_interior_tu_hits() -> usize {
     RECT_SPLIT_SB_INTERIOR_TU_HITS.with(|c| c.get())
 }
@@ -1498,6 +1542,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_SPLIT_CHROMA_SHAPE_HITS`] (32x8, 8x32, 8x4, 4x8).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_split_chroma_shape_hits() -> [usize; 4] {
     RECT_SPLIT_CHROMA_SHAPE_HITS.with(|c| c.get())
 }
@@ -1512,6 +1557,7 @@ thread_local! {
 }
 
 /// Current value of [`FILTER_INTRA_RECT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn filter_intra_rect_hits() -> usize {
     FILTER_INTRA_RECT_HITS.with(|c| c.get())
 }
@@ -1532,11 +1578,13 @@ thread_local! {
 }
 
 /// Current value of [`FILTER_INTRA_RECT4_HORZ_HITS`] (32x8 strips).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn filter_intra_rect4_horz_hits() -> usize {
     FILTER_INTRA_RECT4_HORZ_HITS.with(|c| c.get())
 }
 
 /// Current value of [`FILTER_INTRA_RECT4_VERT_HITS`] (8x32 strips).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn filter_intra_rect4_vert_hits() -> usize {
     FILTER_INTRA_RECT4_VERT_HITS.with(|c| c.get())
 }
@@ -1551,6 +1599,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_COEFF_TU_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_coeff_tu_hits() -> usize {
     RECT_COEFF_TU_HITS.with(|c| c.get())
 }
@@ -1559,6 +1608,7 @@ pub(crate) fn rect_coeff_tu_hits() -> usize {
 /// (`V_DCT`/`H_DCT`) -- [`TX_CLASS1_HITS`]'s rect-only half, so a gate can
 /// pin that the 1D-class-on-a-RECT-transform path fired rather than settling
 /// for the square reader's own 1D types.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_class1_hits() -> usize {
     RECT_CLASS1_HITS.with(|c| c.get())
 }
@@ -1574,6 +1624,7 @@ thread_local! {
 }
 
 /// Current value of [`FILTER_INTRA_RECT_SUB16_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn filter_intra_rect_sub16_hits() -> usize {
     FILTER_INTRA_RECT_SUB16_HITS.with(|c| c.get())
 }
@@ -1587,6 +1638,7 @@ thread_local! {
 }
 
 /// Current value of [`FILTER_INTRA_RECT_SUB8_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn filter_intra_rect_sub8_hits() -> usize {
     FILTER_INTRA_RECT_SUB8_HITS.with(|c| c.get())
 }
@@ -1612,6 +1664,7 @@ thread_local! {
 }
 
 /// Current value of [`DIRECTIONAL_UV_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn directional_uv_hits() -> usize {
     DIRECTIONAL_UV_HITS.with(|c| c.get())
 }
@@ -1637,6 +1690,7 @@ thread_local! {
 }
 
 /// Current value of [`NON_LAST_REF_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn non_last_ref_hits() -> usize {
     NON_LAST_REF_HITS.with(|c| c.get())
 }
@@ -1683,6 +1737,7 @@ thread_local! {
 }
 
 /// Current value of [`COMP_MODE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn comp_mode_hits() -> usize {
     COMP_MODE_HITS.with(|c| c.get())
 }
@@ -1697,6 +1752,7 @@ thread_local! {
 }
 
 /// Current value of [`PALETTE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn palette_hits() -> usize {
     PALETTE_HITS.with(|c| c.get())
 }
@@ -1710,6 +1766,7 @@ thread_local! {
 }
 
 /// Current value of [`PALETTE_TILE_LEFT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn palette_tile_left_hits() -> usize {
     PALETTE_TILE_LEFT_HITS.with(|c| c.get())
 }
@@ -1722,6 +1779,7 @@ thread_local! {
 }
 
 /// Current value of [`PALETTE_UV_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn palette_uv_hits() -> usize {
     PALETTE_UV_HITS.with(|c| c.get())
 }
@@ -1734,6 +1792,7 @@ thread_local! {
 }
 
 /// Current value of [`PALETTE_RECT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn palette_rect_hits() -> usize {
     PALETTE_RECT_HITS.with(|c| c.get())
 }
@@ -1753,6 +1812,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_SCREEN_CONTENT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_screen_content_hits() -> usize {
     RECT_SCREEN_CONTENT_HITS.with(|c| c.get())
 }
@@ -1774,11 +1834,13 @@ thread_local! {
 }
 
 /// Current value of [`RECT4_PALETTE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect4_palette_hits() -> usize {
     RECT4_PALETTE_HITS.with(|c| c.get())
 }
 
 /// Current value of [`PALETTE_SPLIT_TX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn palette_split_tx_hits() -> usize {
     PALETTE_SPLIT_TX_HITS.with(|c| c.get())
 }
@@ -1792,11 +1854,13 @@ thread_local! {
 }
 
 /// Current value of [`PALETTE_LEAF8_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn palette_leaf8_hits() -> usize {
     PALETTE_LEAF8_HITS.with(|c| c.get())
 }
 
 /// Zeroes [`PALETTE_LEAF8_HITS`] (per-attempt gate counting).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_palette_leaf8_hits() {
     PALETTE_LEAF8_HITS.with(|c| c.set(0));
 }
@@ -1809,11 +1873,13 @@ thread_local! {
 }
 
 /// Current value of [`PALETTE_SB_STRIP_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn palette_sb_strip_hits() -> usize {
     PALETTE_SB_STRIP_HITS.with(|c| c.get())
 }
 
 /// Zeroes [`PALETTE_SB_STRIP_HITS`] (per-attempt gate counting).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_palette_sb_strip_hits() {
     PALETTE_SB_STRIP_HITS.with(|c| c.set(0));
 }
@@ -1877,6 +1943,7 @@ thread_local! {
 }
 
 /// Current value of [`INTRA_IN_INTER_SPLIT_TX_HITS`], indexed 8/16/32/64.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_in_inter_split_tx_hits() -> [usize; 4] {
     INTRA_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
@@ -1975,6 +2042,7 @@ pub(crate) fn rect_intrabc_reads() -> usize {
 }
 
 /// Zeroes [`RECT_INTRABC_READS`] (gate tests call this before a decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_rect_intrabc_reads() {
     RECT_INTRABC_READS.with(|c| c.set(0));
 }
@@ -1991,16 +2059,19 @@ pub(crate) fn leaf8_intrabc_hits() -> usize {
 }
 
 /// Zeroes [`LEAF8_INTRABC_HITS`] (gate tests call this before a decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_leaf8_intrabc_hits() {
     LEAF8_INTRABC_HITS.with(|c| c.set(0));
 }
 
 /// Current value of [`INTRABC_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intrabc_hits() -> usize {
     INTRABC_HITS.with(|c| c.get())
 }
 
 /// Zeroes [`INTRABC_HITS`] (gate tests call this before a decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_intrabc_hits() {
     INTRABC_HITS.with(|c| c.set(0));
 }
@@ -2013,11 +2084,13 @@ thread_local! {
 }
 
 /// Current value of [`INTRABC_VARTX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intrabc_vartx_hits() -> usize {
     INTRABC_VARTX_HITS.with(|c| c.get())
 }
 
 /// Zeroes [`INTRABC_VARTX_HITS`] (gate tests call this before a decode).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_intrabc_vartx_hits() {
     INTRABC_VARTX_HITS.with(|c| c.set(0));
 }
@@ -2061,6 +2134,7 @@ thread_local! {
 }
 
 /// Current value of [`SKIP_MODE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn skip_mode_hits() -> usize {
     SKIP_MODE_HITS.with(|c| c.get())
 }
@@ -2092,7 +2166,7 @@ pub fn fimv_alphabet_hits() -> usize {
 }
 
 // lane-fimv r1: how many frame headers this decoder has decoded with
-/// `force_integer_mv == 1` (bumped by `stream.rs` per frame). Lets a gate
+// `force_integer_mv == 1` (bumped by `stream.rs` per frame). Lets a gate
 // prove the encoder really produced the header state under test rather than
 // assume it.
 thread_local! {
@@ -2111,6 +2185,7 @@ pub fn note_force_integer_mv_frame() {
 }
 
 /// Current value of [`OBMC_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn obmc_hits() -> usize {
     OBMC_HITS.with(|c| c.get())
 }
@@ -2126,6 +2201,7 @@ thread_local! {
 }
 
 /// Current value of [`OBMC_FILTER_BAND_READS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn obmc_filter_band_reads() -> usize {
     OBMC_FILTER_BAND_READS.with(|c| c.get())
 }
@@ -2149,6 +2225,7 @@ thread_local! {
 
 /// Current value of [`MIXED_SCALE_COMPOUND_HITS`]: compound blocks with one
 /// scaled and one unscaled tap.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn mixed_scale_compound_hits() -> usize {
     MIXED_SCALE_COMPOUND_HITS.with(|c| c.get())
 }
@@ -2157,11 +2234,13 @@ pub(crate) fn mixed_scale_compound_hits() -> usize {
 /// read the 3-symbol `motion_mode_cdf` but read the 2-symbol `obmc_cdf`
 /// instead because their reference is scaled (libaom `motion_mode_allowed`,
 /// `blockd.h:1484`).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn scaled_warp_suppressed_hits() -> usize {
     SCALED_WARP_SUPPRESSED_HITS.with(|c| c.get())
 }
 
 /// Current value of [`SCALED_COMPOUND_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn scaled_compound_hits() -> usize {
     SCALED_COMPOUND_HITS.with(|c| c.get())
 }
@@ -2172,16 +2251,19 @@ pub fn scaled_warp_fallback_hits() -> usize {
 }
 
 /// Current value of [`SCALED_OBMC_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn scaled_obmc_hits() -> usize {
     SCALED_OBMC_HITS.with(|c| c.get())
 }
 
 /// Current value of [`SCALED_INTERINTRA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn scaled_interintra_hits() -> usize {
     SCALED_INTERINTRA_HITS.with(|c| c.get())
 }
 
 /// Current value of [`SCALED_BLOCK8_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn scaled_block8_hits() -> usize {
     SCALED_BLOCK8_HITS.with(|c| c.get())
 }
@@ -2211,11 +2293,13 @@ thread_local! {
 }
 
 /// Current value of [`DUAL_FILTER_DIFF_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn dual_filter_diff_hits() -> usize {
     DUAL_FILTER_DIFF_HITS.with(|c| c.get())
 }
 
 /// Current value of [`COMPOUND8_FILTER_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn compound8_filter_hits() -> usize {
     COMPOUND8_FILTER_HITS.with(|c| c.get())
 }
@@ -2232,6 +2316,7 @@ thread_local! {
 }
 
 /// Current value of [`WARP_SELECTED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn warp_selected_hits() -> usize {
     WARP_SELECTED_HITS.with(|c| c.get())
 }
@@ -2247,6 +2332,7 @@ thread_local! {
 }
 
 /// Current value of [`COMPOUND_WARP_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn compound_warp_hits() -> usize {
     COMPOUND_WARP_HITS.with(|c| c.get())
 }
@@ -2261,6 +2347,7 @@ thread_local! {
 }
 
 /// Current value of [`COMPOUND_WARP_HITS_8`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn compound_warp_hits_8() -> usize {
     COMPOUND_WARP_HITS_8.with(|c| c.get())
 }
@@ -2276,6 +2363,7 @@ thread_local! {
 }
 
 /// Current value of [`AFFINE_GM_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn affine_gm_hits() -> usize {
     AFFINE_GM_HITS.with(|c| c.get())
 }
@@ -2321,11 +2409,13 @@ thread_local! {
 }
 
 /// Current value of [`GLOBALMV_HITS_8`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn globalmv_hits_8() -> usize {
     GLOBALMV_HITS_8.with(|c| c.get())
 }
 
 /// Current value of [`WARP_HITS_8`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn warp_hits_8() -> usize {
     WARP_HITS_8.with(|c| c.get())
 }
@@ -2339,6 +2429,7 @@ thread_local! {
 }
 
 /// Current value of [`INTERINTRA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn interintra_hits() -> usize {
     INTERINTRA_HITS.with(|c| c.get())
 }
@@ -2368,6 +2459,7 @@ thread_local! {
 }
 
 /// Current value of [`MASKED_COMPOUND_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn masked_compound_hits() -> usize {
     MASKED_COMPOUND_HITS.with(|c| c.get())
 }
@@ -2383,6 +2475,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_MASKED_COMPOUND_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_masked_compound_hits() -> usize {
     RECT_MASKED_COMPOUND_HITS.with(|c| c.get())
 }
@@ -2397,6 +2490,7 @@ thread_local! {
 }
 
 /// Current value of [`WEDGE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn wedge_hits() -> usize {
     WEDGE_HITS.with(|c| c.get())
 }
@@ -2411,6 +2505,7 @@ thread_local! {
 }
 
 /// Current value of [`WII_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn wii_hits() -> usize {
     WII_HITS.with(|c| c.get())
 }
@@ -2425,6 +2520,7 @@ thread_local! {
 }
 
 /// Current value of [`NOCFL_UV_MODE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn nocfl_uv_mode_hits() -> usize {
     NOCFL_UV_MODE_HITS.with(|c| c.get())
 }
@@ -2495,11 +2591,13 @@ thread_local! {
 }
 
 /// Current value of [`OBMC_EDGE_SPAN_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn obmc_edge_span_hits() -> usize {
     OBMC_EDGE_SPAN_HITS.with(|c| c.get())
 }
 
 /// Current value of [`OBMC_HITS_8`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.with(|c| c.get())
 }
@@ -2517,6 +2615,7 @@ thread_local! {
 }
 
 /// Current value of [`EXTENDED_PARTITION_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn extended_partition_hits() -> usize {
     EXTENDED_PARTITION_HITS.with(|c| c.get())
 }
@@ -2531,6 +2630,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_PARTITION_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_partition_hits() -> usize {
     RECT_PARTITION_HITS.with(|c| c.get())
 }
@@ -2580,6 +2680,7 @@ thread_local! {
 }
 
 /// Current value of [`INTER_SB_NONE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn inter_sb_none_hits() -> usize {
     INTER_SB_NONE_HITS.with(|c| c.get())
 }
@@ -2594,6 +2695,7 @@ thread_local! {
 }
 
 /// Current value of [`INTER_SUB16_SPLIT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn inter_sub16_split_hits() -> usize {
     INTER_SUB16_SPLIT_HITS.with(|c| c.get())
 }
@@ -2634,6 +2736,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_COEFF_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_coeff_hits() -> usize {
     RECT_COEFF_HITS.with(|c| c.get())
 }
@@ -2647,6 +2750,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT_LEAF_COEFF_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_leaf_coeff_hits() -> usize {
     RECT_LEAF_COEFF_HITS.with(|c| c.get())
 }
@@ -2663,6 +2767,7 @@ thread_local! {
 
 /// Current value of [`INTRA_RECT_IN_INTER_HITS`] for one shape class
 /// (0 = 64x32/32x64, 1 = 32x16/16x32, 2 = 16x8/8x16).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_rect_strip_in_inter_hits(class: usize) -> usize {
     INTRA_RECT_IN_INTER_HITS.with(|c| c.get()[class])
 }
@@ -2703,16 +2808,19 @@ thread_local! {
 }
 
 /// Current value of [`INTRA_RECT_IN_INTER_SCREEN_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_rect_in_inter_screen_hits() -> usize {
     INTRA_RECT_IN_INTER_SCREEN_HITS.with(std::cell::Cell::get)
 }
 
 /// Resets [`INTRA_RECT_IN_INTER_SCREEN_HITS`] before a decode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_intra_rect_in_inter_screen_hits() {
     INTRA_RECT_IN_INTER_SCREEN_HITS.with(|c| c.set(0));
 }
 
 /// Current value of [`INTRA_RECT_IN_INTER_SPLIT_TX_HITS`], indexed by tx depth.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_rect_in_inter_split_tx_hits() -> [usize; 3] {
     INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
@@ -2726,6 +2834,7 @@ thread_local! {
 }
 
 /// Current value of [`INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS`].
+#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 pub(crate) fn intra_rect_in_inter_txctx_override_hits() -> usize {
     INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS.with(std::cell::Cell::get)
 }
@@ -2763,6 +2872,7 @@ thread_local! {
 }
 
 /// Current value of [`MODE_MI_OVERRIDE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn mode_mi_override_hits() -> usize {
     MODE_MI_OVERRIDE_HITS.with(|c| c.get())
 }
@@ -2781,6 +2891,7 @@ thread_local! {
 }
 
 /// Current value of [`MODE_TILE_EDGE_COARSE_LEAKS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn mode_tile_edge_coarse_leaks() -> usize {
     MODE_TILE_EDGE_COARSE_LEAKS.with(|c| c.get())
 }
@@ -2795,6 +2906,7 @@ thread_local! {
 }
 
 /// Current value of [`UV_MODE_MI_OVERRIDE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn uv_mode_mi_override_hits() -> usize {
     UV_MODE_MI_OVERRIDE_HITS.with(|c| c.get())
 }
@@ -2825,6 +2937,7 @@ thread_local! {
 }
 
 /// Current value of [`INTER_NEIGHBOUR_NOT_SMOOTH_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn inter_neighbour_not_smooth_hits() -> usize {
     INTER_NEIGHBOUR_NOT_SMOOTH_HITS.with(|c| c.get())
 }
@@ -2842,6 +2955,7 @@ thread_local! {
 }
 
 /// Current value of [`UV_TILE_EDGE_SUPPRESSED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn uv_tile_edge_suppressed_hits() -> usize {
     UV_TILE_EDGE_SUPPRESSED_HITS.with(|c| c.get())
 }
@@ -2855,11 +2969,13 @@ thread_local! {
 }
 
 /// Current value of [`CFL_BLOCK_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn cfl_block_hits() -> usize {
     CFL_BLOCK_HITS.with(|c| c.get())
 }
 
 /// Current value of [`UV_ANGLE_DELTA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn uv_angle_delta_hits() -> usize {
     UV_ANGLE_DELTA_HITS.with(|c| c.get())
 }
@@ -2873,7 +2989,7 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-/// Current value of [`SB_RECT_HITS`].
+// Current value of [`SB_RECT_HITS`].
 // lane-hgkf r1: the frame-edge partition bit, one level each. Slot 0 = a
 // 64-level gathered edge bit read as HORZ/VERT, 1 = the same bit read as
 // SPLIT, 2/3 = the 32-level pair. A gate asserting slot 0 or 2 proves the
@@ -2884,11 +3000,13 @@ thread_local! {
 }
 
 /// Current value of [`EDGE_PART_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn edge_part_hits() -> [usize; 4] {
     EDGE_PART_HITS.with(|c| c.get())
 }
 
 /// Reset [`EDGE_PART_HITS`] (a gate counts one stream at a time).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn reset_edge_part_hits() {
     EDGE_PART_HITS.with(|c| c.set([0; 4]));
 }
@@ -2901,6 +3019,7 @@ fn bump_edge_part(slot: usize) {
     });
 }
 
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sb_rect_hits() -> usize {
     SB_RECT_HITS.with(|c| c.get())
 }
@@ -2924,6 +3043,7 @@ thread_local! {
 }
 
 /// Current value of [`EDGE32_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn edge32_hits() -> [usize; 8] {
     EDGE32_HITS.with(|c| c.get())
 }
@@ -2954,6 +3074,7 @@ thread_local! {
 }
 
 /// Current value of [`SB_AB_HITS`], summed over the four arms.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sb_ab_hits() -> usize {
     SB_AB_HITS.with(|c| c.get().iter().sum())
 }
@@ -2962,6 +3083,7 @@ pub(crate) fn sb_ab_hits() -> usize {
 /// `_VERT_A`, `_VERT_B` order -- what the gate hard-asserts arm by arm, so a
 /// run where aomenc's RD only ever picked (say) `HORZ_A` cannot pass off as
 /// proof of all four.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sb_ab_hits_by_arm() -> [usize; 4] {
     SB_AB_HITS.with(std::cell::Cell::get)
 }
@@ -2977,11 +3099,13 @@ thread_local! {
 }
 
 /// Current value of `SB_RECT4_HORZ_HITS` (64x16 strips decoded).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sb_rect4_horz_hits() -> usize {
     SB_RECT4_HORZ_HITS.with(|c| c.get())
 }
 
 /// Current value of `SB_RECT4_VERT_HITS` (16x64 strips decoded).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sb_rect4_vert_hits() -> usize {
     SB_RECT4_VERT_HITS.with(|c| c.get())
 }
@@ -3005,9 +3129,9 @@ thread_local! {
     static INTER_SB_VERT4_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// How many 32x32-level 1:4 strips actually read coefficients (non-skip):
-/// a gate that only counted strips would pass on an all-skip stream, which
-/// exercises none of the new scan/context tables.
+// How many 32x32-level 1:4 strips actually read coefficients (non-skip):
+// a gate that only counted strips would pass on an all-skip stream, which
+// exercises none of the new scan/context tables.
 thread_local! {
     static RECT4_COEFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -3024,6 +3148,7 @@ thread_local! {
 }
 
 /// Current values of `RECT4_SPLIT_DEPTH1_HITS` / `RECT4_SPLIT_DEPTH2_HITS`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect4_split_depth_hits() -> (usize, usize) {
     (
         RECT4_SPLIT_DEPTH1_HITS.with(|c| c.get()),
@@ -3032,6 +3157,7 @@ pub(crate) fn rect4_split_depth_hits() -> (usize, usize) {
 }
 
 /// Current value of `SUB16_SPLIT_HITS`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sub16_split_hits() -> usize {
     SUB16_SPLIT_HITS.with(|c| c.get())
 }
@@ -3044,6 +3170,7 @@ thread_local! {
 }
 
 /// Current value of `RECT64_SPLIT_TXFM_PUBLISH_HITS`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect64_split_txfm_publish_hits() -> usize {
     RECT64_SPLIT_TXFM_PUBLISH_HITS.with(|c| c.get())
 }
@@ -3273,6 +3400,7 @@ thread_local! {
 }
 
 /// Current value of [`RECT64_QIDX_DRIFT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect64_qidx_drift_hits() -> usize {
     RECT64_QIDX_DRIFT_HITS.with(|c| c.get())
 }
@@ -3287,6 +3415,7 @@ thread_local! {
 }
 
 /// Current value of [`PARTAB_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn partab_hits() -> usize {
     PARTAB_HITS.with(|c| c.get())
 }
@@ -3307,18 +3436,22 @@ thread_local! {
 }
 
 /// Current value of [`INTRA_HORZ_A_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_horz_a_hits() -> usize {
     INTRA_HORZ_A_HITS.with(|c| c.get())
 }
 /// Current value of [`INTRA_HORZ_B_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_horz_b_hits() -> usize {
     INTRA_HORZ_B_HITS.with(|c| c.get())
 }
 /// Current value of [`INTRA_VERT_A_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_vert_a_hits() -> usize {
     INTRA_VERT_A_HITS.with(|c| c.get())
 }
 /// Current value of [`INTRA_VERT_B_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_vert_b_hits() -> usize {
     INTRA_VERT_B_HITS.with(|c| c.get())
 }
@@ -3335,6 +3468,7 @@ thread_local! {
 }
 
 /// Current value of [`COMPOUND_MODE_HITS`].
+#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 pub(crate) fn compound_mode_hits() -> usize {
     COMPOUND_MODE_HITS.with(|c| c.get())
 }
@@ -3352,12 +3486,14 @@ pub(crate) fn compound_mode_hits() -> usize {
 /// [`crate::motion_field::setup_motion_field`] yet, so this will read `0`
 /// against any real stream today. See the module doc on
 /// `crate::motion_field` and this crate's ledger for the remaining wiring.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tmv_hits() -> usize {
     crate::mvstack::tmv_hits()
 }
 
 /// Current value of [`crate::mc::inter_pred_hits`] -- inter predictions
 /// produced on this thread, the 10-bit inter gate's firing proof.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn inter_pred_hits() -> usize {
     crate::mc::inter_pred_hits()
 }
@@ -3465,6 +3601,7 @@ pub(crate) fn build_motion_field(
 
 /// Current value of the counter for `ref_frame` (`LAST2_FRAME`..=`ALTREF_FRAME`;
 /// panics on `LAST_FRAME`/`INTRA_FRAME`/`NONE`, which have no counter here).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn ref_hits(ref_frame: i8) -> usize {
     let c = match ref_frame {
         LAST2_FRAME => &LAST2_HITS,
@@ -3499,11 +3636,13 @@ pub(crate) fn set_enable_edge_filter(value: bool, fctx: &crate::decode::FrameCtx
 }
 
 /// Current value of [`ANGLE_DELTA_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn angle_delta_hits() -> usize {
     ANGLE_DELTA_HITS.with(|c| c.get())
 }
 
 /// Current value of [`TX_CLASS1_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tx_class1_hits() -> usize {
     TX_CLASS1_HITS.with(|c| c.get())
 }
@@ -3592,6 +3731,7 @@ pub fn cdef_mixed_skip_units() -> usize {
 }
 
 /// Current value of `CDEF_SKIPPED_UNITS`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn cdef_skipped_units() -> usize {
     CDEF_SKIPPED_UNITS.with(|c| c.get())
 }
@@ -3603,16 +3743,19 @@ pub fn cdef_unwritten_skip_units() -> usize {
 }
 
 /// Current value of `INTER8_SKIP_BAND_HITS`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn inter8_skip_band_hits() -> usize {
     INTER8_SKIP_BAND_HITS.with(|c| c.get())
 }
 
 /// Current value of `CDEF_STRADDLE_UNITS`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn cdef_straddle_units() -> usize {
     CDEF_STRADDLE_UNITS.with(|c| c.get())
 }
 
 /// Current value of [`SUB8_SPLIT_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sub8_split_hits() -> usize {
     SUB8_SPLIT_HITS.with(|c| c.get())
 }
@@ -3669,26 +3812,31 @@ thread_local! {
 }
 
 /// Current value of [`RECT8_SPLIT_TX_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect8_split_tx_hits() -> usize {
     RECT8_SPLIT_TX_HITS.with(|c| c.get())
 }
 
 /// Current value of [`RECT_STRIP_PRED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_strip_pred_hits() -> usize {
     RECT_STRIP_PRED_HITS.with(|c| c.get())
 }
 
 /// Current value of [`RECT_STRIP_REACH_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn rect_strip_reach_hits() -> usize {
     RECT_STRIP_REACH_HITS.with(|c| c.get())
 }
 
 /// Current value of [`TX4X8_CODED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tx4x8_coded_hits() -> usize {
     TX4X8_CODED_HITS.with(|c| c.get())
 }
 
 /// Current value of [`TX8X4_CODED_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tx8x4_coded_hits() -> usize {
     TX8X4_CODED_HITS.with(|c| c.get())
 }
@@ -3705,6 +3853,7 @@ thread_local! {
 }
 
 /// Current value of [`CHROMA_EOB_CLASS1_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn chroma_eob_class1_hits() -> usize {
     CHROMA_EOB_CLASS1_HITS.with(|c| c.get())
 }
@@ -4680,7 +4829,7 @@ fn read_coeffs_rect(
         let pos = scan[scan_idx] as usize;
         let (row, col) = (pos / w, pos % w);
         // libaom's column-major `coeff_idx`, for ladder comparison.
-        let apos = col * h + row;
+        let _apos = col * h + row;
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, w * h);
             let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
@@ -5014,6 +5163,7 @@ struct Neighbours {
     tile_col0_mi: usize,
 }
 
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 impl Neighbours {
     /// `cols`/`rows` are in [`SUB`] units; `mi_cols`/`mi_rows` are the frame's
     /// true (unpadded) size in 4x4 mode-info units.
@@ -5603,6 +5753,7 @@ impl Neighbours {
     /// "no neighbour"). `ref_frame` is `-1` for an intra block, else the
     /// `1..=7` reference it coded (lane-av1refs's `single_ref_p*_ctx` needs
     /// the real value, not just `is_inter`).
+    #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
     fn record_inter(
         &mut self,
         at: (usize, usize),
@@ -5622,6 +5773,7 @@ impl Neighbours {
     /// left-context span (its own height) differ, unlike every caller before
     /// this round (class neighbour-votes-all-its-fields).
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
     fn record_inter_rect(
         &mut self,
         at: (usize, usize),
@@ -5721,6 +5873,7 @@ impl Neighbours {
     /// this is the one caller that actually knows it) -- so the next block's
     /// [`NeighbourRef`](crate::mvstack::NeighbourRef) sees a real compound
     /// neighbour instead of `record_inter`'s single-ref default.
+    #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
     fn record_compound_ctx(
         &mut self,
         at: (usize, usize),
@@ -5735,6 +5888,7 @@ impl Neighbours {
     /// [`Self::record_compound_ctx`] with independent above/left extents,
     /// mirroring [`Self::record_inter_rect`] (lane-partitions r1).
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
     fn record_compound_ctx_rect(
         &mut self,
         at: (usize, usize),
@@ -9810,9 +9964,9 @@ fn decode_rect4_16(
     let (r, c) = at16;
     let (mi_row0, mi_col0) = (r * (SUB / MI), c * (SUB / MI));
     let (bw, bh) = if horz { (16, 4) } else { (4, 16) };
-    let (mi_w, mi_h) = (bw / MI, bh / MI);
-    let scan: &[u16] = if horz { &SCAN_16X4 } else { &SCAN_4X16 };
-    let chroma_scan: &[u16] = if horz { &SCAN_8X4 } else { &SCAN_4X8 };
+    let (_mi_w, _mi_h) = (bw / MI, bh / MI);
+    let _scan: &[u16] = if horz { &SCAN_16X4 } else { &SCAN_4X16 };
+    let _chroma_scan: &[u16] = if horz { &SCAN_8X4 } else { &SCAN_4X8 };
     let mut prev: Option<((usize, usize), usize)> = None;
     let mut last_mode = DC_PRED;
     let mut last_uv_mode = DC_PRED;
@@ -11345,6 +11499,7 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// deblock/CDEF stages run, so the frame being dumped here is `idx - 1` --
 /// without this every frame overwrote `.f0` and a per-frame bisection silently
 /// compared the LAST decoded frame (ledger, class stale-output-faked-measurement).
+#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 fn stage_dump_idx() -> usize {
     PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(1)
 }
@@ -13347,7 +13502,6 @@ fn decode_leaf8(
         // 8x8 `mode` and reading its own fresh context off the earlier
         // units in this same leaf (the same per-TU pattern `decode_block`'s
         // multi-TU branch runs at bigger blocks).
-        luma_grid = vec![0i32; 64];
         for tu_row in 0..2 {
             for tu_col in 0..2 {
                 let tu_mi = (leaf_mi.0 + tu_row, leaf_mi.1 + tu_col);
@@ -14243,6 +14397,7 @@ fn cdef_msb(x: i32) -> i32 {
 
 /// Spec 7.15.3's `constrain`: how much of a neighbour's difference from the
 /// centre sample a filter tap is allowed to contribute.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 fn cdef_constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
     if threshold == 0 {
         return 0;
@@ -15016,6 +15171,7 @@ fn read_tx_size(
 /// transform and whether this unit already sits below it, times three, plus
 /// the two neighbour terms (whether the transform last written above/left of
 /// this unit is narrower/shorter than the unit itself).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 fn txfm_partition_ctx(above_px: u8, left_px: u8, blk_max_px: usize, tx_px: usize) -> usize {
     txfm_partition_ctx_rect(above_px, left_px, blk_max_px, tx_px, tx_px)
 }
@@ -15048,6 +15204,7 @@ fn txfm_partition_ctx_rect(
 /// `txfm_partition_update` (libaom `av1_common_int.h`): once a var-tx unit
 /// resolves, every mi cell its *parent* unit (`txb_px`) spans records the
 /// resolved transform's own size.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 fn txfm_partition_update(
     n: &mut Neighbours,
     at_mi: (usize, usize),
@@ -16453,6 +16610,7 @@ fn deblock_thresholds(level: i32, sharpness: u8) -> (i32, i32, i32) {
     (2 * (level + 2) + lim, lim, level >> 4)
 }
 
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 fn sclamp(v: i32, fctx: &crate::decode::FrameCtx) -> i32 {
     // libaom's `signed_char_clamp_high`: the clamp range scales with
     // `128 << (bit_depth - 8)` alongside the centering constant below.
@@ -17651,6 +17809,7 @@ fn apply_loop_restoration(
 /// 16x16, a directional mode's angle delta other than zero, chroma-from-luma),
 /// or when the tile payload runs out of the symbols this decode expects (a
 /// genuinely foreign stream).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn decode_key_frame_tile(
     data: &[u8],
     mi_cols: u32,
@@ -17708,6 +17867,7 @@ pub(crate) fn decode_key_frame_tile(
 /// (see [`LAST_FRAME_WIDE_MARGIN`]) -- `stream.rs`'s superres path
 /// reads this immediately after the call, before any other frame
 /// decode can overwrite it.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn take_last_frame_wide_margin(fctx: &crate::decode::FrameCtx) -> Option<Picture> {
     fctx.last_frame_wide_margin.with(|m| m.borrow_mut().take())
 }
@@ -17764,13 +17924,12 @@ fn sb_visit_order(r0: u32, r1: u32, c0: u32, c1: u32, sb128: bool) -> Vec<(u32, 
     out
 }
 
-/// lane-sb128 r2: the 128x128 superblock root, shared by the key-frame and
-/// the inter tile loop. Its loop-restoration units are read once for the whole
-/// 128x128 (spec 5.11.57 is called with the superblock's own size), then one
-/// partition symbol off the `BLOCK_128X128` CDF (8 symbols, no HORZ_4/VERT_4)
-/// decides the root -- only SPLIT recurses into the four 64x64 quadrants this
-/// decoder codes, the other seven arms refuse by name.
-#[allow(clippy::too_many_arguments)]
+// lane-sb128 r2: the 128x128 superblock root, shared by the key-frame and
+// the inter tile loop. Its loop-restoration units are read once for the whole
+// 128x128 (spec 5.11.57 is called with the superblock's own size), then one
+// partition symbol off the `BLOCK_128X128` CDF (8 symbols, no HORZ_4/VERT_4)
+// decides the root -- only SPLIT recurses into the four 64x64 quadrants this
+// decoder codes, the other seven arms refuse by name.
 thread_local! {
     /// How many 128x128 superblock roots resolved to `PARTITION_NONE` -- one
     /// whole 128x128 block (lane-sb128b r1's gate counter).
@@ -17795,16 +17954,19 @@ pub(crate) fn part128_ab_hits() -> [usize; 4] {
 }
 
 /// [`PART128_NONE_HITS`], for a gate's own before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn part128_none_hits() -> usize {
     PART128_NONE_HITS.with(std::cell::Cell::get)
 }
 
 /// [`PART128_HORZ_HITS`], for a gate's own before/after delta.
+#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 pub(crate) fn part128_horz_hits() -> usize {
     PART128_HORZ_HITS.with(std::cell::Cell::get)
 }
 
 /// [`PART128_VERT_HITS`], for a gate's own before/after delta.
+#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 pub(crate) fn part128_vert_hits() -> usize {
     PART128_VERT_HITS.with(std::cell::Cell::get)
 }
@@ -17827,6 +17989,7 @@ thread_local! {
 }
 
 /// [`CHROMA_SPLIT_TX_HITS`], for a gate's own before/after delta.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn chroma_split_tx_hits() -> usize {
     CHROMA_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
@@ -20423,7 +20586,7 @@ fn read_inter_plane(
     x: usize,
     y: usize,
     side: usize,
-    base_q_idx: u8,
+    _base_q_idx: u8,
     prediction: &[u16],
     // lane-chromau: this block's own luma transform's *actual coded*
     // `tx_type` -- `av1_get_tx_type` (libaom `blockd.h`): an inter block's
@@ -22124,7 +22287,7 @@ fn decode_inter_block(
     // 5.11.17), `Some` only when this block's var-tx tree resolved to more
     // than one luma transform -- read back by the residual loop, the
     // coefficient-context write-back and the loop-filter grid fill below.
-    let mut vartx_leaves: Option<Vec<(usize, usize, usize, usize)>> = None;
+    let vartx_leaves: Option<Vec<(usize, usize, usize, usize)>>;
     // lane-t900 r22: this block's own palette state, stamped into the
     // mi-granular neighbour bands at the tail below for EVERY block --
     // libaom's `MB_MODE_INFO.palette_size` is 0 on an inter block, and
@@ -22811,7 +22974,7 @@ fn decode_inter_block(
                 );
             }
             let mut pred_y = vec![0u16; side * side];
-            let mut diffwtd_mask_y = Vec::new();
+            let mut diffwtd_mask_y;
             // lane-wedge r3: `mask_y` is the DIFFWTD buffer just computed OR
             // the wedge codebook lookup (comp_group_idx==1's two mutually
             // exclusive branches) -- same [`mc::blend_masked_compound`] call
@@ -25669,7 +25832,7 @@ fn decode_inter_sub8_split4(
             neighbours.left_ref[rmi],
             neighbours.left_ref1[rmi],
         );
-        let (sref_y, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (sref_y, _sref_u, _sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         // lane-t900 r28: refusal lifted -- this sub-block's own reference may
         // be scaled (superres); spec 7.11.3.3's walk is per reference, and
         // each of the group's pieces (luma and its 2x2 chroma) carries its
@@ -27227,7 +27390,7 @@ fn decode_inter_block8(
     // the one split a `BLOCK_8X8` can take (`read_block_tx_size` below) --
     // read back by the luma residual read and the tail's neighbour/loop-filter
     // bookkeeping. Always `false` outside a `TxMode::Select` inter frame.
-    let mut split8 = false;
+    let split8;
     const SIDE: usize = 8;
     const CHROMA_SIDE: usize = 4;
 
@@ -27711,7 +27874,7 @@ fn decode_inter_block8(
                     );
                 }
                 let mut pred_y = vec![0u16; SIDE * SIDE];
-                let mut diffwtd_mask_y = Vec::new();
+                let mut diffwtd_mask_y;
                 let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
                     diffwtd_mask_y = vec![0u8; SIDE * SIDE];
                     DIFFWTD_HITS.with(|c| c.set(c.get() + 1));
@@ -29143,6 +29306,7 @@ fn decode_inter_block8(
 /// or when `reference` is not this frame's own true size, or when the tile
 /// codes a 16x16 leaf whose own true edge cuts through it (round 2, same
 /// refusal [`crate::tile`]'s writer gives its encoder).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn decode_inter_frame_tile(
     data: &[u8],
     mi_cols: u32,
