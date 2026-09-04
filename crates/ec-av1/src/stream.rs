@@ -5816,6 +5816,75 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
     }
 
+    /// lane-filt1: `EC_AV1_FILTER_THREADS` splits every in-frame filter stage
+    /// -- deblock (row bands for the vertical-edge pass, column bands for the
+    /// horizontal one), CDEF (mi row bands), loop restoration (RU row bands)
+    /// and film grain (32-pixel block rows) -- across scoped worker threads.
+    /// A split is only legal if it is BYTE-EXACT, so this gate decodes two
+    /// real aomenc streams at 1 and at 4 filter threads and compares every
+    /// output frame's three planes.
+    ///
+    /// Between them the fixtures fire all four stages, and the firing
+    /// counters are asserted rather than assumed (class `gate-blind-to-feature`):
+    /// `superres_alltools_sb128_320x180.obu` is the 10-bit CDEF + loop
+    /// restoration stream, `grain_cdef_lr_128x128.obu` a 128x128
+    /// `--denoise-noise-level=25` stream whose frames carry film grain
+    /// parameters (small enough that 4 bands is one block row each, which is
+    /// what exercises the grain band's one-row `prelude` replay).
+    #[test]
+    fn a_real_stream_filters_identically_with_one_and_four_filter_threads() {
+        const NAME: &str = "a_real_stream_filters_identically_with_one_and_four_filter_threads";
+        let _gate_lock = lock_gate_counters();
+        for (fixture, wants_lr, wants_grain) in [
+            ("superres_alltools_sb128_320x180.obu", true, false),
+            ("grain_cdef_lr_128x128.obu", false, true),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(fixture);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            let before = (
+                crate::decode::deblock_hits(),
+                crate::restoration::wiener_hits() + crate::restoration::sgrproj_hits(),
+                crate::film_grain::grain_hits(),
+            );
+            crate::par::set_filter_threads(1);
+            let one = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => panic!("{NAME}: {fixture} refused at 1 filter thread: {e}"),
+            };
+            let after = (
+                crate::decode::deblock_hits(),
+                crate::restoration::wiener_hits() + crate::restoration::sgrproj_hits(),
+                crate::film_grain::grain_hits(),
+            );
+            crate::par::set_filter_threads(4);
+            let four = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    crate::par::set_filter_threads(1);
+                    panic!("{NAME}: {fixture} refused at 4 filter threads: {e}")
+                }
+            };
+            crate::par::set_filter_threads(1);
+            assert!(after.0 > before.0, "{NAME}: {fixture} deblocked no edge at all");
+            if wants_lr {
+                assert!(after.1 > before.1, "{NAME}: {fixture} ran no restoration unit");
+            }
+            if wants_grain {
+                assert!(after.2 > before.2, "{NAME}: {fixture} applied no film grain");
+            }
+            assert_eq!(one.len(), four.len(), "{NAME}: {fixture} frame count");
+            assert!(!one.is_empty(), "{NAME}: {fixture} decoded nothing");
+            for (i, (a, b)) in one.iter().zip(four.iter()).enumerate() {
+                assert_eq!(a.y, b.y, "{NAME}: {fixture} frame {i} luma differs at 4 filter threads");
+                assert_eq!(a.u, b.u, "{NAME}: {fixture} frame {i} U differs at 4 filter threads");
+                assert_eq!(a.v, b.v, "{NAME}: {fixture} frame {i} V differs at 4 filter threads");
+            }
+        }
+    }
+
     /// lane-t900 r30b: `fixtures/superres_alltools_sb128_320x180.obu` is 10
     /// frames of `--cpu-used=4 --sb-size=128 --superres-mode=1
     /// --superres-denominator=12 --cq-level=32` with every tool aomenc turns

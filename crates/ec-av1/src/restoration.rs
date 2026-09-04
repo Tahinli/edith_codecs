@@ -1074,8 +1074,13 @@ pub(crate) fn apply_loop_restoration_plane(
     }
     let voffset = 8u32 >> ss_y;
     let ext_size = (unit_size * 3) / 2;
+    // lane-filt1: the RU row walk is data-dependent (a short remainder is
+    // swallowed by the previous unit row), so resolve it into a row list
+    // first. Each row writes exactly `v_start..v_end` of `out` and the next
+    // row's `v_start` is this one's `v_end`, so row bands are disjoint; the
+    // reads are all from `cdef`/`deblocked`, immutable snapshots.
+    let mut rows: Vec<(u32, u32)> = Vec::new();
     let mut y0 = 0u32;
-    let mut rrow = 0usize;
     while y0 < plane_h as u32 {
         let remaining_h = plane_h as u32 - y0;
         let uh = if remaining_h < ext_size { remaining_h } else { unit_size };
@@ -1084,35 +1089,46 @@ pub(crate) fn apply_loop_restoration_plane(
         if v_end < plane_h as u32 {
             v_end -= voffset;
         }
-
-        let mut x0 = 0u32;
-        let mut rcol = 0usize;
-        while x0 < plane_w as u32 {
-            let remaining_w = plane_w as u32 - x0;
-            let uw = if remaining_w < ext_size { remaining_w } else { unit_size };
-            let filter = grid.get(plane, rrow, rcol);
-            if filter != UnitFilter::None {
-                filter_restoration_unit(
-                    out,
-                    cdef,
-                    deblocked,
-                    stride,
-                    plane_w,
-                    plane_h,
-                    x0 as usize,
-                    (x0 + uw) as usize,
-                    v_start as usize,
-                    v_end as usize,
-                    ss_y,
-                    filter, fctx,
-                );
-            }
-            x0 += uw;
-            rcol += 1;
-        }
+        rows.push((v_start, v_end));
         y0 += uh;
-        rrow += 1;
     }
+    let rrow_count = rows.len();
+    let so = crate::par::Shared::new(out);
+    let rbands = crate::par::bands(rrow_count, crate::par::filter_threads());
+    crate::par::run_bands(&rbands, fctx, |r_lo, r_hi, fctx| {
+        // SAFETY: this band writes only the `out` rows its own RU rows cover.
+        #[allow(unsafe_code)]
+        let out = unsafe { so.get() };
+        for rrow in r_lo..r_hi {
+            let (v_start, v_end) = rows[rrow];
+            let mut x0 = 0u32;
+            let mut rcol = 0usize;
+            while x0 < plane_w as u32 {
+                let remaining_w = plane_w as u32 - x0;
+                let uw = if remaining_w < ext_size { remaining_w } else { unit_size };
+                let filter = grid.get(plane, rrow, rcol);
+                if filter != UnitFilter::None {
+                    filter_restoration_unit(
+                        out,
+                        cdef,
+                        deblocked,
+                        stride,
+                        plane_w,
+                        plane_h,
+                        x0 as usize,
+                        (x0 + uw) as usize,
+                        v_start as usize,
+                        v_end as usize,
+                        ss_y,
+                        filter, fctx,
+                    );
+                }
+                x0 += uw;
+                rcol += 1;
+            }
+        }
+    });
+    let rrow = rrow_count;
     debug_assert_eq!(rrow, grid.vert_units[plane], "RU row walk must match RestorationGrid::new's count_units");
 }
 
