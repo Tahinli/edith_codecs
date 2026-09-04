@@ -143,6 +143,14 @@ const PROVEN: &[(&str, &str)] = &[
         "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)",
         "every_intra_in_inter_shape_the_census_lists_has_a_size_group_row",
     ),
+    // lane-t900 r20, census: the only sub-8 footprints three real streams
+    // present are the 16x4/4x16 strips of a 16x16-level 1:4 partition, whose
+    // caller records the chroma pair for every strip, while the supported path
+    // fires on both orientations inside streams that decode with no refusal.
+    (
+        "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
+        "a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable",
+    ),
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
