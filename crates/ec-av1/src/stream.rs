@@ -32124,6 +32124,71 @@ mod tests {
         );
     }
 
+    /// lane-thread2 (iv): frame-parallel decoding changes nothing a caller
+    /// can observe. Two real streams are decoded through
+    /// [`decode_stream_with_threads`] at 1 and at 4 threads and every sink
+    /// call is compared -- decode index, shown flag, and all three planes.
+    ///
+    /// `hg_arf_witness.obu` is the one that proves the parallel path: 18 of
+    /// its 40 coded frames are leaves of the reference graph (shown,
+    /// non-key, `refresh_frame_flags == 0`), so 18 frames really are decoded
+    /// off the main thread, and it carries hidden alt-refs, which is exactly
+    /// the case where "output in coded order" is not the same as "output in
+    /// the order workers finish". `palette_screen_witness.obu` is the
+    /// complement: an 8-bit screen stream whose every coded frame refreshes a
+    /// slot, so at 4 threads it dispatches NOTHING and pins that the threaded
+    /// entry point is byte-identical on the inline path too. The dispatch
+    /// counter is asserted in both directions, so neither arm can pass
+    /// vacuously.
+    #[test]
+    fn a_real_stream_decodes_identically_with_one_and_four_threads() {
+        const NAME: &str = "a_real_stream_decodes_identically_with_one_and_four_threads";
+        // (fixture, shown frames, leaf frames a 4-thread run must dispatch)
+        for (fixture, shown_frames, want_leaves) in [
+            ("fixtures/hg_arf_witness.obu", 37usize, 18usize),
+            ("fixtures/palette_screen_witness.obu", 15, 0),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            let run = |threads: usize| -> Vec<(usize, bool, Picture)> {
+                let mut out = Vec::new();
+                decode_stream_with_threads(&stream, threads, |p, idx, shown| {
+                    out.push((idx, shown, p.clone()));
+                    Ok(())
+                })
+                .unwrap_or_else(|e| panic!("{NAME}: {fixture} at {threads} threads refused: {e}"));
+                out
+            };
+            let serial = run(1);
+            let before = leaf_frames_dispatched();
+            let parallel = run(4);
+            let dispatched = leaf_frames_dispatched() - before;
+            assert_eq!(
+                dispatched, want_leaves,
+                "{NAME}: {fixture} dispatched {dispatched} leaf frames to workers, expected {want_leaves}"
+            );
+            assert_eq!(
+                serial.iter().filter(|f| f.1).count(),
+                shown_frames,
+                "{NAME}: {fixture} shown frames"
+            );
+            assert_eq!(
+                serial.len(),
+                parallel.len(),
+                "{NAME}: {fixture} sink call count differs"
+            );
+            for (i, (a, b)) in serial.iter().zip(&parallel).enumerate() {
+                assert_eq!(a.0, b.0, "{NAME}: {fixture} sink {i} decode index");
+                assert_eq!(a.1, b.1, "{NAME}: {fixture} sink {i} shown flag");
+                assert_eq!(a.2.y, b.2.y, "{NAME}: {fixture} sink {i} luma");
+                assert_eq!(a.2.u, b.2.u, "{NAME}: {fixture} sink {i} U");
+                assert_eq!(a.2.v, b.2.v, "{NAME}: {fixture} sink {i} V");
+            }
+            eprintln!("{NAME}: {fixture} {} sink calls identical, {dispatched} decoded on workers", serial.len());
+        }
+    }
+
     /// lane-frame36 r2: the hidden-ARF witness. `crates/ec-av1/fixtures/
     /// hg_arf_witness.obu`, 32126 bytes, sha256
     /// `7f3b060da5aa9c537633e760c4af71316237db7692f6ae0d459bd2c2dd867d37`:
