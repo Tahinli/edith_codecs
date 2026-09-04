@@ -46,6 +46,12 @@ const REFUSALS: &[&str] = &[
     "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
+    // lane-t900 r22: palette RECONSTRUCTION landed for the key-frame paths
+    // (earlier lanes) and for the intra-in-inter square and rect paths (this
+    // one). These two strings survive at exactly two kinds of site: the
+    // `palette.is_none()` guards in `read_intra_mode`/`read_intra_mode_rect`
+    // (defensive -- every caller now passes a real ctx/cache pair), and the
+    // sub-8x8 `decode_inter_block8` leaf, which has no witness stream.
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
     "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
@@ -111,9 +117,13 @@ const REFUSALS: &[&str] = &[
     // both arms of gate
     // `a_real_aomenc_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips`
     // decode ten frames pixel-exact with the strips counted. What still
-    // refuses is a 16x4/4x16 strip and a 128-root half, neither of which is
-    // palette-eligible (`palette_bsize_ctx_wh` wants `8 <= min`, `max <= 64`)
-    // and neither of which has a witness stream yet.
+    // lane-t900 r22 NARROWED it again: the 16x4/4x16 arm is LIFTED (that arm
+    // routes through `decode_rect4_16_strip`, which reads the palette syntax
+    // itself -- the premise was stale), gated by
+    // `a_screen_stream_with_16x4_intra_strips_in_inter_frames_decodes_pixel_exact`.
+    // What still refuses is the 128-root half of a screen-content frame, whose
+    // body (`decode_block_128rect`) reads no palette syntax and for which no
+    // `--sb-size=128` screen witness exists yet.
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",

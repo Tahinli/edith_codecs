@@ -34,6 +34,8 @@ fn main() {
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
         println!("rect_intrabc_reads: {}", ec_av1::stream::rect_intrabc_reads());
+        let (pal_y, pal_uv) = ec_av1::stream::intra_in_inter_palette_hits();
+        println!("intra_in_inter_palette: y={pal_y} uv={pal_uv}");
         println!(
             "rect64_corner_tu: 64x32={} 32x64={}",
             ec_av1::stream::rect64_corner_tu_hits(0),
