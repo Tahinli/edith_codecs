@@ -119,6 +119,13 @@ pub fn rect_intrabc_reads() -> usize {
     crate::decode::rect_intrabc_reads()
 }
 
+/// `(y, uv)` palette blocks RECONSTRUCTED inside an inter frame (lane-t900
+/// r22) -- the counter a screen-content witness gate reads to prove it
+/// exercises the inter-frame palette path, not the key frame's.
+pub fn intra_in_inter_palette_hits() -> (usize, usize) {
+    crate::decode::intra_in_inter_palette_hits()
+}
+
 /// lane-rect64port r1: coded 64-level HORZ/VERT intra strips whose luma
 /// transform unit is the un-split TX_64X32 (orient 0) / TX_32X64 (orient 1).
 pub fn rect64_corner_tu_hits(orient: usize) -> usize {
@@ -30920,6 +30927,123 @@ mod tests {
              intra128_in_inter 128x64={} 64x128={}",
             fired[0], fired[1]
         );
+    }
+
+    /// lane-t900 r22 GATE: a real `aomenc --tune-content=screen
+    /// --enable-palette=1` stream whose INTER frames reconstruct palette
+    /// blocks (Y and UV), at both bit depths.
+    ///
+    /// Recipe (both fixtures, 15 frames, key + 14 inter, 256x192, one tile):
+    /// `aomenc --codec=av1 --passes=1 --end-usage=q --cq-level=20 --cpu-used=1
+    /// --threads=1 --row-mt=0 --lag-in-frames=0 --kf-max-dist=9999
+    /// --sb-size=64 --tune-content=screen --enable-palette=1
+    /// --enable-intrabc=0 --obu` (plus `--bit-depth=10 --profile=0` for the
+    /// twin) over a synthetic screen-like source: two luma levels on a 16x16
+    /// grid, four chroma levels on an 8x8 one, both re-keyed per frame so the
+    /// encoder cannot predict the new blocks and codes them INTRA inside the
+    /// inter frames. `--enable-palette=0` on the same source is 13% larger,
+    /// which is what says the tool is really used.
+    ///
+    /// What this pins that no key-frame palette gate can: the palette
+    /// colour-index CDFs are this decoder's only VARIABLE-ALPHABET tables (the
+    /// reader takes `[..=n]` of a `[u16; 9]` row, so `update_cdf`'s counter
+    /// lives at index `n`), and `Cdfs::reset_counts` zeroed slot 8 instead --
+    /// so every colour-index row crossed a frame boundary with a SATURATED
+    /// count and adapted at rate 6 where libaom, counting from 0, adapts at 4.
+    /// The first inter-frame palette block's map desynced at its THIRD
+    /// colour-index symbol (decode-order frame 3, mi(40,0), map cell (0,2):
+    /// ours cdf0 = 32768-1071, aomdec's = 32768-971, same ctx, same value,
+    /// different range).
+    #[test]
+    fn a_real_aomenc_screen_stream_with_palette_blocks_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_screen_stream_with_palette_blocks_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        for (fixture, ten_bit) in [
+            ("fixtures/palette_screen_witness.obu", false),
+            ("fixtures/palette_screen_witness_10bit.obu", true),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            let (width, height) = (256usize, 192usize);
+            let before = intra_in_inter_palette_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => panic!("{NAME} [{fixture}]: decode_stream refused: {e}"),
+            };
+            let after = intra_in_inter_palette_hits();
+            let (fired_y, fired_uv) = (after.0 - before.0, after.1 - before.1);
+            assert!(
+                fired_y > 0 && fired_uv > 0,
+                "{NAME} [{fixture}]: inter-frame palette fired y={fired_y} uv={fired_uv} \
+                 -- both planes must fire or the gate is vacuous for the one that did not"
+            );
+            assert_eq!(frames.len(), 15, "{NAME} [{fixture}]: 15 shown frames");
+            let ffmpeg_frames = if ten_bit {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frames.len())
+            };
+            assert_eq!(
+                ffmpeg_frames.len(),
+                frames.len(),
+                "{NAME} [{fixture}]: frame count"
+            );
+            for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(ours.y, theirs.y, "{NAME} [{fixture}]: frame {i} luma vs ffmpeg");
+                assert_eq!(ours.u, theirs.u, "{NAME} [{fixture}]: frame {i} U vs ffmpeg");
+                assert_eq!(ours.v, theirs.v, "{NAME} [{fixture}]: frame {i} V vs ffmpeg");
+            }
+            eprintln!(
+                "{NAME} [{fixture}]: 15 frames pixel-exact on every plane; \
+                 inter-frame palette y={fired_y} uv={fired_uv}"
+            );
+        }
+    }
+
+    /// lane-t900 r22 GATE for the LIFTED refusal `"a HORZ/VERT intra strip in
+    /// a screen-content frame (palette syntax is consumed for square blocks
+    /// only)"` on its 16x4/4x16 arm: that arm routes through
+    /// `decode_rect4_16_strip`, which takes `allow_screen_content_tools` and
+    /// reads the whole palette syntax itself, so the refusal was a stale
+    /// premise (the key-frame path proves that body). This 10-bit
+    /// `--tune-content=screen` stream reached that exact refusal before the
+    /// lift and now decodes all 15 frames pixel-exact while 8 inter-frame
+    /// palette blocks reconstruct.
+    #[test]
+    fn a_screen_stream_with_16x4_intra_strips_in_inter_frames_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_screen_stream_with_16x4_intra_strips_in_inter_frames_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/palette_screen_strip16_witness_10bit.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let before = intra_in_inter_palette_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let fired_y = intra_in_inter_palette_hits().0 - before.0;
+        assert!(
+            fired_y > 0,
+            "{NAME}: no inter-frame palette block -- gate is vacuous"
+        );
+        assert_eq!(frames.len(), 15, "{NAME}: 15 shown frames");
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, 256, 192, frames.len());
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!("{NAME}: 15 frames pixel-exact; inter-frame palette y={fired_y}");
     }
 
     /// lane-t900 r20 GATE, refusal A -- `"a non-skip rectangular
