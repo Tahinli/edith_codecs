@@ -19,6 +19,7 @@ mod compound;
 pub mod decode;
 pub mod encode;
 pub mod encoder;
+mod envflags;
 mod film_grain;
 pub mod frame;
 mod gate_coverage;
