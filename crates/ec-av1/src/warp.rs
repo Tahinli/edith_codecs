@@ -429,7 +429,7 @@ fn clip_pixel(v: i32, fctx: &crate::decode::FrameCtx) -> u16 {
 /// the stream (`crate::decode::bit_depth`), the same thread-local
 /// [`clip_pixel`] already clamps against -- libaom's `bd` parameter.
 #[allow(clippy::too_many_arguments)]
-pub fn warp_affine(
+pub(crate) fn warp_affine(
     params: &WarpParams,
     reference: &[u16],
     width: i32,
@@ -477,7 +477,7 @@ pub fn warp_affine(
 /// [`mc::predict_compound_intermediate`]'s for
 /// [`mc::combine_compound`]/[`mc::blend_masked_compound`].
 #[allow(clippy::too_many_arguments)]
-pub fn warp_affine_compound(
+pub(crate) fn warp_affine_compound(
     params: &WarpParams,
     reference: &[u16],
     width: i32,

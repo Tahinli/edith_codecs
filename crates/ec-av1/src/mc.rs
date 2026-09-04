@@ -663,7 +663,7 @@ fn with_scratch<R>(rows: usize, block_w: usize, f: impl FnOnce(&mut [i32], &mut 
 /// Panics when `dst` is not `block_w * block_h` long, or the reference is
 /// empty.
 #[allow(clippy::too_many_arguments)] // one reference plane, one position, one block shape
-pub fn predict(
+pub(crate) fn predict(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -692,7 +692,7 @@ pub fn predict(
 /// 6.8.9's `interpolation_filter`) instead of always `Regular` -- the same
 /// kernel both directions.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_with_filter(
+pub(crate) fn predict_with_filter(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -724,7 +724,7 @@ pub fn predict_with_filter(
 /// 5.11.20's per-block `SWITCHABLE` read is per-direction (`enable_dual_filter`),
 /// so the two passes can genuinely differ.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_with_filters(
+pub(crate) fn predict_with_filters(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -752,7 +752,7 @@ pub fn predict_with_filters(
 /// chroma is 4 wide or 4 tall (luma 8x16 / 16x8 and taller kin) must still ask
 /// for the 4-tap kernel on that axis -- lane-rectchroma2 r1.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_with_filters_kern(
+pub(crate) fn predict_with_filters_kern(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -1070,7 +1070,7 @@ fn horizontal_pass(
 /// Panics when `dst` is not `block_w * block_h` long, or the reference is
 /// empty.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_scaled(
+pub(crate) fn predict_scaled(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -1093,7 +1093,7 @@ pub fn predict_scaled(
 /// [`predict_scaled`] with the 4-tap decision from the block's true dims
 /// (see [`predict_with_filters_kern`]).
 #[allow(clippy::too_many_arguments)]
-pub fn predict_scaled_kern(
+pub(crate) fn predict_scaled_kern(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -1156,7 +1156,7 @@ pub fn predict_scaled_kern(
 /// scaled (superres). `REF_NO_SCALE` takes the ordinary stride-1 path, which
 /// keeps [`predict_scaled_hits`] a true count of scaled predictions.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_maybe_scaled(
+pub(crate) fn predict_maybe_scaled(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -1305,7 +1305,7 @@ pub fn predict_compound_intermediate_kern(
 /// output; both always sum to `1 << DIST_PRECISION_BITS`). Masked compound
 /// (`comp_group_idx == 1`, wedge/diffwtd) is a different combine this
 /// function does not cover -- decode.rs still refuses those by name.
-pub fn combine_compound(
+pub(crate) fn combine_compound(
     pred0: &[i32],
     pred1: &[i32],
     fwd_weight: i32,
@@ -1338,7 +1338,7 @@ pub fn combine_compound(
 /// produces give the identical `diff` libaom computes. `round` is
 /// `2*FILTER_BITS - round_0 - round_1 + (bd-8)` == [`INTER_POST_ROUND`] for
 /// 8-bit content (`round_0=3`, compound `round_1=7`, `bd=8`).
-pub fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8], fctx: &crate::decode::FrameCtx) {
+pub(crate) fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8], fctx: &crate::decode::FrameCtx) {
     assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
     assert_eq!(mask.len(), pred0.len(), "one mask byte per pixel");
     // libaom `diffwtd_mask_d16` (`reconinter.c:307`): `round = 2*FILTER_BITS
@@ -1365,7 +1365,7 @@ pub fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8], fc
 /// `subsampled` selects the 2x2-average chroma read (spec 7.11.3.14 /
 /// libaom's `subw == 1 && subh == 1` branch) vs. the direct luma read.
 #[allow(clippy::too_many_arguments)]
-pub fn blend_masked_compound(
+pub(crate) fn blend_masked_compound(
     pred0: &[i32],
     pred1: &[i32],
     mask: &[u8],
