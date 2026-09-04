@@ -4370,7 +4370,7 @@ mod tests {
         const TILE: &str = "smptebars=size=128x96:rate=25";
         let (width, height) = (256usize, 192usize);
         // (arm, source, cq, tx-size-search, tiled, square_only)
-        let arms: [(&str, &str, &str, &str, bool, bool); 13] = [
+        let arms: [(&str, &str, &str, &str, bool, bool); 14] = [
             ("smptebars-cq40-txs1", SB, "40", "1", false, false),
             ("smptebars-cq45-txs1", SB, "45", "1", false, false),
             ("smptebars-cq55-txs1", SB, "55", "1", false, false),
@@ -4384,13 +4384,11 @@ mod tests {
             ("tiled-cq30-txs1", TILE, "30", "1", true, false),
             ("tiled-cq45-txs1", TILE, "45", "1", true, false),
             ("tiled-square-cq30-txs1", TILE, "30", "1", true, true),
-            // `tiled-square-cq45-txs1` belongs here too and is NOT in this
-            // table: its intrabc blocks are all `skip`, so the `&& !skip`
-            // guard lets them through -- and the frame decodes WRONG against
-            // ffmpeg. A refusal one `&&` narrower than the hole it guards
-            // (class `refusal-hides-a-defect`); that arm lives in the ignored
-            // gate below with the unskipped one, and the guard itself is a
-            // `decode.rs` edit this round could not make.
+            // lane-t900 r32: both square arms are now ORDINARY census members
+            // -- cq30 (unskipped intrabc, the inter var-tx tree) and cq45
+            // (all-skip intrabc, `maxRectTxSize` with no symbol at all) decode
+            // pixel-exact, so nothing here reaches the lifted refusal.
+            ("tiled-square-cq45-txs1", TILE, "45", "1", true, true),
         ];
         let (mut select_arms, mut premise_arms, mut intrabc_arms, mut blocks_total) =
             (0u32, 0u32, 0u32, 0usize);
@@ -4468,9 +4466,9 @@ mod tests {
              tx_mode == Select, so the refusal's own premise was never within reach"
         );
         assert_eq!(
-            refused_tx_select, 1,
-            "{NAME}: exactly one arm (tiled-square-cq30-txs1) must reach the refusal -- if \
-             none does, the census no longer measures it; if more do, say so here"
+            refused_tx_select, 0,
+            "{NAME}: lane-t900 r32 lifted this refusal -- an intrabc block now reads the \
+             INTER tx-size syntax, so no arm may reach it again"
         );
         assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
     }
@@ -4484,13 +4482,17 @@ mod tests {
     /// (`read_var_tx_size`), which this decoder reads nowhere on the intra
     /// path -- reading the intra `tx_depth` symbol instead desyncs.
     ///
-    /// Two arms of the same recipe: `cq=30`, whose intrabc block is unskipped
-    /// and refused by name, and `cq=45`, whose intrabc blocks are all `skip`
-    /// and therefore pass the `&& !skip` guard -- and decode WRONG (frame 0
-    /// mismatches ffmpeg). So the refusal is one `&&` narrower than the hole:
-    /// until the var-tx read lands, the skipped case needs the same refusal.
+    /// lane-t900 r32 closed both arms. A SKIPPED intrabc block reads no
+    /// tx-size symbol at all (`allowSelect = !skip || !is_inter`, false for an
+    /// intrabc block since libaom's `is_inter_block` counts one); reading the
+    /// intra `tx_depth` for it consumed a symbol libaom never wrote and
+    /// desynced the tile a whole block later, at the superblock corner
+    /// (192,64) (class `equal-range-means-unread`). An UNSKIPPED one reads the
+    /// inter var-tx tree (`read_var_tx_size`). r31's note that cq=45's blocks
+    /// are all `skip` was read off that desynced decode: with the tx-size read
+    /// corrected, cq=45 carries 3 unskipped intrabc blocks of 10 and cq=30
+    /// carries 1 of 16, so both arms exercise both sides of the split.
     #[test]
-    #[ignore = "capability gap: an intrabc block's tx size is coded by the inter var-tx tree"]
     fn an_intrabc_block_under_tx_mode_select_decodes_pixel_exact() {
         const NAME: &str = "an_intrabc_block_under_tx_mode_select_decodes_pixel_exact";
         if !have_ffmpeg() || !have_aomenc() {
@@ -4507,11 +4509,21 @@ mod tests {
                  (select={select} premise={premise})"
             );
             crate::decode::reset_intrabc_hits();
+            crate::decode::reset_intrabc_vartx_hits();
             let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: cq={cq}: {e}"));
+            let (blocks, vartx) =
+                (crate::decode::intrabc_hits(), crate::decode::intrabc_vartx_hits());
+            assert!(blocks > 0, "{NAME}: cq={cq} no longer decodes an intrabc block");
+            // r31 recorded cq=45's intrabc blocks as ALL skip; that was read
+            // off the desynced decode. With the tx-size read corrected both
+            // arms carry unskipped ones (cq30 1 of 16, cq45 3 of 10), so both
+            // must reach the var-tx tree or the gate is blind to the lift
+            // (class `gate-blind-to-feature`).
             assert!(
-                crate::decode::intrabc_hits() > 0,
-                "{NAME}: cq={cq} no longer decodes an intrabc block"
+                vartx > 0,
+                "{NAME}: cq={cq} no longer reads the inter var-tx tree for an intrabc block"
             );
+            eprintln!("{NAME}: cq={cq} {blocks} intrabc block(s), {vartx} through var-tx");
             let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
             assert_eq!(frames.len(), theirs.len(), "{NAME}: cq={cq} frame count");
             for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
@@ -32178,6 +32190,93 @@ mod tests {
         eprintln!(
             "{NAME}: 15 shown frames pixel-exact on every plane; \
              intra128_in_inter 128x64={} 64x128={}",
+            fired[0], fired[1]
+        );
+    }
+
+    /// lane-t900 r32 GATE for the LIFTED refusal "a HORZ/VERT intra strip in
+    /// a screen-content frame (palette syntax is consumed for square blocks
+    /// only)": the r18 edge-forced recipe re-encoded with
+    /// `--tune-content=screen`, i.e. the exact case that refusal guarded.
+    ///
+    /// `crates/ec-av1/fixtures/intra128_in_inter_screen_witness.obu`, 119048
+    /// bytes, sha256
+    /// `c84a493f90327f5d2bea038a42e87cbfe56762b5c6a856d76b4bff9797c5ea09`,
+    /// from this repository's aomenc oracle over r18's own 10-bit 704x320
+    /// source (`gen3.py`): the r18 flag set plus `--tune-content=screen
+    /// --enable-palette=0 --enable-intrabc=0 --cq-level=20`. Three cq levels
+    /// were swept (20/35/50); all three fire, and the `--enable-rect-\
+    /// partitions=0` twin of each codes ZERO 128-root halves, which is what
+    /// says the shape here is the coded HORZ/VERT arm and not an artefact.
+    ///
+    /// The lift's proof is r31's enumeration
+    /// (`no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax`):
+    /// `av1_allow_palette`'s `bw > 64 || bh > 64` bound means a 128x64/64x128
+    /// half codes no palette syntax at all, so the screen flag changes nothing
+    /// about its syntax. This is the WITNESS that the lifted arm is reachable
+    /// and decodes, which r23's census could not produce.
+    #[test]
+    fn an_intra_coded_128_half_in_a_screen_content_inter_frame_decodes_pixel_exact() {
+        const NAME: &str =
+            "an_intra_coded_128_half_in_a_screen_content_inter_frame_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/intra128_in_inter_screen_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (704usize, 320usize);
+        // The refusal named `allow_screen_content_tools`, so the gate reads
+        // that bit out of the frame headers rather than trusting the encoder
+        // flag (class `gate-blind-to-feature`).
+        let mut screen_frames = 0u32;
+        {
+            let mut p = Av1Parser::new();
+            let mut pos = 0usize;
+            while pos < stream.len() {
+                let obu = p.parse_obu(&stream[pos..]).expect("parse");
+                pos += obu.total_size;
+                let header = match &obu.kind {
+                    ObuKind::Frame(h, _) => Some(&**h),
+                    ObuKind::FrameHeader(h) => Some(&**h),
+                    _ => None,
+                };
+                if header.is_some_and(|h| h.allow_screen_content_tools) {
+                    screen_frames += 1;
+                }
+            }
+        }
+        assert!(
+            screen_frames > 0,
+            "{NAME}: no frame sets allow_screen_content_tools -- the gate no longer \
+             exercises the lifted refusal's own condition"
+        );
+        let before = intra128_in_inter_counters();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let after = intra128_in_inter_counters();
+        let fired = [after[0] - before[0], after[1] - before[1]];
+        assert!(
+            fired[0] > 0 && fired[1] > 0,
+            "{NAME}: intra-128-in-inter fired {fired:?} (128x64, 64x128) -- both arms \
+             must fire or the lift is unwitnessed at the one that did not"
+        );
+        assert_eq!(frames.len(), 15, "{NAME}: 15 shown frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: frame count vs ffmpeg");
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: {screen_frames} screen-content frame(s), 15 shown frames pixel-exact \
+             on every plane; intra128_in_inter 128x64={} 64x128={}",
             fired[0], fired[1]
         );
     }
