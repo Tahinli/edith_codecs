@@ -22852,7 +22852,7 @@ fn decode_inter_block(
         // libaom never coded.
         // lane-intra16x4 r1: the strip DECODES through the key frame's own
         // per-strip body, [`decode_rect4_16_strip`].
-        // lane-sub8x4 r3: pixel-proven, so `EC_INTRA16X4_DECODE` is gone. r1
+        // lane-sub8x4 r3: pixel-proven, so the decode opt-in was lifted. r1
         // and r2 found no witness because every firing film frame ALSO carried
         // a sub-8x8 intra block, which refused until r2 lifted it; on this tip
         // the first 50 frame OBUs of the 10-bit 3840x1608 stream's head decode
@@ -22882,10 +22882,10 @@ fn decode_inter_block(
         // (run `--include-ignored` on this tip: FAILED, 0 pixel-exact attempts
         // carrying the strip, per-arm [0, 0, 0]). A lifted refusal with no
         // witness is a capability claim (class `refusal-lifted-without-a-gate`),
-        // so the decode path stays behind `EC_INTRA16X4_DECODE` for the round
-        // that finds a witness.
+        // so the decode path stayed behind an opt-in for the round that found
+        // a witness.
         //
-        // lane-t900 r6: THAT WITNESS EXISTS, so `EC_INTRA16X4_DECODE` is gone
+        // lane-t900 r6: THAT WITNESS EXISTS, so the opt-in was lifted (the path decodes by default)
         // and the refusal is narrowed back to "no chroma-pair record". The
         // witness is a REAL 10-bit 1920x792 128-superblock film stream, not an
         // aomenc recipe: `fixtures/troy_sb128_inter_witness.obu` (177773 bytes,
