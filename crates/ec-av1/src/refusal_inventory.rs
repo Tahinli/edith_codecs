@@ -314,6 +314,53 @@ const PROVEN: &[(&str, &str)] = &[
     // by name (a 64x32 inter frame over a 64x64 reference; a stream opening on
     // a non-error-resilient inter frame whose primary_ref slot is empty, over
     // all 8 slots) with the picture/CDF slot invariant enumerated alongside.
+    // lane-t900 r27, negative gate + structural note: every non-`LAST_FRAME`
+    // reference resolves through `ref_planes`, where an empty slot refuses by
+    // name (swept over all six such references). The STREAM-level witness is
+    // out of reach of this crate's writers -- a shown key frame refreshes all
+    // eight slots and nothing ever clears one, and a stream opening on an
+    // inter frame is stopped one guard earlier -- so the reachable premise is
+    // a HIDDEN key frame with a partial `refresh_frame_flags`, which
+    // `write_frame_header` cannot write. That gap is the open half.
+    (
+        "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
+        "a_selected_reference_with_an_empty_ref_frame_idx_slot_refuses_by_name",
+    ),
+    // lane-t900 r27, negative gate + census: a written key frame carrying
+    // each of the three mode-overriding features (over three segment ids) is
+    // refused by name with no picture; and six real aomenc recipes
+    // (`--aq-mode=1/2/3`, `--deltaq-mode=1`, plus a baseline for arrival)
+    // never enable one -- only `--aq-mode=3` changes the stream at all, and
+    // what it codes is `segment_id` symbols under `SEG_LVL_ALT_Q`.
+    (
+        "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
+        "a_frame_whose_segmentation_overrides_a_block_mode_is_refused_by_name",
+    ),
+    // lane-t900 r27, structural audit + witness: `record_inter_rect_mi` is the
+    // single writer of the interp-filter neighbour band, and no call site
+    // stamps the `[3, 3]` sentinel on an INTER cell (the audit tokenises each
+    // site's arguments); two real `--enable-obmc=1 --enable-dual-filter=1
+    // --cpu-used=0` streams then decode with 237 band reads over ~115 OBMC
+    // blocks each and the refusal firing 0 times (gate
+    // `a_real_obmc_stream_reads_a_recorded_switchable_filter_for_every_neighbour`).
+    // At `--cpu-used=4` aomenc settles on a frame-level fixed filter and the
+    // band is never read -- the speed is load-bearing in that gate.
+    (
+        "an OBMC neighbour whose switchable interp filter was never recorded",
+        "every_inter_record_publishes_an_obmc_readable_filter",
+    ),
+    // lane-t900 r27, census: this one is a REAL capability gap, and the gate
+    // proves it fires by name on real streams -- four fixed-denominator
+    // `--superres-mode=1` encodes (denoms 10/12/16, warped motion and OBMC
+    // on) all stop here, while the two `--superres-mode=3` auto encodes pick
+    // denominator 8 and carry no scaling at all. Its two siblings ("warp
+    // prediction with a scaled reference", "a sub-8x8 inter block under a
+    // scaled reference") stay UNPROVEN: this refusal sits in front of them,
+    // so nothing measures them until the 8x8-leaf gap is lifted.
+    (
+        "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
+        "a_superres_census_over_six_real_streams_records_which_scaled_refusals_fire",
+    ),
     (
         "a reference picture whose height does not match this frame's own true size",
         "an_inter_frame_shorter_than_its_reference_is_refused_by_name",
