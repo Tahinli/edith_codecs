@@ -107,7 +107,7 @@ fn clamp_range(x: i32, r: usize) -> i32 {
 
 /// `B(a, b, angle, flip, r)` (spec 7.13.2.1): a butterfly rotation, and an
 /// exchange of the two entries when `flip` is set.
-fn butterfly(t: &mut [i32], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
+fn butterfly(t: &mut [i32; 64], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
     let (ta, tb) = (i64::from(t[a]), i64::from(t[b]));
     let (c, s) = (i64::from(cos128(angle)), i64::from(sin128(angle)));
     let x = ta * c - tb * s;
@@ -121,7 +121,7 @@ fn butterfly(t: &mut [i32], a: usize, b: usize, angle: i32, flip: bool, _r: usiz
 
 /// `H(a, b, flip, r)` (spec 7.13.2.1): a Hadamard rotation, with the indices
 /// exchanged when `flip` is set.
-fn hadamard(t: &mut [i32], a: usize, b: usize, flip: bool, r: usize) {
+fn hadamard(t: &mut [i32; 64], a: usize, b: usize, flip: bool, r: usize) {
     let (a, b) = if flip { (b, a) } else { (a, b) };
     let (x, y) = (t[a], t[b]);
     t[a] = clamp_range(x.wrapping_add(y), r);
@@ -130,7 +130,7 @@ fn hadamard(t: &mut [i32], a: usize, b: usize, flip: bool, r: usize) {
 
 /// The inverse DCT array permutation (spec 7.13.2.2): an in-place bit-reversal
 /// of the first `1 << n` entries.
-fn permute(t: &mut [i32], n: u32) {
+fn permute(t: &mut [i32; 64], n: u32) {
     let n0 = 1usize << n;
     // A stack copy: this ran once per 1D transform and its `Vec` was the
     // `malloc` at the top of every `inverse_dct` frame in the annotation.
@@ -148,6 +148,20 @@ fn permute(t: &mut [i32], n: u32) {
 /// The stage list is the spec's, in the spec's order; the guards on `n` are
 /// what make one network serve every transform size from 4 to 64.
 pub fn inverse_dct(t: &mut [i32], n: u32, r: usize) {
+    // lane-perf10: the network below indexes a 64-entry scratch with computed
+    // indices, and on a `&mut [i32]` every one of them carried a bounds check.
+    // A `&mut [i32; 64]` lets the optimiser discharge them all against the
+    // constant length; this wrapper keeps the slice-taking signature for
+    // callers outside the 2D driver.
+    let m = 1usize << n;
+    let mut fixed = [0i32; 64];
+    fixed[..m].copy_from_slice(&t[..m]);
+    inverse_dct_fixed(&mut fixed, n, r);
+    t[..m].copy_from_slice(&fixed[..m]);
+}
+
+/// [`inverse_dct`] on the driver's own 64-entry scratch.
+fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
     assert!((2..=6).contains(&n), "the inverse DCT is defined for 4..64");
     permute(t, n);
 
@@ -827,9 +841,9 @@ fn inverse_identity(t: &mut [i32], side: usize) {
 
 /// Dispatches one row or column's 1D inverse transform by [`TxType1d`],
 /// `log2` the spec's transform-size log (as [`inverse_dct`] takes).
-fn inverse_1d(t: &mut [i32], log2: u32, r: usize, kind: TxType1d) {
+fn inverse_1d(t: &mut [i32; 64], log2: u32, r: usize, kind: TxType1d) {
     match kind {
-        TxType1d::Dct => inverse_dct(t, log2, r),
+        TxType1d::Dct => inverse_dct_fixed(t, log2, r),
         TxType1d::Adst => match log2 {
             2 => inverse_adst4(t),
             3 => inverse_adst8(t, r),
