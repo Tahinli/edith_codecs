@@ -444,7 +444,7 @@ pub fn warp_affine(
     subsampling_x: i32,
     subsampling_y: i32,
 ) {
-    if std::env::var_os("EC_MC_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_MC_TRACE") {
         eprintln!("EC_MC_WARP x={p_col} y={p_row} w={p_width} h={p_height}");
     }
     let bd = i32::from(crate::decode::bit_depth());

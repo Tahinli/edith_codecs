@@ -14086,8 +14086,75 @@ fn cdef_constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
     if threshold == 0 {
         return 0;
     }
-    let shift = (damping - cdef_msb(threshold)).max(0);
-    diff.signum() * (threshold - (diff.abs() >> shift)).clamp(0, diff.abs())
+    cdef_constrain_shifted(diff, threshold, cdef_constrain_shift(threshold, damping))
+}
+
+/// `constrain`'s damping shift: a function of the block's threshold and
+/// damping alone, so the filter loop computes it once per block instead of
+/// the `leading_zeros` + branch it used to do twice per tap read.
+fn cdef_constrain_shift(threshold: i32, damping: i32) -> i32 {
+    (damping - cdef_msb(threshold)).max(0)
+}
+
+/// [`cdef_constrain`]'s body with the shift already resolved; `threshold` is
+/// non-zero on every call (the caller only filters when its strength is).
+fn cdef_constrain_shifted(diff: i32, threshold: i32, shift: i32) -> i32 {
+    let a = diff.abs();
+    diff.signum() * (threshold - (a >> shift)).clamp(0, a)
+}
+
+/// The widest `CDEF_DIRECTIONS` offset in either axis: every tap a block reads
+/// lies inside its own samples grown by this much.
+const CDEF_BORDER: usize = 2;
+
+/// Copies one block's whole CDEF footprint -- its `bh` x `bw` samples plus the
+/// [`CDEF_BORDER`] tap ring -- out of the *unfiltered* plane into `buf` (row
+/// stride `bw + 2 * CDEF_BORDER`), so the direction search and the tap loops
+/// index a small contiguous window instead of re-deriving the frame-bounds
+/// test on every one of a pixel's ~17 tap reads. Out-of-frame positions get
+/// `CDEF_VERY_LARGE`, exactly as the per-sample closure did.
+fn cdef_gather(
+    src: &[u16],
+    stride: usize,
+    true_w: usize,
+    true_h: usize,
+    ox: usize,
+    oy: usize,
+    bw: usize,
+    bh: usize,
+    buf: &mut [i32],
+) {
+    let bstride = bw + 2 * CDEF_BORDER;
+    let rows = bh + 2 * CDEF_BORDER;
+    if oy >= CDEF_BORDER
+        && ox >= CDEF_BORDER
+        && oy + bh + CDEF_BORDER <= true_h
+        && ox + bw + CDEF_BORDER <= true_w
+    {
+        // Interior block: every tap is inside the frame, so the whole window
+        // is `rows` contiguous runs.
+        for r in 0..rows {
+            let s0 = (oy - CDEF_BORDER + r) * stride + (ox - CDEF_BORDER);
+            let src_row = &src[s0..s0 + bstride];
+            let dst_row = &mut buf[r * bstride..r * bstride + bstride];
+            for (d, &v) in dst_row.iter_mut().zip(src_row) {
+                *d = i32::from(v);
+            }
+        }
+        return;
+    }
+    for r in 0..rows {
+        let ny = oy as isize + r as isize - CDEF_BORDER as isize;
+        for c in 0..bstride {
+            let nx = ox as isize + c as isize - CDEF_BORDER as isize;
+            buf[r * bstride + c] =
+                if ny < 0 || nx < 0 || ny as usize >= true_h || nx as usize >= true_w {
+                    CDEF_VERY_LARGE
+                } else {
+                    i32::from(src[ny as usize * stride + nx as usize])
+                };
+        }
+    }
 }
 
 /// Spec 7.15.3's direction search (libaom `cdef_find_dir_c`): the dominant
@@ -14168,7 +14235,7 @@ fn cdef_adjust_strength(strength: i32, var: i32) -> i32 {
 /// previously-filtered neighbour must never feed this block's own sum).
 #[allow(clippy::too_many_arguments)]
 fn cdef_filter_block(
-    sample: impl Fn(i32, i32) -> i32,
+    src: &[i32],
     dst: &mut PlaneBuf,
     ox: usize,
     oy: usize,
@@ -14189,19 +14256,33 @@ fn cdef_filter_block(
     // derivative) carries the bit-depth shift, so the tap-set parity bit
     // must be read back above that shift, not off the raw low bit.
     let pri_taps = CDEF_PRI_TAPS[((pri_strength >> coeff_shift) & 1) as usize];
+    // Both damping shifts depend only on this block's strengths (spec 7.15.3's
+    // `constrain`), so they are resolved here rather than per tap read.
+    let pri_shift = cdef_constrain_shift(pri_strength.max(1), pri_damping);
+    let sec_shift = cdef_constrain_shift(sec_strength.max(1), sec_damping);
+    let bstride = bw + 2 * CDEF_BORDER;
+    let smax = sample_max();
+    // `src` is [`cdef_gather`]'s window: (i, j) in block coordinates, taps
+    // reaching +-CDEF_BORDER, so every index below is in range by construction.
+    let at = |i: i32, j: i32| -> i32 {
+        src[(i + CDEF_BORDER as i32) as usize * bstride + (j + CDEF_BORDER as i32) as usize]
+    };
+    let (pri_dir, sec_dir0, sec_dir1) =
+        (CDEF_DIRECTIONS[dir], CDEF_DIRECTIONS[(dir + 2) & 7], CDEF_DIRECTIONS[(dir + 6) & 7]);
     for i in 0..bh {
         for j in 0..bw {
-            let x = sample(i as i32, j as i32);
+            let (i32i, i32j) = (i as i32, j as i32);
+            let x = at(i32i, i32j);
             let mut sum = 0i32;
             let mut max = x;
             let mut min = x;
             for k in 0..2usize {
                 if enable_primary {
-                    let (tr, tc) = CDEF_DIRECTIONS[dir][k];
-                    let p0 = sample(i as i32 + tr, j as i32 + tc);
-                    let p1 = sample(i as i32 - tr, j as i32 - tc);
-                    sum += pri_taps[k] * cdef_constrain(p0 - x, pri_strength, pri_damping);
-                    sum += pri_taps[k] * cdef_constrain(p1 - x, pri_strength, pri_damping);
+                    let (tr, tc) = pri_dir[k];
+                    let p0 = at(i32i + tr, i32j + tc);
+                    let p1 = at(i32i - tr, i32j - tc);
+                    sum += pri_taps[k] * cdef_constrain_shifted(p0 - x, pri_strength, pri_shift);
+                    sum += pri_taps[k] * cdef_constrain_shifted(p1 - x, pri_strength, pri_shift);
                     if clipping_required {
                         if p0 != CDEF_VERY_LARGE {
                             max = max.max(p0);
@@ -14213,12 +14294,12 @@ fn cdef_filter_block(
                     }
                 }
                 if enable_secondary {
-                    let (tr0, tc0) = CDEF_DIRECTIONS[(dir + 2) & 7][k];
-                    let (tr1, tc1) = CDEF_DIRECTIONS[(dir + 6) & 7][k];
-                    let s0 = sample(i as i32 + tr0, j as i32 + tc0);
-                    let s1 = sample(i as i32 - tr0, j as i32 - tc0);
-                    let s2 = sample(i as i32 + tr1, j as i32 + tc1);
-                    let s3 = sample(i as i32 - tr1, j as i32 - tc1);
+                    let (tr0, tc0) = sec_dir0[k];
+                    let (tr1, tc1) = sec_dir1[k];
+                    let s0 = at(i32i + tr0, i32j + tc0);
+                    let s1 = at(i32i - tr0, i32j - tc0);
+                    let s2 = at(i32i + tr1, i32j + tc1);
+                    let s3 = at(i32i - tr1, i32j - tc1);
                     if clipping_required {
                         for s in [s0, s1, s2, s3] {
                             if s != CDEF_VERY_LARGE {
@@ -14228,17 +14309,17 @@ fn cdef_filter_block(
                         min = min.min(s0).min(s1).min(s2).min(s3);
                     }
                     sum += CDEF_SEC_TAPS[k]
-                        * (cdef_constrain(s0 - x, sec_strength, sec_damping)
-                            + cdef_constrain(s1 - x, sec_strength, sec_damping)
-                            + cdef_constrain(s2 - x, sec_strength, sec_damping)
-                            + cdef_constrain(s3 - x, sec_strength, sec_damping));
+                        * (cdef_constrain_shifted(s0 - x, sec_strength, sec_shift)
+                            + cdef_constrain_shifted(s1 - x, sec_strength, sec_shift)
+                            + cdef_constrain_shifted(s2 - x, sec_strength, sec_shift)
+                            + cdef_constrain_shifted(s3 - x, sec_strength, sec_shift));
                 }
             }
             let mut y = x + ((8 + sum - i32::from(sum < 0)) >> 4);
             if clipping_required {
                 y = y.clamp(min, max);
             }
-            dst.data[(oy + i) * dst.width + (ox + j)] = y.clamp(0, sample_max()) as u16;
+            dst.data[(oy + i) * dst.width + (ox + j)] = y.clamp(0, smax) as u16;
         }
     }
 }
@@ -15915,7 +15996,12 @@ fn filter4(mask: bool, thresh: i32, p1: i32, p0: i32, q0: i32, q1: i32) -> [i32;
         return [p1, p0, q0, q1];
     }
     let hev = (p1 - p0).abs() > thresh || (q1 - q0).abs() > thresh;
-    let centre = 128i32 << (bit_depth() - 8);
+    // lane-perf6: `sclamp` re-read the thread-local bit depth on every one of
+    // this kernel's eight clamps, and this kernel runs per deblocked sample.
+    // Same bound, resolved once.
+    let scale = 1i32 << (bit_depth() - 8);
+    let sclamp = |v: i32| v.clamp(-128 * scale, 128 * scale - 1);
+    let centre = 128i32 * scale;
     let (ps1, ps0, qs0, qs1) = (p1 - centre, p0 - centre, q0 - centre, q1 - centre);
     let outer = if hev { sclamp(ps1 - qs1) } else { 0 };
     let filter = sclamp(outer + 3 * (qs0 - ps0));
@@ -16083,6 +16169,7 @@ fn filter_edge(
     let shift = bit_depth() - 8;
     let (blimit, limit, hev_thr) = (blimit << shift, limit << shift, hev_thr << shift);
     let flat_thresh = 1i32 << shift;
+    let smax = sample_max();
     for i in 0..4isize {
         let center = (base as isize + i * outer_stride) as usize;
         let idx = |k: isize| -> usize { (center as isize + k * tap_stride) as usize };
@@ -16094,10 +16181,10 @@ fn filter_edge(
                     && (q1 - q0).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
                 let [op1, op0, oq0, oq1] = filter4(mask, hev_thr, p1, p0, q0, q1);
-                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
-                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
-                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
-                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
+                data[idx(-2)] = op1.clamp(0, smax) as u16;
+                data[idx(-1)] = op0.clamp(0, smax) as u16;
+                data[idx(0)] = oq0.clamp(0, smax) as u16;
+                data[idx(1)] = oq1.clamp(0, smax) as u16;
             }
             6 => {
                 let (p2, p1, p0, q0, q1, q2) = (px(-3), px(-2), px(-1), px(0), px(1), px(2));
@@ -16111,10 +16198,10 @@ fn filter_edge(
                     && (p2 - p0).abs() <= flat_thresh
                     && (q2 - q0).abs() <= flat_thresh;
                 let [op1, op0, oq0, oq1] = filter6(mask, hev_thr, flat, p2, p1, p0, q0, q1, q2);
-                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
-                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
-                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
-                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
+                data[idx(-2)] = op1.clamp(0, smax) as u16;
+                data[idx(-1)] = op0.clamp(0, smax) as u16;
+                data[idx(0)] = oq0.clamp(0, smax) as u16;
+                data[idx(1)] = oq1.clamp(0, smax) as u16;
             }
             8 => {
                 let (p3, p2, p1, p0, q0, q1, q2, q3) =
@@ -16134,12 +16221,12 @@ fn filter_edge(
                     && (q3 - q0).abs() <= flat_thresh;
                 let [op2, op1, op0, oq0, oq1, oq2] =
                     filter8(mask, hev_thr, flat, p3, p2, p1, p0, q0, q1, q2, q3);
-                data[idx(-3)] = op2.clamp(0, sample_max()) as u16;
-                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
-                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
-                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
-                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
-                data[idx(2)] = oq2.clamp(0, sample_max()) as u16;
+                data[idx(-3)] = op2.clamp(0, smax) as u16;
+                data[idx(-2)] = op1.clamp(0, smax) as u16;
+                data[idx(-1)] = op0.clamp(0, smax) as u16;
+                data[idx(0)] = oq0.clamp(0, smax) as u16;
+                data[idx(1)] = oq1.clamp(0, smax) as u16;
+                data[idx(2)] = oq2.clamp(0, smax) as u16;
             }
             _ => {
                 let (p6, p5, p4, p3, p2, p1, p0) =
@@ -16170,7 +16257,7 @@ fn filter_edge(
                     q6,
                 );
                 for (k, v) in (-6..=5isize).zip(out) {
-                    data[idx(k)] = v.clamp(0, sample_max()) as u16;
+                    data[idx(k)] = v.clamp(0, smax) as u16;
                 }
             }
         }
@@ -16273,6 +16360,43 @@ fn deblock_plane(
     }
 }
 
+thread_local! {
+    /// lane-perf6: reused whole-plane `u16` buffers. Every frame takes a
+    /// pre-CDEF snapshot of all three planes, a post-deblock snapshot when
+    /// loop restoration is active, and a fresh LR destination per plane --
+    /// freshly allocated that is ~25 MB of `mmap`/`munmap` per frame at 4K,
+    /// so every sample written also takes a first-touch page fault. The
+    /// buffers are handed back here instead and refilled in place.
+    static PLANE_SCRATCH: std::cell::RefCell<Vec<Vec<u16>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A pooled buffer holding a copy of `src`.
+fn scratch_from(src: &[u16]) -> Vec<u16> {
+    let mut v = PLANE_SCRATCH.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    v.clear();
+    v.extend_from_slice(src);
+    v
+}
+
+/// An empty pooled buffer, for a caller that fills it itself.
+fn scratch_empty() -> Vec<u16> {
+    let mut v = PLANE_SCRATCH.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    v.clear();
+    v
+}
+
+/// A plane's post-deblock snapshot, its samples taken from the pool (every
+/// other field is `usize`).
+fn plane_snapshot(p: &PlaneBuf) -> PlaneBuf {
+    PlaneBuf { data: scratch_from(&p.data), ..*p }
+}
+
+/// Hands a buffer back to the pool; the capacity is what is worth keeping.
+fn scratch_return(v: Vec<u16>) {
+    PLANE_SCRATCH.with(|p| p.borrow_mut().push(v));
+}
+
 fn apply_cdef(
     y: &mut PlaneBuf,
     u: &mut PlaneBuf,
@@ -16343,6 +16467,8 @@ fn apply_cdef(
         return;
     }
     let sb_cols = CDEF_SB_COLS.with(|c| c.get());
+    // One entry per superblock (a few hundred at 4K), so this clone is not
+    // one of the per-frame copies lane-perf6 pooled below.
     let idx_grid = CDEF_IDX_GRID.with(|g| g.borrow().clone());
     let strength_idx = |mi_r: usize, mi_c: usize| -> usize {
         if sb_cols == 0 {
@@ -16354,14 +16480,18 @@ fn apply_cdef(
             .copied()
             .unwrap_or(0) as usize
     };
-    let src_y = y.data.clone();
-    let src_u = u.data.clone();
-    let src_v = v.data.clone();
+    let src_y = scratch_from(&y.data);
+    let src_u = scratch_from(&u.data);
+    let src_v = scratch_from(&v.data);
     // libaom `av1_cdef_filter_fb`: `pri_strength = level << coeff_shift`,
     // `sec_strength <<= coeff_shift`, `damping += coeff_shift - (pli != 0)`.
     let coeff_shift = i32::from(bit_depth()) - 8;
     let damping = i32::from(cdef.damping) + coeff_shift;
     let damping_uv = (damping - 1).max(0);
+    // One scratch window per plane kind, reused by every unit (8x8 luma and
+    // 4x4 chroma, each grown by the [`CDEF_BORDER`] tap ring).
+    let mut win_y = [0i32; (8 + 2 * CDEF_BORDER) * (8 + 2 * CDEF_BORDER)];
+    let mut win_uv = [0i32; (4 + 2 * CDEF_BORDER) * (4 + 2 * CDEF_BORDER)];
     let mut mi_r = 0usize;
     while mi_r < skip_grid.mi_rows {
         let mut mi_c = 0usize;
@@ -16372,14 +16502,22 @@ fn apply_cdef(
             if !skip_grid.is_skip_txfm(mi_r, mi_c) {
                 let sidx = strength_idx(mi_r, mi_c);
                 let (ox, oy) = (mi_c * 4, mi_r * 4);
+                // Nothing to do for this unit at all: the direction search is
+                // only ever consumed through a strength, so a unit whose four
+                // strengths are zero never needs its 8x8 window gathered.
+                if cdef.y_pri_strength[sidx] == 0
+                    && cdef.y_sec_strength[sidx] == 0
+                    && cdef.uv_pri_strength[sidx] == 0
+                    && cdef.uv_sec_strength[sidx] == 0
+                {
+                    mi_c += 2;
+                    continue;
+                }
                 let (y_stride, y_true_w, y_true_h) = (y.width, y.true_width, y.true_height);
+                cdef_gather(&src_y, y_stride, y_true_w, y_true_h, ox, oy, 8, 8, &mut win_y);
                 let sample_y = |r: i32, c: i32| -> i32 {
-                    let (ny, nx) = (oy as i32 + r, ox as i32 + c);
-                    if ny < 0 || nx < 0 || ny as usize >= y_true_h || nx as usize >= y_true_w {
-                        CDEF_VERY_LARGE
-                    } else {
-                        i32::from(src_y[ny as usize * y_stride + nx as usize])
-                    }
+                    win_y[(r + CDEF_BORDER as i32) as usize * (8 + 2 * CDEF_BORDER)
+                        + (c + CDEF_BORDER as i32) as usize]
                 };
                 // lane-cdef r1: the direction search reads the SAME padded
                 // block the taps do -- libaom runs `cdef_find_dir` on the
@@ -16417,7 +16555,7 @@ fn apply_cdef(
                 }
                 if enable_primary || enable_secondary {
                     cdef_filter_block(
-                        sample_y,
+                        &win_y,
                         y,
                         ox,
                         oy,
@@ -16444,16 +16582,9 @@ fn apply_cdef(
                     for (plane, src_p) in [(&mut *u, &src_u), (&mut *v, &src_v)] {
                         let (tw, th) = (plane.true_width, plane.true_height);
                         let stride = plane.width;
-                        let sample_uv = |r: i32, c: i32| -> i32 {
-                            let (ny, nx) = (coy as i32 + r, cox as i32 + c);
-                            if ny < 0 || nx < 0 || ny as usize >= th || nx as usize >= tw {
-                                CDEF_VERY_LARGE
-                            } else {
-                                i32::from(src_p[ny as usize * stride + nx as usize])
-                            }
-                        };
+                        cdef_gather(src_p, stride, tw, th, cox, coy, 4, 4, &mut win_uv);
                         cdef_filter_block(
-                            sample_uv,
+                            &win_uv,
                             plane,
                             cox,
                             coy,
@@ -16475,6 +16606,9 @@ fn apply_cdef(
         }
         mi_r += 2;
     }
+    scratch_return(src_y);
+    scratch_return(src_u);
+    scratch_return(src_v);
 }
 
 /// Spec 7.17: loop restoration, run after [`apply_cdef`] (a sibling lane's
@@ -16512,7 +16646,8 @@ fn apply_loop_restoration(
     // (class av1-truesize-lane: true frame size vs mi-rounded).
     (frame_w, frame_h): (usize, usize),
 ) {
-    y.data = crate::restoration::apply_loop_restoration_plane(
+    let mut out = scratch_empty();
+    crate::restoration::apply_loop_restoration_plane(
         &y.data,
         &deblocked_y.data,
         y.width,
@@ -16523,8 +16658,12 @@ fn apply_loop_restoration(
         lr.loop_restoration_size[0],
         grid,
         0,
+        &mut out,
     );
-    u.data = crate::restoration::apply_loop_restoration_plane(
+    std::mem::swap(&mut y.data, &mut out);
+    scratch_return(out);
+    let mut out = scratch_empty();
+    crate::restoration::apply_loop_restoration_plane(
         &u.data,
         &deblocked_u.data,
         u.width,
@@ -16535,8 +16674,12 @@ fn apply_loop_restoration(
         lr.loop_restoration_size[1],
         grid,
         1,
+        &mut out,
     );
-    v.data = crate::restoration::apply_loop_restoration_plane(
+    std::mem::swap(&mut u.data, &mut out);
+    scratch_return(out);
+    let mut out = scratch_empty();
+    crate::restoration::apply_loop_restoration_plane(
         &v.data,
         &deblocked_v.data,
         v.width,
@@ -16547,7 +16690,10 @@ fn apply_loop_restoration(
         lr.loop_restoration_size[2],
         grid,
         2,
+        &mut out,
     );
+    std::mem::swap(&mut v.data, &mut out);
+    scratch_return(out);
 }
 
 /// Decodes the payload [`crate::tile::sb_coeff_key_frame_tile`] writes,
@@ -18864,7 +19010,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
             && lr.loop_restoration_size[p] != 0
     });
-    let deblocked = lr_active.then(|| (y.clone(), u.clone(), v.clone()));
+    let deblocked =
+        lr_active.then(|| (plane_snapshot(&y), plane_snapshot(&u), plane_snapshot(&v)));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -18921,6 +19068,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             &mut y, &mut u, &mut v, deblocked_y, deblocked_u, deblocked_v, lr, &lr_grid,
             (lr_w, frame_height as usize),
         );
+    }
+    if let Some((db_y, db_u, db_v)) = deblocked {
+        scratch_return(db_y.data);
+        scratch_return(db_u.data);
+        scratch_return(db_v.data);
     }
 
     let (fw, fh) = (lr_w, frame_height as usize);
@@ -30892,7 +31044,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
             && lr.loop_restoration_size[p] != 0
     });
-    let deblocked = lr_active.then(|| (y.clone(), u.clone(), v.clone()));
+    let deblocked =
+        lr_active.then(|| (plane_snapshot(&y), plane_snapshot(&u), plane_snapshot(&v)));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -30949,6 +31102,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             &mut y, &mut u, &mut v, deblocked_y, deblocked_u, deblocked_v, lr, &lr_grid,
             (lr_w, frame_height as usize),
         );
+    }
+    if let Some((db_y, db_u, db_v)) = deblocked {
+        scratch_return(db_y.data);
+        scratch_return(db_u.data);
+        scratch_return(db_v.data);
     }
 
     let motion_field = build_motion_field(
@@ -31029,6 +31187,49 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-perf6 step 2: the CDEF kernel now reads a pre-gathered window and
+    /// a pre-resolved damping shift instead of a bounds-testing closure and a
+    /// per-tap `msb`. Both replacements must be value-identical to the spec
+    /// forms they came from, over the whole strength/damping/diff domain.
+    #[test]
+    fn cdef_gather_and_shifted_constrain_match_the_spec_forms() {
+        for damping in 3..=9i32 {
+            for threshold in 1..=64i32 {
+                let shift = super::cdef_constrain_shift(threshold, damping);
+                for diff in -300..=300i32 {
+                    assert_eq!(
+                        super::cdef_constrain(diff, threshold, damping),
+                        super::cdef_constrain_shifted(diff, threshold, shift),
+                        "diff={diff} threshold={threshold} damping={damping}"
+                    );
+                }
+            }
+        }
+        // `cdef_gather`'s interior fast path and its bounds-testing slow path
+        // must agree with the per-sample closure the filter used to call, at
+        // every block position including the three that straddle the crop.
+        let (stride, tw, th) = (24usize, 21usize, 19usize);
+        let src: Vec<u16> = (0..stride * 24).map(|i| (i * 7 % 1024) as u16).collect();
+        for &(ox, oy, bw, bh) in &[(0, 0, 8, 8), (8, 8, 8, 8), (16, 16, 8, 8), (4, 12, 4, 4)] {
+            let bstride = bw + 2 * super::CDEF_BORDER;
+            let mut win = vec![0i32; bstride * (bh + 2 * super::CDEF_BORDER)];
+            super::cdef_gather(&src, stride, tw, th, ox, oy, bw, bh, &mut win);
+            for r in -(super::CDEF_BORDER as i32)..(bh + super::CDEF_BORDER) as i32 {
+                for c in -(super::CDEF_BORDER as i32)..(bw + super::CDEF_BORDER) as i32 {
+                    let (ny, nx) = (oy as i32 + r, ox as i32 + c);
+                    let want = if ny < 0 || nx < 0 || ny as usize >= th || nx as usize >= tw {
+                        super::CDEF_VERY_LARGE
+                    } else {
+                        i32::from(src[ny as usize * stride + nx as usize])
+                    };
+                    let got = win[(r + super::CDEF_BORDER as i32) as usize * bstride
+                        + (c + super::CDEF_BORDER as i32) as usize];
+                    assert_eq!(got, want, "({ox},{oy}) r={r} c={c}");
+                }
+            }
+        }
+    }
 
     /// lane-golomb r7: [`reduce_inherited_chroma_tx_type`] must reproduce
     /// `av1_ext_tx_used[av1_get_ext_tx_set_type(uv_tx, 1, reduced)]`
