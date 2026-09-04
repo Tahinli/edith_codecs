@@ -461,7 +461,7 @@ pub fn setup_motion_field(
         );
     }
 
-    if std::env::var_os("EC_TRACE_TPL").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_TPL") {
         eprintln!("EC_TPL_FIELD oh={cur_order_hint} rows={rows} cols={cols}");
         for r in 0..rows {
             let row: String = (0..cols)
@@ -516,7 +516,7 @@ pub fn add_tpl_ref_mv(
         return None;
     }
     let probe = tpl.get(row8 as usize / 2, col8 as usize / 2);
-    if std::env::var_os("EC_TRACE_TPL").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_TPL") {
         match probe {
             None => eprintln!("EC_TPL mi_row={mi_row} mi_col={mi_col} blk=({blk_row},{blk_col}) INVALID"),
             Some((m, rfo)) => eprintln!(
