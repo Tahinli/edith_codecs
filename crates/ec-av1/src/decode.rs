@@ -17971,11 +17971,6 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     }
     fctx.enable_edge_filter.with(|f| f.set(enable_edge_filter));
     let sb128 = sb128(fctx);
-    if sb128 && allow_intrabc {
-        return Err(unsupported(
-            "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
-        ));
-    }
     let (sb_cols, sb_rows) = (mi_cols.div_ceil(SB_MI), mi_rows.div_ceil(SB_MI));
     fctx.intrabc_mi_grid.with(|g| {
         *g.borrow_mut() = allow_intrabc.then(|| {
@@ -20328,8 +20323,13 @@ fn read_intrabc_dv(
     if pred == (0, 0) {
         // `av1_find_ref_dv` (mvref_common.c). Tile row start is 0 here (the
         // single-tile-row case every intrabc gate stream is).
-        let sb_px = SB_MI as i32 * MI as i32;
-        pred = if mi_r < SB_MI as usize {
+        // lane-t900 r34: `av1_find_ref_dv` takes `mib_size` -- the SEQUENCE's
+        // superblock size in mi units -- so a 128x128 superblock stream's
+        // fallback DV is one 128-px superblock up (or 128+256 px left on the
+        // tile's first superblock row), never the 64 this hardcoded.
+        let sb_mi = sb_mi_cur(fctx) as i32;
+        let sb_px = sb_mi * MI as i32;
+        pred = if (mi_r as i32) < sb_mi {
             (0, -(sb_px + INTRABC_DELAY_PIXELS) * 8)
         } else {
             (-sb_px * 8, 0)
