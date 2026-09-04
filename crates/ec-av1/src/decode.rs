@@ -5692,6 +5692,16 @@ impl Neighbours {
             left |= self.left[mi_r + cell][0].level;
         }
         let ctx = SKIP_CONTEXTS[(top as usize).min(4)][(left as usize).min(4)];
+        if std::env::var_os("EC_ECDUMP").is_some() {
+            let ab: Vec<String> =
+                (0..w_mi).map(|k| self.above[mi_c + k][0].level.to_string()).collect();
+            let lf: Vec<String> =
+                (0..h_mi).map(|k| self.left[mi_r + k][0].level.to_string()).collect();
+            eprintln!(
+                "EC_ECDUMP plane=0 mi=({mi_r},{mi_c}) wh=({w_mi},{h_mi}) ctx={ctx} above=[{},] left=[{},]",
+                ab.join(","), lf.join(",")
+            );
+        }
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
                 "TRACE luma_skip_ctx mi=({mi_r},{mi_c}) side_mi={side_mi} top={top} left={left} ctx={ctx} band={:?}",
@@ -6036,6 +6046,9 @@ impl Neighbours {
         let (mi_r, mi_c) = at_mi;
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         let (w_mi, h_mi) = (w / MI, h / MI);
+        if std::env::var_os("EC_ECPUB").is_some() {
+            eprintln!("EC_ECPUB blk mi=({mi_r},{mi_c}) wh=({w},{h}) lvl={}", states[0].level);
+        }
         for cell in 0..h_mi {
             if let Some(slot) = self.left_side_mi.get_mut(mi_r + cell) {
                 *slot = h;
@@ -6141,6 +6154,9 @@ impl Neighbours {
         grid: &[i32],
     ) {
         let state = neighbour_state(grid);
+        if std::env::var_os("EC_ECPUB").is_some() {
+            eprintln!("EC_ECPUB tu  mi=({mi_r},{mi_c}) wh=({w_px},{h_px}) lvl={}", state.level);
+        }
         for cell in 0..h_px / MI {
             if mi_r + cell < self.mi_rows {
                 self.left[mi_r + cell][0] = state;
@@ -7717,13 +7733,17 @@ fn decode_intra_rect_in_inter(
     // palette (>64) do not exist at this size and are refused by name there.
     // lane-inter128intra r1: OPT-IN ONLY (`EC_INTRA128_IN_INTER=1`) until a
     // gate exists. The body below is believed right (it is the key frame's own
-    // proven body plus the three inter-frame differences), but the three 1080p
-    // cuts that reach this shape reach it AFTER a pre-existing desync (see the
-    // lane report: their frame 2 diverges from aomdec inside the superblock at
-    // mi(0,320), long before mi(128,416)), and no aomenc recipe found so far
-    // emits a 128-root HORZ/VERT half coded intra in an inter frame -- so
-    // nothing can currently prove this arm. A refusal is lifted only with a
-    // gate (COMMON), so the default path still refuses by name below.
+    // proven body plus the three inter-frame differences), but nothing proves
+    // it: no aomenc recipe found so far emits a 128-root HORZ/VERT half coded
+    // intra in an inter frame. A refusal is lifted only with a gate (COMMON),
+    // so the default path still refuses by name below.
+    //
+    // lane-t900 r17: the opt-in STAYS. `intra128_in_inter_witness.obu` was
+    // built as this arm's witness and r16 measured three hits in it -- but
+    // every one of them was an artifact of the skipped-128-block entropy
+    // desync fixed this round (class `counter-from-refused-stream`). With the
+    // stream decoding byte-exact the arm fires ZERO times, so the witness does
+    // not carry the shape at all and the lift has no gate.
     if bw.max(bh) == 128 && std::env::var_os("EC_INTRA128_IN_INTER").is_some() {
         if allow_screen_content_tools {
             return Err(unsupported(
@@ -12065,6 +12085,18 @@ thread_local! {
     /// (an intra-coded PARTITION_HORZ/VERT half of a 128 superblock inside an
     /// inter frame) -- (128x64, 64x128).
     pub(crate) static INTRA128_IN_INTER_HITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+    /// lane-t900 r17: skipped INTER blocks whose `read_block_tx_size` still
+    /// handed back var-tx leaves, so the per-transform-unit luma publication
+    /// loop never ran and the block has to clear its own luma coefficient
+    /// contexts (libaom `av1_reset_entropy_context`). Every 128 root under
+    /// `TX_MODE_LARGEST` is one; the counter is what keeps that reset's gate
+    /// non-vacuous.
+    pub(crate) static SKIP_VARTX_LUMA_RESET_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`SKIP_VARTX_LUMA_RESET_HITS`], for a gate's own before/after delta.
+pub fn skip_vartx_luma_reset_hits() -> usize {
+    SKIP_VARTX_LUMA_RESET_HITS.with(std::cell::Cell::get)
 }
 
 /// [`INTRA128_IN_INTER_HITS`], for a gate's own before/after delta.
@@ -23470,6 +23502,25 @@ fn decode_inter_block(
         (left, above)
     });
     if vartx_leaves.is_some() {
+        // lane-t900 r17 root cause (class early-return-skips-tail): the
+        // "plane 0 is already correct per transform unit" premise below holds
+        // only when the per-TU luma loop RAN. A SKIP inter block takes the
+        // `if skip` arm above, which reconstructs straight from the predictor
+        // and never enters that loop -- yet `read_block_tx_size` still hands
+        // back four TX_64X64 leaves for a 128 root under `TX_MODE_LARGEST`
+        // (and for any block under it), so `vartx_leaves` is `Some` and the
+        // luma coefficient contexts were left at the PREVIOUS block's values.
+        // libaom calls `av1_reset_entropy_context` for every skipped block,
+        // zeroing all three planes over its own footprint; `luma_grid` is the
+        // all-zero grid on this arm, so publishing it is exactly that reset.
+        // Witnessed on a 10-bit 512x512 --sb-size=128 stream: the 128x128
+        // block at mi(32,64) of decode-order frame 1 read `txb_skip_ctx` 2
+        // where aomdec reads 1, because the skipped 128x128 block at
+        // mi(32,32) never cleared `left[32..48]`.
+        if skip {
+            SKIP_VARTX_LUMA_RESET_HITS.with(|c| c.set(c.get() + 1));
+            neighbours.record_mi_luma_rect(at, write_w, write_h, &luma_grid);
+        }
         // Plane 0 is already correct per transform unit
         // ([`Neighbours::record_mi_luma`] above); this writes everything else
         // [`Neighbours::record_rect`] would.
