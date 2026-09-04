@@ -1168,6 +1168,162 @@ mod tests {
         );
     }
 
+    /// lane-t900 r25: the refusal "a frame OBU with no tile group" names a
+    /// shape the parser cannot hand [`decode_stream`].
+    ///
+    /// `tiles` reaches that check from exactly two places -- `ObuKind::Frame`'s
+    /// own vector and the `ObuKind::TileGroup` accumulation -- and both are
+    /// filled by `ec_av1_syntax`'s `parse_tile_group`, whose only success path
+    /// pushes one `Tile` per `tile_num` of the INCLUSIVE range
+    /// `tg_start..=tg_end`. That range is never empty: the single-tile-group
+    /// case takes `(0, num_tiles - 1)` saturating at 0, and the multi-group
+    /// case rejects `end < start` as corrupt. So an `OBU_FRAME` either fails to
+    /// parse or carries at least one tile, however short its payload is --
+    /// including the empty payload the charter for this round asked to build,
+    /// which parses into ONE zero-byte tile rather than none.
+    ///
+    /// Sweeping a real frame OBU's tile payload from empty upwards asserts both
+    /// halves: every `Frame` OBU that parses has a tile, and `decode_stream`
+    /// never reports this refusal for any of them.
+    #[test]
+    fn a_frame_obu_that_parses_always_carries_at_least_one_tile() {
+        const REFUSAL: &str = "a frame OBU with no tile group";
+        let picture = test_card(64, 64);
+        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let (seq, header) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
+        let mut frame_obus_parsed = 0;
+        for len in 0..=encoded.tile.len().min(24) {
+            let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+            stream.extend_from_slice(
+                &crate::frame::frame_obu(&seq, &header, &encoded.tile[..len]).unwrap(),
+            );
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            while pos < stream.len() {
+                let Ok(obu) = parser.parse_obu(&stream[pos..]) else {
+                    break;
+                };
+                pos += obu.total_size;
+                if let ObuKind::Frame(_, tiles) = &obu.kind {
+                    frame_obus_parsed += 1;
+                    assert!(
+                        !tiles.is_empty(),
+                        "a {len}-byte tile payload parsed into a frame OBU with no tile group -- \
+                         the refusal {REFUSAL:?} is reachable after all"
+                    );
+                }
+            }
+            if let Err(e) = decode_stream(&stream) {
+                let e = e.to_string();
+                assert!(
+                    !e.contains(REFUSAL),
+                    "a {len}-byte tile payload reached {REFUSAL:?}: {e}"
+                );
+            }
+        }
+        assert!(
+            frame_obus_parsed >= 2,
+            "the sweep parsed {frame_obus_parsed} frame OBUs -- it proves nothing about the \
+             refusal's reachability"
+        );
+    }
+
+    /// lane-t900 r25, negative gate: a `show_existing_frame` header naming a
+    /// slot no frame has refreshed is refused BY NAME, and outputs no picture.
+    ///
+    /// The OBU is hand-built because [`crate::frame::write_frame_header`]
+    /// refuses to write one (it writes shown key and inter frames only): spec
+    /// 5.9.2's whole header for this case is `show_existing_frame` (1) plus
+    /// `frame_to_show_map_idx` (3), the sequence carrying neither a decoder
+    /// model nor frame ids.
+    ///
+    /// Deviation from the round's charter, which asked for a key frame first
+    /// with the named slot's `refresh_frame_flags` bit clear: a SHOWN key frame
+    /// refreshes every slot (spec 5.9.2 forces `refresh_frame_flags` to
+    /// `all_frames` and does not code it, which is also what
+    /// `write_frame_header` does), so the only reachable empty-slot stream is
+    /// one where no frame has refreshed that slot yet. The stream below is a
+    /// valid sequence header followed by the header OBU, and every one of the
+    /// eight slots is tried.
+    #[test]
+    fn a_show_existing_frame_header_naming_an_empty_slot_is_refused_by_name() {
+        const REFUSAL: &str = "a show_existing_frame header naming an empty reference slot";
+        let (seq, _) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
+        for slot in 0..NUM_REF_FRAMES as u32 {
+            let mut w = ec_core::BitWriter::new();
+            w.write_bit(true); // show_existing_frame
+            w.write_bits(slot, 3); // frame_to_show_map_idx
+            crate::bits::write_byte_alignment(&mut w);
+            let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+            stream.extend_from_slice(&crate::obu::wrap_obu(
+                &ec_av1_syntax::obu::ObuHeader {
+                    obu_type: ec_av1_syntax::obu::ObuType::FrameHeader,
+                    extension_flag: false,
+                    has_size_field: true,
+                    temporal_id: 0,
+                    spatial_id: 0,
+                },
+                &w.into_bytes(),
+            ));
+
+            let mut shown = 0;
+            let err = decode_stream_with(&stream, |_, _, _| {
+                shown += 1;
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(REFUSAL),
+                "slot {slot}: expected {REFUSAL:?}, got: {err}"
+            );
+            assert_eq!(shown, 0, "slot {slot}: an empty slot was output as a picture");
+        }
+    }
+
+    /// lane-t900 r25, negative gate: an inter frame whose `ref_frame_idx[0]`
+    /// slot holds no picture -- a stream that opens on an inter frame -- is
+    /// refused BY NAME rather than predicting from nothing.
+    ///
+    /// Deviation from the round's charter, which asked for a real aomenc
+    /// two-frame stream with the key frame's OBUs stripped: this crate's own
+    /// `write_frame_header` writes a shown INTER frame (short reference
+    /// signalling and non-identity global motion are the parts it refuses), so
+    /// the fixture is built from the writers, needs neither ffmpeg nor aomenc,
+    /// and is byte-identical on every run. The tile payload is a real key
+    /// frame's; the refusal fires on the header's reference lookup, before any
+    /// tile is decoded.
+    #[test]
+    fn an_inter_frame_opening_a_stream_is_refused_by_name() {
+        const REFUSAL: &str = "an inter frame with no key frame before it";
+        let picture = test_card(64, 64);
+        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
+        let inter = FrameHeader {
+            frame_type: FrameType::Inter,
+            frame_is_intra: false,
+            // Keeps `primary_ref_frame`, `frame_size_with_refs` and
+            // `use_ref_frame_mvs` out of the written header (spec 5.9.2).
+            error_resilient_mode: true,
+            primary_ref_frame: PRIMARY_REF_NONE,
+            refresh_frame_flags: 0x02,
+            order_hint: 1,
+            ..key
+        };
+        let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+        stream.extend_from_slice(&crate::frame::frame_obu(&seq, &inter, &encoded.tile).unwrap());
+
+        let mut shown = 0;
+        let err = decode_stream_with(&stream, |_, _, _| {
+            shown += 1;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(REFUSAL), "expected {REFUSAL:?}, got: {err}");
+        assert_eq!(shown, 0, "an inter frame with no reference produced a picture");
+    }
+
     /// lane-interedge r1: one attempt of the inter frame-edge half-strip gate --
     /// encode `width x height` with real aomenc (rect partitions ON, every other
     /// lane's open tool pinned off), decode it, and return
