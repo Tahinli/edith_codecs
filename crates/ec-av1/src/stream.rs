@@ -318,38 +318,140 @@ impl Reorder {
     }
 }
 
-/// lane-thread2: how many leaf frames this PROCESS has dispatched to a worker
-/// thread (see [`decode_stream_with_threads`]). Process-global and atomic on
-/// purpose: it is the only counter here a caller can read after a threaded
-/// decode, and it is what keeps a "decodes identically with 4 threads" gate
-/// from silently proving nothing because every frame ran inline.
-static LEAF_FRAMES_DISPATCHED: std::sync::atomic::AtomicUsize =
+/// lane-thread2/3: how many coded frames this PROCESS has dispatched to a
+/// worker thread (see [`decode_stream_with_threads`]). Process-global and
+/// atomic on purpose: it is the only counter here a caller can read after a
+/// threaded decode, and it is what keeps a "decodes identically with 4
+/// threads" gate from silently proving nothing because every frame ran
+/// inline. (lane-thread2 counted only LEAF frames, the only ones it could
+/// dispatch; lane-thread3 dispatches every non-key, non-`show_existing_frame`
+/// frame, hence the rename.)
+static FRAMES_DISPATCHED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Reads [`LEAF_FRAMES_DISPATCHED`].
-pub fn leaf_frames_dispatched() -> usize {
-    LEAF_FRAMES_DISPATCHED.load(std::sync::atomic::Ordering::Relaxed)
+/// Reads [`FRAMES_DISPATCHED`].
+pub fn frames_dispatched() -> usize {
+    FRAMES_DISPATCHED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One finished leaf frame from a worker: its output position, and either the
-/// (grain-synthesised) picture with the decode index to report or the error
-/// that aborts the stream.
-type LeafResult = (usize, Result<(Picture, usize, bool)>);
+/// lane-thread3: what one decoded frame stores into every reference slot its
+/// `refresh_frame_flags` names (spec 7.20), as one shared, never-mutated
+/// object -- so a slot costs an `Arc` clone instead of a picture copy.
+struct SlotValue {
+    picture: std::sync::Arc<Picture>,
+    cdfs: Cdfs,
+    motion_field: crate::motion_field::MotionField,
+    seg_map: Vec<u8>,
+    order_hint: u32,
+}
 
-/// Waits for one in-flight leaf frame and emits whatever that unblocks.
+/// lane-thread3: a reference slot's contents as a FUTURE. At `threads > 1`
+/// the 8-slot bank holds these instead of values: a slot refreshed by a frame
+/// that is still decoding on a worker holds the promise from the moment the
+/// parsing thread DISPATCHES that frame, so the next frame can be dispatched
+/// straight away and waits, on its own worker, for exactly the slots it
+/// reads. This is what makes a pyramid stream (aomenc's default, where nearly
+/// every coded frame refreshes a slot, so lane-thread2's leaf rule dispatched
+/// almost nothing) decode in parallel.
+///
+/// DEADLOCK ARGUMENT. A promise is installed into a slot on the parsing
+/// thread, in decode order, when its producer is dispatched; a consumer
+/// captures the promises of the slots it reads at ITS dispatch, which is
+/// strictly later in decode order. Every wait therefore points from a later
+/// coded frame to an earlier one -- the wait graph is the reference DAG, and
+/// is acyclic. The parsing thread waits only for a `show_existing_frame`
+/// output (again an earlier frame) and at the in-flight bound, where it waits
+/// for ANY worker to answer: the earliest in-flight frame has no earlier
+/// in-flight producer, so it is always runnable and the bound always clears.
+/// Each dispatched frame gets its own thread, so a blocked waiter never holds
+/// a resource its producer needs. A producer that errors or panics marks its
+/// promise `Failed`, so no consumer can wait for a value that never comes.
+struct SlotPromise {
+    state: std::sync::Mutex<PromiseState>,
+    ready: std::sync::Condvar,
+}
+
+enum PromiseState {
+    Pending,
+    Ready(std::sync::Arc<SlotValue>),
+    Failed,
+}
+
+impl SlotPromise {
+    fn pending() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: std::sync::Mutex::new(PromiseState::Pending),
+            ready: std::sync::Condvar::new(),
+        })
+    }
+
+    /// A slot filled by a frame the parsing thread decoded itself.
+    fn ready(value: std::sync::Arc<SlotValue>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: std::sync::Mutex::new(PromiseState::Ready(value)),
+            ready: std::sync::Condvar::new(),
+        })
+    }
+
+    fn fulfil(&self, value: std::sync::Arc<SlotValue>) {
+        *self.state.lock().expect("slot promise") = PromiseState::Ready(value);
+        self.ready.notify_all();
+    }
+
+    fn fail(&self) {
+        let mut state = self.state.lock().expect("slot promise");
+        if matches!(*state, PromiseState::Pending) {
+            *state = PromiseState::Failed;
+        }
+        self.ready.notify_all();
+    }
+
+    /// Blocks until the producing frame has published this slot.
+    fn wait(&self) -> Result<std::sync::Arc<SlotValue>> {
+        let mut state = self.state.lock().expect("slot promise");
+        loop {
+            match &*state {
+                PromiseState::Ready(value) => return Ok(value.clone()),
+                PromiseState::Failed => {
+                    return Err(Error::corrupt(
+                        "AV1 decode_stream: a reference frame this frame depends on failed to decode",
+                    ));
+                }
+                PromiseState::Pending => {
+                    state = self.ready.wait(state).expect("slot promise");
+                }
+            }
+        }
+    }
+}
+
+/// One finished frame from a worker: its output position, whether the job was
+/// a frame DECODE (as opposed to a `show_existing_frame` output, which only
+/// waits for a slot and synthesises grain -- lane-thread3 counts the two
+/// against separate in-flight bounds, since a waiting output job costs no
+/// CPU), and either the (grain-synthesised) picture with the decode index to
+/// report or the error that aborts the stream.
+type LeafResult = (usize, bool, Result<(Picture, usize, bool)>);
+
+/// Waits for one in-flight job and emits whatever that unblocks.
 fn collect_one(
     rx: &std::sync::mpsc::Receiver<LeafResult>,
-    in_flight: &mut usize,
+    decodes: &mut usize,
+    shows: &mut usize,
     reorder: &mut Reorder,
     sink: &mut impl FnMut(&Picture, usize, bool) -> Result<()>,
 ) -> Result<()> {
     // Every dispatched worker answers exactly once, panic included (it is
     // caught and turned into an error below), so the sender count cannot
     // reach zero while `in_flight > 0`.
-    let (seq, result) = rx
+    let (seq, decode_job, result) = rx
         .recv()
         .map_err(|_| Error::corrupt("AV1 decode_stream: a worker thread vanished"))?;
-    *in_flight -= 1;
+    if decode_job {
+        *decodes -= 1;
+    } else {
+        *shows -= 1;
+    }
     let (picture, decode_idx, shown) = result?;
     reorder.push(seq, picture, decode_idx, shown);
     reorder.drain(sink)
@@ -422,15 +524,21 @@ pub fn decode_stream_with_threads(
     // pushed).
     let mut emit_seq = 0usize;
     let mut reorder = Reorder::default();
-    let mut in_flight = 0usize;
-    let in_flight_cap = threads + 1;
+    // lane-thread3: frame decodes and `show_existing_frame` outputs are
+    // bounded separately -- an output job is a promise wait plus a memcpy, so
+    // letting it eat a decode's budget just idles a core (measured: sharing
+    // one bound cost 4K 18.7 s at 244% CPU against 17.7 s at 287%).
+    let mut in_flight_decodes = 0usize;
+    let mut in_flight_shows = 0usize;
+    let in_flight_cap = threads + 2;
     let (tx, rx) = std::sync::mpsc::channel::<LeafResult>();
-    // A worker needs its references to outlive the main thread's next
-    // `refresh_frame_flags` write, so a dispatched slot is copied once into an
-    // `Arc` and re-shared until that slot is overwritten (cleared alongside
-    // every `ref_slots` write below). The DPB itself stays owned `Picture`s:
-    // an `Arc` DPB measured ~1% SLOWER single-threaded (lane-perf9).
-    let mut ref_arcs: [Option<std::sync::Arc<Picture>>; NUM_REF_FRAMES] =
+    // lane-thread3: at `threads > 1` THIS is the reference bank -- one
+    // [`SlotPromise`] per DPB slot, ready for a slot the parsing thread filled
+    // itself and pending for one an in-flight frame will fill. The owned
+    // arrays above are then untouched (and the single-threaded path never
+    // creates a promise: it stays exactly the decoder it was, which is what
+    // keeps every counter-reading gate meaningful).
+    let mut slot_promises: [Option<std::sync::Arc<SlotPromise>>; NUM_REF_FRAMES] =
         std::array::from_fn(|_| None);
 
     let mut pos = 0usize;
@@ -471,22 +579,93 @@ pub fn decode_stream_with_threads(
             // was emitted (wrongly, in decode order) and its real
             // `show_existing_frame` output was silently dropped.
             let slot = header.frame_to_show_map_idx as usize;
-            let picture = ref_slots[slot].clone().ok_or_else(|| {
+            let empty_slot = || {
                 Error::unsupported(
                     "AV1 decode_stream",
                     "a show_existing_frame header naming an empty reference slot",
                 )
-            })?;
-            for i in 0..NUM_REF_FRAMES {
-                if header.refresh_frame_flags & (1 << i) != 0 {
-                    cdf_slots[i] = cdf_slots[slot].clone();
-                    ref_slots[i] = Some(picture.clone());
-                    ref_arcs[i] = None;
-                    motion_field_slots[i] = motion_field_slots[slot].clone();
-                    seg_map_slots[i] = seg_map_slots[slot].clone();
-                    order_hint_slots[i] = order_hint_slots[slot];
+            };
+            if threads > 1 {
+                // lane-thread3: the named slot may still be decoding on a
+                // worker, and the copy into the slots this header refreshes
+                // is then just the promise -- no value needed. The OUTPUT
+                // does need the picture, so it is produced on a worker too:
+                // waiting for it here would stall the parsing thread, and a
+                // stalled parser dispatches nothing (measured before this
+                // arm existed: 7.9 s of an 8.8 s 1080p decode, 18.9 s of
+                // 23.3 s at 4K, spent in this one wait). The wait still
+                // points at an earlier coded frame, so the argument in
+                // [`SlotPromise`] is unchanged.
+                let promise = slot_promises[slot].clone().ok_or_else(empty_slot)?;
+                for i in 0..NUM_REF_FRAMES {
+                    if header.refresh_frame_flags & (1 << i) != 0 {
+                        slot_promises[i] = Some(promise.clone());
+                    }
                 }
+                while in_flight_shows >= in_flight_cap {
+                    collect_one(
+                    &rx,
+                    &mut in_flight_decodes,
+                    &mut in_flight_shows,
+                    &mut reorder,
+                    &mut sink,
+                )?;
+                }
+                let (job_seq, decode_idx) = (emit_seq, pictures_decoded);
+                emit_seq += 1;
+                pictures_shown += 1;
+                let grain = header.film_grain;
+                let seq = SeqFlags::read(&parser);
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let value = promise.wait()?;
+                        let output = if grain.apply_grain && !no_grain() {
+                            crate::film_grain::apply_grain(
+                                &value.picture,
+                                &grain,
+                                seq.mc_identity,
+                                u32::from(seq.bit_depth),
+                                &crate::decode::FrameCtx::new(),
+                            )
+                        } else {
+                            value.picture.as_ref().clone()
+                        };
+                        Ok((output, decode_idx, true))
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(Error::corrupt(
+                            "AV1 decode_stream: a worker thread panicked on a show_existing_frame output",
+                        ))
+                    });
+                    let _ = tx.send((job_seq, false, reply));
+                });
+                in_flight_shows += 1;
+                while let Ok((seq, decode_job, result)) = rx.try_recv() {
+                    if decode_job {
+                        in_flight_decodes -= 1;
+                    } else {
+                        in_flight_shows -= 1;
+                    }
+                    let (picture, decode_idx, shown) = result?;
+                    reorder.push(seq, picture, decode_idx, shown);
+                    reorder.drain(&mut sink)?;
+                }
+                continue;
             }
+            let picture = {
+                let picture = ref_slots[slot].clone().ok_or_else(empty_slot)?;
+                for i in 0..NUM_REF_FRAMES {
+                    if header.refresh_frame_flags & (1 << i) != 0 {
+                        cdf_slots[i] = cdf_slots[slot].clone();
+                        ref_slots[i] = Some(picture.clone());
+                        motion_field_slots[i] = motion_field_slots[slot].clone();
+                        seg_map_slots[i] = seg_map_slots[slot].clone();
+                        order_hint_slots[i] = order_hint_slots[slot];
+                    }
+                }
+                picture
+            };
             let output = if header.film_grain.apply_grain && !no_grain() {
                 // lane-hbd10 r1: grain synthesis is bit-depth generic
                 // (`film_grain.rs`'s `grain_range`/`scale_lut`, spec 7.18.3).
@@ -612,57 +791,84 @@ pub fn decode_stream_with_threads(
             })
             .collect::<Result<_>>()?;
         let seq = SeqFlags::read(&parser);
-        // A LEAF of the reference graph: shown, not a key frame, and
-        // refreshing no slot -- so nothing it produces except its own picture
-        // is ever read again (spec 7.20's bank update is keyed entirely on
-        // `refresh_frame_flags`), and it can be decoded anywhere.
-        if threads > 1
-            && header.refresh_frame_flags == 0
-            && header.show_frame
-            && !header.show_existing_frame
-            && header.frame_type != FrameType::Key
-        {
-            while in_flight >= in_flight_cap {
-                collect_one(&rx, &mut in_flight, &mut reorder, &mut sink)?;
+        // lane-thread3: at `threads > 1` every coded frame that is not a key
+        // frame is decoded on a worker -- frames that refresh reference slots
+        // included, which on a pyramid stream is nearly all of them. Its
+        // inputs are taken as promises and its output is published as one,
+        // installed into the slots it refreshes HERE, on the parsing thread,
+        // in decode order, so the next frame's dependencies are known without
+        // waiting for this one to finish (see [`SlotPromise`] for the
+        // deadlock argument). A key frame stays inline: it resets the whole
+        // bank and reads nothing, so there is nothing to gain.
+        if threads > 1 && header.frame_type != FrameType::Key && !header.show_existing_frame {
+            while in_flight_decodes >= in_flight_cap {
+                collect_one(
+                    &rx,
+                    &mut in_flight_decodes,
+                    &mut in_flight_shows,
+                    &mut reorder,
+                    &mut sink,
+                )?;
             }
-            let mut arcs: [Option<std::sync::Arc<Picture>>; NUM_REF_FRAMES] =
+            // Exactly the slots this frame reads: `ref_frame_idx` names its
+            // references, and its `primary_ref_frame` CDFs/segment map, its
+            // reference order hints and every field `setup_motion_field`
+            // projects all come from those same slots. Nothing else is
+            // waited on.
+            let mut deps: [Option<std::sync::Arc<SlotPromise>>; NUM_REF_FRAMES] =
                 std::array::from_fn(|_| None);
             for i in 0..7 {
                 let slot = header.ref_frame_idx[i] as usize;
-                if arcs[slot].is_none()
-                    && let Some(picture) = ref_slots[slot].as_ref()
-                {
-                    arcs[slot] = Some(
-                        ref_arcs[slot]
-                            .get_or_insert_with(|| std::sync::Arc::new(picture.clone()))
-                            .clone(),
-                    );
+                deps[slot] = slot_promises[slot].clone();
+            }
+            let produces = (header.refresh_frame_flags != 0).then(SlotPromise::pending);
+            if let Some(promise) = &produces {
+                for i in 0..NUM_REF_FRAMES {
+                    if header.refresh_frame_flags & (1 << i) != 0 {
+                        slot_promises[i] = Some(promise.clone());
+                    }
                 }
             }
-            let snap = RefSnapshot::take(
-                &header,
-                seq,
-                std::array::from_fn(|_| None),
-                &cdf_slots,
-                &seg_map_slots,
-                &motion_field_slots,
-                &order_hint_slots,
-            );
             let (job_seq, decode_idx, shown_idx) = (emit_seq, pictures_decoded, pictures_shown);
             emit_seq += 1;
             pictures_decoded += 1;
-            pictures_shown += 1;
+            let shown = header.show_frame;
+            if shown {
+                pictures_shown += 1;
+            }
             let tx = tx.clone();
             let dump = final_dump.clone();
             scope.spawn(move || {
+                let promise = produces;
                 let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // The wait happens HERE, off the parsing thread, and only
+                    // for this frame's own references.
+                    let mut resolved: [Option<std::sync::Arc<SlotValue>>; NUM_REF_FRAMES] =
+                        std::array::from_fn(|_| None);
+                    for (slot, dep) in deps.iter().enumerate() {
+                        if let Some(dep) = dep {
+                            resolved[slot] = Some(dep.wait()?);
+                        }
+                    }
                     // Fresh per-thread state: every field this path reads is
                     // written from this frame's own header before it is read.
                     let fctx = crate::decode::FrameCtx::new();
-                    let snap = RefSnapshot {
-                        refs: std::array::from_fn(|i| arcs[i].as_deref()),
-                        ..snap
-                    };
+                    // spec 7.9's `av1_setup_motion_field` runs inside
+                    // `RefSnapshot::take`, i.e. here, after those waits --
+                    // it reads the referenced slots' saved motion fields.
+                    let motion_fields =
+                        std::array::from_fn(|i| resolved[i].as_ref().map(|v| &v.motion_field));
+                    let snap = RefSnapshot::take(
+                        &header,
+                        seq,
+                        std::array::from_fn(|i| resolved[i].as_ref().map(|v| &*v.picture)),
+                        std::array::from_fn(|i| resolved[i].as_ref().map(|v| &v.cdfs)),
+                        std::array::from_fn(|i| {
+                            resolved[i].as_ref().map(|v| v.seg_map.as_slice())
+                        }),
+                        &motion_fields,
+                        std::array::from_fn(|i| resolved[i].as_ref().map_or(0, |v| v.order_hint)),
+                    );
                     let out = decode_frame(
                         &fctx,
                         &header,
@@ -673,31 +879,58 @@ pub fn decode_stream_with_threads(
                         shown_idx,
                         dump.as_deref(),
                     )?;
-                    let picture = if header.film_grain.apply_grain && !no_grain() {
+                    // Publish before grain synthesis: every frame waiting on
+                    // this slot can start the moment the clean picture exists
+                    // (spec 7.18.3.1 -- the bank never stores grain).
+                    let picture = std::sync::Arc::new(out.picture);
+                    if let Some(promise) = &promise {
+                        promise.fulfil(std::sync::Arc::new(SlotValue {
+                            picture: picture.clone(),
+                            cdfs: out.stored_cdfs,
+                            motion_field: out.motion_field,
+                            seg_map: out.seg_map,
+                            order_hint: header.order_hint,
+                        }));
+                    }
+                    // Grain is synthesised for OUTPUT only: a hidden frame is
+                    // reported to the sink clean, exactly as the inline path
+                    // below reports it (spec 7.18.3.1).
+                    let output = if shown && header.film_grain.apply_grain && !no_grain() {
                         crate::film_grain::apply_grain(
-                            &out.picture,
+                            &picture,
                             &header.film_grain,
                             seq.mc_identity,
                             u32::from(seq.bit_depth),
                             &fctx,
                         )
                     } else {
-                        out.picture
+                        std::sync::Arc::try_unwrap(picture).unwrap_or_else(|p| (*p).clone())
                     };
-                    Ok((picture, decode_idx, true))
+                    Ok((output, decode_idx, shown))
                 }))
                 .unwrap_or_else(|_| {
                     Err(Error::corrupt(
-                        "AV1 decode_stream: a worker thread panicked decoding a leaf frame",
+                        "AV1 decode_stream: a worker thread panicked decoding a frame",
                     ))
                 });
-                let _ = tx.send((job_seq, reply));
+                // A frame nobody can decode must not leave its consumers
+                // waiting for a slot that will never be filled.
+                if reply.is_err()
+                    && let Some(promise) = &promise
+                {
+                    promise.fail();
+                }
+                let _ = tx.send((job_seq, true, reply));
             });
-            in_flight += 1;
-            LEAF_FRAMES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            in_flight_decodes += 1;
+            FRAMES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Anything that finished while this frame was being set up.
-            while let Ok((seq, result)) = rx.try_recv() {
-                in_flight -= 1;
+            while let Ok((seq, decode_job, result)) = rx.try_recv() {
+                if decode_job {
+                    in_flight_decodes -= 1;
+                } else {
+                    in_flight_shows -= 1;
+                }
                 let (picture, decode_idx, shown) = result?;
                 reorder.push(seq, picture, decode_idx, shown);
                 reorder.drain(&mut sink)?;
@@ -708,10 +941,10 @@ pub fn decode_stream_with_threads(
             &header,
             seq,
             std::array::from_fn(|i| ref_slots[i].as_ref()),
-            &cdf_slots,
-            &seg_map_slots,
-            &motion_field_slots,
-            &order_hint_slots,
+            std::array::from_fn(|i| cdf_slots[i].as_ref()),
+            std::array::from_fn(|i| seg_map_slots[i].as_deref()),
+            &std::array::from_fn(|i| motion_field_slots[i].as_ref()),
+            order_hint_slots,
         );
         let bit_depth = seq.bit_depth;
         let FrameOutput {
@@ -730,18 +963,38 @@ pub fn decode_stream_with_threads(
             final_dump.as_deref(),
         )?;
         pictures_decoded += 1;
-        for i in 0..NUM_REF_FRAMES {
-            if header.refresh_frame_flags & (1 << i) != 0 {
-                cdf_slots[i] = Some(stored_cdfs.clone());
-                // Spec 7.18.3.1: synthesized grain is never stored for later
-                // prediction -- the reference bank always keeps the clean,
-                // pre-grain decode, even though the frame pushed onto the
-                // caller's output below carries the grained picture.
-                ref_slots[i] = Some(picture.clone());
-                ref_arcs[i] = None;
-                motion_field_slots[i] = Some(motion_field.clone());
-                seg_map_slots[i] = Some(decoded_seg_map.clone());
-                order_hint_slots[i] = header.order_hint;
+        if threads > 1 {
+            // lane-thread3: only a key frame reaches this inline path at
+            // `threads > 1`, and the bank it fills is the promise array --
+            // already resolved, since the picture exists right here.
+            if header.refresh_frame_flags != 0 {
+                let promise = SlotPromise::ready(std::sync::Arc::new(SlotValue {
+                    picture: std::sync::Arc::new(picture.clone()),
+                    cdfs: stored_cdfs,
+                    motion_field,
+                    seg_map: decoded_seg_map,
+                    order_hint: header.order_hint,
+                }));
+                for i in 0..NUM_REF_FRAMES {
+                    if header.refresh_frame_flags & (1 << i) != 0 {
+                        slot_promises[i] = Some(promise.clone());
+                    }
+                }
+            }
+        } else {
+            for i in 0..NUM_REF_FRAMES {
+                if header.refresh_frame_flags & (1 << i) != 0 {
+                    cdf_slots[i] = Some(stored_cdfs.clone());
+                    // Spec 7.18.3.1: synthesized grain is never stored for
+                    // later prediction -- the reference bank always keeps the
+                    // clean, pre-grain decode, even though the frame pushed
+                    // onto the caller's output below carries the grained
+                    // picture.
+                    ref_slots[i] = Some(picture.clone());
+                    motion_field_slots[i] = Some(motion_field.clone());
+                    seg_map_slots[i] = Some(decoded_seg_map.clone());
+                    order_hint_slots[i] = header.order_hint;
+                }
             }
         }
         // lane-defon r1: a forward keyframe (aomenc `--enable-fwd-kf`) is a
@@ -777,8 +1030,14 @@ pub fn decode_stream_with_threads(
             reorder.drain(&mut sink)?;
         }
     }
-    while in_flight > 0 {
-        collect_one(&rx, &mut in_flight, &mut reorder, &mut sink)?;
+    while in_flight_decodes + in_flight_shows > 0 {
+        collect_one(
+            &rx,
+            &mut in_flight_decodes,
+            &mut in_flight_shows,
+            &mut reorder,
+            &mut sink,
+        )?;
     }
     debug_assert!(reorder.pending.is_empty(), "a frame was never emitted");
     Ok(())
@@ -842,17 +1101,19 @@ pub(crate) struct RefSnapshot<'a> {
 }
 
 impl<'a> RefSnapshot<'a> {
-    /// Reads the banks for `header`. `refs` is passed in so that the
-    /// single-threaded path can borrow the DPB pictures in place while the
-    /// worker path hands over its own `Arc` clones.
+    /// Reads the banks for `header`. Every slot is passed in by reference so
+    /// that the single-threaded path can borrow the DPB in place while a
+    /// worker borrows the resolved [`SlotPromise`] values it waited on --
+    /// spec 7.9's `setup_motion_field` therefore runs on the DECODING thread
+    /// (lane-thread3), after those waits.
     fn take(
         header: &FrameHeader,
         seq: SeqFlags,
         refs: [Option<&'a Picture>; NUM_REF_FRAMES],
-        cdf_slots: &[Option<Cdfs>; NUM_REF_FRAMES],
-        seg_map_slots: &[Option<Vec<u8>>; NUM_REF_FRAMES],
-        motion_field_slots: &[Option<crate::motion_field::MotionField>; NUM_REF_FRAMES],
-        order_hint_slots: &[u32; NUM_REF_FRAMES],
+        cdf_slots: [Option<&Cdfs>; NUM_REF_FRAMES],
+        seg_map_slots: [Option<&[u8]>; NUM_REF_FRAMES],
+        motion_field_slots: &[Option<&crate::motion_field::MotionField>; NUM_REF_FRAMES],
+        order_hint_slots: [u32; NUM_REF_FRAMES],
     ) -> Self {
         let primary = (header.primary_ref_frame != PRIMARY_REF_NONE)
             .then(|| header.ref_frame_idx[header.primary_ref_frame as usize] as usize);
@@ -883,8 +1144,8 @@ impl<'a> RefSnapshot<'a> {
         }
         Self {
             refs,
-            primary_cdfs: primary.and_then(|slot| cdf_slots[slot].clone()),
-            prev_seg_map: primary.and_then(|slot| seg_map_slots[slot].clone()),
+            primary_cdfs: primary.and_then(|slot| cdf_slots[slot].cloned()),
+            prev_seg_map: primary.and_then(|slot| seg_map_slots[slot].map(<[u8]>::to_vec)),
             tpl_field,
             ref_order_hints: std::array::from_fn(|i| {
                 order_hint_slots[header.ref_frame_idx[i] as usize]
@@ -32415,24 +32676,25 @@ mod tests {
     /// [`decode_stream_with_threads`] at 1 and at 4 threads and every sink
     /// call is compared -- decode index, shown flag, and all three planes.
     ///
-    /// `hg_arf_witness.obu` is the one that proves the parallel path: 18 of
-    /// its 40 coded frames are leaves of the reference graph (shown,
-    /// non-key, `refresh_frame_flags == 0`), so 18 frames really are decoded
-    /// off the main thread, and it carries hidden alt-refs, which is exactly
-    /// the case where "output in coded order" is not the same as "output in
-    /// the order workers finish". `palette_screen_witness.obu` is the
-    /// complement: an 8-bit screen stream whose every coded frame refreshes a
-    /// slot, so at 4 threads it dispatches NOTHING and pins that the threaded
-    /// entry point is byte-identical on the inline path too. The dispatch
-    /// counter is asserted in both directions, so neither arm can pass
-    /// vacuously.
+    /// `hg_arf_witness.obu` is the one that proves the parallel path: it
+    /// carries hidden alt-refs, which is exactly the case where "output in
+    /// coded order" is not the same as "output in the order workers finish",
+    /// and under lane-thread3's dependency-aware scheduling 39 of its 40
+    /// coded frames (all but the key frame) are decoded off the main thread
+    /// -- MORE than its 37 shown frames, which is the point: lane-thread2's
+    /// leaf rule dispatched 18. `palette_screen_witness.obu` is the
+    /// complement, an 8-bit screen stream whose every coded frame refreshes a
+    /// slot: lane-thread2 dispatched NOTHING for it, lane-thread3 dispatches
+    /// all 14 of its non-key frames. Both counts are asserted exactly, plus
+    /// the "more than half the shown frames really ran on a worker" bound, so
+    /// neither arm can pass vacuously.
     #[test]
     fn a_real_stream_decodes_identically_with_one_and_four_threads() {
         const NAME: &str = "a_real_stream_decodes_identically_with_one_and_four_threads";
-        // (fixture, shown frames, leaf frames a 4-thread run must dispatch)
-        for (fixture, shown_frames, want_leaves) in [
-            ("fixtures/hg_arf_witness.obu", 37usize, 18usize),
-            ("fixtures/palette_screen_witness.obu", 15, 0),
+        // (fixture, shown frames, frames a 4-thread run must dispatch)
+        for (fixture, shown_frames, want_dispatched) in [
+            ("fixtures/hg_arf_witness.obu", 37usize, 39usize),
+            ("fixtures/palette_screen_witness.obu", 15, 14),
         ] {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
             let stream = std::fs::read(&path)
@@ -32447,12 +32709,16 @@ mod tests {
                 out
             };
             let serial = run(1);
-            let before = leaf_frames_dispatched();
+            let before = frames_dispatched();
             let parallel = run(4);
-            let dispatched = leaf_frames_dispatched() - before;
+            let dispatched = frames_dispatched() - before;
             assert_eq!(
-                dispatched, want_leaves,
-                "{NAME}: {fixture} dispatched {dispatched} leaf frames to workers, expected {want_leaves}"
+                dispatched, want_dispatched,
+                "{NAME}: {fixture} dispatched {dispatched} frames to workers, expected {want_dispatched}"
+            );
+            assert!(
+                dispatched * 2 > shown_frames,
+                "{NAME}: {fixture} dispatched {dispatched} frames, not even half of its {shown_frames} shown frames -- the parallel path is barely exercised"
             );
             assert_eq!(
                 serial.iter().filter(|f| f.1).count(),
