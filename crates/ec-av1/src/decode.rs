@@ -16140,6 +16140,9 @@ fn lf_level(
     // Feature index: `SEG_LVL_ALT_LF_Y_V + dir` for luma, `_U`/`_V` (3/4)
     // for chroma.
     let feature = if plane_idx == 0 { SEG_LVL_ALT_LF_Y_V + dir } else { plane_idx + 2 };
+    // lane-perf9: `segment_id` is `0` and this lookup is skipped entirely
+    // when the frame codes no segmentation (`seg_lf_active`), which is what
+    // spares the deblock loop two thread-local reads per 4x4 edge.
     let base = match seg_feature(usize::from(segment_id), feature) {
         Some(data) => (base + data).clamp(0, 63),
         None => base,
@@ -16173,6 +16176,11 @@ fn edge_params(
     chroma: bool,
     x0: usize,
     y0: usize,
+    // lane-perf9: `segmentation_enabled`, read once per plane pass instead of
+    // four thread-local reads (`SEG_MI_DIMS`, `SEG_IDS`, twice each) plus two
+    // `SEG` borrows per 4x4 edge. With it clear, every segment id is 0 and no
+    // `SEG_LVL_ALT_LF_*` feature can be active, so the levels are unchanged.
+    seg_lf_active: bool,
 ) -> Option<(u8, i32)> {
     let (mi_r, mi_c) = (plane_to_mi(chroma, y0), plane_to_mi(chroma, x0));
     let cur_tx = if dir == 0 {
@@ -16220,15 +16228,13 @@ fn edge_params(
     {
         return None;
     }
-    let cur_level = lf_level(lf, plane_idx, dir, cur_ref, cur_delta_lf, segment_id_at(mi_r, mi_c));
-    let pv_level = lf_level(
-        lf,
-        plane_idx,
-        dir,
-        pv_ref,
-        pv_delta_lf,
-        segment_id_at(pv_mi_r, pv_mi_c),
-    );
+    let (cur_seg, pv_seg) = if seg_lf_active {
+        (segment_id_at(mi_r, mi_c), segment_id_at(pv_mi_r, pv_mi_c))
+    } else {
+        (0, 0)
+    };
+    let cur_level = lf_level(lf, plane_idx, dir, cur_ref, cur_delta_lf, cur_seg);
+    let pv_level = lf_level(lf, plane_idx, dir, pv_ref, pv_delta_lf, pv_seg);
     if cur_level == 0 && pv_level == 0 {
         return None;
     }
@@ -16976,13 +16982,14 @@ fn deblock_plane(
     // dependence is on ascending `x0` within a row, which stays the outer
     // loop's order, and rows remain independent (horizontal pass mirrored).
     let rows = plane.data.len() / stride.max(1);
+    let seg_lf_active = SEG.with(|s| s.borrow().enabled);
     let mut x0 = 4usize;
     while x0 < tw {
         let mut y0 = 0usize;
         while y0 < th {
             if y0 + 16 <= th && x0 >= 8 && x0 + 8 <= stride {
                 let ps: [Option<(u8, i32)>; 4] =
-                    std::array::from_fn(|k| edge_params(lf, n, plane_idx, 0, chroma, x0, y0 + 4 * k));
+                    std::array::from_fn(|k| edge_params(lf, n, plane_idx, 0, chroma, x0, y0 + 4 * k, seg_lf_active));
                 if let Some((len, level)) = ps[0] {
                     if ps.iter().all(|p| *p == ps[0])
                         && filter_edge16(
@@ -17015,7 +17022,7 @@ fn deblock_plane(
                 y0 += 16;
                 continue;
             }
-            if let Some((len, level)) = edge_params(lf, n, plane_idx, 0, chroma, x0, y0) {
+            if let Some((len, level)) = edge_params(lf, n, plane_idx, 0, chroma, x0, y0, seg_lf_active) {
                 if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE_V") && plane_idx == 0 {
                     eprintln!("VEDGE x0={x0} y0={y0} len={len} level={level}");
                 }
@@ -17039,7 +17046,7 @@ fn deblock_plane(
         while x0 < tw {
             if x0 + 16 <= tw && y0 >= 8 && y0 + 7 <= rows {
                 let ps: [Option<(u8, i32)>; 4] =
-                    std::array::from_fn(|k| edge_params(lf, n, plane_idx, 1, chroma, x0 + 4 * k, y0));
+                    std::array::from_fn(|k| edge_params(lf, n, plane_idx, 1, chroma, x0 + 4 * k, y0, seg_lf_active));
                 if let Some((len, level)) = ps[0] {
                     if ps.iter().all(|p| *p == ps[0])
                         && filter_edge16(
@@ -17072,7 +17079,7 @@ fn deblock_plane(
                 x0 += 16;
                 continue;
             }
-            if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0) {
+            if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0, seg_lf_active) {
                 if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE")
                     && plane_idx == 0
                     && x0 == 44
