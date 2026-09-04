@@ -263,8 +263,117 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
 /// As [`decode_stream`], plus whatever `sink` returns.
 pub fn decode_stream_with(
     data: &[u8],
+    sink: impl FnMut(&Picture, usize, bool) -> Result<()>,
+) -> Result<()> {
+    decode_stream_with_threads(data, decode_threads(), sink)
+}
+
+/// lane-thread2: how many threads [`decode_stream_with`] decodes with --
+/// `EC_AV1_THREADS`, default 1. One is not "threading with a pool of one":
+/// it is the single-threaded decoder unchanged, which is what keeps every
+/// gate that reads this crate's per-thread counters meaningful.
+fn decode_threads() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    });
+    *N
+}
+
+/// lane-thread2: output-order queue. A leaf frame decoded on a worker
+/// finishes whenever it finishes; `sink` must still see every picture in the
+/// order the stream codes them, so each sink call gets an `emit_seq` when the
+/// main thread reaches its frame header and is held here until every earlier
+/// one has been emitted. (The decode index the sink is TOLD is unchanged, and
+/// is deliberately not unique: a `show_existing_frame` re-output reports the
+/// count of frames decoded before it, per this function's contract.)
+#[derive(Default)]
+struct Reorder {
+    next: usize,
+    pending: std::collections::BTreeMap<usize, (Picture, usize, bool)>,
+}
+
+impl Reorder {
+    fn push(&mut self, seq: usize, picture: Picture, decode_idx: usize, shown: bool) {
+        self.pending.insert(seq, (picture, decode_idx, shown));
+    }
+
+    /// Emits every queued picture whose turn has come. An `Err` from `sink`
+    /// aborts the decode, unchanged, exactly as the serial path did.
+    fn drain(
+        &mut self,
+        sink: &mut impl FnMut(&Picture, usize, bool) -> Result<()>,
+    ) -> Result<()> {
+        while let Some((picture, decode_idx, shown)) = self.pending.remove(&self.next) {
+            self.next += 1;
+            sink(&picture, decode_idx, shown)?;
+        }
+        Ok(())
+    }
+}
+
+/// lane-thread2: how many leaf frames this PROCESS has dispatched to a worker
+/// thread (see [`decode_stream_with_threads`]). Process-global and atomic on
+/// purpose: it is the only counter here a caller can read after a threaded
+/// decode, and it is what keeps a "decodes identically with 4 threads" gate
+/// from silently proving nothing because every frame ran inline.
+static LEAF_FRAMES_DISPATCHED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Reads [`LEAF_FRAMES_DISPATCHED`].
+pub fn leaf_frames_dispatched() -> usize {
+    LEAF_FRAMES_DISPATCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One finished leaf frame from a worker: its output position, and either the
+/// (grain-synthesised) picture with the decode index to report or the error
+/// that aborts the stream.
+type LeafResult = (usize, Result<(Picture, usize, bool)>);
+
+/// Waits for one in-flight leaf frame and emits whatever that unblocks.
+fn collect_one(
+    rx: &std::sync::mpsc::Receiver<LeafResult>,
+    in_flight: &mut usize,
+    reorder: &mut Reorder,
+    sink: &mut impl FnMut(&Picture, usize, bool) -> Result<()>,
+) -> Result<()> {
+    // Every dispatched worker answers exactly once, panic included (it is
+    // caught and turned into an error below), so the sender count cannot
+    // reach zero while `in_flight > 0`.
+    let (seq, result) = rx
+        .recv()
+        .map_err(|_| Error::corrupt("AV1 decode_stream: a worker thread vanished"))?;
+    *in_flight -= 1;
+    let (picture, decode_idx, shown) = result?;
+    reorder.push(seq, picture, decode_idx, shown);
+    reorder.drain(sink)
+}
+
+/// [`decode_stream_with`] with an explicit worker count (lane-thread2).
+///
+/// `threads == 1` is the serial decoder. Above that, frames that no later
+/// frame can reference -- a shown, non-key frame whose `refresh_frame_flags`
+/// is 0, i.e. a leaf of the reference graph -- are decoded on worker threads
+/// while the main thread keeps parsing headers and decoding the frames that
+/// DO feed the reference banks; `sink` still sees every picture in coded
+/// order. Each worker owns a fresh [`crate::decode::FrameCtx`] and a snapshot
+/// of the banks taken before dispatch, so no decode state is shared.
+///
+/// The per-decode counters this crate's gates read are thread-local, so at
+/// `threads > 1` a leaf frame's counts land on the worker and are invisible
+/// to the caller; that is why the default is 1.
+///
+/// # Errors
+/// As [`decode_stream_with`]; a worker's error aborts the stream.
+pub fn decode_stream_with_threads(
+    data: &[u8],
+    threads: usize,
     mut sink: impl FnMut(&Picture, usize, bool) -> Result<()>,
 ) -> Result<()> {
+    std::thread::scope(|scope| {
     // lane-thread1: this stream's per-frame decode state (was 38 thread_local
     // statics in decode.rs) -- one object, threaded down the decode call graph.
     let fctx = &crate::decode::FrameCtx::new();
@@ -304,6 +413,22 @@ pub fn decode_stream_with(
     // (spec `load_previous_segment_ids`) for temporal segment-id prediction
     // and for a `segmentation_update_map == 0` frame's inherited map.
     let mut seg_map_slots: [Option<Vec<u8>>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
+
+    // lane-thread2: output plumbing (inert at `threads == 1`, where nothing
+    // is ever dispatched and `reorder` emits each picture the moment it is
+    // pushed).
+    let mut emit_seq = 0usize;
+    let mut reorder = Reorder::default();
+    let mut in_flight = 0usize;
+    let in_flight_cap = threads + 1;
+    let (tx, rx) = std::sync::mpsc::channel::<LeafResult>();
+    // A worker needs its references to outlive the main thread's next
+    // `refresh_frame_flags` write, so a dispatched slot is copied once into an
+    // `Arc` and re-shared until that slot is overwritten (cleared alongside
+    // every `ref_slots` write below). The DPB itself stays owned `Picture`s:
+    // an `Arc` DPB measured ~1% SLOWER single-threaded (lane-perf9).
+    let mut ref_arcs: [Option<std::sync::Arc<Picture>>; NUM_REF_FRAMES] =
+        std::array::from_fn(|_| None);
 
     let mut pos = 0usize;
     // A frame whose tiles are split across several `OBU_TILE_GROUP`s (spec
@@ -353,6 +478,7 @@ pub fn decode_stream_with(
                 if header.refresh_frame_flags & (1 << i) != 0 {
                     cdf_slots[i] = cdf_slots[slot].clone();
                     ref_slots[i] = Some(picture.clone());
+                    ref_arcs[i] = None;
                     motion_field_slots[i] = motion_field_slots[slot].clone();
                     seg_map_slots[i] = seg_map_slots[slot].clone();
                     order_hint_slots[i] = order_hint_slots[slot];
@@ -376,7 +502,9 @@ pub fn decode_stream_with(
             } else {
                 picture
             };
-            sink(&output, pictures_decoded, true)?;
+            reorder.push(emit_seq, output, pictures_decoded, true);
+            emit_seq += 1;
+            reorder.drain(&mut sink)?;
             pictures_shown += 1;
             continue;
         }
@@ -481,6 +609,98 @@ pub fn decode_stream_with(
             })
             .collect::<Result<_>>()?;
         let seq = SeqFlags::read(&parser);
+        // A LEAF of the reference graph: shown, not a key frame, and
+        // refreshing no slot -- so nothing it produces except its own picture
+        // is ever read again (spec 7.20's bank update is keyed entirely on
+        // `refresh_frame_flags`), and it can be decoded anywhere.
+        if threads > 1
+            && header.refresh_frame_flags == 0
+            && header.show_frame
+            && !header.show_existing_frame
+            && header.frame_type != FrameType::Key
+        {
+            while in_flight >= in_flight_cap {
+                collect_one(&rx, &mut in_flight, &mut reorder, &mut sink)?;
+            }
+            let mut arcs: [Option<std::sync::Arc<Picture>>; NUM_REF_FRAMES] =
+                std::array::from_fn(|_| None);
+            for i in 0..7 {
+                let slot = header.ref_frame_idx[i] as usize;
+                if arcs[slot].is_none()
+                    && let Some(picture) = ref_slots[slot].as_ref()
+                {
+                    arcs[slot] = Some(
+                        ref_arcs[slot]
+                            .get_or_insert_with(|| std::sync::Arc::new(picture.clone()))
+                            .clone(),
+                    );
+                }
+            }
+            let snap = RefSnapshot::take(
+                &header,
+                seq,
+                std::array::from_fn(|_| None),
+                &cdf_slots,
+                &seg_map_slots,
+                &motion_field_slots,
+                &order_hint_slots,
+            );
+            let (job_seq, decode_idx, shown_idx) = (emit_seq, pictures_decoded, pictures_shown);
+            emit_seq += 1;
+            pictures_decoded += 1;
+            pictures_shown += 1;
+            let tx = tx.clone();
+            let dump = final_dump.clone();
+            scope.spawn(move || {
+                let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Fresh per-thread state: every field this path reads is
+                    // written from this frame's own header before it is read.
+                    let fctx = crate::decode::FrameCtx::new();
+                    let snap = RefSnapshot {
+                        refs: std::array::from_fn(|i| arcs[i].as_deref()),
+                        ..snap
+                    };
+                    let out = decode_frame(
+                        &fctx,
+                        &header,
+                        &tile_bufs,
+                        seq,
+                        snap,
+                        decode_idx,
+                        shown_idx,
+                        dump.as_deref(),
+                    )?;
+                    let picture = if header.film_grain.apply_grain && !no_grain() {
+                        crate::film_grain::apply_grain(
+                            &out.picture,
+                            &header.film_grain,
+                            seq.mc_identity,
+                            u32::from(seq.bit_depth),
+                            &fctx,
+                        )
+                    } else {
+                        out.picture
+                    };
+                    Ok((picture, decode_idx, true))
+                }))
+                .unwrap_or_else(|_| {
+                    Err(Error::corrupt(
+                        "AV1 decode_stream: a worker thread panicked decoding a leaf frame",
+                    ))
+                });
+                let _ = tx.send((job_seq, reply));
+            });
+            in_flight += 1;
+            LEAF_FRAMES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Anything that finished while this frame was being set up.
+            while let Ok((seq, result)) = rx.try_recv() {
+                in_flight -= 1;
+                let (picture, decode_idx, shown) = result?;
+                reorder.push(seq, picture, decode_idx, shown);
+                reorder.drain(&mut sink)?;
+            }
+            continue;
+        }
         let snap = RefSnapshot::take(
             &header,
             seq,
@@ -515,6 +735,7 @@ pub fn decode_stream_with(
                 // pre-grain decode, even though the frame pushed onto the
                 // caller's output below carries the grained picture.
                 ref_slots[i] = Some(picture.clone());
+                ref_arcs[i] = None;
                 motion_field_slots[i] = Some(motion_field.clone());
                 seg_map_slots[i] = Some(decoded_seg_map.clone());
                 order_hint_slots[i] = header.order_hint;
@@ -539,17 +760,26 @@ pub fn decode_stream_with(
             } else {
                 picture
             };
-            sink(&output, pictures_decoded - 1, true)?;
+            reorder.push(emit_seq, output, pictures_decoded - 1, true);
+            emit_seq += 1;
+            reorder.drain(&mut sink)?;
             pictures_shown += 1;
         } else {
             // Hidden (alt-ref/forward-key) frames never reach
             // `decode_stream`'s output, but a decode-order consumer -- the
             // `EC_AV1_FINAL_DUMP` comparison against aomdec, say -- needs
             // them, so they are reported too, with `shown == false`.
-            sink(&picture, pictures_decoded - 1, false)?;
+            reorder.push(emit_seq, picture, pictures_decoded - 1, false);
+            emit_seq += 1;
+            reorder.drain(&mut sink)?;
         }
     }
+    while in_flight > 0 {
+        collect_one(&rx, &mut in_flight, &mut reorder, &mut sink)?;
+    }
+    debug_assert!(reorder.pending.is_empty(), "a frame was never emitted");
     Ok(())
+    })
 }
 
 
