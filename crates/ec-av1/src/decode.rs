@@ -24653,6 +24653,15 @@ fn decode_inter_sub8_split4(
             (ug, vg)
         };
         neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+        // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
+        // needs EVERY writer): a sub-8x8 group published no palette state, so
+        // once an 8x8 leaf of the same row can BE a palette block, the group
+        // left the row's band holding that earlier block's size and the next
+        // intra block read `av1_get_palette_mode_ctx` one too high (measured:
+        // mi(30,30) of decode-order frame 1, ours ctx 1 where libaom gathers
+        // 0). No sub-8x8 piece can itself be a palette (`av1_allow_palette`
+        // needs `bsize >= BLOCK_8X8`), so the group always clears.
+        record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let bound_h = round_up_even(neighbours.mi_rows);
         let bound_w = round_up_even(neighbours.mi_cols);
@@ -25054,6 +25063,16 @@ fn decode_intra_sub8_leaf(
     neighbours.above_uv_mode[c] = uv_predict_mode;
     neighbours.left_uv_mode[r] = uv_predict_mode;
     neighbours.record_uv_mode_mi(gr, gc, 2, 2, uv_predict_mode);
+    // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
+    // needs EVERY writer): a sub-8x8 group published no palette state, so
+    // once an 8x8 leaf of the same row can BE a palette block, the group
+    // left the row's band holding that earlier block's size and the next
+    // intra block read `av1_get_palette_mode_ctx` one too high (measured:
+    // mi(30,30) of decode-order frame 1, ours ctx 1 where libaom gathers
+    // 0). No sub-8x8 piece can itself be a palette (`av1_allow_palette`
+    // needs `bsize >= BLOCK_8X8`), so the group always clears.
+    record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
+
     let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if skip {
         if alpha.is_some() {
@@ -25654,6 +25673,15 @@ fn decode_inter_sub8_rect2(
             (ug, vg)
         };
         neighbours.record_uv_mode_mi(gr, gc, 2, 2, DC_PRED);
+        // lane-t900 r23 (class [[new-map-ignores-tile-edge]]: a neighbour map
+        // needs EVERY writer): a sub-8x8 group published no palette state, so
+        // once an 8x8 leaf of the same row can BE a palette block, the group
+        // left the row's band holding that earlier block's size and the next
+        // intra block read `av1_get_palette_mode_ctx` one too high (measured:
+        // mi(30,30) of decode-order frame 1, ours ctx 1 where libaom gathers
+        // 0). No sub-8x8 piece can itself be a palette (`av1_allow_palette`
+        // needs `bsize >= BLOCK_8X8`), so the group always clears.
+        record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let bound_h = round_up_even(neighbours.mi_rows);
         let bound_w = round_up_even(neighbours.mi_cols);

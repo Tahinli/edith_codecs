@@ -31012,6 +31012,63 @@ mod tests {
         }
     }
 
+    /// lane-t900 r23 GATE for the two LIFTED refusals `"a block that actually
+    /// uses a palette (Y)/(UV) -- reconstruction is out of scope"` at their
+    /// 8x8-LEAF site ([`crate::decode`]'s `decode_inter_block8` intra arm):
+    /// a palette block on an 8x8 intra leaf inside an inter frame.
+    ///
+    /// Recipe (`fixtures/palette_screen_leaf8_witness.obu`): 256x192, 15
+    /// frames, a static two-level 16x16 screen background with a 96x96 patch
+    /// of hashed 4x4 colour cells that moves non-periodically (so no
+    /// reference holds it and the encoder codes it INTRA inside the inter
+    /// frames), `aomenc --tune-content=screen --enable-palette=1
+    /// --enable-intrabc=0 --sb-size=64 --cq-level=20 --cpu-used=1
+    /// --lag-in-frames=0 --kf-max-dist=9999 --max-partition-size=8` -- the
+    /// partition cap is what puts the palette on BLOCK_8X8 rather than on the
+    /// 16x16/16x8 blocks r22's recipe produced. `EC_PALSYN=1` on aomdec
+    /// counts 25 `bsize=BLOCK_8X8 palette_size>0` blocks past the key frame.
+    ///
+    /// What it caught beyond the refusal itself: a sub-8x8 group publishes no
+    /// palette state, so it left the row's `left_palette_size` band holding an
+    /// earlier 8x8 palette block's size and `av1_get_palette_mode_ctx` read 1
+    /// where libaom gathers 0 (decode-order frame 1, mi(30,30), palette size
+    /// decoded as 8 instead of 2) -- class `new-map-ignores-tile-edge`, fixed
+    /// at all three sub-8x8 tails.
+    #[test]
+    fn a_screen_stream_with_palette_8x8_leaves_in_inter_frames_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_screen_stream_with_palette_8x8_leaves_in_inter_frames_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/palette_screen_leaf8_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let before = inter8_palette_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let after = inter8_palette_hits();
+        let (fired_y, fired_uv) = (after.0 - before.0, after.1 - before.1);
+        assert!(
+            fired_y > 0,
+            "{NAME}: no palette block on an 8x8 leaf inside an inter frame \
+             -- the gate is vacuous for the site whose refusal it pins"
+        );
+        assert_eq!(frames.len(), 15, "{NAME}: 15 shown frames");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 256, 192, frames.len());
+        assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: frame count");
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!("{NAME}: 15 frames pixel-exact; 8x8-leaf palette y={fired_y} uv={fired_uv}");
+    }
+
     /// lane-t900 r22 GATE for the LIFTED refusal `"a HORZ/VERT intra strip in
     /// a screen-content frame (palette syntax is consumed for square blocks
     /// only)"` on its 16x4/4x16 arm: that arm routes through
