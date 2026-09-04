@@ -16541,6 +16541,389 @@ fn filter_edge(
     }
 }
 
+/// lane-perf8: [`filter_edge`]'s AVX2 kernel -- the scalar loop was 8.0% of a
+/// 4K decode's self time, spent almost entirely on the per-tap strided
+/// addressing (`perf annotate`'s hot lines are `leaq`/`movzwl` pairs, not the
+/// arithmetic). Nothing here is spec logic: the same masks, the same
+/// `filter4`/`filter6`/`filter8`/`filter14` weighted sums and the same
+/// rounding, done for 16 edge lines at once.
+///
+/// 16-bit lanes are exact for every value these filters see. Samples are in
+/// `[0, 4095]`, so a difference and the `blimit` term (`2 * |p0 - q0| +
+/// |p1 - q1| / 2 <= 10237`) fit `i16`; `filter4` works in the centred domain
+/// where every intermediate is clamped to `+-128 << (bit_depth - 8)`; and the
+/// wide kernels' weights each total 8 or 16, so their sums (at most
+/// `16 * 4095 + 8 = 65528`) fit `u16` -- hence `_mm256_srli_epi16` for their
+/// rounding shift, which is the unsigned shift the scalar's non-negative sum
+/// takes.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+#[allow(unsafe_op_in_unsafe_fn)] // the kernel's whole body is its contract
+mod deblock_simd {
+    use std::arch::x86_64::*;
+
+    /// `a <= b` lane-wise, as a full-width mask.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn le(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_cmpeq_epi16(_mm256_max_epi16(a, b), b)
+    }
+
+    /// `|a - b|` lane-wise.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn ad(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_abs_epi16(_mm256_sub_epi16(a, b))
+    }
+
+    /// `signed_char_clamp_high`, lane-wise.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn sclamp(v: __m256i, lo: __m256i, hi: __m256i) -> __m256i {
+        _mm256_min_epi16(_mm256_max_epi16(v, lo), hi)
+    }
+
+    /// 16 rows of 16 `i16` transposed in place (unpack ladder, then the
+    /// 128-bit lane swap AVX2's in-lane unpacks leave behind).
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    unsafe fn transpose16(t: &mut [__m256i; 16]) {
+        let mut a = [_mm256_setzero_si256(); 16];
+        for k in 0..8 {
+            a[2 * k] = _mm256_unpacklo_epi16(t[2 * k], t[2 * k + 1]);
+            a[2 * k + 1] = _mm256_unpackhi_epi16(t[2 * k], t[2 * k + 1]);
+        }
+        let mut b = [_mm256_setzero_si256(); 16];
+        for g in 0..4 {
+            let s = 4 * g;
+            b[s] = _mm256_unpacklo_epi32(a[s], a[s + 2]);
+            b[s + 1] = _mm256_unpackhi_epi32(a[s], a[s + 2]);
+            b[s + 2] = _mm256_unpacklo_epi32(a[s + 1], a[s + 3]);
+            b[s + 3] = _mm256_unpackhi_epi32(a[s + 1], a[s + 3]);
+        }
+        let mut c = [_mm256_setzero_si256(); 16];
+        for g in 0..2 {
+            let s = 8 * g;
+            for j in 0..4 {
+                c[s + 2 * j] = _mm256_unpacklo_epi64(b[s + j], b[s + j + 4]);
+                c[s + 2 * j + 1] = _mm256_unpackhi_epi64(b[s + j], b[s + j + 4]);
+            }
+        }
+        for i in 0..8 {
+            t[i] = _mm256_permute2x128_si256(c[i], c[i + 8], 0x20);
+            t[i + 8] = _mm256_permute2x128_si256(c[i], c[i + 8], 0x31);
+        }
+    }
+
+    /// The wide kernels' tap weights, in tap order and with the spec's
+    /// rounding divisor as the row sum: `filter6` over `p2..q2`, `filter8`
+    /// over `p3..q3`, `filter14` over `p6..q6`.
+    const W6: [[i16; 6]; 4] = [
+        [3, 2, 2, 1, 0, 0],
+        [1, 2, 2, 2, 1, 0],
+        [0, 1, 2, 2, 2, 1],
+        [0, 0, 1, 2, 2, 3],
+    ];
+    const W8: [[i16; 8]; 6] = [
+        [3, 2, 1, 1, 1, 0, 0, 0],
+        [2, 1, 2, 1, 1, 1, 0, 0],
+        [1, 1, 1, 2, 1, 1, 1, 0],
+        [0, 1, 1, 1, 2, 1, 1, 1],
+        [0, 0, 1, 1, 1, 2, 1, 2],
+        [0, 0, 0, 1, 1, 1, 2, 3],
+    ];
+    const W14: [[i16; 14]; 12] = [
+        [7, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+        [5, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
+        [4, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0],
+        [3, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0],
+        [2, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0],
+        [1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0],
+        [0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1],
+        [0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 2],
+        [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 3],
+        [0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 1, 4],
+        [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 5],
+        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 7],
+    ];
+
+    /// One weighted tap sum, rounded by `shift` (3 for the divide-by-8 rows,
+    /// 4 for `filter14`'s divide-by-16 ones). The sum is non-negative and
+    /// below `1 << 16`, so the logical shift is the arithmetic one.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn wsum(taps: &[__m256i], w: &[i16], shift: i32) -> __m256i {
+        let mut s = _mm256_setzero_si256();
+        for (t, &k) in taps.iter().zip(w) {
+            match k {
+                0 => {}
+                1 => s = _mm256_add_epi16(s, *t),
+                2 => s = _mm256_add_epi16(s, _mm256_add_epi16(*t, *t)),
+                _ => s = _mm256_add_epi16(s, _mm256_mullo_epi16(*t, _mm256_set1_epi16(k))),
+            }
+        }
+        let s = _mm256_add_epi16(s, _mm256_set1_epi16(1 << (shift - 1)));
+        if shift == 3 {
+            _mm256_srli_epi16(s, 3)
+        } else {
+            _mm256_srli_epi16(s, 4)
+        }
+    }
+
+    /// [`super::filter_edge`]'s body for 16 lines held as `t[0..16]`, `q0` in
+    /// `t[8]`; the filtered taps are written back in place.
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn filter16(
+        t: &mut [__m256i; 16],
+        len: u8,
+        blimit: i32,
+        limit: i32,
+        hev_thr: i32,
+        flat_thresh: i32,
+        scale: i32,
+        smax: i32,
+    ) {
+        let lim = _mm256_set1_epi16(limit as i16);
+        let blim = _mm256_set1_epi16(blimit as i16);
+        let hthr = _mm256_set1_epi16(hev_thr as i16);
+        let fthr = _mm256_set1_epi16(flat_thresh as i16);
+        let zero = _mm256_setzero_si256();
+        let smaxv = _mm256_set1_epi16(smax as i16);
+        let (p6, p5, p4, p3, p2, p1, p0) = (t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
+        let (q0, q1, q2, q3, q4, q5, q6) = (t[8], t[9], t[10], t[11], t[12], t[13], t[14]);
+
+        // `highbd_filter_mask`: the neighbour steps this kernel's length
+        // reaches, plus the shared `blimit` term.
+        let d1 = _mm256_max_epi16(ad(p1, p0), ad(q1, q0));
+        let mut md = d1;
+        if len >= 6 {
+            md = _mm256_max_epi16(md, _mm256_max_epi16(ad(p2, p1), ad(q2, q1)));
+        }
+        if len >= 8 {
+            md = _mm256_max_epi16(md, _mm256_max_epi16(ad(p3, p2), ad(q3, q2)));
+        }
+        let bl = _mm256_add_epi16(
+            _mm256_slli_epi16(ad(p0, q0), 1),
+            _mm256_srli_epi16(ad(p1, q1), 1),
+        );
+        let mask = _mm256_and_si256(le(md, lim), le(bl, blim));
+        let hev = _mm256_cmpgt_epi16(d1, hthr);
+
+        // `filter4`, in the centred domain.
+        let centre = _mm256_set1_epi16((128 * scale) as i16);
+        let lo = _mm256_set1_epi16((-128 * scale) as i16);
+        let hi = _mm256_set1_epi16((128 * scale - 1) as i16);
+        let ps1 = _mm256_sub_epi16(p1, centre);
+        let ps0 = _mm256_sub_epi16(p0, centre);
+        let qs0 = _mm256_sub_epi16(q0, centre);
+        let qs1 = _mm256_sub_epi16(q1, centre);
+        let outer = _mm256_and_si256(hev, sclamp(_mm256_sub_epi16(ps1, qs1), lo, hi));
+        let f = sclamp(
+            _mm256_add_epi16(
+                outer,
+                _mm256_mullo_epi16(_mm256_set1_epi16(3), _mm256_sub_epi16(qs0, ps0)),
+            ),
+            lo,
+            hi,
+        );
+        let f1 = _mm256_srai_epi16(sclamp(_mm256_add_epi16(f, _mm256_set1_epi16(4)), lo, hi), 3);
+        let f2 = _mm256_srai_epi16(sclamp(_mm256_add_epi16(f, _mm256_set1_epi16(3)), lo, hi), 3);
+        let tap = _mm256_andnot_si256(
+            hev,
+            _mm256_srai_epi16(_mm256_add_epi16(f1, _mm256_set1_epi16(1)), 1),
+        );
+        let n_p1 = _mm256_add_epi16(sclamp(_mm256_add_epi16(ps1, tap), lo, hi), centre);
+        let n_p0 = _mm256_add_epi16(sclamp(_mm256_add_epi16(ps0, f2), lo, hi), centre);
+        let n_q0 = _mm256_add_epi16(sclamp(_mm256_sub_epi16(qs0, f1), lo, hi), centre);
+        let n_q1 = _mm256_add_epi16(sclamp(_mm256_sub_epi16(qs1, tap), lo, hi), centre);
+        let mut r = [
+            p5,
+            p4,
+            p3,
+            p2,
+            _mm256_blendv_epi8(p1, n_p1, mask),
+            _mm256_blendv_epi8(p0, n_p0, mask),
+            _mm256_blendv_epi8(q0, n_q0, mask),
+            _mm256_blendv_epi8(q1, n_q1, mask),
+            q2,
+            q3,
+            q4,
+            q5,
+        ];
+
+        if len >= 6 {
+            // `highbd_flat_mask4`, over the same reach as this length's mask.
+            let mut fl = _mm256_max_epi16(
+                _mm256_max_epi16(ad(p1, p0), ad(q1, q0)),
+                _mm256_max_epi16(ad(p2, p0), ad(q2, q0)),
+            );
+            if len >= 8 {
+                fl = _mm256_max_epi16(fl, _mm256_max_epi16(ad(p3, p0), ad(q3, q0)));
+            }
+            let flat = _mm256_and_si256(le(fl, fthr), mask);
+            if len == 6 {
+                let taps = [p2, p1, p0, q0, q1, q2];
+                for (j, w) in W6.iter().enumerate() {
+                    r[4 + j] = _mm256_blendv_epi8(r[4 + j], wsum(&taps, w, 3), flat);
+                }
+            } else {
+                let taps = [p3, p2, p1, p0, q0, q1, q2, q3];
+                for (j, w) in W8.iter().enumerate() {
+                    r[3 + j] = _mm256_blendv_epi8(r[3 + j], wsum(&taps, w, 3), flat);
+                }
+                if len > 8 {
+                    let fl2 = _mm256_max_epi16(
+                        _mm256_max_epi16(
+                            _mm256_max_epi16(ad(p4, p0), ad(q4, q0)),
+                            _mm256_max_epi16(ad(p5, p0), ad(q5, q0)),
+                        ),
+                        _mm256_max_epi16(ad(p6, p0), ad(q6, q0)),
+                    );
+                    let flat2 = _mm256_and_si256(le(fl2, fthr), flat);
+                    let taps = [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6];
+                    for (j, w) in W14.iter().enumerate() {
+                        r[j] = _mm256_blendv_epi8(r[j], wsum(&taps, w, 4), flat2);
+                    }
+                }
+            }
+        }
+
+        // `r[j]` holds the sample at tap `j - 6`, i.e. `t[j + 2]`.
+        let (a, b) = match len {
+            4 | 6 => (4, 8),
+            8 => (3, 9),
+            _ => (0, 12),
+        };
+        for j in a..b {
+            t[j + 2] = _mm256_min_epi16(_mm256_max_epi16(r[j], zero), smaxv);
+        }
+    }
+
+    /// 16 edge lines at `base`. `vertical` names the edge: a vertical edge's
+    /// 16 lines are 16 consecutive rows and its taps are consecutive samples
+    /// (loaded as a 16x16 tile and transposed), a horizontal edge's are 16
+    /// consecutive columns with each tap a whole row segment.
+    ///
+    /// # Safety
+    /// Requires AVX2. For a vertical edge `base % stride >= 8`, `base %
+    /// stride + 8 <= stride` and 16 rows from `base` must be inside `data`;
+    /// for a horizontal edge `base >= 8 * stride` and `base + 8 * stride`
+    /// must be inside it.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn edge16(
+        data: &mut [u16],
+        base: usize,
+        stride: usize,
+        vertical: bool,
+        len: u8,
+        blimit: i32,
+        limit: i32,
+        hev_thr: i32,
+        flat_thresh: i32,
+        scale: i32,
+        smax: i32,
+    ) {
+        let p = data.as_mut_ptr();
+        let mut t = [_mm256_setzero_si256(); 16];
+        // The taps this length reads, as `t` indices.
+        let (lo, hi) = match len {
+            4 => (6, 10),
+            6 => (5, 11),
+            8 => (4, 12),
+            _ => (1, 15),
+        };
+        if vertical {
+            for j in 0..16 {
+                t[j] = _mm256_loadu_si256(p.add(base + j * stride - 8).cast());
+            }
+            transpose16(&mut t);
+        } else {
+            let top = base - 8 * stride;
+            for i in lo..hi {
+                t[i] = _mm256_loadu_si256(p.add(top + i * stride).cast());
+            }
+        }
+        filter16(&mut t, len, blimit, limit, hev_thr, flat_thresh, scale, smax);
+        if vertical {
+            transpose16(&mut t);
+            for j in 0..16 {
+                _mm256_storeu_si256(p.add(base + j * stride - 8).cast(), t[j]);
+            }
+        } else {
+            let top = base - 8 * stride;
+            let (a, b) = match len {
+                4 | 6 => (6, 10),
+                8 => (5, 11),
+                _ => (2, 14),
+            };
+            for i in a..b {
+                _mm256_storeu_si256(p.add(top + i * stride).cast(), t[i]);
+            }
+        }
+    }
+}
+
+/// [`filter_edge`] for 16 adjacent edge lines that share `edge_params`'
+/// output. Returns `false` when this build or CPU has no kernel, leaving the
+/// caller on the scalar path.
+#[allow(unused_variables)]
+fn filter_edge16(
+    data: &mut [u16],
+    base: usize,
+    stride: usize,
+    vertical: bool,
+    len: u8,
+    level: i32,
+    sharpness: u8,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
+            let (blimit, limit, hev_thr) = deblock_thresholds(level, sharpness);
+            let shift = bit_depth() - 8;
+            // SAFETY: the avx2 arm is reached only when the CPU reports it,
+            // and `deblock_plane` checks the kernel's edge bounds.
+            #[allow(unsafe_code)]
+            unsafe {
+                deblock_simd::edge16(
+                    data,
+                    base,
+                    stride,
+                    vertical,
+                    len,
+                    blimit << shift,
+                    limit << shift,
+                    hev_thr << shift,
+                    1 << shift,
+                    1 << shift,
+                    sample_max(),
+                )
+            };
+            return true;
+        }
+    }
+    false
+}
+
 /// One plane's worth of spec 7.14: every vertical edge across the plane,
 /// then every horizontal edge (the order the spec and libaom both use).
 fn deblock_plane(
@@ -16585,10 +16968,53 @@ fn deblock_plane(
     if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE_V") {
         eprintln!("DEBLOCK plane={plane_idx} tw={tw} th={th} stride={stride} true={}x{} crop={cw}x{ch}", plane.true_width, plane.true_height);
     }
-    let mut y0 = 0usize;
-    while y0 < th {
-        let mut x0 = 4usize;
-        while x0 < tw {
+    // lane-perf8: both passes iterate the edge's OWN direction innermost, so
+    // 4 consecutive 4-sample groups (16 lines) can go through one AVX2
+    // kernel. The swap is order-preserving: a filtered group overlaps only
+    // groups along the edge it sits on -- the vertical pass's writes at
+    // `x0` reach columns `x0 - 7 ..= x0 + 5` of its own 4 rows, so the
+    // dependence is on ascending `x0` within a row, which stays the outer
+    // loop's order, and rows remain independent (horizontal pass mirrored).
+    let rows = plane.data.len() / stride.max(1);
+    let mut x0 = 4usize;
+    while x0 < tw {
+        let mut y0 = 0usize;
+        while y0 < th {
+            if y0 + 16 <= th && x0 >= 8 && x0 + 8 <= stride {
+                let ps: [Option<(u8, i32)>; 4] =
+                    std::array::from_fn(|k| edge_params(lf, n, plane_idx, 0, chroma, x0, y0 + 4 * k));
+                if let Some((len, level)) = ps[0] {
+                    if ps.iter().all(|p| *p == ps[0])
+                        && filter_edge16(
+                            &mut plane.data,
+                            y0 * stride + x0,
+                            stride,
+                            true,
+                            len,
+                            level,
+                            lf.sharpness,
+                        )
+                    {
+                        y0 += 16;
+                        continue;
+                    }
+                }
+                for (k, p) in ps.iter().enumerate() {
+                    if let Some((len, level)) = *p {
+                        filter_edge(
+                            &mut plane.data,
+                            (y0 + 4 * k) * stride + x0,
+                            stride as isize,
+                            1,
+                            len,
+                            level,
+                            lf.sharpness,
+                        );
+                    }
+                }
+                y0 += 16;
+                continue;
+            }
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 0, chroma, x0, y0) {
                 if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE_V") && plane_idx == 0 {
                     eprintln!("VEDGE x0={x0} y0={y0} len={len} level={level}");
@@ -16603,14 +17029,49 @@ fn deblock_plane(
                     lf.sharpness,
                 );
             }
-            x0 += 4;
+            y0 += 4;
         }
-        y0 += 4;
+        x0 += 4;
     }
-    let mut x0 = 0usize;
-    while x0 < tw {
-        let mut y0 = 4usize;
-        while y0 < th {
+    let mut y0 = 4usize;
+    while y0 < th {
+        let mut x0 = 0usize;
+        while x0 < tw {
+            if x0 + 16 <= tw && y0 >= 8 && y0 + 7 <= rows {
+                let ps: [Option<(u8, i32)>; 4] =
+                    std::array::from_fn(|k| edge_params(lf, n, plane_idx, 1, chroma, x0 + 4 * k, y0));
+                if let Some((len, level)) = ps[0] {
+                    if ps.iter().all(|p| *p == ps[0])
+                        && filter_edge16(
+                            &mut plane.data,
+                            y0 * stride + x0,
+                            stride,
+                            false,
+                            len,
+                            level,
+                            lf.sharpness,
+                        )
+                    {
+                        x0 += 16;
+                        continue;
+                    }
+                }
+                for (k, p) in ps.iter().enumerate() {
+                    if let Some((len, level)) = *p {
+                        filter_edge(
+                            &mut plane.data,
+                            y0 * stride + x0 + 4 * k,
+                            1,
+                            stride as isize,
+                            len,
+                            level,
+                            lf.sharpness,
+                        );
+                    }
+                }
+                x0 += 16;
+                continue;
+            }
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0) {
                 if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE")
                     && plane_idx == 0
@@ -16631,9 +17092,9 @@ fn deblock_plane(
                     lf.sharpness,
                 );
             }
-            y0 += 4;
+            x0 += 4;
         }
-        x0 += 4;
+        y0 += 4;
     }
 }
 
@@ -31590,6 +32051,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// lane-perf8: the AVX2 deblock kernel must be sample-identical to
+    /// [`super::filter_edge`] over the whole input domain -- every bit depth,
+    /// every filter length, every level and sharpness, and sample patterns
+    /// that put each of `mask`, `flat` and `flat2` on both sides of its
+    /// threshold (uniform, flat-with-step, small-noise and full-range
+    /// random), on both edge directions.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn deblock_simd_kernel_matches_the_scalar_filter() {
+        if crate::mc::simd_level() != crate::mc::SimdLevel::Avx2 {
+            eprintln!("SKIP deblock simd: no avx2");
+            return;
+        }
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let (stride, rows) = (64usize, 64usize);
+        for &bd in &[8u8, 10, 12] {
+            super::set_bit_depth(bd);
+            let smax = (1u64 << bd) - 1;
+            for pattern in 0..4u32 {
+                for trial in 0..8 {
+                    let seed: Vec<u16> = (0..stride * rows)
+                        .map(|k| {
+                            let base = ((k / stride) as u64 * 7 + trial) % (smax + 1);
+                            (match pattern {
+                                // Uniform-ish: every mask and both flats pass.
+                                0 => base,
+                                // A step across the edge column/row.
+                                1 => (base + if k % stride >= 32 { smax / 2 } else { 0 }) % (smax + 1),
+                                // Small noise: flat passes at 8-bit, not always higher.
+                                2 => (base + next() % 4) % (smax + 1),
+                                _ => next() % (smax + 1),
+                            }) as u16
+                        })
+                        .collect();
+                    for &len in &[4u8, 6, 8, 14] {
+                        for &level in &[0i32, 1, 7, 23, 40, 63] {
+                            for sharpness in 0..8u8 {
+                                for &vertical in &[true, false] {
+                                    let (base, outer, tap) = if vertical {
+                                        (32 * stride + 32, stride as isize, 1isize)
+                                    } else {
+                                        (32 * stride + 32, 1isize, stride as isize)
+                                    };
+                                    let mut a = seed.clone();
+                                    for g in 0..4usize {
+                                        let b = if vertical {
+                                            base + 4 * g * stride
+                                        } else {
+                                            base + 4 * g
+                                        };
+                                        super::filter_edge(
+                                            &mut a, b, outer, tap, len, level, sharpness,
+                                        );
+                                    }
+                                    let mut b = seed.clone();
+                                    assert!(super::filter_edge16(
+                                        &mut b, base, stride, vertical, len, level, sharpness,
+                                    ));
+                                    assert_eq!(
+                                        a, b,
+                                        "bd={bd} pattern={pattern} trial={trial} len={len} \
+                                         level={level} sharp={sharpness} vert={vertical}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        super::set_bit_depth(8);
     }
 
     /// lane-golomb r7: [`reduce_inherited_chroma_tx_type`] must reproduce
