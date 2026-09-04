@@ -4370,7 +4370,7 @@ mod tests {
         const TILE: &str = "smptebars=size=128x96:rate=25";
         let (width, height) = (256usize, 192usize);
         // (arm, source, cq, tx-size-search, tiled, square_only)
-        let arms: [(&str, &str, &str, &str, bool, bool); 13] = [
+        let arms: [(&str, &str, &str, &str, bool, bool); 14] = [
             ("smptebars-cq40-txs1", SB, "40", "1", false, false),
             ("smptebars-cq45-txs1", SB, "45", "1", false, false),
             ("smptebars-cq55-txs1", SB, "55", "1", false, false),
@@ -4384,13 +4384,11 @@ mod tests {
             ("tiled-cq30-txs1", TILE, "30", "1", true, false),
             ("tiled-cq45-txs1", TILE, "45", "1", true, false),
             ("tiled-square-cq30-txs1", TILE, "30", "1", true, true),
-            // `tiled-square-cq45-txs1` belongs here too and is NOT in this
-            // table: its intrabc blocks are all `skip`, so the `&& !skip`
-            // guard lets them through -- and the frame decodes WRONG against
-            // ffmpeg. A refusal one `&&` narrower than the hole it guards
-            // (class `refusal-hides-a-defect`); that arm lives in the ignored
-            // gate below with the unskipped one, and the guard itself is a
-            // `decode.rs` edit this round could not make.
+            // lane-t900 r32: both square arms are now ORDINARY census members
+            // -- cq30 (unskipped intrabc, the inter var-tx tree) and cq45
+            // (all-skip intrabc, `maxRectTxSize` with no symbol at all) decode
+            // pixel-exact, so nothing here reaches the lifted refusal.
+            ("tiled-square-cq45-txs1", TILE, "45", "1", true, true),
         ];
         let (mut select_arms, mut premise_arms, mut intrabc_arms, mut blocks_total) =
             (0u32, 0u32, 0u32, 0usize);
@@ -4468,9 +4466,9 @@ mod tests {
              tx_mode == Select, so the refusal's own premise was never within reach"
         );
         assert_eq!(
-            refused_tx_select, 1,
-            "{NAME}: exactly one arm (tiled-square-cq30-txs1) must reach the refusal -- if \
-             none does, the census no longer measures it; if more do, say so here"
+            refused_tx_select, 0,
+            "{NAME}: lane-t900 r32 lifted this refusal -- an intrabc block now reads the \
+             INTER tx-size syntax, so no arm may reach it again"
         );
         assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
     }
@@ -4484,13 +4482,17 @@ mod tests {
     /// (`read_var_tx_size`), which this decoder reads nowhere on the intra
     /// path -- reading the intra `tx_depth` symbol instead desyncs.
     ///
-    /// Two arms of the same recipe: `cq=30`, whose intrabc block is unskipped
-    /// and refused by name, and `cq=45`, whose intrabc blocks are all `skip`
-    /// and therefore pass the `&& !skip` guard -- and decode WRONG (frame 0
-    /// mismatches ffmpeg). So the refusal is one `&&` narrower than the hole:
-    /// until the var-tx read lands, the skipped case needs the same refusal.
+    /// lane-t900 r32 closed both arms. A SKIPPED intrabc block reads no
+    /// tx-size symbol at all (`allowSelect = !skip || !is_inter`, false for an
+    /// intrabc block since libaom's `is_inter_block` counts one); reading the
+    /// intra `tx_depth` for it consumed a symbol libaom never wrote and
+    /// desynced the tile a whole block later, at the superblock corner
+    /// (192,64) (class `equal-range-means-unread`). An UNSKIPPED one reads the
+    /// inter var-tx tree (`read_var_tx_size`). r31's note that cq=45's blocks
+    /// are all `skip` was read off that desynced decode: with the tx-size read
+    /// corrected, cq=45 carries 3 unskipped intrabc blocks of 10 and cq=30
+    /// carries 1 of 16, so both arms exercise both sides of the split.
     #[test]
-    #[ignore = "capability gap: an intrabc block's tx size is coded by the inter var-tx tree"]
     fn an_intrabc_block_under_tx_mode_select_decodes_pixel_exact() {
         const NAME: &str = "an_intrabc_block_under_tx_mode_select_decodes_pixel_exact";
         if !have_ffmpeg() || !have_aomenc() {
@@ -4507,11 +4509,21 @@ mod tests {
                  (select={select} premise={premise})"
             );
             crate::decode::reset_intrabc_hits();
+            crate::decode::reset_intrabc_vartx_hits();
             let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: cq={cq}: {e}"));
+            let (blocks, vartx) =
+                (crate::decode::intrabc_hits(), crate::decode::intrabc_vartx_hits());
+            assert!(blocks > 0, "{NAME}: cq={cq} no longer decodes an intrabc block");
+            // r31 recorded cq=45's intrabc blocks as ALL skip; that was read
+            // off the desynced decode. With the tx-size read corrected both
+            // arms carry unskipped ones (cq30 1 of 16, cq45 3 of 10), so both
+            // must reach the var-tx tree or the gate is blind to the lift
+            // (class `gate-blind-to-feature`).
             assert!(
-                crate::decode::intrabc_hits() > 0,
-                "{NAME}: cq={cq} no longer decodes an intrabc block"
+                vartx > 0,
+                "{NAME}: cq={cq} no longer reads the inter var-tx tree for an intrabc block"
             );
+            eprintln!("{NAME}: cq={cq} {blocks} intrabc block(s), {vartx} through var-tx");
             let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
             assert_eq!(frames.len(), theirs.len(), "{NAME}: cq={cq} frame count");
             for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
