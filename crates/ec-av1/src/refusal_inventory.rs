@@ -103,8 +103,17 @@ const REFUSALS: &[&str] = &[
     // what is left is the 1:4 shape, whose `bsize_to_tx_size_cat` breaks the
     // size-group/category diagonal the 2:1 shapes share.
     "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)",
-    // The same arm's screen-content gate: palette/intrabc syntax is consumed
-    // for square blocks only, so a strip in such a frame would skip symbols.
+    // lane-t900 r21 NARROWED this: the string used to guard EVERY rect intra
+    // strip of a screen-content inter frame, and a real
+    // `--tune-content=screen` stream reached it on an 8x16 (8-bit) / 16x8
+    // (10-bit) strip. The 2:1 reader now codes the palette syntax itself and
+    // the 1:4 arm goes through `read_intra_mode_rect`, which already did --
+    // both arms of gate
+    // `a_real_aomenc_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips`
+    // decode ten frames pixel-exact with the strips counted. What still
+    // refuses is a 16x4/4x16 strip and a 128-root half, neither of which is
+    // palette-eligible (`palette_bsize_ctx_wh` wants `8 <= min`, `max <= 64`)
+    // and neither of which has a witness stream yet.
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
