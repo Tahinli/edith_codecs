@@ -1070,7 +1070,7 @@ pub fn intra_rect4_in_inter_counters() -> (usize, usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::{Picture as Pic, encode_key_frame, encode_sequence};
+    use crate::encode::{Picture as Pic, encode_key_frame_with_ctx, encode_sequence_with_ctx};
 
     fn test_card(width: usize, height: usize) -> Pic {
         let mut picture = Pic::grey(width, height);
@@ -1119,7 +1119,7 @@ mod tests {
     fn a_twelve_bit_sequence_header_is_refused_by_name() {
     let fctx = &crate::decode::FrameCtx::new();
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5, fctx).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let mut color = ec_av1_syntax::ColorConfig {
             bit_depth: 12,
             ..Default::default()
@@ -1164,7 +1164,7 @@ mod tests {
     let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str = "a frame OBU with no tile group";
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5, fctx).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, header) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         let mut frame_obus_parsed = 0;
         for len in 0..=encoded.tile.len().min(24) {
@@ -1221,7 +1221,7 @@ mod tests {
         const REFUSAL: &str =
             "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV";
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5, fctx).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {
             for segment in [0usize, 3, 7] {
@@ -1612,7 +1612,7 @@ mod tests {
     let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str = "an inter frame with no key frame before it";
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5, fctx).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         let inter = FrameHeader {
             frame_type: FrameType::Inter,
@@ -1659,7 +1659,7 @@ mod tests {
         const REFUSAL: &str =
             "a reference picture whose height does not match this frame's own true size";
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5, fctx).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         let inter = FrameHeader {
             frame_type: FrameType::Inter,
@@ -1736,7 +1736,7 @@ mod tests {
         }
 
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5, fctx).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         for slot in 0..NUM_REF_FRAMES as u8 {
             let inter = FrameHeader {
@@ -2142,7 +2142,7 @@ mod tests {
     let fctx = &crate::decode::FrameCtx::new();
         for &(width, height) in &[(64usize, 64usize), (216, 96)] {
             let picture = test_card(width, height);
-            let encoded = encode_key_frame(&picture, 100, 0.5, fctx).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let via_tile = decode_key_frame_tile(
                 &encoded.tile,
                 encoded.mi_cols,
@@ -2179,7 +2179,7 @@ mod tests {
         let pictures: Vec<_> = (0..4)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5, fctx).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         let decoded = decode_stream(&encoded.stream).unwrap();
         assert_eq!(decoded.len(), encoded.frames.len());
         for (i, (got, frame)) in decoded.iter().zip(&encoded.frames).enumerate() {
@@ -2222,7 +2222,7 @@ mod tests {
     fn streaming_decode_matches_the_collecting_one() {
     let fctx = &crate::decode::FrameCtx::new();
         let pictures: Vec<_> = (0..4).map(|i| panned_test_card(128, 64, i * 3)).collect();
-        let stream = encode_sequence(&pictures, 100, 0.5, fctx).unwrap().stream;
+        let stream = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap().stream;
         let collected = decode_stream(&stream).unwrap();
 
         let mut shown = Vec::new();
@@ -2466,7 +2466,7 @@ mod tests {
         let pictures: Vec<_> = (0..3)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5, fctx).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         let ffmpeg_frames = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
         let decoded = decode_stream(&encoded.stream).unwrap();
         assert_eq!(decoded.len(), 3);
@@ -2541,7 +2541,7 @@ mod tests {
 
         for run in 0..4 {
             let picture = test_card(width, height);
-            let key = encode_key_frame(&picture, base_q_idx, 0.5, fctx).unwrap();
+            let key = encode_key_frame_with_ctx(&picture, base_q_idx, 0.5, fctx).unwrap();
             let (seq, _) = key_frame_headers(width, height, base_q_idx).unwrap();
 
             // Frame 1: hand-coded, intra-only, refreshes slot 0 with a flat

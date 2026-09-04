@@ -262,7 +262,7 @@ pub(crate) fn intra_edge_filter_hits() -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn predict(
+pub(crate) fn predict(
     mode: u8,
     angle_delta: i32,
     above: Option<&[u16]>,
@@ -772,7 +772,7 @@ const FILTER_INTRA_SCALE_BITS: u32 = 4;
 /// Panics when `dst` is not `bw * bh` long, or `bw` is not a multiple of 4
 /// or `bh` not a multiple of 2 (spec `av1_filter_intra_allowed_bsize` never
 /// offers this mode past 32x32).
-pub fn predict_filter_intra(
+pub(crate) fn predict_filter_intra(
     mode: usize,
     above: Option<&[u16]>,
     left: Option<&[u16]>,
