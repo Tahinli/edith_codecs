@@ -299,16 +299,30 @@ fn horizontal_pass_unscaled(
     rows: usize,
     intermediate: &mut [i32],
 ) {
+    // Fraction 0 is the identity tap (`128` at slot 3), and `Round2(128 * s,
+    // InterRound0) == 16 * s` exactly, so a whole-pel horizontal position
+    // needs no filter at all -- one widened row read.
+    let identity = taps[3] == 128 && taps.iter().enumerate().all(|(i, &t)| i == 3 || t == 0);
     for r in 0..rows {
         let y = (y0 - 3 + r as i32).clamp(0, true_height as i32 - 1) as usize;
-        hpass_row(
-            reference,
-            y * stride,
-            true_width,
-            x0,
-            taps,
-            &mut intermediate[r * block_w..(r + 1) * block_w],
-        );
+        let out = &mut intermediate[r * block_w..(r + 1) * block_w];
+        if identity {
+            let gain = 128 >> INTER_ROUND_0;
+            if x0 >= 0 && x0 as usize + block_w <= true_width {
+                if let Some(src) = reference.get(y * stride + x0 as usize..y * stride + x0 as usize + block_w) {
+                    for (o, &s) in out.iter_mut().zip(src) {
+                        *o = gain * i32::from(s);
+                    }
+                    continue;
+                }
+            }
+            for (c, o) in out.iter_mut().enumerate() {
+                let x = (x0 + c as i32).clamp(0, true_width as i32 - 1) as usize;
+                *o = gain * i32::from(reference[y * stride + x]);
+            }
+            continue;
+        }
+        hpass_row(reference, y * stride, true_width, x0, taps, out);
     }
 }
 
@@ -543,13 +557,24 @@ pub fn predict_with_filters_kern(
 
     // The vertical pass reads 3 rows above and 4 below the block, so the
     // horizontal pass must produce that many extra intermediate rows.
-    let rows = block_h + 7;
+    // A whole-pel vertical position needs neither the 3 rows above nor the 4
+    // below, and its vertical pass is the identity tap: `Round2(128 * a,
+    // InterRound1) == Round2(a, InterRound1 - 7)`. Passing `y0 + 3` puts the
+    // block's own first row where the pass would have put the 4th.
+    let rows = if yfrac == 0 { block_h } else { block_h + 7 };
     let max = crate::decode::sample_max();
     with_scratch(rows, block_w, |intermediate, acc| {
         horizontal_pass_unscaled(
-            reference, stride, true_width, true_height, x0, y0, h_filter, block_w, rows,
+            reference, stride, true_width, true_height, x0,
+            if yfrac == 0 { y0 + 3 } else { y0 }, h_filter, block_w, rows,
             intermediate,
         );
+        if yfrac == 0 {
+            for (d, &a) in dst.iter_mut().zip(intermediate.iter()) {
+                *d = round2(a, INTER_ROUND_1 - 7).clamp(0, max) as u16;
+            }
+            return;
+        }
         for row in 0..block_h {
             vpass_row(intermediate, block_w, row, v_filter, acc);
             for (d, &a) in dst[row * block_w..(row + 1) * block_w].iter_mut().zip(acc.iter()) {
@@ -826,13 +851,20 @@ pub fn predict_scaled_kern(
         &v_wide[yfrac]
     };
 
-    let rows = block_h + 7;
+    let rows = if yfrac == 0 { block_h } else { block_h + 7 };
     let max = crate::decode::sample_max();
     with_scratch(rows, block_w, |intermediate, acc| {
         horizontal_pass(
-            reference, stride, true_width, true_height, x_q4, y0, x_scale_fp, block_w,
+            reference, stride, true_width, true_height, x_q4,
+            if yfrac == 0 { y0 + 3 } else { y0 }, x_scale_fp, block_w,
             kern_w, rows, h_kind, intermediate,
         );
+        if yfrac == 0 {
+            for (d, &a) in dst.iter_mut().zip(intermediate.iter()) {
+                *d = round2(a, INTER_ROUND_1 - 7).clamp(0, max) as u16;
+            }
+            return;
+        }
         for row in 0..block_h {
             vpass_row(intermediate, block_w, row, v_filter, acc);
             for (d, &a) in dst[row * block_w..(row + 1) * block_w].iter_mut().zip(acc.iter()) {
@@ -936,12 +968,18 @@ pub fn predict_compound_intermediate_kern(
         &v_wide[yfrac]
     };
 
-    let rows = block_h + 7;
+    let rows = if yfrac == 0 { block_h } else { block_h + 7 };
     with_scratch(rows, block_w, |intermediate, acc| {
         horizontal_pass(
-            reference, stride, true_width, true_height, x_q4, y0, x_scale_fp, block_w,
+            reference, stride, true_width, true_height, x_q4,
+            if yfrac == 0 { y0 + 3 } else { y0 }, x_scale_fp, block_w,
             kern_w, rows, h_kind, intermediate,
         );
+        if yfrac == 0 {
+            // `Round2(128 * a, INTER_ROUND_1_COMPOUND) == a`.
+            dst.copy_from_slice(&intermediate[..dst.len()]);
+            return;
+        }
         for row in 0..block_h {
             vpass_row(intermediate, block_w, row, v_filter, acc);
             for (d, &a) in dst[row * block_w..(row + 1) * block_w].iter_mut().zip(acc.iter()) {
