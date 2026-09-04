@@ -173,9 +173,13 @@ const SUBPEL_FILTERS_BILINEAR: [[i32; 8]; 16] = [
 /// this type only ever names the resolved kernel, never `Switchable` itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterpFilterKind {
+    /// The `Regular` interpolation kernel.
     Regular,
+    /// The `Smooth` interpolation kernel.
     Smooth,
+    /// The `Sharp` interpolation kernel.
     Sharp,
+    /// The `Bilinear` interpolation kernel.
     Bilinear,
 }
 

@@ -24,9 +24,11 @@ use ec_core::{Error, Result};
 use crate::cdf_state::Cdfs;
 use crate::decode;
 use crate::decode::{
-    decode_inter_frame_tile_with_cdfs, decode_key_frame_tile, decode_key_frame_tile_with_cdfs,
+    decode_inter_frame_tile_with_cdfs, decode_key_frame_tile_with_cdfs,
     q_ctx_of,
 };
+#[cfg(test)]
+use crate::decode::decode_key_frame_tile;
 use crate::encode::Picture;
 
 /// lane-midcut r1: `EC_AV1_NO_GRAIN=1` skips film grain synthesis at output, so a
@@ -36,13 +38,13 @@ fn no_grain() -> bool {
     std::env::var_os("EC_AV1_NO_GRAIN").is_some()
 }
 
-/// lane-hidden r1: where `EC_AV1_FINAL_DUMP`'s per-frame dump goes for the
-/// current thread, overriding the environment variable. Every ffmpeg/aomdec
-/// pixel gate in this repo compares SHOWN frames only (class
-/// gate-blind-to-hidden-frames), so the hidden alt-ref frames a real aomenc
-/// stream carries were never compared at all; the gate that does compare
-/// them needs a dump path that cannot race a sibling test's decode on
-/// another thread, which a process-global env var cannot give.
+// lane-hidden r1: where `EC_AV1_FINAL_DUMP`'s per-frame dump goes for the
+// current thread, overriding the environment variable. Every ffmpeg/aomdec
+// pixel gate in this repo compares SHOWN frames only (class
+// gate-blind-to-hidden-frames), so the hidden alt-ref frames a real aomenc
+// stream carries were never compared at all; the gate that does compare
+// them needs a dump path that cannot race a sibling test's decode on
+// another thread, which a process-global env var cannot give.
 thread_local! {
     static FINAL_DUMP_PREFIX: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
@@ -200,6 +202,7 @@ pub fn obmc_pair_filter_hits() -> usize {
     crate::decode::obmc_pair_filter_hits()
 }
 
+/// Gate counters for the 4x32/32x4 rectangular strips: `(horz, vert, coeff)` hits.
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -26910,14 +26913,13 @@ mod tests {
     }
 
     fn edge32_gate(name: &str, flat_band: bool) {
-        let NAME = name;
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
-            eprintln!("SKIP {NAME}: no ffmpeg");
+            eprintln!("SKIP {name}: no ffmpeg");
             return;
         }
         if !have_aomenc() {
-            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
             return;
         }
         // (width, height, frames, ten_bit, tile_columns_log2)
@@ -27029,7 +27031,7 @@ mod tests {
                     .expect("ffmpeg failed to run");
                 assert!(
                     y4m.status.success(),
-                    "{NAME}: ffmpeg fixture: {}",
+                    "{name}: ffmpeg fixture: {}",
                     String::from_utf8_lossy(&y4m.stderr)
                 );
                 let cq_arg = format!("--cq-level={cq}");
@@ -27085,7 +27087,7 @@ mod tests {
                 let out = child.wait_with_output().expect("aomenc failed to run");
                 assert!(
                     out.status.success(),
-                    "{NAME}: aomenc refused the fixture: {}",
+                    "{name}: aomenc refused the fixture: {}",
                     String::from_utf8_lossy(&out.stderr)
                 );
                 let stream = out.stdout;
@@ -27093,7 +27095,7 @@ mod tests {
                     assert_eq!(
                         parsed_bit_depth(&stream),
                         10,
-                        "{NAME}: aomenc did not write a 10-bit sequence header"
+                        "{name}: aomenc did not write a 10-bit sequence header"
                     );
                 }
                 let tag = format!(
@@ -27106,7 +27108,7 @@ mod tests {
                 // desync surfaces as a panic deep in mc.rs with no arm in the
                 // message, and r8 spent a run bisecting arms by hand.
                 if std::env::var_os("EC_GATE_VERBOSE").is_some() {
-                    eprintln!("{NAME}: attempting {tag}");
+                    eprintln!("{name}: attempting {tag}");
                 }
                 let decoded = match decode_stream(&stream) {
                     Ok(frames) => frames,
@@ -27114,7 +27116,7 @@ mod tests {
                         let msg = e.to_string();
                         assert!(
                             msg.contains("unsupported"),
-                            "{NAME} failed outright, not a named refusal ({tag}): {msg}"
+                            "{name} failed outright, not a named refusal ({tag}): {msg}"
                         );
                         refusals.push(format!("{tag}: {msg}"));
                         continue;
@@ -27131,7 +27133,7 @@ mod tests {
                 assert_eq!(
                     decoded.len(),
                     reference.len(),
-                    "{NAME}: {tag}: shown-frame count vs ffmpeg"
+                    "{name}: {tag}: shown-frame count vs ffmpeg"
                 );
                 for (i, (ours, theirs)) in decoded.iter().zip(reference.iter()).enumerate() {
                     for (plane, a, b, w) in [
@@ -27149,10 +27151,10 @@ mod tests {
                                         *per_row.entry(k / w).or_default() += 1;
                                     }
                                 }
-                                eprintln!("{NAME}: {tag} plane {plane} diffs per row: {per_row:?}");
+                                eprintln!("{name}: {tag} plane {plane} diffs per row: {per_row:?}");
                             }
                             panic!(
-                                "{NAME}: {tag} frame {i} plane {plane}: {n} pixels differ, first \
+                                "{name}: {tag} frame {i} plane {plane}: {n} pixels differ, first \
                                  at row {} col {} (ours {} vs ffmpeg {}) [edge32={delta:?}]",
                                 d / w,
                                 d % w,
@@ -27174,23 +27176,23 @@ mod tests {
         }
         assert!(
             compared > 0,
-            "{NAME}: every attempt hit a named refusal:\n{}",
+            "{name}: every attempt hit a named refusal:\n{}",
             refusals.join("\n")
         );
         assert!(
             !straddle || compared_multi_tile > 0,
-            "{NAME}: every `--tile-columns=1` attempt hit a named refusal -- the \
+            "{name}: every `--tile-columns=1` attempt hit a named refusal -- the \
              multi-tile twins compared nothing:\n{}",
             refusals.join("\n")
         );
         assert!(
             !straddle || straddle_units > 0,
-            "{NAME}: no FILTERED 8x8 CDEF unit crossed the cropped frame edge over \
+            "{name}: no FILTERED 8x8 CDEF unit crossed the cropped frame edge over \
              {compared} compared attempts -- the straddling arms proved nothing"
         );
         assert!(
             totals[0] + totals[1] + totals[4] + totals[5] > 0,
-            "{NAME}: no frame-edge partition bit was read at all over \
+            "{name}: no frame-edge partition bit was read at all over \
              {compared} compared attempts -- the gate proved nothing"
         );
         // lane-golomb r3: the flat-band arm's ASSERT moved one level up. Until
@@ -27202,16 +27204,16 @@ mod tests {
         // content. Slots 6/7 are the strips actually decoded at the edge.
         assert!(
             !flat_band || totals[6] > 0,
-            "{NAME}: no 64x32 bottom-edge HORZ strip was decoded \
+            "{name}: no 64x32 bottom-edge HORZ strip was decoded \
              (edge32={totals:?}, {compared} compared attempts)"
         );
         assert!(
             !flat_band || totals[7] > 0,
-            "{NAME}: no 32x64 right-edge VERT strip was decoded \
+            "{name}: no 32x64 right-edge VERT strip was decoded \
              (edge32={totals:?}, {compared} compared attempts)"
         );
         eprintln!(
-            "{NAME}: {compared} pixel-exact attempts, 32-level edge bits \
+            "{name}: {compared} pixel-exact attempts, 32-level edge bits \
              [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, 64-level edge bits \
              [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, \
              {straddle_units} straddling CDEF units, {} named refusals",
@@ -27226,7 +27228,7 @@ mod tests {
             refusals.len()
         );
         for r in &refusals {
-            eprintln!("{NAME} refusal: {r}");
+            eprintln!("{name} refusal: {r}");
         }
     }
 
