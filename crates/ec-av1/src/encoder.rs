@@ -221,7 +221,20 @@ pub struct Av1Encoder {
     /// otherwise every picture is coded at `config.base_q_idx`, unchanged
     /// from before this field existed.
     rate_loop: Option<RateLoop>,
+    /// This stream's decode-side per-frame state, owned here so `encode`
+    /// keeps the public signature it had before the state stopped being
+    /// thread-local. One per encoder, never per frame: several of its fields
+    /// (the inter-frame inheritance guards) carry state ACROSS frames.
+    fctx: crate::decode::FrameCtx,
 }
+
+/// The encoder stays `Send` now that it owns a `FrameCtx` (whose cells are
+/// `Send` but `!Sync`): it can move to another thread, it just cannot be
+/// shared by reference across threads.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Av1Encoder>();
+};
 
 impl Av1Encoder {
     /// # Errors
@@ -243,6 +256,7 @@ impl Av1Encoder {
             reference: None,
             next_index: 0,
             rate_loop: None,
+            fctx: crate::decode::FrameCtx::new(),
         })
     }
 
@@ -297,7 +311,7 @@ impl Av1Encoder {
     /// [`EncoderConfig::width`]/[`EncoderConfig::height`], or under the same
     /// conditions [`crate::encode::encode_key_frame`]/
     /// [`crate::encode::encode_sequence`] do.
-    pub fn encode(&mut self, picture: &Picture, fctx: &crate::decode::FrameCtx) -> Result<Packet> {
+    pub fn encode(&mut self, picture: &Picture) -> Result<Packet> {
         if (picture.width, picture.height) != (self.config.width, self.config.height) {
             return Err(Error::unsupported(
                 "AV1 encode",
@@ -324,7 +338,8 @@ impl Av1Encoder {
                 &KEY_FRAME_MODES,
                 split_blocks(),
                 render,
-                self.color_config, fctx,
+                self.color_config,
+                &self.fctx,
             )?
         } else {
             let reference = self.reference.as_ref().ok_or_else(|| {
@@ -339,7 +354,8 @@ impl Av1Encoder {
                 base_q_idx,
                 DEADZONE,
                 order as u32,
-                render, fctx,
+                render,
+                &self.fctx,
             )?
         };
 
@@ -414,7 +430,6 @@ mod tests {
     /// ffmpeg since it is a property of the return type, not the bytes.
     #[test]
     fn one_in_one_out() {
-    let fctx = &crate::decode::FrameCtx::new();
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -424,7 +439,7 @@ mod tests {
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         for t in 0..5u64 {
-            let packet = enc.encode(&test_card(64, 64, t as usize), fctx).unwrap();
+            let packet = enc.encode(&test_card(64, 64, t as usize)).unwrap();
             assert!(!packet.data.is_empty(), "picture {t}: empty packet");
             assert_eq!(packet.order, t, "picture {t}: order");
         }
@@ -435,7 +450,6 @@ mod tests {
     /// reads back out of the coded bytes.
     #[test]
     fn gop_cadence_is_honored() {
-    let fctx = &crate::decode::FrameCtx::new();
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -445,7 +459,7 @@ mod tests {
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let keys: Vec<bool> = (0..7)
-            .map(|t| enc.encode(&test_card(64, 64, t), fctx).unwrap().key)
+            .map(|t| enc.encode(&test_card(64, 64, t)).unwrap().key)
             .collect();
         assert_eq!(keys, vec![true, false, false, true, false, false, true]);
     }
@@ -529,7 +543,6 @@ mod tests {
     /// coded size confirm what the facade already reported.
     #[test]
     fn thirty_pictures_at_gop_fifteen_decode_to_two_key_frames() {
-    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP thirty_pictures_at_gop_fifteen_decode_to_two_key_frames: no ffmpeg");
             return;
@@ -554,7 +567,7 @@ mod tests {
         );
 
         let packets: Vec<Packet> = (0..30)
-            .map(|t| enc.encode(&test_card(width, height, t), fctx).unwrap())
+            .map(|t| enc.encode(&test_card(width, height, t)).unwrap())
             .collect();
         let expect_key: Vec<bool> = (0..30).map(|t| t % 15 == 0).collect();
         assert_eq!(
@@ -584,7 +597,6 @@ mod tests {
     /// which is a visibly different string).
     #[test]
     fn bt709_limited_colour_is_reported_by_ffprobe() {
-    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP bt709_limited_colour_is_reported_by_ffprobe: no ffmpeg");
             return;
@@ -597,7 +609,7 @@ mod tests {
             colour: Colour::Bt709Limited,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
-        let packet = enc.encode(&test_card(64, 64, 0), fctx).unwrap();
+        let packet = enc.encode(&test_card(64, 64, 0)).unwrap();
         let colour = ffprobe_colour(&packet.data);
         assert_eq!(colour, "tv,bt709,bt709,bt709", "ffprobe colour fields");
     }
@@ -607,7 +619,6 @@ mod tests {
     /// as BT.709 for every input.
     #[test]
     fn bt601_limited_colour_is_reported_by_ffprobe() {
-    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP bt601_limited_colour_is_reported_by_ffprobe: no ffmpeg");
             return;
@@ -620,7 +631,7 @@ mod tests {
             colour: Colour::Bt601Limited,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
-        let packet = enc.encode(&test_card(64, 64, 0), fctx).unwrap();
+        let packet = enc.encode(&test_card(64, 64, 0)).unwrap();
         let colour = ffprobe_colour(&packet.data);
         assert_eq!(
             colour, "tv,smpte170m,smpte170m,smpte170m",
@@ -632,7 +643,6 @@ mod tests {
     /// is refused by name.
     #[test]
     fn geometry_mismatch_is_refused() {
-    let fctx = &crate::decode::FrameCtx::new();
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -641,7 +651,7 @@ mod tests {
             colour: Colour::Bt709Limited,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
-        let err = enc.encode(&Picture::grey(32, 32), fctx).unwrap_err();
+        let err = enc.encode(&Picture::grey(32, 32)).unwrap_err();
         assert!(err.to_string().contains("64x64"), "{err}");
     }
 
@@ -714,7 +724,6 @@ mod tests {
     /// state and the controller's first couple of steps).
     #[test]
     fn bytes_per_frame_target_settles_within_20_percent() {
-    let fctx = &crate::decode::FrameCtx::new();
         let Some(pictures) = h264_clip_frames(640, 384, 24) else {
             eprintln!("SKIP bytes_per_frame_target_settles_within_20_percent: no ffmpeg/fixture");
             return;
@@ -731,7 +740,7 @@ mod tests {
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(target_bytes)).unwrap();
         let sizes: Vec<usize> = pictures
             .iter()
-            .map(|p| enc.encode(p, fctx).unwrap().data.len())
+            .map(|p| enc.encode(p).unwrap().data.len())
             .collect();
         // Discard the key frame (always far larger than an inter target) and
         // the next 4 inter frames the loop needs to step toward it.
@@ -751,7 +760,6 @@ mod tests {
     /// that breaks the bound).
     #[test]
     fn bytes_per_frame_controller_never_oscillates_past_its_clamp() {
-    let fctx = &crate::decode::FrameCtx::new();
         let Some(pictures) = h264_clip_frames(640, 384, 24) else {
             eprintln!(
                 "SKIP bytes_per_frame_controller_never_oscillates_past_its_clamp: no ffmpeg/fixture"
@@ -769,7 +777,7 @@ mod tests {
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(4_000)).unwrap();
         let mut prev_q = enc.rate_loop.as_ref().unwrap().q_idx();
         for picture in &pictures {
-            enc.encode(picture, fctx).unwrap();
+            enc.encode(picture).unwrap();
             let q = enc.rate_loop.as_ref().unwrap().q_idx();
             let step = (i32::from(q) - i32::from(prev_q)).abs();
             assert!(
@@ -832,7 +840,6 @@ mod tests {
     /// the same real clip.
     #[test]
     fn quality_target_is_monotone_in_bytes_and_psnr() {
-    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP quality_target_is_monotone_in_bytes_and_psnr: no ffmpeg");
             return;
@@ -857,7 +864,7 @@ mod tests {
             let mut stream = Vec::new();
             let mut total_bytes = 0usize;
             for picture in &pictures {
-                let packet = enc.encode(picture, fctx).unwrap();
+                let packet = enc.encode(picture).unwrap();
                 total_bytes += packet.data.len();
                 stream.extend_from_slice(&packet.data);
             }

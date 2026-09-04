@@ -189,7 +189,7 @@ pub struct MotionSearch {
 /// Panics when `source` is not `block_w * block_h` long, or `reference` is
 /// empty (the same contracts [`predict`] has).
 #[allow(clippy::too_many_arguments)] // one reference plane, one block, one predictor
-pub fn search(
+pub(crate) fn search(
     reference: &[u8],
     stride: usize,
     ref_width: usize,

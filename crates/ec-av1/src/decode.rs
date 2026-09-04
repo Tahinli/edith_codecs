@@ -81,6 +81,12 @@ pub(crate) struct FrameCtx {
     pub(crate) grain_bit_depth: std::cell::Cell<u32>,
 }
 
+impl std::fmt::Debug for FrameCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FrameCtx")
+    }
+}
+
 impl FrameCtx {
     /// A fresh context, every field at the default its thread-local
     /// predecessor was born with.
@@ -17535,7 +17541,7 @@ fn apply_loop_restoration(
 /// 16x16, a directional mode's angle delta other than zero, chroma-from-luma),
 /// or when the tile payload runs out of the symbols this decode expects (a
 /// genuinely foreign stream).
-pub fn decode_key_frame_tile(
+pub(crate) fn decode_key_frame_tile(
     data: &[u8],
     mi_cols: u32,
     mi_rows: u32,
@@ -32763,7 +32769,7 @@ mod tests {
             mi_rows,
             base_q_idx,
             ..
-        }: Encoded = crate::encode::encode_key_frame_with_modes(&picture, 40, 0.0, modes, fctx).unwrap();
+        }: Encoded = crate::encode::encode_key_frame_with_modes_with_ctx(&picture, 40, 0.0, modes, fctx).unwrap();
         let decoded = decode_key_frame_tile(
             &tile,
             mi_cols,
@@ -33118,10 +33124,10 @@ mod tests {
             eprintln!("SKIP ffmpeg_and_this_decoder_agree_on_a_key_frame: no ffmpeg");
             return;
         }
-        use crate::encode::encode_key_frame;
+        use crate::encode::encode_key_frame_with_ctx;
         for &(width, height) in &[(64usize, 64usize), (216, 96), (40, 32)] {
             let picture = round_trip_test_card(width, height);
-            let encoded = encode_key_frame(&picture, 100, 0.5, fctx).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let (coded_w, coded_h) = ffprobe_size(&encoded.stream);
             let ffmpeg_decoded = ffmpeg_decode(&encoded.stream, coded_w as usize, coded_h as usize);
             let ours = decode_key_frame_tile(
@@ -33190,11 +33196,11 @@ mod tests {
     /// into the next as its reference -- exactly the single-slot DPB
     /// [`crate::encode::encode_sequence`] itself threads.
     fn gop_round_trips(width: usize, height: usize, fctx: &crate::decode::FrameCtx) {
-        use crate::encode::encode_sequence;
+        use crate::encode::encode_sequence_with_ctx;
         let pictures: Vec<_> = (0..4)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5, fctx).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         assert_eq!(encoded.frames.len(), 4);
 
         let key = &encoded.frames[0];
@@ -33521,12 +33527,12 @@ mod tests {
             eprintln!("SKIP ffmpeg_and_this_decoder_agree_on_a_gop: no ffmpeg");
             return;
         }
-        use crate::encode::encode_sequence;
+        use crate::encode::encode_sequence_with_ctx;
         let (width, height) = (128usize, 64usize);
         let pictures: Vec<_> = (0..3)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5, fctx).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         let (coded_w, coded_h) = ffprobe_size(&encoded.stream);
         let ffmpeg_frames =
             ffmpeg_decode_sequence(&encoded.stream, coded_w as usize, coded_h as usize, 3);
