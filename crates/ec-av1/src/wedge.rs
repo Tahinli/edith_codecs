@@ -251,12 +251,16 @@ fn wedge_window(wedge_index: usize, neg: usize, bw: usize, bh: usize) -> (usize,
 /// `stride x stride` plane (`stride = max(bw, bh)`) so a rectangular mask
 /// indexes exactly like the square prediction buffer `decode.rs` blends
 /// into. Only rows `0..bh` / columns `0..bw` are meaningful.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub struct WedgeCodebook {
     /// `[sign][wedge_index] -> stride*stride` bytes, row stride `stride`.
     masks: [[Vec<u8>; MAX_WEDGE_TYPES]; 2],
+    #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
     pub bw: usize,
+    #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
     pub bh: usize,
     /// `max(bw, bh)` -- the row stride of every mask returned by [`Self::mask`].
+    #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
     pub stride: usize,
 }
 

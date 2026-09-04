@@ -79,7 +79,9 @@ fn decode_signed_subexp_with_ref_msac(dec: &mut SymbolDecoder, low: i32, high: i
     decode_unsigned_subexp_with_ref_msac(dec, n, k, r) as i32 + low
 }
 
+#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 const WIENER_HALFWIN: usize = 3;
+#[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 pub(crate) const WIENER_WIN: usize = 7;
 const WIENER_TAP_MINV: [i32; 3] = [-5, -23, -17];
 const WIENER_TAP_MAXV: [i32; 3] = [10, 8, 46];
@@ -363,49 +365,54 @@ pub(crate) fn read_lr(
     }
 }
 
-/// r3 gate self-pin: how many units decoded a real (non-`None`) filter, by
-/// kind -- proves a real `--enable-restoration=1` aomenc stream actually
-/// exercises `read_lr_unit`'s Wiener/SGR/switchable arms, not just that the
-/// symbol-count/refusal-string wiring compiles. Never reset -- summed across
-/// a gate's whole attempt loop, matching `MASKED_COMPOUND_HITS`/`WEDGE_HITS`
-/// (decode.rs) which this mirrors.
+// r3 gate self-pin: how many units decoded a real (non-`None`) filter, by
+// kind -- proves a real `--enable-restoration=1` aomenc stream actually
+// exercises `read_lr_unit`'s Wiener/SGR/switchable arms, not just that the
+// symbol-count/refusal-string wiring compiles. Never reset -- summed across
+// a gate's whole attempt loop, matching `MASKED_COMPOUND_HITS`/`WEDGE_HITS`
+// (decode.rs) which this mirrors.
 thread_local! {
     static WIENER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SGRPROJ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SWITCHABLE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// lane-troykf2 r1: how many *stripes* a real filter ran on with the frame's
-/// own top row as their above boundary (`stripe_v_start == 0`, the 56-row
-/// first stripe of `RESTORATION_UNIT_OFFSET == 8`), and how many ran on a
-/// short LAST stripe (`stripe_v_end == plane_h` with a partial height). Those
-/// are the two stripe shapes whose boundary substitution differs from every
-/// interior stripe, and no gate size before this one had either.
+// lane-troykf2 r1: how many *stripes* a real filter ran on with the frame's
+// own top row as their above boundary (`stripe_v_start == 0`, the 56-row
+// first stripe of `RESTORATION_UNIT_OFFSET == 8`), and how many ran on a
+// short LAST stripe (`stripe_v_end == plane_h` with a partial height). Those
+// are the two stripe shapes whose boundary substitution differs from every
+// interior stripe, and no gate size before this one had either.
 thread_local! {
     static LR_STRIPE0_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LR_LAST_STRIPE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Current value of [`LR_STRIPE0_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn lr_stripe0_hits() -> usize {
     LR_STRIPE0_HITS.with(|c| c.get())
 }
 /// Current value of [`LR_LAST_STRIPE_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn lr_last_stripe_hits() -> usize {
     LR_LAST_STRIPE_HITS.with(|c| c.get())
 }
 
 /// Current value of [`WIENER_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn wiener_hits() -> usize {
     WIENER_HITS.with(|c| c.get())
 }
 /// Current value of [`SGRPROJ_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn sgrproj_hits() -> usize {
     SGRPROJ_HITS.with(|c| c.get())
 }
 /// Current value of [`SWITCHABLE_HITS`] -- bumped once per unit whose frame
 /// `restoration_type` is `Switchable`, regardless of which `RestoreType`
 /// (`None`/Wiener/Sgrproj) that unit's own symbol resolved to.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn switchable_hits() -> usize {
     SWITCHABLE_HITS.with(|c| c.get())
 }
