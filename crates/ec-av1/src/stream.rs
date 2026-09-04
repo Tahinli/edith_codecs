@@ -30637,10 +30637,15 @@ mod tests {
         );
     }
 
-    /// lane-t900 r16: the intra-coded 128x64 / 64x128 INTER-frame witness --
-    /// IGNORED, and it is the `EC_INTRA128_IN_INTER` opt-in's blocker, not its
-    /// lift. Run it with
-    /// `EC_INTRA128_IN_INTER=1 cargo test -p ec-av1 intra_coded_128x64 -- --ignored`.
+    /// lane-t900 r16/r17: a 10-bit 512x512 `--sb-size=128` stream in which
+    /// every 128 root is a var-tx block, and the gate for the SKIPPED-128-block
+    /// luma entropy reset (r17). It was BUILT as an intra-128-in-inter witness
+    /// and r16 measured three hits of that arm in it -- every one of them an
+    /// artifact of the desync fixed here (class `counter-from-refused-stream`).
+    /// Decoding exactly, the arm fires ZERO times, so this stream does not
+    /// carry that shape and the `EC_INTRA128_IN_INTER` opt-in stays. Renamed
+    /// out of `an_intra_coded_128x64_block_inside_an_inter_frame_...` for that
+    /// reason -- the fixture keeps the original intent in its own name.
     ///
     /// `crates/ec-av1/fixtures/intra128_in_inter_witness.obu`, 13066 bytes,
     /// sha256 `dd41fc39367a3d38bf8a8a8106dc30d91b716b2a9123fdfa4716930f4f98caf9`,
@@ -30667,42 +30672,35 @@ mod tests {
     /// cyclically repeating phases (GOLDEN holds an earlier phase, so the cut
     /// is predicted rather than coded intra).
     ///
-    /// It does NOT yet lift the opt-in, because the three hits land in a frame
-    /// this decoder does not decode exactly, and a counter read out of a
-    /// desynced frame proves nothing (class `counter-from-refused-stream`).
-    /// The blocking defect is measured, separate, and NOT this arm -- the same
-    /// source re-encoded with `--enable-intrabc=0 --enable-palette=0
-    /// --enable-obmc=0 --enable-warped-motion=0 --enable-global-motion=0
-    /// --enable-interintra-comp=0 --enable-masked-comp=0
-    /// --enable-filter-intra=0 --enable-ab-partitions=0
-    /// --enable-1to4-partitions=0` fires the arm 0 times and desyncs on
-    /// exactly the same frames, and the same source at `--sb-size=64` decodes
-    /// all 10 frames byte-exact. First-bad, measured against ffmpeg and
-    /// against this repository's instrumented aomdec:
+    /// r16 could not lift the opt-in: the three hits landed in a frame this
+    /// decoder did not decode exactly, and a counter read out of a desynced
+    /// frame proves nothing (class `counter-from-refused-stream`). The blocker
+    /// was a SEPARATE defect on the inter path, not this arm -- the same source
+    /// re-encoded with every optional tool disabled fired the arm 0 times and
+    /// desynced on exactly the same frames, and the same source at
+    /// `--sb-size=64` decoded all 10 frames byte-exact.
     ///
-    /// * pixels: decode-order frame 1, luma (row 122, col 354), 160285
-    ///   differing samples (Y 146713 / U 5936 / V 7636), max |delta| 738.
-    ///   Frames 0, 4 and 7 -- the key frame and the two all-intra scene cuts --
-    ///   are byte-exact on every plane; every other frame is not.
-    /// * entropy (`EC_TRACE_COEFF` on both decoders, prefiltered to the
-    ///   `all_zero`/`eob`/`after_bases` tags): frame 1, the 128x128
-    ///   `is_inter=1 skip=0` block at mi(32,64) (pixel 128,256), its FIRST
-    ///   luma TU (`bc=0 br=0`, a TX_64X64 unit, `coding.side=32`). aomdec
-    ///   reads `txb_skip` ctx 1 (`top == 0 && left == 0`) and gets
-    ///   `all_zero=1`; we read ctx 2 and get `all_zero=0`. Entry range is
-    ///   equal on both, so this is the txb_skip CONTEXT -- i.e. the luma
-    ///   entropy levels the PRECEDING 128x128 inter block published into
-    ///   `above`/`left` -- and not the symbol's own alphabet.
-    /// * `EC_TRACE_MODE` confirms the same point from the other side: the
-    ///   first differing `EC_MODE` range is at the ENTRY of mi(32,96), i.e.
-    ///   inside mi(32,64); every 128-root block before it matches exactly.
+    /// r17 root cause, and what this gate now pins (class
+    /// `early-return-skips-tail`): a SKIPPED inter block
+    /// whose `read_block_tx_size` still hands back var-tx leaves -- which every
+    /// 128 root does under `TX_MODE_LARGEST` -- took `decode_inter_block`'s
+    /// `if skip` arm, so the per-transform-unit luma publication loop never
+    /// ran, and the block-level `record_split_luma_rect_mi` deliberately writes
+    /// no plane 0. The skipped block therefore left the PREVIOUS block's luma
+    /// coefficient levels standing where libaom's `av1_reset_entropy_context`
+    /// zeroes all three planes over the block. First-bad before the fix
+    /// (`EC_TRACE_COEFF` on both decoders, prefiltered to the
+    /// `all_zero`/`eob`/`after_bases` tags, filtered index 426): frame 1, the
+    /// 128x128 `is_inter=1 skip=0` block at mi(32,64), its first luma TU
+    /// (`bc=0 br=0`, TX_64X64) -- aomdec `txb_skip` ctx 1 (`top == 0 &&
+    /// left == 0`), ours ctx 2, entry range equal on both, because the skipped
+    /// 128x128 block at mi(32,32) never cleared `left[32..48]` (ours 1,
+    /// aomdec 0). With the publication restored the whole 10-frame filtered
+    /// ladder matches 1397/1397 steps.
     ///
-    /// The arm's own three hits are at mi(8,24) 128x64 and mi(16,16) /
-    /// mi(16,20) 64x128 (`EC_INTRA128` trace, decode.rs).
-    #[ignore = "lane-t900 r16: needs EC_INTRA128_IN_INTER=1, and the stream carries a separate 128x128-inter txb_skip-context desync at frame 1 mi(32,64)"]
     #[test]
-    fn an_intra_coded_128x64_block_inside_an_inter_frame_decodes_pixel_exact() {
-        const NAME: &str = "an_intra_coded_128x64_block_inside_an_inter_frame_decodes_pixel_exact";
+    fn a_128_superblock_stream_whose_skipped_blocks_are_var_tx_decodes_pixel_exact() {
+        const NAME: &str = "a_128_superblock_stream_whose_skipped_blocks_are_var_tx_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -30712,20 +30710,28 @@ mod tests {
         let stream = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
         let (width, height) = (512usize, 512usize);
-        let before = intra128_in_inter_counters();
+        let before = crate::decode::skip_vartx_luma_reset_hits();
+        let intra128_before = intra128_in_inter_counters();
         let frames = match decode_stream(&stream) {
             Ok(frames) => frames,
             Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
         };
-        let now = intra128_in_inter_counters();
-        let fired = [now[0] - before[0], now[1] - before[1]];
-        for (what, n) in [("128x64", fired[0]), ("64x128", fired[1])] {
-            assert!(
-                n > 0,
-                "{NAME}: an intra {what} block on the inter path never fired -- \
-                 the gate would be vacuous for it"
-            );
-        }
+        let fired = crate::decode::skip_vartx_luma_reset_hits() - before;
+        assert!(
+            fired > 0,
+            "{NAME}: no skipped var-tx block cleared its own luma coefficient \
+             contexts -- the gate would be vacuous for the defect it pins"
+        );
+        let intra128_now = intra128_in_inter_counters();
+        assert_eq!(
+            [
+                intra128_now[0] - intra128_before[0],
+                intra128_now[1] - intra128_before[1]
+            ],
+            [0, 0],
+            "{NAME}: the intra-128-in-inter arm fired on a stream that decodes \
+             exactly -- the opt-in now HAS a witness and should be lifted"
+        );
         assert_eq!(frames.len(), 10, "{NAME}: 10 shown frames");
         assert_eq!((frames[0].width, frames[0].height), (width, height));
         let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
@@ -30743,8 +30749,7 @@ mod tests {
         }
         eprintln!(
             "{NAME}: 10 shown frames pixel-exact on every plane; \
-             intra128_in_inter 128x64={} 64x128={}",
-            fired[0], fired[1]
+             skip_vartx_luma_reset={fired}"
         );
     }
 
