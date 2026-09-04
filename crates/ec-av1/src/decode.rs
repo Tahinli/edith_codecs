@@ -2521,6 +2521,25 @@ thread_local! {
         const { std::cell::Cell::new([0; 3]) };
 }
 
+// lane-t900 r21: rect intra strips inside an inter frame that read the
+// screen-content palette syntax (`allow_screen_content_tools` set and the
+// strip's own shape admitted by `palette_bsize_ctx_wh`) -- the site a blanket
+// refusal used to guard, so this counter is what keeps its witness gate
+// non-vacuous.
+thread_local! {
+    static INTRA_RECT_IN_INTER_SCREEN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_RECT_IN_INTER_SCREEN_HITS`].
+pub(crate) fn intra_rect_in_inter_screen_hits() -> usize {
+    INTRA_RECT_IN_INTER_SCREEN_HITS.with(std::cell::Cell::get)
+}
+
+/// Resets [`INTRA_RECT_IN_INTER_SCREEN_HITS`] before a decode.
+pub(crate) fn reset_intra_rect_in_inter_screen_hits() {
+    INTRA_RECT_IN_INTER_SCREEN_HITS.with(|c| c.set(0));
+}
+
 /// Current value of [`INTRA_RECT_IN_INTER_SPLIT_TX_HITS`], indexed by tx depth.
 pub(crate) fn intra_rect_in_inter_split_tx_hits() -> [usize; 3] {
     INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
@@ -7852,15 +7871,14 @@ fn decode_intra_rect_in_inter(
             "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)"
         )));
     };
-    // [`read_intra_mode_rect`]'s own refusal: palette/intrabc syntax is
-    // consumed for square blocks only, so a strip in a screen-content frame
-    // would skip symbols the encoder wrote.
-    if allow_screen_content_tools {
-        return Err(unsupported(
-            "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
-             is consumed for square blocks only)",
-        ));
-    }
+    // lane-t900 r21: this arm used to refuse EVERY rect strip of a
+    // screen-content frame ("palette syntax is consumed for square blocks
+    // only"). It is not: [`read_intra_mode_rect`] generalised the palette read
+    // to rect blocks on the key-frame path, and the 1:4 arm below goes through
+    // it, while the 2:1 reader inlined further down now codes the same syntax
+    // itself. A real `--tune-content=screen` inter stream reached this refusal
+    // on 8x16 / 16x8 strips (gate
+    // `a_real_aomenc_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips`).
     // lane-intra14 r1: a 1:4 strip decodes through the very readers the KEY
     // FRAME path already proves for this shape ([`decode_block_rect4`] at the
     // 32 level, [`decode_block_rect64`] at 64 -- both already handle the 1:4
@@ -7990,6 +8008,32 @@ fn decode_intra_rect_in_inter(
     if angle_delta_uv != 0 {
         UV_ANGLE_DELTA_HITS.with(|h| h.set(h.get() + 1));
         INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|h| h.set(h.get() + 1));
+    }
+    // `read_palette_mode_info` (spec 5.11.13), in the position
+    // `read_intra_block_mode_info` writes it: after the chroma mode and
+    // before `filter_intra`. lane-t900 r21: a `--tune-content=screen` inter
+    // frame writes `palette_y_mode`/`palette_uv_mode` for every block whose
+    // shape [`palette_bsize_ctx_wh`] admits, intra strips included, so
+    // skipping the syntax here desynced the tile at the strip's own symbol.
+    // No block this decoder produces can USE a palette (the arms below refuse
+    // by name), so the neighbour mode context is 0 and there is no cache --
+    // the same stand-in [`read_intra_mode_rect`] uses when its caller has none.
+    if allow_screen_content_tools
+        && let Some(bsize_ctx) = palette_bsize_ctx_wh(bw, bh)
+    {
+        INTRA_RECT_IN_INTER_SCREEN_HITS.with(|c| c.set(c.get() + 1));
+        if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
+            return Err(unsupported(
+                "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+            ));
+        }
+        // A 2:1 strip of at least 8x8 is always a chroma reference, so
+        // `read_palette_mode_info`'s `xd->is_chroma_ref` guard holds here.
+        if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+            return Err(unsupported(
+                "a block that actually uses a palette (UV) -- reconstruction is out of scope",
+            ));
+        }
     }
     // lane-fiinter (merged on main for the square intra-in-inter arm):
     // `read_filter_intra_mode_info` is the tail of
