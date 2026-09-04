@@ -32587,4 +32587,52 @@ mod tests {
         );
     }
 
+
+    /// lane-thread1: every per-frame/per-stream decode state now lives in
+    /// [`crate::decode::FrameCtx`], not in a `thread_local!`. A static that
+    /// comes back would silently re-break frame-parallel decoding (a worker
+    /// thread sees an empty copy) without failing any pixel gate, so pin the
+    /// 38 names by name against the sources themselves.
+    #[test]
+    fn no_per_frame_state_is_thread_local_any_more() {
+        const MOVED: [&str; 38] = [
+            "SB128", "CDEF_BITS", "BIT_DEPTH", "SUPERRES", "CDEF_TRANSMITTED", "CDEF_SB_COLS",
+            "CDEF_IDX_GRID", "DELTA_Q_PRESENT", "DELTA_Q_RES", "CURRENT_Q_IDX", "QUANT_DELTAS",
+            "DELTA_LF_PRESENT", "DELTA_LF_RES", "DELTA_LF_MULTI", "CURRENT_DELTA_LF", "SEG",
+            "SEG_IDS", "PREV_SEG_IDS", "SEG_MI_DIMS", "ABOVE_SEG_PRED", "LEFT_SEG_PRED",
+            "CUR_SEGMENT_ID", "SEG_TILE_ORIGIN", "TX_SELECT_INTER", "REDUCED_TX_SET_INTER",
+            "ENABLE_FILTER_INTRA_INTER", "PALETTE_PRED", "INTRABC_MI_GRID", "INTRABC_DV",
+            "LUMA_TX_TYPE", "INTRABC_CHROMA_TX", "INTRA_IN_INTER_MODE", "INTER_STRIP_CHROMA",
+            "INTER_LAST_MC", "ENABLE_EDGE_FILTER", "LAST_FRAME_WIDE_MARGIN", "REACH_SB_PX",
+            "GRAIN_BIT_DEPTH",
+        ];
+        let sources = [
+            ("decode.rs", include_str!("decode.rs")),
+            ("encode.rs", include_str!("encode.rs")),
+            ("film_grain.rs", include_str!("film_grain.rs")),
+        ];
+        let mut back = Vec::new();
+        for (name, src) in sources {
+            for line in src.lines() {
+                let t = line.trim_start().trim_start_matches("pub(crate) ");
+                if let Some(rest) = t.strip_prefix("static ") {
+                    let ident = rest.split(':').next().unwrap_or("").trim();
+                    if MOVED.contains(&ident) {
+                        back.push(format!("{name}: {ident}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            back.is_empty(),
+            "per-frame state is thread_local again (belongs in FrameCtx): {back:?}"
+        );
+        // ... and the scratch pools / gate counters DID stay thread-local:
+        // this file's own counter reads run on the test thread.
+        assert!(
+            include_str!("decode.rs").contains("thread_local!"),
+            "the scratch pools and gate hit counters are still thread_local by design"
+        );
+    }
+
 }
