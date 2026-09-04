@@ -6710,7 +6710,12 @@ fn decode_color_index_map_wh(
             let (ctx, color_order) = palette_color_index_context(&map, bw, row, col, n);
             if trace {
                 let (rng, _) = dec.debug_state();
-                eprintln!("EC_PAL row={row} col={col} ctx={ctx} n={n} rng={rng}");
+                let row_cdf = if uv {
+                    &cdfs.palette_uv_color_index[n - 2][ctx]
+                } else {
+                    &cdfs.palette_y_color_index[n - 2][ctx]
+                };
+                eprintln!("EC_PAL row={row} col={col} ctx={ctx} n={n} cdf0={} cnt={} rng={rng}", row_cdf[0], row_cdf[n]);
             }
             let symbol = if uv {
                 dec.symbol(&mut cdfs.palette_uv_color_index[n - 2][ctx][..=n])
@@ -6922,7 +6927,7 @@ fn read_intra_mode_rect(
         if use_palette_y {
             if palette.is_none() {
                 return Err(unsupported(
-                    "a block that actually uses a palette (Y@rect) -- reconstruction is out of scope",
+                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
                 ));
             }
             let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
@@ -7733,12 +7738,13 @@ fn decode_intra_rect_in_inter(
     // [`INTRA_IN_INTER_MODE`] switches to `read_intra_block_mode_info`'s
     // `y_mode[0]` plus the `skip` this caller already read.
     if let Some((horz, has_chroma)) = strip16 {
-        if allow_screen_content_tools {
-            return Err(unsupported(
-                "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
-                 is consumed for square blocks only)",
-            ));
-        }
+        // lane-t900 r22: the screen-content refusal here was STALE (class
+        // stale-premise): [`decode_rect4_16_strip`] takes
+        // `allow_screen_content_tools` and reads the whole palette syntax
+        // (mode/size/colours/colour-index map, its own `palette_ctx_and_cache_mi`
+        // pair) -- the key frame proves that body. Lifted with the 10-bit
+        // witness `palette_screen_witness_10bit.obu`, whose inter frames carry
+        // 16x4/4x16 intra strips inside a `--tune-content=screen` frame.
         debug_assert_eq!((bw, bh), if horz { (16, 4) } else { (4, 16) });
         INTRA_IN_INTER_MODE.with(|c| c.set(Some((0, skip))));
         let res = decode_rect4_16_strip(
@@ -8088,9 +8094,6 @@ fn decode_intra_rect_in_inter(
         PALETTE_HITS.with(|c| c.set(c.get() + 1));
         PALETTE_RECT_HITS.with(|c| c.set(c.get() + 1));
         INTRA_IN_INTER_PALETTE_Y_HITS.with(|c| c.set(c.get() + 1));
-        if crate::envflags::env_flag!("EC_PALII") {
-            eprintln!("EC_PALII yrect mi={mi_r},{mi_c} bw={bw} bh={bh} n={n} skip={skip}");
-        }
         PaletteY { size: n, colors, map }
     });
     let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
@@ -10891,7 +10894,7 @@ fn read_intra_mode(
         if use_palette_y {
             if palette.is_none() {
                 return Err(unsupported(
-                    "a block that actually uses a palette (Y@square) -- reconstruction is out of scope",
+                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
                 ));
             }
             let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
@@ -23471,6 +23474,9 @@ fn decode_inter_block(
                 let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
                 palette_y_pending = Some((n, read_palette_colors_y(dec, n, &palette_cache)));
             }
+            if crate::envflags::env_flag!("EC_PALSYN") {
+                eprintln!("EC_PALSYN_PRE sq mi={rmi},{cmi} bw={write_w} bh={write_h} mode={mode} uv={uv_mode} ctx={palette_ctx} y={} rng={}", palette_y_pending.map_or(0, |(n, _)| n), dec.debug_state().0);
+            }
             let use_palette_uv =
                 uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
             if crate::envflags::env_flag!("EC_PALSYN") {
@@ -23511,9 +23517,6 @@ fn decode_inter_block(
             let map = decode_color_index_map_wh(dec, cdfs, n, write_w, write_h, false);
             PALETTE_HITS.with(|c| c.set(c.get() + 1));
             INTRA_IN_INTER_PALETTE_Y_HITS.with(|c| c.set(c.get() + 1));
-            if crate::envflags::env_flag!("EC_PALII") {
-                eprintln!("EC_PALII y mi={rmi},{cmi} bw={write_w} bh={write_h} n={n} skip={skip}");
-            }
             PaletteY { size: n, colors, map }
         });
         let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
@@ -27205,7 +27208,7 @@ fn decode_inter_block8(
         if allow_screen_content_tools {
             if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[0][0]) != 0 {
                 return Err(unsupported(
-                    "a block that actually uses a palette (Y@inter_block8) -- reconstruction is out of scope",
+                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
                 ));
             }
             // lane-uv8 r1: `read_palette_mode_info` reads the UV symbol only
@@ -27213,7 +27216,7 @@ fn decode_inter_block8(
             // while every non-DC uv_mode was refused a few lines above.
             if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
                 return Err(unsupported(
-                    "a block that actually uses a palette (UV@inter_block8) -- reconstruction is out of scope",
+                    "a block that actually uses a palette (UV) -- reconstruction is out of scope",
                 ));
             }
         }
