@@ -166,6 +166,18 @@ const PROVEN: &[(&str, &str)] = &[
         "a rectangular transform unit whose shape has no coefficient scan table here",
         "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
     ),
+    // lane-t900 r21, enumeration: a var-tx leaf is never larger than the unit
+    // the tree was entered with, and both callers enter at or below their own
+    // ceiling (the one case that does not, a 64px block at TX_64X64, is the
+    // `single` whole-block case the refusal is guarded by).
+    (
+        "an inter var-tx tree with a leaf transform larger than 32x32",
+        "a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered",
+    ),
+    (
+        "an inter var-tx tree with a leaf transform larger than 64x64",
+        "a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered",
+    ),
     // Pre-existing proofs, registered by lane-t900 r21: a negative gate (a
     // hand-built 12-bit sequence header is refused BY THIS EXACT STRING rather
     // than decoded wrong) and a witness gate (a real aomenc screen key frame
