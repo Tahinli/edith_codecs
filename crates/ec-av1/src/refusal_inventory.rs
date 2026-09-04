@@ -235,6 +235,12 @@ const PROVEN: &[(&str, &str)] = &[
         "a 128x128 superblock partition value outside the 8-symbol alphabet",
         "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
     ),
+    // lane-t900 r24, enumeration: the key-frame superblock root's own `match`
+    // has an arm for all ten `partition_w64` values.
+    (
+        "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
+        "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+    ),
     (
         "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         "a_twelve_bit_sequence_header_is_refused_by_name",
@@ -456,10 +462,18 @@ mod tests {
             "PARTITION_VERT_4",
         ];
         // (the refusal in the fallback arm, the alphabet its CDF codes)
-        let blocks: [(&str, usize); 3] = [
+        let blocks: [(&str, usize); 4] = [
             ("a 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
             ("an INTER 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
             ("a 128x128 superblock partition value outside the 8-symbol alphabet", crate::cdf::PARTITION_W128[0].len() - 1),
+            // lane-t900 r24: the key-frame superblock root. Its `part` is
+            // either a `partition_w64` symbol or, at a frame edge, one of the
+            // three gathered outcomes (PARTITION_HORZ, PARTITION_VERT,
+            // PARTITION_SPLIT) -- all inside the same ten-value alphabet.
+            (
+                "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
+                crate::cdf::PARTITION_W64[0].len() - 1,
+            ),
         ];
         // A pattern's own tokens, plus every value of an inclusive range
         // (`p if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&p)` is four
