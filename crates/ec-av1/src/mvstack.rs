@@ -695,8 +695,8 @@ fn top_right_scan_allowed(bw4: usize, bh4: usize) -> bool {
 /// here) is still missing -- ceiling is a square INTER leaf inside a VERT_A
 /// partition whose warp-sample top-right probe may answer 1 where libaom says
 /// 0; upgrade path = thread `partition` into this call.
-pub(crate) fn has_top_right(mi_row: usize, mi_col: usize, bw4: usize, bh4: usize) -> bool {
-    let sb_mi_size = crate::decode::sb_mi_cur() as usize;
+pub(crate) fn has_top_right(mi_row: usize, mi_col: usize, bw4: usize, bh4: usize, fctx: &crate::decode::FrameCtx) -> bool {
+    let sb_mi_size = crate::decode::sb_mi_cur(fctx) as usize;
     let bs0 = bw4.max(bh4);
     if bs0 > 16 {
         return false;
