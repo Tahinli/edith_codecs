@@ -76,7 +76,7 @@ thread_local! {
 pub fn set_coeff_trace_frame(idx: usize) {
     COEFF_TRACE_FRAME.with(|c| {
         if c.get().is_none() {
-            let want = match std::env::var("EC_TRACE_COEFF_FRAME") {
+            let want = match crate::envflags::var("EC_TRACE_COEFF_FRAME") {
                 Ok(v) => v.parse::<usize>().unwrap_or(usize::MAX),
                 // unset: keep tracing every frame, as before this rung existed
                 Err(_) => usize::MAX - 1,
@@ -85,13 +85,13 @@ pub fn set_coeff_trace_frame(idx: usize) {
         }
     });
     COEFF_TRACE_CUR.with(|c| c.set(idx));
-    if std::env::var_os("EC_TRACE_COEFF").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_COEFF") {
         eprintln!("EC_COEFF_FRAME decode_idx={idx}");
     }
 }
 
 pub(crate) fn coeff_trace_on() -> bool {
-    if std::env::var_os("EC_TRACE_COEFF").is_none() {
+    if !crate::envflags::env_flag!("EC_TRACE_COEFF") {
         return false;
     }
     match COEFF_TRACE_FRAME.with(|c| c.get()) {
@@ -1200,7 +1200,7 @@ pub(crate) fn vartx_rect_leaf4_hits() -> [usize; 2] {
 
 /// Records one rectangular var-tx leaf.
 fn vartx_rect_leaf_hit(tw: usize, th: usize) {
-    if std::env::var_os("EC_VARTXLEAF").is_some() {
+    if crate::envflags::env_flag!("EC_VARTXLEAF") {
         eprintln!("EC_VARTXLEAF tw={tw} th={th}");
     }
     let cell = if tw.min(th) == 4 { &VARTX_RECT_LEAF4_HITS } else { &VARTX_RECT_LEAF_HITS };
@@ -1779,7 +1779,7 @@ thread_local! {
 /// `EC_DEBUG_PAL=1` traces every arm and every consumption with its call site.
 #[track_caller]
 fn set_palette_pred(buf: Vec<u16>) {
-    if std::env::var_os("EC_DEBUG_PAL").is_some() {
+    if crate::envflags::env_flag!("EC_DEBUG_PAL") {
         let stale = PALETTE_PRED.with(|c| c.borrow().is_some());
         eprintln!(
             "PALSET len={} stale={stale} at {}",
@@ -1793,7 +1793,7 @@ fn set_palette_pred(buf: Vec<u16>) {
 #[track_caller]
 fn take_palette_pred() -> Option<Vec<u16>> {
     let got = PALETTE_PRED.with(|c| c.borrow_mut().take());
-    if std::env::var_os("EC_DEBUG_PAL").is_some() {
+    if crate::envflags::env_flag!("EC_DEBUG_PAL") {
         eprintln!(
             "PALTAKE len={:?} at {}",
             got.as_ref().map(Vec::len),
@@ -3274,7 +3274,7 @@ pub(crate) fn build_motion_field(
             field.set(row, col, saved);
         }
     }
-    if std::env::var_os("EC_TRACE_TPL").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_TPL") {
         eprintln!("EC_TPL_SAVED oh={order_hint}");
         for (r, row) in field.occupancy().iter().enumerate() {
             eprintln!("EC_TPL_SAVED r{r} {row}");
@@ -3591,7 +3591,7 @@ const VERT_ALIKE: [usize; 6] = [2, PARTITION_SPLIT, 4, 6, 7, 9];
 const HORZ_ALIKE: [usize; 6] = [1, PARTITION_SPLIT, 4, 5, 6, 8];
 
 fn trace_edge(mi_r: usize, mi_c: usize, bsize: u32, ctx: usize, rng: u32) {
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
         eprintln!("OUR_PART mi_row={mi_r} mi_col={mi_c} bsize={bsize} ctx={ctx} rng={rng}");
     }
 }
@@ -3776,7 +3776,7 @@ fn base_ctx(
             // once; `base_ctx_rect_offsets_match_the_transcribed_tables_over_the_whole_domain`
             // pins the rule against the tables over their whole 5x5 domain.
             if let Some((w, h)) = rect_shape {
-                if std::env::var_os("EC_NZOFF_DUMP").is_some() {
+                if crate::envflags::env_flag!("EC_NZOFF_DUMP") {
                     eprintln!("NZOFF side={side} shape={w}x{h} row={row} col={col}");
                 }
                 if w < h && row < 2 {
@@ -4118,7 +4118,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
     const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
     const OFFSET_BITS: [u32; 12] = [0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
-    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
+    let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     // libaom's `eob_flag_cdf*` tables carry a second dimension the 2D scan
     // never touches: `TX_CLASS_HORIZ`/`TX_CLASS_VERT` (`V_DCT`/`H_DCT`) adapt
     // a wholly separate CDF from every other tx_type (`decodetxb.c`'s
@@ -4129,7 +4129,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
         (TxClass::TwoD, _) | (_, None) => coding.eob_pt,
         (_, Some(class1)) => class1,
     };
-    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") {
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_EOBPT_CDF {eob_pt:?} range={range} value={value}");
     }
@@ -4213,10 +4213,10 @@ fn read_coeffs(
     // caller's block genuinely is `side` x `side`.
     rect_shape: Option<(usize, usize)>,
 ) -> Result<(Vec<i32>, TxType)> {
-    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
+    let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     let side = coding.side;
     let mut grid = vec![0i32; side * side];
-    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") {
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
@@ -4234,7 +4234,7 @@ fn read_coeffs(
             all_zero as i32
         );
     }
-    if std::env::var_os("EC_AV1_TELL").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TELL") {
         eprintln!(
             "TELL label=post_txb_skip ctx={skip_ctx} all_zero={} tell={} range={}",
             all_zero as u8, dec.debug_bitpos(), dec.debug_state().0
@@ -4243,7 +4243,7 @@ fn read_coeffs(
     if trace {
         eprintln!("TRACE all_zero ctx={skip_ctx} value={}", all_zero as i32);
     }
-    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") {
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_AFTER_TXBSKIP range={range} value={value}");
     }
@@ -4261,7 +4261,7 @@ fn read_coeffs(
         // share their symbol order with (`Tx_Type_Inter_Inv_Set3`'s two
         // members are a prefix of `Tx_Type_Intra_Inv_Set2`'s five).
         let len = tx_type_cdf.len();
-        if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() && len == 3 {
+        if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") && len == 3 {
             eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
         }
         let t = dec.symbol(tx_type_cdf);
@@ -4269,7 +4269,7 @@ fn read_coeffs(
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=tx_type len={len} rng={rng}");
         }
-        if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_EOBPT_CDF") {
             let (range, value) = dec.debug_state();
             eprintln!("EC_AV1_STATE_AFTER_TXTYPE range={range} value={value}");
         }
@@ -5228,7 +5228,7 @@ impl Neighbours {
         // TX_32X32 -- independent of this block's luma `tx_depth`.
         let uv_tx_w = ((w_mi * MI / 2).max(4).min(32)) as u8;
         let uv_tx_h = ((h_mi * MI / 2).max(4).min(32)) as u8;
-        if std::env::var_os("EC_TXGRID_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_TXGRID_TRACE") {
             eprintln!("EC_LFGRID mi_row={mi_r} mi_col={mi_c} w_mi={w_mi} h_mi={h_mi} tx_px={tx_px} tx_h_px={tx_h_px}");
         }
         let cur = CURRENT_DELTA_LF.with(|c| c.get());
@@ -5279,7 +5279,7 @@ impl Neighbours {
         tx_h_px: u8,
     ) {
         let (mi_r, mi_c) = at_mi;
-        if std::env::var_os("EC_TXGRID_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_TXGRID_TRACE") {
             eprintln!("EC_LFLEAF mi_row={mi_r} mi_col={mi_c} w_mi={w_mi} h_mi={h_mi} tx_px={tx_px} tx_h_px={tx_h_px}");
         }
         for rr in 0..h_mi {
@@ -5649,7 +5649,7 @@ impl Neighbours {
                 left_coded |= left.level != 0;
                 vote += dc_vote(left.dc);
             }
-            if std::env::var_os("EC_DCDUMP").is_some() {
+            if crate::envflags::env_flag!("EC_DCDUMP") {
                 let ab: Vec<String> = (0..w_mi)
                     .map(|k| format!("{:?}/{}", self.above[mi_c + k][plane].dc, self.above[mi_c + k][plane].level))
                     .collect();
@@ -5692,7 +5692,7 @@ impl Neighbours {
             left |= self.left[mi_r + cell][0].level;
         }
         let ctx = SKIP_CONTEXTS[(top as usize).min(4)][(left as usize).min(4)];
-        if std::env::var_os("EC_ECDUMP").is_some() {
+        if crate::envflags::env_flag!("EC_ECDUMP") {
             let ab: Vec<String> =
                 (0..w_mi).map(|k| self.above[mi_c + k][0].level.to_string()).collect();
             let lf: Vec<String> =
@@ -5702,7 +5702,7 @@ impl Neighbours {
                 ab.join(","), lf.join(",")
             );
         }
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TRACE") {
             eprintln!(
                 "TRACE luma_skip_ctx mi=({mi_r},{mi_c}) side_mi={side_mi} top={top} left={left} ctx={ctx} band={:?}",
                 self.left.iter().map(|e| e[0].level).collect::<Vec<_>>()
@@ -6046,7 +6046,7 @@ impl Neighbours {
         let (mi_r, mi_c) = at_mi;
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         let (w_mi, h_mi) = (w / MI, h / MI);
-        if std::env::var_os("EC_ECPUB").is_some() {
+        if crate::envflags::env_flag!("EC_ECPUB") {
             eprintln!("EC_ECPUB blk mi=({mi_r},{mi_c}) wh=({w},{h}) lvl={}", states[0].level);
         }
         for cell in 0..h_mi {
@@ -6154,7 +6154,7 @@ impl Neighbours {
         grid: &[i32],
     ) {
         let state = neighbour_state(grid);
-        if std::env::var_os("EC_ECPUB").is_some() {
+        if crate::envflags::env_flag!("EC_ECPUB") {
             eprintln!("EC_ECPUB tu  mi=({mi_r},{mi_c}) wh=({w_px},{h_px}) lvl={}", state.level);
         }
         for cell in 0..h_px / MI {
@@ -6653,7 +6653,7 @@ fn decode_color_index_map_wh(
     bh: usize,
     uv: bool,
 ) -> Vec<u8> {
-    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
+    let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     let mut map = vec![0u8; bw * bh];
     if trace {
         let (rng, _) = dec.debug_state();
@@ -6734,7 +6734,7 @@ fn read_intra_mode_rect(
     Option<PaletteY>,
     Option<PaletteUv>,
 )> {
-    let ec_istep = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if ec_istep {
         // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
         // (decodemv.c:818), printed at the same point: before the first
@@ -6904,7 +6904,7 @@ fn read_intra_mode_rect(
         }
     }
     let mut filter_intra = None;
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
         let (rng, _) = dec.debug_state();
         eprintln!(
             "TRACE_RECT_PREFI mode={mode} uv_mode={uv_mode} enable_filter_intra={} \
@@ -6921,7 +6921,7 @@ fn read_intra_mode_rect(
         && let Some(class) = filter_intra_size_class_rect(bw, bh)
     {
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TRACE") {
             eprintln!("TRACE_RECT_USEFI value={}", use_filter_intra as i32);
         }
         istep!("use_filter_intra", use_filter_intra as i32);
@@ -7028,7 +7028,7 @@ fn tx_size_context_rect(
     let (own_w, own_h) = (own_w.min(64), own_h.min(64));
     let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
     let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
-    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
         eprintln!(
             "EC_TXCTX mi_row={mi_r} mi_col={mi_c} w={own_w} h={own_h} above_px={} left_px={} ctx={}",
             if mi_r > n.tile_row0_mi { tx_px_at(n, false, mi_r - 1, mi_c) } else { 0 },
@@ -7335,7 +7335,7 @@ fn decode_rect_split(
                 // (`av1_get_ext_tx_set_type` resolves EXT_TX_SET_DCTONLY once
                 // the square-up size is TX_64X64), and this unit covers its
                 // whole block, so `get_txb_ctx` gives txb_skip ctx 0 flat.
-                if std::env::var_os("EC_RECT64TU").is_some() {
+                if crate::envflags::env_flag!("EC_RECT64TU") {
                     eprintln!("EC_RECT64TU mi={tu_mi:?} tx={tx_w}x{tx_h} mode={}", m.mode);
                 }
                 RECT64_CORNER_TU_HITS.with(|c| {
@@ -7571,7 +7571,7 @@ fn decode_rect_split(
     );
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, m.skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
         let (rng, _) = dec.debug_state();
         eprintln!(
             "TRACE_RECT_SPLIT mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} \
@@ -7702,7 +7702,7 @@ fn decode_intra_rect_in_inter(
         }
         neighbours.above_side[c] = bw;
         neighbours.left_side[r] = bh;
-        if std::env::var_os("EC_INTRA16X4").is_some() {
+        if crate::envflags::env_flag!("EC_INTRA16X4") {
             eprintln!(
                 "EC_INTRA16X4 decoded mi={mi_r},{mi_c} px={},{} horz={horz} has_chroma={has_chroma} skip={skip} mode={mode} uv={uv:?}",
                 mi_c * MI,
@@ -7793,7 +7793,7 @@ fn decode_intra_rect_in_inter(
         (8, 32) => (1, 2),
         (16, 64) => (2, 3),
         _ => {
-            if std::env::var_os("EC_OBMCREC").is_some() {
+            if crate::envflags::env_flag!("EC_OBMCREC") {
                 eprintln!(
                     "OBMCREC intra-in-inter shape bw={bw} bh={bh} mi=({mi_r},{mi_c}) skip={skip}"
                 );
@@ -7886,7 +7886,7 @@ fn decode_intra_rect_in_inter(
     // lane-t900 r1: this arm read six mode symbols with no ladder rung of its
     // own, so a cross-decoder bisection could only see the block's first
     // coefficient. Same names/format as [`read_tx_size`]'s rung.
-    let step_trace = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    let step_trace = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if step_trace {
         eprintln!(
             "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=y_mode val={mode} grp={size_group} rng={}",
@@ -8016,7 +8016,7 @@ fn decode_intra_rect_in_inter(
     // lane-intrasplit r3: print EVERY intra strip with its depth, not only the
     // split ones -- a `depth=0`-only stream is a witness gap in the SOURCE, and
     // the two are indistinguishable when the diagnostic fires on splits alone.
-    if std::env::var_os("EC_SPLITSTRIP").is_some() {
+    if crate::envflags::env_flag!("EC_SPLITSTRIP") {
         eprintln!("EC_SPLITSTRIP mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} depth={depth}");
     }
     let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
@@ -8184,7 +8184,7 @@ fn decode_block_rect(
             tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh)
         };
         let d = dec.symbol(&mut cdfs.tx_size_cat2[ctx]);
-        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
             eprintln!(
                 "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat=2 rng={}",
                 dec.debug_state().0
@@ -8201,7 +8201,7 @@ fn decode_block_rect(
         // unit's reconstruction inside this same strip (spec 5.11.36) --
         // [`decode_rect_split`], the unit named by [`depth_to_tx_wh`].
         let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
-        if std::env::var_os("EC_SBPART_DUMP64").is_some() {
+        if crate::envflags::env_flag!("EC_SBPART_DUMP64") {
             eprintln!(
                 "DUMP64SPLIT mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} \
                  depth={depth} tx={tx_w}x{tx_h} mode={mode} uv={uv_predict_mode} skip={skip} \
@@ -8266,7 +8266,7 @@ fn decode_block_rect(
     let (cpx, cpy) = (px / 2, py / 2);
     let (chroma_w, chroma_h) = (bw / 2, bh / 2);
     let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
         let (rng, _) = dec.debug_state();
         eprintln!(
             "TRACE_RECT_IMODE mi_row={mi_r} mi_col={mi_c} mode={mode} uv_mode={uv_mode} \
@@ -8404,7 +8404,7 @@ fn decode_block_rect(
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
         )?;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TRACE") {
             let (rng, _) = dec.debug_state();
             eprintln!("TRACE_RECT_COEFF plane=0 mi_row={mi_r} mi_col={mi_c} rng={rng}");
         }
@@ -8448,7 +8448,7 @@ fn decode_block_rect(
             dc_sign_ctx(around[1].2),
             u_default_tx,
         )?;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TRACE") {
             let (rng, _) = dec.debug_state();
             eprintln!("TRACE_RECT_COEFF plane=1 mi_row={mi_r} mi_col={mi_c} rng={rng}");
         }
@@ -8491,7 +8491,7 @@ fn decode_block_rect(
             dc_sign_ctx(around[2].2),
             v_default_tx,
         )?;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TRACE") {
             let (rng, _) = dec.debug_state();
             eprintln!("TRACE_RECT_COEFF plane=2 mi_row={mi_r} mi_col={mi_c} rng={rng}");
         }
@@ -8530,7 +8530,7 @@ fn decode_block_rect(
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
         eprintln!("TRACE_RECT32_END mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh}");
     }
     Ok(())
@@ -8574,7 +8574,7 @@ fn decode_leaf_rect(
     reduced_tx_set: bool,
 ) -> Result<usize> {
     let _ = base_q_idx;
-    if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_RECTX_TRACE") {
         eprintln!(
             "decode_leaf_rect: leaf_mi={leaf_mi:?} bw={bw} bh={bh} outer_at={outer_at:?} rng={}",
             dec.debug_state().0
@@ -8656,7 +8656,7 @@ fn decode_leaf_rect(
         palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
     let (pal_uv_size, pal_uv_colors) =
         palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
-    if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_RECTX_TRACE") {
         eprintln!("  skip={skip} mode={mode} angle_delta_y={angle_delta_y} uv_mode={uv_mode}");
     }
     if filter_intra.is_some() {
@@ -8800,7 +8800,7 @@ fn decode_leaf_rect(
         let (l_levels, luma_tx_type) = read_coeffs_rect(
             dec, &mut luma_coding, luma_scan, bw, bh, 0, dc_sign_ctx(around[0].2), TxType::DctDct,
         )?;
-        if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_RECTX_TRACE") {
             let nz: Vec<(usize, i32)> = l_levels.iter().copied().enumerate().filter(|(_, v)| *v != 0).collect();
             eprintln!("  luma_tx_type={luma_tx_type:?} nz_levels={nz:?}");
         }
@@ -9024,7 +9024,7 @@ fn decode_block_rect4(
             tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh)
         };
         let d = dec.symbol(&mut cdfs.tx_size_cat2[ctx]);
-        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
             eprintln!(
                 "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat=2 rng={}",
                 dec.debug_state().0
@@ -9548,7 +9548,7 @@ fn decode_rect4_16_strip(
                 tx_size_context_rect(neighbours, lmi, bw, bh)
             };
             let d = dec.symbol(&mut cdfs.tx_size_cat1[ctx]);
-            if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
                 eprintln!(
                     "EC_ISTEP mi_row={} mi_col={} name=tx_depth val={d} ctx={ctx} cat=1 rng={}",
                     lmi.0,
@@ -10053,7 +10053,7 @@ fn decode_block_rect64(
         // block uses), not the 2 a 32x16 strip uses. Reading the cat-2 CDF
         // here was a wrong-table read of a real symbol.
         let d = dec.symbol(&mut cdfs.tx_size_cat3[ctx]);
-        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
             eprintln!(
                 "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat=3 rng={}",
                 dec.debug_state().0
@@ -10087,7 +10087,7 @@ fn decode_block_rect64(
             };
             which.with(|c| c.set(c.get() + 1));
         }
-        if std::env::var_os("EC_SBPART_DUMP64").is_some() {
+        if crate::envflags::env_flag!("EC_SBPART_DUMP64") {
             eprintln!(
                 "DUMP64SPLIT mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} \
                  depth={depth} tx={tx_w}x{tx_h} mode={mode} uv={uv_predict_mode} skip={skip} \
@@ -10293,7 +10293,7 @@ fn decode_block_rect64(
             if cur != i32::from(base_q_idx) {
                 RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
             }
-            if std::env::var_os("EC_AV1_TRACE").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 eprintln!(
                     "TRACE rect64_dequant plane=0 base_q_idx={base_q_idx} current_q_idx={cur}"
                 );
@@ -10322,7 +10322,7 @@ fn decode_block_rect64(
             filter_intra,
             smooth_neighbor,
         );
-        if std::env::var_os("EC_SBPART_DUMP64").is_some() {
+        if crate::envflags::env_flag!("EC_SBPART_DUMP64") {
             let leftcol: Vec<u16> = if px > 0 {
                 (py..py + bh).map(|row| y.data[row * y.width + px - 1]).collect()
             } else {
@@ -10376,7 +10376,7 @@ fn decode_block_rect64(
             if cur != i32::from(base_q_idx) {
                 RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
             }
-            if std::env::var_os("EC_AV1_TRACE").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 eprintln!(
                     "TRACE rect64_dequant plane=1 base_q_idx={base_q_idx} current_q_idx={cur}"
                 );
@@ -10430,7 +10430,7 @@ fn decode_block_rect64(
             if cur != i32::from(base_q_idx) {
                 RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
             }
-            if std::env::var_os("EC_AV1_TRACE").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 eprintln!(
                     "TRACE rect64_dequant plane=2 base_q_idx={base_q_idx} current_q_idx={cur}"
                 );
@@ -10486,7 +10486,7 @@ fn decode_block_rect64(
         (16, 64) => SB_RECT4_VERT_HITS.with(|c| c.set(c.get() + 1)),
         _ => {}
     }
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
         let (rng, _) = dec.debug_state();
         eprintln!("TRACE_RECT64_END mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} rng={rng}");
     }
@@ -10543,12 +10543,12 @@ fn read_intra_mode(
     Option<PaletteY>,
     Option<PaletteUv>,
 )> {
-    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
+    let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
     // lane-tiny r2: EC_ISTEP-format trace (same "name=... val=... rng=..."
     // shape the oracle's own `ec_read_intra_frame_mode_info_impl` prints
     // under `EC_TRACE_MODE_STEP`) so a range ladder can be diffed line for
     // line against the instrumented aomdec, not just `tell()`.
-    let ec_istep = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     if ec_istep {
         // Mirrors the oracle's own `EC_IMODE mi_row=.. mi_col=.. rng=..` line
         // (decodemv.c:818), printed at the same point: before the first
@@ -10935,7 +10935,7 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
     // decode-order picture like EC_AV1_PREFILT_DUMP already does -- a fixed
     // `.f0` name kept only the LAST frame, so a mid-sequence divergence could
     // not be read out at all.
-    if let Ok(path) = std::env::var(var)
+    if let Ok(path) = crate::envflags::var(var)
         && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for (p, w, h) in [(y, fw, fh), (u, fw.div_ceil(2), fh.div_ceil(2)), (v, fw.div_ceil(2), fh.div_ceil(2))] {
@@ -10967,7 +10967,7 @@ fn dump_stage_idx(var: &str) -> usize {
 
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
-    if let Ok(path) = std::env::var(var)
+    if let Ok(path) = crate::envflags::var(var)
         && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
     {
         for p in [y, u, v] {
@@ -11132,7 +11132,7 @@ impl PlaneBuf {
             buf
         } else {
             let (above, left, corner) = self.edges_rect(x, y, bw, bh, reach);
-            if std::env::var_os("EC_DEBUG_EDGES").is_some() {
+            if crate::envflags::env_flag!("EC_DEBUG_EDGES") {
                 eprintln!(
                     "EDGES x={x} y={y} bw={bw} bh={bh} mode={mode} above={:?} left_len={:?} left0={:?} corner={corner:?} tx0={} ty0={} truew={} trueh={}",
                     above.as_ref().map(|a| (a.len(), a[0])),
@@ -11171,7 +11171,7 @@ impl PlaneBuf {
         };
         // lane-hgkf r2: per-TU prediction trace, the twin of aomdec's
         // EC_PRED/EC_PREDND rungs (x/y are this plane's pixel origin).
-        if std::env::var_os("EC_PRED").is_some() {
+        if crate::envflags::env_flag!("EC_PRED") {
             let sum: i64 = prediction.iter().map(|&v| i64::from(v)).sum();
             let row0: Vec<u16> = prediction[..bw.min(8)].to_vec();
             let col0: Vec<u16> = (0..bh.min(8)).map(|r| prediction[r * bw]).collect();
@@ -11273,7 +11273,7 @@ impl PlaneBuf {
         };
         // lane-hgkf r2: per-TU prediction trace, the twin of aomdec's
         // EC_PRED/EC_PREDND rungs (x/y are this plane's pixel origin).
-        if std::env::var_os("EC_PRED").is_some() {
+        if crate::envflags::env_flag!("EC_PRED") {
             let sum: i64 = prediction.iter().map(|&v| i64::from(v)).sum();
             let row0: Vec<u16> = prediction[..side.min(8)].to_vec();
             let col0: Vec<u16> = (0..side.min(8)).map(|r| prediction[r * side]).collect();
@@ -11418,7 +11418,7 @@ fn read_plane(
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
     let residual = dequant_and_inverse_typed(&levels, side, bit_depth(), block_q_idx(), dc_delta, ac_delta, tx_type);
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
         eprintln!(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
         );
@@ -11530,7 +11530,7 @@ fn decode_block(
     }
     let smooth_neighbor_uv =
         neighbours.smooth_uv_neighbour(r * (SUB / MI), c * (SUB / MI), r, c);
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
         eprintln!(
             "TRACE block px={px} py={py} side={side} mode={mode} uv_mode={uv_mode} \
              angle_delta_uv={angle_delta_uv}"
@@ -11830,7 +11830,7 @@ fn decode_block(
             None,
             smooth_neighbor_uv,
         )?;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TRACE") {
             eprintln!(
                 "TRACE u-write cpx={cpx} cpy={cpy} chroma_side={chroma_side} row0={:?}",
                 &u.data[cpy * u.width + cpx..][..chroma_side]
@@ -11963,7 +11963,7 @@ fn decode_block(
                     Some(tu_skip_ctx),
                     smooth_neighbor,
                 )?;
-                if std::env::var_os("EC_AV1_TRACE").is_some() {
+                if crate::envflags::env_flag!("EC_AV1_TRACE") {
                     eprintln!(
                         "TRACE tu_bitpos mi=({},{}) tell={}",
                         tu_mi.0,
@@ -12900,7 +12900,7 @@ fn decode_leaf8(
                     Some(tu_skip_ctx),
                     smooth_neighbor,
                 )?;
-                if std::env::var_os("EC_AV1_TRACE").is_some() {
+                if crate::envflags::env_flag!("EC_AV1_TRACE") {
                     eprintln!(
                         "TRACE tu_bitpos mi=({},{}) tell={}",
                         tu_mi.0,
@@ -13059,8 +13059,8 @@ fn read_intra_mode_sub8(
     mi_r: usize,
     mi_c: usize,
 ) -> Result<(bool, usize, i32, Option<(usize, i32, Option<(i32, i32)>)>, Option<usize>)> {
-    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
-    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+    let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
+    if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
         eprintln!("EC_IMODE mi_row={mi_r} mi_col={mi_c} fn=sub8 rng={}", dec.debug_state().0);
     }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
@@ -13901,7 +13901,7 @@ fn apply_deblock(
 ) {
     // lane-part32 r2 debug rung, env-gated: bisecting a widespread pixel
     // mismatch between the raw reconstruction and post-filter output.
-    if std::env::var_os("EC_AV1_DEBUG_SKIP_DEBLOCK").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_DEBUG_SKIP_DEBLOCK") {
         return;
     }
     if lf.level[0] != 0 || lf.level[1] != 0 {
@@ -13986,7 +13986,7 @@ fn tx_size_context_txfm_rect(
     if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= own_h;
     }
-    if std::env::var_os("EC_TXCTX").is_some() {
+    if crate::envflags::env_flag!("EC_TXCTX") {
         eprintln!(
             "EC_TXCTX mi={mi_r},{mi_c} own={own_w}x{own_h} ha={has_above} hl={has_left} \
              above_txfm={} left_txfm={} above_inter={} left_inter={} above_side={} left_side={} \
@@ -14046,7 +14046,7 @@ fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usiz
     if has_left && n.left_inter[mi_r] {
         left = n.left_side_mi[mi_r] >= side;
     }
-    if std::env::var_os("EC_TXCTX").is_some() {
+    if crate::envflags::env_flag!("EC_TXCTX") {
         eprintln!(
             "EC_TXCTX mi={mi_r},{mi_c} own={side} ha={has_above} hl={has_left} \
              above_txfm={} left_txfm={} above_inter={} left_inter={} above_side={} left_side={} \
@@ -14105,7 +14105,7 @@ fn read_tx_size(
         }
         _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64/128"),
     };
-    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
         let (rng, _) = dec.debug_state();
         let (mi_r, mi_c) = at_mi;
         eprintln!(
@@ -14213,7 +14213,7 @@ fn txfm_partition_update_rect(
     (tx_w, tx_h): (usize, usize),
     (txb_w, txb_h): (usize, usize),
 ) {
-    if std::env::var_os("EC_TXUPD").is_some() {
+    if crate::envflags::env_flag!("EC_TXUPD") {
         eprintln!("EC_TXUPD rect mi=({},{}) tx=({tx_w},{tx_h}) txb=({txb_w},{txb_h})", mi_r, mi_c);
     }
     for i in 0..txb_h / MI {
@@ -14239,7 +14239,7 @@ fn set_txfm_ctxs(
     h_mi: usize,
     skip_inter: bool,
 ) {
-    if std::env::var_os("EC_TXUPD").is_some() {
+    if crate::envflags::env_flag!("EC_TXUPD") {
         eprintln!("EC_TXUPD ctxs mi=({mi_r},{mi_c}) tx={tx_px} wh=({w_mi},{h_mi}) skip_inter={skip_inter}");
     }
     let bw = if skip_inter { w_mi * MI } else { tx_px };
@@ -14348,7 +14348,7 @@ fn read_var_tx_size(
     );
     let split = dec.symbol(&mut cdfs.txfm_partition[ctx]) == 1;
     TXFM_SPLIT_READS.with(|c| c.set(c.get() + 1));
-    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
         let (rng, _) = dec.debug_state();
         eprintln!(
             "EC_ISTEP mi_row={} mi_col={} name=txfm_split val={} ctx={ctx} rng={rng}",
@@ -14795,7 +14795,7 @@ fn read_block_tx_size_rect(
     );
     let split = dec.symbol(&mut cdfs.txfm_partition[ctx]) == 1;
     TXFM_SPLIT_READS.with(|c| c.set(c.get() + 1));
-    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
         let (rng, _) = dec.debug_state();
         eprintln!(
             "EC_ISTEP mi_row={} mi_col={} name=txfm_split_rect val={} ctx={ctx} rng={rng}",
@@ -14943,7 +14943,7 @@ fn read_inter_plane_rect(
         ac_delta,
         tx_type,
     );
-    if std::env::var_os("EC_TRACE_TXTYPE").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_TXTYPE") {
         eprintln!("OUR_TXTYPE plane={plane_idx} x={x} y={y} w={w} h={h} tx_type={tx_type:?} inh={inherited_luma_tx_type:?}");
     }
     // `reconstruct_mc_rect` reads both buffers at the square prediction
@@ -15649,7 +15649,7 @@ fn deblock_plane(
         plane.true_height.min(ch),
         plane.width,
     );
-    if std::env::var_os("EC_AV1_DEBLOCK_TRACE_V").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE_V") {
         eprintln!("DEBLOCK plane={plane_idx} tw={tw} th={th} stride={stride} true={}x{} crop={cw}x{ch}", plane.true_width, plane.true_height);
     }
     let mut y0 = 0usize;
@@ -15657,7 +15657,7 @@ fn deblock_plane(
         let mut x0 = 4usize;
         while x0 < tw {
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 0, chroma, x0, y0) {
-                if std::env::var_os("EC_AV1_DEBLOCK_TRACE_V").is_some() && plane_idx == 0 {
+                if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE_V") && plane_idx == 0 {
                     eprintln!("VEDGE x0={x0} y0={y0} len={len} level={level}");
                 }
                 filter_edge(
@@ -15679,7 +15679,7 @@ fn deblock_plane(
         let mut y0 = 4usize;
         while y0 < th {
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0) {
-                if std::env::var_os("EC_AV1_DEBLOCK_TRACE").is_some()
+                if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE")
                     && plane_idx == 0
                     && x0 == 44
                 {
@@ -15715,7 +15715,7 @@ fn apply_cdef(
     (frame_w, frame_h): (usize, usize),
 ) {
     // lane-part32 r2 debug rung, env-gated: see `apply_deblock`'s sibling.
-    if std::env::var_os("EC_AV1_DEBUG_SKIP_CDEF").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_DEBUG_SKIP_CDEF") {
         return;
     }
     // lane-cdefstrip r1 instrument, BEFORE either early return so it is valid
@@ -15739,7 +15739,7 @@ fn apply_cdef(
                     })
                 }) {
                     CDEF_UNWRITTEN_SKIP_UNITS.with(|c2| c2.set(c2.get() + 1));
-                    if std::env::var_os("EC_AV1_DEBUG_CDEF_BAND").is_some() {
+                    if crate::envflags::env_flag!("EC_AV1_DEBUG_CDEF_BAND") {
                         eprintln!("cdef band unwritten at mi ({r},{c}) px ({},{})", r * 4, c * 4);
                     }
                 }
@@ -15831,7 +15831,7 @@ fn apply_cdef(
                 let y_dir = if y_pri_strength != 0 { dir } else { 0 };
                 let t = cdef_adjust_strength(y_pri_strength, var);
                 // lane-cdef r1 rung: one line per filtered 8x8 luma CDEF unit.
-                if std::env::var_os("EC_AV1_CDEF_DBG").is_some() {
+                if crate::envflags::env_flag!("EC_AV1_CDEF_DBG") {
                     eprintln!(
                         "EC_CDEF mi_r={mi_r} mi_c={mi_c} x={ox} y={oy} sidx={sidx} dir={dir} var={var} t={t} pri={y_pri_strength} sec={y_sec_strength} damp={damping}"
                     );
@@ -16215,7 +16215,7 @@ fn read_sb128_root(
     let part128 = if has_cols128 && has_rows128 {
         PART128_SYMBOLS.with(|c| c.set(c.get() + 1));
         let p = dec.symbol(&mut cdfs.partition_w128[ctx128]);
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TRACE") {
             eprintln!("TRACE partition_w128 ctx={ctx128} value={p}");
         }
         p
@@ -16443,7 +16443,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         CURRENT_Q_IDX.with(|c| c.set(i32::from(base_q_idx)));
         QUANT_DELTAS.with(|c| c.set(deltas));
         CURRENT_DELTA_LF.with(|c| c.set([0; 4]));
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TRACE") {
             eprintln!(
                 "TRACE key_tile_bytes tile={tile_num} len={} first8={:02x?} base_q_idx={base_q_idx} mi_cols={mi_cols} mi_rows={mi_rows}",
                 tile_bytes.len(),
@@ -16792,7 +16792,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             // three-way write exactly.
             let part = if has_cols && has_rows {
                 let p = dec.symbol(&mut cdfs.partition_w64[ctx]);
-                if std::env::var_os("EC_AV1_TRACE").is_some() {
+                if crate::envflags::env_flag!("EC_AV1_TRACE") {
                     eprintln!("TRACE partition_w64 ctx={ctx} value={p}");
                 }
                 p
@@ -16869,7 +16869,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         );
                         let part32 = if has_cols32 && has_rows32 {
                             let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
-                            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                            if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                 let (rng, _) = dec.debug_state();
                                 eprintln!(
                                     "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p} rng={rng}",
@@ -16955,7 +16955,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     let ctx16 = neighbours.partition_ctx(at16, SUB);
                                     if has_cols16 && has_rows16 {
                                         let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
-                                        if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                        if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                             eprintln!(
                                                 "TRACE partition_w16 mi=({},{}) ctx={ctx16} value={part16}",
                                                 at16.0, at16.1
@@ -17280,7 +17280,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                             let part8 =
                                                 dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
-                                            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                            if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                                 eprintln!(
                                                     "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
                                                 );
@@ -17471,7 +17471,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                         let pre8 = dec.debug_state().0;
                                         let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
-                                        if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                        if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                             eprintln!(
                                                 "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8} pre_rng={pre8}"
                                             );
@@ -18230,9 +18230,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
     // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
-    if std::env::var_os("EC_OBMC").is_some()
-        || std::env::var_os("EC_TRACE_MODE").is_some()
-        || std::env::var_os("EC_PRED").is_some()
+    if crate::envflags::env_flag!("EC_OBMC")
+        || crate::envflags::env_flag!("EC_TRACE_MODE")
+        || crate::envflags::env_flag!("EC_PRED")
     {
         eprintln!(
             "EC_PICT idx={}",
@@ -18240,7 +18240,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         );
     }
     dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
+    if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
@@ -18252,7 +18252,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    if let Ok(path) = std::env::var("EC_AV1_PREFILT_WIDE_DUMP") {
+    if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_WIDE_DUMP") {
         use std::io::Write;
         static IDX2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let idx = IDX2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -18337,7 +18337,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     LAST_FRAME_WIDE_MARGIN.with(|m| {
         *m.borrow_mut() = if true_width > fw || true_height > fh {
             let yc = crop(&y, true_width, true_height);
-            if let Ok(path) = std::env::var("EC_AV1_MARGIN_DUMP") {
+            if let Ok(path) = crate::envflags::var("EC_AV1_MARGIN_DUMP") {
                 use std::io::Write;
                 static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let idx = IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -18434,7 +18434,7 @@ fn resolve_interp_filter(
     // `h_kind`/`v_kind` argument order, which is why this function returns
     // `(h, v, ..)` but reads `dir0` (`v`) before `dir1` (`h`).
     let ctx0 = switchable_interp_ctx(above[0], left[0], 0, is_compound);
-    if std::env::var_os("EC_AV1_IFDBG").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_IFDBG") {
         eprintln!(
             "IFDBG dir=0 ctx={ctx0} above={above:?} left={left:?} cdf={:?}",
             &cdfs.switchable_interp[ctx0][..3]
@@ -18443,7 +18443,7 @@ fn resolve_interp_filter(
     let sym0 = dec.symbol(&mut cdfs.switchable_interp[ctx0]) as u8;
     let sym1 = if enable_dual_filter {
         let ctx1 = switchable_interp_ctx(above[1], left[1], 1, is_compound);
-        if std::env::var_os("EC_AV1_IFDBG").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_IFDBG") {
             eprintln!(
                 "IFDBG dir=1 ctx={ctx1} above={above:?} left={left:?} cdf={:?} sym0={sym0}",
                 &cdfs.switchable_interp[ctx1][..3]
@@ -18456,7 +18456,7 @@ fn resolve_interp_filter(
     if enable_dual_filter && sym0 != sym1 {
         DUAL_FILTER_DIFF_HITS.with(|c| c.set(c.get() + 1));
     }
-    if std::env::var_os("EC_TRACE_MODE").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
         eprintln!(
             "EC_IF ctx0={ctx0} above={above:?} left={left:?} sym0={sym0} sym1={sym1} rng={}",
             dec.debug_state().0
@@ -18743,7 +18743,7 @@ fn read_inter_plane(
         None,
     )?;
     note_chroma_class1(plane_idx, tx_type);
-    if std::env::var_os("EC_TRACE_TXTYPE").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_TXTYPE") {
         eprintln!("OUR_TXTYPE plane={plane_idx} x={x} y={y} side={side} tx_type={tx_type:?} inh={inherited_luma_tx_type:?}");
     }
     // lane-inter8 r1: a 64-point transform covers the whole 64x64 area but
@@ -19008,7 +19008,7 @@ fn find_samples(
     // sample candidates in libaom's own order (above, left, top-left,
     // top-right) -- `num_proj_ref >= 1` is what picks the 3-symbol
     // motion_mode alphabet over the 2-symbol obmc one.
-    let proj_dbg = std::env::var("EC_PROJ_MI")
+    let proj_dbg = crate::envflags::var("EC_PROJ_MI")
         .is_ok_and(|v| v == format!("{mi_row},{mi_col}"));
     let single_ref_match = |info: &MiInfo| {
         let m = info.ref_frame == ref_frame && info.ref_frame1.is_none();
@@ -19247,7 +19247,7 @@ fn obmcrec_probe(
     cell: Option<MiInfo>,
     fixed: bool,
 ) {
-    if (syms[0] <= 2 && syms[1] <= 2) || std::env::var_os("EC_OBMCREC").is_none() {
+    if (syms[0] <= 2 && syms[1] <= 2) || !crate::envflags::env_flag!("EC_OBMCREC") {
         return;
     }
     eprintln!(
@@ -19502,7 +19502,7 @@ fn ec_obmc_trace(
     h_kind: mc::InterpFilterKind,
     v_kind: mc::InterpFilterKind,
 ) {
-    if std::env::var_os("EC_OBMC").is_none() {
+    if !crate::envflags::env_flag!("EC_OBMC") {
         return;
     }
     let sym = |k: mc::InterpFilterKind| match k {
@@ -19613,7 +19613,7 @@ fn obmc_blend(
     // lane-t900 r13 rung: EC_MCB="<plane>:<px>:<py>[:<frame>]" (chroma plane
     // 1 only) prints this block's chroma prediction rows before and after the
     // OBMC blend, matching the instrumented aomdec's EC_MCB dump.
-    let ec_mcb: Option<(usize, usize, i64)> = std::env::var("EC_MCB").ok().and_then(|v| {
+    let ec_mcb: Option<(usize, usize, i64)> = crate::envflags::var("EC_MCB").ok().and_then(|v| {
         let f: Vec<&str> = v.split(':').collect();
         if f.len() < 3 || f[0] != "1" {
             return None;
@@ -20269,11 +20269,11 @@ fn decode_inter_block(
     // bails per PLANE at `block_width < 8 || block_height < 8` -- on the
     // block's own dims, never on the square prediction buffer this reader
     // allocates.
-    if std::env::var_os("EC_MC_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_MC_TRACE") {
         eprintln!("EC_IB px={px} py={py} side={side} w={write_w} h={write_h}");
     }
 
-    if std::env::var_os("EC_AV1_TELL").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TELL") {
         eprintln!(
             "TELL mi_row={} mi_col={} label=block_entry side={side} tell={} range={}",
             rmi, cmi, dec.debug_bitpos(), dec.debug_state().0
@@ -20284,7 +20284,7 @@ fn decode_inter_block(
     // lane-comppin r3: skip_mode desync isolation -- dump ctx + the pre-read
     // MSAC tell so it can be diffed against an equivalent hook in libaom's
     // own `read_skip_mode`/`av1_get_skip_mode_context`.
-    if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_SKIPMODE_DUMP") {
         eprintln!(
             "EC_SKIPMODE r={r} c={c} ctx={skip_mode_ctx} skip_mode_present={skip_mode_present} tell_before={}",
             dec.debug_bitpos()
@@ -20301,7 +20301,7 @@ fn decode_inter_block(
     let comp_allowed = write_w.min(write_h) >= 8;
     let skip_mode =
         skip_mode_present && comp_allowed && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
-    if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_SKIPMODE_DUMP") {
         eprintln!(
             "EC_SKIPMODE r={r} c={c} result={skip_mode} tell_after={}",
             dec.debug_bitpos()
@@ -20335,7 +20335,7 @@ fn decode_inter_block(
     // chunk). An INTRA block at that size inside an inter frame takes the
     // intra tail below, which still codes one whole-block chroma unit and one
     // `read_tx_size` at 128 -- refuse by name instead of mis-decoding it.
-    if std::env::var_os("EC_TRACE_MODE").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
         eprintln!(
             "EC_MODE mi_row={} mi_col={} rng={} is_inter={} skip={} side={side}",
             rmi,
@@ -20364,7 +20364,7 @@ fn decode_inter_block(
         && !rect_inter_residual_supported(write_w, write_h)
         && (is_inter || (write_w == side && write_h == side))
     {
-        if std::env::var_os("EC_RECTRES").is_some() {
+        if crate::envflags::env_flag!("EC_RECTRES") {
             eprintln!(
                 "EC_RECTRES w={write_w} h={write_h} side={side} skip={} is_inter={} mi_row={rmi} mi_col={cmi}",
                 u8::from(skip),
@@ -20375,7 +20375,7 @@ fn decode_inter_block(
             "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
         ));
     }
-    if std::env::var_os("EC_AV1_TELL").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TELL") {
         eprintln!(
             "TELL mi_row={} mi_col={} label=post_is_inter skip_mode={skip_mode} skip={skip} is_inter={is_inter} tell={} range={}",
             rmi, cmi, dec.debug_bitpos(), dec.debug_state().0
@@ -20427,7 +20427,7 @@ fn decode_inter_block(
             uni: neighbours.left_ref1[rmi]
                 .is_some_and(|r1| is_uni_comp_ref(neighbours.left_ref[rmi], r1)),
         });
-        if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_COMPIDX_DUMP") {
             eprintln!(
                 "EC_PRECOMP r={r} c={c} skip_mode={skip_mode} skip={skip} reference_select={reference_select} tell={}",
                 dec.debug_bitpos()
@@ -20510,7 +20510,7 @@ fn decode_inter_block(
                 force_integer_mv,
                 (gm_table[(ref0 - LAST_FRAME) as usize], gm_table[(ref1 - LAST_FRAME) as usize]),
             );
-            if std::env::var_os("EC_TRACE_MODE").is_some() {
+            if crate::envflags::env_flag!("EC_TRACE_MODE") {
                 eprintln!(
                     "EC_MODE_VAL mi_row={mi_row} mi_col={mi_col} mode={} ref0={ref0} ref1={ref1} mv0=({},{}) stack={} rng={}",
                     compound_mode + 17,
@@ -20654,7 +20654,7 @@ fn decode_inter_block(
             } else {
                 0
             };
-            if std::env::var_os("EC_TRACE_MODE").is_some() {
+            if crate::envflags::env_flag!("EC_TRACE_MODE") {
                 eprintln!(
                     "EC_CGI mi_row={rmi} mi_col={cmi} ctx={group_ctx} val={comp_group_idx} rng={}",
                     dec.debug_state().0
@@ -20941,7 +20941,7 @@ fn decode_inter_block(
                     ref_order_hints[(ref1 - LAST_FRAME) as usize],
                 );
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
-                if std::env::var_os("EC_TRACE_MODE").is_some() {
+                if crate::envflags::env_flag!("EC_TRACE_MODE") {
                     eprintln!(
                         "EC_CIDX mi_row={rmi} mi_col={cmi} ctx={idx_ctx} val={idx} rng={}",
                         dec.debug_state().0
@@ -20962,7 +20962,7 @@ fn decode_inter_block(
                 (8, 8, 1u8)
             };
             compound_ctx = Some((ref1, comp_group_idx as u8, compound_idx));
-            if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_COMPIDX_DUMP") {
                 eprintln!(
                     "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize={side} mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
                     mv0.0, mv0.1, mv1.0, mv1.1, dec.debug_bitpos()
@@ -21602,7 +21602,7 @@ fn decode_inter_block(
                     neighbours.left_ref1[rmi],
                 );
             ref_frame_for_lf = ref_frame;
-            if std::env::var_os("EC_AV1_TELL").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TELL") {
                 let (mi_row, mi_col) = (rmi, cmi);
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_ref_frame ref={ref_frame} tell={} range={}",
@@ -21740,7 +21740,7 @@ fn decode_inter_block(
                 };
                 (mv, false)
             };
-            if std::env::var_os("EC_TRACE_MODE").is_some() {
+            if crate::envflags::env_flag!("EC_TRACE_MODE") {
                 for (i, e) in stack.entries.iter().enumerate() {
                     eprintln!(
                         "EC_STACK mi_row={mi_row} mi_col={mi_col} ref={ref_frame} i={i} this=({},{}) comp=(0,0) w={}",
@@ -21767,7 +21767,7 @@ fn decode_inter_block(
             let is_global_mv_block = is_globalmv && gm_model as u8 > 1 && min_bw_bh4 >= 2;
             let gm_nontrans =
                 is_globalmv && gm_model != ec_av1_syntax::WarpModel::Translation && min_bw_bh4 >= 2;
-            if std::env::var_os("EC_AV1_TELL").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TELL") {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_assign_mv tell={} range={}",
                     dec.debug_bitpos(), dec.debug_state().0
@@ -21846,7 +21846,7 @@ fn decode_inter_block(
                     interintra_mode = Some(ii);
                 }
             }
-            if std::env::var_os("EC_AV1_TELL").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TELL") {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_interintra tell={} range={}",
                     dec.debug_bitpos(), dec.debug_state().0
@@ -21894,7 +21894,7 @@ fn decode_inter_block(
             // as aomdec's `EC_ISTEP2 name=motion_mode` -- an eligibility
             // mismatch is otherwise invisible (a skipped symbol prints
             // nothing).
-            if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
                 eprintln!(
                     "EC_MM mi_row={mi_row} mi_col={mi_col} w={write_w} h={write_h} elig={} \
                      ab={} lf={} sw={} skipmode={} ii={} gmb={} rng={}",
@@ -22026,7 +22026,7 @@ fn decode_inter_block(
                                 mi_rows as usize,
                                 ref_frame,
                             );
-                            if std::env::var_os("EC_WARP_DEBUG").is_some() {
+                            if crate::envflags::env_flag!("EC_WARP_DEBUG") {
                                 eprintln!(
                                     "EC_WARP_DEBUG findSamples mi_row={mi_row} mi_col={mi_col} bsize={side} num_proj_ref={}",
                                     samples.len()
@@ -22050,7 +22050,7 @@ fn decode_inter_block(
                                 mi_row as i32,
                                 mi_col as i32,
                             );
-                            if std::env::var_os("EC_WARP_DEBUG").is_some() {
+                            if crate::envflags::env_flag!("EC_WARP_DEBUG") {
                                 eprintln!(
                                     "EC_WARP_DEBUG projection mi_row={mi_row} mi_col={mi_col} num_proj_ref(final)={} mv=({},{}) params={:?}",
                                     samples.len(), mv.0, mv.1, warp_params
@@ -22071,7 +22071,7 @@ fn decode_inter_block(
                 // motion_mode vs 2-symbol obmc) and the range after -- the
                 // two give the same value with a different narrowing (class
                 // wrong-alphabet-same-value).
-                if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+                if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
                     eprintln!(
                         "EC_MM2 mi_row={mi_row} mi_col={mi_col} row={bsize_idx} warp_elig={} \
                          scaled={} fimv={} obmc={} warped={} rng={}",
@@ -22107,7 +22107,7 @@ fn decode_inter_block(
                     AFFINE_GM_HITS.with(|c| c.set(c.get() + 1));
                 }
             }
-            if std::env::var_os("EC_AV1_TELL").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TELL") {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_motion_mode eligible={} tell={} range={}",
                     motion_mode_eligible as u8, dec.debug_bitpos(), dec.debug_state().0
@@ -22150,13 +22150,13 @@ fn decode_inter_block(
             );
             block_filter = resolved_filter;
             globalmv_for_lf = is_globalmv;
-            if std::env::var_os("EC_AV1_TELL").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TELL") {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_interp_filter tell={} range={}",
                     dec.debug_bitpos(), dec.debug_state().0
                 );
             }
-            if std::env::var_os("EC_AV1_TRACE").is_some() {
+            if crate::envflags::env_flag!("EC_AV1_TRACE") {
                 eprintln!(
                     "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} warped={} tell={}",
                     skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, warp_params.is_some() as u8, dec.debug_bitpos()
@@ -22909,7 +22909,7 @@ fn decode_inter_block(
             .filter(|_| write_w.min(write_h) == 4 && write_w.max(write_h) == 16)
             .map(|s| (s.horz, s.has_chroma));
         if write_w.min(write_h) < 8 && strip16.is_none() {
-            if std::env::var_os("EC_INTRA16X4").is_some() {
+            if crate::envflags::env_flag!("EC_INTRA16X4") {
                 let (idx, hc, prev_inter) = match strip_chroma {
                     Some(s) => (
                         if s.horz { rmi - s.pair_mi.0 } else { cmi - s.pair_mi.1 },
@@ -22990,7 +22990,7 @@ fn decode_inter_block(
             return Ok(());
         }
         let mode = dec.symbol(&mut cdfs.y_mode[size_group_wh(write_w, write_h)]);
-        if std::env::var_os("EC_IIS").is_some() {
+        if crate::envflags::env_flag!("EC_IIS") {
             eprintln!(
                 "TRACE iis px={px} py={py} side={side} w={write_w} h={write_h} sg={} mode={mode} skip={skip}",
                 size_group_wh(write_w, write_h)
@@ -23443,7 +23443,7 @@ fn decode_inter_block(
     // equivalent post-content point (added at the matching call site)
     // narrows the ladder to this block's own tail instead of the next
     // block's partition read.
-    if std::env::var_os("EC_AV1_TELL").is_some() {
+    if crate::envflags::env_flag!("EC_AV1_TELL") {
         eprintln!(
             "TELL mi_row={} mi_col={} label=block_end tell={} range={}",
             rmi, cmi, dec.debug_bitpos(), dec.debug_state().0
@@ -23779,7 +23779,7 @@ fn decode_inter_sub8_split4(
         );
         let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
         if !is_inter {
-            if std::env::var_os("EC_SUB8INTRA").is_some() {
+            if crate::envflags::env_flag!("EC_SUB8INTRA") {
                 eprintln!(
                     "EC_SUB8INTRA shape=4x4 sub={i} has_chroma={} skip={skip} mi={rmi},{cmi} tx_select={}",
                     i == 3,
@@ -23825,7 +23825,7 @@ fn decode_inter_sub8_split4(
         // Same print point as the oracle's `EC_MODE` (entry of
         // `read_inter_block_mode_info`, i.e. after skip / is_inter), so the
         // two range ladders line up element for element.
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_MODE mi_row={rmi} mi_col={cmi} rng={}",
                 dec.debug_state().0
@@ -23922,7 +23922,7 @@ fn decode_inter_sub8_split4(
         };
         // Same print point as the oracle's `EC_MODE_MV` (right after
         // `assign_mv`), the second rung of the sub-8x8 range ladder.
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_MODE_MV mi_row={rmi} mi_col={cmi} mv0=({},{}) rng={}",
                 mv.0,
@@ -23947,7 +23947,7 @@ fn decode_inter_sub8_split4(
         } else {
             [3, 3]
         };
-        if std::env::var_os("EC_AV1_IFDBG").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_IFDBG") {
             eprintln!(
                 "IFDBG4 mi=({rmi},{cmi}) ref={ref_frame} above_ref={} above_ref1={:?} \
                  above_filt={:?} left_ref={} left_ref1={:?} left_filt={:?}",
@@ -23977,7 +23977,7 @@ fn decode_inter_sub8_split4(
             left_filter_ctx,
             false,
         );
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_MODE_VAL4 mi_row={rmi} mi_col={cmi} newmv={is_new_mv} globalmv={is_globalmv} \
                  ref0={ref_frame} mv0=({},{}) stack={} rng={}",
@@ -24227,7 +24227,7 @@ fn decode_intra_sub8_leaf(
         .mode_above_mi(lmi.0, lmi.1)
         .unwrap_or(above_mode);
     let leaf_left = neighbours.mode_left_mi(lmi.0, lmi.1).unwrap_or(left_mode);
-    let step = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    let step = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
     // `size_group_lookup[BLOCK_8X4] == size_group_lookup[BLOCK_4X8] == 0`
     // (libaom common_data.h:61).
     let mode = dec.symbol(&mut cdfs.y_mode[0]);
@@ -24735,7 +24735,7 @@ fn decode_inter_sub8_rect2(
         );
         let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
         if !is_inter {
-            if std::env::var_os("EC_SUB8INTRA").is_some() {
+            if crate::envflags::env_flag!("EC_SUB8INTRA") {
                 eprintln!(
                     "EC_SUB8INTRA shape={}x{} sub={i} has_chroma={} skip={skip} mi={rmi},{cmi} tx_select={}",
                     bw,
@@ -24774,7 +24774,7 @@ fn decode_inter_sub8_rect2(
             }
             continue;
         }
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_MODE mi_row={rmi} mi_col={cmi} rng={}",
                 dec.debug_state().0
@@ -24869,7 +24869,7 @@ fn decode_inter_sub8_rect2(
             };
             (mv, false)
         };
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_MODE_MV mi_row={rmi} mi_col={cmi} mv0=({},{}) rng={}",
                 mv.0,
@@ -24936,7 +24936,7 @@ fn decode_inter_sub8_rect2(
             leaves.push((0, 0, bw, bh));
             set_txfm_ctxs(neighbours, lmi, bw.max(bh), w_mi, h_mi, skip);
         }
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_MODE_VALR mi_row={rmi} mi_col={cmi} newmv={is_new_mv} globalmv={is_globalmv} \
                  ref0={ref_frame} mv0=({},{}) stack={} leaves={} rng={}",
@@ -25407,7 +25407,7 @@ fn decode_inter_block8(
     // lane-inter8 r1: mirrors the oracle's `EC_MODE` (instrument rung 4,
     // `read_inter_block_mode_info`) so an 8x8 leaf's mode-info range ladder
     // diffs line for line against a real aomdec.
-    if std::env::var_os("EC_TRACE_MODE").is_some() {
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
         eprintln!(
             "EC_MODE mi_row={} mi_col={} rng={}",
             leaf_mi.0,
@@ -25520,7 +25520,7 @@ fn decode_inter_block8(
                         comp_stack.ref_mv_ctx,
                     )
                 };
-                if std::env::var_os("EC_TRACE_MODE").is_some() {
+                if crate::envflags::env_flag!("EC_TRACE_MODE") {
                     eprintln!(
                         "EC_LEAFMODE mi_row={} mi_col={} cmode={} stack={} newmv_ctx={} refmv_ctx={} rng={}",
                         leaf_mi.0,
@@ -25549,7 +25549,7 @@ fn decode_inter_block8(
                 // lane-inter8 r3: byte-format-identical to the oracle's
                 // rung-4 `EC_MODE_VAL`, so the leaf's mode+mv VALUE ladder
                 // diffs line for line against a real aomdec.
-                if std::env::var_os("EC_TRACE_MODE").is_some() {
+                if crate::envflags::env_flag!("EC_TRACE_MODE") {
                     eprintln!(
                         "EC_MODE_VAL mi_row={} mi_col={} mode={} ref0={} ref1={} mv0=({},{}) rng={}",
                         leaf_mi.0,
@@ -25644,7 +25644,7 @@ fn decode_inter_block8(
                     (8, 8, 1u8)
                 };
                 compound_ctx8 = Some((ref0, ref1, comp_group_idx as u8, compound_idx));
-                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                if crate::envflags::env_flag!("EC_AV1_COMPIDX_DUMP") {
                     eprintln!(
                         "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize=8 mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
                         mv0.0, mv0.1, mv1.0, mv1.1, dec.debug_bitpos()
@@ -26139,7 +26139,7 @@ fn decode_inter_block8(
         // lane-interp3 r2: same per-entry EC_STACK ladder
         // [`decode_inter_block`]'s single-ref arm prints, so this leaf's stack
         // diffs line for line against the oracle's.
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             for (i, e) in stack.entries.iter().enumerate() {
                 eprintln!(
                     "EC_STACK mi_row={mi_row} mi_col={mi_col} ref={ref_frame} i={i} this=({},{}) comp=(0,0) w={}",
@@ -26376,7 +26376,7 @@ fn decode_inter_block8(
             false,
         );
         leaf_filter_syms = resolved_filter;
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_MODE_VAL8 mi_row={} mi_col={} newmv={is_new_mv} globalmv={is_globalmv} ref0={ref_frame} mv0=({},{}) stack={} rng={}",
                 leaf_mi.0,
@@ -26398,7 +26398,7 @@ fn decode_inter_block8(
                 AFFINE_GM_HITS.with(|c| c.set(c.get() + 1));
             }
         }
-        if std::env::var_os("EC_TRACE_MODE").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE") {
             eprintln!(
                 "EC_WARP8 mi_row={} mi_col={} warp={} globalblk={is_global_mv_block}",
                 leaf_mi.0,
@@ -26686,7 +26686,7 @@ fn decode_inter_block8(
         // but `DC_PRED` was refused here, which is what blocked the low-cq
         // CDEF arms and the 10-bit gates.
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
-        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+        if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
             eprintln!(
                 "EC_ISTEP8 mi_row={} mi_col={} name=modes y={mode} uv={uv_mode} fi_enabled={} rng={}",
                 leaf_mi.0,
@@ -26759,7 +26759,7 @@ fn decode_inter_block8(
         // prints `use_filter_intra` for an intra block inside an INTER frame
         // and nothing else, so this leaf needs the same two lines for a
         // range-ladder diff against it.
-        let ec_istep8 = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+        let ec_istep8 = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
         if mode == DC_PRED
             && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
             && let Some(class) = filter_intra_size_class(SIDE)
@@ -27483,7 +27483,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         // lane-comppin r9: tile-entry range, the earliest point comparable
         // against aomdec's own `r->ec.rng` right after `aom_reader_init` -- the
         // first ladder rung before any symbol (partition or otherwise) is read.
-        if std::env::var_os("EC_AV1_TELL").is_some() {
+        if crate::envflags::env_flag!("EC_AV1_TELL") {
             eprintln!(
                 "TELL label=tile_init tell={} range={}",
                 dec.debug_bitpos(),
@@ -27928,9 +27928,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             let part64 = match (has_cols, has_rows) {
                 (true, true) => {
                     let pre_rng = dec.debug_state().0;
-                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PART mi_row={} mi_col={} bsize=12 ctx={} rng={}", sb_r as usize * SB_MI as usize, sb_c as usize * SB_MI as usize, sb_ctx, dec.debug_state().0); }
+                    if crate::envflags::env_flag!("EC_TRACE_PART") { eprintln!("EC_PART mi_row={} mi_col={} bsize=12 ctx={} rng={}", sb_r as usize * SB_MI as usize, sb_c as usize * SB_MI as usize, sb_ctx, dec.debug_state().0); }
                     let p = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
-                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                    if crate::envflags::env_flag!("EC_AV1_TRACE") {
                         eprintln!(
                             "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p} pre_rng={pre_rng}",
                             sb_r * SB_MI,
@@ -27943,7 +27943,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                     // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                     // (libaom `ec_read_partition_impl`).
-                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=12 ctx={} rng={}", sb_r as usize * SB_MI as usize, sb_c as usize * SB_MI as usize, sb_ctx, dec.debug_state().0); }
+                    if crate::envflags::env_flag!("EC_TRACE_PART") { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=12 ctx={} rng={}", sb_r as usize * SB_MI as usize, sb_c as usize * SB_MI as usize, sb_ctx, dec.debug_state().0); }
                     if bump_edge32_bit(
                         4,
                         dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE)),
@@ -28246,7 +28246,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                 );
                 let part32 = if has_cols32 && has_rows32 {
-                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                    if crate::envflags::env_flag!("EC_AV1_TRACE") {
                         eprintln!(
                             "TRACE part32_pre mi=({},{}) rng={}",
                             r32 * BLOCK_MI,
@@ -28254,9 +28254,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             dec.debug_state().0
                         );
                     }
-                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PART mi_row={} mi_col={} bsize=9 ctx={} rng={}", (r32 as usize), (c32 as usize), ctx32, dec.debug_state().0); }
+                    if crate::envflags::env_flag!("EC_TRACE_PART") { eprintln!("EC_PART mi_row={} mi_col={} bsize=9 ctx={} rng={}", (r32 as usize), (c32 as usize), ctx32, dec.debug_state().0); }
                     let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
-                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                    if crate::envflags::env_flag!("EC_AV1_TRACE") {
                         eprintln!(
                             "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p}",
                             r32 * BLOCK_MI,
@@ -28270,7 +28270,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                             // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                             // (libaom `ec_read_partition_impl`).
-                            if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=9 ctx={} rng={}", r32 as usize * BLOCK_MI as usize, c32 as usize * BLOCK_MI as usize, ctx32, dec.debug_state().0); }
+                            if crate::envflags::env_flag!("EC_TRACE_PART") { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=9 ctx={} rng={}", r32 as usize * BLOCK_MI as usize, c32 as usize * BLOCK_MI as usize, ctx32, dec.debug_state().0); }
                             if {
                                         let b = dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE));
                                         bump_edge32(b.min(1) as usize);
@@ -28372,9 +28372,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             // inter leaves through the very same loop the
                             // straddling case has always used.
                             let part16 = if has_cols16 && has_rows16 {
-                                if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PART mi_row={} mi_col={} bsize=6 ctx={} rng={}", (sr as usize*SUB_MI as usize), (sc as usize*SUB_MI as usize), ctx16, dec.debug_state().0); }
+                                if crate::envflags::env_flag!("EC_TRACE_PART") { eprintln!("EC_PART mi_row={} mi_col={} bsize=6 ctx={} rng={}", (sr as usize*SUB_MI as usize), (sc as usize*SUB_MI as usize), ctx16, dec.debug_state().0); }
                                 let p = dec.symbol(&mut cdfs.partition_w16[ctx16]);
-                                if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                if crate::envflags::env_flag!("EC_AV1_TRACE") {
                                     let (rng, _) = dec.debug_state();
                                     eprintln!(
                                         "TRACE partition_w16 mi=({},{}) ctx={ctx16} value={p} rng={rng}",
@@ -28396,7 +28396,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                                     // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                                     // (libaom `ec_read_partition_impl`).
-                                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=6 ctx={} rng={}", sr as usize * SUB_MI as usize, sc as usize * SUB_MI as usize, ctx16, dec.debug_state().0); }
+                                    if crate::envflags::env_flag!("EC_TRACE_PART") { eprintln!("EC_PARTG mi_row={} mi_col={} bsize=6 ctx={} rng={}", sr as usize * SUB_MI as usize, sc as usize * SUB_MI as usize, ctx16, dec.debug_state().0); }
                                     if dec.symbol_fixed(&gather(&cdfs.partition_w16[ctx16], VERT_ALIKE)) == 1 {
                                         PARTITION_SPLIT
                                     } else {
@@ -28780,7 +28780,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 for (mr, mc) in leaf_positions {
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
-                                    if std::env::var_os("EC_TRACE_PART").is_some() { eprintln!("EC_PART mi_row={} mi_col={} bsize=3 ctx={} rng={}", leaf_mi.0, leaf_mi.1, leaf_ctx, dec.debug_state().0); }
+                                    if crate::envflags::env_flag!("EC_TRACE_PART") { eprintln!("EC_PART mi_row={} mi_col={} bsize=3 ctx={} rng={}", leaf_mi.0, leaf_mi.1, leaf_ctx, dec.debug_state().0); }
                                     let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                     if part8 == PARTITION_SPLIT {
                                         // lane-intersub8: four BLOCK_4X4 inter
@@ -29902,9 +29902,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
     // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
-    if std::env::var_os("EC_OBMC").is_some()
-        || std::env::var_os("EC_TRACE_MODE").is_some()
-        || std::env::var_os("EC_PRED").is_some()
+    if crate::envflags::env_flag!("EC_OBMC")
+        || crate::envflags::env_flag!("EC_TRACE_MODE")
+        || crate::envflags::env_flag!("EC_PRED")
     {
         eprintln!(
             "EC_PICT idx={}",
@@ -29912,7 +29912,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         );
     }
     dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
+    if let Ok(path) = crate::envflags::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
@@ -30632,8 +30632,8 @@ mod tests {
             .is_ok_and(|s| s.success());
         assert!(
             present
-                || (std::env::var_os("EC_AV1_REQUIRE_FFMPEG").is_none()
-                    && std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none()),
+                || (!crate::envflags::env_flag!("EC_AV1_REQUIRE_FFMPEG")
+                    && !crate::envflags::env_flag!("EC_AV1_REQUIRE_AOMENC")),
             "EC_AV1_REQUIRE_FFMPEG/EC_AV1_REQUIRE_AOMENC is set but no working ffmpeg on PATH"
         );
         present

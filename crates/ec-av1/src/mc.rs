@@ -375,7 +375,7 @@ pub fn predict_with_filters_kern(
     let xfrac = x_q4.rem_euclid(16) as usize;
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
-    if std::env::var_os("EC_MC_TRACE").is_some() && block_w >= 4 {
+    if crate::envflags::env_flag!("EC_MC_TRACE") && block_w >= 4 {
         eprintln!(
             "EC_MC_CALL x_q4={x_q4} y_q4={y_q4} w={block_w} h={block_h} xfrac={xfrac} yfrac={yfrac} hk={h_kind:?} vk={v_kind:?} tw={true_width} th={true_height} stride={stride}"
         );
@@ -774,7 +774,7 @@ pub fn predict_compound_intermediate_kern(
 
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
-    if std::env::var_os("EC_MC_TRACE").is_some() {
+    if crate::envflags::env_flag!("EC_MC_TRACE") {
         eprintln!("EC_MC_COMP x_q4={x_q4} y_q4={y_q4} w={block_w} h={block_h} hk={h_kind:?} vk={v_kind:?}");
     }
 
