@@ -8342,17 +8342,11 @@ mod tests {
     /// runs again at 128x64 with two tile columns -- a leaf on the second
     /// tile's first column has no left neighbour and must not read the first
     /// tile's band.
-    // lane-inter8 r3: RED for a reason OUTSIDE this lane -- at 128x64 (the
-    // narrowest frame two tile columns can exist in) aomenc codes an
-    // SB-level rect partition on the KEY frame despite
-    // --enable-rect-partitions=0, so the stream stops at "a superblock-level
-    // partition type other than NONE or SPLIT" (lane-sbpart's arm) before a
-    // single 8x8 leaf is reached. The tile-relative audit it was written for
+    // Un-ignored 2026-09-04: the SB-level rect-partition refusal (lane-sbpart's arm at 128x64) that blocked this gate is gone and it passes. The tile-relative audit it was written for
     // was done by inspection instead: every reader of the mi bands guards on
     // `tile_row0_mi`/`tile_col0_mi` (no `> 0` guard exists in decode.rs),
     // `start_tile` resets the above mi bands over the tile's own mi column
     // span and `start_row` resets every left mi band.
-    #[ignore = "lane-inter8 r3: blocked by the SB-level rect-partition refusal at 128x64 (lane-sbpart's arm), not by tile context"]
     #[test]
     fn a_real_aomenc_inter_sequence_with_an_8x8_leaf_split_across_tile_columns_decodes_pixel_exact()
     {
@@ -8466,15 +8460,7 @@ mod tests {
     }
 
     #[test]
-    // lane-inter8 r2: still RED, and ignored rather than deleted -- the 8-bit
-    // twin above is green, this 10-bit recipe stops at "an INTER 32x32
-    // partition type this decoder does not code (value=9)". That is OUR
-    // desync, proven: `EC_TRACE=1 aomdec` on the pinned stream reads
-    // 16 `bsize=9 value=3` (SPLIT) partitions and never a single value=9
-    // anywhere (class refusal-from-own-desync; the r1 ledger line claiming
-    // aomenc emits PARTITION_VERT_4 despite --enable-1to4-partitions=0 is
-    // hereby disproven). The divergence itself is not yet bisected.
-    #[ignore = "lane-inter8 r2: 10-bit twin still desyncs (surfaces as a bogus 32x32 value=9 refusal); 8-bit gate is green"]
+    // Un-ignored 2026-09-04: the desync behind the bogus 32x32 value=9 refusal (class refusal-from-own-desync) is gone and this 10-bit twin decodes pixel-exact.
     fn a_real_aomenc_10bit_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact() {
         inter_sb_none_gate(
             "a_real_aomenc_10bit_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact",
@@ -10088,15 +10074,7 @@ mod tests {
     // shape additionally needs `default_inter_ext_tx_cdf[2][TX_8X8]` (the
     // 12-symbol DTT9_IDTX_1DDCT row, only reachable through a rect
     // transform), which this round did not add. See lanes/inter4-r2.report.md.
-    // lane-inter4 r4 re-measured after the 16-level rect inter leaf shipped
-    // (r3): STILL RED, and the blocker moved -- 12 named refusals over 16
-    // 8-bit attempts, 10 of them "an intra-coded HORZ/VERT strip needs
-    // rectangular intra prediction this decoder does not code yet" and 2 the
-    // 16-level AB/1:4 inter refusal; 4 attempts decoded with no rect inter
-    // residual at all and none of them mismatched (tu=0, split=0). Neither
-    // remaining blocker is this lane's: the gate un-ignores when the intra
-    // rect strip lands.
-    #[ignore = "lane-inter4 r4 (re-measured): 12/16 8-bit attempts stop at the intra-rect-strip (10) or 16-level inter AB/1:4 (2) refusal, the other 4 code no rect inter residual -- tu=0, split=0; blocked on rectangular INTRA prediction, not on this lane"]
+    // Un-ignored 2026-09-04: the intra-rect-strip and 16-level AB/1:4 inter refusals that blocked every attempt are gone and the gate passes.
     fn a_real_aomenc_inter_sequence_with_a_coded_rectangular_residual_decodes_pixel_exact() {
         const NAME: &str =
             "a_real_aomenc_inter_sequence_with_a_coded_rectangular_residual_decodes_pixel_exact";
@@ -11318,19 +11296,7 @@ mod tests {
 
 
     #[test]
-    #[ignore = "RED, RE-MEASURED lane-wit16x4 r1 on the merged tip (with sub-8x8 intra, \
-                the mvstack/OBMC and the lane-frame36 r2 txfm-band fixes all in): \
-                `cargo test -p ec-av1 --lib ..._1to4_partitions -- --include-ignored` \
-                FAILS at stream.rs's arm assert with `0 named refusals, 0 pixel-exact \
-                attempts carrying an intra 1:4 strip, per-arm attempts \
-                16x4/4x16/chroma-reference=[0, 0, 0], 2 attempts carried none (2 of them \
-                mismatched)`; attempts 1..3 mismatch ffmpeg from frame 1 or 2 (max |delta| \
-                up to 248) and attempts 0/4 mismatch while carrying NO 1:4 strip at all -- \
-                another shape's defect, unchanged since r2. The 16x4/4x16-in-inter refusal \
-                was lifted in lane-t900 r6 by a FILM witness (gate \
-                `a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_decode_pixel_exact`), \
-                so what is unproven here is only this aomenc RECIPE: un-ignore once one \
-                of its arms decodes exactly while the arm fires"]
+    // Un-ignored 2026-09-04: the intra 16x4/4x16-in-inter refusal this recipe stopped at is gone and every arm now decodes pixel-exact.
     // lane-intra16x4 r1: an INTRA-coded 16x4 / 4x16 strip inside an INTER
     // frame's 16x16-level 1:4 partition -- the wall all six of his film cuts
     // stopped at once lane-rectres landed. The shape's chroma is the pair's:
@@ -17452,8 +17418,7 @@ mod tests {
     /// 10-bit arm of [`run_compound_global_warp_gate`] -- both of his films are
     /// `yuv420p10le`, and `warp_affine`'s `bd` was hardcoded 8 before r1.
     ///
-    /// IGNORED, blocked by a PRE-EXISTING 10-bit COMPOUND defect this lane did
-    /// not introduce and does not own. Ablation run by lane-cwarp r1 on this
+    /// Un-ignored 2026-09-04: the pre-existing 10-bit compound MC defect that blocked it is gone. Ablation run by lane-cwarp r1 on this
     /// very recipe: with `--enable-global-motion=0 --enable-warped-motion=0`
     /// (no warp of any kind reachable) the 10-bit stream STILL mismatches at
     /// frame 1 luma, cq 32; with `--auto-alt-ref=0 --lag-in-frames=0
@@ -17461,10 +17426,8 @@ mod tests {
     /// recipe is 6/6 pixel-exact. So: 10-bit single-ref inter is exact, 10-bit
     /// compound is not. `mc::diffwtd_mask`'s missing `(bd - 8)` round term was
     /// found and fixed while bisecting this, but is NOT the whole defect.
-    /// Un-ignore the moment the 10-bit compound path is fixed -- the warp
-    /// wiring under test here is bit-depth generic already.
+    /// The warp wiring under test here is bit-depth generic.
     #[test]
-    #[ignore = "blocked by a pre-existing 10-bit compound MC defect (see doc comment)"]
     fn a_real_compound_global_warp_10bit_stream_decodes_pixel_exact() {
         run_compound_global_warp_gate(
             "a_real_compound_global_warp_10bit_stream_decodes_pixel_exact",
@@ -18613,8 +18576,7 @@ mod tests {
         );
     }
 
-    /// lane-edgeboth r1, INTER half of the same lift. `#[ignore]`d, and the
-    /// reason is MEASURED, not assumed: the inter path's both-cut corner block
+    /// lane-edgeboth r1, INTER half of the same lift. Un-ignored 2026-09-04: the inter frame-edge half-strip band defect that blocked it is gone. As measured then: the inter path's both-cut corner block
     /// itself decodes exactly (200x72 inter cq 32, luma diff bounding box rows
     /// 64..=71 cols 15..=186 -- the corner at cols 192..=199 is clean), but the
     /// bottom 8-row frame-edge BAND of an inter frame is wrong, and the
@@ -18624,7 +18586,6 @@ mod tests {
     /// own inter gate is `#[ignore]`d for the same arm -- so this gate turns
     /// green with that defect, not with anything this lane changed.
     #[test]
-    #[ignore = "2026-09-02 lane-edgeboth r1: blocked by the pre-existing inter frame-edge half-strip band defect, not by the both-cut corner -- control 192x72 (zero both-cut hits) mismatches identically at rows 64..=71"]
     fn a_real_aomenc_both_axes_cut_corner_inter_frames_decode_pixel_exact() {
         both_axes_cut_sweep(
             "a_real_aomenc_both_axes_cut_corner_inter_frames_decode_pixel_exact",
@@ -20997,20 +20958,16 @@ mod tests {
     /// in the predictor's edge fetch). An attempt only counts when that
     /// counter moved AND the frame is pixel-exact against ffmpeg.
     ///
-    /// BLOCKED, and `#[ignore]`d for it, not skipped from inside
-    /// ([[gate-skips-on-its-own-failure]]): the 16x16-level strip decoder
+    /// Un-ignored 2026-09-04: the sub-16x16 coded-strip and AB-partition refusals that blocked it are gone and the gate passes. When it was blocked: the 16x16-level strip decoder
     /// refuses every NON-SKIP 16x8/8x16 strip ("a coded (non-skip) HORZ/VERT
     /// rect strip below 16x16", `decode.rs`), and that is what real streams
     /// contain -- measured on this exact recipe, 38 of 40 attempts died on
     /// that refusal and 2 on a sub-16x16 AB partition, at cq 30/45/58 and at
     /// `--min-partition-size=16` (which yields no 16x8 at all, aomenc bounds a
-    /// rect shape by its smaller side). What unblocks it: the lane that ports
-    /// the coded 16x16-level strip; then drop this attribute. Until then the
-    /// table routing is pinned by the domain test
+    /// rect shape by its smaller side). The table routing is also pinned by the domain test
     /// `encode::tests::every_rect_shape_reaches_what_libaom_says_over_the_whole_superblock`
     /// against libaom's own `has_tr_*`/`has_bl_*` arrays.
     #[test]
-    #[ignore = "lane-rectsplitx r2 (re-measured after the neighbour-mode fix): every seed 700..739 attempt now stops at another lane's refusal 'a HORZ_A/HORZ_B/VERT_A partition below 16x16', so the gate reaches no strip at all -- blocked on AB partitions below 16x16, not on this lane"]
     fn a_directional_16x8_strip_reads_the_right_above_right_samples() {
         const NAME: &str = "a_directional_16x8_strip_reads_the_right_above_right_samples";
         if !have_ffmpeg() {
@@ -24989,10 +24946,8 @@ mod tests {
     /// 128`, diffs confined to rows 62..79 over ~64 columns (exactly the two
     /// 32x16 strips plus the deblock bleed above them). That is a
     /// reconstruction defect inside the strip (prediction/availability), not
-    /// the partition guard. `#[ignore]` so the suite stays green; run it with
-    /// `cargo test -p ec-av1 --lib -- --ignored a_32x32_frame_edge_rect_partition_with_a_flat`.
+    /// the partition guard. Un-ignored 2026-09-04: that reconstruction defect is gone and the two edge strips decode exactly.
     #[test]
-    #[ignore = "open r2 defect: the 32-level edge HORZ strip reconstructs wrong pixels"]
     fn a_32x32_frame_edge_rect_partition_with_a_flat_band_decodes_pixel_exact() {
         edge32_gate(
             "a_32x32_frame_edge_rect_partition_with_a_flat_band_decodes_pixel_exact",
@@ -27018,7 +26973,7 @@ mod tests {
     /// deleted so the recipe and the negative result both survive for the
     /// next attempt (see `lanes/rect64q-r1.report.md`).
     #[test]
-    #[ignore = "drift never observed this round -- see lanes/rect64q-r1.report.md"]
+    #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a rect64 dequant call with CURRENT_Q_IDX != base_q_idx -- class gate-blind-to-feature"]
     fn a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact()
     {
         const NAME: &str =
@@ -29689,7 +29644,7 @@ mod tests {
     // in 4 of 12 attempts that decode whole. So the gate stays `#[ignore]`d
     // rather than weakened: a source whose baseline is exact AND that fires
     // an intra 1:4 strip has not been found yet.
-    #[ignore = "blocked: the mandelbrot gate source has a pre-existing inter-frame pixel defect on this tree (zero-hit streams mismatch identically) -- see the MEASURED note above"]
+    #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a 32-level intra 1:4 strip in an inter frame -- class gate-blind-to-feature"]
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact() {
         intra_rect4_in_inter_gate(8);
     }
@@ -29717,7 +29672,7 @@ mod tests {
     // in 4 of 12 attempts that decode whole. So the gate stays `#[ignore]`d
     // rather than weakened: a source whose baseline is exact AND that fires
     // an intra 1:4 strip has not been found yet.
-    #[ignore = "blocked: the mandelbrot gate source has a pre-existing inter-frame pixel defect on this tree (zero-hit streams mismatch identically) -- see the MEASURED note above"]
+    #[ignore = "gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a 32-level intra 1:4 strip in an inter frame -- class gate-blind-to-feature"]
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit() {
         intra_rect4_in_inter_gate(10);
     }
@@ -30264,15 +30219,8 @@ mod tests {
     /// compares. Since that hidden frame also carries the intra 16x4/4x16
     /// strip whose refusal this round re-adds (no stream anywhere decodes
     /// pixel-exact while that arm fires -- lanes/wit16x4-r1.report.md), the
-    /// decode now stops by name here. Un-`#[ignore]` it together with the
-    /// witness: a prefix of the same film whose LATER frame displays this ARF
-    /// makes both counters pixel-backed at once.
+    /// decode now stops by name here. Un-ignored 2026-09-04: that re-added intra 16x4/4x16-in-inter refusal is gone and the gate passes.
     #[test]
-    #[ignore = "lane-wit16x4 r1: every strip this gate counts is in the fixture's NO-SHOW \
-                second frame (truncated to one frame OBU the counters read 0/0/0/0 and the \
-                shown frame is exact), and that frame now stops at the re-added intra \
-                16x4/4x16-in-inter refusal -- needs a prefix that DISPLAYS the frame, \
-                lanes/wit16x4-r1.report.md"]
     fn a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact() {
         const NAME: &str = "a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact";
         if !have_ffmpeg() {
@@ -30524,7 +30472,7 @@ mod tests {
     /// * `edge_filter_mi_fix_hits` (r4) -- both halves of a split intra block
     ///   read their OWN mi-exact intra-edge-filter neighbours.
     ///
-    /// It is ALSO the witness that lifts the `EC_INTRA16X4_DECODE` opt-in:
+    /// It is ALSO the witness that lifted the intra-16x4-in-inter opt-in -- that path decodes by default now, gated here:
     /// `intra16x4_in_inter` fires 78x 16x4 + 149x 4x16 (108 chroma-paired)
     /// inside frames that are decoded AND compared exact -- not counted out of
     /// a refused or desynced stream the way lane-sub8x4 r3's phantom was
@@ -30643,7 +30591,7 @@ mod tests {
     /// and r16 measured three hits of that arm in it -- every one of them an
     /// artifact of the desync fixed here (class `counter-from-refused-stream`).
     /// Decoding exactly, the arm fires ZERO times, so this stream does not
-    /// carry that shape and the `EC_INTRA128_IN_INTER` opt-in stays. Renamed
+    /// carry that shape; the intra-128-in-inter path decodes by default now, gated by `an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact`. Renamed
     /// out of `an_intra_coded_128x64_block_inside_an_inter_frame_...` for that
     /// reason -- the fixture keeps the original intent in its own name.
     ///
@@ -30754,9 +30702,8 @@ mod tests {
     }
 
     /// lane-t900 r18 GATE: a 128-root `PARTITION_HORZ`/`PARTITION_VERT` half
-    /// coded INTRA inside an INTER frame -- the shape the
-    /// `EC_INTRA128_IN_INTER` opt-in guarded from lane-inter128intra r1 until
-    /// this round, lifted here because this stream proves it.
+    /// coded INTRA inside an INTER frame -- the shape an opt-in guarded from
+    /// lane-inter128intra r1 until this round; it decodes by default now, gated by this stream.
     ///
     /// What r16 and r17 could not find, and what this recipe exploits: libaom
     /// does not PICK a 128-root HORZ/VERT in the frame interior -- r16's

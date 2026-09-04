@@ -88,7 +88,7 @@ const REFUSALS: &[&str] = &[
     // lane-sub8x4 r3 narrowed this to "a strip with no chroma-pair record";
     // lane-wit16x4 r1 put it back at FULL width (r3's witness counters were
     // phantoms of a desync, class `refusal-lifted-without-a-gate`) behind
-    // `EC_INTRA16X4_DECODE`. lane-t900 r6 NARROWED it again -- the opt-in is
+    // an opt-in. lane-t900 r6 NARROWED it again -- the opt-in is
     // gone -- on a real 10-bit 1920x792 128-superblock film witness that
     // decodes 14/14 decode-order frames exact vs aomdec and 12/12 shown frames
     // exact vs ffmpeg while the arm fires 78 16x4 + 149 4x16 (108 chroma-
