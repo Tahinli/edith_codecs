@@ -140,6 +140,20 @@ const REFUSALS: &[&str] = &[
     // `refusal-lifted-without-a-gate`). What is still untried: a 10-bit
     // source, and screen content in the forced bands with a NON-screen
     // interior.
+    // lane-t900 r31, ENUMERATION: the premise is DISPROVED -- `av1_allow_palette`'s
+    // bound (`palette_bsize_ctx_wh`: `bw > 64 || bh > 64`) rejects every
+    // footprint with a 128-pixel side, so a screen-content frame codes no
+    // palette syntax on a 128-root half and that half decodes exactly like the
+    // non-screen twin r18 already witnesses (test
+    // `no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax`).
+    // The string is a claim about the SYNTAX, and the syntax it fears does not
+    // exist at this size. It stays UNPROVEN and live for two reasons: the
+    // guarded condition is reachable (proving the lift safe is not proving the
+    // case absent), and lifting it is a `decode.rs` edit -- delete the
+    // `if allow_screen_content_tools { return Err(unsupported(..)) }` block
+    // inside the `bw.max(bh) == 128` branch of `decode_intra_rect_in_inter`
+    // -- which needs a `--sb-size=128 --tune-content=screen` witness that
+    // actually codes a 128-root half (r23's census found none).
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "a motion_mode symbol for a block shape with no CDF row here",
 ];
@@ -359,6 +373,20 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
         "an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name",
+    ),
+    // lane-t900 r31, census + refusal-by-name: 13 real `--tune-content=screen
+    // --enable-intrabc=1` key frames measure this string instead of assuming
+    // it. The refusal is NOT unreachable -- an exact-repetition source
+    // (a 2x2 tiling of one bar pattern) with the rect/1:4 partitions off codes
+    // an unskipped intrabc block on a square block of a TX_MODE_SELECT frame,
+    // and exactly that arm refuses by name while the other twelve decode
+    // pixel-exact. So it is a real capability gap with a waiting witness gate
+    // (`an_intrabc_block_under_tx_mode_select_decodes_pixel_exact`, ignored),
+    // and libaom does not couple the two bits: `select_tx_mode`
+    // (encodeframe.c:2355) never reads `allow_intrabc`.
+    (
+        "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
+        "an_intrabc_census_over_screen_key_frames_measures_the_tx_select_refusal",
     ),
 ];
 
@@ -973,6 +1001,79 @@ mod tests {
             );
         }
         assert_eq!(sites, 3, "the intra-mode guard is at three sites, found {sites}");
+    }
+
+    /// lane-t900 r31, ENUMERATION for "a HORZ/VERT intra strip in a
+    /// screen-content frame (palette syntax is consumed for square blocks
+    /// only)".
+    ///
+    /// That refusal guards the 128-root HORZ/VERT arm of the intra-in-inter
+    /// path (`decode.rs`, the `bw.max(bh) == 128` branch): the body it calls,
+    /// `decode_block_128rect`, reads no palette syntax, so a screen-content
+    /// frame was assumed to code some there. It cannot. `av1_allow_palette`
+    /// (spec 5.11.46 `read_palette_mode_info`: `bsize` between `BLOCK_8X8`
+    /// and `BLOCK_64X64` by side) is what this decoder mirrors in
+    /// `palette_bsize_ctx_wh`, whose bound is `bw > 64 || bh > 64 ||
+    /// bw * bh < 64`. Every footprint with a 128-pixel side fails it, so the
+    /// screen flag changes NOTHING a 128-root half codes -- the refusal's
+    /// stated premise is false, and the string is a claim about the SYNTAX
+    /// (provable, and disproved here) rather than about libaom.
+    ///
+    /// It is deliberately NOT registered in [`PROVEN`]: the guarded condition
+    /// is still reachable (a screen frame CAN code a 128-root half), so this
+    /// test proves the LIFT is safe, not that the case never happens. Lifting
+    /// it is a `decode.rs` edit plus a witness stream, and no `--sb-size=128
+    /// --tune-content=screen` encode found so far codes a 128-root half at all
+    /// (lane-t900 r23's census).
+    ///
+    /// The bound is asserted against `decode.rs`'s own source rather than a
+    /// copy of it here, so a change to the predicate breaks this test rather
+    /// than silently invalidating it (class `table-and-reader-move-together`).
+    #[test]
+    fn no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax() {
+        const BOUND: &str = "if bw > 64 || bh > 64 || bw * bh < 64 {";
+        let src = include_str!("decode.rs");
+        assert!(
+            src.contains("fn palette_bsize_ctx_wh(bw: usize, bh: usize) -> Option<usize> {"),
+            "palette_bsize_ctx_wh is gone -- this enumeration no longer names the predicate \
+             the decoder gates every palette read on"
+        );
+        assert_eq!(
+            src.matches(BOUND).count(),
+            1,
+            "av1_allow_palette's size bound is no longer spelled {BOUND:?} exactly once in \
+             decode.rs -- re-derive this enumeration from the new spelling"
+        );
+        // `palette_bsize_ctx_wh`'s own bound, applied to every AV1 block
+        // footprint (both sides a power of two from 4 to 128).
+        let allows_palette = |bw: usize, bh: usize| !(bw > 64 || bh > 64 || bw * bh < 64);
+        let (mut with_128, mut allowed_at_128) = (0u32, 0u32);
+        for wl in 2..=7u32 {
+            for hl in 2..=7u32 {
+                let (bw, bh) = (1usize << wl, 1usize << hl);
+                if bw.max(bh) != 128 {
+                    continue;
+                }
+                with_128 += 1;
+                if allows_palette(bw, bh) {
+                    allowed_at_128 += 1;
+                }
+            }
+        }
+        assert!(with_128 > 0, "enumeration is vacuous -- no 128-sided footprint was tried");
+        assert_eq!(
+            allowed_at_128, 0,
+            "a footprint with a 128-pixel side passed av1_allow_palette's bound -- the \
+             128-root HORZ/VERT arm really would have to read palette syntax"
+        );
+        // And the guarded shapes specifically: the two 128-root HORZ/VERT
+        // halves the refusal names.
+        for (bw, bh) in [(128usize, 64usize), (64, 128)] {
+            assert!(
+                !allows_palette(bw, bh),
+                "a {bw}x{bh} half can carry a palette after all"
+            );
+        }
     }
 
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
