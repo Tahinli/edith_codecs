@@ -1727,6 +1727,24 @@ pub(crate) fn reset_palette_sb_strip_hits() {
     PALETTE_SB_STRIP_HITS.with(|c| c.set(0));
 }
 
+// lane-t900 r22: palette blocks reconstructed inside an INTER frame (the
+// intra-in-inter path, `decode_inter_block`/`decode_inter_block8`) -- counted
+// apart from [`PALETTE_HITS`] so a witness gate can prove the INTER-frame
+// capability rather than the key frame's, which every screen stream also
+// carries.
+thread_local! {
+    static INTRA_IN_INTER_PALETTE_Y_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTRA_IN_INTER_PALETTE_UV_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current values of the two intra-in-inter palette counters, `(y, uv)`.
+pub(crate) fn intra_in_inter_palette_hits() -> (usize, usize) {
+    (
+        INTRA_IN_INTER_PALETTE_Y_HITS.with(|c| c.get()),
+        INTRA_IN_INTER_PALETTE_UV_HITS.with(|c| c.get()),
+    )
+}
+
 // lane-hgkf r2: SKIPPED intra blocks whose `tx_depth` split the luma transform
 // and which are therefore predicted one transform unit at a time (a skipped
 // block codes no coefficients, so nothing else in the stream witnesses this
@@ -6904,7 +6922,7 @@ fn read_intra_mode_rect(
         if use_palette_y {
             if palette.is_none() {
                 return Err(unsupported(
-                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+                    "a block that actually uses a palette (Y@rect) -- reconstruction is out of scope",
                 ));
             }
             let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
@@ -8015,24 +8033,35 @@ fn decode_intra_rect_in_inter(
     // frame writes `palette_y_mode`/`palette_uv_mode` for every block whose
     // shape [`palette_bsize_ctx_wh`] admits, intra strips included, so
     // skipping the syntax here desynced the tile at the strip's own symbol.
-    // No block this decoder produces can USE a palette (the arms below refuse
-    // by name), so the neighbour mode context is 0 and there is no cache --
-    // the same stand-in [`read_intra_mode_rect`] uses when its caller has none.
+    // lane-t900 r22: reconstructed, not refused -- the strip's real mode
+    // context and colour cache at its own mi position, and the two
+    // colour-index maps decoded after `filter_intra` (`av1_visit_palette`),
+    // exactly as [`read_intra_mode_rect`] does on the key-frame path.
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi((mi_r, mi_c));
+    let palette_uv_cache = neighbours.palette_uv_cache_mi((mi_r, mi_c));
+    let mut palette_y_pending: Option<(usize, [u16; 8])> = None;
+    let mut palette_uv_pending: Option<(usize, [u16; 8], [u16; 8])> = None;
     if allow_screen_content_tools
         && let Some(bsize_ctx) = palette_bsize_ctx_wh(bw, bh)
     {
         INTRA_RECT_IN_INTER_SCREEN_HITS.with(|c| c.set(c.get() + 1));
-        if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
-            return Err(unsupported(
-                "a block that actually uses a palette (Y) -- reconstruction is out of scope",
-            ));
+        let use_palette_y =
+            mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][palette_ctx]) != 0;
+        if use_palette_y {
+            let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
+            palette_y_pending = Some((n, read_palette_colors_y(dec, n, &palette_cache)));
         }
         // A 2:1 strip of at least 8x8 is always a chroma reference, so
         // `read_palette_mode_info`'s `xd->is_chroma_ref` guard holds here.
-        if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
-            return Err(unsupported(
-                "a block that actually uses a palette (UV) -- reconstruction is out of scope",
-            ));
+        let use_palette_uv =
+            uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
+        if crate::envflags::env_flag!("EC_PALSYN") {
+            eprintln!("EC_PALSYN rect mi={mi_r},{mi_c} bw={bw} bh={bh} mode={mode} uv={uv_mode} ctx={palette_ctx} y={} uv={} rng={}", use_palette_y as i32, use_palette_uv as i32, dec.debug_state().0);
+        }
+        if use_palette_uv {
+            let n = 2 + dec.symbol(&mut cdfs.palette_uv_size[bsize_ctx]);
+            let (u_colors, v_colors) = read_palette_colors_uv(dec, n, &palette_uv_cache);
+            palette_uv_pending = Some((n, u_colors, v_colors));
         }
     }
     // lane-fiinter (merged on main for the square intra-in-inter arm):
@@ -8044,6 +8073,8 @@ fn decode_intra_rect_in_inter(
     let mut filter_intra = None;
     if mode == DC_PRED
         && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
+        // `av1_filter_intra_allowed` excludes a palette-Y block.
+        && palette_y_pending.is_none()
         && let Some(class) = filter_intra_size_class_rect(bw, bh)
         && dec.symbol(&mut cdfs.filter_intra[class]) != 0
     {
@@ -8051,6 +8082,24 @@ fn decode_intra_rect_in_inter(
         INTRA_IN_INTER_FILTER_INTRA_HITS.with(|h| h.set(h.get() + 1));
         filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
     }
+    // `av1_visit_palette`: Y's colour-index map then the shared chroma one.
+    let palette_y = palette_y_pending.map(|(n, colors)| {
+        let map = decode_color_index_map_wh(dec, cdfs, n, bw, bh, false);
+        PALETTE_HITS.with(|c| c.set(c.get() + 1));
+        PALETTE_RECT_HITS.with(|c| c.set(c.get() + 1));
+        INTRA_IN_INTER_PALETTE_Y_HITS.with(|c| c.set(c.get() + 1));
+        if crate::envflags::env_flag!("EC_PALII") {
+            eprintln!("EC_PALII yrect mi={mi_r},{mi_c} bw={bw} bh={bh} n={n} skip={skip}");
+        }
+        PaletteY { size: n, colors, map }
+    });
+    let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
+        let (cw, ch) = ((bw / 2).max(4), (bh / 2).max(4));
+        let map = decode_color_index_map_wh(dec, cdfs, n, cw, ch, true);
+        PALETTE_UV_HITS.with(|c| c.set(c.get() + 1));
+        INTRA_IN_INTER_PALETTE_UV_HITS.with(|c| c.set(c.get() + 1));
+        PaletteUv { size: n, u_colors, v_colors, map }
+    });
     // The intra-edge filter type is the NEIGHBOUR's mode (libaom
     // `get_filt_type`), luma's off the luma neighbours and chroma's off the
     // chroma ones -- [`decode_block_rect`]'s own pair.
@@ -8127,10 +8176,15 @@ fn decode_intra_rect_in_inter(
         filter_intra,
         smooth_neighbor,
         smooth_neighbor_uv,
-        // screen-content frames are refused whole above, so this strip can
-        // carry no palette.
-        palette_y: None,
-        palette_uv: None,
+        palette_y: palette_y
+            .as_ref()
+            .map(|p| p.map.iter().map(|&i| p.colors[i as usize]).collect()),
+        palette_uv: palette_uv.as_ref().map(|p| {
+            (
+                p.map.iter().map(|&i| p.u_colors[i as usize]).collect(),
+                p.map.iter().map(|&i| p.v_colors[i as usize]).collect(),
+            )
+        }),
     };
     decode_rect_split(
         dec,
@@ -8164,6 +8218,18 @@ fn decode_intra_rect_in_inter(
             *cell = tx_h as u8;
         }
     }
+    // The strip's own palette state into the mi-granular neighbour bands, so
+    // the next block's colour cache and `palette_y_mode` context are libaom's.
+    record_strip_palette(
+        neighbours,
+        (mi_r, mi_c),
+        bw,
+        bh,
+        palette_y.as_ref().map_or(0, |p| p.size),
+        palette_y.as_ref().map_or([0u16; 8], |p| p.colors),
+        palette_uv.as_ref().map_or(0, |p| p.size),
+        palette_uv.as_ref().map_or([0u16; 8], |p| p.u_colors),
+    );
     let class = match bw.max(bh) {
         64 => 0,
         32 => 1,
@@ -10825,7 +10891,7 @@ fn read_intra_mode(
         if use_palette_y {
             if palette.is_none() {
                 return Err(unsupported(
-                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+                    "a block that actually uses a palette (Y@square) -- reconstruction is out of scope",
                 ));
             }
             let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
@@ -20692,6 +20758,13 @@ fn decode_inter_block(
     // than one luma transform -- read back by the residual loop, the
     // coefficient-context write-back and the loop-filter grid fill below.
     let mut vartx_leaves: Option<Vec<(usize, usize, usize, usize)>> = None;
+    // lane-t900 r22: this block's own palette state, stamped into the
+    // mi-granular neighbour bands at the tail below for EVERY block --
+    // libaom's `MB_MODE_INFO.palette_size` is 0 on an inter block, and
+    // `av1_get_palette_cache`/`av1_get_palette_mode_ctx` read those cells, so
+    // leaving a previous palette block's colours standing here would feed the
+    // next intra block a cache libaom never builds.
+    let mut palette_record: (usize, [u16; 8], usize, [u16; 8]) = (0, [0u16; 8], 0, [0u16; 8]);
     let at_mi = at;
     // lane-vert46 r1: set when this block's chroma was coded as one 32x32 unit
     // per 64x64 "mu" chunk (any side above 64), so the end-of-block record
@@ -23377,18 +23450,36 @@ fn decode_inter_block(
         // by the block's TRUE footprint -- a rect strip's row is not its
         // enclosing square's, and a 16x4 strip (64 pixels) reads no palette
         // symbol at all.
+        // lane-t900 r22: reconstructed, not refused. Same syntax and same
+        // deferral of the colour-index maps past `filter_intra`
+        // (`av1_visit_palette` runs from `parse_decode_block`, after the whole
+        // mode-info read) as the key frame's [`read_intra_mode`]; the mode
+        // context and colour cache are this block's real above/left ones, at
+        // its own mi position (`av1_get_palette_mode_ctx`/
+        // `av1_get_palette_cache`), not the hardcoded 0/empty pair the refusal
+        // could get away with while no neighbour could ever be a palette.
+        let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi((rmi, cmi));
+        let palette_uv_cache = neighbours.palette_uv_cache_mi((rmi, cmi));
+        let mut palette_y_pending: Option<(usize, [u16; 8])> = None;
+        let mut palette_uv_pending: Option<(usize, [u16; 8], [u16; 8])> = None;
         if allow_screen_content_tools
             && let Some(bsize_ctx) = palette_bsize_ctx_wh(write_w, write_h)
         {
-            if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
-                return Err(unsupported(
-                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
-                ));
+            let use_palette_y =
+                mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][palette_ctx]) != 0;
+            if use_palette_y {
+                let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
+                palette_y_pending = Some((n, read_palette_colors_y(dec, n, &palette_cache)));
             }
-            if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
-                return Err(unsupported(
-                    "a block that actually uses a palette (UV) -- reconstruction is out of scope",
-                ));
+            let use_palette_uv =
+                uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
+            if crate::envflags::env_flag!("EC_PALSYN") {
+                eprintln!("EC_PALSYN sq mi={rmi},{cmi} bw={write_w} bh={write_h} mode={mode} uv={uv_mode} ctx={palette_ctx} y={} uv={} rng={}", use_palette_y as i32, use_palette_uv as i32, dec.debug_state().0);
+            }
+            if use_palette_uv {
+                let n = 2 + dec.symbol(&mut cdfs.palette_uv_size[bsize_ctx]);
+                let (u_colors, v_colors) = read_palette_colors_uv(dec, n, &palette_uv_cache);
+                palette_uv_pending = Some((n, u_colors, v_colors));
             }
         }
         // lane-fiinter r1: `read_filter_intra_mode_info` (libaom `decodemv.c`,
@@ -23402,6 +23493,9 @@ fn decode_inter_block(
         let mut filter_intra = None;
         if mode == DC_PRED
             && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
+            // `av1_filter_intra_allowed` (reconintra.h:77) excludes a
+            // palette-Y block, so no `use_filter_intra` symbol exists there.
+            && palette_y_pending.is_none()
             // lane-inter16ab r4 (class sweep): `cdf::FILTER_INTRA`'s row is the
             // true `BLOCK_SIZES_ALL` class of this strip, not its square side's.
             && let Some(class) = filter_intra_size_class_rect(write_w, write_h)
@@ -23411,6 +23505,44 @@ fn decode_inter_block(
             INTRA_IN_INTER_FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
             filter_intra = Some(dec.symbol(&mut cdfs.filter_intra_mode));
         }
+        // `av1_visit_palette`: the two colour-index maps, Y then the shared
+        // chroma one, after the WHOLE mode-info read.
+        let palette_y = palette_y_pending.map(|(n, colors)| {
+            let map = decode_color_index_map_wh(dec, cdfs, n, write_w, write_h, false);
+            PALETTE_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_PALETTE_Y_HITS.with(|c| c.set(c.get() + 1));
+            if crate::envflags::env_flag!("EC_PALII") {
+                eprintln!("EC_PALII y mi={rmi},{cmi} bw={write_w} bh={write_h} n={n} skip={skip}");
+            }
+            PaletteY { size: n, colors, map }
+        });
+        let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
+            // `av1_get_plane_block_size(bsize, 1, 1)` floors at the 4-px
+            // transform, as the rect reader's own copy.
+            let (cw, ch) = ((write_w / 2).max(4), (write_h / 2).max(4));
+            let map = decode_color_index_map_wh(dec, cdfs, n, cw, ch, true);
+            PALETTE_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_PALETTE_UV_HITS.with(|c| c.set(c.get() + 1));
+            PaletteUv { size: n, u_colors, v_colors, map }
+        });
+        palette_record = (
+            palette_y.as_ref().map_or(0, |p| p.size),
+            palette_y.as_ref().map_or([0u16; 8], |p| p.colors),
+            palette_uv.as_ref().map_or(0, |p| p.size),
+            palette_uv.as_ref().map_or([0u16; 8], |p| p.u_colors),
+        );
+        // A palette block predicts from its own colour-index map, never from
+        // the block edge (spec 7.11.2/7.11.4) -- these ride the [`PALETTE_PRED`]
+        // slot into each `reconstruct`/`read_plane` call below, exactly as the
+        // key-frame paths do.
+        let palette_y_buf: Option<Vec<u16>> =
+            palette_y.as_ref().map(|p| p.map.iter().map(|&i| p.colors[i as usize]).collect());
+        let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|p| {
+            (
+                p.map.iter().map(|&i| p.u_colors[i as usize]).collect(),
+                p.map.iter().map(|&i| p.v_colors[i as usize]).collect(),
+            )
+        });
         mode_for_tx = mode;
         block_filter = [3, 3];
         ref_frame_for_lf = 0;
@@ -23474,6 +23606,19 @@ fn decode_inter_block(
                 // bottom-left availability is the block's, narrowed by the
                 // unit's own offset inside it.
                 let tu_reach = Reach::of_tu(side, side, col * MI, row * MI, tx_px, tx_px, reach);
+                // This unit's own window on the block's palette prediction
+                // (the whole-block buffer would be indexed at the wrong
+                // stride by the first unit).
+                if let Some(buf) = &palette_y_buf {
+                    PALETTE_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                    let window: Vec<u16> = (0..tx_px)
+                        .flat_map(|i| {
+                            let base = (row * MI + i) * side + col * MI;
+                            buf[base..base + tx_px].iter().copied()
+                        })
+                        .collect();
+                    set_palette_pred(window);
+                }
                 let tu_grid = if skip {
                     y.reconstruct(
                         tu_px,
@@ -23612,6 +23757,9 @@ fn decode_inter_block(
             INTRA_128_IN_INTER_HITS.with(|c| c.set(c.get() + 1));
         } else if skip {
             if !split_luma {
+                if let Some(buf) = &palette_y_buf {
+                    set_palette_pred(buf.clone());
+                }
                 y.reconstruct(
                     px,
                     py,
@@ -23626,6 +23774,9 @@ fn decode_inter_block(
                 );
             }
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+            if let Some((ub, _)) = &palette_uv_bufs {
+                set_palette_pred(ub.clone());
+            }
             u.reconstruct(
                 cpx,
                 cpy,
@@ -23638,6 +23789,9 @@ fn decode_inter_block(
                 None,
                 smooth_neighbor_uv,
             );
+            if let Some((_, vb)) = &palette_uv_bufs {
+                set_palette_pred(vb.clone());
+            }
             v.reconstruct(
                 cpx,
                 cpy,
@@ -23661,6 +23815,9 @@ fn decode_inter_block(
                 // which `record_split_luma` ignores for plane 0.
                 vec![0i32; side * side]
             } else {
+                if let Some(buf) = &palette_y_buf {
+                    set_palette_pred(buf.clone());
+                }
                 read_plane(
                     dec,
                     cdfs,
@@ -23685,6 +23842,9 @@ fn decode_inter_block(
                 )?
             };
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+            if let Some((ub, _)) = &palette_uv_bufs {
+                set_palette_pred(ub.clone());
+            }
             u_grid = read_plane(
                 dec,
                 cdfs,
@@ -23707,6 +23867,9 @@ fn decode_inter_block(
                 None,
                 smooth_neighbor_uv,
             )?;
+            if let Some((_, vb)) = &palette_uv_bufs {
+                set_palette_pred(vb.clone());
+            }
             v_grid = read_plane(
                 dec,
                 cdfs,
@@ -23792,6 +23955,20 @@ fn decode_inter_block(
     // mi(40,220): base 1 where libaom gathers 2). Snapshot and restore is
     // equivalent to not writing them, without threading a flag through both
     // recorders.
+    // lane-t900 r22: every block stamps its palette state (all-zero for an
+    // inter block, real for a palette one) into the mi-granular neighbour
+    // bands, so the next intra block's `av1_get_palette_mode_ctx` and colour
+    // cache see exactly what libaom's mode-info grid holds.
+    record_strip_palette(
+        neighbours,
+        at,
+        write_w,
+        write_h,
+        palette_record.0,
+        palette_record.1,
+        palette_record.2,
+        palette_record.3,
+    );
     let saved_chroma_ctx = (!has_chroma).then(|| {
         NON_CHROMA_REF_CTX_SKIP_HITS.with(|c| c.set(c.get() + 1));
         let (w_mi, h_mi) = (write_w / MI, write_h / MI);
@@ -27028,7 +27205,7 @@ fn decode_inter_block8(
         if allow_screen_content_tools {
             if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[0][0]) != 0 {
                 return Err(unsupported(
-                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+                    "a block that actually uses a palette (Y@inter_block8) -- reconstruction is out of scope",
                 ));
             }
             // lane-uv8 r1: `read_palette_mode_info` reads the UV symbol only
@@ -27036,7 +27213,7 @@ fn decode_inter_block8(
             // while every non-DC uv_mode was refused a few lines above.
             if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
                 return Err(unsupported(
-                    "a block that actually uses a palette (UV) -- reconstruction is out of scope",
+                    "a block that actually uses a palette (UV@inter_block8) -- reconstruction is out of scope",
                 ));
             }
         }
