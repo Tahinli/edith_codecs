@@ -2016,6 +2016,21 @@ pub(crate) fn obmc_hits() -> usize {
     OBMC_HITS.with(|c| c.get())
 }
 
+// lane-t900 r27: OBMC blends that actually READ a recorded switchable filter
+// off the neighbour band -- the positive half of the proof for "an OBMC
+// neighbour whose switchable interp filter was never recorded". A
+// fixed-filter frame returns before this point (its neighbours legitimately
+// carry the `[3, 3]` sentinel), so every bump is a neighbour whose own
+// `interp_filter` symbols were published by `record_inter_rect_mi`.
+thread_local! {
+    static OBMC_FILTER_BAND_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`OBMC_FILTER_BAND_READS`].
+pub(crate) fn obmc_filter_band_reads() -> usize {
+    OBMC_FILTER_BAND_READS.with(|c| c.get())
+}
+
 // lane-scaledref r1: per-case firing counts for the scaled-reference gate
 // (class `gate-blind-to-feature`) -- a pixel match under an UNSCALED
 // reference would pass just as well and prove nothing, so the gate
@@ -19724,6 +19739,7 @@ fn neighbour_filter(
             "an OBMC neighbour whose switchable interp filter was never recorded",
         ));
     }
+    OBMC_FILTER_BAND_READS.with(|c| c.set(c.get() + 1));
     Ok((
         mc::InterpFilterKind::from_switchable_symbol(sym[1] as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym[0] as usize),
@@ -31103,6 +31119,131 @@ mod tests {
         let (h, v) = neighbour_filter(Some(mc::InterpFilterKind::Smooth), [3, 3])
             .expect("a fixed-filter frame never reads a symbol");
         assert_eq!((h, v), (mc::InterpFilterKind::Smooth, mc::InterpFilterKind::Smooth));
+    }
+
+    /// lane-t900 r27, structural audit for "an OBMC neighbour whose switchable
+    /// interp filter was never recorded": the `[3, 3]` sentinel is only ever
+    /// PUBLISHED for a cell an OBMC blend cannot pick up.
+    ///
+    /// `Neighbours::record_inter_rect_mi` is the single writer of
+    /// `above_filter`/`left_filter` (every other recorder routes through it),
+    /// so the whole domain of published values is its call sites' 7th
+    /// argument. Two publications are safe: an INTRA cell (`is_inter = false`,
+    /// skipped by `overlappable_above`/`overlappable_left`'s own `is_inter`
+    /// gate) and a fixed-filter frame (`resolve_interp_filter` returns the
+    /// sentinel when `interp_fixed` is `Some`, which `neighbour_filter`
+    /// answers before ever looking at the symbols). What this scans for is the
+    /// third case -- an INTER cell stamped with a literal sentinel, which is
+    /// what the refusal actually fires on. Arguments are tokenised
+    /// positionally, never `contains()`d.
+    #[test]
+    fn every_inter_record_publishes_an_obmc_readable_filter() {
+        let src = include_str!("decode.rs");
+        let mut calls = 0usize;
+        for (start, _) in src.match_indices("record_inter_rect_mi(") {
+            // Skip the definition and the wrapper's own forwarding call.
+            let line_start = src[..start].rfind('\n').map_or(0, |i| i + 1);
+            let head = &src[line_start..start];
+            // The definition, the wrapper's own forwarding call, and this
+            // test's own mentions of the name (doc comment, scan pattern,
+            // assert message) are not publication sites.
+            if head.contains("fn ") || head.contains("///") || head.ends_with('"') {
+                continue;
+            }
+            let mut i = start + "record_inter_rect_mi(".len();
+            let (mut depth, mut arg, mut args) = (0i32, String::new(), Vec::new());
+            let bytes = src.as_bytes();
+            while i < bytes.len() {
+                let c = bytes[i] as char;
+                match c {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' if depth == 0 && c == ')' => break,
+                    ')' | ']' => depth -= 1,
+                    ',' if depth == 0 => {
+                        args.push(std::mem::take(&mut arg));
+                        i += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                arg.push(c);
+                i += 1;
+            }
+            if !arg.trim().is_empty() {
+                args.push(arg);
+            }
+            assert_eq!(
+                args.len(),
+                8,
+                "record_inter_rect_mi gained an argument -- re-index this audit: {args:?}"
+            );
+            calls += 1;
+            let (is_inter, filter) = (args[4].trim(), args[6].trim());
+            if filter.starts_with('[') {
+                assert_eq!(
+                    filter.replace(' ', ""),
+                    "[3,3]",
+                    "a literal filter other than the sentinel is published at call {calls}"
+                );
+                assert_eq!(
+                    is_inter, "false",
+                    "an INTER cell is stamped with the [3, 3] sentinel (call {calls}): an OBMC \
+                     blend picking it up refuses by name. Publish the block's own resolved \
+                     switchable symbols instead."
+                );
+            }
+        }
+        assert!(
+            calls >= 6,
+            "the audit found only {calls} publication sites -- it is broken, not the decoder"
+        );
+    }
+
+    /// lane-t900 r27, negative gate for "a reference frame selected with no
+    /// picture at this frame's own ref_frame_idx slot for it": every
+    /// non-`LAST_FRAME` reference resolves through `ref_planes`, and an empty
+    /// slot is refused BY NAME there rather than predicting from `LAST`.
+    ///
+    /// Direct-call, not a stream: with this crate's writers the case is
+    /// unreachable end to end. A SHOWN key frame refreshes all eight slots
+    /// (spec 5.9.2 forces `refresh_frame_flags`, `write_frame_header` does the
+    /// same) and nothing ever clears a slot, so once a stream has a key frame
+    /// every slot holds a picture; a stream that OPENS on an inter frame is
+    /// stopped one guard earlier, by `decode_stream`'s own `LAST` lookup
+    /// ("an inter frame with no key frame before it", gated by
+    /// `an_inter_frame_opening_a_stream_is_refused_by_name`). The reachable
+    /// premise is a HIDDEN key frame refreshing only some slots, which
+    /// `write_frame_header` refuses to write (`show_frame` must be set) --
+    /// so the stream-level witness needs a hidden-frame writer, noted as the
+    /// open half of this proof.
+    #[test]
+    fn a_selected_reference_with_an_empty_ref_frame_idx_slot_refuses_by_name() {
+        const REFUSAL: &str =
+            "a reference frame selected with no picture at this frame's own ref_frame_idx slot";
+        let plane = PlaneBuf {
+            data: vec![0u16; 16],
+            width: 4,
+            height: 4,
+            true_width: 4,
+            true_height: 4,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: 4,
+            tile_y1: 4,
+        };
+        let empty: RefSlots = [None; 8];
+        for ref_frame in [LAST2_FRAME, LAST3_FRAME, GOLDEN_FRAME, BWDREF_FRAME, ALTREF2_FRAME, ALTREF_FRAME] {
+            let err = match ref_planes(ref_frame, &plane, &plane, &plane, &empty) {
+                Ok(_) => panic!("ref {ref_frame}: an empty slot resolved to a picture"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(REFUSAL), "ref {ref_frame}: expected {REFUSAL:?}, got: {err}");
+        }
+        // `LAST_FRAME` never consults the slots: `decode_stream` checked it.
+        let Ok((y, _, _)) = ref_planes(LAST_FRAME, &plane, &plane, &plane, &empty) else {
+            panic!("LAST_FRAME resolves to the frame's own reference planes")
+        };
+        assert_eq!(y.width, 4);
     }
 
     #[test]
