@@ -126,6 +126,13 @@ pub fn intra_in_inter_palette_hits() -> (usize, usize) {
     crate::decode::intra_in_inter_palette_hits()
 }
 
+/// `(y, uv)` palette blocks reconstructed on an 8x8 LEAF inside an inter
+/// frame (lane-t900 r23) -- the site-specific half of
+/// [`intra_in_inter_palette_hits`], which a >=16 block also moves.
+pub fn inter8_palette_hits() -> (usize, usize) {
+    crate::decode::inter8_palette_hits()
+}
+
 /// lane-rect64port r1: coded 64-level HORZ/VERT intra strips whose luma
 /// transform unit is the un-split TX_64X32 (orient 0) / TX_32X64 (orient 1).
 pub fn rect64_corner_tu_hits(orient: usize) -> usize {
