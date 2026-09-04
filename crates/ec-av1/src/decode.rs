@@ -275,6 +275,33 @@ pub(crate) fn bit_depth() -> u8 {
 pub(crate) fn set_bit_depth(bit_depth: u8) {
     BIT_DEPTH.with(|c| c.set(bit_depth));
 }
+
+thread_local! {
+    /// This frame's superres state: `(upscaled_width, superres_denom)`, or
+    /// `(0, 8)` when the frame is not scaled. Spec 7.16's upscale runs
+    /// between CDEF and loop restoration, so LOOP RESTORATION -- unit grid,
+    /// `read_lr`'s unit corners and the pixel filters themselves -- works in
+    /// UPSCALED coordinates while deblock and CDEF work in downscaled ones
+    /// (libaom `av1_superres_upscale` in `decodeframe.c`, and
+    /// `av1_loop_restoration_corners_in_sb`'s own `mi_to_num_x`/`denom_x`
+    /// superres arms). Set once per frame from [`crate::stream`]'s decode
+    /// loop, like [`BIT_DEPTH`], and reset to `(0, 8)` on an unscaled frame
+    /// so a later frame never inherits it.
+    static SUPERRES: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 8)) };
+}
+
+/// Sets [`SUPERRES`] for the current thread. `upscaled_width` is 0 (and
+/// `denom` 8) for a frame that is not superres-scaled.
+pub(crate) fn set_superres(upscaled_width: u32, denom: u32) {
+    SUPERRES.with(|c| c.set((upscaled_width, denom)));
+}
+
+/// `(upscaled_width, superres_denom)` when this frame is superres-scaled
+/// (libaom `av1_superres_scaled`), else `None`.
+pub(crate) fn superres() -> Option<(u32, u32)> {
+    let (w, d) = SUPERRES.with(std::cell::Cell::get);
+    (w > 0 && d != 8).then_some((w, d))
+}
 // Whether this superblock's single CDEF unit (this decoder has no 128x128
 // SB, so the SB IS the CDEF unit) has already had its `cdef_idx` literal
 // read -- reset to `false` at the top of each superblock in the two tile
@@ -16940,7 +16967,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         mi_cols as usize,
         mi_rows as usize,
     );
-    let mut lr_grid = crate::restoration::RestorationGrid::new(lr, frame_width, frame_height);
+    // spec 7.16/libaom `av1_alloc_restoration_struct`: the unit grid is
+    // sized from `av1_get_upsampled_plane_size`, i.e. the UPSCALED width --
+    // loop restoration runs after the superres upscale.
+    let mut lr_grid = crate::restoration::RestorationGrid::new(
+        lr,
+        superres().map_or(frame_width, |(w, _)| w),
+        frame_height,
+    );
 
     // lane-tiles r2: each tile gets its own fresh `SymbolDecoder` over its
     // own byte range and its own fresh copy of the frame's initial CDFs
@@ -18836,12 +18870,57 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
+    // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
+    // between `av1_cdef_frame` and `av1_loop_restoration_filter_frame`):
+    // the horizontal upscale runs HERE -- after CDEF, before loop
+    // restoration, not after the whole filter chain. Both the post-CDEF
+    // frame and the post-deblock frame that LR substitutes at its stripe
+    // boundaries are upscaled (`save_deblock_boundary_lines` runs
+    // `av1_upscale_normative_rows` over its saved rows when the frame is
+    // scaled), so every LR coordinate from here on is in upscaled space.
+    let (mut deblocked_y, mut deblocked_u, mut deblocked_v) =
+        (deblocked_y, deblocked_u, deblocked_v);
+    let mut lr_w = frame_width as usize;
+    if let Some((upscaled_w, _)) = superres() {
+        let bd = u32::from(bit_depth());
+        let (uw, fw, fh) = (upscaled_w as usize, frame_width as usize, frame_height as usize);
+        let up = |p: &PlaneBuf, in_w: usize, in_h: usize, out_w: usize| PlaneBuf {
+            data: crate::superres::upscale_plane_strided(
+                &p.data, p.width, in_w, in_h, p.true_width, out_w, bd,
+            ),
+            width: out_w,
+            height: in_h,
+            true_width: out_w,
+            true_height: in_h,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: out_w,
+            tile_y1: in_h,
+        };
+        let (cw, ch, cuw) = (fw.div_ceil(2), fh.div_ceil(2), uw.div_ceil(2));
+        y = up(&y, fw, fh, uw);
+        u = up(&u, cw, ch, cuw);
+        v = up(&v, cw, ch, cuw);
+        deblocked_y = up(&deblocked_y, fw, fh, uw);
+        deblocked_u = up(&deblocked_u, cw, ch, cuw);
+        deblocked_v = up(&deblocked_v, cw, ch, cuw);
+        lr_w = uw;
+        crate::superres::note_upscaled_picture();
+    }
     apply_loop_restoration(
         &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
-        (frame_width as usize, frame_height as usize),
+        (lr_w, frame_height as usize),
     );
 
-    let (fw, fh) = (frame_width as usize, frame_height as usize);
+    let (fw, fh) = (lr_w, frame_height as usize);
+    // An upscaled frame is already at its final size with no mi-aligned
+    // margin beyond it (the upscale consumed those columns), so the
+    // wide-margin stash below has nothing left to hand out.
+    let (true_width, true_height) = if superres().is_some() {
+        (fw, fh)
+    } else {
+        (true_width, true_height)
+    };
     if fw == width && fh == height {
         LAST_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
         return Ok((
@@ -28298,7 +28377,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         mi_rows as usize,
     );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
-    let mut lr_grid = crate::restoration::RestorationGrid::new(lr, frame_width, frame_height);
+    // spec 7.16/libaom `av1_alloc_restoration_struct`: the unit grid is
+    // sized from `av1_get_upsampled_plane_size`, i.e. the UPSCALED width --
+    // loop restoration runs after the superres upscale.
+    let mut lr_grid = crate::restoration::RestorationGrid::new(
+        lr,
+        superres().map_or(frame_width, |(w, _)| w),
+        frame_height,
+    );
 
     // lane-tiles r6: mirrors decode_key_frame_tile_with_cdfs's own per-tile
     // loop (spec 5.11.2 decode_tile / 7.20 exit_symbol) -- each tile gets
@@ -30793,9 +30879,46 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
+    // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
+    // between `av1_cdef_frame` and `av1_loop_restoration_filter_frame`):
+    // the horizontal upscale runs HERE -- after CDEF, before loop
+    // restoration, not after the whole filter chain. Both the post-CDEF
+    // frame and the post-deblock frame that LR substitutes at its stripe
+    // boundaries are upscaled (`save_deblock_boundary_lines` runs
+    // `av1_upscale_normative_rows` over its saved rows when the frame is
+    // scaled), so every LR coordinate from here on is in upscaled space.
+    let (mut deblocked_y, mut deblocked_u, mut deblocked_v) =
+        (deblocked_y, deblocked_u, deblocked_v);
+    let mut lr_w = frame_width as usize;
+    if let Some((upscaled_w, _)) = superres() {
+        let bd = u32::from(bit_depth());
+        let (uw, fw, fh) = (upscaled_w as usize, frame_width as usize, frame_height as usize);
+        let up = |p: &PlaneBuf, in_w: usize, in_h: usize, out_w: usize| PlaneBuf {
+            data: crate::superres::upscale_plane_strided(
+                &p.data, p.width, in_w, in_h, p.true_width, out_w, bd,
+            ),
+            width: out_w,
+            height: in_h,
+            true_width: out_w,
+            true_height: in_h,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: out_w,
+            tile_y1: in_h,
+        };
+        let (cw, ch, cuw) = (fw.div_ceil(2), fh.div_ceil(2), uw.div_ceil(2));
+        y = up(&y, fw, fh, uw);
+        u = up(&u, cw, ch, cuw);
+        v = up(&v, cw, ch, cuw);
+        deblocked_y = up(&deblocked_y, fw, fh, uw);
+        deblocked_u = up(&deblocked_u, cw, ch, cuw);
+        deblocked_v = up(&deblocked_v, cw, ch, cuw);
+        lr_w = uw;
+        crate::superres::note_upscaled_picture();
+    }
     apply_loop_restoration(
         &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
-        (frame_width as usize, frame_height as usize),
+        (lr_w, frame_height as usize),
     );
 
     let motion_field = build_motion_field(
@@ -30807,7 +30930,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         ref_order_hints,
     );
 
-    let (fw, fh) = (frame_width as usize, frame_height as usize);
+    let (fw, fh) = (lr_w, frame_height as usize);
+    // An upscaled frame is already at its final size with no mi-aligned
+    // margin beyond it (the upscale consumed those columns), so the
+    // wide-margin stash below has nothing left to hand out.
+    let (true_width, true_height) = if superres().is_some() {
+        (fw, fh)
+    } else {
+        (true_width, true_height)
+    };
     if fw == width && fh == height {
         LAST_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
         return Ok((
