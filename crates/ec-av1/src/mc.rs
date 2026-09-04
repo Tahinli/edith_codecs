@@ -874,6 +874,38 @@ pub fn predict_scaled_kern(
     });
 }
 
+/// [`predict_with_filters`] or [`predict_scaled`], on this reference's own
+/// `x_scale_fp` -- the dispatch every inter path needs once a reference can be
+/// scaled (superres). `REF_NO_SCALE` takes the ordinary stride-1 path, which
+/// keeps [`predict_scaled_hits`] a true count of scaled predictions.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_maybe_scaled(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    x_scale_fp: i64,
+    block_w: usize,
+    block_h: usize,
+    h_kind: InterpFilterKind,
+    v_kind: InterpFilterKind,
+    dst: &mut [u16],
+) {
+    if x_scale_fp == REF_NO_SCALE {
+        predict_with_filters(
+            reference, stride, true_width, true_height, x_q4, y_q4, block_w, block_h, h_kind,
+            v_kind, dst,
+        );
+    } else {
+        predict_scaled(
+            reference, stride, true_width, true_height, x_q4, y_q4, x_scale_fp, block_w,
+            block_h, h_kind, v_kind, dst,
+        );
+    }
+}
+
 /// `InterRound1` for a compound ref (spec 7.11.3.2's `isCompound` branch,
 /// `COMPOUND_ROUND1_BITS` in libaom's `convolve.h`): 4 bits shallower than
 /// [`INTER_ROUND_1`] so the vertical pass lands in the `CONV_BUF` domain

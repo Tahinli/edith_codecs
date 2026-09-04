@@ -1555,11 +1555,15 @@ mod tests {
         // leaf guard is reached first. Lifting the leaf gap is what makes the
         // other two measurable, so this gate pins the ORDER, not just a count.
         assert!(decoded > 0, "no superres recipe decoded -- the census is vacuous");
-        assert!(
-            leaf8 > 0,
-            "no fixed-denominator recipe reached the 8x8-leaf refusal any more: either the \
-             capability landed (drop the refusal) or the recipes stopped scaling"
+        // lane-t900 r28: all three scaled refusals are LIFTED, so the census
+        // now pins the opposite shape -- every fixed-denominator recipe must
+        // DECODE, and none of the three strings may come back.
+        assert_eq!(
+            (warp, sub8, leaf8),
+            (0, 0, 0),
+            "a scaled-reference refusal came back (warp {warp}, sub8 {sub8}, leaf8 {leaf8})"
         );
+        assert!(decoded > 0, "no superres recipe decoded -- the census is vacuous");
     }
 
     /// lane-t900 r25, negative gate: a `show_existing_frame` header naming a
@@ -14778,6 +14782,152 @@ mod tests {
             crate::superres::superres_hits(),
             crate::mc::predict_scaled_hits()
         );
+    }
+
+    /// lane-t900 r28: the three scaled-reference (superres) refusals are
+    /// LIFTED -- an 8x8 partition leaf, a sub-8x8 inter block, and warp --
+    /// so two real `--superres-mode=1` streams whose references are all
+    /// scaled must decode PIXEL-EXACT vs ffmpeg.
+    ///
+    /// Arm A drives `--min-partition-size=4` so the split (4x4) and rect
+    /// (8x4/4x8) sub-8x8 readers and the 8x8 leaf all run over a scaled
+    /// reference; arm B turns `--enable-warped-motion=1` on, which is the
+    /// root cause this round fixed: libaom `motion_mode_allowed` drops
+    /// WARPED_CAUSAL eligibility when `av1_is_scaled(sf)`, so the 8x8 leaf
+    /// must read the 2-symbol obmc alphabet (here: no symbol at all, OBMC
+    /// off) instead of the 3-symbol motion_mode row.
+    ///
+    /// Each arm hard-asserts its own counter (class `gate-blind-to-feature`):
+    /// a pixel match with zero scaled leaves/sub-8x8 blocks/suppressed warp
+    /// eligibilities would prove nothing.
+    #[test]
+    fn real_superres_streams_with_sub8_leaf8_and_warp_decode_pixel_exact() {
+        const NAME: &str = "real_superres_streams_with_sub8_leaf8_and_warp_decode_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // Every tool whose scaled-reference path this round does NOT touch is
+        // off, so a mismatch can only be the lifted paths (the same scoping
+        // the r10 key+inter superres gate uses).
+        let common: [&str; 21] = [
+            "--codec=av1", "--passes=1", "--end-usage=q", "--threads=1", "--row-mt=0",
+            "--kf-max-dist=9999", "--lag-in-frames=0", "--auto-alt-ref=0", "--cpu-used=0",
+            "--sb-size=64", "--superres-mode=1", "--superres-denominator=12",
+            "--superres-kf-denominator=12", "--enable-obmc=0", "--enable-masked-comp=0",
+            "--enable-interintra-comp=0", "--enable-tx-size-search=0", "--enable-cdef=0",
+            "--enable-restoration=0", "--enable-palette=0", "--enable-intrabc=0",
+        ];
+        struct Arm {
+            name: &'static str,
+            frames: usize,
+            cq: &'static str,
+            extra: [&'static str; 4],
+        }
+        let arms = [
+            Arm {
+                name: "sub8+leaf8",
+                frames: 4,
+                cq: "--cq-level=4",
+                extra: [
+                    "--enable-warped-motion=0",
+                    "--enable-rect-partitions=1",
+                    "--max-partition-size=32",
+                    "--min-partition-size=4",
+                ],
+            },
+            Arm {
+                name: "warp",
+                frames: 6,
+                cq: "--cq-level=20",
+                extra: [
+                    "--enable-warped-motion=1",
+                    "--enable-rect-partitions=1",
+                    "--max-partition-size=32",
+                    "--min-partition-size=8",
+                ],
+            },
+        ];
+        let (width, height) = (96usize, 96usize);
+        for arm in &arms {
+            let duration = format!("{}", arm.frames as f64 / 25.0);
+            let src = format!("mandelbrot=size={width}x{height}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &src, "-t", &duration, "-pix_fmt",
+                    "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(y4m.status.success(), "{NAME}: ffmpeg refused the fixture");
+            let limit = format!("--limit={}", arm.frames);
+            let mut args: Vec<&str> = common.to_vec();
+            args.push(&limit);
+            args.push(arm.cq);
+            args.extend_from_slice(&arm.extra);
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME} {}: aomenc refused the recipe: {}",
+                arm.name,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let leaf8_before = crate::decode::scaled_leaf8_hits();
+            let sub8_before = crate::decode::scaled_sub8_hits();
+            let warp_before = crate::decode::scaled_warp_suppressed_hits();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME} {}: refused: {e}", arm.name));
+            assert_eq!(frames.len(), arm.frames, "{NAME} {}", arm.name);
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, arm.frames);
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} {} frame {i} luma vs ffmpeg", arm.name);
+                assert_eq!(got.u, want.u, "{NAME} {} frame {i} U vs ffmpeg", arm.name);
+                assert_eq!(got.v, want.v, "{NAME} {} frame {i} V vs ffmpeg", arm.name);
+            }
+            let (leaf8, sub8, warp) = (
+                crate::decode::scaled_leaf8_hits() - leaf8_before,
+                crate::decode::scaled_sub8_hits() - sub8_before,
+                crate::decode::scaled_warp_suppressed_hits() - warp_before,
+            );
+            eprintln!(
+                "{NAME} {}: {} frames pixel-exact, scaled leaf8={leaf8} sub8={sub8} \
+                 warp_suppressed={warp}",
+                arm.name, arm.frames
+            );
+            if arm.name == "sub8+leaf8" {
+                assert!(leaf8 > 0 && sub8 > 0, "{NAME} {}: the lifted paths never ran (leaf8={leaf8} sub8={sub8})", arm.name);
+            } else {
+                assert!(
+                    warp > 0,
+                    "{NAME} {}: no block reached WARPED_CAUSAL eligibility under a scaled \
+                     reference, so the alphabet fix is unexercised",
+                    arm.name
+                );
+            }
+        }
     }
 
     /// lane-interintra r1: `--enable-interintra-comp=1` streams must DECODE
