@@ -387,35 +387,51 @@ fn add_noise_to_block(
 
     let cy0 = py0 / 2;
     let cx0 = px0 / 2;
-    for i in 0..half_h {
-        for j in 0..half_w {
-            let ly = py0 + i * 2;
-            let lx = px0 + j * 2;
-            let l0 = (ly * y_stride + lx) as usize;
-            let average_luma = (picture.y[l0] as i32 + picture.y[l0 + 1] as i32 + 1) >> 1;
-            let cidx = ((cy0 + i) * c_stride + (cx0 + j)) as usize;
-            let gidx = ((cg_row0 + i) * cg_stride + (cg_col0 + j)) as usize;
-            if apply_cb {
-                let scaled = (((average_luma * cb_luma_mult + cb_mult * picture.u[cidx] as i32)
-                    >> 6)
-                    + cb_offset)
-                    .clamp(0, index_max);
-                let delta =
-                    (scaling_cb[scaled as usize] * cb_grain[gidx] + rounding_offset)
-                        >> scaling_shift;
-                picture.u[cidx] =
-                    ((picture.u[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
-            }
-            if apply_cr {
-                let scaled = (((average_luma * cr_luma_mult + cr_mult * picture.v[cidx] as i32)
-                    >> 6)
-                    + cr_offset)
-                    .clamp(0, index_max);
-                let delta =
-                    (scaling_cr[scaled as usize] * cr_grain[gidx] + rounding_offset)
-                        >> scaling_shift;
-                picture.v[cidx] =
-                    ((picture.v[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
+    if apply_cb || apply_cr {
+        // lane-perf4: one row of each operand at a time. The 4:2:0 luma
+        // average (spec 7.18.3.5) reads a horizontally adjacent PAIR of the
+        // block's own luma row, so `chunks_exact(2)` walks exactly the pairs
+        // the per-sample `(ly * y_stride + lx)` form used to re-derive, and
+        // the U/V/grain rows advance in lockstep with it -- same integers,
+        // same rounding, no per-sample index arithmetic or bounds check.
+        let cw = half_w as usize;
+        // U and V are distinct fields, so a disjoint borrow of each is
+        // needed alongside the immutable read of Y.
+        let Picture { y: ref luma_plane, u: ref mut u_plane, v: ref mut v_plane, .. } =
+            *picture;
+        for i in 0..half_h {
+            let lrow = ((py0 + i * 2) * y_stride + px0) as usize;
+            let crow = ((cy0 + i) * c_stride + cx0) as usize;
+            let grow = ((cg_row0 + i) * cg_stride + cg_col0) as usize;
+            let luma = &luma_plane[lrow..lrow + cw * 2];
+            let gcb = &cb_grain[grow..grow + cw];
+            let gcr = &cr_grain[grow..grow + cw];
+            let urow = &mut u_plane[crow..crow + cw];
+            let vrow = &mut v_plane[crow..crow + cw];
+            for ((((lpair, u), v), &gb), &gr) in luma
+                .chunks_exact(2)
+                .zip(urow.iter_mut())
+                .zip(vrow.iter_mut())
+                .zip(gcb.iter())
+                .zip(gcr.iter())
+            {
+                let average_luma = (lpair[0] as i32 + lpair[1] as i32 + 1) >> 1;
+                if apply_cb {
+                    let scaled = (((average_luma * cb_luma_mult + cb_mult * *u as i32) >> 6)
+                        + cb_offset)
+                        .clamp(0, index_max);
+                    let delta =
+                        (scaling_cb[scaled as usize] * gb + rounding_offset) >> scaling_shift;
+                    *u = ((*u as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
+                }
+                if apply_cr {
+                    let scaled = (((average_luma * cr_luma_mult + cr_mult * *v as i32) >> 6)
+                        + cr_offset)
+                        .clamp(0, index_max);
+                    let delta =
+                        (scaling_cr[scaled as usize] * gr + rounding_offset) >> scaling_shift;
+                    *v = ((*v as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
+                }
             }
         }
     }

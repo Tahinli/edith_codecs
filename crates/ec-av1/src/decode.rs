@@ -18854,7 +18854,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         frame_width as usize,
         frame_height as usize,
     );
-    let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
+    // lane-perf4: loop restoration is the only reader of the pre-CDEF planes,
+    // and a frame that restores nothing copied every plane twice for nothing
+    // (three `PlaneBuf` clones here plus the `cdef.to_vec()` inside
+    // [`crate::restoration::apply_loop_restoration_plane`], which returns its
+    // input unchanged when the plane's type is `None`). Clone only when some
+    // plane actually restores.
+    let lr_active = (0..3).any(|p| {
+        lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
+            && lr.loop_restoration_size[p] != 0
+    });
+    let deblocked = lr_active.then(|| (y.clone(), u.clone(), v.clone()));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -18878,8 +18888,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // boundaries are upscaled (`save_deblock_boundary_lines` runs
     // `av1_upscale_normative_rows` over its saved rows when the frame is
     // scaled), so every LR coordinate from here on is in upscaled space.
-    let (mut deblocked_y, mut deblocked_u, mut deblocked_v) =
-        (deblocked_y, deblocked_u, deblocked_v);
+    let mut deblocked = deblocked;
     let mut lr_w = frame_width as usize;
     if let Some((upscaled_w, _)) = superres() {
         let bd = u32::from(bit_depth());
@@ -18901,16 +18910,18 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         y = up(&y, fw, fh, uw);
         u = up(&u, cw, ch, cuw);
         v = up(&v, cw, ch, cuw);
-        deblocked_y = up(&deblocked_y, fw, fh, uw);
-        deblocked_u = up(&deblocked_u, cw, ch, cuw);
-        deblocked_v = up(&deblocked_v, cw, ch, cuw);
+        if let Some((dy, du, dv)) = deblocked.take() {
+            deblocked = Some((up(&dy, fw, fh, uw), up(&du, cw, ch, cuw), up(&dv, cw, ch, cuw)));
+        }
         lr_w = uw;
         crate::superres::note_upscaled_picture();
     }
-    apply_loop_restoration(
-        &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
-        (lr_w, frame_height as usize),
-    );
+    if let Some((deblocked_y, deblocked_u, deblocked_v)) = &deblocked {
+        apply_loop_restoration(
+            &mut y, &mut u, &mut v, deblocked_y, deblocked_u, deblocked_v, lr, &lr_grid,
+            (lr_w, frame_height as usize),
+        );
+    }
 
     let (fw, fh) = (lr_w, frame_height as usize);
     // An upscaled frame is already at its final size with no mi-aligned
@@ -19291,11 +19302,19 @@ impl PlaneBuf {
         // 768..832). libaom reconstructs those rows into the frame buffer's
         // border; nothing reads them back, so they are simply dropped here.
         let (h, w) = (h.min(self.height.saturating_sub(y)), w.min(self.width.saturating_sub(x)));
+        // lane-perf4: one row of each operand at a time. `side` is the
+        // prediction/residual stride and `self.width` the plane's, so the
+        // three row bases are computed once per row instead of a
+        // multiply-add per sample (the samples themselves are unchanged).
+        let max = crate::decode::sample_max();
         for row in 0..h {
-            for col in 0..w {
-                let sample = (i32::from(prediction[row * side + col]) + residual[row * side + col])
-                    .clamp(0, crate::decode::sample_max()) as u16;
-                self.data[(y + row) * self.width + x + col] = sample;
+            let src = row * side;
+            let dst = (y + row) * self.width + x;
+            let pred = &prediction[src..src + w];
+            let res = &residual[src..src + w];
+            let out = &mut self.data[dst..dst + w];
+            for ((o, &p), &r) in out.iter_mut().zip(pred).zip(res) {
+                *o = (i32::from(p) + r).clamp(0, max) as u16;
             }
         }
     }
@@ -30863,7 +30882,17 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         frame_width as usize,
         frame_height as usize,
     );
-    let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
+    // lane-perf4: loop restoration is the only reader of the pre-CDEF planes,
+    // and a frame that restores nothing copied every plane twice for nothing
+    // (three `PlaneBuf` clones here plus the `cdef.to_vec()` inside
+    // [`crate::restoration::apply_loop_restoration_plane`], which returns its
+    // input unchanged when the plane's type is `None`). Clone only when some
+    // plane actually restores.
+    let lr_active = (0..3).any(|p| {
+        lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
+            && lr.loop_restoration_size[p] != 0
+    });
+    let deblocked = lr_active.then(|| (y.clone(), u.clone(), v.clone()));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -30887,8 +30916,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // boundaries are upscaled (`save_deblock_boundary_lines` runs
     // `av1_upscale_normative_rows` over its saved rows when the frame is
     // scaled), so every LR coordinate from here on is in upscaled space.
-    let (mut deblocked_y, mut deblocked_u, mut deblocked_v) =
-        (deblocked_y, deblocked_u, deblocked_v);
+    let mut deblocked = deblocked;
     let mut lr_w = frame_width as usize;
     if let Some((upscaled_w, _)) = superres() {
         let bd = u32::from(bit_depth());
@@ -30910,16 +30938,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         y = up(&y, fw, fh, uw);
         u = up(&u, cw, ch, cuw);
         v = up(&v, cw, ch, cuw);
-        deblocked_y = up(&deblocked_y, fw, fh, uw);
-        deblocked_u = up(&deblocked_u, cw, ch, cuw);
-        deblocked_v = up(&deblocked_v, cw, ch, cuw);
+        if let Some((dy, du, dv)) = deblocked.take() {
+            deblocked = Some((up(&dy, fw, fh, uw), up(&du, cw, ch, cuw), up(&dv, cw, ch, cuw)));
+        }
         lr_w = uw;
         crate::superres::note_upscaled_picture();
     }
-    apply_loop_restoration(
-        &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
-        (lr_w, frame_height as usize),
-    );
+    if let Some((deblocked_y, deblocked_u, deblocked_v)) = &deblocked {
+        apply_loop_restoration(
+            &mut y, &mut u, &mut v, deblocked_y, deblocked_u, deblocked_v, lr, &lr_grid,
+            (lr_w, frame_height as usize),
+        );
+    }
 
     let motion_field = build_motion_field(
         &grid,
