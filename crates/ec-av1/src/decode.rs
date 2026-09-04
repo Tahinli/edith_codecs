@@ -7734,6 +7734,110 @@ fn every_intra_in_inter_shape_the_census_lists_has_a_size_group_row() {
     );
 }
 
+/// The `motion_mode` / `obmc` CDF row for a block footprint: libaom's
+/// `motion_mode_cdf[mbmi->bsize]`, in this crate's packed row order (which
+/// `cdf::MOTION_MODE` documents -- the 128-px rows come last, so they are
+/// matched before the square arm's `log2` shortcut).
+///
+/// `None` is the refusal "a motion_mode symbol for a block shape with no CDF
+/// row here"; the enumeration below is what proves no conformant block can
+/// reach it.
+pub(crate) fn motion_mode_cdf_row(write_w: usize, write_h: usize) -> Option<usize> {
+    Some(match (write_w, write_h) {
+        // lane-sb128c r5: the 128 root's own rows come FIRST -- the square arm
+        // below maps 128 to row 4 (BLOCK_16X32).
+        (64, 128) => 14,
+        (128, 64) => 15,
+        (128, 128) => 16,
+        (w, h) if w == h => (w.trailing_zeros() - 3) as usize,
+        (16, 32) => 4,
+        (32, 16) => 5,
+        (32, 64) => 6,
+        (64, 32) => 7,
+        (8, 32) => 8,
+        (32, 8) => 9,
+        (16, 64) => 10,
+        (64, 16) => 11,
+        // lane-inter4 r3: the 16x16-level rect inter leaves.
+        (8, 16) => 12,
+        (16, 8) => 13,
+        _ => return None,
+    })
+}
+
+/// Every `BLOCK_SIZES_ALL` footprint, as `(width, height)` in pixels: the six
+/// squares, the ten 2:1 shapes and the six 1:4 ones (libaom `common_data.h`,
+/// `block_size_wide`/`block_size_high`).
+#[cfg(test)]
+const BLOCK_SIZES_ALL_WH: [(usize, usize); 22] = [
+    (4, 4),
+    (4, 8),
+    (8, 4),
+    (8, 8),
+    (8, 16),
+    (16, 8),
+    (16, 16),
+    (16, 32),
+    (32, 16),
+    (32, 32),
+    (32, 64),
+    (64, 32),
+    (64, 64),
+    (64, 128),
+    (128, 64),
+    (128, 128),
+    (4, 16),
+    (16, 4),
+    (8, 32),
+    (32, 8),
+    (16, 64),
+    (64, 16),
+];
+
+/// lane-t900 r25, enumeration: the refusal "a motion_mode symbol for a block
+/// shape with no CDF row here" names a shape no conformant stream can present.
+///
+/// A `motion_mode`/`obmc` symbol is read only under `motion_mode_eligible`,
+/// whose `write_w.min(write_h) >= 8` clause is libaom's
+/// `is_motion_variation_allowed_bsize` (`blockd.h:1455`). So the reachable
+/// domain of [`motion_mode_cdf_row`] is exactly the `BLOCK_SIZES_ALL`
+/// footprints with `min(bw, bh) >= 8` -- 17 of the 22 -- and each of those
+/// must map to a distinct row of the 17-row `Cdfs::motion_mode` table. The
+/// five it excludes (4x4, 4x8, 8x4, 4x16, 16x4) are the ones the eligibility
+/// clause rejects before the lookup.
+#[test]
+fn every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row() {
+    let mut rows = std::collections::BTreeSet::new();
+    let mut excluded = 0;
+    for (w, h) in BLOCK_SIZES_ALL_WH {
+        if w.min(h) < 8 {
+            excluded += 1;
+            assert!(
+                w == 4 || h == 4,
+                "{w}x{h} is not one of the sub-8 shapes is_motion_variation_allowed_bsize rejects"
+            );
+            continue;
+        }
+        let row = motion_mode_cdf_row(w, h).unwrap_or_else(|| {
+            panic!(
+                "a {w}x{h} block passes is_motion_variation_allowed_bsize and reads a motion_mode \
+                 symbol, but has no CDF row -- the refusal is a real gap, not a dead arm"
+            )
+        });
+        assert!(
+            row < 17,
+            "{w}x{h} maps to motion_mode row {row}, outside the 17-row table"
+        );
+        assert!(rows.insert(row), "{w}x{h} shares motion_mode row {row}");
+    }
+    assert_eq!(excluded, 5, "the sub-8 footprint set changed");
+    assert_eq!(
+        rows.len(),
+        17,
+        "17 eligible footprints must fill all 17 rows of the motion_mode table"
+    );
+}
+
 fn decode_intra_rect_in_inter(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -22343,30 +22447,9 @@ fn decode_inter_block(
                 // documented on `cdf::MOTION_MODE`); a wrong row is a wrong
                 // interval narrowing, not a wrong value (class
                 // wrong-alphabet-same-value).
-                let bsize_idx = match (write_w, write_h) {
-                    // lane-sb128c r5: the 128 root's own rows come FIRST --
-                    // the square arm below maps 128 to row 4 (BLOCK_16X32).
-                    (64, 128) => 14,
-                    (128, 64) => 15,
-                    (128, 128) => 16,
-                    (w, h) if w == h => (w.trailing_zeros() - 3) as usize,
-                    (16, 32) => 4,
-                    (32, 16) => 5,
-                    (32, 64) => 6,
-                    (64, 32) => 7,
-                    (8, 32) => 8,
-                    (32, 8) => 9,
-                    (16, 64) => 10,
-                    (64, 16) => 11,
-                    // lane-inter4 r3: the 16x16-level rect inter leaves.
-                    (8, 16) => 12,
-                    (16, 8) => 13,
-                    _ => {
-                        return Err(unsupported(
-                            "a motion_mode symbol for a block shape with no CDF row here",
-                        ));
-                    }
-                };
+                let bsize_idx = motion_mode_cdf_row(write_w, write_h).ok_or_else(|| {
+                    unsupported("a motion_mode symbol for a block shape with no CDF row here")
+                })?;
                 // `motion_mode_allowed` reads the 3-symbol `motion_mode_cdf`
                 // instead of the 2-symbol `obmc_cdf` exactly when
                 // `num_proj_ref >= 1` under `allow_warped_motion`.
