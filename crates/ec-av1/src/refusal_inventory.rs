@@ -262,6 +262,25 @@ const PROVEN: &[(&str, &str)] = &[
         "a Golomb tail longer than this decoder reads",
         "read_golomb_reads_every_value_a_conformant_stream_can_carry",
     ),
+    // lane-t900 r25, enumeration: `parse_tile_group` is the only producer of
+    // the `tiles` vector `decode_stream` tests, and its success path always
+    // pushes at least one `Tile` -- swept over a real frame OBU's tile payload
+    // truncated from empty upwards.
+    (
+        "a frame OBU with no tile group",
+        "a_frame_obu_that_parses_always_carries_at_least_one_tile",
+    ),
+    // lane-t900 r25, negative gates: hand-built streams that reach each
+    // refusal by name and output no picture (a `show_existing_frame` header
+    // over all 8 empty slots; a stream that opens on an inter frame).
+    (
+        "a show_existing_frame header naming an empty reference slot",
+        "a_show_existing_frame_header_naming_an_empty_slot_is_refused_by_name",
+    ),
+    (
+        "an inter frame with no key frame before it",
+        "an_inter_frame_opening_a_stream_is_refused_by_name",
+    ),
     // lane-t900 r25, enumeration: a motion_mode/obmc symbol is read only under
     // `is_motion_variation_allowed_bsize` (min side >= 8), and each of the 17
     // `BLOCK_SIZES_ALL` footprints that clause admits maps to a distinct row of
