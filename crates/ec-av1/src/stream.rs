@@ -30729,8 +30729,8 @@ mod tests {
                 intra128_now[1] - intra128_before[1]
             ],
             [0, 0],
-            "{NAME}: the intra-128-in-inter arm fired on a stream that decodes \
-             exactly -- the opt-in now HAS a witness and should be lifted"
+            "{NAME}: this stream does not carry a 128-root intra half -- the \
+             witness for that arm is `intra128_in_inter_witness2.obu` (r18)"
         );
         assert_eq!(frames.len(), 10, "{NAME}: 10 shown frames");
         assert_eq!((frames[0].width, frames[0].height), (width, height));
@@ -30750,6 +30750,95 @@ mod tests {
         eprintln!(
             "{NAME}: 10 shown frames pixel-exact on every plane; \
              skip_vartx_luma_reset={fired}"
+        );
+    }
+
+    /// lane-t900 r18 GATE: a 128-root `PARTITION_HORZ`/`PARTITION_VERT` half
+    /// coded INTRA inside an INTER frame -- the shape the
+    /// `EC_INTRA128_IN_INTER` opt-in guarded from lane-inter128intra r1 until
+    /// this round, lifted here because this stream proves it.
+    ///
+    /// What r16 and r17 could not find, and what this recipe exploits: libaom
+    /// does not PICK a 128-root HORZ/VERT in the frame interior -- r16's
+    /// 512x512 witness codes its 128 roots as NONE (96) or SPLIT (64) and
+    /// nothing else, and a textured 640x384 sweep the same. The shape appears
+    /// where the frame EDGE forces it: with a partial last superblock ROW
+    /// `has_rows128 == false`, so `PARTITION_HORZ` is implied and only the
+    /// 128x64 top half is decoded; a partial last COLUMN implies the 64x128
+    /// left half the same way (the arm the
+    /// `..._sb128_gathered_edge_horz_partition_...` gate pins for INTER
+    /// blocks). Put content no reference holds in exactly those two bands and
+    /// the encoder codes those forced halves INTRA.
+    ///
+    /// `crates/ec-av1/fixtures/intra128_in_inter_witness2.obu`, 86516 bytes,
+    /// sha256 `cace4cc3a5ba4dc5f8c7c219e87c9052351e832cad3d7f4c8ffe09288a6d7ccf`,
+    /// produced by this repository's aomenc oracle:
+    ///
+    /// ```text
+    /// aomenc --codec=av1 -w 704 -h 320 --input-bit-depth=10 --bit-depth=10 \
+    ///   --sb-size=128 --max-partition-size=128 --enable-rect-partitions=1 \
+    ///   --enable-ab-partitions=0 --enable-1to4-partitions=0 \
+    ///   --enable-intrabc=0 --enable-palette=0 --tune=psnr \
+    ///   --kf-max-dist=9999 --lag-in-frames=0 --cpu-used=1 --end-usage=q \
+    ///   --cq-level=20 --threads=1 --passes=1 --obu -o s.obu src.y4m
+    /// ```
+    ///
+    /// The source is 15 frames of 10-bit 704x320 (704 = 5*128 + 64 and
+    /// 320 = 2*128 + 64, so BOTH the last superblock column and the last
+    /// superblock row are partial) whose interior is a low-passed noise
+    /// texture panning 4 px per frame -- an exact integer translation, so
+    /// inter predicts it and intra never would -- and whose bottom 64 rows and
+    /// right 64 columns are replaced at frames 6, 9 and 12 by a fresh smooth
+    /// diagonal ramp with a different angle and offset each time. No
+    /// reference holds that content (`--lag-in-frames=0`, so there is no
+    /// hidden alt-ref either), it is internally smooth, and it lands exactly
+    /// in the edge-forced halves: `intra128_in_inter` fires 3x 128x64 and
+    /// 6x 64x128, every one of them inside a frame this gate compares
+    /// byte-exact against ffmpeg (class `counter-from-refused-stream`).
+    #[test]
+    fn an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact() {
+        const NAME: &str =
+            "an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/intra128_in_inter_witness2.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (704usize, 320usize);
+        let before = intra128_in_inter_counters();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let after = intra128_in_inter_counters();
+        let fired = [after[0] - before[0], after[1] - before[1]];
+        assert!(
+            fired[0] > 0 && fired[1] > 0,
+            "{NAME}: intra-128-in-inter fired {fired:?} (128x64, 64x128) -- both \
+             arms must fire or the gate is vacuous for the one that did not"
+        );
+        assert_eq!(frames.len(), 15, "{NAME}: 15 shown frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg returned {} frames, we decoded {}",
+            ffmpeg_frames.len(),
+            frames.len()
+        );
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: 15 shown frames pixel-exact on every plane; \
+             intra128_in_inter 128x64={} 64x128={}",
+            fired[0], fired[1]
         );
     }
 
