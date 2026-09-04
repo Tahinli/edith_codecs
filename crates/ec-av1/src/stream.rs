@@ -28608,24 +28608,20 @@ mod tests {
         );
     }
 
-    /// OPEN DEFECT (lane-tiles r11), which is why this arm is `#[ignore]`d
-    /// rather than deleted or quietly reseeded: at seed 42 this recipe
-    /// mismatches ffmpeg from frame 4 on, in one 32x32 block at
-    /// x[224..255] y[32..63] (measured with `--loopfilter-control=0`, which
-    /// removes the deblock spreading; with deblocking on the region grows to
-    /// x[221..255] y[30..69] and crosses the tile row boundary at y=64), and
-    /// the error then propagates through inter prediction to 12 of 16 frames.
-    /// Ablations that did NOT remove it: `--enable-restoration=0`,
-    /// `--enable-cdef=0`, `--loopfilter-control=0`. It is seed-specific
-    /// (seeds 47 and 48 decode 16/16 exact with two tile rows) and its
-    /// tile attribution is UNPROVEN: the single-tile control at seed 42
-    /// re-encodes to different partitions and refuses on
-    /// "an inter SB-level partition type other than SPLIT", so no
-    /// same-content one-tile comparison exists. Reproducer:
-    /// `EC_AV1_GATE_DUMP=<path> cargo test -p ec-av1 --lib
-    /// a_real_aomenc_multi_tile_inter_stream -- --ignored`.
+    /// lane-t900 r19, the defect this arm exists for, now FIXED: spec 5.11.2
+    /// `decode_tile` resets `RefLrWiener`/`RefSgrXqd` (the running
+    /// loop-restoration coefficient reference) to the midpoint filter at the
+    /// top of EVERY tile; `decode.rs` declared that state once per frame, so
+    /// every tile after the first decoded its Wiener/Sgrproj coefficients off
+    /// the previous tile's reference. The symbol COUNT is unchanged, so
+    /// entropy and reconstruction stayed byte-exact and only the filtered
+    /// pixels moved -- at seed 44 frame 0 (the key frame) the whole right tile
+    /// column, luma x[128..255] y[0..91], 1330 samples off by at most 2, with
+    /// chroma exact. Ladder that named it: `EC_AV1_PREFILT_DUMP` exact,
+    /// `EC_AV1_POSTDEBLOCK_DUMP` exact, `EC_AV1_POSTCDEF_DUMP` exact (that
+    /// last rung added to the oracle's `decodeframe.c` in this round), so the
+    /// only remaining stage was loop restoration.
     #[test]
-    #[ignore = "open defect: seed-42 32x32 block at x[224..255] y[32..63] mismatches; tile attribution unproven"]
     fn a_real_aomenc_multi_tile_inter_stream_decodes_pixel_exact() {
         run_multi_tile_gate(
             "a_real_aomenc_multi_tile_inter_stream_decodes_pixel_exact",
