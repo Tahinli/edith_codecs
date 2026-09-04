@@ -125,6 +125,22 @@ const REFUSALS: &[&str] = &[
     // What still refuses is the 128-root half of a screen-content frame, whose
     // body (`decode_block_128rect`) reads no palette syntax and for which no
     // `--sb-size=128` screen witness exists yet.
+    // lane-t900 r23 CENSUS for this string's remaining 128-root arm (the
+    // 16x4/4x16 arm was lifted in r22): its premise is already known to be
+    // false by the spec -- `read_palette_mode_info` (5.11.46) codes palette
+    // only for `Block_Width <= 64 && Block_Height <= 64`, so a 128x64/64x128
+    // half consumes NO palette syntax and the screen flag changes nothing
+    // about it. It stays because nothing witnesses it: 6 aomenc encodes at
+    // `--sb-size=128 --tune-content=screen` (704x320 = 5*128+64 by 2*128+64,
+    // the edge-forced size r18 proved for the non-screen twin; screen cell
+    // content at cq 10/20/40, and r18's own panning-texture-plus-fresh-ramp
+    // shape with `--max-partition-size=128 --enable-ab-partitions=0
+    // --enable-1to4-partitions=0`) code ZERO 128-root halves of any kind
+    // (`intra128_in_inter` and `sb128_rect` both 0 in every stream), so
+    // lifting it would be a capability claim no gate exercises (class
+    // `refusal-lifted-without-a-gate`). What is still untried: a 10-bit
+    // source, and screen content in the forced bands with a NON-screen
+    // interior.
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
