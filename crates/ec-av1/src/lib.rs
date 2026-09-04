@@ -41,6 +41,7 @@ mod motion_field;
 pub mod msac;
 pub mod mvstack;
 pub mod obu;
+mod par;
 pub mod quant;
 mod refusal_inventory;
 mod restoration;
