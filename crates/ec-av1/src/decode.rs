@@ -14234,6 +14234,7 @@ fn cdef_adjust_strength(strength: i32, var: i32) -> i32 {
 /// chroma) in place, `sample(row, col)` reading the *unfiltered* frame (a
 /// previously-filtered neighbour must never feed this block's own sum).
 #[allow(clippy::too_many_arguments)]
+#[allow(unsafe_code)]
 fn cdef_filter_block(
     src: &[i32],
     dst: &mut PlaneBuf,
@@ -14250,6 +14251,77 @@ fn cdef_filter_block(
     enable_secondary: bool,
     coeff_shift: i32,
 ) {
+    let (stride, smax) = (dst.width, sample_max());
+    #[cfg(target_arch = "x86_64")]
+    if crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 && (bw == 4 || bw == 8) && bh % 2 == 0
+    {
+        // SAFETY: reached only when the CPU reports avx2; the kernel reads
+        // `src`'s whole (bw + 4) x (bh + 4) window and writes exactly the
+        // `bh` runs of `bw` samples the scalar form writes.
+        unsafe {
+            cdef_simd::filter_block_avx2(
+                src,
+                &mut dst.data,
+                stride,
+                ox,
+                oy,
+                bw,
+                bh,
+                pri_strength,
+                sec_strength,
+                dir,
+                pri_damping,
+                sec_damping,
+                enable_primary,
+                enable_secondary,
+                coeff_shift,
+                smax,
+            )
+        };
+        return;
+    }
+    cdef_filter_block_scalar(
+        src,
+        &mut dst.data,
+        stride,
+        ox,
+        oy,
+        bw,
+        bh,
+        pri_strength,
+        sec_strength,
+        dir,
+        pri_damping,
+        sec_damping,
+        enable_primary,
+        enable_secondary,
+        coeff_shift,
+        smax,
+    );
+}
+
+/// [`cdef_filter_block`]'s scalar reference: spec 7.15.3 sample by sample,
+/// the form every non-AVX2 build decodes through and the one
+/// `cdef_simd_kernel_matches_the_scalar_filter` checks the kernel against.
+#[allow(clippy::too_many_arguments)]
+fn cdef_filter_block_scalar(
+    src: &[i32],
+    dst: &mut [u16],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    bw: usize,
+    bh: usize,
+    pri_strength: i32,
+    sec_strength: i32,
+    dir: usize,
+    pri_damping: i32,
+    sec_damping: i32,
+    enable_primary: bool,
+    enable_secondary: bool,
+    coeff_shift: i32,
+    smax: i32,
+) {
     let clipping_required = enable_primary && enable_secondary;
     // libaom `cdef_filter_block_internal`: `cdef_pri_taps[(pri_strength >>
     // coeff_shift) & 1]` -- `pri_strength` (and its `adjust_strength`
@@ -14261,7 +14333,6 @@ fn cdef_filter_block(
     let pri_shift = cdef_constrain_shift(pri_strength.max(1), pri_damping);
     let sec_shift = cdef_constrain_shift(sec_strength.max(1), sec_damping);
     let bstride = bw + 2 * CDEF_BORDER;
-    let smax = sample_max();
     // `src` is [`cdef_gather`]'s window: (i, j) in block coordinates, taps
     // reaching +-CDEF_BORDER, so every index below is in range by construction.
     let at = |i: i32, j: i32| -> i32 {
@@ -14319,7 +14390,213 @@ fn cdef_filter_block(
             if clipping_required {
                 y = y.clamp(min, max);
             }
-            dst.data[(oy + i) * dst.width + (ox + j)] = y.clamp(0, smax) as u16;
+            dst[(oy + i) * stride + (ox + j)] = y.clamp(0, smax) as u16;
+        }
+    }
+}
+
+/// lane-perf7 step 1: [`cdef_filter_block`]'s AVX2 kernel -- the scalar
+/// filter was 13.1% of a 4K decode's self time. Nothing here is spec logic:
+/// the same taps, the same `constrain`, the same `min`/`max` clamp with the
+/// `CDEF_VERY_LARGE` sentinel excluded from the max, the same
+/// `y + ((8 + sum - (sum < 0)) >> 4)` rounding, done 16 samples (two rows) at
+/// a time in 16-bit lanes.
+///
+/// 16-bit lanes are exact for every value this filter sees: window samples
+/// are in `[0, CDEF_VERY_LARGE]` (0x4000), so a tap difference fits in
+/// `i16`, a `constrain` result is bounded by the threshold (at most
+/// `15 << 4`), and the tap-weighted sum by `24 *` that.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+#[allow(unsafe_op_in_unsafe_fn)] // the kernel's whole body is its contract
+mod cdef_simd {
+    use super::{
+        cdef_constrain_shift, CDEF_BORDER, CDEF_DIRECTIONS, CDEF_PRI_TAPS, CDEF_SEC_TAPS,
+        CDEF_VERY_LARGE,
+    };
+    use std::arch::x86_64::*;
+
+    /// The window's rows `i` and `i + 1` at one tap offset, as one 256-bit
+    /// register (low half = row `i`).
+    ///
+    /// # Safety
+    /// Requires AVX2; `off + bstride + 8` must be inside `w`.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn ld2(w: *const i16, off: isize, bstride: isize) -> __m256i {
+        let lo = _mm_loadu_si128(w.offset(off).cast());
+        let hi = _mm_loadu_si128(w.offset(off + bstride).cast());
+        _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1)
+    }
+
+    /// Spec 7.15.3's `constrain`, lane-parallel:
+    /// `sign(diff) * clamp(threshold - (|diff| >> shift), 0, |diff|)`.
+    /// `_mm256_sign_epi16` reproduces `signum` exactly, zero included (the
+    /// clamped magnitude is already 0 where `diff` is).
+    ///
+    /// # Safety
+    /// Requires AVX2.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn constrain(p: __m256i, x: __m256i, thr: __m256i, shift: __m128i) -> __m256i {
+        let diff = _mm256_sub_epi16(p, x);
+        let a = _mm256_abs_epi16(diff);
+        let t = _mm256_sub_epi16(thr, _mm256_sra_epi16(a, shift));
+        let t = _mm256_min_epi16(_mm256_max_epi16(t, _mm256_setzero_si256()), a);
+        _mm256_sign_epi16(t, diff)
+    }
+
+    /// [`super::cdef_filter_block_scalar`]'s arithmetic, two rows per
+    /// iteration. `bw` is 8 (luma) or 4 (4:2:0 chroma) and `bh` matches; for
+    /// `bw == 4` the upper four lanes of each half are window samples read
+    /// past the row (never past the buffer -- `w` is padded to 256 entries),
+    /// computed and then dropped by the 64-bit store.
+    ///
+    /// # Safety
+    /// Requires AVX2. `src` must hold the `(bw + 4) x (bh + 4)` window and
+    /// `dst` the `bh` rows of `bw` samples at `(ox, oy)`.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn filter_block_avx2(
+        src: &[i32],
+        dst: &mut [u16],
+        stride: usize,
+        ox: usize,
+        oy: usize,
+        bw: usize,
+        bh: usize,
+        pri_strength: i32,
+        sec_strength: i32,
+        dir: usize,
+        pri_damping: i32,
+        sec_damping: i32,
+        enable_primary: bool,
+        enable_secondary: bool,
+        coeff_shift: i32,
+        smax: i32,
+    ) {
+        let bstride = bw + 2 * CDEF_BORDER;
+        // The window as `i16`, padded so every two-row tap load stays inside
+        // it (largest read: (bh + 3) * bstride + 8 <= 152 for the 8x8 luma
+        // block, 72 for the 4x4 chroma one).
+        let mut w = [0i16; 256];
+        let rows = bh + 2 * CDEF_BORDER;
+        for (d, &v) in w[..rows * bstride].iter_mut().zip(&src[..rows * bstride]) {
+            *d = v as i16;
+        }
+        let clipping_required = enable_primary && enable_secondary;
+        let pri_taps = CDEF_PRI_TAPS[((pri_strength >> coeff_shift) & 1) as usize];
+        let pri_shift = _mm_cvtsi32_si128(cdef_constrain_shift(pri_strength.max(1), pri_damping));
+        let sec_shift = _mm_cvtsi32_si128(cdef_constrain_shift(sec_strength.max(1), sec_damping));
+        let pri_thr = _mm256_set1_epi16(pri_strength as i16);
+        let sec_thr = _mm256_set1_epi16(sec_strength as i16);
+        let very_large = _mm256_set1_epi16(CDEF_VERY_LARGE as i16);
+        let zero = _mm256_setzero_si256();
+        let eight = _mm256_set1_epi16(8);
+        let smaxv = _mm256_set1_epi16(smax as i16);
+        let (pri_dir, sec_dir0, sec_dir1) =
+            (CDEF_DIRECTIONS[dir], CDEF_DIRECTIONS[(dir + 2) & 7], CDEF_DIRECTIONS[(dir + 6) & 7]);
+        let wp = w.as_ptr();
+        let bs = bstride as isize;
+        let dp = dst.as_mut_ptr();
+        let mut i = 0usize;
+        while i < bh {
+            let base = (i + CDEF_BORDER) as isize * bs + CDEF_BORDER as isize;
+            let x = ld2(wp, base, bs);
+            let mut sum = zero;
+            let mut max = x;
+            let mut min = x;
+            for k in 0..2usize {
+                if enable_primary {
+                    let (tr, tc) = pri_dir[k];
+                    let off = tr as isize * bs + tc as isize;
+                    let p0 = ld2(wp, base + off, bs);
+                    let p1 = ld2(wp, base - off, bs);
+                    let tap = _mm256_set1_epi16(pri_taps[k] as i16);
+                    sum = _mm256_add_epi16(
+                        sum,
+                        _mm256_mullo_epi16(tap, constrain(p0, x, pri_thr, pri_shift)),
+                    );
+                    sum = _mm256_add_epi16(
+                        sum,
+                        _mm256_mullo_epi16(tap, constrain(p1, x, pri_thr, pri_shift)),
+                    );
+                    if clipping_required {
+                        // The sentinel is excluded from the max exactly as the
+                        // scalar `if p != CDEF_VERY_LARGE` does: masking it to
+                        // 0 cannot win a max whose seed `x` is non-negative.
+                        max = _mm256_max_epi16(
+                            max,
+                            _mm256_andnot_si256(_mm256_cmpeq_epi16(p0, very_large), p0),
+                        );
+                        max = _mm256_max_epi16(
+                            max,
+                            _mm256_andnot_si256(_mm256_cmpeq_epi16(p1, very_large), p1),
+                        );
+                        min = _mm256_min_epi16(min, _mm256_min_epi16(p0, p1));
+                    }
+                }
+                if enable_secondary {
+                    let (tr0, tc0) = sec_dir0[k];
+                    let (tr1, tc1) = sec_dir1[k];
+                    let off0 = tr0 as isize * bs + tc0 as isize;
+                    let off1 = tr1 as isize * bs + tc1 as isize;
+                    let s0 = ld2(wp, base + off0, bs);
+                    let s1 = ld2(wp, base - off0, bs);
+                    let s2 = ld2(wp, base + off1, bs);
+                    let s3 = ld2(wp, base - off1, bs);
+                    if clipping_required {
+                        for s in [s0, s1, s2, s3] {
+                            max = _mm256_max_epi16(
+                                max,
+                                _mm256_andnot_si256(_mm256_cmpeq_epi16(s, very_large), s),
+                            );
+                        }
+                        min = _mm256_min_epi16(
+                            min,
+                            _mm256_min_epi16(
+                                _mm256_min_epi16(s0, s1),
+                                _mm256_min_epi16(s2, s3),
+                            ),
+                        );
+                    }
+                    let c = _mm256_add_epi16(
+                        _mm256_add_epi16(
+                            constrain(s0, x, sec_thr, sec_shift),
+                            constrain(s1, x, sec_thr, sec_shift),
+                        ),
+                        _mm256_add_epi16(
+                            constrain(s2, x, sec_thr, sec_shift),
+                            constrain(s3, x, sec_thr, sec_shift),
+                        ),
+                    );
+                    sum = _mm256_add_epi16(
+                        sum,
+                        _mm256_mullo_epi16(_mm256_set1_epi16(CDEF_SEC_TAPS[k] as i16), c),
+                    );
+                }
+            }
+            // `-1` where `sum < 0`, i.e. the scalar `- i32::from(sum < 0)`.
+            let neg = _mm256_cmpgt_epi16(zero, sum);
+            let mut y = _mm256_add_epi16(
+                x,
+                _mm256_srai_epi16(_mm256_add_epi16(_mm256_add_epi16(eight, sum), neg), 4),
+            );
+            if clipping_required {
+                y = _mm256_min_epi16(_mm256_max_epi16(y, min), max);
+            }
+            y = _mm256_min_epi16(_mm256_max_epi16(y, zero), smaxv);
+            let (lo, hi) = (_mm256_castsi256_si128(y), _mm256_extracti128_si256(y, 1));
+            let o0 = ((oy + i) * stride + ox) as isize;
+            let o1 = o0 + stride as isize;
+            if bw == 8 {
+                _mm_storeu_si128(dp.offset(o0).cast(), lo);
+                _mm_storeu_si128(dp.offset(o1).cast(), hi);
+            } else {
+                _mm_storel_epi64(dp.offset(o0).cast(), lo);
+                _mm_storel_epi64(dp.offset(o1).cast(), hi);
+            }
+            i += 2;
         }
     }
 }
@@ -31226,6 +31503,90 @@ mod tests {
                     let got = win[(r + super::CDEF_BORDER as i32) as usize * bstride
                         + (c + super::CDEF_BORDER as i32) as usize];
                     assert_eq!(got, want, "({ox},{oy}) r={r} c={c}");
+                }
+            }
+        }
+    }
+
+    /// lane-perf7 step 1: the AVX2 CDEF kernel must be value-identical to
+    /// [`super::cdef_filter_block_scalar`] over the whole input domain --
+    /// every direction, every enable pair, both block shapes, the 8/10/12-bit
+    /// strength and damping ranges, and windows that mix real samples with
+    /// the `CDEF_VERY_LARGE` out-of-frame sentinel (which must stay out of
+    /// the max clamp).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cdef_simd_kernel_matches_the_scalar_filter() {
+        if crate::mc::simd_level() != crate::mc::SimdLevel::Avx2 {
+            eprintln!("SKIP cdef simd: no avx2");
+            return;
+        }
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for &(bit_depth, coeff_shift) in &[(8u8, 0i32), (10, 2), (12, 4)] {
+            let smax = (1i32 << bit_depth) - 1;
+            for &(bw, bh) in &[(8usize, 8usize), (4, 4)] {
+                let bstride = bw + 2 * super::CDEF_BORDER;
+                let rows = bh + 2 * super::CDEF_BORDER;
+                let stride = bw + 5;
+                for trial in 0..64 {
+                    // Every fourth window seeds sentinels, in a growing
+                    // border ring, so the straddling-block case is covered.
+                    let sentinels = trial % 4;
+                    let win: Vec<i32> = (0..rows * bstride)
+                        .map(|k| {
+                            let (r, c) = (k / bstride, k % bstride);
+                            if sentinels > 0
+                                && (r < sentinels
+                                    || c < sentinels
+                                    || r + sentinels >= rows
+                                    || c + sentinels >= bstride)
+                            {
+                                super::CDEF_VERY_LARGE
+                            } else {
+                                (next() % (smax as u64 + 1)) as i32
+                            }
+                        })
+                        .collect();
+                    for dir in 0..8usize {
+                        for &pri in &[0i32, 1, 3, 15] {
+                            for &sec in &[0i32, 1, 2, 4] {
+                                for &damping in &[3i32, 5, 6, 9] {
+                                    let (pri, sec) = (pri << coeff_shift, sec << coeff_shift);
+                                    let (ep, es) = (pri != 0, sec != 0);
+                                    if !ep && !es {
+                                        continue;
+                                    }
+                                    let seed: Vec<u16> =
+                                        (0..stride * (bh + 2)).map(|k| (k % 97) as u16).collect();
+                                    let mut a = seed.clone();
+                                    let mut b = seed;
+                                    super::cdef_filter_block_scalar(
+                                        &win, &mut a, stride, 1, 1, bw, bh, pri, sec, dir,
+                                        damping, damping, ep, es, coeff_shift, smax,
+                                    );
+                                    // SAFETY: the avx2 arm was probed above.
+                                    #[allow(unsafe_code)]
+                                    unsafe {
+                                        super::cdef_simd::filter_block_avx2(
+                                            &win, &mut b, stride, 1, 1, bw, bh, pri, sec, dir,
+                                            damping, damping, ep, es, coeff_shift, smax,
+                                        )
+                                    };
+                                    assert_eq!(
+                                        a, b,
+                                        "bd={bit_depth} bw={bw} trial={trial} dir={dir} \
+                                         pri={pri} sec={sec} damping={damping}"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
