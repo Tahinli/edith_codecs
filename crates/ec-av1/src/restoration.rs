@@ -562,7 +562,11 @@ fn apply_wiener_stripe(
     let wiener_bias = 1i64 << (bd + 3);
     let wiener_limit = 1i64 << (bd + 5);
     let rows = h + 6;
-    let mut inter = vec![0i32; rows * w];
+    // lane-perf7: reused across stripes, as the sgrproj `ab` grids are --
+    // this was a fresh allocation per stripe. Every entry is written below.
+    let mut inter = WIENER_INTER_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    inter.clear();
+    inter.resize(rows * w, 0i32);
     for r in 0..rows {
         let row = v_start as i64 - 3 + r as i64;
         for c in 0..w {
@@ -589,15 +593,30 @@ fn apply_wiener_stripe(
             inter[r * w + c] = round2(sum, 3).clamp(-wiener_bias, wiener_limit - 1 - wiener_bias) as i32;
         }
     }
+    // lane-perf7: the clamp bound is the frame's, so it is read once here
+    // instead of taking a thread-local read per output sample.
+    let smax = i64::from(crate::decode::sample_max());
     for r in 0..h {
         for c in 0..w {
             let mut sum = 0i64;
             for (t, &tap) in info.vfilter.iter().enumerate() {
                 sum += tap as i64 * inter[(r + t) * w + c] as i64;
             }
-            out[(v_start + r) * stride + h_start + c] = round2(sum, 11).clamp(0, crate::decode::sample_max() as i64) as u16;
+            out[(v_start + r) * stride + h_start + c] = round2(sum, 11).clamp(0, smax) as u16;
         }
     }
+    WIENER_INTER_SCRATCH.with(|c| *c.borrow_mut() = inter);
+}
+
+thread_local! {
+    /// [`apply_wiener_stripe`]'s horizontal-pass intermediate, kept across
+    /// calls so a stripe does not allocate (lane-perf7).
+    static WIENER_INTER_SCRATCH: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// [`compute_ab`]'s two `(A, B)` grids, likewise (lane-perf7).
+    #[allow(clippy::type_complexity)]
+    static SGR_AB_SCRATCH: std::cell::RefCell<(Vec<(i32, i64)>, Vec<(i32, i64)>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// `av1_x_by_xplus1` (`restoration.c`): `round(256*z/(z+1))` for `z` in
@@ -669,10 +688,17 @@ fn compute_ab(
     h: usize,
     r: i32,
     s: i32,
-) -> Vec<(i32, i64)> {
+    // lane-perf7: a reused scratch buffer. This used to be a fresh
+    // `vec![(0, 0); (w + 2) * (h + 2)]` per call (two calls per sgrproj
+    // stripe, ~70 KB each at a 64-wide unit), i.e. an allocation whose every
+    // page then faulted in on first touch. Every entry is written below, so
+    // the resize's fill value is never read.
+    ab: &mut Vec<(i32, i64)>,
+) {
     let gw = w + 2;
     let gh = h + 2;
-    let mut ab = vec![(0i32, 0i64); gw * gh];
+    ab.clear();
+    ab.resize(gw * gh, (0i32, 0i64));
     let n = ((2 * r + 1) * (2 * r + 1)) as i64;
     // lane-perf6: the box sums are separable. Summing every grid point's own
     // (2r+1)^2 window called `lr_sample` -- whose stripe-boundary test is the
@@ -738,7 +764,6 @@ fn compute_ab(
             ab[gi * gw + gj] = (a_val, b_val);
         }
     }
-    ab
 }
 
 /// Self-guided pixel filter (spec 7.17.3, libaom `sgrproj_filter_stripe` ->
@@ -769,8 +794,18 @@ fn apply_sgrproj_stripe(
     let gw = w + 2;
     let idx = |gi: i64, gj: i64| -> usize { (gi + 1) as usize * gw + (gj + 1) as usize };
 
-    let ab0 = (r0 > 0).then(|| compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0));
-    let ab1 = (r1 > 0).then(|| compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1));
+    let (mut buf0, mut buf1) = SGR_AB_SCRATCH.with(|c| {
+        let mut m = c.borrow_mut();
+        (std::mem::take(&mut m.0), std::mem::take(&mut m.1))
+    });
+    if r0 > 0 {
+        compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0, &mut buf0);
+    }
+    if r1 > 0 {
+        compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1, &mut buf1);
+    }
+    let ab0 = (r0 > 0).then_some(&buf0);
+    let ab1 = (r1 > 0).then_some(&buf1);
 
     // r8: call-unique debug dump -- r6's coordinate-only gate (`v_start==60`)
     // matched several unrelated calls across the gate's attempt sweep, so its
@@ -806,6 +841,9 @@ fn apply_sgrproj_stripe(
         xq[1] = (1 << SGRPROJ_PRJ_BITS) - xq[0] - info.xqd[1];
     }
 
+    // lane-perf7: as in `apply_wiener_stripe`, the clamp bound is read once
+    // per stripe instead of per output sample.
+    let smax = i64::from(crate::decode::sample_max());
     for i in 0..h as i64 {
         for j in 0..w as i64 {
             let dgd = lr_sample(
@@ -879,10 +917,11 @@ fn apply_sgrproj_stripe(
                     );
                 }
             }
-            let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS).clamp(0, crate::decode::sample_max() as i64) as u16;
+            let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS).clamp(0, smax) as u16;
             out[(v_start as i64 + i) as usize * stride + (h_start as i64 + j) as usize] = out_v;
         }
     }
+    SGR_AB_SCRATCH.with(|c| *c.borrow_mut() = (buf0, buf1));
 }
 
 /// Chunks one restoration unit's `[v_start, v_end)` extent into 64-row
