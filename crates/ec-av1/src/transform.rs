@@ -107,7 +107,7 @@ fn clamp_range(x: i32, r: usize) -> i32 {
 
 /// `B(a, b, angle, flip, r)` (spec 7.13.2.1): a butterfly rotation, and an
 /// exchange of the two entries when `flip` is set.
-fn butterfly(t: &mut [i32], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
+fn butterfly(t: &mut [i32; 64], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
     let (ta, tb) = (i64::from(t[a]), i64::from(t[b]));
     let (c, s) = (i64::from(cos128(angle)), i64::from(sin128(angle)));
     let x = ta * c - tb * s;
@@ -121,7 +121,7 @@ fn butterfly(t: &mut [i32], a: usize, b: usize, angle: i32, flip: bool, _r: usiz
 
 /// `H(a, b, flip, r)` (spec 7.13.2.1): a Hadamard rotation, with the indices
 /// exchanged when `flip` is set.
-fn hadamard(t: &mut [i32], a: usize, b: usize, flip: bool, r: usize) {
+fn hadamard(t: &mut [i32; 64], a: usize, b: usize, flip: bool, r: usize) {
     let (a, b) = if flip { (b, a) } else { (a, b) };
     let (x, y) = (t[a], t[b]);
     t[a] = clamp_range(x.wrapping_add(y), r);
@@ -130,7 +130,7 @@ fn hadamard(t: &mut [i32], a: usize, b: usize, flip: bool, r: usize) {
 
 /// The inverse DCT array permutation (spec 7.13.2.2): an in-place bit-reversal
 /// of the first `1 << n` entries.
-fn permute(t: &mut [i32], n: u32) {
+fn permute(t: &mut [i32; 64], n: u32) {
     let n0 = 1usize << n;
     // A stack copy: this ran once per 1D transform and its `Vec` was the
     // `malloc` at the top of every `inverse_dct` frame in the annotation.
@@ -148,6 +148,20 @@ fn permute(t: &mut [i32], n: u32) {
 /// The stage list is the spec's, in the spec's order; the guards on `n` are
 /// what make one network serve every transform size from 4 to 64.
 pub fn inverse_dct(t: &mut [i32], n: u32, r: usize) {
+    // lane-perf10: the network below indexes a 64-entry scratch with computed
+    // indices, and on a `&mut [i32]` every one of them carried a bounds check.
+    // A `&mut [i32; 64]` lets the optimiser discharge them all against the
+    // constant length; this wrapper keeps the slice-taking signature for
+    // callers outside the 2D driver.
+    let m = 1usize << n;
+    let mut fixed = [0i32; 64];
+    fixed[..m].copy_from_slice(&t[..m]);
+    inverse_dct_fixed(&mut fixed, n, r);
+    t[..m].copy_from_slice(&fixed[..m]);
+}
+
+/// [`inverse_dct`] on the driver's own 64-entry scratch.
+fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
     assert!((2..=6).contains(&n), "the inverse DCT is defined for 4..64");
     permute(t, n);
 
@@ -827,9 +841,9 @@ fn inverse_identity(t: &mut [i32], side: usize) {
 
 /// Dispatches one row or column's 1D inverse transform by [`TxType1d`],
 /// `log2` the spec's transform-size log (as [`inverse_dct`] takes).
-fn inverse_1d(t: &mut [i32], log2: u32, r: usize, kind: TxType1d) {
+fn inverse_1d(t: &mut [i32; 64], log2: u32, r: usize, kind: TxType1d) {
     match kind {
-        TxType1d::Dct => inverse_dct(t, log2, r),
+        TxType1d::Dct => inverse_dct_fixed(t, log2, r),
         TxType1d::Adst => match log2 {
             2 => inverse_adst4(t),
             3 => inverse_adst8(t, r),
@@ -904,6 +918,11 @@ pub fn inverse_transform_2d_typed_wh(
         }
         let residual = &mut scratch[..w * h];
         let mut t = [0i32; 64];
+        // lane-perf10: rows the row pass left non-zero, and whether the first
+        // of them came out constant along the row -- see the fast path below.
+        let mut nz_rows = 0usize;
+        let mut nz_row = 0usize;
+        let mut const_row = false;
         for i in 0..h {
             let dst = &mut residual[i * w..(i + 1) * w];
             // Rows at or past 32 carry no coefficients (the spec zeroes them
@@ -930,6 +949,26 @@ pub fn inverse_transform_2d_typed_wh(
             for (d, &v) in dst.iter_mut().zip(t[..w].iter()) {
                 *d = clamp_range(round2(v, shift), col_clamp);
             }
+            nz_rows += 1;
+            nz_row = i;
+            const_row = nz_rows == 1 && dst.iter().all(|&v| v == dst[0]);
+        }
+
+        // A block whose row pass left exactly one non-zero row, constant along
+        // that row, feeds every column of the column pass the same vector --
+        // the DC-only case, which dominates inter residuals. `inverse_1d` is a
+        // pure function of its input, so one column transform broadcast across
+        // the block is byte-identical to `w` of them, and the per-column gather
+        // disappears with it.
+        if nz_rows <= 1 && const_row {
+            t[..h].fill(0);
+            t[nz_row] = residual[nz_row * w];
+            inverse_1d(&mut t, log2h, col_clamp, col_kind);
+            for i in 0..h {
+                let dst_row = if ud_flip { h - 1 - i } else { i };
+                out[dst_row * w..dst_row * w + w].fill(round2(t[i], 4));
+            }
+            return;
         }
 
         for j in 0..w {
