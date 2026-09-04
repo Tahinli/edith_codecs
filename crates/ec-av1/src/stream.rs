@@ -32194,6 +32194,93 @@ mod tests {
         );
     }
 
+    /// lane-t900 r32 GATE for the LIFTED refusal "a HORZ/VERT intra strip in
+    /// a screen-content frame (palette syntax is consumed for square blocks
+    /// only)": the r18 edge-forced recipe re-encoded with
+    /// `--tune-content=screen`, i.e. the exact case that refusal guarded.
+    ///
+    /// `crates/ec-av1/fixtures/intra128_in_inter_screen_witness.obu`, 119048
+    /// bytes, sha256
+    /// `c84a493f90327f5d2bea038a42e87cbfe56762b5c6a856d76b4bff9797c5ea09`,
+    /// from this repository's aomenc oracle over r18's own 10-bit 704x320
+    /// source (`gen3.py`): the r18 flag set plus `--tune-content=screen
+    /// --enable-palette=0 --enable-intrabc=0 --cq-level=20`. Three cq levels
+    /// were swept (20/35/50); all three fire, and the `--enable-rect-\
+    /// partitions=0` twin of each codes ZERO 128-root halves, which is what
+    /// says the shape here is the coded HORZ/VERT arm and not an artefact.
+    ///
+    /// The lift's proof is r31's enumeration
+    /// (`no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax`):
+    /// `av1_allow_palette`'s `bw > 64 || bh > 64` bound means a 128x64/64x128
+    /// half codes no palette syntax at all, so the screen flag changes nothing
+    /// about its syntax. This is the WITNESS that the lifted arm is reachable
+    /// and decodes, which r23's census could not produce.
+    #[test]
+    fn an_intra_coded_128_half_in_a_screen_content_inter_frame_decodes_pixel_exact() {
+        const NAME: &str =
+            "an_intra_coded_128_half_in_a_screen_content_inter_frame_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/intra128_in_inter_screen_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (704usize, 320usize);
+        // The refusal named `allow_screen_content_tools`, so the gate reads
+        // that bit out of the frame headers rather than trusting the encoder
+        // flag (class `gate-blind-to-feature`).
+        let mut screen_frames = 0u32;
+        {
+            let mut p = Av1Parser::new();
+            let mut pos = 0usize;
+            while pos < stream.len() {
+                let obu = p.parse_obu(&stream[pos..]).expect("parse");
+                pos += obu.total_size;
+                let header = match &obu.kind {
+                    ObuKind::Frame(h, _) => Some(&**h),
+                    ObuKind::FrameHeader(h) => Some(&**h),
+                    _ => None,
+                };
+                if header.is_some_and(|h| h.allow_screen_content_tools) {
+                    screen_frames += 1;
+                }
+            }
+        }
+        assert!(
+            screen_frames > 0,
+            "{NAME}: no frame sets allow_screen_content_tools -- the gate no longer \
+             exercises the lifted refusal's own condition"
+        );
+        let before = intra128_in_inter_counters();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let after = intra128_in_inter_counters();
+        let fired = [after[0] - before[0], after[1] - before[1]];
+        assert!(
+            fired[0] > 0 && fired[1] > 0,
+            "{NAME}: intra-128-in-inter fired {fired:?} (128x64, 64x128) -- both arms \
+             must fire or the lift is unwitnessed at the one that did not"
+        );
+        assert_eq!(frames.len(), 15, "{NAME}: 15 shown frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: frame count vs ffmpeg");
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: {screen_frames} screen-content frame(s), 15 shown frames pixel-exact \
+             on every plane; intra128_in_inter 128x64={} 64x128={}",
+            fired[0], fired[1]
+        );
+    }
+
     /// lane-t900 r22 GATE: a real `aomenc --tune-content=screen
     /// --enable-palette=1` stream whose INTER frames reconstruct palette
     /// blocks (Y and UV), at both bit depths.
