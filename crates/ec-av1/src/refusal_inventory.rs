@@ -262,6 +262,14 @@ const PROVEN: &[(&str, &str)] = &[
         "a Golomb tail longer than this decoder reads",
         "read_golomb_reads_every_value_a_conformant_stream_can_carry",
     ),
+    // lane-t900 r25, enumeration: a motion_mode/obmc symbol is read only under
+    // `is_motion_variation_allowed_bsize` (min side >= 8), and each of the 17
+    // `BLOCK_SIZES_ALL` footprints that clause admits maps to a distinct row of
+    // the 17-row table.
+    (
+        "a motion_mode symbol for a block shape with no CDF row here",
+        "every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row",
+    ),
     (
         "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         "a_twelve_bit_sequence_header_is_refused_by_name",
