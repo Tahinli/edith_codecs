@@ -50,10 +50,12 @@ const REFUSALS: &[&str] = &[
     // 8x8 LEAF inside an inter frame (this round, gate
     // `a_screen_stream_with_palette_8x8_leaves_in_inter_frames_decodes_pixel_exact`),
     // which is why the (UV) string is gone from the decoder entirely -- the
-    // leaf was its only site. The (Y) one survives ONLY as the defensive
-    // `palette.is_none()` guard in `read_intra_mode`/`read_intra_mode_rect`;
-    // every caller now passes a real ctx/cache pair, so no stream reaches it.
-    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+    // leaf was its only site. The (Y) one survived as the defensive
+    // `palette.is_none()` guard in `read_intra_mode`/`read_intra_mode_rect`
+    // until lane-t900 r33 DELETED both arms: all eight call sites hand the
+    // reader a real ctx/cache pair, so no stream could reach either (audit
+    // `every_read_intra_mode_call_site_hands_the_reader_a_palette_cache`,
+    // which keeps that invariant now the refusal is gone).
     "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
@@ -349,6 +351,37 @@ const PROVEN: &[(&str, &str)] = &[
     // `real_superres_streams_with_sub8_leaf8_and_warp_decode_pixel_exact`
     // decodes both lifted shapes byte-exact vs ffmpeg, and the census now
     // asserts none of the three strings comes back.
+    // lane-t900 r33, enumeration: the five callers of `decode_rect_split` pass
+    // the ten rect footprints with `8 <= min` and `max <= 64`, and every one of
+    // them has a chroma table and -- at every tx depth -- a luma arm. The two
+    // shape classes that would miss one (a 128-sided half, a sub-8 strip) have
+    // readers that are not among those callers.
+    (
+        "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
+        "every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table",
+    ),
+    (
+        "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
+        "every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table",
+    ),
+    // lane-t900 r33, enumeration: each of the four symbols this guard tests is
+    // read under a size gate that no 128-pixel side passes (the call site's
+    // literal `cfl=false`, `filter_intra_size_class_rect`'s table, and
+    // `palette_bsize_ctx_wh`'s bound).
+    (
+        "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
+        "no_128_root_half_reads_a_cfl_filter_intra_or_palette_symbol",
+    ),
+    // lane-t900 r33, WITNESS of a capability gap: the refusal is REACHED by
+    // real `--tune-content=screen --enable-palette=1` streams, counted
+    // (`palette_sb_strip_hits`) and hard-asserted non-zero by its gate, which
+    // also decodes the arms that do not reach it pixel-exact. lane-pal8 r1
+    // measured the lift and it mismatches whole-frame, so the string names a
+    // real shape a real encoder writes -- an open capability, not a claim.
+    (
+        "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
+        "a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact",
+    ),
     (
         "a reference picture whose height does not match this frame's own true size",
         "an_inter_frame_shorter_than_its_reference_is_refused_by_name",
@@ -1043,6 +1076,281 @@ mod tests {
                 "a {bw}x{bh} half can carry a palette after all"
             );
         }
+    }
+
+    /// lane-t900 r33, ENUMERATION for the two [`decode_rect_split`] refusals
+    /// ("a coded HORZ/VERT strip whose chroma transform has no rect
+    /// coefficient tables here" and "a split intra strip whose transform unit
+    /// is {tx_w}x{tx_h}").
+    ///
+    /// Both guard shape lookups inside one function, so the proof is one
+    /// enumeration: the footprints that function is CALLED with, walked
+    /// through `depth_to_tx_wh` at every depth, against the two `match`
+    /// tables read out of `decode.rs` itself (class
+    /// `table-and-reader-move-together` -- a table edit invalidates this test
+    /// rather than sneaking past it).
+    ///
+    /// The footprint domain is the five callers' own: `decode_block_rect`
+    /// (32-level 2:1), `decode_block_rect4` (32-level 1:4), `decode_leaf_rect`
+    /// (16-level 2:1), `decode_block_rect64` (64-level 2:1 and 1:4) and
+    /// `decode_intra_rect_in_inter`, whose reachable shapes are the ten
+    /// rectangular census shapes with `8 <= min` and `max <= 64` (already
+    /// pinned by `every_intra_in_inter_shape_the_census_lists_has_a_size_group_row`).
+    /// The two shape classes that would MISS a table -- a 128-sided half
+    /// (chroma 64x32) and a sub-8 strip (16x4 -> chroma 8x2) -- are excluded
+    /// structurally: their readers, `decode_block_128rect` and
+    /// `decode_rect4_16_strip`, are not among the callers, which this test
+    /// asserts by locating every `decode_rect_split(` call in its enclosing
+    /// function.
+    #[test]
+    fn every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table() {
+        let src = include_str!("decode.rs");
+
+        // (1) The caller set. Each call's enclosing function is the last
+        // top-level `fn` before it.
+        let fn_starts: Vec<(usize, String)> = src
+            .match_indices("\nfn ")
+            .map(|(i, _)| {
+                let rest = &src[i + 4..];
+                let name = rest[..rest.find('(').unwrap_or(0)].to_string();
+                (i, name)
+            })
+            .collect();
+        let mut callers: BTreeSet<String> = BTreeSet::new();
+        for (at, _) in src.match_indices("decode_rect_split(") {
+            let enclosing = fn_starts
+                .iter()
+                .filter(|(i, _)| *i < at)
+                .next_back()
+                .expect("a decode_rect_split call outside any function");
+            if enclosing.1 != "decode_rect_split" {
+                callers.insert(enclosing.1.clone());
+            }
+        }
+        let expected: BTreeSet<String> = [
+            "decode_block_rect",
+            "decode_block_rect4",
+            "decode_block_rect64",
+            "decode_intra_rect_in_inter",
+            "decode_leaf_rect",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            callers, expected,
+            "the set of functions that call decode_rect_split changed -- re-derive the \
+             footprint domain below from the new caller (a 128-sided or sub-8 caller makes \
+             both refusals live)"
+        );
+
+        // (2) The walk, asserted against its own source before it is applied.
+        const WALK: &str = "    let (mut w, mut h) = (bw.min(64), bh.min(64));\n    \
+                            for _ in 0..depth {\n        match w.cmp(&h) {\n            \
+                            std::cmp::Ordering::Greater => w /= 2,\n            \
+                            std::cmp::Ordering::Less => h /= 2,\n            \
+                            std::cmp::Ordering::Equal => {\n                w /= 2;\n                \
+                            h /= 2;\n            }\n        }\n    }";
+        assert_eq!(
+            src.matches(WALK).count(),
+            1,
+            "depth_to_tx_wh's walk is no longer spelled the way this enumeration mirrors it"
+        );
+        let depth_to_tx_wh = |bw: usize, bh: usize, depth: usize| {
+            let (mut w, mut h) = (bw.min(64), bh.min(64));
+            for _ in 0..depth {
+                match w.cmp(&h) {
+                    std::cmp::Ordering::Greater => w /= 2,
+                    std::cmp::Ordering::Less => h /= 2,
+                    std::cmp::Ordering::Equal => {
+                        w /= 2;
+                        h /= 2;
+                    }
+                }
+            }
+            (w, h)
+        };
+
+        // (3) The two tables, read out of decode_rect_split's own text: every
+        // `(w, h) =>` / `(w, h) |` match arm head between the table's `let`
+        // and the guard that follows it.
+        let body_at = src.find("fn decode_rect_split(").expect("decode_rect_split is gone");
+        let body = &src[body_at..];
+        let slice = |from: &str, to: &str| -> &str {
+            let a = body.find(from).unwrap_or_else(|| panic!("{from:?} is gone from decode_rect_split"));
+            let b = body[a..].find(to).unwrap_or_else(|| panic!("{to:?} is gone from decode_rect_split"));
+            &body[a..a + b]
+        };
+        let arm_shapes = |text: &str| -> BTreeSet<(usize, usize)> {
+            let mut out = BTreeSet::new();
+            let bytes = text.as_bytes();
+            for (i, _) in text.match_indices('(') {
+                let mut j = i + 1;
+                let mut w = 0usize;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    w = w * 10 + usize::from(bytes[j] - b'0');
+                    j += 1;
+                }
+                if j == i + 1 || !text[j..].starts_with(", ") {
+                    continue;
+                }
+                j += 2;
+                let mut h = 0usize;
+                let start_h = j;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    h = h * 10 + usize::from(bytes[j] - b'0');
+                    j += 1;
+                }
+                if j == start_h || !text[j..].starts_with(')') {
+                    continue;
+                }
+                // Only an arm HEAD counts, never a `(32, 8)` inside prose.
+                let after = text[j + 1..].trim_start();
+                if after.starts_with("=>") || after.starts_with('|') {
+                    out.insert((w, h));
+                }
+            }
+            out
+        };
+        let chroma = arm_shapes(slice("let chroma: Option<(TxbSet", "if !m.skip {"));
+        let luma = arm_shapes(slice("let luma_rect: Option<(TxbSet", "no luma \\"));
+        assert!(
+            chroma.len() >= 6 && luma.len() >= 6,
+            "the tables parsed to {} chroma / {} luma shapes -- the parse, not the decoder, \
+             is what this would be measuring",
+            chroma.len(),
+            luma.len()
+        );
+
+        // (4) The enumeration itself.
+        let mut checked = 0u32;
+        for wl in 3..=6u32 {
+            for hl in 3..=6u32 {
+                let (bw, bh) = (1usize << wl, 1usize << hl);
+                let ratio = bw.max(bh) / bw.min(bh);
+                if ratio != 2 && ratio != 4 {
+                    continue;
+                }
+                assert!(
+                    chroma.contains(&(bw / 2, bh / 2)),
+                    "a {bw}x{bh} strip's {}x{} chroma transform has no rect table -- the \
+                     chroma refusal is LIVE for a shape a caller codes",
+                    bw / 2,
+                    bh / 2
+                );
+                // Every depth: once the walk reaches a square it stays square,
+                // so this covers any tx_depth a header can code.
+                for depth in 1..=4 {
+                    let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+                    assert!(
+                        tx_w == tx_h || luma.contains(&(tx_w, tx_h)),
+                        "a {bw}x{bh} strip at depth {depth} resolves to a {tx_w}x{tx_h} \
+                         transform unit, which has no luma arm -- that refusal is LIVE"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 40, "the strip domain is not the ten rect shapes x four depths");
+    }
+
+    /// lane-t900 r33, ENUMERATION for "CfL, filter intra or a palette on a
+    /// 128-root HORZ/VERT intra block".
+    ///
+    /// The guard fires when any of four symbols came back `Some` from
+    /// `read_intra_mode_rect` on a 128x64/64x128 half. Each of the four is
+    /// read under a size gate, and none of those gates admits a 128-pixel
+    /// side:
+    ///
+    /// * `cfl_alpha` -- read only under the `cfl` PARAMETER, and the 128-root
+    ///   call site passes the literal `false`;
+    /// * `use_filter_intra` -- read only when `filter_intra_size_class_rect`
+    ///   is `Some`, whose table has no arm with a 128 side and whose square
+    ///   fallback (`filter_intra_size_class`) caps at 32
+    ///   (`av1_filter_intra_allowed_bsize`);
+    /// * `palette_y_mode` / `palette_uv_mode` -- both inside the
+    ///   `palette_bsize_ctx_wh` block already enumerated by
+    ///   [`no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax`].
+    #[test]
+    fn no_128_root_half_reads_a_cfl_filter_intra_or_palette_symbol() {
+        let src = include_str!("decode.rs");
+        // The 128-root call site's own `cfl` argument, with the comment that
+        // explains it -- the two lines are matched together so that reordering
+        // the arguments cannot leave this test pointing at another `false`.
+        const CFL_OFF_AT_128: &str = "            // `is_cfl_allowed` caps CFL at 32x32: `uv_mode` comes off the\n            \
+                                      // 13-symbol no-CFL CDF here, never the 14-symbol one.\n            false,";
+        assert_eq!(
+            src.matches(CFL_OFF_AT_128).count(),
+            1,
+            "the 128-root call site no longer passes cfl=false -- a CfL alpha can reach the \
+             guard, so this enumeration proves nothing"
+        );
+        // The filter-intra table: every arm head, plus the square fallback.
+        let fi_at = src
+            .find("fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {")
+            .expect("filter_intra_size_class_rect is gone");
+        let fi_body = &src[fi_at..fi_at + src[fi_at..].find("\n}\n").expect("unterminated fn")];
+        assert!(
+            !fi_body.contains("128"),
+            "filter_intra_size_class_rect grew an arm naming a 128 side"
+        );
+        assert!(
+            fi_body.contains("_ if bw == bh => filter_intra_size_class(bw),")
+                && fi_body.contains("_ => None,"),
+            "filter_intra_size_class_rect's fallbacks changed shape"
+        );
+        let sq_at = src
+            .find("fn filter_intra_size_class(side: usize) -> Option<usize> {")
+            .expect("filter_intra_size_class is gone");
+        let sq_body = &src[sq_at..sq_at + src[sq_at..].find("\n}\n").expect("unterminated fn")];
+        assert!(
+            !sq_body.contains("128") && !sq_body.contains("64"),
+            "filter_intra_size_class admits a side above 32 -- av1_filter_intra_allowed_bsize \
+             does not, so re-derive this proof"
+        );
+        // And palette, at the two shapes the refusal names.
+        assert!(
+            src.contains("if bw > 64 || bh > 64 || bw * bh < 64 {"),
+            "palette_bsize_ctx_wh's bound moved -- see \
+             no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax"
+        );
+        for (bw, bh) in [(128usize, 64usize), (64, 128)] {
+            assert!(bw > 64 || bh > 64, "{bw}x{bh} is not a 128-root half");
+        }
+    }
+
+    /// lane-t900 r33, STRUCTURAL AUDIT behind the DELETION of "a block that
+    /// actually uses a palette (Y) -- reconstruction is out of scope".
+    ///
+    /// That refusal was the `palette.is_none()` arm of `read_intra_mode` and
+    /// `read_intra_mode_rect`: a stream reached it only if a CALLER read the
+    /// palette syntax without handing the reader a neighbour ctx/cache pair.
+    /// Every one of the eight call sites passes `Some((palette_ctx,
+    /// &palette_cache))`, so no stream could reach either arm and both are
+    /// gone from `decode.rs`. This test keeps the invariant the deletion rests
+    /// on: a future caller that passes `None` fails here rather than decoding
+    /// a palette off an empty colour cache.
+    #[test]
+    fn every_read_intra_mode_call_site_hands_the_reader_a_palette_cache() {
+        let src = include_str!("decode.rs");
+        let mut sites = 0u32;
+        for name in ["read_intra_mode(", "read_intra_mode_rect("] {
+            for (at, _) in src.match_indices(name) {
+                // The definition itself, not a call.
+                if src[..at].ends_with("fn ") {
+                    continue;
+                }
+                sites += 1;
+                let window = &src[at..(at + 4096).min(src.len())];
+                let end = window.find("fctx,\n").unwrap_or(window.len());
+                assert!(
+                    window[..end].contains("Some((palette_ctx, &palette_cache)),"),
+                    "a {name} call site does not hand the reader a palette ctx/cache pair -- \
+                     the deleted `palette.is_none()` refusal was its guard"
+                );
+            }
+        }
+        assert_eq!(sites, 8, "the call-site audit found {sites} sites, not the 8 it enumerated");
     }
 
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
