@@ -171,6 +171,17 @@ const PROVEN: &[(&str, &str)] = &[
     // than decoded wrong) and a witness gate (a real aomenc screen key frame
     // reaches intrabc on a rect strip, so the refusal names a shape a real
     // encoder does write).
+    // lane-t900 r21, enumeration: `partition_w32` is a ten-symbol CDF and both
+    // `match part32` blocks carry an arm for each of its values, so neither
+    // fallback arm can be reached by any stream.
+    (
+        "a 32x32 partition type this decoder does not code (value={part32})",
+        "every_32x32_partition_value_has_an_arm_on_both_paths",
+    ),
+    (
+        "an INTER 32x32 partition type this decoder does not code (value={part32})",
+        "every_32x32_partition_value_has_an_arm_on_both_paths",
+    ),
     (
         "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         "a_twelve_bit_sequence_header_is_refused_by_name",
@@ -358,12 +369,107 @@ mod tests {
         );
     }
 
+    /// The 32x32 partition alphabet, enumerated against the arms that code it.
+    ///
+    /// `partition_w32` is a ten-symbol CDF -- `PARTITION_NONE ..=
+    /// PARTITION_VERT_4` -- and `SymbolDecoder::symbol_fixed` cannot return a
+    /// value outside `0..nsyms`, so those ten values are the whole domain of
+    /// `part32` (the frame-edge path narrows it further still, to
+    /// HORZ/VERT/SPLIT). If both `match part32` blocks -- the intra one and
+    /// the inter one -- carry an arm for every value, then the `_ =>` refusal
+    /// each ends with names a value no stream can present.
+    ///
+    /// The refusals stay in the code: `part32` is a `usize`, so the match
+    /// needs a fallback arm, and a named refusal is a better one than a panic
+    /// (class `branch-dropped-as-unreachable`). What this test removes is the
+    /// UNMEASURED part of the claim.
+    #[test]
+    fn every_32x32_partition_value_has_an_arm_on_both_paths() {
+        const NAMES: [&str; 10] = [
+            "PARTITION_NONE",
+            "PARTITION_HORZ",
+            "PARTITION_VERT",
+            "PARTITION_SPLIT",
+            "PARTITION_HORZ_A",
+            "PARTITION_HORZ_B",
+            "PARTITION_VERT_A",
+            "PARTITION_VERT_B",
+            "PARTITION_HORZ_4",
+            "PARTITION_VERT_4",
+        ];
+        let alphabet = crate::cdf::PARTITION_W32[0].len() - 1;
+        assert_eq!(
+            alphabet,
+            NAMES.len(),
+            "the partition_w32 CDF codes {alphabet} symbols, not the {} this test enumerates",
+            NAMES.len()
+        );
+
+        let src = include_str!("decode.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let mut blocks = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim() != "match part32 {" {
+                continue;
+            }
+            blocks += 1;
+            let outer = indent(line);
+            let close = " ".repeat(outer) + "}";
+            let mut arms: BTreeSet<&str> = BTreeSet::new();
+            let mut has_fallback = false;
+            for l in &lines[i + 1..] {
+                if *l == close {
+                    break;
+                }
+                // Arm patterns sit exactly one level in; anything deeper is an
+                // arm's body, including the nested `match` blocks and the
+                // `part32 == PARTITION_HORZ_4` reads inside them.
+                if indent(l) != outer + 4 || !l.contains("=>") {
+                    continue;
+                }
+                let pat = l.trim();
+                if pat.starts_with("_ =>") {
+                    has_fallback = true;
+                }
+                // Token-exact, not substring: `PARTITION_VERT_B` is a prefix of
+                // other identifiers, and a misspelled constant in a pattern
+                // position is an irrefutable BINDING that swallows the whole
+                // alphabet while still compiling.
+                let head = pat.split("=>").next().unwrap_or("");
+                for tok in head.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    if let Some(name) = NAMES.iter().find(|n| **n == tok) {
+                        arms.insert(name);
+                    }
+                }
+            }
+            let missing: Vec<&&str> = NAMES.iter().filter(|n| !arms.contains(**n)).collect();
+            assert!(
+                missing.is_empty(),
+                "the `match part32` at decode.rs:{} has no arm for {missing:?} -- that is a real \
+                 gap in the 32x32 partition alphabet, not a dead refusal",
+                i + 1
+            );
+            assert!(
+                has_fallback,
+                "the `match part32` at decode.rs:{} lost its fallback arm; if it is exhaustive \
+                 now, drop its refusal from the inventory instead",
+                i + 1
+            );
+        }
+        assert_eq!(blocks, 2, "expected the intra and inter 32x32 partition matches");
+    }
+
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
     /// that exists, and the count it prints is the inventory's numerator.
     #[test]
     fn every_proven_refusal_names_a_test_that_exists() {
         let found = decode_path_refusals();
-        let sources = [include_str!("stream.rs"), include_str!("decode.rs")];
+        let sources = [
+            include_str!("stream.rs"),
+            include_str!("decode.rs"),
+            include_str!("refusal_inventory.rs"),
+        ];
         for (reason, gate) in PROVEN {
             assert!(
                 found.contains(*reason),
