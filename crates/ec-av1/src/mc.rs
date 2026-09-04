@@ -257,10 +257,17 @@ fn hpass_row(reference: &[u16], row_base: usize, true_width: usize, x0: i32, tap
     if start >= 0 && start as usize + block_w + 7 <= true_width {
         let s = row_base + start as usize;
         if let Some(src) = reference.get(s..s + block_w + 7) {
+            // Both factors are 16-bit (a tap is |x| <= 128, a sample fits the
+            // bit depth), so the products are exactly the i32 ones above but
+            // the widening multiply is one instruction per pair.
+            let t16 = [
+                taps[0] as i16, taps[1] as i16, taps[2] as i16, taps[3] as i16,
+                taps[4] as i16, taps[5] as i16, taps[6] as i16, taps[7] as i16,
+            ];
             for (o, w) in out.iter_mut().zip(src.windows(8)) {
                 let mut sum = 0i32;
                 for t in 0..8 {
-                    sum += taps[t] * i32::from(w[t]);
+                    sum += i32::from(t16[t]) * i32::from(w[t] as i16);
                 }
                 *o = round2(sum, INTER_ROUND_0);
             }
