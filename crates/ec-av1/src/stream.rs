@@ -30179,6 +30179,143 @@ mod tests {
         );
     }
 
+    /// lane-t900 r21: the witness for the palette SYNTAX on a rect intra strip
+    /// inside a screen-content INTER frame.
+    ///
+    /// `read_palette_mode_info` is gated by the frame's
+    /// `allow_screen_content_tools` and by the block's own shape
+    /// (`palette_bsize_ctx_wh`: `min(w,h) >= 8`, `max(w,h) <= 64`),
+    /// with no square-only term -- so a `--tune-content=screen` inter frame
+    /// writes `palette_y_mode` (and `palette_uv_mode`) for an 8x16 or 16x8
+    /// intra strip exactly as for a square block. This decoder's inter-path
+    /// intra arm skipped both symbols and refused the whole case by name ("a
+    /// HORZ/VERT intra strip in a screen-content frame (palette syntax is
+    /// consumed for square blocks only)"), which a real stream reached:
+    /// measured with `decode_probe`, `testsrc2` 256x192 at
+    /// `--tune-content=screen --enable-palette=0 --enable-intrabc=0` stops on
+    /// that refusal at an 8x16 strip (8-bit) / a 16x8 one (10-bit).
+    ///
+    /// Both arms now decode all ten frames pixel-exact against ffmpeg, and
+    /// [`decode::intra_rect_in_inter_screen_hits`] counts the strips that read
+    /// the syntax -- hard-asserted, because an attempt with no such strip
+    /// proves nothing about the case the refusal named.
+    ///
+    /// Note `--enable-palette=0`: the encoder's palette SEARCH is what this
+    /// gate must switch off, not the syntax. With it on, the key frame codes
+    /// a block that really uses a palette and stops on the separate,
+    /// still-live "a block that actually uses a palette (Y)" refusal before
+    /// any inter frame is reached (class `refusal-hides-a-defect`, measured on
+    /// six such encodes).
+    #[test]
+    fn a_real_aomenc_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips() {
+        screen_rect_intra_palette_syntax_gate(8);
+    }
+
+    /// The 10-bit arm (both of the user's films are `yuv420p10le`).
+    #[test]
+    fn a_real_aomenc_10bit_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips() {
+        screen_rect_intra_palette_syntax_gate(10);
+    }
+
+    fn screen_rect_intra_palette_syntax_gate(bit_depth: u32) {
+        let name = format!("screen_rect_intra_palette_syntax_gate({bit_depth})");
+        if !have_ffmpeg() {
+            eprintln!("SKIP {name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (256usize, 192usize, 10usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=256x192:r=25", "-t", "0.4",
+                "-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success(), "{name}: ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+        // The source stays 8-bit for both arms: `--bit-depth=10
+        // --input-bit-depth=8` is the recipe that was measured to reach the
+        // refusal, and the arm's point is the coded syntax, not the input.
+        let depth_arg = format!("--bit-depth={bit_depth}");
+        let cq_arg = format!("--cq-level={}", if bit_depth == 10 { 45 } else { 40 });
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cpu-used=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=30",
+                "--limit=10",
+                "--threads=1",
+                "--tile-columns=0",
+                "--enable-rect-partitions=1",
+                "--enable-1to4-partitions=1",
+                "--min-partition-size=8",
+                "--sb-size=64",
+                "--input-bit-depth=8",
+                // `allow_screen_content_tools` in every frame header comes
+                // from here; the two searches below stay off so the KEY frame
+                // does not stop on a palette/intrabc RECONSTRUCTION refusal
+                // before an inter frame exists.
+                "--tune-content=screen",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+            ])
+            .args([&depth_arg, &cq_arg])
+            .args(["--obu", "-o", "-", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .or_else(|e| match e.kind() {
+                std::io::ErrorKind::BrokenPipe => Ok(()),
+                _ => Err(e),
+            })
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "{name}: aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        decode::reset_intra_rect_in_inter_screen_hits();
+        let frames = decode_stream(&stream).unwrap_or_else(|e| {
+            panic!("{name}: decode failed -- the case this gate exists for: {e}")
+        });
+        let strips = decode::intra_rect_in_inter_screen_hits();
+        eprintln!("{name}: {} frames, {strips} rect intra strip(s) read the palette syntax", frames.len());
+        assert_eq!(frames.len(), frame_count, "{name}: frame count");
+        let ffmpeg_frames = if bit_depth == 10 {
+            ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+        } else {
+            ffmpeg_decode_sequence(&stream, width, height, frame_count)
+        };
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "{name}: frame {i} luma vs ffmpeg");
+            assert_eq!(got.u, want.u, "{name}: frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{name}: frame {i} V vs ffmpeg");
+        }
+        assert!(
+            strips > 0,
+            "{name}: no rect intra strip of a screen-content frame read the palette syntax -- \
+             the gate is vacuous, the recipe stopped producing the shape"
+        );
+    }
+
     /// lane-intra14 r4: the FILM witness for an intra block on a 1:4 partition
     /// inside an INTER frame -- `crates/ec-av1/fixtures/hg_intra14_witness.obu`,
     /// 163057 bytes, sha256
