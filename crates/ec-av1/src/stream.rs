@@ -1324,6 +1324,208 @@ mod tests {
         assert_eq!(shown, 0, "an inter frame with no reference produced a picture");
     }
 
+    /// lane-t900 r26, negative gate: an inter frame whose own coded size is
+    /// SHORTER than the reference it predicts from is refused BY NAME, and
+    /// outputs no picture beyond the key frame that preceded it.
+    ///
+    /// The height mismatch is the one size difference this decoder cannot
+    /// absorb: `mc::predict_scaled` scales horizontally (a `use_superres`
+    /// reference), and nothing on this path scales vertically. The fixture is
+    /// written, not hand-built: a shown key frame at 64x64 (which refreshes
+    /// every slot), then a shown inter frame carrying
+    /// `frame_size_override_flag` with `error_resilient_mode` set -- the one
+    /// combination [`crate::frame::write_frame_header`] writes, since
+    /// `frame_size_with_refs` (spec 5.9.7) is only read when error resilience
+    /// is OFF. The inter frame's tile payload is the key frame's; the refusal
+    /// fires on the reference's dimensions before a tile symbol is read.
+    #[test]
+    fn an_inter_frame_shorter_than_its_reference_is_refused_by_name() {
+        const REFUSAL: &str =
+            "a reference picture whose height does not match this frame's own true size";
+        let picture = test_card(64, 64);
+        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
+        let inter = FrameHeader {
+            frame_type: FrameType::Inter,
+            frame_is_intra: false,
+            error_resilient_mode: true,
+            primary_ref_frame: PRIMARY_REF_NONE,
+            refresh_frame_flags: 0x02,
+            order_hint: 1,
+            frame_size_override_flag: true,
+            frame_height: 32,
+            render_height: 32,
+            ..key.clone()
+        };
+        let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+        stream.extend_from_slice(&crate::frame::frame_obu(&seq, &key, &encoded.tile).unwrap());
+        stream.extend_from_slice(&crate::frame::frame_obu(&seq, &inter, &encoded.tile).unwrap());
+
+        let mut shown = 0;
+        let err = decode_stream_with(&stream, |_, _, _| {
+            shown += 1;
+            Ok(())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(REFUSAL), "expected {REFUSAL:?}, got: {err}");
+        assert_eq!(shown, 1, "expected the key frame alone, got {shown} pictures");
+    }
+
+    /// lane-t900 r26, negative gate: an inter frame naming a
+    /// `primary_ref_frame` whose reference slot has never been refreshed is
+    /// refused BY NAME rather than decoded from the spec 8.4 default tables.
+    ///
+    /// Enumeration first, because the refusal's premise is an invariant: the
+    /// picture slots and the CDF slots are written by exactly two loops in
+    /// [`decode_stream`] (the `show_existing_frame` arm's copy and the
+    /// end-of-frame store), and both walk the SAME `refresh_frame_flags` mask
+    /// writing `ref_slots[i]` and `cdf_slots[i]` together -- so no slot can
+    /// hold a picture without CDFs, and the reachable case is a slot nothing
+    /// has refreshed at all. That is what this builds: a stream that OPENS on
+    /// a non-error-resilient inter frame (the only header shape that codes
+    /// `primary_ref_frame` at all, spec 5.9.2), tried at all eight slots.
+    ///
+    /// This refusal, not "an inter frame with no key frame before it", is the
+    /// one such a stream reaches: the CDF load happens in the header path,
+    /// before the reference pictures are looked up.
+    #[test]
+    fn an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name() {
+        const REFUSAL: &str =
+            "a frame naming primary_ref_frame at a reference slot with no saved CDF state";
+        // The invariant above, read off the source: every line that stores a
+        // picture into a slot sits in a block that stores that slot's CDFs too.
+        let src = include_str!("stream.rs");
+        let stores: Vec<usize> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim().starts_with("ref_slots[i] = "))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            stores.len(),
+            2,
+            "the picture slots gained a writer -- check it stores cdf_slots too"
+        );
+        let lines: Vec<&str> = src.lines().collect();
+        for &i in &stores {
+            let window = lines[i.saturating_sub(6)..(i + 6).min(lines.len())].join("\n");
+            assert!(
+                window.contains("cdf_slots[i] = "),
+                "line {} stores a reference picture with no cdf_slots store beside it: a slot \
+                 can then hold a picture with no saved CDF state",
+                i + 1
+            );
+        }
+
+        let picture = test_card(64, 64);
+        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
+        for slot in 0..NUM_REF_FRAMES as u8 {
+            let inter = FrameHeader {
+                frame_type: FrameType::Inter,
+                frame_is_intra: false,
+                // `primary_ref_frame` is coded only when error resilience is
+                // off (spec 5.9.2); `frame_size_override_flag` stays clear so
+                // the header writes a plain `frame_size()`.
+                error_resilient_mode: false,
+                primary_ref_frame: 0,
+                ref_frame_idx: [slot; ec_av1_syntax::REFS_PER_FRAME],
+                refresh_frame_flags: 0x02,
+                order_hint: 1,
+                ..key.clone()
+            };
+            let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+            stream
+                .extend_from_slice(&crate::frame::frame_obu(&seq, &inter, &encoded.tile).unwrap());
+
+            let mut shown = 0;
+            let err = decode_stream_with(&stream, |_, _, _| {
+                shown += 1;
+                Ok(())
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(REFUSAL), "slot {slot}: expected {REFUSAL:?}, got: {err}");
+            assert_eq!(shown, 0, "slot {slot}: a frame with no CDF state produced a picture");
+        }
+    }
+
+    /// lane-t900 r26, enumeration: no frame header a stream can carry derives
+    /// an empty mode-info grid, so "a frame with no mode-info grid" names a
+    /// case outside the coded domain.
+    ///
+    /// `compute_image_size` (spec 5.9.9) is `mi_cols = 2 * ((frame_width + 7)
+    /// >> 3)`, which is 0 only for `frame_width == 0`, and a frame width is
+    /// never 0 on any of the three paths that set one:
+    ///
+    /// * `frame_size()` (5.9.5) reads `frame_width_minus_1` and adds one, or
+    ///   takes the sequence's `max_frame_width` (itself `+ 1`-coded);
+    /// * `superres_params()` (5.9.8) divides by a denominator of 9..=16 with
+    ///   rounding, whose minimum over the whole 16-bit upscaled-width domain
+    ///   is enumerated below and is 1, not 0;
+    /// * `show_existing_frame` and `frame_size_with_refs()` copy a slot's own
+    ///   dimensions, which came from one of the above.
+    ///
+    /// The sweep drives the REAL header reader (write a header, parse it back)
+    /// over every width and every height a 16-bit `frame_size()` can code,
+    /// per axis -- the derivation is independent per axis -- rather than
+    /// re-deriving the formula here.
+    #[test]
+    fn every_frame_size_a_header_can_code_has_a_mode_info_grid() {
+        let mut sizes: Vec<u32> = (1..=1024).collect();
+        sizes.extend([2048, 4095, 4096, 8192, 16384, 32768, 65535, 65536]);
+        // `mi_cols` is nondecreasing in `frame_width`, so an empty grid can
+        // only appear at the SMALL end -- which is why a size this crate's
+        // tile-info writer cannot express (its tile log2 range runs out well
+        // before 65536) is skipped rather than worked around, while every
+        // size up to 1024 must be covered.
+        let mut skipped: Vec<u32> = Vec::new();
+        for n in sizes {
+            for (w, h) in [(n, 16), (16, n)] {
+                let Ok((seq, header)) =
+                    crate::encode::key_frame_headers(w as usize, h as usize, 100)
+                else {
+                    skipped.push(n);
+                    continue;
+                };
+                let Ok(stream) = crate::frame::frame_obu(&seq, &header, &[]) else {
+                    skipped.push(n);
+                    continue;
+                };
+                let mut parser = Av1Parser::new();
+                parser.parse_obu(&crate::sequence::sequence_header_obu(&seq).unwrap()).unwrap();
+                let obu = parser.parse_obu(&stream).unwrap();
+                let ObuKind::Frame(parsed, _) = &obu.kind else {
+                    panic!("{w}x{h}: the written frame OBU did not parse as one");
+                };
+                assert!(
+                    parsed.mi_cols >= 2 && parsed.mi_rows >= 2,
+                    "{w}x{h} parsed to a {}x{} mode-info grid",
+                    parsed.mi_cols,
+                    parsed.mi_rows
+                );
+            }
+        }
+        assert!(
+            skipped.iter().all(|&n| n > 1024),
+            "the writer could not express these small frame sizes, so the small end of the \
+             sweep is incomplete: {skipped:?}"
+        );
+        // The superres arm, which no writer here can express: spec 5.9.8's
+        // `(upscaled_width * 8 + denom / 2) / denom` over its whole domain.
+        for denom in 9u32..=16 {
+            for upscaled in [1u32, 2, 3, 7, 8, 9, 255, 4096, 65535, 65536] {
+                let width = (upscaled * 8 + denom / 2) / denom;
+                assert!(
+                    width >= 1,
+                    "superres denom {denom} maps an upscaled width of {upscaled} to {width}, \
+                     which would derive an empty mode-info grid"
+                );
+            }
+        }
+    }
+
     /// lane-interedge r1: one attempt of the inter frame-edge half-strip gate --
     /// encode `width x height` with real aomenc (rect partitions ON, every other
     /// lane's open tool pinned off), decode it, and return
