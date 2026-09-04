@@ -674,28 +674,48 @@ fn compute_ab(
     let gh = h + 2;
     let mut ab = vec![(0i32, 0i64); gw * gh];
     let n = ((2 * r + 1) * (2 * r + 1)) as i64;
+    // lane-perf6: the box sums are separable. Summing every grid point's own
+    // (2r+1)^2 window called `lr_sample` -- whose stripe-boundary test is the
+    // expensive part -- (2r+1) times more often than needed; one column-sum
+    // pass per grid row reads each source sample once per row instead, and
+    // the horizontal sum is then (2r+1) adds of i64s. Integer addition is
+    // exact and associative, so the totals are unchanged bit for bit.
+    let ru = r as usize;
+    let ncols = gw + 2 * ru;
+    let mut col_a = vec![0i64; ncols];
+    let mut col_b = vec![0i64; ncols];
+    // Hoisted out of the per-point body: one thread-local read per call.
+    let bd_shift = u32::from(crate::decode::bit_depth()).saturating_sub(8);
     for gi in 0..gh {
         let i = gi as i64 - 1;
+        let base_col = h_start as i64 - 1 - r as i64;
+        for k in 0..ncols {
+            let col = base_col + k as i64;
+            let (mut ca, mut cb) = (0i64, 0i64);
+            for dr in -r..=r {
+                let row = v_start as i64 + i + dr as i64;
+                let px = lr_sample(
+                    cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col,
+                ) as i64;
+                ca += px * px;
+                cb += px;
+            }
+            col_a[k] = ca;
+            col_b[k] = cb;
+        }
         for gj in 0..gw {
             let j = gj as i64 - 1;
             let mut a = 0i64;
             let mut b = 0i64;
-            for dr in -r..=r {
-                let row = v_start as i64 + i + dr as i64;
-                for dc in -r..=r {
-                    let col = h_start as i64 + j + dc as i64;
-                    let px =
-                        lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col) as i64;
-                    a += px * px;
-                    b += px;
-                }
+            for k in gj..gj + 2 * ru + 1 {
+                a += col_a[k];
+                b += col_b[k];
             }
             // libaom `restoration.c:660` -- the box sums are brought back
             // to the 8-bit scale before `p` is formed (`a` is a sum of
             // squares, so it loses twice the shift `b` does); `B[k]` below
             // keeps the RAW `b`, only `p` uses the scaled pair. At 8-bit
             // both shifts are 0, which is why this was invisible until now.
-            let bd_shift = u32::from(crate::decode::bit_depth()).saturating_sub(8);
             let a_s = round2(a, 2 * bd_shift);
             let b_s = round2(b, bd_shift);
             let p = if a_s * n < b_s * b_s { 0 } else { a_s * n - b_s * b_s };
@@ -705,7 +725,7 @@ fn compute_ab(
                 (256 - a_val) as i64 * b * SGR_ONE_BY_X[(n - 1) as usize] as i64,
                 SGRPROJ_RECIP_BITS,
             );
-            if std::env::var("EC_LR_CALL_DUMP").is_ok()
+            if crate::envflags::env_flag!("EC_LR_CALL_DUMP")
                 && v_start as i64 + i == 60
                 && h_start as i64 + j == 6
                 && r == 1
@@ -759,7 +779,7 @@ fn apply_sgrproj_stripe(
     // r7 traced (`[-16,-32]`); dump the real 9-byte dense-arm (r1) "u"-tap
     // window (physical rows 59..=61, cols 5..=7 -- r7's traced tap) straight
     // from `lr_sample` for this exact call, no coordinate matching involved.
-    if std::env::var("EC_LR_CALL_DUMP").is_ok() && r1 > 0 && info.xqd == [-16, -32] {
+    if crate::envflags::env_flag!("EC_LR_CALL_DUMP") && r1 > 0 && info.xqd == [-16, -32] {
         let bytes: Vec<i32> = (59..=61)
             .flat_map(|row| {
                 (5..=7).map(move |col| {
@@ -844,7 +864,7 @@ fn apply_sgrproj_stripe(
                 let b = (b_c + b_u + b_d + b_l + b_r) * 4 + (b_ul + b_ur + b_dl + b_dr) * 3;
                 let flt1 = round2(a * dgd + b, SGRPROJ_SGR_BITS + 5 - SGRPROJ_RST_BITS);
                 v += xq[1] as i64 * (flt1 - u);
-                if std::env::var("EC_LR_CALL_DUMP").is_ok()
+                if crate::envflags::env_flag!("EC_LR_CALL_DUMP")
                     && info.xqd == [-16, -32]
                     && v_start as i64 + i == 61
                     && h_start as i64 + j == 6
@@ -929,7 +949,7 @@ fn filter_restoration_unit(
 /// restoration-unit pixels replaced -- a restoration unit must never read
 /// another, already-filtered unit's output (spec keeps a separate
 /// destination buffer for exactly this reason), so this never filters in
-/// place.
+/// place -- `out` is that buffer, refilled from `cdef` on entry.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_loop_restoration_plane(
     cdef: &[u16],
@@ -942,10 +962,15 @@ pub(crate) fn apply_loop_restoration_plane(
     unit_size: u32,
     grid: &RestorationGrid,
     plane: usize,
-) -> Vec<u16> {
-    let mut out = cdef.to_vec();
+    // lane-perf6: the destination buffer, refilled from `cdef` here. It used
+    // to be a fresh `cdef.to_vec()` per plane per frame -- a multi-megabyte
+    // allocation whose every page then faulted in on first touch.
+    out: &mut Vec<u16>,
+) {
+    out.clear();
+    out.extend_from_slice(cdef);
     if ftype == RestorationType::None || unit_size == 0 {
-        return out;
+        return;
     }
     let voffset = 8u32 >> ss_y;
     let ext_size = (unit_size * 3) / 2;
@@ -968,7 +993,7 @@ pub(crate) fn apply_loop_restoration_plane(
             let filter = grid.get(plane, rrow, rcol);
             if filter != UnitFilter::None {
                 filter_restoration_unit(
-                    &mut out,
+                    out,
                     cdef,
                     deblocked,
                     stride,
@@ -989,7 +1014,6 @@ pub(crate) fn apply_loop_restoration_plane(
         rrow += 1;
     }
     debug_assert_eq!(rrow, grid.vert_units[plane], "RU row walk must match RestorationGrid::new's count_units");
-    out
 }
 
 #[cfg(test)]
