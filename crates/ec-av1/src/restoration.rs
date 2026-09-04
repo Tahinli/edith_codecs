@@ -674,28 +674,48 @@ fn compute_ab(
     let gh = h + 2;
     let mut ab = vec![(0i32, 0i64); gw * gh];
     let n = ((2 * r + 1) * (2 * r + 1)) as i64;
+    // lane-perf6: the box sums are separable. Summing every grid point's own
+    // (2r+1)^2 window called `lr_sample` -- whose stripe-boundary test is the
+    // expensive part -- (2r+1) times more often than needed; one column-sum
+    // pass per grid row reads each source sample once per row instead, and
+    // the horizontal sum is then (2r+1) adds of i64s. Integer addition is
+    // exact and associative, so the totals are unchanged bit for bit.
+    let ru = r as usize;
+    let ncols = gw + 2 * ru;
+    let mut col_a = vec![0i64; ncols];
+    let mut col_b = vec![0i64; ncols];
+    // Hoisted out of the per-point body: one thread-local read per call.
+    let bd_shift = u32::from(crate::decode::bit_depth()).saturating_sub(8);
     for gi in 0..gh {
         let i = gi as i64 - 1;
+        let base_col = h_start as i64 - 1 - r as i64;
+        for k in 0..ncols {
+            let col = base_col + k as i64;
+            let (mut ca, mut cb) = (0i64, 0i64);
+            for dr in -r..=r {
+                let row = v_start as i64 + i + dr as i64;
+                let px = lr_sample(
+                    cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col,
+                ) as i64;
+                ca += px * px;
+                cb += px;
+            }
+            col_a[k] = ca;
+            col_b[k] = cb;
+        }
         for gj in 0..gw {
             let j = gj as i64 - 1;
             let mut a = 0i64;
             let mut b = 0i64;
-            for dr in -r..=r {
-                let row = v_start as i64 + i + dr as i64;
-                for dc in -r..=r {
-                    let col = h_start as i64 + j + dc as i64;
-                    let px =
-                        lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col) as i64;
-                    a += px * px;
-                    b += px;
-                }
+            for k in gj..gj + 2 * ru + 1 {
+                a += col_a[k];
+                b += col_b[k];
             }
             // libaom `restoration.c:660` -- the box sums are brought back
             // to the 8-bit scale before `p` is formed (`a` is a sum of
             // squares, so it loses twice the shift `b` does); `B[k]` below
             // keeps the RAW `b`, only `p` uses the scaled pair. At 8-bit
             // both shifts are 0, which is why this was invisible until now.
-            let bd_shift = u32::from(crate::decode::bit_depth()).saturating_sub(8);
             let a_s = round2(a, 2 * bd_shift);
             let b_s = round2(b, bd_shift);
             let p = if a_s * n < b_s * b_s { 0 } else { a_s * n - b_s * b_s };
