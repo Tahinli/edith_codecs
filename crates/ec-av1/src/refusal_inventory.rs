@@ -43,7 +43,6 @@ const REFUSALS: &[&str] = &[
     "a 128x128 superblock partition value outside the 8-symbol alphabet",
     "an inter var-tx tree with a leaf transform larger than 64x64",
     "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
-    "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
     // lane-t900 r23: palette RECONSTRUCTION now covers the key-frame paths
     // (earlier lanes), the intra-in-inter square/rect paths (r22) and the
     // 8x8 LEAF inside an inter frame (this round, gate
@@ -370,16 +369,6 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
         "no_128_root_half_reads_a_cfl_filter_intra_or_palette_symbol",
-    ),
-    // lane-t900 r33, WITNESS of a capability gap: the refusal is REACHED by
-    // real `--tune-content=screen --enable-palette=1` streams, counted
-    // (`palette_sb_strip_hits`) and hard-asserted non-zero by its gate, which
-    // also decodes the arms that do not reach it pixel-exact. lane-pal8 r1
-    // measured the lift and it mismatches whole-frame, so the string names a
-    // real shape a real encoder writes -- an open capability, not a claim.
-    (
-        "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
-        "a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact",
     ),
     // lane-t900 r33, CENSUS: the `use_intrabc` symbol IS read at the sub-8
     // reader for every sub-8x8 leaf of an `allow_intrabc` frame, and over the
