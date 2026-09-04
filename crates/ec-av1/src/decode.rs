@@ -7088,11 +7088,6 @@ fn read_intra_mode_rect(
         let use_palette_y =
             mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][mode_ctx]) != 0;
         if use_palette_y {
-            if palette.is_none() {
-                return Err(unsupported(
-                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
-                ));
-            }
             let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
             let colors = read_palette_colors_y(dec, n, cache, fctx);
             palette_y_pending = Some((n, colors));
@@ -11166,11 +11161,6 @@ fn read_intra_mode(
             eprintln!("TRACE palette_y_mode value={} rng={rng}", use_palette_y as i32);
         }
         if use_palette_y {
-            if palette.is_none() {
-                return Err(unsupported(
-                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
-                ));
-            }
             let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
             if trace {
                 let (rng, _) = dec.debug_state();
