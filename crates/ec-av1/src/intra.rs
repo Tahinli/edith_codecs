@@ -623,31 +623,33 @@ fn directional(
 /// frame edge must be extended by repetition here too, not averaged over its
 /// own shorter length.
 fn dc(above: Option<&[u16]>, left: Option<&[u16]>, bw: usize, bh: usize) -> i32 {
-    let extend = |samples: &[u16], want: usize| -> Vec<u16> {
-        if samples.len() >= want {
-            samples[..want].to_vec()
+    // lane-perf4: the replication is only ever *summed*, never indexed, so
+    // the extended edge is a sum rather than the `Vec<u16>` it used to be
+    // built as (two allocations per intra block, 0.9% of a 1080p decode's
+    // self time between them). Same integers, same order of magnitude, no
+    // rounding difference: `sum(samples[..n]) + last * (want - n)`.
+    let extend = |samples: &[u16], want: usize| -> u32 {
+        let n = samples.len().min(want);
+        let sum: u32 = samples[..n].iter().map(|&s| u32::from(s)).sum();
+        if n < want {
+            let last = u32::from(*samples.last().expect("an edge that exists has samples"));
+            sum + last * (want - n) as u32
         } else {
-            let last = *samples.last().expect("an edge that exists has samples");
-            let mut v = samples.to_vec();
-            v.resize(want, last);
-            v
+            sum
         }
     };
     let above = above.map(|a| extend(a, bw));
     let left = left.map(|l| extend(l, bh));
-    let average = |samples: &[u16]| {
-        let sum: u32 = samples.iter().map(|&s| u32::from(s)).sum();
-        ((sum + (samples.len() as u32 >> 1)) / samples.len() as u32) as i32
-    };
-    match (&above, &left) {
+    let average = |sum: u32, count: u32| ((sum + (count >> 1)) / count) as i32;
+    match (above, left) {
         (None, None) => 1i32 << (crate::decode::bit_depth() - 1),
-        (Some(a), None) => average(a),
-        (None, Some(l)) => average(l),
+        (Some(a), None) => average(a, bw as u32),
+        (None, Some(l)) => average(l, bh as u32),
         (Some(a), Some(l)) if bw == bh => {
             // `dc_predictor` (libaom `intrapred.c`): exact division, the
             // square path this whole lane must leave bit-identical.
-            let sum: u32 = a.iter().chain(l).map(|&s| u32::from(s)).sum();
-            let count = (a.len() + l.len()) as u32;
+            let sum: u32 = a + l;
+            let count = (bw + bh) as u32;
             ((sum + (count >> 1)) / count) as i32
         }
         (Some(a), Some(l)) => {
@@ -657,7 +659,7 @@ fn dc(above: Option<&[u16]>, left: Option<&[u16]>, bw: usize, bh: usize) -> i32 
             // every 1:2 ratio, `d == 5` for every 1:4 one; libaom comments
             // this exact derivation in `intrapred.c` rather than tabulating
             // it, so this ports the derivation, not a lookup).
-            let sum: u32 = a.iter().chain(l).map(|&s| u32::from(s)).sum();
+            let sum: u32 = a + l;
             let (shift1, multiplier) = dc_rect_multiplier(bw, bh);
             let num = u64::from(sum + ((bw + bh) as u32 >> 1));
             (((num >> shift1) * multiplier) >> 16) as i32
