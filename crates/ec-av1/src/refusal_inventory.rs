@@ -135,6 +135,14 @@ const PROVEN: &[(&str, &str)] = &[
         "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
         "a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable",
     ),
+    // lane-t900 r20, census: the shapes that can reach `decode_intra_rect_in_inter`'s
+    // size-group/tx-category lookup are the ten rectangular census shapes with
+    // `8 <= min` and `max <= 64` (a sub-8 footprint and a 128-px one take
+    // earlier branches), and every one of them has a row.
+    (
+        "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)",
+        "every_intra_in_inter_shape_the_census_lists_has_a_size_group_row",
+    ),
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
@@ -319,15 +327,16 @@ mod tests {
     #[test]
     fn every_proven_refusal_names_a_test_that_exists() {
         let found = decode_path_refusals();
-        let src = include_str!("stream.rs");
+        let sources = [include_str!("stream.rs"), include_str!("decode.rs")];
         for (reason, gate) in PROVEN {
             assert!(
                 found.contains(*reason),
                 "{reason:?} is listed as proven but is no longer a decode-path refusal --                  drop it from PROVEN (the capability landed) or fix the string"
             );
             assert!(
-                src.contains(&format!("fn {gate}(")),
-                "{reason:?} names the proving test {gate}, which does not exist in stream.rs"
+                sources.iter().any(|src| src.contains(&format!("fn {gate}("))),
+                "{reason:?} names the proving test {gate}, which exists in neither stream.rs \
+                 nor decode.rs"
             );
         }
         eprintln!(
