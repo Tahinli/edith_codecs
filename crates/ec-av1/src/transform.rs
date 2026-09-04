@@ -8,7 +8,7 @@
 //! rounded DCT would drift away from the decoder by a sample here and there.
 
 /// `Cos128_Lookup` (spec 7.13.2.1): `4096 * cos(angle * pi / 128)` rounded.
-static COS128_LOOKUP: [i32; 65] = [
+const COS128_LOOKUP: [i32; 65] = [
     4096, 4095, 4091, 4085, 4076, 4065, 4052, 4036, 4017, 3996, 3973, 3948, 3920, 3889, 3857, 3822,
     3784, 3745, 3703, 3659, 3612, 3564, 3513, 3461, 3406, 3349, 3290, 3229, 3166, 3102, 3035, 2967,
     2896, 2824, 2751, 2675, 2598, 2520, 2440, 2359, 2276, 2191, 2106, 2019, 1931, 1842, 1751, 1660,
@@ -18,15 +18,32 @@ static COS128_LOOKUP: [i32; 65] = [
 /// The fixed-point position of the cosine table.
 const COS_BITS: usize = 12;
 
+/// [`COS128_LOOKUP`] unfolded to the whole circle at compile time -- the same
+/// four quadrant cases the spec writes, evaluated once here so a butterfly's
+/// cosine is one load instead of a four-way branch per call.
+const fn build_cos128_full() -> [i32; 256] {
+    let mut t = [0i32; 256];
+    let mut a = 0usize;
+    while a < 256 {
+        t[a] = if a <= 64 {
+            COS128_LOOKUP[a]
+        } else if a <= 128 {
+            -COS128_LOOKUP[128 - a]
+        } else if a <= 192 {
+            -COS128_LOOKUP[a - 128]
+        } else {
+            COS128_LOOKUP[256 - a]
+        };
+        a += 1;
+    }
+    t
+}
+
+static COS128_FULL: [i32; 256] = build_cos128_full();
+
 /// `cos128(angle)` (spec 7.13.2.1), folded from the quarter table.
 fn cos128(angle: i32) -> i32 {
-    let angle2 = (angle & 255) as usize;
-    match angle2 {
-        0..=64 => COS128_LOOKUP[angle2],
-        65..=128 => -COS128_LOOKUP[128 - angle2],
-        129..=192 => -COS128_LOOKUP[angle2 - 128],
-        _ => COS128_LOOKUP[256 - angle2],
-    }
+    COS128_FULL[(angle & 255) as usize]
 }
 
 /// `sin128(angle)` (spec 7.13.2.1).
@@ -34,9 +51,39 @@ fn sin128(angle: i32) -> i32 {
     cos128(angle - 64)
 }
 
+/// `brev(numBits, x)` (spec 7.13.2.1) tabulated at compile time, one row per
+/// `num_bits`. The bit-fold ran per butterfly index at runtime and was the
+/// single hottest instruction sequence in `inverse_dct`'s annotation.
+const fn build_brev(num_bits: u32) -> [u8; 64] {
+    let mut t = [0u8; 64];
+    let n0 = 1usize << num_bits;
+    let mut x = 0usize;
+    while x < n0 {
+        let mut v = 0usize;
+        let mut i = 0u32;
+        while i < num_bits {
+            v |= ((x >> i) & 1) << (num_bits - 1 - i);
+            i += 1;
+        }
+        t[x] = v as u8;
+        x += 1;
+    }
+    t
+}
+
+static BREV_TAB: [[u8; 64]; 7] = [
+    build_brev(0),
+    build_brev(1),
+    build_brev(2),
+    build_brev(3),
+    build_brev(4),
+    build_brev(5),
+    build_brev(6),
+];
+
 /// `brev(numBits, x)` (spec 7.13.2.1): the bit reversal of the low `num_bits`.
 fn brev(num_bits: u32, x: usize) -> usize {
-    (0..num_bits).fold(0, |t, i| t | (((x >> i) & 1) << (num_bits - 1 - i)))
+    BREV_TAB[num_bits as usize][x] as usize
 }
 
 /// `Round2(x, n)` (spec 4.7): shift down `n` places, rounding halves up.
@@ -85,9 +132,13 @@ fn hadamard(t: &mut [i32], a: usize, b: usize, flip: bool, r: usize) {
 /// of the first `1 << n` entries.
 fn permute(t: &mut [i32], n: u32) {
     let n0 = 1usize << n;
-    let copy: Vec<i32> = t[..n0].to_vec();
+    // A stack copy: this ran once per 1D transform and its `Vec` was the
+    // `malloc` at the top of every `inverse_dct` frame in the annotation.
+    let mut copy = [0i32; 64];
+    copy[..n0].copy_from_slice(&t[..n0]);
+    let tab = &BREV_TAB[n as usize];
     for (i, v) in t[..n0].iter_mut().enumerate() {
-        *v = copy[brev(n, i)];
+        *v = copy[tab[i] as usize];
     }
 }
 
@@ -828,52 +879,88 @@ pub fn inverse_transform_2d_typed_wh(
     assert_eq!(dequant.len(), w * h, "one coefficient per position");
     let row_clamp = usize::from(bit_depth) + 8;
     let col_clamp = (usize::from(bit_depth) + 6).max(16);
-    let mut residual = vec![0i32; w * h];
     let (row_kind, col_kind) = tx_type.axes();
     let (ud_flip, lr_flip) = tx_type.flip();
     // `get_rect_tx_log_ratio` (`av1_inv_txfm2d.c:248`): the scale fires only
     // at ratio exactly 1, never 0 (square) or 2 (e.g. 4x16/16x4/8x32/32x8/
     // 16x64/64x16).
     let rect_scale = (log2w as i32 - log2h as i32).abs() == 1;
-
-    let mut t = [0i32; 64];
-    for i in 0..h {
-        for j in 0..w {
-            let c = if i < 32 && j < 32 { dequant[i * w + j] } else { 0 };
-            t[j] = if rect_scale {
-                round2(c * 2896, 12)
-            } else {
-                c
-            };
-        }
-        inverse_1d(&mut t, log2w, row_clamp, row_kind);
-        for j in 0..w {
-            // The row's output is shifted, then clamped before the column
-            // transform reads it back.
-            residual[i * w + j] = clamp_range(round2(t[j], row_shift_wh(w, h)), col_clamp);
-        }
-    }
-
+    // Loop-invariant: the shift is keyed on the transform size, and was being
+    // looked up through a match once per output sample.
+    let shift = row_shift_wh(w, h);
     // A FLIPADST axis reads the row-pass output right-to-left and/or writes
     // its own output bottom-to-top (`inv_txfm2d_add_c`, `av1_inv_txfm2d.c`
-    // lines 291-314): `out` is a second buffer, not `residual` reused in
+    // lines 291-314): `out` is a second buffer, not the row scratch reused in
     // place, because a flipped read/write pair aliases a column this same
     // loop has not visited yet (column `j`'s write target under `lr_flip`
     // is a column an unflipped loop would still need to read from later).
     // `lr_flip` mirrors over `w` (the row axis), `ud_flip` over `h`.
     let mut out = vec![0i32; w * h];
-    for j in 0..w {
-        let src_col = if lr_flip { w - 1 - j } else { j };
-        for i in 0..h {
-            t[i] = residual[i * w + src_col];
+    let cols = w.min(32);
+    ROW_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < w * h {
+            scratch.resize(64 * 64, 0);
         }
-        inverse_1d(&mut t, log2h, col_clamp, col_kind);
+        let residual = &mut scratch[..w * h];
+        let mut t = [0i32; 64];
         for i in 0..h {
-            let dst_row = if ud_flip { h - 1 - i } else { i };
-            out[dst_row * w + j] = round2(t[i], 4);
+            let dst = &mut residual[i * w..(i + 1) * w];
+            // Rows at or past 32 carry no coefficients (the spec zeroes them
+            // before the row transform), and a zero row transforms to a zero
+            // row: every butterfly and Hadamard of zeros is zero, and
+            // `Round2(0, n)` is zero at every `n`, so this is the full
+            // network's own answer, not an approximation of it.
+            let src = if i < 32 { &dequant[i * w..i * w + cols] } else { &[][..] };
+            if src.iter().all(|&c| c == 0) {
+                dst.fill(0);
+                continue;
+            }
+            if rect_scale {
+                for (tj, &c) in t[..cols].iter_mut().zip(src) {
+                    *tj = round2(c * 2896, 12);
+                }
+            } else {
+                t[..cols].copy_from_slice(src);
+            }
+            t[cols..w].fill(0);
+            inverse_1d(&mut t, log2w, row_clamp, row_kind);
+            // The row's output is shifted, then clamped before the column
+            // transform reads it back.
+            for (d, &v) in dst.iter_mut().zip(t[..w].iter()) {
+                *d = clamp_range(round2(v, shift), col_clamp);
+            }
         }
-    }
+
+        for j in 0..w {
+            let src_col = if lr_flip { w - 1 - j } else { j };
+            let mut any = 0i32;
+            for i in 0..h {
+                let v = residual[i * w + src_col];
+                t[i] = v;
+                any |= v;
+            }
+            // Same zero-in/zero-out argument as the row pass, and `out` is
+            // already zero at every position this column would write.
+            if any == 0 {
+                continue;
+            }
+            inverse_1d(&mut t, log2h, col_clamp, col_kind);
+            for i in 0..h {
+                let dst_row = if ud_flip { h - 1 - i } else { i };
+                out[dst_row * w + j] = round2(t[i], 4);
+            }
+        }
+    });
     out
+}
+
+thread_local! {
+    /// Row-pass scratch, reused per thread. The row pass writes every position
+    /// it later reads, so the buffer needs no zeroing, and the two `Vec`s this
+    /// function allocated per transform unit become one.
+    static ROW_SCRATCH: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// [`inverse_transform_2d_typed`] at `DCT_DCT`, this crate's original
@@ -916,8 +1003,19 @@ pub fn dequant_and_inverse_typed_wh(
     ac_delta: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
-    let dq = crate::quant::dequant_wh(levels, w, h, bit_depth, q_idx, dc_delta, ac_delta);
-    inverse_transform_2d_typed_wh(&dq, w, h, bit_depth, tx_type)
+    DQ_SCRATCH.with(|cell| {
+        let mut dq = cell.borrow_mut();
+        crate::quant::dequant_wh_into(levels, &mut dq, w, h, bit_depth, q_idx, dc_delta, ac_delta);
+        inverse_transform_2d_typed_wh(&dq, w, h, bit_depth, tx_type)
+    })
+}
+
+thread_local! {
+    /// The dequantized grid, reused per thread: it lives only until the
+    /// inverse transform has read it, so it was a `Vec` allocated and dropped
+    /// once per transform unit.
+    static DQ_SCRATCH: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// [`dequant_and_inverse_typed`] at `DCT_DCT`, no per-plane quantizer delta.
@@ -1216,6 +1314,45 @@ pub fn forward_and_quantize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row and column passes skip an all-zero vector instead of running
+    /// the butterfly network over it. That is only bit-exact because a zero
+    /// vector transforms to a zero vector at every size, type and bit depth --
+    /// which is what this pins, per 1D transform and end to end.
+    #[test]
+    fn a_zero_vector_transforms_to_zero() {
+        for log2 in 2..=6u32 {
+            for kind in [TxType1d::Dct, TxType1d::Adst, TxType1d::Identity] {
+                if kind == TxType1d::Adst && log2 > 4 {
+                    continue;
+                }
+                if kind == TxType1d::Identity && log2 > 5 {
+                    continue;
+                }
+                for bit_depth in [8u8, 10, 12] {
+                    let r = (usize::from(bit_depth) + 6).max(16);
+                    let mut t = [0i32; 64];
+                    inverse_1d(&mut t, log2, r, kind);
+                    assert!(
+                        t.iter().all(|&v| v == 0),
+                        "1D {kind:?} log2={log2} depth={bit_depth} left a non-zero"
+                    );
+                }
+            }
+        }
+        for (w, h) in [(4, 4), (8, 8), (16, 16), (32, 32), (64, 64), (8, 16), (16, 8), (4, 16), (32, 8)] {
+            for tx in [TxType::DctDct, TxType::AdstAdst, TxType::Idtx, TxType::AdstDct, TxType::DctAdst] {
+                if w.max(h) > 16 && tx != TxType::DctDct && tx != TxType::Idtx {
+                    continue;
+                }
+                if w.max(h) > 32 && tx != TxType::DctDct {
+                    continue;
+                }
+                let out = inverse_transform_2d_typed_wh(&vec![0i32; w * h], w, h, 10, tx);
+                assert!(out.iter().all(|&v| v == 0), "2D {w}x{h} {tx:?} left a non-zero");
+            }
+        }
+    }
 
     /// The orthonormal DCT-II basis the forward transform is written against,
     /// computed independently of `dct_basis` so a test is not checking a
