@@ -46,13 +46,14 @@ const REFUSALS: &[&str] = &[
     "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
-    // lane-t900 r22: palette RECONSTRUCTION landed for the key-frame paths
-    // (earlier lanes) and for the intra-in-inter square and rect paths (this
-    // one). These two strings survive at exactly two kinds of site: the
-    // `palette.is_none()` guards in `read_intra_mode`/`read_intra_mode_rect`
-    // (defensive -- every caller now passes a real ctx/cache pair), and the
-    // sub-8x8 `decode_inter_block8` leaf, which has no witness stream.
-    "a block that actually uses a palette (UV) -- reconstruction is out of scope",
+    // lane-t900 r23: palette RECONSTRUCTION now covers the key-frame paths
+    // (earlier lanes), the intra-in-inter square/rect paths (r22) and the
+    // 8x8 LEAF inside an inter frame (this round, gate
+    // `a_screen_stream_with_palette_8x8_leaves_in_inter_frames_decodes_pixel_exact`),
+    // which is why the (UV) string is gone from the decoder entirely -- the
+    // leaf was its only site. The (Y) one survives ONLY as the defensive
+    // `palette.is_none()` guard in `read_intra_mode`/`read_intra_mode_rect`;
+    // every caller now passes a real ctx/cache pair, so no stream reaches it.
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
     "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
@@ -124,6 +125,22 @@ const REFUSALS: &[&str] = &[
     // What still refuses is the 128-root half of a screen-content frame, whose
     // body (`decode_block_128rect`) reads no palette syntax and for which no
     // `--sb-size=128` screen witness exists yet.
+    // lane-t900 r23 CENSUS for this string's remaining 128-root arm (the
+    // 16x4/4x16 arm was lifted in r22): its premise is already known to be
+    // false by the spec -- `read_palette_mode_info` (5.11.46) codes palette
+    // only for `Block_Width <= 64 && Block_Height <= 64`, so a 128x64/64x128
+    // half consumes NO palette syntax and the screen flag changes nothing
+    // about it. It stays because nothing witnesses it: 6 aomenc encodes at
+    // `--sb-size=128 --tune-content=screen` (704x320 = 5*128+64 by 2*128+64,
+    // the edge-forced size r18 proved for the non-screen twin; screen cell
+    // content at cq 10/20/40, and r18's own panning-texture-plus-fresh-ramp
+    // shape with `--max-partition-size=128 --enable-ab-partitions=0
+    // --enable-1to4-partitions=0`) code ZERO 128-root halves of any kind
+    // (`intra128_in_inter` and `sb128_rect` both 0 in every stream), so
+    // lifting it would be a capability claim no gate exercises (class
+    // `refusal-lifted-without-a-gate`). What is still untried: a 10-bit
+    // source, and screen content in the forced bands with a NON-screen
+    // interior.
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
