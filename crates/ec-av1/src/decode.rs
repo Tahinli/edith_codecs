@@ -79,6 +79,9 @@ pub(crate) struct FrameCtx {
     pub(crate) last_frame_wide_margin: std::cell::RefCell<Option<Picture>>,
     pub(crate) reach_sb_px: std::cell::Cell<usize>,
     pub(crate) grain_bit_depth: std::cell::Cell<u32>,
+    /// lane-wave1 step (i): this superblock's recorded pixel writes, see
+    /// [`ReconOp`]. Pushed by parse, replayed by [`flush_recon`].
+    pub(crate) recon_ops: std::cell::RefCell<Vec<ReconOp>>,
 }
 
 impl std::fmt::Debug for FrameCtx {
@@ -136,6 +139,7 @@ impl FrameCtx {
             last_frame_wide_margin: std::cell::RefCell::new(None),
             reach_sb_px: std::cell::Cell::new(crate::encode::SUPERBLOCK),
             grain_bit_depth: std::cell::Cell::new(8),
+            recon_ops: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -2008,6 +2012,204 @@ fn take_palette_pred(fctx: &crate::decode::FrameCtx) -> Option<Vec<u16>> {
         );
     }
     got
+}
+
+/// The luma window a `UV_CFL_PRED` chroma block averages its AC signal over
+/// (lane-wave1 step (i)). Parse records the window; [`flush_recon`] reads the
+/// pixels, because at parse time this block's own luma is still queued.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CflSrc {
+    px: usize,
+    py: usize,
+    bw: usize,
+    bh: usize,
+    /// Which averager the parse site asked for -- [`cfl_ac_q3_rect`] and
+    /// [`cfl_ac_q3`] are not the same function at `bw == bh`.
+    rect: bool,
+}
+
+fn cfl_src(px: usize, py: usize, side: usize) -> CflSrc {
+    CflSrc { px, py, bw: side, bh: side, rect: false }
+}
+
+fn cfl_src_rect(px: usize, py: usize, bw: usize, bh: usize) -> CflSrc {
+    CflSrc { px, py, bw, bh, rect: true }
+}
+
+/// lane-wave1 step (i): the pixel-writing half of block decoding, recorded
+/// instead of executed. Each variant is the resolved argument tuple of the
+/// `PlaneBuf::reconstruct*` call it replaces, so replaying the queue in push
+/// order performs exactly the same writes in exactly the same order --
+/// entropy parsing no longer touches the frame's own planes (except the two
+/// sites named in [`flush_recon`]'s doc), which is what lets step (ii) run
+/// the replay on a superblock-row wavefront worker.
+pub(crate) enum ReconOp {
+    Intra {
+        plane: usize,
+        x: usize,
+        y: usize,
+        bw: usize,
+        bh: usize,
+        /// `true` when the parse site called `reconstruct_rect` (whose
+        /// `edges_rect` differs from `edges` even at `bw == bh`).
+        rect: bool,
+        mode: usize,
+        angle_delta: i32,
+        reach: Reach,
+        residual: Vec<i32>,
+        cfl: Option<(i32, CflSrc)>,
+        filter_intra: Option<usize>,
+        smooth_neighbor: bool,
+        /// The palette/intrabc prediction override, taken off
+        /// [`FrameCtx::palette_pred`] at PUSH time (parse order), never read
+        /// from that slot by the replay.
+        pred: Option<Vec<u16>>,
+    },
+    Mc {
+        plane: usize,
+        x: usize,
+        y: usize,
+        stride: usize,
+        w: usize,
+        h: usize,
+        prediction: Vec<u16>,
+        residual: Vec<i32>,
+    },
+}
+
+fn push_op(fctx: &crate::decode::FrameCtx, op: ReconOp) {
+    fctx.recon_ops.with(|c| c.borrow_mut().push(op));
+}
+
+/// [`PlaneBuf::reconstruct`], recorded (lane-wave1 step (i)).
+#[allow(clippy::too_many_arguments)]
+fn push_intra(
+    plane: usize,
+    x: usize,
+    y: usize,
+    side: usize,
+    mode: usize,
+    angle_delta: i32,
+    reach: Reach,
+    residual: &[i32],
+    cfl: Option<(i32, CflSrc)>,
+    filter_intra: Option<usize>,
+    smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
+) {
+    let pred = take_palette_pred(fctx);
+    push_op(fctx, ReconOp::Intra {
+        plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
+        residual: residual.to_vec(), cfl, filter_intra, smooth_neighbor, pred,
+    });
+}
+
+/// [`PlaneBuf::reconstruct_rect`], recorded (lane-wave1 step (i)).
+#[allow(clippy::too_many_arguments)]
+fn push_intra_rect(
+    plane: usize,
+    x: usize,
+    y: usize,
+    bw: usize,
+    bh: usize,
+    mode: usize,
+    angle_delta: i32,
+    reach: Reach,
+    residual: &[i32],
+    cfl: Option<(i32, CflSrc)>,
+    filter_intra: Option<usize>,
+    smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
+) {
+    let pred = take_palette_pred(fctx);
+    push_op(fctx, ReconOp::Intra {
+        plane, x, y, bw, bh, rect: true, mode, angle_delta, reach,
+        residual: residual.to_vec(), cfl, filter_intra, smooth_neighbor, pred,
+    });
+}
+
+/// [`PlaneBuf::reconstruct_mc_rect`] at `stride == w == h == side`, recorded.
+fn push_mc(
+    plane: usize,
+    x: usize,
+    y: usize,
+    side: usize,
+    prediction: &[u16],
+    residual: &[i32], fctx: &crate::decode::FrameCtx,
+) {
+    push_mc_rect(plane, x, y, side, side, side, prediction, residual, fctx);
+}
+
+/// [`PlaneBuf::reconstruct_mc_rect`], recorded (lane-wave1 step (i)).
+#[allow(clippy::too_many_arguments)]
+fn push_mc_rect(
+    plane: usize,
+    x: usize,
+    y: usize,
+    stride: usize,
+    w: usize,
+    h: usize,
+    prediction: &[u16],
+    residual: &[i32], fctx: &crate::decode::FrameCtx,
+) {
+    push_op(fctx, ReconOp::Mc {
+        plane, x, y, stride, w, h,
+        prediction: prediction.to_vec(), residual: residual.to_vec(),
+    });
+}
+
+/// Replays every recorded [`ReconOp`] into the frame's planes, in push order,
+/// and empties the queue (lane-wave1 step (i)).
+///
+/// Called at the top of each superblock visit and at the end of each tile, so
+/// a whole superblock's parsing runs with no plane access at all; the two
+/// parse-time pixel READS that survive -- the intrabc source fetch and the
+/// interintra intra predictor -- flush ahead of themselves instead, which
+/// keeps them byte-exact and names exactly what step (ii) still has to move.
+fn flush_recon(
+    fctx: &crate::decode::FrameCtx,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+) {
+    let ops = fctx.recon_ops.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    for op in ops {
+        match op {
+            ReconOp::Intra {
+                plane, x, y: oy, bw, bh, rect, mode, angle_delta, reach, residual, cfl,
+                filter_intra, smooth_neighbor, pred,
+            } => {
+                // The CfL AC signal is read HERE, off the luma this very
+                // replay has already written for this block -- at parse time
+                // it would have been the previous frame's samples.
+                let ac = cfl.map(|(alpha, src)| {
+                    let sig = if src.rect {
+                        cfl_ac_q3_rect(&*y, src.px, src.py, src.bw, src.bh)
+                    } else {
+                        cfl_ac_q3(&*y, src.px, src.py, src.bw)
+                    };
+                    (alpha, sig)
+                });
+                let cfl = ac.as_ref().map(|(a, sig)| (*a, sig.as_slice()));
+                let target: &mut PlaneBuf<'static> =
+                    match plane { 0 => &mut *y, 1 => &mut *u, _ => &mut *v };
+                if rect {
+                    target.reconstruct_rect(
+                        x, oy, bw, bh, mode, angle_delta, reach, &residual, cfl, filter_intra,
+                        smooth_neighbor, pred, fctx,
+                    );
+                } else {
+                    target.reconstruct(
+                        x, oy, bw, mode, angle_delta, reach, &residual, cfl, filter_intra,
+                        smooth_neighbor, pred, fctx,
+                    );
+                }
+            }
+            ReconOp::Mc { plane, x, y: oy, stride, w, h, prediction, residual } => {
+                let target: &mut PlaneBuf<'static> =
+                    match plane { 0 => &mut *y, 1 => &mut *u, _ => &mut *v };
+                target.reconstruct_mc_rect(x, oy, stride, w, h, &prediction, &residual, fctx);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -7693,7 +7895,7 @@ fn decode_rect_split(
                 set_palette_pred(tu_buf, fctx);
             }
             if m.skip {
-                y.reconstruct_rect(
+                push_intra_rect(0, 
                     tu_px,
                     tu_py,
                     tx_w,
@@ -7751,7 +7953,7 @@ fn decode_rect_split(
                     plane_q_delta(0, fctx).1,
                     tu_tx_type,
                 );
-                y.reconstruct_rect(
+                push_intra_rect(0, 
                     tu_px,
                     tu_py,
                     tx_w,
@@ -7807,7 +8009,7 @@ fn decode_rect_split(
                     plane_q_delta(0, fctx).1,
                     tu_tx_type,
                 );
-                y.reconstruct_rect(
+                push_intra_rect(0, 
                     tu_px,
                     tu_py,
                     tx_w,
@@ -7854,23 +8056,23 @@ fn decode_rect_split(
         }
     }
     // CHROMA: one un-split rect transform for the whole strip.
-    let ac = m.alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+    let ac = m.alpha.map(|_| cfl_src_rect(px, py, bw, bh));
     let reach = block_reach;
     let (u_grid, v_grid) = if m.skip {
         let zero = vec![0i32; chroma_w * chroma_h];
         if let Some((ub, _)) = &m.palette_uv {
             set_palette_pred(ub.clone(), fctx);
         }
-        u.reconstruct_rect(
+        push_intra_rect(1, 
             cpx, cpy, chroma_w, chroma_h, m.uv_predict_mode, m.angle_delta_uv, reach, &zero,
-            m.alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, m.smooth_neighbor_uv, fctx,
+            m.alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, m.smooth_neighbor_uv, fctx,
         );
         if let Some((_, vb)) = &m.palette_uv {
             set_palette_pred(vb.clone(), fctx);
         }
-        v.reconstruct_rect(
+        push_intra_rect(2, 
             cpx, cpy, chroma_w, chroma_h, m.uv_predict_mode, m.angle_delta_uv, reach, &zero,
-            m.alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, m.smooth_neighbor_uv, fctx,
+            m.alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, m.smooth_neighbor_uv, fctx,
         );
         (zero.clone(), zero)
     } else {
@@ -7918,14 +8120,14 @@ fn decode_rect_split(
             );
             let cfl = m
                 .alpha
-                .zip(ac.as_deref())
+                .zip(ac)
                 .map(|((au, av), ac)| (if plane_idx == 1 { au } else { av }, ac));
-            let plane = if plane_idx == 1 { &mut *u } else { &mut *v };
+            let _plane = if plane_idx == 1 { &mut *u } else { &mut *v };
             if let Some((ub, vb)) = &m.palette_uv {
                 let buf = if plane_idx == 1 { ub } else { vb };
                 set_palette_pred(buf.clone(), fctx);
             }
-            plane.reconstruct_rect(
+            push_intra_rect(plane_idx, 
                 cpx,
                 cpy,
                 chroma_w,
@@ -8888,7 +9090,7 @@ fn decode_block_rect(
         )
     });
     if skip {
-        y.reconstruct_rect(
+        push_intra_rect(0, 
             px,
             py,
             bw,
@@ -8901,11 +9103,11 @@ fn decode_block_rect(
             filter_intra,
             smooth_neighbor, fctx,
         );
-        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
-        u.reconstruct_rect(
+        push_intra_rect(1, 
             cpx,
             cpy,
             chroma_w,
@@ -8914,14 +9116,14 @@ fn decode_block_rect(
             angle_delta_uv,
             reach,
             &vec![0i32; chroma_w * chroma_h],
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
         }
-        v.reconstruct_rect(
+        push_intra_rect(2, 
             cpx,
             cpy,
             chroma_w,
@@ -8930,7 +9132,7 @@ fn decode_block_rect(
             angle_delta_uv,
             reach,
             &vec![0i32; chroma_w * chroma_h],
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
@@ -9018,7 +9220,7 @@ fn decode_block_rect(
             plane_q_delta(0, fctx).1,
             luma_tx_type,
         );
-        y.reconstruct_rect(
+        push_intra_rect(0, 
             px,
             py,
             bw,
@@ -9031,7 +9233,7 @@ fn decode_block_rect(
             filter_intra,
             smooth_neighbor, fctx,
         );
-        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
@@ -9062,7 +9264,7 @@ fn decode_block_rect(
             plane_q_delta(1, fctx).1,
             u_tx_type,
         );
-        u.reconstruct_rect(
+        push_intra_rect(1, 
             cpx,
             cpy,
             chroma_w,
@@ -9071,7 +9273,7 @@ fn decode_block_rect(
             angle_delta_uv,
             reach,
             &u_residual,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
@@ -9105,7 +9307,7 @@ fn decode_block_rect(
             plane_q_delta(2, fctx).1,
             v_tx_type,
         );
-        v.reconstruct_rect(
+        push_intra_rect(2, 
             cpx,
             cpy,
             chroma_w,
@@ -9114,7 +9316,7 @@ fn decode_block_rect(
             angle_delta_uv,
             reach,
             &v_residual,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
@@ -9359,24 +9561,24 @@ fn decode_leaf_rect(
         if let Some(b) = &palette_y_buf {
             set_palette_pred(b.clone(), fctx);
         }
-        y.reconstruct_rect(
+        push_intra_rect(0, 
             px, py, bw, bh, mode, angle_delta_y, reach, &luma_levels, None, filter_intra,
             smooth_neighbor, fctx,
         );
-        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
-        u.reconstruct_rect(
+        push_intra_rect(1, 
             cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &u_levels,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
         }
-        v.reconstruct_rect(
+        push_intra_rect(2, 
             cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &v_levels,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx,
         );
     } else {
         // lane-rectx: a genuine 16x8/8x16 luma transform (`TxbSet::LumaRect16x8`,
@@ -9412,11 +9614,11 @@ fn decode_leaf_rect(
         if let Some(b) = &palette_y_buf {
             set_palette_pred(b.clone(), fctx);
         }
-        y.reconstruct_rect(
+        push_intra_rect(0, 
             px, py, bw, bh, mode, angle_delta_y, reach, &luma_residual, None, filter_intra,
             smooth_neighbor, fctx,
         );
-        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
         let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
         let mut u_coding = cdfs.txb(TxbSet::ChromaRect8x4, uv_predict_mode);
@@ -9432,9 +9634,9 @@ fn decode_leaf_rect(
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
-        u.reconstruct_rect(
+        push_intra_rect(1, 
             cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &u_residual,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx,
         );
         let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
@@ -9451,9 +9653,9 @@ fn decode_leaf_rect(
         if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
         }
-        v.reconstruct_rect(
+        push_intra_rect(2, 
             cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &v_residual,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx,
         );
         RECT_LEAF_COEFF_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -9798,7 +10000,7 @@ fn decode_block_rect4(
         if let Some(b) = &palette_y_buf {
             set_palette_pred(b.clone(), fctx);
         }
-        y.reconstruct_rect(
+        push_intra_rect(0, 
             px,
             py,
             bw,
@@ -9811,8 +10013,8 @@ fn decode_block_rect4(
             filter_intra,
             smooth_neighbor, fctx,
         );
-        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
-        for (plane, buf, levels, tx_type) in [
+        let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
+        for (plane, _buf, levels, tx_type) in [
             (1usize, &mut *u, &u_levels, u_tx_type),
             (2, &mut *v, &v_levels, v_tx_type),
         ] {
@@ -9829,7 +10031,7 @@ fn decode_block_rect4(
             if let Some((ub, vb)) = &palette_uv_bufs {
                 set_palette_pred(if plane == 1 { ub.clone() } else { vb.clone() }, fctx);
             }
-            buf.reconstruct_rect(
+            push_intra_rect(plane, 
                 cpx,
                 cpy,
                 chroma_w,
@@ -9839,7 +10041,7 @@ fn decode_block_rect4(
                 reach,
                 &residual,
                 alpha
-                    .zip(ac.as_deref())
+                    .zip(ac)
                     .map(|((au, av), ac)| (if plane == 1 { au } else { av }, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
@@ -9874,7 +10076,7 @@ fn decode_block_rect4(
     if let Some(b) = &palette_y_buf {
         set_palette_pred(b.clone(), fctx);
     }
-    y.reconstruct_rect(
+    push_intra_rect(0, 
         px,
         py,
         bw,
@@ -9887,11 +10089,11 @@ fn decode_block_rect4(
         filter_intra,
         smooth_neighbor, fctx,
     );
-    let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+    let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
     if let Some((ub, _)) = &palette_uv_bufs {
         set_palette_pred(ub.clone(), fctx);
     }
-    u.reconstruct_rect(
+    push_intra_rect(1, 
         cpx,
         cpy,
         chroma_w,
@@ -9900,14 +10102,14 @@ fn decode_block_rect4(
         angle_delta_uv,
         reach,
         &u_levels,
-        alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+        alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
         None,
         smooth_neighbor_uv, fctx,
     );
     if let Some((_, vb)) = &palette_uv_bufs {
         set_palette_pred(vb.clone(), fctx);
     }
-    v.reconstruct_rect(
+    push_intra_rect(2, 
         cpx,
         cpy,
         chroma_w,
@@ -9916,7 +10118,7 @@ fn decode_block_rect4(
         angle_delta_uv,
         reach,
         &v_levels,
-        alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+        alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
         None,
         smooth_neighbor_uv, fctx,
     );
@@ -10200,7 +10402,7 @@ fn decode_rect4_16_strip(
                         set_palette_pred(tu_buf, fctx);
                     }
                     if skip {
-                        y.reconstruct_rect(
+                        push_intra_rect(0, 
                             tu_px, tu_py, tx_w, tx_h, mode, angle_delta_y, tu_reach, &zero_tu,
                             None, filter_intra, smooth_neighbor, fctx,
                         );
@@ -10239,7 +10441,7 @@ fn decode_rect4_16_strip(
                             plane_q_delta(0, fctx).1,
                             tu_tx_type,
                         );
-                        y.reconstruct_rect(
+                        push_intra_rect(0, 
                             tu_px, tu_py, tx_w, tx_h, mode, angle_delta_y, tu_reach, &residual,
                             None, filter_intra, smooth_neighbor, fctx,
                         );
@@ -10285,7 +10487,7 @@ fn decode_rect4_16_strip(
             if let Some(b) = &palette_y_buf {
                 set_palette_pred(b.clone(), fctx);
             }
-            y.reconstruct_rect(
+            push_intra_rect(0, 
                 px, py, bw, bh, mode, angle_delta_y, reach, &zeros, None, filter_intra,
                 smooth_neighbor, fctx,
             );
@@ -10324,7 +10526,7 @@ fn decode_rect4_16_strip(
             if let Some(b) = &palette_y_buf {
                 set_palette_pred(b.clone(), fctx);
             }
-            y.reconstruct_rect(
+            push_intra_rect(0, 
                 px, py, bw, bh, mode, angle_delta_y, reach, &residual, None, filter_intra,
                 smooth_neighbor, fctx,
             );
@@ -10388,15 +10590,15 @@ fn decode_rect4_16_strip(
                 // `mbmi->skip_txfm`, so a skipped `UV_CFL_PRED` block is still
                 // DC + alpha * luma-AC. Dropping the CfL term here left a
                 // chroma-only bounded box on Troy's key frames.
-                let ac = alpha.map(|_| cfl_ac_q3_rect(y, ppx, ppy, pw, ph));
+                let ac = alpha.map(|_| cfl_src_rect(ppx, ppy, pw, ph));
                 if alpha.is_some() {
                     CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
                 }
-                for (buf, plane) in [(&mut *u, 1usize), (&mut *v, 2)] {
+                for (_buf, plane) in [(&mut *u, 1usize), (&mut *v, 2)] {
                     if let Some((ub, vb)) = &palette_uv_bufs {
                         set_palette_pred(if plane == 1 { ub.clone() } else { vb.clone() }, fctx);
                     }
-                    buf.reconstruct_rect(
+                    push_intra_rect(plane, 
                         cpx,
                         cpy,
                         cw,
@@ -10406,7 +10608,7 @@ fn decode_rect4_16_strip(
                         pair_reach,
                         &zeros,
                         alpha
-                            .zip(ac.as_deref())
+                            .zip(ac)
                             .map(|((au, av), ac)| (if plane == 1 { au } else { av }, ac)),
                         None,
                         smooth_neighbor_uv, fctx,
@@ -10436,8 +10638,8 @@ fn decode_rect4_16_strip(
                 let (u_levels, u_tx_type) = planes.pop().expect("plane 1");
                 // CfL averages the luma of the WHOLE pair, the region this one
                 // chroma transform covers.
-                let ac = alpha.map(|_| cfl_ac_q3_rect(y, ppx, ppy, pw, ph));
-                for (plane, buf, levels, tx_type) in [
+                let ac = alpha.map(|_| cfl_src_rect(ppx, ppy, pw, ph));
+                for (plane, _buf, levels, tx_type) in [
                     (1usize, &mut *u, &u_levels, u_tx_type),
                     (2, &mut *v, &v_levels, v_tx_type),
                 ] {
@@ -10454,7 +10656,7 @@ fn decode_rect4_16_strip(
                     if let Some((ub, vb)) = &palette_uv_bufs {
                         set_palette_pred(if plane == 1 { ub.clone() } else { vb.clone() }, fctx);
                     }
-                    buf.reconstruct_rect(
+                    push_intra_rect(plane, 
                         cpx,
                         cpy,
                         cw,
@@ -10464,7 +10666,7 @@ fn decode_rect4_16_strip(
                         pair_reach,
                         &residual,
                         alpha
-                            .zip(ac.as_deref())
+                            .zip(ac)
                             .map(|((au, av), ac)| (if plane == 1 { au } else { av }, ac)),
                         None,
                         smooth_neighbor_uv, fctx,
@@ -10757,7 +10959,7 @@ fn decode_block_rect64(
         )
     });
     if skip {
-        y.reconstruct_rect(
+        push_intra_rect(0, 
             px,
             py,
             bw,
@@ -10770,11 +10972,11 @@ fn decode_block_rect64(
             filter_intra,
             smooth_neighbor, fctx,
         );
-        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
-        u.reconstruct_rect(
+        push_intra_rect(1, 
             cpx,
             cpy,
             chroma_w,
@@ -10783,14 +10985,14 @@ fn decode_block_rect64(
             angle_delta_uv,
             reach,
             &vec![0i32; chroma_w * chroma_h],
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
         }
-        v.reconstruct_rect(
+        push_intra_rect(2, 
             cpx,
             cpy,
             chroma_w,
@@ -10799,7 +11001,7 @@ fn decode_block_rect64(
             angle_delta_uv,
             reach,
             &vec![0i32; chroma_w * chroma_h],
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
@@ -10896,7 +11098,7 @@ fn decode_block_rect64(
             plane_q_delta(0, fctx).1,
             luma_tx_type,
         );
-        y.reconstruct_rect(
+        push_intra_rect(0, 
             px,
             py,
             bw,
@@ -10925,7 +11127,7 @@ fn decode_block_rect64(
         }
         // CHROMA: a real, untruncated chroma_w x chroma_h transform -- no
         // corner crop needed (see doc comment).
-        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let ac = alpha.map(|_| cfl_src_rect(px, py, bw, bh));
         // The chroma plane is never truncated (both axes <= 32 after
         // subsampling). Under a 1:4 strip it is a true 32x8/8x32:
         // `get_txsize_entropy_ctx(TX_32X8)` = (TX_8X8 + TX_32X32 + 1) >> 1 =
@@ -10989,7 +11191,7 @@ fn decode_block_rect64(
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
-        u.reconstruct_rect(
+        push_intra_rect(1, 
             cpx,
             cpy,
             chroma_w,
@@ -10998,7 +11200,7 @@ fn decode_block_rect64(
             angle_delta_uv,
             reach,
             &u_residual,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
@@ -11046,7 +11248,7 @@ fn decode_block_rect64(
         if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
         }
-        v.reconstruct_rect(
+        push_intra_rect(2, 
             cpx,
             cpy,
             chroma_w,
@@ -11055,7 +11257,7 @@ fn decode_block_rect64(
             angle_delta_uv,
             reach,
             &v_residual,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
@@ -11719,12 +11921,16 @@ impl PlaneBuf<'_> {
         residual: &[i32],
         cfl: Option<(i32, &[i32])>,
         filter_intra: Option<usize>,
-        smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
+        smooth_neighbor: bool,
+        // lane-wave1 step (i): the palette/intrabc prediction override, taken
+        // off `FrameCtx::palette_pred` by the PUSH site (parse order) rather
+        // than by this replay.
+        pred: Option<Vec<u16>>, fctx: &crate::decode::FrameCtx,
     ) {
         // As [`Self::reconstruct`]'s own [`PALETTE_PRED`] override
         // (lane-palette2 r4): a palette block's prediction is the
         // reconstructed colour-index map, needing no edge pixels at all.
-        let prediction = if let Some(buf) = take_palette_pred(fctx) {
+        let prediction = if let Some(buf) = pred {
             buf
         } else {
             let (above, left, corner) = self.edges_rect(x, y, bw, bh, reach);
@@ -11823,12 +12029,16 @@ impl PlaneBuf<'_> {
         // callers until a smooth/paeth `uv_mode` can reach this call at all
         // (still refused in `read_intra_mode`/`read_intra_mode_rect`), which
         // keeps `false` exact for chroma without this fn needing to know why.
-        smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
+        smooth_neighbor: bool,
+        // lane-wave1 step (i): the palette/intrabc prediction override, taken
+        // off `FrameCtx::palette_pred` by the PUSH site (parse order) rather
+        // than by this replay.
+        pred: Option<Vec<u16>>, fctx: &crate::decode::FrameCtx,
     ) {
         // A palette block's own [`PALETTE_PRED`] override (lane-palette r2)
         // takes priority over `predict()`/`predict_filter_intra` entirely --
         // palette prediction needs no edge pixels at all.
-        let prediction = if let Some(buf) = take_palette_pred(fctx) {
+        let prediction = if let Some(buf) = pred {
             buf
         } else {
             let (above, left, corner) = self.edges(x, y, side, reach);
@@ -11922,13 +12132,17 @@ fn read_plane(
     predict_mode: usize,
     angle_delta: i32,
     reach: Reach,
-    plane: &mut PlaneBuf<'static>,
+    // lane-wave1 step (i): unread -- this reader records its write
+    // ([`push_intra`]/[`push_mc`]) instead of performing it; the borrow
+    // stays in the signature so every call site still proves the plane is
+    // exclusively held while its coefficients are parsed.
+    _plane: &mut PlaneBuf<'static>,
     x: usize,
     y: usize,
     side: usize,
     tx_side: usize,
     base_q_idx: u8,
-    cfl: Option<(i32, &[i32])>,
+    cfl: Option<(i32, CflSrc)>,
     filter_intra: Option<usize>,
     // Only meaningful for `plane_idx == 0`: `Some` when this transform unit is
     // smaller than its own block (spec `get_txb_ctx_general`'s
@@ -12019,7 +12233,7 @@ fn read_plane(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
         );
     }
-    plane.reconstruct(
+    push_intra(plane_idx, 
         x,
         y,
         side,
@@ -12215,6 +12429,7 @@ fn decode_block(
     // block vector, with the BILINEAR kernel libaom forces for intrabc --
     // luma is a straight copy, chroma lands half-pel whenever the luma DV is
     // odd, which is exactly what the bilinear taps then interpolate.
+    flush_recon(fctx, y, u, v);
     let intrabc_bufs = intrabc_dv.map(|(dv_row, dv_col)| {
         let mut yb = vec![0u16; side * side];
         mc::predict_with_filter(
@@ -12333,7 +12548,7 @@ fn decode_block(
                         y.width,
                         y.height, fctx,
                     );
-                    y.reconstruct(
+                    push_intra(0, 
                         tu_px,
                         tu_py,
                         logical_tx,
@@ -12348,7 +12563,7 @@ fn decode_block(
                 }
             }
         } else {
-            y.reconstruct(
+            push_intra(0, 
                 px,
                 py,
                 side,
@@ -12361,7 +12576,7 @@ fn decode_block(
                 smooth_neighbor, fctx,
             );
         }
-        let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+        let ac = alpha.map(|_| cfl_src(px, py, side));
         let cn = (chroma_side / chroma_tx).max(1);
         for cu_row in 0..cn {
             for cu_col in 0..cn {
@@ -12379,7 +12594,7 @@ fn decode_block(
                 if let Some((ub, _)) = &palette_uv_bufs {
                     set_palette_pred(ub.clone(), fctx);
                 }
-                u.reconstruct(
+                push_intra(1, 
                     cu_x,
                     cu_y,
                     chroma_tx,
@@ -12387,14 +12602,14 @@ fn decode_block(
                     angle_delta_uv,
                     cu_r,
                     &vec![0i32; chroma_tx * chroma_tx],
-                    alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                    alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                     None,
                     smooth_neighbor_uv, fctx,
                 );
                 if let Some((_, vb)) = &palette_uv_bufs {
                     set_palette_pred(vb.clone(), fctx);
                 }
-                v.reconstruct(
+                push_intra(2, 
                     cu_x,
                     cu_y,
                     chroma_tx,
@@ -12402,7 +12617,7 @@ fn decode_block(
                     angle_delta_uv,
                     cu_r,
                     &vec![0i32; chroma_tx * chroma_tx],
-                    alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                    alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                     None,
                     smooth_neighbor_uv, fctx,
                 );
@@ -12444,7 +12659,7 @@ fn decode_block(
             None,
             smooth_neighbor, fctx,
         )?;
-        let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+        let ac = alpha.map(|_| cfl_src(px, py, side));
         // Armed for exactly this block's two chroma reads (see
         // [`INTRABC_CHROMA_TX`]); the luma call above just set
         // [`LUMA_TX_TYPE`] to the type it coded.
@@ -12471,7 +12686,7 @@ fn decode_block(
             chroma_side,
             chroma_tx,
             base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             None,
             smooth_neighbor_uv, fctx,
@@ -12502,7 +12717,7 @@ fn decode_block(
             chroma_side,
             chroma_tx,
             base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             None,
             smooth_neighbor_uv, fctx,
@@ -12622,7 +12837,7 @@ fn decode_block(
         }
         // CfL is only allowed up to 32x32, i.e. only at `nchunk == 1`, where
         // this still runs after every luma unit of the block.
-        let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+        let ac = alpha.map(|_| cfl_src(px, py, side));
         // The block's uv plane block is `chroma_side` across but its uv
         // transform is `chroma_tx` (`av1_get_max_uv_txsize` =
         // `av1_get_adjusted_tx_size(max_txsize_rect_lookup[uv_plane_bsize])`):
@@ -12657,7 +12872,7 @@ fn decode_block(
                     dec, cdfs, chroma_set, scans.1, 1, cu_around[1], mode,
                     uv_predict_mode, angle_delta_uv, cu_reach, u, cu_x, cu_y,
                     chroma_tx, chroma_tx, base_q_idx,
-                    alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                    alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                     None, chroma_ctx_offset, smooth_neighbor_uv, fctx,
                 )?;
                 if let Some((_, vb)) = &palette_uv_bufs {
@@ -12667,7 +12882,7 @@ fn decode_block(
                     dec, cdfs, chroma_set, scans.1, 2, cu_around[2], mode,
                     uv_predict_mode, angle_delta_uv, cu_reach, v, cu_x, cu_y,
                     chroma_tx, chroma_tx, base_q_idx,
-                    alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                    alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                     None, chroma_ctx_offset, smooth_neighbor_uv, fctx,
                 )?;
                 if cn > 1 {
@@ -12930,7 +13145,7 @@ fn decode_block_128rect(
                         y.height, fctx,
                     );
                     if skip {
-                        y.reconstruct(
+                        push_intra(0, 
                             tu_px, tu_py, logical_tx, mode, angle_delta_y, tu_r, &zero_tu, None,
                             None, smooth_neighbor, fctx,
                         );
@@ -12987,11 +13202,11 @@ fn decode_block_128rect(
             );
             let (cu_x, cu_y) = (cpx + ch_col * chroma_tx, cpy + ch_row * chroma_tx);
             if skip {
-                u.reconstruct(
+                push_intra(1, 
                     cu_x, cu_y, chroma_tx, uv_predict_mode, angle_delta_uv, cu_r, &zero_cu, None,
                     None, smooth_neighbor_uv, fctx,
                 );
-                v.reconstruct(
+                push_intra(2, 
                     cu_x, cu_y, chroma_tx, uv_predict_mode, angle_delta_uv, cu_r, &zero_cu, None,
                     None, smooth_neighbor_uv, fctx,
                 );
@@ -13287,6 +13502,7 @@ fn decode_leaf8(
     // the CURRENT frame's own pre-loop-filter reconstruction (every loop
     // filter is off whenever `allow_intrabc`, frame.rs:194/210/252/272) at
     // the full-pel block vector, with the BILINEAR kernel libaom forces.
+    flush_recon(fctx, y, u, v);
     let intrabc_bufs = intrabc_dv.map(|(dv_row, dv_col)| {
         let mut yb = vec![0u16; 8 * 8];
         mc::predict_with_filter(
@@ -13349,7 +13565,7 @@ fn decode_leaf8(
                         y.width,
                         y.height, fctx,
                     );
-                    y.reconstruct(
+                    push_intra(0, 
                         tu_px,
                         tu_py,
                         4,
@@ -13367,7 +13583,7 @@ fn decode_leaf8(
             if let Some(buf) = &palette_y_buf {
                 set_palette_pred(buf.clone(), fctx);
             }
-            y.reconstruct(
+            push_intra(0, 
                 px,
                 py,
                 8,
@@ -13380,13 +13596,13 @@ fn decode_leaf8(
                 smooth_neighbor, fctx,
             );
         }
-        let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
+        let ac = alpha.map(|_| cfl_src(px, py, 8));
         if let Some((_, ub, _)) = &intrabc_bufs {
             set_palette_pred(ub.clone(), fctx);
         } else if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
         }
-        u.reconstruct(
+        push_intra(1, 
             cpx,
             cpy,
             4,
@@ -13394,7 +13610,7 @@ fn decode_leaf8(
             angle_delta_uv,
             reach,
             &vec![0i32; 16],
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
@@ -13403,7 +13619,7 @@ fn decode_leaf8(
         } else if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
         }
-        v.reconstruct(
+        push_intra(2, 
             cpx,
             cpy,
             4,
@@ -13411,7 +13627,7 @@ fn decode_leaf8(
             angle_delta_uv,
             reach,
             &vec![0i32; 16],
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             smooth_neighbor_uv, fctx,
         );
@@ -13457,7 +13673,7 @@ fn decode_leaf8(
         if intrabc_dv.is_some() {
             fctx.intrabc_chroma_tx.with(|c| c.set(Some(fctx.luma_tx_type.with(std::cell::Cell::get))));
         }
-        let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
+        let ac = alpha.map(|_| cfl_src(px, py, 8));
         if let Some((_, ub, _)) = &intrabc_bufs {
             set_palette_pred(ub.clone(), fctx);
         } else if let Some((ub, _)) = &palette_uv_bufs {
@@ -13480,7 +13696,7 @@ fn decode_leaf8(
             4,
             TX4,
             base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             None,
             smooth_neighbor_uv, fctx,
@@ -13507,7 +13723,7 @@ fn decode_leaf8(
             4,
             TX4,
             base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             None,
             smooth_neighbor_uv, fctx,
@@ -13597,7 +13813,7 @@ fn decode_leaf8(
                 neighbours.record_mi_luma(tu_mi, 4, &tu_grid);
             }
         }
-        let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
+        let ac = alpha.map(|_| cfl_src(px, py, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
@@ -13619,7 +13835,7 @@ fn decode_leaf8(
             4,
             TX4,
             base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             None,
             smooth_neighbor_uv, fctx,
@@ -13644,7 +13860,7 @@ fn decode_leaf8(
             4,
             TX4,
             base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             None,
             smooth_neighbor_uv, fctx,
@@ -13907,7 +14123,7 @@ fn decode_leaf_split4(
         let (px, py) = (lmi.1 * MI, lmi.0 * MI);
         let reach = Reach::of(4, px, py, y.width, y.height, fctx);
         if skip {
-            y.reconstruct(px, py, 4, mode, angle_delta_y, reach, &vec![0i32; 16], None, filter_intra, smooth_neighbor, fctx);
+            push_intra(0, px, py, 4, mode, angle_delta_y, reach, &vec![0i32; 16], None, filter_intra, smooth_neighbor, fctx);
             neighbours.record_mi_luma(lmi, 4, &vec![0i32; 16]);
         } else {
             let tu_around = neighbours.around_mi(lmi, 4)[0];
@@ -13964,26 +14180,26 @@ fn decode_leaf_split4(
         // lane-troykf and lane-kf1200 fixed THIS SAME arm independently; the
         // merge keeps one fix and feeds both lanes' counters so neither of
         // their gates goes vacuous.
-        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
         if alpha.is_some() {
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
             SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
-        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
-        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
-        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
         let ug = read_plane(
             dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], uv_mode, uv_predict_mode,
             angle_delta_uv, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv, fctx,
         )?;
         let vg = read_plane(
             dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], uv_mode, uv_predict_mode,
             angle_delta_uv, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
         )?;
         (ug, vg)
     };
@@ -14194,7 +14410,7 @@ fn decode_leaf_rect8(
                     // one's reconstruction, which is NOT what a single 4x8
                     // prediction of the same mode produces.
                     let zeros = vec![0i32; 16];
-                    y.reconstruct(
+                    push_intra(0, 
                         tu_px, tu_py, 4, mode, angle_delta_y, tu_reach, &zeros, None,
                         filter_intra, smooth_neighbor, fctx,
                     );
@@ -14248,7 +14464,7 @@ fn decode_leaf_rect8(
         }
         let grid = if skip {
             let zeros = vec![0i32; bw * bh];
-            y.reconstruct_rect(
+            push_intra_rect(0, 
                 px, py, bw, bh, mode, angle_delta_y, reach, &zeros, None, filter_intra,
                 smooth_neighbor, fctx,
             );
@@ -14291,7 +14507,7 @@ fn decode_leaf_rect8(
                 plane_q_delta(0, fctx).1,
                 tx_type,
             );
-            y.reconstruct_rect(
+            push_intra_rect(0, 
                 px, py, bw, bh, mode, angle_delta_y, reach, &residual, None, filter_intra,
                 smooth_neighbor, fctx,
             );
@@ -14336,26 +14552,26 @@ fn decode_leaf_rect8(
         // lane-troykf and lane-kf1200 fixed THIS SAME arm independently; the
         // merge keeps one fix and feeds both lanes' counters so neither of
         // their gates goes vacuous.
-        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
         if alpha.is_some() {
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
             SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
-        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
-        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
-        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
         let chroma_around = neighbours.around_mi(leaf_mi, 8);
         let ug = read_plane(
             dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], uv_mode, uv_predict_mode,
             angle_delta_uv, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv, fctx,
         )?;
         let vg = read_plane(
             dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], uv_mode, uv_predict_mode,
             angle_delta_uv, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
         )?;
         (ug, vg)
     };
@@ -16138,7 +16354,11 @@ fn read_inter_plane_rect(
     plane_idx: usize,
     around: (bool, bool, i32),
     tx_mode: usize,
-    plane: &mut PlaneBuf<'static>,
+    // lane-wave1 step (i): unread -- this reader records its write
+    // ([`push_intra`]/[`push_mc`]) instead of performing it; the borrow
+    // stays in the signature so every call site still proves the plane is
+    // exclusively held while its coefficients are parsed.
+    _plane: &mut PlaneBuf<'static>,
     x: usize,
     y: usize,
     prediction: &[u16],
@@ -16230,7 +16450,7 @@ fn read_inter_plane_rect(
     for row in 0..h {
         strided[row * stride..][..w].copy_from_slice(&residual[row * w..][..w]);
     }
-    plane.reconstruct_mc_rect(x, y, stride, w, h, prediction, &strided, fctx);
+    push_mc_rect(plane_idx, x, y, stride, w, h, prediction, &strided, fctx);
     Ok((grid, tx_type))
 }
 
@@ -18365,6 +18585,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // visits of this superblock code nothing at all.
     let mut sb128_none = false;
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
+        // lane-wave1 step (i): the previous superblock's recorded writes.
+        flush_recon(fctx, &mut y, &mut u, &mut v);
         if row_start {
             neighbours.start_row();
         }
@@ -20106,6 +20328,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             }
         }
     }
+    flush_recon(fctx, &mut y, &mut u, &mut v);
 
         if tile_num == tile_info.context_update_tile_id {
             result_cdfs = cdfs;
@@ -20590,18 +20813,7 @@ impl PlaneBuf<'_> {
     /// compensation's output, rather than [`predict`]'s intra one), writing
     /// the clamped reconstruction into the plane at `(x, y)` -- the inter
     /// counterpart of [`PlaneBuf::reconstruct`].
-    fn reconstruct_mc(
-        &mut self,
-        x: usize,
-        y: usize,
-        side: usize,
-        prediction: &[u16],
-        residual: &[i32], fctx: &crate::decode::FrameCtx,
-    ) {
-        self.reconstruct_mc_rect(x, y, side, side, side, prediction, residual, fctx);
-    }
-
-    /// [`Self::reconstruct_mc`], writing only a `w`x`h` sub-rectangle of the
+    /// [`Self::reconstruct_mc_rect`], writing only a `w`x`h` sub-rectangle of the
     /// `side`x`side` `prediction`/`residual` buffers (which stay `side`-square
     /// for stride/indexing) -- lane-partitions r1: a true rectangular HORZ/
     /// VERT strip is predicted at its enclosing square `side` (matching
@@ -20657,7 +20869,11 @@ fn read_inter_plane(
     plane_idx: usize,
     around: (bool, bool, i32),
     tx_mode: usize,
-    plane: &mut PlaneBuf<'static>,
+    // lane-wave1 step (i): unread -- this reader records its write
+    // ([`push_intra`]/[`push_mc`]) instead of performing it; the borrow
+    // stays in the signature so every call site still proves the plane is
+    // exclusively held while its coefficients are parsed.
+    _plane: &mut PlaneBuf<'static>,
     x: usize,
     y: usize,
     side: usize,
@@ -20728,7 +20944,7 @@ fn read_inter_plane(
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let residual = dequant_and_inverse_typed(&grid, side, bit_depth(fctx), block_q_idx(fctx), dc_delta, ac_delta, tx_type);
-    plane.reconstruct_mc(x, y, side, prediction, &residual, fctx);
+    push_mc(plane_idx, x, y, side, prediction, &residual, fctx);
     Ok((grid, tx_type))
 }
 
@@ -23245,7 +23461,7 @@ fn decode_inter_block(
                 .1
             };
             if skip {
-                y.reconstruct_mc_rect(
+                push_mc_rect(0, 
                     px,
                     py,
                     side,
@@ -23254,7 +23470,7 @@ fn decode_inter_block(
                     &pred_y,
                     &vec![0i32; side * side], fctx,
                 );
-                u.reconstruct_mc_rect(
+                push_mc_rect(1, 
                     cpx,
                     cpy,
                     chroma_side,
@@ -23263,7 +23479,7 @@ fn decode_inter_block(
                     &pred_u,
                     &vec![0i32; chroma_side * chroma_side], fctx,
                 );
-                v.reconstruct_mc_rect(
+                push_mc_rect(2, 
                     cpx,
                     cpy,
                     chroma_side,
@@ -24368,6 +24584,7 @@ fn decode_inter_block(
             // result, all planes (reconinter.c av1_build_interintra_predictor
             // plane loop).
             if let Some(ii) = interintra_mode {
+                flush_recon(fctx, y, u, v);
                 if write_w != write_h {
                     INTERINTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
                 }
@@ -24455,7 +24672,7 @@ fn decode_inter_block(
                 .1
             };
             if skip {
-                y.reconstruct_mc_rect(
+                push_mc_rect(0, 
                     px,
                     py,
                     side,
@@ -24465,7 +24682,7 @@ fn decode_inter_block(
                     &vec![0i32; side * side], fctx,
                 );
                 if has_chroma {
-                    u.reconstruct_mc_rect(
+                    push_mc_rect(1, 
                         cpx,
                         cpy,
                         chroma_side,
@@ -24474,7 +24691,7 @@ fn decode_inter_block(
                         &pred_u,
                         &vec![0i32; chroma_side * chroma_side], fctx,
                     );
-                    v.reconstruct_mc_rect(
+                    push_mc_rect(2, 
                         cpx,
                         cpy,
                         chroma_side,
@@ -25217,7 +25434,7 @@ fn decode_inter_block(
                     set_palette_pred(window, fctx);
                 }
                 let tu_grid = if skip {
-                    y.reconstruct(
+                    push_intra(0, 
                         tu_px,
                         tu_py,
                         tx_px,
@@ -25287,7 +25504,7 @@ fn decode_inter_block(
                     for plane_idx in 1..3 {
                         let buf: &mut PlaneBuf<'static> = if plane_idx == 1 { &mut *u } else { &mut *v };
                         let cu_grid = if skip {
-                            buf.reconstruct(
+                            push_intra(plane_idx, 
                                 cu_x,
                                 cu_y,
                                 cu_tx,
@@ -25357,7 +25574,7 @@ fn decode_inter_block(
                 if let Some(buf) = &palette_y_buf {
                     set_palette_pred(buf.clone(), fctx);
                 }
-                y.reconstruct(
+                push_intra(0, 
                     px,
                     py,
                     side,
@@ -25370,11 +25587,11 @@ fn decode_inter_block(
                     smooth_neighbor, fctx,
                 );
             }
-            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+            let ac = alpha.map(|_| cfl_src(px, py, side));
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
-            u.reconstruct(
+            push_intra(1, 
                 cpx,
                 cpy,
                 chroma_side,
@@ -25382,14 +25599,14 @@ fn decode_inter_block(
                 angle_delta_uv,
                 reach,
                 &vec![0i32; chroma_side * chroma_side],
-                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
             );
             if let Some((_, vb)) = &palette_uv_bufs {
                 set_palette_pred(vb.clone(), fctx);
             }
-            v.reconstruct(
+            push_intra(2, 
                 cpx,
                 cpy,
                 chroma_side,
@@ -25397,7 +25614,7 @@ fn decode_inter_block(
                 angle_delta_uv,
                 reach,
                 &vec![0i32; chroma_side * chroma_side],
-                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
             );
@@ -25438,7 +25655,7 @@ fn decode_inter_block(
                     smooth_neighbor, fctx,
                 )?
             };
-            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+            let ac = alpha.map(|_| cfl_src(px, py, side));
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
@@ -25459,7 +25676,7 @@ fn decode_inter_block(
                 chroma_side,
                 chroma_tx,
                 base_q_idx,
-                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                 None,
                 None,
                 smooth_neighbor_uv, fctx,
@@ -25484,7 +25701,7 @@ fn decode_inter_block(
                 chroma_side,
                 chroma_tx,
                 base_q_idx,
-                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                 None,
                 None,
                 smooth_neighbor_uv, fctx,
@@ -26095,7 +26312,7 @@ fn decode_inter_sub8_split4(
         // txsize_to_bsize[tx_size]` branch (`txb_skip_ctx = 0`, which
         // `read_inter_plane`'s `plane_idx == 0` arm already assumes).
         if skip {
-            y.reconstruct_mc(px, py, B4, &pred_y, &vec![0i32; B4 * B4], fctx);
+            push_mc(0, px, py, B4, &pred_y, &vec![0i32; B4 * B4], fctx);
             neighbours.record_mi_luma_rect(lmi, B4, B4, &vec![0i32; B4 * B4]);
         } else {
             let around = neighbours.around_mi(lmi, B4);
@@ -26210,8 +26427,8 @@ fn decode_inter_sub8_split4(
             }
         }
         let (u_grid, v_grid) = if last_skip {
-            u.reconstruct_mc(cpx, cpy, B4, &pred_u, &vec![0i32; B4 * B4], fctx);
-            v.reconstruct_mc(cpx, cpy, B4, &pred_v, &vec![0i32; B4 * B4], fctx);
+            push_mc(1, cpx, cpy, B4, &pred_u, &vec![0i32; B4 * B4], fctx);
+            push_mc(2, cpx, cpy, B4, &pred_v, &vec![0i32; B4 * B4], fctx);
             (vec![0i32; B4 * B4], vec![0i32; B4 * B4])
         } else {
             let around = neighbours.around_mi(group_mi, 8);
@@ -26440,7 +26657,7 @@ fn decode_intra_sub8_leaf(
             );
             if skip {
                 let zeros = vec![0i32; 16];
-                y.reconstruct(
+                push_intra(0, 
                     tu_px, tu_py, 4, mode, angle_delta_y, tu_reach, &zeros, None, filter_intra,
                     smooth_neighbor, fctx,
                 );
@@ -26482,7 +26699,7 @@ fn decode_intra_sub8_leaf(
         // fixes `txb_skip_ctx` at 0 (`luma_skip_ctx: None`) -- the same square
         // reader [`decode_leaf_split4`] uses.
         if skip {
-            y.reconstruct(
+            push_intra(0, 
                 px, py, 4, mode, angle_delta_y, reach, &vec![0i32; 16], None, filter_intra,
                 smooth_neighbor, fctx,
             );
@@ -26520,7 +26737,7 @@ fn decode_intra_sub8_leaf(
     } else {
         let grid_levels = if skip {
             let zeros = vec![0i32; bw * bh];
-            y.reconstruct_rect(
+            push_intra_rect(0, 
                 px, py, bw, bh, mode, angle_delta_y, reach, &zeros, None, filter_intra,
                 smooth_neighbor, fctx,
             );
@@ -26555,7 +26772,7 @@ fn decode_intra_sub8_leaf(
                 plane_q_delta(0, fctx).1,
                 tx_type,
             );
-            y.reconstruct_rect(
+            push_intra_rect(0, 
                 px, py, bw, bh, mode, angle_delta_y, reach, &residual, None, filter_intra,
                 smooth_neighbor, fctx,
             );
@@ -26650,26 +26867,26 @@ fn decode_intra_sub8_leaf(
     // needs `bsize >= BLOCK_8X8`), so the group always clears.
     record_strip_palette(neighbours, (gr, gc), 8, 8, 0, [0u16; 8], 0, [0u16; 8]);
 
-    let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+    let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if skip {
         if alpha.is_some() {
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
             SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
-        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
-        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let chroma_around = neighbours.around_mi(group_mi, 8);
         let ug = read_plane(
             dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], uv_mode, uv_predict_mode,
             angle_delta_uv, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv, fctx,
         )?;
         let vg = read_plane(
             dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], uv_mode, uv_predict_mode,
             angle_delta_uv, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
+            alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv, fctx,
         )?;
         (ug, vg)
     };
@@ -27068,7 +27285,7 @@ fn decode_inter_sub8_rect2(
             }
         }
         if skip {
-            y.reconstruct_mc_rect(px, py, SIDE, bw, bh, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
+            push_mc_rect(0, px, py, SIDE, bw, bh, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
             neighbours.record_mi_luma_rect(lmi, bw, bh, &vec![0i32; bw * bh]);
             neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, bw as u8, bh as u8, ref_frame.max(LAST_FRAME), fctx);
         } else {
@@ -27234,8 +27451,8 @@ fn decode_inter_sub8_rect2(
             }
         }
         let (u_grid, v_grid) = if last_skip {
-            u.reconstruct_mc(cpx, cpy, B4, &pred_u, &vec![0i32; B4 * B4], fctx);
-            v.reconstruct_mc(cpx, cpy, B4, &pred_v, &vec![0i32; B4 * B4], fctx);
+            push_mc(1, cpx, cpy, B4, &pred_u, &vec![0i32; B4 * B4], fctx);
+            push_mc(2, cpx, cpy, B4, &pred_v, &vec![0i32; B4 * B4], fctx);
             (vec![0i32; B4 * B4], vec![0i32; B4 * B4])
         } else {
             let around = neighbours.around_mi(group_mi, 8);
@@ -28071,15 +28288,15 @@ fn decode_inter_block8(
                 .1
                 .is_some();
                 if skip {
-                    y.reconstruct_mc(px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
-                    u.reconstruct_mc(
+                    push_mc(0, px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
+                    push_mc(1, 
                         cpx,
                         cpy,
                         CHROMA_SIDE,
                         &pred_u,
                         &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
                     );
-                    v.reconstruct_mc(
+                    push_mc(2, 
                         cpx,
                         cpy,
                         CHROMA_SIDE,
@@ -28698,6 +28915,7 @@ fn decode_inter_block8(
         // Non-wedge interintra blend, mutually exclusive with OBMC (the
         // motion_mode symbol is not read for an interintra block).
         if let Some(ii) = interintra_mode {
+            flush_recon(fctx, y, u, v);
             interintra_blend(y, px, py, SIDE, SIDE, SIDE, ii, wedge_mask, &mut pred_y, fctx);
             interintra_blend(
                 u, cpx, cpy, CHROMA_SIDE, CHROMA_SIDE, CHROMA_SIDE, ii, wedge_mask, &mut pred_u, fctx,
@@ -28720,15 +28938,15 @@ fn decode_inter_block8(
         .1
         .is_some();
         if skip {
-            y.reconstruct_mc(px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
-            u.reconstruct_mc(
+            push_mc(0, px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
+            push_mc(1, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
                 &pred_u,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
             );
-            v.reconstruct_mc(
+            push_mc(2, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
@@ -29091,7 +29309,7 @@ fn decode_inter_block8(
                     set_palette_pred(window, fctx);
                 }
                 let tu_grid = if skip {
-                    y.reconstruct(
+                    push_intra(0, 
                         tu_px,
                         tu_py,
                         tx_px,
@@ -29144,7 +29362,7 @@ fn decode_inter_block8(
                 if let Some(buf) = &palette_y_buf {
                     set_palette_pred(buf.clone(), fctx);
                 }
-                y.reconstruct(
+                push_intra(0, 
                     px,
                     py,
                     SIDE,
@@ -29159,11 +29377,11 @@ fn decode_inter_block8(
             }
             // CfL's AC contribution is the luma this leaf just reconstructed,
             // averaged over the 4x4 chroma block (`cfl_ac_q3`, spec 7.11.5).
-            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
+            let ac = alpha.map(|_| cfl_src(px, py, SIDE));
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
-            u.reconstruct(
+            push_intra(1, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
@@ -29171,14 +29389,14 @@ fn decode_inter_block8(
                 angle_delta_uv,
                 reach,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
-                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
             );
             if let Some((_, vb)) = &palette_uv_bufs {
                 set_palette_pred(vb.clone(), fctx);
             }
-            v.reconstruct(
+            push_intra(2, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
@@ -29186,7 +29404,7 @@ fn decode_inter_block8(
                 angle_delta_uv,
                 reach,
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
-                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
             );
@@ -29235,7 +29453,7 @@ fn decode_inter_block8(
                 smooth_neighbor, fctx,
             )?
             };
-            let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
+            let ac = alpha.map(|_| cfl_src(px, py, SIDE));
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
@@ -29256,7 +29474,7 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
-                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                 None,
                 None,
                 smooth_neighbor_uv, fctx,
@@ -29281,7 +29499,7 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
-                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                 None,
                 None,
                 smooth_neighbor_uv, fctx,
@@ -29820,6 +30038,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // key-frame tile loop runs).
     let mut sb128_none = false;
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
+        // lane-wave1 step (i): the previous superblock's recorded writes.
+        flush_recon(fctx, &mut y, &mut u, &mut v);
         if row_start {
             neighbours.start_row();
         }
@@ -32163,6 +32383,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             }
         }
     }
+    flush_recon(fctx, &mut y, &mut u, &mut v);
 
         if tile_num == tile_info.context_update_tile_id {
             result_cdfs = cdfs;
