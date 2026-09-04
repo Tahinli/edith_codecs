@@ -7731,20 +7731,21 @@ fn decode_intra_rect_in_inter(
     // already read), the `tx_depth` context (the real TXFM_CONTEXT bands) and
     // the `set_txfm_ctxs` publication. CfL (>32), filter intra (>32) and
     // palette (>64) do not exist at this size and are refused by name there.
-    // lane-inter128intra r1: OPT-IN ONLY (`EC_INTRA128_IN_INTER=1`) until a
-    // gate exists. The body below is believed right (it is the key frame's own
-    // proven body plus the three inter-frame differences), but nothing proves
-    // it: no aomenc recipe found so far emits a 128-root HORZ/VERT half coded
-    // intra in an inter frame. A refusal is lifted only with a gate (COMMON),
-    // so the default path still refuses by name below.
-    //
-    // lane-t900 r17: the opt-in STAYS. `intra128_in_inter_witness.obu` was
-    // built as this arm's witness and r16 measured three hits in it -- but
-    // every one of them was an artifact of the skipped-128-block entropy
-    // desync fixed this round (class `counter-from-refused-stream`). With the
-    // stream decoding byte-exact the arm fires ZERO times, so the witness does
-    // not carry the shape at all and the lift has no gate.
-    if bw.max(bh) == 128 && std::env::var_os("EC_INTRA128_IN_INTER").is_some() {
+    // lane-t900 r18: the opt-in is LIFTED -- the arm has a witness.
+    // `intra128_in_inter_witness2.obu` (gate
+    // `an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact`)
+    // fires it 3x 128x64 + 6x 64x128 and decodes byte-exact on every plane of
+    // all 15 frames, so the hits are counted out of exact frames (class
+    // `counter-from-refused-stream`). What r16/r17 could not find, and what
+    // that recipe exploits: libaom's RD essentially never PICKS a 128-root
+    // HORZ/VERT in the interior -- the 512x512 r16 witness and a textured
+    // 640x384 sweep code 128 roots as NONE or SPLIT only. The shape appears
+    // where the frame EDGE forces it: a partial last superblock row has
+    // `has_rows128 == false`, so the 128x64 top half is implied, and a
+    // partial last column implies the 64x128 left half. Put content no
+    // reference holds (a fresh smooth ramp) in exactly those two bands of an
+    // inter frame and the encoder codes those forced halves INTRA.
+    if bw.max(bh) == 128 {
         if allow_screen_content_tools {
             return Err(unsupported(
                 "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
