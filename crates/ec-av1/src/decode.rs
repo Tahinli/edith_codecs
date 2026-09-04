@@ -15996,7 +15996,12 @@ fn filter4(mask: bool, thresh: i32, p1: i32, p0: i32, q0: i32, q1: i32) -> [i32;
         return [p1, p0, q0, q1];
     }
     let hev = (p1 - p0).abs() > thresh || (q1 - q0).abs() > thresh;
-    let centre = 128i32 << (bit_depth() - 8);
+    // lane-perf6: `sclamp` re-read the thread-local bit depth on every one of
+    // this kernel's eight clamps, and this kernel runs per deblocked sample.
+    // Same bound, resolved once.
+    let scale = 1i32 << (bit_depth() - 8);
+    let sclamp = |v: i32| v.clamp(-128 * scale, 128 * scale - 1);
+    let centre = 128i32 * scale;
     let (ps1, ps0, qs0, qs1) = (p1 - centre, p0 - centre, q0 - centre, q1 - centre);
     let outer = if hev { sclamp(ps1 - qs1) } else { 0 };
     let filter = sclamp(outer + 3 * (qs0 - ps0));
@@ -16164,6 +16169,7 @@ fn filter_edge(
     let shift = bit_depth() - 8;
     let (blimit, limit, hev_thr) = (blimit << shift, limit << shift, hev_thr << shift);
     let flat_thresh = 1i32 << shift;
+    let smax = sample_max();
     for i in 0..4isize {
         let center = (base as isize + i * outer_stride) as usize;
         let idx = |k: isize| -> usize { (center as isize + k * tap_stride) as usize };
@@ -16175,10 +16181,10 @@ fn filter_edge(
                     && (q1 - q0).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
                 let [op1, op0, oq0, oq1] = filter4(mask, hev_thr, p1, p0, q0, q1);
-                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
-                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
-                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
-                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
+                data[idx(-2)] = op1.clamp(0, smax) as u16;
+                data[idx(-1)] = op0.clamp(0, smax) as u16;
+                data[idx(0)] = oq0.clamp(0, smax) as u16;
+                data[idx(1)] = oq1.clamp(0, smax) as u16;
             }
             6 => {
                 let (p2, p1, p0, q0, q1, q2) = (px(-3), px(-2), px(-1), px(0), px(1), px(2));
@@ -16192,10 +16198,10 @@ fn filter_edge(
                     && (p2 - p0).abs() <= flat_thresh
                     && (q2 - q0).abs() <= flat_thresh;
                 let [op1, op0, oq0, oq1] = filter6(mask, hev_thr, flat, p2, p1, p0, q0, q1, q2);
-                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
-                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
-                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
-                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
+                data[idx(-2)] = op1.clamp(0, smax) as u16;
+                data[idx(-1)] = op0.clamp(0, smax) as u16;
+                data[idx(0)] = oq0.clamp(0, smax) as u16;
+                data[idx(1)] = oq1.clamp(0, smax) as u16;
             }
             8 => {
                 let (p3, p2, p1, p0, q0, q1, q2, q3) =
@@ -16215,12 +16221,12 @@ fn filter_edge(
                     && (q3 - q0).abs() <= flat_thresh;
                 let [op2, op1, op0, oq0, oq1, oq2] =
                     filter8(mask, hev_thr, flat, p3, p2, p1, p0, q0, q1, q2, q3);
-                data[idx(-3)] = op2.clamp(0, sample_max()) as u16;
-                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
-                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
-                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
-                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
-                data[idx(2)] = oq2.clamp(0, sample_max()) as u16;
+                data[idx(-3)] = op2.clamp(0, smax) as u16;
+                data[idx(-2)] = op1.clamp(0, smax) as u16;
+                data[idx(-1)] = op0.clamp(0, smax) as u16;
+                data[idx(0)] = oq0.clamp(0, smax) as u16;
+                data[idx(1)] = oq1.clamp(0, smax) as u16;
+                data[idx(2)] = oq2.clamp(0, smax) as u16;
             }
             _ => {
                 let (p6, p5, p4, p3, p2, p1, p0) =
@@ -16251,7 +16257,7 @@ fn filter_edge(
                     q6,
                 );
                 for (k, v) in (-6..=5isize).zip(out) {
-                    data[idx(k)] = v.clamp(0, sample_max()) as u16;
+                    data[idx(k)] = v.clamp(0, smax) as u16;
                 }
             }
         }
