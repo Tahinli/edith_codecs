@@ -18820,7 +18820,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         frame_width as usize,
         frame_height as usize,
     );
-    let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
+    // lane-perf4: loop restoration is the only reader of the pre-CDEF planes,
+    // and a frame that restores nothing copied every plane twice for nothing
+    // (three `PlaneBuf` clones here plus the `cdef.to_vec()` inside
+    // [`crate::restoration::apply_loop_restoration_plane`], which returns its
+    // input unchanged when the plane's type is `None`). Clone only when some
+    // plane actually restores.
+    let lr_active = (0..3).any(|p| {
+        lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
+            && lr.loop_restoration_size[p] != 0
+    });
+    let deblocked = lr_active.then(|| (y.clone(), u.clone(), v.clone()));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -18836,10 +18846,12 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_loop_restoration(
-        &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
-        (frame_width as usize, frame_height as usize),
-    );
+    if let Some((deblocked_y, deblocked_u, deblocked_v)) = &deblocked {
+        apply_loop_restoration(
+            &mut y, &mut u, &mut v, deblocked_y, deblocked_u, deblocked_v, lr, &lr_grid,
+            (frame_width as usize, frame_height as usize),
+        );
+    }
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
@@ -30777,7 +30789,17 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         frame_width as usize,
         frame_height as usize,
     );
-    let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
+    // lane-perf4: loop restoration is the only reader of the pre-CDEF planes,
+    // and a frame that restores nothing copied every plane twice for nothing
+    // (three `PlaneBuf` clones here plus the `cdef.to_vec()` inside
+    // [`crate::restoration::apply_loop_restoration_plane`], which returns its
+    // input unchanged when the plane's type is `None`). Clone only when some
+    // plane actually restores.
+    let lr_active = (0..3).any(|p| {
+        lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
+            && lr.loop_restoration_size[p] != 0
+    });
+    let deblocked = lr_active.then(|| (y.clone(), u.clone(), v.clone()));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -30793,10 +30815,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_loop_restoration(
-        &mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid,
-        (frame_width as usize, frame_height as usize),
-    );
+    if let Some((deblocked_y, deblocked_u, deblocked_v)) = &deblocked {
+        apply_loop_restoration(
+            &mut y, &mut u, &mut v, deblocked_y, deblocked_u, deblocked_v, lr, &lr_grid,
+            (frame_width as usize, frame_height as usize),
+        );
+    }
 
     let motion_field = build_motion_field(
         &grid,
