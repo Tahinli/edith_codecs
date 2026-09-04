@@ -759,6 +759,19 @@ fn reset3<const N: usize, const M: usize, const K: usize>(a: &mut [[[u16; N]; M]
     a.iter_mut().for_each(reset2);
 }
 
+/// [`reset3`] for a table whose ALPHABET grows with its first index: the
+/// palette colour-index CDFs are `[u16; 9]` rows read as `[..=n]` with
+/// `n = idx + 2`, so their symbol counter sits at index `n`, not `N - 1`.
+fn reset_var_alphabet<const N: usize, const M: usize, const K: usize>(
+    a: &mut [[[u16; N]; M]; K],
+) {
+    for (idx, rows) in a.iter_mut().enumerate() {
+        for row in rows.iter_mut() {
+            row[idx + 2] = 0;
+        }
+    }
+}
+
 impl MvComponentCdfs {
     fn reset_counts(&mut self) {
         reset1(&mut self.class);
@@ -926,8 +939,18 @@ impl Cdfs {
         reset2(&mut self.palette_y_size);
         reset2(&mut self.palette_uv_mode);
         reset2(&mut self.palette_uv_size);
-        reset3(&mut self.palette_y_color_index);
-        reset3(&mut self.palette_uv_color_index);
+        // lane-t900 r22 (class cdf-counter-not-reset): the two colour-index
+        // tables are the only VARIABLE-ALPHABET ones here -- the reader takes
+        // `[..=n]` of a `[u16; 9]` row, so `update_cdf`'s symbol counter lives
+        // at index `n` (= table index + 2), not at the array's last entry.
+        // `reset3` zeroed slot 8, which no `n < 8` row ever uses, so every
+        // palette colour-index row crossed a frame boundary with a SATURATED
+        // count (32) and adapted at rate 6 where libaom, counting from 0,
+        // adapts at rate 4: the first inter-frame palette block's map desynced
+        // at its third colour-index symbol (witness `palette_screen_witness.obu`,
+        // decode-order frame 3, mi(40,0), Y map (0,2)).
+        reset_var_alphabet(&mut self.palette_y_color_index);
+        reset_var_alphabet(&mut self.palette_uv_color_index);
         reset1(&mut self.intrabc);
         reset1(&mut self.restore_wiener);
         reset1(&mut self.restore_sgrproj);
