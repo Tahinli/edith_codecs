@@ -19,6 +19,7 @@ pub const PARTITION_W128: [[u16; 9]; 4] = [
     [711, 966, 1172, 32448, 32538, 32617, 32664, 32768, 0],
 ];
 
+/// Default CDF table `PARTITION_W64` (AV1 spec 9.4 initial probabilities).
 pub const PARTITION_W64: [[u16; 11]; 4] = [
     [
         20137, 21547, 23078, 29566, 29837, 30261, 30524, 30892, 31724, 32768, 0,
@@ -63,6 +64,7 @@ pub const TXFM_PARTITION: [[u16; 3]; 21] = [
     [16088, 32768, 0],
 ];
 
+/// Default CDF table `SKIP` (AV1 spec 9.4 initial probabilities).
 pub const SKIP: [[u16; 3]; 3] = [[31671, 32768, 0], [16515, 32768, 0], [4576, 32768, 0]];
 
 /// `Default_Intra_Frame_Y_Mode_Cdf` (spec 9.4): the thirteen luma intra
@@ -698,6 +700,7 @@ pub const SEGMENT_ID: [[u16; 9]; 3] = [
 /// `seg_id_predicted`, indexed by `AboveSegPredContext + LeftSegPredContext`.
 pub const SEGMENT_PRED: [[u16; 3]; 3] = [[16384, 32768, 0]; 3];
 
+/// Default CDF table `DELTA_Q` (AV1 spec 9.4 initial probabilities).
 pub const DELTA_Q: [u16; 5] = [28160, 32120, 32677, 32768, 0];
 /// `default_delta_lf_cdf` -- see [`DELTA_Q`]'s doc.
 pub const DELTA_LF: [u16; 5] = DELTA_Q;
@@ -3186,8 +3189,11 @@ pub const TXB_SKIP_CHROMA_32_Q3: [[u16; 3]; 3] =
 /// 128x128 block's four TX_32X32 chroma units -- the offset-7 rows above are
 /// every other case (lane-sb128b r3).
 pub const TXB_SKIP_CHROMA_32_BIG_Q0: [[u16; 3]; 3] = [[146, 32768, 0], [5132, 32768, 0], [31657, 32768, 0]];
+/// Default CDF table `TXB_SKIP_CHROMA_32_BIG_Q1` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_CHROMA_32_BIG_Q1: [[u16; 3]; 3] = [[641, 32768, 0], [22265, 32768, 0], [31452, 32768, 0]];
+/// Default CDF table `TXB_SKIP_CHROMA_32_BIG` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_CHROMA_32_BIG: [[u16; 3]; 3] = [[3082, 32768, 0], [20982, 32768, 0], [29443, 32768, 0]];
+/// Default CDF table `TXB_SKIP_CHROMA_32_BIG_Q3` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_CHROMA_32_BIG_Q3: [[u16; 3]; 3] = [[1806, 32768, 0], [14645, 32768, 0], [25336, 32768, 0]];
 /// EOB_EXTRA_LUMA_16, q-context 3: the same table as [`EOB_EXTRA_LUMA_16`], for `base_q_idx` 121..=255.
 pub const EOB_EXTRA_LUMA_16_Q3: [[u16; 3]; 9] = [
@@ -3886,8 +3892,11 @@ pub const EOB_PT_64_LUMA_Q3: [u16; 8] = [6307, 7541, 12060, 16358, 22553, 27865,
 /// (`av1_default_eob_multi64_cdfs[q][0][1]`), for an 8x8 luma TU whose
 /// `tx_type` resolves `V_DCT`/`H_DCT`.
 pub const EOB_PT_64_LUMA_CLASS1_Q0: [u16; 8] = [335, 730, 1459, 5494, 8755, 12997, 32768, 0];
+/// Default CDF table `EOB_PT_64_LUMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_64_LUMA_CLASS1_Q1: [u16; 8] = [401, 605, 1029, 2563, 5845, 12626, 32768, 0];
+/// Default CDF table `EOB_PT_64_LUMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_64_LUMA_CLASS1: [u16; 8] = [497, 810, 1315, 3000, 7004, 15641, 32768, 0];
+/// Default CDF table `EOB_PT_64_LUMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_64_LUMA_CLASS1_Q3: [u16; 8] = [1289, 2320, 3971, 7926, 14153, 24291, 32768, 0];
 
 /// EOB_PT_16_CHROMA_Q0, q-context 0: the same table as [`EOB_PT_16_CHROMA`], for `base_q_idx` 0..=20.
@@ -4683,6 +4692,7 @@ pub const TXB_SKIP_LUMA_8_Q0_CTX: [[u16; 3]; 7] = [
     [26308, 32768, 0],
     [32537, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_8_Q1_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_8_Q1_CTX: [[u16; 3]; 7] = [
     [31782, 32768, 0],
     [1836, 32768, 0],
@@ -4692,6 +4702,7 @@ pub const TXB_SKIP_LUMA_8_Q1_CTX: [[u16; 3]; 7] = [
     [27518, 32768, 0],
     [32399, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_8_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_8_CTX: [[u16; 3]; 7] = [
     [31957, 32768, 0],
     [3230, 32768, 0],
@@ -4701,6 +4712,7 @@ pub const TXB_SKIP_LUMA_8_CTX: [[u16; 3]; 7] = [
     [26536, 32768, 0],
     [31986, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_8_Q3_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_8_Q3_CTX: [[u16; 3]; 7] = [
     [31903, 32768, 0],
     [2044, 32768, 0],
@@ -4710,6 +4722,7 @@ pub const TXB_SKIP_LUMA_8_Q3_CTX: [[u16; 3]; 7] = [
     [24168, 32768, 0],
     [31037, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_16_Q0_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_16_Q0_CTX: [[u16; 3]; 7] = [
     [29957, 32768, 0],
     [5391, 32768, 0],
@@ -4719,6 +4732,7 @@ pub const TXB_SKIP_LUMA_16_Q0_CTX: [[u16; 3]; 7] = [
     [25822, 32768, 0],
     [32197, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_16_Q1_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_16_Q1_CTX: [[u16; 3]; 7] = [
     [31901, 32768, 0],
     [10311, 32768, 0],
@@ -4728,6 +4742,7 @@ pub const TXB_SKIP_LUMA_16_Q1_CTX: [[u16; 3]; 7] = [
     [27914, 32768, 0],
     [32296, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_16_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_16_CTX: [[u16; 3]; 7] = [
     [32363, 32768, 0],
     [10692, 32768, 0],
@@ -4737,6 +4752,7 @@ pub const TXB_SKIP_LUMA_16_CTX: [[u16; 3]; 7] = [
     [28312, 32768, 0],
     [32169, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_16_Q3_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_16_Q3_CTX: [[u16; 3]; 7] = [
     [32510, 32768, 0],
     [8430, 32768, 0],
@@ -4746,6 +4762,7 @@ pub const TXB_SKIP_LUMA_16_Q3_CTX: [[u16; 3]; 7] = [
     [28789, 32768, 0],
     [32139, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_32_Q0_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_32_Q0_CTX: [[u16; 3]; 7] = [
     [17920, 32768, 0],
     [1818, 32768, 0],
@@ -4755,6 +4772,7 @@ pub const TXB_SKIP_LUMA_32_Q0_CTX: [[u16; 3]; 7] = [
     [31554, 32768, 0],
     [32624, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_32_Q1_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_32_Q1_CTX: [[u16; 3]; 7] = [
     [26726, 32768, 0],
     [1045, 32768, 0],
@@ -4764,6 +4782,7 @@ pub const TXB_SKIP_LUMA_32_Q1_CTX: [[u16; 3]; 7] = [
     [25970, 32768, 0],
     [31938, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_32_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_32_CTX: [[u16; 3]; 7] = [
     [30669, 32768, 0],
     [3832, 32768, 0],
@@ -4773,6 +4792,7 @@ pub const TXB_SKIP_LUMA_32_CTX: [[u16; 3]; 7] = [
     [23313, 32768, 0],
     [31330, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_32_Q3_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_32_Q3_CTX: [[u16; 3]; 7] = [
     [31671, 32768, 0],
     [2056, 32768, 0],
@@ -4782,6 +4802,7 @@ pub const TXB_SKIP_LUMA_32_Q3_CTX: [[u16; 3]; 7] = [
     [24715, 32768, 0],
     [31484, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_64_Q0_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_64_Q0_CTX: [[u16; 3]; 7] = [
     [6308, 32768, 0],
     [117, 32768, 0],
@@ -4791,6 +4812,7 @@ pub const TXB_SKIP_LUMA_64_Q0_CTX: [[u16; 3]; 7] = [
     [10923, 32768, 0],
     [30247, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_64_Q1_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_64_Q1_CTX: [[u16; 3]; 7] = [
     [26584, 32768, 0],
     [188, 32768, 0],
@@ -4800,6 +4822,7 @@ pub const TXB_SKIP_LUMA_64_Q1_CTX: [[u16; 3]; 7] = [
     [30583, 32768, 0],
     [32608, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_64_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_64_CTX: [[u16; 3]; 7] = [
     [28573, 32768, 0],
     [3183, 32768, 0],
@@ -4809,6 +4832,7 @@ pub const TXB_SKIP_LUMA_64_CTX: [[u16; 3]; 7] = [
     [27832, 32768, 0],
     [32387, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_64_Q3_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_64_Q3_CTX: [[u16; 3]; 7] = [
     [31539, 32768, 0],
     [8433, 32768, 0],
@@ -4838,6 +4862,7 @@ pub const TXB_SKIP_LUMA_4_Q0_CTX: [[u16; 3]; 7] = [
     [27473, 32768, 0],
     [32487, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_4_Q1_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_4_Q1_CTX: [[u16; 3]; 7] = [
     [30371, 32768, 0],
     [7570, 32768, 0],
@@ -4847,6 +4872,7 @@ pub const TXB_SKIP_LUMA_4_Q1_CTX: [[u16; 3]; 7] = [
     [27067, 32768, 0],
     [32013, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_4_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_4_CTX: [[u16; 3]; 7] = [
     [29614, 32768, 0],
     [9068, 32768, 0],
@@ -4856,6 +4882,7 @@ pub const TXB_SKIP_LUMA_4_CTX: [[u16; 3]; 7] = [
     [24619, 32768, 0],
     [30642, 32768, 0],
 ];
+/// Default CDF table `TXB_SKIP_LUMA_4_Q3_CTX` (AV1 spec 9.4 initial probabilities).
 pub const TXB_SKIP_LUMA_4_Q3_CTX: [[u16; 3]; 7] = [
     [26887, 32768, 0],
     [6729, 32768, 0],
@@ -4869,8 +4896,11 @@ pub const TXB_SKIP_LUMA_4_Q3_CTX: [[u16; 3]; 7] = [
 /// The end-of-block group of a 4x4 luma transform (`av1_default_eob_multi16_cdfs`,
 /// `PLANE_TYPES` idx0 luma).
 pub const EOB_PT_16_LUMA_Q0: [u16; 6] = [840, 1039, 1980, 4895, 32768, 0];
+/// Default CDF table `EOB_PT_16_LUMA_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_LUMA_Q1: [u16; 6] = [2125, 2551, 5165, 8946, 32768, 0];
+/// Default CDF table `EOB_PT_16_LUMA` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_LUMA: [u16; 6] = [4016, 4897, 8881, 14968, 32768, 0];
+/// Default CDF table `EOB_PT_16_LUMA_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_LUMA_Q3: [u16; 6] = [6708, 8958, 14746, 22133, 32768, 0];
 
 /// The `TX_CLASS_HORIZ`/`TX_CLASS_VERT` (non-2D-scan) sibling of
@@ -4903,12 +4933,17 @@ pub const EOB_PT_32_LUMA_CLASS1: [u16; 7] = [574, 821, 1836, 5089, 13128, 32768,
 /// [`EOB_PT_32_LUMA_CLASS1_Q0`]'s q-context 3 sibling.
 pub const EOB_PT_32_LUMA_CLASS1_Q3: [u16; 7] = [1156, 1702, 3675, 9274, 20539, 32768, 0];
 
+/// Default CDF table `EOB_PT_16_LUMA_CLASS1_Q0` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_LUMA_CLASS1_Q0: [u16; 6] = [370, 671, 1883, 4471, 32768, 0];
+/// Default CDF table `EOB_PT_16_LUMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_LUMA_CLASS1_Q1: [u16; 6] = [513, 765, 1859, 6339, 32768, 0];
+/// Default CDF table `EOB_PT_16_LUMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_LUMA_CLASS1: [u16; 6] = [716, 1105, 2646, 10056, 32768, 0];
+/// Default CDF table `EOB_PT_16_LUMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_LUMA_CLASS1_Q3: [u16; 6] = [1222, 2074, 4783, 15410, 32768, 0];
 
 // EOB_EXTRA_LUMA_4
+/// Default CDF table `EOB_EXTRA_LUMA_4_Q0` (AV1 spec 9.4 initial probabilities).
 pub const EOB_EXTRA_LUMA_4_Q0: [[u16; 3]; 9] = [
     [16961, 32768, 0],
     [17223, 32768, 0],
@@ -4921,6 +4956,7 @@ pub const EOB_EXTRA_LUMA_4_Q0: [[u16; 3]; 9] = [
     [16384, 32768, 0],
 ];
 
+/// Default CDF table `EOB_EXTRA_LUMA_4_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_EXTRA_LUMA_4_Q1: [[u16; 3]; 9] = [
     [17471, 32768, 0],
     [20223, 32768, 0],
@@ -4933,6 +4969,7 @@ pub const EOB_EXTRA_LUMA_4_Q1: [[u16; 3]; 9] = [
     [16384, 32768, 0],
 ];
 
+/// Default CDF table `EOB_EXTRA_LUMA_4` (AV1 spec 9.4 initial probabilities).
 pub const EOB_EXTRA_LUMA_4: [[u16; 3]; 9] = [
     [18983, 32768, 0],
     [20512, 32768, 0],
@@ -4945,6 +4982,7 @@ pub const EOB_EXTRA_LUMA_4: [[u16; 3]; 9] = [
     [16384, 32768, 0],
 ];
 
+/// Default CDF table `EOB_EXTRA_LUMA_4_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_EXTRA_LUMA_4_Q3: [[u16; 3]; 9] = [
     [20177, 32768, 0],
     [20789, 32768, 0],
@@ -4958,6 +4996,7 @@ pub const EOB_EXTRA_LUMA_4_Q3: [[u16; 3]; 9] = [
 ];
 
 // COEFF_BASE_LUMA_4
+/// Default CDF table `COEFF_BASE_LUMA_4_Q0` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BASE_LUMA_4_Q0: [[u16; 5]; 42] = [
     [4034, 8930, 12727, 32768, 0],
     [18082, 29741, 31877, 32768, 0],
@@ -5003,6 +5042,7 @@ pub const COEFF_BASE_LUMA_4_Q0: [[u16; 5]; 42] = [
     [8192, 16384, 24576, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BASE_LUMA_4_Q1` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BASE_LUMA_4_Q1: [[u16; 5]; 42] = [
     [6041, 11854, 15927, 32768, 0],
     [20326, 30905, 32251, 32768, 0],
@@ -5048,6 +5088,7 @@ pub const COEFF_BASE_LUMA_4_Q1: [[u16; 5]; 42] = [
     [8192, 16384, 24576, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BASE_LUMA_4` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BASE_LUMA_4: [[u16; 5]; 42] = [
     [8896, 16227, 20630, 32768, 0],
     [23629, 31782, 32527, 32768, 0],
@@ -5093,6 +5134,7 @@ pub const COEFF_BASE_LUMA_4: [[u16; 5]; 42] = [
     [8192, 16384, 24576, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BASE_LUMA_4_Q3` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BASE_LUMA_4_Q3: [[u16; 5]; 42] = [
     [7062, 16472, 22319, 32768, 0],
     [24538, 32261, 32674, 32768, 0],
@@ -5139,6 +5181,7 @@ pub const COEFF_BASE_LUMA_4_Q3: [[u16; 5]; 42] = [
 ];
 
 // COEFF_BASE_EOB_LUMA_4
+/// Default CDF table `COEFF_BASE_EOB_LUMA_4_Q0` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BASE_EOB_LUMA_4_Q0: [[u16; 4]; 4] = [
     [17837, 29055, 32768, 0],
     [29600, 31446, 32768, 0],
@@ -5146,6 +5189,7 @@ pub const COEFF_BASE_EOB_LUMA_4_Q0: [[u16; 4]; 4] = [
     [24926, 28948, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BASE_EOB_LUMA_4_Q1` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BASE_EOB_LUMA_4_Q1: [[u16; 4]; 4] = [
     [17560, 29888, 32768, 0],
     [29671, 31549, 32768, 0],
@@ -5153,6 +5197,7 @@ pub const COEFF_BASE_EOB_LUMA_4_Q1: [[u16; 4]; 4] = [
     [27286, 30006, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BASE_EOB_LUMA_4` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BASE_EOB_LUMA_4: [[u16; 4]; 4] = [
     [20092, 30774, 32768, 0],
     [30695, 32020, 32768, 0],
@@ -5160,6 +5205,7 @@ pub const COEFF_BASE_EOB_LUMA_4: [[u16; 4]; 4] = [
     [28666, 30870, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BASE_EOB_LUMA_4_Q3` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BASE_EOB_LUMA_4_Q3: [[u16; 4]; 4] = [
     [22497, 31198, 32768, 0],
     [31715, 32495, 32768, 0],
@@ -5168,6 +5214,7 @@ pub const COEFF_BASE_EOB_LUMA_4_Q3: [[u16; 4]; 4] = [
 ];
 
 // COEFF_BR_LUMA_4
+/// Default CDF table `COEFF_BR_LUMA_4_Q0` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BR_LUMA_4_Q0: [[u16; 5]; 21] = [
     [14298, 20718, 24174, 32768, 0],
     [12536, 19601, 23789, 32768, 0],
@@ -5192,6 +5239,7 @@ pub const COEFF_BR_LUMA_4_Q0: [[u16; 5]; 21] = [
     [3034, 5860, 8462, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BR_LUMA_4_Q1` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BR_LUMA_4_Q1: [[u16; 5]; 21] = [
     [14995, 21341, 24749, 32768, 0],
     [13158, 20289, 24601, 32768, 0],
@@ -5216,6 +5264,7 @@ pub const COEFF_BR_LUMA_4_Q1: [[u16; 5]; 21] = [
     [3793, 7278, 10447, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BR_LUMA_4` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BR_LUMA_4: [[u16; 5]; 21] = [
     [16138, 22223, 25509, 32768, 0],
     [15347, 22430, 26332, 32768, 0],
@@ -5240,6 +5289,7 @@ pub const COEFF_BR_LUMA_4: [[u16; 5]; 21] = [
     [5413, 10335, 14498, 32768, 0],
 ];
 
+/// Default CDF table `COEFF_BR_LUMA_4_Q3` (AV1 spec 9.4 initial probabilities).
 pub const COEFF_BR_LUMA_4_Q3: [[u16; 5]; 21] = [
     [18315, 24289, 27551, 32768, 0],
     [16854, 24068, 27835, 32768, 0],
@@ -5295,79 +5345,115 @@ pub const INTRA_TX_TYPE_SET1_4: [[u16; 8]; 13] = [
 /// `DCTONLY`) hold no 1D type.
 pub const EOB_PT_256_LUMA_CLASS1_Q0: [u16; 10] =
     [998, 1850, 2998, 5604, 17341, 19888, 22899, 25583, 32768, 0];
+/// Default CDF table `EOB_PT_256_LUMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_256_LUMA_CLASS1_Q1: [u16; 10] =
     [399, 1019, 1749, 3038, 10444, 15546, 22739, 27294, 32768, 0];
+/// Default CDF table `EOB_PT_256_LUMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_256_LUMA_CLASS1: [u16; 10] =
     [1084, 2358, 3488, 5122, 11483, 18103, 26023, 29799, 32768, 0];
+/// Default CDF table `EOB_PT_256_LUMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_256_LUMA_CLASS1_Q3: [u16; 10] =
     [2453, 4474, 6307, 8777, 16474, 22975, 29000, 31547, 32768, 0];
 
+/// Default CDF table `EOB_PT_256_CHROMA_CLASS1_Q0` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_256_CHROMA_CLASS1_Q0: [u16; 10] =
     [2203, 4130, 7435, 10739, 20652, 23681, 25609, 27261, 32768, 0];
+/// Default CDF table `EOB_PT_256_CHROMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_256_CHROMA_CLASS1_Q1: [u16; 10] =
     [1674, 3252, 5734, 10159, 22397, 23802, 24821, 30940, 32768, 0];
+/// Default CDF table `EOB_PT_256_CHROMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_256_CHROMA_CLASS1: [u16; 10] =
     [6571, 9610, 15516, 21826, 29092, 30829, 31842, 32708, 32768, 0];
+/// Default CDF table `EOB_PT_256_CHROMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_256_CHROMA_CLASS1_Q3: [u16; 10] =
     [9998, 17661, 25178, 28097, 31308, 32038, 32403, 32695, 32768, 0];
 
+/// Default CDF table `EOB_PT_64_CHROMA_CLASS1_Q0` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_64_CHROMA_CLASS1_Q0: [u16; 8] =
     [1563, 2700, 4876, 10911, 14706, 22480, 32768, 0];
+/// Default CDF table `EOB_PT_64_CHROMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_64_CHROMA_CLASS1_Q1: [u16; 8] =
     [1923, 3127, 5867, 9703, 14277, 27100, 32768, 0];
+/// Default CDF table `EOB_PT_64_CHROMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_64_CHROMA_CLASS1: [u16; 8] =
     [4034, 6290, 10235, 14982, 21214, 28491, 32768, 0];
+/// Default CDF table `EOB_PT_64_CHROMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_64_CHROMA_CLASS1_Q3: [u16; 8] =
     [8726, 12378, 19409, 26450, 30038, 32462, 32768, 0];
 
+/// Default CDF table `EOB_PT_16_CHROMA_CLASS1_Q0` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_CHROMA_CLASS1_Q0: [u16; 6] = [1904, 3354, 7763, 14647, 32768, 0];
+/// Default CDF table `EOB_PT_16_CHROMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_CHROMA_CLASS1_Q1: [u16; 6] = [2497, 4096, 8866, 16993, 32768, 0];
+/// Default CDF table `EOB_PT_16_CHROMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_CHROMA_CLASS1: [u16; 6] = [3192, 5032, 10297, 19755, 32768, 0];
+/// Default CDF table `EOB_PT_16_CHROMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_16_CHROMA_CLASS1_Q3: [u16; 6] = [7297, 10767, 19273, 28194, 32768, 0];
 
 /// `EOB_PT_128_LUMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][0][1]`),
 /// read by a 16x8/8x16 luma transform whose inherited `tx_type` is 1D
 /// (`TxbSet::LumaRect16x8`) -- machine-extracted, scripts/extract-eob-class1.py.
 pub const EOB_PT_128_LUMA_CLASS1_Q0: [u16; 9] = [371, 699, 1254, 4830, 9479, 12562, 17497, 32768, 0];
+/// Default CDF table `EOB_PT_128_LUMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_128_LUMA_CLASS1_Q1: [u16; 9] = [217, 352, 618, 2303, 5261, 9969, 17472, 32768, 0];
+/// Default CDF table `EOB_PT_128_LUMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_128_LUMA_CLASS1: [u16; 9] = [354, 558, 944, 2760, 7287, 14037, 21779, 32768, 0];
+/// Default CDF table `EOB_PT_128_LUMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_128_LUMA_CLASS1_Q3: [u16; 9] = [886, 1731, 3271, 8469, 15569, 22126, 28383, 32768, 0];
 
 /// `EOB_PT_32_CHROMA`'s class-1 sibling (`av1_default_eob_multi32_cdfs[q][1][1]`),
 /// read by an 8x4/4x8 chroma transform under a 1D luma `tx_type`
 /// (`TxbSet::ChromaRect8x4`) -- machine-extracted, scripts/extract-eob-class1.py.
 pub const EOB_PT_32_CHROMA_CLASS1_Q0: [u16; 7] = [1786, 3179, 6902, 11357, 19054, 32768, 0];
+/// Default CDF table `EOB_PT_32_CHROMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_32_CHROMA_CLASS1_Q1: [u16; 7] = [2578, 4124, 8181, 13670, 24234, 32768, 0];
+/// Default CDF table `EOB_PT_32_CHROMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_32_CHROMA_CLASS1: [u16; 7] = [3542, 5502, 10415, 16760, 25644, 32768, 0];
+/// Default CDF table `EOB_PT_32_CHROMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_32_CHROMA_CLASS1_Q3: [u16; 7] = [7699, 10897, 20891, 26926, 31628, 32768, 0];
 
 /// `EOB_PT_128_CHROMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][1][1]`).
 pub const EOB_PT_128_CHROMA_CLASS1_Q0: [u16; 9] = [2054, 3472, 5869, 14232, 18242, 20590, 26752, 32768, 0];
+/// Default CDF table `EOB_PT_128_CHROMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_128_CHROMA_CLASS1_Q1: [u16; 9] = [2310, 4160, 7471, 14997, 17931, 20768, 30240, 32768, 0];
+/// Default CDF table `EOB_PT_128_CHROMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_128_CHROMA_CLASS1: [u16; 9] = [6275, 9889, 14769, 23164, 27988, 30493, 32272, 32768, 0];
+/// Default CDF table `EOB_PT_128_CHROMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_128_CHROMA_CLASS1_Q3: [u16; 9] = [9165, 13282, 21150, 30286, 31894, 32571, 32712, 32768, 0];
 
 /// `EOB_PT_512_LUMA`'s class-1 sibling (`av1_default_eob_multi512_cdfs[q][0][1]`).
 pub const EOB_PT_512_LUMA_CLASS1_Q0: [u16; 11] = [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0];
+/// Default CDF table `EOB_PT_512_LUMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_512_LUMA_CLASS1_Q1: [u16; 11] = [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0];
+/// Default CDF table `EOB_PT_512_LUMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_512_LUMA_CLASS1: [u16; 11] = [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0];
+/// Default CDF table `EOB_PT_512_LUMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_512_LUMA_CLASS1_Q3: [u16; 11] = [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0];
 
 /// `EOB_PT_512_CHROMA`'s class-1 sibling (`av1_default_eob_multi512_cdfs[q][1][1]`).
 pub const EOB_PT_512_CHROMA_CLASS1_Q0: [u16; 11] = [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0];
+/// Default CDF table `EOB_PT_512_CHROMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_512_CHROMA_CLASS1_Q1: [u16; 11] = [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0];
+/// Default CDF table `EOB_PT_512_CHROMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_512_CHROMA_CLASS1: [u16; 11] = [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0];
+/// Default CDF table `EOB_PT_512_CHROMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_512_CHROMA_CLASS1_Q3: [u16; 11] = [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0];
 
 /// `EOB_PT_1024_LUMA`'s class-1 sibling (`av1_default_eob_multi1024_cdfs[q][0][1]`).
 pub const EOB_PT_1024_LUMA_CLASS1_Q0: [u16; 12] = [2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0];
+/// Default CDF table `EOB_PT_1024_LUMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_1024_LUMA_CLASS1_Q1: [u16; 12] = [2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0];
+/// Default CDF table `EOB_PT_1024_LUMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_1024_LUMA_CLASS1: [u16; 12] = [2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0];
+/// Default CDF table `EOB_PT_1024_LUMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_1024_LUMA_CLASS1_Q3: [u16; 12] = [2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0];
 
 /// `EOB_PT_1024_CHROMA`'s class-1 sibling (`av1_default_eob_multi1024_cdfs[q][1][1]`).
 pub const EOB_PT_1024_CHROMA_CLASS1_Q0: [u16; 12] = [2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0];
+/// Default CDF table `EOB_PT_1024_CHROMA_CLASS1_Q1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_1024_CHROMA_CLASS1_Q1: [u16; 12] = [2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0];
+/// Default CDF table `EOB_PT_1024_CHROMA_CLASS1` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_1024_CHROMA_CLASS1: [u16; 12] = [2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0];
+/// Default CDF table `EOB_PT_1024_CHROMA_CLASS1_Q3` (AV1 spec 9.4 initial probabilities).
 pub const EOB_PT_1024_CHROMA_CLASS1_Q3: [u16; 12] = [2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0];
 

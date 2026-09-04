@@ -206,35 +206,35 @@ impl Edges {
     }
 }
 
-/// Predicts one `bw`-wide, `bh`-tall block into `dst`, row-major and
-/// `bw * bh` long; `bw == bh` for a square block, the only shape every
-/// caller outside this lane's own tests passes.
-///
-/// `above` is the reconstructed row above the block and `left` its
-/// reconstructed left column, each at least `bw`/`bh` samples long
-/// respectively, and `corner` the sample diagonally above-left; `None` where
-/// the block sits against an edge of the frame. A directional mode reads out
-/// to `bw + bh`: pass the samples above-right and below-left where the
-/// decoder has them decoded, and the edge is extended by repetition where it
-/// does not, which is what the decoder's own clamp to `aboveLimit` and
-/// `leftLimit` comes to.
-///
-/// `angle_delta` (spec `AngleDeltaY`/`AngleDeltaUV`, `-MAX_ANGLE_DELTA` to
-/// `MAX_ANGLE_DELTA`) steers every one of `V_PRED`, `H_PRED` and the six
-/// diagonal modes off their base angle by `ANGLE_STEP` degrees per unit (spec
-/// 7.11.2.1's `pAngle = Mode_To_Angle[mode] + angleDelta * ANGLE_STEP`);
-/// ignored (must be `0`) for the seven modes that carry no angle at all.
-///
-/// `enable_edge_filter` is the sequence header's `enable_intra_edge_filter`
-/// (spec 7.11.2.4's own gate on the whole filter/upsample step); `smooth_neighbor`
-/// is `get_intra_edge_filter_type` (spec 7.11.2.9, libaom `reconintra.c`) --
-/// whether the block above or to the left predicted with one of the three
-/// smooth modes, which steers [`intra_edge_filter_strength`]'s threshold
-/// table. Ignored outside the directional modes.
-///
-/// # Panics
-/// Panics on a mode this module does not predict, or when `dst` is not
-/// `bw * bh` long.
+// Predicts one `bw`-wide, `bh`-tall block into `dst`, row-major and
+// `bw * bh` long; `bw == bh` for a square block, the only shape every
+// caller outside this lane's own tests passes.
+//
+// `above` is the reconstructed row above the block and `left` its
+// reconstructed left column, each at least `bw`/`bh` samples long
+// respectively, and `corner` the sample diagonally above-left; `None` where
+// the block sits against an edge of the frame. A directional mode reads out
+// to `bw + bh`: pass the samples above-right and below-left where the
+// decoder has them decoded, and the edge is extended by repetition where it
+// does not, which is what the decoder's own clamp to `aboveLimit` and
+// `leftLimit` comes to.
+//
+// `angle_delta` (spec `AngleDeltaY`/`AngleDeltaUV`, `-MAX_ANGLE_DELTA` to
+// `MAX_ANGLE_DELTA`) steers every one of `V_PRED`, `H_PRED` and the six
+// diagonal modes off their base angle by `ANGLE_STEP` degrees per unit (spec
+// 7.11.2.1's `pAngle = Mode_To_Angle[mode] + angleDelta * ANGLE_STEP`);
+// ignored (must be `0`) for the seven modes that carry no angle at all.
+//
+// `enable_edge_filter` is the sequence header's `enable_intra_edge_filter`
+// (spec 7.11.2.4's own gate on the whole filter/upsample step); `smooth_neighbor`
+// is `get_intra_edge_filter_type` (spec 7.11.2.9, libaom `reconintra.c`) --
+// whether the block above or to the left predicted with one of the three
+// smooth modes, which steers [`intra_edge_filter_strength`]'s threshold
+// table. Ignored outside the directional modes.
+//
+// # Panics
+// Panics on a mode this module does not predict, or when `dst` is not
+// `bw * bh` long.
 // lane-hbdgates r1: per-tool firing counters for the 10-bit gates. Each tool
 // the coverage table tracks needs its OWN counter -- `smooth_uv_hits` lumps
 // SMOOTH..=PAETH together, so a paeth-only stream would have "proved" smooth
@@ -246,17 +246,20 @@ thread_local! {
 }
 
 /// How many blocks were predicted with SMOOTH/SMOOTH_V/SMOOTH_H on this thread.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn smooth_pred_hits() -> usize {
     SMOOTH_PRED_HITS.with(|c| c.get())
 }
 
 /// How many blocks were predicted with PAETH_PRED on this thread.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn paeth_pred_hits() -> usize {
     PAETH_PRED_HITS.with(|c| c.get())
 }
 
 /// How many directional edges [`filter_intra_edge`] actually smoothed
 /// (strength != 0) on this thread -- the `--enable-intra-edge-filter` proof.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intra_edge_filter_hits() -> usize {
     EDGE_FILTER_HITS.with(|c| c.get())
 }
@@ -994,7 +997,7 @@ mod tests {
     let fctx = &crate::decode::FrameCtx::new();
         // xorshift64*: a seeded stream, so a failure names one (shape, mode,
         // seed) triple that reproduces.
-        let mut rng = |state: &mut u64| {
+        let rng = |state: &mut u64| {
             *state ^= *state << 13;
             *state ^= *state >> 7;
             *state ^= *state << 17;

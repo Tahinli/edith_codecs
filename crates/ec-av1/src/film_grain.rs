@@ -800,7 +800,7 @@ fn copy_area(
     width: i32,
     height: i32, fctx: &crate::decode::FrameCtx,
 ) {
-    let (grain_min, grain_max) = grain_range(fctx);
+    let (_grain_min, _grain_max) = grain_range(fctx);
     for h in 0..height {
         for w in 0..width {
             let v = at(src, src_stride, src_row0 + h, src_col0 + w);
@@ -816,6 +816,7 @@ thread_local! {
 }
 
 /// Current value of [`GRAIN_HITS`].
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn grain_hits() -> usize {
     GRAIN_HITS.with(|c| c.get())
 }

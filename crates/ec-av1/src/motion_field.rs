@@ -317,6 +317,7 @@ thread_local! {
 
 /// Reads the counter above (gate
 /// `a_real_aomenc_inter_sequence_with_forward_keyframes_and_temporal_mvs_decodes_pixel_exact`).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub fn refstamp_intra_frames() -> (usize, usize) {
     (
         REFSTAMP_INTRA_FRAMES.with(std::cell::Cell::get),
