@@ -2005,6 +2005,23 @@ pub(crate) fn reset_intrabc_hits() {
     INTRABC_HITS.with(|c| c.set(0));
 }
 
+thread_local! {
+    /// lane-t900 r32: intrabc blocks whose transform size came off the INTER
+    /// var-tx partition tree (unskipped, `TX_MODE_SELECT`) -- the capability
+    /// that replaced the refusal "an intrabc block under TxMode::Select".
+    static INTRABC_VARTX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRABC_VARTX_HITS`].
+pub(crate) fn intrabc_vartx_hits() -> usize {
+    INTRABC_VARTX_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`INTRABC_VARTX_HITS`] (gate tests call this before a decode).
+pub(crate) fn reset_intrabc_vartx_hits() {
+    INTRABC_VARTX_HITS.with(|c| c.set(0));
+}
+
 /// Records one coded block into [`INTRABC_MI_GRID`]: every block contributes
 /// its size (libaom's `scan_row_mbmi` advances `processed_rows` off any
 /// candidate's `bsize`, ref-match or not), an intrabc one also its DV as an
@@ -11920,15 +11937,6 @@ fn decode_block(
         PALETTE_TILE_LEFT_HITS.with(|c| c.set(c.get() + 1));
     }
     let intrabc_dv = fctx.intrabc_dv.with(|c| c.take());
-    // libaom `parse_decode_block`: an intrabc block is `inter_block_tx`, so
-    // under `TX_MODE_SELECT` its transform size comes from the inter var-tx
-    // partition tree (`read_var_tx_size`), a syntax element this decoder has
-    // nowhere -- reading the intra `tx_depth` symbol instead would desync.
-    if intrabc_dv.is_some() && tx_select && !skip {
-        return Err(unsupported(
-            "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
-        ));
-    }
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
     // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
     // actual chroma-from-luma correlation, same as this decoder always did.
@@ -11956,7 +11964,59 @@ fn decode_block(
     // transform size -- 64 even for the 64x64 corner-scanned case, spec
     // 5.11.40); `coeff_tx_side` is the actual coded coefficient grid's side,
     // which only differs from it at that one corner case.
-    let (logical_tx, coeff_tx_side) = if tx_select {
+    // lane-t900 r32: spec 5.11.16 `read_block_tx_size` gates the `tx_depth`
+    // symbol on `allowSelect = !skip || !is_inter`, and libaom's
+    // `is_inter_block` counts an INTRABC block (`blockd.h:373`). So a SKIPPED
+    // intrabc block reads NO tx-size symbol at all -- it takes
+    // `maxRectTxSize` -- while every ordinary skipped intra block does read
+    // one. Reading it anyway consumed a symbol libaom never wrote and desynced
+    // the tile from that block on (class `equal-range-means-unread`).
+    // lane-t900 r32: and an UNSKIPPED one reads the inter var-tx partition
+    // tree instead (`read_var_tx_size`), the same syntax the inter block path
+    // has always read -- libaom's `parse_decode_block` dispatches on
+    // `is_inter_block`, so both branches of `read_block_tx_size` treat an
+    // intrabc block as inter.
+    let intrabc_skip_tx = intrabc_dv.is_some() && skip;
+    let intrabc_vartx = intrabc_dv.is_some() && tx_select && !skip;
+    let intrabc_leaves = if intrabc_vartx {
+        let max_tx = side.min(64);
+        // `max_block_wide`/`max_block_high`: the frame's own mi grid
+        // (`av1_calc_mi_size`, 8-px aligned), so a block hanging over the
+        // right/bottom edge reads no split symbol for the units outside it.
+        let mi_cols = 2 * y.true_width.div_ceil(8);
+        let mi_rows = 2 * y.true_height.div_ceil(8);
+        let side_mi = side / MI;
+        let max_w_mi = side_mi.min(mi_cols.saturating_sub(mi_c));
+        let max_h_mi = side_mi.min(mi_rows.saturating_sub(mi_r));
+        let mut leaves = Vec::new();
+        for row in (0..side_mi).step_by(max_tx / MI) {
+            for col in (0..side_mi).step_by(max_tx / MI) {
+                read_var_tx_size(
+                    dec, cdfs, neighbours, (mi_r, mi_c), side,
+                    (max_w_mi, max_h_mi), (max_tx, max_tx), 0, row, col, &mut leaves,
+                );
+            }
+        }
+        INTRABC_VARTX_HITS.with(|c| c.set(c.get() + 1));
+        // The luma reconstruct loop below is a UNIFORM grid of one square
+        // transform (the intra `tx_depth` shape), so a tree that resolved to
+        // mixed leaf sizes is refused by name rather than reconstructed at the
+        // wrong stride.
+        let uniform = leaves
+            .first()
+            .is_some_and(|f| leaves.iter().all(|l| (l.2, l.3) == (f.2, f.3) && l.2 == l.3));
+        if !uniform {
+            return Err(unsupported(
+                "an intrabc block whose var-tx tree resolved to mixed leaf transform sizes",
+            ));
+        }
+        Some(leaves[0].2)
+    } else {
+        None
+    };
+    let (logical_tx, coeff_tx_side) = if let Some(tx) = intrabc_leaves {
+        (tx, if tx == 64 { 32 } else { tx })
+    } else if tx_select && !intrabc_skip_tx {
         let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side, None);
         (resolved, if resolved == 64 { 32 } else { resolved })
     } else {
@@ -12010,9 +12070,6 @@ fn decode_block(
         );
         (yb, ub, vb)
     });
-    if let Some((yb, _, _)) = &intrabc_bufs {
-        set_palette_pred(yb.clone(), fctx);
-    }
     // A palette-Y block's own prediction is the reconstructed colour-index
     // map, not `predict()`'s edge-based one -- [`PALETTE_PRED`] carries it
     // to [`PlaneBuf::reconstruct`]'s next call rather than threading a
@@ -12027,6 +12084,16 @@ fn decode_block(
             .map(|&idx| py.colors[idx as usize])
             .collect()
     });
+    // lane-t900 r32: the intrabc luma prediction rides the very same
+    // whole-block override slot, so the multi-TU loop below windows it per
+    // transform unit exactly like a palette map -- setting it once up front
+    // handed the whole `side`x`side` buffer to the FIRST unit and left every
+    // later one predicting off block edges (the var-tx tree above is what
+    // first makes `logical_tx < side` reachable for an intrabc block).
+    let palette_y_buf = match &intrabc_bufs {
+        Some((yb, _, _)) => Some(yb.clone()),
+        None => palette_y_buf,
+    };
     // With one luma transform unit the whole `side`x`side` map is the
     // prediction; with several (`logical_tx != side`) each unit takes its own
     // `logical_tx`-sized window of that same map, set fresh inside the TU loop
@@ -12483,6 +12550,22 @@ fn decode_block(
         logical_tx as u8,
         0, fctx,
     );
+    // lane-t900 r32: libaom runs `set_txfm_ctxs` at the end of EVERY
+    // `decode_block`, key frames included, and the intrabc var-tx read above
+    // (`txfm_partition_ctx`) is the only intra-path reader of those bands --
+    // left at `TXFM_CTX_INIT` it would take the split symbol off the wrong CDF
+    // row. Armed by the frame's own `allow_intrabc` so every other key frame
+    // (whose readers use the deblock-grid approximation) is untouched.
+    if allow_intrabc {
+        set_txfm_ctxs(
+            neighbours,
+            (mi_r, mi_c),
+            logical_tx,
+            side / MI,
+            side / MI,
+            skip && intrabc_dv.is_some(),
+        );
+    }
     record_intrabc_mi(mi_r, mi_c, side / MI, intrabc_dv, fctx);
     Ok(())
 }
@@ -12965,11 +13048,6 @@ fn decode_leaf8(
     if intrabc_dv.is_some() {
         LEAF8_INTRABC_HITS.with(|c| c.set(c.get() + 1));
     }
-    if intrabc_dv.is_some() && tx_select && !skip {
-        return Err(unsupported(
-            "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
-        ));
-    }
     // `av1_visit_palette`'s reconstruction (decodeframe.c:1135): the colour
     // index map, mapped through the base colours, IS the block's prediction --
     // carried to the next `reconstruct`/`read_plane` through the same
@@ -13003,11 +13081,35 @@ fn decode_leaf8(
     // which splits the leaf's own 8x8 prediction into a 2x2 grid of 4x4
     // transform units, same raster-order per-TU pattern `decode_block`'s
     // multi-TU branch runs).
-    // ... and an intrabc leaf reads no intra `tx_depth` symbol at all: under
-    // `TX_MODE_SELECT` a skipped inter block takes the largest transform
-    // (`read_tx_size(.., is_inter=1, ..)`), and the unskipped case is refused
-    // above.
-    let resolved = if tx_select && intrabc_dv.is_none() {
+    // ... and an intrabc leaf reads no intra `tx_depth` symbol at all: libaom
+    // dispatches `read_block_tx_size` on `is_inter_block`, which counts an
+    // intrabc block, so a SKIPPED one takes the largest transform and an
+    // UNSKIPPED one reads the inter var-tx tree (lane-t900 r32). At 8x8 that
+    // tree is one `txfm_split` symbol: TX_8X8, or TX_4X4 over all four mi
+    // cells (`read_var_tx_size`'s `sub_txs == TX_4X4` early return).
+    let resolved = if tx_select && intrabc_dv.is_some() && !skip {
+        let mut leaves = Vec::new();
+        let mi_cols = 2 * y.true_width.div_ceil(8);
+        let mi_rows = 2 * y.true_height.div_ceil(8);
+        read_var_tx_size(
+            dec,
+            cdfs,
+            neighbours,
+            leaf_mi,
+            8,
+            (
+                2usize.min(mi_cols.saturating_sub(leaf_mi.1)),
+                2usize.min(mi_rows.saturating_sub(leaf_mi.0)),
+            ),
+            (8, 8),
+            0,
+            0,
+            0,
+            &mut leaves,
+        );
+        INTRABC_VARTX_HITS.with(|c| c.set(c.get() + 1));
+        leaves.first().map_or(8, |l| l.2)
+    } else if tx_select && intrabc_dv.is_none() {
         read_tx_size(dec, cdfs, neighbours, leaf_mi, 8, None)
     } else {
         8
@@ -13043,9 +13145,13 @@ fn decode_leaf8(
     // The per-plane prediction override rides the same [`PALETTE_PRED`] slot
     // `decode_block` uses: set fresh right before each plane's own
     // `reconstruct`/`read_plane` call (the slot is taken, not copied).
-    if let Some((yb, _, _)) = &intrabc_bufs {
-        set_palette_pred(yb.clone(), fctx);
-    }
+    // lane-t900 r32: through `palette_y_buf`, so the 4x4 TU loop below windows
+    // it per unit (an intrabc leaf whose var-tx tree split to TX_4X4 is the
+    // first shape that reaches that loop with an override set).
+    let palette_y_buf = match &intrabc_bufs {
+        Some((yb, _, _)) => Some(yb.clone()),
+        None => palette_y_buf,
+    };
     let (luma_grid, u_grid, v_grid);
     if skip {
         // lane-hgkf r2 (same shape as `decode_block`'s own skip branch): an
@@ -13290,7 +13396,9 @@ fn decode_leaf8(
                 let tu_grid = read_plane(
                     dec,
                     cdfs,
-                    if reduced_tx_set {
+                    if intrabc_dv.is_some() {
+                        txbset_for_inter(4, reduced_tx_set)
+                    } else if reduced_tx_set {
                         TxbSet::Luma4
                     } else {
                         TxbSet::Luma4Set1
@@ -13413,6 +13521,12 @@ fn decode_leaf8(
     }
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
         neighbours.fill_lf_grid(leaf_mi, 2, 4, 0, fctx);
+    // lane-t900 r32: `set_txfm_ctxs` for an 8x8 leaf -- see `decode_block`'s
+        // own copy; only an intrabc var-tx read consumes these bands on the intra
+        // path, so the write is armed by `allow_intrabc`.
+        if allow_intrabc {
+            set_txfm_ctxs(neighbours, leaf_mi, 4, 2, 2, skip && intrabc_dv.is_some());
+        }
         neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
         record_intrabc_mi(leaf_mi.0, leaf_mi.1, 2, intrabc_dv, fctx);
         return Ok(mode);
@@ -13438,6 +13552,12 @@ fn decode_leaf8(
     // (class `wrong-alphabet-same-value`; the Hunger Games key frame at
     // -ss 900, first bad luma sample row 186 col 1803).
     neighbours.fill_lf_grid(leaf_mi, 2, resolved as u8, 0, fctx);
+    // lane-t900 r32: `set_txfm_ctxs` for an 8x8 leaf -- see `decode_block`'s
+    // own copy; only an intrabc var-tx read consumes these bands on the intra
+    // path, so the write is armed by `allow_intrabc`.
+    if allow_intrabc {
+        set_txfm_ctxs(neighbours, leaf_mi, resolved, 2, 2, skip && intrabc_dv.is_some());
+    }
     neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
     // The DV predictor of a LATER intrabc block is the ordinary `INTRA_FRAME`
     // MV stack over this grid (`av1_find_mv_refs`), so an 8x8 leaf has to
