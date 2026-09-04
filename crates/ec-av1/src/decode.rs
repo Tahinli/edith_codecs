@@ -14800,6 +14800,80 @@ fn rect_scan(w: usize, h: usize) -> Result<&'static [u16]> {
     })
 }
 
+/// lane-t900 r20, refusal D -- the three "a rectangular inter luma/chroma
+/// transform unit whose shape has no coefficient table set here" / "a
+/// rectangular transform unit whose shape has no coefficient scan table here"
+/// arms, enumerated against the MEASURED domain of the inter block path
+/// ([`INTER_BLOCK_SHAPES`], filled from three real streams by the gate
+/// `a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable`).
+///
+/// What each helper is actually handed:
+///
+/// * [`rect_inter_luma_set`] -- the block's own footprint (call sites at the
+///   whole-block residual), and a var-tx LEAF shape. `sub_tx_size_map` is
+///   square for every rect transform except TX_16X4/TX_4X16, whose leaves are
+///   TX_8X4/TX_4X8, so the leaf domain adds exactly 8x4 and 4x8.
+/// * [`rect_inter_chroma_set`] -- `(write_w / 2, write_h / 2)` for a 4:2:0
+///   block, except a 16x4/4x16 strip, whose chroma is the PAIR's 8x4 / 4x8.
+/// * [`rect_scan`] -- the `min(w, 32) x min(h, 32)` coded corner of a rect
+///   unit, and only when that corner is not 32x32 (a square corner goes
+///   through the square reader with `rect_shape = Some((w, h))`).
+///
+/// The 128-px halves take neither: `max_txsize_rect_lookup[BLOCK_128X64]` is
+/// TX_64X64, so they tile into SQUARE 64x64 luma units through the mu-chunk
+/// loop, which is why they are skipped below.
+#[test]
+fn every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan() {
+    let corner_scan = |w: usize, h: usize| {
+        let (cw, ch) = (w.min(32), h.min(32));
+        if (cw, ch) == (32, 32) {
+            return; // the square coefficient reader, not `rect_scan`
+        }
+        assert!(
+            rect_scan(cw, ch).is_ok(),
+            "a {w}x{h} rect transform codes its {cw}x{ch} corner, which has no scan table"
+        );
+    };
+    let mut checked = 0;
+    for &(side, w, h) in &INTER_BLOCK_SHAPES {
+        if (w, h) == (side, side) || w.max(h) > 64 {
+            continue;
+        }
+        assert!(
+            rect_inter_luma_set(w, h).is_ok(),
+            "the inter path decodes {w}x{h} blocks but has no luma coefficient table set for one"
+        );
+        corner_scan(w, h);
+        // 4:2:0 chroma: the pair's 8x4 / 4x8 for a 1:4 strip, the halved
+        // footprint for every other shape.
+        let (cw, ch) = match (w, h) {
+            (16, 4) => (8, 4),
+            (4, 16) => (4, 8),
+            _ => (w / 2, h / 2),
+        };
+        assert!(
+            rect_inter_chroma_set(cw, ch).is_ok(),
+            "a {w}x{h} block's {cw}x{ch} chroma unit has no coefficient table set"
+        );
+        corner_scan(cw, ch);
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 12,
+        "the block-shape census changed: {checked} rect shapes reach the rect transform \
+         tables, not the 12 this claim was measured over"
+    );
+    // `sub_tx_size_map[TX_16X4] == TX_8X4` -- the only RECTANGULAR var-tx leaf
+    // shapes, which reach `rect_inter_luma_set` as `(tw, th)`.
+    for (w, h) in [(8usize, 4usize), (4, 8)] {
+        assert!(
+            rect_inter_luma_set(w, h).is_ok(),
+            "the {w}x{h} split leaf of a 16x4/4x16 strip has no luma coefficient table set"
+        );
+        corner_scan(w, h);
+    }
+}
+
 /// [`read_block_tx_size`] for a rectangular inter block (lane-inter4 r2):
 /// spec 5.11.17 / libaom `read_tx_size_vartx` starting from the block's own
 /// `max_txsize_rect_lookup` entry, which for a 2:1 strip IS rectangular. The
