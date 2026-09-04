@@ -145,91 +145,46 @@ pub(crate) fn upscale_row(
     }
 }
 
-/// Spec 7.16, applied to a whole plane: `av1_upscale_normative_rows`
-/// widened to every row (`height2 == height`, no vertical scaling -- the
-/// spec only widens columns). `rows` is the plane's row-major byte buffer
-/// at `in_width`; returns a new buffer at `out_width`.
-pub(crate) fn upscale_plane(
-    rows: &[u16],
-    height: usize,
-    in_width: usize,
-    out_width: usize,
-    margin: Option<(&[u16], usize)>,
+/// Every row of one decoded plane, upscaled by spec 7.16 from `in_w` to
+/// `out_w` (`av1_upscale_normative_rows`; the process is horizontal-only,
+/// so the row count is unchanged). `data`/`stride` are the decoder's own
+/// reconstruction buffer, whose columns `[in_w, true_w)` hold the real
+/// decoded samples of the coding block straddling the frame edge -- libaom's
+/// border extension replicates from that last real column, so they are
+/// handed to [`upscale_row`] as its right margin (see its doc).
+pub(crate) fn upscale_plane_strided(
+    data: &[u16],
+    stride: usize,
+    in_w: usize,
+    in_h: usize,
+    true_w: usize,
+    out_w: usize,
     bit_depth: u32,
 ) -> Vec<u16> {
-    debug_assert_eq!(rows.len(), height * in_width);
-    let mut out = vec![0u16; height * out_width];
-    for r in 0..height {
-        let src = &rows[r * in_width..(r + 1) * in_width];
-        let dst = &mut out[r * out_width..(r + 1) * out_width];
-        let real_right = match margin {
-            Some((margin_rows, margin_width)) if margin_width > in_width => {
-                &margin_rows[r * margin_width + in_width..(r + 1) * margin_width]
-            }
-            _ => &[],
-        };
-        upscale_row(src, real_right, out_width, dst, bit_depth);
+    let mut out = vec![0u16; in_h * out_w];
+    for r in 0..in_h {
+        let row = &data[r * stride..r * stride + in_w];
+        let margin = &data[r * stride + in_w..r * stride + true_w.max(in_w)];
+        upscale_row(row, margin, out_w, &mut out[r * out_w..(r + 1) * out_w], bit_depth);
     }
     out
 }
 
 thread_local! {
     /// Firing count for the superres gate (class `gate-blind-to-feature`):
-    /// how many whole pictures actually ran through [`upscale_plane`].
+    /// how many whole pictures actually ran through [`upscale_plane_strided`].
     static SUPERRES_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Current value of [`SUPERRES_HITS`].
+#[allow(dead_code)]
 pub(crate) fn superres_hits() -> usize {
     SUPERRES_HITS.with(|c| c.get())
 }
 
-/// A whole [`crate::encode::Picture`]'s Y/U/V planes, upscaled from
-/// `frame_width`/`frame_height` (4:2:0 chroma) to `upscaled_width` at the
-/// same height -- spec 7.16 is horizontal-only. Increments
-/// [`SUPERRES_HITS`] once per call. `margin`, when set (r3, from
-/// `decode::take_last_frame_wide_margin`), is the real decoded pixels
-/// beyond `picture`'s own width out to the mi-aligned `true_width` -- see
-/// [`upscale_row`]'s doc for why the right-edge padding needs it.
-pub(crate) fn upscale_picture(
-    picture: &crate::encode::Picture,
-    upscaled_width: usize,
-    margin: Option<&crate::encode::Picture>,
-    bit_depth: u32,
-) -> crate::encode::Picture {
+/// Counts one whole upscaled picture (all three planes) for [`SUPERRES_HITS`].
+pub(crate) fn note_upscaled_picture() {
     SUPERRES_HITS.with(|c| c.set(c.get() + 1));
-    let height = picture.height;
-    let chroma_in_w = picture.width.div_ceil(2);
-    let chroma_out_w = upscaled_width.div_ceil(2);
-    let chroma_h = height.div_ceil(2);
-    crate::encode::Picture {
-        width: upscaled_width,
-        height,
-        y: upscale_plane(
-            &picture.y,
-            height,
-            picture.width,
-            upscaled_width,
-            margin.map(|m| (m.y.as_slice(), m.width)),
-            bit_depth,
-        ),
-        u: upscale_plane(
-            &picture.u,
-            chroma_h,
-            chroma_in_w,
-            chroma_out_w,
-            margin.map(|m| (m.u.as_slice(), m.width.div_ceil(2))),
-            bit_depth,
-        ),
-        v: upscale_plane(
-            &picture.v,
-            chroma_h,
-            chroma_in_w,
-            chroma_out_w,
-            margin.map(|m| (m.v.as_slice(), m.width.div_ceil(2))),
-            bit_depth,
-        ),
-    }
 }
 
 #[cfg(test)]

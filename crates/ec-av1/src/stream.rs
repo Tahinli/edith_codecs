@@ -701,6 +701,14 @@ pub fn decode_stream_with(
             ));
         }
         crate::decode::set_bit_depth(bit_depth);
+        // spec 7.16: this frame's superres state, for the filter chain --
+        // `decode.rs` upscales between CDEF and loop restoration and sizes
+        // the LR unit grid in upscaled coordinates. Cleared (0, 8) on an
+        // unscaled frame so a later frame never inherits it.
+        crate::decode::set_superres(
+            if header.use_superres { header.upscaled_width } else { 0 },
+            u32::from(header.superres_denom),
+        );
         // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
         let enable_masked_compound = parser
             .sequence_header()
@@ -802,25 +810,6 @@ pub fn decode_stream_with(
                 header.allow_intrabc,
                 header.delta,
             )?;
-            // lane-superres stage 3, spec 7.16: upscale AFTER deblock+CDEF
-            // (both already applied inside `decode_key_frame_tile_with_cdfs`)
-            // and BEFORE this picture is stored as a reference or handed to
-            // the caller -- loop restoration is not yet ported, so there is
-            // no LR step here for the upscale to precede.
-            // r3: the real decoded margin beyond `frame_width` (set by the
-            // call above, right before anything else can overwrite it) --
-            // see `decode::take_last_frame_wide_margin`'s doc.
-            let wide_margin = crate::decode::take_last_frame_wide_margin();
-            let picture = if header.use_superres {
-                crate::superres::upscale_picture(
-                    &picture,
-                    header.upscaled_width as usize,
-                    wide_margin.as_ref(),
-                    bit_depth as u32,
-                )
-            } else {
-                picture
-            };
             // A key frame codes no inter blocks -- its own saved motion
             // field has no cells set, matching libaom's own "intra frame
             // contributes nothing to a later projection" behaviour, but
@@ -932,25 +921,6 @@ pub fn decode_stream_with(
                 header.delta,
                 enable_filter_intra,
             )?;
-            // lane-superres r10: mirrors the key-frame branch above --
-            // `decode_inter_frame_tile_with_cdfs` decodes at the downscaled
-            // `frame_width`/`frame_height` and crops to it; upscale AFTER
-            // (deblock/CDEF/LR already applied inside that call) BEFORE this
-            // picture is stored as a reference or shown, same margin
-            // mechanism (`take_last_frame_wide_margin`, read immediately
-            // after the call, before any other frame decode can overwrite
-            // it).
-            let wide_margin = crate::decode::take_last_frame_wide_margin();
-            let picture = if header.use_superres {
-                crate::superres::upscale_picture(
-                    &picture,
-                    header.upscaled_width as usize,
-                    wide_margin.as_ref(),
-                    bit_depth as u32,
-                )
-            } else {
-                picture
-            };
             (picture, end_cdfs, motion_field)
         };
         // lane-lr r4: the Wiener/self-guided pixel filters are wired
@@ -4821,6 +4791,107 @@ mod tests {
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
         eprintln!("{NAME}: pixel-exact, grain_hits={}", crate::film_grain::grain_hits());
+    }
+
+    /// lane-t900 r29: `fixtures/superres_kf_cdef_lr_64x64.obu` is a real
+    /// aomenc key frame (64x64 upscaled from a coded 43x64,
+    /// `--superres-mode=1 --superres-denominator=12 --cpu-used=0 --sb-size=64
+    /// --enable-cdef=1 --enable-restoration=1 --cq-level=32`) -- the first
+    /// stream in this repo that runs BOTH in-loop filters under superres.
+    ///
+    /// The defect it pins: spec 7.16's upscale runs between CDEF and loop
+    /// restoration (libaom `superres_post_decode`, `decodeframe.c`, called
+    /// between `av1_cdef_frame` and `av1_loop_restoration_filter_frame`),
+    /// but this decoder ran the whole filter chain on the DOWNSCALED frame
+    /// and upscaled last, in `stream.rs`. Loop restoration therefore filtered
+    /// downscaled pixels with a unit grid sized from the downscaled width
+    /// (1873 wrong samples, max 7, on this very stream). Class
+    /// `wrong-stage-width`: every plane width in the filter chain is either
+    /// the downscaled one (deblock, CDEF, and the mi grid all three walk) or
+    /// the upscaled one (loop restoration's `av1_get_upsampled_plane_size`
+    /// unit grid, `av1_loop_restoration_corners_in_sb`'s `mi_to_num_x`
+    /// superres arm, and the pixel filters themselves); the sweep is every
+    /// caller of `apply_deblock`/`apply_cdef`/`apply_loop_restoration` plus
+    /// `RestorationGrid::new` and `read_lr`.
+    #[test]
+    fn a_superres_key_frame_with_cdef_and_loop_restoration_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_superres_key_frame_with_cdef_and_loop_restoration_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/superres_kf_cdef_lr_64x64.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (64usize, 64usize);
+        let before_lr = crate::restoration::wiener_hits() + crate::restoration::sgrproj_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert_eq!(frames.len(), 1, "{NAME}: one key frame");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        // class `gate-blind-to-feature`: the stream must actually upscale and
+        // actually run a real restoration filter, or this gate proves nothing.
+        assert!(
+            crate::superres::superres_hits() > 0,
+            "{NAME}: zero superres_hits -- the frame was never upscaled"
+        );
+        assert!(
+            crate::restoration::wiener_hits() + crate::restoration::sgrproj_hits() > before_lr,
+            "{NAME}: zero restoration units fired -- LR never ran under superres"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
+    }
+
+    /// lane-t900 r29 RESIDUAL, ignored: `fixtures/superres_alltools_sb128_320x180.obu`
+    /// is 10 frames of `--cpu-used=4 --sb-size=128 --superres-mode=1
+    /// --superres-denominator=12 --cq-level=32` with every tool aomenc turns
+    /// on by default (CDEF, loop restoration, OBMC, compound, warp).
+    ///
+    /// FIRST BAD (measured 2026-09-04, after the r29 upscale-before-LR fix):
+    /// display frame 2, plane U, (x=88, y=21), delta 1; the mismatch is
+    /// CHROMA ONLY and grows with the reference chain (frame 9: 280 U + 331
+    /// V samples, max 9). LUMA IS EXACT IN ALL 10 FRAMES. It is NOT the
+    /// filter chain: re-encoding the same recipe with `--enable-cdef=0
+    /// --enable-restoration=0` still mismatches (359 samples, max 5, first
+    /// bad display frame 4 plane V (115, 31)), and the r29 fix took the
+    /// filters-on numbers from 37315 samples/max 171 down to 1620/max 11.
+    /// So the residual is a scaled-reference CHROMA prediction defect at
+    /// sb128/cpu-used=4 block shapes, not superres filtering -- next round's
+    /// ladder starts at `EC_AV1_PREFILT_DUMP16` on decode-order frame 4 of
+    /// the filters-off arm.
+    #[test]
+    #[ignore = "lane-t900 r29 residual: scaled-reference chroma prediction, frame 2 U (88,21)"]
+    fn a_superres_all_tools_sb128_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_superres_all_tools_sb128_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/superres_alltools_sb128_320x180.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height, count) = (320usize, 180usize, 10usize);
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert_eq!(frames.len(), count, "{NAME}: frame count");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, count);
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
     }
 
     /// lane-golomb r1: THE FILM ITSELF. `crates/ec-av1/fixtures/hg_head_key_frame.obu`
