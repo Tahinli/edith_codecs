@@ -151,6 +151,21 @@ const PROVEN: &[(&str, &str)] = &[
         "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
         "a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable",
     ),
+    // lane-t900 r20, census: the rect transform tables and scans, enumerated
+    // over the shapes the measured block-shape domain hands each helper (block
+    // footprint, 4:2:0 chroma unit, rect var-tx leaf, clamped coded corner).
+    (
+        "a rectangular inter luma transform unit whose shape has no coefficient table set here",
+        "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+    ),
+    (
+        "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
+        "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+    ),
+    (
+        "a rectangular transform unit whose shape has no coefficient scan table here",
+        "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+    ),
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
