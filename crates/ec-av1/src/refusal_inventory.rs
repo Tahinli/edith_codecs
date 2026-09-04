@@ -382,6 +382,31 @@ const PROVEN: &[(&str, &str)] = &[
         "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
         "a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact",
     ),
+    // lane-t900 r33, CENSUS (reached -- a pinned capability gap): all four
+    // `--sb-size=128` exact-repetition screen arms code
+    // `use_128x128_superblock && allow_intrabc`, and every one of them reaches
+    // this refusal by name. The lift is a decode.rs change (the block-vector
+    // delay of `av1_is_dv_valid` is superblock-sized) with a waiting witness,
+    // `an_sb128_screen_stream_with_intrabc_decodes_pixel_exact` (ignored).
+    (
+        "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
+        "an_sb128_screen_census_measures_the_sb128_intrabc_refusal",
+    ),
+    // lane-t900 r33, CENSUS: the `use_intrabc` symbol IS read at the sub-8
+    // reader for every sub-8x8 leaf of an `allow_intrabc` frame, and over the
+    // `--min-partition-size=4` exact-repetition screen arms every such symbol
+    // came back 0 while the frames decode pixel-exact.
+    (
+        "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
+        "a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal",
+    ),
+    // lane-t900 r33, CENSUS: four quantisers of the recipe that reaches the
+    // intrabc var-tx tree at all read it for 5 blocks in total, every one of
+    // which resolved to a UNIFORM leaf size, with the frames pixel-exact.
+    (
+        "an intrabc block whose var-tx tree resolved to mixed leaf transform sizes",
+        "an_intrabc_vartx_census_measures_the_mixed_leaf_refusal",
+    ),
     (
         "a reference picture whose height does not match this frame's own true size",
         "an_inter_frame_shorter_than_its_reference_is_refused_by_name",
