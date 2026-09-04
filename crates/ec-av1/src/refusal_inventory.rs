@@ -253,6 +253,15 @@ const PROVEN: &[(&str, &str)] = &[
         "a tx_type symbol outside its CDF's own set: {t}",
         "every_tx_type_symbol_of_every_cdf_width_maps_into_its_own_set",
     ),
+    // lane-t900 r24, enumeration: the reader covers spec 5.11.40's whole value
+    // domain (`0..=(1 << 20) - 2`, both ends of every prefix length), so the
+    // refusal is outside it. What it still names is a bit pattern no encoder
+    // writes -- a 20th prefix bit of 0, which the spec's `length == 20` break
+    // makes a don't-care.
+    (
+        "a Golomb tail longer than this decoder reads",
+        "read_golomb_reads_every_value_a_conformant_stream_can_carry",
+    ),
     (
         "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         "a_twelve_bit_sequence_header_is_refused_by_name",
@@ -731,6 +740,73 @@ mod tests {
             }
             assert_eq!(set.len(), nsyms);
         }
+    }
+
+    /// The Golomb tail, enumerated over every value a conformant stream can
+    /// carry.
+    ///
+    /// Spec 5.11.40 `read_golomb` counts its unary prefix and BREAKS at
+    /// `length == 20`, then reads `length - 1` payload bits into an `x` whose
+    /// top bit is implicit -- so no conformant stream carries a value above
+    /// `(1 << 20) - 2`, and spec 5.11.39 agrees from the other side by masking
+    /// the level it feeds with `0xFFFFF`. This walks both ends of every
+    /// prefix length 1..=20 (plus the small values every real stream uses)
+    /// through [`crate::tile::write_golomb`] and back through the decoder's own
+    /// [`crate::decode::read_golomb`], so the refusal "a Golomb tail longer
+    /// than this decoder reads" is proved to sit strictly OUTSIDE the value
+    /// domain, not inside it.
+    ///
+    /// The residue is a bit pattern, not a value: the spec's break makes the
+    /// 20th prefix bit a don't-care, so a stream whose 20th prefix bit is 0
+    /// decodes to the same value there and is refused here. Every encoder
+    /// writes the terminating 1 (our own writer tops out at 19 zeros), and
+    /// lifting the cap is blocked on the defect it currently masks -- see the
+    /// comment on `read_golomb`.
+    #[test]
+    fn read_golomb_reads_every_value_a_conformant_stream_can_carry() {
+        let roundtrip = |value: u32| -> ec_core::Result<u32> {
+            let mut enc = crate::msac::SymbolEncoder::new();
+            crate::tile::write_golomb(&mut enc, value);
+            let data = enc.finish();
+            let mut dec = crate::msac::SymbolDecoder::new(&data);
+            crate::decode::read_golomb(&mut dec)
+        };
+        let mut values: BTreeSet<u32> = (0..=64u32).collect();
+        for length in 1..=20u32 {
+            // `x` has `length` bits with its top bit set, and the value is
+            // `x - 1`: the two ends of what this prefix length can express.
+            values.insert((1u32 << (length - 1)) - 1);
+            values.insert(((1u64 << length) - 2) as u32);
+        }
+        let max = *values.iter().max().unwrap();
+        assert_eq!(max, (1u32 << 20) - 2, "the enumeration misses the spec's own ceiling");
+        // A coefficient is masked to 20 bits (spec 5.11.39), and the base and
+        // base-range syntax contribute at most 15 of that before the tail, so
+        // this is the largest tail a legal coefficient can need.
+        assert!(max >= 0xF_FFFF - 15, "the ceiling is below the largest legal tail");
+        for value in values {
+            match roundtrip(value) {
+                Ok(read) => assert_eq!(read, value, "the Golomb tail {value} read back as {read}"),
+                Err(e) => panic!(
+                    "the Golomb tail {value} is inside the domain spec 5.11.40 can write but \
+                     this decoder refuses it: {e}"
+                ),
+            }
+        }
+        // And the refusal still names something: 20 zero prefix bits.
+        let mut enc = crate::msac::SymbolEncoder::new();
+        for _ in 0..20 {
+            enc.literal(0, 1);
+        }
+        for _ in 0..20 {
+            enc.literal(1, 1);
+        }
+        let data = enc.finish();
+        let mut dec = crate::msac::SymbolDecoder::new(&data);
+        assert!(
+            crate::decode::read_golomb(&mut dec).is_err(),
+            "the Golomb refusal is dead code -- drop it from the inventory"
+        );
     }
 
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
