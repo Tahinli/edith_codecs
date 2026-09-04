@@ -46,13 +46,14 @@ const REFUSALS: &[&str] = &[
     "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
-    // lane-t900 r22: palette RECONSTRUCTION landed for the key-frame paths
-    // (earlier lanes) and for the intra-in-inter square and rect paths (this
-    // one). These two strings survive at exactly two kinds of site: the
-    // `palette.is_none()` guards in `read_intra_mode`/`read_intra_mode_rect`
-    // (defensive -- every caller now passes a real ctx/cache pair), and the
-    // sub-8x8 `decode_inter_block8` leaf, which has no witness stream.
-    "a block that actually uses a palette (UV) -- reconstruction is out of scope",
+    // lane-t900 r23: palette RECONSTRUCTION now covers the key-frame paths
+    // (earlier lanes), the intra-in-inter square/rect paths (r22) and the
+    // 8x8 LEAF inside an inter frame (this round, gate
+    // `a_screen_stream_with_palette_8x8_leaves_in_inter_frames_decodes_pixel_exact`),
+    // which is why the (UV) string is gone from the decoder entirely -- the
+    // leaf was its only site. The (Y) one survives ONLY as the defensive
+    // `palette.is_none()` guard in `read_intra_mode`/`read_intra_mode_rect`;
+    // every caller now passes a real ctx/cache pair, so no stream reaches it.
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
     "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
