@@ -279,13 +279,22 @@ impl<'a> SymbolDecoder<'a> {
 
     /// `f(n)`: the next `n` bits, most significant first, zero past the end.
     fn f(&mut self, n: u32) -> u32 {
-        let mut v = 0;
-        for _ in 0..n {
-            let byte = self.data.get(self.bit >> 3).copied().unwrap_or(0);
-            v = (v << 1) | u32::from((byte >> (7 - (self.bit & 7))) & 1);
-            self.bit += 1;
+        debug_assert!(n <= 32, "f(n) reads at most 32 bits");
+        if n == 0 {
+            return 0;
         }
-        v
+        // The bit-at-a-time form of this loop was the renormalisation cost
+        // inside every `symbol_fixed`. Five bytes cover any 32-bit field at
+        // any bit offset, and a byte past the end reads as zero exactly as
+        // the per-bit `unwrap_or(0)` did.
+        let start = self.bit >> 3;
+        let off = (self.bit & 7) as u32;
+        let mut acc = 0u64;
+        for k in 0..5 {
+            acc = (acc << 8) | u64::from(self.data.get(start + k).copied().unwrap_or(0));
+        }
+        self.bit += n as usize;
+        ((acc >> (40 - off - n)) & ((1u64 << n) - 1)) as u32
     }
 
     /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
@@ -303,10 +312,13 @@ impl<'a> SymbolDecoder<'a> {
         let mut cur = self.range;
         let mut prev;
         let mut symbol = 0;
+        // Loop-invariant: the coder's range does not move until the symbol is
+        // chosen, so its top byte is computed once rather than per candidate.
+        let base = self.range >> 8;
         loop {
             prev = cur;
             let f = u32::from(CDF_TOP - cdf[symbol]);
-            cur = (((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+            cur = ((base * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
                 + EC_MIN_PROB * (nsyms - 1 - symbol) as u32;
             if self.value >= cur {
                 break;
@@ -357,6 +369,34 @@ impl<'a> SymbolDecoder<'a> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// `f(n)` now assembles five bytes and shifts instead of walking bits.
+    /// This pins it against the per-bit form it replaced, at every start
+    /// offset, every width up to 32, and past the end of the buffer (where
+    /// both forms must read zeros).
+    #[test]
+    fn bulk_bit_reads_match_the_per_bit_form() {
+        let data: Vec<u8> = (0..40u32).map(|i| (i * 37 + 11) as u8).collect();
+        let per_bit = |start: usize, n: u32| -> u32 {
+            let mut bit = start;
+            let mut v = 0u32;
+            for _ in 0..n {
+                let byte = data.get(bit >> 3).copied().unwrap_or(0);
+                v = (v << 1) | u32::from((byte >> (7 - (bit & 7))) & 1);
+                bit += 1;
+            }
+            v
+        };
+        for start in 0..(data.len() * 8 + 16) {
+            for n in 0..=32u32 {
+                let mut d = SymbolDecoder::new(&data);
+                d.bit = start;
+                let got = d.f(n);
+                assert_eq!(got, per_bit(start, n), "start {start} width {n}");
+                assert_eq!(d.bit, start + n as usize, "start {start} width {n} advance");
+            }
+        }
+    }
 
     // `tile.rs`'s own tests reach `SymbolDecoder` through this path; it now
     // lives in the outer module (non-test code decodes with it too), so this
