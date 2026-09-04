@@ -263,8 +263,117 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
 /// As [`decode_stream`], plus whatever `sink` returns.
 pub fn decode_stream_with(
     data: &[u8],
+    sink: impl FnMut(&Picture, usize, bool) -> Result<()>,
+) -> Result<()> {
+    decode_stream_with_threads(data, decode_threads(), sink)
+}
+
+/// lane-thread2: how many threads [`decode_stream_with`] decodes with --
+/// `EC_AV1_THREADS`, default 1. One is not "threading with a pool of one":
+/// it is the single-threaded decoder unchanged, which is what keeps every
+/// gate that reads this crate's per-thread counters meaningful.
+fn decode_threads() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    });
+    *N
+}
+
+/// lane-thread2: output-order queue. A leaf frame decoded on a worker
+/// finishes whenever it finishes; `sink` must still see every picture in the
+/// order the stream codes them, so each sink call gets an `emit_seq` when the
+/// main thread reaches its frame header and is held here until every earlier
+/// one has been emitted. (The decode index the sink is TOLD is unchanged, and
+/// is deliberately not unique: a `show_existing_frame` re-output reports the
+/// count of frames decoded before it, per this function's contract.)
+#[derive(Default)]
+struct Reorder {
+    next: usize,
+    pending: std::collections::BTreeMap<usize, (Picture, usize, bool)>,
+}
+
+impl Reorder {
+    fn push(&mut self, seq: usize, picture: Picture, decode_idx: usize, shown: bool) {
+        self.pending.insert(seq, (picture, decode_idx, shown));
+    }
+
+    /// Emits every queued picture whose turn has come. An `Err` from `sink`
+    /// aborts the decode, unchanged, exactly as the serial path did.
+    fn drain(
+        &mut self,
+        sink: &mut impl FnMut(&Picture, usize, bool) -> Result<()>,
+    ) -> Result<()> {
+        while let Some((picture, decode_idx, shown)) = self.pending.remove(&self.next) {
+            self.next += 1;
+            sink(&picture, decode_idx, shown)?;
+        }
+        Ok(())
+    }
+}
+
+/// lane-thread2: how many leaf frames this PROCESS has dispatched to a worker
+/// thread (see [`decode_stream_with_threads`]). Process-global and atomic on
+/// purpose: it is the only counter here a caller can read after a threaded
+/// decode, and it is what keeps a "decodes identically with 4 threads" gate
+/// from silently proving nothing because every frame ran inline.
+static LEAF_FRAMES_DISPATCHED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Reads [`LEAF_FRAMES_DISPATCHED`].
+pub fn leaf_frames_dispatched() -> usize {
+    LEAF_FRAMES_DISPATCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One finished leaf frame from a worker: its output position, and either the
+/// (grain-synthesised) picture with the decode index to report or the error
+/// that aborts the stream.
+type LeafResult = (usize, Result<(Picture, usize, bool)>);
+
+/// Waits for one in-flight leaf frame and emits whatever that unblocks.
+fn collect_one(
+    rx: &std::sync::mpsc::Receiver<LeafResult>,
+    in_flight: &mut usize,
+    reorder: &mut Reorder,
+    sink: &mut impl FnMut(&Picture, usize, bool) -> Result<()>,
+) -> Result<()> {
+    // Every dispatched worker answers exactly once, panic included (it is
+    // caught and turned into an error below), so the sender count cannot
+    // reach zero while `in_flight > 0`.
+    let (seq, result) = rx
+        .recv()
+        .map_err(|_| Error::corrupt("AV1 decode_stream: a worker thread vanished"))?;
+    *in_flight -= 1;
+    let (picture, decode_idx, shown) = result?;
+    reorder.push(seq, picture, decode_idx, shown);
+    reorder.drain(sink)
+}
+
+/// [`decode_stream_with`] with an explicit worker count (lane-thread2).
+///
+/// `threads == 1` is the serial decoder. Above that, frames that no later
+/// frame can reference -- a shown, non-key frame whose `refresh_frame_flags`
+/// is 0, i.e. a leaf of the reference graph -- are decoded on worker threads
+/// while the main thread keeps parsing headers and decoding the frames that
+/// DO feed the reference banks; `sink` still sees every picture in coded
+/// order. Each worker owns a fresh [`crate::decode::FrameCtx`] and a snapshot
+/// of the banks taken before dispatch, so no decode state is shared.
+///
+/// The per-decode counters this crate's gates read are thread-local, so at
+/// `threads > 1` a leaf frame's counts land on the worker and are invisible
+/// to the caller; that is why the default is 1.
+///
+/// # Errors
+/// As [`decode_stream_with`]; a worker's error aborts the stream.
+pub fn decode_stream_with_threads(
+    data: &[u8],
+    threads: usize,
     mut sink: impl FnMut(&Picture, usize, bool) -> Result<()>,
 ) -> Result<()> {
+    std::thread::scope(|scope| {
     // lane-thread1: this stream's per-frame decode state (was 38 thread_local
     // statics in decode.rs) -- one object, threaded down the decode call graph.
     let fctx = &crate::decode::FrameCtx::new();
@@ -304,6 +413,22 @@ pub fn decode_stream_with(
     // (spec `load_previous_segment_ids`) for temporal segment-id prediction
     // and for a `segmentation_update_map == 0` frame's inherited map.
     let mut seg_map_slots: [Option<Vec<u8>>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
+
+    // lane-thread2: output plumbing (inert at `threads == 1`, where nothing
+    // is ever dispatched and `reorder` emits each picture the moment it is
+    // pushed).
+    let mut emit_seq = 0usize;
+    let mut reorder = Reorder::default();
+    let mut in_flight = 0usize;
+    let in_flight_cap = threads + 1;
+    let (tx, rx) = std::sync::mpsc::channel::<LeafResult>();
+    // A worker needs its references to outlive the main thread's next
+    // `refresh_frame_flags` write, so a dispatched slot is copied once into an
+    // `Arc` and re-shared until that slot is overwritten (cleared alongside
+    // every `ref_slots` write below). The DPB itself stays owned `Picture`s:
+    // an `Arc` DPB measured ~1% SLOWER single-threaded (lane-perf9).
+    let mut ref_arcs: [Option<std::sync::Arc<Picture>>; NUM_REF_FRAMES] =
+        std::array::from_fn(|_| None);
 
     let mut pos = 0usize;
     // A frame whose tiles are split across several `OBU_TILE_GROUP`s (spec
@@ -353,6 +478,7 @@ pub fn decode_stream_with(
                 if header.refresh_frame_flags & (1 << i) != 0 {
                     cdf_slots[i] = cdf_slots[slot].clone();
                     ref_slots[i] = Some(picture.clone());
+                    ref_arcs[i] = None;
                     motion_field_slots[i] = motion_field_slots[slot].clone();
                     seg_map_slots[i] = seg_map_slots[slot].clone();
                     order_hint_slots[i] = order_hint_slots[slot];
@@ -376,7 +502,9 @@ pub fn decode_stream_with(
             } else {
                 picture
             };
-            sink(&output, pictures_decoded, true)?;
+            reorder.push(emit_seq, output, pictures_decoded, true);
+            emit_seq += 1;
+            reorder.drain(&mut sink)?;
             pictures_shown += 1;
             continue;
         }
@@ -473,182 +601,6 @@ pub fn decode_stream_with(
         // reader on the inter path, so they still refuse by name rather than
         // desyncing. aomenc's `--aq-mode` segmentation only ever sets
         // `SEG_LVL_ALT_Q`.
-        if header.segmentation.enabled {
-            for segment in 0..MAX_SEGMENTS {
-                for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {
-                    if header.segmentation.feature_enabled[segment][feature] {
-                        return Err(Error::unsupported(
-                            "AV1 decode_stream",
-                            "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
-                        ));
-                    }
-                }
-            }
-        }
-        // spec `load_previous_segment_ids`: `PrevSegmentIds` comes from the
-        // primary reference frame's slot, and is all-zero without one.
-        let prev_seg_map = if header.primary_ref_frame == PRIMARY_REF_NONE {
-            None
-        } else {
-            seg_map_slots[header.ref_frame_idx[header.primary_ref_frame as usize] as usize].clone()
-        };
-        decode::set_segmentation(
-            header.segmentation,
-            header.mi_rows as usize,
-            header.mi_cols as usize,
-            prev_seg_map.as_deref(), fctx,
-        );
-        // lane-superres stage 2/3: `use_superres` adds/removes no per-block
-        // symbol (spec 7.16's upscaling is a pixel-domain post-process
-        // libaom's `decodeframe.c` runs between CDEF and loop restoration,
-        // `av1_upscale_normative_*` in `resize.c`), so a key frame's tile
-        // reads stay bit-exact in sync and `crate::superres::upscale_picture`
-        // (below, after decode) makes its `Picture` the spec-correct
-        // `upscaled_width` instead of silently staying at `frame_width`.
-        // lane-superres r10: an INTER frame under `use_superres` no longer
-        // refuses at the frame level. `mc::predict_scaled` (spec 7.11.3.3)
-        // is wired into `decode_inter_block`'s single-ref, non-warp/OBMC/
-        // interintra branch, and `decode_inter_frame_tile_with_cdfs` decodes
-        // at the downscaled `frame_width` and upscales its own output the
-        // same way the key-frame branch above does (see the inter branch
-        // below). The combinations `predict_scaled` does not cover
-        // (compound MC, warp/OBMC/interintra, `decode_inter_block8`'s 8x8
-        // leaf) still refuse by name, deep in `decode.rs`, rather than
-        // silently mispredicting -- see `refusal_inventory.rs`.
-        // Loop restoration carries per-restoration-unit symbols in the tile
-        // (spec 5.11.57 `read_lr`, one group per LR unit reached from the
-        // superblock walk) -- lane-lr r2 ported the reader
-        // (`crate::restoration`), r3 moved this refusal check to AFTER the
-        // tile decode call below (was here, before it, in r2 -- meaning
-        // `read_lr` was NEVER actually reached through `decode_stream`, the
-        // gap the r3 gate caught live: 40/40 attempts hit this refusal with
-        // zero `read_lr_unit` hits). Checking post-decode instead proves the
-        // superblock walk actually survived `read_lr` (no desync) before
-        // refusing on the true remaining gap: decoded Wiener/SGR filters are
-        // stored per unit but never applied to pixels.
-        // `decode_inter_block`/`decode_inter_block8`'s `GLOBALMV` arm (spec
-        // 5.11.26's `read_inter_intra`... really `assign_mv`'s `GLOBALMV`
-        // case, spec 7.10.2.1) uses `gm_get_motion_vector`, which is the
-        // zero vector only under `GmType == IDENTITY` -- any other warp
-        // model needs the full affine/translation MV derivation this
-        // decoder does not carry. `global_motion` is indexed `ref_frame - 1`
-        // (`read_global_motion_params`'s `i` loops from `LAST_FRAME`);
-        // lane-av1refs widens this from `[0, 3]` (LAST_FRAME/GOLDEN_FRAME)
-        // to every one of the 7 single-reference slots `decode_inter_block`
-        // can now select.
-        //
-        // lane-gm r2 STEP-8 ATTEMPT (reverted): removing this refusal
-        // exposed a real pixel mismatch --
-        // a_real_aomenc_stream_with_interintra_wedge_decodes_pixel_exact
-        // seed 43, frame 1 luma, with EC_WEDGE_GATE_ATTEMPTS=20
-        // EC_AV1_REQUIRE_AOMENC=1 -- so the single-ref/compound MV wiring
-        // is not yet provably correct end to end; keeping the refusal
-        // until that seed is captured (EC_AV1_GATE_DUMP), self-pinned, and
-        // root-caused rather than shipping a wrong decode.
-        //
-        // lane-gm r3 ROOT CAUSE (pinned, range-ladder-confirmed, still not
-        // fixed): the mismatch is NOT an mv/mvstack/entropy bug -- msac
-        // RANGE at the first divergent block (mi=(8,0), frame 1) matches
-        // aomdec's own `EC_PART` trace bit-for-bit (rng=38664 both sides),
-        // and this decoder's own `gm_get_motion_vector` for that block
-        // (ROTZOOM, seed 43's own header) computes the spec-correct
-        // mv=(-8,8) (hand-verified against mv.h's `block_center_x`/`_y`,
-        // which found and fixed a real `- 1` omission in `warp.rs` --
-        // harmless for THIS block's rounding but a genuine spec bug fixed
-        // regardless). The actual gap: `reconinter.c`'s `allow_warp` has a
-        // `global_warp_allowed` branch (`warp_types.global_warp_allowed =
-        // is_global_mv_block(...)`, `reconinter_enc.c:281`) that predicts
-        // an `is_global_mv_block` block (ROTZOOM/AFFINE GLOBALMV, >=8x8)
-        // with the FULL per-pixel affine global-motion warp, independent
-        // of `motion_mode` -- this decoder only ever builds a warp
-        // prediction for local `WARPED_CAUSAL` motion mode and falls back
-        // to plain translational MC with the block-centre mv for every
-        // other GLOBALMV block, which is only a centre-point approximation
-        // of the true per-pixel warp. That is the entire remaining gap.
-        // lane-gm r4: `decode.rs` now feeds `global_motion[ref]` into
-        // `crate::warp::global_warp_params` for every single-ref
-        // `is_global_mv_block` (ROTZOOM/AFFINE), matching `allow_warp`'s
-        // `global_warp_allowed` branch -- ROTZOOM is pin-verified
-        // (`gm-seed43.obu`, frame 1 luma MATCH) and TRANSLATION already
-        // worked (`gm_get_motion_vector`'s translation-only mv, no warp
-        // needed). AFFINE is untested this round (no aomenc fixture in the
-        // wedge gate reached a 6-parameter model) -- keep refusing it by
-        // name rather than shipping an unverified decode.
-        // lane-gmaffine r1: AFFINE is now GATED, not refused. Stock libaom
-        // can never write a 6-parameter model -- its encoder-side search is
-        // pinned to ROTZOOM (`av1/encoder/global_motion_facade.c:24`,
-        // `FIRST_GLOBAL_TRANS_TYPE == LAST_GLOBAL_TRANS_TYPE == ROTZOOM`) --
-        // which is why four rounds of `--enable-global-motion=1` recipes
-        // never reached the case. `scripts/build-aom-affine-oracle.sh` widens
-        // exactly that search range in a side build, and
-        // `a_real_affine_global_motion_stream_decodes_pixel_exact` below
-        // decodes its output pixel-exact against ffmpeg with
-        // `affine_gm_hits() > 0`, i.e. real blocks predicted through the
-        // 6-parameter warp. Nothing in the decoder needed changing: the
-        // header reader already reads params 4/5 with their own subexp refs
-        // (`ec-av1-syntax` `read_global_motion_params`) and `warp.rs`'s
-        // shear-validity check + `warp_affine` are model-agnostic.
-        // lane-gm r4/r5/r6: r4 found a NEW mismatch on frames with two
-        // concurrently active ROTZOOM/AFFINE ref slots (GOLDEN + BWDREF) and
-        // refused the shape by name rather than guess-fix it. r5 localized
-        // the mismatch to an ordinary NEWMV/GOLDEN block, not the new
-        // global-warp branch at all -- proving "two active slots" was a
-        // correlated symptom, not the cause. r6 range-laddered that block
-        // against aomdec's `EC_TRACE_MODE` (identical `rng` before/after
-        // mode info -- symbol consumption bit-exact) and found the real
-        // defect in `mvstack.rs`'s single-reference predictor fallback:
-        // libaom's `setup_ref_mv_list` fills any `mv_ref_list` slot the real
-        // neighbour scan left short with this block's OWN global motion
-        // vector for its ref (`gm_get_motion_vector`), not zero -- invisible
-        // whenever the live ref's global motion is itself
-        // identity/translation, wrong the moment it's a real ROTZOOM/AFFINE
-        // and the querying block's own stack comes up short (frame 14's
-        // mi=(0,0), the very first block decoded, has no neighbours at
-        // all). Fixed at the predictor fallback; the refusal above (single
-        // untested shape: AFFINE on a single-ref frame) stays, but the
-        // *multi-slot* refusal this comment used to guard is lifted -- the
-        // r5/r6 pin (seed-43 wedge-gate mismatch) now decodes all 24 frames
-        // byte-exact with it gone.
-        // lane-av1comp: `decode_inter_block`/`decode_inter_block8` now read
-        // `comp_mode` per block whenever this frame's own `reference_select`
-        // header bit is set (spec 5.11.25), and refuse by name the blocks
-        // that pick `COMPOUND_REFERENCE` -- two-reference motion
-        // compensation is not wired yet. Round 14: `skip_mode` (spec 5.9.22)
-        // is wired at the block level too (forced NEAREST_NEARESTMV compound
-        // of `skip_mode_frame`, plain average blend), so the old blanket
-        // `skip_mode_present` refusal is gone.
-        // `context_update_tile_id` (spec `decode_tile`/`exit_symbol`) names
-        // which tile's end-of-tile adapted CDFs become the frame's own.
-        // lane-tiles r8: this comment used to claim a `!= 0` refusal existed
-        // "further down" -- it did not (`decode.rs` reads
-        // `tile_info.context_update_tile_id` generically at both the
-        // key-frame and inter-frame tile loops' `result_cdfs = cdfs` sites,
-        // never hardcoded to tile 0); stale documentation, not a real gap.
-        // `a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact`
-        // hard-asserts a live aomenc stream naming tile 1/2/3 decodes
-        // pixel-exact, so the capability is now proven as well as described
-        // correctly.
-        //
-        // lane-tiles r4/r6/r7/r8: the multi-tile refusal itself is scoped,
-        // not blanket. `decode_key_frame_tile_with_cdfs` and (r6)
-        // `decode_inter_frame_tile_with_cdfs` both genuinely loop every
-        // tile, `mvstack.rs`'s `MiGrid` is bounded per tile
-        // (`MiGrid::set_tile_bounds`), and `PlaneBuf`'s `tile_x0/y0/x1/y1`
-        // origin receives real values at every call site (r6's
-        // `set_tile_origin` sweep). r7 proved the two remaining
-        // tile-*column* gaps closed (inter frames, >2 columns with loop
-        // filtering on). r8 proved tile *rows* the same way: the per-tile
-        // loop's row math (`tile_num / tile_info.cols`,
-        // `mi_row_starts`/`set_tile_origin`'s `y0`/`y1`) is exactly
-        // symmetric with the column path already proven, and
-        // `a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact`
-        // (bypass gate, loop filter ON) confirmed it: 20/20 pixel-exact.
-        // `a_real_aomenc_stream_with_two_tile_rows_decodes_through_decode_
-        // stream` below re-proves it through this entry point. Tile columns
-        // and tile rows (any count, loop filter on) are no longer capped.
-        // `Tile::offset` is relative to the buffer `parse_obu` was handed
-        // (`&data[pos..]` at the time this OBU was parsed), so it is relative
-        // to `obu_offset`, not to `data` as a whole.
         let tile_bufs: Vec<&[u8]> = tiles
             .iter()
             .map(|t| {
@@ -656,357 +608,125 @@ pub fn decode_stream_with(
                     .ok_or(Error::NeedMore)
             })
             .collect::<Result<_>>()?;
-        let enable_filter_intra = parser
-            .sequence_header()
-            .is_some_and(|seq| seq.enable_filter_intra);
-        let enable_dual_filter = parser
-            .sequence_header()
-            .is_some_and(|seq| seq.enable_dual_filter);
-        let enable_edge_filter = parser
-            .sequence_header()
-            .is_some_and(|seq| seq.enable_intra_edge_filter);
-        // Inter frames' intra blocks read this through a thread-local that only
-        // the key-frame tile path used to set; without this call a stream whose
-        // inter frames are decoded on a thread that previously decoded a
-        // different sequence would inherit that sequence's bit.
-        crate::decode::set_enable_edge_filter(enable_edge_filter, fctx);
-        // lane-sb128 r1/r2: `use_128x128_superblock` (spec 5.5.1). Both the
-        // key-frame and the inter tile path read the 128 partition root and
-        // recurse SPLIT into the four 64x64 quadrants (r2 ported the root and
-        // libaom's quadrant visit order into the inter loop too). A frame at
-        // most 64x64 decodes identically either way (its 128 root reads no
-        // symbol -- neither half is in frame, so SPLIT is inferred), so the
-        // flag is only armed for frames bigger than one 64x64 superblock.
-        let use_sb128 = parser
-            .sequence_header()
-            .is_some_and(|seq| seq.use_128x128_superblock);
-        let sb128_active = use_sb128 && (header.mi_cols > 16 || header.mi_rows > 16);
-        crate::decode::set_sb128(sb128_active, fctx);
-        // lane-hbd r5: `BIT_DEPTH` (decode.rs) drives `crate::decode::sample_max`,
-        // which every dequant/inverse-transform clamp reads -- set per frame,
-        // not once per process, for the same cross-sequence-on-one-thread
-        // reason as `set_enable_edge_filter` above. Defaults to 8 when no
-        // sequence header has been seen yet, matching every existing fixture.
-        let bit_depth = parser
-            .sequence_header()
-            .map_or(8, |seq| seq.color_config.bit_depth);
-        // lane-bd12: the sequence-header parser accepts `twelve_bit`, but every
-        // rounding shift below is written for 8/10-bit only -- `warp.rs`'s
-        // `REDUCE_BITS_HORIZ` is a hard 3 where libaom uses
-        // `round_0 + max(bd + FILTER_BITS - round_0 - 14, 0)` (5 at bd 12), the
-        // MC `round_0`/`round_1` change at 12-bit (libaom convolve.h:83), the
-        // Wiener rounding bits change, and neither CDEF nor film grain has a
-        // 12-bit path. Refuse by name rather than decode silently wrong pixels.
-        if bit_depth == 12 {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
-            ));
-        }
-        crate::decode::set_bit_depth(bit_depth, fctx);
-        // spec 7.16: this frame's superres state, for the filter chain --
-        // `decode.rs` upscales between CDEF and loop restoration and sizes
-        // the LR unit grid in upscaled coordinates. Cleared (0, 8) on an
-        // unscaled frame so a later frame never inherits it.
-        crate::decode::set_superres(
-            if header.use_superres { header.upscaled_width } else { 0 },
-            u32::from(header.superres_denom), fctx,
-        );
-        // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
-        let enable_masked_compound = parser
-            .sequence_header()
-            .is_some_and(|seq| seq.enable_masked_compound);
-        let enable_jnt_comp = parser
-            .sequence_header()
-            .is_some_and(|seq| seq.enable_jnt_comp);
-        // lane-sb128 r4: `interintra`'s own gating bit -- see decode.rs's
-        // read site doc.
-        let enable_interintra_compound = parser
-            .sequence_header()
-            .is_some_and(|seq| seq.enable_interintra_compound);
-        let interp_fixed = match header.interpolation_filter {
-            ec_av1_syntax::InterpolationFilter::Switchable => None,
-            fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
-        };
-        // Spec 7.20 `load_cdfs`: a frame naming a `primary_ref_frame` resumes
-        // from that reference slot's saved CDF state instead of the spec 8.4
-        // defaults `decode_key/inter_frame_tile_with_cdfs`'s `None` case
-        // builds.
-        let initial_cdfs = if header.primary_ref_frame == PRIMARY_REF_NONE {
-            None
-        } else {
-            let slot = header.ref_frame_idx[header.primary_ref_frame as usize] as usize;
-            Some(cdf_slots[slot].clone().ok_or_else(|| {
-                Error::unsupported(
-                    "AV1 decode_stream",
-                    "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
-                )
-            })?)
-        };
-        let started_from = initial_cdfs.clone();
-        // lane-frame80: narrow the EC_TRACE_COEFF rungs to one DECODE-order frame.
-        decode::set_coeff_trace_frame(pictures_decoded);
-        // lane-t900 r9: one line per DECODE-order frame naming the header
-        // fields a desync cliff is usually keyed on (frame type, base q,
-        // primary_ref, the 7 ref slots, refresh mask, order hints).
-        if std::env::var_os("EC_PROBE_HDR").is_some() {
-            eprintln!(
-                "EC_HDR decode_idx={pictures_decoded} type={:?} show={} show_existing={}                  base_q={} primary_ref={} ref_idx={:?} refresh=0x{:02x} order_hint={}                  tiles={}x{} txmode={:?} interp={:?} reduced_tx={} allow_warp={}                  switchable_mo={} ref_mvs={} skip_mode={} cdef={:?} lr={:?}",
-                header.frame_type,
-                header.show_frame,
-                header.show_existing_frame,
-                header.quantization.base_q_idx,
-                header.primary_ref_frame,
-                header.ref_frame_idx,
-                header.refresh_frame_flags,
-                header.order_hint,
-                header.tile_info.cols,
-                header.tile_info.rows,
-                header.tx_mode,
-                header.interpolation_filter,
-                header.reduced_tx_set,
-                header.allow_warped_motion,
-                header.is_motion_mode_switchable,
-                header.use_ref_frame_mvs,
-                header.skip_mode_present,
-                header.cdef.bits,
-                header.loop_restoration.frame_restoration_type,
-            );
-        }
-
-        let order_hint_bits = parser
-            .sequence_header()
-            .map_or(0, |seq| seq.order_hint_bits);
-        // spec 7.9/7.20: this frame's own `ref_order_hints` -- the OrderHint
-        // of the picture sitting in each of its 7 single references' DPB
-        // slots, for this frame's *own* saved [`crate::motion_field::MotionField`]
-        // (a later frame projects from it) whether or not this frame itself
-        // reads temporal candidates.
-        let ref_order_hints: [u32; 7] =
-            std::array::from_fn(|i| order_hint_slots[header.ref_frame_idx[i] as usize]);
-
-        let (picture, end_cdfs, motion_field) = if header.frame_type == FrameType::Key {
-            let (picture, end_cdfs) = decode_key_frame_tile_with_cdfs(
-                &tile_bufs,
-                &header.tile_info,
-                header.mi_cols,
-                header.mi_rows,
-                header.quantization.base_q_idx,
-                crate::quant::QuantDeltas {
-                    y_dc: i32::from(header.quantization.delta_q_y_dc),
-                    u_dc: i32::from(header.quantization.delta_q_u_dc),
-                    u_ac: i32::from(header.quantization.delta_q_u_ac),
-                    v_dc: i32::from(header.quantization.delta_q_v_dc),
-                    v_ac: i32::from(header.quantization.delta_q_v_ac),
-                },
-                header.frame_width,
-                header.frame_height,
-                enable_filter_intra,
-                enable_edge_filter,
-                &header.cdef,
-                &header.loop_filter,
-                &header.loop_restoration,
-                initial_cdfs,
-                header.tx_mode == TxMode::Select,
-                header.reduced_tx_set,
-                header.allow_screen_content_tools,
-                header.allow_intrabc,
-                header.delta, fctx,
-            )?;
-            // A key frame codes no inter blocks -- its own saved motion
-            // field has no cells set, matching libaom's own "intra frame
-            // contributes nothing to a later projection" behaviour, but
-            // still carries `order_hint`/`ref_order_hints` for the distance
-            // arithmetic a later frame's projection needs.
-            let motion_field = crate::motion_field::MotionField::new(
-                header.mi_cols as usize,
-                header.mi_rows as usize,
-                header.order_hint,
-                ref_order_hints,
-                // `frame_type` for the DPB slot: a key (or intra-only) frame is
-                // never a projection source, and never spends a `ref_stamp`.
-                true,
-            );
-            (picture, end_cdfs, motion_field)
-        } else {
-            let last_slot = header.ref_frame_idx[0] as usize;
-            let reference = ref_slots[last_slot].as_ref().ok_or_else(|| {
-                Error::unsupported(
-                    "AV1 decode_stream",
-                    "an inter frame with no key frame before it",
-                )
-            })?;
-            // `ref_frame_idx[i]` names the DPB slot for `LAST_FRAME + i`
-            // (spec 7.8/7.20). Any of them having no picture yet is not a
-            // stream error on its own: `decode_inter_block` only needs a
-            // given slot when a block actually selects that reference, and
-            // refuses by name there if the slot is still empty -- widened
-            // (lane-av1refs) from `GOLDEN_FRAME`'s own slot alone to every
-            // one of the 7 single-reference slots.
-            // lane-fimv r1: record the header state the fimv gate asserts on
-            // (`motion_mode_allowed`'s `!cur_frame_force_integer_mv` clause).
-            if header.force_integer_mv {
-                decode::note_force_integer_mv_frame();
+        let seq = SeqFlags::read(&parser);
+        // A LEAF of the reference graph: shown, not a key frame, and
+        // refreshing no slot -- so nothing it produces except its own picture
+        // is ever read again (spec 7.20's bank update is keyed entirely on
+        // `refresh_frame_flags`), and it can be decoded anywhere.
+        if threads > 1
+            && header.refresh_frame_flags == 0
+            && header.show_frame
+            && !header.show_existing_frame
+            && header.frame_type != FrameType::Key
+        {
+            while in_flight >= in_flight_cap {
+                collect_one(&rx, &mut in_flight, &mut reorder, &mut sink)?;
             }
-            let other_refs: [Option<&Picture>; 8] = std::array::from_fn(|ref_frame| {
-                if ref_frame == 0 {
-                    None
-                } else {
-                    ref_slots
-                        .get(header.ref_frame_idx[ref_frame - 1] as usize)
-                        .and_then(Option::as_ref)
+            let mut arcs: [Option<std::sync::Arc<Picture>>; NUM_REF_FRAMES] =
+                std::array::from_fn(|_| None);
+            for i in 0..7 {
+                let slot = header.ref_frame_idx[i] as usize;
+                if arcs[slot].is_none()
+                    && let Some(picture) = ref_slots[slot].as_ref()
+                {
+                    arcs[slot] = Some(
+                        ref_arcs[slot]
+                            .get_or_insert_with(|| std::sync::Arc::new(picture.clone()))
+                            .clone(),
+                    );
                 }
-            });
-            // spec 7.9's own driver, `av1_setup_motion_field`: only run when
-            // this frame's header actually asks for temporal candidates --
-            // `find_mv_stack_with_sign_bias` reproduces its old always-`None`
-            // behaviour bit for bit when this is `None` (see its own doc).
-            let tpl_field = header.use_ref_frame_mvs.then(|| {
-                crate::motion_field::setup_motion_field(
-                    &motion_field_slots,
-                    header.ref_frame_idx,
-                    header.order_hint,
-                    order_hint_bits,
-                    header.mi_rows as usize,
-                    header.mi_cols as usize,
-                )
-            });
-            if std::env::var_os("EC_TPL").is_some() {
-                eprintln!(
-                    "EC_TPL order_hint={} use_ref_frame_mvs={} cells={}",
-                    header.order_hint,
-                    header.use_ref_frame_mvs,
-                    tpl_field.as_ref().map_or(0, crate::motion_field::TplField::filled_cells)
-                );
             }
-            let (picture, end_cdfs, motion_field) = decode_inter_frame_tile_with_cdfs(
-                &tile_bufs,
-                &header.tile_info,
-                header.mi_cols,
-                header.mi_rows,
-                header.quantization.base_q_idx,
-                crate::quant::QuantDeltas {
-                    y_dc: i32::from(header.quantization.delta_q_y_dc),
-                    u_dc: i32::from(header.quantization.delta_q_u_dc),
-                    u_ac: i32::from(header.quantization.delta_q_u_ac),
-                    v_dc: i32::from(header.quantization.delta_q_v_dc),
-                    v_ac: i32::from(header.quantization.delta_q_v_ac),
-                },
-                header.frame_width,
-                header.frame_height,
-                reference,
-                other_refs,
-                &header.cdef,
-                &header.loop_filter,
-                &header.loop_restoration,
-                initial_cdfs,
-                header.allow_high_precision_mv,
-                header.force_integer_mv,
-                header.ref_frame_sign_bias,
-                header.global_motion,
-                interp_fixed,
-                enable_dual_filter,
-                order_hint_bits,
-                header.order_hint,
-                ref_order_hints,
-                tpl_field.as_ref(),
-                header.reference_select,
-                enable_masked_compound,
-                enable_jnt_comp,
-                enable_interintra_compound,
-                header.skip_mode_present,
-                header.skip_mode_frame,
-                header.reduced_tx_set,
-                header.tx_mode == TxMode::Select,
-                header.is_motion_mode_switchable,
-                header.allow_warped_motion,
-                header.allow_screen_content_tools,
-                header.delta,
-                enable_filter_intra, fctx,
-            )?;
-            (picture, end_cdfs, motion_field)
-        };
-        // lane-lr r4: the Wiener/self-guided pixel filters are wired
-        // (`decode.rs::apply_loop_restoration`) -- no more refusal here,
-        // `uses_lr` frames now decode all the way to pixels.
-        // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
-        // *initial* table into the slots it refreshes, not the adapted
-        // end-of-tile one.
-        let stored_cdfs = if header.disable_frame_end_update_cdf {
-            started_from.unwrap_or_else(|| Cdfs::new(q_ctx_of(header.quantization.base_q_idx)))
-        } else {
-            // Spec 7.20 `save_cdfs` (libaom `av1_reset_cdf_symbol_counters`):
-            // the adapted table is saved with every symbol counter zeroed,
-            // not with the counts the tile's own decode left behind.
-            let mut end_cdfs = end_cdfs;
-            end_cdfs.reset_counts();
-            end_cdfs
-        };
-        if let Ok(path) = std::env::var("EC_AV1_DUMP_TABLES") {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = writeln!(f, "=== frame idx={} ===", pictures_shown);
-                let _ = writeln!(f, "partition_w64 {:?}", stored_cdfs.partition_w64);
-                let _ = writeln!(f, "partition_w32 {:?}", stored_cdfs.partition_w32);
-                let _ = writeln!(f, "partition_w16 {:?}", stored_cdfs.partition_w16);
-                let _ = writeln!(f, "skip {:?}", stored_cdfs.skip);
-                let _ = writeln!(f, "new_mv {:?}", stored_cdfs.new_mv);
-                let _ = writeln!(f, "zero_mv {:?}", stored_cdfs.zero_mv);
-                let _ = writeln!(f, "ref_mv {:?}", stored_cdfs.ref_mv);
-                let _ = writeln!(f, "mv_joint {:?}", stored_cdfs.mv_joint);
-            }
-        }
-        // lane-comppin r3: decode-order (not display-order) dump of every
-        // frame's own post-deblock buffer -- the pre-existing pixel diff
-        // (`scratch_isolate_pinned_mismatch`) only ever compares *shown*
-        // frames, so a hidden reference (altref/bwdref) that DPB-corrupts a
-        // later shown frame is otherwise invisible; diff this byte-for-byte
-        // against `EC_AV1_POSTFILT_DUMP.fN` from the instrumented aomdec
-        // build to isolate whether the defect is in a hidden frame's own
-        // reconstruction or downstream of it.
-        if let Ok(path) = std::env::var("EC_AV1_DECODE_ORDER_DUMP") {
-            use std::io::Write;
-            let idx = pictures_decoded;
-            if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-                // lane-hbd r4: debug dump narrows to u8 -- this diagnostic
-                // predates 10-bit support and is an 8-bit-oracle comparison
-                // only (aomdec's own dump is 8-bit here too).
-                let narrow = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
-                let _ = f.write_all(&narrow(&picture.y));
-                let _ = f.write_all(&narrow(&picture.u));
-                let _ = f.write_all(&narrow(&picture.v));
-            }
-        }
-        // lane-hidden r1: the frame exactly as it is about to be stored into
-        // the reference slots -- after deblock/CDEF/LR/superres, in DECODE
-        // order, hidden (`show_frame == 0`) alt-ref frames included, and
-        // bit-depth correct (8-bit as u8, 10/12-bit as u16 LE) unlike the
-        // u8-narrowing diagnostic dumps above. Matches the instrumented
-        // aomdec's own `EC_AV1_FINAL_DUMP` rung byte for byte
-        // (scripts/instrument-aom-oracle.sh rung 12), which is what makes a
-        // hidden frame's pixels comparable at all.
-        if let Some(prefix) = &final_dump {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::File::create(format!("{prefix}.f{pictures_decoded}")) {
-                let mut buf = Vec::new();
-                for plane in [&picture.y, &picture.u, &picture.v] {
-                    if bit_depth == 8 {
-                        buf.extend(plane.iter().map(|&s| s as u8));
+            let snap = RefSnapshot::take(
+                &header,
+                seq,
+                std::array::from_fn(|_| None),
+                &cdf_slots,
+                &seg_map_slots,
+                &motion_field_slots,
+                &order_hint_slots,
+            );
+            let (job_seq, decode_idx, shown_idx) = (emit_seq, pictures_decoded, pictures_shown);
+            emit_seq += 1;
+            pictures_decoded += 1;
+            pictures_shown += 1;
+            let tx = tx.clone();
+            let dump = final_dump.clone();
+            scope.spawn(move || {
+                let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Fresh per-thread state: every field this path reads is
+                    // written from this frame's own header before it is read.
+                    let fctx = crate::decode::FrameCtx::new();
+                    let snap = RefSnapshot {
+                        refs: std::array::from_fn(|i| arcs[i].as_deref()),
+                        ..snap
+                    };
+                    let out = decode_frame(
+                        &fctx,
+                        &header,
+                        &tile_bufs,
+                        seq,
+                        snap,
+                        decode_idx,
+                        shown_idx,
+                        dump.as_deref(),
+                    )?;
+                    let picture = if header.film_grain.apply_grain && !no_grain() {
+                        crate::film_grain::apply_grain(
+                            &out.picture,
+                            &header.film_grain,
+                            seq.mc_identity,
+                            u32::from(seq.bit_depth),
+                            &fctx,
+                        )
                     } else {
-                        for &s in plane {
-                            buf.extend_from_slice(&s.to_le_bytes());
-                        }
-                    }
-                }
-                let _ = f.write_all(&buf);
+                        out.picture
+                    };
+                    Ok((picture, decode_idx, true))
+                }))
+                .unwrap_or_else(|_| {
+                    Err(Error::corrupt(
+                        "AV1 decode_stream: a worker thread panicked decoding a leaf frame",
+                    ))
+                });
+                let _ = tx.send((job_seq, reply));
+            });
+            in_flight += 1;
+            LEAF_FRAMES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Anything that finished while this frame was being set up.
+            while let Ok((seq, result)) = rx.try_recv() {
+                in_flight -= 1;
+                let (picture, decode_idx, shown) = result?;
+                reorder.push(seq, picture, decode_idx, shown);
+                reorder.drain(&mut sink)?;
             }
+            continue;
         }
+        let snap = RefSnapshot::take(
+            &header,
+            seq,
+            std::array::from_fn(|i| ref_slots[i].as_ref()),
+            &cdf_slots,
+            &seg_map_slots,
+            &motion_field_slots,
+            &order_hint_slots,
+        );
+        let bit_depth = seq.bit_depth;
+        let FrameOutput {
+            picture,
+            stored_cdfs,
+            motion_field,
+            seg_map: decoded_seg_map,
+        } = decode_frame(
+            fctx,
+            &header,
+            &tile_bufs,
+            seq,
+            snap,
+            pictures_decoded,
+            pictures_shown,
+            final_dump.as_deref(),
+        )?;
         pictures_decoded += 1;
-        let decoded_seg_map = decode::take_segment_ids(fctx);
         for i in 0..NUM_REF_FRAMES {
             if header.refresh_frame_flags & (1 << i) != 0 {
                 cdf_slots[i] = Some(stored_cdfs.clone());
@@ -1015,6 +735,7 @@ pub fn decode_stream_with(
                 // pre-grain decode, even though the frame pushed onto the
                 // caller's output below carries the grained picture.
                 ref_slots[i] = Some(picture.clone());
+                ref_arcs[i] = None;
                 motion_field_slots[i] = Some(motion_field.clone());
                 seg_map_slots[i] = Some(decoded_seg_map.clone());
                 order_hint_slots[i] = header.order_hint;
@@ -1029,9 +750,7 @@ pub fn decode_stream_with(
         }
         if header.show_frame {
             let output = if header.film_grain.apply_grain && !no_grain() {
-                let mc_identity = parser
-                    .sequence_header()
-                    .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
+                let mc_identity = seq.mc_identity;
                 crate::film_grain::apply_grain(
                     &picture,
                     &header.film_grain,
@@ -1041,19 +760,661 @@ pub fn decode_stream_with(
             } else {
                 picture
             };
-            sink(&output, pictures_decoded - 1, true)?;
+            reorder.push(emit_seq, output, pictures_decoded - 1, true);
+            emit_seq += 1;
+            reorder.drain(&mut sink)?;
             pictures_shown += 1;
         } else {
             // Hidden (alt-ref/forward-key) frames never reach
             // `decode_stream`'s output, but a decode-order consumer -- the
             // `EC_AV1_FINAL_DUMP` comparison against aomdec, say -- needs
             // them, so they are reported too, with `shown == false`.
-            sink(&picture, pictures_decoded - 1, false)?;
+            reorder.push(emit_seq, picture, pictures_decoded - 1, false);
+            emit_seq += 1;
+            reorder.drain(&mut sink)?;
         }
     }
+    while in_flight > 0 {
+        collect_one(&rx, &mut in_flight, &mut reorder, &mut sink)?;
+    }
+    debug_assert!(reorder.pending.is_empty(), "a frame was never emitted");
     Ok(())
+    })
 }
 
+
+
+/// lane-thread2: the sequence-header bits a single frame's decode needs,
+/// read once on the parsing thread so that [`decode_frame`] never touches the
+/// [`Av1Parser`] (a worker thread has no access to it).
+#[derive(Clone, Copy)]
+pub(crate) struct SeqFlags {
+    pub(crate) enable_filter_intra: bool,
+    pub(crate) enable_dual_filter: bool,
+    pub(crate) enable_edge_filter: bool,
+    pub(crate) enable_masked_compound: bool,
+    pub(crate) enable_jnt_comp: bool,
+    pub(crate) enable_interintra_compound: bool,
+    pub(crate) use_sb128: bool,
+    pub(crate) bit_depth: u8,
+    pub(crate) order_hint_bits: u32,
+    pub(crate) mc_identity: bool,
+}
+
+impl SeqFlags {
+    fn read(parser: &Av1Parser) -> Self {
+        let seq = parser.sequence_header();
+        Self {
+            enable_filter_intra: seq.is_some_and(|s| s.enable_filter_intra),
+            enable_dual_filter: seq.is_some_and(|s| s.enable_dual_filter),
+            enable_edge_filter: seq.is_some_and(|s| s.enable_intra_edge_filter),
+            enable_masked_compound: seq.is_some_and(|s| s.enable_masked_compound),
+            enable_jnt_comp: seq.is_some_and(|s| s.enable_jnt_comp),
+            enable_interintra_compound: seq.is_some_and(|s| s.enable_interintra_compound),
+            use_sb128: seq.is_some_and(|s| s.use_128x128_superblock),
+            bit_depth: seq.map_or(8, |s| s.color_config.bit_depth),
+            order_hint_bits: seq.map_or(0, |s| s.order_hint_bits),
+            mc_identity: seq.is_some_and(|s| s.color_config.matrix_coefficients == 0),
+        }
+    }
+}
+
+/// lane-thread2: everything one frame's decode reads out of the cross-frame
+/// banks `decode_stream_with` owns -- taken on the parsing thread, before any
+/// later frame can overwrite a slot, so a frame can be decoded anywhere.
+pub(crate) struct RefSnapshot<'a> {
+    /// The 8 DPB slots, indexed by slot (NOT by `ref_frame_idx`).
+    pub(crate) refs: [Option<&'a Picture>; NUM_REF_FRAMES],
+    /// `cdf_slots[ref_frame_idx[primary_ref_frame]]`, `None` when this frame
+    /// names `PRIMARY_REF_NONE` *or* that slot holds no saved table (the
+    /// second case is the refusal [`decode_frame`] raises where it always
+    /// did, so the error order over a malformed stream is unchanged).
+    pub(crate) primary_cdfs: Option<Cdfs>,
+    /// Spec `load_previous_segment_ids`, from the same slot.
+    pub(crate) prev_seg_map: Option<Vec<u8>>,
+    /// Spec 7.9's projection, already run against `motion_field_slots`.
+    pub(crate) tpl_field: Option<crate::motion_field::TplField>,
+    /// `order_hint_slots[ref_frame_idx[i]]` for `LAST_FRAME + i`.
+    pub(crate) ref_order_hints: [u32; 7],
+}
+
+impl<'a> RefSnapshot<'a> {
+    /// Reads the banks for `header`. `refs` is passed in so that the
+    /// single-threaded path can borrow the DPB pictures in place while the
+    /// worker path hands over its own `Arc` clones.
+    fn take(
+        header: &FrameHeader,
+        seq: SeqFlags,
+        refs: [Option<&'a Picture>; NUM_REF_FRAMES],
+        cdf_slots: &[Option<Cdfs>; NUM_REF_FRAMES],
+        seg_map_slots: &[Option<Vec<u8>>; NUM_REF_FRAMES],
+        motion_field_slots: &[Option<crate::motion_field::MotionField>; NUM_REF_FRAMES],
+        order_hint_slots: &[u32; NUM_REF_FRAMES],
+    ) -> Self {
+        let primary = (header.primary_ref_frame != PRIMARY_REF_NONE)
+            .then(|| header.ref_frame_idx[header.primary_ref_frame as usize] as usize);
+        // spec 7.9's own driver, `av1_setup_motion_field`: only run when
+        // this frame's header asks for it, and never for a key frame (which
+        // codes no inter block at all).
+        let tpl_field = (header.frame_type != FrameType::Key && header.use_ref_frame_mvs).then(
+            || {
+                crate::motion_field::setup_motion_field(
+                    motion_field_slots,
+                    header.ref_frame_idx,
+                    header.order_hint,
+                    seq.order_hint_bits,
+                    header.mi_rows as usize,
+                    header.mi_cols as usize,
+                )
+            },
+        );
+        if std::env::var_os("EC_TPL").is_some() {
+            eprintln!(
+                "EC_TPL order_hint={} use_ref_frame_mvs={} cells={}",
+                header.order_hint,
+                header.use_ref_frame_mvs,
+                tpl_field
+                    .as_ref()
+                    .map_or(0, crate::motion_field::TplField::filled_cells)
+            );
+        }
+        Self {
+            refs,
+            primary_cdfs: primary.and_then(|slot| cdf_slots[slot].clone()),
+            prev_seg_map: primary.and_then(|slot| seg_map_slots[slot].clone()),
+            tpl_field,
+            ref_order_hints: std::array::from_fn(|i| {
+                order_hint_slots[header.ref_frame_idx[i] as usize]
+            }),
+        }
+    }
+}
+
+/// lane-thread2: what one decoded frame contributes back to the stream --
+/// its picture (clean, pre-grain: spec 7.18.3.1) plus the three pieces a
+/// `refresh_frame_flags` bit stores into a reference slot.
+pub(crate) struct FrameOutput {
+    pub(crate) picture: Picture,
+    pub(crate) stored_cdfs: Cdfs,
+    pub(crate) motion_field: crate::motion_field::MotionField,
+    pub(crate) seg_map: Vec<u8>,
+}
+
+/// lane-thread2: one coded frame, decoded from its header, its tile payload
+/// and a snapshot of the reference banks -- and from nothing else. Lifted
+/// verbatim out of [`decode_stream_with`]'s loop so that the same code can
+/// run on the parsing thread (a frame that refreshes a reference slot) or on
+/// a worker (a leaf frame, see `decode_stream_with_threads`).
+///
+/// `fctx` is the DECODING thread's context: a worker uses a fresh one, which
+/// is sound because every field this path reads is written by this function
+/// (or by the tile decoders it calls) before it is read -- see the
+/// `a_worker_context_starts_where_the_stream_context_would` gate.
+///
+/// # Errors
+/// As [`decode_stream_with`], for this one frame.
+#[allow(clippy::too_many_arguments)]
+fn decode_frame(
+    fctx: &crate::decode::FrameCtx,
+    header: &FrameHeader,
+    tile_bufs: &[&[u8]],
+    seq: SeqFlags,
+    snap: RefSnapshot<'_>,
+    decode_idx: usize,
+    shown_idx: usize,
+    final_dump: Option<&str>,
+) -> Result<FrameOutput> {
+    if header.segmentation.enabled {
+        for segment in 0..MAX_SEGMENTS {
+            for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {
+                if header.segmentation.feature_enabled[segment][feature] {
+                    return Err(Error::unsupported(
+                        "AV1 decode_stream",
+                        "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
+                    ));
+                }
+            }
+        }
+    }
+    // spec `load_previous_segment_ids`: `PrevSegmentIds` comes from the
+    // primary reference frame's slot, and is all-zero without one.
+    decode::set_segmentation(
+        header.segmentation,
+        header.mi_rows as usize,
+        header.mi_cols as usize,
+        snap.prev_seg_map.as_deref(), fctx,
+    );
+    // lane-superres stage 2/3: `use_superres` adds/removes no per-block
+    // symbol (spec 7.16's upscaling is a pixel-domain post-process
+    // libaom's `decodeframe.c` runs between CDEF and loop restoration,
+    // `av1_upscale_normative_*` in `resize.c`), so a key frame's tile
+    // reads stay bit-exact in sync and `crate::superres::upscale_picture`
+    // (below, after decode) makes its `Picture` the spec-correct
+    // `upscaled_width` instead of silently staying at `frame_width`.
+    // lane-superres r10: an INTER frame under `use_superres` no longer
+    // refuses at the frame level. `mc::predict_scaled` (spec 7.11.3.3)
+    // is wired into `decode_inter_block`'s single-ref, non-warp/OBMC/
+    // interintra branch, and `decode_inter_frame_tile_with_cdfs` decodes
+    // at the downscaled `frame_width` and upscales its own output the
+    // same way the key-frame branch above does (see the inter branch
+    // below). The combinations `predict_scaled` does not cover
+    // (compound MC, warp/OBMC/interintra, `decode_inter_block8`'s 8x8
+    // leaf) still refuse by name, deep in `decode.rs`, rather than
+    // silently mispredicting -- see `refusal_inventory.rs`.
+    // Loop restoration carries per-restoration-unit symbols in the tile
+    // (spec 5.11.57 `read_lr`, one group per LR unit reached from the
+    // superblock walk) -- lane-lr r2 ported the reader
+    // (`crate::restoration`), r3 moved this refusal check to AFTER the
+    // tile decode call below (was here, before it, in r2 -- meaning
+    // `read_lr` was NEVER actually reached through `decode_stream`, the
+    // gap the r3 gate caught live: 40/40 attempts hit this refusal with
+    // zero `read_lr_unit` hits). Checking post-decode instead proves the
+    // superblock walk actually survived `read_lr` (no desync) before
+    // refusing on the true remaining gap: decoded Wiener/SGR filters are
+    // stored per unit but never applied to pixels.
+    // `decode_inter_block`/`decode_inter_block8`'s `GLOBALMV` arm (spec
+    // 5.11.26's `read_inter_intra`... really `assign_mv`'s `GLOBALMV`
+    // case, spec 7.10.2.1) uses `gm_get_motion_vector`, which is the
+    // zero vector only under `GmType == IDENTITY` -- any other warp
+    // model needs the full affine/translation MV derivation this
+    // decoder does not carry. `global_motion` is indexed `ref_frame - 1`
+    // (`read_global_motion_params`'s `i` loops from `LAST_FRAME`);
+    // lane-av1refs widens this from `[0, 3]` (LAST_FRAME/GOLDEN_FRAME)
+    // to every one of the 7 single-reference slots `decode_inter_block`
+    // can now select.
+    //
+    // lane-gm r2 STEP-8 ATTEMPT (reverted): removing this refusal
+    // exposed a real pixel mismatch --
+    // a_real_aomenc_stream_with_interintra_wedge_decodes_pixel_exact
+    // seed 43, frame 1 luma, with EC_WEDGE_GATE_ATTEMPTS=20
+    // EC_AV1_REQUIRE_AOMENC=1 -- so the single-ref/compound MV wiring
+    // is not yet provably correct end to end; keeping the refusal
+    // until that seed is captured (EC_AV1_GATE_DUMP), self-pinned, and
+    // root-caused rather than shipping a wrong decode.
+    //
+    // lane-gm r3 ROOT CAUSE (pinned, range-ladder-confirmed, still not
+    // fixed): the mismatch is NOT an mv/mvstack/entropy bug -- msac
+    // RANGE at the first divergent block (mi=(8,0), frame 1) matches
+    // aomdec's own `EC_PART` trace bit-for-bit (rng=38664 both sides),
+    // and this decoder's own `gm_get_motion_vector` for that block
+    // (ROTZOOM, seed 43's own header) computes the spec-correct
+    // mv=(-8,8) (hand-verified against mv.h's `block_center_x`/`_y`,
+    // which found and fixed a real `- 1` omission in `warp.rs` --
+    // harmless for THIS block's rounding but a genuine spec bug fixed
+    // regardless). The actual gap: `reconinter.c`'s `allow_warp` has a
+    // `global_warp_allowed` branch (`warp_types.global_warp_allowed =
+    // is_global_mv_block(...)`, `reconinter_enc.c:281`) that predicts
+    // an `is_global_mv_block` block (ROTZOOM/AFFINE GLOBALMV, >=8x8)
+    // with the FULL per-pixel affine global-motion warp, independent
+    // of `motion_mode` -- this decoder only ever builds a warp
+    // prediction for local `WARPED_CAUSAL` motion mode and falls back
+    // to plain translational MC with the block-centre mv for every
+    // other GLOBALMV block, which is only a centre-point approximation
+    // of the true per-pixel warp. That is the entire remaining gap.
+    // lane-gm r4: `decode.rs` now feeds `global_motion[ref]` into
+    // `crate::warp::global_warp_params` for every single-ref
+    // `is_global_mv_block` (ROTZOOM/AFFINE), matching `allow_warp`'s
+    // `global_warp_allowed` branch -- ROTZOOM is pin-verified
+    // (`gm-seed43.obu`, frame 1 luma MATCH) and TRANSLATION already
+    // worked (`gm_get_motion_vector`'s translation-only mv, no warp
+    // needed). AFFINE is untested this round (no aomenc fixture in the
+    // wedge gate reached a 6-parameter model) -- keep refusing it by
+    // name rather than shipping an unverified decode.
+    // lane-gmaffine r1: AFFINE is now GATED, not refused. Stock libaom
+    // can never write a 6-parameter model -- its encoder-side search is
+    // pinned to ROTZOOM (`av1/encoder/global_motion_facade.c:24`,
+    // `FIRST_GLOBAL_TRANS_TYPE == LAST_GLOBAL_TRANS_TYPE == ROTZOOM`) --
+    // which is why four rounds of `--enable-global-motion=1` recipes
+    // never reached the case. `scripts/build-aom-affine-oracle.sh` widens
+    // exactly that search range in a side build, and
+    // `a_real_affine_global_motion_stream_decodes_pixel_exact` below
+    // decodes its output pixel-exact against ffmpeg with
+    // `affine_gm_hits() > 0`, i.e. real blocks predicted through the
+    // 6-parameter warp. Nothing in the decoder needed changing: the
+    // header reader already reads params 4/5 with their own subexp refs
+    // (`ec-av1-syntax` `read_global_motion_params`) and `warp.rs`'s
+    // shear-validity check + `warp_affine` are model-agnostic.
+    // lane-gm r4/r5/r6: r4 found a NEW mismatch on frames with two
+    // concurrently active ROTZOOM/AFFINE ref slots (GOLDEN + BWDREF) and
+    // refused the shape by name rather than guess-fix it. r5 localized
+    // the mismatch to an ordinary NEWMV/GOLDEN block, not the new
+    // global-warp branch at all -- proving "two active slots" was a
+    // correlated symptom, not the cause. r6 range-laddered that block
+    // against aomdec's `EC_TRACE_MODE` (identical `rng` before/after
+    // mode info -- symbol consumption bit-exact) and found the real
+    // defect in `mvstack.rs`'s single-reference predictor fallback:
+    // libaom's `setup_ref_mv_list` fills any `mv_ref_list` slot the real
+    // neighbour scan left short with this block's OWN global motion
+    // vector for its ref (`gm_get_motion_vector`), not zero -- invisible
+    // whenever the live ref's global motion is itself
+    // identity/translation, wrong the moment it's a real ROTZOOM/AFFINE
+    // and the querying block's own stack comes up short (frame 14's
+    // mi=(0,0), the very first block decoded, has no neighbours at
+    // all). Fixed at the predictor fallback; the refusal above (single
+    // untested shape: AFFINE on a single-ref frame) stays, but the
+    // *multi-slot* refusal this comment used to guard is lifted -- the
+    // r5/r6 pin (seed-43 wedge-gate mismatch) now decodes all 24 frames
+    // byte-exact with it gone.
+    // lane-av1comp: `decode_inter_block`/`decode_inter_block8` now read
+    // `comp_mode` per block whenever this frame's own `reference_select`
+    // header bit is set (spec 5.11.25), and refuse by name the blocks
+    // that pick `COMPOUND_REFERENCE` -- two-reference motion
+    // compensation is not wired yet. Round 14: `skip_mode` (spec 5.9.22)
+    // is wired at the block level too (forced NEAREST_NEARESTMV compound
+    // of `skip_mode_frame`, plain average blend), so the old blanket
+    // `skip_mode_present` refusal is gone.
+    // `context_update_tile_id` (spec `decode_tile`/`exit_symbol`) names
+    // which tile's end-of-tile adapted CDFs become the frame's own.
+    // lane-tiles r8: this comment used to claim a `!= 0` refusal existed
+    // "further down" -- it did not (`decode.rs` reads
+    // `tile_info.context_update_tile_id` generically at both the
+    // key-frame and inter-frame tile loops' `result_cdfs = cdfs` sites,
+    // never hardcoded to tile 0); stale documentation, not a real gap.
+    // `a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact`
+    // hard-asserts a live aomenc stream naming tile 1/2/3 decodes
+    // pixel-exact, so the capability is now proven as well as described
+    // correctly.
+    //
+    // lane-tiles r4/r6/r7/r8: the multi-tile refusal itself is scoped,
+    // not blanket. `decode_key_frame_tile_with_cdfs` and (r6)
+    // `decode_inter_frame_tile_with_cdfs` both genuinely loop every
+    // tile, `mvstack.rs`'s `MiGrid` is bounded per tile
+    // (`MiGrid::set_tile_bounds`), and `PlaneBuf`'s `tile_x0/y0/x1/y1`
+    // origin receives real values at every call site (r6's
+    // `set_tile_origin` sweep). r7 proved the two remaining
+    // tile-*column* gaps closed (inter frames, >2 columns with loop
+    // filtering on). r8 proved tile *rows* the same way: the per-tile
+    // loop's row math (`tile_num / tile_info.cols`,
+    // `mi_row_starts`/`set_tile_origin`'s `y0`/`y1`) is exactly
+    // symmetric with the column path already proven, and
+    // `a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact`
+    // (bypass gate, loop filter ON) confirmed it: 20/20 pixel-exact.
+    // `a_real_aomenc_stream_with_two_tile_rows_decodes_through_decode_
+    // stream` below re-proves it through this entry point. Tile columns
+    // and tile rows (any count, loop filter on) are no longer capped.
+    // `Tile::offset` is relative to the buffer `parse_obu` was handed
+    // (`&data[pos..]` at the time this OBU was parsed), so it is relative
+    // to `obu_offset`, not to `data` as a whole.
+    let enable_filter_intra = seq.enable_filter_intra;
+    let enable_dual_filter = seq.enable_dual_filter;
+    let enable_edge_filter = seq.enable_edge_filter;
+    // Inter frames' intra blocks read this through a thread-local that only
+    // the key-frame tile path used to set; without this call a stream whose
+    // inter frames are decoded on a thread that previously decoded a
+    // different sequence would inherit that sequence's bit.
+    crate::decode::set_enable_edge_filter(enable_edge_filter, fctx);
+    // lane-sb128 r1/r2: `use_128x128_superblock` (spec 5.5.1). Both the
+    // key-frame and the inter tile path read the 128 partition root and
+    // recurse SPLIT into the four 64x64 quadrants (r2 ported the root and
+    // libaom's quadrant visit order into the inter loop too). A frame at
+    // most 64x64 decodes identically either way (its 128 root reads no
+    // symbol -- neither half is in frame, so SPLIT is inferred), so the
+    // flag is only armed for frames bigger than one 64x64 superblock.
+    let use_sb128 = seq.use_sb128;
+    let sb128_active = use_sb128 && (header.mi_cols > 16 || header.mi_rows > 16);
+    crate::decode::set_sb128(sb128_active, fctx);
+    // lane-hbd r5: `BIT_DEPTH` (decode.rs) drives `crate::decode::sample_max`,
+    // which every dequant/inverse-transform clamp reads -- set per frame,
+    // not once per process, for the same cross-sequence-on-one-thread
+    // reason as `set_enable_edge_filter` above. Defaults to 8 when no
+    // sequence header has been seen yet, matching every existing fixture.
+    let bit_depth = seq.bit_depth;
+    // lane-bd12: the sequence-header parser accepts `twelve_bit`, but every
+    // rounding shift below is written for 8/10-bit only -- `warp.rs`'s
+    // `REDUCE_BITS_HORIZ` is a hard 3 where libaom uses
+    // `round_0 + max(bd + FILTER_BITS - round_0 - 14, 0)` (5 at bd 12), the
+    // MC `round_0`/`round_1` change at 12-bit (libaom convolve.h:83), the
+    // Wiener rounding bits change, and neither CDEF nor film grain has a
+    // 12-bit path. Refuse by name rather than decode silently wrong pixels.
+    if bit_depth == 12 {
+        return Err(Error::unsupported(
+            "AV1 decode_stream",
+            "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
+        ));
+    }
+    crate::decode::set_bit_depth(bit_depth, fctx);
+    // spec 7.16: this frame's superres state, for the filter chain --
+    // `decode.rs` upscales between CDEF and loop restoration and sizes
+    // the LR unit grid in upscaled coordinates. Cleared (0, 8) on an
+    // unscaled frame so a later frame never inherits it.
+    crate::decode::set_superres(
+        if header.use_superres { header.upscaled_width } else { 0 },
+        u32::from(header.superres_denom), fctx,
+    );
+    // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
+    let enable_masked_compound = seq.enable_masked_compound;
+    let enable_jnt_comp = seq.enable_jnt_comp;
+    // lane-sb128 r4: `interintra`'s own gating bit -- see decode.rs's
+    // read site doc.
+    let enable_interintra_compound = seq.enable_interintra_compound;
+    let interp_fixed = match header.interpolation_filter {
+        ec_av1_syntax::InterpolationFilter::Switchable => None,
+        fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
+    };
+    // Spec 7.20 `load_cdfs`: a frame naming a `primary_ref_frame` resumes
+    // from that reference slot's saved CDF state instead of the spec 8.4
+    // defaults `decode_key/inter_frame_tile_with_cdfs`'s `None` case
+    // builds.
+    let initial_cdfs = if header.primary_ref_frame == PRIMARY_REF_NONE {
+        None
+    } else {
+        Some(snap.primary_cdfs.clone().ok_or_else(|| {
+            Error::unsupported(
+                "AV1 decode_stream",
+                "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
+            )
+        })?)
+    };
+    let started_from = initial_cdfs.clone();
+    // lane-frame80: narrow the EC_TRACE_COEFF rungs to one DECODE-order frame.
+    decode::set_coeff_trace_frame(decode_idx);
+    // lane-t900 r9: one line per DECODE-order frame naming the header
+    // fields a desync cliff is usually keyed on (frame type, base q,
+    // primary_ref, the 7 ref slots, refresh mask, order hints).
+    if std::env::var_os("EC_PROBE_HDR").is_some() {
+        eprintln!(
+            "EC_HDR decode_idx={decode_idx} type={:?} show={} show_existing={}                  base_q={} primary_ref={} ref_idx={:?} refresh=0x{:02x} order_hint={}                  tiles={}x{} txmode={:?} interp={:?} reduced_tx={} allow_warp={}                  switchable_mo={} ref_mvs={} skip_mode={} cdef={:?} lr={:?}",
+            header.frame_type,
+            header.show_frame,
+            header.show_existing_frame,
+            header.quantization.base_q_idx,
+            header.primary_ref_frame,
+            header.ref_frame_idx,
+            header.refresh_frame_flags,
+            header.order_hint,
+            header.tile_info.cols,
+            header.tile_info.rows,
+            header.tx_mode,
+            header.interpolation_filter,
+            header.reduced_tx_set,
+            header.allow_warped_motion,
+            header.is_motion_mode_switchable,
+            header.use_ref_frame_mvs,
+            header.skip_mode_present,
+            header.cdef.bits,
+            header.loop_restoration.frame_restoration_type,
+        );
+    }
+
+    let order_hint_bits = seq.order_hint_bits;
+    // spec 7.9/7.20: this frame's own `ref_order_hints` -- the OrderHint
+    // of the picture sitting in each of its 7 single references' DPB
+    // slots, for this frame's *own* saved [`crate::motion_field::MotionField`]
+    // (a later frame projects from it) whether or not this frame itself
+    // reads temporal candidates.
+    let ref_order_hints = snap.ref_order_hints;
+
+    let (picture, end_cdfs, motion_field) = if header.frame_type == FrameType::Key {
+        let (picture, end_cdfs) = decode_key_frame_tile_with_cdfs(
+            &tile_bufs,
+            &header.tile_info,
+            header.mi_cols,
+            header.mi_rows,
+            header.quantization.base_q_idx,
+            crate::quant::QuantDeltas {
+                y_dc: i32::from(header.quantization.delta_q_y_dc),
+                u_dc: i32::from(header.quantization.delta_q_u_dc),
+                u_ac: i32::from(header.quantization.delta_q_u_ac),
+                v_dc: i32::from(header.quantization.delta_q_v_dc),
+                v_ac: i32::from(header.quantization.delta_q_v_ac),
+            },
+            header.frame_width,
+            header.frame_height,
+            enable_filter_intra,
+            enable_edge_filter,
+            &header.cdef,
+            &header.loop_filter,
+            &header.loop_restoration,
+            initial_cdfs,
+            header.tx_mode == TxMode::Select,
+            header.reduced_tx_set,
+            header.allow_screen_content_tools,
+            header.allow_intrabc,
+            header.delta, fctx,
+        )?;
+        // A key frame codes no inter blocks -- its own saved motion
+        // field has no cells set, matching libaom's own "intra frame
+        // contributes nothing to a later projection" behaviour, but
+        // still carries `order_hint`/`ref_order_hints` for the distance
+        // arithmetic a later frame's projection needs.
+        let motion_field = crate::motion_field::MotionField::new(
+            header.mi_cols as usize,
+            header.mi_rows as usize,
+            header.order_hint,
+            ref_order_hints,
+            // `frame_type` for the DPB slot: a key (or intra-only) frame is
+            // never a projection source, and never spends a `ref_stamp`.
+            true,
+        );
+        (picture, end_cdfs, motion_field)
+    } else {
+        let last_slot = header.ref_frame_idx[0] as usize;
+        let reference = snap.refs[last_slot].ok_or_else(|| {
+            Error::unsupported(
+                "AV1 decode_stream",
+                "an inter frame with no key frame before it",
+            )
+        })?;
+        // `ref_frame_idx[i]` names the DPB slot for `LAST_FRAME + i`
+        // (spec 7.8/7.20). Any of them having no picture yet is not a
+        // stream error on its own: `decode_inter_block` only needs a
+        // given slot when a block actually selects that reference, and
+        // refuses by name there if the slot is still empty -- widened
+        // (lane-av1refs) from `GOLDEN_FRAME`'s own slot alone to every
+        // one of the 7 single-reference slots.
+        // lane-fimv r1: record the header state the fimv gate asserts on
+        // (`motion_mode_allowed`'s `!cur_frame_force_integer_mv` clause).
+        if header.force_integer_mv {
+            decode::note_force_integer_mv_frame();
+        }
+        let other_refs: [Option<&Picture>; 8] = std::array::from_fn(|ref_frame| {
+            if ref_frame == 0 {
+                None
+            } else {
+                snap.refs
+                    .get(header.ref_frame_idx[ref_frame - 1] as usize)
+                    .copied()
+                    .flatten()
+            }
+        });
+        // spec 7.9's own driver, `av1_setup_motion_field`: only run when
+        // this frame's header actually asks for temporal candidates --
+        // `find_mv_stack_with_sign_bias` reproduces its old always-`None`
+        // behaviour bit for bit when this is `None` (see its own doc).
+        let tpl_field = &snap.tpl_field;
+        let (picture, end_cdfs, motion_field) = decode_inter_frame_tile_with_cdfs(
+            &tile_bufs,
+            &header.tile_info,
+            header.mi_cols,
+            header.mi_rows,
+            header.quantization.base_q_idx,
+            crate::quant::QuantDeltas {
+                y_dc: i32::from(header.quantization.delta_q_y_dc),
+                u_dc: i32::from(header.quantization.delta_q_u_dc),
+                u_ac: i32::from(header.quantization.delta_q_u_ac),
+                v_dc: i32::from(header.quantization.delta_q_v_dc),
+                v_ac: i32::from(header.quantization.delta_q_v_ac),
+            },
+            header.frame_width,
+            header.frame_height,
+            reference,
+            other_refs,
+            &header.cdef,
+            &header.loop_filter,
+            &header.loop_restoration,
+            initial_cdfs,
+            header.allow_high_precision_mv,
+            header.force_integer_mv,
+            header.ref_frame_sign_bias,
+            header.global_motion,
+            interp_fixed,
+            enable_dual_filter,
+            order_hint_bits,
+            header.order_hint,
+            ref_order_hints,
+            tpl_field.as_ref(),
+            header.reference_select,
+            enable_masked_compound,
+            enable_jnt_comp,
+            enable_interintra_compound,
+            header.skip_mode_present,
+            header.skip_mode_frame,
+            header.reduced_tx_set,
+            header.tx_mode == TxMode::Select,
+            header.is_motion_mode_switchable,
+            header.allow_warped_motion,
+            header.allow_screen_content_tools,
+            header.delta,
+            enable_filter_intra, fctx,
+        )?;
+        (picture, end_cdfs, motion_field)
+    };
+    // lane-lr r4: the Wiener/self-guided pixel filters are wired
+    // (`decode.rs::apply_loop_restoration`) -- no more refusal here,
+    // `uses_lr` frames now decode all the way to pixels.
+    // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
+    // *initial* table into the slots it refreshes, not the adapted
+    // end-of-tile one.
+    let stored_cdfs = if header.disable_frame_end_update_cdf {
+        started_from.unwrap_or_else(|| Cdfs::new(q_ctx_of(header.quantization.base_q_idx)))
+    } else {
+        // Spec 7.20 `save_cdfs` (libaom `av1_reset_cdf_symbol_counters`):
+        // the adapted table is saved with every symbol counter zeroed,
+        // not with the counts the tile's own decode left behind.
+        let mut end_cdfs = end_cdfs;
+        end_cdfs.reset_counts();
+        end_cdfs
+    };
+    if let Ok(path) = std::env::var("EC_AV1_DUMP_TABLES") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(f, "=== frame idx={} ===", shown_idx);
+            let _ = writeln!(f, "partition_w64 {:?}", stored_cdfs.partition_w64);
+            let _ = writeln!(f, "partition_w32 {:?}", stored_cdfs.partition_w32);
+            let _ = writeln!(f, "partition_w16 {:?}", stored_cdfs.partition_w16);
+            let _ = writeln!(f, "skip {:?}", stored_cdfs.skip);
+            let _ = writeln!(f, "new_mv {:?}", stored_cdfs.new_mv);
+            let _ = writeln!(f, "zero_mv {:?}", stored_cdfs.zero_mv);
+            let _ = writeln!(f, "ref_mv {:?}", stored_cdfs.ref_mv);
+            let _ = writeln!(f, "mv_joint {:?}", stored_cdfs.mv_joint);
+        }
+    }
+    // lane-comppin r3: decode-order (not display-order) dump of every
+    // frame's own post-deblock buffer -- the pre-existing pixel diff
+    // (`scratch_isolate_pinned_mismatch`) only ever compares *shown*
+    // frames, so a hidden reference (altref/bwdref) that DPB-corrupts a
+    // later shown frame is otherwise invisible; diff this byte-for-byte
+    // against `EC_AV1_POSTFILT_DUMP.fN` from the instrumented aomdec
+    // build to isolate whether the defect is in a hidden frame's own
+    // reconstruction or downstream of it.
+    if let Ok(path) = std::env::var("EC_AV1_DECODE_ORDER_DUMP") {
+        use std::io::Write;
+        let idx = decode_idx;
+        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+            // lane-hbd r4: debug dump narrows to u8 -- this diagnostic
+            // predates 10-bit support and is an 8-bit-oracle comparison
+            // only (aomdec's own dump is 8-bit here too).
+            let narrow = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
+            let _ = f.write_all(&narrow(&picture.y));
+            let _ = f.write_all(&narrow(&picture.u));
+            let _ = f.write_all(&narrow(&picture.v));
+        }
+    }
+    // lane-hidden r1: the frame exactly as it is about to be stored into
+    // the reference slots -- after deblock/CDEF/LR/superres, in DECODE
+    // order, hidden (`show_frame == 0`) alt-ref frames included, and
+    // bit-depth correct (8-bit as u8, 10/12-bit as u16 LE) unlike the
+    // u8-narrowing diagnostic dumps above. Matches the instrumented
+    // aomdec's own `EC_AV1_FINAL_DUMP` rung byte for byte
+    // (scripts/instrument-aom-oracle.sh rung 12), which is what makes a
+    // hidden frame's pixels comparable at all.
+    if let Some(prefix) = final_dump {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(format!("{prefix}.f{decode_idx}")) {
+            let mut buf = Vec::new();
+            for plane in [&picture.y, &picture.u, &picture.v] {
+                if bit_depth == 8 {
+                    buf.extend(plane.iter().map(|&s| s as u8));
+                } else {
+                    for &s in plane {
+                        buf.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+            }
+            let _ = f.write_all(&buf);
+        }
+    }
+    Ok(FrameOutput {
+        picture,
+        stored_cdfs,
+        motion_field,
+        seg_map: decode::take_segment_ids(fctx),
+    })
+}
 
 /// lane-intra14 r1: INTRA-coded 1:4 strips decoded on the INTER block path
 /// (64x16, 16x64, 32x8, 8x32) -- the counters a recipe sweep needs from
@@ -31773,6 +32134,71 @@ mod tests {
              (intra16x4_in_inter {} {} {}, refused shape)",
             fired64.0, fired64.1, fired16.0, fired16.1, fired16.2
         );
+    }
+
+    /// lane-thread2 (iv): frame-parallel decoding changes nothing a caller
+    /// can observe. Two real streams are decoded through
+    /// [`decode_stream_with_threads`] at 1 and at 4 threads and every sink
+    /// call is compared -- decode index, shown flag, and all three planes.
+    ///
+    /// `hg_arf_witness.obu` is the one that proves the parallel path: 18 of
+    /// its 40 coded frames are leaves of the reference graph (shown,
+    /// non-key, `refresh_frame_flags == 0`), so 18 frames really are decoded
+    /// off the main thread, and it carries hidden alt-refs, which is exactly
+    /// the case where "output in coded order" is not the same as "output in
+    /// the order workers finish". `palette_screen_witness.obu` is the
+    /// complement: an 8-bit screen stream whose every coded frame refreshes a
+    /// slot, so at 4 threads it dispatches NOTHING and pins that the threaded
+    /// entry point is byte-identical on the inline path too. The dispatch
+    /// counter is asserted in both directions, so neither arm can pass
+    /// vacuously.
+    #[test]
+    fn a_real_stream_decodes_identically_with_one_and_four_threads() {
+        const NAME: &str = "a_real_stream_decodes_identically_with_one_and_four_threads";
+        // (fixture, shown frames, leaf frames a 4-thread run must dispatch)
+        for (fixture, shown_frames, want_leaves) in [
+            ("fixtures/hg_arf_witness.obu", 37usize, 18usize),
+            ("fixtures/palette_screen_witness.obu", 15, 0),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            let run = |threads: usize| -> Vec<(usize, bool, Picture)> {
+                let mut out = Vec::new();
+                decode_stream_with_threads(&stream, threads, |p, idx, shown| {
+                    out.push((idx, shown, p.clone()));
+                    Ok(())
+                })
+                .unwrap_or_else(|e| panic!("{NAME}: {fixture} at {threads} threads refused: {e}"));
+                out
+            };
+            let serial = run(1);
+            let before = leaf_frames_dispatched();
+            let parallel = run(4);
+            let dispatched = leaf_frames_dispatched() - before;
+            assert_eq!(
+                dispatched, want_leaves,
+                "{NAME}: {fixture} dispatched {dispatched} leaf frames to workers, expected {want_leaves}"
+            );
+            assert_eq!(
+                serial.iter().filter(|f| f.1).count(),
+                shown_frames,
+                "{NAME}: {fixture} shown frames"
+            );
+            assert_eq!(
+                serial.len(),
+                parallel.len(),
+                "{NAME}: {fixture} sink call count differs"
+            );
+            for (i, (a, b)) in serial.iter().zip(&parallel).enumerate() {
+                assert_eq!(a.0, b.0, "{NAME}: {fixture} sink {i} decode index");
+                assert_eq!(a.1, b.1, "{NAME}: {fixture} sink {i} shown flag");
+                assert_eq!(a.2.y, b.2.y, "{NAME}: {fixture} sink {i} luma");
+                assert_eq!(a.2.u, b.2.u, "{NAME}: {fixture} sink {i} U");
+                assert_eq!(a.2.v, b.2.v, "{NAME}: {fixture} sink {i} V");
+            }
+            eprintln!("{NAME}: {fixture} {} sink calls identical, {dispatched} decoded on workers", serial.len());
+        }
     }
 
     /// lane-frame36 r2: the hidden-ARF witness. `crates/ec-av1/fixtures/
