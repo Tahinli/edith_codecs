@@ -200,11 +200,11 @@ pub fn search(
     block_w: usize,
     block_h: usize,
     pred_mv: (i32, i32),
-    lambda: f64,
+    lambda: f64, fctx: &crate::decode::FrameCtx,
 ) -> MotionSearch {
     let (result, _trace) = search_traced(
         reference, stride, ref_width, ref_height, source, block_x, block_y, block_w, block_h,
-        pred_mv, lambda,
+        pred_mv, lambda, fctx,
     );
     result
 }
@@ -224,7 +224,7 @@ fn search_traced(
     block_w: usize,
     block_h: usize,
     pred_mv: (i32, i32),
-    lambda: f64,
+    lambda: f64, fctx: &crate::decode::FrameCtx,
 ) -> (MotionSearch, Vec<f64>) {
     search_traced_from_step(
         reference,
@@ -238,7 +238,7 @@ fn search_traced(
         block_h,
         pred_mv,
         lambda,
-        SEARCH_INITIAL_STEP_PEL,
+        SEARCH_INITIAL_STEP_PEL, fctx,
     )
 }
 
@@ -258,7 +258,7 @@ fn search_traced_from_step(
     block_h: usize,
     pred_mv: (i32, i32),
     lambda: f64,
-    initial_step_pel: i32,
+    initial_step_pel: i32, fctx: &crate::decode::FrameCtx,
 ) -> (MotionSearch, Vec<f64>) {
     assert_eq!(source.len(), block_w * block_h, "source is one block");
     assert!(!reference.is_empty(), "a reference plane has samples");
@@ -274,7 +274,7 @@ fn search_traced_from_step(
         let y_q4 = (block_y as i32) * 16 + mv.0 * Q4_PER_Q3;
         predict(
             &reference16, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h,
-            &mut dst16,
+            &mut dst16, fctx,
         );
         let sad: f64 = source
             .iter()
@@ -401,6 +401,7 @@ mod tests {
 
     #[test]
     fn finds_exact_integer_translation_all_four_signs() {
+    let fctx = &crate::decode::FrameCtx::new();
         let width = 64;
         let height = 64;
         let (plane, _unused) = plane_and_block(width, height, 0, 0, 1, 1);
@@ -442,7 +443,7 @@ mod tests {
                 block_w,
                 block_h,
                 (0, 0),
-                0.1,
+                0.1, fctx,
             );
             assert_eq!(
                 result.mv,
@@ -454,6 +455,7 @@ mod tests {
 
     #[test]
     fn finds_half_pel_translation() {
+    let fctx = &crate::decode::FrameCtx::new();
         // A ramp, doubled, so every half-pel position lands on an exact
         // integer average of its two neighbours.
         let width = 40;
@@ -489,7 +491,7 @@ mod tests {
             block_w,
             block_h,
             (0, 0),
-            0.1,
+            0.1, fctx,
         );
         assert_eq!(
             result.mv,
@@ -500,6 +502,7 @@ mod tests {
 
     #[test]
     fn cost_is_monotone_non_increasing_over_the_search() {
+    let fctx = &crate::decode::FrameCtx::new();
         let width = 48;
         let height = 48;
         let (plane, _unused) = plane_and_block(width, height, 0, 0, 1, 1);
@@ -525,7 +528,7 @@ mod tests {
             block_w,
             block_h,
             (0, 0),
-            0.1,
+            0.1, fctx,
         );
         assert!(trace.len() > 1, "the search must run more than one round");
         for pair in trace.windows(2) {
@@ -559,6 +562,7 @@ mod tests {
     /// lands.
     #[test]
     fn sweep_initial_step() {
+    let fctx = &crate::decode::FrameCtx::new();
         let width = 96;
         let height = 96;
         let (plane, _unused) = plane_and_block(width, height, 0, 0, 1, 1);
@@ -593,7 +597,7 @@ mod tests {
                     block_h,
                     (0, 0),
                     0.1,
-                    candidate_step,
+                    candidate_step, fctx,
                 );
                 // Every round the trace recorded is 8 neighbour evaluations,
                 // the actual cost this starting step spent on this block.

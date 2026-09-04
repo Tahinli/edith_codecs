@@ -149,7 +149,7 @@ impl Edges {
         left: Option<&[u16]>,
         corner: Option<u16>,
         bw: usize,
-        bh: usize,
+        bh: usize, fctx: &crate::decode::FrameCtx,
     ) -> Self {
         let want = bw + bh;
         let extend = |samples: &[u16]| {
@@ -166,7 +166,7 @@ impl Edges {
         // comment block, lane-tiny r1; an earlier attempt at this fix used
         // 127/129 for the corner instead and made a passing 16x16 fixture
         // regress, which is what caught the misreading).
-        let base = 1i32 << (crate::decode::bit_depth() - 1);
+        let base = 1i32 << (crate::decode::bit_depth(fctx) - 1);
         let above_row = match (above, left) {
             (Some(a), _) => extend(a),
             (None, Some(l)) => vec![i32::from(l[0]); want],
@@ -272,7 +272,7 @@ pub fn predict(
     bh: usize,
     enable_edge_filter: bool,
     smooth_neighbor: bool,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     assert_eq!(dst.len(), bw * bh, "the destination is the block");
     match mode {
@@ -282,7 +282,7 @@ pub fn predict(
         PAETH_PRED => PAETH_PRED_HITS.with(|c| c.set(c.get() + 1)),
         _ => {}
     }
-    let edges = Edges::build(above, left, corner, bw, bh);
+    let edges = Edges::build(above, left, corner, bw, bh, fctx);
     let is_directional = matches!(
         mode,
         V_PRED | H_PRED | D45_PRED | D67_PRED | D113_PRED | D135_PRED | D157_PRED | D203_PRED
@@ -306,7 +306,7 @@ pub fn predict(
                 smooth_neighbor,
                 n_top,
                 n_left,
-                dst,
+                dst, fctx,
             );
             return;
         }
@@ -323,7 +323,7 @@ pub fn predict(
             let last_w = bw as i32 - 1;
             let last_h = bh as i32 - 1;
             let value = match mode {
-                DC_PRED => dc(above, left, bw, bh),
+                DC_PRED => dc(above, left, bw, bh, fctx),
                 V_PRED => edges.above(c),
                 H_PRED => edges.left(r),
                 SMOOTH_PRED => round2(
@@ -346,7 +346,7 @@ pub fn predict(
                 PAETH_PRED => paeth(edges.above(c), edges.left(r), edges.above(-1)),
                 other => panic!("intra mode {other} is not one this module predicts"),
             };
-            dst[row * bw + col] = value.clamp(0, crate::decode::sample_max()) as u16;
+            dst[row * bw + col] = value.clamp(0, crate::decode::sample_max(fctx)) as u16;
         }
     }
 }
@@ -463,7 +463,7 @@ fn filter_intra_edge(buf: &mut [i32], strength: i32) {
 /// result's `[0]` is spec position `-2`, `[2*i + 1]` the half-sample between
 /// `i - 1` and `i`, `[2*i + 2]` the original sample `i` moved to its doubled
 /// slot.
-fn upsample_intra_edge(buf: &[i32]) -> Vec<i32> {
+fn upsample_intra_edge(buf: &[i32], fctx: &crate::decode::FrameCtx) -> Vec<i32> {
     let sz = buf.len() - 1;
     let mut inp = vec![0i32; sz + 3];
     inp[0] = buf[0];
@@ -474,7 +474,7 @@ fn upsample_intra_edge(buf: &[i32]) -> Vec<i32> {
     out[0] = inp[0];
     for i in 0..sz {
         let s = -inp[i] + 9 * inp[i + 1] + 9 * inp[i + 2] - inp[i + 3];
-        out[2 * i + 1] = ((s + 8) >> 4).clamp(0, crate::decode::sample_max());
+        out[2 * i + 1] = ((s + 8) >> 4).clamp(0, crate::decode::sample_max(fctx));
         out[2 * i + 2] = inp[i + 2];
     }
     out
@@ -495,7 +495,7 @@ fn directional(
     smooth_neighbor: bool,
     n_top: usize,
     n_left: usize,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     let (w, h) = (bw as i32, bh as i32);
     let reach = w + h; // `av1_dr_prediction_z{1,3}_c`'s `max_base_{x,y}` reach.
@@ -541,7 +541,7 @@ fn directional(
     let above_up;
     let (above_buf, above_off): (&[i32], i32) = if need_above && upsample_above {
         let n_px = (w + if need_right { h } else { 0 }) as usize;
-        above_up = upsample_intra_edge(&above[..=n_px]);
+        above_up = upsample_intra_edge(&above[..=n_px], fctx);
         (&above_up, 2)
     } else {
         (&above, 1)
@@ -549,7 +549,7 @@ fn directional(
     let left_up;
     let (left_buf, left_off): (&[i32], i32) = if need_left && upsample_left {
         let n_px = (h + if need_bottom { w } else { 0 }) as usize;
-        left_up = upsample_intra_edge(&left[..=n_px]);
+        left_up = upsample_intra_edge(&left[..=n_px], fctx);
         (&left_up, 2)
     } else {
         (&left, 1)
@@ -608,7 +608,7 @@ fn directional(
                     blend(&left_at, y2 >> frac_bits_y, ((y2 << up_l) & 0x3F) >> 1)
                 }
             };
-            dst[(row * w + col) as usize] = value.clamp(0, crate::decode::sample_max()) as u16;
+            dst[(row * w + col) as usize] = value.clamp(0, crate::decode::sample_max(fctx)) as u16;
         }
     }
 }
@@ -622,7 +622,7 @@ fn directional(
 /// before `dc_predictor` averages, so a slice truncated short by the true
 /// frame edge must be extended by repetition here too, not averaged over its
 /// own shorter length.
-fn dc(above: Option<&[u16]>, left: Option<&[u16]>, bw: usize, bh: usize) -> i32 {
+fn dc(above: Option<&[u16]>, left: Option<&[u16]>, bw: usize, bh: usize, fctx: &crate::decode::FrameCtx) -> i32 {
     // lane-perf4: the replication is only ever *summed*, never indexed, so
     // the extended edge is a sum rather than the `Vec<u16>` it used to be
     // built as (two allocations per intra block, 0.9% of a 1080p decode's
@@ -642,7 +642,7 @@ fn dc(above: Option<&[u16]>, left: Option<&[u16]>, bw: usize, bh: usize) -> i32 
     let left = left.map(|l| extend(l, bh));
     let average = |sum: u32, count: u32| ((sum + (count >> 1)) / count) as i32;
     match (above, left) {
-        (None, None) => 1i32 << (crate::decode::bit_depth() - 1),
+        (None, None) => 1i32 << (crate::decode::bit_depth(fctx) - 1),
         (Some(a), None) => average(a, bw as u32),
         (None, Some(l)) => average(l, bh as u32),
         (Some(a), Some(l)) if bw == bh => {
@@ -779,12 +779,12 @@ pub fn predict_filter_intra(
     corner: Option<u16>,
     bw: usize,
     bh: usize,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     assert_eq!(dst.len(), bw * bh, "the destination is the block");
     assert_eq!(bw % 4, 0, "filter intra patches are 4 wide");
     assert_eq!(bh % 2, 0, "filter intra patches are 2 high");
-    let edges = Edges::build(above, left, corner, bw, bh);
+    let edges = Edges::build(above, left, corner, bw, bh, fctx);
     let taps = &FILTER_INTRA_TAPS[mode];
     // A (side+1)-square buffer: row 0 / column 0 hold the corner and the
     // above/left edges, `buffer[r+1][c+1]` the block's own sample at (r, c).
@@ -812,7 +812,7 @@ pub fn predict_filter_intra(
             for k in 0..8 {
                 let (r_off, c_off) = (k >> 2, k & 3);
                 let pr: i32 = taps[k].iter().zip(&p).map(|(t, s)| t * s).sum();
-                let value = round2(pr, FILTER_INTRA_SCALE_BITS).clamp(0, crate::decode::sample_max());
+                let value = round2(pr, FILTER_INTRA_SCALE_BITS).clamp(0, crate::decode::sample_max(fctx));
                 let idx = (r + r_off) * (bw + 1) + c + c_off;
                 buffer[idx] = value;
             }
@@ -991,6 +991,7 @@ mod tests {
     /// on three seeded random edges.
     #[test]
     fn filter_intra_matches_the_libaom_predictor_for_every_mode_and_shape() {
+    let fctx = &crate::decode::FrameCtx::new();
         // xorshift64*: a seeded stream, so a failure names one (shape, mode,
         // seed) triple that reproduces.
         let mut rng = |state: &mut u64| {
@@ -1017,7 +1018,7 @@ mod tests {
         ];
         let mut compared = 0u32;
         for bd in [8u32, 10] {
-            crate::decode::set_bit_depth(bd as u8);
+            crate::decode::set_bit_depth(bd as u8, fctx);
             let max = (1u32 << bd) - 1;
             for &(bw, bh) in &shapes {
                 for mode in 0..5usize {
@@ -1044,7 +1045,7 @@ mod tests {
                             Some(corner),
                             bw,
                             bh,
-                            &mut got,
+                            &mut got, fctx,
                         );
                         assert_eq!(
                             got, want,
@@ -1055,7 +1056,7 @@ mod tests {
                 }
             }
         }
-        crate::decode::set_bit_depth(8);
+        crate::decode::set_bit_depth(8, fctx);
         assert_eq!(compared, 2 * 14 * 5 * 3, "every shape/mode/seed was compared");
     }
 
@@ -1068,6 +1069,7 @@ mod tests {
     /// /tmp/intrarect_dump > lanes/intrarect_dump.expected.txt`).
     #[test]
     fn rect_predictors_match_c_dump() {
+    let fctx = &crate::decode::FrameCtx::new();
         let expected_txt = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../lanes/intrarect_dump.expected.txt"
@@ -1156,7 +1158,7 @@ mod tests {
                     bh,
                     false,
                     false,
-                    &mut dst,
+                    &mut dst, fctx,
                 );
                 let got = if name == "DC" {
                     u64::from(dst[0])
@@ -1184,7 +1186,7 @@ mod tests {
                             bh,
                             ef,
                             sn,
-                            &mut dst,
+                            &mut dst, fctx,
                         );
                         let got = checksum(&dst);
                         let key = ("DR", bw, bh, angle, i32::from(ef), i32::from(sn));
