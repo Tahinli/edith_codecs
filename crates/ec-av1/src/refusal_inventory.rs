@@ -43,7 +43,6 @@ const REFUSALS: &[&str] = &[
     "a 128x128 superblock partition value outside the 8-symbol alphabet",
     "an inter var-tx tree with a leaf transform larger than 64x64",
     "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
-    "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
     // lane-t900 r23: palette RECONSTRUCTION now covers the key-frame paths
     // (earlier lanes), the intra-in-inter square/rect paths (r22) and the
@@ -381,16 +380,6 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
         "a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact",
-    ),
-    // lane-t900 r33, CENSUS (reached -- a pinned capability gap): all four
-    // `--sb-size=128` exact-repetition screen arms code
-    // `use_128x128_superblock && allow_intrabc`, and every one of them reaches
-    // this refusal by name. The lift is a decode.rs change (the block-vector
-    // delay of `av1_is_dv_valid` is superblock-sized) with a waiting witness,
-    // `an_sb128_screen_stream_with_intrabc_decodes_pixel_exact` (ignored).
-    (
-        "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
-        "an_sb128_screen_census_measures_the_sb128_intrabc_refusal",
     ),
     // lane-t900 r33, CENSUS: the `use_intrabc` symbol IS read at the sub-8
     // reader for every sub-8x8 leaf of an `allow_intrabc` frame, and over the

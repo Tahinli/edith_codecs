@@ -4694,31 +4694,32 @@ mod tests {
         (sb128, intrabc)
     }
 
-    /// lane-t900 r33, CENSUS for "intrabc under a 128x128 superblock".
+    /// lane-t900 r34, the WITNESS (r33 pinned it ignored) that intrabc under
+    /// a 128x128 superblock decodes pixel-exact.
     ///
-    /// Unlike every other refusal in the inventory this one is decided in the
-    /// FRAME HEADER, before a single block symbol: `use_128x128_superblock &&
-    /// allow_intrabc`. So the census question is only whether a real encoder
-    /// writes that conjunction -- if it does, the refusal is a capability gap
-    /// (this decoder hardcodes the block-vector delay of `av1_is_dv_valid` to
-    /// a 64-px superblock) and the arm that reaches it is pinned here; if no
-    /// arm does, the string is measured against the domain instead of assumed.
+    /// All four arms of r33's census -- `--sb-size=128 --tune-content=screen
+    /// --enable-intrabc=1` over both `--enable-tx-size-search` settings and
+    /// two quantisers, on a 2x2 tiling of a 128x96 bar pattern (256x192,
+    /// 8-bit, `--cpu-used=0 --min-partition-size=8 --max-partition-size=32`,
+    /// rect and 1:4 off) -- code `use_128x128_superblock && allow_intrabc`.
     ///
-    /// The four arms are the exact-repetition recipe that is the ONLY shape
-    /// known to keep `allow_intrabc` past libaom's own RD (lane-t900 r31: on
-    /// non-repeating content, `--enable-tx-size-search=1` makes RD drop
-    /// intrabc and libaom clears the bit again), with `--sb-size=128` and both
-    /// tx-size-search settings over two quantisers.
+    /// The lift was one constant: `av1_find_ref_dv` (mvref_common.c) takes
+    /// `mib_size`, the SEQUENCE's superblock size in mi units, so the
+    /// fallback DV is one 128-px superblock up (or 128 + `INTRABC_DELAY_PIXELS`
+    /// left on the tile's first superblock row) under a 128 superblock, where
+    /// [`crate::decode::read_intrabc_dv`] hardcoded 64. Every arm is compared
+    /// to ffmpeg and the decoded-intrabc-block counter is asserted non-zero,
+    /// so a stream that stopped using intrabc could not make this vacuous.
     #[test]
-    fn an_sb128_screen_census_measures_the_sb128_intrabc_refusal() {
-        const NAME: &str = "an_sb128_screen_census_measures_the_sb128_intrabc_refusal";
+    fn an_sb128_screen_stream_with_intrabc_decodes_pixel_exact() {
+        const NAME: &str = "an_sb128_screen_stream_with_intrabc_decodes_pixel_exact";
         if !have_ffmpeg() || !have_aomenc() {
             eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
             return;
         }
         let (width, height) = (256usize, 192usize);
-        let (mut premise_arms, mut reached, mut decoded_arms, mut frames_compared) =
-            (0u32, 0u32, 0u32, 0u32);
+        let _guard = lock_gate_counters();
+        let (mut blocks_total, mut frames_compared) = (0usize, 0u32);
         for txs in ["0", "1"] {
             for cq in ["30", "45"] {
                 let arm = format!("sb128 txs={txs} cq={cq}");
@@ -4731,102 +4732,35 @@ mod tests {
                     &["--sb-size=128"],
                 );
                 let (sb128, intrabc_frames) = sb128_and_intrabc_frames(&stream);
-                assert!(sb128, "{NAME}: {arm}: aomenc ignored --sb-size=128");
-                if intrabc_frames > 0 {
-                    premise_arms += 1;
+                assert!(
+                    sb128 && intrabc_frames > 0,
+                    "{NAME}: {arm} no longer codes sb128 + allow_intrabc"
+                );
+                crate::decode::reset_intrabc_hits();
+                let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {arm}: {e}"));
+                let blocks = crate::decode::intrabc_hits();
+                blocks_total += blocks;
+                let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+                assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
+                for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+                    assert!(
+                        ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
+                        "{NAME}: {arm} frame {i} does not match ffmpeg"
+                    );
+                    frames_compared += 1;
                 }
-                match decode_stream(&stream) {
-                    Ok(frames) => {
-                        decoded_arms += 1;
-                        let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
-                        assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
-                        for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
-                            assert!(
-                                ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
-                                "{NAME}: {arm} frame {i} does not match ffmpeg"
-                            );
-                            frames_compared += 1;
-                        }
-                        eprintln!(
-                            "{NAME}: {arm} sb128={sb128} intrabc_frames={intrabc_frames} \
-                             DECODED {} frame(s) exact",
-                            frames.len()
-                        );
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        assert!(msg.contains("unsupported"), "{NAME}: {arm} decode failed: {e}");
-                        if msg.contains("intrabc under a 128x128 superblock") {
-                            reached += 1;
-                        }
-                        eprintln!(
-                            "{NAME}: {arm} sb128={sb128} intrabc_frames={intrabc_frames} \
-                             REFUSED: {e}"
-                        );
-                    }
-                }
+                eprintln!(
+                    "{NAME}: {arm} intrabc_frames={intrabc_frames} intrabc_blocks={blocks} \
+                     DECODED {} frame(s) exact",
+                    frames.len()
+                );
             }
         }
-        eprintln!(
-            "{NAME}: {premise_arms}/4 arm(s) code allow_intrabc under a 128x128 superblock, \
-             {reached} reach the refusal, {decoded_arms} arm(s) decoded \
-             ({frames_compared} frames exact)"
-        );
+        assert!(frames_compared > 0, "{NAME}: no frame was compared");
         assert!(
-            premise_arms + decoded_arms > 0,
-            "{NAME}: census is vacuous -- no arm produced a decodable or premise-carrying stream"
+            blocks_total > 0,
+            "{NAME}: gate is vacuous -- no arm decoded a single intrabc block"
         );
-        assert_eq!(
-            reached, premise_arms,
-            "{NAME}: the refusal is the CONJUNCTION of the two header bits, so every arm \
-             carrying it must reach the refusal and no other arm may"
-        );
-    }
-
-    /// lane-t900 r33, the WAITING witness for the capability gap
-    /// [`an_sb128_screen_census_measures_the_sb128_intrabc_refusal`] pins:
-    /// FIRST BAD is `--sb-size=128 --tune-content=screen --enable-intrabc=1
-    /// --enable-tx-size-search=0 --cq-level=30` on a 2x2 tiling of a 128x96
-    /// bar pattern (256x192, 8-bit, `--cpu-used=0 --min-partition-size=8
-    /// --max-partition-size=32 --enable-rect-partitions=0
-    /// --enable-1to4-partitions=0`) -- all four arms of the census code
-    /// `use_128x128_superblock && allow_intrabc`, so the refusal names a
-    /// configuration real aomenc writes at its FIRST attempt, not a corner.
-    ///
-    /// Lifting it is a `decode.rs` change this lane is not allowed to make:
-    /// `av1_is_dv_valid` derives the block-vector delay (`sb_size` wide
-    /// `INTRABC_DELAY_PIXELS`, the wavefront the valid-DV region is offset
-    /// by) from the SUPERBLOCK SIZE, which this decoder hardcodes to 64, so
-    /// every DV bound and every intrabc source fetch under a 128 superblock
-    /// is computed against the wrong wavefront. Ignored until that lands.
-    #[test]
-    #[ignore = "capability gap: intrabc's block-vector delay is hardcoded to a 64-px superblock"]
-    fn an_sb128_screen_stream_with_intrabc_decodes_pixel_exact() {
-        const NAME: &str = "an_sb128_screen_stream_with_intrabc_decodes_pixel_exact";
-        if !have_ffmpeg() || !have_aomenc() {
-            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
-            return;
-        }
-        let (width, height) = (256usize, 192usize);
-        let stream = screen_intrabc_stream_with(
-            "smptebars=size=128x96:rate=25",
-            "30",
-            "0",
-            true,
-            true,
-            &["--sb-size=128"],
-        );
-        let (sb128, intrabc_frames) = sb128_and_intrabc_frames(&stream);
-        assert!(sb128 && intrabc_frames > 0, "{NAME}: the first-bad recipe no longer codes it");
-        let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: {e}"));
-        let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
-        assert_eq!(frames.len(), theirs.len(), "{NAME}: frame count");
-        for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
-            assert!(
-                ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
-                "{NAME}: frame {i} does not match ffmpeg"
-            );
-        }
     }
 
     /// lane-t900 r33, CENSUS for "a sub-8x8 leaf that uses intrabc".
