@@ -235,6 +235,33 @@ const PROVEN: &[(&str, &str)] = &[
         "a 128x128 superblock partition value outside the 8-symbol alphabet",
         "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
     ),
+    // lane-t900 r24, enumeration: the key-frame superblock root's own `match`
+    // has an arm for all ten `partition_w64` values.
+    (
+        "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
+        "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+    ),
+    // lane-t900 r24, enumeration: the inter 16x16-level if/else chain's
+    // branches name all ten `partition_w16` values between them.
+    (
+        "an inter 16x16-level partition value outside NONE/HORZ/VERT/SPLIT/AB/1:4",
+        "every_partition_value_of_an_if_chain_alphabet_is_named_by_a_branch",
+    ),
+    // lane-t900 r24, enumeration: every (CDF width, symbol) pair a tx_type row
+    // can present maps to a distinct member of that width's own set.
+    (
+        "a tx_type symbol outside its CDF's own set: {t}",
+        "every_tx_type_symbol_of_every_cdf_width_maps_into_its_own_set",
+    ),
+    // lane-t900 r24, enumeration: the reader covers spec 5.11.40's whole value
+    // domain (`0..=(1 << 20) - 2`, both ends of every prefix length), so the
+    // refusal is outside it. What it still names is a bit pattern no encoder
+    // writes -- a 20th prefix bit of 0, which the spec's `length == 20` break
+    // makes a don't-care.
+    (
+        "a Golomb tail longer than this decoder reads",
+        "read_golomb_reads_every_value_a_conformant_stream_can_carry",
+    ),
     (
         "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         "a_twelve_bit_sequence_header_is_refused_by_name",
@@ -422,6 +449,41 @@ mod tests {
         );
     }
 
+    /// The partition alphabet, in CDF symbol order.
+    const PARTITION_NAMES: [&str; 10] = [
+        "PARTITION_NONE",
+        "PARTITION_HORZ",
+        "PARTITION_VERT",
+        "PARTITION_SPLIT",
+        "PARTITION_HORZ_A",
+        "PARTITION_HORZ_B",
+        "PARTITION_VERT_A",
+        "PARTITION_VERT_B",
+        "PARTITION_HORZ_4",
+        "PARTITION_VERT_4",
+    ];
+
+    /// The partition values a `match` arm pattern -- or an `if` chain's
+    /// condition -- names: its own tokens, plus every value of an inclusive
+    /// range (`(PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&p)` is four
+    /// values in one). Tokenised, never `contains()`d: a misspelled constant
+    /// in a match pattern is an irrefutable binding that compiles and swallows
+    /// the alphabet, and a substring check would call that covered.
+    fn partition_values_named(head: &str) -> BTreeSet<usize> {
+        let mut out = BTreeSet::new();
+        let idx: Vec<usize> = head
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter_map(|tok| PARTITION_NAMES.iter().position(|n| *n == tok))
+            .collect();
+        if head.contains("..=") && idx.len() == 2 {
+            for v in idx[0]..=idx[1] {
+                out.insert(v);
+            }
+        }
+        out.extend(idx);
+        out
+    }
+
     /// The partition alphabets, enumerated against the arms that code them.
     ///
     /// A partition value is a CDF symbol, and `SymbolDecoder::symbol_fixed`
@@ -443,42 +505,20 @@ mod tests {
     /// ladder rather than a match, so it needs its own enumerator.
     #[test]
     fn every_partition_value_of_an_enumerated_alphabet_has_an_arm() {
-        const NAMES: [&str; 10] = [
-            "PARTITION_NONE",
-            "PARTITION_HORZ",
-            "PARTITION_VERT",
-            "PARTITION_SPLIT",
-            "PARTITION_HORZ_A",
-            "PARTITION_HORZ_B",
-            "PARTITION_VERT_A",
-            "PARTITION_VERT_B",
-            "PARTITION_HORZ_4",
-            "PARTITION_VERT_4",
-        ];
         // (the refusal in the fallback arm, the alphabet its CDF codes)
-        let blocks: [(&str, usize); 3] = [
+        let blocks: [(&str, usize); 4] = [
             ("a 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
             ("an INTER 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
             ("a 128x128 superblock partition value outside the 8-symbol alphabet", crate::cdf::PARTITION_W128[0].len() - 1),
+            // lane-t900 r24: the key-frame superblock root. Its `part` is
+            // either a `partition_w64` symbol or, at a frame edge, one of the
+            // three gathered outcomes (PARTITION_HORZ, PARTITION_VERT,
+            // PARTITION_SPLIT) -- all inside the same ten-value alphabet.
+            (
+                "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
+                crate::cdf::PARTITION_W64[0].len() - 1,
+            ),
         ];
-        // A pattern's own tokens, plus every value of an inclusive range
-        // (`p if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&p)` is four
-        // arms in one).
-        let covered = |head: &str| -> BTreeSet<usize> {
-            let mut out = BTreeSet::new();
-            let idx: Vec<usize> = head
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .filter_map(|tok| NAMES.iter().position(|n| *n == tok))
-                .collect();
-            if head.contains("..=") && idx.len() == 2 {
-                for v in idx[0]..=idx[1] {
-                    out.insert(v);
-                }
-            }
-            out.extend(idx);
-            out
-        };
-
         let src = include_str!("decode.rs");
         let lines: Vec<&str> = src.lines().collect();
         let indent = |l: &str| l.len() - l.trim_start().len();
@@ -509,7 +549,7 @@ mod tests {
                     continue;
                 }
                 in_fallback = l.trim_start().starts_with("_ =>");
-                arms.extend(covered(l.split("=>").next().unwrap_or("")));
+                arms.extend(partition_values_named(l.split("=>").next().unwrap_or("")));
             }
             let Some((reason, alphabet)) =
                 blocks.iter().find(|(reason, _)| fallback.contains(reason))
@@ -523,13 +563,249 @@ mod tests {
                 "the `match` at decode.rs:{} refuses {reason:?} but has no arm for {:?} -- that \
                  is a real gap in its {alphabet}-value alphabet, not a dead refusal",
                 i + 1,
-                missing.iter().map(|v| NAMES[*v]).collect::<Vec<_>>()
+                missing.iter().map(|v| PARTITION_NAMES[*v]).collect::<Vec<_>>()
             );
         }
         assert_eq!(
             found,
             blocks.len(),
             "not every enumerated partition refusal was located in decode.rs"
+        );
+    }
+
+    /// The same enumeration for a partition refusal that sits in an `if`
+    /// chain rather than a `match` fallback.
+    ///
+    /// The inter 16x16-level ladder tests `part16` against constants arm by
+    /// arm and refuses in its second-to-last branch, with `PARTITION_SPLIT`
+    /// left to the final `else`. Nothing about that shape is weaker than a
+    /// `match`: `part16` is a `partition_w16` symbol (or, at a frame edge, a
+    /// gathered value of the same alphabet), so if the chain's conditions
+    /// between them name every value of that alphabet, the refusing branch is
+    /// unreachable.
+    ///
+    /// The conditions are read from the source, tokenised (never
+    /// substring-matched -- lane-t900 r21), and a condition carrying `&&` is
+    /// rejected outright: a value it names is only conditionally handled, and
+    /// counting it would overstate the coverage.
+    #[test]
+    fn every_partition_value_of_an_if_chain_alphabet_is_named_by_a_branch() {
+        // (the refusal in the chain's refusing branch, the alphabet its CDF codes)
+        let chains: [(&str, usize); 1] = [(
+            "an inter 16x16-level partition value outside NONE/HORZ/VERT/SPLIT/AB/1:4",
+            crate::cdf::PARTITION_W16[0].len() - 1,
+        )];
+
+        let src = include_str!("decode.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let mut found = 0usize;
+        for (reason, alphabet) in chains {
+            let refusal = lines
+                .iter()
+                .position(|l| l.contains(reason))
+                .unwrap_or_else(|| panic!("{reason:?} is not in decode.rs"));
+            // The branch that carries the refusal: the nearest `} else if`
+            // above it. Its indentation is the chain's own.
+            let head = (0..refusal)
+                .rev()
+                .find(|&i| lines[i].trim_start().starts_with("} else if "))
+                .unwrap_or_else(|| panic!("{reason:?} is not inside an if/else chain"));
+            let outer = indent(lines[head]);
+            let var = lines[head].trim_start()["} else if ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            assert!(!var.is_empty(), "the chain at decode.rs:{} tests nothing", head + 1);
+
+            // Walk up collecting every branch head of this chain, each read to
+            // the line that opens its body.
+            let mut named = BTreeSet::new();
+            let mut i = head + 1;
+            let mut heads = 0usize;
+            loop {
+                i -= 1;
+                let t = lines[i].trim_start();
+                if indent(lines[i]) != outer || !(t.starts_with("} else if ") || t.starts_with("if "))
+                {
+                    if i == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let mut cond = String::new();
+                for l in &lines[i..] {
+                    cond.push(' ');
+                    cond.push_str(l.trim());
+                    if l.trim_end().ends_with('{') {
+                        break;
+                    }
+                }
+                assert!(
+                    cond.contains(&var),
+                    "the branch at decode.rs:{} sits in the chain that refuses {reason:?} but \
+                     does not test {var}",
+                    i + 1
+                );
+                assert!(
+                    !cond.contains("&&"),
+                    "the branch at decode.rs:{} handles its partition values only conditionally \
+                     ({cond:?}) -- the enumeration below would overstate what the chain covers",
+                    i + 1
+                );
+                named.extend(partition_values_named(&cond));
+                heads += 1;
+                if t.starts_with("if ") {
+                    break;
+                }
+                assert!(i > 0, "the chain that refuses {reason:?} has no start");
+            }
+            // The value the refusing branch excludes (`part16 != PARTITION_SPLIT`)
+            // is handled by the chain's final `else`, so require one.
+            let close = " ".repeat(outer) + "} else {";
+            assert!(
+                lines[refusal..].iter().any(|l| *l == close),
+                "the chain that refuses {reason:?} has no final `else`, so the value its \
+                 refusing branch excludes is handled nowhere"
+            );
+            assert!(heads >= 2, "only {heads} branch(es) found for {reason:?}");
+            found += 1;
+            let missing: Vec<usize> = (0..alphabet).filter(|v| !named.contains(v)).collect();
+            assert!(
+                missing.is_empty(),
+                "the chain at decode.rs:{} refuses {reason:?} but no branch names {:?} -- that \
+                 is a real gap in its {alphabet}-value alphabet, not a dead refusal",
+                head + 1,
+                missing.iter().map(|v| PARTITION_NAMES[*v]).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(found, chains.len());
+    }
+
+    /// Every `tx_type` symbol of every CDF width, mapped through the set that
+    /// width names.
+    ///
+    /// The reader decodes `t` from a row of `n` slots, so `t` is in
+    /// `0..n - 1`, and hands `(n, t)` to [`crate::decode::tx_type_from_symbol`]
+    /// -- the readers' own mapping, called here rather than transcribed
+    /// (class `shared-oracle-blindness`: a second copy of a table can be
+    /// self-consistently wrong). The widths are read from `cdf_state.rs`'s
+    /// `tx_type` field declarations, so a new table with a width the mapping
+    /// does not name fails this test rather than reaching the refusal at
+    /// runtime.
+    ///
+    /// Distinctness is part of the claim: a set of `n - 1` symbols must map to
+    /// `n - 1` DIFFERENT transform types, or the mapping has lost a member of
+    /// the spec's `Tx_Type_*_Inv_Set*` even while every symbol resolves.
+    #[test]
+    fn every_tx_type_symbol_of_every_cdf_width_maps_into_its_own_set() {
+        let mut widths: BTreeSet<usize> = BTreeSet::new();
+        for line in include_str!("cdf_state.rs").lines() {
+            let t = line.trim();
+            if !(t.starts_with("pub ") && t.contains("tx_type") && t.contains("[u16;")) {
+                continue;
+            }
+            let tail = t.rsplit("[u16;").next().unwrap_or("");
+            let n: usize = tail
+                .split(']')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("cannot read a CDF width out of {t:?}"));
+            widths.insert(n);
+        }
+        assert!(
+            widths.len() >= 4,
+            "the cdf_state.rs scan found only {widths:?} -- it is broken, not the decoder"
+        );
+        for &n in &widths {
+            let nsyms = n - 1;
+            let mut set: Vec<crate::transform::TxType> = Vec::new();
+            for t in 0..nsyms {
+                let ty = crate::decode::tx_type_from_symbol(n, t).unwrap_or_else(|| {
+                    panic!(
+                        "a {n}-slot tx_type CDF codes symbol {t}, which maps to no transform \
+                         type -- the refusal \"a tx_type symbol outside its CDF's own set\" is \
+                         reachable, and that is a mapping-table gap to fix"
+                    )
+                });
+                assert!(
+                    !set.contains(&ty),
+                    "a {n}-slot tx_type CDF maps symbol {t} to {ty:?}, which another symbol of \
+                     the same set already names -- a member of the spec's inverse table is lost"
+                );
+                set.push(ty);
+            }
+            assert_eq!(set.len(), nsyms);
+        }
+    }
+
+    /// The Golomb tail, enumerated over every value a conformant stream can
+    /// carry.
+    ///
+    /// Spec 5.11.40 `read_golomb` counts its unary prefix and BREAKS at
+    /// `length == 20`, then reads `length - 1` payload bits into an `x` whose
+    /// top bit is implicit -- so no conformant stream carries a value above
+    /// `(1 << 20) - 2`, and spec 5.11.39 agrees from the other side by masking
+    /// the level it feeds with `0xFFFFF`. This walks both ends of every
+    /// prefix length 1..=20 (plus the small values every real stream uses)
+    /// through [`crate::tile::write_golomb`] and back through the decoder's own
+    /// [`crate::decode::read_golomb`], so the refusal "a Golomb tail longer
+    /// than this decoder reads" is proved to sit strictly OUTSIDE the value
+    /// domain, not inside it.
+    ///
+    /// The residue is a bit pattern, not a value: the spec's break makes the
+    /// 20th prefix bit a don't-care, so a stream whose 20th prefix bit is 0
+    /// decodes to the same value there and is refused here. Every encoder
+    /// writes the terminating 1 (our own writer tops out at 19 zeros), and
+    /// lifting the cap is blocked on the defect it currently masks -- see the
+    /// comment on `read_golomb`.
+    #[test]
+    fn read_golomb_reads_every_value_a_conformant_stream_can_carry() {
+        let roundtrip = |value: u32| -> ec_core::Result<u32> {
+            let mut enc = crate::msac::SymbolEncoder::new();
+            crate::tile::write_golomb(&mut enc, value);
+            let data = enc.finish();
+            let mut dec = crate::msac::SymbolDecoder::new(&data);
+            crate::decode::read_golomb(&mut dec)
+        };
+        let mut values: BTreeSet<u32> = (0..=64u32).collect();
+        for length in 1..=20u32 {
+            // `x` has `length` bits with its top bit set, and the value is
+            // `x - 1`: the two ends of what this prefix length can express.
+            values.insert((1u32 << (length - 1)) - 1);
+            values.insert(((1u64 << length) - 2) as u32);
+        }
+        let max = *values.iter().max().unwrap();
+        assert_eq!(max, (1u32 << 20) - 2, "the enumeration misses the spec's own ceiling");
+        // A coefficient is masked to 20 bits (spec 5.11.39), and the base and
+        // base-range syntax contribute at most 15 of that before the tail, so
+        // this is the largest tail a legal coefficient can need.
+        assert!(max >= 0xF_FFFF - 15, "the ceiling is below the largest legal tail");
+        for value in values {
+            match roundtrip(value) {
+                Ok(read) => assert_eq!(read, value, "the Golomb tail {value} read back as {read}"),
+                Err(e) => panic!(
+                    "the Golomb tail {value} is inside the domain spec 5.11.40 can write but \
+                     this decoder refuses it: {e}"
+                ),
+            }
+        }
+        // And the refusal still names something: 20 zero prefix bits.
+        let mut enc = crate::msac::SymbolEncoder::new();
+        for _ in 0..20 {
+            enc.literal(0, 1);
+        }
+        for _ in 0..20 {
+            enc.literal(1, 1);
+        }
+        let data = enc.finish();
+        let mut dec = crate::msac::SymbolDecoder::new(&data);
+        assert!(
+            crate::decode::read_golomb(&mut dec).is_err(),
+            "the Golomb refusal is dead code -- drop it from the inventory"
         );
     }
 
