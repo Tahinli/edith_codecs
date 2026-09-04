@@ -247,6 +247,12 @@ const PROVEN: &[(&str, &str)] = &[
         "an inter 16x16-level partition value outside NONE/HORZ/VERT/SPLIT/AB/1:4",
         "every_partition_value_of_an_if_chain_alphabet_is_named_by_a_branch",
     ),
+    // lane-t900 r24, enumeration: every (CDF width, symbol) pair a tx_type row
+    // can present maps to a distinct member of that width's own set.
+    (
+        "a tx_type symbol outside its CDF's own set: {t}",
+        "every_tx_type_symbol_of_every_cdf_width_maps_into_its_own_set",
+    ),
     (
         "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         "a_twelve_bit_sequence_header_is_refused_by_name",
@@ -666,6 +672,65 @@ mod tests {
             );
         }
         assert_eq!(found, chains.len());
+    }
+
+    /// Every `tx_type` symbol of every CDF width, mapped through the set that
+    /// width names.
+    ///
+    /// The reader decodes `t` from a row of `n` slots, so `t` is in
+    /// `0..n - 1`, and hands `(n, t)` to [`crate::decode::tx_type_from_symbol`]
+    /// -- the readers' own mapping, called here rather than transcribed
+    /// (class `shared-oracle-blindness`: a second copy of a table can be
+    /// self-consistently wrong). The widths are read from `cdf_state.rs`'s
+    /// `tx_type` field declarations, so a new table with a width the mapping
+    /// does not name fails this test rather than reaching the refusal at
+    /// runtime.
+    ///
+    /// Distinctness is part of the claim: a set of `n - 1` symbols must map to
+    /// `n - 1` DIFFERENT transform types, or the mapping has lost a member of
+    /// the spec's `Tx_Type_*_Inv_Set*` even while every symbol resolves.
+    #[test]
+    fn every_tx_type_symbol_of_every_cdf_width_maps_into_its_own_set() {
+        let mut widths: BTreeSet<usize> = BTreeSet::new();
+        for line in include_str!("cdf_state.rs").lines() {
+            let t = line.trim();
+            if !(t.starts_with("pub ") && t.contains("tx_type") && t.contains("[u16;")) {
+                continue;
+            }
+            let tail = t.rsplit("[u16;").next().unwrap_or("");
+            let n: usize = tail
+                .split(']')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("cannot read a CDF width out of {t:?}"));
+            widths.insert(n);
+        }
+        assert!(
+            widths.len() >= 4,
+            "the cdf_state.rs scan found only {widths:?} -- it is broken, not the decoder"
+        );
+        for &n in &widths {
+            let nsyms = n - 1;
+            let mut set: Vec<crate::transform::TxType> = Vec::new();
+            for t in 0..nsyms {
+                let ty = crate::decode::tx_type_from_symbol(n, t).unwrap_or_else(|| {
+                    panic!(
+                        "a {n}-slot tx_type CDF codes symbol {t}, which maps to no transform \
+                         type -- the refusal \"a tx_type symbol outside its CDF's own set\" is \
+                         reachable, and that is a mapping-table gap to fix"
+                    )
+                });
+                assert!(
+                    !set.contains(&ty),
+                    "a {n}-slot tx_type CDF maps symbol {t} to {ty:?}, which another symbol of \
+                     the same set already names -- a member of the spec's inverse table is lost"
+                );
+                set.push(ty);
+            }
+            assert_eq!(set.len(), nsyms);
+        }
     }
 
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
