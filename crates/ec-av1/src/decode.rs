@@ -4133,6 +4133,27 @@ fn dc_sign_ctx(vote: i32) -> usize {
     }
 }
 
+/// The `tx_type` a CDF symbol names, given the width of the row it was read
+/// from.
+///
+/// The row's own width names its set (spec `Tx_Type_Intra_Inv_Set*` /
+/// `Tx_Type_Inter_Inv_Set*`): 17 slots (16 symbols) is `EXT_TX_SET_ALL16`, 13
+/// (12) `EXT_TX_SET_DTT9_IDTX_1DDCT`, 8 (7) `TX_SET_INTRA_1`, and everything
+/// narrower the reduced `TX_SET_INTRA_2`/`TX_SET_INTER_3` order, whose two
+/// members are a prefix of the five.
+///
+/// One function rather than a `match` at each reader, so
+/// [`crate::refusal_inventory`]'s enumeration of every (width, symbol) pair
+/// tests the mapping the readers actually use.
+pub(crate) fn tx_type_from_symbol(cdf_len: usize, t: usize) -> Option<TxType> {
+    match cdf_len {
+        17 => TxType::from_symbol_all16(t),
+        13 => TxType::from_symbol_set2_12(t),
+        8 => TxType::from_symbol_set1(t),
+        _ => TxType::from_symbol(t),
+    }
+}
+
 /// The remainder of a level the base and base-range syntax could not reach
 /// (spec 5.11.40): its bit length in unary, then that many of its own bits,
 /// most significant first — the exact inverse of [`crate::tile::write_golomb`].
@@ -4327,13 +4348,8 @@ fn read_coeffs(
         if trace {
             eprintln!("TRACE tx_type value={t} len={len}");
         }
-        tx_type = match len {
-            17 => TxType::from_symbol_all16(t),
-            13 => TxType::from_symbol_set2_12(t),
-            8 => TxType::from_symbol_set1(t),
-            _ => TxType::from_symbol(t),
-        }
-        .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
+        tx_type = tx_type_from_symbol(len, t)
+            .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
     }
 
     let class = TxClass::of(tx_type);
@@ -4512,13 +4528,8 @@ fn read_coeffs_rect(
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
         let len = tx_type_cdf.len();
         let t = dec.symbol(tx_type_cdf);
-        tx_type = match len {
-            17 => TxType::from_symbol_all16(t),
-            13 => TxType::from_symbol_set2_12(t),
-            8 => TxType::from_symbol_set1(t),
-            _ => TxType::from_symbol(t),
-        }
-        .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
+        tx_type = tx_type_from_symbol(len, t)
+            .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
         if rect_trace {
             eprintln!("EC_COEFF_STEP tag=tx_type plane=0 rng={}", dec.debug_state().0);
         }
