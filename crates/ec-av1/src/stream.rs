@@ -281,7 +281,11 @@ pub fn decode_stream_with(
     // luma-only (chroma coincidentally shares this fixture's flat regions)
     // and small-magnitude (the two pictures mostly agree), which is exactly
     // what made it look like a rounding bug rather than a wrong reference.
-    let mut ref_slots: [Option<Picture>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
+    // lane-perf9: the DPB holds each picture behind an `Arc`, so a frame whose
+    // `refresh_frame_flags` names several slots (a key frame names all eight)
+    // stores eight pointers instead of eight ~25 MB 4K picture copies.
+    let mut ref_slots: [Option<std::sync::Arc<Picture>>; NUM_REF_FRAMES] =
+        std::array::from_fn(|_| None);
     // lane-av1tmvp: each of the 8 reference slots' own saved temporal motion
     // field (spec 7.9's per-frame `MotionFieldMvs` storage, libaom
     // `cur_frame->mvs`) plus the `OrderHint` the picture in that slot was
@@ -371,7 +375,7 @@ pub fn decode_stream_with(
                     bit_depth as u32,
                 )
             } else {
-                picture
+                (*picture).clone()
             };
             sink(&output, pictures_decoded, true)?;
             pictures_shown += 1;
@@ -851,7 +855,7 @@ pub fn decode_stream_with(
                 } else {
                     ref_slots
                         .get(header.ref_frame_idx[ref_frame - 1] as usize)
-                        .and_then(Option::as_ref)
+                        .and_then(|slot| slot.as_deref())
                 }
             });
             // spec 7.9's own driver, `av1_setup_motion_field`: only run when
@@ -923,6 +927,9 @@ pub fn decode_stream_with(
             )?;
             (picture, end_cdfs, motion_field)
         };
+        // lane-perf9: one allocation per decoded frame, then every reference
+        // slot this frame refreshes (and the sink) shares it.
+        let picture = std::sync::Arc::new(picture);
         // lane-lr r4: the Wiener/self-guided pixel filters are wired
         // (`decode.rs::apply_loop_restoration`) -- no more refusal here,
         // `uses_lr` frames now decode all the way to pixels.
@@ -1029,16 +1036,16 @@ pub fn decode_stream_with(
                 let mc_identity = parser
                     .sequence_header()
                     .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
-                crate::film_grain::apply_grain(
+                Some(crate::film_grain::apply_grain(
                     &picture,
                     &header.film_grain,
                     mc_identity,
                     bit_depth as u32,
-                )
+                ))
             } else {
-                picture
+                None
             };
-            sink(&output, pictures_decoded - 1, true)?;
+            sink(output.as_ref().unwrap_or(&picture), pictures_decoded - 1, true)?;
             pictures_shown += 1;
         } else {
             // Hidden (alt-ref/forward-key) frames never reach
