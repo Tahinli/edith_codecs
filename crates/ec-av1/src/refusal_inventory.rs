@@ -166,6 +166,19 @@ const PROVEN: &[(&str, &str)] = &[
         "a rectangular transform unit whose shape has no coefficient scan table here",
         "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
     ),
+    // Pre-existing proofs, registered by lane-t900 r21: a negative gate (a
+    // hand-built 12-bit sequence header is refused BY THIS EXACT STRING rather
+    // than decoded wrong) and a witness gate (a real aomenc screen key frame
+    // reaches intrabc on a rect strip, so the refusal names a shape a real
+    // encoder does write).
+    (
+        "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
+        "a_twelve_bit_sequence_header_is_refused_by_name",
+    ),
+    (
+        "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
+        "a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips",
+    ),
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
