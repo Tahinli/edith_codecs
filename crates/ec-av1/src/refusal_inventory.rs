@@ -241,6 +241,12 @@ const PROVEN: &[(&str, &str)] = &[
         "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
         "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
     ),
+    // lane-t900 r24, enumeration: the inter 16x16-level if/else chain's
+    // branches name all ten `partition_w16` values between them.
+    (
+        "an inter 16x16-level partition value outside NONE/HORZ/VERT/SPLIT/AB/1:4",
+        "every_partition_value_of_an_if_chain_alphabet_is_named_by_a_branch",
+    ),
     (
         "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         "a_twelve_bit_sequence_header_is_refused_by_name",
@@ -428,6 +434,41 @@ mod tests {
         );
     }
 
+    /// The partition alphabet, in CDF symbol order.
+    const PARTITION_NAMES: [&str; 10] = [
+        "PARTITION_NONE",
+        "PARTITION_HORZ",
+        "PARTITION_VERT",
+        "PARTITION_SPLIT",
+        "PARTITION_HORZ_A",
+        "PARTITION_HORZ_B",
+        "PARTITION_VERT_A",
+        "PARTITION_VERT_B",
+        "PARTITION_HORZ_4",
+        "PARTITION_VERT_4",
+    ];
+
+    /// The partition values a `match` arm pattern -- or an `if` chain's
+    /// condition -- names: its own tokens, plus every value of an inclusive
+    /// range (`(PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&p)` is four
+    /// values in one). Tokenised, never `contains()`d: a misspelled constant
+    /// in a match pattern is an irrefutable binding that compiles and swallows
+    /// the alphabet, and a substring check would call that covered.
+    fn partition_values_named(head: &str) -> BTreeSet<usize> {
+        let mut out = BTreeSet::new();
+        let idx: Vec<usize> = head
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter_map(|tok| PARTITION_NAMES.iter().position(|n| *n == tok))
+            .collect();
+        if head.contains("..=") && idx.len() == 2 {
+            for v in idx[0]..=idx[1] {
+                out.insert(v);
+            }
+        }
+        out.extend(idx);
+        out
+    }
+
     /// The partition alphabets, enumerated against the arms that code them.
     ///
     /// A partition value is a CDF symbol, and `SymbolDecoder::symbol_fixed`
@@ -449,18 +490,6 @@ mod tests {
     /// ladder rather than a match, so it needs its own enumerator.
     #[test]
     fn every_partition_value_of_an_enumerated_alphabet_has_an_arm() {
-        const NAMES: [&str; 10] = [
-            "PARTITION_NONE",
-            "PARTITION_HORZ",
-            "PARTITION_VERT",
-            "PARTITION_SPLIT",
-            "PARTITION_HORZ_A",
-            "PARTITION_HORZ_B",
-            "PARTITION_VERT_A",
-            "PARTITION_VERT_B",
-            "PARTITION_HORZ_4",
-            "PARTITION_VERT_4",
-        ];
         // (the refusal in the fallback arm, the alphabet its CDF codes)
         let blocks: [(&str, usize); 4] = [
             ("a 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
@@ -475,24 +504,6 @@ mod tests {
                 crate::cdf::PARTITION_W64[0].len() - 1,
             ),
         ];
-        // A pattern's own tokens, plus every value of an inclusive range
-        // (`p if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&p)` is four
-        // arms in one).
-        let covered = |head: &str| -> BTreeSet<usize> {
-            let mut out = BTreeSet::new();
-            let idx: Vec<usize> = head
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .filter_map(|tok| NAMES.iter().position(|n| *n == tok))
-                .collect();
-            if head.contains("..=") && idx.len() == 2 {
-                for v in idx[0]..=idx[1] {
-                    out.insert(v);
-                }
-            }
-            out.extend(idx);
-            out
-        };
-
         let src = include_str!("decode.rs");
         let lines: Vec<&str> = src.lines().collect();
         let indent = |l: &str| l.len() - l.trim_start().len();
@@ -523,7 +534,7 @@ mod tests {
                     continue;
                 }
                 in_fallback = l.trim_start().starts_with("_ =>");
-                arms.extend(covered(l.split("=>").next().unwrap_or("")));
+                arms.extend(partition_values_named(l.split("=>").next().unwrap_or("")));
             }
             let Some((reason, alphabet)) =
                 blocks.iter().find(|(reason, _)| fallback.contains(reason))
@@ -537,7 +548,7 @@ mod tests {
                 "the `match` at decode.rs:{} refuses {reason:?} but has no arm for {:?} -- that \
                  is a real gap in its {alphabet}-value alphabet, not a dead refusal",
                 i + 1,
-                missing.iter().map(|v| NAMES[*v]).collect::<Vec<_>>()
+                missing.iter().map(|v| PARTITION_NAMES[*v]).collect::<Vec<_>>()
             );
         }
         assert_eq!(
@@ -545,6 +556,116 @@ mod tests {
             blocks.len(),
             "not every enumerated partition refusal was located in decode.rs"
         );
+    }
+
+    /// The same enumeration for a partition refusal that sits in an `if`
+    /// chain rather than a `match` fallback.
+    ///
+    /// The inter 16x16-level ladder tests `part16` against constants arm by
+    /// arm and refuses in its second-to-last branch, with `PARTITION_SPLIT`
+    /// left to the final `else`. Nothing about that shape is weaker than a
+    /// `match`: `part16` is a `partition_w16` symbol (or, at a frame edge, a
+    /// gathered value of the same alphabet), so if the chain's conditions
+    /// between them name every value of that alphabet, the refusing branch is
+    /// unreachable.
+    ///
+    /// The conditions are read from the source, tokenised (never
+    /// substring-matched -- lane-t900 r21), and a condition carrying `&&` is
+    /// rejected outright: a value it names is only conditionally handled, and
+    /// counting it would overstate the coverage.
+    #[test]
+    fn every_partition_value_of_an_if_chain_alphabet_is_named_by_a_branch() {
+        // (the refusal in the chain's refusing branch, the alphabet its CDF codes)
+        let chains: [(&str, usize); 1] = [(
+            "an inter 16x16-level partition value outside NONE/HORZ/VERT/SPLIT/AB/1:4",
+            crate::cdf::PARTITION_W16[0].len() - 1,
+        )];
+
+        let src = include_str!("decode.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let mut found = 0usize;
+        for (reason, alphabet) in chains {
+            let refusal = lines
+                .iter()
+                .position(|l| l.contains(reason))
+                .unwrap_or_else(|| panic!("{reason:?} is not in decode.rs"));
+            // The branch that carries the refusal: the nearest `} else if`
+            // above it. Its indentation is the chain's own.
+            let head = (0..refusal)
+                .rev()
+                .find(|&i| lines[i].trim_start().starts_with("} else if "))
+                .unwrap_or_else(|| panic!("{reason:?} is not inside an if/else chain"));
+            let outer = indent(lines[head]);
+            let var = lines[head].trim_start()["} else if ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            assert!(!var.is_empty(), "the chain at decode.rs:{} tests nothing", head + 1);
+
+            // Walk up collecting every branch head of this chain, each read to
+            // the line that opens its body.
+            let mut named = BTreeSet::new();
+            let mut i = head + 1;
+            let mut heads = 0usize;
+            loop {
+                i -= 1;
+                let t = lines[i].trim_start();
+                if indent(lines[i]) != outer || !(t.starts_with("} else if ") || t.starts_with("if "))
+                {
+                    if i == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                let mut cond = String::new();
+                for l in &lines[i..] {
+                    cond.push(' ');
+                    cond.push_str(l.trim());
+                    if l.trim_end().ends_with('{') {
+                        break;
+                    }
+                }
+                assert!(
+                    cond.contains(&var),
+                    "the branch at decode.rs:{} sits in the chain that refuses {reason:?} but \
+                     does not test {var}",
+                    i + 1
+                );
+                assert!(
+                    !cond.contains("&&"),
+                    "the branch at decode.rs:{} handles its partition values only conditionally \
+                     ({cond:?}) -- the enumeration below would overstate what the chain covers",
+                    i + 1
+                );
+                named.extend(partition_values_named(&cond));
+                heads += 1;
+                if t.starts_with("if ") {
+                    break;
+                }
+                assert!(i > 0, "the chain that refuses {reason:?} has no start");
+            }
+            // The value the refusing branch excludes (`part16 != PARTITION_SPLIT`)
+            // is handled by the chain's final `else`, so require one.
+            let close = " ".repeat(outer) + "} else {";
+            assert!(
+                lines[refusal..].iter().any(|l| *l == close),
+                "the chain that refuses {reason:?} has no final `else`, so the value its \
+                 refusing branch excludes is handled nowhere"
+            );
+            assert!(heads >= 2, "only {heads} branch(es) found for {reason:?}");
+            found += 1;
+            let missing: Vec<usize> = (0..alphabet).filter(|v| !named.contains(v)).collect();
+            assert!(
+                missing.is_empty(),
+                "the chain at decode.rs:{} refuses {reason:?} but no branch names {:?} -- that \
+                 is a real gap in its {alphabet}-value alphabet, not a dead refusal",
+                head + 1,
+                missing.iter().map(|v| PARTITION_NAMES[*v]).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(found, chains.len());
     }
 
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
