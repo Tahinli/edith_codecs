@@ -2521,6 +2521,25 @@ thread_local! {
         const { std::cell::Cell::new([0; 3]) };
 }
 
+// lane-t900 r21: rect intra strips inside an inter frame that read the
+// screen-content palette syntax (`allow_screen_content_tools` set and the
+// strip's own shape admitted by `palette_bsize_ctx_wh`) -- the site a blanket
+// refusal used to guard, so this counter is what keeps its witness gate
+// non-vacuous.
+thread_local! {
+    static INTRA_RECT_IN_INTER_SCREEN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_RECT_IN_INTER_SCREEN_HITS`].
+pub(crate) fn intra_rect_in_inter_screen_hits() -> usize {
+    INTRA_RECT_IN_INTER_SCREEN_HITS.with(std::cell::Cell::get)
+}
+
+/// Resets [`INTRA_RECT_IN_INTER_SCREEN_HITS`] before a decode.
+pub(crate) fn reset_intra_rect_in_inter_screen_hits() {
+    INTRA_RECT_IN_INTER_SCREEN_HITS.with(|c| c.set(0));
+}
+
 /// Current value of [`INTRA_RECT_IN_INTER_SPLIT_TX_HITS`], indexed by tx depth.
 pub(crate) fn intra_rect_in_inter_split_tx_hits() -> [usize; 3] {
     INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
@@ -7852,15 +7871,14 @@ fn decode_intra_rect_in_inter(
             "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)"
         )));
     };
-    // [`read_intra_mode_rect`]'s own refusal: palette/intrabc syntax is
-    // consumed for square blocks only, so a strip in a screen-content frame
-    // would skip symbols the encoder wrote.
-    if allow_screen_content_tools {
-        return Err(unsupported(
-            "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
-             is consumed for square blocks only)",
-        ));
-    }
+    // lane-t900 r21: this arm used to refuse EVERY rect strip of a
+    // screen-content frame ("palette syntax is consumed for square blocks
+    // only"). It is not: [`read_intra_mode_rect`] generalised the palette read
+    // to rect blocks on the key-frame path, and the 1:4 arm below goes through
+    // it, while the 2:1 reader inlined further down now codes the same syntax
+    // itself. A real `--tune-content=screen` inter stream reached this refusal
+    // on 8x16 / 16x8 strips (gate
+    // `a_real_aomenc_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips`).
     // lane-intra14 r1: a 1:4 strip decodes through the very readers the KEY
     // FRAME path already proves for this shape ([`decode_block_rect4`] at the
     // 32 level, [`decode_block_rect64`] at 64 -- both already handle the 1:4
@@ -7990,6 +8008,32 @@ fn decode_intra_rect_in_inter(
     if angle_delta_uv != 0 {
         UV_ANGLE_DELTA_HITS.with(|h| h.set(h.get() + 1));
         INTRA_IN_INTER_ANGLE_DELTA_UV_HITS.with(|h| h.set(h.get() + 1));
+    }
+    // `read_palette_mode_info` (spec 5.11.13), in the position
+    // `read_intra_block_mode_info` writes it: after the chroma mode and
+    // before `filter_intra`. lane-t900 r21: a `--tune-content=screen` inter
+    // frame writes `palette_y_mode`/`palette_uv_mode` for every block whose
+    // shape [`palette_bsize_ctx_wh`] admits, intra strips included, so
+    // skipping the syntax here desynced the tile at the strip's own symbol.
+    // No block this decoder produces can USE a palette (the arms below refuse
+    // by name), so the neighbour mode context is 0 and there is no cache --
+    // the same stand-in [`read_intra_mode_rect`] uses when its caller has none.
+    if allow_screen_content_tools
+        && let Some(bsize_ctx) = palette_bsize_ctx_wh(bw, bh)
+    {
+        INTRA_RECT_IN_INTER_SCREEN_HITS.with(|c| c.set(c.get() + 1));
+        if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
+            return Err(unsupported(
+                "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+            ));
+        }
+        // A 2:1 strip of at least 8x8 is always a chroma reference, so
+        // `read_palette_mode_info`'s `xd->is_chroma_ref` guard holds here.
+        if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+            return Err(unsupported(
+                "a block that actually uses a palette (UV) -- reconstruction is out of scope",
+            ));
+        }
     }
     // lane-fiinter (merged on main for the square intra-in-inter arm):
     // `read_filter_intra_mode_info` is the tail of
@@ -14348,6 +14392,81 @@ fn sub_tx_size_map_matches_libaom() {
     ];
     for (tx, want) in TABLE {
         assert_eq!(sub_tx_size_map(tx.0, tx.1), want, "sub_tx_size_map({tx:?})");
+    }
+}
+
+/// The domain of var-tx leaf sizes, enumerated against the two refusals that
+/// name a leaf "larger than 32x32" / "larger than 64x64".
+///
+/// [`read_var_tx_size`] emits a leaf in exactly three places, and each one is
+/// either the unit it was entered with or a `sub_tx_size_map` step below it:
+/// the depth cap, the `!split` return, and libaom's `sub_txs == TX_4X4` early
+/// return. So the leaf set reachable from an entry unit is that unit plus the
+/// chain of `sub_tx_size_map` steps under it, capped at `MAX_VARTX_DEPTH` --
+/// which this test enumerates, and over which no leaf is ever larger than the
+/// entry.
+///
+/// That closes both refusals:
+///
+/// * [`read_block_tx_size_rect`]'s `bw.max(bh) > 64` branch enters every unit
+///   at TX_64X64 (`max_txsize_rect_lookup[BLOCK_128X64]`), so "larger than
+///   64x64" names a leaf the tree cannot produce;
+/// * [`read_block_tx_size`] enters at `side.min(64)` with a ceiling of 32
+///   below the 128 root. The only entry that exceeds that ceiling is 64x64,
+///   reached only when `side == 64`, and then the block is ONE unit whose only
+///   above-ceiling leaf is the whole 64x64 unit itself -- which is the `single`
+///   case the refusal is guarded by.
+#[test]
+fn a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered() {
+    // Every leaf `read_var_tx_size` can reach from `entry`, as (depth, w, h).
+    fn reachable(entry: (usize, usize), depth: usize, out: &mut Vec<(usize, usize, usize)>) {
+        out.push((depth, entry.0, entry.1));
+        if depth == MAX_VARTX_DEPTH {
+            return;
+        }
+        let sub = sub_tx_size_map(entry.0, entry.1);
+        if sub == (4, 4) {
+            out.push((depth + 1, 4, 4));
+            return;
+        }
+        reachable(sub, depth + 1, out);
+    }
+
+    for entry in [(4, 4), (8, 8), (16, 16), (32, 32), (64, 64)] {
+        let mut leaves = Vec::new();
+        reachable(entry, 0, &mut leaves);
+        for (depth, w, h) in &leaves {
+            assert!(
+                w.max(h) <= &entry.0.max(entry.1),
+                "a {}x{} unit reaches a {w}x{h} leaf at depth {depth}",
+                entry.0,
+                entry.1
+            );
+        }
+        // Above-ceiling leaves of a 64x64 entry: the entry itself, at depth 0.
+        if entry == (64, 64) {
+            let above: Vec<&(usize, usize, usize)> =
+                leaves.iter().filter(|(_, w, h)| w.max(h) > &32).collect();
+            assert_eq!(above, [&(0usize, 64usize, 64usize)], "64x64 entry, leaves above 32");
+        }
+    }
+
+    // The entry size and ceiling each caller uses, over the block sides that
+    // reach them (`read_block_tx_size`'s square path; the 128-root rect path
+    // enters at a fixed 64).
+    for side in [8usize, 16, 32, 64, 128] {
+        let max_tx = side.min(64);
+        let ceiling = if side > 64 { 64 } else { 32 };
+        let units = (side / max_tx) * (side / max_tx);
+        if max_tx <= ceiling {
+            continue;
+        }
+        assert_eq!(
+            (side, units),
+            (64, 1),
+            "a {side}px block enters var-tx at {max_tx} over a ceiling of {ceiling} in \
+             {units} units -- an above-ceiling leaf there would NOT be the `single` case"
+        );
     }
 }
 
