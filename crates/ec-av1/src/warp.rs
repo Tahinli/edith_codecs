@@ -417,8 +417,8 @@ pub fn global_warp_params(wmmat: [i32; 6]) -> Option<WarpParams> {
     Some(WarpParams { wmmat, alpha, beta, gamma, delta })
 }
 
-fn clip_pixel(v: i32) -> u16 {
-    v.clamp(0, crate::decode::sample_max()) as u16
+fn clip_pixel(v: i32, fctx: &crate::decode::FrameCtx) -> u16 {
+    v.clamp(0, crate::decode::sample_max(fctx)) as u16
 }
 
 /// `av1_highbd_warp_affine_c` (`warped_motion.c`)'s non-compound branch:
@@ -442,12 +442,12 @@ pub fn warp_affine(
     p_height: i32,
     p_stride: i32,
     subsampling_x: i32,
-    subsampling_y: i32,
+    subsampling_y: i32, fctx: &crate::decode::FrameCtx,
 ) {
     if crate::envflags::env_flag!("EC_MC_TRACE") {
         eprintln!("EC_MC_WARP x={p_col} y={p_row} w={p_width} h={p_height}");
     }
-    let bd = i32::from(crate::decode::bit_depth());
+    let bd = i32::from(crate::decode::bit_depth(fctx));
     // `reduce_bits_vert`, non-compound: `2 * FILTER_BITS - round_0`.
     let reduce_bits_vert = 2 * FILTER_BITS - REDUCE_BITS_HORIZ;
     warp_inner(
@@ -455,7 +455,7 @@ pub fn warp_affine(
         subsampling_x, subsampling_y, bd, reduce_bits_vert,
         |row, col, sum| {
             dst[row * p_stride as usize + col] =
-                clip_pixel(sum - (1 << (bd - 1)) - (1 << bd));
+                clip_pixel(sum - (1 << (bd - 1)) - (1 << bd), fctx);
         },
     );
 }
@@ -490,9 +490,9 @@ pub fn warp_affine_compound(
     p_height: i32,
     p_stride: i32,
     subsampling_x: i32,
-    subsampling_y: i32,
+    subsampling_y: i32, fctx: &crate::decode::FrameCtx,
 ) {
-    let bd = i32::from(crate::decode::bit_depth());
+    let bd = i32::from(crate::decode::bit_depth(fctx));
     let bias = (1 << (bd + 4)) + (1 << (bd + 3));
     warp_inner(
         params, reference, width, height, stride, p_col, p_row, p_width, p_height,
