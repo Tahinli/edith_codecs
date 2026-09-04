@@ -705,7 +705,7 @@ fn compute_ab(
                 (256 - a_val) as i64 * b * SGR_ONE_BY_X[(n - 1) as usize] as i64,
                 SGRPROJ_RECIP_BITS,
             );
-            if std::env::var("EC_LR_CALL_DUMP").is_ok()
+            if crate::envflags::env_flag!("EC_LR_CALL_DUMP")
                 && v_start as i64 + i == 60
                 && h_start as i64 + j == 6
                 && r == 1
@@ -759,7 +759,7 @@ fn apply_sgrproj_stripe(
     // r7 traced (`[-16,-32]`); dump the real 9-byte dense-arm (r1) "u"-tap
     // window (physical rows 59..=61, cols 5..=7 -- r7's traced tap) straight
     // from `lr_sample` for this exact call, no coordinate matching involved.
-    if std::env::var("EC_LR_CALL_DUMP").is_ok() && r1 > 0 && info.xqd == [-16, -32] {
+    if crate::envflags::env_flag!("EC_LR_CALL_DUMP") && r1 > 0 && info.xqd == [-16, -32] {
         let bytes: Vec<i32> = (59..=61)
             .flat_map(|row| {
                 (5..=7).map(move |col| {
@@ -844,7 +844,7 @@ fn apply_sgrproj_stripe(
                 let b = (b_c + b_u + b_d + b_l + b_r) * 4 + (b_ul + b_ur + b_dl + b_dr) * 3;
                 let flt1 = round2(a * dgd + b, SGRPROJ_SGR_BITS + 5 - SGRPROJ_RST_BITS);
                 v += xq[1] as i64 * (flt1 - u);
-                if std::env::var("EC_LR_CALL_DUMP").is_ok()
+                if crate::envflags::env_flag!("EC_LR_CALL_DUMP")
                     && info.xqd == [-16, -32]
                     && v_start as i64 + i == 61
                     && h_start as i64 + j == 6
