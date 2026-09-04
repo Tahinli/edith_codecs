@@ -103,8 +103,17 @@ const REFUSALS: &[&str] = &[
     // what is left is the 1:4 shape, whose `bsize_to_tx_size_cat` breaks the
     // size-group/category diagonal the 2:1 shapes share.
     "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)",
-    // The same arm's screen-content gate: palette/intrabc syntax is consumed
-    // for square blocks only, so a strip in such a frame would skip symbols.
+    // lane-t900 r21 NARROWED this: the string used to guard EVERY rect intra
+    // strip of a screen-content inter frame, and a real
+    // `--tune-content=screen` stream reached it on an 8x16 (8-bit) / 16x8
+    // (10-bit) strip. The 2:1 reader now codes the palette syntax itself and
+    // the 1:4 arm goes through `read_intra_mode_rect`, which already did --
+    // both arms of gate
+    // `a_real_aomenc_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips`
+    // decode ten frames pixel-exact with the strips counted. What still
+    // refuses is a 16x4/4x16 strip and a 128-root half, neither of which is
+    // palette-eligible (`palette_bsize_ctx_wh` wants `8 <= min`, `max <= 64`)
+    // and neither of which has a witness stream yet.
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
@@ -165,6 +174,47 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a rectangular transform unit whose shape has no coefficient scan table here",
         "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+    ),
+    // lane-t900 r21, enumeration: a var-tx leaf is never larger than the unit
+    // the tree was entered with, and both callers enter at or below their own
+    // ceiling (the one case that does not, a 64px block at TX_64X64, is the
+    // `single` whole-block case the refusal is guarded by).
+    (
+        "an inter var-tx tree with a leaf transform larger than 32x32",
+        "a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered",
+    ),
+    (
+        "an inter var-tx tree with a leaf transform larger than 64x64",
+        "a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered",
+    ),
+    // Pre-existing proofs, registered by lane-t900 r21: a negative gate (a
+    // hand-built 12-bit sequence header is refused BY THIS EXACT STRING rather
+    // than decoded wrong) and a witness gate (a real aomenc screen key frame
+    // reaches intrabc on a rect strip, so the refusal names a shape a real
+    // encoder does write).
+    // lane-t900 r21, enumeration: `partition_w32` is a ten-symbol CDF and
+    // `partition_w128` an eight-symbol one, and every `match` carrying one of
+    // these three fallbacks has an arm for each value of its own alphabet, so
+    // no stream can reach them.
+    (
+        "a 32x32 partition type this decoder does not code (value={part32})",
+        "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+    ),
+    (
+        "an INTER 32x32 partition type this decoder does not code (value={part32})",
+        "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+    ),
+    (
+        "a 128x128 superblock partition value outside the 8-symbol alphabet",
+        "every_partition_value_of_an_enumerated_alphabet_has_an_arm",
+    ),
+    (
+        "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
+        "a_twelve_bit_sequence_header_is_refused_by_name",
+    ),
+    (
+        "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
+        "a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips",
     ),
 ];
 
@@ -345,12 +395,127 @@ mod tests {
         );
     }
 
+    /// The partition alphabets, enumerated against the arms that code them.
+    ///
+    /// A partition value is a CDF symbol, and `SymbolDecoder::symbol_fixed`
+    /// cannot return one outside `0..nsyms` -- so a `match` whose arms cover
+    /// its whole alphabet has an unreachable fallback, and the refusal that
+    /// fallback carries names a value no stream can present. This test finds
+    /// each such `match` by the refusal in its OWN fallback arm (rather than
+    /// by line number, which drifts) and enumerates the alphabet against the
+    /// arm patterns, ranges included.
+    ///
+    /// The refusals stay in the code: a partition value is a `usize`, so the
+    /// match needs a fallback arm, and a named refusal is a better one than a
+    /// panic (class `branch-dropped-as-unreachable`). What this removes is the
+    /// UNMEASURED part of the claim.
+    ///
+    /// Not every partition fallback belongs here: the ones that name a shape
+    /// this decoder genuinely does not code yet (the 128-root consumers) are
+    /// live refusals, and the 16x16-level inter chain is an `if`/`else if`
+    /// ladder rather than a match, so it needs its own enumerator.
+    #[test]
+    fn every_partition_value_of_an_enumerated_alphabet_has_an_arm() {
+        const NAMES: [&str; 10] = [
+            "PARTITION_NONE",
+            "PARTITION_HORZ",
+            "PARTITION_VERT",
+            "PARTITION_SPLIT",
+            "PARTITION_HORZ_A",
+            "PARTITION_HORZ_B",
+            "PARTITION_VERT_A",
+            "PARTITION_VERT_B",
+            "PARTITION_HORZ_4",
+            "PARTITION_VERT_4",
+        ];
+        // (the refusal in the fallback arm, the alphabet its CDF codes)
+        let blocks: [(&str, usize); 3] = [
+            ("a 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
+            ("an INTER 32x32 partition type this decoder does not code", crate::cdf::PARTITION_W32[0].len() - 1),
+            ("a 128x128 superblock partition value outside the 8-symbol alphabet", crate::cdf::PARTITION_W128[0].len() - 1),
+        ];
+        // A pattern's own tokens, plus every value of an inclusive range
+        // (`p if (PARTITION_HORZ_A..=PARTITION_VERT_B).contains(&p)` is four
+        // arms in one).
+        let covered = |head: &str| -> BTreeSet<usize> {
+            let mut out = BTreeSet::new();
+            let idx: Vec<usize> = head
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter_map(|tok| NAMES.iter().position(|n| *n == tok))
+                .collect();
+            if head.contains("..=") && idx.len() == 2 {
+                for v in idx[0]..=idx[1] {
+                    out.insert(v);
+                }
+            }
+            out.extend(idx);
+            out
+        };
+
+        let src = include_str!("decode.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let mut found = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if !(t.starts_with("match part") && t.ends_with('{')) {
+                continue;
+            }
+            let outer = indent(line);
+            let close = " ".repeat(outer) + "}";
+            let (mut arms, mut fallback) = (BTreeSet::new(), String::new());
+            let mut in_fallback = false;
+            for l in &lines[i + 1..] {
+                if *l == close {
+                    break;
+                }
+                // Arm patterns sit exactly one level in; anything deeper is an
+                // arm's body, nested matches and `part == PARTITION_*` reads
+                // included.
+                if indent(l) != outer + 4 && !l.trim().is_empty() {
+                    if in_fallback {
+                        fallback.push_str(l.trim());
+                    }
+                    continue;
+                }
+                if !l.contains("=>") {
+                    continue;
+                }
+                in_fallback = l.trim_start().starts_with("_ =>");
+                arms.extend(covered(l.split("=>").next().unwrap_or("")));
+            }
+            let Some((reason, alphabet)) =
+                blocks.iter().find(|(reason, _)| fallback.contains(reason))
+            else {
+                continue;
+            };
+            found += 1;
+            let missing: Vec<usize> = (0..*alphabet).filter(|v| !arms.contains(v)).collect();
+            assert!(
+                missing.is_empty(),
+                "the `match` at decode.rs:{} refuses {reason:?} but has no arm for {:?} -- that \
+                 is a real gap in its {alphabet}-value alphabet, not a dead refusal",
+                i + 1,
+                missing.iter().map(|v| NAMES[*v]).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            found,
+            blocks.len(),
+            "not every enumerated partition refusal was located in decode.rs"
+        );
+    }
+
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
     /// that exists, and the count it prints is the inventory's numerator.
     #[test]
     fn every_proven_refusal_names_a_test_that_exists() {
         let found = decode_path_refusals();
-        let sources = [include_str!("stream.rs"), include_str!("decode.rs")];
+        let sources = [
+            include_str!("stream.rs"),
+            include_str!("decode.rs"),
+            include_str!("refusal_inventory.rs"),
+        ];
         for (reason, gate) in PROVEN {
             assert!(
                 found.contains(*reason),
