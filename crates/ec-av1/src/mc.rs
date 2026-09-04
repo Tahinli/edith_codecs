@@ -663,7 +663,7 @@ fn with_scratch<R>(rows: usize, block_w: usize, f: impl FnOnce(&mut [i32], &mut 
 /// Panics when `dst` is not `block_w * block_h` long, or the reference is
 /// empty.
 #[allow(clippy::too_many_arguments)] // one reference plane, one position, one block shape
-pub fn predict(
+pub(crate) fn predict(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -672,7 +672,7 @@ pub fn predict(
     y_q4: i32,
     block_w: usize,
     block_h: usize,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     predict_with_filter(
         reference,
@@ -684,7 +684,7 @@ pub fn predict(
         block_w,
         block_h,
         InterpFilterKind::Regular,
-        dst,
+        dst, fctx,
     );
 }
 
@@ -692,7 +692,7 @@ pub fn predict(
 /// 6.8.9's `interpolation_filter`) instead of always `Regular` -- the same
 /// kernel both directions.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_with_filter(
+pub(crate) fn predict_with_filter(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -702,7 +702,7 @@ pub fn predict_with_filter(
     block_w: usize,
     block_h: usize,
     filter_kind: InterpFilterKind,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     predict_with_filters(
         reference,
@@ -715,7 +715,7 @@ pub fn predict_with_filter(
         block_h,
         filter_kind,
         filter_kind,
-        dst,
+        dst, fctx,
     );
 }
 
@@ -724,7 +724,7 @@ pub fn predict_with_filter(
 /// 5.11.20's per-block `SWITCHABLE` read is per-direction (`enable_dual_filter`),
 /// so the two passes can genuinely differ.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_with_filters(
+pub(crate) fn predict_with_filters(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -735,11 +735,11 @@ pub fn predict_with_filters(
     block_h: usize,
     h_kind: InterpFilterKind,
     v_kind: InterpFilterKind,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     predict_with_filters_kern(
         reference, stride, true_width, true_height, x_q4, y_q4, block_w,
-        block_h, block_w, block_h, h_kind, v_kind, dst,
+        block_h, block_w, block_h, h_kind, v_kind, dst, fctx,
     );
 }
 
@@ -752,7 +752,7 @@ pub fn predict_with_filters(
 /// chroma is 4 wide or 4 tall (luma 8x16 / 16x8 and taller kin) must still ask
 /// for the 4-tap kernel on that axis -- lane-rectchroma2 r1.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_with_filters_kern(
+pub(crate) fn predict_with_filters_kern(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -765,7 +765,7 @@ pub fn predict_with_filters_kern(
     kern_h: usize,
     h_kind: InterpFilterKind,
     v_kind: InterpFilterKind,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
@@ -839,7 +839,7 @@ pub fn predict_with_filters_kern(
     // InterRound1) == Round2(a, InterRound1 - 7)`. Passing `y0 + 3` puts the
     // block's own first row where the pass would have put the 4th.
     let rows = if yfrac == 0 { block_h } else { block_h + 7 };
-    let max = crate::decode::sample_max();
+    let max = crate::decode::sample_max(fctx);
     with_scratch(rows, block_w, |intermediate, acc| {
         horizontal_pass_unscaled(
             reference, stride, true_width, true_height, x0,
@@ -1070,7 +1070,7 @@ fn horizontal_pass(
 /// Panics when `dst` is not `block_w * block_h` long, or the reference is
 /// empty.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_scaled(
+pub(crate) fn predict_scaled(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -1082,18 +1082,18 @@ pub fn predict_scaled(
     block_h: usize,
     h_kind: InterpFilterKind,
     v_kind: InterpFilterKind,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     predict_scaled_kern(
         reference, stride, true_width, true_height, x_q4, y_q4, x_scale_fp,
-        block_w, block_h, block_w, block_h, h_kind, v_kind, dst,
+        block_w, block_h, block_w, block_h, h_kind, v_kind, dst, fctx,
     );
 }
 
 /// [`predict_scaled`] with the 4-tap decision from the block's true dims
 /// (see [`predict_with_filters_kern`]).
 #[allow(clippy::too_many_arguments)]
-pub fn predict_scaled_kern(
+pub(crate) fn predict_scaled_kern(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -1107,7 +1107,7 @@ pub fn predict_scaled_kern(
     kern_h: usize,
     h_kind: InterpFilterKind,
     v_kind: InterpFilterKind,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
@@ -1129,7 +1129,7 @@ pub fn predict_scaled_kern(
     };
 
     let rows = if yfrac == 0 { block_h } else { block_h + 7 };
-    let max = crate::decode::sample_max();
+    let max = crate::decode::sample_max(fctx);
     with_scratch(rows, block_w, |intermediate, acc| {
         horizontal_pass(
             reference, stride, true_width, true_height, x_q4,
@@ -1156,7 +1156,7 @@ pub fn predict_scaled_kern(
 /// scaled (superres). `REF_NO_SCALE` takes the ordinary stride-1 path, which
 /// keeps [`predict_scaled_hits`] a true count of scaled predictions.
 #[allow(clippy::too_many_arguments)]
-pub fn predict_maybe_scaled(
+pub(crate) fn predict_maybe_scaled(
     reference: &[u16],
     stride: usize,
     true_width: usize,
@@ -1168,17 +1168,17 @@ pub fn predict_maybe_scaled(
     block_h: usize,
     h_kind: InterpFilterKind,
     v_kind: InterpFilterKind,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     if x_scale_fp == REF_NO_SCALE {
         predict_with_filters(
             reference, stride, true_width, true_height, x_q4, y_q4, block_w, block_h, h_kind,
-            v_kind, dst,
+            v_kind, dst, fctx,
         );
     } else {
         predict_scaled(
             reference, stride, true_width, true_height, x_q4, y_q4, x_scale_fp, block_w,
-            block_h, h_kind, v_kind, dst,
+            block_h, h_kind, v_kind, dst, fctx,
         );
     }
 }
@@ -1305,12 +1305,12 @@ pub fn predict_compound_intermediate_kern(
 /// output; both always sum to `1 << DIST_PRECISION_BITS`). Masked compound
 /// (`comp_group_idx == 1`, wedge/diffwtd) is a different combine this
 /// function does not cover -- decode.rs still refuses those by name.
-pub fn combine_compound(
+pub(crate) fn combine_compound(
     pred0: &[i32],
     pred1: &[i32],
     fwd_weight: i32,
     bck_weight: i32,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
     assert_eq!(dst.len(), pred0.len(), "the destination is the block");
@@ -1324,7 +1324,7 @@ pub fn combine_compound(
         // dropped low 4 bits are non-zero.
         let sum = pred0[i] * fwd_weight + pred1[i] * bck_weight;
         dst[i] = round2(sum >> DIST_PRECISION_BITS, INTER_POST_ROUND)
-            .clamp(0, crate::decode::sample_max()) as u16;
+            .clamp(0, crate::decode::sample_max(fctx)) as u16;
     }
 }
 
@@ -1338,7 +1338,7 @@ pub fn combine_compound(
 /// produces give the identical `diff` libaom computes. `round` is
 /// `2*FILTER_BITS - round_0 - round_1 + (bd-8)` == [`INTER_POST_ROUND`] for
 /// 8-bit content (`round_0=3`, compound `round_1=7`, `bd=8`).
-pub fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8]) {
+pub(crate) fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8], fctx: &crate::decode::FrameCtx) {
     assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
     assert_eq!(mask.len(), pred0.len(), "one mask byte per pixel");
     // libaom `diffwtd_mask_d16` (`reconinter.c:307`): `round = 2*FILTER_BITS
@@ -1346,7 +1346,7 @@ pub fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8]) {
     // bit-depth headroom the CONV_BUF domain carries at 10/12-bit. `round_0`
     // and `round_1` themselves only move at 12-bit (`convolve.h:83`'s
     // `intbufrange > 16`), so the whole bit-depth dependence here is `bd - 8`.
-    let round = INTER_POST_ROUND + u32::from(crate::decode::bit_depth()).saturating_sub(8);
+    let round = INTER_POST_ROUND + u32::from(crate::decode::bit_depth(fctx)).saturating_sub(8);
     for i in 0..mask.len() {
         let diff = round2((pred0[i] - pred1[i]).abs(), round);
         let m = (38 + diff / 16).clamp(0, 64);
@@ -1365,7 +1365,7 @@ pub fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8]) {
 /// `subsampled` selects the 2x2-average chroma read (spec 7.11.3.14 /
 /// libaom's `subw == 1 && subh == 1` branch) vs. the direct luma read.
 #[allow(clippy::too_many_arguments)]
-pub fn blend_masked_compound(
+pub(crate) fn blend_masked_compound(
     pred0: &[i32],
     pred1: &[i32],
     mask: &[u8],
@@ -1373,7 +1373,7 @@ pub fn blend_masked_compound(
     w: usize,
     h: usize,
     subsampled: bool,
-    dst: &mut [u16],
+    dst: &mut [u16], fctx: &crate::decode::FrameCtx,
 ) {
     assert_eq!(pred0.len(), w * h, "pred0 is the destination-sized block");
     assert_eq!(pred1.len(), w * h, "pred1 is the destination-sized block");
@@ -1393,7 +1393,7 @@ pub fn blend_masked_compound(
                 i32::from(mask[i * mask_stride + j])
             };
             let res = (m * pred0[i * w + j] + (64 - m) * pred1[i * w + j]) >> 6;
-            dst[i * w + j] = round2(res, INTER_POST_ROUND).clamp(0, crate::decode::sample_max()) as u16;
+            dst[i * w + j] = round2(res, INTER_POST_ROUND).clamp(0, crate::decode::sample_max(fctx)) as u16;
         }
     }
 }
@@ -1409,6 +1409,7 @@ pub fn blend_masked_compound(
 /// off-by-one from double rounding.
 #[test]
 fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
+    let fctx = &crate::decode::FrameCtx::new();
     let reference = vec![100u16; 16 * 16];
     let mut pred0 = vec![0i32; 16];
     predict_compound_intermediate(
@@ -1429,7 +1430,7 @@ fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
 
     let pred1 = pred0.clone();
     let mut dst = vec![0u16; 16];
-    combine_compound(&pred0, &pred1, 8, 8, &mut dst);
+    combine_compound(&pred0, &pred1, 8, 8, &mut dst, fctx);
     assert!(dst.iter().all(|&v| v == 100), "{dst:?}");
 }
 
@@ -1450,6 +1451,7 @@ mod tests {
     /// instrumented aomdec's `av1_convolve_2d_sr_c` on the pinned stream.
     #[test]
     fn smooth_filter_matches_aomdec_chroma_inter_block() {
+    let fctx = &crate::decode::FrameCtx::new();
         #[rustfmt::skip]
         let window: [[u8; 24]; 24] = [
             [114,114,114,114,114,114,114,114,115,115,115,115,116,116,116,116,117,117,117,116,115,115,114,114],
@@ -1508,7 +1510,7 @@ mod tests {
             16,
             16,
             InterpFilterKind::Smooth,
-            &mut dst,
+            &mut dst, fctx,
         );
         #[rustfmt::skip]
         let expected_row0: [u16; 16] =
@@ -1559,6 +1561,7 @@ mod tests {
 
     #[test]
     fn integer_mv_is_identity() {
+    let fctx = &crate::decode::FrameCtx::new();
         let width = 12;
         let height = 12;
         let reference: Vec<u16> = (0..width * height).map(|i| (i * 7 % 251) as u16).collect();
@@ -1572,7 +1575,7 @@ mod tests {
             4 * 16,
             6,
             6,
-            &mut dst,
+            &mut dst, fctx,
         );
         for row in 0..6 {
             for col in 0..6 {
@@ -1587,6 +1590,7 @@ mod tests {
 
     #[test]
     fn half_pel_reproduces_the_ramp_midpoint() {
+    let fctx = &crate::decode::FrameCtx::new();
         // Step 2 so every half-pel position lands on an exact integer.
         let width = 16;
         let height = 16;
@@ -1604,7 +1608,7 @@ mod tests {
             5 * 16,
             4,
             4,
-            &mut dst,
+            &mut dst, fctx,
         );
         for row in 0..4 {
             for col in 0..4 {
@@ -1620,6 +1624,7 @@ mod tests {
 
     #[test]
     fn constant_plane_has_unit_dc_gain_at_every_subpel_position() {
+    let fctx = &crate::decode::FrameCtx::new();
         let width = 20;
         let height = 20;
         let reference = vec![142u16; width * height];
@@ -1635,7 +1640,7 @@ mod tests {
                     5 * 16 + yfrac,
                     5,
                     5,
-                    &mut dst,
+                    &mut dst, fctx,
                 );
                 assert!(
                     dst.iter().all(|&v| v == 142),
@@ -1647,6 +1652,7 @@ mod tests {
 
     #[test]
     fn horizontal_and_vertical_only_filtering_differ() {
+    let fctx = &crate::decode::FrameCtx::new();
         // A plane linear in both x and y with different, even coefficients so
         // each axis's half-pel interpolation lands on an exact integer: this
         // pins the actual value each pass produces, not just that the two
@@ -1668,7 +1674,7 @@ mod tests {
             3 * 16,
             4,
             4,
-            &mut horiz,
+            &mut horiz, fctx,
         );
         let mut vert = vec![0u16; 4 * 4];
         predict(
@@ -1680,7 +1686,7 @@ mod tests {
             3 * 16 + 8,
             4,
             4,
-            &mut vert,
+            &mut vert, fctx,
         );
 
         for row in 0..4 {
@@ -1707,6 +1713,7 @@ mod tests {
 
     #[test]
     fn mv_past_the_edge_clamps_instead_of_panicking() {
+    let fctx = &crate::decode::FrameCtx::new();
         let width = 8;
         let height = 8;
         let reference: Vec<u16> = (0..width * height).map(|i| (i * 3 % 200) as u16).collect();
@@ -1722,7 +1729,7 @@ mod tests {
             -50 * 16 + 5,
             4,
             4,
-            &mut dst,
+            &mut dst, fctx,
         );
         let expected = reference[0]; // the whole plane clamps to the top-left corner
         assert!(
@@ -1740,7 +1747,7 @@ mod tests {
             50 * 16 + 5,
             4,
             4,
-            &mut dst2,
+            &mut dst2, fctx,
         );
         let expected2 = reference[height * width - 1]; // clamps to the bottom-right corner
         assert!(
@@ -1751,6 +1758,7 @@ mod tests {
 
     #[test]
     fn predict_scaled_at_no_scale_matches_predict_with_filters() {
+    let fctx = &crate::decode::FrameCtx::new();
         // Algebraic pin from the r8/r9 derivation: x_scale_fp == REF_NO_SCALE
         // must reduce predict_scaled's per-column scaled walk to the exact
         // same int_pel/filter_idx sequence predict_with_filters computes from
@@ -1774,7 +1782,7 @@ mod tests {
                     8,
                     InterpFilterKind::Regular,
                     InterpFilterKind::Regular,
-                    &mut expected,
+                    &mut expected, fctx,
                 );
                 let mut got = vec![0u16; block_w * 8];
                 predict_scaled(
@@ -1789,7 +1797,7 @@ mod tests {
                     8,
                     InterpFilterKind::Regular,
                     InterpFilterKind::Regular,
-                    &mut got,
+                    &mut got, fctx,
                 );
                 assert_eq!(
                     got, expected,
