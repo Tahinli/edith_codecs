@@ -14,6 +14,7 @@
 //! as the decoder will. That makes the reconstruction a claim about what a
 //! decoder produces, and it is gated as one — sample for sample against ffmpeg.
 
+use crate::decode::WithRef;
 use ec_av1_syntax::sequence::{ColorConfig, OperatingPoint, SequenceHeader};
 use ec_av1_syntax::{
     ChromaSamplePosition, FrameHeader, FrameType, PRIMARY_REF_NONE, QuantizationParams, TileInfo,
@@ -54,17 +55,14 @@ pub(crate) const SUPERBLOCK: usize = 64;
 // superblock changes every answer inside it (the tables themselves are
 // already laid out 128-relative -- see `Reach::table_stride`). [`SUPERBLOCK`]
 // stays the encoder's own fixed 64.
-thread_local! {
-    static REACH_SB_PX: std::cell::Cell<usize> = const { std::cell::Cell::new(SUPERBLOCK) };
-}
 
 /// Sets the superblock size [`Reach`] answers against (64 or 128).
-pub(crate) fn set_reach_superblock_px(px: usize) {
-    REACH_SB_PX.with(|c| c.set(px));
+pub(crate) fn set_reach_superblock_px(px: usize, fctx: &crate::decode::FrameCtx) {
+    fctx.reach_sb_px.with(|c| c.set(px));
 }
 
-fn reach_sb_px() -> usize {
-    REACH_SB_PX.with(|c| c.get())
+fn reach_sb_px(fctx: &crate::decode::FrameCtx) -> usize {
+    fctx.reach_sb_px.with(|c| c.get())
 }
 
 /// How heavily the mode search weighs rate against squared error, in units of
@@ -241,7 +239,7 @@ fn intra_predict_u8(
     bh: usize,
     enable_edge_filter: bool,
     smooth_neighbor: bool,
-    dst: &mut [u8],
+    dst: &mut [u8], fctx: &crate::decode::FrameCtx,
 ) {
     let above16: Option<Vec<u16>> = above.map(|s| s.iter().map(|&v| u16::from(v)).collect());
     let left16: Option<Vec<u16>> = left.map(|s| s.iter().map(|&v| u16::from(v)).collect());
@@ -256,7 +254,7 @@ fn intra_predict_u8(
         bh,
         enable_edge_filter,
         smooth_neighbor,
-        &mut dst16,
+        &mut dst16, fctx,
     );
     for (d, &s) in dst.iter_mut().zip(dst16.iter()) {
         *d = s as u8;
@@ -658,7 +656,7 @@ impl Plane<'_> {
     /// Codes one block under one mode without committing it: hands back the
     /// levels, the block the decoder would reconstruct, the squared error
     /// against the source and an estimate of what the levels cost in bits.
-    fn trial(&self, at: At, mode: u8, base_q_idx: u8, deadzone: f64) -> Trial {
+    fn trial(&self, at: At, mode: u8, base_q_idx: u8, deadzone: f64, fctx: &crate::decode::FrameCtx) -> Trial {
         let At {
             x, y, side, reach, ..
         } = at;
@@ -674,7 +672,7 @@ impl Plane<'_> {
             side,
             false,
             false,
-            &mut prediction,
+            &mut prediction, fctx,
         );
 
         let mut residual = vec![0i32; side * side];
@@ -832,9 +830,9 @@ impl Plane<'_> {
         at: At,
         mode: u8,
         base_q_idx: u8,
-        deadzone: f64,
+        deadzone: f64, fctx: &crate::decode::FrameCtx,
     ) -> (Vec<Coeff>, f64, f64) {
-        let trial = self.trial(at, mode, base_q_idx, deadzone);
+        let trial = self.trial(at, mode, base_q_idx, deadzone, fctx);
         self.commit(at.x, at.y, at.side, &trial);
         (coeffs(&trial.levels, at.side), trial.sse, trial.bits)
     }
@@ -874,7 +872,7 @@ impl Plane<'_> {
         at: At,
         modes: &[u8],
         mode_bits: &[f64; 13],
-        lambda: f64,
+        lambda: f64, fctx: &crate::decode::FrameCtx,
     ) -> Vec<(f64, u8)> {
         let At {
             x, y, side, reach, ..
@@ -894,7 +892,7 @@ impl Plane<'_> {
                     side,
                     false,
                     false,
-                    &mut prediction,
+                    &mut prediction, fctx,
                 );
                 let sad: f64 = (0..side * side)
                     .map(|i| {
@@ -925,7 +923,7 @@ impl Plane<'_> {
         &mut self,
         at: At,
         search: &Search,
-        mode_bits: &[f64; 13],
+        mode_bits: &[f64; 13], fctx: &crate::decode::FrameCtx,
     ) -> (Vec<Coeff>, u8, f64) {
         let At {
             x, y, side, reach, ..
@@ -946,7 +944,7 @@ impl Plane<'_> {
                     side,
                     false,
                     false,
-                    &mut prediction,
+                    &mut prediction, fctx,
                 );
                 let sad: f64 = (0..side * side)
                     .map(|i| {
@@ -1298,10 +1296,10 @@ impl Reach {
 
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
     /// in a frame of `width` by `height`.
-    pub(crate) fn of(side: usize, x: usize, y: usize, width: usize, height: usize) -> Self {
+    pub(crate) fn of(side: usize, x: usize, y: usize, width: usize, height: usize, fctx: &crate::decode::FrameCtx) -> Self {
         Self {
-            above_right: y > 0 && x + side < width && Self::top_right(side, x, y),
-            below_left: x > 0 && y + side < height && Self::bottom_left(side, x, y),
+            above_right: y > 0 && x + side < width && Self::top_right(side, x, y, fctx),
+            below_left: x > 0 && y + side < height && Self::bottom_left(side, x, y, fctx),
         }
     }
 
@@ -1316,11 +1314,11 @@ impl Reach {
         x: usize,
         y: usize,
         width: usize,
-        height: usize,
+        height: usize, fctx: &crate::decode::FrameCtx,
     ) -> Self {
         Self {
-            above_right: y > 0 && x + bw < width && Self::top_right_rect(bw, bh, x, y),
-            below_left: x > 0 && y + bh < height && Self::bottom_left_rect(bw, bh, x, y),
+            above_right: y > 0 && x + bw < width && Self::top_right_rect(bw, bh, x, y, fctx),
+            below_left: x > 0 && y + bh < height && Self::bottom_left_rect(bw, bh, x, y, fctx),
         }
     }
 
@@ -1338,8 +1336,8 @@ impl Reach {
      /// libaom `has_top_right` at block granularity (`row_off`/`col_off` 0,
     /// the transform covering the whole block, luma): everything before the
     /// table lookup is that function's own early-exit ladder.
-    fn top_right_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
-        let sb_mi: usize = reach_sb_px() / 4;
+    fn top_right_rect(bw: usize, bh: usize, x: usize, y: usize, fctx: &crate::decode::FrameCtx) -> bool {
+        let sb_mi: usize = reach_sb_px(fctx) / 4;
         let (mi_row, mi_col) = (y / 4, x / 4);
         let bw_log2 = (bw / 4).trailing_zeros() as usize;
         let bh_log2 = (bh / 4).trailing_zeros() as usize;
@@ -1371,8 +1369,8 @@ impl Reach {
     }
 
     /// libaom `has_bottom_left`, same granularity as [`Self::top_right_rect`].
-    fn bottom_left_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
-        let sb_mi: usize = reach_sb_px() / 4;
+    fn bottom_left_rect(bw: usize, bh: usize, x: usize, y: usize, fctx: &crate::decode::FrameCtx) -> bool {
+        let sb_mi: usize = reach_sb_px(fctx) / 4;
         let (mi_row, mi_col) = (y / 4, x / 4);
         let bw_log2 = (bw / 4).trailing_zeros() as usize;
         let bh_log2 = (bh / 4).trailing_zeros() as usize;
@@ -1421,8 +1419,8 @@ impl Reach {
     /// row of a superblock reads into the superblock above, which is decoded;
     /// the rightmost column would read into the superblock to the right, which
     /// is not; and everything between is the table's to answer.
-    fn top_right(side: usize, x: usize, y: usize) -> bool {
-        let (row, col, per_side) = Self::position(side, x, y);
+    fn top_right(side: usize, x: usize, y: usize, fctx: &crate::decode::FrameCtx) -> bool {
+        let (row, col, per_side) = Self::position(side, x, y, fctx);
         if row == 0 {
             return true;
         }
@@ -1456,10 +1454,10 @@ impl Reach {
     /// reads into the superblock to its left, which is decoded only as far
     /// down as its own bottom; the bottom row would read into the superblock
     /// below, which is not decoded at all; and the table answers the rest.
-    fn bottom_left(side: usize, x: usize, y: usize) -> bool {
-        let (row, col, per_side) = Self::position(side, x, y);
+    fn bottom_left(side: usize, x: usize, y: usize, fctx: &crate::decode::FrameCtx) -> bool {
+        let (row, col, per_side) = Self::position(side, x, y, fctx);
         if col == 0 {
-            return row * side + side < reach_sb_px();
+            return row * side + side < reach_sb_px(fctx);
         }
         if row + 1 == per_side {
             return false;
@@ -1489,8 +1487,8 @@ impl Reach {
 
     /// Where a block sits inside its superblock, in blocks of its own size,
     /// and how many of them a superblock is across.
-    fn position(side: usize, x: usize, y: usize) -> (usize, usize, usize) {
-        let sb = reach_sb_px();
+    fn position(side: usize, x: usize, y: usize, fctx: &crate::decode::FrameCtx) -> (usize, usize, usize) {
+        let sb = reach_sb_px(fctx);
         ((y % sb) / side, (x % sb) / side, sb / side)
     }
 
@@ -1550,7 +1548,7 @@ fn code_square(
     (x, y): (usize, usize),
     side: usize,
     search: &Search,
-    mode_bits: &[f64; 13],
+    mode_bits: &[f64; 13], fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (luma_set, chroma_set) = if side == BLOCK {
         (TxbSet::Luma32, TxbSet::Chroma16)
@@ -1571,11 +1569,11 @@ fn code_square(
             x,
             y,
             side,
-            reach: Reach::of(side, x, y, luma.true_width, luma.true_height),
+            reach: Reach::of(side, x, y, luma.true_width, luma.true_height, fctx),
             set: luma_set,
         },
         search,
-        mode_bits,
+        mode_bits, fctx,
     );
     // Chroma is predicted DC because that is the mode the tile writer codes
     // for it; what it costs still counts towards the partition decision.
@@ -1591,7 +1589,7 @@ fn code_square(
             },
             DC_PRED,
             search.base_q_idx,
-            search.deadzone,
+            search.deadzone, fctx,
         );
         *coeffs = levels;
         cost += sse + search.lambda * bits;
@@ -1629,9 +1627,9 @@ fn code_square_inter(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    stack: &MvStack,
+    stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> BlockCoeffs {
-    let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), side, search, mode_bits);
+    let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), side, search, mode_bits, fctx);
     let luma_set = if side == 8 {
         TxbSet::Luma8Inter
     } else {
@@ -1685,7 +1683,7 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        luma_set,
+        luma_set, fctx,
     );
     let u = mc_trial(
         &chroma[0],
@@ -1701,7 +1699,7 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        chroma_set,
+        chroma_set, fctx,
     );
     let v = mc_trial(
         &chroma[1],
@@ -1717,7 +1715,7 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        chroma_set,
+        chroma_set, fctx,
     );
     let skip = luma_trial.levels.iter().all(|&l| l == 0)
         && u.levels.iter().all(|&l| l == 0)
@@ -1997,8 +1995,52 @@ fn coeffs(levels: &[i32], side: usize) -> Vec<Coeff> {
 /// # Errors
 /// Returns an error when the picture's width or height is zero or odd, or
 /// when its planes are not 4:2:0 of that size.
+/// Codes one picture as a whole key frame, at `base_q_idx`, and returns its
+/// stream. The per-frame decode state this needs lives for exactly this call.
+///
+/// # Errors
+/// Returns an error under the same conditions
+/// [`encode_key_frame_with_modes`] does.
 pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Result<Encoded> {
-    encode_key_frame_with_modes(picture, base_q_idx, deadzone, &KEY_FRAME_MODES)
+    encode_key_frame_with_ctx(picture, base_q_idx, deadzone, &crate::decode::FrameCtx::new())
+}
+
+/// [`encode_key_frame`] with the per-block intra modes given rather than
+/// searched.
+///
+/// # Errors
+/// Returns an error when `picture`'s dimensions are odd or zero, when `modes`
+/// is empty, or when a block's coefficients do not fit the coded frame.
+pub fn encode_key_frame_with_modes(
+    picture: &Picture,
+    base_q_idx: u8,
+    deadzone: f64,
+    modes: &[u8],
+) -> Result<Encoded> {
+    encode_key_frame_with_modes_with_ctx(
+        picture,
+        base_q_idx,
+        deadzone,
+        modes,
+        &crate::decode::FrameCtx::new(),
+    )
+}
+
+/// Codes `pictures` as one key frame followed by inter frames.
+///
+/// # Errors
+/// Returns an error under the same conditions [`encode_key_frame`] and the
+/// inter frame path do.
+pub fn encode_sequence(
+    pictures: &[Picture],
+    base_q_idx: u8,
+    deadzone: f64,
+) -> Result<EncodedSequence> {
+    encode_sequence_with_ctx(pictures, base_q_idx, deadzone, &crate::decode::FrameCtx::new())
+}
+
+pub(crate) fn encode_key_frame_with_ctx(picture: &Picture, base_q_idx: u8, deadzone: f64, fctx: &crate::decode::FrameCtx) -> Result<Encoded> {
+    encode_key_frame_with_modes_with_ctx(picture, base_q_idx, deadzone, &KEY_FRAME_MODES, fctx)
 }
 
 /// Encodes one picture as a key frame, choosing each block's luma mode from
@@ -2012,11 +2054,11 @@ pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Res
 /// # Errors
 /// The same as [`encode_key_frame`], and additionally when `modes` is empty or
 /// names a mode [`crate::intra::predict`] does not predict.
-pub fn encode_key_frame_with_modes(
+pub(crate) fn encode_key_frame_with_modes_with_ctx(
     picture: &Picture,
     base_q_idx: u8,
     deadzone: f64,
-    modes: &[u8],
+    modes: &[u8], fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     picture.check_even()?;
     let padded = picture.padded_to(BLOCK);
@@ -2027,7 +2069,7 @@ pub fn encode_key_frame_with_modes(
         modes,
         split_blocks(),
         (picture.width, picture.height),
-        unspecified_color_config(),
+        unspecified_color_config(), fctx,
     )?;
     Ok(crop_encoded(&encoded, picture.width, picture.height))
 }
@@ -2043,7 +2085,7 @@ pub(crate) fn encode_key_frame_inner(
     modes: &[u8],
     split_blocks: bool,
     render: (usize, usize),
-    color_config: ColorConfig,
+    color_config: ColorConfig, fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     picture.check()?;
     if modes.is_empty() {
@@ -2220,7 +2262,7 @@ pub(crate) fn encode_key_frame_inner(
                     (x, y),
                     BLOCK,
                     &search,
-                    &mode_bits(above_mode[c0], left_mode[r0]),
+                    &mode_bits(above_mode[c0], left_mode[r0]), fctx,
                 );
                 cost_whole += search.lambda * partition_bits(BLOCK, false);
                 let after_whole = snapshot(&luma, &chroma, (x, y));
@@ -2253,7 +2295,7 @@ pub(crate) fn encode_key_frame_inner(
                             (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
                             SUB,
                             &search,
-                            &mode_bits(above_mode[sc], left_mode[sr]),
+                            &mode_bits(above_mode[sc], left_mode[sr]), fctx,
                         );
                         cost_split += cost;
                         split_modes.push(block.mode);
@@ -2284,7 +2326,7 @@ pub(crate) fn encode_key_frame_inner(
                                 (leaf_x, leaf_y),
                                 8,
                                 &search,
-                                &leaf_mode_bits,
+                                &leaf_mode_bits, fctx,
                             );
                             cost_split += cost;
                             split_modes.push(leaf.mode);
@@ -2500,7 +2542,7 @@ fn mc_trial(
     skip: bool,
     base_q_idx: u8,
     deadzone: f64,
-    set: TxbSet,
+    set: TxbSet, fctx: &crate::decode::FrameCtx,
 ) -> Trial {
     let x_q4 = mv_to_q4(x, mv.1, luma);
     let y_q4 = mv_to_q4(y, mv.0, luma);
@@ -2517,7 +2559,7 @@ fn mc_trial(
         y_q4,
         side,
         side,
-        &mut prediction16,
+        &mut prediction16, fctx,
     );
     let prediction: Vec<u8> = prediction16.iter().map(|&v| v as u8).collect();
     plane.code_from_prediction(x, y, side, &prediction, skip, base_q_idx, deadzone, set)
@@ -2549,10 +2591,10 @@ fn search_inter_block(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    stack: &MvStack,
+    stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> BlockCoeffs {
     let (luma_set, chroma_set) = (TxbSet::Luma32, TxbSet::Chroma16);
-    let reach = Reach::of(BLOCK, x, y, luma.true_width, luma.true_height);
+    let reach = Reach::of(BLOCK, x, y, luma.true_width, luma.true_height, fctx);
 
     // skip / intra_inter symbol costs at a fixed context -- see this
     // function's doc comment.
@@ -2596,7 +2638,7 @@ fn search_inter_block(
         },
         DC_PRED,
         search.base_q_idx,
-        search.deadzone,
+        search.deadzone, fctx,
     );
     let v_trial = chroma[1].trial(
         At {
@@ -2608,7 +2650,7 @@ fn search_inter_block(
         },
         DC_PRED,
         search.base_q_idx,
-        search.deadzone,
+        search.deadzone, fctx,
     );
 
     let intra_modes: Vec<u8> = match search.top_k {
@@ -2623,7 +2665,7 @@ fn search_inter_block(
                 },
                 search.modes,
                 mode_bits,
-                search.lambda,
+                search.lambda, fctx,
             );
             prune_by_sad(search.modes, scored, k)
         }
@@ -2640,7 +2682,7 @@ fn search_inter_block(
             },
             mode,
             search.base_q_idx,
-            search.deadzone,
+            search.deadzone, fctx,
         );
         let u = u_trial.clone();
         let v = v_trial.clone();
@@ -2716,7 +2758,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            luma_set,
+            luma_set, fctx,
         );
         let u = mc_trial(
             &chroma[0],
@@ -2732,7 +2774,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            chroma_set,
+            chroma_set, fctx,
         );
         let v = mc_trial(
             &chroma[1],
@@ -2748,7 +2790,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            chroma_set,
+            chroma_set, fctx,
         );
         let skip = luma_trial.levels.iter().all(|&l| l == 0)
             && u.levels.iter().all(|&l| l == 0)
@@ -2797,7 +2839,7 @@ fn search_inter_block(
         BLOCK,
         BLOCK,
         stack.pred_mv,
-        search.lambda,
+        search.lambda, fctx,
     );
     #[cfg(test)]
     stage_add(0, t.elapsed());
@@ -2817,7 +2859,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            luma_set,
+            luma_set, fctx,
         );
         let u = mc_trial(
             &chroma[0],
@@ -2833,7 +2875,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            chroma_set,
+            chroma_set, fctx,
         );
         let v = mc_trial(
             &chroma[1],
@@ -2849,7 +2891,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            chroma_set,
+            chroma_set, fctx,
         );
         let drl_bits = if stack.entries.len() > 1 {
             symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[0]], 0)
@@ -2912,7 +2954,7 @@ pub(crate) fn encode_inter_frame(
     base_q_idx: u8,
     deadzone: f64,
     order_hint: u32,
-    render: (usize, usize),
+    render: (usize, usize), fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -3043,7 +3085,7 @@ pub(crate) fn encode_inter_frame(
                         &search,
                         &mode_bits_table,
                         reference,
-                        &stack,
+                        &stack, fctx,
                     );
 
                     for dr in 0..8 {
@@ -3142,7 +3184,7 @@ pub(crate) fn encode_inter_frame(
                                 &search,
                                 &mode_bits_table,
                                 reference,
-                                &stack,
+                                &stack, fctx,
                             );
                             for dr in 0..4 {
                                 for dc in 0..4 {
@@ -3202,7 +3244,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                    &stack,
+                                    &stack, fctx,
                                 );
                                 for dr in 0..2 {
                                     for dc in 0..2 {
@@ -3316,10 +3358,10 @@ pub struct EncodedSequence {
 /// Returns an error when `pictures` is empty, when any picture besides the
 /// first is not the same size as the first, or under the same conditions
 /// [`encode_key_frame`] and the inter frame path do.
-pub fn encode_sequence(
+pub(crate) fn encode_sequence_with_ctx(
     pictures: &[Picture],
     base_q_idx: u8,
-    deadzone: f64,
+    deadzone: f64, fctx: &crate::decode::FrameCtx,
 ) -> Result<EncodedSequence> {
     let Some((first, rest)) = pictures.split_first() else {
         return Err(Error::unsupported(
@@ -3341,7 +3383,7 @@ pub fn encode_sequence(
         &KEY_FRAME_MODES,
         split_blocks(),
         render,
-        unspecified_color_config(),
+        unspecified_color_config(), fctx,
     )?;
     let mut stream = key.stream.clone();
     let mut reference = key.reconstruction.clone();
@@ -3361,7 +3403,7 @@ pub fn encode_sequence(
             base_q_idx,
             deadzone,
             order_hint,
-            render,
+            render, fctx,
         )?;
         stream.extend_from_slice(&inter.stream);
         reference = inter.reconstruction.clone();
@@ -3442,6 +3484,7 @@ mod tests {
     /// (the horizontal shapes, which those partitions never produce).
     #[test]
     fn every_rect_shape_reaches_what_libaom_says_over_the_whole_superblock() {
+        let fctx = &crate::decode::FrameCtx::new();
         // (bw, bh, has_tr len, has_tr byte sum, has_bl len, has_bl byte sum).
         const SHAPES: [(usize, usize, usize, u32, usize, u32); 14] = [
         (4, 8, 64, 9280, 64, 550),
@@ -3469,7 +3512,7 @@ mod tests {
             x: usize,
             y: usize,
             width: usize,
-            height: usize,
+            height: usize, fctx: &crate::decode::FrameCtx,
         ) -> (bool, bool) {
             let (bw_log2, bh_log2) = ((bw / 4).ilog2() as usize, (bh / 4).ilog2() as usize);
             let (_bw_unit, bh_unit) = (bw / 4, bh / 4);
@@ -3518,8 +3561,8 @@ mod tests {
                 for sb_x in [0usize, 64] {
                     for y in (sb_y..sb_y + 64).step_by(bh) {
                         for x in (sb_x..sb_x + 64).step_by(bw) {
-                            let got = Reach::of_rect(bw, bh, x, y, 256, 256);
-                            let want = libaom_reach(bw, bh, x, y, 256, 256);
+                            let got = Reach::of_rect(bw, bh, x, y, 256, 256, fctx);
+                            let want = libaom_reach(bw, bh, x, y, 256, 256, fctx);
                             assert_eq!(
                                 (got.above_right, got.below_left),
                                 want,
@@ -3653,13 +3696,14 @@ mod tests {
     /// which is why this is an equality and not a tolerance.
     #[test]
     fn ffmpeg_decodes_exactly_what_the_encoder_reconstructed() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP ffmpeg_decodes_exactly_what_the_encoder_reconstructed: no ffmpeg");
             return;
         }
         for &(width, height) in &[(64usize, 64usize), (96, 64), (160, 96), (32, 48)] {
             let picture = test_card(width, height);
-            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
             assert_eq!(
                 decoded.y, encoded.reconstruction.y,
@@ -3673,7 +3717,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let picture = test_card(width, height);
         for &q in &[15u8, 45, 100, 200] {
-            let encoded = encode_key_frame(&picture, q, 0.5).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, q, 0.5, fctx).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
             assert_eq!(decoded.y, encoded.reconstruction.y, "q={q}: luma");
             assert_eq!(decoded.u, encoded.reconstruction.u, "q={q}: U");
@@ -3691,6 +3735,7 @@ mod tests {
     /// same coefficient syntax decodes clean on every intra key-frame gate).
     #[test]
     fn a_nearestmv_block_with_one_nonzero_coefficient_decodes_clean() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_nearestmv_block_with_one_nonzero_coefficient_decodes_clean: no ffmpeg"
@@ -3699,7 +3744,7 @@ mod tests {
         }
         let (width, height) = (64usize, 64usize);
         let picture = Picture::grey(width, height);
-        let key = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let key = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
 
         let (seq, _) = key_frame_headers(width, height, 100).unwrap();
         let (_, inter_header) = inter_frame_headers(width, height, 100, 1, 0).unwrap();
@@ -3810,6 +3855,7 @@ mod tests {
     /// `ffprobe` is asserted to report below.
     #[test]
     fn a_frame_round_trips_at_its_own_size() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP a_frame_round_trips_at_its_own_size: no ffmpeg");
             return;
@@ -3827,7 +3873,7 @@ mod tests {
             (192, 120),
         ] {
             let picture = test_card(width, height);
-            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             assert_eq!(
                 (encoded.reconstruction.width, encoded.reconstruction.height),
                 (width, height),
@@ -3875,12 +3921,13 @@ mod tests {
     /// the header's own size before output).
     #[test]
     fn an_854x480_picture_round_trips_through_its_padding() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             return;
         }
         let (width, height) = (854usize, 480usize);
         let picture = test_card(width, height);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let decoded = ffmpeg_decode(&encoded.stream, width, height);
         assert_eq!(decoded.y, encoded.reconstruction.y, "854x480: luma");
         assert_eq!(decoded.u, encoded.reconstruction.u, "854x480: U");
@@ -3905,19 +3952,20 @@ mod tests {
     ///    (`has_tr_vert_8x8` bit 16 = 0, ordinary `has_tr_8x8` bit 16 = 1).
     #[test]
     fn of_tu_follows_the_block_row_including_under_vert_ab() {
+    let fctx = &crate::decode::FrameCtx::new();
         // The 8x8 square at superblock row 1, column 0, and the TX4 unit in
         // its top-right corner (`col_off = 4`, `row_off = 0`): that unit's
         // above-right answer is the BLOCK's, which is the whole reason a unit
         // asks the block instead of looking itself up (the
         // `has_tr_vert_*` tables have no 4x4 row at all, lane-ab16 r2).
-        let plain = Reach::of(8, 0, 8, SUPERBLOCK, SUPERBLOCK);
+        let plain = Reach::of(8, 0, 8, SUPERBLOCK, SUPERBLOCK, fctx);
         assert_eq!(
             Reach::of_tu(8, 8, 4, 0, 4, 4, plain).above_right,
             plain.above_right,
             "ordinary table: the top-right TX4 unit takes the block's row"
         );
         let guard = Reach::vert_ab_partition();
-        let vert = Reach::of(8, 0, 8, SUPERBLOCK, SUPERBLOCK);
+        let vert = Reach::of(8, 0, 8, SUPERBLOCK, SUPERBLOCK, fctx);
         assert_eq!(
             Reach::of_tu(8, 8, 4, 0, 4, 4, vert).above_right,
             vert.above_right,
@@ -3939,6 +3987,7 @@ mod tests {
     /// wrong for one block size while looking plausible for the other.
     #[test]
     fn reach_matches_libaom_has_top_right_and_has_bottom_left() {
+        let fctx = &crate::decode::FrameCtx::new();
         // Transcribed from has_top_right/has_bottom_left's row_off==0,
         // col_off==0 (whole-transform) path, with MAX_MIB_SIZE_LOG2 = 5 (a
         // 128px reference grid) pinned as libaom pins it, independent of the
@@ -3968,7 +4017,7 @@ mod tests {
             (table[index / 8] >> (index % 8)) & 1 != 0
         }
 
-        fn libaom_bottom_left(side: usize, x: usize, y: usize, height: usize) -> bool {
+        fn libaom_bottom_left(side: usize, x: usize, y: usize, height: usize, fctx: &crate::decode::FrameCtx) -> bool {
             if x == 0 || y + side >= height {
                 return false;
             }
@@ -3997,7 +4046,7 @@ mod tests {
         for side in [16usize, BLOCK] {
             for y in (0..height).step_by(side) {
                 for x in (0..width).step_by(side) {
-                    let reach = Reach::of(side, x, y, width, height);
+                    let reach = Reach::of(side, x, y, width, height, fctx);
                     assert_eq!(
                         reach.above_right,
                         libaom_top_right(side, x, y, width, height),
@@ -4005,7 +4054,7 @@ mod tests {
                     );
                     assert_eq!(
                         reach.below_left,
-                        libaom_bottom_left(side, x, y, height),
+                        libaom_bottom_left(side, x, y, height, fctx),
                         "side={side} x={x} y={y}: below_left"
                     );
                 }
@@ -4083,6 +4132,7 @@ mod tests {
 
     #[test]
     fn vert_ab_partition_flips_below_left_for_the_top_right_8x8() {
+    let fctx = &crate::decode::FrameCtx::new();
         let (width, height) = (SUPERBLOCK * 3, SUPERBLOCK * 3);
         // Interior superblock, so neither the frame edge nor the col == 0 /
         // last-row early returns answer instead of the table.
@@ -4091,10 +4141,10 @@ mod tests {
         for row in 0..8 {
             for col in 1..8 {
                 let (x, y) = (sb_x + col * 8, sb_y + row * 8);
-                let raster = Reach::of(8, x, y, width, height).below_left;
+                let raster = Reach::of(8, x, y, width, height, fctx).below_left;
                 let vert = {
                     let _guard = Reach::vert_ab_partition();
-                    Reach::of(8, x, y, width, height).below_left
+                    Reach::of(8, x, y, width, height, fctx).below_left
                 };
                 // The TR square of a VERT_A/_B sits at an even row, odd
                 // column; every other slot must be untouched by the guard.
@@ -4109,16 +4159,17 @@ mod tests {
         }
         assert_eq!(flipped, 4 * 4, "expected the 16 8x8 TR slots to flip");
         // The guard is scoped: it must not leak past its own block.
-        assert!(!Reach::of(8, sb_x + 8, sb_y, width, height).below_left);
+        assert!(!Reach::of(8, sb_x + 8, sb_y, width, height, fctx).below_left);
     }
 
     /// An odd width or height is refused by name, not by however the padder
     /// or the block coder would happen to fail on it.
     #[test]
     fn odd_dimensions_are_refused() {
+    let fctx = &crate::decode::FrameCtx::new();
         for &(width, height) in &[(1921usize, 1080usize), (1920, 1081), (63, 63)] {
             let picture = Picture::grey(width, height);
-            let err = encode_key_frame(&picture, 100, 0.5)
+            let err = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx)
                 .expect_err(&format!("{width}x{height} is odd and must be refused"));
             assert!(
                 err.to_string().contains("even"),
@@ -4133,6 +4184,7 @@ mod tests {
     /// own (padded) reconstruction.
     #[test]
     fn sequence_round_trips_at_a_non_multiple_size() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP sequence_round_trips_at_a_non_multiple_size: no ffmpeg");
             return;
@@ -4141,7 +4193,7 @@ mod tests {
         let pictures: Vec<Picture> = (0..3)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         assert_eq!(encoded.frames.len(), 3);
         for (i, frame) in encoded.frames.iter().enumerate() {
             assert_eq!(
@@ -4175,6 +4227,7 @@ mod tests {
     /// inter tile writer's parity with it across a real multi-frame export.
     #[test]
     fn a_sequence_round_trips_at_the_exactly_half_straddle_size() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP a_sequence_round_trips_at_the_exactly_half_straddle_size: no ffmpeg");
             return;
@@ -4183,7 +4236,7 @@ mod tests {
         let pictures: Vec<Picture> = (0..3)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         assert_eq!(encoded.frames.len(), 3);
         for (i, frame) in encoded.frames.iter().enumerate() {
             assert_eq!(
@@ -4219,14 +4272,15 @@ mod tests {
     /// actually exercised).
     #[test]
     fn key_frame_and_inter_frame_both_encode_at_half_straddle_size() {
+    let fctx = &crate::decode::FrameCtx::new();
         let (width, height) = (640usize, 360usize);
         let picture = Picture::grey(width, height);
-        encode_key_frame(&picture, 100, 0.5).expect("key frame now codes the mod-32==8 straddle");
+        encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).expect("key frame now codes the mod-32==8 straddle");
 
         // `encode_sequence`'s second frame is the inter path: same size, now
         // wired the same way.
         let pictures = vec![picture.clone(), picture];
-        encode_sequence(&pictures, 100, 0.5)
+        encode_sequence_with_ctx(&pictures, 100, 0.5, fctx)
             .expect("inter frame now codes the mod-32==8 straddle too");
     }
 
@@ -4237,6 +4291,7 @@ mod tests {
     /// only encoder-clean.
     #[test]
     fn a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames: \
@@ -4247,7 +4302,7 @@ mod tests {
         let (width, height) = (640usize, 360usize);
         for shift in [0i64, 7, 19] {
             let picture = panned_test_card(width, height, shift);
-            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
             assert_eq!(decoded.y, encoded.reconstruction.y, "shift {shift}: luma");
             assert_eq!(decoded.u, encoded.reconstruction.u, "shift {shift}: U");
@@ -4261,6 +4316,7 @@ mod tests {
     /// encoder-clean (the test above) but decoder-clean against ffmpeg too.
     #[test]
     fn a_640x360_half_straddle_sequence_round_trips_through_ffmpeg() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_640x360_half_straddle_sequence_round_trips_through_ffmpeg: no ffmpeg"
@@ -4271,7 +4327,7 @@ mod tests {
         let pictures: Vec<Picture> = (0..4)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         assert_eq!(encoded.frames.len(), 4);
         if let Ok(path) = std::env::var("EC_AV1_DUMP") {
             std::fs::write(&path, &encoded.stream).expect("dump the raw stream");
@@ -4319,6 +4375,7 @@ mod tests {
     #[test]
     #[ignore = "a sweep, not a gate"]
     fn probe_lambda() {
+    let fctx = &crate::decode::FrameCtx::new();
         let mut pictures = vec![
             ("test card".to_string(), test_card(160, 96)),
             ("stripes".to_string(), stripes(160, 96, true)),
@@ -4331,8 +4388,8 @@ mod tests {
             }
         }
         for (name, picture) in pictures {
-            let dc = ladder(&picture, &[DC_PRED]);
-            let searched = ladder(&picture, &NON_DIRECTIONAL);
+            let dc = ladder(&picture, &[DC_PRED], fctx);
+            let searched = ladder(&picture, &NON_DIRECTIONAL, fctx);
             println!(
                 "{name}: {:+.1}% rate against DC alone, {:.0}B/{:.2}dB against {:.0}B/{:.2}dB at the middle point",
                 bd_rate(&dc, &searched) * 100.0,
@@ -4349,8 +4406,9 @@ mod tests {
     #[test]
     #[ignore = "a sweep, not a gate"]
     fn probe_ladder() {
+    let fctx = &crate::decode::FrameCtx::new();
         for (name, picture) in sweep_pictures() {
-            let all = ladder(&picture, &KEY_FRAME_MODES);
+            let all = ladder(&picture, &KEY_FRAME_MODES, fctx);
             let points = all
                 .iter()
                 .map(|&(db, log_bytes)| format!("{:.0}@{db:.3}", 10f64.powf(log_bytes)))
@@ -4366,6 +4424,7 @@ mod tests {
     #[test]
     #[ignore = "a sweep, not a gate"]
     fn probe_split() {
+    let fctx = &crate::decode::FrameCtx::new();
         for (name, picture) in sweep_pictures() {
             let ladder = |split: bool| {
                 let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
@@ -4378,7 +4437,7 @@ mod tests {
                             &KEY_FRAME_MODES,
                             split,
                             (picture.width, picture.height),
-                            unspecified_color_config(),
+                            unspecified_color_config(), fctx,
                         )
                         .unwrap();
                         (
@@ -4398,7 +4457,7 @@ mod tests {
                 &KEY_FRAME_MODES,
                 true,
                 (picture.width, picture.height),
-                unspecified_color_config(),
+                unspecified_color_config(), fctx,
             )
             .unwrap()
             .modes
@@ -4446,6 +4505,7 @@ mod tests {
     /// over a whole picture and the reconstruction gated against ffmpeg.
     #[test]
     fn every_mode_decodes_to_what_the_encoder_predicted() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP every_mode_decodes_to_what_the_encoder_predicted: no ffmpeg");
             return;
@@ -4456,7 +4516,7 @@ mod tests {
         for (width, height) in [(128, 96), (160, 96)] {
             let picture = test_card(width, height);
             for mode in KEY_FRAME_MODES {
-                let encoded = encode_key_frame_with_modes(&picture, 100, 0.5, &[mode]).unwrap();
+                let encoded = encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[mode], fctx).unwrap();
                 let decoded = ffmpeg_decode(&encoded.stream, width, height);
                 for (plane, ours, theirs, stride) in [
                     ("luma", &encoded.reconstruction.y, &decoded.y, width),
@@ -4483,6 +4543,7 @@ mod tests {
     /// while leaving every fidelity gate intact.
     #[test]
     fn the_search_picks_the_direction_the_picture_runs() {
+    let fctx = &crate::decode::FrameCtx::new();
         for (vertical, want) in [(true, V_PRED), (false, H_PRED)] {
             let picture = stripes(128, 96, vertical);
             // Only the pair, because on stripes a third mode predicts exactly
@@ -4491,7 +4552,7 @@ mod tests {
             // tie then goes to whichever is cheaper to name, which is not what
             // this gate is about.
             let encoded =
-                encode_key_frame_with_modes(&picture, 100, 0.5, &[V_PRED, H_PRED]).unwrap();
+                encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[V_PRED, H_PRED], fctx).unwrap();
             // The first block of the picture has neither neighbour, so it
             // cannot tell the modes apart; every other one can.
             let picked = encoded.modes[1..].iter().filter(|&&m| m == want).count();
@@ -4536,11 +4597,11 @@ mod tests {
 
     /// A ladder of (luma PSNR, log10 bytes) for one mode set, ordered by
     /// fidelity.
-    fn ladder(picture: &Picture, modes: &[u8]) -> Vec<(f64, f64)> {
+    fn ladder(picture: &Picture, modes: &[u8], fctx: &crate::decode::FrameCtx) -> Vec<(f64, f64)> {
         let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
             .iter()
             .map(|&q| {
-                let encoded = encode_key_frame_with_modes(picture, q, 0.5, modes).unwrap();
+                let encoded = encode_key_frame_with_modes_with_ctx(picture, q, 0.5, modes, fctx).unwrap();
                 (
                     psnr(&encoded.reconstruction.y, picture.y.as_slice()),
                     (encoded.stream.len() as f64).log10(),
@@ -4557,13 +4618,14 @@ mod tests {
     /// directional pair has.
     #[test]
     fn the_search_beats_dc_alone() {
+    let fctx = &crate::decode::FrameCtx::new();
         for (name, picture, want) in [
             ("test card", test_card(160, 96), -0.05),
             ("stripes", stripes(160, 96, true), -0.40),
         ] {
             let saved = bd_rate(
-                &ladder(&picture, &[DC_PRED]),
-                &ladder(&picture, &NON_DIRECTIONAL),
+                &ladder(&picture, &[DC_PRED], fctx),
+                &ladder(&picture, &NON_DIRECTIONAL, fctx),
             );
             assert!(
                 saved < want,
@@ -4598,11 +4660,12 @@ mod tests {
     #[test]
     #[ignore = "a sweep, not a gate"]
     fn probe_directional() {
+    let fctx = &crate::decode::FrameCtx::new();
         for (name, picture) in sweep_pictures() {
-            let dc = ladder(&picture, &[DC_PRED]);
-            let flat = ladder(&picture, &NON_DIRECTIONAL);
-            let all = ladder(&picture, &KEY_FRAME_MODES);
-            let encoded = encode_key_frame(&picture, 90, 0.5).unwrap();
+            let dc = ladder(&picture, &[DC_PRED], fctx);
+            let flat = ladder(&picture, &NON_DIRECTIONAL, fctx);
+            let all = ladder(&picture, &KEY_FRAME_MODES, fctx);
+            let encoded = encode_key_frame_with_ctx(&picture, 90, 0.5, fctx).unwrap();
             let directional = encoded
                 .modes
                 .iter()
@@ -4646,8 +4709,8 @@ mod tests {
 
     /// The mode picked by the most blocks of a picture, ignoring the first
     /// block, which has no neighbours to tell the modes apart with.
-    fn favourite_mode(picture: &Picture) -> (u8, usize, usize) {
-        let encoded = encode_key_frame(picture, 100, 0.5).unwrap();
+    fn favourite_mode(picture: &Picture, fctx: &crate::decode::FrameCtx) -> (u8, usize, usize) {
+        let encoded = encode_key_frame_with_ctx(picture, 100, 0.5, fctx).unwrap();
         let blocks = &encoded.modes[1..];
         let mut counts = [0usize; 13];
         for &mode in blocks {
@@ -4667,9 +4730,10 @@ mod tests {
     /// the above row where it should read the left column, would swap these.
     #[test]
     fn the_search_picks_the_diagonal_the_picture_runs() {
+    let fctx = &crate::decode::FrameCtx::new();
         for (down_right, want) in [(true, D135_PRED), (false, D45_PRED)] {
             let picture = diagonal(160, 96, down_right);
-            let (mode, count, blocks) = favourite_mode(&picture);
+            let (mode, count, blocks) = favourite_mode(&picture, fctx);
             assert_eq!(
                 mode, want,
                 "down_right={down_right}: {count} of {blocks} blocks picked mode {mode}"
@@ -4685,14 +4749,15 @@ mod tests {
     /// it, which is what costing the mode symbol is for.
     #[test]
     fn the_diagonals_beat_the_modes_that_read_no_further() {
+    let fctx = &crate::decode::FrameCtx::new();
         for (name, picture, want) in [
             ("down-right", diagonal(160, 96, true), -0.20),
             ("down-left", diagonal(160, 96, false), -0.20),
             ("test card", test_card(160, 96), 0.01),
         ] {
             let saved = bd_rate(
-                &ladder(&picture, &NON_DIRECTIONAL),
-                &ladder(&picture, &KEY_FRAME_MODES),
+                &ladder(&picture, &NON_DIRECTIONAL, fctx),
+                &ladder(&picture, &KEY_FRAME_MODES, fctx),
             );
             assert!(
                 saved < want,
@@ -4707,15 +4772,16 @@ mod tests {
     /// something else, and a search with nothing to choose from likewise.
     #[test]
     fn a_mode_the_encoder_cannot_predict_is_refused() {
+    let fctx = &crate::decode::FrameCtx::new();
         let picture = test_card(64, 64);
-        let message = encode_key_frame_with_modes(&picture, 100, 0.5, &[13])
+        let message = encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[13], fctx)
             .unwrap_err()
             .to_string();
         assert!(
             message.contains("intra mode 13"),
             "the refusal must name the mode, got {message}"
         );
-        assert!(encode_key_frame_with_modes(&picture, 100, 0.5, &[]).is_err());
+        assert!(encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[], fctx).is_err());
     }
 
     /// The picture that comes back is the picture that went in, to within the
@@ -4725,8 +4791,9 @@ mod tests {
     /// right picture.
     #[test]
     fn the_encoded_picture_is_the_one_that_went_in() {
+    let fctx = &crate::decode::FrameCtx::new();
         let picture = test_card(160, 96);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let luma = psnr(&encoded.reconstruction.y, &picture.y);
         assert!(luma > 36.0, "luma PSNR {luma} at q 100");
         for (plane, (got, want)) in [
@@ -4746,10 +4813,11 @@ mod tests {
     /// loop above this will assume.
     #[test]
     fn fidelity_and_rate_move_with_the_quantizer() {
+    let fctx = &crate::decode::FrameCtx::new();
         let picture = test_card(128, 128);
         let mut previous: Option<(usize, f64)> = None;
         for &q in &[70u8, 90, 110] {
-            let encoded = encode_key_frame(&picture, q, 0.5).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, q, 0.5, fctx).unwrap();
             let quality = psnr(&encoded.reconstruction.y, &picture.y);
             if let Some((bytes, better)) = previous {
                 assert!(
@@ -4764,7 +4832,7 @@ mod tests {
 
         let mut previous = None;
         for &deadzone in &[0.5f64, 0.3, 0.15] {
-            let encoded = encode_key_frame(&picture, 100, deadzone).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, 100, deadzone, fctx).unwrap();
             let quality = psnr(&encoded.reconstruction.y, &picture.y);
             if let Some((bytes, better)) = previous {
                 assert!(
@@ -4782,8 +4850,8 @@ mod tests {
         // even though a coarser quantizer always codes no more than a finer
         // one on the same picture.
         for &(lo, hi) in &[(20u8, 21u8), (60, 61), (120, 121)] {
-            let lo_bytes = encode_key_frame(&picture, lo, 0.5).unwrap().stream.len();
-            let hi_bytes = encode_key_frame(&picture, hi, 0.5).unwrap().stream.len();
+            let lo_bytes = encode_key_frame_with_ctx(&picture, lo, 0.5, fctx).unwrap().stream.len();
+            let hi_bytes = encode_key_frame_with_ctx(&picture, hi, 0.5, fctx).unwrap().stream.len();
             assert!(
                 hi_bytes <= lo_bytes,
                 "q {lo}->{hi} crosses a context boundary: {lo_bytes} -> {hi_bytes} bytes"
@@ -4795,9 +4863,10 @@ mod tests {
     /// average, which is the picture's own value, and codes nothing.
     #[test]
     fn a_flat_picture_costs_almost_nothing() {
+    let fctx = &crate::decode::FrameCtx::new();
         let mut picture = Picture::grey(128, 128);
         picture.y.fill(97);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         // The first block has no neighbour and predicts 128, so it carries a
         // DC; every block after it predicts 97 and carries nothing.
         assert!(
@@ -4824,14 +4893,15 @@ mod tests {
     /// corrupting the stream.
     #[test]
     fn a_picture_off_the_block_grid_is_refused() {
-        let msg = encode_key_frame(&Picture::grey(40, 40), 100, 0.5)
+    let fctx = &crate::decode::FrameCtx::new();
+        let msg = encode_key_frame_with_ctx(&Picture::grey(40, 40), 100, 0.5, fctx)
             .expect_err("40x40 straddles both axes of a 16x16 leaf, needs a rectangular transform")
             .to_string();
         assert!(msg.contains("rectangular"), "refusal: {msg}");
 
         let mut short = Picture::grey(64, 64);
         short.u.truncate(10);
-        assert!(encode_key_frame(&short, 100, 0.5).is_err());
+        assert!(encode_key_frame_with_ctx(&short, 100, 0.5, fctx).is_err());
     }
 
     /// 40x32: cols mod 32 == 8, so the true edge cuts a 16x16 leaf's own
@@ -4906,13 +4976,14 @@ mod tests {
     /// right-most) leaf's mode. The stream now round-trips through ffmpeg.
     #[test]
     fn a_single_axis_straddle_round_trips_through_ffmpeg() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP a_single_axis_straddle_round_trips_through_ffmpeg: no ffmpeg");
             return;
         }
         let (width, height) = (40usize, 32usize);
         let picture = test_card(width, height);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         assert_eq!(
             (encoded.reconstruction.width, encoded.reconstruction.height),
             (width, height)
@@ -4934,6 +5005,7 @@ mod tests {
     /// synthetic pictures — real video reaches contexts a test card does not.
     #[test]
     fn a_frame_of_real_video_decodes_to_what_the_encoder_reconstructed() {
+    let fctx = &crate::decode::FrameCtx::new();
         let Ok(clip) = std::env::var("EC_AV1_CLIP") else {
             eprintln!(
                 "SKIP a_frame_of_real_video_decodes_to_what_the_encoder_reconstructed: \
@@ -4953,7 +5025,7 @@ mod tests {
         let (width, height) = (640usize, 352usize);
         let picture = clip_frame(&clip, &skip, width, height);
 
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let decoded = ffmpeg_decode(&encoded.stream, width, height);
         assert_eq!(decoded.y, encoded.reconstruction.y, "luma");
         assert_eq!(decoded.u, encoded.reconstruction.u, "U");
@@ -5064,6 +5136,7 @@ mod tests {
     /// just the last one, and why this is an equality and not a tolerance.
     #[test]
     fn every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed: no ffmpeg"
@@ -5074,7 +5147,7 @@ mod tests {
         let pictures: Vec<Picture> = (0..5)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         assert_eq!(encoded.frames.len(), 5);
 
         let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 5);
@@ -5104,11 +5177,12 @@ mod tests {
     /// asserted on beyond being reachable at all.
     #[test]
     fn low_motion_makes_an_inter_frame_smaller_than_the_key_frame() {
+    let fctx = &crate::decode::FrameCtx::new();
         let (width, height) = (256usize, 128usize);
         let pictures: Vec<Picture> = (0..5)
             .map(|i| panned_test_card(width, height, i * 2))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
 
         let key_bytes = encoded.frames[0].stream.len();
         eprintln!("frame  bytes  inter share");
@@ -5140,22 +5214,23 @@ mod tests {
     #[test]
     #[ignore = "a perf probe, not a gate"]
     fn stage_timing_breakdown() {
+    let fctx = &crate::decode::FrameCtx::new();
         use std::time::Instant;
 
         for &(width, height) in &[(1920usize, 1080usize), (3840, 2160)] {
             let picture = test_card(width, height);
 
             let t = Instant::now();
-            let dc_only = encode_key_frame_with_modes(&picture, 100, 0.5, &[DC_PRED]).unwrap();
+            let dc_only = encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &[DC_PRED], fctx).unwrap();
             let dc_only_t = t.elapsed();
 
             let t = Instant::now();
             let non_directional =
-                encode_key_frame_with_modes(&picture, 100, 0.5, &NON_DIRECTIONAL).unwrap();
+                encode_key_frame_with_modes_with_ctx(&picture, 100, 0.5, &NON_DIRECTIONAL, fctx).unwrap();
             let non_directional_t = t.elapsed();
 
             let t = Instant::now();
-            let all_modes = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let all_modes = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let all_modes_t = t.elapsed();
 
             eprintln!(
@@ -5175,7 +5250,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height)).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), fctx).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -5233,7 +5308,7 @@ mod tests {
                     side,
                     false,
                     false,
-                    &mut prediction,
+                    &mut prediction, fctx,
                 );
             }
             let predict_t = t.elapsed() / N;
@@ -5261,18 +5336,19 @@ mod tests {
     #[test]
     #[ignore = "a perf probe, not a gate"]
     fn stage_timing_breakdown_inter() {
+    let fctx = &crate::decode::FrameCtx::new();
         use std::time::Instant;
 
         let (width, height) = (1280usize, 720);
         let picture = test_card(width, height);
-        let key = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let key = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let padded_ref = key.reconstruction.padded_to(SUPERBLOCK);
         let padded_pic = picture.padded_to(SUPERBLOCK);
 
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height)).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), fctx).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -5308,6 +5384,7 @@ mod tests {
     #[test]
     #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
     fn prune_k_quality_sweep() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP prune_k_quality_sweep: no ffmpeg");
             return;
@@ -5343,7 +5420,7 @@ mod tests {
                 // a single-threaded #[ignore] probe, run by hand, never
                 // alongside other tests that read Search::top_k.
                 set_test_top_k_override(None);
-                let baseline = encode_key_frame(&picture, q, 0.5).unwrap();
+                let baseline = encode_key_frame_with_ctx(&picture, q, 0.5, fctx).unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &picture.y);
                 eprint!(
                     "{label:9} q={q:3}  baseline {:6} bytes  {:6.2} dB",
@@ -5352,7 +5429,7 @@ mod tests {
                 );
                 for &k in &[3usize, 4, 6] {
                     set_test_top_k_override(Some(k));
-                    let pruned = encode_key_frame(&picture, q, 0.5).unwrap();
+                    let pruned = encode_key_frame_with_ctx(&picture, q, 0.5, fctx).unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &picture.y);
                     eprint!(
                         "   K={k} {:6} bytes  {:6.2} dB ({:+.3} dB)",
@@ -5407,6 +5484,7 @@ mod tests {
     #[test]
     #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
     fn prune_k_quality_sweep_inter() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP prune_k_quality_sweep_inter: no ffmpeg");
             return;
@@ -5440,14 +5518,14 @@ mod tests {
                 // single-threaded #[ignore] probe, run by hand, never
                 // alongside other tests that read Search::top_k.
                 set_test_top_k_override_inter(None);
-                let key = encode_key_frame(&key_source, q, 0.5).unwrap();
+                let key = encode_key_frame_with_ctx(&key_source, q, 0.5, fctx).unwrap();
                 let baseline = encode_inter_frame(
                     &inter_source,
                     &key.reconstruction,
                     q,
                     0.5,
                     1,
-                    (width, height),
+                    (width, height), fctx,
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -5464,7 +5542,7 @@ mod tests {
                         q,
                         0.5,
                         1,
-                        (width, height),
+                        (width, height), fctx,
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
@@ -5544,6 +5622,7 @@ mod tests {
     /// measured - 0.5 dB; byte ceiling = measured * 1.15).
     #[test]
     fn real_clip_encodes_within_its_quality_and_size_budget() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP real_clip_encodes_within_its_quality_and_size_budget: no ffmpeg");
             return;
@@ -5559,7 +5638,7 @@ mod tests {
         }
         let (width, height, frame_count) = (640usize, 384usize, 12usize);
         let source = clip_frames(clip.to_str().unwrap(), "0", width, height, frame_count);
-        let encoded = encode_sequence(&source, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&source, 100, 0.5, fctx).unwrap();
         assert_eq!(encoded.frames.len(), frame_count);
 
         // Gate 1: a real AV1 decoder (dav1d, via ffmpeg) accepts the whole
@@ -5604,6 +5683,7 @@ mod tests {
     /// floor = measured - 0.5 dB; byte ceiling = measured * 1.15).
     #[test]
     fn real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size: \
@@ -5623,7 +5703,7 @@ mod tests {
         }
         let (width, height, frame_count) = (704usize, 400usize, 8usize);
         let source = clip_frames(clip.to_str().unwrap(), "0", width, height, frame_count);
-        let encoded = encode_sequence(&source, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&source, 100, 0.5, fctx).unwrap();
         assert_eq!(encoded.frames.len(), frame_count);
 
         // Gate 1: a real AV1 decoder (dav1d, via ffmpeg) accepts the whole
@@ -5660,13 +5740,14 @@ mod tests {
     #[test]
     #[ignore = "a perf probe, not a gate"]
     fn sequence_bench_sanity() {
+    let fctx = &crate::decode::FrameCtx::new();
         use std::time::Instant;
         let (width, height) = (1280usize, 720usize);
         let pictures: Vec<Picture> = (0..24)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
         let t = Instant::now();
-        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         let elapsed = t.elapsed();
         let total_bytes: usize = encoded.frames.iter().map(|f| f.stream.len()).sum();
         eprintln!(
@@ -5682,6 +5763,7 @@ mod tests {
     #[test]
     #[ignore = "a calibration probe, not a gate"]
     fn calibration_sweep_base_q_idx() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP calibration_sweep_base_q_idx: no ffmpeg");
             return;
@@ -5701,7 +5783,7 @@ mod tests {
             let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
             eprintln!("--- {clip} ---");
             for q in [40u8, 70, 100, 130, 160, 190, 220, 240] {
-                let encoded = encode_sequence(&source, q, 0.5).unwrap();
+                let encoded = encode_sequence_with_ctx(&source, q, 0.5, fctx).unwrap();
                 let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, frames);
                 let mean_psnr: f64 = decoded
                     .iter()

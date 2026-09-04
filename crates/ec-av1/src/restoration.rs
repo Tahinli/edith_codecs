@@ -326,7 +326,7 @@ pub(crate) fn read_lr(
     reference: &mut [(WienerInfo, SgrprojInfo); 3],
     mi_row: u32,
     mi_col: u32,
-    sb_mi: u32,
+    sb_mi: u32, fctx: &crate::decode::FrameCtx,
 ) {
     if !lr.uses_lr {
         return;
@@ -345,7 +345,7 @@ pub(crate) fn read_lr(
         // is in upscaled ones, so the column division scales by
         // `superres_denom / SCALE_NUMERATOR` (`mi_to_num_x`/`denom_x`). Rows
         // are never scaled (spec 7.16 widens columns only).
-        let (num_x, denom_x) = match crate::decode::superres() {
+        let (num_x, denom_x) = match crate::decode::superres(fctx) {
             Some((_, denom)) => (mi_size * denom, unit_size * 8),
             None => (mi_size, unit_size),
         };
@@ -571,14 +571,14 @@ fn apply_wiener_stripe(
     h_end: usize,
     v_start: usize,
     v_end: usize,
-    info: &WienerInfo,
+    info: &WienerInfo, fctx: &crate::decode::FrameCtx,
 ) {
     let w = h_end - h_start;
     let h = v_end - v_start;
     if w == 0 || h == 0 {
         return;
     }
-    let bd = i64::from(crate::decode::bit_depth());
+    let bd = i64::from(crate::decode::bit_depth(fctx));
     let wiener_bias = 1i64 << (bd + 3);
     let wiener_limit = 1i64 << (bd + 5);
     let rows = h + 6;
@@ -622,7 +622,7 @@ fn apply_wiener_stripe(
     WIENER_ROW_SCRATCH.with(|c| *c.borrow_mut() = hbuf);
     // lane-perf7: the clamp bound is the frame's, so it is read once here
     // instead of taking a thread-local read per output sample.
-    let smax = i64::from(crate::decode::sample_max());
+    let smax = i64::from(crate::decode::sample_max(fctx));
     // The vertical pass is `mc.rs`'s too, same 8th-tap-zero trick: it leaves
     // the accumulator unrounded, and `Round2(_, 11)` is `INTER_ROUND_1`.
     let vf = &info.vfilter;
@@ -732,7 +732,7 @@ fn compute_ab(
     // stripe, ~70 KB each at a 64-wide unit), i.e. an allocation whose every
     // page then faulted in on first touch. Every entry is written below, so
     // the resize's fill value is never read.
-    ab: &mut Vec<(i32, i64)>,
+    ab: &mut Vec<(i32, i64)>, fctx: &crate::decode::FrameCtx,
 ) {
     let gw = w + 2;
     let gh = h + 2;
@@ -750,7 +750,7 @@ fn compute_ab(
     let mut col_a = vec![0i64; ncols];
     let mut col_b = vec![0i64; ncols];
     // Hoisted out of the per-point body: one thread-local read per call.
-    let bd_shift = u32::from(crate::decode::bit_depth()).saturating_sub(8);
+    let bd_shift = u32::from(crate::decode::bit_depth(fctx)).saturating_sub(8);
     let base_col = h_start as i64 - 1 - r as i64;
     // lane-perf9: the column sums slide down the grid too. Grid row `gi+1`'s
     // window is row `gi`'s minus its top source row plus one new bottom row,
@@ -844,7 +844,7 @@ fn apply_sgrproj_stripe(
     h_end: usize,
     v_start: usize,
     v_end: usize,
-    info: &SgrprojInfo,
+    info: &SgrprojInfo, fctx: &crate::decode::FrameCtx,
 ) {
     let w = h_end - h_start;
     let h = v_end - v_start;
@@ -860,10 +860,10 @@ fn apply_sgrproj_stripe(
         (std::mem::take(&mut m.0), std::mem::take(&mut m.1))
     });
     if r0 > 0 {
-        compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0, &mut buf0);
+        compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0, &mut buf0, fctx);
     }
     if r1 > 0 {
-        compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1, &mut buf1);
+        compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1, &mut buf1, fctx);
     }
     let ab0 = (r0 > 0).then_some(&buf0);
     let ab1 = (r1 > 0).then_some(&buf1);
@@ -904,7 +904,7 @@ fn apply_sgrproj_stripe(
 
     // lane-perf7: as in `apply_wiener_stripe`, the clamp bound is read once
     // per stripe instead of per output sample.
-    let smax = i64::from(crate::decode::sample_max());
+    let smax = i64::from(crate::decode::sample_max(fctx));
     for i in 0..h as i64 {
         for j in 0..w as i64 {
             let dgd = lr_sample(
@@ -1005,7 +1005,7 @@ fn filter_restoration_unit(
     v_start: usize,
     v_end: usize,
     ss_y: u32,
-    filter: UnitFilter,
+    filter: UnitFilter, fctx: &crate::decode::FrameCtx,
 ) {
     let full_stripe_height = 64usize >> ss_y;
     let runit_offset = 8usize >> ss_y;
@@ -1027,10 +1027,10 @@ fn filter_restoration_unit(
         }
         match filter {
             UnitFilter::Wiener(info) => apply_wiener_stripe(
-                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info,
+                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info, fctx,
             ),
             UnitFilter::Sgrproj(info) => apply_sgrproj_stripe(
-                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info,
+                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info, fctx,
             ),
             UnitFilter::None => {}
         }
@@ -1065,7 +1065,7 @@ pub(crate) fn apply_loop_restoration_plane(
     // lane-perf6: the destination buffer, refilled from `cdef` here. It used
     // to be a fresh `cdef.to_vec()` per plane per frame -- a multi-megabyte
     // allocation whose every page then faulted in on first touch.
-    out: &mut Vec<u16>,
+    out: &mut Vec<u16>, fctx: &crate::decode::FrameCtx,
 ) {
     out.clear();
     out.extend_from_slice(cdef);
@@ -1104,7 +1104,7 @@ pub(crate) fn apply_loop_restoration_plane(
                     v_start as usize,
                     v_end as usize,
                     ss_y,
-                    filter,
+                    filter, fctx,
                 );
             }
             x0 += uw;

@@ -221,7 +221,20 @@ pub struct Av1Encoder {
     /// otherwise every picture is coded at `config.base_q_idx`, unchanged
     /// from before this field existed.
     rate_loop: Option<RateLoop>,
+    /// This stream's decode-side per-frame state, owned here so `encode`
+    /// keeps the public signature it had before the state stopped being
+    /// thread-local. One per encoder, never per frame: several of its fields
+    /// (the inter-frame inheritance guards) carry state ACROSS frames.
+    fctx: crate::decode::FrameCtx,
 }
+
+/// The encoder stays `Send` now that it owns a `FrameCtx` (whose cells are
+/// `Send` but `!Sync`): it can move to another thread, it just cannot be
+/// shared by reference across threads.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Av1Encoder>();
+};
 
 impl Av1Encoder {
     /// # Errors
@@ -243,6 +256,7 @@ impl Av1Encoder {
             reference: None,
             next_index: 0,
             rate_loop: None,
+            fctx: crate::decode::FrameCtx::new(),
         })
     }
 
@@ -325,6 +339,7 @@ impl Av1Encoder {
                 split_blocks(),
                 render,
                 self.color_config,
+                &self.fctx,
             )?
         } else {
             let reference = self.reference.as_ref().ok_or_else(|| {
@@ -340,6 +355,7 @@ impl Av1Encoder {
                 DEADZONE,
                 order as u32,
                 render,
+                &self.fctx,
             )?
         };
 
