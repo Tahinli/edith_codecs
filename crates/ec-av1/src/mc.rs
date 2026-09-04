@@ -243,6 +243,265 @@ fn sample(
     i32::from(reference[cy * stride + cx])
 }
 
+/// lane-perf5: which explicit-SIMD kernels this CPU can run. The scalar
+/// functions below stay the reference implementation -- every SIMD kernel is
+/// checked against them by `simd_matches_scalar_*` -- and every non-x86_64
+/// build, plus any x86_64 CPU without AVX2 or SSE4.1, decodes through them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // every variant is constructed only on x86_64
+pub(crate) enum SimdLevel {
+    Scalar,
+    /// `_mm_madd_epi16` (SSE2) horizontal pass, `_mm_mullo_epi32` (SSE4.1)
+    /// vertical pass -- the pair is gated on SSE4.1, the later of the two.
+    Sse41,
+    Avx2,
+}
+
+/// The level, detected once per process (spec-irrelevant: pure dispatch).
+pub(crate) fn simd_level() -> SimdLevel {
+    static LEVEL: std::sync::OnceLock<SimdLevel> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return SimdLevel::Avx2;
+            }
+            if std::arch::is_x86_feature_detected!("sse4.1") {
+                return SimdLevel::Sse41;
+            }
+        }
+        SimdLevel::Scalar
+    })
+}
+
+/// The horizontal pass's inner loop over a contiguous window (`src` holds the
+/// row's whole footprint, `out.len() + 7` samples): SIMD where available,
+/// [`hpass_contig_scalar`] otherwise. Both produce the same `i32`s -- the
+/// SIMD form multiplies the same `i16` pairs, sums them in `i32` and applies
+/// the same `Round2(sum, InterRound0)`.
+#[allow(unsafe_code)]
+#[inline]
+fn hpass_contig(src: &[u16], t16: &[i16; 8], out: &mut [i32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match simd_level() {
+            SimdLevel::Avx2 => {
+                // SAFETY: the AVX2 arm is reached only when the CPU reports
+                // avx2, and the kernel reads at most `out.len() + 7` samples.
+                unsafe { simd::hpass_avx2(src, t16, out) };
+                return;
+            }
+            SimdLevel::Sse41 => {
+                // SAFETY: as above; the kernel needs only SSE2, which every
+                // x86_64 CPU has.
+                unsafe { simd::hpass_sse2(src, t16, out) };
+                return;
+            }
+            SimdLevel::Scalar => {}
+        }
+    }
+    hpass_contig_scalar(src, t16, out);
+}
+
+/// The scalar reference for [`hpass_contig`] (lane-perf2's loop).
+fn hpass_contig_scalar(src: &[u16], t16: &[i16; 8], out: &mut [i32]) {
+    // Both factors are 16-bit (a tap is |x| <= 128, a sample fits the bit
+    // depth), so the products are exactly the i32 ones but the widening
+    // multiply is one instruction per pair.
+    for (o, w) in out.iter_mut().zip(src.windows(8)) {
+        let mut sum = 0i32;
+        for t in 0..8 {
+            sum += i32::from(t16[t]) * i32::from(w[t] as i16);
+        }
+        *o = round2(sum, INTER_ROUND_0);
+    }
+}
+
+/// lane-perf5: explicit `std::arch::x86_64` kernels for the two motion
+/// compensation passes -- the 18.7% of a 1080p decode that lane-perf4 left in
+/// `hpass_row` + `vpass_row`. Nothing here is spec logic: each kernel is the
+/// scalar function's arithmetic, lane-parallel, with identical rounding.
+#[allow(unsafe_code)]
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)] // each kernel's whole body is its contract
+mod simd {
+    use super::{round2, INTER_ROUND_0};
+    use std::arch::x86_64::*;
+
+    /// `[t0,t1]`, `[t2,t3]`, `[t4,t5]`, `[t6,t7]` packed as `i32`s, the shape
+    /// `_mm*_madd_epi16` wants: lane `j` of `madd(samples, set1(pair))` is
+    /// `s[2j]*t_even + s[2j+1]*t_odd`, i.e. two taps of one output at once.
+    #[inline]
+    fn tap_pairs(t: &[i16; 8]) -> [i32; 4] {
+        let pack = |a: i16, b: i16| (a as u16 as i32) | ((b as i32) << 16);
+        [pack(t[0], t[1]), pack(t[2], t[3]), pack(t[4], t[5]), pack(t[6], t[7])]
+    }
+
+    /// Horizontal pass, AVX2: 16 outputs per iteration. Each 256-bit `madd`
+    /// covers 8 outputs two taps at a time, but only every other output (the
+    /// pairs are consecutive samples), so even and odd output columns are
+    /// accumulated in two registers and interleaved back into order by
+    /// `unpack` + `permute2x128`.
+    ///
+    /// # Safety
+    /// Requires AVX2. `src.len()` must be at least `out.len() + 7`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn hpass_avx2(src: &[u16], t16: &[i16; 8], out: &mut [i32]) {
+        debug_assert!(src.len() >= out.len() + 7);
+        let n = out.len();
+        let tp = tap_pairs(t16);
+        let tv = [
+            _mm256_set1_epi32(tp[0]),
+            _mm256_set1_epi32(tp[1]),
+            _mm256_set1_epi32(tp[2]),
+            _mm256_set1_epi32(tp[3]),
+        ];
+        let rnd = _mm256_set1_epi32(1 << (INTER_ROUND_0 - 1));
+        let sp = src.as_ptr();
+        let op = out.as_mut_ptr();
+        let mut c = 0usize;
+        while c + 16 <= n {
+            let mut e = _mm256_setzero_si256();
+            let mut o = _mm256_setzero_si256();
+            for k in 0..4 {
+                let se = _mm256_loadu_si256(sp.add(c + 2 * k).cast());
+                e = _mm256_add_epi32(e, _mm256_madd_epi16(se, tv[k]));
+                let so = _mm256_loadu_si256(sp.add(c + 2 * k + 1).cast());
+                o = _mm256_add_epi32(o, _mm256_madd_epi16(so, tv[k]));
+            }
+            e = _mm256_srai_epi32(_mm256_add_epi32(e, rnd), INTER_ROUND_0 as i32);
+            o = _mm256_srai_epi32(_mm256_add_epi32(o, rnd), INTER_ROUND_0 as i32);
+            let lo = _mm256_unpacklo_epi32(e, o);
+            let hi = _mm256_unpackhi_epi32(e, o);
+            _mm256_storeu_si256(op.add(c).cast(), _mm256_permute2x128_si256(lo, hi, 0x20));
+            _mm256_storeu_si256(op.add(c + 8).cast(), _mm256_permute2x128_si256(lo, hi, 0x31));
+            c += 16;
+        }
+        if c < n {
+            hpass_sse2(&src[c..], t16, &mut out[c..]);
+        }
+    }
+
+    /// Vertical pass, AVX2: 8 output columns per iteration, one
+    /// `_mm256_mullo_epi32` + `_mm256_add_epi32` per non-zero tap. Exact:
+    /// an intermediate is at most ~2^17 and a tap at most 128, so the eight
+    /// products stay well inside `i32` and `mullo`'s low half is the whole
+    /// product. `acc` is left unrounded, as the scalar form leaves it.
+    ///
+    /// # Safety
+    /// Requires AVX2. `intermediate` must hold `(row + 8) * block_w` elements
+    /// and `acc` at least `block_w`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vpass_avx2(
+        intermediate: &[i32],
+        block_w: usize,
+        row: usize,
+        taps: &[i32; 8],
+        acc: &mut [i32],
+    ) {
+        debug_assert!(intermediate.len() >= (row + 8) * block_w && acc.len() >= block_w);
+        let ip = intermediate.as_ptr().add(row * block_w);
+        let ap = acc.as_mut_ptr();
+        let mut c = 0usize;
+        while c + 8 <= block_w {
+            let mut v = _mm256_setzero_si256();
+            for (t, &tap) in taps.iter().enumerate() {
+                if tap == 0 {
+                    continue;
+                }
+                let s = _mm256_loadu_si256(ip.add(t * block_w + c).cast());
+                v = _mm256_add_epi32(v, _mm256_mullo_epi32(_mm256_set1_epi32(tap), s));
+            }
+            _mm256_storeu_si256(ap.add(c).cast(), v);
+            c += 8;
+        }
+        // Widths are multiples of 4, so at most one 4-column tail is left.
+        for cc in c..block_w {
+            let mut sum = 0i32;
+            for (t, &tap) in taps.iter().enumerate() {
+                sum += tap * intermediate[(row + t) * block_w + cc];
+            }
+            acc[cc] = sum;
+        }
+    }
+
+    /// Vertical pass, SSE4.1 (`_mm_mullo_epi32` is SSE4.1, unlike the
+    /// horizontal pass's SSE2 `madd`): [`vpass_avx2`] at 4 columns.
+    ///
+    /// # Safety
+    /// Requires SSE4.1; same slice contract as [`vpass_avx2`].
+    #[target_feature(enable = "sse4.1")]
+    pub unsafe fn vpass_sse41(
+        intermediate: &[i32],
+        block_w: usize,
+        row: usize,
+        taps: &[i32; 8],
+        acc: &mut [i32],
+    ) {
+        debug_assert!(intermediate.len() >= (row + 8) * block_w && acc.len() >= block_w);
+        let ip = intermediate.as_ptr().add(row * block_w);
+        let ap = acc.as_mut_ptr();
+        let mut c = 0usize;
+        while c + 4 <= block_w {
+            let mut v = _mm_setzero_si128();
+            for (t, &tap) in taps.iter().enumerate() {
+                if tap == 0 {
+                    continue;
+                }
+                let s = _mm_loadu_si128(ip.add(t * block_w + c).cast());
+                v = _mm_add_epi32(v, _mm_mullo_epi32(_mm_set1_epi32(tap), s));
+            }
+            _mm_storeu_si128(ap.add(c).cast(), v);
+            c += 4;
+        }
+        debug_assert_eq!(c, block_w, "every AV1 block width is a multiple of 4");
+    }
+
+    /// Horizontal pass, SSE2: [`hpass_avx2`]'s scheme at 8 outputs per
+    /// iteration; the remainder (a width-4 block, or a 4-column tail) is the
+    /// scalar loop, which is where 4-tap kernels mostly land anyway.
+    ///
+    /// # Safety
+    /// `src.len()` must be at least `out.len() + 7`. SSE2 is baseline x86_64.
+    pub unsafe fn hpass_sse2(src: &[u16], t16: &[i16; 8], out: &mut [i32]) {
+        debug_assert!(src.len() >= out.len() + 7);
+        let n = out.len();
+        let tp = tap_pairs(t16);
+        let tv = [
+            _mm_set1_epi32(tp[0]),
+            _mm_set1_epi32(tp[1]),
+            _mm_set1_epi32(tp[2]),
+            _mm_set1_epi32(tp[3]),
+        ];
+        let rnd = _mm_set1_epi32(1 << (INTER_ROUND_0 - 1));
+        let sp = src.as_ptr();
+        let op = out.as_mut_ptr();
+        let mut c = 0usize;
+        while c + 8 <= n {
+            let mut e = _mm_setzero_si128();
+            let mut o = _mm_setzero_si128();
+            for k in 0..4 {
+                let se = _mm_loadu_si128(sp.add(c + 2 * k).cast());
+                e = _mm_add_epi32(e, _mm_madd_epi16(se, tv[k]));
+                let so = _mm_loadu_si128(sp.add(c + 2 * k + 1).cast());
+                o = _mm_add_epi32(o, _mm_madd_epi16(so, tv[k]));
+            }
+            e = _mm_srai_epi32(_mm_add_epi32(e, rnd), INTER_ROUND_0 as i32);
+            o = _mm_srai_epi32(_mm_add_epi32(o, rnd), INTER_ROUND_0 as i32);
+            _mm_storeu_si128(op.add(c).cast(), _mm_unpacklo_epi32(e, o));
+            _mm_storeu_si128(op.add(c + 4).cast(), _mm_unpackhi_epi32(e, o));
+            c += 8;
+        }
+        for (o, w) in out[c..].iter_mut().zip(src[c..].windows(8)) {
+            let mut sum = 0i32;
+            for t in 0..8 {
+                sum += i32::from(t16[t]) * i32::from(w[t] as i16);
+            }
+            *o = round2(sum, INTER_ROUND_0);
+        }
+    }
+}
+
 /// lane-perf2: one row of the separable filter's horizontal pass, dav1d
 /// style. When the row's whole 8-tap footprint (`x0-3 .. x0+block_w+4`) lies
 /// inside the reference's true extent -- the overwhelmingly common case --
@@ -264,13 +523,7 @@ fn hpass_row(reference: &[u16], row_base: usize, true_width: usize, x0: i32, tap
                 taps[0] as i16, taps[1] as i16, taps[2] as i16, taps[3] as i16,
                 taps[4] as i16, taps[5] as i16, taps[6] as i16, taps[7] as i16,
             ];
-            for (o, w) in out.iter_mut().zip(src.windows(8)) {
-                let mut sum = 0i32;
-                for t in 0..8 {
-                    sum += i32::from(t16[t]) * i32::from(w[t] as i16);
-                }
-                *o = round2(sum, INTER_ROUND_0);
-            }
+            hpass_contig(src, &t16, out);
             return;
         }
     }
@@ -332,14 +585,38 @@ fn horizontal_pass_unscaled(
 /// adding `0 * x` is exactly nothing, and the 4-tap kernels zero four of the
 /// eight slots. `acc` is left holding the unrounded sums.
 #[inline]
+#[allow(unsafe_code)]
 fn vpass_row(intermediate: &[i32], block_w: usize, row: usize, taps: &[i32; 8], acc: &mut [i32]) {
-    acc.fill(0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        match simd_level() {
+            // SAFETY: the arm is reached only when the CPU reports the
+            // feature; the kernel reads `intermediate[(row+t)*block_w ..
+            // + block_w]` for t in 0..8 and writes `acc[..block_w]`, which
+            // the debug asserts pin.
+            SimdLevel::Avx2 => {
+                unsafe { simd::vpass_avx2(intermediate, block_w, row, taps, acc) };
+                return;
+            }
+            SimdLevel::Sse41 => {
+                unsafe { simd::vpass_sse41(intermediate, block_w, row, taps, acc) };
+                return;
+            }
+            SimdLevel::Scalar => {}
+        }
+    }
+    vpass_row_scalar(intermediate, block_w, row, taps, acc);
+}
+
+/// The scalar reference for [`vpass_row`] (lane-perf2's tap-major loop).
+fn vpass_row_scalar(intermediate: &[i32], block_w: usize, row: usize, taps: &[i32; 8], acc: &mut [i32]) {
+    acc[..block_w].fill(0);
     for (t, &tap) in taps.iter().enumerate() {
         if tap == 0 {
             continue;
         }
         let base = (row + t) * block_w;
-        for (a, &s) in acc.iter_mut().zip(&intermediate[base..base + block_w]) {
+        for (a, &s) in acc[..block_w].iter_mut().zip(&intermediate[base..base + block_w]) {
             *a += tap * s;
         }
     }
@@ -1520,5 +1797,130 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// lane-perf5: every explicit-SIMD kernel is checked against the scalar
+    /// reference it replaces, over the whole domain a decode can hand it --
+    /// all block widths (4..=128), all 16 sub-pel phases, all four filter
+    /// kinds with both their wide and narrow (4-tap) tables, and 8/10/12-bit
+    /// sample ranges. The dispatch itself is exercised through
+    /// [`super::hpass_contig`] (whatever this CPU selected).
+    #[allow(unsafe_code)]
+    #[test]
+    fn simd_matches_scalar_horizontal_pass() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let kinds = [
+            InterpFilterKind::Regular,
+            InterpFilterKind::Smooth,
+            InterpFilterKind::Sharp,
+            InterpFilterKind::Bilinear,
+        ];
+        let mut checked = 0usize;
+        for depth_max in [255u16, 1023, 4095] {
+            for &kind in &kinds {
+                let (wide, narrow) = kind.tables();
+                for table in [wide, narrow] {
+                    for frac in 0..16usize {
+                        let taps = &table[frac];
+                        let t16 = [
+                            taps[0] as i16, taps[1] as i16, taps[2] as i16, taps[3] as i16,
+                            taps[4] as i16, taps[5] as i16, taps[6] as i16, taps[7] as i16,
+                        ];
+                        for w in [4usize, 8, 12, 16, 20, 32, 64, 128] {
+                            let src: Vec<u16> = (0..w + 7)
+                                .map(|_| (rng() % (u64::from(depth_max) + 1)) as u16)
+                                .collect();
+                            let mut want = vec![0i32; w];
+                            super::hpass_contig_scalar(&src, &t16, &mut want);
+                            let mut got = vec![0i32; w];
+                            super::hpass_contig(&src, &t16, &mut got);
+                            assert_eq!(got, want, "dispatch w={w} frac={frac} max={depth_max}");
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                let mut sse = vec![0i32; w];
+                                unsafe { super::simd::hpass_sse2(&src, &t16, &mut sse) };
+                                assert_eq!(sse, want, "sse w={w} frac={frac} max={depth_max}");
+                                if std::arch::is_x86_feature_detected!("avx2") {
+                                    let mut avx = vec![0i32; w];
+                                    unsafe { super::simd::hpass_avx2(&src, &t16, &mut avx) };
+                                    assert_eq!(avx, want, "avx2 w={w} frac={frac} max={depth_max}");
+                                }
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 4 * 2 * 16 * 8);
+    }
+
+    /// lane-perf5: the vertical pass's SIMD kernels against the scalar
+    /// reference, over the same domain as
+    /// [`simd_matches_scalar_horizontal_pass`] -- all widths, all phases,
+    /// both wide and narrow (4-tap) tables of all four filter kinds, and
+    /// intermediates spanning the 8/10/12-bit ranges the horizontal pass can
+    /// produce (a 12-bit sample times the filter gain, both signs).
+    #[allow(unsafe_code)]
+    #[test]
+    fn simd_matches_scalar_vertical_pass() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let kinds = [
+            InterpFilterKind::Regular,
+            InterpFilterKind::Smooth,
+            InterpFilterKind::Sharp,
+            InterpFilterKind::Bilinear,
+        ];
+        let mut checked = 0usize;
+        for span in [255i32 * 16, 1023 * 16, 4095 * 22] {
+            for &kind in &kinds {
+                let (wide, narrow) = kind.tables();
+                for table in [wide, narrow] {
+                    for frac in 0..16usize {
+                        let taps = &table[frac];
+                        for w in [4usize, 8, 12, 16, 20, 32, 64, 128] {
+                            let rows = 12usize;
+                            let inter: Vec<i32> = (0..rows * w)
+                                .map(|_| (rng() % (2 * span as u64 + 1)) as i32 - span)
+                                .collect();
+                            for row in [0usize, 1, 4] {
+                                let mut want = vec![0i32; w];
+                                super::vpass_row_scalar(&inter, w, row, taps, &mut want);
+                                let mut got = vec![0i32; w];
+                                super::vpass_row(&inter, w, row, taps, &mut got);
+                                assert_eq!(got, want, "dispatch w={w} frac={frac} row={row}");
+                                #[cfg(target_arch = "x86_64")]
+                                {
+                                    if std::arch::is_x86_feature_detected!("sse4.1") {
+                                        let mut sse = vec![0i32; w];
+                                        unsafe { super::simd::vpass_sse41(&inter, w, row, taps, &mut sse) };
+                                        assert_eq!(sse, want, "sse4.1 w={w} frac={frac} row={row}");
+                                    }
+                                    if std::arch::is_x86_feature_detected!("avx2") {
+                                        let mut avx = vec![0i32; w];
+                                        unsafe { super::simd::vpass_avx2(&inter, w, row, taps, &mut avx) };
+                                        assert_eq!(avx, want, "avx2 w={w} frac={frac} row={row}");
+                                    }
+                                }
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 4 * 2 * 16 * 8 * 3);
     }
 }
