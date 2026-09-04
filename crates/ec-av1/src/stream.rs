@@ -1228,6 +1228,340 @@ mod tests {
         );
     }
 
+    /// lane-t900 r27, negative gate: a frame whose segmentation enables one of
+    /// the three MODE-OVERRIDING features -- `SEG_LVL_REF_FRAME` (forces a
+    /// block's reference), `SEG_LVL_SKIP` and `SEG_LVL_GLOBALMV` (both
+    /// suppress symbols `decode_inter_block` reads unconditionally) -- is
+    /// refused BY NAME and outputs no picture, rather than desyncing on the
+    /// first block that would have obeyed the override.
+    ///
+    /// Written, not hand-built: `write_segmentation_params` (spec 5.9.14)
+    /// codes `feature_enabled`/`feature_data` for every segment, so a real
+    /// key frame carrying the flag is a two-line change to the header the
+    /// encoder already produced. Swept over all three features and over the
+    /// first, a middle and the last segment id.
+    #[test]
+    fn a_frame_whose_segmentation_overrides_a_block_mode_is_refused_by_name() {
+        const REFUSAL: &str =
+            "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV";
+        let picture = test_card(64, 64);
+        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
+        for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {
+            for segment in [0usize, 3, 7] {
+                let mut header = key.clone();
+                header.segmentation.enabled = true;
+                header.segmentation.update_map = true;
+                header.segmentation.update_data = true;
+                header.segmentation.feature_enabled[segment][feature] = true;
+                header.segmentation.feature_data[segment][feature] = 1;
+                let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+                stream.extend_from_slice(
+                    &crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap(),
+                );
+                let mut shown = 0;
+                let err = decode_stream_with(&stream, |_, _, _| {
+                    shown += 1;
+                    Ok(())
+                })
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    err.contains(REFUSAL),
+                    "feature {feature} segment {segment}: expected {REFUSAL:?}, got: {err}"
+                );
+                assert_eq!(
+                    shown, 0,
+                    "feature {feature} segment {segment}: a refused frame produced a picture"
+                );
+            }
+        }
+    }
+
+    /// One census attempt: encode `frames` frames of `source` with real
+    /// aomenc plus `extra` args, decode with THIS decoder, and return the
+    /// stream's byte length with either the picture count or the refusal (any
+    /// decode error) it produced. A census is about what the encoder emits,
+    /// so a refusal is data here, not a failure.
+    fn census_attempt(
+        source: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+        extra: &[&str],
+    ) -> (usize, std::result::Result<usize, String>) {
+        let duration = format!("{}", frames as f64 / 25.0);
+        let src = format!("{source}=size={width}x{height}:rate=25");
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", &src, "-t", &duration, "-pix_fmt", "yuv420p",
+                "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success(), "ffmpeg refused the {width}x{height} fixture");
+        let limit = format!("--limit={frames}");
+        let mut args: Vec<String> = [
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--threads=1",
+            "--row-mt=0",
+            "--kf-max-dist=9999",
+            "--lag-in-frames=0",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        args.push(limit);
+        args.extend(extra.iter().map(|s| (*s).to_owned()));
+        args.extend(["--obu".to_owned(), "-o".to_owned(), "-".to_owned(), "-".to_owned()]);
+        let mut child = Command::new(aomenc_path())
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(out.status.success(), "aomenc refused {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let stream = out.stdout;
+        let result = match decode_stream(&stream) {
+            Ok(pictures) => Ok(pictures.len()),
+            Err(e) => Err(e.to_string()),
+        };
+        (stream.len(), result)
+    }
+
+    /// lane-t900 r27 CENSUS behind the negative gate above: does a real
+    /// aomenc ever ENABLE one of the three mode-overriding segmentation
+    /// features? Measured over the recipes that turn segmentation on --
+    /// `--aq-mode=1/2/3` (variance, complexity and cyclic-refresh AQ) and
+    /// `--deltaq-mode=1` -- with the refusal as the instrument: if one of
+    /// those features appeared, the decode would stop by name.
+    #[test]
+    fn a_segmentation_census_over_real_aq_streams_finds_no_mode_overriding_feature() {
+        if !have_aomenc() {
+            eprintln!("SKIP a_segmentation_census_over_real_aq_streams: no aomenc");
+            return;
+        }
+        const REFUSAL: &str =
+            "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV";
+        let recipes: [(&str, Vec<&str>); 6] = [
+            ("baseline", vec!["--cpu-used=4", "--cq-level=40"]),
+            ("aq-mode=1", vec!["--cpu-used=4", "--aq-mode=1", "--cq-level=40"]),
+            ("aq-mode=2", vec!["--cpu-used=4", "--aq-mode=2", "--cq-level=40"]),
+            ("aq-mode=3", vec!["--cpu-used=4", "--aq-mode=3", "--cq-level=40"]),
+            ("aq-mode=3 cq10", vec!["--cpu-used=4", "--aq-mode=3", "--cq-level=10"]),
+            ("deltaq-mode=1", vec!["--cpu-used=4", "--deltaq-mode=1", "--cq-level=40"]),
+        ];
+        // Arrival, not intent (class knob-never-reached-the-tool): a recipe
+        // whose stream is byte-for-byte the baseline's changed nothing, and a
+        // census over such arms would be vacuous. Measured r27: only
+        // `--aq-mode=3` (cyclic refresh) does -- aq-mode 1/2 and deltaq-mode=1
+        // all reproduce the baseline's 7147 B at this recipe.
+        let mut baseline_bytes = 0usize;
+        let mut segment_symbols = 0usize;
+        let mut refused = 0usize;
+        let mut decoded = 0usize;
+        for (name, extra) in &recipes {
+            let before = crate::decode::segment_id_hits();
+            let (bytes, result) = census_attempt("mandelbrot", 192, 128, 8, extra);
+            match result {
+                Ok(pictures) => {
+                    decoded += 1;
+                    let symbols = crate::decode::segment_id_hits() - before;
+                    segment_symbols += symbols;
+                    if *name == "baseline" {
+                        baseline_bytes = bytes;
+                    }
+                    eprintln!(
+                        "SEGCENSUS {name}: {bytes} B{}, {pictures} pictures, segment_id symbols {symbols}",
+                        if bytes == baseline_bytes && *name != "baseline" {
+                            " (== baseline: the flag changed nothing)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                Err(e) => {
+                    eprintln!("SEGCENSUS {name}: {bytes} B, refused: {e}");
+                    assert!(
+                        !e.contains(REFUSAL),
+                        "{name}: a real aomenc stream DOES enable a mode-overriding \
+                         segmentation feature -- the refusal is a capability gap, not a \
+                         claim about the encoder: {e}"
+                    );
+                    refused += 1;
+                }
+            }
+        }
+        eprintln!(
+            "SEGCENSUS: {} recipes, {decoded} decoded, {refused} refused for other reasons",
+            recipes.len()
+        );
+        assert_eq!(decoded, recipes.len(), "every recipe must decode; {refused} refused");
+        assert!(
+            segment_symbols > 0,
+            "no recipe coded a single segment_id symbol -- segmentation never arrived, so \
+             this census measures nothing about the three mode-overriding features"
+        );
+    }
+
+    /// lane-t900 r27, WITNESS half of the proof for "an OBMC neighbour whose
+    /// switchable interp filter was never recorded" (the structural half is
+    /// `decode::tests::every_inter_record_publishes_an_obmc_readable_filter`,
+    /// which shows no INTER cell is ever stamped with the `[3, 3]`
+    /// sentinel): real OBMC streams whose frames use a SWITCHABLE (and dual)
+    /// interp filter decode with the refusal firing 0 times while OBMC blends
+    /// really read the neighbour band -- a decode that never read one would
+    /// pass just as well and prove nothing (class gate-blind-to-feature).
+    #[test]
+    fn a_real_obmc_stream_reads_a_recorded_switchable_filter_for_every_neighbour() {
+        if !have_aomenc() {
+            eprintln!("SKIP a_real_obmc_stream_reads_a_recorded_switchable_filter: no aomenc");
+            return;
+        }
+        // `--cpu-used=0` is load-bearing: at speed 4 aomenc settles on a
+        // FRAME-level fixed interp filter, every neighbour then legitimately
+        // carries the sentinel, and the band is never read at all (measured
+        // r27: 0 reads over two speed-4 streams).
+        let base = vec![
+            "--cpu-used=0",
+            "--enable-obmc=1",
+            "--enable-dual-filter=1",
+            "--min-partition-size=8",
+            "--max-partition-size=16",
+            "--enable-palette=0",
+            "--enable-intrabc=0",
+        ];
+        let recipes: [(&str, usize, usize, Vec<&str>); 2] = [
+            ("obmc dual cq40", 192, 128, [vec!["--cq-level=40"], base.clone()].concat()),
+            ("obmc dual cq20", 192, 128, [vec!["--cq-level=20"], base.clone()].concat()),
+        ];
+        let mut reads = 0usize;
+        let mut decoded = 0usize;
+        for (name, w, h, extra) in &recipes {
+            let before = crate::decode::obmc_filter_band_reads();
+            let obmc_before = crate::decode::obmc_hits();
+            let (bytes, result) = census_attempt("mandelbrot", *w, *h, 8, extra);
+            match result {
+                Ok(pictures) => {
+                    decoded += 1;
+                    let got = crate::decode::obmc_filter_band_reads() - before;
+                    reads += got;
+                    eprintln!(
+                        "OBMCFILT {name}: {bytes} B, {pictures} pictures, {got} band reads, \
+                         {} OBMC blocks",
+                        crate::decode::obmc_hits() - obmc_before
+                    );
+                }
+                Err(e) => {
+                    assert!(
+                        !e.contains("an OBMC neighbour whose switchable interp filter was never recorded"),
+                        "{name}: a real OBMC stream reached the unrecorded-filter refusal -- \
+                         a publication site is missing: {e}"
+                    );
+                    eprintln!("OBMCFILT {name}: {bytes} B, refused for another reason: {e}");
+                }
+            }
+        }
+        assert!(decoded > 0, "no OBMC recipe decoded -- the witness is vacuous");
+        assert!(
+            reads > 0,
+            "every OBMC blend took the fixed-filter path: the band was never read, so this \
+             proves nothing about the refusal"
+        );
+    }
+
+    /// lane-t900 r27 CENSUS for the three SUPERRES refusals -- "warp
+    /// prediction with a scaled reference", "a sub-8x8 inter block under a
+    /// scaled reference" and "an 8x8 partition leaf under a scaled reference".
+    /// Six real `--superres-mode` encodes (fixed denominators and the auto
+    /// mode, warped motion and OBMC on), decoded by this decoder: the table it
+    /// prints is which of the three a real encoder actually reaches.
+    ///
+    /// Every one of them is a REAL capability gap (unlike the enumerated
+    /// refusals elsewhere in the inventory), so this gate asserts the measured
+    /// shape rather than "no refusal": at least one recipe must decode (else
+    /// the census says nothing), and any refusal must be one of the three
+    /// named superres ones -- a fourth string would be a new gap this round
+    /// did not measure.
+    #[test]
+    fn a_superres_census_over_six_real_streams_records_which_scaled_refusals_fire() {
+        if !have_aomenc() {
+            eprintln!("SKIP a_superres_census_over_six_real_streams: no aomenc");
+            return;
+        }
+        const WARP: &str = "warp prediction with a scaled reference";
+        const SUB8: &str = "a sub-8x8 inter block under a scaled reference";
+        const LEAF8: &str = "an 8x8 partition leaf under a scaled reference";
+        let common = [
+            "--enable-warped-motion=1",
+            "--enable-obmc=1",
+            "--enable-palette=0",
+            "--enable-intrabc=0",
+        ];
+        let recipes: [(&str, usize, usize, Vec<&str>); 6] = [
+            ("denom12 320x180 cq32", 320, 180, vec!["--cpu-used=4", "--superres-mode=1", "--superres-denominator=12", "--cq-level=32"]),
+            ("denom12 320x180 cq50", 320, 180, vec!["--cpu-used=4", "--superres-mode=1", "--superres-denominator=12", "--cq-level=50"]),
+            ("denom16 320x180 cq32", 320, 180, vec!["--cpu-used=4", "--superres-mode=1", "--superres-denominator=16", "--cq-level=32"]),
+            ("denom10 192x128 cq32", 192, 128, vec!["--cpu-used=4", "--superres-mode=1", "--superres-denominator=10", "--cq-level=32"]),
+            ("auto 320x180 cq50", 320, 180, vec!["--cpu-used=4", "--superres-mode=3", "--cq-level=50"]),
+            ("auto 192x128 cq50", 192, 128, vec!["--cpu-used=4", "--superres-mode=3", "--cq-level=50"]),
+        ];
+        let (mut decoded, mut warp, mut sub8, mut leaf8, mut other) = (0, 0, 0, 0, 0);
+        for (name, w, h, extra) in &recipes {
+            let mut args = extra.clone();
+            args.extend_from_slice(&common);
+            let before = crate::mc::predict_scaled_hits();
+            let (bytes, result) = census_attempt("mandelbrot", *w, *h, 10, &args);
+            match result {
+                Ok(pictures) => {
+                    decoded += 1;
+                    eprintln!(
+                        "SUPERRES {name}: {bytes} B, {pictures} pictures, scaled MC blocks {}",
+                        crate::mc::predict_scaled_hits() - before
+                    );
+                }
+                Err(e) => {
+                    eprintln!("SUPERRES {name}: {bytes} B, refused: {e}");
+                    if e.contains(WARP) {
+                        warp += 1;
+                    } else if e.contains(SUB8) {
+                        sub8 += 1;
+                    } else if e.contains(LEAF8) {
+                        leaf8 += 1;
+                    } else {
+                        other += 1;
+                        panic!("{name}: a superres stream stopped on a string this census does not know: {e}");
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "SUPERRES CENSUS: 6 streams, {decoded} decoded, warp {warp}x, sub8 {sub8}x, leaf8 {leaf8}x, other {other}x"
+        );
+        // Measured r27: the four FIXED-denominator recipes all stop at the
+        // 8x8-leaf refusal, and the two `--superres-mode=3` (auto) streams
+        // decode with ZERO scaled MC blocks -- auto picked denominator 8, so
+        // those two arms carry no scaling at all and prove nothing. The warp
+        // and sub-8x8 refusals never fire because the 8x8-leaf one sits in
+        // front of them: whichever partition path a scaled frame takes, the
+        // leaf guard is reached first. Lifting the leaf gap is what makes the
+        // other two measurable, so this gate pins the ORDER, not just a count.
+        assert!(decoded > 0, "no superres recipe decoded -- the census is vacuous");
+        assert!(
+            leaf8 > 0,
+            "no fixed-denominator recipe reached the 8x8-leaf refusal any more: either the \
+             capability landed (drop the refusal) or the recipes stopped scaling"
+        );
+    }
+
     /// lane-t900 r25, negative gate: a `show_existing_frame` header naming a
     /// slot no frame has refreshed is refused BY NAME, and outputs no picture.
     ///
