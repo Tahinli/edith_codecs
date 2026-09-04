@@ -694,6 +694,58 @@ fn horizontal_scaled_pass(
     }
 }
 
+/// lane-perf2: the horizontal pass every two-pass entry point takes.
+/// `horizontal_scaled_pass` was carrying the UNSCALED work too (every
+/// compound prediction goes through it whatever the reference's scale), and
+/// its per-column walk re-derives an integer position and a filter phase
+/// that are constant at `REF_NO_SCALE`, reads the reference column-major,
+/// and clamps per tap -- 14% of decode self time. At `REF_NO_SCALE` the
+/// scaled walk reduces algebraically to `x0 = x_q4 / 16`, phase `x_q4 % 16`
+/// (`pos_x_q10 == x_q4 * 64 + 32`, so `int_pel == x0` and
+/// `(x_qn & 1023) >> 6 == xfrac` for every column), which is exactly
+/// [`horizontal_pass_unscaled`] -- and
+/// `predict_scaled_at_no_scale_matches_predict_with_filters` pins that
+/// equality end to end. A genuinely scaled reference (superres) still takes
+/// the general path.
+#[allow(clippy::too_many_arguments)]
+fn horizontal_pass(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y0: i32,
+    x_scale_fp: i64,
+    block_w: usize,
+    kern_w: usize,
+    rows: usize,
+    h_kind: InterpFilterKind,
+    intermediate: &mut [i32],
+) {
+    if x_scale_fp == REF_NO_SCALE {
+        let (h_wide, h_narrow) = h_kind.tables();
+        let xfrac = x_q4.rem_euclid(16) as usize;
+        let taps = if kern_w <= 4 { &h_narrow[xfrac] } else { &h_wide[xfrac] };
+        horizontal_pass_unscaled(
+            reference,
+            stride,
+            true_width,
+            true_height,
+            x_q4.div_euclid(16),
+            y0,
+            taps,
+            block_w,
+            rows,
+            intermediate,
+        );
+        return;
+    }
+    horizontal_scaled_pass(
+        reference, stride, true_width, true_height, x_q4, y0, x_scale_fp, block_w, kern_w,
+        rows, h_kind, intermediate,
+    );
+}
+
 /// [`predict_with_filters`]'s scaled-reference counterpart (spec 7.11.3.3):
 /// used only when the stored reference's luma width differs from the current
 /// frame's (`use_superres` on a non-key frame). `x_scale_fp` is
@@ -768,32 +820,19 @@ pub fn predict_scaled_kern(
     };
 
     let rows = block_h + 7;
-    let mut intermediate = vec![0i32; rows * block_w];
-    horizontal_scaled_pass(
-        reference,
-        stride,
-        true_width,
-        true_height,
-        x_q4,
-        y0,
-        x_scale_fp,
-        block_w,
-        kern_w,
-        rows,
-        h_kind,
-        &mut intermediate,
-    );
-
-    for row in 0..block_h {
-        for col in 0..block_w {
-            let mut sum = 0;
-            for (t, &tap) in v_filter.iter().enumerate() {
-                sum += tap * intermediate[(row + t) * block_w + col];
+    let max = crate::decode::sample_max();
+    with_scratch(rows, block_w, |intermediate, acc| {
+        horizontal_pass(
+            reference, stride, true_width, true_height, x_q4, y0, x_scale_fp, block_w,
+            kern_w, rows, h_kind, intermediate,
+        );
+        for row in 0..block_h {
+            vpass_row(intermediate, block_w, row, v_filter, acc);
+            for (d, &a) in dst[row * block_w..(row + 1) * block_w].iter_mut().zip(acc.iter()) {
+                *d = round2(a, INTER_ROUND_1).clamp(0, max) as u16;
             }
-            dst[row * block_w + col] =
-                round2(sum, INTER_ROUND_1).clamp(0, crate::decode::sample_max()) as u16;
         }
-    }
+    });
 }
 
 /// `InterRound1` for a compound ref (spec 7.11.3.2's `isCompound` branch,
@@ -891,31 +930,18 @@ pub fn predict_compound_intermediate_kern(
     };
 
     let rows = block_h + 7;
-    let mut intermediate = vec![0i32; rows * block_w];
-    horizontal_scaled_pass(
-        reference,
-        stride,
-        true_width,
-        true_height,
-        x_q4,
-        y0,
-        x_scale_fp,
-        block_w,
-        kern_w,
-        rows,
-        h_kind,
-        &mut intermediate,
-    );
-
-    for row in 0..block_h {
-        for col in 0..block_w {
-            let mut sum = 0;
-            for (t, &tap) in v_filter.iter().enumerate() {
-                sum += tap * intermediate[(row + t) * block_w + col];
+    with_scratch(rows, block_w, |intermediate, acc| {
+        horizontal_pass(
+            reference, stride, true_width, true_height, x_q4, y0, x_scale_fp, block_w,
+            kern_w, rows, h_kind, intermediate,
+        );
+        for row in 0..block_h {
+            vpass_row(intermediate, block_w, row, v_filter, acc);
+            for (d, &a) in dst[row * block_w..(row + 1) * block_w].iter_mut().zip(acc.iter()) {
+                *d = round2(a, INTER_ROUND_1_COMPOUND);
             }
-            dst[row * block_w + col] = round2(sum, INTER_ROUND_1_COMPOUND);
         }
-    }
+    });
 }
 
 /// Blends two [`predict_compound_intermediate`] outputs into a finished
