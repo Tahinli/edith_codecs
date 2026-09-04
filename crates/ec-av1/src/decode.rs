@@ -2068,7 +2068,7 @@ pub(crate) fn scaled_compound_hits() -> usize {
 }
 
 /// Current value of [`SCALED_WARP_FALLBACK_HITS`].
-pub(crate) fn scaled_warp_fallback_hits() -> usize {
+pub fn scaled_warp_fallback_hits() -> usize {
     SCALED_WARP_FALLBACK_HITS.with(|c| c.get())
 }
 
@@ -2497,6 +2497,32 @@ thread_local! {
 /// Current value of [`INTER_SUB16_SPLIT_HITS`].
 pub(crate) fn inter_sub16_split_hits() -> usize {
     INTER_SUB16_SPLIT_HITS.with(|c| c.get())
+}
+
+// lane-t900 r28: how many 16x16 inter splits reached their four 8x8 leaves
+// while at least one reference picture was SCALED (superres) -- the counter
+// behind the lifted "8x8 partition leaf under a scaled reference" refusal.
+thread_local! {
+    static SCALED_LEAF8_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SCALED_LEAF8_HITS`].
+pub fn scaled_leaf8_hits() -> usize {
+    SCALED_LEAF8_HITS.with(|c| c.get())
+}
+
+// lane-t900 r28: how many sub-8x8 inter blocks (the 4x4 split and the 8x4/4x8
+// rect pair) were predicted from a SCALED reference -- the counter behind the
+// lifted "sub-8x8 inter block under a scaled reference" refusal.
+thread_local! {
+    static SCALED_SUB8_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SCALED_SUB8_HITS`].
+pub fn scaled_sub8_hits() -> usize {
+    SCALED_SUB8_HITS.with(|c| c.get())
 }
 
 // lane-rectwire r2: how many `PARTITION_HORZ`/`VERT` strips actually decoded
@@ -21101,8 +21127,20 @@ fn decode_inter_block(
                     None
                 }
             };
-            let warp0 = compound_warp(ref0, is_global_mv0);
-            let warp1 = compound_warp(ref1, is_global_mv1);
+            // lane-t900 r28 (class branch-dropped-as-unreachable, swept out
+            // of the scaled-ref lift): libaom `allow_warp`
+            // (av1/common/reconinter.c:41) opens with `if (av1_is_scaled(sf))
+            // return 0;` PER SLOT, so a compound tap whose own reference is
+            // scaled (superres) is predicted translationally while its
+            // sibling may still warp.
+            let ref_unscaled = |rf: i8| {
+                ref_planes(rf, ref_y, ref_u, ref_v, other_refs)
+                    .is_ok_and(|(py, _, _)| {
+                        mc::scale_factor(py.width, frame_width) == mc::REF_NO_SCALE
+                    })
+            };
+            let warp0 = compound_warp(ref0, is_global_mv0).filter(|_| ref_unscaled(ref0));
+            let warp1 = compound_warp(ref1, is_global_mv1).filter(|_| ref_unscaled(ref1));
             if warp0.is_some() || warp1.is_some() {
                 COMPOUND_WARP_HITS.with(|c| c.set(c.get() + 1));
             }
@@ -22711,18 +22749,13 @@ fn decode_inter_block(
                 // lane-scaledref r1: libaom `allow_warp`
                 // (av1/common/reconinter.c:41) suppresses BOTH local and
                 // global warp under a scaled reference and predicts
-                // translationally instead -- that fallback is implemented
-                // below, but the one real aomenc stream this round found
-                // that reaches it (`--enable-warped-motion=1`,
-                // `--superres-denominator=16`, seed 47) still mismatches
-                // ffmpeg at frame 2 luma, so the case stays refused by name
-                // until it has a green gate rather than shipping wrong
-                // pixels behind a lifted refusal.
+                // translationally instead -- the fallback below. lane-t900
+                // r28 LIFTED the refusal that sat here: the mismatch r1
+                // measured was the 16x4/4x16 strip's sub-8x8 chroma piece,
+                // which this file used to SKIP under a scaled reference
+                // (fixed in the same commit), not the warp fallback.
                 if warp_params.is_some() {
                     SCALED_WARP_FALLBACK_HITS.with(|c| c.set(c.get() + 1));
-                    return Err(unsupported(
-                        "warp prediction with a scaled reference (superres, unimplemented)",
-                    ));
                 }
                 if obmc_selected {
                     SCALED_OBMC_HITS.with(|c| c.set(c.get() + 1));
@@ -22941,19 +22974,25 @@ fn decode_inter_block(
             // through to the ordinary whole-block predictor.
             if let Some(s) = strip_chroma.filter(|s| s.has_chroma)
                 && let Some((prev_ref, prev_mv, prev_h, prev_v)) = s.prev
-                && luma_scale == mc::REF_NO_SCALE
             {
                 let (piece_w, piece_h) = if s.horz { (8usize, 2usize) } else { (2usize, 8usize) };
-                let (_, prev_u, prev_v_plane) = ref_planes(prev_ref, ref_y, ref_u, ref_v, other_refs)?;
+                // lane-t900 r28 (same-shape sweep of the sub-8x8 scaled-ref
+                // lift): this piece used to be SKIPPED when the block's
+                // reference was scaled, which silently left the whole-block
+                // prediction in place instead of refusing. It scales off the
+                // PREVIOUS strip's own reference, not this block's.
+                let (prev_y_plane, prev_u, prev_v_plane) = ref_planes(prev_ref, ref_y, ref_u, ref_v, other_refs)?;
+                let prev_scale = mc::scale_factor(prev_y_plane.width, frame_width);
                 for (src, dst) in [(prev_u, &mut pred_u), (prev_v_plane, &mut pred_v)] {
                     let mut piece = vec![0u16; piece_w * piece_h];
-                    mc::predict_with_filters(
+                    mc::predict_maybe_scaled(
                         &src.data,
                         src.width,
                         src.true_width,
                         src.true_height,
                         mv_to_q4(cpx, prev_mv.1, false),
                         mv_to_q4(cpy, prev_mv.0, false),
+                        prev_scale,
                         piece_w,
                         piece_h,
                         prev_h,
@@ -24448,10 +24487,13 @@ fn decode_inter_sub8_split4(
             neighbours.left_ref1[rmi],
         );
         let (sref_y, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
-        if mc::scale_factor(sref_y.width, frame_width) != mc::REF_NO_SCALE {
-            return Err(unsupported(
-                "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
-            ));
+        // lane-t900 r28: refusal lifted -- this sub-block's own reference may
+        // be scaled (superres); spec 7.11.3.3's walk is per reference, and
+        // each of the group's pieces (luma and its 2x2 chroma) carries its
+        // OWN factor because each can name a different `ref_frame`.
+        let luma_scale = mc::scale_factor(sref_y.width, frame_width);
+        if luma_scale != mc::REF_NO_SCALE {
+            SCALED_SUB8_HITS.with(|c| c.set(c.get() + 1));
         }
         let gm_table = build_gm_mv_table(
             global_motion,
@@ -24613,13 +24655,14 @@ fn decode_inter_sub8_split4(
         );
         piece[i] = Some((ref_frame, mv, h_filter, v_filter));
         let mut pred_y = vec![0u16; B4 * B4];
-        mc::predict_with_filters(
+        mc::predict_maybe_scaled(
             &sref_y.data,
             sref_y.width,
             sref_y.true_width,
             sref_y.true_height,
             mv_to_q4(px, mv.1, true),
             mv_to_q4(py, mv.0, true),
+            luma_scale,
             B4,
             B4,
             h_filter,
@@ -24712,7 +24755,9 @@ fn decode_inter_sub8_split4(
             let Some((ref_frame, mv, h_filter, v_filter)) = piece[i] else {
                 continue;
             };
-            let (_, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+            let (piece_ref_y, sref_u, sref_v) =
+                ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+            let piece_scale = mc::scale_factor(piece_ref_y.width, frame_width);
             let (ox, oy) = if mixed {
                 (cpx, cpy)
             } else {
@@ -24722,13 +24767,14 @@ fn decode_inter_sub8_split4(
             let (row0, col0) = if mixed { (0, 0) } else { (dr * 2, dc * 2) };
             for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
                 let mut buf = vec![0u16; pw * ph];
-                mc::predict_with_filters(
+                mc::predict_maybe_scaled(
                     &plane.data,
                     plane.width,
                     plane.true_width,
                     plane.true_height,
                     mv_to_q4(ox, mv.1, false),
                     mv_to_q4(oy, mv.0, false),
+                    piece_scale,
                     pw,
                     ph,
                     h_filter,
@@ -25416,10 +25462,10 @@ fn decode_inter_sub8_rect2(
             neighbours.left_ref1[rmi],
         );
         let (sref_y, _, _) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
-        if mc::scale_factor(sref_y.width, frame_width) != mc::REF_NO_SCALE {
-            return Err(unsupported(
-                "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
-            ));
+        // lane-t900 r28: refusal lifted -- see the split arm above.
+        let luma_scale = mc::scale_factor(sref_y.width, frame_width);
+        if luma_scale != mc::REF_NO_SCALE {
+            SCALED_SUB8_HITS.with(|c| c.set(c.get() + 1));
         }
         let gm_table = build_gm_mv_table(
             global_motion,
@@ -25582,13 +25628,14 @@ fn decode_inter_sub8_rect2(
         let mut pred_y = vec![0u16; SIDE * SIDE];
         {
             let mut dense = vec![0u16; bw * bh];
-            mc::predict_with_filters(
+            mc::predict_maybe_scaled(
                 &sref_y.data,
                 sref_y.width,
                 sref_y.true_width,
                 sref_y.true_height,
                 mv_to_q4(px, mv.1, true),
                 mv_to_q4(py, mv.0, true),
+                luma_scale,
                 bw,
                 bh,
                 h_filter,
@@ -25725,7 +25772,9 @@ fn decode_inter_sub8_rect2(
             let Some((ref_frame, mv, h_filter, v_filter)) = piece[i] else {
                 continue;
             };
-            let (_, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+            let (piece_ref_y, sref_u, sref_v) =
+                ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+            let piece_scale = mc::scale_factor(piece_ref_y.width, frame_width);
             let (ox, oy) = if mixed {
                 (cpx, cpy)
             } else if vert {
@@ -25742,13 +25791,14 @@ fn decode_inter_sub8_rect2(
             };
             for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
                 let mut buf = vec![0u16; piece_w * piece_h];
-                mc::predict_with_filters(
+                mc::predict_maybe_scaled(
                     &plane.data,
                     plane.width,
                     plane.true_width,
                     plane.true_height,
                     mv_to_q4(ox, mv.1, false),
                     mv_to_q4(oy, mv.0, false),
+                    piece_scale,
                     piece_w,
                     piece_h,
                     h_filter,
@@ -26395,8 +26445,18 @@ fn decode_inter_block8(
                         None
                     }
                 };
-                let warp0_c = leaf_compound_warp(ref0, is_global_mv0_c);
-                let warp1_c = leaf_compound_warp(ref1, is_global_mv1_c);
+                // lane-t900 r28: same per-slot `allow_warp` scale bail-out as
+                // the 16x16-and-bigger compound path above.
+                let leaf_ref_unscaled = |rf: i8| {
+                    ref_planes(rf, ref_y, ref_u, ref_v, other_refs)
+                        .is_ok_and(|(py, _, _)| {
+                            mc::scale_factor(py.width, frame_width) == mc::REF_NO_SCALE
+                        })
+                };
+                let warp0_c =
+                    leaf_compound_warp(ref0, is_global_mv0_c).filter(|_| leaf_ref_unscaled(ref0));
+                let warp1_c =
+                    leaf_compound_warp(ref1, is_global_mv1_c).filter(|_| leaf_ref_unscaled(ref1));
                 if warp0_c.is_some() || warp1_c.is_some() {
                     COMPOUND_WARP_HITS.with(|c| c.set(c.get() + 1));
                     COMPOUND_WARP_HITS_8.with(|c| c.set(c.get() + 1));
@@ -26930,8 +26990,24 @@ fn decode_inter_block8(
             // (class wrong-alphabet-same-value).
             let proj_ok =
                 num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
-            let warp_eligible = allow_warped_motion && !force_integer_mv && proj_ok;
-            if allow_warped_motion && proj_ok && force_integer_mv {
+            // lane-t900 r28: the `&& !ref_is_scaled` the note above asked the
+            // lifter of the 8x8-leaf refusal to add. libaom
+            // `motion_mode_allowed` (blockd.h) makes WARPED_CAUSAL eligible
+            // only `if (mbmi->num_proj_ref >= 1 && (allow_warped_motion &&
+            // !av1_is_scaled(xd->block_ref_scale_factors[0])))`, so under a
+            // scaled reference the ALPHABET shrinks to the 2-symbol obmc one
+            // -- and with OBMC off no symbol is read at all (class
+            // wrong-alphabet-same-value: reading the 3-symbol row here
+            // desynced every warped-motion superres stream at its first
+            // eligible 8x8 leaf).
+            let ref_is_scaled =
+                mc::scale_factor(sref_y.width, frame_width) != mc::REF_NO_SCALE;
+            let warp_eligible =
+                allow_warped_motion && !ref_is_scaled && !force_integer_mv && proj_ok;
+            if allow_warped_motion && proj_ok && ref_is_scaled {
+                SCALED_WARP_SUPPRESSED_HITS.with(|c| c.set(c.get() + 1));
+            }
+            if allow_warped_motion && proj_ok && !ref_is_scaled && force_integer_mv {
                 FIMV_ALPHABET_HITS.with(|c| c.set(c.get() + 1));
             }
             if warp_eligible {
@@ -27140,7 +27216,11 @@ fn decode_inter_block8(
         // lane-gmaffine r1: the warp filter REPLACES the translational
         // prediction just built (libaom builds one or the other), same as
         // the 16x16+ leaf's own call trio.
-        if let Some(params) = &warp_params {
+        // lane-t900 r28: `allow_warp`'s scaled-reference bail-out, which this
+        // leaf was missing -- it is the defect the 8x8-leaf refusal hid (a
+        // warped 8x8 leaf over a superres reference; libaom predicts it
+        // translationally, every symbol still read).
+        if let Some(params) = warp_params.as_ref().filter(|_| luma_scale == mc::REF_NO_SCALE) {
             crate::warp::warp_affine(
                 params, &sref_y.data, sref_y.true_width as i32, sref_y.true_height as i32,
                 sref_y.width as i32, &mut pred_y, px as i32, py as i32, SIDE as i32,
@@ -29526,31 +29606,19 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
                                     .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                     .collect();
-                                // lane-scaledref r1: `decode_inter_block8` IS
-                                // threaded for a scaled reference now (its
-                                // single-ref, compound and OBMC MC all take
-                                // spec 7.11.3.3's scaled walk), but the one
-                                // recipe that reaches this path at all -- a
-                                // 64x72 superres fixture whose bottom 16-row
-                                // band straddles the true edge, so the
-                                // gathered split bit lands on 8x8 leaves --
-                                // DESYNCS inside the leaf itself
-                                // (`from_switchable_symbol` handed a 4th
-                                // symbol, mc.rs:200), the same
-                                // below-8x8 desync lane-sub8 r2 left open and
-                                // unrelated to scaling. So the scaled MC here
-                                // is unproven: refuse by name rather than
-                                // ship a capability claim no gate exercises.
-                                // Deleting these six lines is the whole lift
-                                // once the leaf8 desync is fixed.
+                                // lane-t900 r28: the 8x8-leaf refusal under a
+                                // scaled reference is LIFTED --
+                                // `decode_inter_block8`'s single-ref,
+                                // compound and OBMC MC all take spec
+                                // 7.11.3.3's scaled walk. The counter is what
+                                // proves a gate actually reached a scaled
+                                // leaf rather than a same-size reference.
                                 if ref_y.width != frame_width as usize
                                     || ref_slots.iter().flatten().any(|(py, _, _)| {
                                         py.width != frame_width as usize
                                     })
                                 {
-                                    return Err(unsupported(
-                                        "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
-                                    ));
+                                    SCALED_LEAF8_HITS.with(|c| c.set(c.get() + 1));
                                 }
                                 let mut prev_leaves: Vec<((usize, usize), bool, bool, i8, Option<i8>)> = Vec::new();
                                 for (mr, mc) in leaf_positions {
