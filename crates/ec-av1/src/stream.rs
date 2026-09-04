@@ -4141,8 +4141,8 @@ mod tests {
             (0usize, 0u32, 0u32, 0usize);
         let (mut out_of_scope, mut out_of_scope_mismatch, mut refusals) = (0u32, 0u32, 0u32);
         let (mut sb_strip_total, mut sb_strip_arms) = (0usize, 0u32);
-        // The one palette shape this round did NOT lift (measured: lifting it
-        // mismatches -- see [`decode_block_rect64`]'s own comment).
+        // lane-t900 r34 LIFTED this shape; the counter stays so the gate
+        // fails loudly if the refusal ever comes back.
         let mut sb_strip_refusals = 0u32;
         for src in ["testsrc2", "smptebars"] {
             for depth in [8usize, 10usize] {
@@ -4322,10 +4322,14 @@ mod tests {
             leaf8_total > 0 && fired_arms > 0,
             "{NAME}: gate is vacuous -- no compared arm decoded an 8x8-leaf palette block"
         );
+        assert_eq!(
+            sb_strip_refusals, 0,
+            "{NAME}: the superblock-strip palette refusal is back (lane-t900 r34 lifted it)"
+        );
         assert!(
-            sb_strip_refusals > 0,
-            "{NAME}: no arm reached the superblock-strip palette refusal -- the open residue \
-             this gate documents is no longer exercised"
+            sb_strip_arms > 0 && sb_strip_total > 0,
+            "{NAME}: no arm decoded a non-skip palette block on a superblock-level strip -- \
+             the shape r34 lifted is no longer exercised"
         );
         assert_eq!(
             out_of_scope_mismatch, 0,
