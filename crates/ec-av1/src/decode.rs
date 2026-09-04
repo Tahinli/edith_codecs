@@ -7247,7 +7247,7 @@ fn tx_size_context_rect(
 }
 
 /// [`cfl_ac_q3`] for a true `bw`x`bh` rect strip (lane-intradisp r1).
-fn cfl_ac_q3_rect(y: &PlaneBuf, px: usize, py: usize, bw: usize, bh: usize) -> Vec<i32> {
+fn cfl_ac_q3_rect(y: &PlaneBuf<'_>, px: usize, py: usize, bw: usize, bh: usize) -> Vec<i32> {
     let (cw, ch) = (bw / 2, bh / 2);
     let mut ac = vec![0i32; cw * ch];
     let mut sum = 0i32;
@@ -7351,9 +7351,9 @@ fn decode_rect_split(
     tx_w: usize,
     tx_h: usize,
     m: &RectStripModes,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     base_q_idx: u8,
     reduced_tx_set: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
@@ -7980,9 +7980,9 @@ fn decode_intra_rect_in_inter(
     // `(PARTITION_HORZ_4, is_chroma_reference)` when this strip is one of the
     // four 16x4 / 4x16 strips of a 16x16-level 1:4 partition (lane-intra16x4).
     strip16: Option<(bool, bool)>,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     base_q_idx: u8, fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
     // `at` is in MI units (the inter path's own unit since lane-inter4);
@@ -8533,9 +8533,9 @@ fn decode_block_rect(
     at: (usize, usize),
     bw: usize,
     bh: usize,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
     base_q_idx: u8,
@@ -8989,9 +8989,9 @@ fn decode_leaf_rect(
     bw: usize,
     bh: usize,
     prev_leaf: Option<((usize, usize), usize)>,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
     base_q_idx: u8,
@@ -9329,9 +9329,9 @@ fn decode_block_rect4(
     bw: usize,
     bh: usize,
     prev_strip: Option<((usize, usize), usize)>,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
     base_q_idx: u8,
@@ -9798,9 +9798,9 @@ fn decode_rect4_16(
     neighbours: &mut Neighbours,
     at16: (usize, usize),
     horz: bool,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
     base_q_idx: u8,
@@ -9874,9 +9874,9 @@ fn decode_rect4_16_strip(
     horz: bool,
     has_chroma: bool,
     prev: Option<((usize, usize), usize)>,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
     base_q_idx: u8,
@@ -10376,9 +10376,9 @@ fn decode_block_rect64(
     at: (usize, usize),
     bw: usize,
     bh: usize,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
     base_q_idx: u8,
@@ -11296,7 +11296,7 @@ fn read_cfl_alphas(dec: &mut SymbolDecoder, cdfs: &mut Cdfs) -> (i32, i32) {
 /// 4:2:0 to Q3 (`(a+b+c+d) << 1`, each 2x2 group), then block-average
 /// subtracted (`round_offset = num_pel/2`, right-shifted by `log2(num_pel)`)
 /// to give the AC values [`cfl_scaled`] scales by alpha.
-fn cfl_ac_q3(y: &PlaneBuf, px: usize, py: usize, side: usize) -> Vec<i32> {
+fn cfl_ac_q3(y: &PlaneBuf<'_>, px: usize, py: usize, side: usize) -> Vec<i32> {
     let cside = side / 2;
     let mut ac = vec![0i32; cside * cside];
     let mut sum = 0i32;
@@ -11349,7 +11349,7 @@ fn stage_dump_idx() -> usize {
     PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(1)
 }
 
-fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, fh: usize) {
+fn dump_stage16(var: &str, y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>, fw: usize, fh: usize) {
     use std::io::Write;
     // lane-sbrect10 r2 / lane-cdef r1 (one shared helper): index the dump by
     // decode-order picture like EC_AV1_PREFILT_DUMP already does -- a fixed
@@ -11385,7 +11385,7 @@ fn dump_stage_idx(var: &str) -> usize {
     i
 }
 
-fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
+fn dump_stage(var: &str, y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     use std::io::Write;
     if let Ok(path) = crate::envflags::var(var)
         && let Ok(mut f) = std::fs::File::create(format!("{path}.f{}", dump_stage_idx(var)))
@@ -11398,8 +11398,8 @@ fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
 }
 
 #[derive(Clone)]
-struct PlaneBuf {
-    data: Vec<u16>,
+struct PlaneBuf<'a> {
+    data: std::borrow::Cow<'a, [u16]>,
     width: usize,
     height: usize,
     /// The frame's true, decodable extent in this plane's own units — past
@@ -11432,9 +11432,9 @@ struct PlaneBuf {
 /// (lane-av1refs: the same "empty slot" case `GOLDEN_FRAME` already
 /// refused by name, now generic across `LAST2`/`LAST3`/`GOLDEN`/`BWDREF`/
 /// `ALTREF2`/`ALTREF`).
-type RefSlots<'a> = [Option<(&'a PlaneBuf, &'a PlaneBuf, &'a PlaneBuf)>; 8];
+type RefSlots<'a> = [Option<(&'a PlaneBuf<'a>, &'a PlaneBuf<'a>, &'a PlaneBuf<'a>)>; 8];
 
-impl PlaneBuf {
+impl PlaneBuf<'_> {
     /// Sets this plane's own tile pixel origin ([`Self::tile_x0`]/
     /// [`Self::tile_y0`]) before that tile's own superblock walk. `x0`/`y0`
     /// are already in this plane's own units (luma pixels for `y`, chroma
@@ -11616,7 +11616,7 @@ impl PlaneBuf {
                     base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, sample_max(fctx));
                 }
                 let sample = (base + residual[idx]).clamp(0, sample_max(fctx)) as u16;
-                self.data[(y + row) * self.width + x + col] = sample;
+                self.data.to_mut()[(y + row) * self.width + x + col] = sample;
             }
         }
     }
@@ -11723,7 +11723,7 @@ impl PlaneBuf {
                     base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, sample_max(fctx));
                 }
                 let sample = (base + residual[idx]).clamp(0, sample_max(fctx)) as u16;
-                self.data[(y + row) * self.width + x + col] = sample;
+                self.data.to_mut()[(y + row) * self.width + x + col] = sample;
             }
         }
     }
@@ -11746,7 +11746,7 @@ fn read_plane(
     predict_mode: usize,
     angle_delta: i32,
     reach: Reach,
-    plane: &mut PlaneBuf,
+    plane: &mut PlaneBuf<'static>,
     x: usize,
     y: usize,
     side: usize,
@@ -11886,9 +11886,9 @@ fn decode_block(
     chroma_tx: usize,
     scans: (&[u16], &[u16]),
     cfl: bool,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     base_q_idx: u8,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
@@ -12631,9 +12631,9 @@ fn decode_block_128rect(
     at: (usize, usize),
     bw: usize,
     bh: usize,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     base_q_idx: u8,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
@@ -12952,9 +12952,9 @@ fn decode_leaf8(
     leaf_mi: (usize, usize),
     scans: (&[u16], &[u16]),
     prev_leaf: Option<((usize, usize), usize)>,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     base_q_idx: u8,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
@@ -13669,9 +13669,9 @@ fn decode_leaf_split4(
     leaf_mi: (usize, usize),
     scan4: &[u16],
     prev_leaf: Option<((usize, usize), usize)>,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     base_q_idx: u8,
     enable_filter_intra: bool,
     allow_intrabc: bool,
@@ -13889,9 +13889,9 @@ fn decode_leaf_rect8(
     leaf_mi: (usize, usize),
     vert: bool,
     scan4: &[u16],
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     base_q_idx: u8,
     enable_filter_intra: bool,
     allow_intrabc: bool,
@@ -14398,7 +14398,7 @@ fn cdef_adjust_strength(strength: i32, var: i32) -> i32 {
 #[allow(unsafe_code)]
 fn cdef_filter_block(
     src: &[i32],
-    dst: &mut PlaneBuf,
+    dst: &mut PlaneBuf<'static>,
     ox: usize,
     oy: usize,
     bw: usize,
@@ -14422,7 +14422,7 @@ fn cdef_filter_block(
         unsafe {
             cdef_simd::filter_block_avx2(
                 src,
-                &mut dst.data,
+                dst.data.to_mut(),
                 stride,
                 ox,
                 oy,
@@ -14443,7 +14443,7 @@ fn cdef_filter_block(
     }
     cdef_filter_block_scalar(
         src,
-        &mut dst.data,
+        dst.data.to_mut(),
         stride,
         ox,
         oy,
@@ -14773,9 +14773,9 @@ mod cdef_simd {
 /// Ported from libaom's `av1/common/av1_loopfilter.c` (edge/level decision)
 /// and `aom_dsp/loopfilter.c` (the `aom_lpf_*` pixel kernels).
 fn apply_deblock(
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     lf: &LoopFilterParams,
     n: &Neighbours,
     frame_width: usize,
@@ -15960,7 +15960,7 @@ fn read_inter_plane_rect(
     plane_idx: usize,
     around: (bool, bool, i32),
     tx_mode: usize,
-    plane: &mut PlaneBuf,
+    plane: &mut PlaneBuf<'static>,
     x: usize,
     y: usize,
     prediction: &[u16],
@@ -16080,7 +16080,7 @@ fn read_inter_luma8(
     cdfs: &mut Cdfs,
     neighbours: &mut Neighbours,
     leaf_mi: (usize, usize),
-    y: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
     px: usize,
     py: usize,
     pred_y: &[u16],
@@ -17125,7 +17125,7 @@ fn filter_edge16(
 /// One plane's worth of spec 7.14: every vertical edge across the plane,
 /// then every horizontal edge (the order the spec and libaom both use).
 fn deblock_plane(
-    plane: &mut PlaneBuf,
+    plane: &mut PlaneBuf<'static>,
     plane_idx: usize,
     lf: &LoopFilterParams,
     n: &Neighbours,
@@ -17185,7 +17185,7 @@ fn deblock_plane(
                 if let Some((len, level)) = ps[0] {
                     if ps.iter().all(|p| *p == ps[0])
                         && filter_edge16(
-                            &mut plane.data,
+                            plane.data.to_mut(),
                             y0 * stride + x0,
                             stride,
                             true,
@@ -17201,7 +17201,7 @@ fn deblock_plane(
                 for (k, p) in ps.iter().enumerate() {
                     if let Some((len, level)) = *p {
                         filter_edge(
-                            &mut plane.data,
+                            plane.data.to_mut(),
                             (y0 + 4 * k) * stride + x0,
                             stride as isize,
                             1,
@@ -17219,7 +17219,7 @@ fn deblock_plane(
                     eprintln!("VEDGE x0={x0} y0={y0} len={len} level={level}");
                 }
                 filter_edge(
-                    &mut plane.data,
+                    plane.data.to_mut(),
                     y0 * stride + x0,
                     stride as isize,
                     1,
@@ -17242,7 +17242,7 @@ fn deblock_plane(
                 if let Some((len, level)) = ps[0] {
                     if ps.iter().all(|p| *p == ps[0])
                         && filter_edge16(
-                            &mut plane.data,
+                            plane.data.to_mut(),
                             y0 * stride + x0,
                             stride,
                             false,
@@ -17258,7 +17258,7 @@ fn deblock_plane(
                 for (k, p) in ps.iter().enumerate() {
                     if let Some((len, level)) = *p {
                         filter_edge(
-                            &mut plane.data,
+                            plane.data.to_mut(),
                             y0 * stride + x0 + 4 * k,
                             1,
                             stride as isize,
@@ -17282,7 +17282,7 @@ fn deblock_plane(
                     );
                 }
                 filter_edge(
-                    &mut plane.data,
+                    plane.data.to_mut(),
                     y0 * stride + x0,
                     1,
                     stride as isize,
@@ -17325,8 +17325,8 @@ fn scratch_empty() -> Vec<u16> {
 
 /// A plane's post-deblock snapshot, its samples taken from the pool (every
 /// other field is `usize`).
-fn plane_snapshot(p: &PlaneBuf) -> PlaneBuf {
-    PlaneBuf { data: scratch_from(&p.data), ..*p }
+fn plane_snapshot(p: &PlaneBuf<'_>) -> PlaneBuf<'static> {
+    PlaneBuf { data: std::borrow::Cow::Owned(scratch_from(&p.data)), ..*p }
 }
 
 /// Hands a buffer back to the pool; the capacity is what is worth keeping.
@@ -17335,9 +17335,9 @@ fn scratch_return(v: Vec<u16>) {
 }
 
 fn apply_cdef(
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     cdef: &CdefParams,
     skip_grid: &Neighbours,
     // This frame header's own CROPPED luma size, for the straddling-unit
@@ -17557,12 +17557,12 @@ fn apply_cdef(
 /// CDEF-filtered plane, per `restoration.rs`'s own `lr_sample` doc comment.
 #[allow(clippy::too_many_arguments)]
 fn apply_loop_restoration(
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
-    deblocked_y: &PlaneBuf,
-    deblocked_u: &PlaneBuf,
-    deblocked_v: &PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    deblocked_y: &PlaneBuf<'_>,
+    deblocked_u: &PlaneBuf<'_>,
+    deblocked_v: &PlaneBuf<'_>,
     lr: &LoopRestorationParams,
     grid: &crate::restoration::RestorationGrid,
     // lane-golomb r8: this frame header's own (cropped) luma size. Loop
@@ -17597,8 +17597,7 @@ fn apply_loop_restoration(
         0,
         &mut out, fctx,
     );
-    std::mem::swap(&mut y.data, &mut out);
-    scratch_return(out);
+    scratch_return(std::mem::replace(&mut y.data, std::borrow::Cow::Owned(out)).into_owned());
     let mut out = scratch_empty();
     crate::restoration::apply_loop_restoration_plane(
         &u.data,
@@ -17613,8 +17612,7 @@ fn apply_loop_restoration(
         1,
         &mut out, fctx,
     );
-    std::mem::swap(&mut u.data, &mut out);
-    scratch_return(out);
+    scratch_return(std::mem::replace(&mut u.data, std::borrow::Cow::Owned(out)).into_owned());
     let mut out = scratch_empty();
     crate::restoration::apply_loop_restoration_plane(
         &v.data,
@@ -17629,8 +17627,7 @@ fn apply_loop_restoration(
         2,
         &mut out, fctx,
     );
-    std::mem::swap(&mut v.data, &mut out);
-    scratch_return(out);
+    scratch_return(std::mem::replace(&mut v.data, std::borrow::Cow::Owned(out)).into_owned());
 }
 
 /// Decodes the payload [`crate::tile::sb_coeff_key_frame_tile`] writes,
@@ -17995,7 +17992,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     let (width, height) = (cols32 as usize * BLOCK, rows32 as usize * BLOCK);
 
     let mut y = PlaneBuf {
-        data: vec![0u16; width * height],
+        data: std::borrow::Cow::Owned(vec![0u16; width * height]),
         width,
         height,
         true_width,
@@ -18006,7 +18003,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y1: height,
     };
     let mut u = PlaneBuf {
-        data: vec![0u16; width * height / 4],
+        data: std::borrow::Cow::Owned(vec![0u16; width * height / 4]),
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -18017,7 +18014,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y1: height / 2,
     };
     let mut v = PlaneBuf {
-        data: vec![0u16; width * height / 4],
+        data: std::borrow::Cow::Owned(vec![0u16; width * height / 4]),
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -19894,7 +19891,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            let narrow = |p: &PlaneBuf| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+            let narrow = |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
             let _ = f.write_all(&narrow(&y));
             let _ = f.write_all(&narrow(&u));
             let _ = f.write_all(&narrow(&v));
@@ -19906,7 +19903,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         use std::io::Write;
         static IDX2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let idx = IDX2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let crop_wide = |plane: &PlaneBuf| -> Vec<u8> {
+        let crop_wide = |plane: &PlaneBuf<'_>| -> Vec<u8> {
             let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
             for row in 0..plane.true_height {
                 out.extend(plane.data[row * plane.width..][..plane.true_width].iter().map(|&s| s as u8));
@@ -19968,10 +19965,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     if let Some((upscaled_w, _)) = superres(fctx) {
         let bd = u32::from(bit_depth(fctx));
         let (uw, fw, fh) = (upscaled_w as usize, frame_width as usize, frame_height as usize);
-        let up = |p: &PlaneBuf, in_w: usize, in_h: usize, out_w: usize| PlaneBuf {
-            data: crate::superres::upscale_plane_strided(
+        let up = |p: &PlaneBuf<'_>, in_w: usize, in_h: usize, out_w: usize| PlaneBuf {
+            data: std::borrow::Cow::Owned(crate::superres::upscale_plane_strided(
                 &p.data, p.width, in_w, in_h, p.true_width, out_w, bd,
-            ),
+            )),
             width: out_w,
             height: in_h,
             true_width: out_w,
@@ -19998,9 +19995,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         );
     }
     if let Some((db_y, db_u, db_v)) = deblocked {
-        scratch_return(db_y.data);
-        scratch_return(db_u.data);
-        scratch_return(db_v.data);
+        scratch_return(db_y.data.into_owned());
+        scratch_return(db_u.data.into_owned());
+        scratch_return(db_v.data.into_owned());
     }
 
     let (fw, fh) = (lr_w, frame_height as usize);
@@ -20018,14 +20015,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             Picture {
                 width,
                 height,
-                y: y.data,
-                u: u.data,
-                v: v.data,
+                y: y.data.into_owned(),
+                u: u.data.into_owned(),
+                v: v.data.into_owned(),
             },
             result_cdfs,
         ));
     }
-    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u16> {
+    let crop = |plane: &PlaneBuf<'_>, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
             out.extend(plane.data[row * plane.width..][..w].iter().copied());
@@ -20347,7 +20344,7 @@ fn mv_to_q4(pos: usize, mv_component: i32, luma: bool) -> i32 {
     (pos as i32) * 16 + mv_component * if luma { 2 } else { 1 }
 }
 
-impl PlaneBuf {
+impl PlaneBuf<'_> {
     /// Adds `residual` onto an already-computed `prediction` (motion
     /// compensation's output, rather than [`predict`]'s intra one), writing
     /// the clamped reconstruction into the plane at `(x, y)` -- the inter
@@ -20397,7 +20394,7 @@ impl PlaneBuf {
             let dst = (y + row) * self.width + x;
             let pred = &prediction[src..src + w];
             let res = &residual[src..src + w];
-            let out = &mut self.data[dst..dst + w];
+            let out = &mut self.data.to_mut()[dst..dst + w];
             for ((o, &p), &r) in out.iter_mut().zip(pred).zip(res) {
                 *o = (i32::from(p) + r).clamp(0, max) as u16;
             }
@@ -20419,7 +20416,7 @@ fn read_inter_plane(
     plane_idx: usize,
     around: (bool, bool, i32),
     tx_mode: usize,
-    plane: &mut PlaneBuf,
+    plane: &mut PlaneBuf<'static>,
     x: usize,
     y: usize,
     side: usize,
@@ -20558,11 +20555,11 @@ fn read_single_ref(
 /// the compound path can call it twice (lane-av1comp).
 fn ref_planes<'a>(
     ref_frame: i8,
-    ref_y: &'a PlaneBuf,
-    ref_u: &'a PlaneBuf,
-    ref_v: &'a PlaneBuf,
+    ref_y: &'a PlaneBuf<'a>,
+    ref_u: &'a PlaneBuf<'a>,
+    ref_v: &'a PlaneBuf<'a>,
     other_refs: &'a RefSlots,
-) -> Result<(&'a PlaneBuf, &'a PlaneBuf, &'a PlaneBuf)> {
+) -> Result<(&'a PlaneBuf<'a>, &'a PlaneBuf<'a>, &'a PlaneBuf<'a>)> {
     if ref_frame == LAST_FRAME {
         Ok((ref_y, ref_u, ref_v))
     } else {
@@ -21000,7 +20997,7 @@ nb_newmv={} cell_size={:?} cell_inter={:?} cell_ref={:?} sb_row_off={} sb_col_of
 /// under `av1_setup_build_prediction_by_{above,left}_pred`).
 #[allow(clippy::too_many_arguments)]
 fn obmc_neighbour_pred(
-    refplane: &PlaneBuf,
+    refplane: &PlaneBuf<'_>,
     x: usize,
     y: usize,
     mv: (i32, i32),
@@ -21073,7 +21070,7 @@ const II_WEIGHTS_1D: [u8; 128] = [
 /// lane-wii r2: `wedge == Some(..)` replaces the mode mask with the wedge
 /// codebook mask (fixed sign 0; luma stride, 2x2 box-averaged for chroma).
 fn interintra_blend(
-    plane: &PlaneBuf,
+    plane: &PlaneBuf<'_>,
     x: usize,
     y: usize,
     bw: usize,
@@ -21276,9 +21273,9 @@ fn obmc_blend(
     py: usize,
     cpx: usize,
     cpy: usize,
-    ref_y: &PlaneBuf,
-    ref_u: &PlaneBuf,
-    ref_v: &PlaneBuf,
+    ref_y: &PlaneBuf<'_>,
+    ref_u: &PlaneBuf<'_>,
+    ref_v: &PlaneBuf<'_>,
     other_refs: &RefSlots,
     interp_fixed: Option<mc::InterpFilterKind>,
     // lane-scaledref r1: this frame's own coded luma width -- each OBMC
@@ -21850,12 +21847,12 @@ fn decode_inter_block(
     side: usize,
     mi_cols: u32,
     mi_rows: u32,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
-    ref_y: &PlaneBuf,
-    ref_u: &PlaneBuf,
-    ref_v: &PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    ref_y: &PlaneBuf<'_>,
+    ref_u: &PlaneBuf<'_>,
+    ref_v: &PlaneBuf<'_>,
     // lane-av1refs: every non-`LAST_FRAME` reference this frame header's own
     // `ref_frame_idx` names a live DPB slot for, indexed `[ref_frame]`
     // (`LAST2_FRAME`=2 .. `ALTREF_FRAME`=7; index 0/1 unused, `LAST_FRAME`
@@ -25047,7 +25044,7 @@ fn decode_inter_block(
                     );
                     let cu_scan = default_scan(cu_tx);
                     for plane_idx in 1..3 {
-                        let buf: &mut PlaneBuf = if plane_idx == 1 { &mut *u } else { &mut *v };
+                        let buf: &mut PlaneBuf<'static> = if plane_idx == 1 { &mut *u } else { &mut *v };
                         let cu_grid = if skip {
                             buf.reconstruct(
                                 cu_x,
@@ -25545,12 +25542,12 @@ fn decode_inter_sub8_split4(
     group_mi: (usize, usize),
     mi_cols: u32,
     mi_rows: u32,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
-    ref_y: &PlaneBuf,
-    ref_u: &PlaneBuf,
-    ref_v: &PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    ref_y: &PlaneBuf<'_>,
+    ref_u: &PlaneBuf<'_>,
+    ref_v: &PlaneBuf<'_>,
     other_refs: &RefSlots,
     sign_bias_table: &SignBiasTable,
     global_motion: &[ec_av1_syntax::WarpParams; 7],
@@ -26056,9 +26053,9 @@ fn decode_intra_sub8_leaf(
     has_chroma: bool,
     skip: bool,
     scan4: &[u16],
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
     base_q_idx: u8,
     enable_filter_intra: bool,
     tx_select: bool,
@@ -26502,12 +26499,12 @@ fn decode_inter_sub8_rect2(
     vert: bool,
     mi_cols: u32,
     mi_rows: u32,
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
-    ref_y: &PlaneBuf,
-    ref_u: &PlaneBuf,
-    ref_v: &PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    ref_y: &PlaneBuf<'_>,
+    ref_u: &PlaneBuf<'_>,
+    ref_v: &PlaneBuf<'_>,
     other_refs: &RefSlots,
     sign_bias_table: &SignBiasTable,
     global_motion: &[ec_av1_syntax::WarpParams; 7],
@@ -27109,12 +27106,12 @@ fn decode_inter_block8(
     mi_rows: u32,
     outer_at: (usize, usize),
     leaf_mi: (usize, usize),
-    y: &mut PlaneBuf,
-    u: &mut PlaneBuf,
-    v: &mut PlaneBuf,
-    ref_y: &PlaneBuf,
-    ref_u: &PlaneBuf,
-    ref_v: &PlaneBuf,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    ref_y: &PlaneBuf<'_>,
+    ref_u: &PlaneBuf<'_>,
+    ref_v: &PlaneBuf<'_>,
     other_refs: &RefSlots,
     base_q_idx: u8,
     scan8: &[u16],
@@ -29340,7 +29337,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let (width, height) = (cols as usize * BLOCK, rows as usize * BLOCK);
 
     let ref_y = PlaneBuf {
-        data: reference.y.iter().map(|&s| s as u16).collect(),
+        data: std::borrow::Cow::Borrowed(&reference.y),
         width: reference.width,
         height: reference.height,
         true_width: reference.width,
@@ -29351,7 +29348,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: reference.height,
     };
     let ref_u = PlaneBuf {
-        data: reference.u.iter().map(|&s| s as u16).collect(),
+        data: std::borrow::Cow::Borrowed(&reference.u),
         width: reference.width / 2,
         height: reference.height / 2,
         true_width: reference.width / 2,
@@ -29362,7 +29359,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: reference.height / 2,
     };
     let ref_v = PlaneBuf {
-        data: reference.v.iter().map(|&s| s as u16).collect(),
+        data: std::borrow::Cow::Borrowed(&reference.v),
         width: reference.width / 2,
         height: reference.height / 2,
         true_width: reference.width / 2,
@@ -29379,13 +29376,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // block it is decoding selects an index that is still `None` here
     // (spec 7.9 requires every *active* reference be a compatible size;
     // an inactive one this frame never selects is simply left `None`).
-    let owned_refs: [Option<(PlaneBuf, PlaneBuf, PlaneBuf)>; 8] = std::array::from_fn(|i| {
+    let owned_refs: [Option<(PlaneBuf<'_>, PlaneBuf<'_>, PlaneBuf<'_>)>; 8] = std::array::from_fn(|i| {
         other_refs[i]
             .filter(|g| g.width == reference.width && g.height == reference.height)
             .map(|g| {
                 (
                     PlaneBuf {
-                        data: g.y.iter().map(|&s| s as u16).collect(),
+                        data: std::borrow::Cow::Borrowed(&g.y),
                         width: g.width,
                         height: g.height,
                         true_width: g.width,
@@ -29396,7 +29393,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         tile_y1: g.height,
                     },
                     PlaneBuf {
-                        data: g.u.iter().map(|&s| s as u16).collect(),
+                        data: std::borrow::Cow::Borrowed(&g.u),
                         width: g.width / 2,
                         height: g.height / 2,
                         true_width: g.width / 2,
@@ -29407,7 +29404,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         tile_y1: g.height / 2,
                     },
                     PlaneBuf {
-                        data: g.v.iter().map(|&s| s as u16).collect(),
+                        data: std::borrow::Cow::Borrowed(&g.v),
                         width: g.width / 2,
                         height: g.height / 2,
                         true_width: g.width / 2,
@@ -29424,7 +29421,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         std::array::from_fn(|i| owned_refs[i].as_ref().map(|(a, b, c)| (a, b, c)));
 
     let mut y = PlaneBuf {
-        data: vec![0u16; width * height],
+        data: std::borrow::Cow::Owned(vec![0u16; width * height]),
         width,
         height,
         true_width,
@@ -29435,7 +29432,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: height,
     };
     let mut u = PlaneBuf {
-        data: vec![0u16; width * height / 4],
+        data: std::borrow::Cow::Owned(vec![0u16; width * height / 4]),
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -29446,7 +29443,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: height / 2,
     };
     let mut v = PlaneBuf {
-        data: vec![0u16; width * height / 4],
+        data: std::borrow::Cow::Owned(vec![0u16; width * height / 4]),
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -31950,7 +31947,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            let narrow = |p: &PlaneBuf| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+            let narrow = |p: &PlaneBuf<'_>| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
             let _ = f.write_all(&narrow(&y));
             let _ = f.write_all(&narrow(&u));
             let _ = f.write_all(&narrow(&v));
@@ -32007,10 +32004,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     if let Some((upscaled_w, _)) = superres(fctx) {
         let bd = u32::from(bit_depth(fctx));
         let (uw, fw, fh) = (upscaled_w as usize, frame_width as usize, frame_height as usize);
-        let up = |p: &PlaneBuf, in_w: usize, in_h: usize, out_w: usize| PlaneBuf {
-            data: crate::superres::upscale_plane_strided(
+        let up = |p: &PlaneBuf<'_>, in_w: usize, in_h: usize, out_w: usize| PlaneBuf {
+            data: std::borrow::Cow::Owned(crate::superres::upscale_plane_strided(
                 &p.data, p.width, in_w, in_h, p.true_width, out_w, bd,
-            ),
+            )),
             width: out_w,
             height: in_h,
             true_width: out_w,
@@ -32037,9 +32034,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         );
     }
     if let Some((db_y, db_u, db_v)) = deblocked {
-        scratch_return(db_y.data);
-        scratch_return(db_u.data);
-        scratch_return(db_v.data);
+        scratch_return(db_y.data.into_owned());
+        scratch_return(db_u.data.into_owned());
+        scratch_return(db_v.data.into_owned());
     }
 
     let motion_field = build_motion_field(
@@ -32066,15 +32063,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             Picture {
                 width,
                 height,
-                y: y.data,
-                u: u.data,
-                v: v.data,
+                y: y.data.into_owned(),
+                u: u.data.into_owned(),
+                v: v.data.into_owned(),
             },
             result_cdfs,
             motion_field,
         ));
     }
-    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u16> {
+    let crop = |plane: &PlaneBuf<'_>, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
             out.extend(plane.data[row * plane.width..][..w].iter().copied());
@@ -32749,7 +32746,7 @@ mod tests {
         const REFUSAL: &str =
             "a reference frame selected with no picture at this frame's own ref_frame_idx slot";
         let plane = PlaneBuf {
-            data: vec![0u16; 16],
+            data: std::borrow::Cow::Owned(vec![0u16; 16]),
             width: 4,
             height: 4,
             true_width: 4,
@@ -33471,12 +33468,14 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let ref_pattern: Vec<u16> = (0..width * height).map(|i| (i % 251) as u16).collect();
         let ref_plane = |scale: usize| PlaneBuf {
-            data: ref_pattern
-                .iter()
-                .step_by(scale.max(1))
-                .take((width / scale) * (height / scale))
-                .copied()
-                .collect(),
+            data: std::borrow::Cow::Owned(
+                ref_pattern
+                    .iter()
+                    .step_by(scale.max(1))
+                    .take((width / scale) * (height / scale))
+                    .copied()
+                    .collect(),
+            ),
             width: width / scale,
             height: height / scale,
             true_width: width / scale,
@@ -33487,7 +33486,7 @@ mod tests {
             tile_y1: height / scale,
         };
         let ref_y = PlaneBuf {
-            data: ref_pattern.clone(),
+            data: std::borrow::Cow::Owned(ref_pattern.clone()),
             width,
             height,
             true_width: width,
@@ -33501,7 +33500,7 @@ mod tests {
         let ref_v = ref_plane(2);
 
         let mut y = PlaneBuf {
-            data: vec![0u16; width * height],
+            data: std::borrow::Cow::Owned(vec![0u16; width * height]),
             width,
             height,
             true_width: width,
@@ -33512,7 +33511,7 @@ mod tests {
             tile_y1: height,
         };
         let mut u = PlaneBuf {
-            data: vec![0u16; (width / 2) * (height / 2)],
+            data: std::borrow::Cow::Owned(vec![0u16; (width / 2) * (height / 2)]),
             width: width / 2,
             height: height / 2,
             true_width: width / 2,
@@ -33523,7 +33522,7 @@ mod tests {
             tile_y1: height / 2,
         };
         let mut v = PlaneBuf {
-            data: vec![0u16; (width / 2) * (height / 2)],
+            data: std::borrow::Cow::Owned(vec![0u16; (width / 2) * (height / 2)]),
             width: width / 2,
             height: height / 2,
             true_width: width / 2,
