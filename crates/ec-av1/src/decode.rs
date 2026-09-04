@@ -7731,6 +7731,13 @@ fn decode_intra_rect_in_inter(
                  is consumed for square blocks only)",
             ));
         }
+        if coeff_trace_on() {
+            // lane-t900 r16: which decode-order frame this arm fires in --
+            // interleaved with the `EC_COEFF_FRAME` markers, this is what
+            // proves the hit is counted out of a frame that compares exact
+            // (class `counter-from-refused-stream`).
+            eprintln!("EC_INTRA128 mi_row={r} mi_col={c} bw={bw} bh={bh}");
+        }
         INTRA_IN_INTER_MODE.with(|c| c.set(Some((3, skip))));
         let res = decode_block_128rect(
             dec,

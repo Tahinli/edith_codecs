@@ -30637,6 +30637,117 @@ mod tests {
         );
     }
 
+    /// lane-t900 r16: the intra-coded 128x64 / 64x128 INTER-frame witness --
+    /// IGNORED, and it is the `EC_INTRA128_IN_INTER` opt-in's blocker, not its
+    /// lift. Run it with
+    /// `EC_INTRA128_IN_INTER=1 cargo test -p ec-av1 intra_coded_128x64 -- --ignored`.
+    ///
+    /// `crates/ec-av1/fixtures/intra128_in_inter_witness.obu`, 13066 bytes,
+    /// sha256 `dd41fc39367a3d38bf8a8a8106dc30d91b716b2a9123fdfa4716930f4f98caf9`,
+    /// produced by this repository's aomenc oracle:
+    ///
+    /// ```text
+    /// aomenc --codec=av1 -w 512 -h 512 --input-bit-depth=10 --bit-depth=10 \
+    ///   --sb-size=128 --min-partition-size=64 --max-partition-size=128 \
+    ///   --enable-rect-partitions=1 --kf-max-dist=9999 --lag-in-frames=0 \
+    ///   --cpu-used=1 --end-usage=q --cq-level=24 --threads=1 --obu -o s.obu src.y4m
+    /// ```
+    ///
+    /// The source is 10 frames of 10-bit 512x512 whose left two superblock
+    /// columns carry 128-wide bands 64 rows apart (so the 128 root's cheapest
+    /// split is `PARTITION_HORZ`) and whose right two carry 64-wide vertical
+    /// bands (`PARTITION_VERT`), with two hard scene cuts at frames 4 and 7 and
+    /// `--kf-max-dist=9999` so those cuts must be coded as INTER frames whose
+    /// content no reference holds. It is the first stream found in this
+    /// repository that makes the encoder code a 128-root HORZ/VERT half INTRA
+    /// inside an inter frame at all: `intra128_in_inter` fires 1x 128x64 +
+    /// 2x 64x128. Three recipes that do NOT fire it, so the shape matters: a
+    /// small new patch on a static background (the frame costs 80 bytes, the
+    /// encoder skips), unstructured texture (the 128 root always SPLITs), and
+    /// cyclically repeating phases (GOLDEN holds an earlier phase, so the cut
+    /// is predicted rather than coded intra).
+    ///
+    /// It does NOT yet lift the opt-in, because the three hits land in a frame
+    /// this decoder does not decode exactly, and a counter read out of a
+    /// desynced frame proves nothing (class `counter-from-refused-stream`).
+    /// The blocking defect is measured, separate, and NOT this arm -- the same
+    /// source re-encoded with `--enable-intrabc=0 --enable-palette=0
+    /// --enable-obmc=0 --enable-warped-motion=0 --enable-global-motion=0
+    /// --enable-interintra-comp=0 --enable-masked-comp=0
+    /// --enable-filter-intra=0 --enable-ab-partitions=0
+    /// --enable-1to4-partitions=0` fires the arm 0 times and desyncs on
+    /// exactly the same frames, and the same source at `--sb-size=64` decodes
+    /// all 10 frames byte-exact. First-bad, measured against ffmpeg and
+    /// against this repository's instrumented aomdec:
+    ///
+    /// * pixels: decode-order frame 1, luma (row 122, col 354), 160285
+    ///   differing samples (Y 146713 / U 5936 / V 7636), max |delta| 738.
+    ///   Frames 0, 4 and 7 -- the key frame and the two all-intra scene cuts --
+    ///   are byte-exact on every plane; every other frame is not.
+    /// * entropy (`EC_TRACE_COEFF` on both decoders, prefiltered to the
+    ///   `all_zero`/`eob`/`after_bases` tags): frame 1, the 128x128
+    ///   `is_inter=1 skip=0` block at mi(32,64) (pixel 128,256), its FIRST
+    ///   luma TU (`bc=0 br=0`, a TX_64X64 unit, `coding.side=32`). aomdec
+    ///   reads `txb_skip` ctx 1 (`top == 0 && left == 0`) and gets
+    ///   `all_zero=1`; we read ctx 2 and get `all_zero=0`. Entry range is
+    ///   equal on both, so this is the txb_skip CONTEXT -- i.e. the luma
+    ///   entropy levels the PRECEDING 128x128 inter block published into
+    ///   `above`/`left` -- and not the symbol's own alphabet.
+    /// * `EC_TRACE_MODE` confirms the same point from the other side: the
+    ///   first differing `EC_MODE` range is at the ENTRY of mi(32,96), i.e.
+    ///   inside mi(32,64); every 128-root block before it matches exactly.
+    ///
+    /// The arm's own three hits are at mi(8,24) 128x64 and mi(16,16) /
+    /// mi(16,20) 64x128 (`EC_INTRA128` trace, decode.rs).
+    #[ignore = "lane-t900 r16: needs EC_INTRA128_IN_INTER=1, and the stream carries a separate 128x128-inter txb_skip-context desync at frame 1 mi(32,64)"]
+    #[test]
+    fn an_intra_coded_128x64_block_inside_an_inter_frame_decodes_pixel_exact() {
+        const NAME: &str = "an_intra_coded_128x64_block_inside_an_inter_frame_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/intra128_in_inter_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (512usize, 512usize);
+        let before = intra128_in_inter_counters();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let now = intra128_in_inter_counters();
+        let fired = [now[0] - before[0], now[1] - before[1]];
+        for (what, n) in [("128x64", fired[0]), ("64x128", fired[1])] {
+            assert!(
+                n > 0,
+                "{NAME}: an intra {what} block on the inter path never fired -- \
+                 the gate would be vacuous for it"
+            );
+        }
+        assert_eq!(frames.len(), 10, "{NAME}: 10 shown frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg returned {} frames, we decoded {}",
+            ffmpeg_frames.len(),
+            frames.len()
+        );
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: 10 shown frames pixel-exact on every plane; \
+             intra128_in_inter 128x64={} 64x128={}",
+            fired[0], fired[1]
+        );
+    }
+
     /// lane-t900 r10: the small-side GLOBALMV / rect warp-reach witness.
     /// `crates/ec-av1/fixtures/gm_small_side_witness.obu`, 1158066 bytes,
     /// sha256 `f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca`:
