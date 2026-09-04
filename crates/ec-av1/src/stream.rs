@@ -30785,6 +30785,89 @@ mod tests {
         );
     }
 
+    /// lane-t900 r20 GATE, refusal A -- `"a non-skip rectangular
+    /// (HORZ/VERT/HORZ_B) strip needs rectangular residual coding"`.
+    ///
+    /// That string is a claim about a SHAPE, so what proves it is the set of
+    /// shapes the inter block path presents. `inter_piece!` sets
+    /// `reject_residual` to `$ww != $side || $wh != $side`, i.e. only for a
+    /// block whose true footprint is not its square CDF context, and the
+    /// refusal then needs `!rect_inter_residual_supported(write_w, write_h)`.
+    /// So it can fire only for a footprint that is BOTH rectangular (or a
+    /// square smaller than its own context) AND missing from that table.
+    ///
+    /// This gate measures the domain instead of asserting it:
+    /// [`crate::decode::inter_block_shape_mask`] records every
+    /// `(side, write_w, write_h)` triple decoded on this thread, with bit 31
+    /// reserved for a triple [`crate::decode::INTER_BLOCK_SHAPES`] does not
+    /// list. Three real streams -- a 10-bit 1920x792 128-superblock film cut,
+    /// its 128-root intra witness and the 1920x792 small-side warp cut,
+    /// together ~140k inter blocks -- decode without a refusal and present
+    /// exactly 18 triples: the four square ones (`write == side`, where
+    /// `reject_residual` is false) and the fourteen rectangular AV1 block
+    /// shapes, every one of which `rect_inter_residual_supported` covers. No
+    /// square-inside-a-larger-context triple appears at all.
+    ///
+    /// Measured 2026-09-04: mask covers 18/18 listed triples, bit 31 clear,
+    /// 0 refusals.
+    #[test]
+    fn a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable() {
+        const NAME: &str =
+            "a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable";
+        const REFUSAL: &str =
+            "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let mut blocks = 0usize;
+        for name in [
+            "troy_sb128_inter_witness.obu",
+            "intra128_in_inter_witness2.obu",
+            "gm_small_side_witness.obu",
+        ] {
+            let path = dir.join(name);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            match decode_stream(&stream) {
+                Ok(frames) => {
+                    assert!(!frames.is_empty(), "{NAME}: {name} decoded no frame");
+                    blocks += frames.len();
+                }
+                Err(e) => {
+                    assert!(
+                        !format!("{e}").contains(REFUSAL),
+                        "{NAME}: {name} hit the refusal this gate proves unreachable: {e}"
+                    );
+                    panic!("{NAME}: {name} refused: {e}");
+                }
+            }
+        }
+        assert!(blocks > 0, "{NAME}: no frames decoded");
+        let mask = crate::decode::inter_block_shape_mask();
+        assert_eq!(
+            mask & crate::decode::INTER_BLOCK_SHAPE_UNLISTED,
+            0,
+            "{NAME}: a (side, write_w, write_h) triple outside INTER_BLOCK_SHAPES was decoded --              the census no longer describes the inter path's domain, so {REFUSAL:?} is not              proven by it"
+        );
+        for (i, &(side, w, h)) in crate::decode::INTER_BLOCK_SHAPES.iter().enumerate() {
+            assert!(
+                mask & (1u32 << i) != 0,
+                "{NAME}: {side}: {w}x{h} never decoded -- the census would prove nothing about it"
+            );
+            // `reject_residual` is false for a square footprint (`write ==
+            // side`), so only the rectangular ones can reach the refusal.
+            if (w, h) != (side, side) {
+                assert!(
+                    crate::decode::rect_inter_residual_supported(w, h),
+                    "{NAME}: {w}x{h} is decoded by real streams with reject_residual set but has                      no rectangular residual path -- {REFUSAL:?} is reachable"
+                );
+            }
+        }
+        eprintln!(
+            "{NAME}: 3 streams, 0 refusals, {} of {} listed (side, write) triples decoded,              bit31 clear",
+            crate::decode::INTER_BLOCK_SHAPES.len(),
+            crate::decode::INTER_BLOCK_SHAPES.len()
+        );
+    }
+
     /// lane-t900 r10: the small-side GLOBALMV / rect warp-reach witness.
     /// `crates/ec-av1/fixtures/gm_small_side_witness.obu`, 1158066 bytes,
     /// sha256 `f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca`:

@@ -14526,7 +14526,7 @@ fn read_block_tx_size(
 /// `default_inter_ext_tx_cdf[2][TX_8X8]` (the 12-symbol
 /// `DTT9_IDTX_1DDCT` row at `tx_size_sqr == TX_8X8`, only reachable through a
 /// rect transform), neither of which exists yet -- both stay refused by name.
-fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
+pub(crate) fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
     matches!(
         (w, h),
         // 2:1 strips whose transform is coded in full (lane-inter4).
@@ -14562,6 +14562,63 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
             // (`ss_size_lookup[BLOCK_32X8]` = BLOCK_16X4).
             | (32, 8) | (8, 32)
     )
+}
+
+// lane-t900 r20: the `(side, write_w, write_h)` triples the inter block path
+// actually PRESENTS, as a thread-local bitmask -- the measured domain behind
+// the "rectangular ... has no ... here" refusals. `side` is the square context
+// a block reads its CDFs at and `write_w`/`write_h` its true footprint;
+// `inter_piece!` derives `reject_residual` from exactly that inequality, so
+// these triples are what decides whether those refusals can fire at all. Bit
+// 31 is "a triple this table does not list", which is what makes the gate a
+// census rather than a restatement of its own table.
+pub(crate) const INTER_BLOCK_SHAPES: [(usize, usize, usize); 18] = [
+    (16, 16, 16),
+    (32, 32, 32),
+    (32, 16, 32),
+    (32, 32, 16),
+    (16, 8, 16),
+    (16, 16, 8),
+    (32, 8, 32),
+    (64, 64, 64),
+    (32, 32, 8),
+    (64, 16, 64),
+    (128, 128, 128),
+    (64, 32, 64),
+    (64, 64, 32),
+    (16, 4, 16),
+    (64, 64, 16),
+    (16, 16, 4),
+    (128, 128, 64),
+    (128, 64, 128),
+];
+
+/// Bit 31 of [`inter_block_shape_mask`]: a `(side, write_w, write_h)` triple
+/// outside [`INTER_BLOCK_SHAPES`].
+pub const INTER_BLOCK_SHAPE_UNLISTED: u32 = 1 << 31;
+
+thread_local! {
+    static INTER_BLOCK_SHAPE_MASK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Which of [`INTER_BLOCK_SHAPES`] this THREAD has decoded (thread-local, so a
+/// gate reading it sees only the streams it decoded itself).
+pub fn inter_block_shape_mask() -> u32 {
+    INTER_BLOCK_SHAPE_MASK.with(std::cell::Cell::get)
+}
+
+/// Records one block's shape. The table is ordered by measured frequency over
+/// the three witnesses the census gate decodes, so the common square shapes
+/// leave the scan on their first comparison.
+fn census_inter_block_shape(side: usize, w: usize, h: usize) {
+    let bit = match INTER_BLOCK_SHAPES.iter().position(|&s| s == (side, w, h)) {
+        Some(i) => 1u32 << i,
+        None => INTER_BLOCK_SHAPE_UNLISTED,
+    };
+    let seen = inter_block_shape_mask();
+    if seen & bit == 0 {
+        INTER_BLOCK_SHAPE_MASK.with(|c| c.set(seen | bit));
+    }
 }
 
 /// The luma coefficient/`tx_type` table set of a whole-block rectangular
@@ -20243,6 +20300,7 @@ fn decode_inter_block(
     // exactly what it read before.
     let (rmi, cmi) = at;
     let (px, py) = (at.1 * MI, at.0 * MI);
+    census_inter_block_shape(side, write_w, write_h);
     // lane-inter16ab r2: a 16x4 / 4x16 inter strip's chroma is the PAIR's
     // (8x4 / 4x8 at the even strip's origin) and is coded only by the odd
     // strip (`is_chroma_reference`); every other block keeps its own.

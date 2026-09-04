@@ -111,6 +111,32 @@ const REFUSALS: &[&str] = &[
     "a motion_mode symbol for a block shape with no CDF row here",
 ];
 
+/// The refusals that have a PROVING test, and its name.
+///
+/// A refusal with no such test is an unmeasured claim: nothing in the suite
+/// distinguishes "this case never happens" from "no stream we decode has
+/// reached it yet". A proving test is one of two shapes:
+///
+/// * a WITNESS gate -- a real stream reaches the shape, decodes exact, and the
+///   refusal is gone (the good case), or
+/// * a CENSUS gate -- N real streams decode with the refusal firing 0 times
+///   while the counters for the sibling shapes it names fire, so the claim is
+///   measured against the domain the decoder is actually handed.
+///
+/// The count printed by [`tests::every_proven_refusal_names_a_test_that_exists`]
+/// is the honest numerator over the inventory below.
+#[cfg(test)]
+const PROVEN: &[(&str, &str)] = &[
+    // lane-t900 r20, census: three real streams present exactly the 18
+    // `(side, write_w, write_h)` triples `INTER_BLOCK_SHAPES` lists, and
+    // `rect_inter_residual_supported` covers every rectangular one -- the only
+    // footprints `reject_residual` is set for.
+    (
+        "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
+        "a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable",
+    ),
+];
+
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
 /// a test failure.
 ///
@@ -131,7 +157,7 @@ const GATES_THAT_SKIP_ON_A_DECODE_ERROR: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, REFUSALS};
+    use super::{CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, PROVEN, REFUSALS};
     use std::collections::BTreeSet;
 
     /// Every distinct `unsupported(...)` reason on the decode path.
@@ -285,6 +311,30 @@ mod tests {
         assert!(
             stale.is_empty(),
             "{stale:#?} no longer swallow a decode error -- delete them from the list."
+        );
+    }
+
+    /// Every entry of [`PROVEN`] must still name a live refusal and a test
+    /// that exists, and the count it prints is the inventory's numerator.
+    #[test]
+    fn every_proven_refusal_names_a_test_that_exists() {
+        let found = decode_path_refusals();
+        let src = include_str!("stream.rs");
+        for (reason, gate) in PROVEN {
+            assert!(
+                found.contains(*reason),
+                "{reason:?} is listed as proven but is no longer a decode-path refusal --                  drop it from PROVEN (the capability landed) or fix the string"
+            );
+            assert!(
+                src.contains(&format!("fn {gate}(")),
+                "{reason:?} names the proving test {gate}, which does not exist in stream.rs"
+            );
+        }
+        eprintln!(
+            "refusal inventory: {} refusals + {} capability claims, {} proven",
+            REFUSALS.len(),
+            CAPABILITY_CLAIMS.len(),
+            PROVEN.len()
         );
     }
 }
