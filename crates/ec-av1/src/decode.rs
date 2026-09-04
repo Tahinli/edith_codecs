@@ -10416,24 +10416,11 @@ fn decode_block_rect64(
             c * (SUB / MI), fctx,
         )?;
     if (palette_y.is_some() || palette_uv.is_some()) && !skip {
-        // The luma coefficient path here is the corner-cropped 32x32 real
-        // transform embedded in a 64x32/32x64 grid ([`decode_block_rect64`]'s
-        // own doc comment) -- a real (non-skip) palette block's residual
-        // needs the plain, uncropped rect reader [`decode_block_rect`] already
-        // has, not this one's truncation. `skip` (no residual at all) is
-        // still supported below (lane-palette2 r4).
-        //
-        // lane-pal8 r1 MEASURED the lift and it is NOT free: dropping this
-        // refusal decodes `testsrc2` 128x128 10-bit cq55 `--enable-palette=1
-        // --min-partition-size=8 --tile-columns=1` with a whole-frame pixel
-        // mismatch (the arm the gate below counts). Something in this shape's
-        // palette prediction or its corner-cropped residual is wrong, and the
-        // refusal stays until that is found -- it is counted, never skipped.
+        // lane-t900 r34: a non-skip palette block on a superblock-level strip
+        // -- counted so its gate cannot go vacuous (this was a refusal until
+        // r34; see the gate `a_real_aomenc_palette_stream_with_8x8_leaves_
+        // decodes_pixel_exact`).
         PALETTE_SB_STRIP_HITS.with(|c| c.set(c.get() + 1));
-        return Err(unsupported(
-            "a palette block with a real transform on a superblock-level HORZ/VERT \
-             strip (corner-cropped luma coefficients not ported for palette)",
-        ));
     }
     let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
     if smooth_neighbor {
@@ -10817,6 +10804,16 @@ fn decode_block_rect64(
             plane_q_delta(1, fctx).1,
             u_tx_type,
         );
+        // lane-t900 r34: the UV-palette prediction override, exactly as the
+        // `skip` arm above installs it. The [`PALETTE_PRED`] slot is a
+        // set-then-take, so it must be filled again right before each plane's
+        // own reconstruct; leaving this out of the non-skip arm predicted a
+        // palette block's chroma off its block edges (measured: testsrc2
+        // 128x128 10-bit cq55 `--tile-columns=1`, the 32x64 strip at px=96 --
+        // luma exact, both chroma planes wrong over its whole 16x32).
+        if let Some((ub, _)) = &palette_uv_bufs {
+            set_palette_pred(ub.clone(), fctx);
+        }
         u.reconstruct_rect(
             cpx,
             cpy,
@@ -10871,6 +10868,9 @@ fn decode_block_rect64(
             plane_q_delta(2, fctx).1,
             v_tx_type,
         );
+        if let Some((_, vb)) = &palette_uv_bufs {
+            set_palette_pred(vb.clone(), fctx);
+        }
         v.reconstruct_rect(
             cpx,
             cpy,
@@ -17971,11 +17971,6 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     }
     fctx.enable_edge_filter.with(|f| f.set(enable_edge_filter));
     let sb128 = sb128(fctx);
-    if sb128 && allow_intrabc {
-        return Err(unsupported(
-            "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
-        ));
-    }
     let (sb_cols, sb_rows) = (mi_cols.div_ceil(SB_MI), mi_rows.div_ceil(SB_MI));
     fctx.intrabc_mi_grid.with(|g| {
         *g.borrow_mut() = allow_intrabc.then(|| {
@@ -20328,8 +20323,13 @@ fn read_intrabc_dv(
     if pred == (0, 0) {
         // `av1_find_ref_dv` (mvref_common.c). Tile row start is 0 here (the
         // single-tile-row case every intrabc gate stream is).
-        let sb_px = SB_MI as i32 * MI as i32;
-        pred = if mi_r < SB_MI as usize {
+        // lane-t900 r34: `av1_find_ref_dv` takes `mib_size` -- the SEQUENCE's
+        // superblock size in mi units -- so a 128x128 superblock stream's
+        // fallback DV is one 128-px superblock up (or 128+256 px left on the
+        // tile's first superblock row), never the 64 this hardcoded.
+        let sb_mi = sb_mi_cur(fctx) as i32;
+        let sb_px = sb_mi * MI as i32;
+        pred = if (mi_r as i32) < sb_mi {
             (0, -(sb_px + INTRABC_DELAY_PIXELS) * 8)
         } else {
             (-sb_px * 8, 0)
