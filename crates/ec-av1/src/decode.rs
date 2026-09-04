@@ -4888,6 +4888,11 @@ struct Neighbours {
     /// skipped inter blocks (lane-mergefix r4). Written by
     /// [`Self::fill_skip_grid_rect`], whose `at_mi` IS that origin.
     blk_org_grid: Vec<[u16; 2]>,
+    /// Per-4x4-mi `(width, height)` in mi units of the coded block covering
+    /// that cell -- the other half of `pu_edge`: libaom tests the edge
+    /// coordinate against the block's size in the FILTERED plane's own
+    /// pixels, which for chroma is `max(luma_dim / 2, 4)` (lane-t900 r30b).
+    blk_dim_grid: Vec<[u8; 2]>,
     skip_grid_cols_mi: usize,
     /// Per-4x4-mi luma transform width in pixels (8/16/32/64) -- this decoder
     /// never splits a coded block's transform below its own size (round 2:
@@ -5011,6 +5016,7 @@ impl Neighbours {
             skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
             skip_written: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
             blk_org_grid: vec![[0u16; 2]; cols * (SUB / MI) * rows * (SUB / MI)],
+            blk_dim_grid: vec![[1u8; 2]; cols * (SUB / MI) * rows * (SUB / MI)],
             skip_grid_cols_mi: cols * (SUB / MI),
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
@@ -5453,6 +5459,9 @@ impl Neighbours {
                 }
                 if let Some(org) = self.blk_org_grid.get_mut(idx) {
                     *org = [mi_r as u16, mi_c as u16];
+                }
+                if let Some(dim) = self.blk_dim_grid.get_mut(idx) {
+                    *dim = [w_mi as u8, h_mi as u8];
                 }
             }
         }
@@ -14640,8 +14649,19 @@ fn apply_deblock(
 /// in -- `Neighbours::tx_grid`/`ref_grid` are always indexed at the luma
 /// 4x4-mi grain, even when `coord` is a chroma coordinate (2 chroma px per
 /// mi unit under this decoder's assumed 4:2:0 subsampling).
+///
+/// lane-t900 r30b: the chroma arm ORs in the subsampling, exactly as
+/// `set_lpf_parameters` does (`av1_loopfilter.c:245`, `mi_col = scale_horz |
+/// ((x << scale_horz) >> MI_SIZE_LOG2)`) -- "for sub8x8 block, chroma
+/// prediction mode is obtained from the bottom/right mi structure of the
+/// co-located 8x8 luma block, so for chroma plane both mi_row and mi_col
+/// should be odd". Dropping that `| 1` read the group's TOP-LEFT mi, which
+/// is the same cell for every block 8x8 and larger and a DIFFERENT coded
+/// block (different tx size, ref frame, skip flag and delta_lf) as soon as
+/// the group is split into 4x4 luma blocks (class
+/// `context-read-from-one-cell`).
 fn plane_to_mi(chroma: bool, coord: usize) -> usize {
-    if chroma { coord / 2 } else { coord / 4 }
+    if chroma { (coord / 2) | 1 } else { coord / 4 }
 }
 
 /// This plane's own transform width in pixels at the covering block, spec
@@ -16192,10 +16212,15 @@ fn edge_params(
         return None;
     }
     let cur_ref = n.ref_grid[mi_r * n.skip_grid_cols_mi + mi_c];
+    // `mode_step` (`set_lpf_parameters`): one mi for luma, `1 << ss` for
+    // chroma -- the previous cell must keep the odd parity `plane_to_mi`
+    // just established, i.e. the bottom/right mi of the PREVIOUS 8x8 luma
+    // group, not the other half of this one.
+    let step = if chroma { 2 } else { 1 };
     let (pv_mi_r, pv_mi_c) = if dir == 0 {
-        (mi_r, mi_c - 1)
+        (mi_r, mi_c - step)
     } else {
-        (mi_r - 1, mi_c)
+        (mi_r - step, mi_c)
     };
     let pv_tx = if dir == 0 {
         tx_px_at(n, chroma, pv_mi_r, pv_mi_c)
@@ -16214,11 +16239,25 @@ fn edge_params(
     // is always its own full size", which var-tx broke) had us filtering an
     // interior 8-px lattice the reference never touches: on the pinned 192x68
     // inter stream frame 1 went from 7244 wrong post-deblock luma px to 0.
+    // libaom prices `pu_edge` in the PLANE's own pixels against the plane's
+    // block size (`!(coord & (block_size_wide[get_plane_block_size(bsize)] -
+    // 1))`), which for chroma bottoms out at 4 px: every 4-aligned chroma
+    // edge of a sub-8x8 group is a prediction edge, even though the group's
+    // bottom/right mi does not start there. Comparing mi origins instead is
+    // the same test only while the block's own origin is aligned to its
+    // size, which a 4x4 luma block read at the `| 1` mi is not.
     let cur_org = n.blk_org_grid[mi_r * n.skip_grid_cols_mi + mi_c];
-    let pu_edge = if dir == 0 {
-        mi_c == usize::from(cur_org[1])
+    let cur_dim = n.blk_dim_grid[mi_r * n.skip_grid_cols_mi + mi_c];
+    let (org_px, dim_mi) = if dir == 0 {
+        (usize::from(cur_org[1]), usize::from(cur_dim[0]))
     } else {
-        mi_r == usize::from(cur_org[0])
+        (usize::from(cur_org[0]), usize::from(cur_dim[1]))
+    };
+    let pu_edge = if chroma {
+        let plane_dim = (dim_mi * MI / 2).max(4);
+        (if dir == 0 { x0 } else { y0 }) % plane_dim == 0
+    } else {
+        plane_to_mi(false, if dir == 0 { x0 } else { y0 }) == org_px
     };
     if !pu_edge
         && cur_ref != 0
