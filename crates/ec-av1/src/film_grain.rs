@@ -408,30 +408,25 @@ fn add_noise_to_block(
             let gcr = &cr_grain[grow..grow + cw];
             let urow = &mut u_plane[crow..crow + cw];
             let vrow = &mut v_plane[crow..crow + cw];
-            for ((((lpair, u), v), &gb), &gr) in luma
-                .chunks_exact(2)
-                .zip(urow.iter_mut())
-                .zip(vrow.iter_mut())
-                .zip(gcb.iter())
-                .zip(gcr.iter())
-            {
-                let average_luma = (lpair[0] as i32 + lpair[1] as i32 + 1) >> 1;
-                if apply_cb {
-                    let scaled = (((average_luma * cb_luma_mult + cb_mult * *u as i32) >> 6)
-                        + cb_offset)
-                        .clamp(0, index_max);
-                    let delta =
-                        (scaling_cb[scaled as usize] * gb + rounding_offset) >> scaling_shift;
-                    *u = ((*u as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
-                }
-                if apply_cr {
-                    let scaled = (((average_luma * cr_luma_mult + cr_mult * *v as i32) >> 6)
-                        + cr_offset)
-                        .clamp(0, index_max);
-                    let delta =
-                        (scaling_cr[scaled as usize] * gr + rounding_offset) >> scaling_shift;
-                    *v = ((*v as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
-                }
+            // lane-perf9: one plane at a time, so the row is a straight
+            // vectorisable kernel (the per-sample `apply_cb`/`apply_cr` tests
+            // were loop-invariant anyway).
+            let params = ChromaNoise {
+                index_max,
+                rounding_offset,
+                scaling_shift,
+                min_chroma,
+                max_chroma,
+            };
+            if apply_cb {
+                chroma_noise_row(
+                    urow, luma, gcb, scaling_cb, cb_luma_mult, cb_mult, cb_offset, params,
+                );
+            }
+            if apply_cr {
+                chroma_noise_row(
+                    vrow, luma, gcr, scaling_cr, cr_luma_mult, cr_mult, cr_offset, params,
+                );
             }
         }
     }
@@ -480,6 +475,70 @@ fn luma_noise_row(
     luma_noise_row_scalar(
         pixels, grain, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
     );
+}
+
+/// The loop-invariant half of [`chroma_noise_row`]'s spec 7.18.3.5 arithmetic
+/// (the same values for both chroma planes and every row of a block).
+#[derive(Clone, Copy)]
+struct ChromaNoise {
+    index_max: i32,
+    rounding_offset: i32,
+    scaling_shift: i32,
+    min_chroma: i32,
+    max_chroma: i32,
+}
+
+/// One chroma row of spec 7.18.3.5's `add_noise_to_block`: `luma` is the
+/// block's own luma row pair-averaged 4:2:0 (`luma.len() == 2 *
+/// chroma.len()`), `grain` and `scaling` are the plane's own.
+///
+/// lane-perf9: AVX2 does 8 chroma samples at a time, the luma pair sum being
+/// one `vpmaddwd` against ones; every other CPU runs the scalar loop, which
+/// stays the reference (`simd_matches_scalar_chroma_noise_row` pins the pair).
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn chroma_noise_row(
+    chroma: &mut [u16],
+    luma: &[u16],
+    grain: &[i32],
+    scaling: &[i32],
+    luma_mult: i32,
+    mult: i32,
+    offset: i32,
+    p: ChromaNoise,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
+        // SAFETY: reached only when the CPU reports avx2; the kernel reads
+        // `luma[..2 * n]`/`grain[..n]` for `n` samples it writes, and gathers
+        // only in-range LUT entries.
+        unsafe {
+            simd::chroma_noise_row_avx2(chroma, luma, grain, scaling, luma_mult, mult, offset, p)
+        };
+        return;
+    }
+    chroma_noise_row_scalar(chroma, luma, grain, scaling, luma_mult, mult, offset, p);
+}
+
+/// The scalar reference for [`chroma_noise_row`].
+#[allow(clippy::too_many_arguments)]
+fn chroma_noise_row_scalar(
+    chroma: &mut [u16],
+    luma: &[u16],
+    grain: &[i32],
+    scaling: &[i32],
+    luma_mult: i32,
+    mult: i32,
+    offset: i32,
+    p: ChromaNoise,
+) {
+    for ((c, lpair), &g) in chroma.iter_mut().zip(luma.chunks_exact(2)).zip(grain) {
+        let average_luma = (lpair[0] as i32 + lpair[1] as i32 + 1) >> 1;
+        let scaled =
+            (((average_luma * luma_mult + mult * *c as i32) >> 6) + offset).clamp(0, p.index_max);
+        let delta = (scaling[scaled as usize] * g + p.rounding_offset) >> p.scaling_shift;
+        *c = ((*c as i32 + delta).clamp(p.min_chroma, p.max_chroma)) as u16;
+    }
 }
 
 /// The scalar reference for [`luma_noise_row`].
@@ -557,6 +616,72 @@ mod simd {
         super::luma_noise_row_scalar(
             &mut pixels[c..], &grain[c..], scaling, rounding_offset, scaling_shift, min_luma,
             max_luma,
+        );
+    }
+
+    /// [`super::chroma_noise_row`]'s AVX2 kernel, 8 chroma samples per
+    /// iteration. `vpmaddwd` against a vector of ones is the 4:2:0 luma pair
+    /// sum (the 16 luma samples of the pairs are non-negative and below
+    /// `1 << 15` at every supported bit depth, so the signed multiply is
+    /// exact), and the LUT index is clamped exactly as the scalar form
+    /// clamps it.
+    ///
+    /// # Safety
+    /// Requires AVX2; `luma` must be at least `2 * chroma.len()` long,
+    /// `grain` at least `chroma.len()`, and `scaling` non-empty.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn chroma_noise_row_avx2(
+        chroma: &mut [u16],
+        luma: &[u16],
+        grain: &[i32],
+        scaling: &[i32],
+        luma_mult: i32,
+        mult: i32,
+        offset: i32,
+        p: super::ChromaNoise,
+    ) {
+        let n = chroma.len().min(grain.len()).min(luma.len() / 2);
+        let ones = _mm256_set1_epi16(1);
+        let vluma_mult = _mm256_set1_epi32(luma_mult);
+        let vmult = _mm256_set1_epi32(mult);
+        let voffset = _mm256_set1_epi32(offset);
+        let vindex_max = _mm256_set1_epi32(p.index_max);
+        let last = _mm256_set1_epi32(scaling.len() as i32 - 1);
+        let zero = _mm256_setzero_si256();
+        let rnd = _mm256_set1_epi32(p.rounding_offset);
+        let sh = _mm_cvtsi32_si128(p.scaling_shift);
+        let lo = _mm256_set1_epi32(p.min_chroma);
+        let hi = _mm256_set1_epi32(p.max_chroma);
+        let cp = chroma.as_mut_ptr();
+        let lp = luma.as_ptr();
+        let gp = grain.as_ptr();
+        let mut c = 0usize;
+        while c + 8 <= n {
+            let l = _mm256_loadu_si256(lp.add(c * 2).cast());
+            let pair_sum = _mm256_madd_epi16(l, ones);
+            let avg = _mm256_srai_epi32(_mm256_add_epi32(pair_sum, _mm256_set1_epi32(1)), 1);
+            let c16 = _mm_loadu_si128(cp.add(c).cast());
+            let c32 = _mm256_cvtepu16_epi32(c16);
+            let mixed = _mm256_add_epi32(
+                _mm256_mullo_epi32(avg, vluma_mult),
+                _mm256_mullo_epi32(c32, vmult),
+            );
+            let scaled = _mm256_add_epi32(_mm256_srai_epi32(mixed, 6), voffset);
+            let clamped = _mm256_max_epi32(_mm256_min_epi32(scaled, vindex_max), zero);
+            let idx = _mm256_min_epi32(clamped, last);
+            let s = _mm256_i32gather_epi32(scaling.as_ptr(), idx, 4);
+            let g = _mm256_loadu_si256(gp.add(c).cast());
+            let delta = _mm256_sra_epi32(_mm256_add_epi32(_mm256_mullo_epi32(s, g), rnd), sh);
+            let v = _mm256_max_epi32(_mm256_min_epi32(_mm256_add_epi32(c32, delta), hi), lo);
+            // Same packing argument as the luma kernel: every lane already
+            // sits inside `[min_chroma, max_chroma]`.
+            let packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(v, v), 0b0000_1000);
+            _mm_storeu_si128(cp.add(c).cast(), _mm256_castsi256_si128(packed));
+            c += 8;
+        }
+        super::chroma_noise_row_scalar(
+            &mut chroma[c..], &luma[c * 2..], &grain[c..], scaling, luma_mult, mult, offset, p,
         );
     }
 }
@@ -1152,5 +1277,80 @@ mod perf5_tests {
             }
         }
         assert_eq!(checked, 3 * 4 * 2 * 10);
+    }
+
+    /// [`super::chroma_noise_row`]'s AVX2 kernel against its scalar
+    /// reference, over the parameter ranges a real stream reaches: every
+    /// grain bit depth, both clip ranges, the `chroma_scaling_from_luma`
+    /// multipliers (0/64/0) and coded ones, and lengths either side of the
+    /// 8-sample vector step.
+    #[test]
+    fn simd_matches_scalar_chroma_noise_row() {
+        let mut state = 0x0f1e_2d3c_4b5a_6978u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut checked = 0usize;
+        for bd_shift in 0..3u32 {
+            let lut_len = 256usize << bd_shift;
+            let sample_max = (lut_len - 1) as u16;
+            let index_max = (lut_len - 1) as i32;
+            let scaling: Vec<i32> = (0..lut_len).map(|_| (rng() % 256) as i32).collect();
+            for scaling_shift in [8i32, 11] {
+                for &(luma_mult, mult, offset) in &[
+                    (64i32, 0i32, 0i32),
+                    (-128, 127, -(1 << (8 + bd_shift))),
+                    (17, -64, 42),
+                ] {
+                    for &(lo, hi) in
+                        &[(0i32, index_max), (16 << bd_shift, 240 << bd_shift)]
+                    {
+                        for len in [1usize, 5, 8, 9, 16, 17, 32] {
+                            let p = super::ChromaNoise {
+                                index_max,
+                                rounding_offset: 1i32 << (scaling_shift - 1),
+                                scaling_shift,
+                                min_chroma: lo,
+                                max_chroma: hi,
+                            };
+                            let chroma: Vec<u16> = (0..len)
+                                .map(|_| (rng() % (u64::from(sample_max) + 1)) as u16)
+                                .collect();
+                            let luma: Vec<u16> = (0..len * 2)
+                                .map(|_| (rng() % (u64::from(sample_max) + 1)) as u16)
+                                .collect();
+                            let grain: Vec<i32> =
+                                (0..len).map(|_| (rng() % 513) as i32 - 256).collect();
+                            let mut want = chroma.clone();
+                            super::chroma_noise_row_scalar(
+                                &mut want, &luma, &grain, &scaling, luma_mult, mult, offset, p,
+                            );
+                            let mut got = chroma.clone();
+                            super::chroma_noise_row(
+                                &mut got, &luma, &grain, &scaling, luma_mult, mult, offset, p,
+                            );
+                            assert_eq!(got, want, "dispatch len={len} mult={mult}");
+                            #[cfg(target_arch = "x86_64")]
+                            if std::arch::is_x86_feature_detected!("avx2") {
+                                let mut avx = chroma.clone();
+                                #[allow(unsafe_code)]
+                                unsafe {
+                                    super::simd::chroma_noise_row_avx2(
+                                        &mut avx, &luma, &grain, &scaling, luma_mult, mult,
+                                        offset, p,
+                                    )
+                                };
+                                assert_eq!(avx, want, "avx2 len={len} mult={mult}");
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 2 * 3 * 2 * 7);
     }
 }
