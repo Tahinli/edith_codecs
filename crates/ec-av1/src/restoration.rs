@@ -340,8 +340,17 @@ pub(crate) fn read_lr(
         let unit_size = lr.loop_restoration_size[plane];
         let horz_units = grid.horz_units[plane] as u32;
         let vert_units = grid.vert_units[plane] as u32;
-        let rcol0 = ceil_div(mi_col * mi_size, unit_size);
-        let rcol1 = ceil_div((mi_col + sb_mi) * mi_size, unit_size).min(horz_units);
+        // `av1_loop_restoration_corners_in_sb` (restoration.c:1314): under
+        // superres the mi column is in DOWNSCALED units while the unit grid
+        // is in upscaled ones, so the column division scales by
+        // `superres_denom / SCALE_NUMERATOR` (`mi_to_num_x`/`denom_x`). Rows
+        // are never scaled (spec 7.16 widens columns only).
+        let (num_x, denom_x) = match crate::decode::superres() {
+            Some((_, denom)) => (mi_size * denom, unit_size * 8),
+            None => (mi_size, unit_size),
+        };
+        let rcol0 = ceil_div(mi_col * num_x, denom_x);
+        let rcol1 = ceil_div((mi_col + sb_mi) * num_x, denom_x).min(horz_units);
         let rrow0 = ceil_div(mi_row * mi_size, unit_size);
         let rrow1 = ceil_div((mi_row + sb_mi) * mi_size, unit_size).min(vert_units);
         let chroma = plane != 0;
