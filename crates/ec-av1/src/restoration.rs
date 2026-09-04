@@ -494,11 +494,33 @@ fn lr_sample(
     col: i64,
 ) -> i32 {
     let col_c = col.clamp(0, plane_w as i64 - 1) as usize;
-    if row >= stripe_v_start as i64 && row < stripe_v_end as i64 {
-        i32::from(cdef[row as usize * stride + col_c])
+    i32::from(
+        lr_src_row(cdef, deblocked, stride, plane_w, plane_h, stripe_v_start, stripe_v_end, row)
+            [col_c],
+    )
+}
+
+/// The plane row [`lr_sample`] reads, resolved once. Which buffer and which
+/// row a sample comes from depends only on `row` -- the column only ever
+/// clamps -- so a whole-row consumer (the Wiener horizontal pass) resolves
+/// the substitution once per row instead of once per tap. [`lr_sample`] is
+/// this function plus that clamp, so the rule has one statement.
+#[allow(clippy::too_many_arguments)]
+fn lr_src_row<'a>(
+    cdef: &'a [u16],
+    deblocked: &'a [u16],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    stripe_v_start: usize,
+    stripe_v_end: usize,
+    row: i64,
+) -> &'a [u16] {
+    let (buf, src_row) = if row >= stripe_v_start as i64 && row < stripe_v_end as i64 {
+        (cdef, row as usize)
     } else if row < stripe_v_start as i64 {
         if stripe_v_start == 0 {
-            i32::from(cdef[col_c])
+            (cdef, 0)
         } else {
             // libaom saves 2 deblocked context lines and duplicates the
             // outer one to fill a 3-row border (`RESTORATION_BORDER`):
@@ -506,23 +528,21 @@ fn lr_sample(
             // rows `stripe_v_start-2`/`-3` both read deblocked row
             // `stripe_v_start-2`.
             let dist = stripe_v_start as i64 - 1 - row;
-            let src_row = if dist == 0 {
-                stripe_v_start - 1
-            } else {
-                stripe_v_start.saturating_sub(2)
-            };
-            i32::from(deblocked[src_row * stride + col_c])
+            (
+                deblocked,
+                if dist == 0 { stripe_v_start - 1 } else { stripe_v_start.saturating_sub(2) },
+            )
         }
     } else if stripe_v_end == plane_h {
-        i32::from(cdef[(plane_h - 1) * stride + col_c])
+        (cdef, plane_h - 1)
     } else {
         // Mirror image of the above: rows `stripe_v_end`/`stripe_v_end+1`
         // read their own deblocked row, row `stripe_v_end+2` duplicates
         // `stripe_v_end+1`.
         let dist = (row - stripe_v_end as i64).min(1) as usize;
-        let src_row = (stripe_v_end + dist).min(plane_h - 1);
-        i32::from(deblocked[src_row * stride + col_c])
-    }
+        (deblocked, (stripe_v_end + dist).min(plane_h - 1))
+    };
+    &buf[src_row * stride..src_row * stride + plane_w]
 }
 
 /// Wiener pixel filter (spec 7.17.4, libaom `wiener_filter_stripe` ->
@@ -566,45 +586,58 @@ fn apply_wiener_stripe(
     // this was a fresh allocation per stripe. Every entry is written below.
     let mut inter = WIENER_INTER_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
     inter.clear();
-    inter.resize(rows * w, 0i32);
+    // lane-perf8: `mc::vpass_row` reads a fixed 8 taps from `row`, so the
+    // last vertical output needs two rows of padding past the `h + 6` the
+    // 7-tap kernel actually uses. Tap 7 is zero, so they never contribute.
+    inter.resize((h + 8) * w, 0i32);
+    // lane-perf8: this pass IS `mc.rs`'s horizontal one -- a 7-tap `i16`
+    // convolution over contiguous samples rounded by `Round2(_, 3)`, which
+    // is `INTER_ROUND_0` -- so it runs on that module's kernels with the
+    // eighth tap zeroed, instead of a scalar `lr_sample` call per tap. The
+    // stripe substitution is resolved once per row by `lr_src_row`, and only
+    // a unit touching the plane's left or right edge needs the clamped copy.
+    let hf = &info.hfilter;
+    let t16: [i16; 8] =
+        [hf[0] as i16, hf[1] as i16, hf[2] as i16, hf[3] as i16, hf[4] as i16, hf[5] as i16, hf[6] as i16, 0];
+    let (lo_bound, hi_bound) = (-wiener_bias as i32, (wiener_limit - 1 - wiener_bias) as i32);
+    let mut hbuf = WIENER_ROW_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
     for r in 0..rows {
         let row = v_start as i64 - 3 + r as i64;
-        for c in 0..w {
-            let col = h_start as i64 + c as i64;
-            let mut sum = 0i64;
-            for (t, &tap) in info.hfilter.iter().enumerate() {
-                let x = col - 3 + t as i64;
-                sum += tap as i64
-                    * lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, x) as i64;
-            }
-            // libaom's `highbd_convolve_add_src_horiz_hip` clamps its
-            // *biased* intermediate to `[0, WIENER_CLAMP_LIMIT(3, bd) - 1]`
-            // (`convolve.h:43`, `(1 << (bd + 1 + FILTER_BITS - round0))`).
-            // Its bias over this crate's unbiased sum is exactly
-            // `(1 << (bd + FILTER_BITS - 1)) >> round0 == 1 << (bd + 3)`
-            // (the `rounding` term of that function, the rest cancelling
-            // against `WienerInfo`'s derived centre tap as the doc comment
-            // above derives), so the same clamp in *this* domain is the
-            // bound shifted down by that bias. At 8-bit neither end is ever
-            // reached by real content, which is why the old fixed `[0, 8191]`
-            // survived every 8-bit gate; at 10-bit the upper end is
-            // `128 * 1023 >> 3 == 16368`, well past `8191`, so a fixed
-            // 8-bit limit silently truncated most 10-bit Wiener pixels.
-            inter[r * w + c] = round2(sum, 3).clamp(-wiener_bias, wiener_limit - 1 - wiener_bias) as i32;
+        let src = lr_src_row(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row);
+        let lo = h_start as i64 - 3;
+        let out = &mut inter[r * w..r * w + w];
+        if lo >= 0 && lo as usize + w + 7 <= plane_w {
+            crate::mc::hpass_contig(&src[lo as usize..], &t16, out);
+        } else {
+            hbuf.clear();
+            hbuf.extend(
+                (0..w + 7).map(|k| src[(lo + k as i64).clamp(0, plane_w as i64 - 1) as usize]),
+            );
+            crate::mc::hpass_contig(&hbuf, &t16, out);
+        }
+        for v in out.iter_mut() {
+            *v = (*v).clamp(lo_bound, hi_bound);
         }
     }
+    WIENER_ROW_SCRATCH.with(|c| *c.borrow_mut() = hbuf);
     // lane-perf7: the clamp bound is the frame's, so it is read once here
     // instead of taking a thread-local read per output sample.
     let smax = i64::from(crate::decode::sample_max());
+    // The vertical pass is `mc.rs`'s too, same 8th-tap-zero trick: it leaves
+    // the accumulator unrounded, and `Round2(_, 11)` is `INTER_ROUND_1`.
+    let vf = &info.vfilter;
+    let taps: [i32; 8] = [vf[0], vf[1], vf[2], vf[3], vf[4], vf[5], vf[6], 0];
+    let mut acc = WIENER_ACC_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    acc.clear();
+    acc.resize(w, 0i32);
     for r in 0..h {
-        for c in 0..w {
-            let mut sum = 0i64;
-            for (t, &tap) in info.vfilter.iter().enumerate() {
-                sum += tap as i64 * inter[(r + t) * w + c] as i64;
-            }
-            out[(v_start + r) * stride + h_start + c] = round2(sum, 11).clamp(0, smax) as u16;
+        crate::mc::vpass_row(&inter, w, r, &taps, &mut acc);
+        let dst = &mut out[(v_start + r) * stride + h_start..][..w];
+        for (o, &a) in dst.iter_mut().zip(acc.iter()) {
+            *o = round2(i64::from(a), 11).clamp(0, smax) as u16;
         }
     }
+    WIENER_ACC_SCRATCH.with(|c| *c.borrow_mut() = acc);
     WIENER_INTER_SCRATCH.with(|c| *c.borrow_mut() = inter);
 }
 
@@ -612,6 +645,12 @@ thread_local! {
     /// [`apply_wiener_stripe`]'s horizontal-pass intermediate, kept across
     /// calls so a stripe does not allocate (lane-perf7).
     static WIENER_INTER_SCRATCH: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The clamped-column copy the horizontal pass needs at a plane edge.
+    static WIENER_ROW_SCRATCH: std::cell::RefCell<Vec<u16>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The vertical pass's unrounded accumulator row.
+    static WIENER_ACC_SCRATCH: std::cell::RefCell<Vec<i32>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// [`compute_ab`]'s two `(A, B)` grids, likewise (lane-perf7).
     #[allow(clippy::type_complexity)]

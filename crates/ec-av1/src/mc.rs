@@ -281,7 +281,7 @@ pub(crate) fn simd_level() -> SimdLevel {
 /// the same `Round2(sum, InterRound0)`.
 #[allow(unsafe_code)]
 #[inline]
-fn hpass_contig(src: &[u16], t16: &[i16; 8], out: &mut [i32]) {
+pub(crate) fn hpass_contig(src: &[u16], t16: &[i16; 8], out: &mut [i32]) {
     #[cfg(target_arch = "x86_64")]
     {
         match simd_level() {
@@ -586,7 +586,7 @@ fn horizontal_pass_unscaled(
 /// eight slots. `acc` is left holding the unrounded sums.
 #[inline]
 #[allow(unsafe_code)]
-fn vpass_row(intermediate: &[i32], block_w: usize, row: usize, taps: &[i32; 8], acc: &mut [i32]) {
+pub(crate) fn vpass_row(intermediate: &[i32], block_w: usize, row: usize, taps: &[i32; 8], acc: &mut [i32]) {
     #[cfg(target_arch = "x86_64")]
     {
         match simd_level() {
