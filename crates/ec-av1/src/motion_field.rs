@@ -336,8 +336,8 @@ pub fn refstamp_intra_frames() -> (usize, usize) {
 /// constructed, so also `None` — motion field, contributes nothing);
 /// `ref_frame_idx` is the current frame header's own `ref_frame_idx`
 /// (`LAST_FRAME..=ALTREF_FRAME`, indexed `[i]` for `LAST_FRAME + i`).
-pub fn setup_motion_field(
-    slots: &[Option<MotionField>; 8],
+pub fn setup_motion_field<M: std::borrow::Borrow<MotionField>>(
+    slots: &[Option<M>; 8],
     ref_frame_idx: [u8; 7],
     cur_order_hint: u32,
     order_hint_bits: u32,
@@ -354,7 +354,14 @@ pub fn setup_motion_field(
     }
 
     let slot_of =
-        |ref_frame: i8| slots[ref_frame_idx[(ref_frame - LAST_FRAME) as usize] as usize].as_ref();
+        // lane-thread3: `M` is an owned `MotionField` on the single-threaded
+        // path and a `&MotionField` borrowed out of a resolved reference-slot
+        // promise on a worker; the projection reads the same field either way.
+        |ref_frame: i8| {
+            slots[ref_frame_idx[(ref_frame - LAST_FRAME) as usize] as usize]
+                .as_ref()
+                .map(M::borrow)
+        };
     let order_hint_of = |ref_frame: i8| slot_of(ref_frame).map_or(0, |m| m.order_hint);
 
     let mut ref_stamp = 2i32; // MFMV_STACK_SIZE - 1

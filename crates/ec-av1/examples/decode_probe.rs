@@ -154,8 +154,8 @@ fn main() {
         // lane-thread2: proof the frame-parallel path actually fired (0 at
         // the default EC_AV1_THREADS=1).
         println!(
-            "leaf_frames_dispatched: {}",
-            ec_av1::stream::leaf_frames_dispatched()
+            "frames_dispatched: {}",
+            ec_av1::stream::frames_dispatched()
         );
     };
     // lane-tiles: the tiling a real stream actually uses is a decision input
