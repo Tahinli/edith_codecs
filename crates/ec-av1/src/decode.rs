@@ -16354,6 +16354,43 @@ fn deblock_plane(
     }
 }
 
+thread_local! {
+    /// lane-perf6: reused whole-plane `u16` buffers. Every frame takes a
+    /// pre-CDEF snapshot of all three planes, a post-deblock snapshot when
+    /// loop restoration is active, and a fresh LR destination per plane --
+    /// freshly allocated that is ~25 MB of `mmap`/`munmap` per frame at 4K,
+    /// so every sample written also takes a first-touch page fault. The
+    /// buffers are handed back here instead and refilled in place.
+    static PLANE_SCRATCH: std::cell::RefCell<Vec<Vec<u16>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A pooled buffer holding a copy of `src`.
+fn scratch_from(src: &[u16]) -> Vec<u16> {
+    let mut v = PLANE_SCRATCH.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    v.clear();
+    v.extend_from_slice(src);
+    v
+}
+
+/// An empty pooled buffer, for a caller that fills it itself.
+fn scratch_empty() -> Vec<u16> {
+    let mut v = PLANE_SCRATCH.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    v.clear();
+    v
+}
+
+/// A plane's post-deblock snapshot, its samples taken from the pool (every
+/// other field is `usize`).
+fn plane_snapshot(p: &PlaneBuf) -> PlaneBuf {
+    PlaneBuf { data: scratch_from(&p.data), ..*p }
+}
+
+/// Hands a buffer back to the pool; the capacity is what is worth keeping.
+fn scratch_return(v: Vec<u16>) {
+    PLANE_SCRATCH.with(|p| p.borrow_mut().push(v));
+}
+
 fn apply_cdef(
     y: &mut PlaneBuf,
     u: &mut PlaneBuf,
@@ -16424,6 +16461,8 @@ fn apply_cdef(
         return;
     }
     let sb_cols = CDEF_SB_COLS.with(|c| c.get());
+    // One entry per superblock (a few hundred at 4K), so this clone is not
+    // one of the per-frame copies lane-perf6 pooled below.
     let idx_grid = CDEF_IDX_GRID.with(|g| g.borrow().clone());
     let strength_idx = |mi_r: usize, mi_c: usize| -> usize {
         if sb_cols == 0 {
@@ -16435,9 +16474,9 @@ fn apply_cdef(
             .copied()
             .unwrap_or(0) as usize
     };
-    let src_y = y.data.clone();
-    let src_u = u.data.clone();
-    let src_v = v.data.clone();
+    let src_y = scratch_from(&y.data);
+    let src_u = scratch_from(&u.data);
+    let src_v = scratch_from(&v.data);
     // libaom `av1_cdef_filter_fb`: `pri_strength = level << coeff_shift`,
     // `sec_strength <<= coeff_shift`, `damping += coeff_shift - (pli != 0)`.
     let coeff_shift = i32::from(bit_depth()) - 8;
@@ -16561,6 +16600,9 @@ fn apply_cdef(
         }
         mi_r += 2;
     }
+    scratch_return(src_y);
+    scratch_return(src_u);
+    scratch_return(src_v);
 }
 
 /// Spec 7.17: loop restoration, run after [`apply_cdef`] (a sibling lane's
@@ -16598,7 +16640,8 @@ fn apply_loop_restoration(
     // (class av1-truesize-lane: true frame size vs mi-rounded).
     (frame_w, frame_h): (usize, usize),
 ) {
-    y.data = crate::restoration::apply_loop_restoration_plane(
+    let mut out = scratch_empty();
+    crate::restoration::apply_loop_restoration_plane(
         &y.data,
         &deblocked_y.data,
         y.width,
@@ -16609,8 +16652,12 @@ fn apply_loop_restoration(
         lr.loop_restoration_size[0],
         grid,
         0,
+        &mut out,
     );
-    u.data = crate::restoration::apply_loop_restoration_plane(
+    std::mem::swap(&mut y.data, &mut out);
+    scratch_return(out);
+    let mut out = scratch_empty();
+    crate::restoration::apply_loop_restoration_plane(
         &u.data,
         &deblocked_u.data,
         u.width,
@@ -16621,8 +16668,12 @@ fn apply_loop_restoration(
         lr.loop_restoration_size[1],
         grid,
         1,
+        &mut out,
     );
-    v.data = crate::restoration::apply_loop_restoration_plane(
+    std::mem::swap(&mut u.data, &mut out);
+    scratch_return(out);
+    let mut out = scratch_empty();
+    crate::restoration::apply_loop_restoration_plane(
         &v.data,
         &deblocked_v.data,
         v.width,
@@ -16633,7 +16684,10 @@ fn apply_loop_restoration(
         lr.loop_restoration_size[2],
         grid,
         2,
+        &mut out,
     );
+    std::mem::swap(&mut v.data, &mut out);
+    scratch_return(out);
 }
 
 /// Decodes the payload [`crate::tile::sb_coeff_key_frame_tile`] writes,
@@ -18950,7 +19004,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
             && lr.loop_restoration_size[p] != 0
     });
-    let deblocked = lr_active.then(|| (y.clone(), u.clone(), v.clone()));
+    let deblocked =
+        lr_active.then(|| (plane_snapshot(&y), plane_snapshot(&u), plane_snapshot(&v)));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -19007,6 +19062,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             &mut y, &mut u, &mut v, deblocked_y, deblocked_u, deblocked_v, lr, &lr_grid,
             (lr_w, frame_height as usize),
         );
+    }
+    if let Some((db_y, db_u, db_v)) = deblocked {
+        scratch_return(db_y.data);
+        scratch_return(db_u.data);
+        scratch_return(db_v.data);
     }
 
     let (fw, fh) = (lr_w, frame_height as usize);
@@ -30978,7 +31038,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
             && lr.loop_restoration_size[p] != 0
     });
-    let deblocked = lr_active.then(|| (y.clone(), u.clone(), v.clone()));
+    let deblocked =
+        lr_active.then(|| (plane_snapshot(&y), plane_snapshot(&u), plane_snapshot(&v)));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -31035,6 +31096,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             &mut y, &mut u, &mut v, deblocked_y, deblocked_u, deblocked_v, lr, &lr_grid,
             (lr_w, frame_height as usize),
         );
+    }
+    if let Some((db_y, db_u, db_v)) = deblocked {
+        scratch_return(db_y.data);
+        scratch_return(db_u.data);
+        scratch_return(db_v.data);
     }
 
     let motion_field = build_motion_field(

@@ -929,7 +929,7 @@ fn filter_restoration_unit(
 /// restoration-unit pixels replaced -- a restoration unit must never read
 /// another, already-filtered unit's output (spec keeps a separate
 /// destination buffer for exactly this reason), so this never filters in
-/// place.
+/// place -- `out` is that buffer, refilled from `cdef` on entry.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_loop_restoration_plane(
     cdef: &[u16],
@@ -942,10 +942,15 @@ pub(crate) fn apply_loop_restoration_plane(
     unit_size: u32,
     grid: &RestorationGrid,
     plane: usize,
-) -> Vec<u16> {
-    let mut out = cdef.to_vec();
+    // lane-perf6: the destination buffer, refilled from `cdef` here. It used
+    // to be a fresh `cdef.to_vec()` per plane per frame -- a multi-megabyte
+    // allocation whose every page then faulted in on first touch.
+    out: &mut Vec<u16>,
+) {
+    out.clear();
+    out.extend_from_slice(cdef);
     if ftype == RestorationType::None || unit_size == 0 {
-        return out;
+        return;
     }
     let voffset = 8u32 >> ss_y;
     let ext_size = (unit_size * 3) / 2;
@@ -968,7 +973,7 @@ pub(crate) fn apply_loop_restoration_plane(
             let filter = grid.get(plane, rrow, rcol);
             if filter != UnitFilter::None {
                 filter_restoration_unit(
-                    &mut out,
+                    out,
                     cdef,
                     deblocked,
                     stride,
@@ -989,7 +994,6 @@ pub(crate) fn apply_loop_restoration_plane(
         rrow += 1;
     }
     debug_assert_eq!(rrow, grid.vert_units[plane], "RU row walk must match RestorationGrid::new's count_units");
-    out
 }
 
 #[cfg(test)]
