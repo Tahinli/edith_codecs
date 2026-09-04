@@ -1003,8 +1003,19 @@ pub fn dequant_and_inverse_typed_wh(
     ac_delta: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
-    let dq = crate::quant::dequant_wh(levels, w, h, bit_depth, q_idx, dc_delta, ac_delta);
-    inverse_transform_2d_typed_wh(&dq, w, h, bit_depth, tx_type)
+    DQ_SCRATCH.with(|cell| {
+        let mut dq = cell.borrow_mut();
+        crate::quant::dequant_wh_into(levels, &mut dq, w, h, bit_depth, q_idx, dc_delta, ac_delta);
+        inverse_transform_2d_typed_wh(&dq, w, h, bit_depth, tx_type)
+    })
+}
+
+thread_local! {
+    /// The dequantized grid, reused per thread: it lives only until the
+    /// inverse transform has read it, so it was a `Vec` allocated and dropped
+    /// once per transform unit.
+    static DQ_SCRATCH: std::cell::RefCell<Vec<i32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// [`dequant_and_inverse_typed`] at `DCT_DCT`, no per-plane quantizer delta.

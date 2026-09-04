@@ -226,11 +226,45 @@ pub fn dequant(levels: &[i32], side: usize, bit_depth: u8, q_idx: i32) -> Vec<i3
 /// [`QuantDeltas`]-shaped `dc_delta`/`ac_delta` pair as [`dequant_coeff_wh`].
 #[allow(clippy::too_many_arguments)]
 pub fn dequant_wh(levels: &[i32], w: usize, h: usize, bit_depth: u8, q_idx: i32, dc_delta: i32, ac_delta: i32) -> Vec<i32> {
-    levels
-        .iter()
-        .enumerate()
-        .map(|(i, &l)| dequant_coeff_wh(l, i == 0, bit_depth, q_idx, dc_delta, ac_delta, w, h))
-        .collect()
+    let mut out = Vec::new();
+    dequant_wh_into(levels, &mut out, w, h, bit_depth, q_idx, dc_delta, ac_delta);
+    out
+}
+
+/// [`dequant_wh`] into a caller-owned buffer, with the two quantizer-table
+/// lookups, the area denominator and the clamp bound hoisted out of the
+/// per-coefficient loop -- they depend only on the transform, and this loop
+/// runs once per coefficient of every transform unit in the stream (7.8%
+/// self time). A zero level dequantizes to zero for every parameter set, so
+/// the common all-but-EOB tail costs a compare instead of a 64-bit multiply
+/// and divide. The arithmetic on a non-zero level is the spec's, unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_wh_into(
+    levels: &[i32],
+    out: &mut Vec<i32>,
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    dc_delta: i32,
+    ac_delta: i32,
+) {
+    let dcq = i64::from(dc_q(bit_depth, q_idx + dc_delta));
+    let acq = i64::from(ac_q(bit_depth, q_idx + ac_delta));
+    let denom = dq_denom_area(w * h);
+    let bound = 1i64 << (7 + u32::from(bit_depth));
+    let apply = |l: i32, q: i64| -> i32 {
+        let dq = i64::from(l) * q;
+        let sign = if dq < 0 { -1 } else { 1 };
+        let dq2 = sign * ((dq.abs() & 0xFF_FFFF) / denom);
+        dq2.clamp(-bound, bound - 1) as i32
+    };
+    out.clear();
+    out.reserve(levels.len());
+    out.extend(levels.iter().map(|&l| if l == 0 { 0 } else { apply(l, acq) }));
+    if let (Some(dst), Some(&l)) = (out.first_mut(), levels.first()) {
+        *dst = if l == 0 { 0 } else { apply(l, dcq) };
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +286,29 @@ mod tests {
     #[test]
     fn denominator_follows_the_area() {
         assert_eq!([4, 8, 16, 32, 64].map(dq_denom), [1, 1, 1, 2, 4]);
+    }
+
+    /// The hoisted buffer form must agree with the per-coefficient spec
+    /// function it replaced, at every level sign, both quantizer roles and
+    /// every denominator band.
+    #[test]
+    fn buffered_dequant_matches_the_per_coefficient_form() {
+        let levels: Vec<i32> = (0..64).map(|i| (i as i32 - 32) * 37).collect();
+        let mut out = Vec::new();
+        for (w, h) in [(4, 4), (16, 16), (32, 32), (64, 64), (8, 32), (16, 4)] {
+            for bit_depth in [8u8, 10, 12] {
+                for (q_idx, dc, ac) in [(20, 0, 0), (140, -8, 5), (255, 12, -12)] {
+                    let n = (w * h).min(levels.len());
+                    dequant_wh_into(&levels[..n], &mut out, w, h, bit_depth, q_idx, dc, ac);
+                    for (i, &got) in out.iter().enumerate() {
+                        let want = dequant_coeff_wh(
+                            levels[i], i == 0, bit_depth, q_idx, dc, ac, w, h,
+                        );
+                        assert_eq!(got, want, "{w}x{h} depth {bit_depth} q {q_idx} coeff {i}");
+                    }
+                }
+            }
+        }
     }
 
     /// Negative levels round toward zero, so a level and its negation
