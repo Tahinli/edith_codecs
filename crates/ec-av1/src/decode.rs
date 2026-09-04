@@ -19224,11 +19224,19 @@ impl PlaneBuf {
         // 768..832). libaom reconstructs those rows into the frame buffer's
         // border; nothing reads them back, so they are simply dropped here.
         let (h, w) = (h.min(self.height.saturating_sub(y)), w.min(self.width.saturating_sub(x)));
+        // lane-perf4: one row of each operand at a time. `side` is the
+        // prediction/residual stride and `self.width` the plane's, so the
+        // three row bases are computed once per row instead of a
+        // multiply-add per sample (the samples themselves are unchanged).
+        let max = crate::decode::sample_max();
         for row in 0..h {
-            for col in 0..w {
-                let sample = (i32::from(prediction[row * side + col]) + residual[row * side + col])
-                    .clamp(0, crate::decode::sample_max()) as u16;
-                self.data[(y + row) * self.width + x + col] = sample;
+            let src = row * side;
+            let dst = (y + row) * self.width + x;
+            let pred = &prediction[src..src + w];
+            let res = &residual[src..src + w];
+            let out = &mut self.data[dst..dst + w];
+            for ((o, &p), &r) in out.iter_mut().zip(pred).zip(res) {
+                *o = (i32::from(p) + r).clamp(0, max) as u16;
             }
         }
     }
