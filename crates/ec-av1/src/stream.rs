@@ -4850,25 +4850,34 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
     }
 
-    /// lane-t900 r29 RESIDUAL, ignored: `fixtures/superres_alltools_sb128_320x180.obu`
-    /// is 10 frames of `--cpu-used=4 --sb-size=128 --superres-mode=1
+    /// lane-t900 r30b: `fixtures/superres_alltools_sb128_320x180.obu` is 10
+    /// frames of `--cpu-used=4 --sb-size=128 --superres-mode=1
     /// --superres-denominator=12 --cq-level=32` with every tool aomenc turns
-    /// on by default (CDEF, loop restoration, OBMC, compound, warp).
+    /// on by default (CDEF, loop restoration, OBMC, compound, warp) -- the
+    /// first stream here that deblocks CHROMA across a group of 4x4 luma
+    /// blocks.
     ///
-    /// FIRST BAD (measured 2026-09-04, after the r29 upscale-before-LR fix):
-    /// display frame 2, plane U, (x=88, y=21), delta 1; the mismatch is
-    /// CHROMA ONLY and grows with the reference chain (frame 9: 280 U + 331
-    /// V samples, max 9). LUMA IS EXACT IN ALL 10 FRAMES. It is NOT the
-    /// filter chain: re-encoding the same recipe with `--enable-cdef=0
-    /// --enable-restoration=0` still mismatches (359 samples, max 5, first
-    /// bad display frame 4 plane V (115, 31)), and the r29 fix took the
-    /// filters-on numbers from 37315 samples/max 171 down to 1620/max 11.
-    /// So the residual is a scaled-reference CHROMA prediction defect at
-    /// sb128/cpu-used=4 block shapes, not superres filtering -- next round's
-    /// ladder starts at `EC_AV1_PREFILT_DUMP16` on decode-order frame 4 of
-    /// the filters-off arm.
+    /// The defect it pins (fixed at this commit, `decode.rs`'s
+    /// `plane_to_mi`/`edge_params`): `set_lpf_parameters`
+    /// (`av1_loopfilter.c:245`) indexes the mi grid for a CHROMA edge at
+    /// `scale | ((coord << scale) >> MI_SIZE_LOG2)` -- the BOTTOM/RIGHT mi of
+    /// the co-located 8x8 luma group, the same cell that donates the group's
+    /// chroma prediction. This decoder dropped that `| 1` and read the
+    /// group's top-left mi, stepped to the previous cell by one mi instead of
+    /// `1 << ss`, and priced `pu_edge` by comparing mi origins rather than
+    /// the edge coordinate against the block size in the FILTERED plane's own
+    /// pixels (chroma bottoms out at 4). All three are invisible while every
+    /// block is 8x8 or larger (all four mi of a group carry the same tx size,
+    /// ref frame, skip flag and delta_lf) and wrong the moment cpu-used=4
+    /// splits a group into 4x4 blocks: on this stream one U sample of frame 2
+    /// took a filter level of 12 where libaom's neighbouring 4x4 block gives
+    /// 8, and the error compounded through the reference chain to 280 U + 331
+    /// V samples (max 9) by frame 9. Class `context-read-from-one-cell`.
+    ///
+    /// Post-deblock, this stream is now byte-exact against the instrumented
+    /// libaom (`EC_AV1_POSTDEBLOCK_DUMP`) in all 10 frames, and the final
+    /// output matches ffmpeg's.
     #[test]
-    #[ignore = "lane-t900 r29 residual: scaled-reference chroma prediction, frame 2 U (88,21)"]
     fn a_superres_all_tools_sb128_stream_decodes_pixel_exact() {
         const NAME: &str = "a_superres_all_tools_sb128_stream_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
