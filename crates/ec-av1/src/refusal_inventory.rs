@@ -297,6 +297,31 @@ const PROVEN: &[(&str, &str)] = &[
         "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
         "a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips",
     ),
+    // lane-t900 r26, enumeration: a y_mode symbol comes from a 13-symbol CDF
+    // and all three guards refuse 13 and above.
+    (
+        "an intra mode this decoder does not code (round 2)",
+        "every_intra_mode_symbol_of_the_y_mode_alphabet_is_coded",
+    ),
+    // lane-t900 r26, enumeration: `compute_image_size` is 0 only for a zero
+    // frame width/height, which no path a header can code produces (swept
+    // through the real reader per axis, superres division enumerated).
+    (
+        "a frame with no mode-info grid",
+        "every_frame_size_a_header_can_code_has_a_mode_info_grid",
+    ),
+    // lane-t900 r26, negative gates: written streams that reach each refusal
+    // by name (a 64x32 inter frame over a 64x64 reference; a stream opening on
+    // a non-error-resilient inter frame whose primary_ref slot is empty, over
+    // all 8 slots) with the picture/CDF slot invariant enumerated alongside.
+    (
+        "a reference picture whose height does not match this frame's own true size",
+        "an_inter_frame_shorter_than_its_reference_is_refused_by_name",
+    ),
+    (
+        "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
+        "an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name",
+    ),
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
@@ -834,6 +859,82 @@ mod tests {
             crate::decode::read_golomb(&mut dec).is_err(),
             "the Golomb refusal is dead code -- drop it from the inventory"
         );
+    }
+
+    /// The intra-mode alphabet, enumerated against the guard that refuses a
+    /// symbol outside it.
+    ///
+    /// Three readers -- the rect-in-inter arm, the intra-in-inter square arm
+    /// and the 8x8 leaf -- read a y_mode symbol and refuse `mode >= 13` with
+    /// "an intra mode this decoder does not code (round 2)". A `y_mode` symbol
+    /// comes from `Cdfs::y_mode[size_group]`, whose alphabet is
+    /// `Y_MODE[g].len() - 1` (the last slot is the adaptation counter), and
+    /// `SymbolDecoder::symbol` cannot return a value outside `0..nsyms` -- so
+    /// the guard is unreachable exactly when every size group's alphabet is at
+    /// most the threshold.
+    ///
+    /// Found by the refusal in the guard's own body rather than by line
+    /// number, and the CDF the symbol was read from is checked too: a
+    /// threshold of 13 over a 14-symbol table would be a live refusal, and a
+    /// site reading a WIDER alphabet (`uv_mode` with CfL is 14) under the same
+    /// guard would be one as well.
+    #[test]
+    fn every_intra_mode_symbol_of_the_y_mode_alphabet_is_coded() {
+        const REFUSAL: &str = "an intra mode this decoder does not code (round 2)";
+        // Both uv_mode alphabets are listed so the CfL-allowed one (14
+        // symbols, `UV_MODE_CFL_ALLOWED`) cannot silently become the source of
+        // a symbol tested against 13.
+        let alphabets: [(&str, usize); 3] = [
+            ("y_mode", crate::cdf::Y_MODE[0].len() - 1),
+            ("uv_mode_no_cfl", crate::cdf::UV_MODE_NO_CFL[0].len() - 1),
+            ("uv_mode_cfl", crate::cdf::UV_MODE_CFL[0].len() - 1),
+        ];
+        assert_eq!(alphabets[0].1, 13, "the y_mode alphabet changed size");
+        for group in &crate::cdf::Y_MODE {
+            assert_eq!(group.len() - 1, alphabets[0].1, "the y_mode rows disagree on width");
+        }
+
+        let src = include_str!("decode.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut sites = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("if mode >= ") else { continue };
+            let Some(threshold) = rest.trim_end_matches(" {").parse::<usize>().ok() else {
+                continue;
+            };
+            // Only the guards carrying THIS refusal.
+            if !lines[i..(i + 4).min(lines.len())].join("\n").contains(REFUSAL) {
+                continue;
+            }
+            sites += 1;
+            // The symbol's own CDF: the nearest `dec.symbol(&mut cdfs.X[..])`
+            // above the guard.
+            let read = lines[i.saturating_sub(12)..i]
+                .iter()
+                .rev()
+                .find(|l| l.contains("dec.symbol(&mut cdfs."))
+                .unwrap_or_else(|| panic!("line {}: no symbol read above the guard", i + 1));
+            let table = read
+                .split("dec.symbol(&mut cdfs.")
+                .nth(1)
+                .unwrap()
+                .split('[')
+                .next()
+                .unwrap();
+            let (name, nsyms) = alphabets
+                .iter()
+                .find(|(n, _)| *n == table)
+                .unwrap_or_else(|| panic!("line {}: unknown mode alphabet {table:?}", i + 1));
+            assert!(
+                *nsyms <= threshold,
+                "line {}: the guard refuses mode >= {threshold} on a symbol read from a \
+                 {nsyms}-symbol {name} CDF -- symbol {threshold} is inside that alphabet, so \
+                 the refusal is live and this enumeration does not prove it",
+                i + 1
+            );
+        }
+        assert_eq!(sites, 3, "the intra-mode guard is at three sites, found {sites}");
     }
 
     /// Every entry of [`PROVEN`] must still name a live refusal and a test
