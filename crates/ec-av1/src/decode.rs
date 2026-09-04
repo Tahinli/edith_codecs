@@ -8119,12 +8119,12 @@ fn decode_intra_rect_in_inter(
     // reference holds (a fresh smooth ramp) in exactly those two bands of an
     // inter frame and the encoder codes those forced halves INTRA.
     if bw.max(bh) == 128 {
-        if allow_screen_content_tools {
-            return Err(unsupported(
-                "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
-                 is consumed for square blocks only)",
-            ));
-        }
+        // lane-t900 r32: no screen-content refusal here. `av1_allow_palette`
+        // rejects every footprint with a 128-pixel side (`bw > 64 || bh > 64`,
+        // enumerated by `no_block_footprint_with_a_128_pixel_side_can_carry_\
+        // palette_syntax`), so a 128-root half consumes no palette syntax and
+        // a screen-content frame's half is syntactically identical to the
+        // non-screen one this arm already decodes byte-exact.
         if coeff_trace_on() {
             // lane-t900 r16: which decode-order frame this arm fires in --
             // interleaved with the `EC_COEFF_FRAME` markers, this is what
