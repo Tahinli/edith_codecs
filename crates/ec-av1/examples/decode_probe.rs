@@ -141,6 +141,13 @@ fn main() {
         // lane-t900 r12: chroma edge-filter neighbour answered from the mi-granular
         // uv_mode grid instead of the coarse one-slot-per-column map.
         println!(
+            "scaled: leaf8={} sub8={} warpfb={} predict_scaled={}",
+            ec_av1::decode::scaled_leaf8_hits(),
+            ec_av1::decode::scaled_sub8_hits(),
+            ec_av1::decode::scaled_warp_fallback_hits(),
+            ec_av1::mc::predict_scaled_hits()
+        );
+        println!(
             "uv_mode_grid_override: {}",
             ec_av1::decode::uv_mode_grid_override_hits()
         );
