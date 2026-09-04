@@ -1737,6 +1737,20 @@ thread_local! {
     static INTRA_IN_INTER_PALETTE_UV_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// lane-t900 r23: as [`INTRA_IN_INTER_PALETTE_Y_HITS`], narrowed to the 8x8
+// LEAF site ([`decode_inter_block8`]'s intra arm) -- the >=16 site fires the
+// shared counter too, so only this one proves a gate really reached the leaf
+// where the refusal used to sit.
+thread_local! {
+    static INTER8_PALETTE_HITS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Current values of the 8x8-leaf intra-in-inter palette counters, `(y, uv)`.
+pub(crate) fn inter8_palette_hits() -> (usize, usize) {
+    INTER8_PALETTE_HITS.with(std::cell::Cell::get)
+}
+
 /// Current values of the two intra-in-inter palette counters, `(y, uv)`.
 pub(crate) fn intra_in_inter_palette_hits() -> (usize, usize) {
     (
@@ -5016,6 +5030,9 @@ impl Neighbours {
         colors: [u16; 8],
     ) {
         let (r, c) = mi;
+        if crate::envflags::env_flag!("EC_PALPUB") {
+            eprintln!("EC_PALPUB yrect mi={r},{c} bw={w} bh={h} y={size}");
+        }
         // lane-kf900 r6: mi (4px) granularity, libaom's own -- `palette_size`
         // lives per mi cell in `MB_MODE_INFO`, and `xd->left_mbmi` is the mi
         // cell immediately left of the block, not its 16px [`SUB`] cell. The
@@ -7023,6 +7040,13 @@ fn record_strip_palette(
     uv_colors: [u16; 8],
 ) {
     let (r, c) = mi;
+    // lane-t900 r23 rung: every publication of a block's palette state into
+    // the neighbour bands (`EC_PALPUB=1`) -- the rung that names which decode
+    // path left a stale `left_palette_size` behind when
+    // `av1_get_palette_mode_ctx` disagrees with libaom's.
+    if crate::envflags::env_flag!("EC_PALPUB") {
+        eprintln!("EC_PALPUB strip mi={r},{c} bw={bw} bh={bh} y={y_size} uv={uv_size}");
+    }
     // lane-kf900 r6: the palette side bands are mi-granular now, so a strip
     // writes its OWN span on BOTH axes -- the old `last` split-axis rule only
     // existed because the 16px [`SUB`] cell held one slot for all the strips
@@ -25902,6 +25926,11 @@ fn decode_inter_block8(
     // neighbour (`Neighbours`' arrays only move once per 16x16 block).
     // `(0, None)` is intra.
     let mut leaf_refs: (i8, Option<i8>) = (0, None);
+    // lane-t900 r23: this leaf's own palette state for the neighbour bands
+    // (`(y_size, y_colors, uv_size, uv_colors)`), all-zero for an inter leaf
+    // and for an intra one that codes no palette -- same publication the
+    // >=16 intra-in-inter block makes through [`record_strip_palette`].
+    let mut palette_record8: (usize, [u16; 8], usize, [u16; 8]) = (0, [0u16; 8], 0, [0u16; 8]);
     if is_inter {
         if reference_select || skip_mode {
             // lane-inter8 r1: the REAL neighbour references, not a
@@ -26527,6 +26556,21 @@ fn decode_inter_block8(
                         ],
                     )
                 });
+            // lane-t900 r23: every leaf stamps its palette state (all-zero for an
+            // inter leaf or a non-palette intra one, real for a palette block) into
+            // the mi-granular neighbour bands, so the next intra block's
+            // `av1_get_palette_mode_ctx` and colour cache see exactly what libaom's
+            // mode-info grid holds.
+            record_strip_palette(
+                neighbours,
+                leaf_mi,
+                8,
+                8,
+                palette_record8.0,
+                palette_record8.1,
+                palette_record8.2,
+                palette_record8.3,
+            );
                 neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
                 if let Some((left, above)) = saved_luma_ctx {
                     for (cell, state) in left.into_iter().enumerate() {
@@ -27205,19 +27249,47 @@ fn decode_inter_block8(
         // leaf (a nonzero `mode` still passes, but `uv_mode` is forced
         // `DC_PRED` by the refusal just above), same order as libaom's
         // `read_palette_mode_info` call right after `xd->cfl.store_y`.
-        if allow_screen_content_tools {
-            if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[0][0]) != 0 {
-                return Err(unsupported(
-                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
-                ));
+        // lane-t900 r23: reconstructed, not refused. Same syntax, same
+        // deferral of the colour-index maps past `use_filter_intra`
+        // (`av1_visit_palette` runs from `parse_decode_block`, after the whole
+        // mode-info read) as the >=16 intra-in-inter block's own copy in
+        // [`decode_inter_block`]; the mode context, the colour cache and the
+        // `palette_uv_mode` context are this leaf's REAL ones, not the
+        // hardcoded 0/empty pair the refusal could get away with while no
+        // neighbour could ever be a palette (class
+        // [[cdf-row-held-constant]]). `av1_get_palette_bsize_ctx(BLOCK_8X8)`
+        // = `num_pels_log2_lookup[BLOCK_8X8] - 6` = row 0.
+        let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi(leaf_mi);
+        let palette_uv_cache = neighbours.palette_uv_cache_mi(leaf_mi);
+        let mut palette_y_pending: Option<(usize, [u16; 8])> = None;
+        let mut palette_uv_pending: Option<(usize, [u16; 8], [u16; 8])> = None;
+        if allow_screen_content_tools
+            && let Some(bsize_ctx) = palette_bsize_ctx(SIDE)
+        {
+            let use_palette_y =
+                mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][palette_ctx]) != 0;
+            if use_palette_y {
+                let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
+                palette_y_pending = Some((n, read_palette_colors_y(dec, n, &palette_cache)));
             }
             // lane-uv8 r1: `read_palette_mode_info` reads the UV symbol only
-            // when `uv_mode == UV_DC_PRED` (decodemv.c) -- unconditional here
-            // while every non-DC uv_mode was refused a few lines above.
-            if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
-                return Err(unsupported(
-                    "a block that actually uses a palette (UV) -- reconstruction is out of scope",
-                ));
+            // when `uv_mode == UV_DC_PRED` (decodemv.c).
+            let use_palette_uv = uv_mode == DC_PRED
+                && dec.symbol(&mut cdfs.palette_uv_mode[usize::from(use_palette_y)]) != 0;
+            if crate::envflags::env_flag!("EC_PALSYN") {
+                eprintln!(
+                    "EC_PALSYN leaf8 mi={},{} bw=8 bh=8 mode={mode} uv={uv_mode} ctx={palette_ctx} y={} uv={} rng={}",
+                    leaf_mi.0,
+                    leaf_mi.1,
+                    palette_y_pending.map_or(0, |(n, _)| n),
+                    u8::from(use_palette_uv),
+                    dec.debug_state().0
+                );
+            }
+            if use_palette_uv {
+                let n = 2 + dec.symbol(&mut cdfs.palette_uv_size[bsize_ctx]);
+                let (u_colors, v_colors) = read_palette_colors_uv(dec, n, &palette_uv_cache);
+                palette_uv_pending = Some((n, u_colors, v_colors));
             }
         }
         // lane-fiinter r1: `read_filter_intra_mode_info` (libaom `decodemv.c`,
@@ -27236,6 +27308,9 @@ fn decode_inter_block8(
         let ec_istep8 = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
         if mode == DC_PRED
             && ENABLE_FILTER_INTRA_INTER.with(std::cell::Cell::get)
+            // `av1_filter_intra_allowed` (reconintra.h:77) excludes a
+            // palette-Y block, so no `use_filter_intra` symbol exists there.
+            && palette_y_pending.is_none()
             && let Some(class) = filter_intra_size_class(SIDE)
         {
             let use_fi = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
@@ -27263,6 +27338,49 @@ fn decode_inter_block8(
                 filter_intra = Some(fi);
             }
         }
+        // lane-t900 r23: `av1_visit_palette` -- the two colour-index maps, Y
+        // then the shared chroma one, after the WHOLE mode-info read.
+        let palette_y = palette_y_pending.map(|(n, colors)| {
+            let map = decode_color_index_map_wh(dec, cdfs, n, SIDE, SIDE, false);
+            PALETTE_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_PALETTE_Y_HITS.with(|c| c.set(c.get() + 1));
+            INTER8_PALETTE_HITS.with(|c| {
+                let mut v = c.get();
+                v.0 += 1;
+                c.set(v);
+            });
+            PaletteY { size: n, colors, map }
+        });
+        let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
+            // `av1_get_plane_block_size(BLOCK_8X8, 1, 1)` = BLOCK_4X4.
+            let map = decode_color_index_map_wh(dec, cdfs, n, CHROMA_SIDE, CHROMA_SIDE, true);
+            PALETTE_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTRA_IN_INTER_PALETTE_UV_HITS.with(|c| c.set(c.get() + 1));
+            INTER8_PALETTE_HITS.with(|c| {
+                let mut v = c.get();
+                v.1 += 1;
+                c.set(v);
+            });
+            PaletteUv { size: n, u_colors, v_colors, map }
+        });
+        palette_record8 = (
+            palette_y.as_ref().map_or(0, |p| p.size),
+            palette_y.as_ref().map_or([0u16; 8], |p| p.colors),
+            palette_uv.as_ref().map_or(0, |p| p.size),
+            palette_uv.as_ref().map_or([0u16; 8], |p| p.u_colors),
+        );
+        // A palette block predicts from its own colour-index map, never from
+        // the block edge (spec 7.11.2/7.11.4) -- these ride the
+        // [`PALETTE_PRED`] slot into each `reconstruct`/`read_plane` call
+        // below, exactly as the key-frame and >=16 intra-in-inter paths do.
+        let palette_y_buf: Option<Vec<u16>> =
+            palette_y.as_ref().map(|p| p.map.iter().map(|&i| p.colors[i as usize]).collect());
+        let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|p| {
+            (
+                p.map.iter().map(|&i| p.u_colors[i as usize]).collect(),
+                p.map.iter().map(|&i| p.v_colors[i as usize]).collect(),
+            )
+        });
         mode_for_tx = mode;
         let (mi_row, mi_col) = leaf_mi;
         for dr in 0..2 {
@@ -27320,6 +27438,19 @@ fn decode_inter_block8(
                 // position: top-right / bottom-left availability is the
                 // block's, narrowed by the unit's offset inside it.
                 let tu_reach = Reach::of_tu(SIDE, SIDE, col * MI, row * MI, tx_px, tx_px, reach);
+                // This unit's own window on the block's palette prediction
+                // (the whole-block buffer would be indexed at the wrong
+                // stride by the first unit).
+                if let Some(buf) = &palette_y_buf {
+                    PALETTE_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                    let window: Vec<u16> = (0..tx_px)
+                        .flat_map(|i| {
+                            let base = (row * MI + i) * SIDE + col * MI;
+                            buf[base..base + tx_px].iter().copied()
+                        })
+                        .collect();
+                    set_palette_pred(window);
+                }
                 let tu_grid = if skip {
                     y.reconstruct(
                         tu_px,
@@ -27371,6 +27502,9 @@ fn decode_inter_block8(
         }
         if skip {
             if !split8 {
+                if let Some(buf) = &palette_y_buf {
+                    set_palette_pred(buf.clone());
+                }
                 y.reconstruct(
                     px,
                     py,
@@ -27387,6 +27521,9 @@ fn decode_inter_block8(
             // CfL's AC contribution is the luma this leaf just reconstructed,
             // averaged over the 4x4 chroma block (`cfl_ac_q3`, spec 7.11.5).
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
+            if let Some((ub, _)) = &palette_uv_bufs {
+                set_palette_pred(ub.clone());
+            }
             u.reconstruct(
                 cpx,
                 cpy,
@@ -27399,6 +27536,9 @@ fn decode_inter_block8(
                 None,
                 smooth_neighbor_uv,
             );
+            if let Some((_, vb)) = &palette_uv_bufs {
+                set_palette_pred(vb.clone());
+            }
             v.reconstruct(
                 cpx,
                 cpy,
@@ -27422,6 +27562,9 @@ fn decode_inter_block8(
                 // which the `saved_luma_ctx` restore below keeps per-TU.
                 vec![0i32; SIDE * SIDE]
             } else {
+                if let Some(buf) = &palette_y_buf {
+                    set_palette_pred(buf.clone());
+                }
                 read_plane(
                 dec,
                 cdfs,
@@ -27454,6 +27597,9 @@ fn decode_inter_block8(
             )?
             };
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, SIDE));
+            if let Some((ub, _)) = &palette_uv_bufs {
+                set_palette_pred(ub.clone());
+            }
             u_grid = read_plane(
                 dec,
                 cdfs,
@@ -27476,6 +27622,9 @@ fn decode_inter_block8(
                 None,
                 smooth_neighbor_uv,
             )?;
+            if let Some((_, vb)) = &palette_uv_bufs {
+                set_palette_pred(vb.clone());
+            }
             v_grid = read_plane(
                 dec,
                 cdfs,
@@ -27517,6 +27666,21 @@ fn decode_inter_block8(
             ],
         )
     });
+    // lane-t900 r23: every leaf stamps its palette state (all-zero for an
+    // inter leaf or a non-palette intra one, real for a palette block) into
+    // the mi-granular neighbour bands, so the next intra block's
+    // `av1_get_palette_mode_ctx` and colour cache see exactly what libaom's
+    // mode-info grid holds.
+    record_strip_palette(
+        neighbours,
+        leaf_mi,
+        8,
+        8,
+        palette_record8.0,
+        palette_record8.1,
+        palette_record8.2,
+        palette_record8.3,
+    );
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
     // lane-uv8 r1: this leaf never stamped a mode band at all, so the block
     // below/right of it read whatever block last wrote the coarse [`SUB`]
