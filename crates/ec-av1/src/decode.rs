@@ -4157,7 +4157,7 @@ pub(crate) fn tx_type_from_symbol(cdf_len: usize, t: usize) -> Option<TxType> {
 /// The remainder of a level the base and base-range syntax could not reach
 /// (spec 5.11.40): its bit length in unary, then that many of its own bits,
 /// most significant first — the exact inverse of [`crate::tile::write_golomb`].
-fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
+pub(crate) fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
     // lane-scaledref r1: this cap MASKS A REAL DEFECT and must not be lifted
     // on its own. Reading up to 32 leading zeros (dav1d's `len < 32`; libaom
     // itself calls a 21st bit a corrupt frame, decodetxb.c:30) is bit-identical
