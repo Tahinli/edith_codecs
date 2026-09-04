@@ -2115,7 +2115,13 @@ mod tests {
             ("auto 320x180 cq50", 320, 180, vec!["--cpu-used=4", "--superres-mode=3", "--cq-level=50"]),
             ("auto 192x128 cq50", 192, 128, vec!["--cpu-used=4", "--superres-mode=3", "--cq-level=50"]),
         ];
-        let (mut decoded, mut warp, mut sub8, mut leaf8, mut other) = (0, 0, 0, 0, 0);
+        let (mut decoded, mut warp, mut sub8, mut leaf8) = (0, 0, 0, 0);
+        // lane-t900 r36 (class [[gate-blind-to-feature]]): unknown refusal
+        // strings used to `other += 1` and panic on the spot, so the census
+        // summary below -- the whole point of the gate -- never printed when
+        // one fired. They are collected instead, reported in the summary, and
+        // asserted after it.
+        let mut other: Vec<String> = Vec::new();
         for (name, w, h, extra) in &recipes {
             let mut args = extra.clone();
             args.extend_from_slice(&common);
@@ -2138,14 +2144,19 @@ mod tests {
                     } else if e.contains(LEAF8) {
                         leaf8 += 1;
                     } else {
-                        other += 1;
-                        panic!("{name}: a superres stream stopped on a string this census does not know: {e}");
+                        other.push(format!("{name}: {e}"));
                     }
                 }
             }
         }
         eprintln!(
-            "SUPERRES CENSUS: 6 streams, {decoded} decoded, warp {warp}x, sub8 {sub8}x, leaf8 {leaf8}x, other {other}x"
+            "SUPERRES CENSUS: 6 streams, {decoded} decoded, warp {warp}x, sub8 {sub8}x, leaf8 {leaf8}x, other {}x",
+            other.len()
+        );
+        assert!(
+            other.is_empty(),
+            "{} superres stream(s) stopped on a string this census does not know: {other:?}",
+            other.len()
         );
         // Measured r27: the four FIXED-denominator recipes all stop at the
         // 8x8-leaf refusal, and the two `--superres-mode=3` (auto) streams
@@ -13253,6 +13264,23 @@ mod tests {
                  but mismatched ffmpeg -- a defect of another shape, not a pass"
             );
         }
+        // lane-t900 r36 (class [[gate-blind-to-feature]]): this counter was
+        // incremented and never read. What it was there to prove is that the
+        // VERT_4 / split-tx arms' blocker is still the rect-residual refusal.
+        // It no longer is: `decode.rs`'s "a non-skip rectangular
+        // (HORZ/VERT/HORZ_B) strip needs rectangular residual coding" still
+        // exists but is narrowed (lane-rectres + lane-inter4 +
+        // lane-intrarect), and this sweep now reaches it ZERO times at either
+        // depth -- attempt 1, the one recipe r5 recorded stopping there,
+        // decodes. So the counter is reported and pinned at 0: a non-zero
+        // reading means the refusal came back for this shape.
+        eprintln!("{NAME}: rect-residual refusals over both depths: {rect_residual_refusals}");
+        assert_eq!(
+            rect_residual_refusals, 0,
+            "{NAME}: {rect_residual_refusals} attempt(s) stopped on \"a non-skip rectangular \
+             (HORZ/VERT/HORZ_B) strip needs rectangular residual coding\" -- that refusal was \
+             lifted for this shape and must not block the VERT_4 / split-tx arms again"
+        );
         // Arms 1/3/4 (HORZ_4, the odd-strip `is_chroma_reference` pair, the
         // `build_inter_predictors_sub8x8` two-mv chroma build) are proven
         // outright.
