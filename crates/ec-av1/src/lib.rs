@@ -8,8 +8,19 @@
 //!
 //! AV1 is covered by the AOMedia Patent License 1.0; this crate is an
 //! independent implementation written from the specification alone.
+//!
+//! # Unsafe
+//!
+//! This crate is `deny(unsafe_code)` rather than `forbid`: the two motion
+//! compensation inner loops are the largest single share of a decode's time
+//! and are hand-vectorised with `std::arch::x86_64` intrinsics, which are
+//! unsafe by signature. The exception is confined to [`mc`]'s `simd` module
+//! (plus its dispatch and its tests, each carrying its own
+//! `#[allow(unsafe_code)]`); every kernel there is checked lane-for-lane
+//! against the scalar function it replaces, which stays the reference
+//! implementation and is what every other architecture runs.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod bits;
