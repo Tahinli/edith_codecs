@@ -7601,6 +7601,62 @@ fn decode_rect_split(
 /// grid, deblock grid) are [`decode_rect_split`]'s; the caller adds the
 /// inter-side bands and the mi map.
 #[allow(clippy::too_many_arguments)]
+/// The `(size_group_lookup, bsize_to_tx_size_cat)` row an INTRA block coded
+/// inside an inter frame reads its `y_mode` and `tx_depth` symbols from, for
+/// the rect footprints [`decode_intra_rect_in_inter`] resolves itself (the
+/// 128-root halves and the 16x4/4x16 strips of a 1:4 partition take their own
+/// branches before this). libaom `common_data.h:61` / `blockd.h:1347`: the 2:1
+/// strips keep the group/category diagonal (BLOCK_16X8 -> 1/1, BLOCK_32X16 ->
+/// 2/2, BLOCK_64X32 -> 3/3), the 1:4 ones break it (BLOCK_32X8 is group 1 but
+/// category 2, BLOCK_64X16 group 2 and category 3), which is why the row is a
+/// table here rather than a shift of `bw.min(bh)`.
+fn intra_in_inter_size_row(bw: usize, bh: usize) -> Option<(usize, usize)> {
+    Some(match (bw.min(bh), bw.max(bh)) {
+        (8, 16) => (1usize, 1usize),
+        (16, 32) => (2, 2),
+        (32, 64) => (3, 3),
+        (8, 32) => (1, 2),
+        (16, 64) => (2, 3),
+        _ => return None,
+    })
+}
+
+/// lane-t900 r20, refusal B ("an intra-coded {bw}x{bh} block on the inter
+/// block path"): the shapes that can reach that arm, enumerated against the
+/// MEASURED domain of the inter block path
+/// ([`INTER_BLOCK_SHAPES`], the census the gate
+/// `a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable`
+/// fills from three real streams).
+///
+/// [`decode_intra_rect_in_inter`] is called from one site, under
+/// `write_w != side || write_h != side`, and only after two earlier arms have
+/// taken their shapes: a footprint with a side below 8 is either a 16x4/4x16
+/// strip WITH a chroma-pair record (the `strip16` branch) or refused by name,
+/// and a 128-px footprint returns from the `bw.max(bh) == 128` branch. What is
+/// left is every rectangular census shape with `8 <= min` and `max <= 64` --
+/// and each of those has a row, so the refusal names a shape no measured
+/// stream can present.
+#[test]
+fn every_intra_in_inter_shape_the_census_lists_has_a_size_group_row() {
+    let mut checked = 0;
+    for &(side, w, h) in &INTER_BLOCK_SHAPES {
+        if (w, h) == (side, side) || w.min(h) < 8 || w.max(h) > 64 {
+            continue;
+        }
+        assert!(
+            intra_in_inter_size_row(w, h).is_some(),
+            "the inter path decodes {w}x{h} blocks, and an INTRA one of that shape would hit \
+             the \"no size-group/tx-category row\" refusal"
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 10,
+        "the block-shape census changed: {checked} rect shapes reach the intra-in-inter row \
+         lookup, not the 10 this claim was measured over"
+    );
+}
+
 fn decode_intra_rect_in_inter(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -7779,35 +7835,22 @@ fn decode_intra_rect_in_inter(
         INTRA_IN_INTER_MODE.with(|c| c.set(None));
         return res;
     }
-    let (size_group, tx_cat) = match (bw.min(bh), bw.max(bh)) {
-        (8, 16) => (1usize, 1usize),
-        (16, 32) => (2, 2),
-        (32, 64) => (3, 3),
-        // lane-intra14 r1: the 1:4 strips, read off libaom's own tables --
-        // `size_group_lookup` (common_data.h:61) gives BLOCK_8X32/32X8 group
-        // 1 and BLOCK_16X64/64X16 group 2, while
-        // `bsize_to_tx_size_depth_table` (blockd.h:1347) gives them depth
-        // 3 and 4, i.e. tx categories 2 and 3 -- the diagonal a 2:1 strip
-        // keeps is genuinely broken here, which is why the shape was refused
-        // rather than read from the 2:1 row.
-        (8, 32) => (1, 2),
-        (16, 64) => (2, 3),
-        _ => {
-            if crate::envflags::env_flag!("EC_OBMCREC") {
-                eprintln!(
-                    "OBMCREC intra-in-inter shape bw={bw} bh={bh} mi=({mi_r},{mi_c}) skip={skip}"
-                );
-            }
-            // lane-obmcrec r1: the message used to name a 16x4/4x16 strip
-            // (class refusal-names-a-correlate). Measured with `EC_OBMCREC=1`
-            // on three 2 s cuts of the 10-bit 1920x792 128-superblock stream:
-            // every arrival here is a 128x64 block -- a PARTITION_HORZ half of
-            // a 128 superblock coded INTRA inside an inter frame, at mi
-            // (128,416) / (192,0) / (192,0) -- not a strip at all.
-            return Err(unsupported(format!(
-                "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)"
-            )));
+    let Some((size_group, tx_cat)) = intra_in_inter_size_row(bw, bh) else {
+        if crate::envflags::env_flag!("EC_OBMCREC") {
+            eprintln!(
+                "OBMCREC intra-in-inter shape bw={bw} bh={bh} mi=({mi_r},{mi_c}) skip={skip}"
+            );
         }
+        // lane-obmcrec r1: the message used to name a 16x4/4x16 strip
+        // (class refusal-names-a-correlate). lane-t900 r20: the shapes that
+        // can arrive here are enumerated against the measured block-shape
+        // census ([`INTER_BLOCK_SHAPES`]) by
+        // [`every_intra_in_inter_shape_the_census_lists_has_a_size_group_row`]
+        // -- every one of them has a row, so this arm names a shape no stream
+        // has been able to present.
+        return Err(unsupported(format!(
+            "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)"
+        )));
     };
     // [`read_intra_mode_rect`]'s own refusal: palette/intrabc syntax is
     // consumed for square blocks only, so a strip in a screen-content frame
@@ -14526,7 +14569,7 @@ fn read_block_tx_size(
 /// `default_inter_ext_tx_cdf[2][TX_8X8]` (the 12-symbol
 /// `DTT9_IDTX_1DDCT` row at `tx_size_sqr == TX_8X8`, only reachable through a
 /// rect transform), neither of which exists yet -- both stay refused by name.
-fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
+pub(crate) fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
     matches!(
         (w, h),
         // 2:1 strips whose transform is coded in full (lane-inter4).
@@ -14562,6 +14605,63 @@ fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
             // (`ss_size_lookup[BLOCK_32X8]` = BLOCK_16X4).
             | (32, 8) | (8, 32)
     )
+}
+
+// lane-t900 r20: the `(side, write_w, write_h)` triples the inter block path
+// actually PRESENTS, as a thread-local bitmask -- the measured domain behind
+// the "rectangular ... has no ... here" refusals. `side` is the square context
+// a block reads its CDFs at and `write_w`/`write_h` its true footprint;
+// `inter_piece!` derives `reject_residual` from exactly that inequality, so
+// these triples are what decides whether those refusals can fire at all. Bit
+// 31 is "a triple this table does not list", which is what makes the gate a
+// census rather than a restatement of its own table.
+pub(crate) const INTER_BLOCK_SHAPES: [(usize, usize, usize); 18] = [
+    (16, 16, 16),
+    (32, 32, 32),
+    (32, 16, 32),
+    (32, 32, 16),
+    (16, 8, 16),
+    (16, 16, 8),
+    (32, 8, 32),
+    (64, 64, 64),
+    (32, 32, 8),
+    (64, 16, 64),
+    (128, 128, 128),
+    (64, 32, 64),
+    (64, 64, 32),
+    (16, 4, 16),
+    (64, 64, 16),
+    (16, 16, 4),
+    (128, 128, 64),
+    (128, 64, 128),
+];
+
+/// Bit 31 of [`inter_block_shape_mask`]: a `(side, write_w, write_h)` triple
+/// outside [`INTER_BLOCK_SHAPES`].
+pub const INTER_BLOCK_SHAPE_UNLISTED: u32 = 1 << 31;
+
+thread_local! {
+    static INTER_BLOCK_SHAPE_MASK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Which of [`INTER_BLOCK_SHAPES`] this THREAD has decoded (thread-local, so a
+/// gate reading it sees only the streams it decoded itself).
+pub fn inter_block_shape_mask() -> u32 {
+    INTER_BLOCK_SHAPE_MASK.with(std::cell::Cell::get)
+}
+
+/// Records one block's shape. The table is ordered by measured frequency over
+/// the three witnesses the census gate decodes, so the common square shapes
+/// leave the scan on their first comparison.
+fn census_inter_block_shape(side: usize, w: usize, h: usize) {
+    let bit = match INTER_BLOCK_SHAPES.iter().position(|&s| s == (side, w, h)) {
+        Some(i) => 1u32 << i,
+        None => INTER_BLOCK_SHAPE_UNLISTED,
+    };
+    let seen = inter_block_shape_mask();
+    if seen & bit == 0 {
+        INTER_BLOCK_SHAPE_MASK.with(|c| c.set(seen | bit));
+    }
 }
 
 /// The luma coefficient/`tx_type` table set of a whole-block rectangular
@@ -14698,6 +14798,80 @@ fn rect_scan(w: usize, h: usize) -> Result<&'static [u16]> {
             ));
         }
     })
+}
+
+/// lane-t900 r20, refusal D -- the three "a rectangular inter luma/chroma
+/// transform unit whose shape has no coefficient table set here" / "a
+/// rectangular transform unit whose shape has no coefficient scan table here"
+/// arms, enumerated against the MEASURED domain of the inter block path
+/// ([`INTER_BLOCK_SHAPES`], filled from three real streams by the gate
+/// `a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable`).
+///
+/// What each helper is actually handed:
+///
+/// * [`rect_inter_luma_set`] -- the block's own footprint (call sites at the
+///   whole-block residual), and a var-tx LEAF shape. `sub_tx_size_map` is
+///   square for every rect transform except TX_16X4/TX_4X16, whose leaves are
+///   TX_8X4/TX_4X8, so the leaf domain adds exactly 8x4 and 4x8.
+/// * [`rect_inter_chroma_set`] -- `(write_w / 2, write_h / 2)` for a 4:2:0
+///   block, except a 16x4/4x16 strip, whose chroma is the PAIR's 8x4 / 4x8.
+/// * [`rect_scan`] -- the `min(w, 32) x min(h, 32)` coded corner of a rect
+///   unit, and only when that corner is not 32x32 (a square corner goes
+///   through the square reader with `rect_shape = Some((w, h))`).
+///
+/// The 128-px halves take neither: `max_txsize_rect_lookup[BLOCK_128X64]` is
+/// TX_64X64, so they tile into SQUARE 64x64 luma units through the mu-chunk
+/// loop, which is why they are skipped below.
+#[test]
+fn every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan() {
+    let corner_scan = |w: usize, h: usize| {
+        let (cw, ch) = (w.min(32), h.min(32));
+        if (cw, ch) == (32, 32) {
+            return; // the square coefficient reader, not `rect_scan`
+        }
+        assert!(
+            rect_scan(cw, ch).is_ok(),
+            "a {w}x{h} rect transform codes its {cw}x{ch} corner, which has no scan table"
+        );
+    };
+    let mut checked = 0;
+    for &(side, w, h) in &INTER_BLOCK_SHAPES {
+        if (w, h) == (side, side) || w.max(h) > 64 {
+            continue;
+        }
+        assert!(
+            rect_inter_luma_set(w, h).is_ok(),
+            "the inter path decodes {w}x{h} blocks but has no luma coefficient table set for one"
+        );
+        corner_scan(w, h);
+        // 4:2:0 chroma: the pair's 8x4 / 4x8 for a 1:4 strip, the halved
+        // footprint for every other shape.
+        let (cw, ch) = match (w, h) {
+            (16, 4) => (8, 4),
+            (4, 16) => (4, 8),
+            _ => (w / 2, h / 2),
+        };
+        assert!(
+            rect_inter_chroma_set(cw, ch).is_ok(),
+            "a {w}x{h} block's {cw}x{ch} chroma unit has no coefficient table set"
+        );
+        corner_scan(cw, ch);
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 12,
+        "the block-shape census changed: {checked} rect shapes reach the rect transform \
+         tables, not the 12 this claim was measured over"
+    );
+    // `sub_tx_size_map[TX_16X4] == TX_8X4` -- the only RECTANGULAR var-tx leaf
+    // shapes, which reach `rect_inter_luma_set` as `(tw, th)`.
+    for (w, h) in [(8usize, 4usize), (4, 8)] {
+        assert!(
+            rect_inter_luma_set(w, h).is_ok(),
+            "the {w}x{h} split leaf of a 16x4/4x16 strip has no luma coefficient table set"
+        );
+        corner_scan(w, h);
+    }
 }
 
 /// [`read_block_tx_size`] for a rectangular inter block (lane-inter4 r2):
@@ -20243,6 +20417,7 @@ fn decode_inter_block(
     // exactly what it read before.
     let (rmi, cmi) = at;
     let (px, py) = (at.1 * MI, at.0 * MI);
+    census_inter_block_shape(side, write_w, write_h);
     // lane-inter16ab r2: a 16x4 / 4x16 inter strip's chroma is the PAIR's
     // (8x4 / 4x8 at the even strip's origin) and is coded only by the odd
     // strip (`is_chroma_reference`); every other block keeps its own.

@@ -111,6 +111,63 @@ const REFUSALS: &[&str] = &[
     "a motion_mode symbol for a block shape with no CDF row here",
 ];
 
+/// The refusals that have a PROVING test, and its name.
+///
+/// A refusal with no such test is an unmeasured claim: nothing in the suite
+/// distinguishes "this case never happens" from "no stream we decode has
+/// reached it yet". A proving test is one of two shapes:
+///
+/// * a WITNESS gate -- a real stream reaches the shape, decodes exact, and the
+///   refusal is gone (the good case), or
+/// * a CENSUS gate -- N real streams decode with the refusal firing 0 times
+///   while the counters for the sibling shapes it names fire, so the claim is
+///   measured against the domain the decoder is actually handed.
+///
+/// The count printed by [`tests::every_proven_refusal_names_a_test_that_exists`]
+/// is the honest numerator over the inventory below.
+#[cfg(test)]
+const PROVEN: &[(&str, &str)] = &[
+    // lane-t900 r20, census: three real streams present exactly the 18
+    // `(side, write_w, write_h)` triples `INTER_BLOCK_SHAPES` lists, and
+    // `rect_inter_residual_supported` covers every rectangular one -- the only
+    // footprints `reject_residual` is set for.
+    (
+        "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
+        "a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable",
+    ),
+    // lane-t900 r20, census: the shapes that can reach `decode_intra_rect_in_inter`'s
+    // size-group/tx-category lookup are the ten rectangular census shapes with
+    // `8 <= min` and `max <= 64` (a sub-8 footprint and a 128-px one take
+    // earlier branches), and every one of them has a row.
+    (
+        "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)",
+        "every_intra_in_inter_shape_the_census_lists_has_a_size_group_row",
+    ),
+    // lane-t900 r20, census: the only sub-8 footprints three real streams
+    // present are the 16x4/4x16 strips of a 16x16-level 1:4 partition, whose
+    // caller records the chroma pair for every strip, while the supported path
+    // fires on both orientations inside streams that decode with no refusal.
+    (
+        "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once for two strips; only the inter path implements that pairing)",
+        "a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable",
+    ),
+    // lane-t900 r20, census: the rect transform tables and scans, enumerated
+    // over the shapes the measured block-shape domain hands each helper (block
+    // footprint, 4:2:0 chroma unit, rect var-tx leaf, clamped coded corner).
+    (
+        "a rectangular inter luma transform unit whose shape has no coefficient table set here",
+        "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+    ),
+    (
+        "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
+        "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+    ),
+    (
+        "a rectangular transform unit whose shape has no coefficient scan table here",
+        "every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan",
+    ),
+];
+
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
 /// a test failure.
 ///
@@ -131,7 +188,7 @@ const GATES_THAT_SKIP_ON_A_DECODE_ERROR: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, REFUSALS};
+    use super::{CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, PROVEN, REFUSALS};
     use std::collections::BTreeSet;
 
     /// Every distinct `unsupported(...)` reason on the decode path.
@@ -285,6 +342,31 @@ mod tests {
         assert!(
             stale.is_empty(),
             "{stale:#?} no longer swallow a decode error -- delete them from the list."
+        );
+    }
+
+    /// Every entry of [`PROVEN`] must still name a live refusal and a test
+    /// that exists, and the count it prints is the inventory's numerator.
+    #[test]
+    fn every_proven_refusal_names_a_test_that_exists() {
+        let found = decode_path_refusals();
+        let sources = [include_str!("stream.rs"), include_str!("decode.rs")];
+        for (reason, gate) in PROVEN {
+            assert!(
+                found.contains(*reason),
+                "{reason:?} is listed as proven but is no longer a decode-path refusal --                  drop it from PROVEN (the capability landed) or fix the string"
+            );
+            assert!(
+                sources.iter().any(|src| src.contains(&format!("fn {gate}("))),
+                "{reason:?} names the proving test {gate}, which exists in neither stream.rs \
+                 nor decode.rs"
+            );
+        }
+        eprintln!(
+            "refusal inventory: {} refusals + {} capability claims, {} proven",
+            REFUSALS.len(),
+            CAPABILITY_CLAIMS.len(),
+            PROVEN.len()
         );
     }
 }
