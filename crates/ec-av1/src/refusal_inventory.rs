@@ -56,7 +56,6 @@ const REFUSALS: &[&str] = &[
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
     "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
-    "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
@@ -124,37 +123,21 @@ const REFUSALS: &[&str] = &[
     // What still refuses is the 128-root half of a screen-content frame, whose
     // body (`decode_block_128rect`) reads no palette syntax and for which no
     // `--sb-size=128` screen witness exists yet.
-    // lane-t900 r23 CENSUS for this string's remaining 128-root arm (the
-    // 16x4/4x16 arm was lifted in r22): its premise is already known to be
-    // false by the spec -- `read_palette_mode_info` (5.11.46) codes palette
-    // only for `Block_Width <= 64 && Block_Height <= 64`, so a 128x64/64x128
-    // half consumes NO palette syntax and the screen flag changes nothing
-    // about it. It stays because nothing witnesses it: 6 aomenc encodes at
-    // `--sb-size=128 --tune-content=screen` (704x320 = 5*128+64 by 2*128+64,
-    // the edge-forced size r18 proved for the non-screen twin; screen cell
-    // content at cq 10/20/40, and r18's own panning-texture-plus-fresh-ramp
-    // shape with `--max-partition-size=128 --enable-ab-partitions=0
-    // --enable-1to4-partitions=0`) code ZERO 128-root halves of any kind
-    // (`intra128_in_inter` and `sb128_rect` both 0 in every stream), so
-    // lifting it would be a capability claim no gate exercises (class
-    // `refusal-lifted-without-a-gate`). What is still untried: a 10-bit
-    // source, and screen content in the forced bands with a NON-screen
-    // interior.
-    // lane-t900 r31, ENUMERATION: the premise is DISPROVED -- `av1_allow_palette`'s
-    // bound (`palette_bsize_ctx_wh`: `bw > 64 || bh > 64`) rejects every
-    // footprint with a 128-pixel side, so a screen-content frame codes no
-    // palette syntax on a 128-root half and that half decodes exactly like the
-    // non-screen twin r18 already witnesses (test
-    // `no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax`).
-    // The string is a claim about the SYNTAX, and the syntax it fears does not
-    // exist at this size. It stays UNPROVEN and live for two reasons: the
-    // guarded condition is reachable (proving the lift safe is not proving the
-    // case absent), and lifting it is a `decode.rs` edit -- delete the
-    // `if allow_screen_content_tools { return Err(unsupported(..)) }` block
-    // inside the `bw.max(bh) == 128` branch of `decode_intra_rect_in_inter`
-    // -- which needs a `--sb-size=128 --tune-content=screen` witness that
-    // actually codes a 128-root half (r23's census found none).
-    "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
+    // lane-t900 r32: the 128-root arm is LIFTED. r31's enumeration
+    // (`no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax`) is
+    // its proof -- `av1_allow_palette`'s `bw > 64 || bh > 64` bound means a
+    // 128x64/64x128 half codes NO palette syntax at all, so a screen-content
+    // frame's half is byte-identical in syntax to the non-screen twin gate
+    // `an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact`
+    // already decodes pixel-exact. Nothing of this string remains.
+    // lane-t900 r32: the residue of the LIFTED "an intrabc block under
+    // TxMode::Select". The inter var-tx tree is read in full, but the intra
+    // luma reconstruct loop it feeds is a UNIFORM grid of one square
+    // transform, so a tree resolving to mixed leaf sizes would be
+    // reconstructed at the wrong stride. Neither arm of
+    // `an_intrabc_block_under_tx_mode_select_decodes_pixel_exact` reaches it
+    // (both resolve uniform), so it is unwitnessed and stays live.
+    "an intrabc block whose var-tx tree resolved to mixed leaf transform sizes",
     "a motion_mode symbol for a block shape with no CDF row here",
 ];
 
@@ -373,20 +356,6 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
         "an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name",
-    ),
-    // lane-t900 r31, census + refusal-by-name: 13 real `--tune-content=screen
-    // --enable-intrabc=1` key frames measure this string instead of assuming
-    // it. The refusal is NOT unreachable -- an exact-repetition source
-    // (a 2x2 tiling of one bar pattern) with the rect/1:4 partitions off codes
-    // an unskipped intrabc block on a square block of a TX_MODE_SELECT frame,
-    // and exactly that arm refuses by name while the other twelve decode
-    // pixel-exact. So it is a real capability gap with a waiting witness gate
-    // (`an_intrabc_block_under_tx_mode_select_decodes_pixel_exact`, ignored),
-    // and libaom does not couple the two bits: `select_tx_mode`
-    // (encodeframe.c:2355) never reads `allow_intrabc`.
-    (
-        "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
-        "an_intrabc_census_over_screen_key_frames_measures_the_tx_select_refusal",
     ),
 ];
 
