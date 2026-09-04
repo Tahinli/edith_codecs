@@ -265,6 +265,9 @@ pub fn decode_stream_with(
     data: &[u8],
     mut sink: impl FnMut(&Picture, usize, bool) -> Result<()>,
 ) -> Result<()> {
+    // lane-thread1: this stream's per-frame decode state (was 38 thread_local
+    // statics in decode.rs) -- one object, threaded down the decode call graph.
+    let fctx = &crate::decode::FrameCtx::new();
     let final_dump = final_dump_prefix();
     let mut parser = Av1Parser::new();
     let mut pictures_shown: usize = 0;
@@ -368,7 +371,7 @@ pub fn decode_stream_with(
                     &picture,
                     &header.film_grain,
                     mc_identity,
-                    bit_depth as u32,
+                    bit_depth as u32, fctx,
                 )
             } else {
                 picture
@@ -493,7 +496,7 @@ pub fn decode_stream_with(
             header.segmentation,
             header.mi_rows as usize,
             header.mi_cols as usize,
-            prev_seg_map.as_deref(),
+            prev_seg_map.as_deref(), fctx,
         );
         // lane-superres stage 2/3: `use_superres` adds/removes no per-block
         // symbol (spec 7.16's upscaling is a pixel-domain post-process
@@ -666,7 +669,7 @@ pub fn decode_stream_with(
         // the key-frame tile path used to set; without this call a stream whose
         // inter frames are decoded on a thread that previously decoded a
         // different sequence would inherit that sequence's bit.
-        crate::decode::set_enable_edge_filter(enable_edge_filter);
+        crate::decode::set_enable_edge_filter(enable_edge_filter, fctx);
         // lane-sb128 r1/r2: `use_128x128_superblock` (spec 5.5.1). Both the
         // key-frame and the inter tile path read the 128 partition root and
         // recurse SPLIT into the four 64x64 quadrants (r2 ported the root and
@@ -678,7 +681,7 @@ pub fn decode_stream_with(
             .sequence_header()
             .is_some_and(|seq| seq.use_128x128_superblock);
         let sb128_active = use_sb128 && (header.mi_cols > 16 || header.mi_rows > 16);
-        crate::decode::set_sb128(sb128_active);
+        crate::decode::set_sb128(sb128_active, fctx);
         // lane-hbd r5: `BIT_DEPTH` (decode.rs) drives `crate::decode::sample_max`,
         // which every dequant/inverse-transform clamp reads -- set per frame,
         // not once per process, for the same cross-sequence-on-one-thread
@@ -700,14 +703,14 @@ pub fn decode_stream_with(
                 "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
             ));
         }
-        crate::decode::set_bit_depth(bit_depth);
+        crate::decode::set_bit_depth(bit_depth, fctx);
         // spec 7.16: this frame's superres state, for the filter chain --
         // `decode.rs` upscales between CDEF and loop restoration and sizes
         // the LR unit grid in upscaled coordinates. Cleared (0, 8) on an
         // unscaled frame so a later frame never inherits it.
         crate::decode::set_superres(
             if header.use_superres { header.upscaled_width } else { 0 },
-            u32::from(header.superres_denom),
+            u32::from(header.superres_denom), fctx,
         );
         // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
         let enable_masked_compound = parser
@@ -808,7 +811,7 @@ pub fn decode_stream_with(
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
-                header.delta,
+                header.delta, fctx,
             )?;
             // A key frame codes no inter blocks -- its own saved motion
             // field has no cells set, matching libaom's own "intra frame
@@ -919,7 +922,7 @@ pub fn decode_stream_with(
                 header.allow_warped_motion,
                 header.allow_screen_content_tools,
                 header.delta,
-                enable_filter_intra,
+                enable_filter_intra, fctx,
             )?;
             (picture, end_cdfs, motion_field)
         };
@@ -1003,7 +1006,7 @@ pub fn decode_stream_with(
             }
         }
         pictures_decoded += 1;
-        let decoded_seg_map = decode::take_segment_ids();
+        let decoded_seg_map = decode::take_segment_ids(fctx);
         for i in 0..NUM_REF_FRAMES {
             if header.refresh_frame_flags & (1 << i) != 0 {
                 cdf_slots[i] = Some(stored_cdfs.clone());
@@ -1033,7 +1036,7 @@ pub fn decode_stream_with(
                     &picture,
                     &header.film_grain,
                     mc_identity,
-                    bit_depth as u32,
+                    bit_depth as u32, fctx,
                 )
             } else {
                 picture
@@ -1067,7 +1070,7 @@ pub fn intra_rect4_in_inter_counters() -> (usize, usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::{Picture as Pic, encode_key_frame, encode_sequence};
+    use crate::encode::{Picture as Pic, encode_key_frame_with_ctx, encode_sequence_with_ctx};
 
     fn test_card(width: usize, height: usize) -> Pic {
         let mut picture = Pic::grey(width, height);
@@ -1114,8 +1117,9 @@ mod tests {
     /// tile payload is never reached.
     #[test]
     fn a_twelve_bit_sequence_header_is_refused_by_name() {
+    let fctx = &crate::decode::FrameCtx::new();
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let mut color = ec_av1_syntax::ColorConfig {
             bit_depth: 12,
             ..Default::default()
@@ -1157,9 +1161,10 @@ mod tests {
     /// never reports this refusal for any of them.
     #[test]
     fn a_frame_obu_that_parses_always_carries_at_least_one_tile() {
+    let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str = "a frame OBU with no tile group";
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, header) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         let mut frame_obus_parsed = 0;
         for len in 0..=encoded.tile.len().min(24) {
@@ -1212,10 +1217,11 @@ mod tests {
     /// first, a middle and the last segment id.
     #[test]
     fn a_frame_whose_segmentation_overrides_a_block_mode_is_refused_by_name() {
+    let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str =
             "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV";
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {
             for segment in [0usize, 3, 7] {
@@ -1603,9 +1609,10 @@ mod tests {
     /// tile is decoded.
     #[test]
     fn an_inter_frame_opening_a_stream_is_refused_by_name() {
+    let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str = "an inter frame with no key frame before it";
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         let inter = FrameHeader {
             frame_type: FrameType::Inter,
@@ -1648,10 +1655,11 @@ mod tests {
     /// fires on the reference's dimensions before a tile symbol is read.
     #[test]
     fn an_inter_frame_shorter_than_its_reference_is_refused_by_name() {
+    let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str =
             "a reference picture whose height does not match this frame's own true size";
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         let inter = FrameHeader {
             frame_type: FrameType::Inter,
@@ -1699,6 +1707,7 @@ mod tests {
     /// before the reference pictures are looked up.
     #[test]
     fn an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name() {
+    let fctx = &crate::decode::FrameCtx::new();
         const REFUSAL: &str =
             "a frame naming primary_ref_frame at a reference slot with no saved CDF state";
         // The invariant above, read off the source: every line that stores a
@@ -1727,7 +1736,7 @@ mod tests {
         }
 
         let picture = test_card(64, 64);
-        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
         let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
         for slot in 0..NUM_REF_FRAMES as u8 {
             let inter = FrameHeader {
@@ -2130,9 +2139,10 @@ mod tests {
     /// the encoder's own reconstruction, at an even and an odd size.
     #[test]
     fn decode_stream_matches_the_tile_path_on_a_key_frame() {
+    let fctx = &crate::decode::FrameCtx::new();
         for &(width, height) in &[(64usize, 64usize), (216, 96)] {
             let picture = test_card(width, height);
-            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let via_tile = decode_key_frame_tile(
                 &encoded.tile,
                 encoded.mi_cols,
@@ -2147,7 +2157,7 @@ mod tests {
                 // Our own encoder always writes `reduced_tx_set: true`.
                 true,
                 false,
-                false,
+                false, fctx,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
@@ -2165,11 +2175,11 @@ mod tests {
     /// A GOP (key frame plus panned inter frames, so blocks actually take
     /// motion) decodes bit-exact through `decode_stream` alone, threading its
     /// own DPB rather than a test-supplied reference.
-    fn gop_round_trips(width: usize, height: usize) {
+    fn gop_round_trips(width: usize, height: usize, fctx: &crate::decode::FrameCtx) {
         let pictures: Vec<_> = (0..4)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         let decoded = decode_stream(&encoded.stream).unwrap();
         assert_eq!(decoded.len(), encoded.frames.len());
         for (i, (got, frame)) in decoded.iter().zip(&encoded.frames).enumerate() {
@@ -2190,14 +2200,16 @@ mod tests {
 
     #[test]
     fn decode_stream_round_trips_a_gop() {
-        gop_round_trips(128, 64);
+    let fctx = &crate::decode::FrameCtx::new();
+        gop_round_trips(128, 64, fctx);
     }
 
     /// Same claim at a size that is not a whole number of 32x32 blocks, so
     /// the inter frame's 16x16-leaf split path is exercised too.
     #[test]
     fn decode_stream_round_trips_an_odd_size_gop() {
-        gop_round_trips(216, 96);
+    let fctx = &crate::decode::FrameCtx::new();
+        gop_round_trips(216, 96, fctx);
     }
 
     /// lane-streamsink r1: `decode_stream_with` emits exactly the pictures
@@ -2208,8 +2220,9 @@ mod tests {
     /// decode indices non-decreasing, and an `Err` from the sink aborting.
     #[test]
     fn streaming_decode_matches_the_collecting_one() {
+    let fctx = &crate::decode::FrameCtx::new();
         let pictures: Vec<_> = (0..4).map(|i| panned_test_card(128, 64, i * 3)).collect();
-        let stream = encode_sequence(&pictures, 100, 0.5).unwrap().stream;
+        let stream = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap().stream;
         let collected = decode_stream(&stream).unwrap();
 
         let mut shown = Vec::new();
@@ -2444,6 +2457,7 @@ mod tests {
     /// independent decoder, not just this crate checking its own tile path.
     #[test]
     fn decode_stream_agrees_with_ffmpeg_on_a_gop() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!("SKIP decode_stream_agrees_with_ffmpeg_on_a_gop: no ffmpeg");
             return;
@@ -2452,7 +2466,7 @@ mod tests {
         let pictures: Vec<_> = (0..3)
             .map(|i| panned_test_card(width, height, i * 3))
             .collect();
-        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
         let ffmpeg_frames = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
         let decoded = decode_stream(&encoded.stream).unwrap();
         assert_eq!(decoded.len(), 3);
@@ -2491,6 +2505,7 @@ mod tests {
     /// with itself would prove nothing.
     #[test]
     fn a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg() {
+    let fctx = &crate::decode::FrameCtx::new();
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg: no ffmpeg"
@@ -2526,7 +2541,7 @@ mod tests {
 
         for run in 0..4 {
             let picture = test_card(width, height);
-            let key = encode_key_frame(&picture, base_q_idx, 0.5).unwrap();
+            let key = encode_key_frame_with_ctx(&picture, base_q_idx, 0.5, fctx).unwrap();
             let (seq, _) = key_frame_headers(width, height, base_q_idx).unwrap();
 
             // Frame 1: hand-coded, intra-only, refreshes slot 0 with a flat
@@ -22619,6 +22634,7 @@ mod tests {
     /// the real proof).
     #[test]
     fn a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact() {
+    let fctx = &crate::decode::FrameCtx::new();
         const NAME: &str = "a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -22806,7 +22822,7 @@ mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
-                header.delta,
+                header.delta, fctx,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -22870,6 +22886,7 @@ mod tests {
     /// already proved -- this gate is what actually proves it either way.
     #[test]
     fn a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact() {
+    let fctx = &crate::decode::FrameCtx::new();
         const NAME: &str = "a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -23028,7 +23045,7 @@ mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
-                header.delta,
+                header.delta, fctx,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -23205,6 +23222,7 @@ mod tests {
     /// 2-column case's boundary-that-is-also-the-frame-edge.
     #[test]
     fn a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact() {
+    let fctx = &crate::decode::FrameCtx::new();
         const NAME: &str = "a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -23350,7 +23368,7 @@ mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
-                header.delta,
+                header.delta, fctx,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -32872,6 +32890,54 @@ mod tests {
         }
         eprintln!(
             "{NAME}: {exact_arms} arms pixel-exact over {FRAMES} frames each, counters {fired:?}"
+        );
+    }
+
+
+    /// lane-thread1: every per-frame/per-stream decode state now lives in
+    /// [`crate::decode::FrameCtx`], not in a `thread_local!`. A static that
+    /// comes back would silently re-break frame-parallel decoding (a worker
+    /// thread sees an empty copy) without failing any pixel gate, so pin the
+    /// 38 names by name against the sources themselves.
+    #[test]
+    fn no_per_frame_state_is_thread_local_any_more() {
+        const MOVED: [&str; 38] = [
+            "SB128", "CDEF_BITS", "BIT_DEPTH", "SUPERRES", "CDEF_TRANSMITTED", "CDEF_SB_COLS",
+            "CDEF_IDX_GRID", "DELTA_Q_PRESENT", "DELTA_Q_RES", "CURRENT_Q_IDX", "QUANT_DELTAS",
+            "DELTA_LF_PRESENT", "DELTA_LF_RES", "DELTA_LF_MULTI", "CURRENT_DELTA_LF", "SEG",
+            "SEG_IDS", "PREV_SEG_IDS", "SEG_MI_DIMS", "ABOVE_SEG_PRED", "LEFT_SEG_PRED",
+            "CUR_SEGMENT_ID", "SEG_TILE_ORIGIN", "TX_SELECT_INTER", "REDUCED_TX_SET_INTER",
+            "ENABLE_FILTER_INTRA_INTER", "PALETTE_PRED", "INTRABC_MI_GRID", "INTRABC_DV",
+            "LUMA_TX_TYPE", "INTRABC_CHROMA_TX", "INTRA_IN_INTER_MODE", "INTER_STRIP_CHROMA",
+            "INTER_LAST_MC", "ENABLE_EDGE_FILTER", "LAST_FRAME_WIDE_MARGIN", "REACH_SB_PX",
+            "GRAIN_BIT_DEPTH",
+        ];
+        let sources = [
+            ("decode.rs", include_str!("decode.rs")),
+            ("encode.rs", include_str!("encode.rs")),
+            ("film_grain.rs", include_str!("film_grain.rs")),
+        ];
+        let mut back = Vec::new();
+        for (name, src) in sources {
+            for line in src.lines() {
+                let t = line.trim_start().trim_start_matches("pub(crate) ");
+                if let Some(rest) = t.strip_prefix("static ") {
+                    let ident = rest.split(':').next().unwrap_or("").trim();
+                    if MOVED.contains(&ident) {
+                        back.push(format!("{name}: {ident}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            back.is_empty(),
+            "per-frame state is thread_local again (belongs in FrameCtx): {back:?}"
+        );
+        // ... and the scratch pools / gate counters DID stay thread-local:
+        // this file's own counter reads run on the test thread.
+        assert!(
+            include_str!("decode.rs").contains("thread_local!"),
+            "the scratch pools and gate hit counters are still thread_local by design"
         );
     }
 

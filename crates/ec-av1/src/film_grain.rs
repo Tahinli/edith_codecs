@@ -13,6 +13,7 @@
 //! the frame it pushes onto its output `Vec<Picture>`, after saving the
 //! clean decode into the reference slot bank.
 
+use crate::decode::WithRef;
 use crate::encode::Picture;
 use ec_av1_syntax::FilmGrainParams;
 
@@ -43,23 +44,20 @@ const LUMA_BLOCK_W: i32 =
 const CHROMA_BLOCK_H: i32 = TOP_PAD + AR_PADDING + CHROMA_SUBBLOCK * 2 + BOTTOM_PAD;
 const CHROMA_BLOCK_W: i32 = LEFT_PAD + AR_PADDING + CHROMA_SUBBLOCK * 2 + AR_PADDING + RIGHT_PAD;
 
-thread_local! {
     /// `params->bit_depth` of the picture currently being grained. libaom
     /// keeps `grain_min`/`grain_max` as file statics set once per
     /// `av1_add_film_grain_run` (`grain_synthesis.c:1041-1045`); this mirrors
     /// that rather than threading a parameter through every helper.
-    static GRAIN_BIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(8) };
-}
 
 /// `params->bit_depth` for the [`apply_grain`] call in progress.
-fn grain_bit_depth() -> u32 {
-    GRAIN_BIT_DEPTH.with(|c| c.get())
+fn grain_bit_depth(fctx: &crate::decode::FrameCtx) -> u32 {
+    fctx.grain_bit_depth.with(|c| c.get())
 }
 
 /// `grain_min`/`grain_max` (`grain_synthesis.c:1043-1045`):
 /// `grain_center = 128 << (bit_depth - 8)`.
-fn grain_range() -> (i32, i32) {
-    let center = 128i32 << (grain_bit_depth() - 8);
+fn grain_range(fctx: &crate::decode::FrameCtx) -> (i32, i32) {
+    let center = 128i32 << (grain_bit_depth(fctx) - 8);
     (-center, center - 1)
 }
 
@@ -135,14 +133,14 @@ fn build_pred_pos(lag: i32, has_luma_avg: bool) -> Vec<(i32, i32, i32)> {
 fn generate_luma_grain_block(
     fg: &FilmGrainParams,
     pred_pos: &[(i32, i32, i32)],
-    rng: &mut Rng,
+    rng: &mut Rng, fctx: &crate::decode::FrameCtx,
 ) -> Vec<i32> {
-    let (grain_min, grain_max) = grain_range();
+    let (grain_min, grain_max) = grain_range(fctx);
     let mut block = vec![0i32; (LUMA_BLOCK_H * LUMA_BLOCK_W) as usize];
     if fg.num_y_points == 0 {
         return block;
     }
-    let gauss_sec_shift = 12 - grain_bit_depth() as i32 + fg.grain_scale_shift as i32;
+    let gauss_sec_shift = 12 - grain_bit_depth(fctx) as i32 + fg.grain_scale_shift as i32;
     let ar_coeff_shift = fg.ar_coeff_shift_minus_6 as i32 + 6;
     let rounding_offset = 1i32 << (ar_coeff_shift - 1);
 
@@ -172,12 +170,12 @@ fn generate_chroma_grain_blocks(
     fg: &FilmGrainParams,
     pred_pos: &[(i32, i32, i32)],
     luma_block: &[i32],
-    seed: u16,
+    seed: u16, fctx: &crate::decode::FrameCtx,
 ) -> (Vec<i32>, Vec<i32>) {
-    let (grain_min, grain_max) = grain_range();
+    let (grain_min, grain_max) = grain_range(fctx);
     let mut cb = vec![0i32; (CHROMA_BLOCK_H * CHROMA_BLOCK_W) as usize];
     let mut cr = vec![0i32; (CHROMA_BLOCK_H * CHROMA_BLOCK_W) as usize];
-    let gauss_sec_shift = 12 - grain_bit_depth() as i32 + fg.grain_scale_shift as i32;
+    let gauss_sec_shift = 12 - grain_bit_depth(fctx) as i32 + fg.grain_scale_shift as i32;
     let ar_coeff_shift = fg.ar_coeff_shift_minus_6 as i32 + 6;
     let rounding_offset = 1i32 << (ar_coeff_shift - 1);
 
@@ -336,12 +334,12 @@ fn add_noise_to_block(
     cg_row0: i32,
     cg_col0: i32,
     half_h: i32,
-    half_w: i32,
+    half_w: i32, fctx: &crate::decode::FrameCtx,
 ) {
     let y_stride = picture.width as i32;
     let c_stride = (picture.width / 2) as i32;
     let scaling_shift = fg.grain_scaling_minus_8 as i32 + 8;
-    let bit_depth = grain_bit_depth();
+    let bit_depth = grain_bit_depth(fctx);
     let bd_shift = bit_depth - 8;
     // `(256 << (bit_depth - 8)) - 1`, the scaling-LUT index clamp.
     let index_max = (256i32 << bd_shift) - 1;
@@ -700,9 +698,9 @@ fn ver_overlap_inplace(
     right_row0: i32,
     right_col0: i32,
     width: i32,
-    height: i32,
+    height: i32, fctx: &crate::decode::FrameCtx,
 ) {
-    let (grain_min, grain_max) = grain_range();
+    let (grain_min, grain_max) = grain_range(fctx);
     for h in 0..height {
         if width == 1 {
             let l = at(dst, dst_stride, dst_row0 + h, dst_col0);
@@ -750,9 +748,9 @@ fn hor_overlap_inplace(
     bot_row0: i32,
     bot_col0: i32,
     width: i32,
-    height: i32,
+    height: i32, fctx: &crate::decode::FrameCtx,
 ) {
-    let (grain_min, grain_max) = grain_range();
+    let (grain_min, grain_max) = grain_range(fctx);
     if height == 1 {
         for w in 0..width {
             let t = at(dst, dst_stride, dst_row0, dst_col0 + w);
@@ -800,9 +798,9 @@ fn copy_area(
     src_row0: i32,
     src_col0: i32,
     width: i32,
-    height: i32,
+    height: i32, fctx: &crate::decode::FrameCtx,
 ) {
-    let (grain_min, grain_max) = grain_range();
+    let (grain_min, grain_max) = grain_range(fctx);
     for h in 0..height {
         for w in 0..width {
             let v = at(src, src_stride, src_row0 + h, src_col0 + w);
@@ -830,13 +828,13 @@ pub(crate) fn apply_grain(
     picture: &Picture,
     fg: &FilmGrainParams,
     mc_identity: bool,
-    bit_depth: u32,
+    bit_depth: u32, fctx: &crate::decode::FrameCtx,
 ) -> Picture {
     let mut out = picture.clone();
     if !fg.apply_grain {
         return out;
     }
-    GRAIN_BIT_DEPTH.with(|c| c.set(bit_depth));
+    fctx.grain_bit_depth.with(|c| c.set(bit_depth));
     GRAIN_HITS.with(|c| c.set(c.get() + 1));
     let width = out.width as i32;
     let height = out.height as i32;
@@ -848,9 +846,9 @@ pub(crate) fn apply_grain(
     let pred_chroma = build_pred_pos(lag, fg.num_y_points > 0);
 
     let mut rng = Rng::raw(fg.grain_seed);
-    let luma_template = generate_luma_grain_block(fg, &pred_luma, &mut rng);
+    let luma_template = generate_luma_grain_block(fg, &pred_luma, &mut rng, fctx);
     let (cb_template, cr_template) =
-        generate_chroma_grain_blocks(fg, &pred_chroma, &luma_template, fg.grain_seed);
+        generate_chroma_grain_blocks(fg, &pred_chroma, &luma_template, fg.grain_seed, fctx);
 
     let scaling_y = build_scaling_lut(
         &fg.point_y_value,
@@ -874,7 +872,7 @@ pub(crate) fn apply_grain(
         )
     };
 
-    let expand_bd = grain_bit_depth();
+    let expand_bd = grain_bit_depth(fctx);
     let scaling_y = expand_scaling_lut(&scaling_y, expand_bd);
     let scaling_cb = expand_scaling_lut(&scaling_cb, expand_bd);
     let scaling_cr = expand_scaling_lut(&scaling_cr, expand_bd);
@@ -914,7 +912,7 @@ pub(crate) fn apply_grain(
                     luma_off_y,
                     luma_off_x,
                     2,
-                    h_count,
+                    h_count, fctx,
                 );
                 let hc_count = (CHROMA_SUBBLOCK + 1).min((height - (y << 1)) >> 1);
                 ver_overlap_inplace(
@@ -927,7 +925,7 @@ pub(crate) fn apply_grain(
                     chroma_off_y,
                     chroma_off_x,
                     1,
-                    hc_count,
+                    hc_count, fctx,
                 );
                 ver_overlap_inplace(
                     &mut cr_col_buf,
@@ -939,7 +937,7 @@ pub(crate) fn apply_grain(
                     chroma_off_y,
                     chroma_off_x,
                     1,
-                    hc_count,
+                    hc_count, fctx,
                 );
 
                 let i = if y != 0 { 1 } else { 0 };
@@ -962,7 +960,7 @@ pub(crate) fn apply_grain(
                     i,
                     0,
                     (LUMA_SUBBLOCK >> 1).min(height / 2 - y) - i,
-                    1,
+                    1, fctx,
                 );
             }
 
@@ -978,7 +976,7 @@ pub(crate) fn apply_grain(
                         0,
                         0,
                         2,
-                        2,
+                        2, fctx,
                     );
                     hor_overlap_inplace(
                         &mut cb_line_buf,
@@ -990,7 +988,7 @@ pub(crate) fn apply_grain(
                         0,
                         0,
                         1,
-                        1,
+                        1, fctx,
                     );
                     hor_overlap_inplace(
                         &mut cr_line_buf,
@@ -1002,7 +1000,7 @@ pub(crate) fn apply_grain(
                         0,
                         0,
                         1,
-                        1,
+                        1, fctx,
                     );
                 }
                 let lcol0 = if x != 0 { (x + 1) << 1 } else { 0 };
@@ -1018,7 +1016,7 @@ pub(crate) fn apply_grain(
                     luma_off_y,
                     luma_off_x + if x != 0 { 2 } else { 0 },
                     lw,
-                    2,
+                    2, fctx,
                 );
                 let cw = (CHROMA_SUBBLOCK - (if x != 0 { 1 } else { 0 })).min((width - lcol0) >> 1);
                 hor_overlap_inplace(
@@ -1031,7 +1029,7 @@ pub(crate) fn apply_grain(
                     chroma_off_y,
                     chroma_off_x + if x != 0 { 1 } else { 0 },
                     cw,
-                    1,
+                    1, fctx,
                 );
                 hor_overlap_inplace(
                     &mut cr_line_buf,
@@ -1043,7 +1041,7 @@ pub(crate) fn apply_grain(
                     chroma_off_y,
                     chroma_off_x + if x != 0 { 1 } else { 0 },
                     cw,
-                    1,
+                    1, fctx,
                 );
 
                 add_noise_to_block(
@@ -1065,7 +1063,7 @@ pub(crate) fn apply_grain(
                     0,
                     x,
                     1,
-                    (LUMA_SUBBLOCK >> 1).min(width / 2 - x),
+                    (LUMA_SUBBLOCK >> 1).min(width / 2 - x), fctx,
                 );
             }
 
@@ -1090,7 +1088,7 @@ pub(crate) fn apply_grain(
                 chroma_off_y + i,
                 chroma_off_x + j,
                 (LUMA_SUBBLOCK >> 1).min(height / 2 - y) - i,
-                (LUMA_SUBBLOCK >> 1).min(width / 2 - x) - j,
+                (LUMA_SUBBLOCK >> 1).min(width / 2 - x) - j, fctx,
             );
 
             if overlap {
@@ -1105,7 +1103,7 @@ pub(crate) fn apply_grain(
                         LUMA_SUBBLOCK,
                         0,
                         2,
-                        2,
+                        2, fctx,
                     );
                     copy_area(
                         &mut cb_line_buf,
@@ -1117,7 +1115,7 @@ pub(crate) fn apply_grain(
                         CHROMA_SUBBLOCK,
                         0,
                         1,
-                        1,
+                        1, fctx,
                     );
                     copy_area(
                         &mut cr_line_buf,
@@ -1129,7 +1127,7 @@ pub(crate) fn apply_grain(
                         CHROMA_SUBBLOCK,
                         0,
                         1,
-                        1,
+                        1, fctx,
                     );
                 }
                 let lcol0 = if x != 0 { (x + 1) << 1 } else { 0 };
@@ -1146,7 +1144,7 @@ pub(crate) fn apply_grain(
                     luma_off_y + LUMA_SUBBLOCK,
                     luma_off_x + lcut,
                     LUMA_SUBBLOCK.min(width - (x << 1)) - lcut,
-                    2,
+                    2, fctx,
                 );
                 copy_area(
                     &mut cb_line_buf,
@@ -1158,7 +1156,7 @@ pub(crate) fn apply_grain(
                     chroma_off_y + CHROMA_SUBBLOCK,
                     chroma_off_x + ccut,
                     CHROMA_SUBBLOCK.min((width - (x << 1)) >> 1) - ccut,
-                    1,
+                    1, fctx,
                 );
                 copy_area(
                     &mut cr_line_buf,
@@ -1170,7 +1168,7 @@ pub(crate) fn apply_grain(
                     chroma_off_y + CHROMA_SUBBLOCK,
                     chroma_off_x + ccut,
                     CHROMA_SUBBLOCK.min((width - (x << 1)) >> 1) - ccut,
-                    1,
+                    1, fctx,
                 );
 
                 let h_count = (LUMA_SUBBLOCK + 2).min(height - (y << 1));
@@ -1184,7 +1182,7 @@ pub(crate) fn apply_grain(
                     luma_off_y,
                     luma_off_x + LUMA_SUBBLOCK,
                     2,
-                    h_count,
+                    h_count, fctx,
                 );
                 let hc_count = (CHROMA_SUBBLOCK + 1).min((height - (y << 1)) >> 1);
                 copy_area(
@@ -1197,7 +1195,7 @@ pub(crate) fn apply_grain(
                     chroma_off_y,
                     chroma_off_x + CHROMA_SUBBLOCK,
                     1,
-                    hc_count,
+                    hc_count, fctx,
                 );
                 copy_area(
                     &mut cr_col_buf,
@@ -1209,7 +1207,7 @@ pub(crate) fn apply_grain(
                     chroma_off_y,
                     chroma_off_x + CHROMA_SUBBLOCK,
                     1,
-                    hc_count,
+                    hc_count, fctx,
                 );
             }
 
