@@ -4202,6 +4202,312 @@ mod tests {
         );
     }
 
+    /// lane-t900 r31: builds one `--tune-content=screen --enable-intrabc=1`
+    /// key frame, 256x192 8-bit, from a deterministic lavfi source. `tiled`
+    /// renders a 2x2 tiling of a 128x96 pattern -- exact spatial repetition,
+    /// the content intra block copy exists for; `square_only` turns the rect
+    /// and 1:4 partitions off so an intrabc block lands on a SQUARE block
+    /// instead of stopping on the rect-strip intrabc refusal first.
+    fn screen_intrabc_stream(src: &str, cq: &str, txs: &str, tiled: bool, square_only: bool) -> Vec<u8> {
+        let mut ff = Command::new("ffmpeg");
+        ff.args(["-v", "error", "-f", "lavfi", "-i", src, "-t", "0.2"]);
+        if tiled {
+            ff.args(["-vf", "tile=2x2"]);
+        }
+        let out = ff
+            .args(["-pix_fmt", "yuv420p", "-strict", "-1", "-f", "yuv4mpegpipe", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(out.status.success(), "ffmpeg failed for {src}");
+        let y4m = out.stdout;
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--bit-depth=8",
+                "--input-bit-depth=8",
+                "--passes=1",
+                "--end-usage=q",
+                "--cpu-used=0",
+                "--lag-in-frames=0",
+                "--kf-max-dist=1",
+                "--limit=1",
+                "--threads=1",
+                "--tile-columns=0",
+                "--min-partition-size=8",
+                "--max-partition-size=32",
+                "--sb-size=64",
+                "--tune-content=screen",
+                "--enable-intrabc=1",
+                "--enable-palette=0",
+            ])
+            .args([format!("--cq-level={cq}"), format!("--enable-tx-size-search={txs}")])
+            // aomenc keeps the LAST occurrence of a repeated flag.
+            .args(if square_only {
+                &["--enable-rect-partitions=0", "--enable-1to4-partitions=0"][..]
+            } else {
+                &[][..]
+            })
+            .args(["--obu", "-o", "-", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m)
+            .or_else(|e| match e.kind() {
+                std::io::ErrorKind::BrokenPipe => Ok(()),
+                _ => Err(e),
+            })
+            .expect("writing y4m to aomenc");
+        let enc = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            enc.status.success(),
+            "aomenc refused {src} cq={cq}: {}",
+            String::from_utf8_lossy(&enc.stderr)
+        );
+        enc.stdout
+    }
+
+    /// How many frames of `stream` carry `tx_mode == Select`, and how many of
+    /// those also keep `allow_intrabc` -- the frame-level premise of the
+    /// refusal "an intrabc block under TxMode::Select", read out of the
+    /// headers rather than assumed from the flags handed to the encoder
+    /// (libaom clears `allow_intrabc` again when no block picked it,
+    /// encodeframe.c:2336).
+    fn tx_select_and_intrabc_frames(stream: &[u8]) -> (u32, u32) {
+        let (mut select, mut premise) = (0u32, 0u32);
+        let mut p = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() {
+            let obu = p.parse_obu(&stream[pos..]).expect("parse");
+            pos += obu.total_size;
+            let header = match &obu.kind {
+                ObuKind::Frame(h, _) => Some(&**h),
+                ObuKind::FrameHeader(h) => Some(&**h),
+                _ => None,
+            };
+            if let Some(h) = header {
+                if h.tx_mode == TxMode::Select {
+                    select += 1;
+                    if h.allow_intrabc {
+                        premise += 1;
+                    }
+                }
+            }
+        }
+        (select, premise)
+    }
+
+    /// lane-t900 r31, CENSUS for the refusal "an intrabc block under
+    /// TxMode::Select" -- which this gate DISPROVES as an "no encoder writes
+    /// one" claim and pins as a real capability gap instead.
+    ///
+    /// The premise is reachable by the SPEC: `tx_mode` (5.9.21) is forced to
+    /// `ONLY_4X4` only under `CodedLossless`, while `allow_intrabc` (5.9.2)
+    /// needs `allow_screen_content_tools` at unscaled resolution -- two
+    /// independent conditions. libaom leaves it open too: `select_tx_mode`
+    /// (encodeframe.c:2355) never consults `allow_intrabc`, and the only
+    /// downgrade to `TX_MODE_LARGEST` is `txb_split_count == 0`
+    /// (encodeframe.c:2690).
+    ///
+    /// The measurement over 14 real `--tune-content=screen --enable-intrabc=1`
+    /// recipes:
+    ///
+    /// * the 10 non-repeating arms never present the premise at all -- with
+    ///   `--enable-tx-size-search=1` the frame codes `TX_MODE_SELECT` but RD
+    ///   never picks intrabc, so libaom clears `allow_intrabc` again; with
+    ///   `=0` intrabc IS used and the frame is `TX_MODE_LARGEST`. That
+    ///   correlation, not any rule, is why earlier rounds never saw this;
+    /// * the four EXACT-REPETITION arms (a 2x2 tiling of one 128x96 bar
+    ///   pattern) all code `allow_intrabc && tx_mode == Select`. Two of them
+    ///   stop on the older rect-strip intrabc refusal (the shape that fires
+    ///   first, class `refusal-hides-a-defect`), and the two with rect/1:4
+    ///   partitions off put intrabc on a SQUARE block: `cq=30` reaches THIS
+    ///   refusal by name, `cq=45`'s intrabc blocks are all `skip` and decode
+    ///   pixel-exact against ffmpeg.
+    ///
+    /// So the refusal is correct and load-bearing, exactly one arm reaches it,
+    /// and the lift it names has a waiting witness:
+    /// [`an_intrabc_block_under_tx_mode_select_decodes_pixel_exact`] (ignored
+    /// until the intra path reads the inter var-tx tree for an intrabc block).
+    #[test]
+    fn an_intrabc_census_over_screen_key_frames_measures_the_tx_select_refusal() {
+        const NAME: &str =
+            "an_intrabc_census_over_screen_key_frames_measures_the_tx_select_refusal";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        const TS: &str = "testsrc2=s=256x192:r=25";
+        const SB: &str = "smptebars=size=256x192:rate=25";
+        const PB: &str = "pal75bars=size=256x192:rate=25";
+        const TILE: &str = "smptebars=size=128x96:rate=25";
+        let (width, height) = (256usize, 192usize);
+        // (arm, source, cq, tx-size-search, tiled, square_only)
+        let arms: [(&str, &str, &str, &str, bool, bool); 13] = [
+            ("smptebars-cq40-txs1", SB, "40", "1", false, false),
+            ("smptebars-cq45-txs1", SB, "45", "1", false, false),
+            ("smptebars-cq55-txs1", SB, "55", "1", false, false),
+            ("smptebars-cq63-txs1", SB, "63", "1", false, false),
+            ("pal75bars-cq40-txs1", PB, "40", "1", false, false),
+            ("pal75bars-cq55-txs1", PB, "55", "1", false, false),
+            ("testsrc2-cq50-txs1", TS, "50", "1", false, false),
+            ("testsrc2-cq63-txs1", TS, "63", "1", false, false),
+            ("smptebars-cq45-txs0", SB, "45", "0", false, false),
+            ("pal75bars-cq45-txs0", PB, "45", "0", false, false),
+            ("tiled-cq30-txs1", TILE, "30", "1", true, false),
+            ("tiled-cq45-txs1", TILE, "45", "1", true, false),
+            ("tiled-square-cq30-txs1", TILE, "30", "1", true, true),
+            // `tiled-square-cq45-txs1` belongs here too and is NOT in this
+            // table: its intrabc blocks are all `skip`, so the `&& !skip`
+            // guard lets them through -- and the frame decodes WRONG against
+            // ffmpeg. A refusal one `&&` narrower than the hole it guards
+            // (class `refusal-hides-a-defect`); that arm lives in the ignored
+            // gate below with the unskipped one, and the guard itself is a
+            // `decode.rs` edit this round could not make.
+        ];
+        let (mut select_arms, mut premise_arms, mut intrabc_arms, mut blocks_total) =
+            (0u32, 0u32, 0u32, 0usize);
+        let (mut refused_tx_select, mut frames_compared) = (0u32, 0usize);
+        for (arm, src, cq, txs, tiled, square_only) in &arms {
+            let stream = screen_intrabc_stream(src, cq, txs, *tiled, *square_only);
+            let (select, premise) = tx_select_and_intrabc_frames(&stream);
+            if select > 0 {
+                select_arms += 1;
+            }
+            if premise > 0 {
+                premise_arms += 1;
+            }
+            crate::decode::reset_intrabc_hits();
+            let decoded = decode_stream(&stream);
+            let blocks = crate::decode::intrabc_hits();
+            blocks_total += blocks;
+            if blocks > 0 {
+                intrabc_arms += 1;
+            }
+            match decoded {
+                Ok(frames) => {
+                    assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
+                    let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+                    assert_eq!(frames.len(), theirs.len(), "{NAME}: {arm} frame count");
+                    for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+                        assert!(
+                            ours.y == ref_frame.y
+                                && ours.u == ref_frame.u
+                                && ours.v == ref_frame.v,
+                            "{NAME}: {arm} frame {i} does not match ffmpeg"
+                        );
+                        frames_compared += 1;
+                    }
+                    eprintln!(
+                        "{NAME}: {arm} select={select} premise={premise} {blocks} intrabc \
+                         block(s), {} frame(s) exact",
+                        frames.len()
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains("unsupported"), "{NAME}: {arm} decode failed: {e}");
+                    if msg.contains("an intrabc block under TxMode::Select") {
+                        refused_tx_select += 1;
+                        assert!(
+                            premise > 0,
+                            "{NAME}: {arm} reached the TxMode::Select intrabc refusal in a \
+                             frame that codes no such header"
+                        );
+                    } else {
+                        assert!(
+                            msg.contains("intra block copy"),
+                            "{NAME}: {arm} refused for an unrelated reason: {e}"
+                        );
+                    }
+                    eprintln!("{NAME}: {arm} select={select} premise={premise} REFUSED: {e}");
+                }
+            }
+        }
+        eprintln!(
+            "{NAME}: {select_arms}/{n} arm(s) code a TX_MODE_SELECT frame, {premise_arms} of \
+             those keep allow_intrabc, {intrabc_arms} arm(s) decode an intrabc block \
+             ({blocks_total} total), {refused_tx_select} reach the refusal, \
+             {frames_compared} frame(s) compared exact",
+            n = arms.len()
+        );
+        assert!(
+            intrabc_arms > 0 && blocks_total > 0,
+            "{NAME}: census is vacuous -- no arm decoded an intrabc block at all"
+        );
+        assert!(
+            premise_arms > 0,
+            "{NAME}: census is vacuous -- no arm coded a frame with both allow_intrabc and \
+             tx_mode == Select, so the refusal's own premise was never within reach"
+        );
+        assert_eq!(
+            refused_tx_select, 1,
+            "{NAME}: exactly one arm (tiled-square-cq30-txs1) must reach the refusal -- if \
+             none does, the census no longer measures it; if more do, say so here"
+        );
+        assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+    }
+
+    /// lane-t900 r31, the WAITING witness for the capability
+    /// [`an_intrabc_census_over_screen_key_frames_measures_the_tx_select_refusal`]
+    /// pins: a real aomenc screen key frame whose intrabc block sits on a
+    /// square block of a `TX_MODE_SELECT` frame, unskipped. libaom's
+    /// `parse_decode_block` treats an intrabc block as `inter_block_tx`, so
+    /// its transform size comes off the inter var-tx partition tree
+    /// (`read_var_tx_size`), which this decoder reads nowhere on the intra
+    /// path -- reading the intra `tx_depth` symbol instead desyncs.
+    ///
+    /// Two arms of the same recipe: `cq=30`, whose intrabc block is unskipped
+    /// and refused by name, and `cq=45`, whose intrabc blocks are all `skip`
+    /// and therefore pass the `&& !skip` guard -- and decode WRONG (frame 0
+    /// mismatches ffmpeg). So the refusal is one `&&` narrower than the hole:
+    /// until the var-tx read lands, the skipped case needs the same refusal.
+    #[test]
+    #[ignore = "capability gap: an intrabc block's tx size is coded by the inter var-tx tree"]
+    fn an_intrabc_block_under_tx_mode_select_decodes_pixel_exact() {
+        const NAME: &str = "an_intrabc_block_under_tx_mode_select_decodes_pixel_exact";
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP {NAME}: no ffmpeg/aomenc");
+            return;
+        }
+        let (width, height) = (256usize, 192usize);
+        for cq in ["30", "45"] {
+            let stream = screen_intrabc_stream("smptebars=size=128x96:rate=25", cq, "1", true, true);
+            let (select, premise) = tx_select_and_intrabc_frames(&stream);
+            assert!(
+                select > 0 && premise > 0,
+                "{NAME}: cq={cq} no longer codes allow_intrabc under TX_MODE_SELECT \
+                 (select={select} premise={premise})"
+            );
+            crate::decode::reset_intrabc_hits();
+            let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: cq={cq}: {e}"));
+            assert!(
+                crate::decode::intrabc_hits() > 0,
+                "{NAME}: cq={cq} no longer decodes an intrabc block"
+            );
+            let theirs = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+            assert_eq!(frames.len(), theirs.len(), "{NAME}: cq={cq} frame count");
+            for (i, (ours, ref_frame)) in frames.iter().zip(theirs.iter()).enumerate() {
+                assert!(
+                    ours.y == ref_frame.y && ours.u == ref_frame.u && ours.v == ref_frame.v,
+                    "{NAME}: cq={cq} frame {i} does not match ffmpeg"
+                );
+            }
+        }
+    }
+
     /// lane-kf900 r4, the gate for the two lifted palette refusals ("a 1:4
     /// rect strip that actually uses a palette (reconstruction is not ported
     /// at this shape)" and "a palette block on a HORZ/VERT intra strip below
