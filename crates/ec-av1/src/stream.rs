@@ -30868,6 +30868,86 @@ mod tests {
         );
     }
 
+    /// lane-t900 r20 GATE, refusal C -- `"an intra 16x4/4x16 strip inside an
+    /// inter 16x16-level 1:4 partition (its 4:2:0 chroma pair is coded once
+    /// for two strips; only the inter path implements that pairing)"`.
+    ///
+    /// The arm fires for an INTRA footprint with a side below 8 that carries
+    /// no chroma-pair record (`strip16`). Two measurements make that a claim
+    /// rather than a hope:
+    ///
+    /// * the block-shape census: the ONLY sub-8 footprints three real streams
+    ///   present are 16x4 and 4x16 at a 16-px context, i.e. the strips of a
+    ///   16x16-level 1:4 partition -- and that caller sets
+    ///   `INTER_STRIP_CHROMA` for every one of its four strips before the
+    ///   block is decoded, so the record is never missing there;
+    /// * the sibling counter: the SUPPORTED path
+    ///   ([`crate::decode::intra16x4_in_inter_hits`]) fires on both
+    ///   orientations, chroma-paired, inside streams that decode with no
+    ///   refusal at all.
+    ///
+    /// Measured 2026-09-04: 3 streams, 0 refusals, 78 16x4 + 149 4x16 (108
+    /// chroma-paired), and 2 of 2 sub-8 census triples are the 1:4 strips.
+    #[test]
+    fn a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable()
+    {
+        const NAME: &str =
+            "a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable";
+        const REFUSAL: &str = "an intra 16x4/4x16 strip inside an inter 16x16-level 1:4 partition";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let before = crate::decode::intra16x4_in_inter_hits();
+        for name in [
+            "troy_sb128_inter_witness.obu",
+            "intra128_in_inter_witness2.obu",
+            "gm_small_side_witness.obu",
+        ] {
+            let path = dir.join(name);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            if let Err(e) = decode_stream(&stream) {
+                assert!(
+                    !format!("{e}").contains(REFUSAL),
+                    "{NAME}: {name} hit the refusal this gate proves unreachable: {e}"
+                );
+                panic!("{NAME}: {name} refused: {e}");
+            }
+        }
+        let after = crate::decode::intra16x4_in_inter_hits();
+        let fired = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+        assert!(
+            fired.0 > 0 && fired.1 > 0 && fired.2 > 0,
+            "{NAME}: the SUPPORTED intra 16x4/4x16-in-inter path fired {fired:?} \
+             (16x4, 4x16, chroma-paired) -- with a sibling at zero the refusal's claim is \
+             untested from the other side"
+        );
+        let sub8: Vec<(usize, usize, usize)> = crate::decode::INTER_BLOCK_SHAPES
+            .iter()
+            .copied()
+            .filter(|&(_, w, h)| w.min(h) < 8)
+            .collect();
+        assert_eq!(
+            sub8,
+            vec![(16, 4, 16), (16, 16, 4)],
+            "{NAME}: the sub-8 footprints the inter path presents are no longer just the \
+             16x16-level 1:4 strips, whose caller always records the chroma pair -- the \
+             refusal's domain changed"
+        );
+        let mask = crate::decode::inter_block_shape_mask();
+        for (i, &(side, w, h)) in crate::decode::INTER_BLOCK_SHAPES.iter().enumerate() {
+            if w.min(h) < 8 {
+                assert!(
+                    mask & (1u32 << i) != 0,
+                    "{NAME}: {side}: {w}x{h} never decoded -- the sub-8 census is vacuous"
+                );
+            }
+        }
+        eprintln!(
+            "{NAME}: 3 streams, 0 refusals, intra16x4_in_inter 16x4={} 4x16={} chroma_ref={}, \
+             sub-8 census triples {sub8:?}",
+            fired.0, fired.1, fired.2
+        );
+    }
+
     /// lane-t900 r10: the small-side GLOBALMV / rect warp-reach witness.
     /// `crates/ec-av1/fixtures/gm_small_side_witness.obu`, 1158066 bytes,
     /// sha256 `f1cdbcbb8d6d469c7957d70252ab42b24ab75f48a717600ffa25991458775dca`:
