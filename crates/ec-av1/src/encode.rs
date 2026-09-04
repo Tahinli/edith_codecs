@@ -1859,9 +1859,9 @@ fn prune_top_k() -> Option<usize> {
     }
 }
 
-/// A per-thread override [`prune_top_k`] checks first, so one test can sweep
-/// `top_k` in-process without mutating the environment (forbidden here --
-/// `#![forbid(unsafe_code)]` -- and racy across parallel tests besides).
+// A per-thread override [`prune_top_k`] checks first, so one test can sweep
+// `top_k` in-process without mutating the environment (forbidden here --
+// `#![forbid(unsafe_code)]` -- and racy across parallel tests besides).
 #[cfg(test)]
 thread_local! {
     static TEST_TOP_K_OVERRIDE: std::cell::Cell<Option<Option<usize>>> =
@@ -1898,8 +1898,8 @@ fn prune_top_k_inter() -> Option<usize> {
     }
 }
 
-/// A per-thread override [`prune_top_k_inter`] checks first, same reason as
-/// [`TEST_TOP_K_OVERRIDE`].
+// A per-thread override [`prune_top_k_inter`] checks first, same reason as
+// [`TEST_TOP_K_OVERRIDE`].
 #[cfg(test)]
 thread_local! {
     static TEST_TOP_K_OVERRIDE_INTER: std::cell::Cell<Option<Option<usize>>> =
@@ -1920,14 +1920,14 @@ fn set_test_top_k_override_inter(value: Option<usize>) {
 /// pruning them costs less quality here.
 const INTER_PRUNE_TOP_K: Option<usize> = Some(3);
 
-/// Per-thread nanosecond counters `stage_timing_breakdown_inter` (and
-/// [`crate::mc::predict`], through [`stage_add`]) accumulate into, so an
-/// inter frame's cost can be attributed to a bucket without changing what
-/// the search actually does. Index: 0 = whole-call time inside
-/// [`motion::search`] (includes bucket 1's time, run from inside it), 1 =
-/// [`crate::mc::predict`] (every call, from the motion search's own
-/// candidates and from a committed inter block's final prediction alike),
-/// 2 = `forward_and_quantize` + `dequant_and_inverse`, 3 = `coeff_bits`.
+// Per-thread nanosecond counters `stage_timing_breakdown_inter` (and
+// [`crate::mc::predict`], through [`stage_add`]) accumulate into, so an
+// inter frame's cost can be attributed to a bucket without changing what
+// the search actually does. Index: 0 = whole-call time inside
+// [`motion::search`] (includes bucket 1's time, run from inside it), 1 =
+// [`crate::mc::predict`] (every call, from the motion search's own
+// candidates and from a committed inter block's final prediction alike),
+// 2 = `forward_and_quantize` + `dequant_and_inverse`, 3 = `coeff_bits`.
 #[cfg(test)]
 thread_local! {
     static STAGE_NS: [std::cell::Cell<u64>; 4] = [
@@ -3512,7 +3512,7 @@ mod tests {
             x: usize,
             y: usize,
             width: usize,
-            height: usize, fctx: &crate::decode::FrameCtx,
+            height: usize, _fctx: &crate::decode::FrameCtx,
         ) -> (bool, bool) {
             let (bw_log2, bh_log2) = ((bw / 4).ilog2() as usize, (bh / 4).ilog2() as usize);
             let (_bw_unit, bh_unit) = (bw / 4, bh / 4);
@@ -3992,7 +3992,7 @@ mod tests {
         // col_off==0 (whole-transform) path, with MAX_MIB_SIZE_LOG2 = 5 (a
         // 128px reference grid) pinned as libaom pins it, independent of the
         // 64px superblock this crate actually codes.
-        fn libaom_top_right(side: usize, x: usize, y: usize, width: usize, height: usize) -> bool {
+        fn libaom_top_right(side: usize, x: usize, y: usize, width: usize, _height: usize) -> bool {
             if y == 0 || x + side >= width {
                 return false;
             }
@@ -4017,7 +4017,7 @@ mod tests {
             (table[index / 8] >> (index % 8)) & 1 != 0
         }
 
-        fn libaom_bottom_left(side: usize, x: usize, y: usize, height: usize, fctx: &crate::decode::FrameCtx) -> bool {
+        fn libaom_bottom_left(side: usize, x: usize, y: usize, height: usize, _fctx: &crate::decode::FrameCtx) -> bool {
             if x == 0 || y + side >= height {
                 return false;
             }

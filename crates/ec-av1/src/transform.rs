@@ -1029,6 +1029,7 @@ pub fn dequant_and_inverse(levels: &[i32], side: usize, bit_depth: u8, q_idx: i3
 /// undo, and nothing else: measuring the network's response to a unit
 /// coefficient at every size gives the same `1 / (8 * sqrt(2))` per unit of
 /// `dqDenom`, which is what [`forward_transform_2d`] divides out.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 fn build_dct_basis(n: usize) -> Vec<f64> {
     let mut basis = vec![0.0f64; n * n];
     let scale = (2.0 / n as f64).sqrt();
@@ -1050,6 +1051,7 @@ fn build_dct_basis(n: usize) -> Vec<f64> {
 /// one of the transform sizes this crate codes (4 to 64, a power of two), so
 /// a small fixed table indexed by `log2(n)` covers every caller without a
 /// hash lookup.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 fn dct_basis(n: usize) -> &'static [f64] {
     use std::sync::OnceLock;
     // log2(4)=2 .. log2(64)=6, so index by trailing_zeros() - 2.
