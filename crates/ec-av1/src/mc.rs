@@ -248,7 +248,8 @@ fn sample(
 /// checked against them by `simd_matches_scalar_*` -- and every non-x86_64
 /// build, plus any x86_64 CPU without AVX2 or SSE4.1, decodes through them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SimdLevel {
+#[allow(dead_code)] // every variant is constructed only on x86_64
+pub(crate) enum SimdLevel {
     Scalar,
     /// `_mm_madd_epi16` (SSE2) horizontal pass, `_mm_mullo_epi32` (SSE4.1)
     /// vertical pass -- the pair is gated on SSE4.1, the later of the two.
@@ -257,7 +258,7 @@ enum SimdLevel {
 }
 
 /// The level, detected once per process (spec-irrelevant: pure dispatch).
-fn simd_level() -> SimdLevel {
+pub(crate) fn simd_level() -> SimdLevel {
     static LEVEL: std::sync::OnceLock<SimdLevel> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
         #[cfg(target_arch = "x86_64")]
@@ -322,6 +323,7 @@ fn hpass_contig_scalar(src: &[u16], t16: &[i16; 8], out: &mut [i32]) {
 /// scalar function's arithmetic, lane-parallel, with identical rounding.
 #[allow(unsafe_code)]
 #[cfg(target_arch = "x86_64")]
+#[allow(unsafe_op_in_unsafe_fn)] // each kernel's whole body is its contract
 mod simd {
     use super::{round2, INTER_ROUND_0};
     use std::arch::x86_64::*;

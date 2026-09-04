@@ -444,12 +444,120 @@ fn add_noise_to_block(
             let grow = ((lg_row0 + i) * lg_stride + lg_col0) as usize;
             let pixels = &mut picture.y[prow..prow + width];
             let grain = &luma_grain[grow..grow + width];
-            for (p, &g) in pixels.iter_mut().zip(grain) {
-                let delta =
-                    (scaling_y[*p as usize] * g + rounding_offset) >> scaling_shift;
-                *p = ((*p as i32 + delta).clamp(min_luma, max_luma)) as u16;
-            }
+            luma_noise_row(
+                pixels, grain, scaling_y, rounding_offset, scaling_shift, min_luma, max_luma,
+            );
         }
+    }
+}
+
+/// lane-perf5: the luma noise row (spec 7.18.3.5's `add_noise_to_block` luma
+/// arm), 7% of a 1080p decode with film grain. AVX2 does 8 samples at a time
+/// -- the scaling-LUT read is a `vpgatherdd`, the rest is the same i32
+/// multiply, `Round2` and clip; every other CPU runs the scalar loop, which
+/// stays the reference (`simd_matches_scalar_luma_noise_row` pins the pair).
+#[allow(unsafe_code)]
+fn luma_noise_row(
+    pixels: &mut [u16],
+    grain: &[i32],
+    scaling: &[i32],
+    rounding_offset: i32,
+    scaling_shift: i32,
+    min_luma: i32,
+    max_luma: i32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
+        // SAFETY: reached only when the CPU reports avx2; the kernel reads
+        // `grain[..pixels.len()]` and gathers only in-range LUT entries.
+        unsafe {
+            simd::luma_noise_row_avx2(
+                pixels, grain, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
+            )
+        };
+        return;
+    }
+    luma_noise_row_scalar(
+        pixels, grain, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
+    );
+}
+
+/// The scalar reference for [`luma_noise_row`].
+fn luma_noise_row_scalar(
+    pixels: &mut [u16],
+    grain: &[i32],
+    scaling: &[i32],
+    rounding_offset: i32,
+    scaling_shift: i32,
+    min_luma: i32,
+    max_luma: i32,
+) {
+    for (p, &g) in pixels.iter_mut().zip(grain) {
+        let delta = (scaling[*p as usize] * g + rounding_offset) >> scaling_shift;
+        *p = ((*p as i32 + delta).clamp(min_luma, max_luma)) as u16;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+#[allow(unsafe_op_in_unsafe_fn)] // each kernel's whole body is its contract
+mod simd {
+    use std::arch::x86_64::*;
+
+    /// [`super::luma_noise_row`]'s AVX2 kernel, 8 samples per iteration.
+    ///
+    /// The gather index is clamped to the LUT's last entry. The scalar form
+    /// indexes unclamped -- it would panic rather than read out of bounds --
+    /// so the clamp is only a bound on the load: the LUT covers the whole
+    /// sample range the grain bit depth allows, so a real decode never
+    /// reaches it, and the two forms agree wherever the scalar one does not
+    /// panic.
+    ///
+    /// # Safety
+    /// Requires AVX2; `grain` must be at least `pixels.len()` long and
+    /// `scaling` non-empty.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn luma_noise_row_avx2(
+        pixels: &mut [u16],
+        grain: &[i32],
+        scaling: &[i32],
+        rounding_offset: i32,
+        scaling_shift: i32,
+        min_luma: i32,
+        max_luma: i32,
+    ) {
+        let n = pixels.len().min(grain.len());
+        let last = _mm256_set1_epi32(scaling.len() as i32 - 1);
+        let rnd = _mm256_set1_epi32(rounding_offset);
+        let sh = _mm_cvtsi32_si128(scaling_shift);
+        let lo = _mm256_set1_epi32(min_luma);
+        let hi = _mm256_set1_epi32(max_luma);
+        let pp = pixels.as_mut_ptr();
+        let gp = grain.as_ptr();
+        let mut c = 0usize;
+        while c + 8 <= n {
+            let p16 = _mm_loadu_si128(pp.add(c).cast());
+            let p32 = _mm256_cvtepu16_epi32(p16);
+            let idx = _mm256_min_epi32(p32, last);
+            let s = _mm256_i32gather_epi32(scaling.as_ptr(), idx, 4);
+            let g = _mm256_loadu_si256(gp.add(c).cast());
+            let delta = _mm256_sra_epi32(_mm256_add_epi32(_mm256_mullo_epi32(s, g), rnd), sh);
+            let v = _mm256_max_epi32(
+                _mm256_min_epi32(_mm256_add_epi32(p32, delta), hi),
+                lo,
+            );
+            // Every lane is already inside `[min_luma, max_luma]`, so the
+            // unsigned saturation of `packus` is exact; `permute4x64` undoes
+            // the pack's per-128-bit-lane interleave.
+            let packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(v, v), 0b0000_1000);
+            _mm_storeu_si128(pp.add(c).cast(), _mm256_castsi256_si128(packed));
+            c += 8;
+        }
+        super::luma_noise_row_scalar(
+            &mut pixels[c..], &grain[c..], scaling, rounding_offset, scaling_shift, min_luma,
+            max_luma,
+        );
     }
 }
 
@@ -986,4 +1094,63 @@ pub(crate) fn apply_grain(
     }
 
     out
+}
+
+#[cfg(test)]
+mod perf5_tests {
+    /// lane-perf5: the AVX2 luma-noise kernel against the scalar reference it
+    /// replaces, over the domain a decode hands it -- 8/10/12-bit sample and
+    /// LUT ranges, both grain signs, every `grain_scaling_minus_8` shift, the
+    /// restricted and full clip ranges, and row lengths that exercise the
+    /// 8-lane body and every tail length.
+    #[test]
+    fn simd_matches_scalar_luma_noise_row() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut checked = 0usize;
+        for bd_shift in 0..3u32 {
+            let lut_len = 256usize << bd_shift;
+            let sample_max = (lut_len - 1) as u16;
+            let scaling: Vec<i32> = (0..lut_len).map(|_| (rng() % 256) as i32).collect();
+            for scaling_shift in 8..12i32 {
+                let rounding_offset = 1i32 << (scaling_shift - 1);
+                for &(lo, hi) in &[(0i32, sample_max as i32), (16 << bd_shift, 235 << bd_shift)] {
+                    for len in [1usize, 4, 7, 8, 9, 16, 31, 32, 64, 128] {
+                        let pixels: Vec<u16> =
+                            (0..len).map(|_| (rng() % (u64::from(sample_max) + 1)) as u16).collect();
+                        let grain: Vec<i32> =
+                            (0..len).map(|_| (rng() % 513) as i32 - 256).collect();
+                        let mut want = pixels.clone();
+                        super::luma_noise_row_scalar(
+                            &mut want, &grain, &scaling, rounding_offset, scaling_shift, lo, hi,
+                        );
+                        let mut got = pixels.clone();
+                        super::luma_noise_row(
+                            &mut got, &grain, &scaling, rounding_offset, scaling_shift, lo, hi,
+                        );
+                        assert_eq!(got, want, "dispatch len={len} shift={scaling_shift}");
+                        #[cfg(target_arch = "x86_64")]
+                        if std::arch::is_x86_feature_detected!("avx2") {
+                            let mut avx = pixels.clone();
+                            #[allow(unsafe_code)]
+                            unsafe {
+                                super::simd::luma_noise_row_avx2(
+                                    &mut avx, &grain, &scaling, rounding_offset, scaling_shift,
+                                    lo, hi,
+                                )
+                            };
+                            assert_eq!(avx, want, "avx2 len={len} shift={scaling_shift}");
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 4 * 2 * 10);
+    }
 }
