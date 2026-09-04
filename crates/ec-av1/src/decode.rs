@@ -14351,6 +14351,81 @@ fn sub_tx_size_map_matches_libaom() {
     }
 }
 
+/// The domain of var-tx leaf sizes, enumerated against the two refusals that
+/// name a leaf "larger than 32x32" / "larger than 64x64".
+///
+/// [`read_var_tx_size`] emits a leaf in exactly three places, and each one is
+/// either the unit it was entered with or a `sub_tx_size_map` step below it:
+/// the depth cap, the `!split` return, and libaom's `sub_txs == TX_4X4` early
+/// return. So the leaf set reachable from an entry unit is that unit plus the
+/// chain of `sub_tx_size_map` steps under it, capped at `MAX_VARTX_DEPTH` --
+/// which this test enumerates, and over which no leaf is ever larger than the
+/// entry.
+///
+/// That closes both refusals:
+///
+/// * [`read_block_tx_size_rect`]'s `bw.max(bh) > 64` branch enters every unit
+///   at TX_64X64 (`max_txsize_rect_lookup[BLOCK_128X64]`), so "larger than
+///   64x64" names a leaf the tree cannot produce;
+/// * [`read_block_tx_size`] enters at `side.min(64)` with a ceiling of 32
+///   below the 128 root. The only entry that exceeds that ceiling is 64x64,
+///   reached only when `side == 64`, and then the block is ONE unit whose only
+///   above-ceiling leaf is the whole 64x64 unit itself -- which is the `single`
+///   case the refusal is guarded by.
+#[test]
+fn a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered() {
+    // Every leaf `read_var_tx_size` can reach from `entry`, as (depth, w, h).
+    fn reachable(entry: (usize, usize), depth: usize, out: &mut Vec<(usize, usize, usize)>) {
+        out.push((depth, entry.0, entry.1));
+        if depth == MAX_VARTX_DEPTH {
+            return;
+        }
+        let sub = sub_tx_size_map(entry.0, entry.1);
+        if sub == (4, 4) {
+            out.push((depth + 1, 4, 4));
+            return;
+        }
+        reachable(sub, depth + 1, out);
+    }
+
+    for entry in [(4, 4), (8, 8), (16, 16), (32, 32), (64, 64)] {
+        let mut leaves = Vec::new();
+        reachable(entry, 0, &mut leaves);
+        for (depth, w, h) in &leaves {
+            assert!(
+                w.max(h) <= &entry.0.max(entry.1),
+                "a {}x{} unit reaches a {w}x{h} leaf at depth {depth}",
+                entry.0,
+                entry.1
+            );
+        }
+        // Above-ceiling leaves of a 64x64 entry: the entry itself, at depth 0.
+        if entry == (64, 64) {
+            let above: Vec<&(usize, usize, usize)> =
+                leaves.iter().filter(|(_, w, h)| w.max(h) > &32).collect();
+            assert_eq!(above, [&(0usize, 64usize, 64usize)], "64x64 entry, leaves above 32");
+        }
+    }
+
+    // The entry size and ceiling each caller uses, over the block sides that
+    // reach them (`read_block_tx_size`'s square path; the 128-root rect path
+    // enters at a fixed 64).
+    for side in [8usize, 16, 32, 64, 128] {
+        let max_tx = side.min(64);
+        let ceiling = if side > 64 { 64 } else { 32 };
+        let units = (side / max_tx) * (side / max_tx);
+        if max_tx <= ceiling {
+            continue;
+        }
+        assert_eq!(
+            (side, units),
+            (64, 1),
+            "a {side}px block enters var-tx at {max_tx} over a ceiling of {ceiling} in \
+             {units} units -- an above-ceiling leaf there would NOT be the `single` case"
+        );
+    }
+}
+
 /// `read_var_tx_size` (spec 5.11.17, libaom `decodeframe.c`
 /// `read_tx_size_vartx`): the recursive `txfm_split` tree of one
 /// max-transform-sized unit of an inter block, collecting the resolved leaf
