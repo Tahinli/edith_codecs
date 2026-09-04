@@ -16399,10 +16399,6 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         mi_rows as usize,
     );
     let mut lr_grid = crate::restoration::RestorationGrid::new(lr, frame_width, frame_height);
-    let mut lr_reference = [(
-        crate::restoration::WienerInfo::default(),
-        crate::restoration::SgrprojInfo::default(),
-    ); 3];
 
     // lane-tiles r2: each tile gets its own fresh `SymbolDecoder` over its
     // own byte range and its own fresh copy of the frame's initial CDFs
@@ -16430,6 +16426,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         let (sb_r0, sb_r1) = ((mi_row0 / SB_MI).min(sb_rows), mi_row1.div_ceil(SB_MI).min(sb_rows));
         let (sb_c0, sb_c1) = ((mi_col0 / SB_MI).min(sb_cols), mi_col1.div_ceil(SB_MI).min(sb_cols));
 
+        // lane-t900 r19: spec 5.11.2 `decode_tile` resets `RefLrWiener` /
+        // `RefSgrXqd` to the midpoint filter at the top of EVERY tile, not
+        // once per frame. Carried across a tile boundary, the loop-restoration
+        // coefficients of the next tile decode off the previous tile's
+        // reference -- same symbol count, so entropy and reconstruction stay
+        // exact and only the filtered pixels of every tile after the first
+        // are wrong.
+        let mut lr_reference = [(
+            crate::restoration::WienerInfo::default(),
+            crate::restoration::SgrprojInfo::default(),
+        ); 3];
         let mut cdfs = base_cdfs.clone();
         // spec `decode_tile`: `CurrentQIndex` resets to the frame's own
         // `base_q_idx` at the top of every tile, not once per frame.
@@ -27436,10 +27443,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
     let mut lr_grid = crate::restoration::RestorationGrid::new(lr, frame_width, frame_height);
-    let mut lr_reference = [(
-        crate::restoration::WienerInfo::default(),
-        crate::restoration::SgrprojInfo::default(),
-    ); 3];
 
     // lane-tiles r6: mirrors decode_key_frame_tile_with_cdfs's own per-tile
     // loop (spec 5.11.2 decode_tile / 7.20 exit_symbol) -- each tile gets
@@ -27461,6 +27464,17 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             (mi_col0 / SB_MI).min(sb_cols),
             mi_col1.div_ceil(SB_MI).min(sb_cols),
         );
+        // lane-t900 r19: spec 5.11.2 `decode_tile` resets `RefLrWiener` /
+        // `RefSgrXqd` to the midpoint filter at the top of EVERY tile, not
+        // once per frame. Carried across a tile boundary, the loop-restoration
+        // coefficients of the next tile decode off the previous tile's
+        // reference -- same symbol count, so entropy and reconstruction stay
+        // exact and only the filtered pixels of every tile after the first
+        // are wrong.
+        let mut lr_reference = [(
+            crate::restoration::WienerInfo::default(),
+            crate::restoration::SgrprojInfo::default(),
+        ); 3];
         let mut cdfs = base_cdfs.clone();
         CURRENT_Q_IDX.with(|c| c.set(i32::from(base_q_idx)));
         QUANT_DELTAS.with(|c| c.set(deltas));
