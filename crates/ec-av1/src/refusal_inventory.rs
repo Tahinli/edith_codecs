@@ -32,7 +32,6 @@ const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an OBMC neighbour whose switchable interp filter was never recorded",
-    "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
     "a rectangular inter luma transform unit whose shape has no coefficient table set here",
     "a rectangular inter chroma transform unit whose shape has no coefficient table set here",
     "a rectangular transform unit whose shape has no coefficient scan table here",
@@ -142,8 +141,6 @@ const REFUSALS: &[&str] = &[
     // source, and screen content in the forced bands with a NON-screen
     // interior.
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
-    "warp prediction with a scaled reference (superres, unimplemented)",
-    "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
     "a motion_mode symbol for a block shape with no CDF row here",
 ];
 
@@ -349,18 +346,12 @@ const PROVEN: &[(&str, &str)] = &[
         "an OBMC neighbour whose switchable interp filter was never recorded",
         "every_inter_record_publishes_an_obmc_readable_filter",
     ),
-    // lane-t900 r27, census: this one is a REAL capability gap, and the gate
-    // proves it fires by name on real streams -- four fixed-denominator
-    // `--superres-mode=1` encodes (denoms 10/12/16, warped motion and OBMC
-    // on) all stop here, while the two `--superres-mode=3` auto encodes pick
-    // denominator 8 and carry no scaling at all. Its two siblings ("warp
-    // prediction with a scaled reference", "a sub-8x8 inter block under a
-    // scaled reference") stay UNPROVEN: this refusal sits in front of them,
-    // so nothing measures them until the 8x8-leaf gap is lifted.
-    (
-        "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
-        "a_superres_census_over_six_real_streams_records_which_scaled_refusals_fire",
-    ),
+    // lane-t900 r28: all three scaled-reference (superres) refusals -- the
+    // 8x8 partition leaf, the sub-8x8 inter block and warp -- are LIFTED and
+    // gone from this inventory. The gate
+    // `real_superres_streams_with_sub8_leaf8_and_warp_decode_pixel_exact`
+    // decodes both lifted shapes byte-exact vs ffmpeg, and the census now
+    // asserts none of the three strings comes back.
     (
         "a reference picture whose height does not match this frame's own true size",
         "an_inter_frame_shorter_than_its_reference_is_refused_by_name",
