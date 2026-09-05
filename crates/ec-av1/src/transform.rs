@@ -221,6 +221,23 @@ mod simd {
         }
     }
 
+    /// [`super::inverse_dct_fixed`] over eight AVX2 lanes -- the network the
+    /// column pass below runs, reachable on its own for the equivalence gate.
+    ///
+    /// # Safety
+    /// The caller has checked for AVX2 ([`crate::mc::simd_level`]).
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn dct_x8_avx2(t: &mut [M256; 64], n: u32, r: usize) {
+        match n {
+            2 => inverse_dct_n::<M256, 2>(t, r),
+            3 => inverse_dct_n::<M256, 3>(t, r),
+            4 => inverse_dct_n::<M256, 4>(t, r),
+            5 => inverse_dct_n::<M256, 5>(t, r),
+            6 => inverse_dct_n::<M256, 6>(t, r),
+            _ => unreachable!("the inverse DCT is defined for 4..64"),
+        }
+    }
+
     /// The whole DCT column pass of one transform unit: `residual` is the
     /// row-pass output (`h` rows of `w`), `out` the residual it writes.
     ///
@@ -248,14 +265,8 @@ mod simd {
             if _mm256_testz_si256(any, any) == 1 {
                 continue;
             }
-            match log2h {
-                2 => inverse_dct_n::<M256, 2>(&mut t, r),
-                3 => inverse_dct_n::<M256, 3>(&mut t, r),
-                4 => inverse_dct_n::<M256, 4>(&mut t, r),
-                5 => inverse_dct_n::<M256, 5>(&mut t, r),
-                6 => inverse_dct_n::<M256, 6>(&mut t, r),
-                _ => unreachable!("the inverse DCT is defined for 4..64"),
-            }
+            // SAFETY: this function's own AVX2 contract.
+            unsafe { dct_x8_avx2(&mut t, log2h, r) };
             // `round2(v, 4)` on eight lanes: the shift is arithmetic here
             // because the value stays in its own 32-bit lane.
             let rnd = _mm256_set1_epi32(8);
@@ -2165,6 +2176,71 @@ mod tests {
     /// The eight-wide column kernel is the scalar network, lane for lane: a
     /// pseudo-random sweep over the full coefficient range at every size and
     /// both clamp widths (`bit_depth` 8 and 10) has to agree bit for bit, or
+    /// The AVX2 column pass against the scalar network over the FULL `i32`
+    /// range, not only the dequantizer's own bound: the explicit intrinsics
+    /// claim exact 64-bit products, so the sweep includes `i32::MIN`/`MAX`,
+    /// both clamp boundaries at every `r` the decoder uses, and uniform
+    /// full-range noise. A single differing lane at any size would be a
+    /// silent pixel drift on whatever stream first reaches it.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_avx2_dct_matches_the_scalar_one_over_the_full_range() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for n in 2..=6u32 {
+            for &r in &[16usize, 18, 20] {
+                let (hi, lo) = (((1i64 << (r - 1)) - 1) as i32, (-(1i64 << (r - 1))) as i32);
+                let edges = [0, 1, -1, hi, lo, hi - 1, lo + 1, i32::MAX, i32::MIN];
+                for round in 0..96 {
+                    let mut wide = [[0i32; 8]; 64];
+                    let mut cols = [[0i32; 64]; 8];
+                    for i in 0..(1usize << n) {
+                        for l in 0..8 {
+                            let raw = next();
+                            let v = match round % 3 {
+                                // every extreme, and every pair of them
+                                0 => edges[(raw >> 32) as usize % edges.len()],
+                                // uniform over the whole 32-bit range
+                                1 => raw as i32,
+                                // the range a conformant stream stays inside
+                                _ => raw as i32 % (hi / 2 + 1),
+                            };
+                            wide[i][l] = v;
+                            cols[l][i] = v;
+                        }
+                    }
+                    let mut avx = [simd::splat([0i32; 8]); 64];
+                    for i in 0..(1usize << n) {
+                        avx[i] = simd::splat(wide[i]);
+                    }
+                    // SAFETY: guarded by the feature detection above.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        simd::dct_x8_avx2(&mut avx, n, r);
+                    }
+                    for (l, col) in cols.iter_mut().enumerate() {
+                        inverse_dct_fixed(col, n, r);
+                        for i in 0..(1usize << n) {
+                            assert_eq!(
+                                simd::lanes(avx[i])[l],
+                                col[i],
+                                "avx2 lane {l} of entry {i} at n={n} r={r} round={round}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// the column pass would drift from the decoder on some block this
     /// crate's gate streams happen not to contain.
     #[test]
