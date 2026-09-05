@@ -111,11 +111,26 @@ fn clamp_range(x: i32, r: usize) -> i32 {
 /// output share the whole network). The two impls are elementwise-identical
 /// integer arithmetic, so the eight-wide pass is byte-exact with the scalar
 /// one by construction -- the network itself is written once, above.
+// `unsafe fn` only so the AVX2 impl can carry `#[target_feature]` (rustc
+// rejects it on a SAFE trait method); the two scalar impls below require
+// nothing of their caller.
+#[allow(unsafe_code)]
 trait Lane: Copy {
     /// One butterfly rotation's two outputs, at pre-multiplied `cos`/`sin`.
-    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self);
+    ///
+    /// # Safety
+    /// An impl may require CPU features: `M256`'s is `#[target_feature]` AVX2,
+    /// which is the only way its intrinsics compile INLINE -- as plain safe
+    /// methods every `_mm256_*` stayed an out-of-line call (13% of the 4K
+    /// segment's profile). `M256` values exist only inside
+    /// [`simd::column_pass_dct`], which its caller has feature-detected; the
+    /// scalar impls require nothing.
+    unsafe fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self);
     /// One Hadamard rotation's two outputs, clamped to `r` bits.
-    fn had(a: Self, b: Self, r: usize) -> (Self, Self);
+    ///
+    /// # Safety
+    /// As [`Lane::btf`].
+    unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self);
 }
 
 /// `Round2(x, COS_BITS)` on a butterfly's 64-bit product sum.
@@ -123,21 +138,23 @@ fn round_cos(x: i64) -> i32 {
     ((x + (1 << (COS_BITS - 1))) >> COS_BITS) as i32
 }
 
+#[allow(unsafe_code)]
 impl Lane for i32 {
-    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+    unsafe fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
         let (ta, tb) = (i64::from(a), i64::from(b));
         (round_cos(ta * c - tb * s), round_cos(ta * s + tb * c))
     }
 
-    fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
+    unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
         (clamp_range(a.wrapping_add(b), r), clamp_range(a.wrapping_sub(b), r))
     }
 }
 
 /// Eight columns at once. Every operation is the [`i32`] impl's, lane by lane,
 /// which is what the optimiser turns into one vector op per line.
+#[allow(unsafe_code)]
 impl Lane for [i32; 8] {
-    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+    unsafe fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
         let mut x = [0i32; 8];
         let mut y = [0i32; 8];
         for l in 0..8 {
@@ -148,7 +165,7 @@ impl Lane for [i32; 8] {
         (x, y)
     }
 
-    fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
+    unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
         let mut x = [0i32; 8];
         let mut y = [0i32; 8];
         for l in 0..8 {
@@ -182,42 +199,38 @@ mod simd {
         /// bits (`|a| < 2^31`, `|c| <= 2^12`), and only the low 32 bits of the
         /// shifted sum are kept -- which is what the scalar `as i32` keeps, so
         /// the logical shift below stands in for the arithmetic one exactly.
-        #[inline(always)]
-        fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
-            unsafe {
-                let cv = _mm256_set1_epi32(c as i32);
-                let sv = _mm256_set1_epi32(s as i32);
-                let rnd = _mm256_set1_epi64x(1 << (COS_BITS - 1));
-                let (ae, be) = (a.0, b.0);
-                let (ao, bo) = (_mm256_shuffle_epi32(a.0, 0xB1), _mm256_shuffle_epi32(b.0, 0xB1));
-                let half = |x: __m256i, y: __m256i, u: __m256i, v: __m256i| {
-                    let p = _mm256_sub_epi64(_mm256_mul_epi32(x, u), _mm256_mul_epi32(y, v));
-                    let q = _mm256_add_epi64(_mm256_mul_epi32(x, v), _mm256_mul_epi32(y, u));
-                    (
-                        _mm256_srli_epi64::<{ COS_BITS as i32 }>(_mm256_add_epi64(p, rnd)),
-                        _mm256_srli_epi64::<{ COS_BITS as i32 }>(_mm256_add_epi64(q, rnd)),
-                    )
-                };
-                let (xe, ye) = half(ae, be, cv, sv);
-                let (xo, yo) = half(ao, bo, cv, sv);
+        #[target_feature(enable = "avx2")]
+        unsafe fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+            let cv = _mm256_set1_epi32(c as i32);
+            let sv = _mm256_set1_epi32(s as i32);
+            let rnd = _mm256_set1_epi64x(1 << (COS_BITS - 1));
+            let (ae, be) = (a.0, b.0);
+            let (ao, bo) = (_mm256_shuffle_epi32(a.0, 0xB1), _mm256_shuffle_epi32(b.0, 0xB1));
+            let half = |x: __m256i, y: __m256i, u: __m256i, v: __m256i| {
+                let p = _mm256_sub_epi64(_mm256_mul_epi32(x, u), _mm256_mul_epi32(y, v));
+                let q = _mm256_add_epi64(_mm256_mul_epi32(x, v), _mm256_mul_epi32(y, u));
                 (
-                    M256(_mm256_blend_epi32::<0xAA>(xe, _mm256_slli_epi64::<32>(xo))),
-                    M256(_mm256_blend_epi32::<0xAA>(ye, _mm256_slli_epi64::<32>(yo))),
+                    _mm256_srli_epi64::<{ COS_BITS as i32 }>(_mm256_add_epi64(p, rnd)),
+                    _mm256_srli_epi64::<{ COS_BITS as i32 }>(_mm256_add_epi64(q, rnd)),
                 )
-            }
+            };
+            let (xe, ye) = half(ae, be, cv, sv);
+            let (xo, yo) = half(ao, bo, cv, sv);
+            (
+                M256(_mm256_blend_epi32::<0xAA>(xe, _mm256_slli_epi64::<32>(xo))),
+                M256(_mm256_blend_epi32::<0xAA>(ye, _mm256_slli_epi64::<32>(yo))),
+            )
         }
 
-        #[inline(always)]
-        fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
-            unsafe {
-                let hi = _mm256_set1_epi32(((1i64 << (r - 1)) - 1) as i32);
-                let lo = _mm256_set1_epi32((-(1i64 << (r - 1))) as i32);
-                let clamp = |v| _mm256_min_epi32(_mm256_max_epi32(v, lo), hi);
-                (
-                    M256(clamp(_mm256_add_epi32(a.0, b.0))),
-                    M256(clamp(_mm256_sub_epi32(a.0, b.0))),
-                )
-            }
+        #[target_feature(enable = "avx2")]
+        unsafe fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
+            let hi = _mm256_set1_epi32(((1i64 << (r - 1)) - 1) as i32);
+            let lo = _mm256_set1_epi32((-(1i64 << (r - 1))) as i32);
+            let clamp = |v| _mm256_min_epi32(_mm256_max_epi32(v, lo), hi);
+            (
+                M256(clamp(_mm256_add_epi32(a.0, b.0))),
+                M256(clamp(_mm256_sub_epi32(a.0, b.0))),
+            )
         }
     }
 
@@ -298,7 +311,10 @@ mod simd {
 #[inline(always)]
 fn butterfly<T: Lane>(t: &mut [T; 64], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
     let (c, s) = (i64::from(cos128(angle)), i64::from(sin128(angle)));
-    let (x, y) = T::btf(t[a], t[b], c, s);
+    // SAFETY: [`Lane::btf`] -- an `M256` reaches here only from the
+    // feature-detected [`simd::column_pass_dct`].
+    #[allow(unsafe_code)]
+    let (x, y) = unsafe { T::btf(t[a], t[b], c, s) };
     t[a] = x;
     t[b] = y;
     if flip {
@@ -311,7 +327,9 @@ fn butterfly<T: Lane>(t: &mut [T; 64], a: usize, b: usize, angle: i32, flip: boo
 #[inline(always)]
 fn hadamard<T: Lane>(t: &mut [T; 64], a: usize, b: usize, flip: bool, r: usize) {
     let (a, b) = if flip { (b, a) } else { (a, b) };
-    let (x, y) = T::had(t[a], t[b], r);
+    // SAFETY: as [`butterfly`]'s.
+    #[allow(unsafe_code)]
+    let (x, y) = unsafe { T::had(t[a], t[b], r) };
     t[a] = x;
     t[b] = y;
 }
