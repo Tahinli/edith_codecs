@@ -2162,7 +2162,11 @@ impl<'a> Pred<'a> {
 /// [`Pred`], resolved into what a recorded op carries.
 pub(crate) enum PredSrc {
     Owned(Vec<u16>),
-    Cur { plane: usize, off: usize },
+    /// A window of the block prediction: its plane, its offset, and the
+    /// stride it is read at -- which is the block's, not necessarily the
+    /// op's (a transform unit's residual stays dense, so the worker takes
+    /// its window out of the block prediction itself).
+    Cur { plane: usize, off: usize, src: usize },
 }
 
 /// One block's whole-block prediction build, deferred to a recon worker.
@@ -2639,7 +2643,8 @@ fn push_mc_rect_owned(
         None => {
             let Pred::Cur { plane: sp, stride: ss, off } = prediction else { unreachable!() };
             push_op(fctx, ReconOp::Mc {
-                plane, x, y, stride: ss, w, h, prediction: PredSrc::Cur { plane: sp, off },
+                plane, x, y, stride: ss, w, h,
+                prediction: PredSrc::Cur { plane: sp, off, src: ss },
                 residual: Residual::Done(residual),
             });
             return;
@@ -2712,7 +2717,8 @@ fn push_mc_rect(
         None => {
             let Pred::Cur { plane: sp, stride: ss, off } = prediction else { unreachable!() };
             push_op(fctx, ReconOp::Mc {
-                plane, x, y, stride: ss, w, h, prediction: PredSrc::Cur { plane: sp, off },
+                plane, x, y, stride: ss, w, h,
+                prediction: PredSrc::Cur { plane: sp, off, src: ss },
                 residual: Residual::Done(residual.to_vec()),
             });
             return;
@@ -2785,9 +2791,10 @@ fn push_mc_rect_tx(
         None => {
             let Pred::Cur { plane: sp, stride: ss, off } = prediction else { unreachable!() };
             let mut tx = tx;
-            tx.stride = ss;
+            tx.stride = 0;
             push_op(fctx, ReconOp::Mc {
-                plane, x, y, stride: ss, w, h, prediction: PredSrc::Cur { plane: sp, off },
+                plane, x, y, stride: w, w, h,
+                prediction: PredSrc::Cur { plane: sp, off, src: ss },
                 residual: Residual::Coeffs(tx, grid.to_vec()),
             });
             return;
@@ -2884,10 +2891,21 @@ fn exec_op(
                 PredSrc::Owned(p) => {
                     exec_mc(y, u, v, plane, x, oy, stride, w, h, &p, &residual, fctx);
                 }
-                PredSrc::Cur { plane: sp, off } => {
-                    let src = std::mem::take(&mut cur[sp]);
-                    exec_mc(y, u, v, plane, x, oy, stride, w, h, &src[off..], &residual, fctx);
-                    cur[sp] = src;
+                PredSrc::Cur { plane: sp, off, src } => {
+                    let block = std::mem::take(&mut cur[sp]);
+                    if src == stride {
+                        exec_mc(y, u, v, plane, x, oy, stride, w, h, &block[off..], &residual, fctx);
+                    } else {
+                        // A transform unit's residual is dense, so its window
+                        // of the block prediction is taken out dense too --
+                        // the copy the parsing thread used to make, made here.
+                        let mut window = Vec::with_capacity(w * h);
+                        for row in 0..h {
+                            window.extend_from_slice(&block[off + row * src..][..w]);
+                        }
+                        exec_mc(y, u, v, plane, x, oy, stride, w, h, &window, &residual, fctx);
+                    }
+                    cur[sp] = block;
                 }
             }
         }
