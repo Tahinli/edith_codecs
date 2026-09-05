@@ -3190,8 +3190,8 @@ fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>
             is_new_mv: dv.is_some(),
             is_global_mv0: false,
             is_global_mv1: false,
-            size: n4,
-            size_h: n4,
+            size: n4 as u8,
+            size_h: n4 as u8,
         };
         for r in mi_r..mi_r + n4 {
             for c in mi_c..mi_c + n4 {
@@ -6001,6 +6001,21 @@ struct Neighbour {
     dc: Option<bool>,
 }
 
+/// `dst[start .. start + n] = v`, with the same per-cell bounds behaviour the
+/// per-4x4-cell `get_mut` loops it replaces had: a cell past the end of the
+/// grid is dropped, never a panic. One `memset` per grid row instead of a
+/// bounds check per cell (lane-mi) -- the index span a row of a mi rect covers
+/// is contiguous, so this writes exactly the cells the cell loop did,
+/// including the ones a `mi_c + cc` past `skip_grid_cols_mi` folded into the
+/// next row.
+#[inline]
+fn fill_span<T: Copy>(dst: &mut [T], start: usize, n: usize, v: T) {
+    let end = (start + n).min(dst.len());
+    if start < end {
+        dst[start..end].fill(v);
+    }
+}
+
 fn neighbour_state(grid: &[i32]) -> Neighbour {
     let cul: u32 = grid.iter().map(|&l| l.unsigned_abs()).sum();
     Neighbour {
@@ -6624,15 +6639,9 @@ impl Neighbours {
         let (mi_r, mi_c) = at_mi;
         let (uv_w, uv_h) = ((w_mi * MI / 2).max(4) as u8, (h_mi * MI / 2).max(4) as u8);
         for rr in 0..h_mi {
-            for cc in 0..w_mi {
-                let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
-                if let Some(cell) = self.uv_tx_grid.get_mut(idx) {
-                    *cell = uv_w;
-                }
-                if let Some(cell) = self.uv_tx_h_grid.get_mut(idx) {
-                    *cell = uv_h;
-                }
-            }
+            let start = (mi_r + rr) * self.skip_grid_cols_mi + mi_c;
+            fill_span(&mut self.uv_tx_grid, start, w_mi, uv_w);
+            fill_span(&mut self.uv_tx_h_grid, start, w_mi, uv_h);
         }
     }
 
@@ -6661,27 +6670,13 @@ impl Neighbours {
             [cur[0].clamp(-63, 63) as i8; 4]
         };
         for rr in 0..h_mi {
-            for cc in 0..w_mi {
-                let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
-                if let Some(cell) = self.tx_grid.get_mut(idx) {
-                    *cell = tx_px;
-                }
-                if let Some(cell) = self.tx_h_grid.get_mut(idx) {
-                    *cell = tx_h_px;
-                }
-                if let Some(cell) = self.uv_tx_grid.get_mut(idx) {
-                    *cell = uv_tx_w;
-                }
-                if let Some(cell) = self.uv_tx_h_grid.get_mut(idx) {
-                    *cell = uv_tx_h;
-                }
-                if let Some(cell) = self.ref_grid.get_mut(idx) {
-                    *cell = ref_frame;
-                }
-                if let Some(cell) = self.delta_lf_grid.get_mut(idx) {
-                    *cell = snapshot;
-                }
-            }
+            let start = (mi_r + rr) * self.skip_grid_cols_mi + mi_c;
+            fill_span(&mut self.tx_grid, start, w_mi, tx_px);
+            fill_span(&mut self.tx_h_grid, start, w_mi, tx_h_px);
+            fill_span(&mut self.uv_tx_grid, start, w_mi, uv_tx_w);
+            fill_span(&mut self.uv_tx_h_grid, start, w_mi, uv_tx_h);
+            fill_span(&mut self.ref_grid, start, w_mi, ref_frame);
+            fill_span(&mut self.delta_lf_grid, start, w_mi, snapshot);
         }
     }
 
@@ -6706,15 +6701,9 @@ impl Neighbours {
             eprintln!("EC_LFLEAF mi_row={mi_r} mi_col={mi_c} w_mi={w_mi} h_mi={h_mi} tx_px={tx_px} tx_h_px={tx_h_px}");
         }
         for rr in 0..h_mi {
-            for cc in 0..w_mi {
-                let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
-                if let Some(cell) = self.tx_grid.get_mut(idx) {
-                    *cell = tx_px;
-                }
-                if let Some(cell) = self.tx_h_grid.get_mut(idx) {
-                    *cell = tx_h_px;
-                }
-            }
+            let start = (mi_r + rr) * self.skip_grid_cols_mi + mi_c;
+            fill_span(&mut self.tx_grid, start, w_mi, tx_px);
+            fill_span(&mut self.tx_h_grid, start, w_mi, tx_h_px);
         }
     }
 
@@ -6733,21 +6722,11 @@ impl Neighbours {
             RECT_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
         }
         for rr in 0..h_mi {
-            for cc in 0..w_mi {
-                let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
-                if let Some(cell) = self.skip_grid.get_mut(idx) {
-                    *cell = skip;
-                }
-                if let Some(cell) = self.skip_written.get_mut(idx) {
-                    *cell = true;
-                }
-                if let Some(org) = self.blk_org_grid.get_mut(idx) {
-                    *org = [mi_r as u16, mi_c as u16];
-                }
-                if let Some(dim) = self.blk_dim_grid.get_mut(idx) {
-                    *dim = [w_mi as u8, h_mi as u8];
-                }
-            }
+            let start = (mi_r + rr) * self.skip_grid_cols_mi + mi_c;
+            fill_span(&mut self.skip_grid, start, w_mi, skip);
+            fill_span(&mut self.skip_written, start, w_mi, true);
+            fill_span(&mut self.blk_org_grid, start, w_mi, [mi_r as u16, mi_c as u16]);
+            fill_span(&mut self.blk_dim_grid, start, w_mi, [w_mi as u8, h_mi as u8]);
         }
     }
 
@@ -6909,34 +6888,30 @@ impl Neighbours {
             self.record_uv_mode_mi(r, c, w_mi, h_mi, DC_PRED);
         }
         let altref = is_inter && ref_frame == crate::mvstack::ALTREF_FRAME;
-        for cell in 0..w_mi {
-            self.above_skip[c + cell] = skip;
-            self.above_skip_mode[c + cell] = skip_mode;
-            self.above_inter[c + cell] = is_inter;
-            self.above_ref[c + cell] = ref_frame;
-            // lane-av1comp: no caller of `record_inter` ever decodes a
-            // compound block yet (see [`Self::above_ref1`]'s doc); the
-            // parameter this becomes lands with `read_ref_frames`.
-            self.above_ref1[c + cell] = None;
-            // libaom `get_comp_group_idx_context`/`get_comp_index_context`'s
-            // single-ref special case: `ref_frame[0] == ALTREF_FRAME` reads
-            // as `3`/`1` even though this block has no second reference.
-            // `record_compound_ctx` overwrites this with the real bit for an
-            // actual compound block's cells, called right after this one.
-            self.above_comp_group_idx[c + cell] = if altref { 3 } else { 0 };
-            self.above_compound_idx[c + cell] = u8::from(altref);
-            self.above_filter[c + cell] = filter;
-        }
-        for cell in 0..h_mi {
-            self.left_skip[r + cell] = skip;
-            self.left_skip_mode[r + cell] = skip_mode;
-            self.left_inter[r + cell] = is_inter;
-            self.left_ref[r + cell] = ref_frame;
-            self.left_ref1[r + cell] = None;
-            self.left_comp_group_idx[r + cell] = if altref { 3 } else { 0 };
-            self.left_compound_idx[r + cell] = u8::from(altref);
-            self.left_filter[r + cell] = filter;
-        }
+        self.above_skip[c..c + w_mi].fill(skip);
+        self.above_skip_mode[c..c + w_mi].fill(skip_mode);
+        self.above_inter[c..c + w_mi].fill(is_inter);
+        self.above_ref[c..c + w_mi].fill(ref_frame);
+        // lane-av1comp: no caller of `record_inter` ever decodes a
+        // compound block yet (see [`Self::above_ref1`]'s doc); the
+        // parameter this becomes lands with `read_ref_frames`.
+        self.above_ref1[c..c + w_mi].fill(None);
+        // libaom `get_comp_group_idx_context`/`get_comp_index_context`'s
+        // single-ref special case: `ref_frame[0] == ALTREF_FRAME` reads
+        // as `3`/`1` even though this block has no second reference.
+        // `record_compound_ctx` overwrites this with the real bit for an
+        // actual compound block's cells, called right after this one.
+        self.above_comp_group_idx[c..c + w_mi].fill(if altref { 3 } else { 0 });
+        self.above_compound_idx[c..c + w_mi].fill(u8::from(altref));
+        self.above_filter[c..c + w_mi].fill(filter);
+        self.left_skip[r..r + h_mi].fill(skip);
+        self.left_skip_mode[r..r + h_mi].fill(skip_mode);
+        self.left_inter[r..r + h_mi].fill(is_inter);
+        self.left_ref[r..r + h_mi].fill(ref_frame);
+        self.left_ref1[r..r + h_mi].fill(None);
+        self.left_comp_group_idx[r..r + h_mi].fill(if altref { 3 } else { 0 });
+        self.left_compound_idx[r..r + h_mi].fill(u8::from(altref));
+        self.left_filter[r..r + h_mi].fill(filter);
     }
 
     /// Overwrites [`Self::record_inter`]'s ALTREF-special-case default with
@@ -7222,27 +7197,14 @@ impl Neighbours {
         uv_mode: usize,
     ) {
         let (last_r, last_c) = (mi_r + mi_h - 1, mi_c + mi_w - 1);
-        for cell in 0..mi_w {
-            if let Some(slot) = self.uv_mode_col.get_mut(mi_c + cell) {
-                *slot = (last_r, uv_mode);
-            }
-        }
-        for cell in 0..mi_h {
-            if let Some(slot) = self.uv_mode_row.get_mut(mi_r + cell) {
-                *slot = (last_c, uv_mode);
-            }
-        }
+        fill_span(&mut self.uv_mode_col, mi_c, mi_w, (last_r, uv_mode));
+        fill_span(&mut self.uv_mode_row, mi_r, mi_h, (last_c, uv_mode));
         // libaom writes one `MB_MODE_INFO` pointer into every mi cell a block
         // covers, so the chroma neighbour read below is a plain grid read.
         let stride = self.uv_grid_cols;
+        let n = stride.saturating_sub(mi_c).min(last_c + 1 - mi_c);
         for row in mi_r..=last_r {
-            for col in mi_c..=last_c {
-                if col < stride
-                    && let Some(cell) = self.uv_mode_grid.get_mut(row * stride + col)
-                {
-                    *cell = uv_mode as u8;
-                }
-            }
+            fill_span(&mut self.uv_mode_grid, row * stride + mi_c, n, uv_mode as u8);
         }
     }
 
@@ -7479,16 +7441,8 @@ impl Neighbours {
         if crate::envflags::env_flag!("EC_ECPUB") {
             eprintln!("EC_ECPUB blk mi=({mi_r},{mi_c}) wh=({w},{h}) lvl={}", states[0].level);
         }
-        for cell in 0..h_mi {
-            if let Some(slot) = self.left_side_mi.get_mut(mi_r + cell) {
-                *slot = h;
-            }
-        }
-        for cell in 0..w_mi {
-            if let Some(slot) = self.above_side_mi.get_mut(mi_c + cell) {
-                *slot = w;
-            }
-        }
+        fill_span(&mut self.left_side_mi, mi_r, h_mi, h);
+        fill_span(&mut self.above_side_mi, mi_c, w_mi, w);
         // A chroma 4x4 unit straddling the true luma edge is still whole in
         // chroma's own halved grid, so libaom rounds the luma bound up to the
         // plane's own 4x4 unit before clamping a subsampled plane
@@ -7504,34 +7458,35 @@ impl Neighbours {
             round_up_even(self.mi_cols),
             round_up_even(self.mi_cols),
         ];
-        for cell in 0..h_mi {
-            // lane-sb128c r7: a 128x64 at the bottom frame edge names mi rows
-            // past the padded side arrays (mi_rows 198, block rows 192..208);
-            // libaom's own arrays are superblock-sized, so those cells simply
-            // have no reader. Same guard the `left_side_mi` loop above uses.
-            let Some(left_slot) = self.left.get_mut(mi_r + cell) else {
-                break;
-            };
-            *left_slot = std::array::from_fn(|plane| {
-                if cell < h_mi.min(bound_h[plane].saturating_sub(mi_r)) {
-                    states[plane]
-                } else {
-                    Default::default()
-                }
-            });
-        }
-        for cell in 0..w_mi {
-            let Some(above_slot) = self.above.get_mut(mi_c + cell) else {
-                break;
-            };
-            *above_slot = std::array::from_fn(|plane| {
-                if cell < w_mi.min(bound_w[plane].saturating_sub(mi_c)) {
-                    states[plane]
-                } else {
-                    Default::default()
-                }
-            });
-        }
+        // lane-sb128c r7: a 128x64 at the bottom frame edge names mi rows
+        // past the padded side arrays (mi_rows 198, block rows 192..208);
+        // libaom's own arrays are superblock-sized, so those cells simply
+        // have no reader -- [`fill_span`] drops them, as the `break` did.
+        // `bound_h[1] == bound_h[2] >= bound_h[0]`, so the per-cell plane
+        // predicate is three contiguous runs: all planes, chroma only, none
+        // (lane-mi).
+        let luma_h = h_mi.min(bound_h[0].saturating_sub(mi_r));
+        let chroma_h = h_mi.min(bound_h[1].saturating_sub(mi_r));
+        let uv_only = [Neighbour::default(), states[1], states[2]];
+        fill_span(&mut self.left, mi_r, luma_h, states);
+        fill_span(&mut self.left, mi_r + luma_h, chroma_h - luma_h, uv_only);
+        fill_span(
+            &mut self.left,
+            mi_r + chroma_h,
+            h_mi - chroma_h,
+            [Neighbour::default(); 3],
+        );
+        let luma_w = w_mi.min(bound_w[0].saturating_sub(mi_c));
+        let chroma_w = w_mi.min(bound_w[1].saturating_sub(mi_c));
+        let uv_only_w = [Neighbour::default(), states[1], states[2]];
+        fill_span(&mut self.above, mi_c, luma_w, states);
+        fill_span(&mut self.above, mi_c + luma_w, chroma_w - luma_w, uv_only_w);
+        fill_span(
+            &mut self.above,
+            mi_c + chroma_w,
+            w_mi - chroma_w,
+            [Neighbour::default(); 3],
+        );
     }
 
     /// [`Self::record_mi`]'s plane-0 half only, for one luma transform unit
@@ -7676,16 +7631,8 @@ impl Neighbours {
         let (w_mi, h_mi) = (w / MI, h / MI);
         self.record_mode_mi(mi_r, mi_c, w_mi, h_mi, mode);
         self.record_uv_mode_mi(mi_r, mi_c, w_mi, h_mi, uv_mode);
-        for cell in 0..h_mi {
-            if let Some(slot) = self.left_side_mi.get_mut(mi_r + cell) {
-                *slot = h;
-            }
-        }
-        for cell in 0..w_mi {
-            if let Some(slot) = self.above_side_mi.get_mut(mi_c + cell) {
-                *slot = w;
-            }
-        }
+        fill_span(&mut self.left_side_mi, mi_r, h_mi, h);
+        fill_span(&mut self.above_side_mi, mi_c, w_mi, w);
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
         for (plane_idx, grid) in chroma_grids.into_iter().enumerate() {
@@ -22051,7 +21998,7 @@ fn overlappable_above(
     let mut col = mi_col;
     while col < end_col && out.len() < max_neighbors {
         let cell = grid.get(mi_row - 1, col);
-        let mut step = cell.map_or(1, |c| c.size).max(1).min(SB_MI as usize);
+        let mut step = cell.map_or(1, |c| c.size as usize).max(1).min(SB_MI as usize);
         let mut nb = cell;
         // lane-obmcrec r1: the mi the neighbour's `MiInfo` is actually taken
         // from -- the pair merge below moves it, and libaom reads that same
@@ -22106,7 +22053,7 @@ fn overlappable_left(
         let cell = grid.get(row, mi_col - 1);
         // Vertical walk steps by the neighbour's HEIGHT -- a 32x16 strip's
         // width (8) would swallow the strip below it.
-        let mut step = cell.map_or(1, |c| c.size_h).max(1).min(SB_MI as usize);
+        let mut step = cell.map_or(1, |c| c.size_h as usize).max(1).min(SB_MI as usize);
         let mut nb = cell;
         // lane-obmcrec r1: see `overlappable_above`'s `src`.
         let mut src = row;
@@ -22203,7 +22150,7 @@ fn find_samples(
     'outer: {
         if up_available {
             let above = grid.get(mi_row - 1, mi_col);
-            let superblock_width = above.map_or(1, |c| c.size).max(1);
+            let superblock_width = above.map_or(1, |c| c.size as usize).max(1);
             if bw4 <= superblock_width {
                 let col_offset = -((mi_col % superblock_width) as isize);
                 if col_offset < 0 {
@@ -22225,7 +22172,7 @@ fn find_samples(
                 let limit = bw4.min(mi_cols.saturating_sub(mi_col));
                 while i < limit {
                     let cell = grid.get(mi_row - 1, mi_col + i);
-                    let sw = cell.map_or(1, |c| c.size).max(1);
+                    let sw = cell.map_or(1, |c| c.size as usize).max(1);
                     if let Some(info) = cell {
                         if single_ref_match(info) {
                             samples.push(rec(info, 0, -1, i as i32, 1));
@@ -22241,7 +22188,7 @@ fn find_samples(
 
         if left_available {
             let left = grid.get(mi_row, mi_col - 1);
-            let superblock_height = left.map_or(1, |c| c.size_h).max(1);
+            let superblock_height = left.map_or(1, |c| c.size_h as usize).max(1);
             if bh4 <= superblock_height {
                 let row_offset = -((mi_row % superblock_height) as isize);
                 if row_offset < 0 {
@@ -22260,7 +22207,7 @@ fn find_samples(
                 let limit = bh4.min(mi_rows.saturating_sub(mi_row));
                 while i < limit {
                     let cell = grid.get(mi_row + i, mi_col - 1);
-                    let sh = cell.map_or(1, |c| c.size_h).max(1);
+                    let sh = cell.map_or(1, |c| c.size_h as usize).max(1);
                     if let Some(info) = cell {
                         if single_ref_match(info) {
                             samples.push(rec(info, i as i32, 1, 0, -1));
@@ -22691,7 +22638,7 @@ nbmv=({},{}) nbref={} nbbsize={} filt={}",
         nb.mv.0,
         nb.mv.1,
         nb.ref_frame,
-        ec_obmc_bsize(nb.size, nb.size_h),
+        ec_obmc_bsize(nb.size as usize, nb.size_h as usize),
         sym(v_kind) | (sym(h_kind) << 16),
     );
 }
@@ -23825,8 +23772,8 @@ fn decode_inter_block(
                             mv1: Some(mv1),
                             mv: mv0,
                             is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
-                            size: bw4,
-                            size_h: bh4,
+                            size: bw4 as u8,
+                            size_h: bh4 as u8,
                             // libaom `is_global_mv_block`: per-ref-slot, mode
                             // GLOBAL_GLOBALMV, block >= 8x8, and THAT slot's
                             // own gm model > TRANSLATION (IDENTITY excluded
@@ -25387,8 +25334,8 @@ fn decode_inter_block(
                             mv1: None,
                             mv,
                             is_new_mv,
-                            size: bw4,
-                            size_h: bh4,
+                            size: bw4 as u8,
+                            size_h: bh4 as u8,
                             is_global_mv0: is_global_mv_block,
                             is_global_mv1: false,
                         },
@@ -26213,8 +26160,8 @@ fn decode_inter_block(
                             mv1: None,
                             mv: (0, 0),
                             is_new_mv: false,
-                            size: write_w / MI,
-                            size_h: write_h / MI,
+                            size: (write_w / MI) as u8,
+                            size_h: (write_h / MI) as u8,
                             is_global_mv0: false,
                             is_global_mv1: false,
                         },
@@ -26437,8 +26384,8 @@ fn decode_inter_block(
                         mv1: None,
                         mv: (0, 0),
                         is_new_mv: false,
-                        size: side / 4,
-                        size_h: side / 4,
+                        size: (side / 4) as u8,
+                        size_h: (side / 4) as u8,
                         is_global_mv0: false,
                         is_global_mv1: false,
                     },
@@ -27888,8 +27835,8 @@ fn decode_intra_sub8_leaf(
                     mv1: None,
                     mv: (0, 0),
                     is_new_mv: false,
-                    size: w_mi,
-                    size_h: h_mi,
+                    size: w_mi as u8,
+                    size_h: h_mi as u8,
                     is_global_mv0: false,
                     is_global_mv1: false,
                 },
@@ -28593,8 +28540,8 @@ fn grid_stamp_rect(
                     mv1: None,
                     mv,
                     is_new_mv,
-                    size: w_mi,
-                    size_h: h_mi,
+                    size: w_mi as u8,
+                    size_h: h_mi as u8,
                     is_global_mv0: false,
                     is_global_mv1: false,
                 },
