@@ -466,6 +466,7 @@ fn add_noise_to_block(
 /// multiply, `Round2` and clip; every other CPU runs the scalar loop, which
 /// stays the reference (`simd_matches_scalar_luma_noise_row` pins the pair).
 #[allow(unsafe_code)]
+#[cfg(test)]
 fn luma_noise_row(
     pixels: &mut [u16],
     grain: &[i32],
@@ -551,6 +552,7 @@ struct ChromaNoise {
 /// stays the reference (`simd_matches_scalar_chroma_noise_row` pins the pair).
 #[allow(unsafe_code)]
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn chroma_noise_row(
     chroma: &mut [u16],
     luma: &[u16],
@@ -670,6 +672,7 @@ mod simd {
     /// `scaling` non-empty.
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub unsafe fn luma_noise_row_avx2(
         pixels: &mut [u16],
         grain: &[i32],
@@ -773,6 +776,7 @@ mod simd {
     /// `grain` at least `chroma.len()`, and `scaling` non-empty.
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub unsafe fn chroma_noise_row_avx2(
         chroma: &mut [u16],
         luma: &[u16],
