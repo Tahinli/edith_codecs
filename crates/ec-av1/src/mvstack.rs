@@ -161,6 +161,23 @@ pub struct TplArgs<'a> {
 /// -- as absent without an `Option` tag word per grid cell.
 pub const NO_REF1: i8 = -1;
 
+/// lane-migrid: widen a stored [`MiInfo`] motion vector to the `(i32, i32)`
+/// every consumer computes in.
+pub fn mv32(mv: (i16, i16)) -> (i32, i32) {
+    (i32::from(mv.0), i32::from(mv.1))
+}
+
+/// lane-migrid: narrow a computed motion vector to [`MiInfo`]'s stored
+/// width -- libaom's own `MV` (`int16_t row, col`), which is the spec's MV
+/// range, so this is not a narrowing of anything the spec can produce.
+pub fn mv16(mv: (i32, i32)) -> (i16, i16) {
+    debug_assert!(
+        i16::try_from(mv.0).is_ok() && i16::try_from(mv.1).is_ok(),
+        "mv outside the spec's i16 range: {mv:?}"
+    );
+    (mv.0 as i16, mv.1 as i16)
+}
+
 /// One 4x4 `mi` unit's motion state, as the encode loop will have filled it
 /// in by the time it asks for a block's MV stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,10 +198,13 @@ pub struct MiInfo {
     /// in this slot).
     pub ref_frame1: i8,
     /// The unit's motion vector, `(row, col)`, in the spec's 1/8-pel units.
-    pub mv: (i32, i32),
+    /// lane-migrid: `i16`, which is libaom's own `MV` (`int16_t row, col`)
+    /// and the spec's MV range -- two of these plus the byte-sized fields
+    /// make the grid cell 16 bytes instead of 24.
+    pub mv: (i16, i16),
     /// The unit's second motion vector, matching `ref_frame1` (spec
     /// `Mvs[1]`) — `Some` only for a compound-coded unit, `None` otherwise.
-    pub mv1: (i32, i32),
+    pub mv1: (i16, i16),
     /// Whether this unit's own mode was `NEWMV` (spec's
     /// `have_newmv_in_inter_mode`, compound modes excluded since this module
     /// has no compound candidates). Feeds `NewMvContext` (7.10.2.8): a
@@ -297,7 +317,7 @@ impl MiGrid {
 
     /// The unit at `(row, col)`, or `None` when it is outside the grid, hasn't
     /// been coded, or sits outside the current tile's own bounds ([`Self::set_tile_bounds`]).
-    pub fn get(&self, row: usize, col: usize) -> Option<&MiInfo> {
+    pub fn get(&self, row: usize, col: usize) -> Option<MiInfo> {
         if row < self.rows
             && col < self.cols
             && row >= self.tile_row0
@@ -305,7 +325,7 @@ impl MiGrid {
             && col >= self.tile_col0
             && col < self.tile_col1
         {
-            self.cells[row * self.cols + col].as_ref()
+            self.cells[row * self.cols + col]
         } else {
             None
         }
@@ -319,9 +339,9 @@ impl MiGrid {
     /// only the last tile's columns into the motion field and every other
     /// tile's temporal candidates silently vanished from the next frame's
     /// MV stack.
-    pub fn get_frame(&self, row: usize, col: usize) -> Option<&MiInfo> {
+    pub fn get_frame(&self, row: usize, col: usize) -> Option<MiInfo> {
         if row < self.rows && col < self.cols {
-            self.cells[row * self.cols + col].as_ref()
+            self.cells[row * self.cols + col]
         } else {
             None
         }
@@ -579,13 +599,13 @@ fn process_single_ref_mv_candidate(
     // reads `candidate->mv[rf_idx]` unconditionally here -- unlike
     // `add_ref_mv_candidate`'s row/col/corner scans, this extension pass
     // never checks `is_global_mv_block`/substitutes `gm_mv_candidates`.
-    let mut slots = [(candidate.ref_frame, candidate.mv); 2];
+    let mut slots = [(candidate.ref_frame, mv32(candidate.mv)); 2];
     let mut n_slots = 1;
     // `mv1` is meaningful only for a compound neighbour (`ref_frame1 > 0`);
     // an interintra one stores `INTRA_FRAME` (0) with no second MV, and used
     // to be excluded here by its `mv1` being `None`.
     if candidate.ref_frame1 > 0 {
-        slots[1] = (candidate.ref_frame1, candidate.mv1);
+        slots[1] = (candidate.ref_frame1, mv32(candidate.mv1));
         n_slots = 2;
     }
     for &(rf, mv) in &slots[..n_slots] {
@@ -679,7 +699,7 @@ fn scan_row(
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
-        if let Some(mv) = single_ref_match(info, ref_frame, gm) {
+        if let Some(mv) = single_ref_match(&info, ref_frame, gm) {
             found = true;
             add_candidate(candidates, mv, len as u32 * weight);
             *newmv_count += u32::from(info.is_new_mv);
@@ -706,13 +726,13 @@ fn single_ref_match(info: &MiInfo, ref_frame: i8, gm: &GmMvTable) -> Option<(i32
         Some(if info.is_global_mv0 {
             gm_mv(gm, ref_frame)
         } else {
-            info.mv
+            mv32(info.mv)
         })
     } else if info.ref_frame1 > 0 && info.ref_frame1 == ref_frame {
         if info.is_global_mv1 {
             Some(gm_mv(gm, ref_frame))
         } else {
-            Some(info.mv1)
+            Some(mv32(info.mv1))
         }
     } else {
         None
@@ -767,7 +787,7 @@ fn scan_col(
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
-        if let Some(mv) = single_ref_match(info, ref_frame, gm) {
+        if let Some(mv) = single_ref_match(&info, ref_frame, gm) {
             found = true;
             add_candidate(candidates, mv, len as u32 * weight);
             *newmv_count += u32::from(info.is_new_mv);
@@ -875,7 +895,7 @@ fn scan_top_right(
     };
     let col = mi_col + bw4;
     if let Some(info) = grid.get(row, col)
-        && let Some(mv) = single_ref_match(info, ref_frame, gm)
+        && let Some(mv) = single_ref_match(&info, ref_frame, gm)
     {
         add_candidate(candidates, mv, CORNER_WEIGHT);
         *newmv_count += u32::from(info.is_new_mv);
@@ -903,7 +923,7 @@ fn scan_corner(
         return false;
     };
     if let Some(info) = grid.get(row, col)
-        && let Some(mv) = single_ref_match(info, ref_frame, gm)
+        && let Some(mv) = single_ref_match(&info, ref_frame, gm)
     {
         add_candidate(candidates, mv, CORNER_WEIGHT);
         *newmv_count += u32::from(info.is_new_mv);
@@ -1346,7 +1366,7 @@ pub fn find_mv_stack_with_sign_bias(
             let cand = grid.get(mi_row - 1, mi_col + idx);
             let step = cand.map_or(1, |c| c.size as usize).max(1);
             if let Some(c) = cand {
-                process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
+                process_single_ref_mv_candidate(&c, ref_frame, sign_bias_table, &mut candidates);
             }
             idx += step;
         }
@@ -1357,7 +1377,7 @@ pub fn find_mv_stack_with_sign_bias(
             let cand = grid.get(mi_row + idx, mi_col - 1);
             let step = cand.map_or(1, |c| c.size_h as usize).max(1);
             if let Some(c) = cand {
-                process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
+                process_single_ref_mv_candidate(&c, ref_frame, sign_bias_table, &mut candidates);
             }
             idx += step;
         }
@@ -1588,8 +1608,8 @@ fn scan_row_compound(
             found = true;
             add_compound_candidate(
                 candidates,
-                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1 },
+                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { mv32(info.mv) },
+                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { mv32(info.mv1) },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1651,8 +1671,8 @@ fn scan_col_compound(
             found = true;
             add_compound_candidate(
                 candidates,
-                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1 },
+                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { mv32(info.mv) },
+                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { mv32(info.mv1) },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1685,8 +1705,8 @@ fn scan_top_right_compound(
     {
         add_compound_candidate(
             candidates,
-            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1 },
+            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { mv32(info.mv) },
+            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { mv32(info.mv1) },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1715,8 +1735,8 @@ fn scan_corner_compound(
     {
         add_compound_candidate(
             candidates,
-            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1 },
+            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { mv32(info.mv) },
+            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { mv32(info.mv1) },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1757,11 +1777,11 @@ fn process_compound_ref_mv_candidate(
         return;
     }
     let slots = [
-        Some((candidate.ref_frame, candidate.mv)),
+        Some((candidate.ref_frame, mv32(candidate.mv))),
         // An interintra neighbour stores INTRA_FRAME (0) here; libaom's
         // ref-diff scan requires `can_rf > INTRA_FRAME`
         // (process_compound_ref_mv_candidate), so it contributes nothing.
-        (candidate.ref_frame1 > 0).then_some((candidate.ref_frame1, candidate.mv1)),
+        (candidate.ref_frame1 > 0).then_some((candidate.ref_frame1, mv32(candidate.mv1))),
     ];
     for (candidate_ref, candidate_mv) in slots.into_iter().flatten() {
         for (i, side_ref) in [ref_frame.0, ref_frame.1].into_iter().enumerate() {
@@ -2126,7 +2146,7 @@ pub fn find_mv_stack_compound(
                 let cand = grid.get(mi_row - 1, mi_col + idx);
                 let step = cand.map_or(1, |c| c.size as usize).max(1);
                 if let Some(c) = cand {
-                    process_compound_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut lists);
+                    process_compound_ref_mv_candidate(&c, ref_frame, sign_bias_table, &mut lists);
                 }
                 idx += step;
             }
@@ -2137,7 +2157,7 @@ pub fn find_mv_stack_compound(
                 let cand = grid.get(mi_row + idx, mi_col - 1);
                 let step = cand.map_or(1, |c| c.size_h as usize).max(1);
                 if let Some(c) = cand {
-                    process_compound_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut lists);
+                    process_compound_ref_mv_candidate(&c, ref_frame, sign_bias_table, &mut lists);
                 }
                 idx += step;
             }
@@ -2526,7 +2546,7 @@ mod tests {
     #[test]
     fn mi_info_stays_small_enough_for_a_4k_grid() {
         assert!(
-            std::mem::size_of::<Option<MiInfo>>() <= 32,
+            std::mem::size_of::<Option<MiInfo>>() <= 16,
             "Option<MiInfo> grew to {} bytes",
             std::mem::size_of::<Option<MiInfo>>()
         );
@@ -2540,10 +2560,13 @@ mod tests {
     /// the scan's memory traffic. `ref_frame1`/`mv1` are validity-tagged by
     /// `ref_frame1 == NO_REF1` rather than by two `Option` tags (32 bytes ->
     /// 24), and `is_inter` keeps a niche so the grid's `Option<MiInfo>` costs
-    /// no extra word.
+    /// no extra word. lane-migrid: the two motion vectors ride as `i16`
+    /// pairs -- libaom's own `MV` (`int16_t row, col`), i.e. the spec's MV
+    /// range -- which takes the cell from 24 bytes to 16 and the grid's
+    /// index arithmetic from a multiply to a shift.
     #[test]
     fn mi_info_cell_stays_compact() {
-        assert_eq!(std::mem::size_of::<MiInfo>(), 24);
+        assert_eq!(std::mem::size_of::<MiInfo>(), 16);
         assert_eq!(
             std::mem::size_of::<Option<MiInfo>>(),
             std::mem::size_of::<MiInfo>()
@@ -2556,7 +2579,7 @@ mod tests {
             ref_frame: 1,
             ref_frame1: NO_REF1,
             mv1: (0, 0),
-            mv,
+            mv: mv16(mv),
             is_new_mv: false,
             // 1: smaller than every `bw4`/`bh4` these small-grid tests use,
             // so it never trips the extended-scan coverage boost -- these
@@ -2810,7 +2833,7 @@ mod tests {
         let stack = find_mv_stack(&grid, mi_row, mi_col, 2, 2, 1, 32, 32);
 
         assert_eq!(stack.entries.len(), 1);
-        assert_eq!(stack.entries[0].mv, mv);
+        assert_eq!(stack.entries[0].mv, mv32(mv));
         assert_eq!(stack.entries[0].weight, 12 + REF_CAT_LEVEL);
     }
 
@@ -2849,7 +2872,7 @@ mod tests {
             ref_frame: 1,
             ref_frame1: NO_REF1,
             mv1: (0, 0),
-            mv,
+            mv: mv16(mv),
             is_new_mv: false,
             size: 8,
             size_h: 8,
@@ -3088,8 +3111,8 @@ mod tests {
             is_inter: true,
             ref_frame: COMP_PAIR.0,
             ref_frame1: COMP_PAIR.1,
-            mv: mv0,
-            mv1,
+            mv: mv16(mv0),
+            mv1: mv16(mv1),
             is_new_mv: false,
             size: 1,
             size_h: 1,
