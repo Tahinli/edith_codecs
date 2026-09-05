@@ -343,7 +343,12 @@ pub fn frames_dispatched() -> usize {
 /// `refresh_frame_flags` names (spec 7.20), as one shared, never-mutated
 /// object -- so a slot costs an `Arc` clone instead of a picture copy.
 struct SlotValue {
-    picture: std::sync::Arc<Picture>,
+    /// lane-twostage: this frame's FILTERED pixels, still being produced
+    /// when the rest of this value is published.
+    pixels: std::sync::Arc<SlotPromise<std::sync::Arc<Picture>>>,
+    /// The size those pixels will have, known from the tile decode.
+    width: usize,
+    height: usize,
     cdfs: Cdfs,
     motion_field: crate::motion_field::MotionField,
     seg_map: Vec<u8>,
@@ -371,18 +376,18 @@ struct SlotValue {
 /// Each dispatched frame gets its own thread, so a blocked waiter never holds
 /// a resource its producer needs. A producer that errors or panics marks its
 /// promise `Failed`, so no consumer can wait for a value that never comes.
-struct SlotPromise {
-    state: std::sync::Mutex<PromiseState>,
+struct SlotPromise<T = std::sync::Arc<SlotValue>> {
+    state: std::sync::Mutex<PromiseState<T>>,
     ready: std::sync::Condvar,
 }
 
-enum PromiseState {
+enum PromiseState<T> {
     Pending,
-    Ready(std::sync::Arc<SlotValue>),
+    Ready(T),
     Failed,
 }
 
-impl SlotPromise {
+impl<T: Clone> SlotPromise<T> {
     fn pending() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             state: std::sync::Mutex::new(PromiseState::Pending),
@@ -391,15 +396,26 @@ impl SlotPromise {
     }
 
     /// A slot filled by a frame the parsing thread decoded itself.
-    fn ready(value: std::sync::Arc<SlotValue>) -> std::sync::Arc<Self> {
+    fn ready(value: T) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             state: std::sync::Mutex::new(PromiseState::Ready(value)),
             ready: std::sync::Condvar::new(),
         })
     }
 
-    fn fulfil(&self, value: std::sync::Arc<SlotValue>) {
+    fn fulfil(&self, value: T) {
         *self.state.lock().expect("slot promise") = PromiseState::Ready(value);
+        self.ready.notify_all();
+    }
+
+    /// lane-twostage: fulfils only a promise the stage-1 sink did not
+    /// already fill (a superres frame, or a key frame, whose meta is
+    /// published here as it always was).
+    fn fulfil_if_pending(&self, value: impl FnOnce() -> T) {
+        let mut state = self.state.lock().expect("slot promise");
+        if matches!(*state, PromiseState::Pending) {
+            *state = PromiseState::Ready(value());
+        }
         self.ready.notify_all();
     }
 
@@ -412,7 +428,7 @@ impl SlotPromise {
     }
 
     /// Blocks until the producing frame has published this slot.
-    fn wait(&self) -> Result<std::sync::Arc<SlotValue>> {
+    fn wait(&self) -> Result<T> {
         let mut state = self.state.lock().expect("slot promise");
         loop {
             match &*state {
@@ -643,16 +659,17 @@ pub fn decode_stream_with_threads(
                 jobs.submit(move || {
                     let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let value = promise.wait()?;
+                        let shown_picture = value.pixels.wait()?;
                         let output = if grain.apply_grain && !no_grain() {
                             std::sync::Arc::new(crate::film_grain::apply_grain(
-                                &value.picture,
+                                &shown_picture,
                                 &grain,
                                 seq.mc_identity,
                                 u32::from(seq.bit_depth),
                                 &crate::decode::FrameCtx::new(),
                             ))
                         } else {
-                            std::sync::Arc::clone(&value.picture)
+                            std::sync::Arc::clone(&shown_picture)
                         };
                         Ok((output, decode_idx, true))
                     }))
@@ -871,6 +888,12 @@ pub fn decode_stream_with_threads(
             crate::timeline::submit(decode_idx, if shown { 'P' } else { 'A' }, shown);
             jobs.submit(move || {
                 let promise = produces;
+                // lane-twostage: stage 2 -- this frame's filtered pixels. Its
+                // consumers hold this promise from the moment stage 1 (CDFs,
+                // segment map, motion field, size) is published at the tile
+                // boundary, and wait on it at their first prediction.
+                let pixels: std::sync::Arc<SlotPromise<std::sync::Arc<Picture>>> =
+                    SlotPromise::pending();
                 let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::timeline::start(decode_idx);
                     // The wait happens HERE, off the parsing thread, and only
@@ -893,6 +916,71 @@ pub fn decode_stream_with_threads(
                     // Fresh per-thread state: every field this path reads is
                     // written from this frame's own header before it is read.
                     let fctx = crate::decode::FrameCtx::new();
+                    // lane-twostage: the pictures behind this frame's own
+                    // references, waited for at the first `ref_planes` call
+                    // inside the tile decode rather than here.
+                    let ref_metas: [Option<std::sync::Arc<SlotValue>>; 8] =
+                        std::array::from_fn(|i| {
+                            if i == 0 {
+                                None
+                            } else {
+                                resolved
+                                    .get(header.ref_frame_idx[i - 1] as usize)
+                                    .cloned()
+                                    .flatten()
+                            }
+                        });
+                    let pix_cell: std::sync::OnceLock<
+                        [Option<std::sync::Arc<Picture>>; 8],
+                    > = std::sync::OnceLock::new();
+                    let wait_pixels = || -> Result<[Option<&Picture>; 8]> {
+                        if pix_cell.get().is_none() {
+                            let mut pics: [Option<std::sync::Arc<Picture>>; 8] =
+                                Default::default();
+                            for (i, meta) in ref_metas.iter().enumerate() {
+                                if let Some(meta) = meta {
+                                    let slot = header.ref_frame_idx[i - 1] as usize;
+                                    let t0 = crate::timeline::now();
+                                    pics[i] = Some(meta.pixels.wait()?);
+                                    crate::timeline::ref_wait(
+                                        decode_idx,
+                                        slot,
+                                        dep_owner[slot],
+                                        crate::timeline::now().saturating_sub(t0),
+                                    );
+                                }
+                            }
+                            let _ = pix_cell.set(pics);
+                        }
+                        let pics = pix_cell.get().expect("the pictures were just set");
+                        Ok(std::array::from_fn(|i| pics[i].as_deref()))
+                    };
+                    let refpix = decode::RefPix::lazy(
+                        std::array::from_fn(|i| {
+                            ref_metas[i].as_ref().map(|m| (m.width, m.height))
+                        }),
+                        &wait_pixels,
+                    );
+                    // Stage 1: published at this frame's tile boundary, before
+                    // its filters run (`take_segment_ids` copies the map, so
+                    // the filters that read it are unaffected).
+                    let stage1 = |cdfs: Cdfs,
+                                  motion_field: crate::motion_field::MotionField,
+                                  width: usize,
+                                  height: usize| {
+                        if let Some(promise) = &promise {
+                            promise.fulfil(std::sync::Arc::new(SlotValue {
+                                pixels: pixels.clone(),
+                                width,
+                                height,
+                                cdfs,
+                                motion_field,
+                                seg_map: decode::take_segment_ids(&fctx),
+                                order_hint: header.order_hint,
+                            }));
+                            crate::timeline::slot_fulfil();
+                        }
+                    };
                     // spec 7.9's `av1_setup_motion_field` runs inside
                     // `RefSnapshot::take`, i.e. here, after those waits --
                     // it reads the referenced slots' saved motion fields.
@@ -901,7 +989,7 @@ pub fn decode_stream_with_threads(
                     let snap = RefSnapshot::take(
                         &header,
                         seq,
-                        std::array::from_fn(|i| resolved[i].as_ref().map(|v| &*v.picture)),
+                        &refpix,
                         std::array::from_fn(|i| resolved[i].as_ref().map(|v| &v.cdfs)),
                         std::array::from_fn(|i| {
                             resolved[i].as_ref().map(|v| v.seg_map.as_slice())
@@ -918,19 +1006,41 @@ pub fn decode_stream_with_threads(
                         decode_idx,
                         shown_idx,
                         dump.as_deref(),
+                        // lane-twostage is OFF by default: it is byte-exact
+                        // and the chain shows the producer tail overlapped,
+                        // but it does not move the wall (the consumer parses
+                        // only 4.2% of its tile before its first reference
+                        // pixel read, which is shorter than the tail it
+                        // hides). `EC_AV1_TWO_STAGE=1` publishes a frame's
+                        // meta at its tile boundary instead of after its
+                        // filters; it pays only once the 8x8-leaf, OBMC and
+                        // sub-8x8-piece predictions are deferred to the recon
+                        // workers as well.
+                        crate::envflags::var("EC_AV1_TWO_STAGE")
+                            .is_ok_and(|v| v == "1")
+                            .then_some(&stage1 as &dyn Fn(_, _, _, _)),
                     )?;
                     // Publish before grain synthesis: every frame waiting on
                     // this slot can start the moment the clean picture exists
                     // (spec 7.18.3.1 -- the bank never stores grain).
                     let picture = std::sync::Arc::new(out.picture);
+                    pixels.fulfil(picture.clone());
                     if let Some(promise) = &promise {
-                        promise.fulfil(std::sync::Arc::new(SlotValue {
-                            picture: picture.clone(),
-                            cdfs: out.stored_cdfs,
-                            motion_field: out.motion_field,
-                            seg_map: out.seg_map,
-                            order_hint: header.order_hint,
-                        }));
+                        // Only a frame whose stage-1 sink never fired (a
+                        // superres frame) still has meta to publish here.
+                        promise.fulfil_if_pending(|| {
+                            std::sync::Arc::new(SlotValue {
+                                pixels: pixels.clone(),
+                                width: picture.width,
+                                height: picture.height,
+                                cdfs: out.stored_cdfs,
+                                motion_field: out.motion_field.expect(
+                                    "a frame that published no stage 1 carries its motion field back",
+                                ),
+                                seg_map: out.seg_map,
+                                order_hint: header.order_hint,
+                            })
+                        });
                         crate::timeline::slot_fulfil();
                     }
                     // Grain is synthesised for OUTPUT only: a hidden frame is
@@ -957,10 +1067,13 @@ pub fn decode_stream_with_threads(
                 });
                 // A frame nobody can decode must not leave its consumers
                 // waiting for a slot that will never be filled.
-                if reply.is_err()
-                    && let Some(promise) = &promise
-                {
-                    promise.fail();
+                if reply.is_err() {
+                    // Neither stage may leave a consumer waiting for a value
+                    // that will never come.
+                    if let Some(promise) = &promise {
+                        promise.fail();
+                    }
+                    pixels.fail();
                 }
                 let _ = tx.send((job_seq, true, reply));
             });
@@ -979,10 +1092,21 @@ pub fn decode_stream_with_threads(
             }
             continue;
         }
+        // lane-twostage: the inline path's references are decoded already,
+        // so its handle never waits.
+        let inline_refpix = decode::RefPix::ready(std::array::from_fn(|i| {
+            if i == 0 {
+                None
+            } else {
+                ref_slots
+                    .get(header.ref_frame_idx[i - 1] as usize)
+                    .and_then(|p| p.as_deref())
+            }
+        }));
         let snap = RefSnapshot::take(
             &header,
             seq,
-            std::array::from_fn(|i| ref_slots[i].as_deref()),
+            &inline_refpix,
             std::array::from_fn(|i| cdf_slots[i].as_ref()),
             std::array::from_fn(|i| seg_map_slots[i].as_deref()),
             &std::array::from_fn(|i| motion_field_slots[i].as_ref()),
@@ -1003,7 +1127,10 @@ pub fn decode_stream_with_threads(
             pictures_decoded,
             pictures_shown,
             final_dump.as_deref(),
+            None,
         )?;
+        let motion_field =
+            motion_field.expect("the inline path passes no stage-1 sink");
         pictures_decoded += 1;
         // lane-pool1: one allocation, then every slot store and the output
         // itself are refcount bumps instead of plane copies.
@@ -1014,7 +1141,9 @@ pub fn decode_stream_with_threads(
             // already resolved, since the picture exists right here.
             if header.refresh_frame_flags != 0 {
                 let promise = SlotPromise::ready(std::sync::Arc::new(SlotValue {
-                    picture: std::sync::Arc::clone(&picture),
+                    pixels: SlotPromise::ready(std::sync::Arc::clone(&picture)),
+                    width: picture.width,
+                    height: picture.height,
                     cdfs: stored_cdfs,
                     motion_field,
                     seg_map: decoded_seg_map,
@@ -1131,8 +1260,9 @@ impl SeqFlags {
 /// banks `decode_stream_with` owns -- taken on the parsing thread, before any
 /// later frame can overwrite a slot, so a frame can be decoded anywhere.
 pub(crate) struct RefSnapshot<'a> {
-    /// The 8 DPB slots, indexed by slot (NOT by `ref_frame_idx`).
-    pub(crate) refs: [Option<&'a Picture>; NUM_REF_FRAMES],
+    /// lane-twostage: this frame's references, indexed by `ref_frame`
+    /// (`LAST_FRAME` = 1) -- sizes now, pixels at the first prediction.
+    pub(crate) refpix: &'a decode::RefPix<'a>,
     /// `cdf_slots[ref_frame_idx[primary_ref_frame]]`, `None` when this frame
     /// names `PRIMARY_REF_NONE` *or* that slot holds no saved table (the
     /// second case is the refusal [`decode_frame`] raises where it always
@@ -1155,7 +1285,7 @@ impl<'a> RefSnapshot<'a> {
     fn take(
         header: &FrameHeader,
         seq: SeqFlags,
-        refs: [Option<&'a Picture>; NUM_REF_FRAMES],
+        refpix: &'a decode::RefPix<'a>,
         cdf_slots: [Option<&Cdfs>; NUM_REF_FRAMES],
         seg_map_slots: [Option<&[u8]>; NUM_REF_FRAMES],
         motion_field_slots: &[Option<&crate::motion_field::MotionField>; NUM_REF_FRAMES],
@@ -1189,7 +1319,7 @@ impl<'a> RefSnapshot<'a> {
             );
         }
         Self {
-            refs,
+            refpix,
             primary_cdfs: primary.and_then(|slot| cdf_slots[slot].cloned()),
             prev_seg_map: primary.and_then(|slot| seg_map_slots[slot].map(<[u8]>::to_vec)),
             tpl_field,
@@ -1206,8 +1336,25 @@ impl<'a> RefSnapshot<'a> {
 pub(crate) struct FrameOutput {
     pub(crate) picture: Picture,
     pub(crate) stored_cdfs: Cdfs,
-    pub(crate) motion_field: crate::motion_field::MotionField,
+    /// lane-twostage: `None` when this frame handed its motion field to the
+    /// stage-1 sink at its tile boundary instead of carrying it back here.
+    pub(crate) motion_field: Option<crate::motion_field::MotionField>,
     pub(crate) seg_map: Vec<u8>,
+}
+
+/// Spec 7.20's own `save_cdfs`: what a frame's `refresh_frame_flags` slots
+/// keep -- the frame's INITIAL table when `disable_frame_end_update_cdf`,
+/// otherwise the adapted end-of-tile table with every symbol counter zeroed
+/// (libaom `av1_reset_cdf_symbol_counters`). lane-twostage: shared with the
+/// stage-1 publish, which hands a consumer the same table it always got.
+fn stored_cdfs_for(header: &FrameHeader, end_cdfs: Cdfs, started_from: Option<Cdfs>) -> Cdfs {
+    if header.disable_frame_end_update_cdf {
+        started_from.unwrap_or_else(|| Cdfs::new(q_ctx_of(header.quantization.base_q_idx)))
+    } else {
+        let mut end_cdfs = end_cdfs;
+        end_cdfs.reset_counts();
+        end_cdfs
+    }
 }
 
 /// lane-thread2: one coded frame, decoded from its header, its tile payload
@@ -1233,6 +1380,8 @@ fn decode_frame(
     decode_idx: usize,
     shown_idx: usize,
     final_dump: Option<&str>,
+    // lane-twostage: see `decode_inter_frame_tile_with_cdfs`'s own `stage1`.
+    stage1: Option<&dyn Fn(Cdfs, crate::motion_field::MotionField, usize, usize)>,
 ) -> Result<FrameOutput> {
     if header.segmentation.enabled {
         for segment in 0..MAX_SEGMENTS {
@@ -1568,15 +1717,16 @@ fn decode_frame(
             // never a projection source, and never spends a `ref_stamp`.
             true,
         );
-        (picture, end_cdfs, motion_field)
+        (picture, end_cdfs, Some(motion_field))
     } else {
         let last_slot = header.ref_frame_idx[0] as usize;
-        let reference = snap.refs[last_slot].ok_or_else(|| {
-            Error::unsupported(
+        let _ = last_slot;
+        if snap.refpix.dims(1).is_none() {
+            return Err(Error::unsupported(
                 "AV1 decode_stream",
                 "an inter frame with no key frame before it",
-            )
-        })?;
+            ));
+        }
         // `ref_frame_idx[i]` names the DPB slot for `LAST_FRAME + i`
         // (spec 7.8/7.20). Any of them having no picture yet is not a
         // stream error on its own: `decode_inter_block` only needs a
@@ -1589,20 +1739,26 @@ fn decode_frame(
         if header.force_integer_mv {
             decode::note_force_integer_mv_frame();
         }
-        let other_refs: [Option<&Picture>; 8] = std::array::from_fn(|ref_frame| {
-            if ref_frame == 0 {
-                None
-            } else {
-                snap.refs
-                    .get(header.ref_frame_idx[ref_frame - 1] as usize)
-                    .copied()
-                    .flatten()
-            }
-        });
         // spec 7.9's own driver, `av1_setup_motion_field`: only run when
         // this frame's header actually asks for temporal candidates --
         // `find_mv_stack_with_sign_bias` reproduces its old always-`None`
         // behaviour bit for bit when this is `None` (see its own doc).
+        // lane-twostage: the stage-1 sink is handed the table a consumer
+        // would have read out of the slot, not the raw end-of-tile one.
+        let started_from_stage1 = started_from.clone();
+        let stage1_adapter = stage1.map(|sink| {
+            move |end_cdfs: Cdfs,
+                  motion_field: crate::motion_field::MotionField,
+                  width: usize,
+                  height: usize| {
+                sink(
+                    stored_cdfs_for(header, end_cdfs, started_from_stage1.clone()),
+                    motion_field,
+                    width,
+                    height,
+                )
+            }
+        });
         let tpl_field = &snap.tpl_field;
         let (picture, end_cdfs, motion_field) = decode_inter_frame_tile_with_cdfs(
             &tile_bufs,
@@ -1619,8 +1775,7 @@ fn decode_frame(
             },
             header.frame_width,
             header.frame_height,
-            reference,
-            other_refs,
+            snap.refpix,
             &header.cdef,
             &header.loop_filter,
             &header.loop_restoration,
@@ -1647,7 +1802,11 @@ fn decode_frame(
             header.allow_warped_motion,
             header.allow_screen_content_tools,
             header.delta,
-            enable_filter_intra, fctx,
+            enable_filter_intra,
+            stage1_adapter
+                .as_ref()
+                .map(|f| f as &dyn Fn(Cdfs, crate::motion_field::MotionField, usize, usize)),
+            fctx,
         )?;
         (picture, end_cdfs, motion_field)
     };
@@ -1657,16 +1816,7 @@ fn decode_frame(
     // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
     // *initial* table into the slots it refreshes, not the adapted
     // end-of-tile one.
-    let stored_cdfs = if header.disable_frame_end_update_cdf {
-        started_from.unwrap_or_else(|| Cdfs::new(q_ctx_of(header.quantization.base_q_idx)))
-    } else {
-        // Spec 7.20 `save_cdfs` (libaom `av1_reset_cdf_symbol_counters`):
-        // the adapted table is saved with every symbol counter zeroed,
-        // not with the counts the tile's own decode left behind.
-        let mut end_cdfs = end_cdfs;
-        end_cdfs.reset_counts();
-        end_cdfs
-    };
+    let stored_cdfs = stored_cdfs_for(header, end_cdfs, started_from);
     if let Ok(path) = std::env::var("EC_AV1_DUMP_TABLES") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
