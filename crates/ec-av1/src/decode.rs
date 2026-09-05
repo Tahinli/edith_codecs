@@ -2253,8 +2253,8 @@ fn dense_residual(residual: &[i32], n: usize) -> &[i32] {
 /// block then reads its window out of that slot ([`Pred::Cur`]).
 #[derive(Clone, Copy)]
 pub(crate) enum Pred<'a> {
-    /// A prediction the parse thread already built. `stride == 0` means "the
-    /// reader's own `stride` argument", which is every pre-lane-wave4 site.
+    /// A prediction the parse thread already built, at its own stride
+    /// (`stride == 0` means "the reader's own `stride` argument").
     Inline(&'a [u16], usize),
     /// The current block's deferred prediction: plane, its stride, and this
     /// unit's offset into it.
@@ -2262,9 +2262,6 @@ pub(crate) enum Pred<'a> {
 }
 
 impl<'a> Pred<'a> {
-    fn dense(buf: &'a [u16]) -> Self {
-        Self::Inline(buf, 0)
-    }
     /// The same prediction read at an explicit stride.
     fn view(self, stride: usize) -> Self {
         match self {
@@ -28687,12 +28684,14 @@ fn decode_inter_sub8_split4(
             neighbours.left_ref[rmi],
             neighbours.left_ref1[rmi],
         );
-        let (sref_y, _sref_u, _sref_v) = ref_planes(ref_frame, refpix)?;
+        // lane-sub8group: this piece's reference SIZE at parse, its pictures
+        // inside the prediction closure below.
+        let (ref_width, _) = ref_dims(ref_frame, refpix)?;
         // lane-t900 r28: refusal lifted -- this sub-block's own reference may
         // be scaled (superres); spec 7.11.3.3's walk is per reference, and
         // each of the group's pieces (luma and its 2x2 chroma) carries its
         // OWN factor because each can name a different `ref_frame`.
-        let luma_scale = mc::scale_factor(sref_y.width, frame_width);
+        let luma_scale = mc::scale_factor(ref_width, frame_width);
         if luma_scale != mc::REF_NO_SCALE {
             SCALED_SUB8_HITS.with(|c| c.set(c.get() + 1));
         }
@@ -28855,27 +28854,51 @@ fn decode_inter_sub8_split4(
             },
         );
         piece[i] = Some((ref_frame, mv, h_filter, v_filter));
-        let mut pred_y = vec![0u16; B4 * B4];
-        mc::predict_maybe_scaled(
-            &sref_y.data,
-            sref_y.width,
-            sref_y.true_width,
-            sref_y.true_height,
-            mv_to_q4(px, mv.1, true),
-            mv_to_q4(py, mv.0, true),
-            luma_scale,
-            B4,
-            B4,
-            h_filter,
-            v_filter,
-            &mut pred_y, fctx,
-        );
+        // lane-sub8group: this piece's prediction as a closure, so it runs
+        // where its writes run -- on a recon worker at more than one
+        // reconstruction thread, exactly like the 8x8 leaf's.
+        let build = move |_y: &mut PlaneBuf<'static>,
+                          _u: &mut PlaneBuf<'static>,
+                          _v: &mut PlaneBuf<'static>,
+                          fctx: &crate::decode::FrameCtx,
+                          out: &mut [Vec<u16>; 3]| {
+            let Some((sref_y, _, _)) = ref_planes_deferred(ref_frame, refpix) else {
+                return;
+            };
+            let mut pred_y = refill(std::mem::take(&mut out[0]), B4 * B4);
+            mc::predict_maybe_scaled(
+                &sref_y.data,
+                sref_y.width,
+                sref_y.true_width,
+                sref_y.true_height,
+                mv_to_q4(px, mv.1, true),
+                mv_to_q4(py, mv.0, true),
+                luma_scale,
+                B4,
+                B4,
+                h_filter,
+                v_filter,
+                &mut pred_y, fctx,
+            );
+            out[0] = pred_y;
+        };
+        let pred_y: Vec<u16>;
+        let sy = if recon_deferred(fctx) {
+            push_pred(fctx, build);
+            Pred::Cur { plane: 0, stride: B4, off: 0 }
+        } else {
+            let mut built: [Vec<u16>; 3] = Default::default();
+            build(y, u, v, fctx, &mut built);
+            let [by, _, _] = built;
+            pred_y = by;
+            Pred::Inline(&pred_y, B4)
+        };
         // `BLOCK_4X4` never signals a transform size, so the luma unit is the
         // whole block and `get_txb_ctx` takes its `plane_bsize ==
         // txsize_to_bsize[tx_size]` branch (`txb_skip_ctx = 0`, which
         // `read_inter_plane`'s `plane_idx == 0` arm already assumes).
         if skip {
-            push_mc(0, px, py, B4, Pred::dense(&pred_y), &ZERO_RESIDUAL[..B4 * B4], fctx);
+            push_mc(0, px, py, B4, sy, &ZERO_RESIDUAL[..B4 * B4], fctx);
             neighbours.record_mi_luma_rect(lmi, B4, B4, &ZERO_RESIDUAL[..B4 * B4]);
         } else {
             let around = neighbours.around_mi(lmi, B4);
@@ -28896,7 +28919,7 @@ fn decode_inter_sub8_split4(
                 py,
                 B4,
                 base_q_idx,
-                Pred::dense(&pred_y),
+                sy,
                 None,
                 None, fctx,
             )?;
@@ -28935,8 +28958,6 @@ fn decode_inter_sub8_split4(
         // Chroma, once for the whole group, on the last sub-block's own `skip`
         // flag -- prediction from all four sub-blocks (2x2 pieces), residual as
         // one TX_4X4 unit per plane.
-        let mut pred_u = vec![0u16; B4 * B4];
-        let mut pred_v = vec![0u16; B4 * B4];
         // `is_sub8x8_inter` (reconinter_template.inc:54) is false as soon as ANY
         // mi of the group is intra: the group's 4x4 chroma is then predicted WHOLE
         // from the chroma-reference (last) sub-block's own mv, not in 2x2 pieces.
@@ -28948,61 +28969,89 @@ fn decode_inter_sub8_split4(
                 h.set(st);
             });
         }
-        for i in 0..4usize {
-            let (dr, dc) = (i / 2, i % 2);
-            if mixed && i != 3 {
-                continue;
-            }
-            let Some((ref_frame, mv, h_filter, v_filter)) = piece[i] else {
-                continue;
-            };
-            let (piece_ref_y, sref_u, sref_v) =
-                ref_planes(ref_frame, refpix)?;
-            let piece_scale = mc::scale_factor(piece_ref_y.width, frame_width);
-            let (ox, oy) = if mixed {
-                (cpx, cpy)
-            } else {
-                (cpx + dc * 2, cpy + dr * 2)
-            };
-            let (pw, ph) = if mixed { (B4, B4) } else { (2, 2) };
-            let (row0, col0) = if mixed { (0, 0) } else { (dr * 2, dc * 2) };
-            for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
-                let mut buf = vec![0u16; pw * ph];
-                mc::predict_maybe_scaled(
-                    &plane.data,
-                    plane.width,
-                    plane.true_width,
-                    plane.true_height,
-                    mv_to_q4(ox, mv.1, false),
-                    mv_to_q4(oy, mv.0, false),
-                    piece_scale,
-                    pw,
-                    ph,
-                    h_filter,
-                    v_filter,
-                    &mut buf, fctx,
-                );
-                for row in 0..ph {
-                    for col in 0..pw {
-                        dst[(row0 + row) * B4 + col0 + col] = buf[row * pw + col];
+        // lane-sub8group: the group's chroma pieces, built on the worker that
+        // writes them -- the pieces' refs/mvs/filters travel by value.
+        let build = move |_y: &mut PlaneBuf<'static>,
+                          _u: &mut PlaneBuf<'static>,
+                          _v: &mut PlaneBuf<'static>,
+                          fctx: &crate::decode::FrameCtx,
+                          out: &mut [Vec<u16>; 3]| {
+            let mut pred_u = refill(std::mem::take(&mut out[1]), B4 * B4);
+            let mut pred_v = refill(std::mem::take(&mut out[2]), B4 * B4);
+            for i in 0..4usize {
+                let (dr, dc) = (i / 2, i % 2);
+                if mixed && i != 3 {
+                    continue;
+                }
+                let Some((ref_frame, mv, h_filter, v_filter)) = piece[i] else {
+                    continue;
+                };
+                let Some((piece_ref_y, sref_u, sref_v)) = ref_planes_deferred(ref_frame, refpix)
+                else {
+                    continue;
+                };
+                let piece_scale = mc::scale_factor(piece_ref_y.width, frame_width);
+                let (ox, oy) = if mixed {
+                    (cpx, cpy)
+                } else {
+                    (cpx + dc * 2, cpy + dr * 2)
+                };
+                let (pw, ph) = if mixed { (B4, B4) } else { (2, 2) };
+                let (row0, col0) = if mixed { (0, 0) } else { (dr * 2, dc * 2) };
+                for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
+                    let mut buf = vec![0u16; pw * ph];
+                    mc::predict_maybe_scaled(
+                        &plane.data,
+                        plane.width,
+                        plane.true_width,
+                        plane.true_height,
+                        mv_to_q4(ox, mv.1, false),
+                        mv_to_q4(oy, mv.0, false),
+                        piece_scale,
+                        pw,
+                        ph,
+                        h_filter,
+                        v_filter,
+                        &mut buf, fctx,
+                    );
+                    for row in 0..ph {
+                        for col in 0..pw {
+                            dst[(row0 + row) * B4 + col0 + col] = buf[row * pw + col];
+                        }
                     }
                 }
             }
-        }
+            out[1] = pred_u;
+            out[2] = pred_v;
+        };
+        let (pred_u, pred_v): (Vec<u16>, Vec<u16>);
+        let (su, sv) = if recon_deferred(fctx) {
+            push_pred(fctx, build);
+            (
+                Pred::Cur { plane: 1, stride: B4, off: 0 },
+                Pred::Cur { plane: 2, stride: B4, off: 0 },
+            )
+        } else {
+            let mut built: [Vec<u16>; 3] = Default::default();
+            build(y, u, v, fctx, &mut built);
+            let [_, bu, bv] = built;
+            (pred_u, pred_v) = (bu, bv);
+            (Pred::Inline(&pred_u, B4), Pred::Inline(&pred_v, B4))
+        };
         let (u_grid, v_grid) = if last_skip {
-            push_mc(1, cpx, cpy, B4, Pred::dense(&pred_u), &ZERO_RESIDUAL[..B4 * B4], fctx);
-            push_mc(2, cpx, cpy, B4, Pred::dense(&pred_v), &ZERO_RESIDUAL[..B4 * B4], fctx);
+            push_mc(1, cpx, cpy, B4, su, &ZERO_RESIDUAL[..B4 * B4], fctx);
+            push_mc(2, cpx, cpy, B4, sv, &ZERO_RESIDUAL[..B4 * B4], fctx);
             (Grid::Zero(B4 * B4), Grid::Zero(B4 * B4))
         } else {
             let around = neighbours.around_mi(group_mi, 8);
             let ug = read_inter_plane(
                 dec, cdfs, TxbSet::Chroma4, scan4, 1, around[1], 0, u, cpx, cpy, B4, base_q_idx,
-                Pred::dense(&pred_u), Some(first_tx_type), None, fctx,
+                su, Some(first_tx_type), None, fctx,
             )?
             .0;
             let vg = read_inter_plane(
                 dec, cdfs, TxbSet::Chroma4, scan4, 2, around[2], 0, v, cpx, cpy, B4, base_q_idx,
-                Pred::dense(&pred_v), Some(first_tx_type), None, fctx,
+                sv, Some(first_tx_type), None, fctx,
             )?
             .0;
             let coded = ug.iter().chain(vg.iter()).any(|&c| c != 0);
@@ -29657,9 +29706,11 @@ fn decode_inter_sub8_rect2(
             neighbours.left_ref[rmi],
             neighbours.left_ref1[rmi],
         );
-        let (sref_y, _, _) = ref_planes(ref_frame, refpix)?;
+        // lane-sub8group: this piece's reference SIZE at parse, its pictures
+        // inside the prediction closure below.
+        let (ref_width, _) = ref_dims(ref_frame, refpix)?;
         // lane-t900 r28: refusal lifted -- see the split arm above.
-        let luma_scale = mc::scale_factor(sref_y.width, frame_width);
+        let luma_scale = mc::scale_factor(ref_width, frame_width);
         if luma_scale != mc::REF_NO_SCALE {
             SCALED_SUB8_HITS.with(|c| c.set(c.get() + 1));
         }
@@ -29821,8 +29872,18 @@ fn decode_inter_sub8_rect2(
         // Prediction over the leaf's true footprint, laid out at the group's
         // square stride (what `reconstruct_mc_rect` and `read_inter_plane_rect`
         // index with).
-        let mut pred_y = vec![0u16; SIDE * SIDE];
-        {
+        // lane-sub8group: this piece's prediction as a closure, so it runs
+        // where its writes run -- on a recon worker at more than one
+        // reconstruction thread, exactly like the 8x8 leaf's.
+        let build = move |_y: &mut PlaneBuf<'static>,
+                          _u: &mut PlaneBuf<'static>,
+                          _v: &mut PlaneBuf<'static>,
+                          fctx: &crate::decode::FrameCtx,
+                          out: &mut [Vec<u16>; 3]| {
+            let Some((sref_y, _, _)) = ref_planes_deferred(ref_frame, refpix) else {
+                return;
+            };
+            let mut pred_y = refill(std::mem::take(&mut out[0]), SIDE * SIDE);
             let mut dense = vec![0u16; bw * bh];
             mc::predict_maybe_scaled(
                 &sref_y.data,
@@ -29841,9 +29902,21 @@ fn decode_inter_sub8_rect2(
             for row in 0..bh {
                 pred_y[row * SIDE..][..bw].copy_from_slice(&dense[row * bw..][..bw]);
             }
-        }
+            out[0] = pred_y;
+        };
+        let pred_y: Vec<u16>;
+        let sy = if recon_deferred(fctx) {
+            push_pred(fctx, build);
+            Pred::Cur { plane: 0, stride: SIDE, off: 0 }
+        } else {
+            let mut built: [Vec<u16>; 3] = Default::default();
+            build(y, u, v, fctx, &mut built);
+            let [by, _, _] = built;
+            pred_y = by;
+            Pred::Inline(&pred_y, SIDE)
+        };
         if skip {
-            push_mc_rect(0, px, py, SIDE, bw, bh, Pred::dense(&pred_y), &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
+            push_mc_rect(0, px, py, SIDE, bw, bh, sy, &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
             neighbours.record_mi_luma_rect(lmi, bw, bh, &ZERO_RESIDUAL[..bw * bh]);
             neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, bw as u8, bh as u8, ref_frame.max(LAST_FRAME), fctx);
         } else {
@@ -29851,16 +29924,18 @@ fn decode_inter_sub8_rect2(
             for (idx, &(row, col, tw, th)) in leaves.iter().enumerate() {
                 let tu_mi = (rmi + row, cmi + col);
                 let (tu_px, tu_py) = (px + col * MI, py + row * MI);
+                // This unit's offset into the block prediction (lane-sub8group).
+                let start = row * MI * SIDE + col * MI;
                 let (tu_grid, tu_tx_type) = if tw == th {
                     // A split `TX_4X4` unit: square reader, its own
                     // `get_txb_ctx_general` neighbour context (the unit is
                     // smaller than its plane block, so the lone-TU 0 does not
                     // apply).
-                    let mut tu_pred = Vec::with_capacity(tw * th);
-                    for rr in 0..th {
-                        let start = (row * MI + rr) * SIDE + col * MI;
-                        tu_pred.extend_from_slice(&pred_y[start..start + tw]);
-                    }
+                    // lane-sub8group: the unit's window of the block
+                    // prediction, at the block's stride -- the dense copy the
+                    // parse thread used to make is the recorded op's own
+                    // ([`push_mc_rect_tx`]), and a deferred prediction has no
+                    // buffer here to copy out of.
                     let tu_skip_ctx = neighbours.luma_skip_ctx_rect(tu_mi, tw / MI, th / MI);
                     read_inter_plane(
                         dec,
@@ -29879,7 +29954,7 @@ fn decode_inter_sub8_rect2(
                         tu_py,
                         tw,
                         base_q_idx,
-                        Pred::dense(&tu_pred),
+                        sy.offset(start),
                         None,
                         Some(tu_skip_ctx), fctx,
                     )?
@@ -29887,7 +29962,6 @@ fn decode_inter_sub8_rect2(
                     // The whole leaf as one `TX_8X4`/`TX_4X8` unit: it IS the
                     // plane block, so `get_txb_ctx_general` fixes `txb_skip_ctx`
                     // at 0 (`luma_skip_ctx: None`).
-                    let start = row * MI * SIDE + col * MI;
                     read_inter_plane_rect(
                         dec,
                         cdfs,
@@ -29904,7 +29978,7 @@ fn decode_inter_sub8_rect2(
                         y,
                         tu_px,
                         tu_py,
-                        Pred::dense(&pred_y[start..]),
+                        sy.offset(start),
                         None,
                         None, fctx,
                     )?
@@ -29943,8 +30017,6 @@ fn decode_inter_sub8_rect2(
         // The group's single 4x4 chroma unit per plane, on the chroma-reference
         // (second) sub-block's own skip flag.
         const B4: usize = 4;
-        let mut pred_u = vec![0u16; B4 * B4];
-        let mut pred_v = vec![0u16; B4 * B4];
         // `is_sub8x8_inter` (reconinter_template.inc:54) is false as soon as ANY
         // mi of the group is intra, so a group whose chroma reference is inter but
         // whose sibling is INTRA does NOT get the two-piece sub8x8 prediction: the
@@ -29964,64 +30036,92 @@ fn decode_inter_sub8_rect2(
             (false, true) => (2usize, 4usize),
             (false, false) => (4usize, 2usize),
         };
-        for i in 0..2usize {
-            let Some((ref_frame, mv, h_filter, v_filter)) = piece[i] else {
-                continue;
-            };
-            let (piece_ref_y, sref_u, sref_v) =
-                ref_planes(ref_frame, refpix)?;
-            let piece_scale = mc::scale_factor(piece_ref_y.width, frame_width);
-            let (ox, oy) = if mixed {
-                (cpx, cpy)
-            } else if vert {
-                (cpx + i * piece_w, cpy)
-            } else {
-                (cpx, cpy + i * piece_h)
-            };
-            let (dc, dr) = if mixed {
-                (0, 0)
-            } else if vert {
-                (i * piece_w, 0)
-            } else {
-                (0, i * piece_h)
-            };
-            for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
-                let mut buf = vec![0u16; piece_w * piece_h];
-                mc::predict_maybe_scaled(
-                    &plane.data,
-                    plane.width,
-                    plane.true_width,
-                    plane.true_height,
-                    mv_to_q4(ox, mv.1, false),
-                    mv_to_q4(oy, mv.0, false),
-                    piece_scale,
-                    piece_w,
-                    piece_h,
-                    h_filter,
-                    v_filter,
-                    &mut buf, fctx,
-                );
-                for row in 0..piece_h {
-                    for col in 0..piece_w {
-                        dst[(dr + row) * B4 + dc + col] = buf[row * piece_w + col];
+        // lane-sub8group: the group's chroma pieces, built on the worker that
+        // writes them -- the pieces' refs/mvs/filters travel by value.
+        let build = move |_y: &mut PlaneBuf<'static>,
+                          _u: &mut PlaneBuf<'static>,
+                          _v: &mut PlaneBuf<'static>,
+                          fctx: &crate::decode::FrameCtx,
+                          out: &mut [Vec<u16>; 3]| {
+            let mut pred_u = refill(std::mem::take(&mut out[1]), B4 * B4);
+            let mut pred_v = refill(std::mem::take(&mut out[2]), B4 * B4);
+            for i in 0..2usize {
+                let Some((ref_frame, mv, h_filter, v_filter)) = piece[i] else {
+                    continue;
+                };
+                let Some((piece_ref_y, sref_u, sref_v)) = ref_planes_deferred(ref_frame, refpix)
+                else {
+                    continue;
+                };
+                let piece_scale = mc::scale_factor(piece_ref_y.width, frame_width);
+                let (ox, oy) = if mixed {
+                    (cpx, cpy)
+                } else if vert {
+                    (cpx + i * piece_w, cpy)
+                } else {
+                    (cpx, cpy + i * piece_h)
+                };
+                let (dc, dr) = if mixed {
+                    (0, 0)
+                } else if vert {
+                    (i * piece_w, 0)
+                } else {
+                    (0, i * piece_h)
+                };
+                for (plane, dst) in [(sref_u, &mut pred_u), (sref_v, &mut pred_v)] {
+                    let mut buf = vec![0u16; piece_w * piece_h];
+                    mc::predict_maybe_scaled(
+                        &plane.data,
+                        plane.width,
+                        plane.true_width,
+                        plane.true_height,
+                        mv_to_q4(ox, mv.1, false),
+                        mv_to_q4(oy, mv.0, false),
+                        piece_scale,
+                        piece_w,
+                        piece_h,
+                        h_filter,
+                        v_filter,
+                        &mut buf, fctx,
+                    );
+                    for row in 0..piece_h {
+                        for col in 0..piece_w {
+                            dst[(dr + row) * B4 + dc + col] = buf[row * piece_w + col];
+                        }
                     }
                 }
             }
-        }
+            out[1] = pred_u;
+            out[2] = pred_v;
+        };
+        let (pred_u, pred_v): (Vec<u16>, Vec<u16>);
+        let (su, sv) = if recon_deferred(fctx) {
+            push_pred(fctx, build);
+            (
+                Pred::Cur { plane: 1, stride: B4, off: 0 },
+                Pred::Cur { plane: 2, stride: B4, off: 0 },
+            )
+        } else {
+            let mut built: [Vec<u16>; 3] = Default::default();
+            build(y, u, v, fctx, &mut built);
+            let [_, bu, bv] = built;
+            (pred_u, pred_v) = (bu, bv);
+            (Pred::Inline(&pred_u, B4), Pred::Inline(&pred_v, B4))
+        };
         let (u_grid, v_grid) = if last_skip {
-            push_mc(1, cpx, cpy, B4, Pred::dense(&pred_u), &ZERO_RESIDUAL[..B4 * B4], fctx);
-            push_mc(2, cpx, cpy, B4, Pred::dense(&pred_v), &ZERO_RESIDUAL[..B4 * B4], fctx);
+            push_mc(1, cpx, cpy, B4, su, &ZERO_RESIDUAL[..B4 * B4], fctx);
+            push_mc(2, cpx, cpy, B4, sv, &ZERO_RESIDUAL[..B4 * B4], fctx);
             (Grid::Zero(B4 * B4), Grid::Zero(B4 * B4))
         } else {
             let around = neighbours.around_mi(group_mi, 8);
             let ug = read_inter_plane(
                 dec, cdfs, TxbSet::Chroma4, scan4, 1, around[1], 0, u, cpx, cpy, B4, base_q_idx,
-                Pred::dense(&pred_u), Some(first_tx_type), None, fctx,
+                su, Some(first_tx_type), None, fctx,
             )?
             .0;
             let vg = read_inter_plane(
                 dec, cdfs, TxbSet::Chroma4, scan4, 2, around[2], 0, v, cpx, cpy, B4, base_q_idx,
-                Pred::dense(&pred_v), Some(first_tx_type), None, fctx,
+                sv, Some(first_tx_type), None, fctx,
             )?
             .0;
             let coded = ug.iter().chain(vg.iter()).any(|&c| c != 0);
