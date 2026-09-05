@@ -23201,11 +23201,16 @@ fn read_single_ref(
 /// way with a coarser (`LAST_FRAME`-only) neighbour shape.
 /// lane-twostage: this frame's references as DIMENSIONS now and PIXELS on
 /// demand. An inter tile's parse reads reference SIZES (`mc::scale_factor`)
-/// but touches no reference PIXEL until its first prediction -- measured 4.2%
-/// of a 4K tile's parse into it -- so the pictures are resolved here, at the
-/// first [`ref_planes`] call, rather than at frame entry. On the threaded
-/// path that resolution is a WAIT on the producing frame's pixels, which is
-/// what lets a consumer parse while its references are still being filtered.
+/// only, so the pictures are resolved at the first [`ref_planes`] call
+/// rather than at frame entry. On the threaded path that resolution is a
+/// WAIT on the producing frame's pixels, which is what lets a consumer parse
+/// while its references are still being filtered.
+/// lane-defer8: at more than one reconstruction thread that first call now
+/// happens on a recon WORKER -- every whole-block prediction (the 16x16+
+/// paths, the 8x8 leaf, OBMC and the sub-8x8 chroma piece) is built inside
+/// its [`PredBuild`] closure, and the parse thread only ever asks for
+/// [`ref_dims`]. The sub-8x8 GROUP paths (4xN/Nx4 partitions) still predict
+/// inline and are the last parse-thread reference readers.
 pub(crate) struct RefPix<'p> {
     /// `(width, height)` per `ref_frame` index (`LAST_FRAME` = 1). `None` is
     /// a slot this frame may not use: empty, or -- for a non-`LAST_FRAME`
@@ -23214,6 +23219,10 @@ pub(crate) struct RefPix<'p> {
     dims: [Option<(usize, usize)>; 8],
     src: RefSrc<'p>,
     bufs: std::sync::OnceLock<[Option<(PlaneBuf<'p>, PlaneBuf<'p>, PlaneBuf<'p>)>; 8]>,
+    /// lane-defer8: a DEFERRED prediction's [`ref_planes`] failure, parked
+    /// here for the frame decoder to take ([`take_err`](Self::take_err)) --
+    /// a recon worker replaying a recorded op has no `?` of its own.
+    err: std::sync::Mutex<Option<Error>>,
 }
 
 /// Where a [`RefPix`] gets its pictures: already in hand, or behind a wait
@@ -23233,7 +23242,7 @@ impl<'p> RefPix<'p> {
         let dims = Self::compatible(std::array::from_fn(|i| {
             refs[i].map(|p| (p.width, p.height))
         }));
-        Self { dims, src: RefSrc::Ready(refs), bufs: std::sync::OnceLock::new() }
+        Self { dims, src: RefSrc::Ready(refs), bufs: std::sync::OnceLock::new(), err: std::sync::Mutex::new(None) }
     }
 
     /// References whose sizes are known (from their producers' headers) but
@@ -23242,7 +23251,12 @@ impl<'p> RefPix<'p> {
         dims: [Option<(usize, usize)>; 8],
         wait: &'p (dyn Fn() -> Result<[Option<&'p Picture>; 8]> + Send + Sync + 'p),
     ) -> Self {
-        Self { dims: Self::compatible(dims), src: RefSrc::Lazy(wait), bufs: std::sync::OnceLock::new() }
+        Self {
+            dims: Self::compatible(dims),
+            src: RefSrc::Lazy(wait),
+            bufs: std::sync::OnceLock::new(),
+            err: std::sync::Mutex::new(None),
+        }
     }
 
     /// Spec 7.9's compatible-size rule: a non-`LAST_FRAME` slot at a
@@ -23261,6 +23275,23 @@ impl<'p> RefPix<'p> {
     /// This slot's picture size, without touching its pixels.
     pub(crate) fn dims(&self, ref_frame: i8) -> Option<(usize, usize)> {
         self.dims.get(ref_frame as usize).copied().flatten()
+    }
+
+    /// Parks a deferred prediction's failure (first one wins).
+    fn park_err(&self, e: Error) {
+        let mut slot = self.err.lock().expect("the parked-error slot is never poisoned");
+        if slot.is_none() {
+            *slot = Some(e);
+        }
+    }
+
+    /// The first failure any deferred prediction parked, taken once every
+    /// recon worker of the frame has been joined.
+    pub(crate) fn take_err(&self) -> Result<()> {
+        match self.err.lock().expect("the parked-error slot is never poisoned").take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Every usable slot's three planes, resolving (and, on the threaded
@@ -23285,6 +23316,37 @@ impl<'p> RefPix<'p> {
         });
         let _ = self.bufs.set(bufs);
         Ok(self.bufs.get().expect("the plane array was just set"))
+    }
+}
+
+/// This slot's picture SIZE, with [`ref_planes`]' own error when the slot
+/// carries no usable picture -- `dims` is `None` exactly when `planes()`
+/// would have nothing there, so the parse thread keeps refusing the same
+/// streams at the same block WITHOUT waiting for a producer's pixels
+/// (lane-defer8).
+fn ref_dims(ref_frame: i8, refpix: &RefPix<'_>) -> Result<(usize, usize)> {
+    refpix.dims(ref_frame).ok_or_else(|| {
+        unsupported(
+            "a reference frame selected with no picture at this frame's own \
+                 ref_frame_idx slot for it",
+        )
+    })
+}
+
+/// [`ref_planes`] from inside a DEFERRED prediction, where there is no `?`
+/// to take: the error is parked on the [`RefPix`] and taken by the frame
+/// decoder once the workers are joined ([`RefPix::take_err`]). The block's
+/// prediction is left zeroed -- the frame is failing either way.
+fn ref_planes_deferred<'a, 'p>(
+    ref_frame: i8,
+    refpix: &'a RefPix<'p>,
+) -> Option<(&'a PlaneBuf<'p>, &'a PlaneBuf<'p>, &'a PlaneBuf<'p>)> {
+    match ref_planes(ref_frame, refpix) {
+        Ok(planes) => Some(planes),
+        Err(e) => {
+            refpix.park_err(e);
+            None
+        }
     }
 }
 
@@ -24013,7 +24075,7 @@ nbmv=({},{}) nbref={} nbbsize={} filt={}",
 /// how many bordering blocks actually get blended, separate from the
 /// eligibility scan's own unbounded ("any at all") walk.
 #[allow(clippy::too_many_arguments)]
-fn obmc_blend(
+fn obmc_plan(
     grid: &MiGrid,
     neighbours: &Neighbours,
     mi_row: usize,
@@ -24038,10 +24100,7 @@ fn obmc_blend(
     // `av1_setup_build_prediction_by_above_pred` passing that ref's own
     // `scale_factors`).
     frame_width: usize,
-    pred_y: &mut [u16],
-    pred_u: &mut [u16],
-    pred_v: &mut [u16], fctx: &crate::decode::FrameCtx,
-) -> Result<()> {
+) -> Result<ObmcPlan> {
     // lane-rect r2 (libaom av1_build_obmc_inter_prediction): each pass has
     // its OWN neighbour cap (width-log2 for above, height-log2 for left) and
     // overlap (bh/2 rows above, bw/2 cols left) -- one square `side` was
@@ -24061,31 +24120,151 @@ fn obmc_blend(
         5..=8 => 3,
         _ => 4,
     };
-    // lane-inter4 r4: r3 refused OBMC on a 16x8/8x16 leaf (5302 luma pixels
-    // of one frame wrong). Re-measured on this tree with an `EC_OBMC` rung in
-    // both decoders on that exact stream: the neighbour lists agree entry for
-    // entry (position, span, mv, ref, size, filter) and all six pre-filter
-    // frames are byte-identical to the instrumented aomdec's. The refusal is
-    // gone; the counter below is what the gate's `--enable-obmc=1` arm reads.
-    // The only decode-path change between r3's measurement and this one is the
-    // lane-interbis merge (`build_motion_field`'s compound slot walk), which
-    // moves temporal MV candidates -- not bisected further.
+    // lane-inter4 r4: r3 refused OBMC on a 16x8/8x16 leaf; re-measured
+    // byte-exact against an instrumented aomdec, the refusal is gone and the
+    // counter below is what the gate's `--enable-obmc=1` arm reads.
     if matches!((write_w, write_h), (16, 8) | (8, 16)) {
         OBMC_RECT_LEAF_HITS.with(|c| c.set(c.get() + 1));
     }
     // lane-sb128c r1: libaom caps the overlap strip at a 64x64 block's own
-    // half (`reconinter.c` 860/899: `AOMMIN(block_size_high[bsize],
-    // block_size_high[BLOCK_64X64]) >> 1`, and the `block_size_wide` mirror) --
-    // inert below 128, where a 128x128 block would otherwise blend a 64-row
-    // strip `obmc_mask` has no table for.
+    // half (`reconinter.c` 860/899), inert below 128.
     let overlap_above = write_h.min(64) / 2;
     let overlap_left = write_w.min(64) / 2;
     // lane-inter8 r1 / lane-scaledref r1: `av1_skip_u4x4_pred_in_obmc`
-    // (`reconinter.c` 820, `DISABLE_CHROMA_U8X8_OBMC == 0` -- "one-sided
-    // obmc") returns `dir == 0` when the chroma plane's own block is
-    // BLOCK_4X4/8X4/4X8 (an 8x8, 16x8 or 8x16 luma block at 4:2:0): the
-    // ABOVE pass skips chroma entirely, the LEFT pass still blends it.
+    // (`reconinter.c` 820) returns `dir == 0` when the chroma plane's own
+    // block is BLOCK_4X4/8X4/4X8 (an 8x8, 16x8 or 8x16 luma block at 4:2:0):
+    // the ABOVE pass skips chroma entirely, the LEFT pass still blends it.
     let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
+    let mut above = Vec::new();
+    for (off4, span4, nb, src4) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
+    {
+        // `Neighbours::above_filter` is indexed in `SUB`(16px)-wide columns,
+        // one step coarser than the mi(4px) units `overlappable_above` walks
+        // in -- divide back down to that column. lane-gmaffine r2: the
+        // neighbour's OWN mi-granular filter (libaom
+        // `av1_setup_build_prediction_by_above_pred` reads
+        // `above_mbmi->interp_filters`).
+        let above_syms = neighbours.above_filter[mi_col + src4];
+        obmcrec_probe(
+            "above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, above_syms,
+            grid.get(mi_row - 1, mi_col + src4), interp_fixed.is_some(),
+        );
+        let (h_kind, v_kind) = neighbour_filter(interp_fixed, above_syms)?;
+        ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
+        let (nb_width, _) = ref_dims(nb.ref_frame, refpix)?;
+        if mi_col + off4 + span4 > mi_cols {
+            OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
+        }
+        above.push(ObmcNb {
+            off4,
+            span4,
+            mv: mv32(nb.mv),
+            ref_frame: nb.ref_frame,
+            h_kind,
+            v_kind,
+            scale: mc::scale_factor(nb_width, frame_width),
+        });
+    }
+    let mut left = Vec::new();
+    for (off4, span4, nb, src4) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4))
+    {
+        let left_syms = neighbours.left_filter[mi_row + src4];
+        obmcrec_probe(
+            "left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, left_syms,
+            grid.get(mi_row + src4, mi_col - 1), interp_fixed.is_some(),
+        );
+        let (h_kind, v_kind) = neighbour_filter(interp_fixed, left_syms)?;
+        ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
+        let (nb_width, _) = ref_dims(nb.ref_frame, refpix)?;
+        if mi_row + off4 + span4 > mi_rows {
+            OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
+        }
+        left.push(ObmcNb {
+            off4,
+            span4,
+            mv: mv32(nb.mv),
+            ref_frame: nb.ref_frame,
+            h_kind,
+            v_kind,
+            scale: mc::scale_factor(nb_width, frame_width),
+        });
+    }
+    Ok(ObmcPlan {
+        above,
+        left,
+        side,
+        chroma_side,
+        write_w,
+        write_h,
+        px,
+        py,
+        cpx,
+        cpy,
+        overlap_above,
+        overlap_left,
+        skip_chroma_above,
+    })
+}
+
+/// One OBMC neighbour as the PARSE thread resolved it (lane-defer8): every
+/// value [`obmc_run`] needs that lives in the mode-info grid or the
+/// neighbour bands, which the parse keeps overwriting as it walks on.
+struct ObmcNb {
+    off4: usize,
+    span4: usize,
+    mv: (i32, i32),
+    ref_frame: i8,
+    h_kind: mc::InterpFilterKind,
+    v_kind: mc::InterpFilterKind,
+    /// spec 7.11.3.3's `x_scale_fp` for THIS neighbour's own reference.
+    scale: i64,
+}
+
+/// [`obmc_plan`]'s result: the two neighbour passes plus this block's own
+/// geometry, everything [`obmc_run`] reads apart from reference PIXELS.
+pub(crate) struct ObmcPlan {
+    above: Vec<ObmcNb>,
+    left: Vec<ObmcNb>,
+    side: usize,
+    chroma_side: usize,
+    write_w: usize,
+    write_h: usize,
+    px: usize,
+    py: usize,
+    cpx: usize,
+    cpy: usize,
+    overlap_above: usize,
+    overlap_left: usize,
+    skip_chroma_above: bool,
+}
+
+/// The reference-pixel half of OBMC: re-predicts every planned neighbour
+/// over this block's own edge strips and blends it into the prediction
+/// (libaom `av1_build_obmc_inter_prediction`). Reads nothing but reference
+/// pixels and the plan, so it runs wherever the block's prediction is built
+/// -- on a recon worker when that prediction is deferred (lane-defer8).
+fn obmc_run(
+    plan: &ObmcPlan,
+    refpix: &RefPix<'_>,
+    pred_y: &mut [u16],
+    pred_u: &mut [u16],
+    pred_v: &mut [u16],
+    fctx: &crate::decode::FrameCtx,
+) {
+    let &ObmcPlan {
+        side,
+        chroma_side,
+        write_w,
+        write_h,
+        px,
+        py,
+        cpx,
+        cpy,
+        overlap_above,
+        overlap_left,
+        skip_chroma_above,
+        ..
+    } = plan;
     // lane-alloc: one neighbour-prediction buffer per plane for the whole
     // block, reused by every neighbour of the above and left passes.
     let (mut tmp_y, mut tmp_u, mut tmp_v) = (Vec::new(), Vec::new(), Vec::new());
@@ -24123,74 +24302,41 @@ fn obmc_blend(
             eprintln!("OUR_MCB prerow{r}: {row:?}");
         }
     }
-    for (off4, span4, nb, src4) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
-    {
-        // `Neighbours::above_filter` is indexed in `SUB`(16px)-wide columns
-        // (this decoder's own outer block-loop granularity), one step
-        // coarser than the mi(4px) units `overlappable_above` walks in --
-        // divide back down to that column.
-        // lane-gmaffine r2: the neighbour's OWN mi-granular filter
-        // (libaom `av1_setup_build_prediction_by_above_pred` reads
-        // `above_mbmi->interp_filters`); the 16px-granular `Neighbours` slot
-        // stays as the fallback for paths that do not record one yet
-        // (compound), which is what every earlier round used.
-        let above_syms = neighbours.above_filter[mi_col + src4];
-        obmcrec_probe(
-            "above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, above_syms,
-            grid.get(mi_row - 1, mi_col + src4), interp_fixed.is_some(),
-        );
-        let (h_kind, v_kind) = neighbour_filter(interp_fixed, above_syms)?;
-        ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
-        let (ny, nu, nv) = ref_planes(nb.ref_frame, refpix)?;
-        let nb_scale = mc::scale_factor(ny.width, frame_width);
-        if mi_col + off4 + span4 > mi_cols {
-            OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
-        }
-        let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
+    for nb in &plan.above {
+        let Some((ny, nu, nv)) = ref_planes_deferred(nb.ref_frame, refpix) else {
+            return;
+        };
+        let (bw, bh, ox) = (nb.span4 * 4, overlap_above, nb.off4 * 4);
         // lane-t900 r14: the prediction is `op_mi_size` wide (kernel choice
         // included); only the WRITE is clipped to this block's own buffer.
-        obmc_neighbour_pred(ny, px + ox, py, mv32(nb.mv), bw, bh, true, h_kind, v_kind, nb_scale, &mut tmp_y, fctx);
+        obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_y, fctx);
         obmc_blend_v(pred_y, side, ox, 0, bw.min(write_w - ox), bh, bw, &tmp_y);
         if !skip_chroma_above {
             // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
-            // (`dec_build_prediction_by_above_pred`) sizes only the OBMC
-            // PREDICTION buffer; the blend length is the plain half
-            // (`build_obmc_inter_pred_above`: `overlap >> ss_y`), so flooring
-            // this at 4 blends rows libaom never blends -- on a 10-bit
-            // 1920x792 cut that went 36 differing frames -> 266, worst
-            // 13 B -> 11007 B.
+            // sizes only the OBMC PREDICTION buffer; the blend length is the
+            // plain half (`build_obmc_inter_pred_above`: `overlap >> ss_y`).
             let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
             let cw = cbw.min(write_w / 2 - cox);
-            obmc_neighbour_pred(nu, cpx + cox, cpy, mv32(nb.mv), cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_u, fctx);
+            obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
-            obmc_neighbour_pred(nv, cpx + cox, cpy, mv32(nb.mv), cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_v, fctx);
+            obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
             obmc_blend_v(pred_v, chroma_side, cox, 0, cw, cbh, cbw, &tmp_v);
         }
     }
 
-    for (off4, span4, nb, src4) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4))
-    {
-        let left_syms = neighbours.left_filter[mi_row + src4];
-        obmcrec_probe(
-            "left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, left_syms,
-            grid.get(mi_row + src4, mi_col - 1), interp_fixed.is_some(),
-        );
-        let (h_kind, v_kind) = neighbour_filter(interp_fixed, left_syms)?;
-        ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
-        let (ny, nu, nv) = ref_planes(nb.ref_frame, refpix)?;
-        let nb_scale = mc::scale_factor(ny.width, frame_width);
-        if mi_row + off4 + span4 > mi_rows {
-            OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
-        }
-        let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
-        obmc_neighbour_pred(ny, px, py + oy, mv32(nb.mv), bw, bh, true, h_kind, v_kind, nb_scale, &mut tmp_y, fctx);
+    for nb in &plan.left {
+        let Some((ny, nu, nv)) = ref_planes_deferred(nb.ref_frame, refpix) else {
+            return;
+        };
+        let (bw, bh, oy) = (overlap_left, nb.span4 * 4, nb.off4 * 4);
+        obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_y, fctx);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh.min(write_h - oy), &tmp_y);
         let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
-        obmc_neighbour_pred(nu, cpx, cpy + coy, mv32(nb.mv), cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_u, fctx);
+        obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_u, fctx);
         if let Some((_, _, idx)) = ec_mcb {
             eprintln!(
-                "OUR_MCB left f={idx} off4={off4} span4={span4} cbw={cbw} cbh={cbh} coy={coy} mv=({},{}) ref0={}",
-                nb.mv.0, nb.mv.1, nb.ref_frame
+                "OUR_MCB left f={idx} off4={} span4={} cbw={cbw} cbh={cbh} coy={coy} mv=({},{}) ref0={}",
+                nb.off4, nb.span4, nb.mv.0, nb.mv.1, nb.ref_frame
             );
             for r in 0..cbh {
                 let row: Vec<u16> = (0..cbw).map(|c| tmp_u[r * cbw + c]).collect();
@@ -24199,7 +24345,7 @@ fn obmc_blend(
         }
         let ch = cbh.min(write_h / 2 - coy);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
-        obmc_neighbour_pred(nv, cpx, cpy + coy, mv32(nb.mv), cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_v, fctx);
+        obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, nb.h_kind, nb.v_kind, nb.scale, &mut tmp_v, fctx);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
@@ -24208,7 +24354,6 @@ fn obmc_blend(
             eprintln!("OUR_MCB post f={idx} row{r}: {row:?}");
         }
     }
-    Ok(())
 }
 
 /// `is_any_masked_compound_used` (libaom `reconinter.h`), specialised to
@@ -25028,8 +25173,8 @@ fn decode_inter_block(
             if gm_nontrans_models && !gm_nontrans {
                 GM_NONTRANS_SMALL_SIDE_HITS.with(|c| c.set(c.get() + 1));
             }
-            let (py0, pu0, pv0) = ref_planes(ref0, refpix)?;
-            let (py1, pu1, pv1) = ref_planes(ref1, refpix)?;
+            // lane-defer8: both slots' pictures are resolved inside the
+            // prediction closure; the parse only needs their SIZES.
             // lane-cwarp r1: `is_global_mv_block` (blockd.h:421-429) is
             // PER REFERENCE SLOT -- mode GLOBAL_GLOBALMV, block >= 8x8, and
             // THAT slot's own gm model > TRANSLATION. `bw4`/`bh4` come from
@@ -25071,10 +25216,9 @@ fn decode_inter_block(
             // scaled (superres) is predicted translationally while its
             // sibling may still warp.
             let ref_unscaled = |rf: i8| {
-                ref_planes(rf, refpix)
-                    .is_ok_and(|(py, _, _)| {
-                        mc::scale_factor(py.width, frame_width) == mc::REF_NO_SCALE
-                    })
+                refpix
+                    .dims(rf)
+                    .is_some_and(|(w, _)| mc::scale_factor(w, frame_width) == mc::REF_NO_SCALE)
             };
             let warp0 = compound_warp(ref0, is_global_mv0).filter(|_| ref_unscaled(ref0));
             let warp1 = compound_warp(ref1, is_global_mv1).filter(|_| ref_unscaled(ref1));
@@ -25496,8 +25640,8 @@ fn decode_inter_block(
             // different ratios in the same block. `REF_NO_SCALE` reduces
             // `predict_compound_intermediate`'s walk to the ordinary
             // stride-1 one, so the unscaled case is unchanged.
-            let scale0 = mc::scale_factor(py0.width, frame_width);
-            let scale1 = mc::scale_factor(py1.width, frame_width);
+            let scale0 = mc::scale_factor(ref_dims(ref0, refpix)?.0, frame_width);
+            let scale1 = mc::scale_factor(ref_dims(ref1, refpix)?.0, frame_width);
             if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
                 SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
             }
@@ -25520,6 +25664,11 @@ fn decode_inter_block(
                               _v: &mut PlaneBuf<'static>,
                               fctx: &crate::decode::FrameCtx,
                               out: &mut [Vec<u16>; 3]| {
+            let (Some((py0, pu0, pv0)), Some((py1, pu1, pv1))) =
+                (ref_planes_deferred(ref0, refpix), ref_planes_deferred(ref1, refpix))
+            else {
+                return;
+            };
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate_kern(
                 &py0.data,
@@ -26152,7 +26301,10 @@ fn decode_inter_block(
             // below same as every other non-`LAST_FRAME` reference. lane-av1refs
             // widens this from GOLDEN alone to every reference `read_single_ref`
             // can name.
-            let (py_ref, pu_ref, pv_ref) = ref_planes(ref_frame, refpix)?;
+            // lane-defer8: SIZE here (spec 7.11.3.3's scale factor), pixels
+            // inside the prediction closure -- the parse thread of a threaded
+            // decode must never wait on a reference picture.
+            let (ref_width, _) = ref_dims(ref_frame, refpix)?;
 
             let (mi_row, mi_col) = (rmi, cmi);
             // lane-rect r2: the mv stack must be queried with the block's
@@ -26488,7 +26640,7 @@ fn decode_inter_block(
                 // picture whose height does not match this frame's own true
                 // size", ~14681). Whoever lifts that refusal adds the y term.
                 let ref_is_scaled =
-                    mc::scale_factor(py_ref.width, frame_width) != mc::REF_NO_SCALE;
+                    mc::scale_factor(ref_width, frame_width) != mc::REF_NO_SCALE;
                 let proj_ok = num_proj_ref(
                     grid,
                     mi_row,
@@ -26702,7 +26854,7 @@ fn decode_inter_block(
             // by name instead of silently sampling a scaled reference wrong
             // (warp_params/obmc_selected/interintra_mode are all resolved by
             // this point, every symbol for this block already read).
-            let luma_scale = mc::scale_factor(py_ref.width, frame_width);
+            let luma_scale = mc::scale_factor(ref_width, frame_width);
             if luma_scale != mc::REF_NO_SCALE {
                 // lane-scaledref r1: libaom `allow_warp`
                 // (av1/common/reconinter.c:41) suppresses BOTH local and
@@ -26728,8 +26880,23 @@ fn decode_inter_block(
             // (reconinter_template.inc:75-82); record them for the next 1:4
             // strip, which is the only reader.
             fctx.inter_last_mc.with(|c| c.set(Some((ref_frame, mv, h_filter, v_filter))));
-            let sub8_piece =
-                strip_chroma.filter(|s| s.has_chroma).and_then(|s| s.prev).is_some();
+            // lane-defer8: the sub-8x8 chroma piece's own reference resolved to
+            // a SIZE here and to pixels inside the closure, like the block's own.
+            let sub8 = match strip_chroma.filter(|s| s.has_chroma).and_then(|s| s.prev.map(|p| (s.horz, p))) {
+                Some((horz, (prev_ref, prev_mv, prev_h, prev_v))) => {
+                    let (prev_width, _) = ref_dims(prev_ref, refpix)?;
+                    INTER16_SUB8_PIECE_HITS.with(|c| c.set(c.get() + 1));
+                    Some((
+                        horz,
+                        prev_ref,
+                        prev_mv,
+                        prev_h,
+                        prev_v,
+                        mc::scale_factor(prev_width, frame_width),
+                    ))
+                }
+                None => None,
+            };
             // lane-wave4: the whole-block prediction (motion compensation +
             // warp + the interintra blend) as a closure, so it runs where the
             // writes it feeds run. At one reconstruction thread that is right
@@ -26738,11 +26905,42 @@ fn decode_inter_block(
             // ([`push_pred`]), which is what takes mc off the parse thread.
             // OBMC and the sub-8x8 chroma piece stay here: both can fail, and
             // a recorded op has no way to report it.
+            // lane-defer8: OBMC's neighbour walk reads the mode-info grid and
+            // the neighbour bands, both of which the parse keeps rewriting --
+            // so the walk happens here and the blend inside the closure.
+            let obmc = if obmc_selected {
+                Some(obmc_plan(
+                    grid,
+                    neighbours,
+                    mi_row,
+                    mi_col,
+                    bw4,
+                    bh4,
+                    mi_rows as usize,
+                    mi_cols as usize,
+                    side,
+                    write_w,
+                    write_h,
+                    chroma_side,
+                    px,
+                    py,
+                    cpx,
+                    cpy,
+                    refpix,
+                    interp_fixed,
+                    frame_width,
+                )?)
+            } else {
+                None
+            };
             let build = move |y: &mut PlaneBuf<'static>,
                               u: &mut PlaneBuf<'static>,
                               v: &mut PlaneBuf<'static>,
                               fctx: &crate::decode::FrameCtx,
                               out: &mut [Vec<u16>; 3]| {
+            let Some((py_ref, pu_ref, pv_ref)) = ref_planes_deferred(ref_frame, refpix) else {
+                return;
+            };
             let mut pred_y = refill(std::mem::take(&mut out[0]), side * side);
             let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_side * chroma_side);
             let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_side * chroma_side);
@@ -26902,62 +27100,9 @@ fn decode_inter_block(
                     &mut pred_v, fctx,
                 );
             }
-            *out = [pred_y, pred_u, pred_v];
-            };
-            // OBMC and interintra are mutually exclusive (`motion_mode` is
-            // never read for an interintra block), so blending interintra
-            // inside `build` and OBMC after it is still the coded order.
-            debug_assert!(!(obmc_selected && interintra_mode.is_some()));
-            let deferred = recon_deferred(fctx) && !obmc_selected && !sub8_piece;
-            let (mut pred_y, mut pred_u, mut pred_v): (Vec<u16>, Vec<u16>, Vec<u16>);
-            let (sy, su, sv) = if deferred {
-                // The interintra predictor inside `build` reads this block's
-                // own above/left edges: by the wavefront rule ((r-1, c+1) and
-                // (r, c-1) complete) and this superblock's own ops replaying
-                // in push order ahead of it, they are written by the time the
-                // worker runs it -- which retires the `flush_recon` barrier
-                // this arm used to take for interintra.
-                push_pred(fctx, build);
-                (
-                    Pred::Cur { plane: 0, stride: side, off: 0 },
-                    Pred::Cur { plane: 1, stride: chroma_side, off: 0 },
-                    Pred::Cur { plane: 2, stride: chroma_side, off: 0 },
-                )
-            } else {
-                if interintra_mode.is_some() {
-                    flush_recon(fctx, y, u, v);
-                }
-                let mut built: [Vec<u16>; 3] = Default::default();
-                build(y, u, v, fctx, &mut built);
-                let [by, bu, bv] = built;
-                (pred_y, pred_u, pred_v) = (by, bu, bv);
-            if obmc_selected {
-                obmc_blend(
-                    grid,
-                    neighbours,
-                    mi_row,
-                    mi_col,
-                    bw4,
-                    bh4,
-                    mi_rows as usize,
-                    mi_cols as usize,
-                    side,
-                    write_w,
-                    write_h,
-                    chroma_side,
-                    px,
-                    py,
-                    cpx,
-                    cpy,
-                    refpix,
-                    interp_fixed,
-                    frame_width,
-                    &mut pred_y,
-                    &mut pred_u,
-                    &mut pred_v, fctx,
-                )?;
+            if let Some(plan) = &obmc {
+                obmc_run(plan, refpix, &mut pred_y, &mut pred_u, &mut pred_v, fctx);
             }
-
             // lane-inter16ab r2: libaom `build_inter_predictors_sub8x8`
             // (reconinter_template.inc:87-160). A 4:2:0 chroma block under a
             // 16x4 (4x16) luma pair covers TWO luma blocks, so it is built in
@@ -26966,20 +27111,13 @@ fn decode_inter_block(
             // over its own rows, which the whole-block prediction above
             // already wrote there (MC is position-invariant for a fixed mv),
             // so only the FIRST piece has to be rebuilt -- and only when
-            // `is_sub8x8_inter` holds, i.e. the previous strip was itself a
-            // single-reference inter block (`prev`), else libaom falls
-            // through to the ordinary whole-block predictor.
-            if let Some(s) = strip_chroma.filter(|s| s.has_chroma)
-                && let Some((prev_ref, prev_mv, prev_h, prev_v)) = s.prev
-            {
-                let (piece_w, piece_h) = if s.horz { (8usize, 2usize) } else { (2usize, 8usize) };
-                // lane-t900 r28 (same-shape sweep of the sub-8x8 scaled-ref
-                // lift): this piece used to be SKIPPED when the block's
-                // reference was scaled, which silently left the whole-block
-                // prediction in place instead of refusing. It scales off the
-                // PREVIOUS strip's own reference, not this block's.
-                let (prev_y_plane, prev_u, prev_v_plane) = ref_planes(prev_ref, refpix)?;
-                let prev_scale = mc::scale_factor(prev_y_plane.width, frame_width);
+            // `is_sub8x8_inter` holds. lane-t900 r28: it scales off the
+            // PREVIOUS strip's own reference, not this block's.
+            if let Some((horz, prev_ref, prev_mv, prev_h, prev_v, prev_scale)) = sub8 {
+                let Some((_, prev_u, prev_v_plane)) = ref_planes_deferred(prev_ref, refpix) else {
+                    return;
+                };
+                let (piece_w, piece_h) = if horz { (8usize, 2usize) } else { (2usize, 8usize) };
                 for (src, dst) in [(prev_u, &mut pred_u), (prev_v_plane, &mut pred_v)] {
                     let mut piece = vec![0u16; piece_w * piece_h];
                     mc::predict_maybe_scaled(
@@ -27001,8 +27139,50 @@ fn decode_inter_block(
                             .copy_from_slice(&piece[row * piece_w..(row + 1) * piece_w]);
                     }
                 }
-                INTER16_SUB8_PIECE_HITS.with(|c| c.set(c.get() + 1));
             }
+            *out = [pred_y, pred_u, pred_v];
+            };
+            // OBMC and interintra are mutually exclusive (`motion_mode` is
+            // never read for an interintra block), so blending interintra
+            // inside `build` and OBMC after it is still the coded order.
+            debug_assert!(!(obmc_selected && interintra_mode.is_some()));
+            // lane-defer8: OBMC and the sub-8x8 piece now live inside `build`,
+            // so nothing about this block keeps its prediction on this thread.
+            let deferred = recon_deferred(fctx);
+            let (pred_y, pred_u, pred_v): (Vec<u16>, Vec<u16>, Vec<u16>);
+            let (sy, su, sv) = if deferred {
+                // The interintra predictor inside `build` reads this block's
+                // own above/left edges: by the wavefront rule ((r-1, c+1) and
+                // (r, c-1) complete) and this superblock's own ops replaying
+                // in push order ahead of it, they are written by the time the
+                // worker runs it -- which retires the `flush_recon` barrier
+                // this arm used to take for interintra.
+                push_pred(fctx, build);
+                (
+                    Pred::Cur { plane: 0, stride: side, off: 0 },
+                    Pred::Cur { plane: 1, stride: chroma_side, off: 0 },
+                    Pred::Cur { plane: 2, stride: chroma_side, off: 0 },
+                )
+            } else {
+                if interintra_mode.is_some() {
+                    flush_recon(fctx, y, u, v);
+                }
+                let mut built: [Vec<u16>; 3] = Default::default();
+                build(y, u, v, fctx, &mut built);
+                let [by, bu, bv] = built;
+                (pred_y, pred_u, pred_v) = (by, bu, bv);
+
+            // lane-inter16ab r2: libaom `build_inter_predictors_sub8x8`
+            // (reconinter_template.inc:87-160). A 4:2:0 chroma block under a
+            // 16x4 (4x16) luma pair covers TWO luma blocks, so it is built in
+            // `b4_w x b4_h` = 8x2 (2x8) pieces, each from its own strip's
+            // mv/ref/filters. The bottom (right) piece is this strip's own mv
+            // over its own rows, which the whole-block prediction above
+            // already wrote there (MC is position-invariant for a fixed mv),
+            // so only the FIRST piece has to be rebuilt -- and only when
+            // `is_sub8x8_inter` holds, i.e. the previous strip was itself a
+            // single-reference inter block (`prev`), else libaom falls
+            // through to the ordinary whole-block predictor.
                 (
                     Pred::Inline(&pred_y, side),
                     Pred::Inline(&pred_u, chroma_side),
@@ -30395,10 +30575,9 @@ fn decode_inter_block8(
                     COMPOUND8_FILTER_HITS.with(|c| c.set(c.get() + 1));
                 }
 
-                let (py0, pu0, pv0) = ref_planes(ref0, refpix)?;
-                let (py1, pu1, pv1) = ref_planes(ref1, refpix)?;
-                let scale0 = mc::scale_factor(py0.width, frame_width);
-                let scale1 = mc::scale_factor(py1.width, frame_width);
+                // lane-defer8: both slots' SIZES at parse, pictures in the closure.
+                let scale0 = mc::scale_factor(ref_dims(ref0, refpix)?.0, frame_width);
+                let scale1 = mc::scale_factor(ref_dims(ref1, refpix)?.0, frame_width);
                 if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
                     SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
                     SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
@@ -30449,10 +30628,9 @@ fn decode_inter_block8(
                 // lane-t900 r28: same per-slot `allow_warp` scale bail-out as
                 // the 16x16-and-bigger compound path above.
                 let leaf_ref_unscaled = |rf: i8| {
-                    ref_planes(rf, refpix)
-                        .is_ok_and(|(py, _, _)| {
-                            mc::scale_factor(py.width, frame_width) == mc::REF_NO_SCALE
-                        })
+                    refpix
+                        .dims(rf)
+                        .is_some_and(|(w, _)| mc::scale_factor(w, frame_width) == mc::REF_NO_SCALE)
                 };
                 let warp0_c =
                     leaf_compound_warp(ref0, is_global_mv0_c).filter(|_| leaf_ref_unscaled(ref0));
@@ -30482,6 +30660,19 @@ fn decode_inter_block8(
                 );
                 mode_for_tx = 0;
 
+                // lane-defer8: this leaf's whole prediction as a closure, so it runs
+                // where its writes run -- on a recon worker at more than one
+                // reconstruction thread, exactly like [`decode_inter_block`]'s.
+                let build = move |_y: &mut PlaneBuf<'static>,
+                                  _u: &mut PlaneBuf<'static>,
+                                  _v: &mut PlaneBuf<'static>,
+                                  fctx: &crate::decode::FrameCtx,
+                                  out: &mut [Vec<u16>; 3]| {
+                let (Some((py0, pu0, pv0)), Some((py1, pu1, pv1))) =
+                    (ref_planes_deferred(ref0, refpix), ref_planes_deferred(ref1, refpix))
+                else {
+                    return;
+                };
                 let mut inter0_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py0.data,
@@ -30526,7 +30717,7 @@ fn decode_inter_block8(
                         SIDE as i32, SIDE as i32, 0, 0, fctx,
                     );
                 }
-                let mut pred_y = vec![0u16; SIDE * SIDE];
+                let mut pred_y = refill(std::mem::take(&mut out[0]), SIDE * SIDE);
                 let mut diffwtd_mask_y;
                 let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
                     diffwtd_mask_y = vec![0u8; SIDE * SIDE];
@@ -30574,7 +30765,7 @@ fn decode_inter_block8(
                     v_filter,
                     &mut inter1_u,
                 );
-                let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
+                let mut pred_u = refill(std::mem::take(&mut out[1]), CHROMA_SIDE * CHROMA_SIDE);
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_u,
@@ -30620,7 +30811,7 @@ fn decode_inter_block8(
                     v_filter,
                     &mut inter1_v,
                 );
-                let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
+                let mut pred_v = refill(std::mem::take(&mut out[2]), CHROMA_SIDE * CHROMA_SIDE);
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_v,
@@ -30636,6 +30827,28 @@ fn decode_inter_block8(
                     mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v, fctx);
                 }
 
+                *out = [pred_y, pred_u, pred_v];
+                };
+        let deferred = recon_deferred(fctx);
+                        let (pred_y, pred_u, pred_v): (Vec<u16>, Vec<u16>, Vec<u16>);
+                        let (sy, su, sv) = if deferred {
+                            push_pred(fctx, build);
+                            (
+                                Pred::Cur { plane: 0, stride: SIDE, off: 0 },
+                                Pred::Cur { plane: 1, stride: CHROMA_SIDE, off: 0 },
+                                Pred::Cur { plane: 2, stride: CHROMA_SIDE, off: 0 },
+                            )
+                        } else {
+                            let mut built: [Vec<u16>; 3] = Default::default();
+                            build(y, u, v, fctx, &mut built);
+                            let [by, bu, bv] = built;
+                            (pred_y, pred_u, pred_v) = (by, bu, bv);
+                            (
+                                Pred::Inline(&pred_y, SIDE),
+                                Pred::Inline(&pred_u, CHROMA_SIDE),
+                                Pred::Inline(&pred_v, CHROMA_SIDE),
+                            )
+                        };
                 split8 = read_block_tx_size(
                     dec,
                     cdfs,
@@ -30649,19 +30862,19 @@ fn decode_inter_block8(
                 .1
                 .is_some();
                 if skip {
-                    push_mc(0, px, py, SIDE, Pred::dense(&pred_y), &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
+                    push_mc(0, px, py, SIDE, sy, &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
                     push_mc(1, 
                         cpx,
                         cpy,
                         CHROMA_SIDE,
-                        Pred::dense(&pred_u),
+                        su,
                         &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE], fctx,
                     );
                     push_mc(2, 
                         cpx,
                         cpy,
                         CHROMA_SIDE,
-                        Pred::dense(&pred_v),
+                        sv,
                         &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE], fctx,
                     );
                     luma_grid = vec![0i32; SIDE * SIDE];
@@ -30677,7 +30890,7 @@ fn decode_inter_block8(
                         y,
                         px,
                         py,
-                        Pred::dense(&pred_y),
+                        sy,
                         mode_for_tx,
                         base_q_idx,
                         scan8,
@@ -30699,7 +30912,7 @@ fn decode_inter_block8(
                         cpy,
                         CHROMA_SIDE,
                         base_q_idx,
-                        Pred::dense(&pred_u),
+                        su,
                         Some(luma_tx_type),
                         None, fctx,
                     )?
@@ -30717,7 +30930,7 @@ fn decode_inter_block8(
                         cpy,
                         CHROMA_SIDE,
                         base_q_idx,
-                        Pred::dense(&pred_v),
+                        sv,
                         Some(luma_tx_type),
                         None, fctx,
                     )?
@@ -30824,7 +31037,9 @@ fn decode_inter_block8(
             neighbours.left_ref1[rmi],
         );
         leaf_refs = (ref_frame, None);
-        let (sref_y, sref_u, sref_v) = ref_planes(ref_frame, refpix)?;
+        // lane-defer8: this leaf's reference SIZE at parse, its pictures
+        // inside the prediction closure below.
+        let (ref_width, _) = ref_dims(ref_frame, refpix)?;
 
         let (mi_row, mi_col) = leaf_mi;
         // lane-inter8 r2: the frame's temporal mv candidates, keyed on THIS
@@ -31000,7 +31215,7 @@ fn decode_inter_block8(
             // desynced every warped-motion superres stream at its first
             // eligible 8x8 leaf).
             let ref_is_scaled =
-                mc::scale_factor(sref_y.width, frame_width) != mc::REF_NO_SCALE;
+                mc::scale_factor(ref_width, frame_width) != mc::REF_NO_SCALE;
             let warp_eligible =
                 allow_warped_motion && !ref_is_scaled && !force_integer_mv && proj_ok;
             if allow_warped_motion && proj_ok && ref_is_scaled {
@@ -31162,13 +31377,49 @@ fn decode_inter_block8(
         // lane-scaledref r1: this leaf's own prediction is always `Regular`
         // (documented corner-cut above); under a scaled reference the same
         // fixed kernel runs through spec 7.11.3.3's scaled walk instead.
-        let luma_scale = mc::scale_factor(sref_y.width, frame_width);
+        let luma_scale = mc::scale_factor(ref_width, frame_width);
         if luma_scale != mc::REF_NO_SCALE {
             SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
         }
-        let mut pred_y = vec![0u16; SIDE * SIDE];
-        let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
-        let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
+        let obmc = if obmc_selected {
+            Some(obmc_plan(
+                grid,
+                neighbours,
+                mi_row,
+                mi_col,
+                2,
+                2,
+                mi_rows as usize,
+                mi_cols as usize,
+                SIDE,
+                SIDE,
+                SIDE,
+                CHROMA_SIDE,
+                px,
+                py,
+                cpx,
+                cpy,
+                refpix,
+                interp_fixed,
+                frame_width,
+            )?)
+        } else {
+            None
+        };
+        // lane-defer8: this leaf's whole prediction as a closure, so it runs
+        // where its writes run -- on a recon worker at more than one
+        // reconstruction thread, exactly like [`decode_inter_block`]'s.
+        let build = move |y: &mut PlaneBuf<'static>,
+                          u: &mut PlaneBuf<'static>,
+                          v: &mut PlaneBuf<'static>,
+                          fctx: &crate::decode::FrameCtx,
+                          out: &mut [Vec<u16>; 3]| {
+        let Some((sref_y, sref_u, sref_v)) = ref_planes_deferred(ref_frame, refpix) else {
+            return;
+        };
+        let mut pred_y = refill(std::mem::take(&mut out[0]), SIDE * SIDE);
+        let mut pred_u = refill(std::mem::take(&mut out[1]), CHROMA_SIDE * CHROMA_SIDE);
+        let mut pred_v = refill(std::mem::take(&mut out[2]), CHROMA_SIDE * CHROMA_SIDE);
         // Merge of lane-gmaffine (this leaf's own switchable filters) with
         // lane-scaledref (spec 7.11.3.3's scaled walk): same kernels either
         // way, only the sample walk differs.
@@ -31241,37 +31492,13 @@ fn decode_inter_block8(
             }
         }
 
-        if obmc_selected {
-            obmc_blend(
-                grid,
-                neighbours,
-                mi_row,
-                mi_col,
-                2,
-                2,
-                mi_rows as usize,
-                mi_cols as usize,
-                SIDE,
-                SIDE,
-                SIDE,
-                CHROMA_SIDE,
-                px,
-                py,
-                cpx,
-                cpy,
-                refpix,
-                interp_fixed,
-                frame_width,
-                &mut pred_y,
-                &mut pred_u,
-                &mut pred_v, fctx,
-            )?;
+        if let Some(plan) = &obmc {
+            obmc_run(plan, refpix, &mut pred_y, &mut pred_u, &mut pred_v, fctx);
         }
 
         // Non-wedge interintra blend, mutually exclusive with OBMC (the
         // motion_mode symbol is not read for an interintra block).
         if let Some(ii) = interintra_mode {
-            flush_recon(fctx, y, u, v);
             interintra_blend(y, px, py, SIDE, SIDE, SIDE, ii, wedge_mask, &mut pred_y, fctx);
             interintra_blend(
                 u, cpx, cpy, CHROMA_SIDE, CHROMA_SIDE, CHROMA_SIDE, ii, wedge_mask, &mut pred_u, fctx,
@@ -31281,6 +31508,34 @@ fn decode_inter_block8(
             );
         }
 
+        *out = [pred_y, pred_u, pred_v];
+        };
+        let deferred = recon_deferred(fctx);
+        let (pred_y, pred_u, pred_v): (Vec<u16>, Vec<u16>, Vec<u16>);
+        let (sy, su, sv) = if deferred {
+            push_pred(fctx, build);
+            (
+                Pred::Cur { plane: 0, stride: SIDE, off: 0 },
+                Pred::Cur { plane: 1, stride: CHROMA_SIDE, off: 0 },
+                Pred::Cur { plane: 2, stride: CHROMA_SIDE, off: 0 },
+            )
+        } else {
+            // The interintra predictor reads this block's own above/left
+            // edges: deferred, the wavefront rule has them written by the time
+            // the worker runs; inline, the queue has to drain first.
+            if interintra_mode.is_some() {
+                flush_recon(fctx, y, u, v);
+            }
+            let mut built: [Vec<u16>; 3] = Default::default();
+            build(y, u, v, fctx, &mut built);
+            let [by, bu, bv] = built;
+            (pred_y, pred_u, pred_v) = (by, bu, bv);
+            (
+                Pred::Inline(&pred_y, SIDE),
+                Pred::Inline(&pred_u, CHROMA_SIDE),
+                Pred::Inline(&pred_v, CHROMA_SIDE),
+            )
+        };
         split8 = read_block_tx_size(
             dec,
             cdfs,
@@ -31294,19 +31549,19 @@ fn decode_inter_block8(
         .1
         .is_some();
         if skip {
-            push_mc(0, px, py, SIDE, Pred::dense(&pred_y), &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
+            push_mc(0, px, py, SIDE, sy, &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
             push_mc(1, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                Pred::dense(&pred_u),
+                su,
                 &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE], fctx,
             );
             push_mc(2, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                Pred::dense(&pred_v),
+                sv,
                 &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE], fctx,
             );
             luma_grid = vec![0i32; SIDE * SIDE];
@@ -31322,7 +31577,7 @@ fn decode_inter_block8(
                 y,
                 px,
                 py,
-                Pred::dense(&pred_y),
+                sy,
                 mode_for_tx,
                 base_q_idx,
                 scan8,
@@ -31344,7 +31599,7 @@ fn decode_inter_block8(
                 cpy,
                 CHROMA_SIDE,
                 base_q_idx,
-                Pred::dense(&pred_u),
+                su,
                 Some(luma_tx_type),
                 None, fctx,
             )?
@@ -31362,7 +31617,7 @@ fn decode_inter_block8(
                 cpy,
                 CHROMA_SIDE,
                 base_q_idx,
-                Pred::dense(&pred_v),
+                sv,
                 Some(luma_tx_type),
                 None, fctx,
             )?
@@ -34712,6 +34967,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             result_cdfs = cdfs;
         }
     }
+    // lane-defer8: every tile's recon workers are joined by its own
+    // `WaveGuard`, so a deferred prediction's parked failure is complete here.
+    refpix.take_err()?;
     crate::timeline::recon_done();
     // lane-twostage: the motion field is built from the mode-info grid alone
     // (no pixel), so it moves up here with the CDFs -- everything a
