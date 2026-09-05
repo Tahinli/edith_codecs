@@ -4730,6 +4730,7 @@ pub(crate) struct TplFrameArgs<'a> {
 /// block-uniform), so sampling any one 4x4 unit inside each 8x8 cell is
 /// exact — every block this crate ever codes is at least 8x8, so no 8x8
 /// cell straddles two different blocks' values.
+#[allow(unsafe_code)] // lane-mf: `par::Shared` band split, same corner-cut as the filter stages
 pub(crate) fn build_motion_field(
     grid: &MiGrid,
     mi_cols: usize,
@@ -4737,6 +4738,7 @@ pub(crate) fn build_motion_field(
     order_hint: u32,
     order_hint_bits: u32,
     ref_order_hints: [u32; 7],
+    fctx: &FrameCtx,
 ) -> crate::motion_field::MotionField {
     let mut field =
         crate::motion_field::MotionField::new(mi_cols, mi_rows, order_hint, ref_order_hints, false);
@@ -4746,57 +4748,80 @@ pub(crate) fn build_motion_field(
     // referencing one stores only its OTHER side's mv. With
     // `enable_order_hint` off (`order_hint_bits == 0`) every side is 0 and
     // nothing is skipped.
-    let other_side = |rf: i8| -> bool {
-        if order_hint_bits == 0 {
-            return false;
-        }
-        let oh = ref_order_hints[(rf - LAST_FRAME) as usize];
-        crate::motion_field::get_relative_dist(order_hint_bits, oh, order_hint) > 0
-            || oh == order_hint
-    };
+    // lane-mf: hoisted out of the per-4x4-unit loop -- the answer depends
+    // only on the reference frame, so it is 7 table lookups per frame instead
+    // of two per inter unit.
+    let other_side: [bool; 8] = std::array::from_fn(|rf| {
+        let i = rf.wrapping_sub(LAST_FRAME as usize);
+        order_hint_bits != 0
+            && i < 7
+            && (crate::motion_field::get_relative_dist(order_hint_bits, ref_order_hints[i], order_hint) > 0
+                || ref_order_hints[i] == order_hint)
+    });
     // libaom `REFMVS_LIMIT` (`mvref_common.h`): a stored motion field mv is
     // capped at 12 bits per component; a longer one is not stored at all.
     const REFMVS_LIMIT: i32 = (1 << 12) - 1;
-    for row in 0..mi_rows {
-        for col in 0..mi_cols {
-            let Some(info) = grid.get_frame(row, col) else {
-                continue;
-            };
-            // `av1_copy_frame_mvs` runs for EVERY block of an inter frame and
-            // CLEARS the cells it covers first (`mv->ref_frame = NONE_FRAME`),
-            // so an intra block -- or an inter block whose every slot is on the
-            // other side / over the limit -- wipes what an earlier block wrote
-            // into the same 8x8 cell (only reachable from sub-8x8 leaves, which
-            // share a cell).
-            if !info.is_inter {
-                field.set(row, col, None);
-                continue;
-            }
-            // `av1_copy_frame_mvs` walks BOTH reference slots and the LAST
-            // qualifying one wins -- a compound block stores its second
-            // reference's mv, never its first (unless the second is on the
-            // other side or over the limit). Storing slot 0 unconditionally
-            // put the wrong (mv, ref_frame_offset) pair in every compound
-            // block's cell, which a later frame's temporal candidate then
-            // projected with the wrong reference distance.
-            let mut saved: Option<crate::motion_field::SavedMv> = None;
-            for (rf, mv) in [
-                (info.ref_frame, Some(info.mv)),
-                (info.ref_frame1.unwrap_or(0), info.mv1),
-            ] {
-                let (Some(mv), true) = (mv, rf > 0) else {
+    let (cols, rows, cells) = field.cells_mut();
+    // Fills cell rows `r0..r1`; `out` is exactly those rows' cells, so bands
+    // never touch each other (an 8x8 cell lives in one cell row, and mi row
+    // `row` writes cell row `row / 2`).
+    let fill = |r0: usize, r1: usize, out: &mut [Option<crate::motion_field::SavedMv>]| {
+        for row in (r0 * 2)..(r1 * 2).min(mi_rows) {
+            let out = &mut out[(row / 2 - r0) * cols..][..cols];
+            for col in 0..mi_cols {
+                let Some(info) = grid.get_frame(row, col) else {
                     continue;
                 };
-                if other_side(rf) {
+                // `av1_copy_frame_mvs` runs for EVERY block of an inter frame and
+                // CLEARS the cells it covers first (`mv->ref_frame = NONE_FRAME`),
+                // so an intra block -- or an inter block whose every slot is on the
+                // other side / over the limit -- wipes what an earlier block wrote
+                // into the same 8x8 cell (only reachable from sub-8x8 leaves, which
+                // share a cell).
+                if !info.is_inter {
+                    out[col / 2] = None;
                     continue;
                 }
-                if mv.0.abs() > REFMVS_LIMIT || mv.1.abs() > REFMVS_LIMIT {
-                    continue;
+                // `av1_copy_frame_mvs` walks BOTH reference slots and the LAST
+                // qualifying one wins -- a compound block stores its second
+                // reference's mv, never its first (unless the second is on the
+                // other side or over the limit). Storing slot 0 unconditionally
+                // put the wrong (mv, ref_frame_offset) pair in every compound
+                // block's cell, which a later frame's temporal candidate then
+                // projected with the wrong reference distance.
+                let mut saved: Option<crate::motion_field::SavedMv> = None;
+                for (rf, mv) in [
+                    (info.ref_frame, Some(info.mv)),
+                    (info.ref_frame1.unwrap_or(0), info.mv1),
+                ] {
+                    let (Some(mv), true) = (mv, rf > 0) else {
+                        continue;
+                    };
+                    if other_side[rf as usize] {
+                        continue;
+                    }
+                    if mv.0.abs() > REFMVS_LIMIT || mv.1.abs() > REFMVS_LIMIT {
+                        continue;
+                    }
+                    saved = Some(crate::motion_field::SavedMv { mv, ref_frame: rf });
                 }
-                saved = Some(crate::motion_field::SavedMv { mv, ref_frame: rf });
+                out[col / 2] = saved;
             }
-            field.set(row, col, saved);
         }
+    };
+    // lane-mf: the whole-frame pass split over the filter pool in cell-row
+    // bands (same `Shared` corner-cut as the filter stages -- disjointness is
+    // the band arithmetic above, proved by the 1-vs-16-thread byte-exact gate).
+    let bands = crate::par::bands(rows, crate::par::filter_threads());
+    if bands.len() <= 1 {
+        fill(0, rows, cells);
+    } else {
+        let shared = crate::par::Shared::new(cells);
+        crate::par::run_bands(&bands, fctx, |r0, r1, _| {
+            // SAFETY: cell rows `r0..r1` are this band's alone.
+            let cells = unsafe { shared.get() };
+            fill(r0, r1, &mut cells[r0 * cols..r1 * cols]);
+        });
     }
     if crate::envflags::env_flag!("EC_TRACE_TPL") {
         eprintln!("EC_TPL_SAVED oh={order_hint}");
@@ -34026,6 +34051,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         order_hint,
         order_hint_bits,
         ref_order_hints,
+           fctx,
     );
 
     let (fw, fh) = (lr_w, frame_height as usize);

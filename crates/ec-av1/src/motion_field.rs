@@ -68,6 +68,7 @@ impl MotionField {
     /// (`mv->ref_frame = NONE_FRAME; mv->mv.as_int = 0;`), which every block
     /// of an inter frame performs -- an intra (or nothing-to-store) block
     /// sharing an 8x8 cell with an earlier inter one wipes that cell.
+    #[allow(dead_code)] // lane-mf: the frame build now fills cell rows directly; kept for the module's tests
     pub fn set(&mut self, mi_row: usize, mi_col: usize, saved: Option<SavedMv>) {
         let (r, c) = (mi_row / 2, mi_col / 2);
         if r < self.rows && c < self.cols {
@@ -85,6 +86,13 @@ impl MotionField {
                     .collect()
             })
             .collect()
+    }
+
+    /// lane-mf: the cell grid itself (`cols`, `rows`, cells in row-major
+    /// order), so [`crate::decode::build_motion_field`] can fill disjoint
+    /// row bands of it in parallel. Cell row `r` owns `cells[r * cols..][..cols]`.
+    pub(crate) fn cells_mut(&mut self) -> (usize, usize, &mut [Option<SavedMv>]) {
+        (self.cols, self.rows, &mut self.cells)
     }
 
     fn get(&self, row8: usize, col8: usize) -> Option<SavedMv> {
