@@ -2112,7 +2112,121 @@ impl Residual {
     }
 }
 
+/// Where a recorded motion-compensated write reads its prediction from.
+///
+/// lane-wave4: a block's whole-block prediction (mc + warp + interintra) is
+/// the parse thread's single biggest reconstruction cost, so at
+/// `EC_AV1_RECON_THREADS > 1` it is not built at parse at all: the block
+/// pushes a [`ReconOp::Pred`] carrying the build as a closure, the worker
+/// runs it into its own three-plane slot, and every transform unit of that
+/// block then reads its window out of that slot ([`Pred::Cur`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Pred<'a> {
+    /// A prediction the parse thread already built. `stride == 0` means "the
+    /// reader's own `stride` argument", which is every pre-lane-wave4 site.
+    Inline(&'a [u16], usize),
+    /// The current block's deferred prediction: plane, its stride, and this
+    /// unit's offset into it.
+    Cur { plane: usize, stride: usize, off: usize },
+}
+
+impl<'a> Pred<'a> {
+    fn dense(buf: &'a [u16]) -> Self {
+        Self::Inline(buf, 0)
+    }
+    /// The same prediction read at an explicit stride.
+    fn view(self, stride: usize) -> Self {
+        match self {
+            Self::Inline(b, _) => Self::Inline(b, stride),
+            Self::Cur { plane, off, .. } => Self::Cur { plane, stride, off },
+        }
+    }
+    /// The materialised buffer and the stride to read it at (`stride` is the
+    /// reader's own when this prediction was built dense); `None` for a
+    /// deferred prediction, which only a recorded op can carry.
+    fn inline(self, stride: usize) -> Option<(&'a [u16], usize)> {
+        match self {
+            Self::Inline(b, s) => Some((b, if s == 0 { stride } else { s })),
+            Self::Cur { .. } => None,
+        }
+    }
+    /// This prediction's window starting `n` samples in.
+    fn offset(self, n: usize) -> Self {
+        match self {
+            Self::Inline(b, s) => Self::Inline(&b[n..], s),
+            Self::Cur { plane, stride, off } => Self::Cur { plane, stride, off: off + n },
+        }
+    }
+}
+
+/// [`Pred`], resolved into what a recorded op carries.
+pub(crate) enum PredSrc {
+    Owned(Vec<u16>),
+    /// A window of the block prediction: its plane, its offset, and the
+    /// stride it is read at -- which is the block's, not necessarily the
+    /// op's (a transform unit's residual stays dense, so the worker takes
+    /// its window out of the block prediction itself).
+    Cur { plane: usize, off: usize, src: usize },
+}
+
+/// One block's whole-block prediction build, deferred to a recon worker.
+///
+/// The closure borrows the tile's reference pictures and its own frame-level
+/// tables; [`WaveGuard`] joins every worker before the tile decoder returns,
+/// so those borrows outlive it -- the [`ReconPlanes`] trade-off, stated once
+/// here for the closure's `'static`/`Send` laundering in [`push_pred`].
+pub(crate) struct PredBuild(
+    Box<
+        dyn FnOnce(
+            &mut PlaneBuf<'static>,
+            &mut PlaneBuf<'static>,
+            &mut PlaneBuf<'static>,
+            &crate::decode::FrameCtx,
+        ) -> [Vec<u16>; 3],
+    >,
+);
+
+// SAFETY: see [`PredBuild`] -- the captured borrows are read-only reference
+// pictures and frame tables, and the closure runs on exactly one worker.
+#[allow(unsafe_code)]
+unsafe impl Send for PredBuild {}
+
+/// `true` when this tile's writes are recorded for the wavefront instead of
+/// performed at the push site, i.e. when a prediction may be deferred.
+fn recon_deferred(fctx: &crate::decode::FrameCtx) -> bool {
+    fctx.recon_planes.with(std::cell::Cell::get).is_none()
+}
+
+/// Records one block's prediction build for the worker that reconstructs it.
+#[allow(unsafe_code)]
+fn push_pred<'a>(
+    fctx: &crate::decode::FrameCtx,
+    f: impl FnOnce(
+        &mut PlaneBuf<'static>,
+        &mut PlaneBuf<'static>,
+        &mut PlaneBuf<'static>,
+        &crate::decode::FrameCtx,
+    ) -> [Vec<u16>; 3]
+    + 'a,
+) {
+    type Built = [Vec<u16>; 3];
+    type Dyn<'x> = dyn FnOnce(
+        &mut PlaneBuf<'static>,
+        &mut PlaneBuf<'static>,
+        &mut PlaneBuf<'static>,
+        &crate::decode::FrameCtx,
+    ) -> Built
+        + 'x;
+    let boxed: Box<Dyn<'a>> = Box::new(f);
+    // SAFETY: see [`PredBuild`] -- every worker is joined by [`WaveGuard`]
+    // before the borrows the closure holds go out of scope.
+    let boxed: Box<Dyn<'static>> = unsafe { std::mem::transmute(boxed) };
+    push_op(fctx, ReconOp::Pred(PredBuild(boxed)));
+}
+
 pub(crate) enum ReconOp {
+    /// lane-wave4: build this block's prediction into the worker's slot.
+    Pred(PredBuild),
     Intra {
         plane: usize,
         x: usize,
@@ -2141,7 +2255,7 @@ pub(crate) enum ReconOp {
         stride: usize,
         w: usize,
         h: usize,
-        prediction: Vec<u16>,
+        prediction: PredSrc,
         residual: Residual,
     },
 }
@@ -2222,7 +2336,7 @@ fn push_op(fctx: &crate::decode::FrameCtx, op: ReconOp) {
     if let Some(ReconPlanes(y, u, v)) = fctx.recon_planes.with(std::cell::Cell::get) {
         // SAFETY: see [`ReconPlanes`] -- one thread, and the write is the one
         // the parse site would have performed itself before lane-wave1.
-        unsafe { exec_op(op, &mut *y, &mut *u, &mut *v, fctx) };
+        unsafe { exec_op(op, &mut *y, &mut *u, &mut *v, &mut Default::default(), fctx) };
         return;
     }
     fctx.recon_ops.with(|c| c.borrow_mut().push(op));
@@ -2295,9 +2409,10 @@ fn wave_worker(st: &WaveState) {
         // SAFETY: this job writes only superblock (r, c)'s own pixels, and
         // every superblock that could have written or be reading them is
         // complete by the wavefront rule above.
+        let mut cur: [Vec<u16>; 3] = Default::default();
         unsafe {
             for op in ops {
-                exec_op(op, &mut *y, &mut *u, &mut *v, &fctx);
+                exec_op(op, &mut *y, &mut *u, &mut *v, &mut cur, &fctx);
             }
         }
         let mut q = st.q.lock().unwrap();
@@ -2520,14 +2635,26 @@ fn push_mc_rect_owned(
     stride: usize,
     w: usize,
     h: usize,
-    prediction: &[u16],
+    prediction: Pred<'_>,
     residual: Vec<i32>, fctx: &crate::decode::FrameCtx,
 ) {
-    if inline_mc(plane, x, y, stride, w, h, prediction, &residual, fctx) {
+    let (src, stride) = match prediction.inline(stride) {
+        Some(v) => v,
+        None => {
+            let Pred::Cur { plane: sp, stride: ss, off } = prediction else { unreachable!() };
+            push_op(fctx, ReconOp::Mc {
+                plane, x, y, stride: ss, w, h,
+                prediction: PredSrc::Cur { plane: sp, off, src: ss },
+                residual: Residual::Done(residual),
+            });
+            return;
+        }
+    };
+    if inline_mc(plane, x, y, stride, w, h, src, &residual, fctx) {
         return;
     }
     push_op(fctx, ReconOp::Mc {
-        plane, x, y, stride, w, h, prediction: prediction.to_vec(),
+        plane, x, y, stride, w, h, prediction: PredSrc::Owned(src.to_vec()),
         residual: Residual::Done(residual),
     });
 }
@@ -2567,7 +2694,7 @@ fn push_mc(
     x: usize,
     y: usize,
     side: usize,
-    prediction: &[u16],
+    prediction: Pred<'_>,
     residual: &[i32], fctx: &crate::decode::FrameCtx,
 ) {
     push_mc_rect(plane, x, y, side, side, side, prediction, residual, fctx);
@@ -2582,15 +2709,27 @@ fn push_mc_rect(
     stride: usize,
     w: usize,
     h: usize,
-    prediction: &[u16],
+    prediction: Pred<'_>,
     residual: &[i32], fctx: &crate::decode::FrameCtx,
 ) {
-    if inline_mc(plane, x, y, stride, w, h, prediction, residual, fctx) {
+    let (src, stride) = match prediction.inline(stride) {
+        Some(v) => v,
+        None => {
+            let Pred::Cur { plane: sp, stride: ss, off } = prediction else { unreachable!() };
+            push_op(fctx, ReconOp::Mc {
+                plane, x, y, stride: ss, w, h,
+                prediction: PredSrc::Cur { plane: sp, off, src: ss },
+                residual: Residual::Done(residual.to_vec()),
+            });
+            return;
+        }
+    };
+    if inline_mc(plane, x, y, stride, w, h, src, residual, fctx) {
         return;
     }
     push_op(fctx, ReconOp::Mc {
         plane, x, y, stride, w, h,
-        prediction: prediction.to_vec(), residual: Residual::Done(residual.to_vec()),
+        prediction: PredSrc::Owned(src.to_vec()), residual: Residual::Done(residual.to_vec()),
     });
 }
 
@@ -2638,13 +2777,49 @@ fn push_mc_rect_tx(
     stride: usize,
     w: usize,
     h: usize,
-    prediction: &[u16],
+    prediction: Pred<'_>,
     tx: TxParams,
     grid: &[i32],
     fctx: &crate::decode::FrameCtx,
 ) {
+    // lane-wave4: a deferred prediction is not there to be windowed -- the
+    // op carries its offset into the block's prediction instead, and the
+    // residual is laid out at that same stride (`reconstruct_mc_rect` reads
+    // both buffers at one stride).
+    let (prediction, stride) = match prediction.inline(stride) {
+        Some(v) => v,
+        None => {
+            let Pred::Cur { plane: sp, stride: ss, off } = prediction else { unreachable!() };
+            let mut tx = tx;
+            tx.stride = 0;
+            push_op(fctx, ReconOp::Mc {
+                plane, x, y, stride: w, w, h,
+                prediction: PredSrc::Cur { plane: sp, off, src: ss },
+                residual: Residual::Coeffs(tx, grid.to_vec()),
+            });
+            return;
+        }
+    };
     if fctx.recon_planes.with(std::cell::Cell::get).is_some() {
-        inline_mc(plane, x, y, stride, w, h, prediction, &tx.run(grid), fctx);
+        // `reconstruct_mc_rect` reads the prediction and the residual at ONE
+        // stride, so a prediction handed over at the block's stride (a var-tx
+        // unit's window, lane-wave4) has to be densified for a dense residual
+        // -- which is exactly what the recorded path below does.
+        let residual = tx.run(grid);
+        let res_stride = if tx.stride == 0 { w } else { tx.stride };
+        let window;
+        let prediction = if stride == res_stride {
+            prediction
+        } else {
+            debug_assert_eq!(res_stride, w);
+            let mut win = Vec::with_capacity(w * h);
+            for row in 0..h {
+                win.extend_from_slice(&prediction[row * stride..][..w]);
+            }
+            window = win;
+            &window[..]
+        };
+        inline_mc(plane, x, y, res_stride, w, h, prediction, &residual, fctx);
         return;
     }
     // `reconstruct_mc_rect` reads exactly rows `0..h`, columns `0..w` of the
@@ -2660,7 +2835,7 @@ fn push_mc_rect_tx(
     let mut tx = tx;
     tx.stride = 0;
     push_op(fctx, ReconOp::Mc {
-        plane, x, y, stride: w, w, h, prediction: window,
+        plane, x, y, stride: w, w, h, prediction: PredSrc::Owned(window),
         residual: Residual::Coeffs(tx, grid.to_vec()),
     });
 }
@@ -2684,8 +2859,9 @@ fn flush_recon(
     wave_barrier(fctx);
     let mut ops = fctx.recon_spare.with(|c| std::mem::take(&mut *c.borrow_mut()));
     fctx.recon_ops.with(|c| std::mem::swap(&mut *c.borrow_mut(), &mut ops));
+    let mut cur: [Vec<u16>; 3] = Default::default();
     for op in ops.drain(..) {
-        exec_op(op, y, u, v, fctx);
+        exec_op(op, y, u, v, &mut cur, fctx);
     }
     fctx.recon_spare.with(|c| *c.borrow_mut() = ops);
 }
@@ -2697,9 +2873,11 @@ fn exec_op(
     y: &mut PlaneBuf<'static>,
     u: &mut PlaneBuf<'static>,
     v: &mut PlaneBuf<'static>,
+    cur: &mut [Vec<u16>; 3],
     fctx: &crate::decode::FrameCtx,
 ) {
     match op {
+        ReconOp::Pred(b) => *cur = (b.0)(y, u, v, fctx),
         ReconOp::Intra {
             plane, x, y: oy, bw, bh, rect, mode, angle_delta, reach, residual, cfl,
             filter_intra, smooth_neighbor, pred,
@@ -2708,7 +2886,28 @@ fn exec_op(
             cfl, filter_intra, smooth_neighbor, pred, fctx,
         ),
         ReconOp::Mc { plane, x, y: oy, stride, w, h, prediction, residual } => {
-            exec_mc(y, u, v, plane, x, oy, stride, w, h, &prediction, &residual.resolve(), fctx);
+            let residual = residual.resolve();
+            match prediction {
+                PredSrc::Owned(p) => {
+                    exec_mc(y, u, v, plane, x, oy, stride, w, h, &p, &residual, fctx);
+                }
+                PredSrc::Cur { plane: sp, off, src } => {
+                    let block = std::mem::take(&mut cur[sp]);
+                    if src == stride {
+                        exec_mc(y, u, v, plane, x, oy, stride, w, h, &block[off..], &residual, fctx);
+                    } else {
+                        // A transform unit's residual is dense, so its window
+                        // of the block prediction is taken out dense too --
+                        // the copy the parsing thread used to make, made here.
+                        let mut window = Vec::with_capacity(w * h);
+                        for row in 0..h {
+                            window.extend_from_slice(&block[off + row * src..][..w]);
+                        }
+                        exec_mc(y, u, v, plane, x, oy, stride, w, h, &window, &residual, fctx);
+                    }
+                    cur[sp] = block;
+                }
+            }
         }
     }
 }
@@ -16941,7 +17140,7 @@ fn read_inter_plane_rect(
     _plane: &mut PlaneBuf<'static>,
     x: usize,
     y: usize,
-    prediction: &[u16],
+    prediction: Pred<'_>,
     inherited_luma_tx_type: Option<TxType>,
     luma_skip_ctx: Option<usize>, fctx: &crate::decode::FrameCtx,
 ) -> Result<(Vec<i32>, TxType)> {
@@ -17052,7 +17251,7 @@ fn read_inter_luma8(
     y: &mut PlaneBuf<'static>,
     px: usize,
     py: usize,
-    pred_y: &[u16],
+    pred_y: Pred<'_>,
     mode_for_tx: usize,
     base_q_idx: u8,
     scan8: &[u16],
@@ -17087,11 +17286,7 @@ fn read_inter_luma8(
     for tu_row in 0..2 {
         for tu_col in 0..2 {
             let tu_mi = (leaf_mi.0 + tu_row, leaf_mi.1 + tu_col);
-            let mut tu_pred = Vec::with_capacity(16);
-            for rr in 0..4 {
-                let start = (tu_row * 4 + rr) * 8 + tu_col * 4;
-                tu_pred.extend_from_slice(&pred_y[start..start + 4]);
-            }
+            let tu_pred = pred_y.view(8).offset(tu_row * 4 * 8 + tu_col * 4);
             let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
             let (tu_grid, tu_tx_type) = read_inter_plane(
                 dec,
@@ -17110,7 +17305,7 @@ fn read_inter_luma8(
                 py + tu_row * 4,
                 4,
                 base_q_idx,
-                &tu_pred,
+                tu_pred,
                 None,
                 Some(tu_skip_ctx), fctx,
             )?;
@@ -21526,7 +21721,7 @@ fn read_inter_plane(
     y: usize,
     side: usize,
     _base_q_idx: u8,
-    prediction: &[u16],
+    prediction: Pred<'_>,
     // lane-chromau: this block's own luma transform's *actual coded*
     // `tx_type` -- `av1_get_tx_type` (libaom `blockd.h`): an inter block's
     // chroma plane never codes its own `tx_type` symbol, but (unlike an
@@ -23861,6 +24056,18 @@ fn decode_inter_block(
                 MIXED_SCALE_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
             }
 
+            // lane-wave4 (the compound arm's half): this block's whole
+            // prediction -- both references, the wedge/diffwtd/distance
+            // blend, every plane -- as a closure, run here at one
+            // reconstruction thread and on the wavefront worker otherwise
+            // (see the single-reference arm below). A compound block reads
+            // neither `motion_mode` nor `interintra`, so nothing but the
+            // blend itself lives in here.
+            let build = move |_y: &mut PlaneBuf<'static>,
+                              _u: &mut PlaneBuf<'static>,
+                              _v: &mut PlaneBuf<'static>,
+                              fctx: &crate::decode::FrameCtx|
+             -> [Vec<u16>; 3] {
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate_kern(
                 &py0.data,
@@ -24087,6 +24294,26 @@ fn decode_inter_block(
 
             // lane-inter4 r2: a rectangular strip's transform tree starts from
             // its own rect `max_txsize_rect_lookup` entry, not a square one.
+            [pred_y, pred_u, pred_v]
+            };
+            let (pred_y, pred_u, pred_v): (Vec<u16>, Vec<u16>, Vec<u16>);
+            let (sy, su, sv) = if recon_deferred(fctx) {
+                push_pred(fctx, build);
+                (
+                    Pred::Cur { plane: 0, stride: side, off: 0 },
+                    Pred::Cur { plane: 1, stride: chroma_side, off: 0 },
+                    Pred::Cur { plane: 2, stride: chroma_side, off: 0 },
+                )
+            } else {
+                let [by, bu, bv] = build(y, u, v, fctx);
+                (pred_y, pred_u, pred_v) = (by, bu, bv);
+                (
+                    Pred::Inline(&pred_y, side),
+                    Pred::Inline(&pred_u, chroma_side),
+                    Pred::Inline(&pred_v, chroma_side),
+                )
+            };
+
             let rect_tu = (write_w, write_h) != (side, side);
             vartx_leaves = if rect_tu {
                 read_block_tx_size_rect(
@@ -24118,7 +24345,7 @@ fn decode_inter_block(
                     side,
                     write_w,
                     write_h,
-                    &pred_y,
+                    sy,
                     &vec![0i32; side * side], fctx,
                 );
                 push_mc_rect(1, 
@@ -24127,7 +24354,7 @@ fn decode_inter_block(
                     chroma_side,
                     write_chroma_w,
                     write_chroma_h,
-                    &pred_u,
+                    su,
                     &vec![0i32; chroma_side * chroma_side], fctx,
                 );
                 push_mc_rect(2, 
@@ -24136,7 +24363,7 @@ fn decode_inter_block(
                     chroma_side,
                     write_chroma_w,
                     write_chroma_h,
-                    &pred_v,
+                    sv,
                     &vec![0i32; chroma_side * chroma_side], fctx,
                 );
                 luma_grid = vec![0i32; side * side];
@@ -24170,11 +24397,7 @@ fn decode_inter_block(
                         let (tu_px, tu_py) = (px + col * MI, py + row * MI);
                         let (tu_grid, tu_tx_type) = if tw == th {
                             let tx_px = tw;
-                            let mut tu_pred = Vec::with_capacity(tx_px * tx_px);
-                            for rr in 0..tx_px {
-                                let start = (row * MI + rr) * side + col * MI;
-                                tu_pred.extend_from_slice(&pred_y[start..start + tx_px]);
-                            }
+                            let tu_pred = sy.offset(row * MI * side + col * MI);
                             let scan = default_scan(tx_px.min(32));
                             let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tx_px / MI);
                             read_inter_plane(
@@ -24190,7 +24413,7 @@ fn decode_inter_block(
                                 tu_py,
                                 tx_px,
                                 base_q_idx,
-                                &tu_pred,
+                                tu_pred,
                                 None,
                                 Some(tu_skip_ctx), fctx,
                             )?
@@ -24218,7 +24441,7 @@ fn decode_inter_block(
                                 y,
                                 tu_px,
                                 tu_py,
-                                &pred_y[start..],
+                                sy.offset(start),
                                 None,
                                 Some(tu_skip_ctx), fctx,
                             )?
@@ -24252,16 +24475,12 @@ fn decode_inter_block(
                                 let cu_scan = default_scan(cu_tx);
                                 for plane_idx in 1..3 {
                                     let (src, buf) = if plane_idx == 1 {
-                                        (&pred_u, &mut *u)
+                                        (su, &mut *u)
                                     } else {
-                                        (&pred_v, &mut *v)
+                                        (sv, &mut *v)
                                     };
-                                    let mut cu_pred = Vec::with_capacity(cu_tx * cu_tx);
-                                    for rr in 0..cu_tx {
-                                        let start =
-                                            (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
-                                        cu_pred.extend_from_slice(&src[start..start + cu_tx]);
-                                    }
+                                    let cu_pred =
+                                        src.offset(cr * cu_tx * chroma_side + cc * cu_tx);
                                     let cu_grid = read_inter_plane(
                                         dec,
                                         cdfs,
@@ -24275,7 +24494,7 @@ fn decode_inter_block(
                                         cu_y,
                                         cu_tx,
                                         base_q_idx,
-                                        &cu_pred,
+                                        cu_pred,
                                         Some(first_tx_type),
                                         Some(3), fctx,
                                     )?
@@ -24322,7 +24541,7 @@ fn decode_inter_block(
                         y,
                         px,
                         py,
-                        &pred_y,
+                        sy,
                         None,
                         None, fctx,
                     )?;
@@ -24342,7 +24561,7 @@ fn decode_inter_block(
                         py,
                         side,
                         base_q_idx,
-                        &pred_y,
+                        sy,
                         None,
                         None, fctx,
                     )?;
@@ -24372,7 +24591,7 @@ fn decode_inter_block(
                             u,
                             cpx,
                             cpy,
-                            &pred_u,
+                            su,
                             Some(luma_tx_type),
                             None, fctx,
                         )?
@@ -24394,7 +24613,7 @@ fn decode_inter_block(
                             v,
                             cpx,
                             cpy,
-                            &pred_v,
+                            sv,
                             Some(luma_tx_type),
                             None, fctx,
                         )?
@@ -24417,7 +24636,7 @@ fn decode_inter_block(
                     cpy,
                     chroma_side,
                     base_q_idx,
-                    &pred_u,
+                    su,
                     Some(luma_tx_type),
                     None, fctx,
                 )?
@@ -24435,7 +24654,7 @@ fn decode_inter_block(
                     cpy,
                     chroma_side,
                     base_q_idx,
-                    &pred_v,
+                    sv,
                     Some(luma_tx_type),
                     None, fctx,
                 )?
@@ -25058,6 +25277,21 @@ fn decode_inter_block(
             // (reconinter_template.inc:75-82); record them for the next 1:4
             // strip, which is the only reader.
             fctx.inter_last_mc.with(|c| c.set(Some((ref_frame, mv, h_filter, v_filter))));
+            let sub8_piece =
+                strip_chroma.filter(|s| s.has_chroma).and_then(|s| s.prev).is_some();
+            // lane-wave4: the whole-block prediction (motion compensation +
+            // warp + the interintra blend) as a closure, so it runs where the
+            // writes it feeds run. At one reconstruction thread that is right
+            // here on the parsing thread, exactly as before; on the wavefront
+            // it travels with the block's recorded ops and runs on the worker
+            // ([`push_pred`]), which is what takes mc off the parse thread.
+            // OBMC and the sub-8x8 chroma piece stay here: both can fail, and
+            // a recorded op has no way to report it.
+            let build = move |y: &mut PlaneBuf<'static>,
+                              u: &mut PlaneBuf<'static>,
+                              v: &mut PlaneBuf<'static>,
+                              fctx: &crate::decode::FrameCtx|
+             -> [Vec<u16>; 3] {
             let mut pred_y = vec![0u16; side * side];
             let mut pred_u = vec![0u16; chroma_side * chroma_side];
             let mut pred_v = vec![0u16; chroma_side * chroma_side];
@@ -25199,7 +25433,51 @@ fn decode_inter_block(
                     );
                 }
             }
-
+            // Mutually exclusive with warp/OBMC (motion_mode is not read for
+            // an interintra block): blend the intra predictor over the MC
+            // result, all planes (reconinter.c av1_build_interintra_predictor
+            // plane loop).
+            if let Some(ii) = interintra_mode {
+                if write_w != write_h {
+                    INTERINTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
+                }
+                interintra_blend(y, px, py, write_w, write_h, side, ii, wedge_mask, &mut pred_y, fctx);
+                interintra_blend(
+                    u, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ii, wedge_mask,
+                    &mut pred_u, fctx,
+                );
+                interintra_blend(
+                    v, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ii, wedge_mask,
+                    &mut pred_v, fctx,
+                );
+            }
+            [pred_y, pred_u, pred_v]
+            };
+            // OBMC and interintra are mutually exclusive (`motion_mode` is
+            // never read for an interintra block), so blending interintra
+            // inside `build` and OBMC after it is still the coded order.
+            debug_assert!(!(obmc_selected && interintra_mode.is_some()));
+            let deferred = recon_deferred(fctx) && !obmc_selected && !sub8_piece;
+            let (mut pred_y, mut pred_u, mut pred_v): (Vec<u16>, Vec<u16>, Vec<u16>);
+            let (sy, su, sv) = if deferred {
+                // The interintra predictor inside `build` reads this block's
+                // own above/left edges: by the wavefront rule ((r-1, c+1) and
+                // (r, c-1) complete) and this superblock's own ops replaying
+                // in push order ahead of it, they are written by the time the
+                // worker runs it -- which retires the `flush_recon` barrier
+                // this arm used to take for interintra.
+                push_pred(fctx, build);
+                (
+                    Pred::Cur { plane: 0, stride: side, off: 0 },
+                    Pred::Cur { plane: 1, stride: chroma_side, off: 0 },
+                    Pred::Cur { plane: 2, stride: chroma_side, off: 0 },
+                )
+            } else {
+                if interintra_mode.is_some() {
+                    flush_recon(fctx, y, u, v);
+                }
+                let [by, bu, bv] = build(y, u, v, fctx);
+                (pred_y, pred_u, pred_v) = (by, bu, bv);
             if obmc_selected {
                 obmc_blend(
                     grid,
@@ -25228,26 +25506,6 @@ fn decode_inter_block(
                     &mut pred_u,
                     &mut pred_v, fctx,
                 )?;
-            }
-
-            // Mutually exclusive with warp/OBMC (motion_mode is not read for
-            // an interintra block): blend the intra predictor over the MC
-            // result, all planes (reconinter.c av1_build_interintra_predictor
-            // plane loop).
-            if let Some(ii) = interintra_mode {
-                flush_recon(fctx, y, u, v);
-                if write_w != write_h {
-                    INTERINTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
-                }
-                interintra_blend(y, px, py, write_w, write_h, side, ii, wedge_mask, &mut pred_y, fctx);
-                interintra_blend(
-                    u, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ii, wedge_mask,
-                    &mut pred_u, fctx,
-                );
-                interintra_blend(
-                    v, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ii, wedge_mask,
-                    &mut pred_v, fctx,
-                );
             }
 
             // lane-inter16ab r2: libaom `build_inter_predictors_sub8x8`
@@ -25295,6 +25553,13 @@ fn decode_inter_block(
                 }
                 INTER16_SUB8_PIECE_HITS.with(|c| c.set(c.get() + 1));
             }
+                (
+                    Pred::Inline(&pred_y, side),
+                    Pred::Inline(&pred_u, chroma_side),
+                    Pred::Inline(&pred_v, chroma_side),
+                )
+            };
+
 
             // lane-inter4 r2: a rectangular strip's transform tree starts from
             // its own rect `max_txsize_rect_lookup` entry, not a square one.
@@ -25329,7 +25594,7 @@ fn decode_inter_block(
                     side,
                     write_w,
                     write_h,
-                    &pred_y,
+                    sy,
                     &vec![0i32; side * side], fctx,
                 );
                 if has_chroma {
@@ -25339,7 +25604,7 @@ fn decode_inter_block(
                         chroma_side,
                         write_chroma_w,
                         write_chroma_h,
-                        &pred_u,
+                        su,
                         &vec![0i32; chroma_side * chroma_side], fctx,
                     );
                     push_mc_rect(2, 
@@ -25348,7 +25613,7 @@ fn decode_inter_block(
                         chroma_side,
                         write_chroma_w,
                         write_chroma_h,
-                        &pred_v,
+                        sv,
                         &vec![0i32; chroma_side * chroma_side], fctx,
                     );
                 }
@@ -25395,11 +25660,7 @@ fn decode_inter_block(
                         let (tu_px, tu_py) = (px + col * MI, py + row * MI);
                         let (tu_grid, tu_tx_type) = if tw == th {
                             let tx_px = tw;
-                            let mut tu_pred = Vec::with_capacity(tx_px * tx_px);
-                            for rr in 0..tx_px {
-                                let start = (row * MI + rr) * side + col * MI;
-                                tu_pred.extend_from_slice(&pred_y[start..start + tx_px]);
-                            }
+                            let tu_pred = sy.offset(row * MI * side + col * MI);
                             let scan = default_scan(tx_px.min(32));
                             let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tx_px / MI);
                             read_inter_plane(
@@ -25415,7 +25676,7 @@ fn decode_inter_block(
                                 tu_py,
                                 tx_px,
                                 base_q_idx,
-                                &tu_pred,
+                                tu_pred,
                                 None,
                                 Some(tu_skip_ctx), fctx,
                             )?
@@ -25443,7 +25704,7 @@ fn decode_inter_block(
                                 y,
                                 tu_px,
                                 tu_py,
-                                &pred_y[start..],
+                                sy.offset(start),
                                 None,
                                 Some(tu_skip_ctx), fctx,
                             )?
@@ -25477,16 +25738,12 @@ fn decode_inter_block(
                                 let cu_scan = default_scan(cu_tx);
                                 for plane_idx in 1..3 {
                                     let (src, buf) = if plane_idx == 1 {
-                                        (&pred_u, &mut *u)
+                                        (su, &mut *u)
                                     } else {
-                                        (&pred_v, &mut *v)
+                                        (sv, &mut *v)
                                     };
-                                    let mut cu_pred = Vec::with_capacity(cu_tx * cu_tx);
-                                    for rr in 0..cu_tx {
-                                        let start =
-                                            (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
-                                        cu_pred.extend_from_slice(&src[start..start + cu_tx]);
-                                    }
+                                    let cu_pred =
+                                        src.offset(cr * cu_tx * chroma_side + cc * cu_tx);
                                     let cu_grid = read_inter_plane(
                                         dec,
                                         cdfs,
@@ -25500,7 +25757,7 @@ fn decode_inter_block(
                                         cu_y,
                                         cu_tx,
                                         base_q_idx,
-                                        &cu_pred,
+                                        cu_pred,
                                         Some(first_tx_type),
                                         Some(3), fctx,
                                     )?
@@ -25547,7 +25804,7 @@ fn decode_inter_block(
                         y,
                         px,
                         py,
-                        &pred_y,
+                        sy,
                         None,
                         None, fctx,
                     )?;
@@ -25567,7 +25824,7 @@ fn decode_inter_block(
                         py,
                         side,
                         base_q_idx,
-                        &pred_y,
+                        sy,
                         None,
                         None, fctx,
                     )?;
@@ -25606,7 +25863,7 @@ fn decode_inter_block(
                             u,
                             cpx,
                             cpy,
-                            &pred_u,
+                            su,
                             Some(luma_tx_type),
                             None, fctx,
                         )?
@@ -25628,7 +25885,7 @@ fn decode_inter_block(
                             v,
                             cpx,
                             cpy,
-                            &pred_v,
+                            sv,
                             Some(luma_tx_type),
                             None, fctx,
                         )?
@@ -25651,7 +25908,7 @@ fn decode_inter_block(
                     cpy,
                     chroma_side,
                     base_q_idx,
-                    &pred_u,
+                    su,
                     Some(luma_tx_type),
                     None, fctx,
                 )?
@@ -25669,7 +25926,7 @@ fn decode_inter_block(
                     cpy,
                     chroma_side,
                     base_q_idx,
-                    &pred_v,
+                    sv,
                     Some(luma_tx_type),
                     None, fctx,
                 )?
@@ -26963,7 +27220,7 @@ fn decode_inter_sub8_split4(
         // txsize_to_bsize[tx_size]` branch (`txb_skip_ctx = 0`, which
         // `read_inter_plane`'s `plane_idx == 0` arm already assumes).
         if skip {
-            push_mc(0, px, py, B4, &pred_y, &vec![0i32; B4 * B4], fctx);
+            push_mc(0, px, py, B4, Pred::dense(&pred_y), &vec![0i32; B4 * B4], fctx);
             neighbours.record_mi_luma_rect(lmi, B4, B4, &vec![0i32; B4 * B4]);
         } else {
             let around = neighbours.around_mi(lmi, B4);
@@ -26984,7 +27241,7 @@ fn decode_inter_sub8_split4(
                 py,
                 B4,
                 base_q_idx,
-                &pred_y,
+                Pred::dense(&pred_y),
                 None,
                 None, fctx,
             )?;
@@ -27078,19 +27335,19 @@ fn decode_inter_sub8_split4(
             }
         }
         let (u_grid, v_grid) = if last_skip {
-            push_mc(1, cpx, cpy, B4, &pred_u, &vec![0i32; B4 * B4], fctx);
-            push_mc(2, cpx, cpy, B4, &pred_v, &vec![0i32; B4 * B4], fctx);
+            push_mc(1, cpx, cpy, B4, Pred::dense(&pred_u), &vec![0i32; B4 * B4], fctx);
+            push_mc(2, cpx, cpy, B4, Pred::dense(&pred_v), &vec![0i32; B4 * B4], fctx);
             (vec![0i32; B4 * B4], vec![0i32; B4 * B4])
         } else {
             let around = neighbours.around_mi(group_mi, 8);
             let ug = read_inter_plane(
                 dec, cdfs, TxbSet::Chroma4, scan4, 1, around[1], 0, u, cpx, cpy, B4, base_q_idx,
-                &pred_u, Some(first_tx_type), None, fctx,
+                Pred::dense(&pred_u), Some(first_tx_type), None, fctx,
             )?
             .0;
             let vg = read_inter_plane(
                 dec, cdfs, TxbSet::Chroma4, scan4, 2, around[2], 0, v, cpx, cpy, B4, base_q_idx,
-                &pred_v, Some(first_tx_type), None, fctx,
+                Pred::dense(&pred_v), Some(first_tx_type), None, fctx,
             )?
             .0;
             let coded = ug.iter().chain(vg.iter()).any(|&c| c != 0);
@@ -27936,7 +28193,7 @@ fn decode_inter_sub8_rect2(
             }
         }
         if skip {
-            push_mc_rect(0, px, py, SIDE, bw, bh, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
+            push_mc_rect(0, px, py, SIDE, bw, bh, Pred::dense(&pred_y), &vec![0i32; SIDE * SIDE], fctx);
             neighbours.record_mi_luma_rect(lmi, bw, bh, &vec![0i32; bw * bh]);
             neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, bw as u8, bh as u8, ref_frame.max(LAST_FRAME), fctx);
         } else {
@@ -27972,7 +28229,7 @@ fn decode_inter_sub8_rect2(
                         tu_py,
                         tw,
                         base_q_idx,
-                        &tu_pred,
+                        Pred::dense(&tu_pred),
                         None,
                         Some(tu_skip_ctx), fctx,
                     )?
@@ -27997,7 +28254,7 @@ fn decode_inter_sub8_rect2(
                         y,
                         tu_px,
                         tu_py,
-                        &pred_y[start..],
+                        Pred::dense(&pred_y[start..]),
                         None,
                         None, fctx,
                     )?
@@ -28102,19 +28359,19 @@ fn decode_inter_sub8_rect2(
             }
         }
         let (u_grid, v_grid) = if last_skip {
-            push_mc(1, cpx, cpy, B4, &pred_u, &vec![0i32; B4 * B4], fctx);
-            push_mc(2, cpx, cpy, B4, &pred_v, &vec![0i32; B4 * B4], fctx);
+            push_mc(1, cpx, cpy, B4, Pred::dense(&pred_u), &vec![0i32; B4 * B4], fctx);
+            push_mc(2, cpx, cpy, B4, Pred::dense(&pred_v), &vec![0i32; B4 * B4], fctx);
             (vec![0i32; B4 * B4], vec![0i32; B4 * B4])
         } else {
             let around = neighbours.around_mi(group_mi, 8);
             let ug = read_inter_plane(
                 dec, cdfs, TxbSet::Chroma4, scan4, 1, around[1], 0, u, cpx, cpy, B4, base_q_idx,
-                &pred_u, Some(first_tx_type), None, fctx,
+                Pred::dense(&pred_u), Some(first_tx_type), None, fctx,
             )?
             .0;
             let vg = read_inter_plane(
                 dec, cdfs, TxbSet::Chroma4, scan4, 2, around[2], 0, v, cpx, cpy, B4, base_q_idx,
-                &pred_v, Some(first_tx_type), None, fctx,
+                Pred::dense(&pred_v), Some(first_tx_type), None, fctx,
             )?
             .0;
             let coded = ug.iter().chain(vg.iter()).any(|&c| c != 0);
@@ -28939,19 +29196,19 @@ fn decode_inter_block8(
                 .1
                 .is_some();
                 if skip {
-                    push_mc(0, px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
+                    push_mc(0, px, py, SIDE, Pred::dense(&pred_y), &vec![0i32; SIDE * SIDE], fctx);
                     push_mc(1, 
                         cpx,
                         cpy,
                         CHROMA_SIDE,
-                        &pred_u,
+                        Pred::dense(&pred_u),
                         &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
                     );
                     push_mc(2, 
                         cpx,
                         cpy,
                         CHROMA_SIDE,
-                        &pred_v,
+                        Pred::dense(&pred_v),
                         &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
                     );
                     luma_grid = vec![0i32; SIDE * SIDE];
@@ -28967,7 +29224,7 @@ fn decode_inter_block8(
                         y,
                         px,
                         py,
-                        &pred_y,
+                        Pred::dense(&pred_y),
                         mode_for_tx,
                         base_q_idx,
                         scan8,
@@ -28989,7 +29246,7 @@ fn decode_inter_block8(
                         cpy,
                         CHROMA_SIDE,
                         base_q_idx,
-                        &pred_u,
+                        Pred::dense(&pred_u),
                         Some(luma_tx_type),
                         None, fctx,
                     )?
@@ -29007,7 +29264,7 @@ fn decode_inter_block8(
                         cpy,
                         CHROMA_SIDE,
                         base_q_idx,
-                        &pred_v,
+                        Pred::dense(&pred_v),
                         Some(luma_tx_type),
                         None, fctx,
                     )?
@@ -29589,19 +29846,19 @@ fn decode_inter_block8(
         .1
         .is_some();
         if skip {
-            push_mc(0, px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE], fctx);
+            push_mc(0, px, py, SIDE, Pred::dense(&pred_y), &vec![0i32; SIDE * SIDE], fctx);
             push_mc(1, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                &pred_u,
+                Pred::dense(&pred_u),
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
             );
             push_mc(2, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
-                &pred_v,
+                Pred::dense(&pred_v),
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
             );
             luma_grid = vec![0i32; SIDE * SIDE];
@@ -29617,7 +29874,7 @@ fn decode_inter_block8(
                 y,
                 px,
                 py,
-                &pred_y,
+                Pred::dense(&pred_y),
                 mode_for_tx,
                 base_q_idx,
                 scan8,
@@ -29639,7 +29896,7 @@ fn decode_inter_block8(
                 cpy,
                 CHROMA_SIDE,
                 base_q_idx,
-                &pred_u,
+                Pred::dense(&pred_u),
                 Some(luma_tx_type),
                 None, fctx,
             )?
@@ -29657,7 +29914,7 @@ fn decode_inter_block8(
                 cpy,
                 CHROMA_SIDE,
                 base_q_idx,
-                &pred_v,
+                Pred::dense(&pred_v),
                 Some(luma_tx_type),
                 None, fctx,
             )?
