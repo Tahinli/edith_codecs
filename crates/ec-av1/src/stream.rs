@@ -6106,6 +6106,50 @@ mod tests {
     /// `--denoise-noise-level=25` stream whose frames carry film grain
     /// parameters (small enough that 4 bands is one block row each, which is
     /// what exercises the grain band's one-row `prelude` replay).
+    /// lane-wave1 step (ii): the superblock-row wavefront
+    /// (`EC_AV1_RECON_THREADS`) reconstructs every output frame byte for
+    /// byte as the inline path does, on a hidden-ARF 10-bit stream (no-show
+    /// frames, CfL, 128 superblocks) and on the two screen-content streams
+    /// whose palette/intrabc blocks READ the current frame's pixels while
+    /// parsing -- the sites that make the workers barrier.
+    #[test]
+    fn a_real_stream_reconstructs_identically_with_one_and_four_recon_threads() {
+        const NAME: &str = "a_real_stream_reconstructs_identically_with_one_and_four_recon_threads";
+        let _gate_lock = lock_gate_counters();
+        for fixture in [
+            "hg_arf_witness.obu",
+            "palette_screen_witness.obu",
+            "palette_screen_witness_10bit.obu",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(fixture);
+            let stream = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+            crate::par::set_recon_threads(1);
+            let one = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => panic!("{NAME}: {fixture} refused at 1 recon thread: {e}"),
+            };
+            crate::par::set_recon_threads(4);
+            let four = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    crate::par::set_recon_threads(1);
+                    panic!("{NAME}: {fixture} refused at 4 recon threads: {e}")
+                }
+            };
+            crate::par::set_recon_threads(1);
+            assert!(!one.is_empty(), "{NAME}: {fixture} decoded nothing");
+            assert_eq!(one.len(), four.len(), "{NAME}: {fixture} frame count");
+            for (i, (a, b)) in one.iter().zip(four.iter()).enumerate() {
+                assert_eq!(a.y, b.y, "{NAME}: {fixture} frame {i} luma differs at 4 recon threads");
+                assert_eq!(a.u, b.u, "{NAME}: {fixture} frame {i} U differs at 4 recon threads");
+                assert_eq!(a.v, b.v, "{NAME}: {fixture} frame {i} V differs at 4 recon threads");
+            }
+        }
+    }
+
     #[test]
     fn a_real_stream_filters_identically_with_one_and_four_filter_threads() {
         const NAME: &str = "a_real_stream_filters_identically_with_one_and_four_filter_threads";
