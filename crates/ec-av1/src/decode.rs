@@ -2466,7 +2466,7 @@ impl<'a> WaveGuard<'a> {
             enable_edge_filter: fctx.enable_edge_filter.with(std::cell::Cell::get),
             last_col: cols - 1,
         });
-        let batch = crate::par::Batch::new();
+        let batch = crate::par::Batch::new("ec-av1-recon");
         for _ in 0..threads {
             let st = std::sync::Arc::clone(&st);
             batch.submit(move || wave_worker(&st));
@@ -2598,68 +2598,6 @@ fn push_intra(
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
         residual: Residual::Done(residual.to_vec()), cfl, filter_intra, smooth_neighbor, pred,
-    });
-}
-
-/// [`push_intra`] for a caller whose residual is dead after the record --
-/// the three fused coefficient readers, i.e. nearly every recorded write.
-#[allow(clippy::too_many_arguments)]
-fn push_intra_owned(
-    plane: usize,
-    x: usize,
-    y: usize,
-    side: usize,
-    mode: usize,
-    angle_delta: i32,
-    reach: Reach,
-    residual: Vec<i32>,
-    cfl: Option<(i32, CflSrc)>,
-    filter_intra: Option<usize>,
-    smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
-) {
-    if inline_intra(
-        plane, x, y, side, side, false, mode, angle_delta, reach, &residual, cfl, filter_intra,
-        smooth_neighbor, fctx,
-    ) {
-        return;
-    }
-    let pred = take_palette_pred(fctx);
-    push_op(fctx, ReconOp::Intra {
-        plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
-        residual: Residual::Done(residual), cfl, filter_intra, smooth_neighbor, pred,
-    });
-}
-
-/// [`push_mc_rect`] with the residual moved in -- see [`push_intra_owned`].
-#[allow(clippy::too_many_arguments)]
-fn push_mc_rect_owned(
-    plane: usize,
-    x: usize,
-    y: usize,
-    stride: usize,
-    w: usize,
-    h: usize,
-    prediction: Pred<'_>,
-    residual: Vec<i32>, fctx: &crate::decode::FrameCtx,
-) {
-    let (src, stride) = match prediction.inline(stride) {
-        Some(v) => v,
-        None => {
-            let Pred::Cur { plane: sp, stride: ss, off } = prediction else { unreachable!() };
-            push_op(fctx, ReconOp::Mc {
-                plane, x, y, stride: ss, w, h,
-                prediction: PredSrc::Cur { plane: sp, off, src: ss },
-                residual: Residual::Done(residual),
-            });
-            return;
-        }
-    };
-    if inline_mc(plane, x, y, stride, w, h, src, &residual, fctx) {
-        return;
-    }
-    push_op(fctx, ReconOp::Mc {
-        plane, x, y, stride, w, h, prediction: PredSrc::Owned(src.to_vec()),
-        residual: Residual::Done(residual),
     });
 }
 
@@ -34503,9 +34441,12 @@ mod tests {
         // below, are the real diagnosis.
         let mut stdin = child.stdin.take().expect("ffmpeg stdin");
         let payload = stream.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&payload);
-        });
+        let writer = std::thread::Builder::new()
+            .name("ec-av1-ffmpeg-in".into())
+            .spawn(move || {
+                let _ = stdin.write_all(&payload);
+            })
+            .expect("spawning the ffmpeg stdin writer");
         let out = child.wait_with_output().expect("ffmpeg failed to run");
         writer.join().expect("ffmpeg stdin writer thread");
         assert!(
@@ -34553,9 +34494,12 @@ mod tests {
         // below, are the real diagnosis.
         let mut stdin = child.stdin.take().expect("ffmpeg stdin");
         let payload = stream.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&payload);
-        });
+        let writer = std::thread::Builder::new()
+            .name("ec-av1-ffmpeg-in".into())
+            .spawn(move || {
+                let _ = stdin.write_all(&payload);
+            })
+            .expect("spawning the ffmpeg stdin writer");
         let out = child.wait_with_output().expect("ffmpeg failed to run");
         writer.join().expect("ffmpeg stdin writer thread");
         assert!(
