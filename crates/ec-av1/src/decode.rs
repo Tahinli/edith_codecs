@@ -2647,8 +2647,20 @@ fn push_mc_rect_tx(
         inline_mc(plane, x, y, stride, w, h, prediction, &tx.run(grid), fctx);
         return;
     }
+    // `reconstruct_mc_rect` reads exactly rows `0..h`, columns `0..w` of the
+    // two buffers at `stride`, so the record carries that window densely
+    // rather than the whole block's prediction: a 4x4 unit of a 64x64 block
+    // copied 64*64 samples on the PARSING thread before. The residual is then
+    // produced dense too (`TxParams::stride = 0`), which is the same numbers
+    // in the same places at stride `w`.
+    let mut window = Vec::with_capacity(w * h);
+    for row in 0..h {
+        window.extend_from_slice(&prediction[row * stride..][..w]);
+    }
+    let mut tx = tx;
+    tx.stride = 0;
     push_op(fctx, ReconOp::Mc {
-        plane, x, y, stride, w, h, prediction: prediction.to_vec(),
+        plane, x, y, stride: w, w, h, prediction: window,
         residual: Residual::Coeffs(tx, grid.to_vec()),
     });
 }
