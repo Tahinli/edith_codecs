@@ -24232,31 +24232,29 @@ fn decode_inter_block(
             // too -- a square `bw4`x`bw4` stamp here claims a rect strip's
             // NEXT strip's own rows/cols before it decodes, corrupting
             // every later mvstack scan that reads this cell back.
-            for dr in 0..bh4 {
-                for dc in 0..bw4 {
-                    grid.set(
-                        mi_row + dr,
-                        mi_col + dc,
-                        MiInfo {
-                            is_inter: true,
-                            ref_frame: ref0,
-                            ref_frame1: Some(ref1),
-                            mv1: Some(mv1),
-                            mv: mv0,
-                            is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
-                            size: bw4 as u8,
-                            size_h: bh4 as u8,
-                            // libaom `is_global_mv_block`: per-ref-slot, mode
-                            // GLOBAL_GLOBALMV, block >= 8x8, and THAT slot's
-                            // own gm model > TRANSLATION (IDENTITY excluded
-                            // too -- the two-predicate trap, distinct from
-                            // `gm_nontrans` above which allows IDENTITY).
-                            is_global_mv0,
-                            is_global_mv1,
-                        },
-                    );
-                }
-            }
+            grid.fill_rect(
+                mi_row,
+                mi_col,
+                bh4,
+                bw4,
+                MiInfo {
+                    is_inter: true,
+                    ref_frame: ref0,
+                    ref_frame1: Some(ref1),
+                    mv1: Some(mv1),
+                    mv: mv0,
+                    is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
+                    size: bw4 as u8,
+                    size_h: bh4 as u8,
+                    // libaom `is_global_mv_block`: per-ref-slot, mode
+                    // GLOBAL_GLOBALMV, block >= 8x8, and THAT slot's
+                    // own gm model > TRANSLATION (IDENTITY excluded
+                    // too -- the two-predicate trap, distinct from
+                    // `gm_nontrans` above which allows IDENTITY).
+                    is_global_mv0,
+                    is_global_mv1,
+                },
+            );
             // spec 5.11.25's `comp_group_idx`/`compound_idx`: only read when
             // masked compound / distance-weighted compound are actually
             // enabled for this stream -- `is_any_masked_compound_used_here`
@@ -25788,32 +25786,30 @@ fn decode_inter_block(
             // lane-rect r2: see the compound path's matching comment above --
             // `grid` must be stamped with the block's true bh4/bw4 span, not
             // a square `bw4`x`bw4` guess.
-            for dr in 0..bh4 {
-                for dc in 0..bw4 {
-                    grid.set(
-                        mi_row + dr,
-                        mi_col + dc,
-                        MiInfo {
-                            is_inter: true,
-                            ref_frame,
-                            // An interintra block records ref_frame[1] ==
-                            // INTRA_FRAME (0): warp-sample gathering
-                            // (libaom av1_findSamples, mvref_common.c:1155)
-                            // requires ref_frame[1] == NONE_FRAME, so such a
-                            // neighbour must not donate samples or count in
-                            // num_proj_ref.
-                            ref_frame1: interintra_mode.map(|_| 0),
-                            mv1: None,
-                            mv,
-                            is_new_mv,
-                            size: bw4 as u8,
-                            size_h: bh4 as u8,
-                            is_global_mv0: is_global_mv_block,
-                            is_global_mv1: false,
-                        },
-                    );
-                }
-            }
+            grid.fill_rect(
+                mi_row,
+                mi_col,
+                bh4,
+                bw4,
+                MiInfo {
+                    is_inter: true,
+                    ref_frame,
+                    // An interintra block records ref_frame[1] ==
+                    // INTRA_FRAME (0): warp-sample gathering
+                    // (libaom av1_findSamples, mvref_common.c:1155)
+                    // requires ref_frame[1] == NONE_FRAME, so such a
+                    // neighbour must not donate samples or count in
+                    // num_proj_ref.
+                    ref_frame1: interintra_mode.map(|_| 0),
+                    mv1: None,
+                    mv,
+                    is_new_mv,
+                    size: bw4 as u8,
+                    size_h: bh4 as u8,
+                    is_global_mv0: is_global_mv_block,
+                    is_global_mv1: false,
+                },
+            );
             mode_for_tx = 0;
             uv_predict_mode = DC_PRED;
 
@@ -26620,26 +26616,24 @@ fn decode_inter_block(
             // lane's `r * SUB_MI` re-derivation would snap a sub-SUB strip to
             // its enclosing 16-px cell.
             let (mi_r0, mi_c0) = (rmi, cmi);
-            for dr in 0..write_h / MI {
-                for dc in 0..write_w / MI {
-                    grid.set(
-                        mi_r0 + dr,
-                        mi_c0 + dc,
-                        MiInfo {
-                            is_inter: false,
-                            ref_frame: -1,
-                            ref_frame1: None,
-                            mv1: None,
-                            mv: (0, 0),
-                            is_new_mv: false,
-                            size: (write_w / MI) as u8,
-                            size_h: (write_h / MI) as u8,
-                            is_global_mv0: false,
-                            is_global_mv1: false,
-                        },
-                    );
-                }
-            }
+            grid.fill_rect(
+                mi_r0,
+                mi_c0,
+                write_h / MI,
+                write_w / MI,
+                MiInfo {
+                    is_inter: false,
+                    ref_frame: -1,
+                    ref_frame1: None,
+                    mv1: None,
+                    mv: (0, 0),
+                    is_new_mv: false,
+                    size: (write_w / MI) as u8,
+                    size_h: (write_h / MI) as u8,
+                    is_global_mv0: false,
+                    is_global_mv1: false,
+                },
+            );
             neighbours.record_inter_rect_mi(
                 at,
                 write_w / MI,
@@ -26844,26 +26838,24 @@ fn decode_inter_block(
         ref_frame_for_lf = 0;
         globalmv_for_lf = false;
         let (mi_row, mi_col) = (rmi, cmi);
-        for dr in 0..side / 4 {
-            for dc in 0..side / 4 {
-                grid.set(
-                    mi_row + dr,
-                    mi_col + dc,
-                    MiInfo {
-                        is_inter: false,
-                        ref_frame: -1,
-                        ref_frame1: None,
-                        mv1: None,
-                        mv: (0, 0),
-                        is_new_mv: false,
-                        size: (side / 4) as u8,
-                        size_h: (side / 4) as u8,
-                        is_global_mv0: false,
-                        is_global_mv1: false,
-                    },
-                );
-            }
-        }
+        grid.fill_rect(
+            mi_row,
+            mi_col,
+            side / 4,
+            side / 4,
+            MiInfo {
+                is_inter: false,
+                ref_frame: -1,
+                ref_frame1: None,
+                mv1: None,
+                mv: (0, 0),
+                is_new_mv: false,
+                size: (side / 4) as u8,
+                size_h: (side / 4) as u8,
+                is_global_mv0: false,
+                is_global_mv1: false,
+            },
+        );
 
         // lane-intrainter r1: an intra block in an inter frame reads the same
         // `tx_depth` symbol a key-frame block does, and when it splits, the
@@ -28295,26 +28287,24 @@ fn decode_intra_sub8_leaf(
     // intra-in-inter block writes them: `is_inter = 0`, `INTRA_FRAME` ref, no
     // interpolation filter, no skip mode.
     neighbours.record_inter_rect_mi(lmi, w_mi, h_mi, skip, false, 0, [3, 3], false);
-    for dr in 0..h_mi {
-        for dc in 0..w_mi {
-            grid.set(
-                lmi.0 + dr,
-                lmi.1 + dc,
-                MiInfo {
-                    is_inter: false,
-                    ref_frame: -1,
-                    ref_frame1: None,
-                    mv1: None,
-                    mv: (0, 0),
-                    is_new_mv: false,
-                    size: w_mi as u8,
-                    size_h: h_mi as u8,
-                    is_global_mv0: false,
-                    is_global_mv1: false,
-                },
-            );
-        }
-    }
+    grid.fill_rect(
+        lmi.0,
+        lmi.1,
+        h_mi,
+        w_mi,
+        MiInfo {
+            is_inter: false,
+            ref_frame: -1,
+            ref_frame1: None,
+            mv1: None,
+            mv: (0, 0),
+            is_new_mv: false,
+            size: w_mi as u8,
+            size_h: h_mi as u8,
+            is_global_mv0: false,
+            is_global_mv1: false,
+        },
+    );
     SUB8_INTRA_RECT_HITS.with(|h| {
         let mut s = h.get();
         s[usize::from(vert)] += 1;
@@ -29000,26 +28990,24 @@ fn grid_stamp_rect(
     mv: (i32, i32),
     is_new_mv: bool,
 ) {
-    for dr in 0..h_mi {
-        for dc in 0..w_mi {
-            grid.set(
-                mi_row + dr,
-                mi_col + dc,
-                MiInfo {
-                    is_inter: true,
-                    ref_frame,
-                    ref_frame1: None,
-                    mv1: None,
-                    mv,
-                    is_new_mv,
-                    size: w_mi as u8,
-                    size_h: h_mi as u8,
-                    is_global_mv0: false,
-                    is_global_mv1: false,
-                },
-            );
-        }
-    }
+    grid.fill_rect(
+        mi_row,
+        mi_col,
+        h_mi,
+        w_mi,
+        MiInfo {
+            is_inter: true,
+            ref_frame,
+            ref_frame1: None,
+            mv1: None,
+            mv,
+            is_new_mv,
+            size: w_mi as u8,
+            size_h: h_mi as u8,
+            is_global_mv0: false,
+            is_global_mv1: false,
+        },
+    );
 }
 
 /// Decodes one 8x8 leaf of a straddling 16x16 inter-frame block
@@ -29581,26 +29569,24 @@ fn decode_inter_block8(
                     COMPOUND_WARP_HITS.with(|c| c.set(c.get() + 1));
                     COMPOUND_WARP_HITS_8.with(|c| c.set(c.get() + 1));
                 }
-                for dr in 0..2 {
-                    for dc in 0..2 {
-                        grid.set(
-                            mi_row + dr,
-                            mi_col + dc,
-                            MiInfo {
-                                is_inter: true,
-                                ref_frame: ref0,
-                                ref_frame1: Some(ref1),
-                                mv1: Some(mv1),
-                                mv: mv0,
-                                is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
-                                size: 2,
-                                size_h: 2,
-                                is_global_mv0: is_global_mv0_c,
-                                is_global_mv1: is_global_mv1_c,
-                            },
-                        );
-                    }
-                }
+                grid.fill_rect(
+                    mi_row,
+                    mi_col,
+                    2,
+                    2,
+                    MiInfo {
+                        is_inter: true,
+                        ref_frame: ref0,
+                        ref_frame1: Some(ref1),
+                        mv1: Some(mv1),
+                        mv: mv0,
+                        is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
+                        size: 2,
+                        size_h: 2,
+                        is_global_mv0: is_global_mv0_c,
+                        is_global_mv1: is_global_mv1_c,
+                    },
+                );
                 mode_for_tx = 0;
 
                 let mut inter0_y = vec![0i32; SIDE * SIDE];
@@ -30258,28 +30244,26 @@ fn decode_inter_block8(
                 warp_params.is_some(),
             );
         }
-        for dr in 0..2 {
-            for dc in 0..2 {
-                grid.set(
-                    mi_row + dr,
-                    mi_col + dc,
-                    MiInfo {
-                        is_inter: true,
-                        ref_frame,
-                        // INTRA_FRAME marker for interintra blocks -- keeps
-                        // them out of warp-sample gathering (see 16/32 site).
-                        ref_frame1: interintra_mode.map(|_| 0),
-                        mv1: None,
-                        mv,
-                        is_new_mv,
-                        size: 2,
-                        size_h: 2,
-                        is_global_mv0: is_global_mv_block,
-                        is_global_mv1: false,
-                    },
-                );
-            }
-        }
+        grid.fill_rect(
+            mi_row,
+            mi_col,
+            2,
+            2,
+            MiInfo {
+                is_inter: true,
+                ref_frame,
+                // INTRA_FRAME marker for interintra blocks -- keeps
+                // them out of warp-sample gathering (see 16/32 site).
+                ref_frame1: interintra_mode.map(|_| 0),
+                mv1: None,
+                mv,
+                is_new_mv,
+                size: 2,
+                size_h: 2,
+                is_global_mv0: is_global_mv_block,
+                is_global_mv1: false,
+            },
+        );
         mode_for_tx = 0;
 
         // lane-scaledref r1: this leaf's own prediction is always `Regular`
@@ -30722,26 +30706,24 @@ fn decode_inter_block8(
         });
         mode_for_tx = mode;
         let (mi_row, mi_col) = leaf_mi;
-        for dr in 0..2 {
-            for dc in 0..2 {
-                grid.set(
-                    mi_row + dr,
-                    mi_col + dc,
-                    MiInfo {
-                        is_inter: false,
-                        ref_frame: -1,
-                        ref_frame1: None,
-                        mv1: None,
-                        mv: (0, 0),
-                        is_new_mv: false,
-                        size: 2,
-                        size_h: 2,
-                        is_global_mv0: false,
-                        is_global_mv1: false,
-                    },
-                );
-            }
-        }
+        grid.fill_rect(
+            mi_row,
+            mi_col,
+            2,
+            2,
+            MiInfo {
+                is_inter: false,
+                ref_frame: -1,
+                ref_frame1: None,
+                mv1: None,
+                mv: (0, 0),
+                is_new_mv: false,
+                size: 2,
+                size_h: 2,
+                is_global_mv0: false,
+                is_global_mv1: false,
+            },
+        );
 
         // lane-leaf8tx r1: the 8x8 leaf's own intra `tx_depth` (libaom
         // `read_tx_size` -> `read_selected_tx_size`, max depth 1 at
