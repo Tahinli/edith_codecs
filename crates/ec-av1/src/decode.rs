@@ -90,6 +90,9 @@ pub(crate) struct FrameCtx {
     /// `None` while the queue is in use (wavefront workers) and outside a
     /// tile. See [`push_op`].
     pub(crate) recon_planes: std::cell::Cell<Option<ReconPlanes>>,
+    /// lane-wave1 step (ii): the superblock wavefront this tile's recorded
+    /// writes are handed to, at more than one reconstruction thread.
+    pub(crate) wave: std::cell::RefCell<Option<std::sync::Arc<WaveState>>>,
 }
 
 impl std::fmt::Debug for FrameCtx {
@@ -150,6 +153,7 @@ impl FrameCtx {
             recon_ops: std::cell::RefCell::new(Vec::new()),
             recon_spare: std::cell::RefCell::new(Vec::new()),
             recon_planes: std::cell::Cell::new(None),
+            wave: std::cell::RefCell::new(None),
         }
     }
 }
@@ -2113,6 +2117,11 @@ pub(crate) struct ReconPlanes(
 // own thread.
 #[allow(unsafe_code)]
 unsafe impl Send for ReconPlanes {}
+// SAFETY: the wavefront's workers share one `ReconPlanes` and write provably
+// disjoint superblocks of it (see [`WaveState`]) -- the [`crate::par::Shared`]
+// contract, one superblock per band instead of one row band.
+#[allow(unsafe_code)]
+unsafe impl Sync for ReconPlanes {}
 
 /// Registers the tile's planes for inline reconstruction and unregisters them
 /// on every exit from the tile decoder, including the `?` ones -- a stale
@@ -2162,6 +2171,173 @@ fn push_op(fctx: &crate::decode::FrameCtx, op: ReconOp) {
         return;
     }
     fctx.recon_ops.with(|c| c.borrow_mut().push(op));
+}
+
+/// lane-wave1 step (ii): the superblock-row wavefront a tile's recorded
+/// writes are reconstructed on when `EC_AV1_RECON_THREADS > 1`.
+///
+/// The parser keeps parsing and never touches the planes; each superblock's
+/// drained `Vec<ReconOp>` becomes one job, keyed by the superblock's own
+/// `(row, column)` inside the tile (128x128 superblocks are one job for all
+/// four of their 64x64 visits, since a 128 block writes across quadrants).
+/// A worker may start job `(r, c)` once `(r - 1, min(c + 1, last_col))` and
+/// `(r, c - 1)` are complete -- the classic wavefront rule, which covers
+/// every pixel an intra predictor can read (its edges reach one block right
+/// along the row above and one block down the column to the left, both
+/// inside those two neighbours) and every CfL AC read (this block's own
+/// luma, written by this same job). Jobs are handed out in raster order, so
+/// the oldest outstanding one always has its dependencies met: no deadlock.
+///
+/// Gate counters incremented inside `reconstruct*`/`intra`/`mc` are
+/// `thread_local!` and miss every worker, which is why the default is 1.
+pub(crate) struct WaveState {
+    q: std::sync::Mutex<WaveQueue>,
+    cv: std::sync::Condvar,
+    planes: ReconPlanes,
+    /// The two [`FrameCtx`] fields reconstruction reads (`sample_max` is
+    /// `bit_depth`'s; everything else a `reconstruct*` needs is in the op).
+    bit_depth: u8,
+    enable_edge_filter: bool,
+    last_col: usize,
+}
+
+struct WaveQueue {
+    jobs: std::collections::VecDeque<(usize, usize, Vec<ReconOp>)>,
+    /// Per superblock row, the last column reconstructed (-1 = none yet).
+    done: Vec<isize>,
+    /// Jobs popped but not finished -- what [`wave_barrier`] waits out.
+    active: usize,
+    closed: bool,
+}
+
+#[allow(unsafe_code)]
+fn wave_worker(st: &WaveState) {
+    let fctx = FrameCtx::new();
+    fctx.bit_depth.set(st.bit_depth);
+    fctx.enable_edge_filter.set(st.enable_edge_filter);
+    loop {
+        let mut q = st.q.lock().unwrap();
+        let (r, c, ops) = loop {
+            if let Some(job) = q.jobs.pop_front() {
+                break job;
+            }
+            if q.closed {
+                return;
+            }
+            q = st.cv.wait(q).unwrap();
+        };
+        q.active += 1;
+        loop {
+            let above = r == 0 || q.done[r - 1] >= (c + 1).min(st.last_col) as isize;
+            let left = c == 0 || q.done[r] >= c as isize - 1;
+            if above && left {
+                break;
+            }
+            q = st.cv.wait(q).unwrap();
+        }
+        drop(q);
+        let ReconPlanes(y, u, v) = st.planes;
+        // SAFETY: this job writes only superblock (r, c)'s own pixels, and
+        // every superblock that could have written or be reading them is
+        // complete by the wavefront rule above.
+        unsafe {
+            for op in ops {
+                exec_op(op, &mut *y, &mut *u, &mut *v, &fctx);
+            }
+        }
+        let mut q = st.q.lock().unwrap();
+        q.done[r] = c as isize;
+        q.active -= 1;
+        st.cv.notify_all();
+    }
+}
+
+/// Installs the wavefront for one tile and joins its workers on every exit
+/// from the tile decoder, including the `?` ones -- the jobs hold raw
+/// pointers into the tile's planes, so no worker may outlive them.
+pub(crate) struct WaveGuard<'a>(&'a crate::decode::FrameCtx, Vec<std::thread::JoinHandle<()>>);
+
+#[allow(unsafe_code)]
+impl<'a> WaveGuard<'a> {
+    fn install(
+        fctx: &'a crate::decode::FrameCtx,
+        y: &mut PlaneBuf<'static>,
+        u: &mut PlaneBuf<'static>,
+        v: &mut PlaneBuf<'static>,
+        rows: usize,
+        cols: usize,
+    ) -> Option<Self> {
+        let threads = crate::par::recon_threads();
+        if threads == 1 || rows == 0 || cols == 0 {
+            return None;
+        }
+        let st = std::sync::Arc::new(WaveState {
+            q: std::sync::Mutex::new(WaveQueue {
+                jobs: std::collections::VecDeque::new(),
+                done: vec![-1; rows],
+                active: 0,
+                closed: false,
+            }),
+            cv: std::sync::Condvar::new(),
+            // SAFETY: the planes are locals of the tile decoder and outlive
+            // this guard, which joins every worker in `drop`.
+            planes: ReconPlanes(
+                std::ptr::from_mut(y),
+                std::ptr::from_mut(u),
+                std::ptr::from_mut(v),
+            ),
+            bit_depth: fctx.bit_depth.with(std::cell::Cell::get),
+            enable_edge_filter: fctx.enable_edge_filter.with(std::cell::Cell::get),
+            last_col: cols - 1,
+        });
+        let workers = (0..threads)
+            .map(|_| {
+                let st = std::sync::Arc::clone(&st);
+                std::thread::spawn(move || wave_worker(&st))
+            })
+            .collect();
+        fctx.wave.with(|w| *w.borrow_mut() = Some(st));
+        Some(Self(fctx, workers))
+    }
+}
+
+impl Drop for WaveGuard<'_> {
+    fn drop(&mut self) {
+        let st = self.0.wave.with(|w| w.borrow_mut().take());
+        if let Some(st) = st {
+            st.q.lock().unwrap().closed = true;
+            st.cv.notify_all();
+        }
+        for h in self.1.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Hands superblock `(r, c)`'s recorded writes to the wavefront. `false`
+/// when there is no wavefront (one reconstruction thread), in which case the
+/// caller replays them itself.
+fn wave_submit(fctx: &crate::decode::FrameCtx, r: usize, c: usize) -> bool {
+    let st = fctx.wave.with(|w| w.borrow().clone());
+    let Some(st) = st else { return false };
+    let ops = fctx.recon_ops.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if !ops.is_empty() {
+        st.q.lock().unwrap().jobs.push_back((r, c, ops));
+        st.cv.notify_all();
+    }
+    true
+}
+
+/// Waits until every submitted job is reconstructed, so the parser may read
+/// the planes itself (the intrabc source fetch and the interintra intra
+/// predictor -- see [`flush_recon`]).
+fn wave_barrier(fctx: &crate::decode::FrameCtx) {
+    let st = fctx.wave.with(|w| w.borrow().clone());
+    let Some(st) = st else { return };
+    let mut q = st.q.lock().unwrap();
+    while !q.jobs.is_empty() || q.active > 0 {
+        q = st.cv.wait(q).unwrap();
+    }
 }
 
 /// Performs an intra write at its push site when the tile registered its
@@ -2376,6 +2552,9 @@ fn flush_recon(
     u: &mut PlaneBuf<'static>,
     v: &mut PlaneBuf<'static>,
 ) {
+    // lane-wave1 step (ii): a parse-time pixel READ needs every worker's
+    // writes in place, not just this superblock's queue.
+    wave_barrier(fctx);
     let mut ops = fctx.recon_spare.with(|c| std::mem::take(&mut *c.borrow_mut()));
     fctx.recon_ops.with(|c| std::mem::swap(&mut *c.borrow_mut(), &mut ops));
     for op in ops.drain(..) {
@@ -18854,9 +19033,36 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // lane-wave1 step (ii): at one reconstruction thread the recorded writes
     // are performed at their push sites (nothing reaches the queue below).
     let _recon_inline = ReconInline::install(fctx, &mut y, &mut u, &mut v);
+    // lane-wave1 step (ii): one job per superblock (per 128x128 superblock
+    // when `sb128`, since a 128 block writes across its four 64x64 visits).
+    let wave_shift = u32::from(sb128);
+    let (wave_r0, wave_c0) = ((sb_r0 >> wave_shift) as usize, (sb_c0 >> wave_shift) as usize);
+    let (wave_rows, wave_cols) = if sb_r1 > sb_r0 && sb_c1 > sb_c0 {
+        (
+            ((sb_r1 - 1) >> wave_shift) as usize - wave_r0 + 1,
+            ((sb_c1 - 1) >> wave_shift) as usize - wave_c0 + 1,
+        )
+    } else {
+        (0, 0)
+    };
+    let _wave = WaveGuard::install(fctx, &mut y, &mut u, &mut v, wave_rows, wave_cols);
+    let waving = fctx.wave.with(|w| w.borrow().is_some());
+    let mut wave_job = (0usize, 0usize);
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
-        // lane-wave1 step (i): the previous superblock's recorded writes.
-        flush_recon(fctx, &mut y, &mut u, &mut v);
+        // lane-wave1: the previous superblock's recorded writes -- handed to
+        // the wavefront workers, or replayed here at one recon thread (where
+        // the queue is empty, every write having run at its push site).
+        if waving {
+            if sb_start {
+                wave_submit(fctx, wave_job.0, wave_job.1);
+                wave_job = (
+                    (sb_r >> wave_shift) as usize - wave_r0,
+                    (sb_c >> wave_shift) as usize - wave_c0,
+                );
+            }
+        } else {
+            flush_recon(fctx, &mut y, &mut u, &mut v);
+        }
         if row_start {
             neighbours.start_row();
         }
@@ -20597,6 +20803,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 }
             }
         }
+    }
+    if waving {
+        wave_submit(fctx, wave_job.0, wave_job.1);
     }
     flush_recon(fctx, &mut y, &mut u, &mut v);
 
@@ -30310,9 +30519,36 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // lane-wave1 step (ii): at one reconstruction thread the recorded writes
     // are performed at their push sites (nothing reaches the queue below).
     let _recon_inline = ReconInline::install(fctx, &mut y, &mut u, &mut v);
+    // lane-wave1 step (ii): one job per superblock (per 128x128 superblock
+    // when `sb128`, since a 128 block writes across its four 64x64 visits).
+    let wave_shift = u32::from(sb128);
+    let (wave_r0, wave_c0) = ((sb_r0 >> wave_shift) as usize, (sb_c0 >> wave_shift) as usize);
+    let (wave_rows, wave_cols) = if sb_r1 > sb_r0 && sb_c1 > sb_c0 {
+        (
+            ((sb_r1 - 1) >> wave_shift) as usize - wave_r0 + 1,
+            ((sb_c1 - 1) >> wave_shift) as usize - wave_c0 + 1,
+        )
+    } else {
+        (0, 0)
+    };
+    let _wave = WaveGuard::install(fctx, &mut y, &mut u, &mut v, wave_rows, wave_cols);
+    let waving = fctx.wave.with(|w| w.borrow().is_some());
+    let mut wave_job = (0usize, 0usize);
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
-        // lane-wave1 step (i): the previous superblock's recorded writes.
-        flush_recon(fctx, &mut y, &mut u, &mut v);
+        // lane-wave1: the previous superblock's recorded writes -- handed to
+        // the wavefront workers, or replayed here at one recon thread (where
+        // the queue is empty, every write having run at its push site).
+        if waving {
+            if sb_start {
+                wave_submit(fctx, wave_job.0, wave_job.1);
+                wave_job = (
+                    (sb_r >> wave_shift) as usize - wave_r0,
+                    (sb_c >> wave_shift) as usize - wave_c0,
+                );
+            }
+        } else {
+            flush_recon(fctx, &mut y, &mut u, &mut v);
+        }
         if row_start {
             neighbours.start_row();
         }
@@ -32655,6 +32891,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 }
             }
         }
+    }
+    if waving {
+        wave_submit(fctx, wave_job.0, wave_job.1);
     }
     flush_recon(fctx, &mut y, &mut u, &mut v);
 
