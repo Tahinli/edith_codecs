@@ -77,6 +77,7 @@
 //! added by the row/col scan), and the "extra search" that pads a short
 //! stack to two entries (spec 7.10.2.12) — this module's stack can be
 //! shorter than two candidates where libaom's never is.
+use crate::hits::hit;
 
 thread_local! {
     /// How many query blocks [`find_mv_stack_with_sign_bias`] has folded at
@@ -503,7 +504,7 @@ fn add_candidate(candidates: &mut StackVec, mv: (i32, i32), weight: u32) {
     if let Some(entry) = candidates.iter_mut().find(|e| e.mv == mv) {
         entry.weight += weight;
     } else if candidates.len() >= MAX_STACK_SIZE {
-        STACK_FULL_DROPS.with(|c| c.set(c.get() + 1));
+        hit!(STACK_FULL_DROPS);
     } else {
         // libaom `add_ref_mv_candidate` (mvref_common.c:100) and
         // `add_tpl_ref_mv` (:388) only push when
@@ -983,7 +984,7 @@ fn clamp_mv_ref(
         let clamped_row = row.clamp(to_top - bh8 - MV_BORDER, to_bottom + bh8 + MV_BORDER);
         let clamped_col = col.clamp(to_left - bw8 - MV_BORDER, to_right + bw8 + MV_BORDER);
         if clamped_row != row || clamped_col != col {
-            MV_CLAMP_EDGE_OVERHANG_HITS.with(|c| c.set(c.get() + 1));
+            hit!(MV_CLAMP_EDGE_OVERHANG_HITS);
         }
     }
 
@@ -1194,7 +1195,7 @@ pub fn find_mv_stack_with_sign_bias(
     // `None` for the cells outside the tile.
     let (tile_row0, tile_col0) = grid.tile_origin();
     if tile_row0 > 0 || tile_col0 > 0 {
-        TILE_REACH_CLIPS.with(|c| c.set(c.get() + 1));
+        hit!(TILE_REACH_CLIPS);
     }
     let max_row_offset: isize = if mi_row > tile_row0 {
         let reach = if bh4 < 2 { -4 } else { -6 } + isize::from(row_adj);
@@ -1361,7 +1362,7 @@ pub fn find_mv_stack_with_sign_bias(
             }
         }
         if any_hit {
-            TMV_HITS.with(|c| c.set(c.get() + 1));
+            hit!(TMV_HITS);
         }
         zero_mv_ctx = usize::from(first_sample_missing || first_sample_far);
     }
@@ -1661,7 +1662,7 @@ fn add_compound_candidate(
     if let Some(entry) = candidates.iter_mut().find(|e| e.mv0 == mv0 && e.mv1 == mv1) {
         entry.weight += weight;
     } else if candidates.len() >= MAX_STACK_SIZE {
-        STACK_FULL_DROPS.with(|c| c.set(c.get() + 1));
+        hit!(STACK_FULL_DROPS);
     } else {
         // Same insertion cap as [`add_candidate`]: libaom's compound branch
         // of `add_ref_mv_candidate` (mvref_common.c:128) and `add_tpl_ref_mv`
@@ -1946,7 +1947,7 @@ fn combine_compound_candidates(
         std::array::from_fn(|i| {
             merged.get(i).copied().unwrap_or_else(|| {
                 if gm_mv_candidates[side] != (0, 0) {
-                    COMP_GM_FILL_HITS.with(|c| c.set(c.get() + 1));
+                    hit!(COMP_GM_FILL_HITS);
                 }
                 gm_mv_candidates[side]
             })
@@ -2006,7 +2007,7 @@ pub fn find_mv_stack_compound(
     // `None` for the cells outside the tile.
     let (tile_row0, tile_col0) = grid.tile_origin();
     if tile_row0 > 0 || tile_col0 > 0 {
-        TILE_REACH_CLIPS.with(|c| c.set(c.get() + 1));
+        hit!(TILE_REACH_CLIPS);
     }
     let max_row_offset: isize = if mi_row > tile_row0 {
         let reach = if bh4 < 2 { -4 } else { -6 } + isize::from(row_adj);
@@ -2171,7 +2172,7 @@ pub fn find_mv_stack_compound(
             }
         }
         if any_hit {
-            TMV_HITS.with(|c| c.set(c.get() + 1));
+            hit!(TMV_HITS);
         }
         zero_mv_ctx = usize::from(first_sample_missing || first_sample_far);
     }

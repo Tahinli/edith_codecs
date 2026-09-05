@@ -5,6 +5,7 @@
 //! (`av1/common/mvref_common.c`) and the projection math `add_tpl_ref_mv`
 //! (same file) applies a second time, per query block, against the block's
 //! own single reference frame.
+use crate::hits::hit;
 
 use crate::mvstack::{ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME};
 
@@ -400,10 +401,10 @@ pub fn setup_motion_field<M: std::borrow::Borrow<MotionField>>(
     })
     .count();
     if intra_forward_refs >= 1 {
-        REFSTAMP_INTRA_FRAMES.with(|c| c.set(c.get() + 1));
+        hit!(REFSTAMP_INTRA_FRAMES);
     }
     if intra_forward_refs >= 2 {
-        REFSTAMP_INTRA2_FRAMES.with(|c| c.set(c.get() + 1));
+        hit!(REFSTAMP_INTRA2_FRAMES);
     }
 
     if let Some(last) = slot_of(LAST_FRAME) {

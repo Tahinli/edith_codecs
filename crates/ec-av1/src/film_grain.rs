@@ -12,6 +12,7 @@
 //! [`crate::stream::decode_stream`] is the only caller: it applies this to
 //! the frame it pushes onto its output `Vec<Picture>`, after saving the
 //! clean decode into the reference slot bank.
+use crate::hits::hit;
 
 use crate::decode::WithRef;
 use crate::encode::Picture;
@@ -1107,7 +1108,7 @@ pub(crate) fn apply_grain(
         return picture.clone();
     }
     fctx.grain_bit_depth.with(|c| c.set(bit_depth));
-    GRAIN_HITS.with(|c| c.set(c.get() + 1));
+    hit!(GRAIN_HITS);
     let width = picture.width as i32;
     let height = picture.height as i32;
     let y_stride = width;
