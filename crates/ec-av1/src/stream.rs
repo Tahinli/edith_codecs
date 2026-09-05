@@ -478,7 +478,12 @@ pub fn decode_stream_with_threads(
     threads: usize,
     mut sink: impl FnMut(&Picture, usize, bool) -> Result<()>,
 ) -> Result<()> {
-    std::thread::scope(|scope| {
+    // lane-pool1: this replaced a `std::thread::scope` -- frame workers now
+    // come from a persistent pool (one per submitting thread, workers reused
+    // across frames, so their `thread_local!` decode scratch survives the
+    // frame). `jobs` is declared here and dropped at the end of the function,
+    // including on `?`, so no job outlives the data it borrows.
+    let jobs = crate::par::Batch::new();
     // lane-thread1: this stream's per-frame decode state (was 38 thread_local
     // statics in decode.rs) -- one object, threaded down the decode call graph.
     let fctx = &crate::decode::FrameCtx::new();
@@ -617,7 +622,7 @@ pub fn decode_stream_with_threads(
                 let grain = header.film_grain;
                 let seq = SeqFlags::read(&parser);
                 let tx = tx.clone();
-                scope.spawn(move || {
+                jobs.submit(move || {
                     let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let value = promise.wait()?;
                         let output = if grain.apply_grain && !no_grain() {
@@ -838,7 +843,7 @@ pub fn decode_stream_with_threads(
             }
             let tx = tx.clone();
             let dump = final_dump.clone();
-            scope.spawn(move || {
+            jobs.submit(move || {
                 let promise = produces;
                 let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     // The wait happens HERE, off the parsing thread, and only
@@ -1041,7 +1046,6 @@ pub fn decode_stream_with_threads(
     }
     debug_assert!(reorder.pending.is_empty(), "a frame was never emitted");
     Ok(())
-    })
 }
 
 
