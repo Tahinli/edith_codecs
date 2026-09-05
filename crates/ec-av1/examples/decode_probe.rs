@@ -292,6 +292,7 @@ fn main() {
     };
     let out16 = std::env::var("EC_PROBE_OUT16").ok();
     let out8 = std::env::args().nth(2).or_else(|| std::env::var("EC_PROBE_OUT").ok());
+    let null16 = out16.as_deref() == Some("/dev/null");
     let mut f16 = out16.as_deref().map(open);
     let mut f8 = out8.as_deref().map(open);
     let mut written16 = 0usize;
@@ -308,12 +309,25 @@ fn main() {
             dims = (f.width, f.height);
         }
         if let Some(w) = f16.as_mut() {
-            buf.clear();
-            for p in [&f.y, &f.u, &f.v] {
-                buf.extend(p.iter().flat_map(|&s| s.to_le_bytes()));
+            let n = 2 * (f.y.len() + f.u.len() + f.v.len());
+            if null16 {
+                // Timing runs point EC_PROBE_OUT16 at /dev/null; the u16->LE
+                // conversion was ~2% of the main thread for bytes nobody reads.
+                written16 += n;
+            } else {
+                buf.clear();
+                buf.resize(n, 0);
+                let mut off = 0;
+                for p in [&f.y, &f.u, &f.v] {
+                    let end = off + 2 * p.len();
+                    for (d, &s) in buf[off..end].chunks_exact_mut(2).zip(p.iter()) {
+                        d.copy_from_slice(&s.to_le_bytes());
+                    }
+                    off = end;
+                }
+                w.write_all(&buf).expect("writing raw planes");
+                written16 += buf.len();
             }
-            w.write_all(&buf).expect("writing raw planes");
-            written16 += buf.len();
         }
         if let Some(w) = f8.as_mut() {
             buf.clear();
