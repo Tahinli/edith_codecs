@@ -29,6 +29,11 @@ fn main() {
         }
     };
     let report = || {
+        // The census below reads ec-av1's gate counters; without the crate's
+        // `gate-counters` feature every one of them is compiled out and reads 0.
+        if !cfg!(feature = "gate-counters") {
+            println!("counters disabled (built without the gate-counters feature)");
+        }
         let (sc, dp) = ec_av1::decode::troy_chroma_counters();
         println!("troy_chroma: skip_cfl={sc} dir_1to4_pairs={dp}");
         let (h, v, c) = ec_av1::stream::rect4_32_counters();

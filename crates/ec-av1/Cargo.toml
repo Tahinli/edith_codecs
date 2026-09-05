@@ -9,3 +9,11 @@ authors.workspace = true
 [dependencies]
 ec-core.workspace = true
 ec-av1-syntax.workspace = true
+
+[features]
+default = ["gate-counters"]
+# Compiles the ~550 `*_HITS` gate counters (see `src/hits.rs`). ON by default so
+# every test gate and the probe's census see the same numbers they always have;
+# a shipped decoder can build `--no-default-features` to drop the TLS bump on
+# each counted path -- the `*_hits()` accessors still compile and return 0.
+gate-counters = []

@@ -3,6 +3,7 @@
 //! `av1_loop_restoration_corners_in_sb`, restoration.c:1277) and spec 7.17's
 //! two pixel filters (Wiener, self-guided/SGR). See `lanes/lr.report.md` for
 //! the full derivation (libaom `decodeframe.c`/`restoration.c` line refs).
+use crate::hits::hit;
 
 use crate::msac::SymbolDecoder;
 use ec_av1_syntax::obu::floor_log2;
@@ -426,23 +427,23 @@ fn read_lr_unit(
 ) -> UnitFilter {
     match ftype {
         RestorationType::Switchable => {
-            SWITCHABLE_HITS.with(|c| c.set(c.get() + 1));
+            hit!(SWITCHABLE_HITS);
             let t = dec.symbol(&mut cdfs.restore_switchable);
             match t {
                 0 => UnitFilter::None,
                 1 => {
-                    WIENER_HITS.with(|c| c.set(c.get() + 1));
+                    hit!(WIENER_HITS);
                     UnitFilter::Wiener(read_wiener_filter(dec, chroma, &mut reference.0))
                 }
                 _ => {
-                    SGRPROJ_HITS.with(|c| c.set(c.get() + 1));
+                    hit!(SGRPROJ_HITS);
                     UnitFilter::Sgrproj(read_sgrproj_filter(dec, &mut reference.1))
                 }
             }
         }
         RestorationType::Wiener => {
             if dec.symbol(&mut cdfs.restore_wiener) != 0 {
-                WIENER_HITS.with(|c| c.set(c.get() + 1));
+                hit!(WIENER_HITS);
                 UnitFilter::Wiener(read_wiener_filter(dec, chroma, &mut reference.0))
             } else {
                 UnitFilter::None
@@ -451,7 +452,7 @@ fn read_lr_unit(
         RestorationType::Sgrproj => {
             let bit = dec.symbol(&mut cdfs.restore_sgrproj);
             if bit != 0 {
-                SGRPROJ_HITS.with(|c| c.set(c.get() + 1));
+                hit!(SGRPROJ_HITS);
                 UnitFilter::Sgrproj(read_sgrproj_filter(dec, &mut reference.1))
             } else {
                 UnitFilter::None
@@ -1191,10 +1192,10 @@ fn filter_restoration_unit(
         let stripe_v_end = stripe_v_start + h;
         if !matches!(filter, UnitFilter::None) {
             if stripe_v_start == 0 {
-                LR_STRIPE0_HITS.with(|c| c.set(c.get() + 1));
+                hit!(LR_STRIPE0_HITS);
             }
             if stripe_v_end == plane_h && h < nominal_h {
-                LR_LAST_STRIPE_HITS.with(|c| c.set(c.get() + 1));
+                hit!(LR_LAST_STRIPE_HITS);
             }
         }
         match filter {
