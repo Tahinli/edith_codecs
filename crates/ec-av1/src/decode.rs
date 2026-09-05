@@ -93,6 +93,9 @@ pub(crate) struct FrameCtx {
     /// lane-wave1 step (ii): the superblock wavefront this tile's recorded
     /// writes are handed to, at more than one reconstruction thread.
     pub(crate) wave: std::cell::RefCell<Option<std::sync::Arc<WaveState>>>,
+    /// lane-wave5 instrumentation only (`EC_AV1_WAVE_STATS`): when the parse
+    /// thread last handed a superblock to the wavefront.
+    pub(crate) wave_mark: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl std::fmt::Debug for FrameCtx {
@@ -154,6 +157,7 @@ impl FrameCtx {
             recon_spare: std::cell::RefCell::new(Vec::new()),
             recon_planes: std::cell::Cell::new(None),
             wave: std::cell::RefCell::new(None),
+            wave_mark: std::cell::Cell::new(None),
         }
     }
 }
@@ -2371,7 +2375,16 @@ pub(crate) struct WaveState {
 }
 
 struct WaveQueue {
-    jobs: std::collections::VecDeque<(usize, usize, Vec<ReconOp>)>,
+    /// Queued jobs per superblock ROW, in column order (lane-wave5). Only a
+    /// row's front job can ever be runnable -- a job waits on its own left
+    /// neighbour -- so a worker takes the lowest row whose front job's
+    /// dependencies are met. Popping the raster-oldest job instead (what
+    /// this replaced) put every worker on the SAME row, where the wavefront
+    /// rule serialises them, which is why 4 workers ran the tile at 1.2x.
+    rows: Vec<std::collections::VecDeque<(usize, Vec<ReconOp>)>>,
+    /// Jobs sitting in `rows`, so a worker knows the queue is empty without
+    /// walking it.
+    queued: usize,
     /// Per superblock row, the last column reconstructed (-1 = none yet).
     done: Vec<isize>,
     /// Jobs popped but not finished -- what [`wave_barrier`] waits out.
@@ -2379,32 +2392,132 @@ struct WaveQueue {
     closed: bool,
 }
 
+impl WaveQueue {
+    /// The lowest-row queued job whose wavefront dependencies are satisfied,
+    /// or `None` (with the blocking condition counted when instrumented).
+    fn take_runnable(&mut self, last_col: usize, stats: bool) -> Option<(usize, usize, Vec<ReconOp>)> {
+        let mut blocked: Option<bool> = None;
+        for r in 0..self.rows.len() {
+            let Some(front) = self.rows[r].front() else {
+                continue;
+            };
+            let c = front.0;
+            let above = r == 0 || self.done[r - 1] >= (c + 1).min(last_col) as isize;
+            let left = c == 0 || self.done[r] >= c as isize - 1;
+            if above && left {
+                let (c, ops) = self.rows[r].pop_front().expect("front checked above");
+                self.queued -= 1;
+                return Some((r, c, ops));
+            }
+            if blocked.is_none() {
+                blocked = Some(above);
+            }
+        }
+        if stats {
+            match blocked {
+                Some(true) => WS_BLOCK_LEFT.fetch_add(1, Relaxed),
+                Some(false) => WS_BLOCK_ABOVE.fetch_add(1, Relaxed),
+                None => 0,
+            };
+        }
+        None
+    }
+}
+
+/// lane-wave5 instrumentation, on `EC_AV1_WAVE_STATS=1`: where a recon
+/// worker's time goes (busy replaying, waiting for a dependency, idle on an
+/// empty queue), how far ahead the parse thread is, and how often the two
+/// parse-time pixel reads barrier the wavefront. Cumulative for the process,
+/// dumped by every [`WaveGuard`] drop, so the LAST line of a decode is the
+/// whole run.
+const WS_SLOTS: usize = 16;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
+static WS_JOBS: [AtomicU64; WS_SLOTS] = [const { AtomicU64::new(0) }; WS_SLOTS];
+static WS_OPS: [AtomicU64; WS_SLOTS] = [const { AtomicU64::new(0) }; WS_SLOTS];
+static WS_BUSY: [AtomicU64; WS_SLOTS] = [const { AtomicU64::new(0) }; WS_SLOTS];
+static WS_WAIT: [AtomicU64; WS_SLOTS] = [const { AtomicU64::new(0) }; WS_SLOTS];
+static WS_BLOCK_ABOVE: AtomicU64 = AtomicU64::new(0);
+static WS_BLOCK_LEFT: AtomicU64 = AtomicU64::new(0);
+/// Parse-thread time between two submits, i.e. everything parse still does
+/// itself (symbol decode plus the predictions not deferred).
+static WS_PARSE: AtomicU64 = AtomicU64::new(0);
+/// Parse-thread time spent waiting for the wavefront: at [`wave_barrier`]
+/// (the intrabc/interintra reads) and at the tile's end.
+static WS_BARRIER: AtomicU64 = AtomicU64::new(0);
+static WS_BARRIERS: AtomicU64 = AtomicU64::new(0);
+static WS_DRAIN: AtomicU64 = AtomicU64::new(0);
+static WS_TILES: AtomicU64 = AtomicU64::new(0);
+
+fn wave_stats() -> bool {
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match ON.load(Relaxed) {
+        0 => {
+            let on = crate::envflags::var("EC_AV1_WAVE_STATS")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false);
+            ON.store(1 + u8::from(on), Relaxed);
+            on
+        }
+        n => n == 2,
+    }
+}
+
+fn wave_stats_dump() {
+    let ms = |n: u64| n as f64 / 1e6;
+    let mut s = format!("wave_stats tiles={}", WS_TILES.load(Relaxed));
+    for i in 0..WS_SLOTS {
+        let jobs = WS_JOBS[i].load(Relaxed);
+        if jobs == 0 {
+            continue;
+        }
+        s += &format!(
+            " | w{i} jobs={jobs} ops/job={:.1} busy={:.0}ms wait={:.0}ms wait/job={:.0}us",
+            WS_OPS[i].load(Relaxed) as f64 / jobs as f64,
+            ms(WS_BUSY[i].load(Relaxed)),
+            ms(WS_WAIT[i].load(Relaxed)),
+            WS_WAIT[i].load(Relaxed) as f64 / jobs as f64 / 1e3,
+        );
+    }
+    s += &format!(
+        " | parse={:.0}ms barrier={:.0}ms/{} drain={:.0}ms block_above={} block_left={}",
+        ms(WS_PARSE.load(Relaxed)),
+        ms(WS_BARRIER.load(Relaxed)),
+        WS_BARRIERS.load(Relaxed),
+        ms(WS_DRAIN.load(Relaxed)),
+        WS_BLOCK_ABOVE.load(Relaxed),
+        WS_BLOCK_LEFT.load(Relaxed),
+    );
+    eprintln!("{s}");
+}
+
 #[allow(unsafe_code)]
-fn wave_worker(st: &WaveState) {
+fn wave_worker(st: &WaveState, idx: usize) {
     let fctx = FrameCtx::new();
     fctx.bit_depth.set(st.bit_depth);
     fctx.enable_edge_filter.set(st.enable_edge_filter);
+    let stats = wave_stats();
+    let slot = idx.min(WS_SLOTS - 1);
     loop {
+        let t0 = std::time::Instant::now();
         let mut q = st.q.lock().unwrap();
         let (r, c, ops) = loop {
-            if let Some(job) = q.jobs.pop_front() {
+            if let Some(job) = q.take_runnable(st.last_col, stats) {
                 break job;
             }
-            if q.closed {
+            if q.closed && q.queued == 0 {
                 return;
             }
             q = st.cv.wait(q).unwrap();
         };
         q.active += 1;
-        loop {
-            let above = r == 0 || q.done[r - 1] >= (c + 1).min(st.last_col) as isize;
-            let left = c == 0 || q.done[r] >= c as isize - 1;
-            if above && left {
-                break;
-            }
-            q = st.cv.wait(q).unwrap();
-        }
         drop(q);
+        if stats {
+            WS_WAIT[slot].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            WS_JOBS[slot].fetch_add(1, Relaxed);
+            WS_OPS[slot].fetch_add(ops.len() as u64, Relaxed);
+        }
+        let t1 = std::time::Instant::now();
         let ReconPlanes(y, u, v) = st.planes;
         // SAFETY: this job writes only superblock (r, c)'s own pixels, and
         // every superblock that could have written or be reading them is
@@ -2414,6 +2527,9 @@ fn wave_worker(st: &WaveState) {
             for op in ops {
                 exec_op(op, &mut *y, &mut *u, &mut *v, &mut cur, &fctx);
             }
+        }
+        if stats {
+            WS_BUSY[slot].fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
         }
         let mut q = st.q.lock().unwrap();
         q.done[r] = c as isize;
@@ -2449,7 +2565,8 @@ impl<'a> WaveGuard<'a> {
         }
         let st = std::sync::Arc::new(WaveState {
             q: std::sync::Mutex::new(WaveQueue {
-                jobs: std::collections::VecDeque::new(),
+                rows: (0..rows).map(|_| std::collections::VecDeque::new()).collect(),
+                queued: 0,
                 done: vec![-1; rows],
                 active: 0,
                 closed: false,
@@ -2467,11 +2584,12 @@ impl<'a> WaveGuard<'a> {
             last_col: cols - 1,
         });
         let batch = crate::par::Batch::new("ec-av1-recon");
-        for _ in 0..threads {
+        for idx in 0..threads {
             let st = std::sync::Arc::clone(&st);
-            batch.submit(move || wave_worker(&st));
+            batch.submit(move || wave_worker(&st, idx));
         }
         fctx.wave.with(|w| *w.borrow_mut() = Some(st));
+        fctx.wave_mark.with(|c| c.set(Some(std::time::Instant::now())));
         Some(Self(fctx, Some(batch)))
     }
 }
@@ -2483,8 +2601,14 @@ impl Drop for WaveGuard<'_> {
             st.q.lock().unwrap().closed = true;
             st.cv.notify_all();
         }
+        let t0 = std::time::Instant::now();
         // Dropping the batch waits every worker out, as the joins did.
         drop(self.1.take());
+        if wave_stats() {
+            WS_DRAIN.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            WS_TILES.fetch_add(1, Relaxed);
+            wave_stats_dump();
+        }
     }
 }
 
@@ -2496,8 +2620,17 @@ fn wave_submit(fctx: &crate::decode::FrameCtx, r: usize, c: usize) -> bool {
     let Some(st) = st else { return false };
     let ops = fctx.recon_ops.with(|c| std::mem::take(&mut *c.borrow_mut()));
     if !ops.is_empty() {
-        st.q.lock().unwrap().jobs.push_back((r, c, ops));
+        let mut q = st.q.lock().unwrap();
+        q.rows[r].push_back((c, ops));
+        q.queued += 1;
+        drop(q);
         st.cv.notify_all();
+    }
+    if wave_stats() {
+        let now = std::time::Instant::now();
+        if let Some(t) = fctx.wave_mark.with(|c| c.replace(Some(now))) {
+            WS_PARSE.fetch_add((now - t).as_nanos() as u64, Relaxed);
+        }
     }
     true
 }
@@ -2508,9 +2641,16 @@ fn wave_submit(fctx: &crate::decode::FrameCtx, r: usize, c: usize) -> bool {
 fn wave_barrier(fctx: &crate::decode::FrameCtx) {
     let st = fctx.wave.with(|w| w.borrow().clone());
     let Some(st) = st else { return };
+    let stats = wave_stats();
+    let t0 = std::time::Instant::now();
     let mut q = st.q.lock().unwrap();
-    while !q.jobs.is_empty() || q.active > 0 {
+    while q.queued > 0 || q.active > 0 {
         q = st.cv.wait(q).unwrap();
+    }
+    drop(q);
+    if stats {
+        WS_BARRIER.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        WS_BARRIERS.fetch_add(1, Relaxed);
     }
 }
 
