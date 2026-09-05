@@ -11067,7 +11067,7 @@ fn decode_block_rect4(
         } else {
             &RECT4_SPLIT_DEPTH2_HITS
         };
-        which.with(|c| c.set(c.get() + 1));
+        hit_do! { which.with(|c| c.set(c.get() + 1)); }
         let modes = RectStripModes {
             skip,
             mode,
@@ -12079,7 +12079,7 @@ fn decode_block_rect64(
             } else {
                 &RECT4_SPLIT_DEPTH2_HITS
             };
-            which.with(|c| c.set(c.get() + 1));
+            hit_do! { which.with(|c| c.set(c.get() + 1)); }
         }
         if crate::envflags::env_flag!("EC_SBPART_DUMP64") {
             eprintln!(
@@ -23236,7 +23236,7 @@ fn read_single_ref(
             ALTREF_FRAME => &ALTREF_HITS,
             _ => unreachable!("read_single_ref only ever returns LAST_FRAME..=ALTREF_FRAME"),
         };
-        c.with(|v| v.set(v.get() + 1));
+        hit_do! { c.with(|v| v.set(v.get() + 1)); }
     }
     ref_frame
 }
