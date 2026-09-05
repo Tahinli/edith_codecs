@@ -85,6 +85,20 @@ pub(crate) struct FrameCtx {
     /// The queue buffer [`flush_recon`] just drained, kept for its capacity
     /// so a superblock's records do not regrow the vector from nothing.
     pub(crate) recon_spare: std::cell::RefCell<Vec<ReconOp>>,
+    /// lane-recoparse: the coefficient grids of the recorded ops above, one
+    /// buffer instead of a `Vec` per transform unit -- a recorded unit is
+    /// `(offset, len)` into it ([`Residual::Coeffs`]). Written by parse
+    /// before the op is published, read only by whoever replays that op, and
+    /// handed over WITH the ops at every drain point ([`wave_submit`],
+    /// [`flush_recon`]), so offsets are always relative to the live arena.
+    pub(crate) coeff_arena: std::cell::RefCell<Vec<i32>>,
+    /// [`recon_spare`](Self::recon_spare) for the arena, on the inline drain
+    /// path (a submitted job's arena travels to its worker instead).
+    pub(crate) coeff_spare: std::cell::RefCell<Vec<i32>>,
+    /// [`coeff_arena`](Self::coeff_arena) for the recorded PREDICTIONS
+    /// ([`PredSrc::Owned`]): same lifetime, same drain points.
+    pub(crate) pred_arena: std::cell::RefCell<Vec<u16>>,
+    pub(crate) pred_spare: std::cell::RefCell<Vec<u16>>,
     /// lane-wave1 step (ii): the tile decoder's own planes, registered by
     /// [`ReconInline`] while reconstruction runs INLINE (one recon thread).
     /// `None` while the queue is in use (wavefront workers) and outside a
@@ -155,6 +169,10 @@ impl FrameCtx {
             grain_bit_depth: std::cell::Cell::new(8),
             recon_ops: std::cell::RefCell::new(Vec::new()),
             recon_spare: std::cell::RefCell::new(Vec::new()),
+            coeff_arena: std::cell::RefCell::new(Vec::new()),
+            coeff_spare: std::cell::RefCell::new(Vec::new()),
+            pred_arena: std::cell::RefCell::new(Vec::new()),
+            pred_spare: std::cell::RefCell::new(Vec::new()),
             recon_planes: std::cell::Cell::new(None),
             wave: std::cell::RefCell::new(None),
             wave_mark: std::cell::Cell::new(None),
@@ -2108,27 +2126,64 @@ impl TxParams {
 /// A recorded write's residual: already transformed, or the coefficients and
 /// [`TxParams`] the worker transforms itself.
 pub(crate) enum Residual {
-    Done(Vec<i32>),
-    Coeffs(TxParams, Vec<i32>),
+    /// An already-transformed residual in the arena, `(offset, len)`; a zero
+    /// `len` is the all-zero marker [`dense_residual`] expands.
+    Done(u32, u32),
+    /// The coefficients live in the pushing tile's arena
+    /// ([`crate::decode::FrameCtx::coeff_arena`]); this is their `(offset,
+    /// len)` in it.
+    Coeffs(TxParams, u32, u32),
 }
 
 impl Residual {
     /// The record for a transform unit whose coefficient grid is all zero:
     /// the empty marker, so neither the grid nor the residual is cloned and
     /// the worker never runs the transform (60% of the 4K segment's units).
-    fn coeffs(tx: TxParams, grid: &[i32]) -> Self {
+    fn coeffs(tx: TxParams, grid: &[i32], fctx: &crate::decode::FrameCtx) -> Self {
         if grid.iter().all(|&c| c == 0) {
-            return Self::Done(Vec::new());
+            return Self::Done(0, 0);
         }
-        Self::Coeffs(tx, grid.to_vec())
+        Self::Coeffs(tx, push_coeffs(grid, fctx), grid.len() as u32)
     }
 
-    fn resolve(self) -> Vec<i32> {
+    /// A residual the parse thread already transformed, kept in the arena
+    /// instead of its own `Vec`.
+    fn done(residual: &[i32], fctx: &crate::decode::FrameCtx) -> Self {
+        Self::Done(push_coeffs(residual, fctx), residual.len() as u32)
+    }
+
+    /// The residual to reconstruct with; `scratch` is where a transform run
+    /// on this thread lands, so the caller owns that buffer.
+    fn resolve<'a>(self, arena: &'a [i32], scratch: &'a mut Vec<i32>) -> &'a [i32] {
         match self {
-            Self::Done(v) => v,
-            Self::Coeffs(p, grid) => p.run(&grid),
+            Self::Done(off, len) => &arena[off as usize..][..len as usize],
+            Self::Coeffs(p, off, len) => {
+                *scratch = p.run(&arena[off as usize..][..len as usize]);
+                scratch
+            }
         }
     }
+}
+
+/// Appends to the tile's coefficient arena, returning the offset the record
+/// carries; see [`crate::decode::FrameCtx::coeff_arena`].
+fn push_coeffs(v: &[i32], fctx: &crate::decode::FrameCtx) -> u32 {
+    fctx.coeff_arena.with(|a| {
+        let mut a = a.borrow_mut();
+        let off = a.len();
+        a.extend_from_slice(v);
+        off as u32
+    })
+}
+
+/// [`push_coeffs`] for a recorded prediction.
+fn push_pred_samples(v: &[u16], fctx: &crate::decode::FrameCtx) -> u32 {
+    fctx.pred_arena.with(|a| {
+        let mut a = a.borrow_mut();
+        let off = a.len();
+        a.extend_from_slice(v);
+        off as u32
+    })
 }
 
 /// An all-zero residual, for the transform units that code no coefficient:
@@ -2192,7 +2247,8 @@ impl<'a> Pred<'a> {
 
 /// [`Pred`], resolved into what a recorded op carries.
 pub(crate) enum PredSrc {
-    Owned(Vec<u16>),
+    /// A prediction window in the tile's prediction arena, `(offset, len)`.
+    Owned(u32, u32),
     /// A window of the block prediction: its plane, its offset, and the
     /// stride it is read at -- which is the block's, not necessarily the
     /// op's (a transform unit's residual stays dense, so the worker takes
@@ -2253,6 +2309,14 @@ fn push_pred<'a>(
     // before the borrows the closure holds go out of scope.
     let boxed: Box<Dyn<'static>> = unsafe { std::mem::transmute(boxed) };
     push_op(fctx, ReconOp::Pred(PredBuild(boxed)));
+}
+
+/// One superblock's recorded writes plus the two arenas they index -- the
+/// unit a wavefront worker takes off the queue (lane-recoparse).
+pub(crate) struct ReconJob {
+    ops: Vec<ReconOp>,
+    coeffs: Vec<i32>,
+    preds: Vec<u16>,
 }
 
 pub(crate) enum ReconOp {
@@ -2367,7 +2431,11 @@ fn push_op(fctx: &crate::decode::FrameCtx, op: ReconOp) {
     if let Some(ReconPlanes(y, u, v)) = fctx.recon_planes.with(std::cell::Cell::get) {
         // SAFETY: see [`ReconPlanes`] -- one thread, and the write is the one
         // the parse site would have performed itself before lane-wave1.
-        unsafe { exec_op(op, &mut *y, &mut *u, &mut *v, &mut Default::default(), fctx) };
+        // The inline path never records coefficients (the transform runs at
+        // the push site), so the arena is not read here.
+        unsafe {
+            exec_op(op, &mut *y, &mut *u, &mut *v, &mut Default::default(), &[], &[], fctx)
+        };
         return;
     }
     fctx.recon_ops.with(|c| c.borrow_mut().push(op));
@@ -2408,7 +2476,7 @@ struct WaveQueue {
     /// dependencies are met. Popping the raster-oldest job instead (what
     /// this replaced) put every worker on the SAME row, where the wavefront
     /// rule serialises them, which is why 4 workers ran the tile at 1.2x.
-    rows: Vec<std::collections::VecDeque<(usize, Vec<ReconOp>)>>,
+    rows: Vec<std::collections::VecDeque<(usize, ReconJob)>>,
     /// Jobs sitting in `rows`, so a worker knows the queue is empty without
     /// walking it.
     queued: usize,
@@ -2422,7 +2490,11 @@ struct WaveQueue {
 impl WaveQueue {
     /// The lowest-row queued job whose wavefront dependencies are satisfied,
     /// or `None` (with the blocking condition counted when instrumented).
-    fn take_runnable(&mut self, last_col: usize, stats: bool) -> Option<(usize, usize, Vec<ReconOp>)> {
+    fn take_runnable(
+        &mut self,
+        last_col: usize,
+        stats: bool,
+    ) -> Option<(usize, usize, ReconJob)> {
         let mut blocked: Option<bool> = None;
         for r in 0..self.rows.len() {
             let Some(front) = self.rows[r].front() else {
@@ -2432,9 +2504,9 @@ impl WaveQueue {
             let above = r == 0 || self.done[r - 1] >= (c + 1).min(last_col) as isize;
             let left = c == 0 || self.done[r] >= c as isize - 1;
             if above && left {
-                let (c, ops) = self.rows[r].pop_front().expect("front checked above");
+                let (c, job) = self.rows[r].pop_front().expect("front checked above");
                 self.queued -= 1;
-                return Some((r, c, ops));
+                return Some((r, c, job));
             }
             if blocked.is_none() {
                 blocked = Some(above);
@@ -2528,7 +2600,7 @@ fn wave_worker(st: &WaveState, idx: usize) {
     loop {
         let t0 = std::time::Instant::now();
         let mut q = st.q.lock().unwrap();
-        let (r, c, ops) = loop {
+        let (r, c, job) = loop {
             if let Some(job) = q.take_runnable(st.last_col, stats) {
                 break job;
             }
@@ -2542,7 +2614,7 @@ fn wave_worker(st: &WaveState, idx: usize) {
         if stats {
             WS_WAIT[slot].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
             WS_JOBS[slot].fetch_add(1, Relaxed);
-            WS_OPS[slot].fetch_add(ops.len() as u64, Relaxed);
+            WS_OPS[slot].fetch_add(job.ops.len() as u64, Relaxed);
         }
         let t1 = std::time::Instant::now();
         let ReconPlanes(y, u, v) = st.planes;
@@ -2551,8 +2623,8 @@ fn wave_worker(st: &WaveState, idx: usize) {
         // complete by the wavefront rule above.
         let mut cur: [Vec<u16>; 3] = Default::default();
         unsafe {
-            for op in ops {
-                exec_op(op, &mut *y, &mut *u, &mut *v, &mut cur, &fctx);
+            for op in job.ops {
+                exec_op(op, &mut *y, &mut *u, &mut *v, &mut cur, &job.coeffs, &job.preds, &fctx);
             }
         }
         if stats {
@@ -2646,9 +2718,22 @@ fn wave_submit(fctx: &crate::decode::FrameCtx, r: usize, c: usize) -> bool {
     let st = fctx.wave.with(|w| w.borrow().clone());
     let Some(st) = st else { return false };
     let ops = fctx.recon_ops.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    // The job owns its coefficients: the arena is replaced by an empty one
+    // sized for the next superblock, so parse never regrows from nothing and
+    // the worker frees this buffer once, instead of once per unit.
+    let coeffs = fctx.coeff_arena.with(|c| {
+        let mut c = c.borrow_mut();
+        let cap = c.len();
+        std::mem::replace(&mut *c, Vec::with_capacity(cap))
+    });
+    let preds = fctx.pred_arena.with(|c| {
+        let mut c = c.borrow_mut();
+        let cap = c.len();
+        std::mem::replace(&mut *c, Vec::with_capacity(cap))
+    });
     if !ops.is_empty() {
         let mut q = st.q.lock().unwrap();
-        q.rows[r].push_back((c, ops));
+        q.rows[r].push_back((c, ReconJob { ops, coeffs, preds }));
         q.queued += 1;
         drop(q);
         st.cv.notify_all();
@@ -2764,7 +2849,7 @@ fn push_intra(
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
-        residual: Residual::Done(residual.to_vec()), cfl, filter_intra, smooth_neighbor, pred,
+        residual: Residual::done(residual, fctx), cfl, filter_intra, smooth_neighbor, pred,
     });
 }
 
@@ -2793,7 +2878,7 @@ fn push_intra_rect(
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw, bh, rect: true, mode, angle_delta, reach,
-        residual: Residual::Done(residual.to_vec()), cfl, filter_intra, smooth_neighbor, pred,
+        residual: Residual::done(residual, fctx), cfl, filter_intra, smooth_neighbor, pred,
     });
 }
 
@@ -2828,7 +2913,7 @@ fn push_mc_rect(
             push_op(fctx, ReconOp::Mc {
                 plane, x, y, stride: ss, w, h,
                 prediction: PredSrc::Cur { plane: sp, off, src: ss },
-                residual: Residual::Done(residual.to_vec()),
+                residual: Residual::done(residual, fctx),
             });
             return;
         }
@@ -2838,7 +2923,10 @@ fn push_mc_rect(
     }
     push_op(fctx, ReconOp::Mc {
         plane, x, y, stride, w, h,
-        prediction: PredSrc::Owned(src.to_vec()), residual: Residual::Done(residual.to_vec()),
+        // The whole window `reconstruct_mc_rect` reads at `stride`, not
+        // `w * h`: the record keeps exactly what `src.to_vec()` carried.
+        prediction: PredSrc::Owned(push_pred_samples(src, fctx), src.len() as u32),
+        residual: Residual::done(residual, fctx),
     });
 }
 
@@ -2873,7 +2961,7 @@ fn push_intra_tx(
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw, bh, rect, mode, angle_delta, reach,
-        residual: Residual::coeffs(tx, grid), cfl, filter_intra, smooth_neighbor, pred,
+        residual: Residual::coeffs(tx, grid, fctx), cfl, filter_intra, smooth_neighbor, pred,
     });
 }
 
@@ -2904,7 +2992,7 @@ fn push_mc_rect_tx(
             push_op(fctx, ReconOp::Mc {
                 plane, x, y, stride: w, w, h,
                 prediction: PredSrc::Cur { plane: sp, off, src: ss },
-                residual: Residual::coeffs(tx, grid),
+                residual: Residual::coeffs(tx, grid, fctx),
             });
             return;
         }
@@ -2937,15 +3025,19 @@ fn push_mc_rect_tx(
     // copied 64*64 samples on the PARSING thread before. The residual is then
     // produced dense too (`TxParams::stride = 0`), which is the same numbers
     // in the same places at stride `w`.
-    let mut window = Vec::with_capacity(w * h);
-    for row in 0..h {
-        window.extend_from_slice(&prediction[row * stride..][..w]);
-    }
+    let off = fctx.pred_arena.with(|a| {
+        let mut a = a.borrow_mut();
+        let off = a.len();
+        for row in 0..h {
+            a.extend_from_slice(&prediction[row * stride..][..w]);
+        }
+        off as u32
+    });
     let mut tx = tx;
     tx.stride = 0;
     push_op(fctx, ReconOp::Mc {
-        plane, x, y, stride: w, w, h, prediction: PredSrc::Owned(window),
-        residual: Residual::coeffs(tx, grid),
+        plane, x, y, stride: w, w, h, prediction: PredSrc::Owned(off, (w * h) as u32),
+        residual: Residual::coeffs(tx, grid, fctx),
     });
 }
 
@@ -2968,11 +3060,19 @@ fn flush_recon(
     wave_barrier(fctx);
     let mut ops = fctx.recon_spare.with(|c| std::mem::take(&mut *c.borrow_mut()));
     fctx.recon_ops.with(|c| std::mem::swap(&mut *c.borrow_mut(), &mut ops));
+    let mut coeffs = fctx.coeff_spare.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    fctx.coeff_arena.with(|c| std::mem::swap(&mut *c.borrow_mut(), &mut coeffs));
+    let mut preds = fctx.pred_spare.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    fctx.pred_arena.with(|c| std::mem::swap(&mut *c.borrow_mut(), &mut preds));
     let mut cur: [Vec<u16>; 3] = Default::default();
     for op in ops.drain(..) {
-        exec_op(op, y, u, v, &mut cur, fctx);
+        exec_op(op, y, u, v, &mut cur, &coeffs, &preds, fctx);
     }
+    coeffs.clear();
+    preds.clear();
     fctx.recon_spare.with(|c| *c.borrow_mut() = ops);
+    fctx.coeff_spare.with(|c| *c.borrow_mut() = coeffs);
+    fctx.pred_spare.with(|c| *c.borrow_mut() = preds);
 }
 
 /// Performs one recorded write: the body [`flush_recon`] replays, and the
@@ -2983,27 +3083,32 @@ fn exec_op(
     u: &mut PlaneBuf<'static>,
     v: &mut PlaneBuf<'static>,
     cur: &mut [Vec<u16>; 3],
+    coeffs: &[i32],
+    preds: &[u16],
     fctx: &crate::decode::FrameCtx,
 ) {
+    let mut scratch = Vec::new();
     match op {
         ReconOp::Pred(b) => *cur = (b.0)(y, u, v, fctx),
         ReconOp::Intra {
             plane, x, y: oy, bw, bh, rect, mode, angle_delta, reach, residual, cfl,
             filter_intra, smooth_neighbor, pred,
         } => exec_intra(
-            y, u, v, plane, x, oy, bw, bh, rect, mode, angle_delta, reach, &residual.resolve(),
+            y, u, v, plane, x, oy, bw, bh, rect, mode, angle_delta, reach,
+            residual.resolve(coeffs, &mut scratch),
             cfl, filter_intra, smooth_neighbor, pred, fctx,
         ),
         ReconOp::Mc { plane, x, y: oy, stride, w, h, prediction, residual } => {
-            let residual = residual.resolve();
+            let residual = residual.resolve(coeffs, &mut scratch);
             match prediction {
-                PredSrc::Owned(p) => {
-                    exec_mc(y, u, v, plane, x, oy, stride, w, h, &p, &residual, fctx);
+                PredSrc::Owned(off, len) => {
+                    let p = &preds[off as usize..][..len as usize];
+                    exec_mc(y, u, v, plane, x, oy, stride, w, h, p, residual, fctx);
                 }
                 PredSrc::Cur { plane: sp, off, src } => {
                     let block = std::mem::take(&mut cur[sp]);
                     if src == stride {
-                        exec_mc(y, u, v, plane, x, oy, stride, w, h, &block[off..], &residual, fctx);
+                        exec_mc(y, u, v, plane, x, oy, stride, w, h, &block[off..], residual, fctx);
                     } else {
                         // A transform unit's residual is dense, so its window
                         // of the block prediction is taken out dense too --
@@ -3012,7 +3117,7 @@ fn exec_op(
                         for row in 0..h {
                             window.extend_from_slice(&block[off + row * src..][..w]);
                         }
-                        exec_mc(y, u, v, plane, x, oy, stride, w, h, &window, &residual, fctx);
+                        exec_mc(y, u, v, plane, x, oy, stride, w, h, &window, residual, fctx);
                     }
                     cur[sp] = block;
                 }
@@ -22122,6 +22227,21 @@ impl PlaneBuf<'_> {
         // three row bases are computed once per row instead of a
         // multiply-add per sample (the samples themselves are unchanged).
         let max = crate::decode::sample_max(fctx);
+        // lane-recoparse: an all-zero residual (60% of the units) is a plain
+        // prediction copy -- the same arithmetic with `r == 0`, without
+        // reading `side * h` zeros out of [`ZERO_RESIDUAL`].
+        if residual.is_empty() {
+            for row in 0..h {
+                let src = row * side;
+                let dst = (y + row) * self.width + x;
+                let pred = &prediction[src..src + w];
+                let out = &mut self.data.to_mut()[dst..dst + w];
+                for (o, &p) in out.iter_mut().zip(pred) {
+                    *o = i32::from(p).clamp(0, max) as u16;
+                }
+            }
+            return;
+        }
         let residual = dense_residual(residual, side * h);
         for row in 0..h {
             let src = row * side;
