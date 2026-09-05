@@ -591,57 +591,72 @@ fn directional(
     let left_at = |p: i32| left_buf[(p + left_off) as usize];
     let up_a = i32::from(upsample_above);
     let up_l = i32::from(upsample_left);
-    let blend = |edge: &dyn Fn(i32) -> i32, base: i32, shift: i32| {
-        round2(edge(base) * (32 - shift) + edge(base + 1) * shift, 5)
+    let max = crate::decode::sample_max(fctx);
+    // lane-intra: the zone test, the derivative lookup (a 27-arm match) and
+    // the blend's `&dyn Fn` indirection all used to sit inside the pixel
+    // loop; they are per-block (per-row for the shift) constants.
+    let blend = |edge: &[i32], off: i32, base: i32, shift: i32| {
+        round2(edge[(base + off) as usize] * (32 - shift) + edge[(base + off + 1) as usize] * shift, 5)
     };
-
-    for row in 0..h {
-        for col in 0..w {
-            let value = if angle < 90 {
-                let dx = dr_intra_derivative(angle);
-                let max_base = (reach - 1) << up_a;
-                let frac_bits = 6 - up_a;
-                let x = dx * (row + 1);
-                let base = (x >> frac_bits) + (col << up_a);
-                let shift = ((x << up_a) & 0x3F) >> 1;
-                if base < max_base {
-                    blend(&above_at, base, shift)
+    if angle < 90 {
+        let dx = dr_intra_derivative(angle);
+        let max_base = (reach - 1) << up_a;
+        let frac_bits = 6 - up_a;
+        for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+            let x = dx * (row as i32 + 1);
+            let base0 = x >> frac_bits;
+            let shift = ((x << up_a) & 0x3F) >> 1;
+            for (col, d) in dstrow.iter_mut().enumerate() {
+                let base = base0 + ((col as i32) << up_a);
+                let value = if base < max_base {
+                    blend(above_buf, above_off, base, shift)
                 } else {
                     above_at(max_base)
-                }
-            } else if angle > 180 {
-                let dy = dr_intra_derivative(270 - angle);
-                let max_base = (reach - 1) << up_l;
-                let frac_bits = 6 - up_l;
-                let y = dy * (col + 1);
-                let base = (y >> frac_bits) + (row << up_l);
+                };
+                *d = value.clamp(0, max) as u16;
+            }
+        }
+    } else if angle > 180 {
+        let dy = dr_intra_derivative(270 - angle);
+        let max_base = (reach - 1) << up_l;
+        let frac_bits = 6 - up_l;
+        for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+            let r = (row as i32) << up_l;
+            for (col, d) in dstrow.iter_mut().enumerate() {
+                let y = dy * (col as i32 + 1);
+                let base = (y >> frac_bits) + r;
                 let shift = ((y << up_l) & 0x3F) >> 1;
-                if base < max_base {
-                    blend(&left_at, base, shift)
+                let value = if base < max_base {
+                    blend(left_buf, left_off, base, shift)
                 } else {
                     left_at(max_base)
-                }
-            } else {
-                // The two zones meet here: a ray that leaves through the row
-                // above is read there, and one that leaves through the column
-                // to the left is read there instead.
-                let dx = dr_intra_derivative(180 - angle);
-                let min_base = -(1 << up_a);
-                let frac_bits_x = 6 - up_a;
-                let y = row + 1;
-                let x = (col << 6) - y * dx;
+                };
+                *d = value.clamp(0, max) as u16;
+            }
+        }
+    } else {
+        // The two zones meet here: a ray that leaves through the row above is
+        // read there, and one that leaves through the column to the left is
+        // read there instead.
+        let dx = dr_intra_derivative(180 - angle);
+        let dy = dr_intra_derivative(angle - 90);
+        let min_base = -(1 << up_a);
+        let frac_bits_x = 6 - up_a;
+        let frac_bits_y = 6 - up_l;
+        for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+            let ydx = (row as i32 + 1) * dx;
+            let yrow = (row as i32) << 6;
+            for (col, d) in dstrow.iter_mut().enumerate() {
+                let x = ((col as i32) << 6) - ydx;
                 let base = x >> frac_bits_x;
-                if base >= min_base {
-                    blend(&above_at, base, ((x << up_a) & 0x3F) >> 1)
+                let value = if base >= min_base {
+                    blend(above_buf, above_off, base, ((x << up_a) & 0x3F) >> 1)
                 } else {
-                    let dy = dr_intra_derivative(angle - 90);
-                    let frac_bits_y = 6 - up_l;
-                    let x2 = col + 1;
-                    let y2 = (row << 6) - x2 * dy;
-                    blend(&left_at, y2 >> frac_bits_y, ((y2 << up_l) & 0x3F) >> 1)
-                }
-            };
-            dst[(row * w + col) as usize] = value.clamp(0, crate::decode::sample_max(fctx)) as u16;
+                    let y2 = yrow - (col as i32 + 1) * dy;
+                    blend(left_buf, left_off, y2 >> frac_bits_y, ((y2 << up_l) & 0x3F) >> 1)
+                };
+                *d = value.clamp(0, max) as u16;
+            }
         }
     }
 }
