@@ -7,6 +7,7 @@
 //! not this module's business -- the caller passes the samples it has, and the
 //! edge is extended by repeating the last one, which is what the decoder does
 //! with its own `BlockDecoded` bookkeeping (spec 7.11.2.2).
+use crate::hits::hit;
 
 /// The average of the neighbours (spec 7.11.2.5).
 pub const DC_PRED: u8 = 0;
@@ -284,9 +285,9 @@ pub(crate) fn predict(
     assert_eq!(dst.len(), bw * bh, "the destination is the block");
     match mode {
         SMOOTH_PRED | SMOOTH_V_PRED | SMOOTH_H_PRED => {
-            SMOOTH_PRED_HITS.with(|c| c.set(c.get() + 1));
+            hit!(SMOOTH_PRED_HITS);
         }
-        PAETH_PRED => PAETH_PRED_HITS.with(|c| c.set(c.get() + 1)),
+        PAETH_PRED => hit!(PAETH_PRED_HITS),
         _ => {}
     }
     let edges = Edges::build(above, left, corner, bw, bh, fctx);
@@ -483,7 +484,7 @@ fn filter_intra_edge(buf: &mut [i32], strength: i32) {
     if strength == 0 {
         return;
     }
-    EDGE_FILTER_HITS.with(|c| c.set(c.get() + 1));
+    hit!(EDGE_FILTER_HITS);
     const KERNEL: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
     let filt = usize::try_from(strength - 1).expect("a filter strength is never negative");
     let sz = buf.len() as i32;

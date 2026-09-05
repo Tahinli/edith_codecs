@@ -34,6 +34,7 @@ mod envflags;
 mod film_grain;
 pub mod frame;
 mod gate_coverage;
+mod hits;
 pub mod intra;
 pub mod mc;
 pub mod motion;
