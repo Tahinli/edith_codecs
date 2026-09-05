@@ -5352,8 +5352,8 @@ fn eob_coeff_ctx(scan_idx: usize, area: usize) -> usize {
 /// this used to run five times per coefficient. Nothing writes a padding
 /// cell, so the values are the same zeros the test returned.
 #[inline]
-fn neighbour(grid: &[i32], stride: usize, row: usize, col: usize) -> i32 {
-    grid[row * stride + col]
+fn neighbour(grid: &[u8], stride: usize, row: usize, col: usize) -> i32 {
+    grid[row * stride + col] as i32
 }
 
 /// spec 5.11.39's three `TxClass`es (`tx_type_to_class`, libaom
@@ -5392,7 +5392,7 @@ fn nz_map_ctx_offset_1d(i: usize) -> usize {
 }
 
 fn base_ctx(
-    grid: &[i32],
+    grid: &[u8],
     stride: usize,
     row: usize,
     col: usize,
@@ -5417,7 +5417,7 @@ fn base_ctx(
     };
     let mag: i32 = offsets
         .iter()
-        .map(|&(dr, dc)| neighbour(grid, stride, row + dr, col + dc).abs().min(3))
+        .map(|&(dr, dc)| neighbour(grid, stride, row + dr, col + dc).min(3))
         .sum();
     let ctx = ((mag + 1) >> 1).min(4) as usize;
     match class {
@@ -5460,14 +5460,14 @@ fn base_ctx(
     }
 }
 
-fn br_ctx(grid: &[i32], stride: usize, row: usize, col: usize, class: TxClass) -> usize {
+fn br_ctx(grid: &[u8], stride: usize, row: usize, col: usize, class: TxClass) -> usize {
     let extra = match class {
-        TxClass::TwoD => neighbour(grid, stride, row + 1, col + 1).abs(),
-        TxClass::Horiz => neighbour(grid, stride, row, col + 2).abs(),
-        TxClass::Vert => neighbour(grid, stride, row + 2, col).abs(),
+        TxClass::TwoD => neighbour(grid, stride, row + 1, col + 1),
+        TxClass::Horiz => neighbour(grid, stride, row, col + 2),
+        TxClass::Vert => neighbour(grid, stride, row + 2, col),
     };
-    let mag = neighbour(grid, stride, row + 1, col).abs()
-        + neighbour(grid, stride, row, col + 1).abs()
+    let mag = neighbour(grid, stride, row + 1, col)
+        + neighbour(grid, stride, row, col + 1)
         + extra;
     let mag = (((mag + 1) >> 1).min(6)) as usize;
     if row == 0 && col == 0 {
@@ -5648,8 +5648,8 @@ const SCAN_4X16: [u16; 64] = [
 /// (`stride = w + 4`, four spare rows), so the edge test is the zeros the
 /// padding already holds.
 #[inline]
-fn neighbour_rect(grid: &[i32], stride: usize, row: usize, col: usize) -> i32 {
-    grid[row * stride + col]
+fn neighbour_rect(grid: &[u8], stride: usize, row: usize, col: usize) -> i32 {
+    grid[row * stride + col] as i32
 }
 
 /// [`base_ctx`]'s `TxClass::TwoD` arm widened to `(w, h)` (lane-rectwire):
@@ -5659,7 +5659,7 @@ fn neighbour_rect(grid: &[i32], stride: usize, row: usize, col: usize) -> i32 {
 /// `V_DCT`/`H_DCT` -- geometrically impossible at the two size pairs
 /// [`decode_block_rect`] codes (see that function's own doc comment).
 fn base_ctx_rect(
-    grid: &[i32],
+    grid: &[u8],
     stride: usize,
     w: usize,
     h: usize,
@@ -5679,7 +5679,7 @@ fn base_ctx_rect(
     };
     let mag: i32 = offsets
         .iter()
-        .map(|&(dr, dc)| neighbour_rect(grid, stride, row + dr, col + dc).abs().min(3))
+        .map(|&(dr, dc)| neighbour_rect(grid, stride, row + dr, col + dc).min(3))
         .sum();
     let ctx = ((mag + 1) >> 1).min(4) as usize;
     match class {
@@ -5704,19 +5704,19 @@ fn base_ctx_rect(
 /// neighbour-offset math itself is shape-independent, only the boundary
 /// clamp needs the real bound in each axis.
 fn br_ctx_rect(
-    grid: &[i32],
+    grid: &[u8],
     stride: usize,
     row: usize,
     col: usize,
     class: TxClass,
 ) -> usize {
     let extra = match class {
-        TxClass::TwoD => neighbour_rect(grid, stride, row + 1, col + 1).abs(),
-        TxClass::Horiz => neighbour_rect(grid, stride, row, col + 2).abs(),
-        TxClass::Vert => neighbour_rect(grid, stride, row + 2, col).abs(),
+        TxClass::TwoD => neighbour_rect(grid, stride, row + 1, col + 1),
+        TxClass::Horiz => neighbour_rect(grid, stride, row, col + 2),
+        TxClass::Vert => neighbour_rect(grid, stride, row + 2, col),
     };
-    let mag = neighbour_rect(grid, stride, row + 1, col).abs()
-        + neighbour_rect(grid, stride, row, col + 1).abs()
+    let mag = neighbour_rect(grid, stride, row + 1, col)
+        + neighbour_rect(grid, stride, row, col + 1)
         + extra;
     let mag = (((mag + 1) >> 1).min(6)) as usize;
     if row == 0 && col == 0 {
@@ -6000,7 +6000,7 @@ fn read_coeffs(
     // `row, col <= side - 1` -- stays inside `(side + 4) * (side + 4)`, at
     // most `36 * 36`. Only `col < side`, `row < side` cells are ever written.
     let stride = side + 4;
-    let mut levels_buf = [0i32; 36 * 36];
+    let mut levels_buf = [0u8; 36 * 36];
     let levels = &mut levels_buf[..stride * stride];
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
@@ -6069,7 +6069,13 @@ fn read_coeffs(
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=base_eob level={level} rng={rng}");
         }
-        levels[row * stride + col] = level;
+        // Every coded level here is a magnitude in `0..=15` (base <= 3 plus
+        // at most `COEFF_BASE_RANGE` from the `br` loop; the Golomb tail is
+        // added in the sign pass below, straight into `grid`), so the context
+        // frame is bytes -- the five-tap sum in [`base_ctx`]/[`br_ctx`] is a
+        // byte gather (lane-coefbuf).
+        debug_assert!(level >= 0 && level <= 15, "level {level} past the u8 frame");
+        levels[row * stride + col] = level as u8;
     }
     if ec_trace_coeff {
         let (rng, _) = dec.debug_state();
@@ -6078,7 +6084,7 @@ fn read_coeffs(
 
     for (c, &pos) in scan[..eob].iter().enumerate() {
         let pos = pos as usize;
-        let level = levels[(pos >> sh) * stride + (pos & col_mask)];
+        let level = levels[(pos >> sh) * stride + (pos & col_mask)] as i32;
         if level == 0 {
             continue;
         }
@@ -6095,7 +6101,7 @@ fn read_coeffs(
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=sign c={c} sign={} rng={rng}", negative as i32);
         }
-        let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
+        let level = if level > MAX_BR_LEVEL {
             let g = read_golomb(dec)?;
             if trace {
                 eprintln!("TRACE golomb pos={pos} value={g}");
@@ -6187,14 +6193,15 @@ fn read_coeffs_rect(
     let n = stride * (h + 4);
     debug_assert!(w.is_power_of_two() && n <= 36 * 36);
     let (mut b96, mut b256, mut b768);
-    let levels: &mut [i32] = if n <= 96 {
-        b96 = [0i32; 96];
+    // Byte levels, same `0..=15` bound [`read_coeffs`] states.
+    let levels: &mut [u8] = if n <= 96 {
+        b96 = [0u8; 96];
         &mut b96[..n]
     } else if n <= 256 {
-        b256 = [0i32; 256];
+        b256 = [0u8; 256];
         &mut b256[..n]
     } else {
-        b768 = [0i32; 768];
+        b768 = [0u8; 768];
         &mut b768[..n]
     };
     let wsh = w.trailing_zeros();
@@ -6247,7 +6254,8 @@ fn read_coeffs_rect(
         } else {
             level
         };
-        levels[row * stride + col] = level;
+        debug_assert!(level >= 0 && level <= 15, "level {level} past the u8 frame");
+        levels[row * stride + col] = level as u8;
         if rect_trace {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=base c={scan_idx} pos={pos} level={level} rng={rng}");
@@ -6259,7 +6267,7 @@ fn read_coeffs_rect(
     }
     for &pos in &scan[..eob] {
         let pos = pos as usize;
-        let level = levels[(pos >> wsh) * stride + (pos & wmask)];
+        let level = levels[(pos >> wsh) * stride + (pos & wmask)] as i32;
         if level == 0 {
             continue;
         }
@@ -6272,7 +6280,7 @@ fn read_coeffs_rect(
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=sign_rect pos={pos} sign={} dcctx={sign_ctx} rng={rng}", u8::from(negative));
         }
-        let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
+        let level = if level > MAX_BR_LEVEL {
             let g = read_golomb(dec)?;
             level + g as i32
         } else {
@@ -35530,7 +35538,7 @@ mod tests {
     /// corner held a coefficient off the first row/column.
     #[test]
     fn base_ctx_rect_offsets_match_the_transcribed_tables_over_the_whole_domain() {
-        let grid = [0i32; 36 * 36];
+        let grid = [0u8; 36 * 36];
         for (shape, table) in [
             (Some((64usize, 32usize)), &cdf::NZ_MAP_CTX_OFFSET_64X32),
             (Some((32, 64)), &cdf::NZ_MAP_CTX_OFFSET_32X64),
