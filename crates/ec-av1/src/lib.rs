@@ -48,6 +48,7 @@ mod restoration;
 pub mod sequence;
 mod superres;
 pub mod stream;
+mod timeline;
 pub mod tile;
 pub mod transform;
 mod warp;
