@@ -28,7 +28,7 @@ use crate::frame::frame_obu;
 use crate::intra::{D67_PRED, DC_PRED, KEY_FRAME_MODES, V_PRED};
 use crate::mc;
 use crate::motion;
-use crate::mvstack::{MiGrid, MiInfo, MvStack, NO_REF1, find_mv_stack};
+use crate::mvstack::{MiGrid, MiInfo, MvStack, NO_REF1, find_mv_stack, mv16};
 use crate::obu::temporal_delimiter;
 use crate::quant::ac_q;
 use crate::sequence::sequence_header_obu;
@@ -3099,7 +3099,7 @@ pub(crate) fn encode_inter_frame(
                                         ref_frame: LAST_FRAME,
                                         ref_frame1: NO_REF1,
                                         mv1: (0, 0),
-                                        mv: info.mv,
+                                        mv: mv16(info.mv),
                                         is_new_mv: matches!(info.mode, InterMode::NewMv),
                                         size: 8,
                                         size_h: 8,
@@ -3197,7 +3197,7 @@ pub(crate) fn encode_inter_frame(
                                                 ref_frame: LAST_FRAME,
                                                 ref_frame1: NO_REF1,
                                                 mv1: (0, 0),
-                                                mv: info.mv,
+                                                mv: mv16(info.mv),
                                                 is_new_mv: matches!(info.mode, InterMode::NewMv),
                                                 size: 4,
                                                 size_h: 4,
@@ -3257,7 +3257,7 @@ pub(crate) fn encode_inter_frame(
                                                     ref_frame: LAST_FRAME,
                                                     ref_frame1: NO_REF1,
                                                     mv1: (0, 0),
-                                                    mv: info.mv,
+                                                    mv: mv16(info.mv),
                                                     is_new_mv: matches!(
                                                         info.mode,
                                                         InterMode::NewMv
