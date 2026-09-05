@@ -336,6 +336,16 @@ fn add_noise_to_block(
     half_h: i32,
     half_w: i32, fctx: &crate::decode::FrameCtx,
 ) {
+    // spec 7.18.3.5 runs the block's noise loops `for i in 0..h`/`for j in
+    // 0..w`, so a block with no rows (or no columns) writes nothing. The
+    // ragged tail of a picture whose chroma plane height is `16k + 1` gives
+    // `half_h == 0` under `overlap_flag` -- the single tail row IS the
+    // overlap row, already written by the line-buffer call -- and the row
+    // base `py0 * y_stride` then addresses one row past the plane's end.
+    // Iterating zero times is the spec's answer; slicing it would panic.
+    if half_h <= 0 || half_w <= 0 {
+        return;
+    }
     let y_stride = picture.width as i32;
     let c_stride = (picture.width / 2) as i32;
     let scaling_shift = fg.grain_scaling_minus_8 as i32 + 8;
@@ -1741,5 +1751,259 @@ mod grain2_tests {
         assert_ne!(out2.y, src.y, "luma grain landed");
         assert_eq!(out2.v, src.v, "no cr points: the V plane is still the clean copy");
         assert_eq!(out2.y.len(), w * h, "the ragged tail row is present");
+    }
+}
+
+#[cfg(test)]
+mod ragged_grain_tests {
+    use super::*;
+
+    fn round2(x: i32, n: i32) -> i32 {
+        (x + (1 << (n - 1))) >> n
+    }
+
+    /// One 17-row chroma stripe block of spec 7.18.3.4's `add_noise_stripe`.
+    fn chroma_stripe_block(
+        st: &mut [i32],
+        tpl: &[i32],
+        coy: i32,
+        cox: i32,
+        x: i32,
+        cw: i32,
+        overlap: bool,
+        gmin: i32,
+        gmax: i32,
+    ) {
+        for i in 0..17 {
+            for j in 0..17 {
+                let col = x + j;
+                let mut g = tpl[((coy + i) * CHROMA_BLOCK_W + cox + j) as usize];
+                if overlap && x > 0 && j < 1 {
+                    let old = st[(i * cw + col) as usize];
+                    g = round2(old * 23 + g * 22, 5).clamp(gmin, gmax);
+                }
+                if col < cw {
+                    st[(i * cw + col) as usize] = g;
+                }
+            }
+        }
+    }
+
+    /// A straightforward transcription of spec 7.18.3.4 (`add_noise_stripe`)
+    /// and 7.18.3.5 (stripe-to-image vertical overlap), independent of the
+    /// fused col/line-buffer walk in [`apply_grain`]: it builds the whole
+    /// noise image first, then hands each row to the crate's per-sample
+    /// pixel kernels (which are not what this test exercises). 8-bit, 4:2:0,
+    /// `clip_to_restricted_range == false`.
+    fn reference(src: &Picture, fg: &FilmGrainParams, fctx: &crate::decode::FrameCtx) -> Picture {
+        let w = src.width as i32;
+        let h = src.height as i32;
+        let cw = w / 2;
+        let ch = h / 2;
+        let (gmin, gmax) = grain_range(fctx);
+        let overlap = fg.overlap_flag;
+
+        let mut rng = Rng::raw(fg.grain_seed);
+        let pl = build_pred_pos(fg.ar_coeff_lag as i32, false);
+        let pc = build_pred_pos(fg.ar_coeff_lag as i32, fg.num_y_points > 0);
+        let lt = generate_luma_grain_block(fg, &pl, &mut rng, fctx);
+        let (cbt, crt) = generate_chroma_grain_blocks(fg, &pc, &lt, fg.grain_seed, fctx);
+
+        let mut nl = vec![0i32; (w * h) as usize];
+        let mut ncb = vec![0i32; (cw * ch) as usize];
+        let mut ncr = vec![0i32; (cw * ch) as usize];
+        let mut prev: Option<(Vec<i32>, Vec<i32>, Vec<i32>)> = None;
+        let mut y = 0;
+        while y < ch {
+            let mut row_rng = Rng::line(y * 2, fg.grain_seed);
+            let mut sl = vec![0i32; (34 * w) as usize];
+            let mut scb = vec![0i32; (17 * cw) as usize];
+            let mut scr = vec![0i32; (17 * cw) as usize];
+            let mut x = 0;
+            while x < cw {
+                let raw = row_rng.get(8);
+                let ox = (raw >> 4) & 15;
+                let oy = raw & 15;
+                let (loy, lox) = (9 + 2 * oy, 9 + 2 * ox);
+                let (coy, cox) = (6 + oy, 6 + ox);
+                for i in 0..34 {
+                    for j in 0..34 {
+                        let col = x * 2 + j;
+                        let mut g = lt[((loy + i) * LUMA_BLOCK_W + lox + j) as usize];
+                        if overlap && x > 0 && j < 2 {
+                            let old = sl[(i * w + col) as usize];
+                            g = if j == 0 { old * 27 + g * 17 } else { old * 17 + g * 27 };
+                            g = round2(g, 5).clamp(gmin, gmax);
+                        }
+                        if col < w {
+                            sl[(i * w + col) as usize] = g;
+                        }
+                    }
+                }
+                chroma_stripe_block(&mut scb, &cbt, coy, cox, x, cw, overlap, gmin, gmax);
+                chroma_stripe_block(&mut scr, &crt, coy, cox, x, cw, overlap, gmin, gmax);
+                x += 16;
+            }
+            for i in 0..32 {
+                let row = y * 2 + i;
+                if row >= h {
+                    break;
+                }
+                for col in 0..w {
+                    let mut g = sl[(i * w + col) as usize];
+                    if overlap && i < 2 {
+                        if let Some((p, _, _)) = &prev {
+                            let old = p[((i + 32) * w + col) as usize];
+                            g = if i == 0 { old * 27 + g * 17 } else { old * 17 + g * 27 };
+                            g = round2(g, 5).clamp(gmin, gmax);
+                        }
+                    }
+                    nl[(row * w + col) as usize] = g;
+                }
+            }
+            for i in 0..16 {
+                let row = y + i;
+                if row >= ch {
+                    break;
+                }
+                for col in 0..cw {
+                    for (st, img) in [(&scb, &mut ncb), (&scr, &mut ncr)] {
+                        let mut g = st[(i * cw + col) as usize];
+                        if overlap && i < 1 {
+                            let old = match &prev {
+                                Some((_, pb, pr)) => {
+                                    let p = if std::ptr::eq(st.as_ptr(), scb.as_ptr()) { pb } else { pr };
+                                    Some(p[((i + 16) * cw + col) as usize])
+                                }
+                                None => None,
+                            };
+                            if let Some(old) = old {
+                                g = round2(old * 23 + g * 22, 5).clamp(gmin, gmax);
+                            }
+                        }
+                        img[(row * cw + col) as usize] = g;
+                    }
+                }
+            }
+            prev = Some((sl, scb, scr));
+            y += 16;
+        }
+
+        let mut out = src.clone();
+        let sy = expand_scaling_lut(
+            &build_scaling_lut(&fg.point_y_value, &fg.point_y_scaling, fg.num_y_points as usize),
+            8,
+        );
+        let s_cb = expand_scaling_lut(
+            &build_scaling_lut(&fg.point_cb_value, &fg.point_cb_scaling, fg.num_cb_points as usize),
+            8,
+        );
+        let s_cr = expand_scaling_lut(
+            &build_scaling_lut(&fg.point_cr_value, &fg.point_cr_scaling, fg.num_cr_points as usize),
+            8,
+        );
+        let scaling_shift = fg.grain_scaling_minus_8 as i32 + 8;
+        let ro = 1i32 << (scaling_shift - 1);
+        let p = ChromaNoise {
+            index_max: 255,
+            rounding_offset: ro,
+            scaling_shift,
+            min_chroma: 0,
+            max_chroma: 255,
+        };
+        // Chroma first, and out of the CLEAN luma: `add_noise_to_block` adds
+        // the block's chroma noise before its luma noise, so no chroma
+        // sample ever sees a noised luma neighbour.
+        for r in 0..ch {
+            let (cs, ce) = ((r * cw) as usize, ((r + 1) * cw) as usize);
+            let (ls, le) = ((2 * r * w) as usize, (2 * r * w + w) as usize);
+            if fg.num_cb_points > 0 {
+                chroma_noise_row_scalar(
+                    &mut out.u[cs..ce],
+                    &src.y[ls..le],
+                    &ncb[cs..ce],
+                    &s_cb,
+                    fg.cb_luma_mult as i32 - 128,
+                    fg.cb_mult as i32 - 128,
+                    fg.cb_offset as i32 - 256,
+                    p,
+                );
+            }
+            if fg.num_cr_points > 0 {
+                chroma_noise_row_scalar(
+                    &mut out.v[cs..ce],
+                    &src.y[ls..le],
+                    &ncr[cs..ce],
+                    &s_cr,
+                    fg.cr_luma_mult as i32 - 128,
+                    fg.cr_mult as i32 - 128,
+                    fg.cr_offset as i32 - 256,
+                    p,
+                );
+            }
+        }
+        if fg.num_y_points > 0 {
+            for r in 0..h {
+                let (ls, le) = ((r * w) as usize, (r * w + w) as usize);
+                luma_noise_row_scalar(&mut out.y[ls..le], &nl[ls..le], &sy, ro, scaling_shift, 0, 255);
+            }
+        }
+        out
+    }
+
+    fn params() -> FilmGrainParams {
+        let mut fg = FilmGrainParams {
+            apply_grain: true,
+            grain_seed: 0x51a7,
+            overlap_flag: true,
+            ar_coeff_lag: 2,
+            ar_coeff_shift_minus_6: 1,
+            num_y_points: 2,
+            num_cb_points: 2,
+            num_cr_points: 2,
+            cb_mult: 128,
+            cb_luma_mult: 192,
+            cb_offset: 256,
+            cr_mult: 128,
+            cr_luma_mult: 192,
+            cr_offset: 256,
+            ..Default::default()
+        };
+        fg.point_y_value[..2].copy_from_slice(&[0, 255]);
+        fg.point_y_scaling[..2].copy_from_slice(&[50, 70]);
+        fg.point_cb_value[..2].copy_from_slice(&[0, 255]);
+        fg.point_cb_scaling[..2].copy_from_slice(&[40, 60]);
+        fg.point_cr_value[..2].copy_from_slice(&[0, 255]);
+        fg.point_cr_scaling[..2].copy_from_slice(&[45, 65]);
+        fg
+    }
+
+    /// A chroma plane height of `16k + 1` (luma height `32k + 2`) makes the
+    /// last block row's `half_h` zero under `overlap_flag`: the single tail
+    /// row is the overlap row itself. That used to slice the luma plane one
+    /// row past its end ("range start index out of range"). The ragged width
+    /// twin (`16k + 1` chroma columns) and a taller case are pinned with it,
+    /// and 48x100 is the control that proves the reference on a size the
+    /// decoder already handled.
+    #[test]
+    fn ragged_overlap_tail_matches_spec_reference() {
+        let fctx = crate::decode::FrameCtx::new();
+        fctx.grain_bit_depth.with(|c| c.set(8));
+        let fg = params();
+        for &(w, h) in &[(64usize, 66usize), (66, 64), (64, 98), (48, 100)] {
+            let src = Picture {
+                width: w,
+                height: h,
+                y: (0..w * h).map(|i| ((i * 7 + 3) % 256) as u16).collect(),
+                u: (0..w / 2 * (h / 2)).map(|i| ((i * 11 + 5) % 256) as u16).collect(),
+                v: (0..w / 2 * (h / 2)).map(|i| ((i * 13 + 9) % 256) as u16).collect(),
+            };
+            let got = apply_grain(&src, &fg, false, 8, &fctx);
+            let want = reference(&src, &fg, &fctx);
+            assert_eq!(got.y, want.y, "{w}x{h} luma");
+            assert_eq!(got.u, want.u, "{w}x{h} cb");
+            assert_eq!(got.v, want.v, "{w}x{h} cr");
+            assert_ne!(got.y, src.y, "{w}x{h} grain actually landed");
+        }
     }
 }
