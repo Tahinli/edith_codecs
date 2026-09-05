@@ -136,8 +136,11 @@ const ANGLE_STEP: i32 = 3;
 /// Both arrays hold the corner first, so the spec's index `-1` is index 0 here
 /// and they run out to the spec's `w + h - 1`.
 struct Edges {
-    above: Vec<i32>,
-    left: Vec<i32>,
+    // lane-intra: `bw + bh + 1` is at most 129 samples, so both edges live on
+    // the stack -- two heap allocations per predicted block otherwise, and
+    // most blocks a stream predicts are 4x4 to 16x16.
+    above: [i32; 129],
+    left: [i32; 129],
 }
 
 impl Edges {
@@ -172,16 +175,21 @@ impl Edges {
         // first and the samples are extended/truncated to `want` in place, so
         // the contents are what `extend` + `with_corner` produced before.
         let build_edge = |samples: Option<&[u16]>, other: Option<&[u16]>, none_fill: i32| {
-            let mut v: Vec<i32> = Vec::with_capacity(want + 1);
-            v.push(corner);
+            let mut v = [0i32; 129];
+            v[0] = corner;
             match (samples, other) {
                 (Some(s), _) => {
-                    v.extend(s.iter().map(|&x| i32::from(x)));
-                    let last = *v.last().expect("an edge that exists has samples");
-                    v.resize(want + 1, last);
+                    let n = s.len().min(want);
+                    for (d, &x) in v[1..=n].iter_mut().zip(s.iter()) {
+                        *d = i32::from(x);
+                    }
+                    if n < want {
+                        let last = i32::from(*s.last().expect("an edge that exists has samples"));
+                        v[n + 1..=want].fill(last);
+                    }
                 }
-                (None, Some(o)) => v.resize(want + 1, i32::from(o[0])),
-                (None, None) => v.resize(want + 1, none_fill),
+                (None, Some(o)) => v[1..=want].fill(i32::from(o[0])),
+                (None, None) => v[1..=want].fill(none_fill),
             }
             v
         };
@@ -316,37 +324,70 @@ pub(crate) fn predict(
     // to one `weights` slice before.
     let weights_w = &SM_WEIGHTS[bw..bw * 2];
     let weights_h = &SM_WEIGHTS[bh..bh * 2];
-    for row in 0..bh {
-        for col in 0..bw {
-            let (r, c) = (row as i32, col as i32);
-            let last_w = bw as i32 - 1;
-            let last_h = bh as i32 - 1;
-            let value = match mode {
-                DC_PRED => dc(above, left, bw, bh, fctx),
-                V_PRED => edges.above(c),
-                H_PRED => edges.left(r),
-                SMOOTH_PRED => round2(
-                    i32::from(weights_h[row]) * edges.above(c)
-                        + (256 - i32::from(weights_h[row])) * edges.left(last_h)
-                        + i32::from(weights_w[col]) * edges.left(r)
-                        + (256 - i32::from(weights_w[col])) * edges.above(last_w),
-                    9,
-                ),
-                SMOOTH_V_PRED => round2(
-                    i32::from(weights_h[row]) * edges.above(c)
-                        + (256 - i32::from(weights_h[row])) * edges.left(last_h),
-                    8,
-                ),
-                SMOOTH_H_PRED => round2(
-                    i32::from(weights_w[col]) * edges.left(r)
-                        + (256 - i32::from(weights_w[col])) * edges.above(last_w),
-                    8,
-                ),
-                PAETH_PRED => paeth(edges.above(c), edges.left(r), edges.above(-1)),
-                other => panic!("intra mode {other} is not one this module predicts"),
-            };
-            dst[row * bw + col] = value.clamp(0, crate::decode::sample_max(fctx)) as u16;
+    // lane-intra: one loop per mode rather than a `match mode` per pixel --
+    // the old shape re-ran the whole dispatch (and, for `DC_PRED`, the edge
+    // average itself) for every sample of every block.
+    let max = crate::decode::sample_max(fctx);
+    let above_row = &edges.above[1..];
+    let left_col = &edges.left[1..];
+    let corner = edges.above[0];
+    match mode {
+        DC_PRED => dst.fill(dc(above, left, bw, bh, fctx).clamp(0, max) as u16),
+        V_PRED => {
+            for row in dst.chunks_exact_mut(bw) {
+                for (d, &a) in row.iter_mut().zip(&above_row[..bw]) {
+                    *d = a.clamp(0, max) as u16;
+                }
+            }
         }
+        H_PRED => {
+            for (row, &l) in dst.chunks_exact_mut(bw).zip(&left_col[..bh]) {
+                row.fill(l.clamp(0, max) as u16);
+            }
+        }
+        SMOOTH_PRED => {
+            let below = left_col[bh - 1];
+            let right = above_row[bw - 1];
+            for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+                let wh = i32::from(weights_h[row]);
+                let acc = (256 - wh) * below;
+                let lr = left_col[row];
+                for (col, d) in dstrow.iter_mut().enumerate() {
+                    let ww = i32::from(weights_w[col]);
+                    let v = round2(acc + wh * above_row[col] + ww * lr + (256 - ww) * right, 9);
+                    *d = v.clamp(0, max) as u16;
+                }
+            }
+        }
+        SMOOTH_V_PRED => {
+            let below = left_col[bh - 1];
+            for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+                let wh = i32::from(weights_h[row]);
+                let acc = (256 - wh) * below;
+                for (d, &a) in dstrow.iter_mut().zip(&above_row[..bw]) {
+                    *d = round2(acc + wh * a, 8).clamp(0, max) as u16;
+                }
+            }
+        }
+        SMOOTH_H_PRED => {
+            let right = above_row[bw - 1];
+            for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+                let lr = left_col[row];
+                for (col, d) in dstrow.iter_mut().enumerate() {
+                    let ww = i32::from(weights_w[col]);
+                    *d = round2(ww * lr + (256 - ww) * right, 8).clamp(0, max) as u16;
+                }
+            }
+        }
+        PAETH_PRED => {
+            for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+                let lr = left_col[row];
+                for (d, &a) in dstrow.iter_mut().zip(&above_row[..bw]) {
+                    *d = paeth(a, lr, corner).clamp(0, max) as u16;
+                }
+            }
+        }
+        other => panic!("intra mode {other} is not one this module predicts"),
     }
 }
 
@@ -446,7 +487,8 @@ fn filter_intra_edge(buf: &mut [i32], strength: i32) {
     const KERNEL: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
     let filt = usize::try_from(strength - 1).expect("a filter strength is never negative");
     let sz = buf.len() as i32;
-    let edge = buf.to_vec();
+    let mut edge = [0i32; 129];
+    edge[..buf.len()].copy_from_slice(buf);
     for i in 1..buf.len() {
         let mut s = 0;
         for (j, &tap) in KERNEL[filt].iter().enumerate() {
@@ -558,57 +600,72 @@ fn directional(
     let left_at = |p: i32| left_buf[(p + left_off) as usize];
     let up_a = i32::from(upsample_above);
     let up_l = i32::from(upsample_left);
-    let blend = |edge: &dyn Fn(i32) -> i32, base: i32, shift: i32| {
-        round2(edge(base) * (32 - shift) + edge(base + 1) * shift, 5)
+    let max = crate::decode::sample_max(fctx);
+    // lane-intra: the zone test, the derivative lookup (a 27-arm match) and
+    // the blend's `&dyn Fn` indirection all used to sit inside the pixel
+    // loop; they are per-block (per-row for the shift) constants.
+    let blend = |edge: &[i32], off: i32, base: i32, shift: i32| {
+        round2(edge[(base + off) as usize] * (32 - shift) + edge[(base + off + 1) as usize] * shift, 5)
     };
-
-    for row in 0..h {
-        for col in 0..w {
-            let value = if angle < 90 {
-                let dx = dr_intra_derivative(angle);
-                let max_base = (reach - 1) << up_a;
-                let frac_bits = 6 - up_a;
-                let x = dx * (row + 1);
-                let base = (x >> frac_bits) + (col << up_a);
-                let shift = ((x << up_a) & 0x3F) >> 1;
-                if base < max_base {
-                    blend(&above_at, base, shift)
+    if angle < 90 {
+        let dx = dr_intra_derivative(angle);
+        let max_base = (reach - 1) << up_a;
+        let frac_bits = 6 - up_a;
+        for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+            let x = dx * (row as i32 + 1);
+            let base0 = x >> frac_bits;
+            let shift = ((x << up_a) & 0x3F) >> 1;
+            for (col, d) in dstrow.iter_mut().enumerate() {
+                let base = base0 + ((col as i32) << up_a);
+                let value = if base < max_base {
+                    blend(above_buf, above_off, base, shift)
                 } else {
                     above_at(max_base)
-                }
-            } else if angle > 180 {
-                let dy = dr_intra_derivative(270 - angle);
-                let max_base = (reach - 1) << up_l;
-                let frac_bits = 6 - up_l;
-                let y = dy * (col + 1);
-                let base = (y >> frac_bits) + (row << up_l);
+                };
+                *d = value.clamp(0, max) as u16;
+            }
+        }
+    } else if angle > 180 {
+        let dy = dr_intra_derivative(270 - angle);
+        let max_base = (reach - 1) << up_l;
+        let frac_bits = 6 - up_l;
+        for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+            let r = (row as i32) << up_l;
+            for (col, d) in dstrow.iter_mut().enumerate() {
+                let y = dy * (col as i32 + 1);
+                let base = (y >> frac_bits) + r;
                 let shift = ((y << up_l) & 0x3F) >> 1;
-                if base < max_base {
-                    blend(&left_at, base, shift)
+                let value = if base < max_base {
+                    blend(left_buf, left_off, base, shift)
                 } else {
                     left_at(max_base)
-                }
-            } else {
-                // The two zones meet here: a ray that leaves through the row
-                // above is read there, and one that leaves through the column
-                // to the left is read there instead.
-                let dx = dr_intra_derivative(180 - angle);
-                let min_base = -(1 << up_a);
-                let frac_bits_x = 6 - up_a;
-                let y = row + 1;
-                let x = (col << 6) - y * dx;
+                };
+                *d = value.clamp(0, max) as u16;
+            }
+        }
+    } else {
+        // The two zones meet here: a ray that leaves through the row above is
+        // read there, and one that leaves through the column to the left is
+        // read there instead.
+        let dx = dr_intra_derivative(180 - angle);
+        let dy = dr_intra_derivative(angle - 90);
+        let min_base = -(1 << up_a);
+        let frac_bits_x = 6 - up_a;
+        let frac_bits_y = 6 - up_l;
+        for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+            let ydx = (row as i32 + 1) * dx;
+            let yrow = (row as i32) << 6;
+            for (col, d) in dstrow.iter_mut().enumerate() {
+                let x = ((col as i32) << 6) - ydx;
                 let base = x >> frac_bits_x;
-                if base >= min_base {
-                    blend(&above_at, base, ((x << up_a) & 0x3F) >> 1)
+                let value = if base >= min_base {
+                    blend(above_buf, above_off, base, ((x << up_a) & 0x3F) >> 1)
                 } else {
-                    let dy = dr_intra_derivative(angle - 90);
-                    let frac_bits_y = 6 - up_l;
-                    let x2 = col + 1;
-                    let y2 = (row << 6) - x2 * dy;
-                    blend(&left_at, y2 >> frac_bits_y, ((y2 << up_l) & 0x3F) >> 1)
-                }
-            };
-            dst[(row * w + col) as usize] = value.clamp(0, crate::decode::sample_max(fctx)) as u16;
+                    let y2 = yrow - (col as i32 + 1) * dy;
+                    blend(left_buf, left_off, y2 >> frac_bits_y, ((y2 << up_l) & 0x3F) >> 1)
+                };
+                *d = value.clamp(0, max) as u16;
+            }
         }
     }
 }
