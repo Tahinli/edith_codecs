@@ -6388,8 +6388,10 @@ struct Neighbours {
     /// block (lane-av1-rect) share a single [`SUB`]-grid cell, so a coarse
     /// array cannot tell the second leaf's partition symbol that the first
     /// one was coded at 8x8.
-    above_side_mi: Vec<usize>,
-    left_side_mi: Vec<usize>,
+    /// lane-publish2: `u8` (a block side is at most 128 px, and so is
+    /// [`NO_NEIGHBOUR_SIDE`]) -- every block stamps these per mi.
+    above_side_mi: Vec<u8>,
+    left_side_mi: Vec<u8>,
     /// The luma `mode` of the last `BLOCK_4X4` leaf decoded at each mi column
     /// / row, with the mi position it was written at
     /// (`(usize::MAX, _)` = never written). `above_mode`/`left_mode` are on
@@ -6401,15 +6403,20 @@ struct Neighbours {
     /// and read only by [`decode_leaf_split4`]; the position guard makes it
     /// fall back to the coarse slot whenever the real neighbour was a block
     /// of 8x8 or larger (whose one mode is correct for every row it spans).
-    sub8_mode_col: Vec<(usize, usize)>,
-    sub8_mode_row: Vec<(usize, usize)>,
+    /// lane-publish2: `(mi position, mode)` narrowed from `(usize, usize)` to
+    /// `(u16, u8)` -- every block stamps these mi-granular maps, and 16 bytes
+    /// per mi per side of publish traffic was pure width. `u16::MAX` is the
+    /// "never written" sentinel (an mi index cannot reach it: AV1's largest
+    /// frame is 65536 px = 16384 mi).
+    sub8_mode_col: Vec<(u16, u8)>,
+    sub8_mode_row: Vec<(u16, u8)>,
     /// The `uv_mode` twin of `sub8_mode_col`/`sub8_mode_row` (lane-sub8 r5):
     /// chroma's edge-filter type reads the CHROMA neighbour's `uv_mode`
     /// (`get_intra_edge_filter_type`, reconintra.c:974), and the coarse
     /// [`SUB`] slots cannot name it once a 16x16 is split into 8x8 leaves --
     /// the leaf above writes the same row slot the block to the left owns.
-    uv_mode_col: Vec<(usize, usize)>,
-    uv_mode_row: Vec<(usize, usize)>,
+    uv_mode_col: Vec<(u16, u8)>,
+    uv_mode_row: Vec<(u16, u8)>,
     /// Every mi cell's own `uv_mode`, the mi grid libaom's
     /// `chroma_above_mbmi`/`chroma_left_mbmi` read directly (`set_mi_row_col`,
     /// blockd.h). lane-t900 r12: the one-slot-per-column
@@ -6462,8 +6469,14 @@ struct Neighbours {
     /// compound (spec `RefFrames[1]`), or `None` for single-ref/intra --
     /// lane-av1comp: `mvstack::reference_mode_ctx`/`comp_reference_type_ctx`
     /// need a full [`crate::mvstack::NeighbourRef`], not just `above_ref`'s
-    /// `i8`, once a compound `read_ref_frames` lands. Always `None` today
-    /// (no decode path here ever produces a compound block yet).
+    /// `i8`, once a compound `read_ref_frames` lands.
+    /// lane-publish2 audit: the "always `None` today" note this doc used to
+    /// carry is long stale -- compound blocks do occur, and
+    /// [`Self::record_compound_ctx_rect_mi`] stamps the real second reference
+    /// over their span right after [`Self::record_inter_rect_mi`]'s reset.
+    /// The array IS read: `single_ref_p*`/`comp_ref` contexts and every
+    /// [`crate::mvstack::NeighbourRef`] construction (class
+    /// [[branch-dropped-as-unreachable]] -- the note, not the code, was wrong).
     above_ref1: Vec<Option<i8>>,
     left_ref1: Vec<Option<i8>>,
     /// The precomputed `get_comp_group_idx_context`/`get_comp_index_context`
@@ -6550,15 +6563,15 @@ struct Neighbours {
     /// and its base colours -- `av1_get_palette_mode_ctx`/
     /// `av1_get_palette_cache` (pred_common.c)'s neighbour lookup, lane-palette
     /// r2. UV has no equivalent yet (stage 2, unreconstructed).
-    above_palette_size: Vec<usize>,
-    left_palette_size: Vec<usize>,
+    above_palette_size: Vec<u8>,
+    left_palette_size: Vec<u8>,
     above_palette_colors: Vec<[u16; 8]>,
     left_palette_colors: Vec<[u16; 8]>,
     /// As the four fields above, for the neighbour's own chroma (U-channel
     /// only -- `av1_get_palette_cache`'s plane-1 lookup, [`Self::palette_uv_cache`])
     /// palette size/colours (lane-palette2 r1).
-    above_palette_uv_size: Vec<usize>,
-    left_palette_uv_size: Vec<usize>,
+    above_palette_uv_size: Vec<u8>,
+    left_palette_uv_size: Vec<u8>,
     above_palette_uv_colors: Vec<[u16; 8]>,
     left_palette_uv_colors: Vec<[u16; 8]>,
     /// This tile's own top-left corner, in 4x4 mode-info units (spec
@@ -6598,12 +6611,12 @@ impl Neighbours {
             left_uv_mode: vec![DC_PRED; rows],
             above_side: vec![NO_NEIGHBOUR_SIDE; cols],
             left_side: vec![NO_NEIGHBOUR_SIDE; rows],
-            above_side_mi: vec![NO_NEIGHBOUR_SIDE; cols * (SUB / MI)],
-            left_side_mi: vec![NO_NEIGHBOUR_SIDE; rows * (SUB / MI)],
-            sub8_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
-            sub8_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
-            uv_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
-            uv_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
+            above_side_mi: vec![NO_NEIGHBOUR_SIDE as u8; cols * (SUB / MI)],
+            left_side_mi: vec![NO_NEIGHBOUR_SIDE as u8; rows * (SUB / MI)],
+            sub8_mode_col: vec![(u16::MAX, 0); cols * (SUB / MI)],
+            sub8_mode_row: vec![(u16::MAX, 0); rows * (SUB / MI)],
+            uv_mode_col: vec![(u16::MAX, 0); cols * (SUB / MI)],
+            uv_mode_row: vec![(u16::MAX, 0); rows * (SUB / MI)],
             uv_mode_grid: vec![u8::MAX; cols * (SUB / MI) * rows * (SUB / MI)],
             uv_grid_cols: cols * (SUB / MI),
             above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
@@ -6669,7 +6682,7 @@ impl Neighbours {
         let end = col1_mi.min(self.above.len());
         for i in col0_mi.min(end)..end {
             self.above[i] = Default::default();
-            self.above_side_mi[i] = NO_NEIGHBOUR_SIDE;
+            self.above_side_mi[i] = NO_NEIGHBOUR_SIDE as u8;
         }
         let (sc0, sc1) = (
             col0_mi / (SUB / MI),
@@ -6697,8 +6710,8 @@ impl Neighbours {
         // tile's first block would read as its own above neighbour.
         let mcol_end = col1_mi.min(self.sub8_mode_col.len());
         for i in col0_mi.min(mcol_end)..mcol_end {
-            self.sub8_mode_col[i] = (usize::MAX, 0);
-            self.uv_mode_col[i] = (usize::MAX, 0);
+            self.sub8_mode_col[i] = (u16::MAX, 0);
+            self.uv_mode_col[i] = (u16::MAX, 0);
         }
         // lane-mergefix r2: `av1_zero_above_context` also memsets the txfm row
         // over the tile's own column span (to `tx_size_wide[TX_SIZES_LARGEST]`,
@@ -6743,14 +6756,21 @@ impl Neighbours {
         // cache came out one entry short (class [[context-read-from-one-cell]]).
         for cell in 0..(w / MI).max(1) {
             if let Some(e) = self.above_palette_size.get_mut(c + cell) {
-                *e = size;
-                self.above_palette_colors[c + cell] = colors;
+                *e = size as u8;
+                // lane-publish2: spec 5.11.46 `get_palette_cache` reads a
+                // neighbour's colours only where its palette size > 0, so a
+                // non-palette block need not stamp 16 bytes of zeroes here.
+                if size > 0 {
+                    self.above_palette_colors[c + cell] = colors;
+                }
             }
         }
         for cell in 0..(h / MI).max(1) {
             if let Some(e) = self.left_palette_size.get_mut(r + cell) {
-                *e = size;
-                self.left_palette_colors[r + cell] = colors;
+                *e = size as u8;
+                if size > 0 {
+                    self.left_palette_colors[r + cell] = colors;
+                }
             }
         }
     }
@@ -6785,7 +6805,7 @@ impl Neighbours {
         // `xd->above_mbmi` exists for every row but the tile's own first.
         let above_is_palette = r > self.tile_row0_mi && self.above_palette_size[c] > 0;
         let (above_n, above_colors) = if above_ok && self.above_palette_size[c] > 0 {
-            (self.above_palette_size[c], self.above_palette_colors[c])
+            (usize::from(self.above_palette_size[c]), self.above_palette_colors[c])
         } else {
             (0, [0u16; 8])
         };
@@ -6796,7 +6816,7 @@ impl Neighbours {
         // and its `palette_y_mode` ctx.
         let left_ok = c > self.tile_col0_mi;
         let (left_n, left_colors) = if left_ok && self.left_palette_size[r] > 0 {
-            (self.left_palette_size[r], self.left_palette_colors[r])
+            (usize::from(self.left_palette_size[r]), self.left_palette_colors[r])
         } else {
             (0, [0u16; 8])
         };
@@ -6861,14 +6881,18 @@ impl Neighbours {
         // mi granularity, see [`Self::record_palette_y_rect`].
         for cell in 0..(w / MI).max(1) {
             if let Some(e) = self.above_palette_uv_size.get_mut(c + cell) {
-                *e = size;
-                self.above_palette_uv_colors[c + cell] = colors;
+                *e = size as u8;
+                if size > 0 {
+                    self.above_palette_uv_colors[c + cell] = colors;
+                }
             }
         }
         for cell in 0..(h / MI).max(1) {
             if let Some(e) = self.left_palette_uv_size.get_mut(r + cell) {
-                *e = size;
-                self.left_palette_uv_colors[r + cell] = colors;
+                *e = size as u8;
+                if size > 0 {
+                    self.left_palette_uv_colors[r + cell] = colors;
+                }
             }
         }
     }
@@ -6888,14 +6912,14 @@ impl Neighbours {
         let (r, c) = mi;
         let above_ok = r % 16 != 0;
         let (above_n, above_colors) = if above_ok && self.above_palette_uv_size[c] > 0 {
-            (self.above_palette_uv_size[c], self.above_palette_uv_colors[c])
+            (usize::from(self.above_palette_uv_size[c]), self.above_palette_uv_colors[c])
         } else {
             (0, [0u16; 8])
         };
         // Same tile-relative left availability as the luma cache above.
         let left_ok = c > self.tile_col0_mi;
         let (left_n, left_colors) = if left_ok && self.left_palette_uv_size[r] > 0 {
-            (self.left_palette_uv_size[r], self.left_palette_uv_colors[r])
+            (usize::from(self.left_palette_uv_size[r]), self.left_palette_uv_colors[r])
         } else {
             (0, [0u16; 8])
         };
@@ -7095,7 +7119,7 @@ impl Neighbours {
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_uv_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_side.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE);
-        self.left_side_mi.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE);
+        self.left_side_mi.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE as u8);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_skip_mode.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
@@ -7106,8 +7130,8 @@ impl Neighbours {
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
         // lane-sub8 r6: mi-granular row maps reset with the rest of the left
         // context (a tile/SB-row boundary has no left neighbour).
-        self.sub8_mode_row.iter_mut().for_each(|s| *s = (usize::MAX, 0));
-        self.uv_mode_row.iter_mut().for_each(|s| *s = (usize::MAX, 0));
+        self.sub8_mode_row.iter_mut().for_each(|s| *s = (u16::MAX, 0));
+        self.uv_mode_row.iter_mut().for_each(|s| *s = (u16::MAX, 0));
         // lane-tiles r11 (COMMON's NEIGHBOUR MAPS rule): the palette side bands
         // are per-mi maps like every other one here, so they reset with the
         // row too -- the left guard above is what actually stops a cross-tile
@@ -7215,9 +7239,9 @@ impl Neighbours {
         self.above_skip_mode[c..c + w_mi].fill(skip_mode);
         self.above_inter[c..c + w_mi].fill(is_inter);
         self.above_ref[c..c + w_mi].fill(ref_frame);
-        // lane-av1comp: no caller of `record_inter` ever decodes a
-        // compound block yet (see [`Self::above_ref1`]'s doc); the
-        // parameter this becomes lands with `read_ref_frames`.
+        // The single-ref default: `record_compound_ctx_rect_mi` overwrites
+        // this with the block's real second reference for a compound block,
+        // called right after this one (lane-publish2 audit).
         self.above_ref1[c..c + w_mi].fill(None);
         // libaom `get_comp_group_idx_context`/`get_comp_index_context`'s
         // single-ref special case: `ref_frame[0] == ALTREF_FRAME` reads
@@ -7323,8 +7347,8 @@ impl Neighbours {
     /// arrays so the second leaf sees the first leaf's own 8x8 side rather
     /// than the enclosing 16x16 slot's stale, shared state.
     fn partition_ctx_mi(&self, (mi_r, mi_c): (usize, usize), side: usize) -> usize {
-        2 * usize::from(self.left_side_mi[mi_r] * 2 <= side)
-            + usize::from(self.above_side_mi[mi_c] * 2 <= side)
+        2 * usize::from(usize::from(self.left_side_mi[mi_r]) * 2 <= side)
+            + usize::from(usize::from(self.above_side_mi[mi_c]) * 2 <= side)
     }
 
     /// The gathered coded/DC-sign state of the blocks above and to the left
@@ -7484,7 +7508,8 @@ impl Neighbours {
         mi_h: usize,
         mode: usize,
     ) {
-        let (last_r, last_c) = (mi_r + mi_h - 1, mi_c + mi_w - 1);
+        let (last_r, last_c) = ((mi_r + mi_h - 1) as u16, (mi_c + mi_w - 1) as u16);
+        let mode = mode as u8;
         for cell in 0..mi_w {
             if let Some(slot) = self.sub8_mode_col.get_mut(mi_c + cell) {
                 *slot = (last_r, mode);
@@ -7503,14 +7528,14 @@ impl Neighbours {
     /// construction). See [`Self::record_mode_mi`].
     fn mode_above_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
         match self.sub8_mode_col.get(mi_c) {
-            Some(&(row, m)) if mi_r > self.tile_row0_mi && row == mi_r - 1 => Some(m),
+            Some(&(row, m)) if mi_r > self.tile_row0_mi && usize::from(row) == mi_r - 1 => Some(usize::from(m)),
             _ => None,
         }
     }
 
     fn mode_left_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
         match self.sub8_mode_row.get(mi_r) {
-            Some(&(col, m)) if mi_c > self.tile_col0_mi && col == mi_c - 1 => Some(m),
+            Some(&(col, m)) if mi_c > self.tile_col0_mi && usize::from(col) == mi_c - 1 => Some(usize::from(m)),
             _ => None,
         }
     }
@@ -7526,8 +7551,8 @@ impl Neighbours {
         uv_mode: usize,
     ) {
         let (last_r, last_c) = (mi_r + mi_h - 1, mi_c + mi_w - 1);
-        fill_span(&mut self.uv_mode_col, mi_c, mi_w, (last_r, uv_mode));
-        fill_span(&mut self.uv_mode_row, mi_r, mi_h, (last_c, uv_mode));
+        fill_span(&mut self.uv_mode_col, mi_c, mi_w, (last_r as u16, uv_mode as u8));
+        fill_span(&mut self.uv_mode_row, mi_r, mi_h, (last_c as u16, uv_mode as u8));
         // libaom writes one `MB_MODE_INFO` pointer into every mi cell a block
         // covers, so the chroma neighbour read below is a plain grid read.
         let stride = self.uv_grid_cols;
@@ -7598,20 +7623,20 @@ impl Neighbours {
         };
         let above = match self.uv_mode_col.get(mi_c) {
             _ if have_above && let Some(m) = cell(&self.uv_mode_grid, mi_r - 1, mi_c) => m,
-            Some(&(row, m)) if have_above && row == mi_r - 1 => m,
+            Some(&(row, m)) if have_above && usize::from(row) == mi_r - 1 => usize::from(m),
             _ if have_above => self.above_uv_mode[c],
             _ => DC_PRED,
         };
         let left = match self.uv_mode_row.get(mi_r) {
             _ if have_left && let Some(m) = cell(&self.uv_mode_grid, mi_r, mi_c - 1) => m,
-            Some(&(col, m)) if have_left && col == mi_c - 1 => m,
+            Some(&(col, m)) if have_left && usize::from(col) == mi_c - 1 => usize::from(m),
             _ if have_left => self.left_uv_mode[r],
             _ => DC_PRED,
         };
         if have_above && cell(&self.uv_mode_grid, mi_r - 1, mi_c).is_some_and(|m| {
-            !matches!(self.uv_mode_col.get(mi_c), Some(&(row, cm)) if row == mi_r - 1 && cm == m)
+            !matches!(self.uv_mode_col.get(mi_c), Some(&(row, cm)) if usize::from(row) == mi_r - 1 && usize::from(cm) == m)
         }) || have_left && cell(&self.uv_mode_grid, mi_r, mi_c - 1).is_some_and(|m| {
-            !matches!(self.uv_mode_row.get(mi_r), Some(&(col, cm)) if col == mi_c - 1 && cm == m)
+            !matches!(self.uv_mode_row.get(mi_r), Some(&(col, cm)) if usize::from(col) == mi_c - 1 && usize::from(cm) == m)
         }) {
             UV_MODE_GRID_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
         }
@@ -7770,8 +7795,8 @@ impl Neighbours {
         if crate::envflags::env_flag!("EC_ECPUB") {
             eprintln!("EC_ECPUB blk mi=({mi_r},{mi_c}) wh=({w},{h}) lvl={}", states[0].level);
         }
-        fill_span(&mut self.left_side_mi, mi_r, h_mi, h);
-        fill_span(&mut self.above_side_mi, mi_c, w_mi, w);
+        fill_span(&mut self.left_side_mi, mi_r, h_mi, h as u8);
+        fill_span(&mut self.above_side_mi, mi_c, w_mi, w as u8);
         // A chroma 4x4 unit straddling the true luma edge is still whole in
         // chroma's own halved grid, so libaom rounds the luma bound up to the
         // plane's own 4x4 unit before clamping a subsampled plane
@@ -7960,8 +7985,8 @@ impl Neighbours {
         let (w_mi, h_mi) = (w / MI, h / MI);
         self.record_mode_mi(mi_r, mi_c, w_mi, h_mi, mode);
         self.record_uv_mode_mi(mi_r, mi_c, w_mi, h_mi, uv_mode);
-        fill_span(&mut self.left_side_mi, mi_r, h_mi, h);
-        fill_span(&mut self.above_side_mi, mi_c, w_mi, w);
+        fill_span(&mut self.left_side_mi, mi_r, h_mi, h as u8);
+        fill_span(&mut self.above_side_mi, mi_c, w_mi, w as u8);
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
         for (plane_idx, grid) in chroma_grids.into_iter().enumerate() {
@@ -8702,10 +8727,16 @@ fn record_strip_palette(
     {
         for cell in 0..(bw / MI).max(1) {
             if let Some(e) = n.above_palette_size.get_mut(c + cell) {
-                *e = y_size;
-                n.above_palette_colors[c + cell] = y_colors;
-                n.above_palette_uv_size[c + cell] = uv_size;
-                n.above_palette_uv_colors[c + cell] = uv_colors;
+                *e = y_size as u8;
+                n.above_palette_uv_size[c + cell] = uv_size as u8;
+                // lane-publish2, see [`Neighbours::record_palette_y_rect`]:
+                // colours of a size-0 neighbour are never read.
+                if y_size > 0 {
+                    n.above_palette_colors[c + cell] = y_colors;
+                }
+                if uv_size > 0 {
+                    n.above_palette_uv_colors[c + cell] = uv_colors;
+                }
             }
         }
     }
@@ -8714,10 +8745,14 @@ fn record_strip_palette(
             if n.left_palette_size.get(r + cell).is_none() {
                 break;
             }
-            n.left_palette_size[r + cell] = y_size;
-            n.left_palette_colors[r + cell] = y_colors;
-            n.left_palette_uv_size[r + cell] = uv_size;
-            n.left_palette_uv_colors[r + cell] = uv_colors;
+            n.left_palette_size[r + cell] = y_size as u8;
+            n.left_palette_uv_size[r + cell] = uv_size as u8;
+            if y_size > 0 {
+                n.left_palette_colors[r + cell] = y_colors;
+            }
+            if uv_size > 0 {
+                n.left_palette_uv_colors[r + cell] = uv_colors;
+            }
         }
     }
 }
@@ -11671,12 +11706,12 @@ fn decode_rect4_16_strip(
         // the left (mirrored under VERT_4).
         for cell in 0..mi_w {
             if let Some(slot) = neighbours.above_side_mi.get_mut(lmi.1 + cell) {
-                *slot = bw;
+                *slot = bw as u8;
             }
         }
         for cell in 0..mi_h {
             if let Some(slot) = neighbours.left_side_mi.get_mut(lmi.0 + cell) {
-                *slot = bh;
+                *slot = bh as u8;
             }
         }
         if has_chroma {
@@ -15745,8 +15780,8 @@ fn decode_leaf_rect8(
     // -- the mirror of `decode_leaf_split4`'s `{31, 31}`, which
     // `partition_ctx_mi` reads back off these side values.
     for cell in 0..2 {
-        neighbours.above_side_mi[leaf_mi.1 + cell] = bw;
-        neighbours.left_side_mi[leaf_mi.0 + cell] = bh;
+        neighbours.above_side_mi[leaf_mi.1 + cell] = bw as u8;
+        neighbours.left_side_mi[leaf_mi.0 + cell] = bh as u8;
     }
     let round_up_even = |n: usize| n.div_ceil(2) * 2;
     let bound_h = round_up_even(neighbours.mi_rows);
@@ -16543,10 +16578,10 @@ fn tx_size_context_txfm_rect(
     let mut above = usize::from(n.above_txfm[mi_c]) >= own_w;
     let mut left = usize::from(n.left_txfm[mi_r]) >= own_h;
     if has_above && n.above_inter[mi_c] {
-        above = n.above_side_mi[mi_c] >= own_w;
+        above = usize::from(n.above_side_mi[mi_c]) >= own_w;
     }
     if has_left && n.left_inter[mi_r] {
-        left = n.left_side_mi[mi_r] >= own_h;
+        left = usize::from(n.left_side_mi[mi_r]) >= own_h;
     }
     if crate::envflags::env_flag!("EC_TXCTX") {
         eprintln!(
@@ -16603,10 +16638,10 @@ fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usiz
     // then missed libaom's "an inter neighbour contributes its BLOCK size"
     // override and read `tx_size_cat1` row 1 where aomdec reads row 2.
     if has_above && n.above_inter[mi_c] {
-        above = n.above_side_mi[mi_c] >= side;
+        above = usize::from(n.above_side_mi[mi_c]) >= side;
     }
     if has_left && n.left_inter[mi_r] {
-        left = n.left_side_mi[mi_r] >= side;
+        left = usize::from(n.left_side_mi[mi_r]) >= side;
     }
     if crate::envflags::env_flag!("EC_TXCTX") {
         eprintln!(
@@ -29278,14 +29313,14 @@ fn decode_inter_sub8_rect2(
         if i == 1 {
             if vert {
                 for cell in 0..h_mi {
-                    neighbours.left_side_mi[gr + cell] = bh;
+                    neighbours.left_side_mi[gr + cell] = bh as u8;
                 }
-                neighbours.above_side_mi[gc] = bw;
+                neighbours.above_side_mi[gc] = bw as u8;
             } else {
                 for cell in 0..w_mi {
-                    neighbours.above_side_mi[gc + cell] = bw;
+                    neighbours.above_side_mi[gc + cell] = bw as u8;
                 }
-                neighbours.left_side_mi[gr] = bh;
+                neighbours.left_side_mi[gr] = bh as u8;
             }
         }
         let (rmi, cmi) = lmi;
@@ -29764,8 +29799,8 @@ fn decode_inter_sub8_rect2(
     // over the whole 8x8 span -- BLOCK_4X8's width above and height left, the
     // same values [`decode_leaf_rect8`] writes for the intra shape.
     for cell in 0..2usize {
-        neighbours.above_side_mi[gc + cell] = bw;
-        neighbours.left_side_mi[gr + cell] = bh;
+        neighbours.above_side_mi[gc + cell] = bw as u8;
+        neighbours.left_side_mi[gr + cell] = bh as u8;
     }
     Ok(())
 }
@@ -35838,6 +35873,33 @@ mod tests {
         assert_eq!(n.palette_uv_cache((1, 1)), vec![1, 2]);
         n.record_palette_uv_rect((4, 4), 8, 8, 0, [0u16; 8]);
         assert!(n.palette_uv_cache((1, 1)).is_empty());
+    }
+
+    /// lane-publish2 (the mode-info publish surface narrowed): two invariants
+    /// the byte-exact stream gate only covers indirectly -- a size-0 palette
+    /// stamp leaves the PREVIOUS block's colours in place (spec 5.11.46
+    /// `get_palette_cache` reads a neighbour's colours only where its size is
+    /// non-zero, so writing 16 bytes of zeroes was pure traffic), and the
+    /// narrowed `(u16, u8)` mi maps keep their "never written" sentinel.
+    #[test]
+    fn narrowed_publish_surface_keeps_neighbour_semantics() {
+        assert_eq!(std::mem::size_of::<(u16, u8)>(), 4, "the narrowing must actually be 4 bytes");
+        let fctx = &crate::decode::FrameCtx::new();
+        let mut n = Neighbours::new(4, 4, 16, 16, fctx);
+        n.record_palette_y_rect((4, 4), 16, 16, 2, [7, 9, 0, 0, 0, 0, 0, 0]);
+        n.record_palette_y_rect((4, 4), 16, 16, 0, [0u16; 8]);
+        assert_eq!(n.above_palette_size[4], 0, "the size is what a reader gates on");
+        assert_eq!(
+            n.above_palette_colors[4],
+            [7, 9, 0, 0, 0, 0, 0, 0],
+            "a size-0 stamp deliberately leaves the stale colours behind"
+        );
+        let (ctx, cache) = n.palette_ctx_and_cache((1, 1));
+        assert_eq!(ctx, 0, "and they stay invisible to every reader");
+        assert!(cache.is_empty());
+        assert_eq!(n.mode_above_mi(4, 4), None, "u16::MAX sentinel = never written");
+        n.record_mode_mi(3, 4, 1, 1, DC_PRED);
+        assert_eq!(n.mode_above_mi(4, 4), Some(DC_PRED));
     }
 
     /// [`cdf::COMPOUND_MODE_CTX_MAP`] folded by hand against libaom's
