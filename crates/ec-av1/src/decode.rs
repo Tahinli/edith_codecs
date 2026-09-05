@@ -13416,19 +13416,12 @@ fn read_plane(
         filter_intra,
         smooth_neighbor, fctx,
     );
-    Ok(if tx_side == side {
-        residual_grid_placeholder(&levels, side)
-    } else {
-        levels
-    })
-}
-
-/// `record`'s neighbour state only reads whether *the coded grid* (not the
-/// residual) has nonzero entries, so the levels this function already built
-/// are what it wants back; this helper exists only to name that clearly at
-/// the one call site where `tx_side == side`.
-fn residual_grid_placeholder(levels: &[i32], _tx_side: usize) -> Vec<i32> {
-    levels.to_vec()
+    // `record`'s neighbour state only reads whether *the coded grid* (not the
+    // residual) has nonzero entries, so the levels this function already
+    // built are what it wants back -- both arms of the old `tx_side == side`
+    // branch returned exactly that, one of them through a full `to_vec` copy
+    // of the grid per intra transform unit (lane-coefbuf).
+    Ok(levels)
 }
 
 /// Decodes one whole-block coded superblock/quadrant/leaf: its mode, then its
