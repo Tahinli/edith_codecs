@@ -19366,20 +19366,59 @@ fn deblock_plane_span(
         }    });
 }
 
-thread_local! {
-    /// lane-perf6: reused whole-plane `u16` buffers. Every frame takes a
-    /// pre-CDEF snapshot of all three planes, a post-deblock snapshot when
-    /// loop restoration is active, and a fresh LR destination per plane --
-    /// freshly allocated that is ~25 MB of `mmap`/`munmap` per frame at 4K,
-    /// so every sample written also takes a first-touch page fault. The
-    /// buffers are handed back here instead and refilled in place.
-    static PLANE_SCRATCH: std::cell::RefCell<Vec<Vec<u16>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// lane-perf6: reused whole-plane `u16` buffers. Every frame takes a
+/// pre-CDEF snapshot of all three planes, a post-deblock snapshot when loop
+/// restoration is active, and a fresh LR destination per plane -- freshly
+/// allocated that is ~25 MB of `mmap`/`munmap` per frame at 4K, so every
+/// sample written also takes a first-touch page fault. The buffers are handed
+/// back here instead and refilled in place.
+///
+/// lane-memfix: PROCESS-WIDE, not one stash per thread. These buffers do not
+/// stay on one thread: the frame thread allocates the snapshots and a filter
+/// worker returns them ([`pipe_run_lr`] swaps the picture's pre-LR planes
+/// into the pool from whichever worker ran it), so a per-thread pool leaked
+/// whole-plane buffers into every worker it touched -- 19 MB a set, times
+/// every pool thread the decode ever created. One shared pool with a hard
+/// entry cap bounds the retention at [`SCRATCH_CAP`] buffers no matter how
+/// many threads cycle through it; anything over the cap is freed.
+static PLANE_SCRATCH: std::sync::Mutex<Vec<Vec<u16>>> = std::sync::Mutex::new(Vec::new());
+
+/// Most buffers the shared pool keeps. ~3 whole-plane sets per in-flight 4K
+/// frame at the shipped `EC_AV1_THREADS` ceiling; the frames actually in
+/// flight cycle through far fewer.
+const SCRATCH_CAP: usize = 32;
+
+/// Takes a pooled buffer for a caller that wants `n` samples, best-fit by
+/// CAPACITY so a chroma-sized request does not permanently promote a
+/// luma-sized allocation (every pooled buffer would drift to the largest
+/// size otherwise). `None` when the pool is empty.
+fn scratch_take(n: usize) -> Option<Vec<u16>> {
+    let mut p = PLANE_SCRATCH.lock().unwrap();
+    if p.is_empty() {
+        return None;
+    }
+    let fit = p
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.capacity() >= n)
+        .min_by_key(|(_, v)| v.capacity())
+        .map(|(i, _)| i);
+    let i = match fit {
+        Some(i) => i,
+        // Nothing big enough: grow the largest rather than a small one.
+        None => p
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i)
+            .expect("the pool is not empty"),
+    };
+    Some(p.swap_remove(i))
 }
 
 /// A pooled buffer holding a copy of `src`.
 fn scratch_from(src: &[u16]) -> Vec<u16> {
-    let mut v = PLANE_SCRATCH.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    let mut v = scratch_take(src.len()).unwrap_or_default();
     v.clear();
     v.extend_from_slice(src);
     v
@@ -19387,7 +19426,7 @@ fn scratch_from(src: &[u16]) -> Vec<u16> {
 
 /// An empty pooled buffer, for a caller that fills it itself.
 fn scratch_empty() -> Vec<u16> {
-    let mut v = PLANE_SCRATCH.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    let mut v = scratch_take(0).unwrap_or_default();
     v.clear();
     v
 }
@@ -19396,7 +19435,7 @@ fn scratch_empty() -> Vec<u16> {
 /// for a caller that writes every element it later reads (lane-copy: the
 /// post-deblock snapshot writes 4 rows in 64 and reads no other).
 fn scratch_sized(n: usize) -> Vec<u16> {
-    let mut v = PLANE_SCRATCH.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    let mut v = scratch_take(n).unwrap_or_default();
     if v.len() > n {
         v.truncate(n);
     } else if v.len() < n {
@@ -19458,8 +19497,13 @@ fn crop_owned(plane: PlaneBuf<'_>, w: usize, h: usize) -> Vec<u16> {
 }
 
 /// Hands a buffer back to the pool; the capacity is what is worth keeping.
+/// Over [`SCRATCH_CAP`] the buffer is dropped (freed) instead -- the cap is
+/// what keeps a pool shared by every thread from being an unbounded stash.
 fn scratch_return(v: Vec<u16>) {
-    PLANE_SCRATCH.with(|p| p.borrow_mut().push(v));
+    let mut p = PLANE_SCRATCH.lock().unwrap();
+    if p.len() < SCRATCH_CAP {
+        p.push(v);
+    }
 }
 
 /// One CDEF mi-row band, as a real function rather than the body of the
