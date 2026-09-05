@@ -2140,12 +2140,7 @@ impl Residual {
     /// the empty marker, so neither the grid nor the residual is cloned and
     /// the worker never runs the transform (60% of the 4K segment's units).
     fn coeffs(tx: TxParams, grid: &[i32], fctx: &crate::decode::FrameCtx) -> Self {
-        // lane-coefgrid: a [`Grid::Zero`] unit IS the shared zero grid -- one
-        // pointer compare instead of scanning up to 16 K coefficients.
-        if std::ptr::eq(grid.as_ptr(), ZERO_RESIDUAL.as_ptr()) {
-            return Self::Done(0, 0);
-        }
-        if grid.iter().all(|&c| c == 0) {
+        if is_zero_grid(grid) {
             return Self::Done(0, 0);
         }
         Self::Coeffs(tx, push_coeffs(grid, fctx), grid.len() as u32)
@@ -2202,7 +2197,7 @@ fn push_pred_samples(v: &[u16], fctx: &crate::decode::FrameCtx) -> u32 {
 /// and the reconstruction loops below read this instead of a per-unit
 /// `vec![0; w * h]`. Sized for the largest stride a recorded unit can carry
 /// (a 128-wide inter block's prediction stride).
-static ZERO_RESIDUAL: [i32; 128 * 128] = [0; 128 * 128];
+pub(crate) static ZERO_RESIDUAL: [i32; 128 * 128] = [0; 128 * 128];
 
 /// lane-blockscratch: one plane's coefficient levels as the block-tail
 /// neighbour writes want them. A plane that coded nothing (a skipped block, a
@@ -2234,6 +2229,13 @@ impl std::ops::Deref for Grid {
             Grid::Own(v) => v,
         }
     }
+}
+
+/// Whether a coefficient grid codes nothing: a [`Grid::Zero`] unit IS the
+/// shared [`ZERO_RESIDUAL`], so one pointer compare answers the 60% of
+/// transform units that code no coefficient without the scan (lane-coefgrid).
+pub(crate) fn is_zero_grid(grid: &[i32]) -> bool {
+    std::ptr::eq(grid.as_ptr(), ZERO_RESIDUAL.as_ptr()) || grid.iter().all(|&c| c == 0)
 }
 
 /// `residual`, or `n` zeros when it is the empty all-zero marker.
@@ -6332,6 +6334,12 @@ fn fill_span<T: Copy>(dst: &mut [T], start: usize, n: usize, v: T) {
 }
 
 fn neighbour_state(grid: &[i32]) -> Neighbour {
+    // lane-coefgrid: the shared zero grid sums to zero by construction; this
+    // sum has no early exit, so the 60% of units that code nothing used to
+    // walk their whole grid here.
+    if is_zero_grid(grid) {
+        return Neighbour::default();
+    }
     let cul: u32 = grid.iter().map(|&l| l.unsigned_abs()).sum();
     Neighbour {
         level: cul.min(7) as u8,
