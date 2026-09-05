@@ -82,6 +82,9 @@ pub(crate) struct FrameCtx {
     /// lane-wave1 step (i): this superblock's recorded pixel writes, see
     /// [`ReconOp`]. Pushed by parse, replayed by [`flush_recon`].
     pub(crate) recon_ops: std::cell::RefCell<Vec<ReconOp>>,
+    /// The queue buffer [`flush_recon`] just drained, kept for its capacity
+    /// so a superblock's records do not regrow the vector from nothing.
+    pub(crate) recon_spare: std::cell::RefCell<Vec<ReconOp>>,
 }
 
 impl std::fmt::Debug for FrameCtx {
@@ -140,6 +143,7 @@ impl FrameCtx {
             reach_sb_px: std::cell::Cell::new(crate::encode::SUPERBLOCK),
             grain_bit_depth: std::cell::Cell::new(8),
             recon_ops: std::cell::RefCell::new(Vec::new()),
+            recon_spare: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -2103,6 +2107,46 @@ fn push_intra(
     });
 }
 
+/// [`push_intra`] for a caller whose residual is dead after the record --
+/// the three fused coefficient readers, i.e. nearly every recorded write.
+#[allow(clippy::too_many_arguments)]
+fn push_intra_owned(
+    plane: usize,
+    x: usize,
+    y: usize,
+    side: usize,
+    mode: usize,
+    angle_delta: i32,
+    reach: Reach,
+    residual: Vec<i32>,
+    cfl: Option<(i32, CflSrc)>,
+    filter_intra: Option<usize>,
+    smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
+) {
+    let pred = take_palette_pred(fctx);
+    push_op(fctx, ReconOp::Intra {
+        plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
+        residual, cfl, filter_intra, smooth_neighbor, pred,
+    });
+}
+
+/// [`push_mc_rect`] with the residual moved in -- see [`push_intra_owned`].
+#[allow(clippy::too_many_arguments)]
+fn push_mc_rect_owned(
+    plane: usize,
+    x: usize,
+    y: usize,
+    stride: usize,
+    w: usize,
+    h: usize,
+    prediction: &[u16],
+    residual: Vec<i32>, fctx: &crate::decode::FrameCtx,
+) {
+    push_op(fctx, ReconOp::Mc {
+        plane, x, y, stride, w, h, prediction: prediction.to_vec(), residual,
+    });
+}
+
 /// [`PlaneBuf::reconstruct_rect`], recorded (lane-wave1 step (i)).
 #[allow(clippy::too_many_arguments)]
 fn push_intra_rect(
@@ -2170,8 +2214,9 @@ fn flush_recon(
     u: &mut PlaneBuf<'static>,
     v: &mut PlaneBuf<'static>,
 ) {
-    let ops = fctx.recon_ops.with(|c| std::mem::take(&mut *c.borrow_mut()));
-    for op in ops {
+    let mut ops = fctx.recon_spare.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    fctx.recon_ops.with(|c| std::mem::swap(&mut *c.borrow_mut(), &mut ops));
+    for op in ops.drain(..) {
         match op {
             ReconOp::Intra {
                 plane, x, y: oy, bw, bh, rect, mode, angle_delta, reach, residual, cfl,
@@ -2210,6 +2255,7 @@ fn flush_recon(
             }
         }
     }
+    fctx.recon_spare.with(|c| *c.borrow_mut() = ops);
 }
 
 thread_local! {
@@ -12233,14 +12279,15 @@ fn read_plane(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
         );
     }
-    push_intra(plane_idx, 
+    push_intra_owned(
+        plane_idx,
         x,
         y,
         side,
         predict_mode,
         angle_delta,
         reach,
-        &residual,
+        residual,
         cfl,
         filter_intra,
         smooth_neighbor, fctx,
@@ -16450,7 +16497,7 @@ fn read_inter_plane_rect(
     for row in 0..h {
         strided[row * stride..][..w].copy_from_slice(&residual[row * w..][..w]);
     }
-    push_mc_rect(plane_idx, x, y, stride, w, h, prediction, &strided, fctx);
+    push_mc_rect_owned(plane_idx, x, y, stride, w, h, prediction, strided, fctx);
     Ok((grid, tx_type))
 }
 
@@ -20944,7 +20991,7 @@ fn read_inter_plane(
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let residual = dequant_and_inverse_typed(&grid, side, bit_depth(fctx), block_q_idx(fctx), dc_delta, ac_delta, tx_type);
-    push_mc(plane_idx, x, y, side, prediction, &residual, fctx);
+    push_mc_rect_owned(plane_idx, x, y, side, side, side, prediction, residual, fctx);
     Ok((grid, tx_type))
 }
 
