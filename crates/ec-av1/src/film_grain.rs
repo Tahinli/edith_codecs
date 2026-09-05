@@ -1041,6 +1041,48 @@ pub(crate) fn grain_hits() -> usize {
     GRAIN_HITS.with(|c| c.get())
 }
 
+/// Copies the clean rows `*lcur..l_to` (luma) and `*ccur..c_to` (chroma) of
+/// `src` into `out`, advancing the cursors. [`apply_grain`]'s bands fill
+/// their own uninitialised destination rows with this before adding noise.
+fn copy_clean_rows(
+    out: &mut Picture,
+    src: &Picture,
+    ys: usize,
+    cs: usize,
+    lcur: &mut usize,
+    ccur: &mut usize,
+    l_to: usize,
+    c_to: usize,
+) {
+    if l_to > *lcur {
+        out.y[*lcur * ys..l_to * ys].copy_from_slice(&src.y[*lcur * ys..l_to * ys]);
+        *lcur = l_to;
+    }
+    if c_to > *ccur {
+        out.u[*ccur * cs..c_to * cs].copy_from_slice(&src.u[*ccur * cs..c_to * cs]);
+        out.v[*ccur * cs..c_to * cs].copy_from_slice(&src.v[*ccur * cs..c_to * cs]);
+        *ccur = c_to;
+    }
+}
+
+/// A plane of `n` samples whose contents are written before they are read.
+///
+/// corner-cut: `set_len` over `Vec::with_capacity` skips the zeroing pass a
+/// `vec![0; n]` would cost (25 MB per 4K frame) for a buffer every one of
+/// whose samples is written by [`apply_grain`]'s band copy. The proof is the
+/// band row partition at that call site, not the type system, exactly as
+/// [`crate::par::Shared`]'s disjointness is; the byte-exact 1-vs-4-thread
+/// gate is what checks it. Upgrade path: `Box<[MaybeUninit<u16>]>` plumbed
+/// through the kernels.
+#[allow(unsafe_code)]
+fn uninit_plane(n: usize) -> Vec<u16> {
+    let mut v: Vec<u16> = Vec::with_capacity(n);
+    // SAFETY: `u16` has no invalid bit pattern and no uninitialised sample is
+    // read -- see the doc comment.
+    unsafe { v.set_len(n) };
+    v
+}
+
 /// `av1_add_film_grain`/`add_film_grain_run` (spec 7.18.3.5): synthesize and
 /// apply film grain to `picture`, returning a new grained picture. `picture`
 /// itself is unchanged -- it stays the clean reference-frame-bank copy.
@@ -1051,14 +1093,13 @@ pub(crate) fn apply_grain(
     mc_identity: bool,
     bit_depth: u32, fctx: &crate::decode::FrameCtx,
 ) -> Picture {
-    let mut out = picture.clone();
     if !fg.apply_grain {
-        return out;
+        return picture.clone();
     }
     fctx.grain_bit_depth.with(|c| c.set(bit_depth));
     GRAIN_HITS.with(|c| c.set(c.get() + 1));
-    let width = out.width as i32;
-    let height = out.height as i32;
+    let width = picture.width as i32;
+    let height = picture.height as i32;
     let y_stride = width;
     let c_stride = width / 2;
 
@@ -1113,13 +1154,47 @@ pub(crate) fn apply_grain(
     // single-threaded walk does.
     let row_step = LUMA_SUBBLOCK >> 1;
     let nrows = ((height / 2).max(0) as usize).div_ceil(row_step as usize);
-    let so = crate::par::Shared::new(&mut out);
     let gbands = crate::par::bands(nrows, crate::par::filter_threads());
+    // lane-grain2: the clean picture used to be cloned here, on the frame
+    // thread, and the noise then written over the copy -- a whole-picture
+    // `memmove` (3.5% of a 4K frame thread's cycles) ahead of the parallel
+    // walk. The bands own a partition of the plane rows, so each band copies
+    // its OWN rows out of the clean source and adds noise to them: the copy
+    // moves onto the filter pool and the destination never needs zeroing.
+    let y_rows = if y_stride > 0 { picture.y.len() / y_stride as usize } else { 0 };
+    let c_rows = if c_stride > 0 { picture.u.len() / c_stride as usize } else { 0 };
+    let banded = !gbands.is_empty() && y_stride > 0 && c_stride > 0;
+    let mut out = if banded {
+        Picture {
+            width: picture.width,
+            height: picture.height,
+            y: uninit_plane(picture.y.len()),
+            u: uninit_plane(picture.u.len()),
+            v: uninit_plane(picture.v.len()),
+        }
+    } else {
+        picture.clone()
+    };
+    let so = crate::par::Shared::new(&mut out);
     crate::par::run_bands(&gbands, fctx, |b_lo, b_hi, fctx| {
         // SAFETY: this band writes only the picture rows its own block rows
         // cover, disjoint from every other band's.
         #[allow(unsafe_code)]
         let out = unsafe { so.get() };
+        // The row ranges below partition every plane across the bands (the
+        // last band runs to the plane's end, so an odd tail row or a height
+        // that is not a multiple of 32 is covered too), which is what makes
+        // every sample of the uninitialised destination written before it is
+        // read -- by this copy, or by the noise written over it. The copy
+        // runs one block row AHEAD of the noise rather than once per band, so
+        // the rows the kernels then read back are still in this core's cache.
+        let ys = y_stride as usize;
+        let cs = c_stride as usize;
+        let c_end = if b_hi == nrows { c_rows } else { (b_hi * row_step as usize).min(c_rows) };
+        let l_end =
+            if b_hi == nrows { y_rows } else { (2 * b_hi * row_step as usize).min(y_rows) };
+        let mut ccur = (b_lo * row_step as usize).min(c_rows);
+        let mut lcur = (2 * b_lo * row_step as usize).min(y_rows);
         let y_lo = (b_lo * row_step as usize) as i32;
         let y_hi = ((b_hi * row_step as usize) as i32).min(height / 2);
         let y_first = if b_lo > 0 { y_lo - row_step } else { y_lo };
@@ -1133,6 +1208,16 @@ pub(crate) fn apply_grain(
         let mut y = y_first;
         while y < y_hi {
             let prelude = y < y_lo;
+            copy_clean_rows(
+                out,
+                picture,
+                ys,
+                cs,
+                &mut lcur,
+                &mut ccur,
+                (2 * (y as usize + row_step as usize)).min(l_end),
+                (y as usize + row_step as usize).min(c_end),
+            );
             let mut row_rng = Rng::line(y * 2, fg.grain_seed);
             let mut x = 0;
             while x < width / 2 {
@@ -1466,6 +1551,7 @@ pub(crate) fn apply_grain(
             }
             y += row_step;
         }
+        copy_clean_rows(out, picture, ys, cs, &mut lcur, &mut ccur, l_end, c_end);
     });
     let _ = so;
 
@@ -1603,5 +1689,57 @@ mod perf5_tests {
             }
         }
         assert_eq!(checked, 3 * 2 * 3 * 2 * 7);
+    }
+}
+
+#[cfg(test)]
+mod grain2_tests {
+    use super::{Picture, apply_grain};
+    use ec_av1_syntax::FilmGrainParams;
+
+    /// lane-grain2: the destination picture is allocated uninitialised and
+    /// filled by the bands' own row copy, so a plane the noise kernels never
+    /// touch -- and the ragged last block row and column of a size that is
+    /// not a multiple of 32 -- must still come back as the clean source,
+    /// sample for sample. An uncovered row would read back as garbage here.
+    #[test]
+    fn untouched_planes_and_ragged_tail_come_back_clean() {
+        let (w, h) = (48usize, 100usize);
+        let src = Picture {
+            width: w,
+            height: h,
+            y: (0..w * h).map(|i| ((i * 7 + 3) % 256) as u16).collect(),
+            u: (0..w * h / 4).map(|i| ((i * 11 + 5) % 256) as u16).collect(),
+            v: (0..w * h / 4).map(|i| ((i * 13 + 9) % 256) as u16).collect(),
+        };
+        let mut fg = FilmGrainParams {
+            apply_grain: true,
+            grain_seed: 0x2f1c,
+            overlap_flag: true,
+            ar_coeff_lag: 2,
+            ar_coeff_shift_minus_6: 1,
+            num_cb_points: 2,
+            cb_mult: 128,
+            cb_luma_mult: 192,
+            cr_mult: 128,
+            cr_luma_mult: 192,
+            ..Default::default()
+        };
+        fg.point_cb_value[..2].copy_from_slice(&[0, 255]);
+        fg.point_cb_scaling[..2].copy_from_slice(&[40, 60]);
+        let fctx = crate::decode::FrameCtx::new();
+        let out = apply_grain(&src, &fg, false, 8, &fctx);
+        assert_eq!(out.y, src.y, "no luma points: the luma plane is the clean copy");
+        assert_eq!(out.v, src.v, "no cr points: the V plane is the clean copy");
+        assert_ne!(out.u, src.u, "cb grain landed on the U plane");
+
+        let mut fg2 = fg;
+        fg2.num_y_points = 2;
+        fg2.point_y_value[..2].copy_from_slice(&[0, 255]);
+        fg2.point_y_scaling[..2].copy_from_slice(&[50, 70]);
+        let out2 = apply_grain(&src, &fg2, false, 8, &fctx);
+        assert_ne!(out2.y, src.y, "luma grain landed");
+        assert_eq!(out2.v, src.v, "no cr points: the V plane is still the clean copy");
+        assert_eq!(out2.y.len(), w * h, "the ragged tail row is present");
     }
 }
