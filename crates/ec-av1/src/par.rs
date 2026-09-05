@@ -125,7 +125,7 @@ where
             // lane-pool1: same shape as the `thread::scope` this replaced --
             // band 0 inline, the rest on this thread's persistent pool, all
             // waited out by `batch`'s drop at the end of the block.
-            let batch = Batch::new();
+            let batch = Batch::new("ec-av1-filter");
             for &(a, b) in rest {
                 let ctx = crate::decode::filter_ctx_copy(fctx);
                 let f = &f;
@@ -239,7 +239,12 @@ impl Pool {
     /// Queues `job` and makes sure a worker is free for it: the pool grows to
     /// `busy + queued` threads and never shrinks, so a submitted job always
     /// starts, even when every other running job is blocked waiting for it.
-    fn push(&mut self, job: Job) {
+    /// `class` names the submitting site of the job that grows the pool, so a
+    /// profiler attributes the thread to the work that created it
+    /// (`ec-av1-frame`, `ec-av1-recon`, `ec-av1-filter`). One pool serves
+    /// every class a thread submits, so later classes on the same pool reuse
+    /// the threads an earlier one named.
+    fn push(&mut self, job: Job, class: &'static str) {
         let want = {
             let mut q = self.inner.q.lock().unwrap();
             q.jobs.push_back(job);
@@ -247,8 +252,13 @@ impl Pool {
         };
         while self.handles.len() < want {
             let inner = std::sync::Arc::clone(&self.inner);
-            self.handles
-                .push(std::thread::spawn(move || pool_worker(&inner)));
+            let name = format!("{class}-{}", self.handles.len());
+            self.handles.push(
+                std::thread::Builder::new()
+                    .name(name)
+                    .spawn(move || pool_worker(&inner))
+                    .expect("spawning an ec-av1 pool worker"),
+            );
         }
         self.inner.cv.notify_one();
     }
@@ -289,12 +299,16 @@ struct BatchState {
 /// indentation for the same guarantee.
 pub(crate) struct Batch<'a> {
     st: std::sync::Arc<BatchState>,
+    class: &'static str,
     _p: std::marker::PhantomData<&'a ()>,
 }
 
 impl<'a> Batch<'a> {
-    pub(crate) fn new() -> Self {
+    /// `class` is the thread-name prefix for any pool worker this batch has
+    /// to spawn -- see [`Pool::push`].
+    pub(crate) fn new(class: &'static str) -> Self {
         Self {
+            class,
             st: std::sync::Arc::new(BatchState {
                 left: std::sync::Mutex::new(0),
                 cv: std::sync::Condvar::new(),
@@ -325,7 +339,7 @@ impl<'a> Batch<'a> {
         let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(job) };
         POOL.with(|p| {
             let mut p = p.borrow_mut();
-            p.get_or_insert_with(Pool::new).push(job);
+            p.get_or_insert_with(Pool::new).push(job, self.class);
         });
     }
 }

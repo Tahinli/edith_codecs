@@ -487,7 +487,7 @@ pub fn decode_stream_with_threads(
     // across frames, so their `thread_local!` decode scratch survives the
     // frame). `jobs` is declared here and dropped at the end of the function,
     // including on `?`, so no job outlives the data it borrows.
-    let jobs = crate::par::Batch::new();
+    let jobs = crate::par::Batch::new("ec-av1-frame");
     // lane-thread1: this stream's per-frame decode state (was 38 thread_local
     // statics in decode.rs) -- one object, threaded down the decode call graph.
     let fctx = &crate::decode::FrameCtx::new();
@@ -3002,9 +3002,12 @@ mod tests {
         // below, are the real diagnosis.
         let mut stdin = child.stdin.take().expect("ffmpeg stdin");
         let payload = stream.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&payload);
-        });
+        let writer = std::thread::Builder::new()
+            .name("ec-av1-ffmpeg-in".into())
+            .spawn(move || {
+                let _ = stdin.write_all(&payload);
+            })
+            .expect("spawning the ffmpeg stdin writer");
         let out = child.wait_with_output().expect("ffmpeg failed to run");
         writer.join().expect("ffmpeg stdin writer thread");
         assert!(
@@ -3064,9 +3067,12 @@ mod tests {
         // below, are the real diagnosis.
         let mut stdin = child.stdin.take().expect("ffmpeg stdin");
         let payload = stream.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&payload);
-        });
+        let writer = std::thread::Builder::new()
+            .name("ec-av1-ffmpeg-in".into())
+            .spawn(move || {
+                let _ = stdin.write_all(&payload);
+            })
+            .expect("spawning the ffmpeg stdin writer");
         let out = child.wait_with_output().expect("ffmpeg failed to run");
         writer.join().expect("ffmpeg stdin writer thread");
         assert!(
@@ -11203,9 +11209,12 @@ mod tests {
                 // does (one 384x256 cq-10 encode hung for 40 minutes).
                 let mut aom_stdin = child.stdin.take().expect("aomenc stdin");
                 let y4m_bytes = y4m.stdout;
-                let feeder = std::thread::spawn(move || {
-                    aom_stdin.write_all(&y4m_bytes).expect("writing y4m to aomenc");
-                });
+                let feeder = std::thread::Builder::new()
+                    .name("ec-av1-aomenc-in".into())
+                    .spawn(move || {
+                        aom_stdin.write_all(&y4m_bytes).expect("writing y4m to aomenc");
+                    })
+                    .expect("spawning the aomenc stdin feeder");
                 let out = child.wait_with_output().expect("aomenc failed to run");
                 feeder.join().expect("y4m feeder thread");
                 assert!(
