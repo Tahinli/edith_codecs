@@ -114,13 +114,6 @@ impl TplField {
         self.cells.iter().filter(|c| c.is_some()).count()
     }
 
-    fn get(&self, row8: usize, col8: usize) -> Option<((i32, i32), i32)> {
-        if row8 < self.rows && col8 < self.cols {
-            self.cells[row8 * self.cols + col8]
-        } else {
-            None
-        }
-    }
 }
 
 /// spec `get_relative_dist` (5.9.3): `a - b` wrapped into the signed range
@@ -508,22 +501,7 @@ pub fn add_tpl_ref_mv(
     cur_offset_0: i32,
     allow_high_precision_mv: bool,
 ) -> Option<TplCandidate> {
-    let pos_row = if mi_row & 1 != 0 {
-        blk_row
-    } else {
-        blk_row + 1
-    };
-    let pos_col = if mi_col & 1 != 0 {
-        blk_col
-    } else {
-        blk_col + 1
-    };
-    let row8 = mi_row as isize + pos_row;
-    let col8 = mi_col as isize + pos_col;
-    if row8 < 0 || col8 < 0 {
-        return None;
-    }
-    let probe = tpl.get(row8 as usize / 2, col8 as usize / 2);
+    let probe = tpl.probe(mi_row, mi_col).cell(blk_row, blk_col);
     if crate::envflags::env_flag!("EC_TRACE_TPL") {
         match probe {
             None => eprintln!("EC_TPL mi_row={mi_row} mi_col={mi_col} blk=({blk_row},{blk_col}) INVALID"),
@@ -534,14 +512,115 @@ pub fn add_tpl_ref_mv(
         }
     }
     let (fwd_mv, ref_frame_offset) = probe?;
-    let projected = get_mv_projection(fwd_mv, cur_offset_0, ref_frame_offset);
-    let mv = lower_mv_precision(projected, allow_high_precision_mv);
-    Some(TplCandidate { mv })
+    Some(TplCandidate {
+        mv: project_tpl_mv(fwd_mv, cur_offset_0, ref_frame_offset, allow_high_precision_mv),
+    })
+}
+
+/// The projection half of [`add_tpl_ref_mv`], split out so a caller holding a
+/// [`TplProbe`] cell can project it to more than one reference offset without
+/// reading the field twice (lane-tpl: the compound stack does exactly that).
+#[inline]
+pub fn project_tpl_mv(
+    fwd_mv: (i32, i32),
+    cur_offset: i32,
+    ref_frame_offset: i32,
+    allow_high_precision_mv: bool,
+) -> (i32, i32) {
+    let projected = get_mv_projection(fwd_mv, cur_offset, ref_frame_offset);
+    lower_mv_precision(projected, allow_high_precision_mv)
+}
+
+/// One query block's view of [`TplField`] (lane-tpl). `add_tpl_ref_mv`'s
+/// parity derivation and row base are the same for every `(blk_row,
+/// blk_col)` the mv stack probes, so they are hoisted here and the per-sample
+/// cost drops to an add, a shift and the bounds check: `row8 = mi_row +
+/// pos_row` with `pos_row = blk_row + (mi_row even)` means the cell index is
+/// `(mi_row + 1 - (mi_row & 1) + blk_row) >> 1`, and an arithmetic shift
+/// keeps the spec's `row8 < 0` rejection exact (`row8 < 0` iff the shifted
+/// index is negative).
+pub struct TplProbe<'a> {
+    cells: &'a [Option<((i32, i32), i32)>],
+    cols: isize,
+    rows: isize,
+    base_row: isize,
+    base_col: isize,
+}
+
+impl TplField {
+    /// [`TplProbe`] for the query block at `(mi_row, mi_col)`.
+    #[inline]
+    pub fn probe(&self, mi_row: usize, mi_col: usize) -> TplProbe<'_> {
+        TplProbe {
+            cells: &self.cells,
+            cols: self.cols as isize,
+            rows: self.rows as isize,
+            base_row: mi_row as isize + 1 - (mi_row & 1) as isize,
+            base_col: mi_col as isize + 1 - (mi_col & 1) as isize,
+        }
+    }
+}
+
+impl TplProbe<'_> {
+    /// The stored `(mv, ref_frame_offset)` at the 8x8-unit offset
+    /// `(blk_row, blk_col)` from the query block, or `None` where the spec's
+    /// probe falls outside the field.
+    #[inline]
+    pub fn cell(&self, blk_row: isize, blk_col: isize) -> Option<((i32, i32), i32)> {
+        let row = (self.base_row + blk_row) >> 1;
+        let col = (self.base_col + blk_col) >> 1;
+        if row < 0 || col < 0 || row >= self.rows || col >= self.cols {
+            return None;
+        }
+        self.cells[(row * self.cols + col) as usize]
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// lane-tpl: `TplProbe::cell` replaced `add_tpl_ref_mv`'s per-sample
+    /// parity derivation with one hoisted base; this pins it against that
+    /// derivation, spelled out, over every parity and every offset the mv
+    /// stack (and its extension samples) can probe with.
+    #[test]
+    fn probe_cell_matches_the_spec_parity_derivation() {
+        let (rows, cols) = (5usize, 6usize);
+        let cells: Vec<Option<((i32, i32), i32)>> = (0..rows * cols)
+            .map(|i| Some(((i as i32, -(i as i32)), 1)))
+            .collect();
+        let tpl = TplField { cols, rows, cells };
+        for mi_row in 0..2 * rows {
+            for mi_col in 0..2 * cols {
+                let probe = tpl.probe(mi_row, mi_col);
+                for blk_row in -4isize..=16 {
+                    for blk_col in -4isize..=16 {
+                        // the spec's own derivation (7.10.2.8)
+                        let pos_row = if mi_row & 1 != 0 { blk_row } else { blk_row + 1 };
+                        let pos_col = if mi_col & 1 != 0 { blk_col } else { blk_col + 1 };
+                        let row8 = mi_row as isize + pos_row;
+                        let col8 = mi_col as isize + pos_col;
+                        let want = if row8 < 0 || col8 < 0 {
+                            None
+                        } else {
+                            let (r, c) = (row8 as usize / 2, col8 as usize / 2);
+                            if r < rows && c < cols {
+                                tpl.cells[r * cols + c]
+                            } else {
+                                None
+                            }
+                        };
+                        assert_eq!(
+                            probe.cell(blk_row, blk_col),
+                            want,
+                            "mi=({mi_row},{mi_col}) blk=({blk_row},{blk_col})"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn relative_dist_wraps_at_order_hint_bits() {
