@@ -2088,6 +2088,11 @@ impl TxParams {
             grid, self.w, self.h, self.bit_depth, self.q_idx, self.dc_delta, self.ac_delta,
             self.tx_type,
         );
+        // An all-zero grid transforms to the empty marker, and a strided copy
+        // of zeros is still zeros: the marker passes straight through.
+        if residual.is_empty() {
+            return residual;
+        }
         if self.stride == 0 {
             return residual;
         }
@@ -2108,12 +2113,34 @@ pub(crate) enum Residual {
 }
 
 impl Residual {
+    /// The record for a transform unit whose coefficient grid is all zero:
+    /// the empty marker, so neither the grid nor the residual is cloned and
+    /// the worker never runs the transform (60% of the 4K segment's units).
+    fn coeffs(tx: TxParams, grid: &[i32]) -> Self {
+        if grid.iter().all(|&c| c == 0) {
+            return Self::Done(Vec::new());
+        }
+        Self::Coeffs(tx, grid.to_vec())
+    }
+
     fn resolve(self) -> Vec<i32> {
         match self {
             Self::Done(v) => v,
             Self::Coeffs(p, grid) => p.run(&grid),
         }
     }
+}
+
+/// An all-zero residual, for the transform units that code no coefficient:
+/// [`crate::transform::dequant_and_inverse_typed_wh`] returns those EMPTY,
+/// and the reconstruction loops below read this instead of a per-unit
+/// `vec![0; w * h]`. Sized for the largest stride a recorded unit can carry
+/// (a 128-wide inter block's prediction stride).
+static ZERO_RESIDUAL: [i32; 128 * 128] = [0; 128 * 128];
+
+/// `residual`, or `n` zeros when it is the empty all-zero marker.
+fn dense_residual(residual: &[i32], n: usize) -> &[i32] {
+    if residual.is_empty() { &ZERO_RESIDUAL[..n] } else { residual }
 }
 
 /// Where a recorded motion-compensated write reads its prediction from.
@@ -2846,7 +2873,7 @@ fn push_intra_tx(
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw, bh, rect, mode, angle_delta, reach,
-        residual: Residual::Coeffs(tx, grid.to_vec()), cfl, filter_intra, smooth_neighbor, pred,
+        residual: Residual::coeffs(tx, grid), cfl, filter_intra, smooth_neighbor, pred,
     });
 }
 
@@ -2877,7 +2904,7 @@ fn push_mc_rect_tx(
             push_op(fctx, ReconOp::Mc {
                 plane, x, y, stride: w, w, h,
                 prediction: PredSrc::Cur { plane: sp, off, src: ss },
-                residual: Residual::Coeffs(tx, grid.to_vec()),
+                residual: Residual::coeffs(tx, grid),
             });
             return;
         }
@@ -2918,7 +2945,7 @@ fn push_mc_rect_tx(
     tx.stride = 0;
     push_op(fctx, ReconOp::Mc {
         plane, x, y, stride: w, w, h, prediction: PredSrc::Owned(window),
-        residual: Residual::Coeffs(tx, grid.to_vec()),
+        residual: Residual::coeffs(tx, grid),
     });
 }
 
@@ -12808,6 +12835,7 @@ impl PlaneBuf<'_> {
                 "@{} OUR_PRED x={x} y={y} bw={bw} bh={bh} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller(), i32::from(smooth_neighbor)
             );
         }
+        let residual = dense_residual(residual, bw * bh);
         for row in 0..bh {
             // Same bottom/right frame-edge clip as [`Self::reconstruct`]'s
             // (lane-sb128c r8) -- a 64x128 block at the right edge of a frame
@@ -12914,6 +12942,7 @@ impl PlaneBuf<'_> {
                 "@{} OUR_PRED x={x} y={y} side={side} side={side} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller(), i32::from(smooth_neighbor)
             );
         }
+        let residual = dense_residual(residual, side * side);
         for row in 0..side {
                 // lane-sb128c r8: libaom's frame buffer is superblock
                 // aligned; ours is padded to 32 (`block_grid`), so a 64x64
@@ -21889,6 +21918,7 @@ impl PlaneBuf<'_> {
         // three row bases are computed once per row instead of a
         // multiply-add per sample (the samples themselves are unchanged).
         let max = crate::decode::sample_max(fctx);
+        let residual = dense_residual(residual, side * h);
         for row in 0..h {
             let src = row * side;
             let dst = (y + row) * self.width + x;
