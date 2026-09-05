@@ -94,24 +94,29 @@ impl MotionField {
     pub(crate) fn cells_mut(&mut self) -> (usize, usize, &mut [Option<SavedMv>]) {
         (self.cols, self.rows, &mut self.cells)
     }
-
-    fn get(&self, row8: usize, col8: usize) -> Option<SavedMv> {
-        if row8 < self.rows && col8 < self.cols {
-            self.cells[row8 * self.cols + col8]
-        } else {
-            None
-        }
-    }
 }
 
+/// lane-mvstack3: one 8x8 temporal-MV cell -- the projected `(mv,
+/// ref_frame_offset)` pair. `motion_field_projection` writes a cell only
+/// with a STRICTLY POSITIVE `ref_frame_offset` (its own `pos_valid` test),
+/// so `0` is exactly libaom's own "this `tpl_mvs` entry was never projected"
+/// marker and the `Option` tag this used to carry was redundant: it cost 8
+/// bytes per cell (20 vs 12) over a field that is 2.6 MB at 4K, read up to
+/// 19 times per inter block.
+pub(crate) type TplCell = ((i32, i32), i32);
+
+/// An unprojected [`TplCell`].
+const TPL_EMPTY: TplCell = ((0, 0), 0);
+
 /// The current frame's projected temporal motion field (spec 7.9.2's
-/// `MotionFieldMvs`): one projected `(mv, ref_frame_offset)` per 8x8 cell,
-/// `None` where no source candidate landed (libaom's `INVALID_MV`).
+/// `MotionFieldMvs`): one projected [`TplCell`] per 8x8 cell, its
+/// `ref_frame_offset` left at `0` where no source candidate landed
+/// (libaom's `INVALID_MV`).
 #[derive(Clone, Debug)]
 pub struct TplField {
     cols: usize,
     rows: usize,
-    cells: Vec<Option<((i32, i32), i32)>>,
+    cells: Vec<TplCell>,
 }
 
 impl TplField {
@@ -119,7 +124,7 @@ impl TplField {
     /// actually filled -- an empty field means every temporal candidate is
     /// silently absent while the entropy stream still matches.
     pub fn filled_cells(&self) -> usize {
-        self.cells.iter().filter(|c| c.is_some()).count()
+        self.cells.iter().filter(|c| c.1 != 0).count()
     }
 
 }
@@ -250,7 +255,7 @@ fn motion_field_projection(
     mi_rows: usize,
     mi_cols: usize,
     dir: u8,
-    tpl_cells: &mut [Option<((i32, i32), i32)>],
+    tpl_cells: &mut [TplCell],
 ) -> bool {
     // libaom's own first two `return 0`s, in order: a key/intra-only start
     // frame is never projected (and so never spends a `ref_stamp` slot --
@@ -281,26 +286,38 @@ fn motion_field_projection(
             )
         }
     });
+    // lane-mvstack3: two of libaom's three `pos_valid` terms do not depend on
+    // the cell at all -- `start_to_current` is one value for the whole field,
+    // and a reference's own offset is one value per `ref_frame` -- so fold
+    // them into a per-ref table read once instead of re-deriving them for
+    // every 8x8 cell (a 4K field is 129600 of them, per direction, per
+    // frame). Same terms, same order of rejection.
+    if start_to_current.abs() > MAX_FRAME_DISTANCE {
+        return true;
+    }
+    let ref_valid: [bool; 8] =
+        std::array::from_fn(|rf| ref_offset[rf] > 0 && ref_offset[rf] <= MAX_FRAME_DISTANCE);
+    let cols = start.cols;
     for row8 in 0..start.rows {
-        for col8 in 0..start.cols {
-            let Some(saved) = start.get(row8, col8) else {
+        // The row is contiguous, so walk it as a slice: `MotionField::get`'s
+        // per-cell bounds test is the same test the loop bounds already make.
+        let row = &start.cells[row8 * cols..][..cols];
+        for (col8, cell) in row.iter().enumerate() {
+            let Some(saved) = *cell else {
                 continue;
             };
             if saved.ref_frame <= 0 {
                 continue;
             }
             let ref_frame_offset = ref_offset[saved.ref_frame as usize];
-            let pos_valid = ref_frame_offset.abs() <= MAX_FRAME_DISTANCE
-                && ref_frame_offset > 0
-                && start_to_current.abs() <= MAX_FRAME_DISTANCE;
-            if !pos_valid {
+            if !ref_valid[saved.ref_frame as usize] {
                 continue;
             }
             let projected = get_mv_projection(saved.mv, start_to_current, ref_frame_offset);
             if let Some((r, c)) =
                 get_block_position(mvs_rows, mvs_cols, row8, col8, projected, dir >> 1 == 1)
             {
-                tpl_cells[r * mvs_cols + c] = Some((saved.mv, ref_frame_offset));
+                tpl_cells[r * mvs_cols + c] = (saved.mv, ref_frame_offset);
             }
         }
     }
@@ -348,7 +365,7 @@ pub fn setup_motion_field<M: std::borrow::Borrow<MotionField>>(
 ) -> TplField {
     let cols = mi_cols.div_ceil(2);
     let rows = mi_rows.div_ceil(2);
-    let mut cells = vec![None; cols * rows];
+    let mut cells = vec![TPL_EMPTY; cols * rows];
     // `av1_setup_motion_field`'s own head: `if (!enable_order_hint) return;`
     // leaves every `tpl_mvs` cell INVALID.
     if order_hint_bits == 0 {
@@ -474,7 +491,7 @@ pub fn setup_motion_field<M: std::borrow::Borrow<MotionField>>(
         eprintln!("EC_TPL_FIELD oh={cur_order_hint} rows={rows} cols={cols}");
         for r in 0..rows {
             let row: String = (0..cols)
-                .map(|c| if cells[r * cols + c].is_some() { '#' } else { '.' })
+                .map(|c| if cells[r * cols + c].1 != 0 { '#' } else { '.' })
                 .collect();
             eprintln!("EC_TPL_FIELD r{r} {row}");
         }
@@ -548,7 +565,7 @@ pub fn project_tpl_mv(
 /// keeps the spec's `row8 < 0` rejection exact (`row8 < 0` iff the shifted
 /// index is negative).
 pub struct TplProbe<'a> {
-    cells: &'a [Option<((i32, i32), i32)>],
+    cells: &'a [TplCell],
     cols: isize,
     rows: isize,
     base_row: isize,
@@ -580,7 +597,8 @@ impl TplProbe<'_> {
         if row < 0 || col < 0 || row >= self.rows || col >= self.cols {
             return None;
         }
-        self.cells[(row * self.cols + col) as usize]
+        let cell = self.cells[(row * self.cols + col) as usize];
+        if cell.1 == 0 { None } else { Some(cell) }
     }
 }
 
@@ -595,8 +613,8 @@ mod tests {
     #[test]
     fn probe_cell_matches_the_spec_parity_derivation() {
         let (rows, cols) = (5usize, 6usize);
-        let cells: Vec<Option<((i32, i32), i32)>> = (0..rows * cols)
-            .map(|i| Some(((i as i32, -(i as i32)), 1)))
+        let cells: Vec<TplCell> = (0..rows * cols)
+            .map(|i| ((i as i32, -(i as i32)), 1))
             .collect();
         let tpl = TplField { cols, rows, cells };
         for mi_row in 0..2 * rows {
@@ -614,7 +632,7 @@ mod tests {
                         } else {
                             let (r, c) = (row8 as usize / 2, col8 as usize / 2);
                             if r < rows && c < cols {
-                                tpl.cells[r * cols + c]
+                                Some(tpl.cells[r * cols + c])
                             } else {
                                 None
                             }
@@ -628,6 +646,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// lane-mvstack3: [`TplCell`] dropped its `Option` tag for the
+    /// `ref_frame_offset == 0` sentinel `motion_field_projection` already
+    /// guarantees (it only ever stores a strictly positive offset). This pins
+    /// that sentinel: an unprojected cell must still read as `None` through
+    /// [`TplProbe::cell`], and a projected one with a zero MV must not.
+    #[test]
+    fn an_unprojected_tpl_cell_reads_as_none_but_a_zero_mv_one_does_not() {
+        let (rows, cols) = (2usize, 2usize);
+        let cells: Vec<TplCell> = vec![TPL_EMPTY, ((0, 0), 3), ((7, -7), 1), TPL_EMPTY];
+        let tpl = TplField { cols, rows, cells };
+        // mi=(0,0) probes cell (0,0) at blk (-1,-1) and (0,1) at blk (-1,1).
+        let probe = tpl.probe(0, 0);
+        assert_eq!(probe.cell(-1, -1), None, "unprojected cell");
+        assert_eq!(probe.cell(-1, 1), Some(((0, 0), 3)), "projected zero mv");
+        assert_eq!(probe.cell(1, -1), Some(((7, -7), 1)));
+        assert_eq!(probe.cell(1, 1), None, "unprojected cell");
+        assert_eq!(tpl.filled_cells(), 2);
     }
 
     #[test]
