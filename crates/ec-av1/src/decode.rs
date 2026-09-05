@@ -2275,7 +2275,11 @@ pub(crate) struct PredBuild(
             &mut PlaneBuf<'static>,
             &mut PlaneBuf<'static>,
             &crate::decode::FrameCtx,
-        ) -> [Vec<u16>; 3],
+            // lane-blockmem: the previous block's three prediction buffers,
+            // refilled in place -- the build used to return three fresh
+            // `Vec`s per block and drop these.
+            &mut [Vec<u16>; 3],
+        ),
     >,
 );
 
@@ -2290,6 +2294,21 @@ fn recon_deferred(fctx: &crate::decode::FrameCtx) -> bool {
     fctx.recon_planes.with(std::cell::Cell::get).is_none()
 }
 
+/// The previous block's prediction buffer, cleared and zero-filled to `n`
+/// (lane-blockmem): the same bytes the `vec![0u16; n]` it replaces produced,
+/// without the per-block allocation and free.
+fn refill(mut v: Vec<u16>, n: usize) -> Vec<u16> {
+    // A buffer that has to grow anyway is cheaper allocated zeroed (`calloc`)
+    // than resized element by element -- which is every block on the inline
+    // path, where there is no previous buffer to reuse.
+    if v.capacity() < n {
+        return vec![0u16; n];
+    }
+    v.clear();
+    v.resize(n, 0);
+    v
+}
+
 /// Records one block's prediction build for the worker that reconstructs it.
 #[allow(unsafe_code)]
 fn push_pred<'a>(
@@ -2299,17 +2318,16 @@ fn push_pred<'a>(
         &mut PlaneBuf<'static>,
         &mut PlaneBuf<'static>,
         &crate::decode::FrameCtx,
-    ) -> [Vec<u16>; 3]
-    + 'a,
+        &mut [Vec<u16>; 3],
+    ) + 'a,
 ) {
-    type Built = [Vec<u16>; 3];
     type Dyn<'x> = dyn FnOnce(
         &mut PlaneBuf<'static>,
         &mut PlaneBuf<'static>,
         &mut PlaneBuf<'static>,
         &crate::decode::FrameCtx,
-    ) -> Built
-        + 'x;
+        &mut [Vec<u16>; 3],
+    ) + 'x;
     let boxed: Box<Dyn<'a>> = Box::new(f);
     // SAFETY: see [`PredBuild`] -- every worker is joined by [`WaveGuard`]
     // before the borrows the closure holds go out of scope.
@@ -2723,7 +2741,15 @@ impl Drop for WaveGuard<'_> {
 fn wave_submit(fctx: &crate::decode::FrameCtx, r: usize, c: usize) -> bool {
     let st = fctx.wave.with(|w| w.borrow().clone());
     let Some(st) = st else { return false };
-    let ops = fctx.recon_ops.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    // lane-blockmem: the op list is replaced sized for the next superblock,
+    // exactly as the two arenas below are -- taking it left a zero-capacity
+    // `Vec` that regrew (and memmoved every recorded op) from nothing on
+    // every superblock.
+    let ops = fctx.recon_ops.with(|c| {
+        let mut c = c.borrow_mut();
+        let cap = c.len();
+        std::mem::replace(&mut *c, Vec::with_capacity(cap))
+    });
     // The job owns its coefficients: the arena is replaced by an empty one
     // sized for the next superblock, so parse never regrows from nothing and
     // the worker frees this buffer once, instead of once per unit.
@@ -3095,7 +3121,7 @@ fn exec_op(
 ) {
     let mut scratch = Vec::new();
     match op {
-        ReconOp::Pred(b) => *cur = (b.0)(y, u, v, fctx),
+        ReconOp::Pred(b) => (b.0)(y, u, v, fctx, cur),
         ReconOp::Intra {
             plane, x, y: oy, bw, bh, rect, mode, angle_delta, reach, residual, cfl,
             filter_intra, smooth_neighbor, pred,
@@ -24701,8 +24727,8 @@ fn decode_inter_block(
             let build = move |_y: &mut PlaneBuf<'static>,
                               _u: &mut PlaneBuf<'static>,
                               _v: &mut PlaneBuf<'static>,
-                              fctx: &crate::decode::FrameCtx|
-             -> [Vec<u16>; 3] {
+                              fctx: &crate::decode::FrameCtx,
+                              out: &mut [Vec<u16>; 3]| {
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate_kern(
                 &py0.data,
@@ -24757,7 +24783,7 @@ fn decode_inter_block(
                     side as i32, side as i32, 0, 0, fctx,
                 );
             }
-            let mut pred_y = vec![0u16; side * side];
+            let mut pred_y = refill(std::mem::take(&mut out[0]), side * side);
             let mut diffwtd_mask_y;
             // lane-wedge r3: `mask_y` is the DIFFWTD buffer just computed OR
             // the wedge codebook lookup (comp_group_idx==1's two mutually
@@ -24837,7 +24863,7 @@ fn decode_inter_block(
                     );
                 }
             }
-            let mut pred_u = vec![0u16; chroma_side * chroma_side];
+            let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_side * chroma_side);
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
                     &inter0_u,
@@ -24911,7 +24937,7 @@ fn decode_inter_block(
                     );
                 }
             }
-            let mut pred_v = vec![0u16; chroma_side * chroma_side];
+            let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_side * chroma_side);
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
                     &inter0_v,
@@ -24929,7 +24955,7 @@ fn decode_inter_block(
 
             // lane-inter4 r2: a rectangular strip's transform tree starts from
             // its own rect `max_txsize_rect_lookup` entry, not a square one.
-            [pred_y, pred_u, pred_v]
+            *out = [pred_y, pred_u, pred_v];
             };
             let (pred_y, pred_u, pred_v): (Vec<u16>, Vec<u16>, Vec<u16>);
             let (sy, su, sv) = if recon_deferred(fctx) {
@@ -24940,7 +24966,9 @@ fn decode_inter_block(
                     Pred::Cur { plane: 2, stride: chroma_side, off: 0 },
                 )
             } else {
-                let [by, bu, bv] = build(y, u, v, fctx);
+                let mut built: [Vec<u16>; 3] = Default::default();
+                build(y, u, v, fctx, &mut built);
+                let [by, bu, bv] = built;
                 (pred_y, pred_u, pred_v) = (by, bu, bv);
                 (
                     Pred::Inline(&pred_y, side),
@@ -25923,11 +25951,11 @@ fn decode_inter_block(
             let build = move |y: &mut PlaneBuf<'static>,
                               u: &mut PlaneBuf<'static>,
                               v: &mut PlaneBuf<'static>,
-                              fctx: &crate::decode::FrameCtx|
-             -> [Vec<u16>; 3] {
-            let mut pred_y = vec![0u16; side * side];
-            let mut pred_u = vec![0u16; chroma_side * chroma_side];
-            let mut pred_v = vec![0u16; chroma_side * chroma_side];
+                              fctx: &crate::decode::FrameCtx,
+                              out: &mut [Vec<u16>; 3]| {
+            let mut pred_y = refill(std::mem::take(&mut out[0]), side * side);
+            let mut pred_u = refill(std::mem::take(&mut out[1]), chroma_side * chroma_side);
+            let mut pred_v = refill(std::mem::take(&mut out[2]), chroma_side * chroma_side);
             if luma_scale == mc::REF_NO_SCALE {
                 mc::predict_with_filters_kern(
                     &py_ref.data,
@@ -26084,7 +26112,7 @@ fn decode_inter_block(
                     &mut pred_v, fctx,
                 );
             }
-            [pred_y, pred_u, pred_v]
+            *out = [pred_y, pred_u, pred_v];
             };
             // OBMC and interintra are mutually exclusive (`motion_mode` is
             // never read for an interintra block), so blending interintra
@@ -26109,7 +26137,9 @@ fn decode_inter_block(
                 if interintra_mode.is_some() {
                     flush_recon(fctx, y, u, v);
                 }
-                let [by, bu, bv] = build(y, u, v, fctx);
+                let mut built: [Vec<u16>; 3] = Default::default();
+                build(y, u, v, fctx, &mut built);
+                let [by, bu, bv] = built;
                 (pred_y, pred_u, pred_v) = (by, bu, bv);
             if obmc_selected {
                 obmc_blend(
