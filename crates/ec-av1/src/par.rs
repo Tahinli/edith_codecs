@@ -133,3 +133,31 @@ where
         }
     }
 }
+
+/// `EC_AV1_RECON_THREADS`, the number of worker threads a tile's
+/// reconstruction (lane-wave1) is spread across, in superblock-row wavefront
+/// order (default 1 = reconstruct inline at the parse site, i.e. exactly the
+/// pre-wavefront decoder). Read once per process, same shape as
+/// [`filter_threads`].
+static RECON_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn recon_threads() -> usize {
+    match RECON_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let n = crate::envflags::var("EC_AV1_RECON_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 64);
+            RECON_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+            n
+        }
+        n => n,
+    }
+}
+
+/// Test-only override of [`recon_threads`] -- see [`set_filter_threads`].
+#[cfg(test)]
+pub(crate) fn set_recon_threads(n: usize) {
+    RECON_THREADS.store(n.clamp(1, 64), std::sync::atomic::Ordering::Relaxed);
+}
