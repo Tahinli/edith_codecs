@@ -17561,6 +17561,7 @@ fn lf_level(
 /// edge" suppression (which only ever fires at a non-PU-edge TU boundary)
 /// never applies here, letting this skip the `skip`/`skip_txfm` lookup
 /// entirely. Returns `None` when this 4-pixel edge group is not filtered.
+#[inline(always)]
 fn edge_params(
     lf: &LoopFilterParams,
     n: &Neighbours,
@@ -17581,9 +17582,37 @@ fn edge_params(
     } else {
         tx_h_px_at(n, chroma, mi_r, mi_c)
     };
-    if cur_tx == 0 || (if dir == 0 { x0 } else { y0 }) % cur_tx as usize != 0 {
+    // lane-deblock: `cur_tx` is a power-of-two pixel size, so the alignment
+    // test is a mask, not the hardware `divl` this used to emit (10.7% of
+    // `edge_params`' own samples sat on that divide's result test).
+    //
+    // Most 4-pixel edge groups die right here (a 4-aligned coordinate that
+    // the covering transform does not start at), so this head is inlined
+    // into the deblock loops and only survivors pay the call and the
+    // register-spilling prologue of the body below.
+    if cur_tx == 0 || (if dir == 0 { x0 } else { y0 }) & (cur_tx as usize - 1) != 0 {
         return None;
     }
+    edge_params_body(lf, n, plane_idx, dir, chroma, x0, y0, mi_r, mi_c, cur_tx, seg_lf_active, fctx)
+}
+
+/// [`edge_params`] past its transform-alignment gate.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn edge_params_body(
+    lf: &LoopFilterParams,
+    n: &Neighbours,
+    plane_idx: usize,
+    dir: usize,
+    chroma: bool,
+    x0: usize,
+    y0: usize,
+    mi_r: usize,
+    mi_c: usize,
+    cur_tx: u32,
+    seg_lf_active: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> Option<(u8, i32)> {
     let cur_ref = n.ref_grid[mi_r * n.skip_grid_cols_mi + mi_c];
     // `mode_step` (`set_lpf_parameters`): one mi for luma, `1 << ss` for
     // chroma -- the previous cell must keep the odd parity `plane_to_mi`
@@ -18062,6 +18091,7 @@ mod deblock_simd {
         [0, 0, 1, 1, 1, 2, 1, 2],
         [0, 0, 0, 1, 1, 1, 2, 3],
     ];
+    #[allow(dead_code)] // superseded by the running-sum rows; kept as the weights' statement
     const W14: [[i16; 14]; 12] = [
         [7, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
         [5, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0],
@@ -18083,24 +18113,42 @@ mod deblock_simd {
     ///
     /// # Safety
     /// Requires AVX2.
+    ///
+    /// lane-deblock: the tap count, the weights and the shift are all const
+    /// here (they were slice parameters, which left the weight `match` as a
+    /// runtime branch and a `movzwl` per tap -- `testl`/`je`/`movzwl` were
+    /// 34% of this kernel's samples, and the spilled tap slices another 17%).
     #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn wsum(taps: &[__m256i], w: &[i16], shift: i32) -> __m256i {
+    #[inline] // rust#145574: `inline(always)` is rejected on a `target_feature` fn
+    unsafe fn wsum<const N: usize, const SHIFT: i32>(
+        taps: &[__m256i; N],
+        w: &[i16; N],
+    ) -> __m256i {
         let mut s = _mm256_setzero_si256();
-        for (t, &k) in taps.iter().zip(w) {
-            match k {
+        for i in 0..N {
+            match w[i] {
                 0 => {}
-                1 => s = _mm256_add_epi16(s, *t),
-                2 => s = _mm256_add_epi16(s, _mm256_add_epi16(*t, *t)),
-                _ => s = _mm256_add_epi16(s, _mm256_mullo_epi16(*t, _mm256_set1_epi16(k))),
+                1 => s = _mm256_add_epi16(s, taps[i]),
+                2 => s = _mm256_add_epi16(s, _mm256_add_epi16(taps[i], taps[i])),
+                k => s = _mm256_add_epi16(s, _mm256_mullo_epi16(taps[i], _mm256_set1_epi16(k))),
             }
         }
-        let s = _mm256_add_epi16(s, _mm256_set1_epi16(1 << (shift - 1)));
-        if shift == 3 {
+        let s = _mm256_add_epi16(s, _mm256_set1_epi16(1 << (SHIFT - 1)));
+        if SHIFT == 3 {
             _mm256_srli_epi16(s, 3)
         } else {
             _mm256_srli_epi16(s, 4)
         }
+    }
+
+    /// One wide-kernel row set, unrolled so each `wsum` sees its weight row
+    /// as a constant.
+    macro_rules! wrows {
+        ($r:expr, $off:expr, $tbl:ident, $taps:expr, $shift:literal, $flat:expr, $($j:literal),*) => {
+            $(
+                $r[$off + $j] = _mm256_blendv_epi8($r[$off + $j], wsum::<_, $shift>(&$taps, &$tbl[$j]), $flat);
+            )*
+        };
     }
 
     /// [`super::filter_edge`]'s body for 16 lines held as `t[0..16]`, `q0` in
@@ -18200,14 +18248,10 @@ mod deblock_simd {
             let flat = _mm256_and_si256(le(fl, fthr), mask);
             if len == 6 {
                 let taps = [p2, p1, p0, q0, q1, q2];
-                for (j, w) in W6.iter().enumerate() {
-                    r[4 + j] = _mm256_blendv_epi8(r[4 + j], wsum(&taps, w, 3), flat);
-                }
+                wrows!(r, 4, W6, taps, 3, flat, 0, 1, 2, 3);
             } else {
                 let taps = [p3, p2, p1, p0, q0, q1, q2, q3];
-                for (j, w) in W8.iter().enumerate() {
-                    r[3 + j] = _mm256_blendv_epi8(r[3 + j], wsum(&taps, w, 3), flat);
-                }
+                wrows!(r, 3, W8, taps, 3, flat, 0, 1, 2, 3, 4, 5);
                 if len > 8 {
                     let fl2 = _mm256_max_epi16(
                         _mm256_max_epi16(
@@ -18217,10 +18261,57 @@ mod deblock_simd {
                         _mm256_max_epi16(ad(p6, p0), ad(q6, q0)),
                     );
                     let flat2 = _mm256_and_si256(le(fl2, fthr), flat);
-                    let taps = [p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5, q6];
-                    for (j, w) in W14.iter().enumerate() {
-                        r[j] = _mm256_blendv_epi8(r[j], wsum(&taps, w, 4), flat2);
+                    // lane-deblock: `filter14`'s twelve rows as a RUNNING
+                    // sum. Consecutive `W14` rows differ by three or four
+                    // taps (row j+1 - row j is a constant vector with two
+                    // negative and two positive entries), so each output
+                    // costs one add, one sub and the rounding shift instead
+                    // of a fresh 14-tap weighted sum -- 168 tap operations
+                    // become 44. Exact: every partial sum is taken mod
+                    // 2^16 by `add/sub_epi16` and every ROW sum is a real
+                    // `W14` row, at most `16 * 4095 + 8 < 2^16`, so the
+                    // unsigned rounding shift sees the true value.
+                    // `deblock_simd_kernel_matches_the_scalar_filter` pins
+                    // it against `filter_edge` at 8/10/12-bit.
+                    let mut s = _mm256_add_epi16(
+                        _mm256_add_epi16(
+                            _mm256_mullo_epi16(p6, _mm256_set1_epi16(7)),
+                            _mm256_slli_epi16(_mm256_add_epi16(p5, p4), 1),
+                        ),
+                        _mm256_add_epi16(
+                            _mm256_add_epi16(_mm256_add_epi16(p3, p2), _mm256_add_epi16(p1, p0)),
+                            q0,
+                        ),
+                    );
+                    macro_rules! row14 {
+                        ($idx:literal) => {
+                            r[$idx] = _mm256_blendv_epi8(
+                                r[$idx],
+                                _mm256_srli_epi16(
+                                    _mm256_add_epi16(s, _mm256_set1_epi16(8)),
+                                    4,
+                                ),
+                                flat2,
+                            );
+                        };
+                        ($idx:literal, $plus:expr, $minus:expr) => {
+                            s = _mm256_sub_epi16(_mm256_add_epi16(s, $plus), $minus);
+                            row14!($idx);
+                        };
                     }
+                    let add2 = |a, b| _mm256_add_epi16(a, b);
+                    row14!(0);
+                    row14!(1, add2(p3, q1), _mm256_slli_epi16(p6, 1));
+                    row14!(2, add2(p2, q2), add2(p6, p5));
+                    row14!(3, add2(p1, q3), add2(p6, p4));
+                    row14!(4, add2(p0, q4), add2(p6, p3));
+                    row14!(5, add2(q0, q5), add2(p6, p2));
+                    row14!(6, add2(q1, q6), add2(p6, p1));
+                    row14!(7, add2(q2, q6), add2(p5, p0));
+                    row14!(8, add2(q3, q6), add2(p4, q0));
+                    row14!(9, add2(q4, q6), add2(p3, q1));
+                    row14!(10, add2(q5, q6), add2(p2, q2));
+                    row14!(11, _mm256_slli_epi16(q6, 1), add2(p1, q3));
                 }
             }
         }
