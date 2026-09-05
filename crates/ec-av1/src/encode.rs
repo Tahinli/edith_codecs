@@ -28,7 +28,7 @@ use crate::frame::frame_obu;
 use crate::intra::{D67_PRED, DC_PRED, KEY_FRAME_MODES, V_PRED};
 use crate::mc;
 use crate::motion;
-use crate::mvstack::{MiGrid, MiInfo, MvStack, find_mv_stack};
+use crate::mvstack::{MiGrid, MiInfo, MvStack, NO_REF1, find_mv_stack};
 use crate::obu::temporal_delimiter;
 use crate::quant::ac_q;
 use crate::sequence::sequence_header_obu;
@@ -3097,8 +3097,8 @@ pub(crate) fn encode_inter_frame(
                                     Some(info) => MiInfo {
                                         is_inter: true,
                                         ref_frame: LAST_FRAME,
-                                        ref_frame1: None,
-                                        mv1: None,
+                                        ref_frame1: NO_REF1,
+                                        mv1: (0, 0),
                                         mv: info.mv,
                                         is_new_mv: matches!(info.mode, InterMode::NewMv),
                                         size: 8,
@@ -3113,8 +3113,8 @@ pub(crate) fn encode_inter_frame(
                                     None => MiInfo {
                                         is_inter: false,
                                         ref_frame: -1,
-                                        ref_frame1: None,
-                                        mv1: None,
+                                        ref_frame1: NO_REF1,
+                                        mv1: (0, 0),
                                         mv: (0, 0),
                                         is_new_mv: false,
                                         size: 8,
@@ -3195,8 +3195,8 @@ pub(crate) fn encode_inter_frame(
                                             Some(info) => MiInfo {
                                                 is_inter: true,
                                                 ref_frame: LAST_FRAME,
-                                                ref_frame1: None,
-                                                mv1: None,
+                                                ref_frame1: NO_REF1,
+                                                mv1: (0, 0),
                                                 mv: info.mv,
                                                 is_new_mv: matches!(info.mode, InterMode::NewMv),
                                                 size: 4,
@@ -3207,8 +3207,8 @@ pub(crate) fn encode_inter_frame(
                                             None => MiInfo {
                                                 is_inter: false,
                                                 ref_frame: -1,
-                                                ref_frame1: None,
-                                                mv1: None,
+                                                ref_frame1: NO_REF1,
+                                                mv1: (0, 0),
                                                 mv: (0, 0),
                                                 is_new_mv: false,
                                                 size: 4,
@@ -3255,8 +3255,8 @@ pub(crate) fn encode_inter_frame(
                                                 Some(info) => MiInfo {
                                                     is_inter: true,
                                                     ref_frame: LAST_FRAME,
-                                                    ref_frame1: None,
-                                                    mv1: None,
+                                                    ref_frame1: NO_REF1,
+                                                    mv1: (0, 0),
                                                     mv: info.mv,
                                                     is_new_mv: matches!(
                                                         info.mode,
@@ -3270,8 +3270,8 @@ pub(crate) fn encode_inter_frame(
                                                 None => MiInfo {
                                                     is_inter: false,
                                                     ref_frame: -1,
-                                                    ref_frame1: None,
-                                                    mv1: None,
+                                                    ref_frame1: NO_REF1,
+                                                    mv1: (0, 0),
                                                     mv: (0, 0),
                                                     is_new_mv: false,
                                                     size: 2,

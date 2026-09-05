@@ -220,7 +220,7 @@ use crate::mc;
 use crate::msac::SymbolDecoder;
 use crate::mvstack::{
     ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME, LAST3_FRAME,
-    MiGrid, MiInfo, NO_SIGN_BIAS, NeighbourRef, SignBiasTable, comp_reference_type_ctx,
+    MiGrid, MiInfo, NO_REF1, NO_SIGN_BIAS, NeighbourRef, SignBiasTable, comp_reference_type_ctx,
     find_mv_stack_with_sign_bias, reference_mode_ctx,
     single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx,
     single_ref_p6_ctx, uni_comp_ref_p1_ctx,
@@ -3316,9 +3316,9 @@ fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>
         let info = crate::mvstack::MiInfo {
             is_inter: dv.is_some(),
             ref_frame: 0,
-            ref_frame1: None,
+            ref_frame1: NO_REF1,
             mv: dv.unwrap_or((0, 0)),
-            mv1: None,
+            mv1: (0, 0),
             is_new_mv: dv.is_some(),
             is_global_mv0: false,
             is_global_mv1: false,
@@ -4782,7 +4782,7 @@ pub(crate) fn build_motion_field(
             let mut saved: Option<crate::motion_field::SavedMv> = None;
             for (rf, mv) in [
                 (info.ref_frame, Some(info.mv)),
-                (info.ref_frame1.unwrap_or(0), info.mv1),
+                (info.ref_frame1.max(0), Some(info.mv1)),
             ] {
                 let (Some(mv), true) = (mv, rf > 0) else {
                     continue;
@@ -22599,7 +22599,7 @@ fn find_samples(
         && crate::envflags::var("EC_PROJ_MI")
             .is_ok_and(|v| v == format!("{mi_row},{mi_col}"));
     let single_ref_match = |info: &MiInfo| {
-        let m = info.ref_frame == ref_frame && info.ref_frame1.is_none();
+        let m = info.ref_frame == ref_frame && info.ref_frame1 == NO_REF1;
         if proj_dbg {
             eprintln!(
                 "EC_PROJ cand ref={} ref1={:?} size={} size_h={} is_inter={} want={ref_frame} match={m}",
@@ -24240,8 +24240,8 @@ fn decode_inter_block(
                 MiInfo {
                     is_inter: true,
                     ref_frame: ref0,
-                    ref_frame1: Some(ref1),
-                    mv1: Some(mv1),
+                    ref_frame1: ref1,
+                    mv1,
                     mv: mv0,
                     is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                     size: bw4 as u8,
@@ -25800,8 +25800,8 @@ fn decode_inter_block(
                     // requires ref_frame[1] == NONE_FRAME, so such a
                     // neighbour must not donate samples or count in
                     // num_proj_ref.
-                    ref_frame1: interintra_mode.map(|_| 0),
-                    mv1: None,
+                    ref_frame1: if interintra_mode.is_some() { 0 } else { NO_REF1 },
+                    mv1: (0, 0),
                     mv,
                     is_new_mv,
                     size: bw4 as u8,
@@ -26624,8 +26624,8 @@ fn decode_inter_block(
                 MiInfo {
                     is_inter: false,
                     ref_frame: -1,
-                    ref_frame1: None,
-                    mv1: None,
+                    ref_frame1: NO_REF1,
+                    mv1: (0, 0),
                     mv: (0, 0),
                     is_new_mv: false,
                     size: (write_w / MI) as u8,
@@ -26846,8 +26846,8 @@ fn decode_inter_block(
             MiInfo {
                 is_inter: false,
                 ref_frame: -1,
-                ref_frame1: None,
-                mv1: None,
+                ref_frame1: NO_REF1,
+                mv1: (0, 0),
                 mv: (0, 0),
                 is_new_mv: false,
                 size: (side / 4) as u8,
@@ -27755,8 +27755,8 @@ fn decode_inter_sub8_split4(
             MiInfo {
                 is_inter: true,
                 ref_frame,
-                ref_frame1: None,
-                mv1: None,
+                ref_frame1: NO_REF1,
+                mv1: (0, 0),
                 mv,
                 is_new_mv,
                 size: 1,
@@ -28295,8 +28295,8 @@ fn decode_intra_sub8_leaf(
         MiInfo {
             is_inter: false,
             ref_frame: -1,
-            ref_frame1: None,
-            mv1: None,
+            ref_frame1: NO_REF1,
+            mv1: (0, 0),
             mv: (0, 0),
             is_new_mv: false,
             size: w_mi as u8,
@@ -28998,8 +28998,8 @@ fn grid_stamp_rect(
         MiInfo {
             is_inter: true,
             ref_frame,
-            ref_frame1: None,
-            mv1: None,
+            ref_frame1: NO_REF1,
+            mv1: (0, 0),
             mv,
             is_new_mv,
             size: w_mi as u8,
@@ -29577,8 +29577,8 @@ fn decode_inter_block8(
                     MiInfo {
                         is_inter: true,
                         ref_frame: ref0,
-                        ref_frame1: Some(ref1),
-                        mv1: Some(mv1),
+                        ref_frame1: ref1,
+                        mv1,
                         mv: mv0,
                         is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                         size: 2,
@@ -30254,8 +30254,8 @@ fn decode_inter_block8(
                 ref_frame,
                 // INTRA_FRAME marker for interintra blocks -- keeps
                 // them out of warp-sample gathering (see 16/32 site).
-                ref_frame1: interintra_mode.map(|_| 0),
-                mv1: None,
+                ref_frame1: if interintra_mode.is_some() { 0 } else { NO_REF1 },
+                mv1: (0, 0),
                 mv,
                 is_new_mv,
                 size: 2,
@@ -30714,8 +30714,8 @@ fn decode_inter_block8(
             MiInfo {
                 is_inter: false,
                 ref_frame: -1,
-                ref_frame1: None,
-                mv1: None,
+                ref_frame1: NO_REF1,
+                mv1: (0, 0),
                 mv: (0, 0),
                 is_new_mv: false,
                 size: 2,
@@ -35498,8 +35498,8 @@ mod tests {
         let neighbour = |mv| MiInfo {
             is_inter: true,
             ref_frame: LAST_FRAME,
-            ref_frame1: None,
-            mv1: None,
+            ref_frame1: NO_REF1,
+            mv1: (0, 0),
             mv,
             is_new_mv: false,
             size: 1,
