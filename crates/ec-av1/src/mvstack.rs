@@ -2390,6 +2390,19 @@ pub(crate) fn comp_reference_type_ctx(
 
 #[cfg(test)]
 mod tests {
+    /// lane-mi: a 4K frame's grid is ~518k cells, refilled per frame, and
+    /// every mv-stack scan walks it -- `size`/`size_h` as `u8` keep the
+    /// option under 32 bytes. Widening a field here is a measurable
+    /// regression, not a free change.
+    #[test]
+    fn mi_info_stays_small_enough_for_a_4k_grid() {
+        assert!(
+            std::mem::size_of::<Option<MiInfo>>() <= 32,
+            "Option<MiInfo> grew to {} bytes",
+            std::mem::size_of::<Option<MiInfo>>()
+        );
+    }
+
     use super::*;
 
     fn inter(mv: (i32, i32)) -> MiInfo {
