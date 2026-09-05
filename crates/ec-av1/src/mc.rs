@@ -8,6 +8,7 @@
 //! in 1/16-pel steps -- luma motion vectors are stored at 1/8-pel and always
 //! land on an even step; chroma vectors, once scaled for subsampling, can
 //! land on any of the 16.
+use crate::hits::hit;
 
 /// `Round2` (spec 4.7): halves round up.
 fn round2(value: i32, shift: u32) -> i32 {
@@ -1133,7 +1134,7 @@ pub(crate) fn predict_with_filters_kern(
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
-    INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
+    hit!(INTER_PRED_HITS);
 
     #[cfg(test)]
     let stage_t = std::time::Instant::now();
@@ -1328,7 +1329,7 @@ pub fn reset_rect_narrow_kern_hits() {
 /// the destination buffer's dims would not have.
 fn note_narrow_kern(block_w: usize, block_h: usize, kern_w: usize, kern_h: usize) {
     if (kern_w <= 4) != (block_w <= 4) || (kern_h <= 4) != (block_h <= 4) {
-        RECT_NARROW_KERN_HITS.with(|c| c.set(c.get() + 1));
+        hit!(RECT_NARROW_KERN_HITS);
     }
 }
 
@@ -1514,8 +1515,8 @@ pub(crate) fn predict_scaled_kern(
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
-    INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
-    PREDICT_SCALED_HITS.with(|c| c.set(c.get() + 1));
+    hit!(INTER_PRED_HITS);
+    hit!(PREDICT_SCALED_HITS);
 
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
@@ -1655,10 +1656,10 @@ pub fn predict_compound_intermediate_kern(
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
-    INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
+    hit!(INTER_PRED_HITS);
 
     if x_scale_fp != REF_NO_SCALE {
-        PREDICT_SCALED_HITS.with(|c| c.set(c.get() + 1));
+        hit!(PREDICT_SCALED_HITS);
     }
 
     let y0 = y_q4.div_euclid(16);
