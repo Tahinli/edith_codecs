@@ -16,7 +16,7 @@ use ec_core::{Error, Result};
 use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::msac::SymbolEncoder;
-use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, single_ref_ctx};
+use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16, single_ref_ctx};
 
 /// round-4 av1-truesize debugging aid: prints `msg()` to stderr when the
 /// `EC_RNG` environment variable is set, mirroring the `EC_PART`/`EC_TOK`
@@ -2436,7 +2436,7 @@ pub fn sb_coeff_inter_frame_tile(
                             ref_frame: LAST_FRAME,
                             ref_frame1: NO_REF1,
                             mv1: (0, 0),
-                            mv,
+                            mv: mv16(mv),
                             is_new_mv,
                             size: 8,
                             size_h: 8,
@@ -2457,7 +2457,7 @@ pub fn sb_coeff_inter_frame_tile(
                                     ref_frame: LAST_FRAME,
                                     ref_frame1: NO_REF1,
                                     mv1: (0, 0),
-                                    mv,
+                                    mv: mv16(mv),
                                     is_new_mv,
                                     size: 8,
                                     size_h: 8,
@@ -2632,7 +2632,7 @@ fn write_inter_frame_leaf(
                         ref_frame: LAST_FRAME,
                         ref_frame1: NO_REF1,
                         mv1: (0, 0),
-                        mv,
+                        mv: mv16(mv),
                         is_new_mv,
                         size: SUB_MI as usize as u8,
                         size_h: SUB_MI as usize as u8,
@@ -2830,7 +2830,7 @@ fn write_inter_frame_leaf8(
                         ref_frame: LAST_FRAME,
                         ref_frame1: NO_REF1,
                         mv1: (0, 0),
-                        mv,
+                        mv: mv16(mv),
                         is_new_mv,
                         size: 2,
                         size_h: 2,
@@ -5140,7 +5140,7 @@ mod tests {
                                 ref_frame: 1,
                                 ref_frame1: NO_REF1,
                                 mv1: (0, 0),
-                                mv,
+                                mv: mv16(mv),
                                 is_new_mv,
                                 size: 8,
                                 size_h: 8,
