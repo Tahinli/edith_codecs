@@ -2149,6 +2149,12 @@ impl Residual {
     /// A residual the parse thread already transformed, kept in the arena
     /// instead of its own `Vec`.
     fn done(residual: &[i32], fctx: &crate::decode::FrameCtx) -> Self {
+        // lane-blockmem: a skipped block hands over [`ZERO_RESIDUAL`] itself,
+        // which is exactly the all-zero marker -- one pointer compare instead
+        // of copying up to 64 KB of zeros into the arena per block.
+        if std::ptr::eq(residual.as_ptr(), ZERO_RESIDUAL.as_ptr()) {
+            return Self::Done(0, 0);
+        }
         Self::Done(push_coeffs(residual, fctx), residual.len() as u32)
     }
 
@@ -7345,7 +7351,7 @@ impl Neighbours {
         side: usize,
         mode: usize,
         uv_mode: usize,
-        grids: &[Vec<i32>; 3],
+        grids: &[&[i32]; 3],
     ) {
         self.record_rect(at, side, side, mode, uv_mode, grids);
     }
@@ -7590,7 +7596,7 @@ impl Neighbours {
         h: usize,
         mode: usize,
         uv_mode: usize,
-        grids: &[Vec<i32>; 3],
+        grids: &[&[i32]; 3],
     ) {
         self.record_rect_mi(sub16_to_mi(at), w, h, mode, uv_mode, grids);
     }
@@ -7607,7 +7613,7 @@ impl Neighbours {
         h: usize,
         mode: usize,
         uv_mode: usize,
-        grids: &[Vec<i32>; 3],
+        grids: &[&[i32]; 3],
     ) {
         let (r, c) = (at_mi.0 / (SUB / MI), at_mi.1 / (SUB / MI));
         // lane-inter4 r2: a strip whose own footprint runs past the frame's
@@ -7638,7 +7644,7 @@ impl Neighbours {
     /// position directly in 4x4 mode-info units rather than [`SUB`]-grid
     /// `(r, c)`: an 8x8 leaf under a straddling 16x16 (lane-av1-rect) sits at
     /// a mi offset [`Self::record`]'s SUB-unit `at` cannot name.
-    fn record_mi(&mut self, at_mi: (usize, usize), side: usize, grids: &[Vec<i32>; 3]) {
+    fn record_mi(&mut self, at_mi: (usize, usize), side: usize, grids: &[&[i32]; 3]) {
         self.record_mi_rect(at_mi, side, side, grids);
     }
 
@@ -7649,10 +7655,10 @@ impl Neighbours {
         at_mi: (usize, usize),
         w: usize,
         h: usize,
-        grids: &[Vec<i32>; 3],
+        grids: &[&[i32]; 3],
     ) {
         let (mi_r, mi_c) = at_mi;
-        let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
+        let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(grids[plane]));
         let (w_mi, h_mi) = (w / MI, h / MI);
         if crate::envflags::env_flag!("EC_ECPUB") {
             eprintln!("EC_ECPUB blk mi=({mi_r},{mi_c}) wh=({w},{h}) lvl={}", states[0].level);
@@ -10114,7 +10120,7 @@ fn decode_block_rect(
             mode,
             angle_delta_y,
             reach,
-            &vec![0i32; bw * bh],
+            &ZERO_RESIDUAL[..bw * bh],
             None,
             filter_intra,
             smooth_neighbor, fctx,
@@ -10131,7 +10137,7 @@ fn decode_block_rect(
             uv_predict_mode,
             angle_delta_uv,
             reach,
-            &vec![0i32; chroma_w * chroma_h],
+            &ZERO_RESIDUAL[..chroma_w * chroma_h],
             alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             smooth_neighbor_uv, fctx,
@@ -10147,7 +10153,7 @@ fn decode_block_rect(
             uv_predict_mode,
             angle_delta_uv,
             reach,
-            &vec![0i32; chroma_w * chroma_h],
+            &ZERO_RESIDUAL[..chroma_w * chroma_h],
             alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             smooth_neighbor_uv, fctx,
@@ -10159,9 +10165,9 @@ fn decode_block_rect(
             mode,
             uv_predict_mode,
             &[
-                vec![0i32; bw * bh],
-                vec![0i32; chroma_w * chroma_h],
-                vec![0i32; chroma_w * chroma_h],
+                &ZERO_RESIDUAL[..bw * bh],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
             ],
         );
     } else {
@@ -10336,7 +10342,7 @@ fn decode_block_rect(
             None,
             smooth_neighbor_uv, fctx,
         );
-        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[luma_levels, u_levels, v_levels]);
+        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[&luma_levels[..], &u_levels[..], &v_levels[..]]);
         RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
         }
     }
@@ -10675,7 +10681,7 @@ fn decode_leaf_rect(
         );
         RECT_LEAF_COEFF_HITS.with(|c| c.set(c.get() + 1));
     }
-    neighbours.record_mi_rect(leaf_mi, bw, bh, &[luma_levels, u_levels, v_levels]);
+    neighbours.record_mi_rect(leaf_mi, bw, bh, &[&luma_levels[..], &u_levels[..], &v_levels[..]]);
     neighbours.fill_skip_grid_rect(leaf_mi, mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect(leaf_mi, mi_w, mi_h, bw as u8, bh as u8, 0, fctx);
     // The leaf's own palette state (`0` clears, as this site always did
@@ -11067,7 +11073,7 @@ fn decode_block_rect4(
             (mi_r, mi_c),
             bw,
             bh,
-            &[luma_levels, u_levels, v_levels],
+            &[&luma_levels[..], &u_levels[..], &v_levels[..]],
         );
         neighbours.fill_skip_grid_rect((mi_r, mi_c), mi_w, mi_h, skip);
         neighbours.fill_lf_grid_rect((mi_r, mi_c), mi_w, mi_h, bw as u8, bh as u8, 0, fctx);
@@ -11138,7 +11144,7 @@ fn decode_block_rect4(
         None,
         smooth_neighbor_uv, fctx,
     );
-    neighbours.record_mi_rect((mi_r, mi_c), bw, bh, &[luma_levels.to_vec(), u_levels, v_levels]);
+    neighbours.record_mi_rect((mi_r, mi_c), bw, bh, &[&luma_levels[..], &u_levels[..], &v_levels[..]]);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), mi_w, mi_h, bw as u8, bh as u8, 0, fctx);
     record_strip_palette(
@@ -11983,7 +11989,7 @@ fn decode_block_rect64(
             mode,
             angle_delta_y,
             reach,
-            &vec![0i32; bw * bh],
+            &ZERO_RESIDUAL[..bw * bh],
             None,
             filter_intra,
             smooth_neighbor, fctx,
@@ -12000,7 +12006,7 @@ fn decode_block_rect64(
             uv_predict_mode,
             angle_delta_uv,
             reach,
-            &vec![0i32; chroma_w * chroma_h],
+            &ZERO_RESIDUAL[..chroma_w * chroma_h],
             alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             smooth_neighbor_uv, fctx,
@@ -12016,7 +12022,7 @@ fn decode_block_rect64(
             uv_predict_mode,
             angle_delta_uv,
             reach,
-            &vec![0i32; chroma_w * chroma_h],
+            &ZERO_RESIDUAL[..chroma_w * chroma_h],
             alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             smooth_neighbor_uv, fctx,
@@ -12028,9 +12034,9 @@ fn decode_block_rect64(
             mode,
             uv_predict_mode,
             &[
-                vec![0i32; bw * bh],
-                vec![0i32; chroma_w * chroma_h],
-                vec![0i32; chroma_w * chroma_h],
+                &ZERO_RESIDUAL[..bw * bh],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
             ],
         );
     } else {
@@ -12277,7 +12283,7 @@ fn decode_block_rect64(
             None,
             smooth_neighbor_uv, fctx,
         );
-        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[luma_levels, u_levels, v_levels]);
+        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[&luma_levels[..], &u_levels[..], &v_levels[..]]);
         RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
     }
     let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
@@ -13581,7 +13587,7 @@ fn decode_block(
                         mode,
                         angle_delta_y,
                         tu_reach,
-                        &vec![0i32; logical_tx * logical_tx],
+                        &ZERO_RESIDUAL[..logical_tx * logical_tx],
                         None,
                         filter_intra,
                         smooth_neighbor, fctx,
@@ -13596,7 +13602,7 @@ fn decode_block(
                 mode,
                 angle_delta_y,
                 reach,
-                &vec![0i32; side * side],
+                &ZERO_RESIDUAL[..side * side],
                 None,
                 filter_intra,
                 smooth_neighbor, fctx,
@@ -13627,7 +13633,7 @@ fn decode_block(
                     uv_predict_mode,
                     angle_delta_uv,
                     cu_r,
-                    &vec![0i32; chroma_tx * chroma_tx],
+                    &ZERO_RESIDUAL[..chroma_tx * chroma_tx],
                     alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                     None,
                     smooth_neighbor_uv, fctx,
@@ -13642,7 +13648,7 @@ fn decode_block(
                     uv_predict_mode,
                     angle_delta_uv,
                     cu_r,
-                    &vec![0i32; chroma_tx * chroma_tx],
+                    &ZERO_RESIDUAL[..chroma_tx * chroma_tx],
                     alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                     None,
                     smooth_neighbor_uv, fctx,
@@ -13652,7 +13658,7 @@ fn decode_block(
         let luma_grid = vec![0i32; side * side];
         let u_grid = vec![0i32; chroma_side * chroma_side];
         let v_grid = vec![0i32; chroma_side * chroma_side];
-        neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
+        neighbours.record(at, side, mode, uv_predict_mode, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
     } else if logical_tx == side {
         // lane-sb128b r1: the test used to be `!tx_select || logical_tx == side`.
         // Without `tx_select` `logical_tx` IS `side` at every size <= 64, so
@@ -13749,7 +13755,7 @@ fn decode_block(
             smooth_neighbor_uv, fctx,
         )?;
         fctx.intrabc_chroma_tx.with(|c| c.set(None));
-        neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
+        neighbours.record(at, side, mode, uv_predict_mode, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
     } else {
         // Several luma transform units, raster order (spec
         // `transform_block`'s loop): the block's resolved transform is
@@ -14267,9 +14273,9 @@ fn decode_block_128rect(
             mode,
             uv_predict_mode,
             &[
-                vec![0i32; bw * bh],
-                vec![0i32; chroma_w * chroma_h],
-                vec![0i32; chroma_w * chroma_h],
+                &ZERO_RESIDUAL[..bw * bh],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
+                &ZERO_RESIDUAL[..chroma_w * chroma_h],
             ],
         );
     } else {
@@ -14598,7 +14604,7 @@ fn decode_leaf8(
                         mode,
                         angle_delta_y,
                         tu_reach,
-                        &vec![0i32; 16],
+                        &ZERO_RESIDUAL[..16],
                         None,
                         filter_intra,
                         smooth_neighbor, fctx,
@@ -14616,7 +14622,7 @@ fn decode_leaf8(
                 mode,
                 angle_delta_y,
                 reach,
-                &vec![0i32; 64],
+                &ZERO_RESIDUAL[..64],
                 None,
                 filter_intra,
                 smooth_neighbor, fctx,
@@ -14635,7 +14641,7 @@ fn decode_leaf8(
             uv_predict_mode,
             angle_delta_uv,
             reach,
-            &vec![0i32; 16],
+            &ZERO_RESIDUAL[..16],
             alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
             None,
             smooth_neighbor_uv, fctx,
@@ -14652,7 +14658,7 @@ fn decode_leaf8(
             uv_predict_mode,
             angle_delta_uv,
             reach,
-            &vec![0i32; 16],
+            &ZERO_RESIDUAL[..16],
             alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
             None,
             smooth_neighbor_uv, fctx,
@@ -14938,7 +14944,7 @@ fn decode_leaf8(
         record_intrabc_mi(leaf_mi.0, leaf_mi.1, 2, intrabc_dv, fctx);
         return Ok(mode);
     }
-    neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    neighbours.record_mi(leaf_mi, 8, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
     // This leaf's own palette state into the mi-granular above/left bands
     // (sizes 0 when it used none, which is what clears a previous block's
     // palette out of the next block's ctx and colour cache).
@@ -15149,8 +15155,8 @@ fn decode_leaf_split4(
         let (px, py) = (lmi.1 * MI, lmi.0 * MI);
         let reach = Reach::of(4, px, py, y.width, y.height, fctx);
         if skip {
-            push_intra(0, px, py, 4, mode, angle_delta_y, reach, &vec![0i32; 16], None, filter_intra, smooth_neighbor, fctx);
-            neighbours.record_mi_luma(lmi, 4, &vec![0i32; 16]);
+            push_intra(0, px, py, 4, mode, angle_delta_y, reach, &ZERO_RESIDUAL[..16], None, filter_intra, smooth_neighbor, fctx);
+            neighbours.record_mi_luma(lmi, 4, &ZERO_RESIDUAL[..16]);
         } else {
             let tu_around = neighbours.around_mi(lmi, 4)[0];
             // A `BLOCK_4X4` leaf's luma TU *is* the whole block, so libaom's
@@ -15211,8 +15217,8 @@ fn decode_leaf_split4(
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
             SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
-        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
-        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
@@ -15583,8 +15589,8 @@ fn decode_leaf_rect8(
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
             SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
-        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
-        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let ac = alpha.map(|_| cfl_src(gpx, gpy, 8));
@@ -24975,7 +24981,7 @@ fn decode_inter_block(
                     write_w,
                     write_h,
                     sy,
-                    &vec![0i32; side * side], fctx,
+                    &ZERO_RESIDUAL[..side * side], fctx,
                 );
                 push_mc_rect(1, 
                     cpx,
@@ -24984,7 +24990,7 @@ fn decode_inter_block(
                     write_chroma_w,
                     write_chroma_h,
                     su,
-                    &vec![0i32; chroma_side * chroma_side], fctx,
+                    &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
                 );
                 push_mc_rect(2, 
                     cpx,
@@ -24993,7 +24999,7 @@ fn decode_inter_block(
                     write_chroma_w,
                     write_chroma_h,
                     sv,
-                    &vec![0i32; chroma_side * chroma_side], fctx,
+                    &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
                 );
                 luma_grid = vec![0i32; side * side];
                 u_grid = vec![0i32; chroma_side * chroma_side];
@@ -26222,7 +26228,7 @@ fn decode_inter_block(
                     write_w,
                     write_h,
                     sy,
-                    &vec![0i32; side * side], fctx,
+                    &ZERO_RESIDUAL[..side * side], fctx,
                 );
                 if has_chroma {
                     push_mc_rect(1, 
@@ -26232,7 +26238,7 @@ fn decode_inter_block(
                         write_chroma_w,
                         write_chroma_h,
                         su,
-                        &vec![0i32; chroma_side * chroma_side], fctx,
+                        &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
                     );
                     push_mc_rect(2, 
                         cpx,
@@ -26241,7 +26247,7 @@ fn decode_inter_block(
                         write_chroma_w,
                         write_chroma_h,
                         sv,
-                        &vec![0i32; chroma_side * chroma_side], fctx,
+                        &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
                     );
                 }
                 luma_grid = vec![0i32; side * side];
@@ -26972,7 +26978,7 @@ fn decode_inter_block(
                         mode,
                         angle_delta_y,
                         tu_reach,
-                        &vec![0i32; tx_px * tx_px],
+                        &ZERO_RESIDUAL[..tx_px * tx_px],
                         None,
                         filter_intra,
                         smooth_neighbor, fctx,
@@ -27042,7 +27048,7 @@ fn decode_inter_block(
                                 uv_predict_mode,
                                 angle_delta_uv,
                                 cu_reach,
-                                &vec![0i32; cu_tx * cu_tx],
+                                &ZERO_RESIDUAL[..cu_tx * cu_tx],
                                 None,
                                 None,
                                 smooth_neighbor_uv, fctx,
@@ -27112,7 +27118,7 @@ fn decode_inter_block(
                     mode,
                     angle_delta_y,
                     reach,
-                    &vec![0i32; side * side],
+                    &ZERO_RESIDUAL[..side * side],
                     None,
                     filter_intra,
                     smooth_neighbor, fctx,
@@ -27129,7 +27135,7 @@ fn decode_inter_block(
                 uv_predict_mode,
                 angle_delta_uv,
                 reach,
-                &vec![0i32; chroma_side * chroma_side],
+                &ZERO_RESIDUAL[..chroma_side * chroma_side],
                 alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
@@ -27144,7 +27150,7 @@ fn decode_inter_block(
                 uv_predict_mode,
                 angle_delta_uv,
                 reach,
-                &vec![0i32; chroma_side * chroma_side],
+                &ZERO_RESIDUAL[..chroma_side * chroma_side],
                 alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
@@ -27374,7 +27380,7 @@ fn decode_inter_block(
             write_h,
             mode_for_tx,
             uv_predict_mode,
-            &[luma_grid, u_grid, v_grid],
+            &[&luma_grid[..], &u_grid[..], &v_grid[..]],
         );
     }
     if let Some((left, above)) = saved_chroma_ctx {
@@ -27843,8 +27849,8 @@ fn decode_inter_sub8_split4(
         // txsize_to_bsize[tx_size]` branch (`txb_skip_ctx = 0`, which
         // `read_inter_plane`'s `plane_idx == 0` arm already assumes).
         if skip {
-            push_mc(0, px, py, B4, Pred::dense(&pred_y), &vec![0i32; B4 * B4], fctx);
-            neighbours.record_mi_luma_rect(lmi, B4, B4, &vec![0i32; B4 * B4]);
+            push_mc(0, px, py, B4, Pred::dense(&pred_y), &ZERO_RESIDUAL[..B4 * B4], fctx);
+            neighbours.record_mi_luma_rect(lmi, B4, B4, &ZERO_RESIDUAL[..B4 * B4]);
         } else {
             let around = neighbours.around_mi(lmi, B4);
             let (luma_grid, tx_type) = read_inter_plane(
@@ -27958,8 +27964,8 @@ fn decode_inter_sub8_split4(
             }
         }
         let (u_grid, v_grid) = if last_skip {
-            push_mc(1, cpx, cpy, B4, Pred::dense(&pred_u), &vec![0i32; B4 * B4], fctx);
-            push_mc(2, cpx, cpy, B4, Pred::dense(&pred_v), &vec![0i32; B4 * B4], fctx);
+            push_mc(1, cpx, cpy, B4, Pred::dense(&pred_u), &ZERO_RESIDUAL[..B4 * B4], fctx);
+            push_mc(2, cpx, cpy, B4, Pred::dense(&pred_v), &ZERO_RESIDUAL[..B4 * B4], fctx);
             (vec![0i32; B4 * B4], vec![0i32; B4 * B4])
         } else {
             let around = neighbours.around_mi(group_mi, 8);
@@ -28231,10 +28237,10 @@ fn decode_intra_sub8_leaf(
         // reader [`decode_leaf_split4`] uses.
         if skip {
             push_intra(0, 
-                px, py, 4, mode, angle_delta_y, reach, &vec![0i32; 16], None, filter_intra,
+                px, py, 4, mode, angle_delta_y, reach, &ZERO_RESIDUAL[..16], None, filter_intra,
                 smooth_neighbor, fctx,
             );
-            neighbours.record_mi_luma(lmi, 4, &vec![0i32; 16]);
+            neighbours.record_mi_luma(lmi, 4, &ZERO_RESIDUAL[..16]);
         } else {
             let tu_around = neighbours.around_mi(lmi, 4)[0];
             let tu_grid = read_plane(
@@ -28402,8 +28408,8 @@ fn decode_intra_sub8_leaf(
             CHROMA_SKIP_CFL_HITS.with(|h| h.set(h.get() + 1));
             SKIP_CFL_HITS.with(|c| c.set(c.get() + 1));
         }
-        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
-        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(1, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((au, _), ac)| (au, ac)), None, smooth_neighbor_uv, fctx);
+        push_intra(2, cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &ZERO_RESIDUAL[..16], alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, smooth_neighbor_uv, fctx);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let chroma_around = neighbours.around_mi(group_mi, 8);
@@ -28814,8 +28820,8 @@ fn decode_inter_sub8_rect2(
             }
         }
         if skip {
-            push_mc_rect(0, px, py, SIDE, bw, bh, Pred::dense(&pred_y), &vec![0i32; SIDE * SIDE], fctx);
-            neighbours.record_mi_luma_rect(lmi, bw, bh, &vec![0i32; bw * bh]);
+            push_mc_rect(0, px, py, SIDE, bw, bh, Pred::dense(&pred_y), &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
+            neighbours.record_mi_luma_rect(lmi, bw, bh, &ZERO_RESIDUAL[..bw * bh]);
             neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, bw as u8, bh as u8, ref_frame.max(LAST_FRAME), fctx);
         } else {
             let (mut last_tw, mut last_th) = (bw, bh);
@@ -28980,8 +28986,8 @@ fn decode_inter_sub8_rect2(
             }
         }
         let (u_grid, v_grid) = if last_skip {
-            push_mc(1, cpx, cpy, B4, Pred::dense(&pred_u), &vec![0i32; B4 * B4], fctx);
-            push_mc(2, cpx, cpy, B4, Pred::dense(&pred_v), &vec![0i32; B4 * B4], fctx);
+            push_mc(1, cpx, cpy, B4, Pred::dense(&pred_u), &ZERO_RESIDUAL[..B4 * B4], fctx);
+            push_mc(2, cpx, cpy, B4, Pred::dense(&pred_v), &ZERO_RESIDUAL[..B4 * B4], fctx);
             (vec![0i32; B4 * B4], vec![0i32; B4 * B4])
         } else {
             let around = neighbours.around_mi(group_mi, 8);
@@ -29813,20 +29819,20 @@ fn decode_inter_block8(
                 .1
                 .is_some();
                 if skip {
-                    push_mc(0, px, py, SIDE, Pred::dense(&pred_y), &vec![0i32; SIDE * SIDE], fctx);
+                    push_mc(0, px, py, SIDE, Pred::dense(&pred_y), &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
                     push_mc(1, 
                         cpx,
                         cpy,
                         CHROMA_SIDE,
                         Pred::dense(&pred_u),
-                        &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
+                        &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE], fctx,
                     );
                     push_mc(2, 
                         cpx,
                         cpy,
                         CHROMA_SIDE,
                         Pred::dense(&pred_v),
-                        &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
+                        &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE], fctx,
                     );
                     luma_grid = vec![0i32; SIDE * SIDE];
                     u_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -29932,7 +29938,7 @@ fn decode_inter_block8(
                 palette_record8.2,
                 palette_record8.3,
             );
-                neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+                neighbours.record_mi(leaf_mi, 8, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
                 if let Some((left, above)) = saved_luma_ctx {
                     for (cell, state) in left.into_iter().enumerate() {
                         neighbours.left[leaf_mi.0 + cell][0] = state;
@@ -30461,20 +30467,20 @@ fn decode_inter_block8(
         .1
         .is_some();
         if skip {
-            push_mc(0, px, py, SIDE, Pred::dense(&pred_y), &vec![0i32; SIDE * SIDE], fctx);
+            push_mc(0, px, py, SIDE, Pred::dense(&pred_y), &ZERO_RESIDUAL[..SIDE * SIDE], fctx);
             push_mc(1, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
                 Pred::dense(&pred_u),
-                &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
+                &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE], fctx,
             );
             push_mc(2, 
                 cpx,
                 cpy,
                 CHROMA_SIDE,
                 Pred::dense(&pred_v),
-                &vec![0i32; CHROMA_SIDE * CHROMA_SIDE], fctx,
+                &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE], fctx,
             );
             luma_grid = vec![0i32; SIDE * SIDE];
             u_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -30837,7 +30843,7 @@ fn decode_inter_block8(
                         mode,
                         angle_delta_y,
                         tu_reach,
-                        &vec![0i32; tx_px * tx_px],
+                        &ZERO_RESIDUAL[..tx_px * tx_px],
                         None,
                         filter_intra,
                         smooth_neighbor, fctx,
@@ -30890,7 +30896,7 @@ fn decode_inter_block8(
                     mode,
                     angle_delta_y,
                     reach,
-                    &vec![0i32; SIDE * SIDE],
+                    &ZERO_RESIDUAL[..SIDE * SIDE],
                     None,
                     filter_intra,
                     smooth_neighbor, fctx,
@@ -30909,7 +30915,7 @@ fn decode_inter_block8(
                 uv_predict_mode,
                 angle_delta_uv,
                 reach,
-                &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE],
                 alpha.zip(ac).map(|((au, _), ac)| (au, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
@@ -30924,7 +30930,7 @@ fn decode_inter_block8(
                 uv_predict_mode,
                 angle_delta_uv,
                 reach,
-                &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                &ZERO_RESIDUAL[..CHROMA_SIDE * CHROMA_SIDE],
                 alpha.zip(ac).map(|((_, av), ac)| (av, ac)),
                 None,
                 smooth_neighbor_uv, fctx,
@@ -31059,7 +31065,7 @@ fn decode_inter_block8(
         palette_record8.2,
         palette_record8.3,
     );
-    neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    neighbours.record_mi(leaf_mi, 8, &[&luma_grid[..], &u_grid[..], &v_grid[..]]);
     // lane-uv8 r1: this leaf never stamped a mode band at all, so the block
     // below/right of it read whatever block last wrote the coarse [`SUB`]
     // slot -- now that an intra leaf here can code a smooth/directional
