@@ -6364,6 +6364,58 @@ mod tests {
         }
     }
 
+    /// lane-memfix: the pool grows to the peak of `busy + queued` over the
+    /// job tree and stops there. Before, a job running on a pool worker
+    /// opened a SECOND pool on that worker's own thread-local -- one level
+    /// per pipeline stage, none of them ever shrinking -- which is how a 4K
+    /// decode at `(16, 4, 2)` reached 1038 live threads. Two decodes of the
+    /// same stream: the count stays inside the composed setting and the
+    /// second decode adds nothing (the ratchet is what cost the memory).
+    #[test]
+    fn the_worker_pool_stays_bounded_across_repeated_threaded_decodes() {
+        const NAME: &str = "the_worker_pool_stays_bounded_across_repeated_threaded_decodes";
+        let _gate_lock = lock_gate_counters();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("superres_alltools_sb128_320x180.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        crate::par::set_filter_threads(4);
+        crate::par::set_recon_threads(2);
+        let mut counts = [0usize; 2];
+        let mut frames = [0usize; 2];
+        for (i, slot) in counts.iter_mut().enumerate() {
+            let mut n = 0usize;
+            let r = decode_stream_with_threads(&stream, 4, |_, _, _| {
+                n += 1;
+                Ok(())
+            });
+            if let Err(e) = r {
+                crate::par::set_filter_threads(1);
+                crate::par::set_recon_threads(1);
+                panic!("{NAME}: refused on decode {i}: {e}");
+            }
+            frames[i] = n;
+            *slot = crate::par::pool_threads();
+        }
+        crate::par::set_filter_threads(1);
+        crate::par::set_recon_threads(1);
+        assert!(frames[0] > 1, "{NAME}: the fixture decoded {} frames, so nothing was threaded", frames[0]);
+        // 4 frame workers x (recon 2 + filter 4) plus the two in-flight
+        // slots `stream.rs` allows over the thread count, with room for the
+        // show jobs -- 1038 was three orders past this.
+        assert!(
+            counts[1] <= 4 * (2 + 4) + 2 * 4,
+            "{NAME}: the pool grew to {} threads at 4 frame / 4 filter / 2 recon",
+            counts[1]
+        );
+        assert_eq!(
+            counts[0], counts[1],
+            "{NAME}: a second decode of the same stream grew the pool from {} to {} threads",
+            counts[0], counts[1]
+        );
+    }
+
     #[test]
     fn a_real_stream_filters_identically_with_one_and_four_filter_threads() {
         const NAME: &str = "a_real_stream_filters_identically_with_one_and_four_filter_threads";
