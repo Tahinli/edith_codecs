@@ -112,8 +112,6 @@ fn clamp_range(x: i32, r: usize) -> i32 {
 /// integer arithmetic, so the eight-wide pass is byte-exact with the scalar
 /// one by construction -- the network itself is written once, above.
 trait Lane: Copy {
-    /// The additive identity, for [`permute`]'s scratch.
-    const ZERO: Self;
     /// One butterfly rotation's two outputs, at pre-multiplied `cos`/`sin`.
     fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self);
     /// One Hadamard rotation's two outputs, clamped to `r` bits.
@@ -126,8 +124,6 @@ fn round_cos(x: i64) -> i32 {
 }
 
 impl Lane for i32 {
-    const ZERO: Self = 0;
-
     fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
         let (ta, tb) = (i64::from(a), i64::from(b));
         (round_cos(ta * c - tb * s), round_cos(ta * s + tb * c))
@@ -141,8 +137,6 @@ impl Lane for i32 {
 /// Eight columns at once. Every operation is the [`i32`] impl's, lane by lane,
 /// which is what the optimiser turns into one vector op per line.
 impl Lane for [i32; 8] {
-    const ZERO: Self = [0; 8];
-
     fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
         let mut x = [0i32; 8];
         let mut y = [0i32; 8];
@@ -165,8 +159,132 @@ impl Lane for [i32; 8] {
     }
 }
 
+/// The same eight-wide column pass in explicit AVX2. Every operation below is
+/// the [`i32`] impl's arithmetic, lane for lane, in 64-bit products -- so it is
+/// byte-exact with the scalar network on every input, not only on conformant
+/// ones (`the_avx2_dct_matches_the_scalar_one_over_the_full_range`).
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod simd {
+    use super::{COS_BITS, Lane, inverse_dct_n};
+    use std::arch::x86_64::*;
+
+    /// Eight `i32` lanes in one AVX2 register.
+    #[derive(Clone, Copy)]
+    pub(super) struct M256(pub(super) __m256i);
+
+    impl Lane for M256 {
+        /// `round_cos(a*c - b*s)`, `round_cos(a*s + b*c)`.
+        ///
+        /// `_mm256_mul_epi32` multiplies the sign-extended low `i32` of each
+        /// 64-bit lane, so the four even lanes go through directly and the four
+        /// odd ones after a shuffle; the products and their sum are exact in 64
+        /// bits (`|a| < 2^31`, `|c| <= 2^12`), and only the low 32 bits of the
+        /// shifted sum are kept -- which is what the scalar `as i32` keeps, so
+        /// the logical shift below stands in for the arithmetic one exactly.
+        #[inline(always)]
+        fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+            unsafe {
+                let cv = _mm256_set1_epi32(c as i32);
+                let sv = _mm256_set1_epi32(s as i32);
+                let rnd = _mm256_set1_epi64x(1 << (COS_BITS - 1));
+                let (ae, be) = (a.0, b.0);
+                let (ao, bo) = (_mm256_shuffle_epi32(a.0, 0xB1), _mm256_shuffle_epi32(b.0, 0xB1));
+                let half = |x: __m256i, y: __m256i, u: __m256i, v: __m256i| {
+                    let p = _mm256_sub_epi64(_mm256_mul_epi32(x, u), _mm256_mul_epi32(y, v));
+                    let q = _mm256_add_epi64(_mm256_mul_epi32(x, v), _mm256_mul_epi32(y, u));
+                    (
+                        _mm256_srli_epi64::<{ COS_BITS as i32 }>(_mm256_add_epi64(p, rnd)),
+                        _mm256_srli_epi64::<{ COS_BITS as i32 }>(_mm256_add_epi64(q, rnd)),
+                    )
+                };
+                let (xe, ye) = half(ae, be, cv, sv);
+                let (xo, yo) = half(ao, bo, cv, sv);
+                (
+                    M256(_mm256_blend_epi32::<0xAA>(xe, _mm256_slli_epi64::<32>(xo))),
+                    M256(_mm256_blend_epi32::<0xAA>(ye, _mm256_slli_epi64::<32>(yo))),
+                )
+            }
+        }
+
+        #[inline(always)]
+        fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
+            unsafe {
+                let hi = _mm256_set1_epi32(((1i64 << (r - 1)) - 1) as i32);
+                let lo = _mm256_set1_epi32((-(1i64 << (r - 1))) as i32);
+                let clamp = |v| _mm256_min_epi32(_mm256_max_epi32(v, lo), hi);
+                (
+                    M256(clamp(_mm256_add_epi32(a.0, b.0))),
+                    M256(clamp(_mm256_sub_epi32(a.0, b.0))),
+                )
+            }
+        }
+    }
+
+    /// The whole DCT column pass of one transform unit: `residual` is the
+    /// row-pass output (`h` rows of `w`), `out` the residual it writes.
+    ///
+    /// # Safety
+    /// The caller has checked for AVX2 ([`crate::mc::simd_level`]).
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn column_pass_dct(
+        residual: &[i32],
+        out: &mut [i32],
+        w: usize,
+        h: usize,
+        log2h: u32,
+        r: usize,
+        ud_flip: bool,
+    ) {
+        let mut t = [M256(_mm256_setzero_si256()); 64];
+        for j in (0..w).step_by(8) {
+            let mut any = _mm256_setzero_si256();
+            for i in 0..h {
+                let v = unsafe { _mm256_loadu_si256(residual[i * w + j..].as_ptr().cast()) };
+                t[i] = M256(v);
+                any = _mm256_or_si256(any, v);
+            }
+            // Zero in, zero out -- and `out` is already zero here.
+            if _mm256_testz_si256(any, any) == 1 {
+                continue;
+            }
+            match log2h {
+                2 => inverse_dct_n::<M256, 2>(&mut t, r),
+                3 => inverse_dct_n::<M256, 3>(&mut t, r),
+                4 => inverse_dct_n::<M256, 4>(&mut t, r),
+                5 => inverse_dct_n::<M256, 5>(&mut t, r),
+                6 => inverse_dct_n::<M256, 6>(&mut t, r),
+                _ => unreachable!("the inverse DCT is defined for 4..64"),
+            }
+            // `round2(v, 4)` on eight lanes: the shift is arithmetic here
+            // because the value stays in its own 32-bit lane.
+            let rnd = _mm256_set1_epi32(8);
+            for i in 0..h {
+                let dst_row = if ud_flip { h - 1 - i } else { i };
+                let v = _mm256_srai_epi32::<4>(_mm256_add_epi32(t[i].0, rnd));
+                unsafe { _mm256_storeu_si256(out[dst_row * w + j..].as_mut_ptr().cast(), v) };
+            }
+        }
+    }
+
+    /// The eight scalar lanes of `v`, for the equivalence gate.
+    #[cfg(test)]
+    pub(super) fn lanes(v: M256) -> [i32; 8] {
+        let mut o = [0i32; 8];
+        unsafe { _mm256_storeu_si256(o.as_mut_ptr().cast(), v.0) };
+        o
+    }
+
+    /// `M256` from eight lanes, for the equivalence gate.
+    #[cfg(test)]
+    pub(super) fn splat(v: [i32; 8]) -> M256 {
+        unsafe { M256(_mm256_loadu_si256(v.as_ptr().cast())) }
+    }
+}
+
 /// `B(a, b, angle, flip, r)` (spec 7.13.2.1): a butterfly rotation, and an
 /// exchange of the two entries when `flip` is set.
+#[inline(always)]
 fn butterfly<T: Lane>(t: &mut [T; 64], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
     let (c, s) = (i64::from(cos128(angle)), i64::from(sin128(angle)));
     let (x, y) = T::btf(t[a], t[b], c, s);
@@ -179,6 +297,7 @@ fn butterfly<T: Lane>(t: &mut [T; 64], a: usize, b: usize, angle: i32, flip: boo
 
 /// `H(a, b, flip, r)` (spec 7.13.2.1): a Hadamard rotation, with the indices
 /// exchanged when `flip` is set.
+#[inline(always)]
 fn hadamard<T: Lane>(t: &mut [T; 64], a: usize, b: usize, flip: bool, r: usize) {
     let (a, b) = if flip { (b, a) } else { (a, b) };
     let (x, y) = T::had(t[a], t[b], r);
@@ -188,15 +307,18 @@ fn hadamard<T: Lane>(t: &mut [T; 64], a: usize, b: usize, flip: bool, r: usize) 
 
 /// The inverse DCT array permutation (spec 7.13.2.2): an in-place bit-reversal
 /// of the first `1 << n` entries.
+#[inline(always)]
 fn permute<T: Lane>(t: &mut [T; 64], n: u32) {
     let n0 = 1usize << n;
-    // A stack copy: this ran once per 1D transform and its `Vec` was the
-    // `malloc` at the top of every `inverse_dct` frame in the annotation.
-    let mut copy = [T::ZERO; 64];
-    copy[..n0].copy_from_slice(&t[..n0]);
+    // In place: a bit reversal is an involution, so swapping every `i` with
+    // `brev(i) > i` visits each transposed pair once. The scratch copy this
+    // replaces was a `[T; 64]` fill -- 2 KB per call at `T = M256`.
     let tab = &BREV_TAB[n as usize];
-    for (i, v) in t[..n0].iter_mut().enumerate() {
-        *v = copy[tab[i] as usize];
+    for i in 0..n0 {
+        let j = tab[i] as usize;
+        if j > i {
+            t.swap(i, j);
+        }
     }
 }
 
@@ -247,6 +369,11 @@ fn inverse_dct_x8(t: &mut [[i32; 8]; 64], n: u32, r: usize) {
 }
 
 /// [`inverse_dct_fixed`] at one fixed `N = log2(size)`.
+// `#[inline(always)]`: the AVX2 instantiation has to land INSIDE the
+// `target_feature` wrapper, or every `_mm256_*` in it stays an out-of-line
+// call (measured: +5.6% instructions on the 4K segment). Every other
+// instantiation has exactly one caller, so this costs no extra copy.
+#[inline(always)]
 fn inverse_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
     permute(t, N);
 
@@ -1063,6 +1190,15 @@ pub fn inverse_transform_2d_typed_wh(
         // eight scalar ones. `lr_flip` reads the columns right-to-left, which
         // is not a contiguous chunk, so it stays on the scalar path below.
         if col_kind == TxType1d::Dct && w >= 8 && !lr_flip {
+            #[cfg(target_arch = "x86_64")]
+            if matches!(crate::mc::simd_level(), crate::mc::SimdLevel::Avx2) {
+                // SAFETY: the branch above is the AVX2 feature detection.
+                #[allow(unsafe_code)]
+                unsafe {
+                    simd::column_pass_dct(residual, &mut out, w, h, log2h, col_clamp, ud_flip);
+                }
+                return;
+            }
             let mut t8 = [[0i32; 8]; 64];
             for j in (0..w).step_by(8) {
                 let mut any = 0i32;
@@ -1141,7 +1277,12 @@ pub fn dequant_and_inverse_typed(
     ac_delta: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
-    dequant_and_inverse_typed_wh(levels, side, side, bit_depth, q_idx, dc_delta, ac_delta, tx_type)
+    let r =
+        dequant_and_inverse_typed_wh(levels, side, side, bit_depth, q_idx, dc_delta, ac_delta, tx_type);
+    // This square entry point keeps the dense contract (its callers are the
+    // encoder-side model and the gates, which index the result directly);
+    // only the decoder's `_wh` path speaks the empty marker.
+    if r.is_empty() { vec![0i32; side * side] } else { r }
 }
 
 /// [`dequant_and_inverse_typed`] widened to `(w, h)` (lane-recttx). `dc_delta`/
@@ -1165,8 +1306,13 @@ pub fn dequant_and_inverse_typed_wh(
     // to a zero residual, which is exactly the buffer below already returns --
     // so one scan of the levels replaces the dequantization, the row pass and
     // the column pass for those.
+    // The residual is returned EMPTY in that case, not as `w * h` zeros: an
+    // empty residual is this decoder's "all zero" marker (`ZERO_RESIDUAL` in
+    // `decode.rs`), which also drops the `vec![0; w * h]` memset here and the
+    // `to_vec` clone the recorded [`crate::decode::Residual`] made of it --
+    // together 6.5% of the 4K segment's profile (memset + memmove).
     if levels.iter().all(|&l| l == 0) {
-        return vec![0i32; w * h];
+        return Vec::new();
     }
     DQ_SCRATCH.with(|cell| {
         let mut dq = cell.borrow_mut();
