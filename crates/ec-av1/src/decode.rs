@@ -34561,6 +34561,10 @@ mod tests {
             width, fctx,
         )
         .unwrap();
+        // lane-wave1: a direct caller of the block decoder RECORDS its writes
+        // (the tile decoder is what replays them), so this gate replays its
+        // own before reading the plane back.
+        flush_recon(fctx, &mut y, &mut u, &mut v);
 
         let (px, py) = (c * SUB, r * SUB);
         let mut want_near = vec![0u16; side * side];
