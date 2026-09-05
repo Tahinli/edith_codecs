@@ -260,18 +260,16 @@ thread_local! {
 /// Called by [`crate::stream::decode_stream`] before each frame's tiles with
 /// that frame's DECODE-order index.
 pub fn set_coeff_trace_frame(idx: usize) {
-    hit_do! {
-        COEFF_TRACE_FRAME.with(|c| {
-            if c.get().is_none() {
-                let want = match crate::envflags::var("EC_TRACE_COEFF_FRAME") {
-                    Ok(v) => v.parse::<usize>().unwrap_or(usize::MAX),
-                    // unset: keep tracing every frame, as before this rung existed
-                    Err(_) => usize::MAX - 1,
-                };
-                c.set(Some(want));
-            }
-        });
-    }
+    COEFF_TRACE_FRAME.with(|c| {
+        if c.get().is_none() {
+            let want = match crate::envflags::var("EC_TRACE_COEFF_FRAME") {
+                Ok(v) => v.parse::<usize>().unwrap_or(usize::MAX),
+                // unset: keep tracing every frame, as before this rung existed
+                Err(_) => usize::MAX - 1,
+            };
+            c.set(Some(want));
+        }
+    });
     COEFF_TRACE_CUR.with(|c| c.set(idx));
     if crate::envflags::env_flag!("EC_TRACE_COEFF") {
         eprintln!("EC_COEFF_FRAME decode_idx={idx}");
@@ -24925,7 +24923,7 @@ fn decode_inter_block(
     // (8x4 / 4x8 at the even strip's origin) and is coded only by the odd
     // strip (`is_chroma_reference`); every other block keeps its own.
     let strip_chroma = fctx.inter_strip_chroma.with(std::cell::Cell::take);
-    hit_do! { fctx.inter_last_mc.with(|c| c.set(None)); }
+    fctx.inter_last_mc.with(|c| c.set(None));
     let has_chroma = strip_chroma.is_none_or(|s| s.has_chroma);
     let (cpx, cpy) = match strip_chroma {
         Some(s) if s.has_chroma => (s.pair_mi.1 * MI / 2, s.pair_mi.0 * MI / 2),
@@ -26935,7 +26933,7 @@ fn decode_inter_block(
             // PREVIOUS strip's `mv`/`ref_frame`/`interp_filters`
             // (reconinter_template.inc:75-82); record them for the next 1:4
             // strip, which is the only reader.
-            hit_do! { fctx.inter_last_mc.with(|c| c.set(Some((ref_frame, mv, h_filter, v_filter)))); }
+            fctx.inter_last_mc.with(|c| c.set(Some((ref_frame, mv, h_filter, v_filter))));
             // lane-defer8: the sub-8x8 chroma piece's own reference resolved to
             // a SIZE here and to pixels inside the closure, like the block's own.
             let sub8 = match strip_chroma.filter(|s| s.has_chroma).and_then(|s| s.prev.map(|p| (s.horz, p))) {
