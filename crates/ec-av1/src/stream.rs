@@ -1006,18 +1006,17 @@ pub fn decode_stream_with_threads(
                         decode_idx,
                         shown_idx,
                         dump.as_deref(),
-                        // lane-twostage is OFF by default: it is byte-exact
-                        // and the chain shows the producer tail overlapped,
-                        // but it does not move the wall (the consumer parses
-                        // only 4.2% of its tile before its first reference
-                        // pixel read, which is shorter than the tail it
-                        // hides). `EC_AV1_TWO_STAGE=1` publishes a frame's
-                        // meta at its tile boundary instead of after its
-                        // filters; it pays only once the 8x8-leaf, OBMC and
-                        // sub-8x8-piece predictions are deferred to the recon
-                        // workers as well.
-                        crate::envflags::var("EC_AV1_TWO_STAGE")
-                            .is_ok_and(|v| v == "1")
+                        // lane-twostage publishes a frame's meta at its tile
+                        // boundary instead of after its filters, so a consumer
+                        // parses over its producer's filter tail. It is ON by
+                        // default since lane-sub8group: with every reference
+                        // pixel read deferred to the recon workers, the
+                        // consumer parses its WHOLE tile before it needs a
+                        // pixel, and the 4K critical chain shortens by 11-14%
+                        // in three interleaved pairs (14450/10594/14407 ms off
+                        // vs 12790/9207/12463 ms on) where it moved 3-7%
+                        // before. `EC_AV1_TWO_STAGE=0` turns it back off.
+                        (crate::envflags::var("EC_AV1_TWO_STAGE").as_deref() != Ok("0"))
                             .then_some(&stage1 as &dyn Fn(_, _, _, _)),
                     )?;
                     // Publish before grain synthesis: every frame waiting on
