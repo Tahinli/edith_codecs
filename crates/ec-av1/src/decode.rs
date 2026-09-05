@@ -5029,7 +5029,26 @@ pub(crate) fn q_ctx_of(base_q_idx: u8) -> usize {
 
 /// `Default_Scan_NxN` (spec 8.4.2), the same anti-diagonal walk
 /// [`crate::tile`]'s writer generates its scan tables with.
-fn default_scan(side: usize) -> Vec<u16> {
+fn default_scan(side: usize) -> &'static [u16] {
+    // One table per transform side (4/8/16/32), built once: this used to be a
+    // fresh heap allocation plus the whole anti-diagonal walk on every
+    // transform block read.
+    static SCANS: std::sync::LazyLock<[Vec<u16>; 4]> = std::sync::LazyLock::new(|| {
+        [
+            default_scan_gen(4),
+            default_scan_gen(8),
+            default_scan_gen(16),
+            default_scan_gen(32),
+        ]
+    });
+    assert!(
+        matches!(side, 4 | 8 | 16 | 32),
+        "no default scan for a {side}-point transform"
+    );
+    &SCANS[side.trailing_zeros() as usize - 2]
+}
+
+fn default_scan_gen(side: usize) -> Vec<u16> {
     let mut scan = Vec::with_capacity(side * side);
     for d in 0..(2 * side - 1) {
         let lo = d.saturating_sub(side - 1);
@@ -5725,10 +5744,18 @@ fn read_coeffs(
         class_scan = class_scan_table(side, class);
         &class_scan
     };
-    let mut levels = vec![0i32; side * side];
+    // `side` is one of 4/8/16/32 (every `TxbTables` row), so the per-
+    // coefficient `pos / side`, `pos % side` was a hardware divide where a
+    // shift and a mask say the same thing, and the level buffer fits a fixed
+    // 32x32 frame of stack instead of a heap allocation per transform block.
+    debug_assert!(side.is_power_of_two() && side <= 32);
+    let sh = side.trailing_zeros();
+    let col_mask = side - 1;
+    let mut levels_buf = [0i32; 32 * 32];
+    let levels = &mut levels_buf[..side * side];
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
-        let (row, col) = (pos / side, pos % side);
+        let (row, col) = (pos >> sh, pos & col_mask);
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, side * side);
             let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
@@ -5739,7 +5766,7 @@ fn read_coeffs(
             }
             v
         } else {
-            let ctx = base_ctx(&levels, side, row, col, class, rect_shape);
+            let ctx = base_ctx(levels, side, row, col, class, rect_shape);
             let v = dec.symbol(&mut coding.base[ctx]) as i32;
             if ec_trace_coeff {
                 let (rng, _) = dec.debug_state();
@@ -5758,7 +5785,7 @@ fn read_coeffs(
             v
         };
         let level = if level > NUM_BASE_LEVELS {
-            let ctx = br_ctx(&levels, side, row, col, class);
+            let ctx = br_ctx(levels, side, row, col, class);
             let mut level = level;
             let mut sent = 0;
             loop {
@@ -8785,7 +8812,7 @@ fn decode_rect_split(
                 let (corner, tu_tx_type) = read_coeffs(
                     dec,
                     &mut coding,
-                    &default_scan(TX32),
+                    default_scan(TX32),
                     0,
                     dc_sign_ctx(tu_around.2),
                     TxType::DctDct,
@@ -11309,7 +11336,7 @@ fn decode_rect4_16_strip(
                             dec,
                             cdfs,
                             txbset_for(tx_w, reduced_tx_set),
-                            &default_scan(tx_w),
+                            default_scan(tx_w),
                             0,
                             tu_around,
                             mode,
@@ -26523,7 +26550,7 @@ fn decode_inter_block(
                         // top-left 32x32 of frequencies (spec 5.11.40), so
                         // the scan and `tx_side` are the CODED corner while
                         // `side` stays the transform's true 64.
-                        &default_scan(tx_px.min(32)),
+                        default_scan(tx_px.min(32)),
                         0,
                         neighbours.around_mi(tu_mi, tx_px)[0],
                         mode,
@@ -30398,7 +30425,7 @@ fn decode_inter_block8(
                         // CDF row is the intra dir (`fi_tx_row` inside
                         // `read_plane` maps a filter-intra block's).
                         txbset_for(tx_px, reduced_tx_set),
-                        &default_scan(tx_px),
+                        default_scan(tx_px),
                         0,
                         neighbours.around_mi(tu_mi, tx_px)[0],
                         mode,
