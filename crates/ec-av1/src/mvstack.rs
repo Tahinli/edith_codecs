@@ -155,6 +155,12 @@ pub struct TplArgs<'a> {
     pub allow_high_precision_mv: bool,
 }
 
+/// [`MiInfo::ref_frame1`]'s "this unit was not coded compound" value. Slot 1
+/// only ever holds a real reference (`0`..=`7`, `0` being `INTRA_FRAME` for
+/// an interintra unit), so `-1` tags the slot -- and with it [`MiInfo::mv1`]
+/// -- as absent without an `Option` tag word per grid cell.
+pub const NO_REF1: i8 = -1;
+
 /// One 4x4 `mi` unit's motion state, as the encode loop will have filled it
 /// in by the time it asks for a block's MV stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,12 +179,12 @@ pub struct MiInfo {
     /// desync (a `new_mv_ctx` fed by a `newmv_count`/`nearest_match` that
     /// silently dropped a compound neighbour's vote whenever its match sat
     /// in this slot).
-    pub ref_frame1: Option<i8>,
+    pub ref_frame1: i8,
     /// The unit's motion vector, `(row, col)`, in the spec's 1/8-pel units.
     pub mv: (i32, i32),
     /// The unit's second motion vector, matching `ref_frame1` (spec
     /// `Mvs[1]`) — `Some` only for a compound-coded unit, `None` otherwise.
-    pub mv1: Option<(i32, i32)>,
+    pub mv1: (i32, i32),
     /// Whether this unit's own mode was `NEWMV` (spec's
     /// `have_newmv_in_inter_mode`, compound modes excluded since this module
     /// has no compound candidates). Feeds `NewMvContext` (7.10.2.8): a
@@ -272,6 +278,23 @@ impl MiGrid {
         }
     }
 
+    /// Records one block's whole `bh4` x `bw4` footprint at once. Every
+    /// caller published a block cell-by-cell through [`Self::set`]; the rows
+    /// are contiguous, so this fills each of them with one `slice::fill` of
+    /// the (`Copy`) cell instead, the way the neighbour grids' own span fills
+    /// do.
+    pub fn fill_rect(&mut self, row: usize, col: usize, h: usize, w: usize, info: MiInfo) {
+        if col >= self.cols || row >= self.rows {
+            return;
+        }
+        let w = w.min(self.cols - col);
+        let cell = Some(info);
+        for r in row..(row + h).min(self.rows) {
+            let base = r * self.cols + col;
+            self.cells[base..base + w].fill(cell);
+        }
+    }
+
     /// The unit at `(row, col)`, or `None` when it is outside the grid, hasn't
     /// been coded, or sits outside the current tile's own bounds ([`Self::set_tile_bounds`]).
     pub fn get(&self, row: usize, col: usize) -> Option<&MiInfo> {
@@ -307,13 +330,92 @@ impl MiGrid {
 
 /// One entry of the reference MV stack: a candidate motion vector and the
 /// total weight the neighbours that agreed on it contributed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackEntry {
     /// The candidate `(row, col)` motion vector.
     pub mv: (i32, i32),
     /// The summed weight of every neighbour cell that voted for this MV.
     pub weight: u32,
 }
+
+/// A fixed-capacity, heap-free candidate list. The MV stack is rebuilt for
+/// EVERY inter block, so the `Vec` this replaces was one malloc/free pair per
+/// block (plus one for `drl_ctx`); capacity is a spec constant
+/// ([`MAX_STACK_SIZE`]), so the storage is inline and `Deref` hands every
+/// consumer the same slice API a `Vec` did.
+#[derive(Clone, Copy, Debug)]
+pub struct SmallVec<T: Copy, const N: usize> {
+    len: u8,
+    buf: [T; N],
+}
+
+impl<T: Copy + Default, const N: usize> Default for SmallVec<T, N> {
+    fn default() -> Self {
+        Self {
+            len: 0,
+            buf: [T::default(); N],
+        }
+    }
+}
+
+impl<T: Copy, const N: usize> SmallVec<T, N> {
+    /// Appends `v`. Callers gate on [`MAX_STACK_SIZE`] before pushing (the
+    /// spec drops the overflowing candidate at insertion), so a full list
+    /// here is a bug, not a stream property.
+    pub fn push(&mut self, v: T) {
+        debug_assert!((self.len as usize) < N);
+        self.buf[self.len as usize] = v;
+        self.len += 1;
+    }
+
+    /// `Vec::truncate`.
+    pub fn truncate(&mut self, n: usize) {
+        if n < self.len as usize {
+            self.len = n as u8;
+        }
+    }
+}
+
+impl<T: Copy + Default, const N: usize> FromIterator<T> for SmallVec<T, N> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut out = Self::default();
+        for v in iter {
+            out.push(v);
+        }
+        out
+    }
+}
+
+impl<T: Copy, const N: usize> std::ops::Deref for SmallVec<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.buf[..self.len as usize]
+    }
+}
+
+impl<T: Copy, const N: usize> std::ops::DerefMut for SmallVec<T, N> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.buf[..self.len as usize]
+    }
+}
+
+impl<T: Copy + PartialEq, const N: usize> PartialEq for SmallVec<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T: Copy + Eq, const N: usize> Eq for SmallVec<T, N> {}
+
+/// The single-reference MV stack's own list type.
+pub type StackVec = SmallVec<StackEntry, MAX_STACK_SIZE>;
+
+/// The compound MV stack's own list type.
+pub type CompoundStackVec = SmallVec<CompoundStackEntry, MAX_STACK_SIZE>;
+
+/// `drl_ctx`: one context per adjacent stack pair, so at most
+/// `MAX_STACK_SIZE - 1` of them.
+pub type DrlVec = SmallVec<usize, MAX_STACK_SIZE>;
 
 /// The result of [`find_mv_stack`]: the sorted candidate list, the two
 /// predictors a `NEARESTMV`/`NEARMV` block reads from it, the predictor a
@@ -323,7 +425,7 @@ pub struct StackEntry {
 pub struct MvStack {
     /// The candidates, highest weight first (ties keep scan order: above,
     /// then left, then top-right).
-    pub entries: Vec<StackEntry>,
+    pub entries: StackVec,
     /// `RefStackMv[0]`, or `(0, 0)` when the stack is empty.
     pub nearest_mv: (i32, i32),
     /// `RefStackMv[1]`, or `(0, 0)` when the stack has fewer than two
@@ -340,7 +442,7 @@ pub struct MvStack {
     pub zero_mv_ctx: usize,
     /// Context for each `drl_mode` symbol between consecutive stack
     /// entries, `entries.len().saturating_sub(1)` long.
-    pub drl_ctx: Vec<usize>,
+    pub drl_ctx: DrlVec,
 }
 
 /// Spec 7.10.2.8's threshold a candidate's weight is compared against to
@@ -377,7 +479,7 @@ const MVREF_ROW_COLS: usize = 3;
 /// Adds one candidate MV with `weight` to `candidates`, merging it into an
 /// existing entry with the same MV rather than duplicating it (spec
 /// `add_ref_mv_candidate`, 7.10.2.5).
-fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) {
+fn add_candidate(candidates: &mut StackVec, mv: (i32, i32), weight: u32) {
     if let Some(entry) = candidates.iter_mut().find(|e| e.mv == mv) {
         entry.weight += weight;
     } else if candidates.len() >= MAX_STACK_SIZE {
@@ -468,7 +570,7 @@ fn process_single_ref_mv_candidate(
     candidate: &MiInfo,
     ref_frame: i8,
     sign_bias_table: &SignBiasTable,
-    candidates: &mut Vec<StackEntry>,
+    candidates: &mut StackVec,
 ) {
     if !candidate.is_inter {
         return;
@@ -479,8 +581,11 @@ fn process_single_ref_mv_candidate(
     // never checks `is_global_mv_block`/substitutes `gm_mv_candidates`.
     let mut slots = [(candidate.ref_frame, candidate.mv); 2];
     let mut n_slots = 1;
-    if let (Some(rf1), Some(mv1)) = (candidate.ref_frame1, candidate.mv1) {
-        slots[1] = (rf1, mv1);
+    // `mv1` is meaningful only for a compound neighbour (`ref_frame1 > 0`);
+    // an interintra one stores `INTRA_FRAME` (0) with no second MV, and used
+    // to be excluded here by its `mv1` being `None`.
+    if candidate.ref_frame1 > 0 {
+        slots[1] = (candidate.ref_frame1, candidate.mv1);
         n_slots = 2;
     }
     for &(rf, mv) in &slots[..n_slots] {
@@ -538,7 +643,7 @@ fn scan_row(
     max_row_offset: isize,
     ref_frame: i8,
     gm: &GmMvTable,
-    candidates: &mut Vec<StackEntry>,
+    candidates: &mut StackVec,
     newmv_count: &mut u32,
     processed_rows: &mut usize,
 ) -> bool {
@@ -603,11 +708,11 @@ fn single_ref_match(info: &MiInfo, ref_frame: i8, gm: &GmMvTable) -> Option<(i32
         } else {
             info.mv
         })
-    } else if info.ref_frame1 == Some(ref_frame) {
+    } else if info.ref_frame1 > 0 && info.ref_frame1 == ref_frame {
         if info.is_global_mv1 {
             Some(gm_mv(gm, ref_frame))
         } else {
-            info.mv1
+            Some(info.mv1)
         }
     } else {
         None
@@ -626,7 +731,7 @@ fn scan_col(
     max_col_offset: isize,
     ref_frame: i8,
     gm: &GmMvTable,
-    candidates: &mut Vec<StackEntry>,
+    candidates: &mut StackVec,
     newmv_count: &mut u32,
     processed_cols: &mut usize,
 ) -> bool {
@@ -762,7 +867,7 @@ fn scan_top_right(
     bw4: usize,
     ref_frame: i8,
     gm: &GmMvTable,
-    candidates: &mut Vec<StackEntry>,
+    candidates: &mut StackVec,
     newmv_count: &mut u32,
 ) -> bool {
     let Some(row) = mi_row.checked_sub(1) else {
@@ -791,7 +896,7 @@ fn scan_corner(
     mi_col: usize,
     ref_frame: i8,
     gm: &GmMvTable,
-    candidates: &mut Vec<StackEntry>,
+    candidates: &mut StackVec,
     newmv_count: &mut u32,
 ) -> bool {
     let (Some(row), Some(col)) = (mi_row.checked_sub(1), mi_col.checked_sub(1)) else {
@@ -919,7 +1024,7 @@ pub fn find_mv_stack_with_sign_bias(
 ) -> MvStack {
     // lane-alloc: the stack is capped at MAX_STACK_SIZE entries, so the pushes
     // below grew (and memcpy'd) a fresh allocation up to 4 times per block.
-    let mut candidates = Vec::with_capacity(MAX_STACK_SIZE);
+    let mut candidates = StackVec::default();
     let mut newmv_count = 0u32;
 
     // libaom's `max_row_offset`/`max_col_offset` (`setup_ref_mv_list`): how
@@ -1011,7 +1116,7 @@ pub fn find_mv_stack_with_sign_bias(
     // av1_find_mv_stack boosts only the entries the immediate scan found —
     // exactly `candidates` at this point, before the corner probe (below)
     // can add anything else (mvref_common.c ~line 544-545).
-    for entry in &mut candidates {
+    for entry in candidates.iter_mut() {
         entry.weight += REF_CAT_LEVEL;
     }
 
@@ -1371,7 +1476,7 @@ pub fn find_mv_stack_with_sign_bias(
 /// combined weight — spec 7.10.2's compound half of `add_ref_mv_candidate`
 /// (libaom `mvref_common.c`, the `is_compound` branch of `scan_row_mbmi`/
 /// `scan_col_mbmi`/`scan_blk_mbmi`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompoundStackEntry {
     /// The candidate's vote for `RefFrame[0]`'s motion vector.
     pub mv0: (i32, i32),
@@ -1386,7 +1491,7 @@ pub struct CompoundStackEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompoundMvStack {
     /// The candidates, highest weight first.
-    pub entries: Vec<CompoundStackEntry>,
+    pub entries: CompoundStackVec,
     /// `RefStackMv[0]` for both refs, or `((0,0),(0,0))` when the stack is
     /// empty.
     pub nearest_mv: ((i32, i32), (i32, i32)),
@@ -1403,12 +1508,12 @@ pub struct CompoundMvStack {
     /// Context for the compound `zero_mv` symbol.
     pub zero_mv_ctx: usize,
     /// Context for each `drl_mode` symbol between consecutive stack entries.
-    pub drl_ctx: Vec<usize>,
+    pub drl_ctx: DrlVec,
 }
 
 /// [`add_candidate`], doubled: dedupes on the whole `(mv0, mv1)` pair.
 fn add_compound_candidate(
-    candidates: &mut Vec<CompoundStackEntry>,
+    candidates: &mut CompoundStackVec,
     mv0: (i32, i32),
     mv1: (i32, i32),
     weight: u32,
@@ -1443,7 +1548,7 @@ fn scan_row_compound(
     max_row_offset: isize,
     ref_frame: (i8, i8),
     gm: &GmMvTable,
-    candidates: &mut Vec<CompoundStackEntry>,
+    candidates: &mut CompoundStackVec,
     newmv_count: &mut u32,
     processed_rows: &mut usize,
 ) -> bool {
@@ -1479,12 +1584,12 @@ fn scan_row_compound(
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
-        if info.is_inter && info.ref_frame == ref_frame.0 && info.ref_frame1 == Some(ref_frame.1) {
+        if info.is_inter && info.ref_frame == ref_frame.0 && info.ref_frame1 > 0 && info.ref_frame1 == ref_frame.1 {
             found = true;
             add_compound_candidate(
                 candidates,
                 if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
+                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1 },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1506,7 +1611,7 @@ fn scan_col_compound(
     max_col_offset: isize,
     ref_frame: (i8, i8),
     gm: &GmMvTable,
-    candidates: &mut Vec<CompoundStackEntry>,
+    candidates: &mut CompoundStackVec,
     newmv_count: &mut u32,
     processed_cols: &mut usize,
 ) -> bool {
@@ -1542,12 +1647,12 @@ fn scan_col_compound(
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
-        if info.is_inter && info.ref_frame == ref_frame.0 && info.ref_frame1 == Some(ref_frame.1) {
+        if info.is_inter && info.ref_frame == ref_frame.0 && info.ref_frame1 > 0 && info.ref_frame1 == ref_frame.1 {
             found = true;
             add_compound_candidate(
                 candidates,
                 if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
+                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1 },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1566,7 +1671,7 @@ fn scan_top_right_compound(
     bw4: usize,
     ref_frame: (i8, i8),
     gm: &GmMvTable,
-    candidates: &mut Vec<CompoundStackEntry>,
+    candidates: &mut CompoundStackVec,
     newmv_count: &mut u32,
 ) -> bool {
     let Some(row) = mi_row.checked_sub(1) else {
@@ -1576,12 +1681,12 @@ fn scan_top_right_compound(
     if let Some(info) = grid.get(row, col)
         && info.is_inter
         && info.ref_frame == ref_frame.0
-        && info.ref_frame1 == Some(ref_frame.1)
+        && info.ref_frame1 > 0 && info.ref_frame1 == ref_frame.1
     {
         add_compound_candidate(
             candidates,
             if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
+            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1 },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1597,7 +1702,7 @@ fn scan_corner_compound(
     mi_col: usize,
     ref_frame: (i8, i8),
     gm: &GmMvTable,
-    candidates: &mut Vec<CompoundStackEntry>,
+    candidates: &mut CompoundStackVec,
     newmv_count: &mut u32,
 ) -> bool {
     let (Some(row), Some(col)) = (mi_row.checked_sub(1), mi_col.checked_sub(1)) else {
@@ -1606,12 +1711,12 @@ fn scan_corner_compound(
     if let Some(info) = grid.get(row, col)
         && info.is_inter
         && info.ref_frame == ref_frame.0
-        && info.ref_frame1 == Some(ref_frame.1)
+        && info.ref_frame1 > 0 && info.ref_frame1 == ref_frame.1
     {
         add_compound_candidate(
             candidates,
             if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
+            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1 },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1653,13 +1758,10 @@ fn process_compound_ref_mv_candidate(
     }
     let slots = [
         Some((candidate.ref_frame, candidate.mv)),
-        candidate
-            .ref_frame1
-            // An interintra neighbour stores INTRA_FRAME (0) here; libaom's
-            // ref-diff scan requires `can_rf > INTRA_FRAME`
-            // (process_compound_ref_mv_candidate), so it contributes nothing.
-            .filter(|&rf1| rf1 > 0)
-            .map(|rf1| (rf1, candidate.mv1.unwrap_or((0, 0)))),
+        // An interintra neighbour stores INTRA_FRAME (0) here; libaom's
+        // ref-diff scan requires `can_rf > INTRA_FRAME`
+        // (process_compound_ref_mv_candidate), so it contributes nothing.
+        (candidate.ref_frame1 > 0).then_some((candidate.ref_frame1, candidate.mv1)),
     ];
     for (candidate_ref, candidate_mv) in slots.into_iter().flatten() {
         for (i, side_ref) in [ref_frame.0, ref_frame.1].into_iter().enumerate() {
@@ -1748,7 +1850,7 @@ pub fn find_mv_stack_compound(
     gm: &GmMvTable,
     tpl: Option<CompoundTplArgs>,
 ) -> CompoundMvStack {
-    let mut candidates: Vec<CompoundStackEntry> = Vec::with_capacity(MAX_STACK_SIZE);
+    let mut candidates = CompoundStackVec::default();
     let mut newmv_count = 0u32;
 
     let row_adj = bh4 < 2 && mi_row % 2 == 1;
@@ -1828,7 +1930,7 @@ pub fn find_mv_stack_compound(
     let row_matched = found_above || found_top_right;
     let nearest_match = usize::from(row_matched) + usize::from(found_left);
 
-    for entry in &mut candidates {
+    for entry in candidates.iter_mut() {
         entry.weight += REF_CAT_LEVEL;
     }
 
@@ -2432,12 +2534,28 @@ mod tests {
 
     use super::*;
 
+
+    /// lane-mvstack2: the mi grid is one cell per 4x4 unit of the frame and
+    /// `find_mv_stack` walks it for every inter block, so the cell's SIZE is
+    /// the scan's memory traffic. `ref_frame1`/`mv1` are validity-tagged by
+    /// `ref_frame1 == NO_REF1` rather than by two `Option` tags (32 bytes ->
+    /// 24), and `is_inter` keeps a niche so the grid's `Option<MiInfo>` costs
+    /// no extra word.
+    #[test]
+    fn mi_info_cell_stays_compact() {
+        assert_eq!(std::mem::size_of::<MiInfo>(), 24);
+        assert_eq!(
+            std::mem::size_of::<Option<MiInfo>>(),
+            std::mem::size_of::<MiInfo>()
+        );
+    }
+
     fn inter(mv: (i32, i32)) -> MiInfo {
         MiInfo {
             is_inter: true,
             ref_frame: 1,
-            ref_frame1: None,
-            mv1: None,
+            ref_frame1: NO_REF1,
+            mv1: (0, 0),
             mv,
             is_new_mv: false,
             // 1: smaller than every `bw4`/`bh4` these small-grid tests use,
@@ -2595,8 +2713,8 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: 1,
-                ref_frame1: None,
-                mv1: None,
+                ref_frame1: NO_REF1,
+                mv1: (0, 0),
                 mv: (4, 4),
                 is_new_mv: true,
                 size: 1,
@@ -2635,7 +2753,7 @@ mod tests {
         assert_eq!(stack.entries.len(), 2);
         assert_eq!(stack.entries[0].mv, (4, 4));
         assert_eq!(stack.entries[1].mv, (8, 8));
-        assert_eq!(stack.drl_ctx, vec![1]);
+        assert_eq!(&stack.drl_ctx[..], &[1]);
     }
 
     #[test]
@@ -2678,8 +2796,8 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: 1,
-                ref_frame1: None,
-                mv1: None,
+                ref_frame1: NO_REF1,
+                mv1: (0, 0),
                 mv,
                 is_new_mv: false,
                 size: 8,
@@ -2710,8 +2828,8 @@ mod tests {
         MiInfo {
             is_inter: false,
             ref_frame: -1,
-            ref_frame1: None,
-            mv1: None,
+            ref_frame1: NO_REF1,
+            mv1: (0, 0),
             mv: (0, 0),
             is_new_mv: false,
             size: 8,
@@ -2729,8 +2847,8 @@ mod tests {
         MiInfo {
             is_inter: true,
             ref_frame: 1,
-            ref_frame1: None,
-            mv1: None,
+            ref_frame1: NO_REF1,
+            mv1: (0, 0),
             mv,
             is_new_mv: false,
             size: 8,
@@ -2969,9 +3087,9 @@ mod tests {
         MiInfo {
             is_inter: true,
             ref_frame: COMP_PAIR.0,
-            ref_frame1: Some(COMP_PAIR.1),
+            ref_frame1: COMP_PAIR.1,
             mv: mv0,
-            mv1: Some(mv1),
+            mv1,
             is_new_mv: false,
             size: 1,
             size_h: 1,
@@ -2992,9 +3110,9 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: LAST_FRAME,
-                ref_frame1: Some(GOLDEN_FRAME),
+                ref_frame1: GOLDEN_FRAME,
                 mv: (9, 9),
-                mv1: Some((9, 9)),
+                mv1: (9, 9),
                 is_new_mv: false,
                 size: 1,
                 size_h: 1,
@@ -3095,9 +3213,9 @@ mod tests {
         let candidate = MiInfo {
             is_inter: true,
             ref_frame: LAST_FRAME,
-            ref_frame1: None,
+            ref_frame1: NO_REF1,
             mv: (5, 5),
-            mv1: None,
+            mv1: (0, 0),
             is_new_mv: false,
             size: 1,
             size_h: 1,
@@ -3124,9 +3242,9 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: LAST_FRAME,
-                ref_frame1: None,
+                ref_frame1: NO_REF1,
                 mv: (7, 7),
-                mv1: None,
+                mv1: (0, 0),
                 is_new_mv: false,
                 size: 8,
                 size_h: 8,
@@ -3140,9 +3258,9 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: ALTREF_FRAME,
-                ref_frame1: None,
+                ref_frame1: NO_REF1,
                 mv: (-3, -3),
-                mv1: None,
+                mv1: (0, 0),
                 is_new_mv: false,
                 size: 8,
                 size_h: 8,
@@ -3197,7 +3315,7 @@ mod tests {
     /// candidate would survive and evict a scanned one.
     #[test]
     fn the_ninth_distinct_candidate_is_dropped_at_insertion_not_after_sorting() {
-        let mut candidates = Vec::new();
+        let mut candidates = StackVec::default();
         for i in 0..MAX_STACK_SIZE as i32 {
             add_candidate(&mut candidates, (i, i), 2);
         }
@@ -3211,7 +3329,7 @@ mod tests {
         add_candidate(&mut candidates, (0, 0), 6);
         assert_eq!(candidates[0].weight, 8);
 
-        let mut comp = Vec::new();
+        let mut comp = CompoundStackVec::default();
         for i in 0..MAX_STACK_SIZE as i32 {
             add_compound_candidate(&mut comp, (i, i), (i, -i), 2);
         }
