@@ -2199,6 +2199,37 @@ fn push_pred_samples(v: &[u16], fctx: &crate::decode::FrameCtx) -> u32 {
 /// (a 128-wide inter block's prediction stride).
 static ZERO_RESIDUAL: [i32; 128 * 128] = [0; 128 * 128];
 
+/// lane-blockscratch: one plane's coefficient levels as the block-tail
+/// neighbour writes want them. A plane that coded nothing (a skipped block, a
+/// strip with no chroma, luma under a var-tx split whose units already wrote
+/// themselves) names the shared [`ZERO_RESIDUAL`] instead of allocating and
+/// zeroing up to 64 KB of its own per block.
+enum Grid {
+    Zero(usize),
+    Own(Vec<i32>),
+}
+
+/// lane-blockscratch: the mu-chunk chroma collector, allocated by the first
+/// unit that writes into it. Only a block wider or taller than 64 px codes its
+/// chroma per 64x64 chunk; every smaller block used to allocate and zero both
+/// collectors per block and then drop them untouched.
+fn mu_units(v: &mut Vec<i32>, n: usize) -> &mut Vec<i32> {
+    if v.is_empty() {
+        *v = vec![0i32; n];
+    }
+    v
+}
+
+impl std::ops::Deref for Grid {
+    type Target = [i32];
+    fn deref(&self) -> &[i32] {
+        match self {
+            Grid::Zero(n) => &ZERO_RESIDUAL[..*n],
+            Grid::Own(v) => v,
+        }
+    }
+}
+
 /// `residual`, or `n` zeros when it is the empty all-zero marker.
 fn dense_residual(residual: &[i32], n: usize) -> &[i32] {
     if residual.is_empty() { &ZERO_RESIDUAL[..n] } else { residual }
@@ -25029,9 +25060,9 @@ fn decode_inter_block(
                     sv,
                     &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
                 );
-                luma_grid = vec![0i32; side * side];
-                u_grid = vec![0i32; chroma_side * chroma_side];
-                v_grid = vec![0i32; chroma_side * chroma_side];
+                luma_grid = Grid::Zero(side * side);
+                u_grid = Grid::Zero(chroma_side * chroma_side);
+                v_grid = Grid::Zero(chroma_side * chroma_side);
             } else {
                 // lane-inter4 r2: a rect strip's coefficient context spans its
                 // OWN width above and height left -- reading `side` cells both
@@ -25045,9 +25076,9 @@ fn decode_inter_block(
                 // lane-sb128c r1: a 128x128 inter block's four chroma units
                 // are read INSIDE the luma leaf loop (one per 64x64 mu chunk);
                 // these collect them for the block-level neighbour write-back.
-                let mut u_units = vec![0i32; chroma_side * chroma_side];
-                let mut v_units = vec![0i32; chroma_side * chroma_side];
-                if let Some(leaves) = vartx_leaves.clone() {
+                let mut u_units: Vec<i32> = Vec::new();
+                let mut v_units: Vec<i32> = Vec::new();
+                if let Some(leaves) = vartx_leaves.as_ref() {
                     // spec 5.11.17's transform tree, leaf by leaf in the order
                     // `read_var_tx_size` coded it: each unit reads its own
                     // coefficients against the neighbour magnitudes the
@@ -25169,11 +25200,10 @@ fn decode_inter_block(
                                     );
                                     CHROMA_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
                                     mu_chroma = true;
-                                    let dst = if plane_idx == 1 {
-                                        &mut u_units
-                                    } else {
-                                        &mut v_units
-                                    };
+                                    let dst = mu_units(
+                                        if plane_idx == 1 { &mut u_units } else { &mut v_units },
+                                        chroma_side * chroma_side,
+                                    );
                                     for rr in 0..cu_tx {
                                         let start =
                                             (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
@@ -25188,7 +25218,7 @@ fn decode_inter_block(
                     // position back to luma, so an inter block's chroma
                     // inherits the *first* (top-left) luma unit's coded type.
                     luma_tx_type = first_tx_type;
-                    luma_grid = vec![0i32; side * side];
+                    luma_grid = Grid::Zero(side * side);
                 } else if rect_tu {
                     // The whole-block rectangular transform unit
                     // (`txfm_partition` said 0 at depth 0).
@@ -25209,9 +25239,10 @@ fn decode_inter_block(
                         None, fctx,
                     )?;
                     luma_tx_type = tx_type;
-                    luma_grid = embed_rect_grid(&grid, write_w, write_h, side);
+                    luma_grid = Grid::Own(embed_rect_grid(&grid, write_w, write_h, side));
                 } else {
-                    (luma_grid, luma_tx_type) = read_inter_plane(
+                    {
+                        let coded = read_inter_plane(
                         dec,
                         cdfs,
                         luma_set_inter,
@@ -25228,20 +25259,31 @@ fn decode_inter_block(
                         None,
                         None, fctx,
                     )?;
+                        luma_grid = Grid::Own(coded.0);
+                        luma_tx_type = coded.1;
+                    }
                 }
                 if side > 64 {
                     // Already read inside the mu-chunk loop above -- at the 128
                     // root a rect (128x64/64x128) block's chroma is per mu
                     // chunk too, so this test comes BEFORE the `rect_tu` one.
-                    u_grid = std::mem::take(&mut u_units);
-                    v_grid = std::mem::take(&mut v_units);
+                    u_grid = if u_units.is_empty() {
+                        Grid::Zero(chroma_side * chroma_side)
+                    } else {
+                        Grid::Own(std::mem::take(&mut u_units))
+                    };
+                    v_grid = if v_units.is_empty() {
+                        Grid::Zero(chroma_side * chroma_side)
+                    } else {
+                        Grid::Own(std::mem::take(&mut v_units))
+                    };
                 } else if rect_tu {
                     // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
                     // 2:1 strip is the strip's own rect chroma size (16x8 /
                     // 8x16), one unit for the whole block, and it codes no
                     // `tx_type` symbol -- it inherits the luma unit's.
                     let (uw, uh) = (write_chroma_w, write_chroma_h);
-                    u_grid = embed_rect_grid(
+                    u_grid = Grid::Own(embed_rect_grid(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
@@ -25262,8 +25304,8 @@ fn decode_inter_block(
                         uw,
                         uh,
                         chroma_side,
-                    );
-                    v_grid = embed_rect_grid(
+                    ));
+                    v_grid = Grid::Own(embed_rect_grid(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
@@ -25284,9 +25326,9 @@ fn decode_inter_block(
                         uw,
                         uh,
                         chroma_side,
-                    );
+                    ));
                 } else {
-                u_grid = read_inter_plane(
+                u_grid = Grid::Own(read_inter_plane(
                     dec,
                     cdfs,
                     chroma_set,
@@ -25303,8 +25345,8 @@ fn decode_inter_block(
                     Some(luma_tx_type),
                     None, fctx,
                 )?
-                .0;
-                v_grid = read_inter_plane(
+                .0);
+                v_grid = Grid::Own(read_inter_plane(
                     dec,
                     cdfs,
                     chroma_set,
@@ -25321,7 +25363,7 @@ fn decode_inter_block(
                     Some(luma_tx_type),
                     None, fctx,
                 )?
-                .0;
+                .0);
                 }
             }
         } else {
@@ -26280,9 +26322,9 @@ fn decode_inter_block(
                         &ZERO_RESIDUAL[..chroma_side * chroma_side], fctx,
                     );
                 }
-                luma_grid = vec![0i32; side * side];
-                u_grid = vec![0i32; chroma_side * chroma_side];
-                v_grid = vec![0i32; chroma_side * chroma_side];
+                luma_grid = Grid::Zero(side * side);
+                u_grid = Grid::Zero(chroma_side * chroma_side);
+                v_grid = Grid::Zero(chroma_side * chroma_side);
             } else {
                 // lane-inter4 r2: a rect strip's coefficient context spans its
                 // OWN width above and height left -- reading `side` cells both
@@ -26308,9 +26350,9 @@ fn decode_inter_block(
                 // lane-sb128c r1: a 128x128 inter block's four chroma units
                 // are read INSIDE the luma leaf loop (one per 64x64 mu chunk);
                 // these collect them for the block-level neighbour write-back.
-                let mut u_units = vec![0i32; chroma_side * chroma_side];
-                let mut v_units = vec![0i32; chroma_side * chroma_side];
-                if let Some(leaves) = vartx_leaves.clone() {
+                let mut u_units: Vec<i32> = Vec::new();
+                let mut v_units: Vec<i32> = Vec::new();
+                if let Some(leaves) = vartx_leaves.as_ref() {
                     // spec 5.11.17's transform tree, leaf by leaf in the order
                     // `read_var_tx_size` coded it: each unit reads its own
                     // coefficients against the neighbour magnitudes the
@@ -26432,11 +26474,10 @@ fn decode_inter_block(
                                     );
                                     CHROMA_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
                                     mu_chroma = true;
-                                    let dst = if plane_idx == 1 {
-                                        &mut u_units
-                                    } else {
-                                        &mut v_units
-                                    };
+                                    let dst = mu_units(
+                                        if plane_idx == 1 { &mut u_units } else { &mut v_units },
+                                        chroma_side * chroma_side,
+                                    );
                                     for rr in 0..cu_tx {
                                         let start =
                                             (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
@@ -26451,7 +26492,7 @@ fn decode_inter_block(
                     // position back to luma, so an inter block's chroma
                     // inherits the *first* (top-left) luma unit's coded type.
                     luma_tx_type = first_tx_type;
-                    luma_grid = vec![0i32; side * side];
+                    luma_grid = Grid::Zero(side * side);
                 } else if rect_tu {
                     // The whole-block rectangular transform unit
                     // (`txfm_partition` said 0 at depth 0).
@@ -26472,9 +26513,10 @@ fn decode_inter_block(
                         None, fctx,
                     )?;
                     luma_tx_type = tx_type;
-                    luma_grid = embed_rect_grid(&grid, write_w, write_h, side);
+                    luma_grid = Grid::Own(embed_rect_grid(&grid, write_w, write_h, side));
                 } else {
-                    (luma_grid, luma_tx_type) = read_inter_plane(
+                    {
+                        let coded = read_inter_plane(
                         dec,
                         cdfs,
                         luma_set_inter,
@@ -26491,6 +26533,9 @@ fn decode_inter_block(
                         None,
                         None, fctx,
                     )?;
+                        luma_grid = Grid::Own(coded.0);
+                        luma_tx_type = coded.1;
+                    }
                 }
                 if !has_chroma {
                     // `is_chroma_reference` is false for this strip: libaom's
@@ -26499,21 +26544,29 @@ fn decode_inter_block(
                     // `reconstruct_inter_block`'s `for (plane...)` guarded by
                     // `xd->is_chroma_ref`) codes NO chroma transform here, so
                     // neither symbol nor context exists.
-                    u_grid = vec![0i32; chroma_side * chroma_side];
-                    v_grid = vec![0i32; chroma_side * chroma_side];
+                    u_grid = Grid::Zero(chroma_side * chroma_side);
+                    v_grid = Grid::Zero(chroma_side * chroma_side);
                 } else if side > 64 {
                     // Already read inside the mu-chunk loop above -- at the 128
                     // root a rect (128x64/64x128) block's chroma is per mu
                     // chunk too, so this test comes BEFORE the `rect_tu` one.
-                    u_grid = std::mem::take(&mut u_units);
-                    v_grid = std::mem::take(&mut v_units);
+                    u_grid = if u_units.is_empty() {
+                        Grid::Zero(chroma_side * chroma_side)
+                    } else {
+                        Grid::Own(std::mem::take(&mut u_units))
+                    };
+                    v_grid = if v_units.is_empty() {
+                        Grid::Zero(chroma_side * chroma_side)
+                    } else {
+                        Grid::Own(std::mem::take(&mut v_units))
+                    };
                 } else if rect_tu {
                     // `av1_get_max_uv_txsize(bsize)`: the chroma transform of a
                     // 2:1 strip is the strip's own rect chroma size (16x8 /
                     // 8x16), one unit for the whole block, and it codes no
                     // `tx_type` symbol -- it inherits the luma unit's.
                     let (uw, uh) = (write_chroma_w, write_chroma_h);
-                    u_grid = embed_rect_grid(
+                    u_grid = Grid::Own(embed_rect_grid(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
@@ -26534,8 +26587,8 @@ fn decode_inter_block(
                         uw,
                         uh,
                         chroma_side,
-                    );
-                    v_grid = embed_rect_grid(
+                    ));
+                    v_grid = Grid::Own(embed_rect_grid(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
@@ -26556,9 +26609,9 @@ fn decode_inter_block(
                         uw,
                         uh,
                         chroma_side,
-                    );
+                    ));
                 } else {
-                u_grid = read_inter_plane(
+                u_grid = Grid::Own(read_inter_plane(
                     dec,
                     cdfs,
                     chroma_set,
@@ -26575,8 +26628,8 @@ fn decode_inter_block(
                     Some(luma_tx_type),
                     None, fctx,
                 )?
-                .0;
-                v_grid = read_inter_plane(
+                .0);
+                v_grid = Grid::Own(read_inter_plane(
                     dec,
                     cdfs,
                     chroma_set,
@@ -26593,7 +26646,7 @@ fn decode_inter_block(
                     Some(luma_tx_type),
                     None, fctx,
                 )?
-                .0;
+                .0);
                 }
             }
         }
@@ -26975,9 +27028,9 @@ fn decode_inter_block(
         // `decode_token_recon_block` walks `mu_blocks_wide/high` and codes
         // every plane of a chunk before the next chunk's luma. These collect
         // the four TX_32X32 units per plane for the block-level write-back.
-        let mut u_units = vec![0i32; chroma_side * chroma_side];
-        let mut v_units = vec![0i32; chroma_side * chroma_side];
-        if let Some(leaves) = vartx_leaves.clone() {
+        let mut u_units: Vec<i32> = Vec::new();
+        let mut v_units: Vec<i32> = Vec::new();
+        if let Some(leaves) = vartx_leaves.as_ref() {
             let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
             for (idx, &(row, col, tx_px, _)) in leaves.iter().enumerate() {
                 let tu_mi = (at_mi.0 + row, at_mi.1 + col);
@@ -27013,13 +27066,13 @@ fn decode_inter_block(
                         filter_intra,
                         smooth_neighbor, fctx,
                     );
-                    vec![0i32; tx_px * tx_px]
+                    Grid::Zero(tx_px * tx_px)
                 } else {
                     // The unit's bsize is smaller than the block it sits in,
                     // so `txb_skip_ctx` is the neighbour-magnitude table, not
                     // the lone-TU 0 (`get_txb_ctx_general`).
                     let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tx_px / MI);
-                    read_plane(
+                    Grid::Own(read_plane(
                         dec,
                         cdfs,
                         txbset_for(tx_px, reduced),
@@ -27044,7 +27097,7 @@ fn decode_inter_block(
                         filter_intra,
                         Some(tu_skip_ctx),
                         smooth_neighbor, fctx,
-                    )?
+                    )?)
                 };
                 neighbours.record_mi_luma(tu_mi, tx_px, &tu_grid);
                 if side > 64 {
@@ -27083,9 +27136,9 @@ fn decode_inter_block(
                                 None,
                                 smooth_neighbor_uv, fctx,
                             );
-                            vec![0i32; cu_tx * cu_tx]
+                            Grid::Zero(cu_tx * cu_tx)
                         } else {
-                            read_plane(
+                            Grid::Own(read_plane(
                                 dec,
                                 cdfs,
                                 chroma_set,
@@ -27112,7 +27165,7 @@ fn decode_inter_block(
                                 // (lane-sb128b r3).
                                 Some(3),
                                 smooth_neighbor_uv, fctx,
-                            )?
+                            )?)
                         };
                         // Immediately, so the NEXT chunk's unit reads this
                         // one's coefficient context.
@@ -27120,7 +27173,10 @@ fn decode_inter_block(
                             cu_mi, luma_span, luma_span, plane_idx, &cu_grid,
                         );
                         CHROMA_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
-                        let dst = if plane_idx == 1 { &mut u_units } else { &mut v_units };
+                        let dst = mu_units(
+                            if plane_idx == 1 { &mut u_units } else { &mut v_units },
+                            chroma_side * chroma_side,
+                        );
                         for rr in 0..cu_tx {
                             let start = (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
                             dst[start..start + cu_tx]
@@ -27132,9 +27188,17 @@ fn decode_inter_block(
         }
         if side > 64 {
             // Chroma is already coded and reconstructed per mu chunk above.
-            luma_grid = vec![0i32; side * side];
-            u_grid = std::mem::take(&mut u_units);
-            v_grid = std::mem::take(&mut v_units);
+            luma_grid = Grid::Zero(side * side);
+            u_grid = if u_units.is_empty() {
+                        Grid::Zero(chroma_side * chroma_side)
+                    } else {
+                        Grid::Own(std::mem::take(&mut u_units))
+                    };
+            v_grid = if v_units.is_empty() {
+                        Grid::Zero(chroma_side * chroma_side)
+                    } else {
+                        Grid::Own(std::mem::take(&mut v_units))
+                    };
             INTRA_128_IN_INTER_HITS.with(|c| c.set(c.get() + 1));
         } else if skip {
             if !split_luma {
@@ -27185,21 +27249,21 @@ fn decode_inter_block(
                 None,
                 smooth_neighbor_uv, fctx,
             );
-            luma_grid = vec![0i32; side * side];
-            u_grid = vec![0i32; chroma_side * chroma_side];
-            v_grid = vec![0i32; chroma_side * chroma_side];
+            luma_grid = Grid::Zero(side * side);
+            u_grid = Grid::Zero(chroma_side * chroma_side);
+            v_grid = Grid::Zero(chroma_side * chroma_side);
         } else {
             let around = neighbours.around_mi(at, side);
-            luma_grid = if split_luma {
+            if split_luma {
                 // Already coded and reconstructed unit by unit above; the
                 // block-level grid is only the neighbour write-back's input,
                 // which `record_split_luma` ignores for plane 0.
-                vec![0i32; side * side]
+                luma_grid = Grid::Zero(side * side);
             } else {
                 if let Some(buf) = &palette_y_buf {
                     set_palette_pred(buf.clone(), fctx);
                 }
-                read_plane(
+                luma_grid = Grid::Own(read_plane(
                     dec,
                     cdfs,
                     luma_set_intra,
@@ -27220,13 +27284,13 @@ fn decode_inter_block(
                     filter_intra,
                     None,
                     smooth_neighbor, fctx,
-                )?
-            };
+                )?);
+            }
             let ac = alpha.map(|_| cfl_src(px, py, side));
             if let Some((ub, _)) = &palette_uv_bufs {
                 set_palette_pred(ub.clone(), fctx);
             }
-            u_grid = read_plane(
+            u_grid = Grid::Own(read_plane(
                 dec,
                 cdfs,
                 chroma_set,
@@ -27247,11 +27311,11 @@ fn decode_inter_block(
                 None,
                 None,
                 smooth_neighbor_uv, fctx,
-            )?;
+            )?);
             if let Some((_, vb)) = &palette_uv_bufs {
                 set_palette_pred(vb.clone(), fctx);
             }
-            v_grid = read_plane(
+            v_grid = Grid::Own(read_plane(
                 dec,
                 cdfs,
                 chroma_set,
@@ -27272,7 +27336,7 @@ fn decode_inter_block(
                 None,
                 None,
                 smooth_neighbor_uv, fctx,
-            )?;
+            )?);
         }
     }
     // lane-comppin r9: end-of-block checkpoint -- everything between
