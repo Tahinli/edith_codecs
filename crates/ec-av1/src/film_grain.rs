@@ -395,52 +395,68 @@ fn add_noise_to_block(
         let cw = half_w as usize;
         // U and V are distinct fields, so a disjoint borrow of each is
         // needed alongside the immutable read of Y.
-        let Picture { y: ref luma_plane, u: ref mut u_plane, v: ref mut v_plane, .. } =
-            *picture;
-        for i in 0..half_h {
-            let lrow = ((py0 + i * 2) * y_stride + px0) as usize;
-            let crow = ((cy0 + i) * c_stride + cx0) as usize;
-            let grow = ((cg_row0 + i) * cg_stride + cg_col0) as usize;
-            let luma = &luma_plane[lrow..lrow + cw * 2];
-            let gcb = &cb_grain[grow..grow + cw];
-            let gcr = &cr_grain[grow..grow + cw];
-            let urow = &mut u_plane[crow..crow + cw];
-            let vrow = &mut v_plane[crow..crow + cw];
-            // lane-perf9: one plane at a time, so the row is a straight
-            // vectorisable kernel (the per-sample `apply_cb`/`apply_cr` tests
-            // were loop-invariant anyway).
-            let params = ChromaNoise {
-                index_max,
-                rounding_offset,
-                scaling_shift,
-                min_chroma,
-                max_chroma,
-            };
-            if apply_cb {
-                chroma_noise_row(
-                    urow, luma, gcb, scaling_cb, cb_luma_mult, cb_mult, cb_offset, params,
-                );
-            }
-            if apply_cr {
-                chroma_noise_row(
-                    vrow, luma, gcr, scaling_cr, cr_luma_mult, cr_mult, cr_offset, params,
-                );
-            }
+        let Picture { y: ref luma_plane, u: ref mut u_plane, v: ref mut v_plane, .. } = *picture;
+        let lrow0 = (py0 * y_stride + px0) as usize;
+        let crow0 = (cy0 * c_stride + cx0) as usize;
+        let grow0 = (cg_row0 * cg_stride + cg_col0) as usize;
+        let luma = &luma_plane[lrow0..];
+        let params = ChromaNoise { index_max, rounding_offset, scaling_shift, min_chroma, max_chroma };
+        // lane-grain: the whole block in one call, so the kernel's AVX2
+        // prologue is paid once per block instead of once per 15-sample row.
+        if apply_cb {
+            chroma_noise_rows(
+                &mut u_plane[crow0..],
+                c_stride as usize,
+                luma,
+                2 * y_stride as usize,
+                &cb_grain[grow0..],
+                cg_stride as usize,
+                half_h as usize,
+                cw,
+                scaling_cb,
+                cb_luma_mult,
+                cb_mult,
+                cb_offset,
+                params,
+            );
+        }
+        if apply_cr {
+            chroma_noise_rows(
+                &mut v_plane[crow0..],
+                c_stride as usize,
+                luma,
+                2 * y_stride as usize,
+                &cr_grain[grow0..],
+                cg_stride as usize,
+                half_h as usize,
+                cw,
+                scaling_cr,
+                cr_luma_mult,
+                cr_mult,
+                cr_offset,
+                params,
+            );
         }
     }
     if apply_y {
         // Both operands are contiguous along a row, so the row bases are
         // computed once instead of a multiply-add per sample.
         let width = (half_w * 2) as usize;
-        for i in 0..half_h * 2 {
-            let prow = ((py0 + i) * y_stride + px0) as usize;
-            let grow = ((lg_row0 + i) * lg_stride + lg_col0) as usize;
-            let pixels = &mut picture.y[prow..prow + width];
-            let grain = &luma_grain[grow..grow + width];
-            luma_noise_row(
-                pixels, grain, scaling_y, rounding_offset, scaling_shift, min_luma, max_luma,
-            );
-        }
+        let prow0 = (py0 * y_stride + px0) as usize;
+        let grow0 = (lg_row0 * lg_stride + lg_col0) as usize;
+        luma_noise_rows(
+            &mut picture.y[prow0..],
+            y_stride as usize,
+            &luma_grain[grow0..],
+            lg_stride as usize,
+            (half_h * 2) as usize,
+            width,
+            scaling_y,
+            rounding_offset,
+            scaling_shift,
+            min_luma,
+            max_luma,
+        );
     }
 }
 
@@ -459,20 +475,60 @@ fn luma_noise_row(
     min_luma: i32,
     max_luma: i32,
 ) {
+    let n = pixels.len().min(grain.len());
+    luma_noise_rows(
+        pixels, n, grain, n, 1, n, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
+    );
+}
+
+/// [`luma_noise_row`] over `rows` consecutive rows of a block: `pixels` and
+/// `grain` start at the block origin and step by their own strides.
+///
+/// lane-grain: the AVX2 prologue (10 broadcasts) used to be paid once per
+/// 30-sample row, and the `30 % 8 == 6` / `15 % 8 == 7` tails handed a fifth
+/// of the luma and half of the chroma samples back to the scalar loop -- the
+/// 32x32 grain block is 30 wide (32 minus the 2-column overlap), never a
+/// multiple of 8. Hoisting the row loop into the kernel pays the prologue
+/// once per block and lets the tail take a 4-wide SSE step.
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn luma_noise_rows(
+    pixels: &mut [u16],
+    p_stride: usize,
+    grain: &[i32],
+    g_stride: usize,
+    rows: usize,
+    n: usize,
+    scaling: &[i32],
+    rounding_offset: i32,
+    scaling_shift: i32,
+    min_luma: i32,
+    max_luma: i32,
+) {
     #[cfg(target_arch = "x86_64")]
-    if crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
+    if n >= 4 && crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
         // SAFETY: reached only when the CPU reports avx2; the kernel reads
-        // `grain[..pixels.len()]` and gathers only in-range LUT entries.
+        // `grain`/`pixels` only inside the `rows x n` window the caller
+        // sliced, and gathers only in-range LUT entries.
         unsafe {
-            simd::luma_noise_row_avx2(
-                pixels, grain, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
+            simd::luma_noise_rows_avx2(
+                pixels, p_stride, grain, g_stride, rows, n, scaling, rounding_offset,
+                scaling_shift, min_luma, max_luma,
             )
         };
         return;
     }
-    luma_noise_row_scalar(
-        pixels, grain, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
-    );
+    for r in 0..rows {
+        luma_noise_row_scalar(
+            &mut pixels[r * p_stride..r * p_stride + n],
+            &grain[r * g_stride..r * g_stride + n],
+            scaling,
+            rounding_offset,
+            scaling_shift,
+            min_luma,
+            max_luma,
+        );
+    }
 }
 
 /// The loop-invariant half of [`chroma_noise_row`]'s spec 7.18.3.5 arithmetic
@@ -505,17 +561,56 @@ fn chroma_noise_row(
     offset: i32,
     p: ChromaNoise,
 ) {
+    let n = chroma.len().min(grain.len()).min(luma.len() / 2);
+    chroma_noise_rows(
+        chroma, n, luma, 2 * n, grain, n, 1, n, scaling, luma_mult, mult, offset, p,
+    );
+}
+
+/// [`chroma_noise_row`] over `rows` consecutive chroma rows of a block; see
+/// [`luma_noise_rows`] for why the row loop lives inside the kernel.
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn chroma_noise_rows(
+    chroma: &mut [u16],
+    c_stride: usize,
+    luma: &[u16],
+    l_stride: usize,
+    grain: &[i32],
+    g_stride: usize,
+    rows: usize,
+    n: usize,
+    scaling: &[i32],
+    luma_mult: i32,
+    mult: i32,
+    offset: i32,
+    p: ChromaNoise,
+) {
     #[cfg(target_arch = "x86_64")]
-    if crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
+    if n >= 4 && crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
         // SAFETY: reached only when the CPU reports avx2; the kernel reads
-        // `luma[..2 * n]`/`grain[..n]` for `n` samples it writes, and gathers
-        // only in-range LUT entries.
+        // `luma`/`grain`/`chroma` only inside the window the caller sliced,
+        // and gathers only in-range LUT entries.
         unsafe {
-            simd::chroma_noise_row_avx2(chroma, luma, grain, scaling, luma_mult, mult, offset, p)
+            simd::chroma_noise_rows_avx2(
+                chroma, c_stride, luma, l_stride, grain, g_stride, rows, n, scaling, luma_mult,
+                mult, offset, p,
+            )
         };
         return;
     }
-    chroma_noise_row_scalar(chroma, luma, grain, scaling, luma_mult, mult, offset, p);
+    for r in 0..rows {
+        chroma_noise_row_scalar(
+            &mut chroma[r * c_stride..r * c_stride + n],
+            &luma[r * l_stride..r * l_stride + 2 * n],
+            &grain[r * g_stride..r * g_stride + n],
+            scaling,
+            luma_mult,
+            mult,
+            offset,
+            p,
+        );
+    }
 }
 
 /// The scalar reference for [`chroma_noise_row`].
@@ -585,36 +680,85 @@ mod simd {
         max_luma: i32,
     ) {
         let n = pixels.len().min(grain.len());
+        luma_noise_rows_avx2(
+            pixels, n, grain, n, 1, n, scaling, rounding_offset, scaling_shift, min_luma, max_luma,
+        );
+    }
+
+    /// [`super::luma_noise_rows`]'s AVX2 kernel: `rows` rows of `n` samples,
+    /// 8 per iteration, then one 4-wide SSE step, then at most 3 scalar
+    /// samples. The prologue is paid once for the whole block.
+    ///
+    /// # Safety
+    /// Requires AVX2; `pixels`/`grain` must cover the `rows x n` window at
+    /// their strides and `scaling` must be non-empty.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn luma_noise_rows_avx2(
+        pixels: &mut [u16],
+        p_stride: usize,
+        grain: &[i32],
+        g_stride: usize,
+        rows: usize,
+        n: usize,
+        scaling: &[i32],
+        rounding_offset: i32,
+        scaling_shift: i32,
+        min_luma: i32,
+        max_luma: i32,
+    ) {
         let last = _mm256_set1_epi32(scaling.len() as i32 - 1);
         let rnd = _mm256_set1_epi32(rounding_offset);
         let sh = _mm_cvtsi32_si128(scaling_shift);
         let lo = _mm256_set1_epi32(min_luma);
         let hi = _mm256_set1_epi32(max_luma);
-        let pp = pixels.as_mut_ptr();
-        let gp = grain.as_ptr();
-        let mut c = 0usize;
-        while c + 8 <= n {
-            let p16 = _mm_loadu_si128(pp.add(c).cast());
-            let p32 = _mm256_cvtepu16_epi32(p16);
-            let idx = _mm256_min_epi32(p32, last);
-            let s = _mm256_i32gather_epi32(scaling.as_ptr(), idx, 4);
-            let g = _mm256_loadu_si256(gp.add(c).cast());
-            let delta = _mm256_sra_epi32(_mm256_add_epi32(_mm256_mullo_epi32(s, g), rnd), sh);
-            let v = _mm256_max_epi32(
-                _mm256_min_epi32(_mm256_add_epi32(p32, delta), hi),
-                lo,
+        let last4 = _mm256_castsi256_si128(last);
+        let rnd4 = _mm256_castsi256_si128(rnd);
+        let lo4 = _mm256_castsi256_si128(lo);
+        let hi4 = _mm256_castsi256_si128(hi);
+        let sp = scaling.as_ptr();
+        for r in 0..rows {
+            let pp = pixels.as_mut_ptr().add(r * p_stride);
+            let gp = grain.as_ptr().add(r * g_stride);
+            let mut c = 0usize;
+            while c + 8 <= n {
+                let p16 = _mm_loadu_si128(pp.add(c).cast());
+                let p32 = _mm256_cvtepu16_epi32(p16);
+                let idx = _mm256_min_epi32(p32, last);
+                let s = _mm256_i32gather_epi32(sp, idx, 4);
+                let g = _mm256_loadu_si256(gp.add(c).cast());
+                let delta = _mm256_sra_epi32(_mm256_add_epi32(_mm256_mullo_epi32(s, g), rnd), sh);
+                let v = _mm256_max_epi32(_mm256_min_epi32(_mm256_add_epi32(p32, delta), hi), lo);
+                // Every lane is already inside `[min_luma, max_luma]`, so the
+                // unsigned saturation of `packus` is exact; `permute4x64`
+                // undoes the pack's per-128-bit-lane interleave.
+                let packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(v, v), 0b0000_1000);
+                _mm_storeu_si128(pp.add(c).cast(), _mm256_castsi256_si128(packed));
+                c += 8;
+            }
+            if c + 4 <= n {
+                let p16 = _mm_loadl_epi64(pp.add(c).cast());
+                let p32 = _mm_cvtepu16_epi32(p16);
+                let idx = _mm_min_epi32(p32, last4);
+                let s = _mm_i32gather_epi32(sp, idx, 4);
+                let g = _mm_loadu_si128(gp.add(c).cast());
+                let delta = _mm_sra_epi32(_mm_add_epi32(_mm_mullo_epi32(s, g), rnd4), sh);
+                let v = _mm_max_epi32(_mm_min_epi32(_mm_add_epi32(p32, delta), hi4), lo4);
+                _mm_storel_epi64(pp.add(c).cast(), _mm_packus_epi32(v, v));
+                c += 4;
+            }
+            let base = r * p_stride;
+            let gbase = r * g_stride;
+            super::luma_noise_row_scalar(
+                &mut pixels[base + c..base + n],
+                &grain[gbase + c..gbase + n],
+                scaling,
+                rounding_offset,
+                scaling_shift,
+                min_luma,
+                max_luma,
             );
-            // Every lane is already inside `[min_luma, max_luma]`, so the
-            // unsigned saturation of `packus` is exact; `permute4x64` undoes
-            // the pack's per-128-bit-lane interleave.
-            let packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(v, v), 0b0000_1000);
-            _mm_storeu_si128(pp.add(c).cast(), _mm256_castsi256_si128(packed));
-            c += 8;
         }
-        super::luma_noise_row_scalar(
-            &mut pixels[c..], &grain[c..], scaling, rounding_offset, scaling_shift, min_luma,
-            max_luma,
-        );
     }
 
     /// [`super::chroma_noise_row`]'s AVX2 kernel, 8 chroma samples per
@@ -640,7 +784,37 @@ mod simd {
         p: super::ChromaNoise,
     ) {
         let n = chroma.len().min(grain.len()).min(luma.len() / 2);
+        chroma_noise_rows_avx2(
+            chroma, n, luma, 2 * n, grain, n, 1, n, scaling, luma_mult, mult, offset, p,
+        );
+    }
+
+    /// [`super::chroma_noise_rows`]'s AVX2 kernel: `rows` chroma rows of `n`
+    /// samples, 8 per iteration, then one 4-wide SSE step, then at most 3
+    /// scalar samples.
+    ///
+    /// # Safety
+    /// Requires AVX2; the three slices must cover the `rows x n` window
+    /// (`2 * n` for luma) at their strides and `scaling` must be non-empty.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn chroma_noise_rows_avx2(
+        chroma: &mut [u16],
+        c_stride: usize,
+        luma: &[u16],
+        l_stride: usize,
+        grain: &[i32],
+        g_stride: usize,
+        rows: usize,
+        n: usize,
+        scaling: &[i32],
+        luma_mult: i32,
+        mult: i32,
+        offset: i32,
+        p: super::ChromaNoise,
+    ) {
         let ones = _mm256_set1_epi16(1);
+        let one = _mm256_set1_epi32(1);
         let vluma_mult = _mm256_set1_epi32(luma_mult);
         let vmult = _mm256_set1_epi32(mult);
         let voffset = _mm256_set1_epi32(offset);
@@ -651,36 +825,78 @@ mod simd {
         let sh = _mm_cvtsi32_si128(p.scaling_shift);
         let lo = _mm256_set1_epi32(p.min_chroma);
         let hi = _mm256_set1_epi32(p.max_chroma);
-        let cp = chroma.as_mut_ptr();
-        let lp = luma.as_ptr();
-        let gp = grain.as_ptr();
-        let mut c = 0usize;
-        while c + 8 <= n {
-            let l = _mm256_loadu_si256(lp.add(c * 2).cast());
-            let pair_sum = _mm256_madd_epi16(l, ones);
-            let avg = _mm256_srai_epi32(_mm256_add_epi32(pair_sum, _mm256_set1_epi32(1)), 1);
-            let c16 = _mm_loadu_si128(cp.add(c).cast());
-            let c32 = _mm256_cvtepu16_epi32(c16);
-            let mixed = _mm256_add_epi32(
-                _mm256_mullo_epi32(avg, vluma_mult),
-                _mm256_mullo_epi32(c32, vmult),
+        let ones4 = _mm256_castsi256_si128(ones);
+        let one4 = _mm256_castsi256_si128(one);
+        let vluma_mult4 = _mm256_castsi256_si128(vluma_mult);
+        let vmult4 = _mm256_castsi256_si128(vmult);
+        let voffset4 = _mm256_castsi256_si128(voffset);
+        let vindex_max4 = _mm256_castsi256_si128(vindex_max);
+        let last4 = _mm256_castsi256_si128(last);
+        let zero4 = _mm256_castsi256_si128(zero);
+        let rnd4 = _mm256_castsi256_si128(rnd);
+        let lo4 = _mm256_castsi256_si128(lo);
+        let hi4 = _mm256_castsi256_si128(hi);
+        let sp = scaling.as_ptr();
+        for r in 0..rows {
+            let cp = chroma.as_mut_ptr().add(r * c_stride);
+            let lp = luma.as_ptr().add(r * l_stride);
+            let gp = grain.as_ptr().add(r * g_stride);
+            let mut c = 0usize;
+            while c + 8 <= n {
+                let l = _mm256_loadu_si256(lp.add(c * 2).cast());
+                let pair_sum = _mm256_madd_epi16(l, ones);
+                let avg = _mm256_srai_epi32(_mm256_add_epi32(pair_sum, one), 1);
+                let c16 = _mm_loadu_si128(cp.add(c).cast());
+                let c32 = _mm256_cvtepu16_epi32(c16);
+                let mixed = _mm256_add_epi32(
+                    _mm256_mullo_epi32(avg, vluma_mult),
+                    _mm256_mullo_epi32(c32, vmult),
+                );
+                let scaled = _mm256_add_epi32(_mm256_srai_epi32(mixed, 6), voffset);
+                let clamped = _mm256_max_epi32(_mm256_min_epi32(scaled, vindex_max), zero);
+                let idx = _mm256_min_epi32(clamped, last);
+                let s = _mm256_i32gather_epi32(sp, idx, 4);
+                let g = _mm256_loadu_si256(gp.add(c).cast());
+                let delta = _mm256_sra_epi32(_mm256_add_epi32(_mm256_mullo_epi32(s, g), rnd), sh);
+                let v = _mm256_max_epi32(_mm256_min_epi32(_mm256_add_epi32(c32, delta), hi), lo);
+                // Same packing argument as the luma kernel: every lane already
+                // sits inside `[min_chroma, max_chroma]`.
+                let packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(v, v), 0b0000_1000);
+                _mm_storeu_si128(cp.add(c).cast(), _mm256_castsi256_si128(packed));
+                c += 8;
+            }
+            if c + 4 <= n {
+                let l = _mm_loadu_si128(lp.add(c * 2).cast());
+                let pair_sum = _mm_madd_epi16(l, ones4);
+                let avg = _mm_srai_epi32(_mm_add_epi32(pair_sum, one4), 1);
+                let c16 = _mm_loadl_epi64(cp.add(c).cast());
+                let c32 = _mm_cvtepu16_epi32(c16);
+                let mixed =
+                    _mm_add_epi32(_mm_mullo_epi32(avg, vluma_mult4), _mm_mullo_epi32(c32, vmult4));
+                let scaled = _mm_add_epi32(_mm_srai_epi32(mixed, 6), voffset4);
+                let clamped = _mm_max_epi32(_mm_min_epi32(scaled, vindex_max4), zero4);
+                let idx = _mm_min_epi32(clamped, last4);
+                let s = _mm_i32gather_epi32(sp, idx, 4);
+                let g = _mm_loadu_si128(gp.add(c).cast());
+                let delta = _mm_sra_epi32(_mm_add_epi32(_mm_mullo_epi32(s, g), rnd4), sh);
+                let v = _mm_max_epi32(_mm_min_epi32(_mm_add_epi32(c32, delta), hi4), lo4);
+                _mm_storel_epi64(cp.add(c).cast(), _mm_packus_epi32(v, v));
+                c += 4;
+            }
+            let cbase = r * c_stride;
+            let lbase = r * l_stride;
+            let gbase = r * g_stride;
+            super::chroma_noise_row_scalar(
+                &mut chroma[cbase + c..cbase + n],
+                &luma[lbase + c * 2..lbase + n * 2],
+                &grain[gbase + c..gbase + n],
+                scaling,
+                luma_mult,
+                mult,
+                offset,
+                p,
             );
-            let scaled = _mm256_add_epi32(_mm256_srai_epi32(mixed, 6), voffset);
-            let clamped = _mm256_max_epi32(_mm256_min_epi32(scaled, vindex_max), zero);
-            let idx = _mm256_min_epi32(clamped, last);
-            let s = _mm256_i32gather_epi32(scaling.as_ptr(), idx, 4);
-            let g = _mm256_loadu_si256(gp.add(c).cast());
-            let delta = _mm256_sra_epi32(_mm256_add_epi32(_mm256_mullo_epi32(s, g), rnd), sh);
-            let v = _mm256_max_epi32(_mm256_min_epi32(_mm256_add_epi32(c32, delta), hi), lo);
-            // Same packing argument as the luma kernel: every lane already
-            // sits inside `[min_chroma, max_chroma]`.
-            let packed = _mm256_permute4x64_epi64(_mm256_packus_epi32(v, v), 0b0000_1000);
-            _mm_storeu_si128(cp.add(c).cast(), _mm256_castsi256_si128(packed));
-            c += 8;
         }
-        super::chroma_noise_row_scalar(
-            &mut chroma[c..], &luma[c * 2..], &grain[c..], scaling, luma_mult, mult, offset, p,
-        );
     }
 }
 
