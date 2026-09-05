@@ -17963,6 +17963,54 @@ fn lf_level(
     lvl.clamp(0, 63)
 }
 
+thread_local! {
+    /// lane-pipefilt: [`EdgeCtx`]'s level LUT, memoised per thread. The table
+    /// is a pure function of the frame's [`LoopFilterParams`], the plane, the
+    /// pass and segment 0's own `SEG_LVL_ALT_LF_*` datum (the only thing
+    /// [`lf_level`] reads out of the `FrameCtx` at `segment_id = 0`), so one
+    /// build per plane and pass serves the whole frame. The pipeline builds
+    /// an `EdgeCtx` per superblock-row band rather than per frame, which
+    /// turned 20 builds a frame into ~680 -- 960 `lf_level` calls each.
+    static LVL_CACHE: std::cell::RefCell<
+        Vec<((usize, usize, LoopFilterParams, Option<i32>), [[u8; 15]; 64])>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `lf_level` over the whole `(base level, ref frame)` domain -- see
+/// [`LVL_CACHE`]. `lf_level`'s own first step is
+/// `(base0 + delta_lf).clamp(0, 63)`, so passing `b - base0` pins its base at
+/// `b` and the rest of the function is a pure function of `(b, ref_frame)`.
+fn lvl_table(
+    lf: &LoopFilterParams,
+    plane_idx: usize,
+    dir: usize,
+    base0: i32,
+    fctx: &crate::decode::FrameCtx,
+) -> [[u8; 15]; 64] {
+    let feature = if plane_idx == 0 { SEG_LVL_ALT_LF_Y_V + dir } else { plane_idx + 2 };
+    let key = (plane_idx, dir, *lf, seg_feature(0, feature, fctx));
+    if let Some(t) = LVL_CACHE.with(|c| {
+        c.borrow().iter().find(|(k, _)| *k == key).map(|(_, t)| *t)
+    }) {
+        return t;
+    }
+    let mut lvl = [[0u8; 15]; 64];
+    for (b, row) in lvl.iter_mut().enumerate() {
+        for (r, cell) in row.iter_mut().enumerate() {
+            *cell =
+                lf_level(lf, plane_idx, dir, (r as i32 - 7) as i8, b as i32 - base0, 0, fctx) as u8;
+        }
+    }
+    LVL_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 8 {
+            c.remove(0);
+        }
+        c.push((key, lvl));
+    });
+    lvl
+}
+
 /// Spec 7.14.2's `set_lpf_parameters`, restricted to the uniform-level,
 /// no-segmentation, no-delta-LF path and to this decoder's own invariant
 /// that a coded block's transform is always its own full size -- so a TU
@@ -18015,17 +18063,7 @@ impl<'a> EdgeCtx<'a> {
         } else {
             lf.level[3]
         });
-        // `lf_level`'s own first step is `(base0 + delta_lf).clamp(0, 63)`,
-        // so passing `b - base0` pins its base at `b` and the rest of the
-        // function is a pure function of `(b, ref_frame)`.
-        let mut lvl = [[0u8; 15]; 64];
-        for (b, row) in lvl.iter_mut().enumerate() {
-            for (r, cell) in row.iter_mut().enumerate() {
-                *cell =
-                    lf_level(lf, plane_idx, dir, (r as i32 - 7) as i8, b as i32 - base0, 0, fctx)
-                        as u8;
-            }
-        }
+        let lvl = lvl_table(lf, plane_idx, dir, base0, fctx);
         Self {
             lf,
             n,
