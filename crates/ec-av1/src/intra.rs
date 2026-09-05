@@ -316,37 +316,70 @@ pub(crate) fn predict(
     // to one `weights` slice before.
     let weights_w = &SM_WEIGHTS[bw..bw * 2];
     let weights_h = &SM_WEIGHTS[bh..bh * 2];
-    for row in 0..bh {
-        for col in 0..bw {
-            let (r, c) = (row as i32, col as i32);
-            let last_w = bw as i32 - 1;
-            let last_h = bh as i32 - 1;
-            let value = match mode {
-                DC_PRED => dc(above, left, bw, bh, fctx),
-                V_PRED => edges.above(c),
-                H_PRED => edges.left(r),
-                SMOOTH_PRED => round2(
-                    i32::from(weights_h[row]) * edges.above(c)
-                        + (256 - i32::from(weights_h[row])) * edges.left(last_h)
-                        + i32::from(weights_w[col]) * edges.left(r)
-                        + (256 - i32::from(weights_w[col])) * edges.above(last_w),
-                    9,
-                ),
-                SMOOTH_V_PRED => round2(
-                    i32::from(weights_h[row]) * edges.above(c)
-                        + (256 - i32::from(weights_h[row])) * edges.left(last_h),
-                    8,
-                ),
-                SMOOTH_H_PRED => round2(
-                    i32::from(weights_w[col]) * edges.left(r)
-                        + (256 - i32::from(weights_w[col])) * edges.above(last_w),
-                    8,
-                ),
-                PAETH_PRED => paeth(edges.above(c), edges.left(r), edges.above(-1)),
-                other => panic!("intra mode {other} is not one this module predicts"),
-            };
-            dst[row * bw + col] = value.clamp(0, crate::decode::sample_max(fctx)) as u16;
+    // lane-intra: one loop per mode rather than a `match mode` per pixel --
+    // the old shape re-ran the whole dispatch (and, for `DC_PRED`, the edge
+    // average itself) for every sample of every block.
+    let max = crate::decode::sample_max(fctx);
+    let above_row = &edges.above[1..];
+    let left_col = &edges.left[1..];
+    let corner = edges.above[0];
+    match mode {
+        DC_PRED => dst.fill(dc(above, left, bw, bh, fctx).clamp(0, max) as u16),
+        V_PRED => {
+            for row in dst.chunks_exact_mut(bw) {
+                for (d, &a) in row.iter_mut().zip(&above_row[..bw]) {
+                    *d = a.clamp(0, max) as u16;
+                }
+            }
         }
+        H_PRED => {
+            for (row, &l) in dst.chunks_exact_mut(bw).zip(&left_col[..bh]) {
+                row.fill(l.clamp(0, max) as u16);
+            }
+        }
+        SMOOTH_PRED => {
+            let below = left_col[bh - 1];
+            let right = above_row[bw - 1];
+            for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+                let wh = i32::from(weights_h[row]);
+                let acc = (256 - wh) * below;
+                let lr = left_col[row];
+                for (col, d) in dstrow.iter_mut().enumerate() {
+                    let ww = i32::from(weights_w[col]);
+                    let v = round2(acc + wh * above_row[col] + ww * lr + (256 - ww) * right, 9);
+                    *d = v.clamp(0, max) as u16;
+                }
+            }
+        }
+        SMOOTH_V_PRED => {
+            let below = left_col[bh - 1];
+            for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+                let wh = i32::from(weights_h[row]);
+                let acc = (256 - wh) * below;
+                for (d, &a) in dstrow.iter_mut().zip(&above_row[..bw]) {
+                    *d = round2(acc + wh * a, 8).clamp(0, max) as u16;
+                }
+            }
+        }
+        SMOOTH_H_PRED => {
+            let right = above_row[bw - 1];
+            for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+                let lr = left_col[row];
+                for (col, d) in dstrow.iter_mut().enumerate() {
+                    let ww = i32::from(weights_w[col]);
+                    *d = round2(ww * lr + (256 - ww) * right, 8).clamp(0, max) as u16;
+                }
+            }
+        }
+        PAETH_PRED => {
+            for (row, dstrow) in dst.chunks_exact_mut(bw).enumerate() {
+                let lr = left_col[row];
+                for (d, &a) in dstrow.iter_mut().zip(&above_row[..bw]) {
+                    *d = paeth(a, lr, corner).clamp(0, max) as u16;
+                }
+            }
+        }
+        other => panic!("intra mode {other} is not one this module predicts"),
     }
 }
 
