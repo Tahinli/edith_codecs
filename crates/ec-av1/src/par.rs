@@ -297,6 +297,7 @@ fn pool_push(inner: &std::sync::Arc<PoolInner>, job: Job, class: &'static str) {
 /// asserts on, and what a profiler counts as `ec-av1-*`.
 static POOL_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
 pub(crate) fn pool_threads() -> usize {
     POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed)
 }
