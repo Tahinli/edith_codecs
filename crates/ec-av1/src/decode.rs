@@ -24038,6 +24038,18 @@ fn decode_inter_block(
                 MIXED_SCALE_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
             }
 
+            // lane-wave4 (the compound arm's half): this block's whole
+            // prediction -- both references, the wedge/diffwtd/distance
+            // blend, every plane -- as a closure, run here at one
+            // reconstruction thread and on the wavefront worker otherwise
+            // (see the single-reference arm below). A compound block reads
+            // neither `motion_mode` nor `interintra`, so nothing but the
+            // blend itself lives in here.
+            let build = move |_y: &mut PlaneBuf<'static>,
+                              _u: &mut PlaneBuf<'static>,
+                              _v: &mut PlaneBuf<'static>,
+                              fctx: &crate::decode::FrameCtx|
+             -> [Vec<u16>; 3] {
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate_kern(
                 &py0.data,
@@ -24264,6 +24276,26 @@ fn decode_inter_block(
 
             // lane-inter4 r2: a rectangular strip's transform tree starts from
             // its own rect `max_txsize_rect_lookup` entry, not a square one.
+            [pred_y, pred_u, pred_v]
+            };
+            let (pred_y, pred_u, pred_v): (Vec<u16>, Vec<u16>, Vec<u16>);
+            let (sy, su, sv) = if recon_deferred(fctx) {
+                push_pred(fctx, build);
+                (
+                    Pred::Cur { plane: 0, stride: side, off: 0 },
+                    Pred::Cur { plane: 1, stride: chroma_side, off: 0 },
+                    Pred::Cur { plane: 2, stride: chroma_side, off: 0 },
+                )
+            } else {
+                let [by, bu, bv] = build(y, u, v, fctx);
+                (pred_y, pred_u, pred_v) = (by, bu, bv);
+                (
+                    Pred::Inline(&pred_y, side),
+                    Pred::Inline(&pred_u, chroma_side),
+                    Pred::Inline(&pred_v, chroma_side),
+                )
+            };
+
             let rect_tu = (write_w, write_h) != (side, side);
             vartx_leaves = if rect_tu {
                 read_block_tx_size_rect(
@@ -24295,7 +24327,7 @@ fn decode_inter_block(
                     side,
                     write_w,
                     write_h,
-                    Pred::dense(&pred_y),
+                    sy,
                     &vec![0i32; side * side], fctx,
                 );
                 push_mc_rect(1, 
@@ -24304,7 +24336,7 @@ fn decode_inter_block(
                     chroma_side,
                     write_chroma_w,
                     write_chroma_h,
-                    Pred::dense(&pred_u),
+                    su,
                     &vec![0i32; chroma_side * chroma_side], fctx,
                 );
                 push_mc_rect(2, 
@@ -24313,7 +24345,7 @@ fn decode_inter_block(
                     chroma_side,
                     write_chroma_w,
                     write_chroma_h,
-                    Pred::dense(&pred_v),
+                    sv,
                     &vec![0i32; chroma_side * chroma_side], fctx,
                 );
                 luma_grid = vec![0i32; side * side];
@@ -24347,11 +24379,7 @@ fn decode_inter_block(
                         let (tu_px, tu_py) = (px + col * MI, py + row * MI);
                         let (tu_grid, tu_tx_type) = if tw == th {
                             let tx_px = tw;
-                            let mut tu_pred = Vec::with_capacity(tx_px * tx_px);
-                            for rr in 0..tx_px {
-                                let start = (row * MI + rr) * side + col * MI;
-                                tu_pred.extend_from_slice(&pred_y[start..start + tx_px]);
-                            }
+                            let tu_pred = sy.offset(row * MI * side + col * MI);
                             let scan = default_scan(tx_px.min(32));
                             let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tx_px / MI);
                             read_inter_plane(
@@ -24367,7 +24395,7 @@ fn decode_inter_block(
                                 tu_py,
                                 tx_px,
                                 base_q_idx,
-                                Pred::dense(&tu_pred),
+                                tu_pred,
                                 None,
                                 Some(tu_skip_ctx), fctx,
                             )?
@@ -24395,7 +24423,7 @@ fn decode_inter_block(
                                 y,
                                 tu_px,
                                 tu_py,
-                                Pred::dense(&pred_y[start..]),
+                                sy.offset(start),
                                 None,
                                 Some(tu_skip_ctx), fctx,
                             )?
@@ -24429,16 +24457,12 @@ fn decode_inter_block(
                                 let cu_scan = default_scan(cu_tx);
                                 for plane_idx in 1..3 {
                                     let (src, buf) = if plane_idx == 1 {
-                                        (&pred_u, &mut *u)
+                                        (su, &mut *u)
                                     } else {
-                                        (&pred_v, &mut *v)
+                                        (sv, &mut *v)
                                     };
-                                    let mut cu_pred = Vec::with_capacity(cu_tx * cu_tx);
-                                    for rr in 0..cu_tx {
-                                        let start =
-                                            (cr * cu_tx + rr) * chroma_side + cc * cu_tx;
-                                        cu_pred.extend_from_slice(&src[start..start + cu_tx]);
-                                    }
+                                    let cu_pred =
+                                        src.offset(cr * cu_tx * chroma_side + cc * cu_tx);
                                     let cu_grid = read_inter_plane(
                                         dec,
                                         cdfs,
@@ -24452,7 +24476,7 @@ fn decode_inter_block(
                                         cu_y,
                                         cu_tx,
                                         base_q_idx,
-                                        Pred::dense(&cu_pred),
+                                        cu_pred,
                                         Some(first_tx_type),
                                         Some(3), fctx,
                                     )?
@@ -24499,7 +24523,7 @@ fn decode_inter_block(
                         y,
                         px,
                         py,
-                        Pred::dense(&pred_y),
+                        sy,
                         None,
                         None, fctx,
                     )?;
@@ -24519,7 +24543,7 @@ fn decode_inter_block(
                         py,
                         side,
                         base_q_idx,
-                        Pred::dense(&pred_y),
+                        sy,
                         None,
                         None, fctx,
                     )?;
@@ -24549,7 +24573,7 @@ fn decode_inter_block(
                             u,
                             cpx,
                             cpy,
-                            Pred::dense(&pred_u),
+                            su,
                             Some(luma_tx_type),
                             None, fctx,
                         )?
@@ -24571,7 +24595,7 @@ fn decode_inter_block(
                             v,
                             cpx,
                             cpy,
-                            Pred::dense(&pred_v),
+                            sv,
                             Some(luma_tx_type),
                             None, fctx,
                         )?
@@ -24594,7 +24618,7 @@ fn decode_inter_block(
                     cpy,
                     chroma_side,
                     base_q_idx,
-                    Pred::dense(&pred_u),
+                    su,
                     Some(luma_tx_type),
                     None, fctx,
                 )?
@@ -24612,7 +24636,7 @@ fn decode_inter_block(
                     cpy,
                     chroma_side,
                     base_q_idx,
-                    Pred::dense(&pred_v),
+                    sv,
                     Some(luma_tx_type),
                     None, fctx,
                 )?
