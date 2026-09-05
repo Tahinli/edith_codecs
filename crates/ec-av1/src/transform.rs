@@ -105,15 +105,73 @@ fn clamp_range(x: i32, r: usize) -> i32 {
     x.clamp(lo, hi)
 }
 
+/// One value the DCT network carries: a single coefficient (the row pass, and
+/// every caller of the slice-taking [`inverse_dct`]) or eight neighbouring
+/// columns at once (the column pass, where eight columns of the row-pass
+/// output share the whole network). The two impls are elementwise-identical
+/// integer arithmetic, so the eight-wide pass is byte-exact with the scalar
+/// one by construction -- the network itself is written once, above.
+trait Lane: Copy {
+    /// The additive identity, for [`permute`]'s scratch.
+    const ZERO: Self;
+    /// One butterfly rotation's two outputs, at pre-multiplied `cos`/`sin`.
+    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self);
+    /// One Hadamard rotation's two outputs, clamped to `r` bits.
+    fn had(a: Self, b: Self, r: usize) -> (Self, Self);
+}
+
+/// `Round2(x, COS_BITS)` on a butterfly's 64-bit product sum.
+fn round_cos(x: i64) -> i32 {
+    ((x + (1 << (COS_BITS - 1))) >> COS_BITS) as i32
+}
+
+impl Lane for i32 {
+    const ZERO: Self = 0;
+
+    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+        let (ta, tb) = (i64::from(a), i64::from(b));
+        (round_cos(ta * c - tb * s), round_cos(ta * s + tb * c))
+    }
+
+    fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
+        (clamp_range(a.wrapping_add(b), r), clamp_range(a.wrapping_sub(b), r))
+    }
+}
+
+/// Eight columns at once. Every operation is the [`i32`] impl's, lane by lane,
+/// which is what the optimiser turns into one vector op per line.
+impl Lane for [i32; 8] {
+    const ZERO: Self = [0; 8];
+
+    fn btf(a: Self, b: Self, c: i64, s: i64) -> (Self, Self) {
+        let mut x = [0i32; 8];
+        let mut y = [0i32; 8];
+        for l in 0..8 {
+            let (ta, tb) = (i64::from(a[l]), i64::from(b[l]));
+            x[l] = round_cos(ta * c - tb * s);
+            y[l] = round_cos(ta * s + tb * c);
+        }
+        (x, y)
+    }
+
+    fn had(a: Self, b: Self, r: usize) -> (Self, Self) {
+        let mut x = [0i32; 8];
+        let mut y = [0i32; 8];
+        for l in 0..8 {
+            x[l] = clamp_range(a[l].wrapping_add(b[l]), r);
+            y[l] = clamp_range(a[l].wrapping_sub(b[l]), r);
+        }
+        (x, y)
+    }
+}
+
 /// `B(a, b, angle, flip, r)` (spec 7.13.2.1): a butterfly rotation, and an
 /// exchange of the two entries when `flip` is set.
-fn butterfly(t: &mut [i32; 64], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
-    let (ta, tb) = (i64::from(t[a]), i64::from(t[b]));
+fn butterfly<T: Lane>(t: &mut [T; 64], a: usize, b: usize, angle: i32, flip: bool, _r: usize) {
     let (c, s) = (i64::from(cos128(angle)), i64::from(sin128(angle)));
-    let x = ta * c - tb * s;
-    let y = ta * s + tb * c;
-    t[a] = ((x + (1 << (COS_BITS - 1))) >> COS_BITS) as i32;
-    t[b] = ((y + (1 << (COS_BITS - 1))) >> COS_BITS) as i32;
+    let (x, y) = T::btf(t[a], t[b], c, s);
+    t[a] = x;
+    t[b] = y;
     if flip {
         t.swap(a, b);
     }
@@ -121,20 +179,20 @@ fn butterfly(t: &mut [i32; 64], a: usize, b: usize, angle: i32, flip: bool, _r: 
 
 /// `H(a, b, flip, r)` (spec 7.13.2.1): a Hadamard rotation, with the indices
 /// exchanged when `flip` is set.
-fn hadamard(t: &mut [i32; 64], a: usize, b: usize, flip: bool, r: usize) {
+fn hadamard<T: Lane>(t: &mut [T; 64], a: usize, b: usize, flip: bool, r: usize) {
     let (a, b) = if flip { (b, a) } else { (a, b) };
-    let (x, y) = (t[a], t[b]);
-    t[a] = clamp_range(x.wrapping_add(y), r);
-    t[b] = clamp_range(x.wrapping_sub(y), r);
+    let (x, y) = T::had(t[a], t[b], r);
+    t[a] = x;
+    t[b] = y;
 }
 
 /// The inverse DCT array permutation (spec 7.13.2.2): an in-place bit-reversal
 /// of the first `1 << n` entries.
-fn permute(t: &mut [i32; 64], n: u32) {
+fn permute<T: Lane>(t: &mut [T; 64], n: u32) {
     let n0 = 1usize << n;
     // A stack copy: this ran once per 1D transform and its `Vec` was the
     // `malloc` at the top of every `inverse_dct` frame in the annotation.
-    let mut copy = [0i32; 64];
+    let mut copy = [T::ZERO; 64];
     copy[..n0].copy_from_slice(&t[..n0]);
     let tab = &BREV_TAB[n as usize];
     for (i, v) in t[..n0].iter_mut().enumerate() {
@@ -161,16 +219,43 @@ pub fn inverse_dct(t: &mut [i32], n: u32, r: usize) {
 }
 
 /// [`inverse_dct`] on the driver's own 64-entry scratch.
+/// [`inverse_dct`] on the driver's own 64-entry scratch: a thin dispatch to
+/// [`inverse_dct_n`], which is the same network monomorphised per size so
+/// the size guards, the `brev` folds and every butterfly angle become
+/// compile-time constants instead of per-call work.
 fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
-    assert!((2..=6).contains(&n), "the inverse DCT is defined for 4..64");
-    permute(t, n);
+    match n {
+        2 => inverse_dct_n::<i32, 2>(t, r),
+        3 => inverse_dct_n::<i32, 3>(t, r),
+        4 => inverse_dct_n::<i32, 4>(t, r),
+        5 => inverse_dct_n::<i32, 5>(t, r),
+        6 => inverse_dct_n::<i32, 6>(t, r),
+        _ => unreachable!("the inverse DCT is defined for 4..64"),
+    }
+}
 
-    if n == 6 {
+/// [`inverse_dct_fixed`] over eight columns at once (the column pass).
+fn inverse_dct_x8(t: &mut [[i32; 8]; 64], n: u32, r: usize) {
+    match n {
+        2 => inverse_dct_n::<[i32; 8], 2>(t, r),
+        3 => inverse_dct_n::<[i32; 8], 3>(t, r),
+        4 => inverse_dct_n::<[i32; 8], 4>(t, r),
+        5 => inverse_dct_n::<[i32; 8], 5>(t, r),
+        6 => inverse_dct_n::<[i32; 8], 6>(t, r),
+        _ => unreachable!("the inverse DCT is defined for 4..64"),
+    }
+}
+
+/// [`inverse_dct_fixed`] at one fixed `N = log2(size)`.
+fn inverse_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
+    permute(t, N);
+
+    if N == 6 {
         for i in 0..16 {
             butterfly(t, 32 + i, 63 - i, 63 - 4 * brev(4, i) as i32, false, r);
         }
     }
-    if n >= 5 {
+    if N >= 5 {
         for i in 0..8 {
             butterfly(
                 t,
@@ -182,12 +267,12 @@ fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
             );
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..16 {
             hadamard(t, 32 + i * 2, 33 + i * 2, i & 1 == 1, r);
         }
     }
-    if n >= 4 {
+    if N >= 4 {
         for i in 0..4 {
             butterfly(
                 t,
@@ -199,12 +284,12 @@ fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
             );
         }
     }
-    if n >= 5 {
+    if N >= 5 {
         for i in 0..8 {
             hadamard(t, 16 + 2 * i, 17 + 2 * i, i & 1 == 1, r);
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..4 {
             for j in 0..2 {
                 let angle = 60 - 16 * brev(2, i) as i32 + 64 * j as i32;
@@ -212,17 +297,17 @@ fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
             }
         }
     }
-    if n >= 3 {
+    if N >= 3 {
         for i in 0..2 {
             butterfly(t, 4 + i, 7 - i, 56 - 32 * i as i32, false, r);
         }
     }
-    if n >= 4 {
+    if N >= 4 {
         for i in 0..4 {
             hadamard(t, 8 + 2 * i, 9 + 2 * i, i & 1 == 1, r);
         }
     }
-    if n >= 5 {
+    if N >= 5 {
         for i in 0..2 {
             for j in 0..2 {
                 let angle = 24 + ((j as i32) << 6) + ((1 - i as i32) << 5);
@@ -230,7 +315,7 @@ fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
             }
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..8 {
             for j in 0..2 {
                 hadamard(t, 32 + i * 4 + j, 35 + i * 4 - j, i & 1 == 1, r);
@@ -240,24 +325,24 @@ fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
     for i in 0..2 {
         butterfly(t, 2 * i, 2 * i + 1, 32 + 16 * i as i32, i == 0, r);
     }
-    if n >= 3 {
+    if N >= 3 {
         for i in 0..2 {
             hadamard(t, 4 + 2 * i, 5 + 2 * i, i == 1, r);
         }
     }
-    if n >= 4 {
+    if N >= 4 {
         for i in 0..2 {
             butterfly(t, 14 - i, 9 + i, 48 + 64 * i as i32, true, r);
         }
     }
-    if n >= 5 {
+    if N >= 5 {
         for i in 0..4 {
             for j in 0..2 {
                 hadamard(t, 16 + 4 * i + j, 19 + 4 * i - j, i & 1 == 1, r);
             }
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..2 {
             for j in 0..4 {
                 let angle = 56 - (i as i32) * 32 + ((j as i32) >> 1) * 64;
@@ -268,77 +353,77 @@ fn inverse_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
     for i in 0..2 {
         hadamard(t, i, 3 - i, false, r);
     }
-    if n >= 3 {
+    if N >= 3 {
         butterfly(t, 6, 5, 32, true, r);
     }
-    if n >= 4 {
+    if N >= 4 {
         for i in 0..2 {
             for j in 0..2 {
                 hadamard(t, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, r);
             }
         }
     }
-    if n >= 5 {
+    if N >= 5 {
         for i in 0..4 {
             butterfly(t, 29 - i, 18 + i, 48 + ((i as i32) >> 1) * 64, true, r);
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..4 {
             for j in 0..4 {
                 hadamard(t, 32 + 8 * i + j, 39 + 8 * i - j, i & 1 == 1, r);
             }
         }
     }
-    if n >= 3 {
+    if N >= 3 {
         for i in 0..4 {
             hadamard(t, i, 7 - i, false, r);
         }
     }
-    if n >= 4 {
+    if N >= 4 {
         for i in 0..2 {
             butterfly(t, 13 - i, 10 + i, 32, true, r);
         }
     }
-    if n >= 5 {
+    if N >= 5 {
         for i in 0..2 {
             for j in 0..4 {
                 hadamard(t, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, r);
             }
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..8 {
             butterfly(t, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true, r);
         }
     }
-    if n >= 4 {
+    if N >= 4 {
         for i in 0..8 {
             hadamard(t, i, 15 - i, false, r);
         }
     }
-    if n >= 5 {
+    if N >= 5 {
         for i in 0..4 {
             butterfly(t, 27 - i, 20 + i, 32, true, r);
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..8 {
             hadamard(t, 32 + i, 47 - i, false, r);
             hadamard(t, 48 + i, 63 - i, true, r);
         }
     }
-    if n >= 5 {
+    if N >= 5 {
         for i in 0..16 {
             hadamard(t, i, 31 - i, false, r);
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..8 {
             butterfly(t, 55 - i, 40 + i, 32, true, r);
         }
     }
-    if n == 6 {
+    if N == 6 {
         for i in 0..32 {
             hadamard(t, i, 63 - i, false, r);
         }
@@ -971,6 +1056,38 @@ pub fn inverse_transform_2d_typed_wh(
             return;
         }
 
+        // The column pass over a plain-DCT axis takes eight neighbouring
+        // columns through one network ([`Lane`]): eight columns of one
+        // row-pass row are eight adjacent `i32`s, so the gather is a
+        // contiguous load and every butterfly is one vector op instead of
+        // eight scalar ones. `lr_flip` reads the columns right-to-left, which
+        // is not a contiguous chunk, so it stays on the scalar path below.
+        if col_kind == TxType1d::Dct && w >= 8 && !lr_flip {
+            let mut t8 = [[0i32; 8]; 64];
+            for j in (0..w).step_by(8) {
+                let mut any = 0i32;
+                for i in 0..h {
+                    let src = &residual[i * w + j..][..8];
+                    for (d, &v) in t8[i].iter_mut().zip(src) {
+                        *d = v;
+                        any |= v;
+                    }
+                }
+                if any == 0 {
+                    continue;
+                }
+                inverse_dct_x8(&mut t8, log2h, col_clamp);
+                for i in 0..h {
+                    let dst_row = if ud_flip { h - 1 - i } else { i };
+                    let dst = &mut out[dst_row * w + j..][..8];
+                    for (d, &v) in dst.iter_mut().zip(t8[i].iter()) {
+                        *d = round2(v, 4);
+                    }
+                }
+            }
+            return;
+        }
+
         for j in 0..w {
             let src_col = if lr_flip { w - 1 - j } else { j };
             let mut any = 0i32;
@@ -1042,6 +1159,15 @@ pub fn dequant_and_inverse_typed_wh(
     ac_delta: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
+    // 60% of the transform units of a 4K inter stream carry no coefficient at
+    // all (measured on the perf segment: 3.46M of 5.7M calls). Dequantization
+    // maps zero to zero (`dequant_wh_into`) and a zero grid inverse-transforms
+    // to a zero residual, which is exactly the buffer below already returns --
+    // so one scan of the levels replaces the dequantization, the row pass and
+    // the column pass for those.
+    if levels.iter().all(|&l| l == 0) {
+        return vec![0i32; w * h];
+    }
     DQ_SCRATCH.with(|cell| {
         let mut dq = cell.borrow_mut();
         crate::quant::dequant_wh_into(levels, &mut dq, w, h, bit_depth, q_idx, dc_delta, ac_delta);
@@ -1889,4 +2015,45 @@ mod tests {
             assert_eq!(via_wrapper, via_wh, "side {side}");
         }
     }
+
+    /// The eight-wide column kernel is the scalar network, lane for lane: a
+    /// pseudo-random sweep over the full coefficient range at every size and
+    /// both clamp widths (`bit_depth` 8 and 10) has to agree bit for bit, or
+    /// the column pass would drift from the decoder on some block this
+    /// crate's gate streams happen not to contain.
+    #[test]
+    fn the_eight_wide_dct_matches_the_scalar_one() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // The transform's input is a dequantized coefficient, bounded by
+            // `dequant_wh_into`'s own +-(1 << (7 + bit_depth)).
+            (state >> 32) as i32 % 262_144 - 131_072
+        };
+        for n in 2..=6u32 {
+            for &r in &[16usize, 18] {
+                for _ in 0..64 {
+                    let mut wide = [[0i32; 8]; 64];
+                    let mut cols = [[0i32; 64]; 8];
+                    for i in 0..(1usize << n) {
+                        for l in 0..8 {
+                            let v = next();
+                            wide[i][l] = v;
+                            cols[l][i] = v;
+                        }
+                    }
+                    inverse_dct_x8(&mut wide, n, r);
+                    for (l, col) in cols.iter_mut().enumerate() {
+                        inverse_dct_fixed(col, n, r);
+                        for i in 0..(1usize << n) {
+                            assert_eq!(wide[i][l], col[i], "n={n} r={r} lane={l} i={i}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }
