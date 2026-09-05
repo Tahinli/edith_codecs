@@ -2712,11 +2712,13 @@ mod tests {
         // A 4x4-mi frame (16x16 px), block 1x1 mi at (1, 1): room for one
         // neighbour above and one to the left, tight edges on every side.
         let mut grid = MiGrid::new(4, 4);
-        grid.set(0, 1, inter((100_000, 100_000)));
+        // lane-migrid: far outside this 16x16-px frame, but inside the
+        // spec's own MV width (`MiInfo` stores libaom's `int16_t` mv).
+        grid.set(0, 1, inter((30_000, 30_000)));
 
         let stack = find_mv_stack(&grid, 1, 1, 1, 1, 1, 4, 4);
 
-        // Unclamped this candidate is (100000, 100000); spec 7.10.2.14 caps
+        // Unclamped this candidate is (30000, 30000); spec 7.10.2.14 caps
         // it at the frame edge (2 mi below/right) plus the block's own 4x4
         // span plus MV_BORDER (128), all in 1/8-pel: (2*4)*8 + 1*4*8 + 128 =
         // 64 + 32 + 128 = 224.
