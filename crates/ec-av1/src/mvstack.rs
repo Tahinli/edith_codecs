@@ -78,52 +78,61 @@
 //! stack to two entries (spec 7.10.2.12) — this module's stack can be
 //! shorter than two candidates where libaom's never is.
 
-/// How many query blocks [`find_mv_stack_with_sign_bias`] has folded at
-/// least one temporal MV candidate into (spec 7.9/7.10.2.8's
-/// `add_tpl_ref_mv`) — the real-aomenc temporal-MV gate's own firing
-/// counter (`crate::decode::tmv_hits`), proving the projection path in
-/// [`crate::motion_field`] is actually reached, not just compiled.
-static TMV_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// How many query blocks [`find_mv_stack_with_sign_bias`] has folded at
+    /// least one temporal MV candidate into (spec 7.9/7.10.2.8's
+    /// `add_tpl_ref_mv`) — the real-aomenc temporal-MV gate's own firing
+    /// counter (`crate::decode::tmv_hits`), proving the projection path in
+    /// [`crate::motion_field`] is actually reached, not just compiled.
+    /// lane-tpl: thread-local (like `restoration`'s stripe counters), not an
+    /// atomic -- this one is bumped once per inter block, and a shared cache line
+    /// on 16 frame threads' critical path costs more than the counter is worth.
+    /// Every gate that reads it decodes on its own thread (`EC_AV1_THREADS`
+    /// defaults to 1, which is the single-threaded decoder unchanged).
+    static TMV_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// The number of query blocks that received at least one temporal MV
 /// candidate so far, across every [`find_mv_stack_with_sign_bias`] call in
 /// this process.
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tmv_hits() -> usize {
-    TMV_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    TMV_HITS.with(|c| c.get())
 }
 
-/// lane-mvtwin r1 firing counters, one per divergence this round closed.
-/// `COMP_GM_FILL_HITS`: compound extension candidates whose `comp_list` slot
-/// came from `gm_mv_candidates[side]` rather than a scanned neighbour, and
-/// where that global mv was NOT `(0, 0)` (the only case the old zero fill
-/// could not fake). `STACK_FULL_DROPS`: distinct candidates libaom drops at
-/// `MAX_REF_MV_STACK_SIZE` on insertion. `TILE_REACH_CLIPS`: row/col reaches
-/// shortened by a tile origin past mi 0, which the old frame-edge clamp
-/// missed entirely.
-static COMP_GM_FILL_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static STACK_FULL_DROPS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static TILE_REACH_CLIPS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// lane-mvtwin r1 firing counters, one per divergence this round closed.
+    /// `COMP_GM_FILL_HITS`: compound extension candidates whose `comp_list` slot
+    /// came from `gm_mv_candidates[side]` rather than a scanned neighbour, and
+    /// where that global mv was NOT `(0, 0)` (the only case the old zero fill
+    /// could not fake). `STACK_FULL_DROPS`: distinct candidates libaom drops at
+    /// `MAX_REF_MV_STACK_SIZE` on insertion. `TILE_REACH_CLIPS`: row/col reaches
+    /// shortened by a tile origin past mi 0, which the old frame-edge clamp
+    /// missed entirely.
+    /// lane-tpl: thread-local for the same reason as [`TMV_HITS`]
+    /// (`STACK_FULL_DROPS` is bumped per candidate insertion, the hottest of the
+    /// four).
+    static COMP_GM_FILL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STACK_FULL_DROPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TILE_REACH_CLIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// [`COMP_GM_FILL_HITS`].
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn comp_gm_fill_hits() -> usize {
-    COMP_GM_FILL_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    COMP_GM_FILL_HITS.with(|c| c.get())
 }
 
 /// [`STACK_FULL_DROPS`].
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn stack_full_drops() -> usize {
-    STACK_FULL_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+    STACK_FULL_DROPS.with(|c| c.get())
 }
 
 /// [`TILE_REACH_CLIPS`].
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn tile_reach_clips() -> usize {
-    TILE_REACH_CLIPS.load(std::sync::atomic::Ordering::Relaxed)
+    TILE_REACH_CLIPS.with(|c| c.get())
 }
 
 /// Everything [`find_mv_stack_with_sign_bias`] needs to fold temporal MV
@@ -372,7 +381,7 @@ fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) 
     if let Some(entry) = candidates.iter_mut().find(|e| e.mv == mv) {
         entry.weight += weight;
     } else if candidates.len() >= MAX_STACK_SIZE {
-        STACK_FULL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STACK_FULL_DROPS.with(|c| c.set(c.get() + 1));
     } else {
         // libaom `add_ref_mv_candidate` (mvref_common.c:100) and
         // `add_tpl_ref_mv` (:388) only push when
@@ -932,7 +941,7 @@ pub fn find_mv_stack_with_sign_bias(
     // `None` for the cells outside the tile.
     let (tile_row0, tile_col0) = grid.tile_origin();
     if tile_row0 > 0 || tile_col0 > 0 {
-        TILE_REACH_CLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TILE_REACH_CLIPS.with(|c| c.set(c.get() + 1));
     }
     let max_row_offset: isize = if mi_row > tile_row0 {
         let reach = if bh4 < 2 { -4 } else { -6 } + isize::from(row_adj);
@@ -1036,27 +1045,48 @@ pub fn find_mv_stack_with_sign_bias(
         let step_w = if bw4 >= 16 { 4 } else { 2 };
         let mut first_sample_missing = true;
         let mut first_sample_far = false;
+        // lane-tpl: the parity/bounds derivation and the field's row base are
+        // per BLOCK, not per sample -- hoisted into `TplProbe` here so each of
+        // the (up to 19) probes below costs an add, a shift and a bounds
+        // check. The `EC_TRACE_TPL` dump lives in `add_tpl_ref_mv` itself, so
+        // the traced path keeps calling it and the hot path never re-reads the
+        // flag.
+        let trace_tpl = crate::envflags::env_flag!("EC_TRACE_TPL");
+        let probe = field.probe(mi_row, mi_col);
+        let sample = |blk_row: isize, blk_col: isize| -> Option<(i32, i32)> {
+            if trace_tpl {
+                return crate::motion_field::add_tpl_ref_mv(
+                    field,
+                    mi_row,
+                    mi_col,
+                    blk_row,
+                    blk_col,
+                    cur_offset_0,
+                    allow_high_precision_mv,
+                )
+                .map(|c| c.mv);
+            }
+            let (fwd_mv, rfo) = probe.cell(blk_row, blk_col)?;
+            Some(crate::motion_field::project_tpl_mv(
+                fwd_mv,
+                cur_offset_0,
+                rfo,
+                allow_high_precision_mv,
+            ))
+        };
         let mut blk_row = 0usize;
         while blk_row < blk_row_end {
             let mut blk_col = 0usize;
             while blk_col < blk_col_end {
-                if let Some(cand) = crate::motion_field::add_tpl_ref_mv(
-                    field,
-                    mi_row,
-                    mi_col,
-                    blk_row as isize,
-                    blk_col as isize,
-                    cur_offset_0,
-                    allow_high_precision_mv,
-                ) {
+                if let Some(mv) = sample(blk_row as isize, blk_col as isize) {
                     any_hit = true;
                     if blk_row == 0 && blk_col == 0 {
                         first_sample_missing = false;
                         let this_gm_mv = gm_mv(gm, ref_frame);
-                        first_sample_far = (cand.mv.0 - this_gm_mv.0).abs() >= 16
-                            || (cand.mv.1 - this_gm_mv.1).abs() >= 16;
+                        first_sample_far = (mv.0 - this_gm_mv.0).abs() >= 16
+                            || (mv.1 - this_gm_mv.1).abs() >= 16;
                     }
-                    add_candidate(&mut candidates, cand.mv, 2);
+                    add_candidate(&mut candidates, mv, 2);
                 }
                 blk_col += step_w;
             }
@@ -1079,22 +1109,14 @@ pub fn find_mv_stack_with_sign_bias(
                 if row < 0 || row >= sb_mask || col < 0 || col >= sb_mask {
                     continue;
                 }
-                if let Some(cand) = crate::motion_field::add_tpl_ref_mv(
-                    field,
-                    mi_row,
-                    mi_col,
-                    row_off,
-                    col_off,
-                    cur_offset_0,
-                    allow_high_precision_mv,
-                ) {
+                if let Some(mv) = sample(row_off, col_off) {
                     any_hit = true;
-                    add_candidate(&mut candidates, cand.mv, 2);
+                    add_candidate(&mut candidates, mv, 2);
                 }
             }
         }
         if any_hit {
-            TMV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TMV_HITS.with(|c| c.set(c.get() + 1));
         }
         zero_mv_ctx = usize::from(first_sample_missing || first_sample_far);
     }
@@ -1394,7 +1416,7 @@ fn add_compound_candidate(
     if let Some(entry) = candidates.iter_mut().find(|e| e.mv0 == mv0 && e.mv1 == mv1) {
         entry.weight += weight;
     } else if candidates.len() >= MAX_STACK_SIZE {
-        STACK_FULL_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        STACK_FULL_DROPS.with(|c| c.set(c.get() + 1));
     } else {
         // Same insertion cap as [`add_candidate`]: libaom's compound branch
         // of `add_ref_mv_candidate` (mvref_common.c:128) and `add_tpl_ref_mv`
@@ -1682,7 +1704,7 @@ fn combine_compound_candidates(
         std::array::from_fn(|i| {
             merged.get(i).copied().unwrap_or_else(|| {
                 if gm_mv_candidates[side] != (0, 0) {
-                    COMP_GM_FILL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    COMP_GM_FILL_HITS.with(|c| c.set(c.get() + 1));
                 }
                 gm_mv_candidates[side]
             })
@@ -1742,7 +1764,7 @@ pub fn find_mv_stack_compound(
     // `None` for the cells outside the tile.
     let (tile_row0, tile_col0) = grid.tile_origin();
     if tile_row0 > 0 || tile_col0 > 0 {
-        TILE_REACH_CLIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TILE_REACH_CLIPS.with(|c| c.set(c.get() + 1));
     }
     let max_row_offset: isize = if mi_row > tile_row0 {
         let reach = if bh4 < 2 { -4 } else { -6 } + isize::from(row_adj);
@@ -1836,32 +1858,50 @@ pub fn find_mv_stack_compound(
         let step_w = if bw4 >= 16 { 4 } else { 2 };
         let mut first_sample_missing = true;
         let mut first_sample_far = false;
+        // lane-tpl: the parity/bounds derivation and the field's row base are
+        // per BLOCK, not per sample -- hoisted into `TplProbe` here so each of
+        // the (up to 19) probes below costs an add, a shift and a bounds
+        // check. The `EC_TRACE_TPL` dump lives in `add_tpl_ref_mv` itself, so
+        // the traced path keeps calling it and the hot path never re-reads the
+        // flag.
+        let trace_tpl = crate::envflags::env_flag!("EC_TRACE_TPL");
+        let probe = field.probe(mi_row, mi_col);
+        let sample = |blk_row: isize, blk_col: isize| -> Option<((i32, i32), (i32, i32))> {
+            if trace_tpl {
+                for off in [cur_offset_0, cur_offset_1] {
+                    let _ = crate::motion_field::add_tpl_ref_mv(
+                        field,
+                        mi_row,
+                        mi_col,
+                        blk_row,
+                        blk_col,
+                        off,
+                        allow_high_precision_mv,
+                    );
+                }
+            }
+            let (fwd_mv, rfo) = probe.cell(blk_row, blk_col)?;
+            Some((
+                crate::motion_field::project_tpl_mv(
+                    fwd_mv,
+                    cur_offset_0,
+                    rfo,
+                    allow_high_precision_mv,
+                ),
+                crate::motion_field::project_tpl_mv(
+                    fwd_mv,
+                    cur_offset_1,
+                    rfo,
+                    allow_high_precision_mv,
+                ),
+            ))
+        };
         let mut blk_row = 0usize;
         while blk_row < blk_row_end {
             let mut blk_col = 0usize;
             while blk_col < blk_col_end {
-                let cand0 = crate::motion_field::add_tpl_ref_mv(
-                    field,
-                    mi_row,
-                    mi_col,
-                    blk_row as isize,
-                    blk_col as isize,
-                    cur_offset_0,
-                    allow_high_precision_mv,
-                );
-                let cand1 = crate::motion_field::add_tpl_ref_mv(
-                    field,
-                    mi_row,
-                    mi_col,
-                    blk_row as isize,
-                    blk_col as isize,
-                    cur_offset_1,
-                    allow_high_precision_mv,
-                );
-                if cand0.is_some() || cand1.is_some() {
+                if let Some((mv0, mv1)) = sample(blk_row as isize, blk_col as isize) {
                     any_hit = true;
-                    let mv0 = cand0.map_or((0, 0), |c| c.mv);
-                    let mv1 = cand1.map_or((0, 0), |c| c.mv);
                     if blk_row == 0 && blk_col == 0 {
                         first_sample_missing = false;
                         let this_gm0 = gm_mv(gm, ref_frame.0);
@@ -1899,27 +1939,14 @@ pub fn find_mv_stack_compound(
                 if row < 0 || row >= sb_mask || col < 0 || col >= sb_mask {
                     continue;
                 }
-                let cand0 = crate::motion_field::add_tpl_ref_mv(
-                    field, mi_row, mi_col, row_off, col_off, cur_offset_0,
-                    allow_high_precision_mv,
-                );
-                let cand1 = crate::motion_field::add_tpl_ref_mv(
-                    field, mi_row, mi_col, row_off, col_off, cur_offset_1,
-                    allow_high_precision_mv,
-                );
-                if cand0.is_some() || cand1.is_some() {
+                if let Some((mv0, mv1)) = sample(row_off, col_off) {
                     any_hit = true;
-                    add_compound_candidate(
-                        &mut candidates,
-                        cand0.map_or((0, 0), |c| c.mv),
-                        cand1.map_or((0, 0), |c| c.mv),
-                        2,
-                    );
+                    add_compound_candidate(&mut candidates, mv0, mv1, 2);
                 }
             }
         }
         if any_hit {
-            TMV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TMV_HITS.with(|c| c.set(c.get() + 1));
         }
         zero_mv_ctx = usize::from(first_sample_missing || first_sample_far);
     }
