@@ -15539,7 +15539,7 @@ fn cdef_gather(
     oy: usize,
     bw: usize,
     bh: usize,
-    buf: &mut [i32],
+    buf: &mut [i16],
 ) {
     let bstride = bw + 2 * CDEF_BORDER;
     let rows = bh + 2 * CDEF_BORDER;
@@ -15555,7 +15555,7 @@ fn cdef_gather(
             let src_row = &src[s0..s0 + bstride];
             let dst_row = &mut buf[r * bstride..r * bstride + bstride];
             for (d, &v) in dst_row.iter_mut().zip(src_row) {
-                *d = i32::from(v);
+                *d = v as i16;
             }
         }
         return;
@@ -15566,58 +15566,88 @@ fn cdef_gather(
             let nx = ox as isize + c as isize - CDEF_BORDER as isize;
             buf[r * bstride + c] =
                 if ny < 0 || nx < 0 || ny as usize >= true_h || nx as usize >= true_w {
-                    CDEF_VERY_LARGE
+                    CDEF_VERY_LARGE as i16
                 } else {
-                    i32::from(src[ny as usize * stride + nx as usize])
+                    src[ny as usize * stride + nx as usize] as i16
                 };
         }
     }
 }
 
-/// Spec 7.15.3's direction search (libaom `cdef_find_dir_c`): the dominant
-/// direction of an 8x8 luma window and the variance gap between it and its
-/// orthogonal, `sample(row, col)` reading that window's own pixels.
-fn cdef_find_dir(coeff_shift: i32, sample: impl Fn(usize, usize) -> i32) -> (usize, i32) {
-    const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
-    let mut partial = [[0i64; 15]; 8];
-    for i in 0..8i64 {
-        for j in 0..8i64 {
-            // libaom `cdef_find_dir_c`: normalise to an 8-bit sample before
-            // accumulating, same as `constrain`'s threshold shift below.
-            let x = i64::from(sample(i as usize, j as usize) >> coeff_shift) - 128;
-            partial[0][(i + j) as usize] += x;
-            partial[1][(i + j / 2) as usize] += x;
-            partial[2][i as usize] += x;
-            partial[3][(3 + i - j / 2) as usize] += x;
-            partial[4][(7 + i - j) as usize] += x;
-            partial[5][(3 - i / 2 + j) as usize] += x;
-            partial[6][j as usize] += x;
-            partial[7][(i / 2 + j) as usize] += x;
+/// libaom `cdef_find_dir_c`'s eight partial-sum arrays, row at a time: each
+/// array takes the row, its reverse, its pairwise sums or its total added
+/// into consecutive slots, so the 512 scalar read-modify-writes on i64 the
+/// per-sample form did become a handful of lane-wide adds per row. i32 is
+/// exact here: every partial is a sum of at most eight values in -128..127,
+/// and slot 15 exists only so an eight-lane store at offset 7 fits.
+fn cdef_find_dir_partials(win: &[i16], bstride: usize, coeff_shift: i32) -> [[i32; 16]; 8] {
+    fn add_at<const N: usize>(dst: &mut [i32; 16], off: usize, src: &[i32; N]) {
+        for (d, &x) in dst[off..off + N].iter_mut().zip(src.iter()) {
+            *d += x;
         }
     }
+    let mut partial = [[0i32; 16]; 8];
+    for i in 0..8usize {
+        let base = (i + CDEF_BORDER) * bstride + CDEF_BORDER;
+        // libaom `cdef_find_dir_c`: normalise to an 8-bit sample before
+        // accumulating, same as `constrain`'s threshold shift.
+        let row: [i32; 8] = core::array::from_fn(|j| (i32::from(win[base + j]) >> coeff_shift) - 128);
+        let rev: [i32; 8] = core::array::from_fn(|j| row[7 - j]);
+        let pair: [i32; 4] = core::array::from_fn(|k| row[2 * k] + row[2 * k + 1]);
+        let rpair: [i32; 4] = core::array::from_fn(|k| pair[3 - k]);
+        let (p, rest) = partial.split_at_mut(1);
+        add_at(&mut p[0], i, &row); // partial[0][i + j]
+        add_at(&mut rest[0], i, &pair); // partial[1][i + j / 2]
+        rest[1][i] = row.iter().sum(); // partial[2][i]
+        add_at(&mut rest[2], i, &rpair); // partial[3][3 + i - j / 2]
+        add_at(&mut rest[3], i, &rev); // partial[4][7 + i - j]
+        add_at(&mut rest[4], 3 - i / 2, &row); // partial[5][3 - i / 2 + j]
+        add_at(&mut rest[5], 0, &row); // partial[6][j]
+        add_at(&mut rest[6], i / 2, &row); // partial[7][i / 2 + j]
+    }
+    partial
+}
+
+/// Spec 7.15.3's direction search (libaom `cdef_find_dir_c`): the dominant
+/// direction of an 8x8 luma window and the variance gap between it and its
+/// orthogonal, reading [`cdef_gather`]'s window (row stride `bstride`, the
+/// block's own samples starting at `CDEF_BORDER, CDEF_BORDER`).
+fn cdef_find_dir(win: &[i16], bstride: usize, coeff_shift: i32) -> (usize, i32) {
+    const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
+    #[cfg(target_arch = "x86_64")]
+    let partial = if crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
+        // SAFETY: reached only when the CPU reports avx2; the kernel reads
+        // the same eight rows of eight samples the scalar form does.
+        #[allow(unsafe_code)]
+        unsafe {
+            cdef_simd::find_dir_partials_avx2(win, bstride, coeff_shift)
+        }
+    } else {
+        cdef_find_dir_partials(win, bstride, coeff_shift)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let partial = cdef_find_dir_partials(win, bstride, coeff_shift);
+    let sq = |a: i32| -> i64 { i64::from(a) * i64::from(a) };
     let mut cost = [0i64; 8];
     for i in 0..8usize {
-        cost[2] += partial[2][i] * partial[2][i];
-        cost[6] += partial[6][i] * partial[6][i];
+        cost[2] += sq(partial[2][i]);
+        cost[6] += sq(partial[6][i]);
     }
     cost[2] *= DIV_TABLE[8];
     cost[6] *= DIV_TABLE[8];
     for i in 0..7usize {
-        cost[0] += (partial[0][i] * partial[0][i] + partial[0][14 - i] * partial[0][14 - i])
-            * DIV_TABLE[i + 1];
-        cost[4] += (partial[4][i] * partial[4][i] + partial[4][14 - i] * partial[4][14 - i])
-            * DIV_TABLE[i + 1];
+        cost[0] += (sq(partial[0][i]) + sq(partial[0][14 - i])) * DIV_TABLE[i + 1];
+        cost[4] += (sq(partial[4][i]) + sq(partial[4][14 - i])) * DIV_TABLE[i + 1];
     }
-    cost[0] += partial[0][7] * partial[0][7] * DIV_TABLE[8];
-    cost[4] += partial[4][7] * partial[4][7] * DIV_TABLE[8];
+    cost[0] += sq(partial[0][7]) * DIV_TABLE[8];
+    cost[4] += sq(partial[4][7]) * DIV_TABLE[8];
     for i in (1..8).step_by(2) {
         for j in 0..5usize {
-            cost[i] += partial[i][3 + j] * partial[i][3 + j];
+            cost[i] += sq(partial[i][3 + j]);
         }
         cost[i] *= DIV_TABLE[8];
         for j in 0..3usize {
-            cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j])
-                * DIV_TABLE[2 * j + 2];
+            cost[i] += (sq(partial[i][j]) + sq(partial[i][10 - j])) * DIV_TABLE[2 * j + 2];
         }
     }
     let mut best_cost = 0i64;
@@ -15653,7 +15683,7 @@ fn cdef_adjust_strength(strength: i32, var: i32) -> i32 {
 #[allow(clippy::too_many_arguments)]
 #[allow(unsafe_code)]
 fn cdef_filter_block(
-    src: &[i32],
+    src: &[i16],
     dst: &mut PlaneBuf<'static>,
     ox: usize,
     oy: usize,
@@ -15722,7 +15752,7 @@ fn cdef_filter_block(
 /// `cdef_simd_kernel_matches_the_scalar_filter` checks the kernel against.
 #[allow(clippy::too_many_arguments)]
 fn cdef_filter_block_scalar(
-    src: &[i32],
+    src: &[i16],
     dst: &mut [u16],
     stride: usize,
     ox: usize,
@@ -15753,7 +15783,7 @@ fn cdef_filter_block_scalar(
     // `src` is [`cdef_gather`]'s window: (i, j) in block coordinates, taps
     // reaching +-CDEF_BORDER, so every index below is in range by construction.
     let at = |i: i32, j: i32| -> i32 {
-        src[(i + CDEF_BORDER as i32) as usize * bstride + (j + CDEF_BORDER as i32) as usize]
+        i32::from(src[(i + CDEF_BORDER as i32) as usize * bstride + (j + CDEF_BORDER as i32) as usize])
     };
     let (pri_dir, sec_dir0, sec_dir1) =
         (CDEF_DIRECTIONS[dir], CDEF_DIRECTIONS[(dir + 2) & 7], CDEF_DIRECTIONS[(dir + 6) & 7]);
@@ -15863,6 +15893,60 @@ mod cdef_simd {
         _mm256_sign_epi16(t, diff)
     }
 
+    /// [`super::cdef_find_dir_partials`] in AVX2 (libaom
+    /// `cdef_find_dir_avx2`'s shape): eight i32 lanes per row instead of the
+    /// four the auto-vectorised scalar form gets without the feature.
+    ///
+    /// # Safety
+    /// Requires AVX2. `win` must hold [`super::cdef_gather`]'s 8x8 window
+    /// grown by `CDEF_BORDER` at row stride `bstride`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn find_dir_partials_avx2(
+        win: &[i16],
+        bstride: usize,
+        coeff_shift: i32,
+    ) -> [[i32; 16]; 8] {
+        #[target_feature(enable = "avx2")]
+        unsafe fn add8(dst: &mut [i32; 16], off: usize, v: __m256i) {
+            let p = dst.as_mut_ptr().add(off) as *mut __m256i;
+            _mm256_storeu_si256(p, _mm256_add_epi32(_mm256_loadu_si256(p), v));
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn add4(dst: &mut [i32; 16], off: usize, v: __m128i) {
+            let p = dst.as_mut_ptr().add(off) as *mut __m128i;
+            _mm_storeu_si128(p, _mm_add_epi32(_mm_loadu_si128(p), v));
+        }
+        let mut partial = [[0i32; 16]; 8];
+        let shift = _mm_cvtsi32_si128(coeff_shift);
+        let c128 = _mm256_set1_epi32(128);
+        let revidx = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+        let mut p6 = _mm256_setzero_si256();
+        for i in 0..8usize {
+            let base = (i + CDEF_BORDER) * bstride + CDEF_BORDER;
+            let raw = _mm_loadu_si128(win.as_ptr().add(base) as *const __m128i);
+            let row = _mm256_sub_epi32(_mm256_sra_epi32(_mm256_cvtepi16_epi32(raw), shift), c128);
+            let rev = _mm256_permutevar8x32_epi32(row, revidx);
+            // `hadd(row, row)` is [p0, p1, p0, p1 | p2, p3, p2, p3], so the
+            // four pairwise sums are the two lanes' low halves joined.
+            let h = _mm256_hadd_epi32(row, row);
+            let pair =
+                _mm_unpacklo_epi64(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
+            let rpair = _mm_shuffle_epi32(pair, 0b00_01_10_11);
+            let hs = _mm_hadd_epi32(pair, pair);
+            let total = _mm_cvtsi128_si32(_mm_hadd_epi32(hs, hs));
+            add8(&mut partial[0], i, row);
+            add4(&mut partial[1], i, pair);
+            partial[2][i] = total;
+            add4(&mut partial[3], i, rpair);
+            add8(&mut partial[4], i, rev);
+            add8(&mut partial[5], 3 - i / 2, row);
+            p6 = _mm256_add_epi32(p6, row);
+            add8(&mut partial[7], i / 2, row);
+        }
+        _mm256_storeu_si256(partial[6].as_mut_ptr() as *mut __m256i, p6);
+        partial
+    }
+
     /// [`super::cdef_filter_block_scalar`]'s arithmetic, two rows per
     /// iteration. `bw` is 8 (luma) or 4 (4:2:0 chroma) and `bh` matches; for
     /// `bw == 4` the upper four lanes of each half are window samples read
@@ -15870,12 +15954,14 @@ mod cdef_simd {
     /// computed and then dropped by the 64-bit store.
     ///
     /// # Safety
-    /// Requires AVX2. `src` must hold the `(bw + 4) x (bh + 4)` window and
-    /// `dst` the `bh` rows of `bw` samples at `(ox, oy)`.
+    /// Requires AVX2. `src` must be [`super::cdef_gather`]'s 256-entry window
+    /// buffer (the tap loads read up to 152 entries past its start, i.e. past
+    /// the `(bw + 4) x (bh + 4)` samples themselves) and `dst` the `bh` rows
+    /// of `bw` samples at `(ox, oy)`.
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn filter_block_avx2(
-        src: &[i32],
+        src: &[i16],
         dst: &mut [u16],
         stride: usize,
         ox: usize,
@@ -15893,14 +15979,11 @@ mod cdef_simd {
         smax: i32,
     ) {
         let bstride = bw + 2 * CDEF_BORDER;
-        // The window as `i16`, padded so every two-row tap load stays inside
-        // it (largest read: (bh + 3) * bstride + 8 <= 152 for the 8x8 luma
-        // block, 72 for the 4x4 chroma one).
-        let mut w = [0i16; 256];
-        let rows = bh + 2 * CDEF_BORDER;
-        for (d, &v) in w[..rows * bstride].iter_mut().zip(&src[..rows * bstride]) {
-            *d = v as i16;
-        }
+        // The caller's window is already `i16` and 256 entries long, so the
+        // kernel taps it in place: the largest two-row load is
+        // (bh + 3) * bstride + 8 <= 152 for the 8x8 luma block, 72 for the
+        // 4x4 chroma one, both inside the buffer's zeroed tail.
+        let w = src;
         let clipping_required = enable_primary && enable_secondary;
         let pri_taps = CDEF_PRI_TAPS[((pri_strength >> coeff_shift) & 1) as usize];
         let pri_shift = _mm_cvtsi32_si128(cdef_constrain_shift(pri_strength.max(1), pri_damping));
@@ -18801,8 +18884,11 @@ fn cdef_band(
     };
         // One scratch window per plane kind, reused by every unit (8x8 luma and
         // 4x4 chroma, each grown by the [`CDEF_BORDER`] tap ring).
-        let mut win_y = [0i32; (8 + 2 * CDEF_BORDER) * (8 + 2 * CDEF_BORDER)];
-        let mut win_uv = [0i32; (4 + 2 * CDEF_BORDER) * (4 + 2 * CDEF_BORDER)];
+        // 256 entries, not the (bw + 4) x (bh + 4) samples themselves: the
+        // AVX2 kernel taps the window in place with two-row loads that reach
+        // past the last sample, and the tail stays zero for every unit.
+        let mut win_y = [0i16; 256];
+        let mut win_uv = [0i16; 256];
         let mut mi_r = r_lo;
         while mi_r < r_hi {
             let mut mi_c = 0usize;
@@ -18826,10 +18912,6 @@ fn cdef_band(
                     }
                     let (y_stride, y_true_w, y_true_h) = (y.width, y.true_width, y.true_height);
                     cdef_gather(src_y, y_stride, y_true_w, y_true_h, ox, oy, 8, 8, &mut win_y);
-                    let sample_y = |r: i32, c: i32| -> i32 {
-                        win_y[(r + CDEF_BORDER as i32) as usize * (8 + 2 * CDEF_BORDER)
-                            + (c + CDEF_BORDER as i32) as usize]
-                    };
                     // lane-cdef r1: the direction search reads the SAME padded
                     // block the taps do -- libaom runs `cdef_find_dir` on the
                     // prepared filter block (`cdef_block.c:296-320` over
@@ -18838,7 +18920,7 @@ fn cdef_band(
                     // Clamping to the last real sample instead made every straddling
                     // edge 8x8 (odd `mi_cols`/`mi_rows`) pick a different var, hence
                     // a different `adjust_strength`, hence a +-1 band at the crop edge.
-                    let (dir, var) = cdef_find_dir(coeff_shift, |r, c| sample_y(r as i32, c as i32));
+                    let (dir, var) = cdef_find_dir(&win_y, 8 + 2 * CDEF_BORDER, coeff_shift);
 
                     // libaom `av1_cdef_filter_fb` passes `pri_strength ? dir : 0`
                     // -- each plane zeroes the shared direction when *its own*
@@ -33799,19 +33881,130 @@ mod tests {
         let src: Vec<u16> = (0..stride * 24).map(|i| (i * 7 % 1024) as u16).collect();
         for &(ox, oy, bw, bh) in &[(0, 0, 8, 8), (8, 8, 8, 8), (16, 16, 8, 8), (4, 12, 4, 4)] {
             let bstride = bw + 2 * super::CDEF_BORDER;
-            let mut win = vec![0i32; bstride * (bh + 2 * super::CDEF_BORDER)];
+            let mut win = vec![0i16; bstride * (bh + 2 * super::CDEF_BORDER)];
             super::cdef_gather(&src, stride, tw, th, ox, oy, bw, bh, &mut win);
             for r in -(super::CDEF_BORDER as i32)..(bh + super::CDEF_BORDER) as i32 {
                 for c in -(super::CDEF_BORDER as i32)..(bw + super::CDEF_BORDER) as i32 {
                     let (ny, nx) = (oy as i32 + r, ox as i32 + c);
                     let want = if ny < 0 || nx < 0 || ny as usize >= th || nx as usize >= tw {
-                        super::CDEF_VERY_LARGE
+                        super::CDEF_VERY_LARGE as i16
                     } else {
-                        i32::from(src[ny as usize * stride + nx as usize])
+                        src[ny as usize * stride + nx as usize] as i16
                     };
                     let got = win[(r + super::CDEF_BORDER as i32) as usize * bstride
                         + (c + super::CDEF_BORDER as i32) as usize];
                     assert_eq!(got, want, "({ox},{oy}) r={r} c={c}");
+                }
+            }
+        }
+    }
+
+    /// lane-cdef: the row-at-a-time direction search (and its AVX2 twin) must
+    /// be value-identical to a literal transcription of libaom
+    /// `cdef_find_dir_c`'s per-sample accumulation, over random windows at
+    /// every bit depth -- including the `CDEF_VERY_LARGE` sentinel rows a
+    /// crop-straddling 8x8 gathers.
+    #[test]
+    fn cdef_find_dir_matches_the_per_sample_reference() {
+        const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
+        fn reference(win: &[i16], bstride: usize, coeff_shift: i32) -> (usize, i32) {
+            let mut partial = [[0i64; 15]; 8];
+            for i in 0..8i64 {
+                for j in 0..8i64 {
+                    let s = i64::from(
+                        win[(i as usize + super::CDEF_BORDER) * bstride
+                            + j as usize
+                            + super::CDEF_BORDER],
+                    );
+                    let x = (s >> coeff_shift) - 128;
+                    partial[0][(i + j) as usize] += x;
+                    partial[1][(i + j / 2) as usize] += x;
+                    partial[2][i as usize] += x;
+                    partial[3][(3 + i - j / 2) as usize] += x;
+                    partial[4][(7 + i - j) as usize] += x;
+                    partial[5][(3 - i / 2 + j) as usize] += x;
+                    partial[6][j as usize] += x;
+                    partial[7][(i / 2 + j) as usize] += x;
+                }
+            }
+            let mut cost = [0i64; 8];
+            for i in 0..8usize {
+                cost[2] += partial[2][i] * partial[2][i];
+                cost[6] += partial[6][i] * partial[6][i];
+            }
+            cost[2] *= DIV_TABLE[8];
+            cost[6] *= DIV_TABLE[8];
+            for i in 0..7usize {
+                cost[0] += (partial[0][i] * partial[0][i]
+                    + partial[0][14 - i] * partial[0][14 - i])
+                    * DIV_TABLE[i + 1];
+                cost[4] += (partial[4][i] * partial[4][i]
+                    + partial[4][14 - i] * partial[4][14 - i])
+                    * DIV_TABLE[i + 1];
+            }
+            cost[0] += partial[0][7] * partial[0][7] * DIV_TABLE[8];
+            cost[4] += partial[4][7] * partial[4][7] * DIV_TABLE[8];
+            for i in (1..8).step_by(2) {
+                for j in 0..5usize {
+                    cost[i] += partial[i][3 + j] * partial[i][3 + j];
+                }
+                cost[i] *= DIV_TABLE[8];
+                for j in 0..3usize {
+                    cost[i] += (partial[i][j] * partial[i][j]
+                        + partial[i][10 - j] * partial[i][10 - j])
+                        * DIV_TABLE[2 * j + 2];
+                }
+            }
+            let (mut best_cost, mut best_dir) = (0i64, 0usize);
+            for (i, &c) in cost.iter().enumerate() {
+                if c > best_cost {
+                    best_cost = c;
+                    best_dir = i;
+                }
+            }
+            (best_dir, ((best_cost - cost[(best_dir + 4) & 7]) >> 10) as i32)
+        }
+        let mut rng = 0x0bad_c0de_dead_beefu64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let bstride = 8 + 2 * super::CDEF_BORDER;
+        for &(bit_depth, coeff_shift) in &[(8u8, 0i32), (10, 2), (12, 4)] {
+            let smax = (1u64 << bit_depth) - 1;
+            for trial in 0..256 {
+                let sentinels = trial % 4;
+                let mut win = [0i16; 256];
+                for (k, w) in win[..bstride * bstride].iter_mut().enumerate() {
+                    let (r, c) = (k / bstride, k % bstride);
+                    *w = if sentinels > 0
+                        && (r < sentinels
+                            || c < sentinels
+                            || r + sentinels >= bstride
+                            || c + sentinels >= bstride)
+                    {
+                        super::CDEF_VERY_LARGE as i16
+                    } else {
+                        (next() % (smax + 1)) as i16
+                    };
+                }
+                let want = reference(&win, bstride, coeff_shift);
+                assert_eq!(
+                    super::cdef_find_dir(&win, bstride, coeff_shift),
+                    want,
+                    "bd={bit_depth} trial={trial}"
+                );
+                let partial = super::cdef_find_dir_partials(&win, bstride, coeff_shift);
+                #[cfg(target_arch = "x86_64")]
+                if crate::mc::simd_level() == crate::mc::SimdLevel::Avx2 {
+                    // SAFETY: the avx2 arm was probed above.
+                    #[allow(unsafe_code)]
+                    let simd = unsafe {
+                        super::cdef_simd::find_dir_partials_avx2(&win, bstride, coeff_shift)
+                    };
+                    assert_eq!(simd, partial, "bd={bit_depth} trial={trial} partials");
                 }
             }
         }
@@ -33847,7 +34040,10 @@ mod tests {
                     // Every fourth window seeds sentinels, in a growing
                     // border ring, so the straddling-block case is covered.
                     let sentinels = trial % 4;
-                    let win: Vec<i32> = (0..rows * bstride)
+                    // 256 entries, as `cdef_band`'s own scratch is: the
+                    // kernel taps the window in place and reads past the last
+                    // sample into the zeroed tail.
+                    let mut win: Vec<i16> = (0..rows * bstride)
                         .map(|k| {
                             let (r, c) = (k / bstride, k % bstride);
                             if sentinels > 0
@@ -33856,12 +34052,13 @@ mod tests {
                                     || r + sentinels >= rows
                                     || c + sentinels >= bstride)
                             {
-                                super::CDEF_VERY_LARGE
+                                super::CDEF_VERY_LARGE as i16
                             } else {
-                                (next() % (smax as u64 + 1)) as i32
+                                (next() % (smax as u64 + 1)) as i16
                             }
                         })
                         .collect();
+                    win.resize(256, 0);
                     for dir in 0..8usize {
                         for &pri in &[0i32, 1, 3, 15] {
                             for &sec in &[0i32, 1, 2, 4] {
