@@ -19645,14 +19645,6 @@ struct PipeCfg<'a> {
     nbands: usize,
     cdef_on: bool,
     snap_on: bool,
-    /// lane-pipefilt2: loop restoration runs in the pipeline too, one RU row
-    /// band behind CDEF (see [`pipe_run`]'s LR step). `lr_grid` is the
-    /// frame's unit-filter grid, whose `Vec`s are sized once by
-    /// `RestorationGrid::new` and only ever written at units the parse
-    /// thread is many bands ahead of.
-    lr: &'a LoopRestorationParams,
-    lr_grid: *const crate::restoration::RestorationGrid,
-    lr_on: bool,
 }
 
 // SAFETY: the `*const u8` is a read-only view of a Vec that is allocated once
@@ -19671,6 +19663,7 @@ fn pipe_run(
     sn: crate::par::Shared<'_, Neighbours>,
     cfg: PipeCfg<'_>,
     snap: &mut Option<(PlaneBuf<'static>, PlaneBuf<'static>, PlaneBuf<'static>)>,
+    lr_sync: Option<&PipeSync>,
     fctx: &crate::decode::FrameCtx,
 ) {
     // SAFETY: the frame thread parses (and reconstructs) bands the pipeline
@@ -19684,45 +19677,11 @@ fn pipe_run(
     let damping_uv = (damping - 1).max(0);
     let (fw, fh) = (cfg.frame_w, cfg.frame_h);
     let nb = cfg.nbands;
-    // lane-pipefilt2: loop restoration's RU row `r` writes `out` rows
-    // `v_start..v_end`; it reads post-CDEF rows only inside that span and
-    // the post-deblock snapshot at most two rows past `v_end` (see
-    // `restoration::lr_src_row`). CDEF band `b` covers luma rows
-    // `64b..64b+64` and runs at iteration `b + 3`, the snapshot band at
-    // `b + 2`, so the row is ready at iteration `(v_end - 1) / 64 + 3`: the
-    // snapshot condition `(v_end + 1) / 64 <= k - 2` is implied by it, the
-    // two row indices being at most one band apart. LR therefore runs in
-    // the SAME iteration as the CDEF band that finishes its last row,
-    // right after it.
-    let mut lr_planes: Vec<LrPlane> = Vec::new();
-    if cfg.lr_on {
-        let dims = [(fw, fh, 0u32, y.width, y.data.len()),
-                    (fw.div_ceil(2), fh.div_ceil(2), 1, u.width, u.data.len()),
-                    (fw.div_ceil(2), fh.div_ceil(2), 1, v.width, v.data.len())];
-        for (p, &(pw, ph, ss, stride, len)) in dims.iter().enumerate() {
-            let rows = crate::restoration::lr_unit_rows(
-                ph,
-                cfg.lr.loop_restoration_size[p],
-                ss,
-                cfg.lr.frame_restoration_type[p],
-            );
-            if rows.is_empty() {
-                continue;
-            }
-            lr_planes.push(LrPlane {
-                p,
-                out: scratch_sized(len),
-                rows,
-                next: 0,
-                pw,
-                ph,
-                ss,
-                stride,
-            });
-        }
-    }
     for k in 0..nb + 3 {
         if !sync.wait_for((k + 2).min(nb)) {
+            if let Some(ls) = lr_sync {
+                ls.close(nb, true);
+            }
             return;
         }
         if k < nb {
@@ -19748,49 +19707,104 @@ fn pipe_run(
                 );
             }
         }
-        if !lr_planes.is_empty() && k >= 3 && k - 3 < nb {
-            let band = k - 3;
-            // SAFETY: sized once per frame by `RestorationGrid::new`.
-            let grid = unsafe { &*cfg.lr_grid };
-            let Some((sy2, su2, sv2)) = snap.as_ref() else { continue };
-            for lp in &mut lr_planes {
-                let stripe = 64usize >> lp.ss;
-                let r_lo = lp.next;
-                while lp.next < lp.rows.len()
-                    && (lp.rows[lp.next].1 as usize - 1) / stripe <= band
-                {
-                    lp.next += 1;
-                }
-                if lp.next == r_lo {
-                    continue;
-                }
-                let (src, deb) = match lp.p {
-                    0 => (&y.data, &sy2.data),
-                    1 => (&u.data, &su2.data),
-                    _ => (&v.data, &sv2.data),
-                };
-                crate::restoration::apply_loop_restoration_plane(
-                    src,
-                    deb,
-                    lp.stride,
-                    lp.pw,
-                    lp.ph,
-                    lp.ss,
-                    cfg.lr.frame_restoration_type[lp.p],
-                    cfg.lr.loop_restoration_size[lp.p],
-                    grid,
-                    lp.p,
-                    &mut lp.out,
-                    Some((r_lo, lp.next)),
-                    fctx,
-                );
+        // lane-pipefilt2: CDEF bands `0..=k-3` are now complete -- release
+        // them to the loop restoration worker.
+        if let Some(ls) = lr_sync {
+            ls.note(k.saturating_sub(2));
+        }
+    }
+    if let Some(ls) = lr_sync {
+        ls.close(nb, false);
+    }
+}
+
+/// The pipeline's loop restoration worker, a second task alongside
+/// [`pipe_run`]: restoration-unit row `r` writes `out` rows
+/// `v_start..v_end`, reads post-CDEF rows only inside that span and the
+/// post-deblock snapshot at most two rows past `v_end` (see
+/// `restoration::lr_src_row`), so it is ready as soon as CDEF band
+/// `(v_end - 1) / 64` is done -- `pipe_run` runs that band at its own
+/// iteration `band + 3` and the snapshot band one iteration earlier, so the
+/// snapshot condition `(v_end + 1) / 64 <= band + 1` is implied, the two row
+/// indices being at most one band apart. Running it as its own worker (not
+/// as a fourth step inside `pipe_run`'s loop) keeps it OFF the deblock/CDEF
+/// critical path: serialised into that loop it measured ~1% slower than the
+/// whole-frame form, which at least ran its RU rows across the filter pool.
+#[allow(unsafe_code)]
+fn pipe_run_lr(
+    sync: &PipeSync,
+    sy: crate::par::Shared<'_, PlaneBuf<'static>>,
+    su: crate::par::Shared<'_, PlaneBuf<'static>>,
+    sv: crate::par::Shared<'_, PlaneBuf<'static>>,
+    snap: crate::par::Shared<'_, Option<(PlaneBuf<'static>, PlaneBuf<'static>, PlaneBuf<'static>)>>,
+    cfg: LrCfg<'_>,
+    fctx: &crate::decode::FrameCtx,
+) {
+    // SAFETY: this worker only reads bands `pipe_run` has finished filtering
+    // and writes its own `out` buffers; the final swap happens after the
+    // last CDEF band, which is `pipe_run`'s last plane write.
+    let (y, u, v) = unsafe { (sy.get(), su.get(), sv.get()) };
+    let snap = unsafe { snap.get() };
+    let grid = unsafe { &*cfg.lr_grid };
+    let (fw, fh) = (cfg.frame_w, cfg.frame_h);
+    let dims = [
+        (fw, fh, 0u32, y.width, y.data.len()),
+        (fw.div_ceil(2), fh.div_ceil(2), 1, u.width, u.data.len()),
+        (fw.div_ceil(2), fh.div_ceil(2), 1, v.width, v.data.len()),
+    ];
+    let mut planes: Vec<LrPlane> = Vec::new();
+    for (p, &(pw, ph, ss, stride, len)) in dims.iter().enumerate() {
+        let rows = crate::restoration::lr_unit_rows(
+            ph,
+            cfg.lr.loop_restoration_size[p],
+            ss,
+            cfg.lr.frame_restoration_type[p],
+        );
+        if rows.is_empty() {
+            continue;
+        }
+        planes.push(LrPlane { p, out: scratch_sized(len), rows, next: 0, pw, ph, ss, stride });
+    }
+    for band in 0..cfg.nbands {
+        if !sync.wait_for(band + 1) {
+            return;
+        }
+        let Some((sy2, su2, sv2)) = snap.as_ref() else { return };
+        for lp in &mut planes {
+            let stripe = 64usize >> lp.ss;
+            let r_lo = lp.next;
+            while lp.next < lp.rows.len() && (lp.rows[lp.next].1 as usize - 1) / stripe <= band {
+                lp.next += 1;
             }
+            if lp.next == r_lo {
+                continue;
+            }
+            let (src, deb) = match lp.p {
+                0 => (&y.data, &sy2.data),
+                1 => (&u.data, &su2.data),
+                _ => (&v.data, &sv2.data),
+            };
+            crate::restoration::apply_loop_restoration_plane(
+                src,
+                deb,
+                lp.stride,
+                lp.pw,
+                lp.ph,
+                lp.ss,
+                cfg.lr.frame_restoration_type[lp.p],
+                cfg.lr.loop_restoration_size[lp.p],
+                grid,
+                lp.p,
+                &mut lp.out,
+                Some((r_lo, lp.next)),
+                fctx,
+            );
         }
     }
     // The RU rows partition `0..plane_h`; the mi-rounded rows below it are
     // untouched by restoration and copied here, then the restored plane
     // takes the picture's place (the whole-frame path's own final swap).
-    for mut lp in lr_planes {
+    for mut lp in planes {
         let buf: &mut PlaneBuf<'static> = match lp.p {
             0 => &mut *y,
             1 => &mut *u,
@@ -19805,6 +19819,21 @@ fn pipe_run(
         );
     }
 }
+
+/// Everything [`pipe_run_lr`] needs beyond the planes.
+struct LrCfg<'a> {
+    lr: &'a LoopRestorationParams,
+    /// Sized once per frame by `RestorationGrid::new`; the parse thread is
+    /// many bands ahead of every unit this worker reads.
+    lr_grid: *const crate::restoration::RestorationGrid,
+    frame_w: usize,
+    frame_h: usize,
+    nbands: usize,
+}
+
+// SAFETY: as `PipeCfg`'s -- a read-only view of a per-frame allocation.
+#[allow(unsafe_code)]
+unsafe impl Send for LrCfg<'_> {}
 
 /// One plane's pipelined loop restoration state (see [`pipe_run`]).
 struct LrPlane {
@@ -19828,6 +19857,8 @@ struct PipeGuard<'a> {
     sync: std::sync::Arc<PipeSync>,
     batch: Option<crate::par::Batch<'a>>,
     nbands: usize,
+    /// The loop restoration worker's own gate, aborted with the first one.
+    lr_sync: Option<std::sync::Arc<PipeSync>>,
 }
 
 impl PipeGuard<'_> {
@@ -19844,6 +19875,9 @@ impl PipeGuard<'_> {
 impl Drop for PipeGuard<'_> {
     fn drop(&mut self) {
         self.sync.close(self.nbands, true);
+        if let Some(ls) = &self.lr_sync {
+            ls.close(self.nbands, true);
+        }
     }
 }
 
@@ -32208,15 +32242,31 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             nbands,
             cdef_on,
             snap_on,
-            lr,
-            lr_grid: std::ptr::from_mut(&mut lr_grid),
-            lr_on: lr_active,
         };
         let ctx = crate::decode::filter_ctx_copy(fctx);
         let sync2 = std::sync::Arc::clone(&sync);
+        // lane-pipefilt2: loop restoration is a SECOND worker, chained one
+        // CDEF band behind the first (see `pipe_run_lr`).
+        let lr_sync = lr_active.then(|| std::sync::Arc::new(PipeSync::new()));
+        let lr_sync2 = lr_sync.clone();
+        #[allow(unsafe_code)]
+        let ssnap = unsafe { crate::par::Shared::from_ptr(std::ptr::from_mut(&mut pipe_snap)) };
         let snap = &mut pipe_snap;
-        batch.submit(move || pipe_run(&sync2, sy, su, sv, sn, cfg, snap, &ctx));
-        PipeGuard { sync, batch: Some(batch), nbands }
+        batch.submit(move || {
+            pipe_run(&sync2, sy, su, sv, sn, cfg, snap, lr_sync2.as_deref(), &ctx)
+        });
+        if let Some(ls) = lr_sync.clone() {
+            let lcfg = LrCfg {
+                lr,
+                lr_grid: std::ptr::from_mut(&mut lr_grid),
+                frame_w: frame_width as usize,
+                frame_h: frame_height as usize,
+                nbands,
+            };
+            let ctx2 = crate::decode::filter_ctx_copy(fctx);
+            batch.submit(move || pipe_run_lr(&ls, sy, su, sv, ssnap, lcfg, &ctx2));
+        }
+        PipeGuard { sync, batch: Some(batch), nbands, lr_sync }
     });
     if !pipe_on && wave_stats() {
         PIPE_WHOLE.fetch_add(1, Relaxed);
