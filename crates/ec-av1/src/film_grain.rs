@@ -1247,7 +1247,7 @@ pub(crate) fn apply_grain(
             y += row_step;
         }
     });
-    drop(so);
+    let _ = so;
 
     out
 }
