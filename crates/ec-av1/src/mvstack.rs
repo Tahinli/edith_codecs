@@ -994,6 +994,134 @@ fn clamp_mv_ref(
     )
 }
 
+/// lane-mvstack3: the `EC_TRACE_TPL` dump path of the temporal-MV sample,
+/// moved out of the sample closure itself. Inlining `add_tpl_ref_mv` into
+/// that closure made its body too big for LLVM to inline at the (four) probe
+/// call sites, so the closure was emitted as a real function
+/// (`find_mv_stack_with_sign_bias::{closure#1}`, 1.9% of the parse thread)
+/// and every one of the up-to-19 probes per inter block paid a call. The
+/// traced path keeps the exact same reads in the exact same order.
+#[cold]
+#[inline(never)]
+fn tpl_trace_sample(
+    field: &crate::motion_field::TplField,
+    mi_row: usize,
+    mi_col: usize,
+    blk_row: isize,
+    blk_col: isize,
+    cur_offset: i32,
+    allow_high_precision_mv: bool,
+) -> Option<(i32, i32)> {
+    crate::motion_field::add_tpl_ref_mv(
+        field,
+        mi_row,
+        mi_col,
+        blk_row,
+        blk_col,
+        cur_offset,
+        allow_high_precision_mv,
+    )
+    .map(|c| c.mv)
+}
+
+/// [`tpl_trace_sample`] for the compound stack, whose trace pass dumps both
+/// reference offsets and discards the values.
+#[cold]
+#[inline(never)]
+fn tpl_trace_sample_compound(
+    field: &crate::motion_field::TplField,
+    mi_row: usize,
+    mi_col: usize,
+    blk_row: isize,
+    blk_col: isize,
+    cur_offsets: (i32, i32),
+    allow_high_precision_mv: bool,
+) {
+    for off in [cur_offsets.0, cur_offsets.1] {
+        let _ = crate::motion_field::add_tpl_ref_mv(
+            field,
+            mi_row,
+            mi_col,
+            blk_row,
+            blk_col,
+            off,
+            allow_high_precision_mv,
+        );
+    }
+}
+
+/// lane-mvstack3: the temporal-MV probe, as a `#[inline(always)]` free
+/// function instead of a closure. LLVM would not inline the closure into
+/// either mv-stack builder (both are far past its size threshold), so it was
+/// emitted as `find_mv_stack_with_sign_bias::{closure#1}` /
+/// `find_mv_stack_compound::{closure#1}` -- together 3.5% of the parse
+/// thread -- and every one of the up-to-19 probes per inter block paid a
+/// call plus the argument shuffle. Same reads, same order.
+#[inline(always)]
+fn tpl_sample(
+    probe: &crate::motion_field::TplProbe<'_>,
+    trace_tpl: bool,
+    field: &crate::motion_field::TplField,
+    mi_row: usize,
+    mi_col: usize,
+    blk_row: isize,
+    blk_col: isize,
+    cur_offset: i32,
+    allow_high_precision_mv: bool,
+) -> Option<(i32, i32)> {
+    if trace_tpl {
+        return tpl_trace_sample(
+            field,
+            mi_row,
+            mi_col,
+            blk_row,
+            blk_col,
+            cur_offset,
+            allow_high_precision_mv,
+        );
+    }
+    let (fwd_mv, rfo) = probe.cell(blk_row, blk_col)?;
+    Some(crate::motion_field::project_tpl_mv(
+        fwd_mv,
+        cur_offset,
+        rfo,
+        allow_high_precision_mv,
+    ))
+}
+
+/// [`tpl_sample`] for the compound stack: one field read projected to both
+/// reference offsets.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn tpl_sample_compound(
+    probe: &crate::motion_field::TplProbe<'_>,
+    trace_tpl: bool,
+    field: &crate::motion_field::TplField,
+    mi_row: usize,
+    mi_col: usize,
+    blk_row: isize,
+    blk_col: isize,
+    cur_offsets: (i32, i32),
+    allow_high_precision_mv: bool,
+) -> Option<((i32, i32), (i32, i32))> {
+    if trace_tpl {
+        tpl_trace_sample_compound(
+            field,
+            mi_row,
+            mi_col,
+            blk_row,
+            blk_col,
+            cur_offsets,
+            allow_high_precision_mv,
+        );
+    }
+    let (fwd_mv, rfo) = probe.cell(blk_row, blk_col)?;
+    Some((
+        crate::motion_field::project_tpl_mv(fwd_mv, cur_offsets.0, rfo, allow_high_precision_mv),
+        crate::motion_field::project_tpl_mv(fwd_mv, cur_offsets.1, rfo, allow_high_precision_mv),
+    ))
+}
+
 /// Builds the reference MV stack for the `bw4`-by-`bh4` (in 4x4 units)
 /// block at `(mi_row, mi_col)`, predicting against `ref_frame`, in a frame
 /// that is `mi_cols`-by-`mi_rows` 4x4 units (used only to clamp the
@@ -1179,25 +1307,17 @@ pub fn find_mv_stack_with_sign_bias(
         let trace_tpl = crate::envflags::env_flag!("EC_TRACE_TPL");
         let probe = field.probe(mi_row, mi_col);
         let sample = |blk_row: isize, blk_col: isize| -> Option<(i32, i32)> {
-            if trace_tpl {
-                return crate::motion_field::add_tpl_ref_mv(
-                    field,
-                    mi_row,
-                    mi_col,
-                    blk_row,
-                    blk_col,
-                    cur_offset_0,
-                    allow_high_precision_mv,
-                )
-                .map(|c| c.mv);
-            }
-            let (fwd_mv, rfo) = probe.cell(blk_row, blk_col)?;
-            Some(crate::motion_field::project_tpl_mv(
-                fwd_mv,
+            tpl_sample(
+                &probe,
+                trace_tpl,
+                field,
+                mi_row,
+                mi_col,
+                blk_row,
+                blk_col,
                 cur_offset_0,
-                rfo,
                 allow_high_precision_mv,
-            ))
+            )
         };
         let mut blk_row = 0usize;
         while blk_row < blk_row_end {
@@ -1989,34 +2109,17 @@ pub fn find_mv_stack_compound(
         let trace_tpl = crate::envflags::env_flag!("EC_TRACE_TPL");
         let probe = field.probe(mi_row, mi_col);
         let sample = |blk_row: isize, blk_col: isize| -> Option<((i32, i32), (i32, i32))> {
-            if trace_tpl {
-                for off in [cur_offset_0, cur_offset_1] {
-                    let _ = crate::motion_field::add_tpl_ref_mv(
-                        field,
-                        mi_row,
-                        mi_col,
-                        blk_row,
-                        blk_col,
-                        off,
-                        allow_high_precision_mv,
-                    );
-                }
-            }
-            let (fwd_mv, rfo) = probe.cell(blk_row, blk_col)?;
-            Some((
-                crate::motion_field::project_tpl_mv(
-                    fwd_mv,
-                    cur_offset_0,
-                    rfo,
-                    allow_high_precision_mv,
-                ),
-                crate::motion_field::project_tpl_mv(
-                    fwd_mv,
-                    cur_offset_1,
-                    rfo,
-                    allow_high_precision_mv,
-                ),
-            ))
+            tpl_sample_compound(
+                &probe,
+                trace_tpl,
+                field,
+                mi_row,
+                mi_col,
+                blk_row,
+                blk_col,
+                (cur_offset_0, cur_offset_1),
+                allow_high_precision_mv,
+            )
         };
         let mut blk_row = 0usize;
         while blk_row < blk_row_end {
