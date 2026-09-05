@@ -745,91 +745,252 @@ fn compute_ab(
     let gh = h + 2;
     ab.clear();
     ab.resize(gw * gh, (0i32, 0i64));
-    let n = ((2 * r + 1) * (2 * r + 1)) as i64;
+    let n = ((2 * r + 1) * (2 * r + 1)) as i32;
     // lane-perf6: the box sums are separable. Summing every grid point's own
     // (2r+1)^2 window called `lr_sample` -- whose stripe-boundary test is the
     // expensive part -- (2r+1) times more often than needed; one column-sum
     // pass per grid row reads each source sample once per row instead, and
-    // the horizontal sum is then (2r+1) adds of i64s. Integer addition is
-    // exact and associative, so the totals are unchanged bit for bit.
+    // the horizontal sum is then (2r+1) adds.
     let ru = r as usize;
     let ncols = gw + 2 * ru;
-    let mut col_a = vec![0i64; ncols];
-    let mut col_b = vec![0i64; ncols];
+    // lane-sgr: `i32` sums. A sample is at most `2^bd - 1 <= 4095`, so the
+    // widest possible window sum of squares is `25 * 4095^2 == 419M` and the
+    // widest plain sum `25 * 4095 == 102k`: both far inside `i32`, and every
+    // downstream product is either kept in `i64` (the two that need it) or
+    // likewise bounded (`a_s * n <= 25 * 25 * 65025 / 16`). Halving the
+    // accumulator width is what lets the row loops below vectorise.
+    debug_assert!(crate::decode::sample_max(fctx) <= 4095);
+    debug_assert!(s > 0);
+    let mut sums = vec![0i32; 2 * ncols + 2 * gw];
+    let (col_a, rest) = sums.split_at_mut(ncols);
+    let (col_b, rest) = rest.split_at_mut(ncols);
+    // lane-sgr: the sliding horizontal sums are laid down as two rows first,
+    // so the `(A, B)` map over them is a straight-line pass `ab_row` can run
+    // eight points at a time.
+    let (a_row, b_row) = rest.split_at_mut(gw);
+    // lane-sgr: one contiguous copy of the source row's whole footprint, with
+    // the column clamp (edge replication) applied while filling, so the
+    // accumulate loops below are branch-free over a plain slice instead of a
+    // `lr_sample` call -- clamp included -- per element.
+    let mut samp = vec![0u16; ncols];
     // Hoisted out of the per-point body: one thread-local read per call.
     let bd_shift = u32::from(crate::decode::bit_depth(fctx)).saturating_sub(8);
     let base_col = h_start as i64 - 1 - r as i64;
+    let dump = crate::envflags::env_flag!("EC_LR_CALL_DUMP");
+    let one_by_x = SGR_ONE_BY_X[(n - 1) as usize] as i64;
     // lane-perf9: the column sums slide down the grid too. Grid row `gi+1`'s
     // window is row `gi`'s minus its top source row plus one new bottom row,
     // so each source sample is read once per grid row instead of (2r+1)
     // times -- the same exactness argument as the separable split above
-    // (i64 addition is associative, and subtracting a row that was added is
-    // exact), and `lr_sample`'s stripe-boundary test, which is what makes a
-    // sample read expensive, is a pure function of `(row, col)`.
+    // (integer addition is associative, and subtracting a row that was added
+    // is exact), and `lr_sample`'s stripe-boundary test, which is what makes
+    // a sample read expensive, is a pure function of `(row, col)`.
     for gi in 0..gh {
         let i = gi as i64 - 1;
         {
-            let mut accumulate = |row: i64, sign: i64| {
-                for k in 0..ncols {
-                    let px = lr_sample(
-                        cdef,
-                        deblocked,
-                        stride,
-                        plane_w,
-                        plane_h,
-                        v_start,
-                        v_end,
-                        row,
-                        base_col + k as i64,
-                    ) as i64;
-                    col_a[k] += sign * px * px;
-                    col_b[k] += sign * px;
+            let mut accumulate = |row: i64, add: bool| {
+                let src =
+                    lr_src_row(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row);
+                fill_clamped_row(src, plane_w, base_col, &mut samp);
+                if add {
+                    for ((c_a, c_b), &px) in col_a.iter_mut().zip(col_b.iter_mut()).zip(samp.iter())
+                    {
+                        let px = i32::from(px);
+                        *c_a += px * px;
+                        *c_b += px;
+                    }
+                } else {
+                    for ((c_a, c_b), &px) in col_a.iter_mut().zip(col_b.iter_mut()).zip(samp.iter())
+                    {
+                        let px = i32::from(px);
+                        *c_a -= px * px;
+                        *c_b -= px;
+                    }
                 }
             };
             if gi == 0 {
                 for dr in -r..=r {
-                    accumulate(v_start as i64 + i + dr as i64, 1);
+                    accumulate(v_start as i64 + i + dr as i64, true);
                 }
             } else {
-                accumulate(v_start as i64 + i - 1 - r as i64, -1);
-                accumulate(v_start as i64 + i + r as i64, 1);
+                accumulate(v_start as i64 + i - 1 - r as i64, false);
+                accumulate(v_start as i64 + i + r as i64, true);
             }
         }
         // The horizontal sum slides the same way (one add and one subtract
         // per grid point instead of 2r+1 adds).
-        let mut a = col_a[..2 * ru + 1].iter().sum::<i64>();
-        let mut b = col_b[..2 * ru + 1].iter().sum::<i64>();
+        let mut a = col_a[..2 * ru + 1].iter().sum::<i32>();
+        let mut b = col_b[..2 * ru + 1].iter().sum::<i32>();
         for gj in 0..gw {
-            let j = gj as i64 - 1;
             if gj > 0 {
                 a += col_a[gj + 2 * ru] - col_a[gj - 1];
                 b += col_b[gj + 2 * ru] - col_b[gj - 1];
             }
-            // libaom `restoration.c:660` -- the box sums are brought back
-            // to the 8-bit scale before `p` is formed (`a` is a sum of
-            // squares, so it loses twice the shift `b` does); `B[k]` below
-            // keeps the RAW `b`, only `p` uses the scaled pair. At 8-bit
-            // both shifts are 0, which is why this was invisible until now.
-            let a_s = round2(a, 2 * bd_shift);
-            let b_s = round2(b, bd_shift);
-            let p = if a_s * n < b_s * b_s { 0 } else { a_s * n - b_s * b_s };
-            let z = round2(p * s as i64, SGRPROJ_MTABLE_BITS).clamp(0, 255) as usize;
-            let a_val = SGR_X_BY_XPLUS1[z];
-            let b_val = round2(
-                (256 - a_val) as i64 * b * SGR_ONE_BY_X[(n - 1) as usize] as i64,
-                SGRPROJ_RECIP_BITS,
+            a_row[gj] = a;
+            b_row[gj] = b;
+        }
+        ab_row(a_row, b_row, n, s, bd_shift, one_by_x, &mut ab[gi * gw..gi * gw + gw]);
+        let dump_gj = 6i64 - h_start as i64 + 1;
+        if dump && v_start as i64 + i == 60 && r == 1 && (0..gw as i64).contains(&dump_gj) {
+            let gj = dump_gj as usize;
+            let (a, b) = (a_row[gj], b_row[gj]);
+            let a_s = round2_u31(a, 2 * bd_shift);
+            let b_s = round2_u31(b, bd_shift);
+            let p = (a_s * n - b_s * b_s).max(0);
+            let z = z_index(p, s);
+            let (a_val, b_val) = ab[gi * gw + gj];
+            eprintln!(
+                "EC_LR_CALL_DUMP compute_ab u_tap: r={r} s={s} n={n} box_a={a} box_b={b} \
+                 p={p} z={z} a_val={a_val} b_val={b_val}"
             );
-            if crate::envflags::env_flag!("EC_LR_CALL_DUMP")
-                && v_start as i64 + i == 60
-                && h_start as i64 + j == 6
-                && r == 1
-            {
-                eprintln!(
-                    "EC_LR_CALL_DUMP compute_ab u_tap: r={r} s={s} n={n} box_a={a} box_b={b} \
-                     p={p} z={z} a_val={a_val} b_val={b_val}"
-                );
+        }
+    }
+}
+
+/// `z = Round2(p * s, SGRPROJ_MTABLE_BITS)` clamped to the
+/// [`SGR_X_BY_XPLUS1`] domain -- the one product that does not fit 32 bits.
+#[inline]
+fn z_index(p: i32, s: i32) -> usize {
+    ((i64::from(p) * i64::from(s) + (1 << (SGRPROJ_MTABLE_BITS - 1))) >> SGRPROJ_MTABLE_BITS)
+        .clamp(0, 255) as usize
+}
+
+/// One grid point's `(A[k], B[k])` from its two box sums -- libaom
+/// `restoration.c:660..672`, and the reference every [`ab_row`] arm matches.
+#[inline]
+fn ab_point(a: i32, b: i32, n: i32, s: i32, bd_shift: u32, one_by_x: i64) -> (i32, i64) {
+    // libaom `restoration.c:660` -- the box sums are brought back to the
+    // 8-bit scale before `p` is formed (`a` is a sum of squares, so it loses
+    // twice the shift `b` does); `B[k]` keeps the RAW `b`, only `p` uses the
+    // scaled pair. At 8-bit both shifts are 0, which is why this was
+    // invisible until now.
+    let a_s = round2_u31(a, 2 * bd_shift);
+    let b_s = round2_u31(b, bd_shift);
+    let p = (a_s * n - b_s * b_s).max(0);
+    let a_val = SGR_X_BY_XPLUS1[z_index(p, s)];
+    let b_val = round2((256 - a_val) as i64 * i64::from(b) * one_by_x, SGRPROJ_RECIP_BITS);
+    (a_val, b_val)
+}
+
+/// One grid row's `(A, B)` pairs: [`ab_point`] per element, eight at a time
+/// under AVX2 (the kernel is that arithmetic lane-wise, same widths).
+fn ab_row(
+    a_row: &[i32], b_row: &[i32], n: i32, s: i32, bd_shift: u32, one_by_x: i64,
+    out: &mut [(i32, i64)],
+) {
+    let mut done = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    #[allow(unsafe_code)]
+    {
+        if matches!(crate::mc::simd_level(), crate::mc::SimdLevel::Avx2) {
+            // SAFETY: the arm is reached only when the CPU reports avx2, and
+            // the kernel touches `8 * (out.len() / 8)` elements of each of
+            // the three equally long slices.
+            done = unsafe {
+                sgr_simd::ab_row_avx2(a_row, b_row, n, s, bd_shift, one_by_x as i32, out)
+            };
+        }
+    }
+    for gj in done..out.len() {
+        out[gj] = ab_point(a_row[gj], b_row[gj], n, s, bd_shift, one_by_x);
+    }
+}
+
+/// [`ab_row`]'s AVX2 kernel.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+#[allow(unsafe_op_in_unsafe_fn)] // each kernel's whole body is its contract
+mod sgr_simd {
+    use super::{SGRPROJ_MTABLE_BITS, SGRPROJ_RECIP_BITS, SGR_X_BY_XPLUS1};
+    use std::arch::x86_64::*;
+
+    /// Eight grid points of `super::ab_point` per iteration, returning how
+    /// many points were written (a multiple of 8; the tail stays scalar).
+    ///
+    /// # Safety
+    /// Requires AVX2. Every lane repeats the scalar arithmetic at the widths
+    /// `compute_ab` proves: `a, b >= 0` and `s > 0`, `p < 2^26`,
+    /// `p * s < 2^38`, `(256 - A) * one_by_x < 2^21` and that times
+    /// `b < 2^17` is `< 2^38` -- so the two 64-bit products below lose no
+    /// bit, and the unsigned `mul_epu32` sees no negative operand.
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn ab_row_avx2(
+        a_row: &[i32], b_row: &[i32], n: i32, s: i32, bd_shift: u32, one_by_x: i32,
+        out: &mut [(i32, i64)],
+    ) -> usize {
+        let len = out.len().min(a_row.len()).min(b_row.len());
+        let nv = _mm256_set1_epi32(n);
+        let sv = _mm256_set1_epi32(s);
+        let obx = _mm256_set1_epi32(one_by_x);
+        let c255 = _mm256_set1_epi32(255);
+        let c256 = _mm256_set1_epi32(256);
+        let zero = _mm256_setzero_si256();
+        let rnd_z = _mm256_set1_epi64x(1 << (SGRPROJ_MTABLE_BITS - 1));
+        let rnd_b = _mm256_set1_epi64x(1 << (SGRPROJ_RECIP_BITS - 1));
+        let sh_z = _mm_cvtsi32_si128(SGRPROJ_MTABLE_BITS as i32);
+        let sh_b = _mm_cvtsi32_si128(SGRPROJ_RECIP_BITS as i32);
+        let sh_a = _mm_cvtsi32_si128(2 * bd_shift as i32);
+        let sh_bd = _mm_cvtsi32_si128(bd_shift as i32);
+        let rnd_a = _mm256_set1_epi32(if bd_shift == 0 { 0 } else { 1 << (2 * bd_shift - 1) });
+        let rnd_bd = _mm256_set1_epi32(if bd_shift == 0 { 0 } else { 1 << (bd_shift - 1) });
+        let mut av = [0i32; 8];
+        let mut bv = [0i32; 8];
+        let mut gj = 0usize;
+        while gj + 8 <= len {
+            let a = _mm256_loadu_si256(a_row.as_ptr().add(gj).cast());
+            let b = _mm256_loadu_si256(b_row.as_ptr().add(gj).cast());
+            let a_s = _mm256_srl_epi32(_mm256_add_epi32(a, rnd_a), sh_a);
+            let b_s = _mm256_srl_epi32(_mm256_add_epi32(b, rnd_bd), sh_bd);
+            let p = _mm256_max_epi32(
+                _mm256_sub_epi32(_mm256_mullo_epi32(a_s, nv), _mm256_mullo_epi32(b_s, b_s)),
+                zero,
+            );
+            let z = _mm256_min_epi32(mul_shift(p, sv, rnd_z, sh_z), c255);
+            let a_val = _mm256_i32gather_epi32(SGR_X_BY_XPLUS1.as_ptr(), z, 4);
+            let t = _mm256_mullo_epi32(_mm256_sub_epi32(c256, a_val), obx);
+            let b_val = mul_shift(t, b, rnd_b, sh_b);
+            _mm256_storeu_si256(av.as_mut_ptr().cast(), a_val);
+            _mm256_storeu_si256(bv.as_mut_ptr().cast(), b_val);
+            for k in 0..8 {
+                out[gj + k] = (av[k], i64::from(bv[k]));
             }
-            ab[gi * gw + gj] = (a_val, b_val);
+            gj += 8;
+        }
+        gj
+    }
+
+    /// `Round2(x * y, shift)` lane-wise for eight non-negative `i32` lanes,
+    /// with the product formed in 64 bits (even and odd lanes separately,
+    /// `mul_epu32`) and packed back once the shift makes it fit again.
+    #[target_feature(enable = "avx2")]
+    unsafe fn mul_shift(x: __m256i, y: __m256i, rnd: __m256i, shift: __m128i) -> __m256i {
+        let ev = _mm256_mul_epu32(x, y);
+        let od = _mm256_mul_epu32(_mm256_srli_epi64(x, 32), _mm256_srli_epi64(y, 32));
+        let ev = _mm256_srl_epi64(_mm256_add_epi64(ev, rnd), shift);
+        let od = _mm256_srl_epi64(_mm256_add_epi64(od, rnd), shift);
+        _mm256_blend_epi32(ev, _mm256_slli_epi64(od, 32), 0b1010_1010)
+    }
+}
+
+/// `Round2` for the non-negative box sums (same value as [`round2`], one
+/// width narrower).
+#[inline]
+fn round2_u31(value: i32, shift: u32) -> i32 {
+    if shift == 0 { value } else { (value + (1 << (shift - 1))) >> shift }
+}
+
+/// Copies one source row's `out.len()` samples starting at `base_col` into a
+/// contiguous scratch, replicating the plane's edge sample outside
+/// `[0, plane_w)` -- exactly the clamp [`lr_sample`] applies per element.
+#[inline]
+fn fill_clamped_row(src: &[u16], plane_w: usize, base_col: i64, out: &mut [u16]) {
+    let ncols = out.len();
+    if base_col >= 0 && base_col as usize + ncols <= plane_w {
+        out.copy_from_slice(&src[base_col as usize..base_col as usize + ncols]);
+    } else {
+        for (k, o) in out.iter_mut().enumerate() {
+            *o = src[(base_col + k as i64).clamp(0, plane_w as i64 - 1) as usize];
         }
     }
 }
