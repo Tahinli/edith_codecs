@@ -6283,6 +6283,19 @@ const SKIP_CONTEXTS: [[usize; 5]; 5] = [
     [3, 5, 5, 5, 6],
 ];
 
+/// The `skip` flag, its written-instrument bit, and the covering coded
+/// block's origin and dims, packed into ONE 8-byte cell (lane-publish): the
+/// four maps are written together by `Neighbours::fill_skip_grid_rect` and by
+/// nothing else, so a block's row is one fill instead of four, and the
+/// deblocker's `pu_edge` reads origin and dims off one cache line.
+#[derive(Clone, Copy)]
+struct BlkCell {
+    skip: bool,
+    written: bool,
+    org: [u16; 2],
+    dim: [u8; 2],
+}
+
 /// The neighbour state a block's contexts are read from — a duplicate of
 /// [`crate::tile`]'s own private `Neighbours` (that module is another lane's
 /// territory this round), kept at the same two granularities the real writer
@@ -6418,27 +6431,25 @@ struct Neighbours {
     /// grain [`Self::record_mi`] already writes at), read back at 8x8
     /// granularity by [`apply_cdef`] since `skip` is constant across every
     /// mi cell one coded block covers.
-    skip_grid: Vec<bool>,
+    /// The four per-mi maps [`Neighbours::blk_grid`] packs, in one cell.
     /// lane-cdefstrip r1 instrument: whether any coded block actually WROTE
-    /// [`Self::skip_grid`] at this mi cell during this frame. A fresh
+    /// the `skip` bit at this mi cell during this frame. A fresh
     /// `Neighbours` seeds `skip_grid` all-`false` ("not skip"), so a decode
     /// arm that forgets [`Self::fill_skip_grid_rect`] silently makes
     /// [`apply_cdef`] filter an 8x8 unit libaom's `is_8x8_block_skip`
     /// (`cdef.c:29-38`) excludes -- exactly the lane-cdef defect, and
     /// unobservable from the pixels alone. Counted by
     /// [`cdef_unwritten_skip_units`].
-    skip_written: Vec<bool>,
     /// Per-4x4-mi origin `(mi_row, mi_col)` of the coded (prediction) block
     /// covering that cell -- spec 7.14.2's `isBlockEdge`/libaom `pu_edge`,
     /// which re-enables the loop filter at a prediction boundary between two
     /// skipped inter blocks (lane-mergefix r4). Written by
     /// [`Self::fill_skip_grid_rect`], whose `at_mi` IS that origin.
-    blk_org_grid: Vec<[u16; 2]>,
     /// Per-4x4-mi `(width, height)` in mi units of the coded block covering
     /// that cell -- the other half of `pu_edge`: libaom tests the edge
     /// coordinate against the block's size in the FILTERED plane's own
     /// pixels, which for chroma is `max(luma_dim / 2, 4)` (lane-t900 r30b).
-    blk_dim_grid: Vec<[u8; 2]>,
+    blk_grid: Vec<BlkCell>,
     skip_grid_cols_mi: usize,
     /// Per-4x4-mi luma transform width in pixels (8/16/32/64) -- this decoder
     /// never splits a coded block's transform below its own size (round 2:
@@ -6560,10 +6571,10 @@ impl Neighbours {
             left_filter: vec![[3u8; 2]; rows * (SUB / MI)],
             mi_cols,
             mi_rows,
-            skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
-            skip_written: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
-            blk_org_grid: vec![[0u16; 2]; cols * (SUB / MI) * rows * (SUB / MI)],
-            blk_dim_grid: vec![[1u8; 2]; cols * (SUB / MI) * rows * (SUB / MI)],
+            blk_grid: vec![
+                BlkCell { skip: false, written: false, org: [0; 2], dim: [1; 2] };
+                cols * (SUB / MI) * rows * (SUB / MI)
+            ],
             skip_grid_cols_mi: cols * (SUB / MI),
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
@@ -6971,10 +6982,17 @@ impl Neighbours {
         }
         for rr in 0..h_mi {
             let start = (mi_r + rr) * self.skip_grid_cols_mi + mi_c;
-            fill_span(&mut self.skip_grid, start, w_mi, skip);
-            fill_span(&mut self.skip_written, start, w_mi, true);
-            fill_span(&mut self.blk_org_grid, start, w_mi, [mi_r as u16, mi_c as u16]);
-            fill_span(&mut self.blk_dim_grid, start, w_mi, [w_mi as u8, h_mi as u8]);
+            fill_span(
+                &mut self.blk_grid,
+                start,
+                w_mi,
+                BlkCell {
+                    skip,
+                    written: true,
+                    org: [mi_r as u16, mi_c as u16],
+                    dim: [w_mi as u8, h_mi as u8],
+                },
+            );
         }
     }
 
@@ -6988,10 +7006,9 @@ impl Neighbours {
     /// filter's `curr_skipped`/`pv_skip_txfm` (spec 7.14.2) want, since a
     /// filtered edge's two sides are each exactly one coded block wide.
     fn skip_at(&self, mi_r: usize, mi_c: usize) -> bool {
-        self.skip_grid
+        self.blk_grid
             .get(mi_r * self.skip_grid_cols_mi + mi_c)
-            .copied()
-            .unwrap_or(false)
+            .is_some_and(|c| c.skip)
     }
 
     /// The `skip_txfm` context of a block whose top-left mi cell is
@@ -7007,10 +7024,9 @@ impl Neighbours {
     fn is_skip_txfm(&self, mi_r: usize, mi_c: usize) -> bool {
         (0..2).all(|rr| {
             (0..2).all(|cc| {
-                self.skip_grid
+                self.blk_grid
                     .get((mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc))
-                    .copied()
-                    .unwrap_or(false)
+                    .is_some_and(|c| c.skip)
             })
         })
     }
@@ -7262,19 +7278,21 @@ impl Neighbours {
     /// units, for the same reason [`Self::record_mi`] does.
     fn around_mi(&self, (mi_r, mi_c): (usize, usize), side: usize) -> [(bool, bool, i32); 3] {
         let side_mi = side / MI;
-        std::array::from_fn(|plane| {
-            let mut above_coded = false;
-            let mut left_coded = false;
-            let mut vote = 0;
-            for cell in 0..side_mi {
-                let above = &self.above[mi_c + cell][plane];
-                let left = &self.left[mi_r + cell][plane];
-                above_coded |= above.level != 0;
-                left_coded |= left.level != 0;
-                vote += dc_vote(above.dc) + dc_vote(left.dc);
+        // One pass over the cells accumulating all three planes, not one pass
+        // per plane: the three planes of a cell live in the same
+        // `[Neighbour; 3]` (6 bytes), so the per-plane form loaded the same
+        // cache lines three times (lane-publish).
+        let mut out = [(false, false, 0i32); 3];
+        for cell in 0..side_mi {
+            let above = &self.above[mi_c + cell];
+            let left = &self.left[mi_r + cell];
+            for (plane, o) in out.iter_mut().enumerate() {
+                o.0 |= above[plane].level != 0;
+                o.1 |= left[plane].level != 0;
+                o.2 += dc_vote(above[plane].dc) + dc_vote(left[plane].dc);
             }
-            (above_coded, left_coded, vote)
-        })
+        }
+        out
     }
 
     /// [`Self::around`] with independent above (`w`)/left (`h`) extents, in
@@ -7288,21 +7306,25 @@ impl Neighbours {
     /// mode-info units, mirroring [`Self::around_mi`].
     fn around_mi_rect(&self, (mi_r, mi_c): (usize, usize), w: usize, h: usize) -> [(bool, bool, i32); 3] {
         let (w_mi, h_mi) = (w / MI, h / MI);
-        std::array::from_fn(|plane| {
-            let mut above_coded = false;
-            let mut left_coded = false;
-            let mut vote = 0;
-            for cell in 0..w_mi {
-                let above = &self.above[mi_c + cell][plane];
-                above_coded |= above.level != 0;
-                vote += dc_vote(above.dc);
+        // [`Self::around_mi`]'s single pass, with the two extents split.
+        let mut out = [(false, false, 0i32); 3];
+        for cell in 0..w_mi {
+            let above = &self.above[mi_c + cell];
+            for (plane, o) in out.iter_mut().enumerate() {
+                o.0 |= above[plane].level != 0;
+                o.2 += dc_vote(above[plane].dc);
             }
-            for cell in 0..h_mi {
-                let left = &self.left[mi_r + cell][plane];
-                left_coded |= left.level != 0;
-                vote += dc_vote(left.dc);
+        }
+        for cell in 0..h_mi {
+            let left = &self.left[mi_r + cell];
+            for (plane, o) in out.iter_mut().enumerate() {
+                o.1 |= left[plane].level != 0;
+                o.2 += dc_vote(left[plane].dc);
             }
-            if crate::envflags::env_flag!("EC_DCDUMP") {
+        }
+        if crate::envflags::env_flag!("EC_DCDUMP") {
+            for (plane, o) in out.iter().enumerate() {
+                let vote = o.2;
                 let ab: Vec<String> = (0..w_mi)
                     .map(|k| format!("{:?}/{}", self.above[mi_c + k][plane].dc, self.above[mi_c + k][plane].level))
                     .collect();
@@ -7311,8 +7333,8 @@ impl Neighbours {
                     .collect();
                 eprintln!("EC_DCDUMP mi=({mi_r},{mi_c}) plane={plane} wh=({w},{h}) vote={vote} above=[{}] left=[{}]", ab.join(","), lf.join(","));
             }
-            (above_coded, left_coded, vote)
-        })
+        }
+        out
     }
 
     /// The luma `txb_skip_ctx` of a transform unit smaller than its own block
@@ -18025,8 +18047,8 @@ fn edge_params_body(
     // bottom/right mi does not start there. Comparing mi origins instead is
     // the same test only while the block's own origin is aligned to its
     // size, which a 4x4 luma block read at the `| 1` mi is not.
-    let cur_org = n.blk_org_grid[mi_r * n.skip_grid_cols_mi + mi_c];
-    let cur_dim = n.blk_dim_grid[mi_r * n.skip_grid_cols_mi + mi_c];
+    let cur_cell = n.blk_grid[mi_r * n.skip_grid_cols_mi + mi_c];
+    let (cur_org, cur_dim) = (cur_cell.org, cur_cell.dim);
     let (org_px, dim_mi) = if c.dir == 0 {
         (usize::from(cur_org[1]), usize::from(cur_dim[0]))
     } else {
@@ -19345,10 +19367,9 @@ fn apply_cdef(
                 if (0..2).any(|rr| {
                     (0..2).any(|cc| {
                         !skip_grid
-                            .skip_written
+                            .blk_grid
                             .get((r + rr) * skip_grid.skip_grid_cols_mi + (c + cc))
-                            .copied()
-                            .unwrap_or(true)
+                            .map_or(true, |x| x.written)
                     })
                 }) {
                     CDEF_UNWRITTEN_SKIP_UNITS.with(|c2| c2.set(c2.get() + 1));
@@ -19358,10 +19379,9 @@ fn apply_cdef(
                 }
                 let cell = |rr: usize, cc: usize| {
                     skip_grid
-                        .skip_grid
+                        .blk_grid
                         .get((r + rr) * skip_grid.skip_grid_cols_mi + (c + cc))
-                        .copied()
-                        .unwrap_or(false)
+                        .is_some_and(|x| x.skip)
                 };
                 let first = cell(0, 0);
                 if (0..2).any(|rr| (0..2).any(|cc| cell(rr, cc) != first)) {
