@@ -1063,7 +1063,16 @@ pub(crate) fn predict_with_filters_kern(
             // lane-perf2: an interior row is one contiguous copy.
             if x0 >= 0 && x0 as usize + block_w <= true_width {
                 if let Some(src) = reference.get(row_base + x0 as usize..row_base + x0 as usize + block_w) {
-                    out.copy_from_slice(src);
+                    // The common widths get a constant-length copy: at 8
+                    // samples a `memcpy` call costs more than the move it
+                    // makes, and 8x8 is the most common inter block on real
+                    // 4K content.
+                    match block_w {
+                        4 => out[..4].copy_from_slice(&src[..4]),
+                        8 => out[..8].copy_from_slice(&src[..8]),
+                        16 => out[..16].copy_from_slice(&src[..16]),
+                        _ => out.copy_from_slice(src),
+                    }
                     continue;
                 }
             }
