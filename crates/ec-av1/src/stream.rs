@@ -1006,13 +1006,19 @@ pub fn decode_stream_with_threads(
                         decode_idx,
                         shown_idx,
                         dump.as_deref(),
-                        // lane-twostage kill switch: `EC_AV1_TWO_STAGE=0`
-                        // publishes a frame's meta where it always was
-                        // (after its filters), for bisecting a mismatch.
+                        // lane-twostage is OFF by default: it is byte-exact
+                        // and the chain shows the producer tail overlapped,
+                        // but it does not move the wall (the consumer parses
+                        // only 4.2% of its tile before its first reference
+                        // pixel read, which is shorter than the tail it
+                        // hides). `EC_AV1_TWO_STAGE=1` publishes a frame's
+                        // meta at its tile boundary instead of after its
+                        // filters; it pays only once the 8x8-leaf, OBMC and
+                        // sub-8x8-piece predictions are deferred to the recon
+                        // workers as well.
                         crate::envflags::var("EC_AV1_TWO_STAGE")
-                            .is_ok_and(|v| v == "0")
-                            .then_some(())
-                            .map_or(Some(&stage1 as &dyn Fn(_, _, _, _)), |()| None),
+                            .is_ok_and(|v| v == "1")
+                            .then_some(&stage1 as &dyn Fn(_, _, _, _)),
                     )?;
                     // Publish before grain synthesis: every frame waiting on
                     // this slot can start the moment the clean picture exists
