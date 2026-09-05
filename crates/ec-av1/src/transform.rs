@@ -1340,7 +1340,7 @@ pub fn dequant_and_inverse_typed_wh(
     // `decode.rs`), which also drops the `vec![0; w * h]` memset here and the
     // `to_vec` clone the recorded [`crate::decode::Residual`] made of it --
     // together 6.5% of the 4K segment's profile (memset + memmove).
-    if levels.iter().all(|&l| l == 0) {
+    if crate::decode::is_zero_grid(levels) {
         return Vec::new();
     }
     DQ_SCRATCH.with(|cell| {
