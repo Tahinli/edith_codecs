@@ -101,6 +101,19 @@ impl<'a, T: ?Sized> Shared<'a, T> {
         Self(v, std::marker::PhantomData)
     }
 
+    /// [`Shared::new`] from a raw pointer, for a caller that keeps using the
+    /// `&mut T` itself (lane-pipefilt: the frame thread parses into the
+    /// planes and the mode-info grids while the filter pipeline reads the
+    /// superblock rows the parse is already three bands past).
+    ///
+    /// # Safety
+    /// `p` must stay valid and unaliased-in-practice for `'a` -- the same
+    /// band-disjointness contract as [`Shared::get`], proved by the caller's
+    /// row-lag arithmetic and the byte-exact gate.
+    pub(crate) unsafe fn from_ptr(p: *mut T) -> Self {
+        Self(p, std::marker::PhantomData)
+    }
+
     /// # Safety
     /// The caller must touch only its own band, disjoint from every other
     /// worker's, for as long as the returned reference lives.

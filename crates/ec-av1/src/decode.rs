@@ -2537,6 +2537,13 @@ struct WaveQueue {
     queued: usize,
     /// Per superblock row, the last column reconstructed (-1 = none yet).
     done: Vec<isize>,
+    /// Per superblock row, the last column PARSED (submitted, whether or not
+    /// it recorded any write) and the last column actually pushed as a job
+    /// (-1 = none). A row is fully reconstructed once it has been parsed to
+    /// `last_col` and `done` has caught up with `last_push` -- lane-pipefilt
+    /// reads that to release the row's filters (see [`wave_rows_complete`]).
+    last_sub: Vec<isize>,
+    last_push: Vec<isize>,
     /// Jobs popped but not finished -- what [`wave_barrier`] waits out.
     active: usize,
     closed: bool,
@@ -2634,6 +2641,11 @@ fn wave_stats_dump() {
         );
     }
     s += &format!(
+        " | pipe={}/{}",
+        PIPE_FRAMES.load(Relaxed),
+        PIPE_FRAMES.load(Relaxed) + PIPE_WHOLE.load(Relaxed),
+    );
+    s += &format!(
         " | parse={:.0}ms barrier={:.0}ms/{} drain={:.0}ms block_above={} block_left={}",
         ms(WS_PARSE.load(Relaxed)),
         ms(WS_BARRIER.load(Relaxed)),
@@ -2722,6 +2734,8 @@ impl<'a> WaveGuard<'a> {
                 rows: (0..rows).map(|_| std::collections::VecDeque::new()).collect(),
                 queued: 0,
                 done: vec![-1; rows],
+                last_sub: vec![-1; rows],
+                last_push: vec![-1; rows],
                 active: 0,
                 closed: false,
             }),
@@ -2794,10 +2808,16 @@ fn wave_submit(fctx: &crate::decode::FrameCtx, r: usize, c: usize) -> bool {
         let cap = c.len();
         std::mem::replace(&mut *c, Vec::with_capacity(cap))
     });
-    if !ops.is_empty() {
+    {
         let mut q = st.q.lock().unwrap();
-        q.rows[r].push_back((c, ReconJob { ops, coeffs, preds }));
-        q.queued += 1;
+        if (c as isize) > q.last_sub[r] {
+            q.last_sub[r] = c as isize;
+        }
+        if !ops.is_empty() {
+            q.rows[r].push_back((c, ReconJob { ops, coeffs, preds }));
+            q.queued += 1;
+            q.last_push[r] = c as isize;
+        }
         drop(q);
         st.cv.notify_all();
     }
@@ -16383,6 +16403,36 @@ fn apply_deblock(
     }
 }
 
+/// [`apply_deblock`] for ONE pass over ONE band of luma rows
+/// (`y_lo..y_hi`), the form [`pipe_run`] calls it in. Running the three
+/// planes' vertical passes and then their three horizontal ones is the same
+/// output as `apply_deblock`'s plane-at-a-time order: the planes are
+/// separate buffers and neither pass reads another plane.
+#[allow(clippy::too_many_arguments)]
+fn deblock_span(
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    lf: &LoopFilterParams,
+    n: &Neighbours,
+    frame_width: usize,
+    frame_height: usize,
+    y_lo: usize,
+    y_hi: usize,
+    horz: bool,
+    fctx: &crate::decode::FrameCtx,
+) {
+    if lf.level[0] != 0 || lf.level[1] != 0 {
+        deblock_plane_span(y, 0, lf, n, frame_width, frame_height, y_lo, y_hi, horz, fctx);
+    }
+    if lf.level[2] != 0 {
+        deblock_plane_span(u, 1, lf, n, frame_width, frame_height, y_lo / 2, y_hi / 2, horz, fctx);
+    }
+    if lf.level[3] != 0 {
+        deblock_plane_span(v, 2, lf, n, frame_width, frame_height, y_lo / 2, y_hi / 2, horz, fctx);
+    }
+}
+
 /// Luma-mi-grid position (row or col) a plane-local pixel coordinate falls
 /// in -- `Neighbours::tx_grid`/`ref_grid` are always indexed at the luma
 /// 4x4-mi grain, even when `coord` is a chroma coordinate (2 chroma px per
@@ -18921,6 +18971,34 @@ fn deblock_plane(
     frame_width: usize,
     frame_height: usize, fctx: &crate::decode::FrameCtx,
 ) {
+    // spec 7.14's order: this plane's whole vertical pass, then its whole
+    // horizontal one. lane-pipefilt split the two into one row-ranged
+    // function so the per-superblock-row pipeline can run them a band at a
+    // time; `0..usize::MAX` is the whole plane, i.e. exactly this call.
+    deblock_plane_span(plane, plane_idx, lf, n, frame_width, frame_height, 0, usize::MAX, false, fctx);
+    deblock_plane_span(plane, plane_idx, lf, n, frame_width, frame_height, 0, usize::MAX, true, fctx);
+}
+
+/// One pass of [`deblock_plane`] -- vertical edges (`horz == false`) or
+/// horizontal ones -- restricted to the plane rows `span_lo..span_hi`.
+///
+/// A row span is a legal cut of either pass because a band boundary is a
+/// multiple of 16 rows and every edge's kernel stays inside its own
+/// 4-sample group's reach; the pipeline's row lags (see [`pipe_run`]) are
+/// what keep the two passes in spec order across bands.
+#[allow(clippy::too_many_arguments)]
+fn deblock_plane_span(
+    plane: &mut PlaneBuf<'static>,
+    plane_idx: usize,
+    lf: &LoopFilterParams,
+    n: &Neighbours,
+    frame_width: usize,
+    frame_height: usize,
+    span_lo: usize,
+    span_hi: usize,
+    horz: bool,
+    fctx: &crate::decode::FrameCtx,
+) {
     let chroma = plane_idx != 0;
     // r7: libaom clips the deblock loop to the CODED frame's own
     // width/height, not the mi-aligned `true_width`/`true_height` margin
@@ -18980,10 +19058,15 @@ fn deblock_plane(
     plane.data.to_mut();
     let threads = crate::par::filter_threads();
     let sp = crate::par::Shared::new(plane);
-    let vbands: Vec<(usize, usize)> = crate::par::bands(th.div_ceil(16), threads)
-        .into_iter()
-        .map(|(a, b)| (a * 16, (b * 16).min(th)))
-        .collect();
+    let (sp_lo, sp_hi) = (span_lo.min(th), span_hi.min(th));
+    let vbands: Vec<(usize, usize)> = if horz || sp_lo >= sp_hi {
+        Vec::new()
+    } else {
+        crate::par::bands((sp_hi - sp_lo).div_ceil(16), threads)
+            .into_iter()
+            .map(|(a, b)| (sp_lo + a * 16, (sp_lo + b * 16).min(sp_hi)))
+            .collect()
+    };
     crate::par::run_bands(&vbands, fctx, |y_lo, y_hi, fctx| {
         // SAFETY: this band writes only rows `y_lo..y_hi` of the plane, which
         // no other band touches (see `Shared`'s own corner-cut note).
@@ -19052,17 +19135,21 @@ fn deblock_plane(
     });
     // The horizontal pass runs only after the WHOLE vertical pass of this
     // plane (spec 7.14 order), which `run_bands` guarantees by joining.
-    let hbands: Vec<(usize, usize)> = crate::par::bands(tw.div_ceil(16), threads)
-        .into_iter()
-        .map(|(a, b)| (a * 16, (b * 16).min(tw)))
-        .collect();
+    let hbands: Vec<(usize, usize)> = if !horz || sp_lo >= sp_hi {
+        Vec::new()
+    } else {
+        crate::par::bands(tw.div_ceil(16), threads)
+            .into_iter()
+            .map(|(a, b)| (a * 16, (b * 16).min(tw)))
+            .collect()
+    };
     crate::par::run_bands(&hbands, fctx, |x_lo, x_hi, fctx| {
         // SAFETY: this band writes only columns `x_lo..x_hi`.
         #[allow(unsafe_code)]
         let plane = unsafe { sp.get() };
         let hctx = EdgeCtx::new(lf, n, plane_idx, 1, chroma, seg_lf_active, fctx);
-        let mut y0 = 4usize;
-        while y0 < th {
+        let mut y0 = sp_lo.max(4);
+        while y0 < sp_hi {
             let mut x0 = x_lo;
             while x0 < x_hi {
                 if x0 + 16 <= x_hi && y0 >= 8 && y0 + 7 <= rows {
@@ -19179,6 +19266,10 @@ fn scratch_sized(n: usize) -> Vec<u16> {
 /// memmove per plane per frame into 4 rows in 64 (luma). Every other row of
 /// the pooled buffer keeps whatever a previous frame left there -- an
 /// initialised value that no reader ever reaches.
+fn snap_alloc(p: &PlaneBuf<'_>) -> PlaneBuf<'static> {
+    PlaneBuf { data: std::borrow::Cow::Owned(scratch_sized(p.data.len())), ..*p }
+}
+
 fn plane_snapshot(p: &PlaneBuf<'_>, ss_y: u32) -> PlaneBuf<'static> {
     let mut data = scratch_sized(p.data.len());
     let rows = if p.width == 0 { 0 } else { p.data.len() / p.width };
@@ -19370,27 +19461,272 @@ fn cdef_band(
         }
 }
 
-fn apply_cdef(
-    y: &mut PlaneBuf<'static>,
-    u: &mut PlaneBuf<'static>,
-    v: &mut PlaneBuf<'static>,
-    cdef: &CdefParams,
-    skip_grid: &Neighbours,
-    // This frame header's own CROPPED luma size, for the straddling-unit
-    // counter only -- CDEF itself walks the mi-rounded plane.
-    (frame_w, frame_h): (usize, usize), fctx: &crate::decode::FrameCtx,
-) {
-    // lane-part32 r2 debug rung, env-gated: see `apply_deblock`'s sibling.
-    if crate::envflags::env_flag!("EC_AV1_DEBUG_SKIP_CDEF") {
+
+// --- lane-pipefilt: the per-superblock-row loop filter pipeline ----------
+//
+// DEPENDENCY SHAPE (derived from this decoder's own whole-frame pass order:
+// every plane's vertical deblock edges, then every plane's horizontal ones,
+// then CDEF, then -- unpipelined -- superres and loop restoration).
+// A band is 64 luma rows, one superblock row (a 128 superblock is two).
+//
+//  * recon: intra prediction of band r+1 reads the UNFILTERED bottom rows of
+//    band r, so no filter may touch band r before band r+1 is reconstructed.
+//    Hence V(r) waits for `ready >= r + 2`.
+//  * V(r) (vertical edges whose 4-sample groups live in band r's rows) then
+//    H(r-1) (horizontal edges at `y` in band r-1, including the one at its
+//    own top boundary): the edge at `y = r*64` reads/writes 6-7 rows either
+//    side of the band boundary, so H(r-1)'s last edge reaches into band r,
+//    which the whole-frame order has already vertical-filtered -- V(r)
+//    before H(r-1) reproduces exactly that.
+//  * post-deblock finality: band j's own bottom rows are still rewritten by
+//    H(j+1)'s first edge, so band j's post-deblock snapshot (`snap`) may
+//    only be taken after H(j+1).
+//  * CDEF(j) reads the post-deblock picture 2-3 rows across its 64x64
+//    boundaries, i.e. bands j-1..j+1, so it runs after snap(j+1).
+//
+// One iteration k therefore runs V(k), H(k-1), snap(k-2), CDEF(k-3), and the
+// loop runs k in `0..nbands+3` so the tail drains. Loop restoration (and the
+// superres upscale, which is a whole-frame refusal for this path) stay in the
+// frame thread's tail; the snapshot the pipeline built is what LR reads.
+struct PipeQ {
+    /// Bands whose reconstruction the frame thread has released.
+    ready: usize,
+    abort: bool,
+}
+
+pub(crate) struct PipeSync {
+    m: std::sync::Mutex<PipeQ>,
+    cv: std::sync::Condvar,
+}
+
+impl PipeSync {
+    fn new() -> Self {
+        Self {
+            m: std::sync::Mutex::new(PipeQ { ready: 0, abort: false }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+    fn note(&self, ready: usize) {
+        let mut q = self.m.lock().unwrap();
+        if ready > q.ready {
+            q.ready = ready;
+            self.cv.notify_all();
+        }
+    }
+    /// Releases every remaining band (`abort` = the tile decoder is bailing
+    /// out, so the worker returns instead of finishing the frame).
+    fn close(&self, all: usize, abort: bool) {
+        let mut q = self.m.lock().unwrap();
+        q.ready = q.ready.max(all);
+        q.abort |= abort;
+        self.cv.notify_all();
+    }
+    /// `false` when the frame was aborted.
+    fn wait_for(&self, want: usize) -> bool {
+        let mut q = self.m.lock().unwrap();
+        while q.ready < want && !q.abort {
+            q = self.cv.wait(q).unwrap();
+        }
+        !q.abort
+    }
+}
+
+/// Band `j`'s rows of `src` copied into the pipeline's post-deblock
+/// snapshot. `full` mirrors [`apply_cdef`]'s whole-plane pre-CDEF copy;
+/// otherwise only the four rows around each stripe boundary that loop
+/// restoration reads are taken, exactly [`plane_snapshot`]'s rows.
+fn snap_band(dst: &mut [u16], src: &PlaneBuf<'_>, ss_y: u32, y_lo: usize, y_hi: usize, full: bool) {
+    let w = src.width;
+    if w == 0 {
         return;
     }
-    // lane-cdefstrip r1 instrument, BEFORE either early return so it is valid
-    // for every frame: an 8x8 CDEF unit none of whose four mi cells a coded
-    // block wrote this frame. `Neighbours` seeds `skip_grid` all-false, so a
-    // decode arm that forgets `fill_skip_grid_rect` reads "not skip" and CDEF
-    // filters a unit libaom's `is_8x8_block_skip` (`cdef.c:29-38`) may exclude.
-    // Always 0 on every stream measured; a gate asserts it stays 0.
-    {
+    let rows = src.data.len() / w;
+    let (lo, hi) = (y_lo.min(rows), y_hi.min(rows));
+    if lo >= hi {
+        return;
+    }
+    if full {
+        dst[lo * w..hi * w].copy_from_slice(&src.data[lo * w..hi * w]);
+        return;
+    }
+    let stripe_h = 64usize >> ss_y;
+    let offset = 8usize >> ss_y;
+    let mut b = stripe_h - offset;
+    while b < rows {
+        let (a, e) = ((b - 2).max(lo), (b + 2).min(rows).min(hi));
+        if a < e {
+            dst[a * w..e * w].copy_from_slice(&src.data[a * w..e * w]);
+        }
+        b += stripe_h;
+    }
+}
+
+/// Everything the pipeline worker needs that is not a plane or a grid.
+struct PipeCfg<'a> {
+    lf: &'a LoopFilterParams,
+    cdef: &'a CdefParams,
+    /// `(cdef_idx_grid.as_ptr(), len)` -- the frame thread keeps filling the
+    /// entries of the superblock rows the pipeline has not reached; the Vec
+    /// itself is sized once per frame, so the pointer stays valid.
+    idx_grid: (*const u8, usize),
+    sb_cols: usize,
+    frame_w: usize,
+    frame_h: usize,
+    nbands: usize,
+    cdef_on: bool,
+    snap_on: bool,
+}
+
+// SAFETY: the `*const u8` is a read-only view of a Vec that is allocated once
+// per frame and only ever written at indices the pipeline is three bands
+// behind (see this module's dependency note).
+#[allow(unsafe_code)]
+unsafe impl Send for PipeCfg<'_> {}
+
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn pipe_run(
+    sync: &PipeSync,
+    sy: crate::par::Shared<'_, PlaneBuf<'static>>,
+    su: crate::par::Shared<'_, PlaneBuf<'static>>,
+    sv: crate::par::Shared<'_, PlaneBuf<'static>>,
+    sn: crate::par::Shared<'_, Neighbours>,
+    cfg: PipeCfg<'_>,
+    snap: &mut Option<(PlaneBuf<'static>, PlaneBuf<'static>, PlaneBuf<'static>)>,
+    fctx: &crate::decode::FrameCtx,
+) {
+    // SAFETY: the frame thread parses (and reconstructs) bands the pipeline
+    // is at least two behind, and the two ranges never meet -- see the
+    // dependency note above and `Shared`'s own corner-cut.
+    let (y, u, v) = unsafe { (sy.get(), su.get(), sv.get()) };
+    let n: &Neighbours = unsafe { sn.get() };
+    let idx_grid = unsafe { std::slice::from_raw_parts(cfg.idx_grid.0, cfg.idx_grid.1) };
+    let coeff_shift = i32::from(bit_depth(fctx)) - 8;
+    let damping = i32::from(cfg.cdef.damping) + coeff_shift;
+    let damping_uv = (damping - 1).max(0);
+    let (fw, fh) = (cfg.frame_w, cfg.frame_h);
+    let nb = cfg.nbands;
+    for k in 0..nb + 3 {
+        if !sync.wait_for((k + 2).min(nb)) {
+            return;
+        }
+        if k < nb {
+            deblock_span(y, u, v, cfg.lf, n, fw, fh, k * 64, (k + 1) * 64, false, fctx);
+        }
+        if k >= 1 && k - 1 < nb {
+            deblock_span(y, u, v, cfg.lf, n, fw, fh, (k - 1) * 64, k * 64, true, fctx);
+        }
+        if cfg.snap_on && k >= 2 && k - 2 < nb {
+            let j = k - 2;
+            if let Some((sy2, su2, sv2)) = snap.as_mut() {
+                snap_band(sy2.data.to_mut(), y, 0, j * 64, (j + 1) * 64, cfg.cdef_on);
+                snap_band(su2.data.to_mut(), u, 1, j * 32, (j + 1) * 32, cfg.cdef_on);
+                snap_band(sv2.data.to_mut(), v, 1, j * 32, (j + 1) * 32, cfg.cdef_on);
+            }
+        }
+        if cfg.cdef_on && k >= 3 && k - 3 < nb {
+            let j = k - 3;
+            if let Some((sy2, su2, sv2)) = snap.as_ref() {
+                cdef_rows(
+                    y, u, v, &sy2.data, &su2.data, &sv2.data, cfg.cdef, n, idx_grid, cfg.sb_cols,
+                    coeff_shift, damping, damping_uv, (fw, fh), j * 16, (j + 1) * 16, fctx,
+                );
+            }
+        }
+    }
+}
+
+/// The pipeline's handle on the frame thread: [`PipeGuard::note`] releases
+/// bands as reconstruction completes, [`PipeGuard::finish`] drains it, and
+/// `Drop` aborts it on any `?` out of the tile decoder (the worker holds raw
+/// pointers into the frame's planes, so it may not outlive them).
+struct PipeGuard<'a> {
+    sync: std::sync::Arc<PipeSync>,
+    batch: Option<crate::par::Batch<'a>>,
+    nbands: usize,
+}
+
+impl PipeGuard<'_> {
+    fn note(&self, bands: usize) {
+        self.sync.note(bands);
+    }
+    fn finish(&mut self) {
+        self.sync.close(self.nbands, false);
+        // Dropping the batch waits the worker out.
+        self.batch.take();
+    }
+}
+
+impl Drop for PipeGuard<'_> {
+    fn drop(&mut self) {
+        self.sync.close(self.nbands, true);
+    }
+}
+
+/// Leading superblock rows of the live tile's wavefront that are fully
+/// reconstructed: parsed out to the last column and with every job that
+/// carried a write finished. 0 when reconstruction is inline (no wavefront),
+/// where the caller uses the parse position instead.
+fn wave_rows_complete(fctx: &crate::decode::FrameCtx) -> usize {
+    let st = fctx.wave.with(|w| w.borrow().clone());
+    let Some(st) = st else { return 0 };
+    let q = st.q.lock().unwrap();
+    let mut n = 0;
+    while n < q.rows.len() {
+        if q.last_sub[n] < st.last_col as isize || q.done[n] < q.last_push[n] {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Frames whose loop filters ran pipelined, and frames that took the
+/// whole-frame path instead (`EC_AV1_WAVE_STATS`).
+static PIPE_FRAMES: AtomicU64 = AtomicU64::new(0);
+static PIPE_WHOLE: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this frame's filters may run per superblock row. Everything that
+/// reads the picture out of band order, or the pipeline's own inputs out of
+/// row order, keeps the whole-frame path: superres (a between-CDEF-and-LR
+/// whole-plane resample), segmentation (the deblocker reads `seg_ids`, which
+/// the parse thread is still filling), delta_lf, more than one tile COLUMN (a
+/// frame row is only complete after the last tile column's own parse), and
+/// every pixel-dump / stage-skip debug flag, whose whole point is the
+/// unpipelined stage boundary. The pipeline also stays off unless some
+/// threading is on -- at (1, 1) the filters would run on a worker thread for
+/// nothing and the crate's `thread_local!` gate counters would miss them.
+fn pipe_filters_ok(fctx: &crate::decode::FrameCtx, tile_cols: u32, lf_present: bool) -> bool {
+    if crate::envflags::var("EC_AV1_PIPE_FILTERS").map(|v| v.trim() == "0").unwrap_or(false) {
+        return false;
+    }
+    if crate::par::filter_threads() == 1 && crate::par::recon_threads() == 1 {
+        return false;
+    }
+    if tile_cols != 1 || lf_present || superres(fctx).is_some() {
+        return false;
+    }
+    if fctx.seg.with(|s| s.borrow().enabled) {
+        return false;
+    }
+    !(crate::envflags::is_set("EC_AV1_PREFILT_DUMP")
+        || crate::envflags::is_set("EC_AV1_PREFILT_DUMP16")
+        || crate::envflags::is_set("EC_AV1_PREFILT_WIDE_DUMP")
+        || crate::envflags::is_set("EC_AV1_POSTDEBLOCK_DUMP")
+        || crate::envflags::is_set("EC_AV1_POSTDEBLOCK_DUMP16")
+        || crate::envflags::is_set("EC_AV1_POSTCDEF_DUMP")
+        || crate::envflags::is_set("EC_AV1_POSTCDEF_DUMP16")
+        || crate::envflags::is_set("EC_AV1_DEBUG_SKIP_DEBLOCK")
+        || crate::envflags::is_set("EC_AV1_DEBUG_SKIP_CDEF")
+        || crate::envflags::is_set("EC_AV1_DEBUG_CDEF_BAND")
+        || crate::envflags::is_set("EC_AV1_DEBLOCK_TRACE")
+        || crate::envflags::is_set("EC_AV1_DEBLOCK_TRACE_V"))
+}
+
+/// lane-cdefstrip r1 instrument, run for every frame BEFORE either of
+/// [`apply_cdef`]'s early returns (lane-pipefilt: the pipelined path
+/// never enters `apply_cdef`, so it calls this itself).
+fn cdef_scan_counters(skip_grid: &Neighbours) {
         let mut r = 0usize;
         while r < skip_grid.mi_rows {
             let mut c = 0usize;
@@ -19422,19 +19758,105 @@ fn apply_cdef(
             }
             r += 2;
         }
+}
+
+/// `true` when this frame's CDEF cannot change a sample: `bits == 0` still
+/// means "no filtering at all" whenever the single (index 0) strength pair
+/// is all-zero, the fast path every existing gate stream takes.
+fn cdef_all_zero(cdef: &CdefParams) -> bool {
+    cdef.bits == 0
+        && cdef.y_pri_strength[0] == 0
+        && cdef.y_sec_strength[0] == 0
+        && cdef.uv_pri_strength[0] == 0
+        && cdef.uv_sec_strength[0] == 0
+}
+
+/// [`apply_cdef`]'s band loop over the mi rows `r_lo0..r_hi0` only (the
+/// whole frame when `0..mi_rows`, which is what `apply_cdef` passes).
+/// `src_*` are the PRE-CDEF planes every unit reads; the writes are this
+/// row range's own pixels.
+#[allow(clippy::too_many_arguments)]
+fn cdef_rows(
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    src_y: &[u16],
+    src_u: &[u16],
+    src_v: &[u16],
+    cdef: &CdefParams,
+    skip_grid: &Neighbours,
+    idx_grid: &[u8],
+    sb_cols: usize,
+    coeff_shift: i32,
+    damping: i32,
+    damping_uv: i32,
+    (frame_w, frame_h): (usize, usize),
+    r_lo0: usize,
+    r_hi0: usize, fctx: &crate::decode::FrameCtx,
+) {
+    let mi_rows = skip_grid.mi_rows;
+    let (lo, hi) = (r_lo0.min(mi_rows), r_hi0.min(mi_rows));
+    if lo >= hi {
+        return;
     }
+    let (sy, su, sv) = (
+        crate::par::Shared::new(y),
+        crate::par::Shared::new(u),
+        crate::par::Shared::new(v),
+    );
+    let cbands: Vec<(usize, usize)> = crate::par::bands((hi - lo).div_ceil(2), crate::par::filter_threads())
+        .into_iter()
+        .map(|(a, b)| (lo + a * 2, (lo + b * 2).min(hi)))
+        .collect();
+    crate::par::run_bands(&cbands, fctx, |r_lo, r_hi, fctx| {
+        // SAFETY: this band writes only the plane rows its own mi rows cover,
+        // disjoint from every other band's (see `Shared`).
+        #[allow(unsafe_code)]
+        let (y, u, v) = unsafe { (sy.get(), su.get(), sv.get()) };
+        cdef_band(
+            r_lo,
+            r_hi,
+            y,
+            u,
+            v,
+            src_y,
+            src_u,
+            src_v,
+            cdef,
+            skip_grid,
+            idx_grid,
+            sb_cols,
+            coeff_shift,
+            damping,
+            damping_uv,
+            (frame_w, frame_h),
+            fctx,
+        );
+    });
+}
+
+fn apply_cdef(
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    cdef: &CdefParams,
+    skip_grid: &Neighbours,
+    // This frame header's own CROPPED luma size, for the straddling-unit
+    // counter only -- CDEF itself walks the mi-rounded plane.
+    (frame_w, frame_h): (usize, usize), fctx: &crate::decode::FrameCtx,
+) {
+    // lane-part32 r2 debug rung, env-gated: see `apply_deblock`'s sibling.
+    if crate::envflags::env_flag!("EC_AV1_DEBUG_SKIP_CDEF") {
+        return;
+    }
+    cdef_scan_counters(skip_grid);
     // `cdef.bits == 0` still means "no filtering at all" whenever the single
     // (index 0) strength pair is all-zero -- the fast path every existing
     // gate stream takes. A `bits > 0` frame can still be all-zero-strength
     // at every index, but that is rare enough not to special-case; the
     // per-superblock lookup below degrades to the same index-0 read anyway
     // when [`CDEF_IDX_GRID`] was never populated (`bits == 0`).
-    if cdef.bits == 0
-        && cdef.y_pri_strength[0] == 0
-        && cdef.y_sec_strength[0] == 0
-        && cdef.uv_pri_strength[0] == 0
-        && cdef.uv_sec_strength[0] == 0
-    {
+    if cdef_all_zero(cdef) {
         return;
     }
     let sb_cols = fctx.cdef_sb_cols.with(|c| c.get());
@@ -19454,41 +19876,10 @@ fn apply_cdef(
     // 4x4 chroma square, so units are independent. Bands are mi ROW bands (2
     // mi = 8 luma rows, 4 chroma rows), which makes each band's writes a
     // disjoint row range of all three planes.
-    let (sy, su, sv) = (
-        crate::par::Shared::new(y),
-        crate::par::Shared::new(u),
-        crate::par::Shared::new(v),
+    cdef_rows(
+        y, u, v, &src_y, &src_u, &src_v, cdef, skip_grid, &idx_grid, sb_cols, coeff_shift,
+        damping, damping_uv, (frame_w, frame_h), 0, skip_grid.mi_rows, fctx,
     );
-    let mi_rows = skip_grid.mi_rows;
-    let cbands: Vec<(usize, usize)> = crate::par::bands(mi_rows.div_ceil(2), crate::par::filter_threads())
-        .into_iter()
-        .map(|(a, b)| (a * 2, (b * 2).min(mi_rows)))
-        .collect();
-    crate::par::run_bands(&cbands, fctx, |r_lo, r_hi, fctx| {
-        // SAFETY: this band writes only the plane rows its own mi rows cover,
-        // disjoint from every other band's (see `Shared`).
-        #[allow(unsafe_code)]
-        let (y, u, v) = unsafe { (sy.get(), su.get(), sv.get()) };
-        cdef_band(
-            r_lo,
-            r_hi,
-            y,
-            u,
-            v,
-            &src_y,
-            &src_u,
-            &src_v,
-            cdef,
-            skip_grid,
-            &idx_grid,
-            sb_cols,
-            coeff_shift,
-            damping,
-            damping_uv,
-            (frame_w, frame_h),
-            fctx,
-        );
-    });
     scratch_return(src_y);
     scratch_return(src_u);
     scratch_return(src_v);
@@ -31588,6 +31979,62 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         frame_height,
     );
 
+    // lane-pipefilt: the loop filters of superblock row r run as soon as row
+    // r+1 is reconstructed, on the filter pool, so the frame thread's latency
+    // is the parse plus the last rows' filters instead of parse plus the
+    // whole frame's filter chain. See `pipe_run` for the row lags.
+    let lr_active = (0..3).any(|p| {
+        lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
+            && lr.loop_restoration_size[p] != 0
+    });
+    let pipe_on = pipe_filters_ok(fctx, tile_info.cols, delta.lf_present);
+    let cdef_on = !cdef_all_zero(cdef);
+    let snap_on = pipe_on && (cdef_on || lr_active);
+    let mut pipe_snap = snap_on.then(|| (snap_alloc(&y), snap_alloc(&u), snap_alloc(&v)));
+    let mut pipe = pipe_on.then(|| {
+        if wave_stats() {
+            PIPE_FRAMES.fetch_add(1, Relaxed);
+        }
+        let nbands = (mi_rows as usize).div_ceil(16);
+        let sync = std::sync::Arc::new(PipeSync::new());
+        let batch = crate::par::Batch::new("ec-av1-filter");
+        // SAFETY (all four): the pipeline only ever touches superblock rows
+        // the frame thread has finished reconstructing and will not revisit
+        // -- the row-lag argument in `pipe_run`'s module note, checked
+        // end to end by the byte-exact gate.
+        #[allow(unsafe_code)]
+        let (sy, su, sv, sn) = unsafe {
+            (
+                crate::par::Shared::from_ptr(std::ptr::from_mut(&mut y)),
+                crate::par::Shared::from_ptr(std::ptr::from_mut(&mut u)),
+                crate::par::Shared::from_ptr(std::ptr::from_mut(&mut v)),
+                crate::par::Shared::from_ptr(std::ptr::from_mut(&mut neighbours)),
+            )
+        };
+        let cfg = PipeCfg {
+            lf: loop_filter,
+            cdef,
+            idx_grid: fctx.cdef_idx_grid.with(|g| {
+                let g = g.borrow();
+                (g.as_ptr(), g.len())
+            }),
+            sb_cols: fctx.cdef_sb_cols.with(std::cell::Cell::get),
+            frame_w: frame_width as usize,
+            frame_h: frame_height as usize,
+            nbands,
+            cdef_on,
+            snap_on,
+        };
+        let ctx = crate::decode::filter_ctx_copy(fctx);
+        let sync2 = std::sync::Arc::clone(&sync);
+        let snap = &mut pipe_snap;
+        batch.submit(move || pipe_run(&sync2, sy, su, sv, sn, cfg, snap, &ctx));
+        PipeGuard { sync, batch: Some(batch), nbands }
+    });
+    if !pipe_on && wave_stats() {
+        PIPE_WHOLE.fetch_add(1, Relaxed);
+    }
+
     // lane-tiles r6: mirrors decode_key_frame_tile_with_cdfs's own per-tile
     // loop (spec 5.11.2 decode_tile / 7.20 exit_symbol) -- each tile gets
     // its own fresh SymbolDecoder over its own byte range and its own fresh
@@ -31712,6 +32159,17 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             flush_recon(fctx, &mut y, &mut u, &mut v);
         }
         if row_start {
+            if let Some(p) = &pipe {
+                // Reconstruction complete through this pixel row: the parse
+                // position itself when reconstruction is inline, the
+                // wavefront's own leading completed rows otherwise.
+                let px = if waving {
+                    ((wave_r0 + wave_rows_complete(fctx)) << wave_shift) * 64
+                } else {
+                    sb_r as usize * 64
+                };
+                p.note(px / 64);
+            }
             neighbours.start_row();
         }
         if sb_start {
@@ -34092,40 +34550,64 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    apply_deblock(
-        &mut y,
-        &mut u,
-        &mut v,
-        loop_filter,
-        &neighbours,
-        frame_width as usize,
-        frame_height as usize, fctx,
-    );
+    // lane-pipefilt: release the rows still pending and wait the pipeline
+    // out; from here the picture is deblocked and CDEF-filtered exactly as
+    // the whole-frame path leaves it.
+    let pipelined = pipe.is_some();
+    if let Some(p) = &mut pipe {
+        p.finish();
+    }
+    drop(pipe);
+    if pipelined {
+        cdef_scan_counters(&neighbours);
+    } else {
+        apply_deblock(
+            &mut y,
+            &mut u,
+            &mut v,
+            loop_filter,
+            &neighbours,
+            frame_width as usize,
+            frame_height as usize, fctx,
+        );
+    }
     // lane-perf4: loop restoration is the only reader of the pre-CDEF planes,
     // and a frame that restores nothing copied every plane twice for nothing
     // (three `PlaneBuf` clones here plus the `cdef.to_vec()` inside
     // [`crate::restoration::apply_loop_restoration_plane`], which returns its
     // input unchanged when the plane's type is `None`). Clone only when some
     // plane actually restores.
-    let lr_active = (0..3).any(|p| {
-        lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
-            && lr.loop_restoration_size[p] != 0
-    });
-    let deblocked =
-        lr_active.then(|| (plane_snapshot(&y, 0), plane_snapshot(&u, 1), plane_snapshot(&v, 1)));
+    let deblocked = if pipelined {
+        // The pipeline already snapshotted every band on its way past it.
+        let snap = pipe_snap.take();
+        match (lr_active, snap) {
+            (true, snap) => snap,
+            (false, Some((a, b, c))) => {
+                scratch_return(c.data.into_owned());
+                scratch_return(b.data.into_owned());
+                scratch_return(a.data.into_owned());
+                None
+            }
+            (false, None) => None,
+        }
+    } else {
+        lr_active.then(|| (plane_snapshot(&y, 0), plane_snapshot(&u, 1), plane_snapshot(&v, 1)))
+    };
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
     dump_stage("EC_AV1_POSTDEBLOCK_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTDEBLOCK_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
-    apply_cdef(
-        &mut y,
-        &mut u,
-        &mut v,
-        cdef,
-        &neighbours,
-        (frame_width as usize, frame_height as usize), fctx,
-    );
+    if !pipelined {
+        apply_cdef(
+            &mut y,
+            &mut u,
+            &mut v,
+            cdef,
+            &neighbours,
+            (frame_width as usize, frame_height as usize), fctx,
+        );
+    }
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
