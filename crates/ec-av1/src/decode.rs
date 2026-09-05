@@ -17561,26 +17561,105 @@ fn lf_level(
 /// edge" suppression (which only ever fires at a non-PU-edge TU boundary)
 /// never applies here, letting this skip the `skip`/`skip_txfm` lookup
 /// entirely. Returns `None` when this 4-pixel edge group is not filtered.
-#[inline(always)]
-fn edge_params(
-    lf: &LoopFilterParams,
-    n: &Neighbours,
+/// One plane pass's worth of [`edge_params`] constants (lane-deblock2): the
+/// seven values that used to be re-passed per 4-pixel edge group -- half of
+/// them on the stack, into an `inline(never)` body -- plus libaom's
+/// `lfi->lfthr` idea in level form: `av1_loop_filter_frame_init` builds the
+/// filter level for every `(base level, ref frame)` pair once per frame
+/// instead of running `av1_get_filter_level`'s delta arithmetic per edge.
+struct EdgeCtx<'a> {
+    lf: &'a LoopFilterParams,
+    n: &'a Neighbours,
+    fctx: &'a crate::decode::FrameCtx,
     plane_idx: usize,
     dir: usize,
     chroma: bool,
-    x0: usize,
-    y0: usize,
-    // lane-perf9: `segmentation_enabled`, read once per plane pass instead of
-    // four thread-local reads (`SEG_MI_DIMS`, `SEG_IDS`, twice each) plus two
-    // `SEG` borrows per 4x4 edge. With it clear, every segment id is 0 and no
-    // `SEG_LVL_ALT_LF_*` feature can be active, so the levels are unchanged.
-    seg_lf_active: bool, fctx: &crate::decode::FrameCtx,
-) -> Option<(u8, i32)> {
-    let (mi_r, mi_c) = (plane_to_mi(chroma, y0), plane_to_mi(chroma, x0));
-    let cur_tx = if dir == 0 {
-        tx_px_at(n, chroma, mi_r, mi_c)
+    seg_lf_active: bool,
+    /// `delta_lf_grid`'s column for this plane and direction.
+    delta_idx: usize,
+    /// `mode_step` (`set_lpf_parameters`): one mi for luma, `1 << ss` for
+    /// chroma.
+    step: usize,
+    /// This pass's own `lf.level[..]`, the LUT's base.
+    base0: i32,
+    /// `lf_level` at `[base level][ref frame + 7]`, with no segment
+    /// override -- the whole domain, since a level is `0..=63` and a ref
+    /// frame `-7..=7` (`ref_deltas` holds `TOTAL_REFS_PER_FRAME` = 8
+    /// entries and is indexed by the ref frame's magnitude).
+    lvl: [[u8; 15]; 64],
+}
+
+impl<'a> EdgeCtx<'a> {
+    fn new(
+        lf: &'a LoopFilterParams,
+        n: &'a Neighbours,
+        plane_idx: usize,
+        dir: usize,
+        chroma: bool,
+        seg_lf_active: bool,
+        fctx: &'a crate::decode::FrameCtx,
+    ) -> Self {
+        let base0 = i32::from(if plane_idx == 0 {
+            lf.level[dir]
+        } else if plane_idx == 1 {
+            lf.level[2]
+        } else {
+            lf.level[3]
+        });
+        // `lf_level`'s own first step is `(base0 + delta_lf).clamp(0, 63)`,
+        // so passing `b - base0` pins its base at `b` and the rest of the
+        // function is a pure function of `(b, ref_frame)`.
+        let mut lvl = [[0u8; 15]; 64];
+        for (b, row) in lvl.iter_mut().enumerate() {
+            for (r, cell) in row.iter_mut().enumerate() {
+                *cell =
+                    lf_level(lf, plane_idx, dir, (r as i32 - 7) as i8, b as i32 - base0, 0, fctx)
+                        as u8;
+            }
+        }
+        Self {
+            lf,
+            n,
+            fctx,
+            plane_idx,
+            dir,
+            chroma,
+            seg_lf_active,
+            delta_idx: if plane_idx == 0 { dir } else { plane_idx + 1 },
+            step: if chroma { 2 } else { 1 },
+            base0,
+            lvl,
+        }
+    }
+
+    /// Spec 7.14.4's `get_filter_level`, off the table when no segment can
+    /// override it (which is every frame that codes no segmentation).
+    #[inline(always)]
+    fn level(&self, ref_frame: i8, delta_lf: i32, seg: u8) -> i32 {
+        if self.seg_lf_active {
+            return lf_level(self.lf, self.plane_idx, self.dir, ref_frame, delta_lf, seg, self.fctx);
+        }
+        let b = (self.base0 + delta_lf).clamp(0, 63) as usize;
+        debug_assert!((-7..=7).contains(&ref_frame));
+        let r = (i32::from(ref_frame) + 7).clamp(0, 14) as usize;
+        i32::from(self.lvl[b][r])
+    }
+}
+
+/// Spec 7.14.2's `set_lpf_parameters`, restricted to the uniform-level,
+/// no-segmentation, no-delta-LF path and to this decoder's own invariant
+/// that a coded block's transform is always its own full size -- so a TU
+/// edge is always also a PU edge, and the "both sides skipped, not a PU
+/// edge" suppression (which only ever fires at a non-PU-edge TU boundary)
+/// never applies here, letting this skip the `skip`/`skip_txfm` lookup
+/// entirely. Returns `None` when this 4-pixel edge group is not filtered.
+#[inline(always)]
+fn edge_params(c: &EdgeCtx, x0: usize, y0: usize) -> Option<(u8, i32)> {
+    let (mi_r, mi_c) = (plane_to_mi(c.chroma, y0), plane_to_mi(c.chroma, x0));
+    let cur_tx = if c.dir == 0 {
+        tx_px_at(c.n, c.chroma, mi_r, mi_c)
     } else {
-        tx_h_px_at(n, chroma, mi_r, mi_c)
+        tx_h_px_at(c.n, c.chroma, mi_r, mi_c)
     };
     // lane-deblock: `cur_tx` is a power-of-two pixel size, so the alignment
     // test is a mask, not the hardware `divl` this used to emit (10.7% of
@@ -17590,49 +17669,41 @@ fn edge_params(
     // the covering transform does not start at), so this head is inlined
     // into the deblock loops and only survivors pay the call and the
     // register-spilling prologue of the body below.
-    if cur_tx == 0 || (if dir == 0 { x0 } else { y0 }) & (cur_tx as usize - 1) != 0 {
+    if cur_tx == 0 || (if c.dir == 0 { x0 } else { y0 }) & (cur_tx as usize - 1) != 0 {
         return None;
     }
-    edge_params_body(lf, n, plane_idx, dir, chroma, x0, y0, mi_r, mi_c, cur_tx, seg_lf_active, fctx)
+    edge_params_body(c, x0, y0, mi_r, mi_c, cur_tx)
 }
 
 /// [`edge_params`] past its transform-alignment gate.
-#[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn edge_params_body(
-    lf: &LoopFilterParams,
-    n: &Neighbours,
-    plane_idx: usize,
-    dir: usize,
-    chroma: bool,
+    c: &EdgeCtx,
     x0: usize,
     y0: usize,
     mi_r: usize,
     mi_c: usize,
     cur_tx: u32,
-    seg_lf_active: bool,
-    fctx: &crate::decode::FrameCtx,
 ) -> Option<(u8, i32)> {
+    let n = c.n;
     let cur_ref = n.ref_grid[mi_r * n.skip_grid_cols_mi + mi_c];
-    // `mode_step` (`set_lpf_parameters`): one mi for luma, `1 << ss` for
-    // chroma -- the previous cell must keep the odd parity `plane_to_mi`
-    // just established, i.e. the bottom/right mi of the PREVIOUS 8x8 luma
-    // group, not the other half of this one.
-    let step = if chroma { 2 } else { 1 };
-    let (pv_mi_r, pv_mi_c) = if dir == 0 {
-        (mi_r, mi_c - step)
+    // The previous cell must keep the odd parity `plane_to_mi` just
+    // established, i.e. the bottom/right mi of the PREVIOUS 8x8 luma group,
+    // not the other half of this one.
+    let (pv_mi_r, pv_mi_c) = if c.dir == 0 {
+        (mi_r, mi_c - c.step)
     } else {
-        (mi_r - step, mi_c)
+        (mi_r - c.step, mi_c)
     };
-    let pv_tx = if dir == 0 {
-        tx_px_at(n, chroma, pv_mi_r, pv_mi_c)
+    let pv_tx = if c.dir == 0 {
+        tx_px_at(n, c.chroma, pv_mi_r, pv_mi_c)
     } else {
-        tx_h_px_at(n, chroma, pv_mi_r, pv_mi_c)
+        tx_h_px_at(n, c.chroma, pv_mi_r, pv_mi_c)
     };
     let pv_ref = n.ref_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c];
-    let delta_idx = if plane_idx == 0 { dir } else { plane_idx + 1 };
-    let cur_delta_lf = i32::from(n.delta_lf_grid[mi_r * n.skip_grid_cols_mi + mi_c][delta_idx]);
-    let pv_delta_lf = i32::from(n.delta_lf_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c][delta_idx]);
+    let cur_delta_lf = i32::from(n.delta_lf_grid[mi_r * n.skip_grid_cols_mi + mi_c][c.delta_idx]);
+    let pv_delta_lf =
+        i32::from(n.delta_lf_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c][c.delta_idx]);
 
     // spec 7.14.2 / libaom `set_lpf_parameters`: a transform edge between two
     // SKIPPED INTER blocks is filtered only when it is also a prediction
@@ -17650,16 +17721,16 @@ fn edge_params_body(
     // size, which a 4x4 luma block read at the `| 1` mi is not.
     let cur_org = n.blk_org_grid[mi_r * n.skip_grid_cols_mi + mi_c];
     let cur_dim = n.blk_dim_grid[mi_r * n.skip_grid_cols_mi + mi_c];
-    let (org_px, dim_mi) = if dir == 0 {
+    let (org_px, dim_mi) = if c.dir == 0 {
         (usize::from(cur_org[1]), usize::from(cur_dim[0]))
     } else {
         (usize::from(cur_org[0]), usize::from(cur_dim[1]))
     };
-    let pu_edge = if chroma {
+    let pu_edge = if c.chroma {
         let plane_dim = (dim_mi * MI / 2).max(4);
-        (if dir == 0 { x0 } else { y0 }) % plane_dim == 0
+        (if c.dir == 0 { x0 } else { y0 }) % plane_dim == 0
     } else {
-        plane_to_mi(false, if dir == 0 { x0 } else { y0 }) == org_px
+        plane_to_mi(false, if c.dir == 0 { x0 } else { y0 }) == org_px
     };
     if !pu_edge
         && cur_ref != 0
@@ -17669,18 +17740,18 @@ fn edge_params_body(
     {
         return None;
     }
-    let (cur_seg, pv_seg) = if seg_lf_active {
-        (segment_id_at(mi_r, mi_c, fctx), segment_id_at(pv_mi_r, pv_mi_c, fctx))
+    let (cur_seg, pv_seg) = if c.seg_lf_active {
+        (segment_id_at(mi_r, mi_c, c.fctx), segment_id_at(pv_mi_r, pv_mi_c, c.fctx))
     } else {
         (0, 0)
     };
-    let cur_level = lf_level(lf, plane_idx, dir, cur_ref, cur_delta_lf, cur_seg, fctx);
-    let pv_level = lf_level(lf, plane_idx, dir, pv_ref, pv_delta_lf, pv_seg, fctx);
+    let cur_level = c.level(cur_ref, cur_delta_lf, cur_seg);
+    let pv_level = c.level(pv_ref, pv_delta_lf, pv_seg);
     if cur_level == 0 && pv_level == 0 {
         return None;
     }
     let dim = unit_log2(cur_tx).min(unit_log2(pv_tx)).clamp(0, 4) as usize;
-    let len: u8 = if chroma {
+    let len: u8 = if c.chroma {
         if dim == 0 { 4 } else { 6 }
     } else {
         [4, 8, 14, 14, 14][dim]
@@ -18141,39 +18212,41 @@ mod deblock_simd {
         }
     }
 
-    /// One wide-kernel row set, unrolled so each `wsum` sees its weight row
-    /// as a constant.
-    macro_rules! wrows {
-        ($r:expr, $off:expr, $tbl:ident, $taps:expr, $shift:literal, $flat:expr, $($j:literal),*) => {
-            $(
-                $r[$off + $j] = _mm256_blendv_epi8($r[$off + $j], wsum::<_, $shift>(&$taps, &$tbl[$j]), $flat);
-            )*
-        };
-    }
-
     /// [`super::filter_edge`]'s body for 16 lines held as `t[0..16]`, `q0` in
-    /// `t[8]`; the filtered taps are written back in place.
+    /// `t[8]`; the filtered taps are written back in place. Returns `false`
+    /// when the filter mask is empty on every one of the 16 lines -- nothing
+    /// was written and the caller can skip the whole write-back.
     ///
     /// # Safety
     /// Requires AVX2.
+    ///
+    /// lane-deblock2: `LEN` is a const parameter, so each edge length gets
+    /// its own kernel holding only its own taps, and every wide row is
+    /// clamped straight into `t` instead of into a shared twelve-entry
+    /// result array (which the register allocator spilled -- 35% of this
+    /// kernel's samples were `vmovdqa` to the stack).
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn filter16(
+    unsafe fn filter16<const LEN: u8>(
         t: &mut [__m256i; 16],
-        len: u8,
         blimit: i32,
         limit: i32,
         hev_thr: i32,
         flat_thresh: i32,
         scale: i32,
         smax: i32,
-    ) {
+    ) -> bool {
         let lim = _mm256_set1_epi16(limit as i16);
         let blim = _mm256_set1_epi16(blimit as i16);
         let hthr = _mm256_set1_epi16(hev_thr as i16);
         let fthr = _mm256_set1_epi16(flat_thresh as i16);
         let zero = _mm256_setzero_si256();
         let smaxv = _mm256_set1_epi16(smax as i16);
+        macro_rules! put {
+            ($i:expr, $v:expr) => {
+                t[$i] = _mm256_min_epi16(_mm256_max_epi16($v, zero), smaxv);
+            };
+        }
         let (p6, p5, p4, p3, p2, p1, p0) = (t[1], t[2], t[3], t[4], t[5], t[6], t[7]);
         let (q0, q1, q2, q3, q4, q5, q6) = (t[8], t[9], t[10], t[11], t[12], t[13], t[14]);
 
@@ -18181,10 +18254,10 @@ mod deblock_simd {
         // reaches, plus the shared `blimit` term.
         let d1 = _mm256_max_epi16(ad(p1, p0), ad(q1, q0));
         let mut md = d1;
-        if len >= 6 {
+        if LEN >= 6 {
             md = _mm256_max_epi16(md, _mm256_max_epi16(ad(p2, p1), ad(q2, q1)));
         }
-        if len >= 8 {
+        if LEN >= 8 {
             md = _mm256_max_epi16(md, _mm256_max_epi16(ad(p3, p2), ad(q3, q2)));
         }
         let bl = _mm256_add_epi16(
@@ -18192,6 +18265,14 @@ mod deblock_simd {
             _mm256_srli_epi16(ad(p1, q1), 1),
         );
         let mask = _mm256_and_si256(le(md, lim), le(bl, blim));
+        // lane-deblock2: an empty mask leaves every tap at its loaded value
+        // (the flat masks are `& mask`, so they are empty too, and the final
+        // clamp is the identity on samples that came out of the plane), so
+        // the whole write-back -- including the vertical edge's second
+        // transpose -- is dead.
+        if _mm256_testz_si256(mask, mask) != 0 {
+            return false;
+        }
         let hev = _mm256_cmpgt_epi16(d1, hthr);
 
         // `filter4`, in the centred domain.
@@ -18221,110 +18302,137 @@ mod deblock_simd {
         let n_p0 = _mm256_add_epi16(sclamp(_mm256_add_epi16(ps0, f2), lo, hi), centre);
         let n_q0 = _mm256_add_epi16(sclamp(_mm256_sub_epi16(qs0, f1), lo, hi), centre);
         let n_q1 = _mm256_add_epi16(sclamp(_mm256_sub_epi16(qs1, tap), lo, hi), centre);
-        let mut r = [
-            p5,
-            p4,
-            p3,
-            p2,
-            _mm256_blendv_epi8(p1, n_p1, mask),
-            _mm256_blendv_epi8(p0, n_p0, mask),
-            _mm256_blendv_epi8(q0, n_q0, mask),
-            _mm256_blendv_epi8(q1, n_q1, mask),
-            q2,
-            q3,
-            q4,
-            q5,
-        ];
+        let b_p1 = _mm256_blendv_epi8(p1, n_p1, mask);
+        let b_p0 = _mm256_blendv_epi8(p0, n_p0, mask);
+        let b_q0 = _mm256_blendv_epi8(q0, n_q0, mask);
+        let b_q1 = _mm256_blendv_epi8(q1, n_q1, mask);
+        if LEN == 4 {
+            put!(6, b_p1);
+            put!(7, b_p0);
+            put!(8, b_q0);
+            put!(9, b_q1);
+            return true;
+        }
 
-        if len >= 6 {
-            // `highbd_flat_mask4`, over the same reach as this length's mask.
-            let mut fl = _mm256_max_epi16(
-                _mm256_max_epi16(ad(p1, p0), ad(q1, q0)),
-                _mm256_max_epi16(ad(p2, p0), ad(q2, q0)),
-            );
-            if len >= 8 {
-                fl = _mm256_max_epi16(fl, _mm256_max_epi16(ad(p3, p0), ad(q3, q0)));
-            }
-            let flat = _mm256_and_si256(le(fl, fthr), mask);
-            if len == 6 {
+        // `highbd_flat_mask4`, over the same reach as this length's mask.
+        let mut fl = _mm256_max_epi16(
+            _mm256_max_epi16(ad(p1, p0), ad(q1, q0)),
+            _mm256_max_epi16(ad(p2, p0), ad(q2, q0)),
+        );
+        if LEN >= 8 {
+            fl = _mm256_max_epi16(fl, _mm256_max_epi16(ad(p3, p0), ad(q3, q0)));
+        }
+        let flat = _mm256_and_si256(le(fl, fthr), mask);
+        let any_flat = _mm256_testz_si256(flat, flat) == 0;
+        if LEN == 6 {
+            if any_flat {
                 let taps = [p2, p1, p0, q0, q1, q2];
-                wrows!(r, 4, W6, taps, 3, flat, 0, 1, 2, 3);
+                put!(6, _mm256_blendv_epi8(b_p1, wsum::<_, 3>(&taps, &W6[0]), flat));
+                put!(7, _mm256_blendv_epi8(b_p0, wsum::<_, 3>(&taps, &W6[1]), flat));
+                put!(8, _mm256_blendv_epi8(b_q0, wsum::<_, 3>(&taps, &W6[2]), flat));
+                put!(9, _mm256_blendv_epi8(b_q1, wsum::<_, 3>(&taps, &W6[3]), flat));
             } else {
-                let taps = [p3, p2, p1, p0, q0, q1, q2, q3];
-                wrows!(r, 3, W8, taps, 3, flat, 0, 1, 2, 3, 4, 5);
-                if len > 8 {
-                    let fl2 = _mm256_max_epi16(
-                        _mm256_max_epi16(
-                            _mm256_max_epi16(ad(p4, p0), ad(q4, q0)),
-                            _mm256_max_epi16(ad(p5, p0), ad(q5, q0)),
-                        ),
-                        _mm256_max_epi16(ad(p6, p0), ad(q6, q0)),
-                    );
-                    let flat2 = _mm256_and_si256(le(fl2, fthr), flat);
-                    // lane-deblock: `filter14`'s twelve rows as a RUNNING
-                    // sum. Consecutive `W14` rows differ by three or four
-                    // taps (row j+1 - row j is a constant vector with two
-                    // negative and two positive entries), so each output
-                    // costs one add, one sub and the rounding shift instead
-                    // of a fresh 14-tap weighted sum -- 168 tap operations
-                    // become 44. Exact: every partial sum is taken mod
-                    // 2^16 by `add/sub_epi16` and every ROW sum is a real
-                    // `W14` row, at most `16 * 4095 + 8 < 2^16`, so the
-                    // unsigned rounding shift sees the true value.
-                    // `deblock_simd_kernel_matches_the_scalar_filter` pins
-                    // it against `filter_edge` at 8/10/12-bit.
-                    let mut s = _mm256_add_epi16(
-                        _mm256_add_epi16(
-                            _mm256_mullo_epi16(p6, _mm256_set1_epi16(7)),
-                            _mm256_slli_epi16(_mm256_add_epi16(p5, p4), 1),
-                        ),
-                        _mm256_add_epi16(
-                            _mm256_add_epi16(_mm256_add_epi16(p3, p2), _mm256_add_epi16(p1, p0)),
-                            q0,
-                        ),
-                    );
-                    macro_rules! row14 {
-                        ($idx:literal) => {
-                            r[$idx] = _mm256_blendv_epi8(
-                                r[$idx],
-                                _mm256_srli_epi16(
-                                    _mm256_add_epi16(s, _mm256_set1_epi16(8)),
-                                    4,
-                                ),
-                                flat2,
-                            );
-                        };
-                        ($idx:literal, $plus:expr, $minus:expr) => {
-                            s = _mm256_sub_epi16(_mm256_add_epi16(s, $plus), $minus);
-                            row14!($idx);
-                        };
-                    }
-                    let add2 = |a, b| _mm256_add_epi16(a, b);
-                    row14!(0);
-                    row14!(1, add2(p3, q1), _mm256_slli_epi16(p6, 1));
-                    row14!(2, add2(p2, q2), add2(p6, p5));
-                    row14!(3, add2(p1, q3), add2(p6, p4));
-                    row14!(4, add2(p0, q4), add2(p6, p3));
-                    row14!(5, add2(q0, q5), add2(p6, p2));
-                    row14!(6, add2(q1, q6), add2(p6, p1));
-                    row14!(7, add2(q2, q6), add2(p5, p0));
-                    row14!(8, add2(q3, q6), add2(p4, q0));
-                    row14!(9, add2(q4, q6), add2(p3, q1));
-                    row14!(10, add2(q5, q6), add2(p2, q2));
-                    row14!(11, _mm256_slli_epi16(q6, 1), add2(p1, q3));
-                }
+                put!(6, b_p1);
+                put!(7, b_p0);
+                put!(8, b_q0);
+                put!(9, b_q1);
             }
+            return true;
         }
 
-        // `r[j]` holds the sample at tap `j - 6`, i.e. `t[j + 2]`.
-        let (a, b) = match len {
-            4 | 6 => (4, 8),
-            8 => (3, 9),
-            _ => (0, 12),
+        // `filter8`'s six rows over `p2..q2`, the wide kernel's base.
+        let (o0, o1, o2, o3, o4, o5) = if any_flat {
+            let taps = [p3, p2, p1, p0, q0, q1, q2, q3];
+            (
+                _mm256_blendv_epi8(p2, wsum::<_, 3>(&taps, &W8[0]), flat),
+                _mm256_blendv_epi8(b_p1, wsum::<_, 3>(&taps, &W8[1]), flat),
+                _mm256_blendv_epi8(b_p0, wsum::<_, 3>(&taps, &W8[2]), flat),
+                _mm256_blendv_epi8(b_q0, wsum::<_, 3>(&taps, &W8[3]), flat),
+                _mm256_blendv_epi8(b_q1, wsum::<_, 3>(&taps, &W8[4]), flat),
+                _mm256_blendv_epi8(q2, wsum::<_, 3>(&taps, &W8[5]), flat),
+            )
+        } else {
+            (p2, b_p1, b_p0, b_q0, b_q1, q2)
         };
-        for j in a..b {
-            t[j + 2] = _mm256_min_epi16(_mm256_max_epi16(r[j], zero), smaxv);
+        macro_rules! put8 {
+            () => {
+                put!(5, o0);
+                put!(6, o1);
+                put!(7, o2);
+                put!(8, o3);
+                put!(9, o4);
+                put!(10, o5);
+            };
         }
+        if LEN == 8 {
+            put8!();
+            return true;
+        }
+
+        let fl2 = _mm256_max_epi16(
+            _mm256_max_epi16(
+                _mm256_max_epi16(ad(p4, p0), ad(q4, q0)),
+                _mm256_max_epi16(ad(p5, p0), ad(q5, q0)),
+            ),
+            _mm256_max_epi16(ad(p6, p0), ad(q6, q0)),
+        );
+        let flat2 = _mm256_and_si256(le(fl2, fthr), flat);
+        if _mm256_testz_si256(flat2, flat2) != 0 {
+            // No line takes the wide rows: `t[2..5]`/`t[11..14]` keep the
+            // taps they were loaded with, exactly as the blend would.
+            put8!();
+            return true;
+        }
+        // lane-deblock: `filter14`'s twelve rows as a RUNNING sum.
+        // Consecutive `W14` rows differ by three or four taps (row j+1 - row
+        // j is a constant vector with two negative and two positive
+        // entries), so each output costs one add, one sub and the rounding
+        // shift instead of a fresh 14-tap weighted sum -- 168 tap operations
+        // become 44. Exact: every partial sum is taken mod 2^16 by
+        // `add/sub_epi16` and every ROW sum is a real `W14` row, at most
+        // `16 * 4095 + 8 < 2^16`, so the unsigned rounding shift sees the
+        // true value. `deblock_simd_kernel_matches_the_scalar_filter` pins
+        // it against `filter_edge` at 8/10/12-bit.
+        let mut s = _mm256_add_epi16(
+            _mm256_add_epi16(
+                _mm256_mullo_epi16(p6, _mm256_set1_epi16(7)),
+                _mm256_slli_epi16(_mm256_add_epi16(p5, p4), 1),
+            ),
+            _mm256_add_epi16(
+                _mm256_add_epi16(_mm256_add_epi16(p3, p2), _mm256_add_epi16(p1, p0)),
+                q0,
+            ),
+        );
+        let add2 = |a, b| _mm256_add_epi16(a, b);
+        macro_rules! row14 {
+            ($idx:literal, $base:expr) => {
+                put!(
+                    $idx,
+                    _mm256_blendv_epi8(
+                        $base,
+                        _mm256_srli_epi16(_mm256_add_epi16(s, _mm256_set1_epi16(8)), 4),
+                        flat2,
+                    )
+                );
+            };
+            ($idx:literal, $base:expr, $plus:expr, $minus:expr) => {
+                s = _mm256_sub_epi16(_mm256_add_epi16(s, $plus), $minus);
+                row14!($idx, $base);
+            };
+        }
+        row14!(2, p5);
+        row14!(3, p4, add2(p3, q1), _mm256_slli_epi16(p6, 1));
+        row14!(4, p3, add2(p2, q2), add2(p6, p5));
+        row14!(5, o0, add2(p1, q3), add2(p6, p4));
+        row14!(6, o1, add2(p0, q4), add2(p6, p3));
+        row14!(7, o2, add2(q0, q5), add2(p6, p2));
+        row14!(8, o3, add2(q1, q6), add2(p6, p1));
+        row14!(9, o4, add2(q2, q6), add2(p5, p0));
+        row14!(10, o5, add2(q3, q6), add2(p4, q0));
+        row14!(11, q3, add2(q4, q6), add2(p3, q1));
+        row14!(12, q4, add2(q5, q6), add2(p2, q2));
+        row14!(13, q5, _mm256_slli_epi16(q6, 1), add2(p1, q3));
+        true
     }
 
     /// 16 edge lines at `base`. `vertical` names the edge: a vertical edge's
@@ -18372,7 +18480,17 @@ mod deblock_simd {
                 t[i] = _mm256_loadu_si256(p.add(top + i * stride).cast());
             }
         }
-        filter16(&mut t, len, blimit, limit, hev_thr, flat_thresh, scale, smax);
+        // lane-deblock2: one monomorphised kernel per edge length, and an
+        // empty filter mask returns without any write-back at all.
+        let modified = match len {
+            4 => filter16::<4>(&mut t, blimit, limit, hev_thr, flat_thresh, scale, smax),
+            6 => filter16::<6>(&mut t, blimit, limit, hev_thr, flat_thresh, scale, smax),
+            8 => filter16::<8>(&mut t, blimit, limit, hev_thr, flat_thresh, scale, smax),
+            _ => filter16::<14>(&mut t, blimit, limit, hev_thr, flat_thresh, scale, smax),
+        };
+        if !modified {
+            return;
+        }
         if vertical {
             transpose16(&mut t);
             for j in 0..16 {
@@ -18512,13 +18630,16 @@ fn deblock_plane(
         // no other band touches (see `Shared`'s own corner-cut note).
         #[allow(unsafe_code)]
         let plane = unsafe { sp.get() };
+        // lane-deblock2: this band's own level table and pass constants,
+        // built once per band instead of re-derived per 4-pixel edge.
+        let vctx = EdgeCtx::new(lf, n, plane_idx, 0, chroma, seg_lf_active, fctx);
         let mut x0 = 4usize;
         while x0 < tw {
             let mut y0 = y_lo;
             while y0 < y_hi {
                 if y0 + 16 <= y_hi && x0 >= 8 && x0 + 8 <= stride {
                     let ps: [Option<(u8, i32)>; 4] =
-                        std::array::from_fn(|k| edge_params(lf, n, plane_idx, 0, chroma, x0, y0 + 4 * k, seg_lf_active, fctx));
+                        std::array::from_fn(|k| edge_params(&vctx, x0, y0 + 4 * k));
                     if let Some((len, level)) = ps[0] {
                         if ps.iter().all(|p| *p == ps[0])
                             && filter_edge16(
@@ -18551,7 +18672,7 @@ fn deblock_plane(
                     y0 += 16;
                     continue;
                 }
-                if let Some((len, level)) = edge_params(lf, n, plane_idx, 0, chroma, x0, y0, seg_lf_active, fctx) {
+                if let Some((len, level)) = edge_params(&vctx, x0, y0) {
                     if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE_V") && plane_idx == 0 {
                         eprintln!("VEDGE x0={x0} y0={y0} len={len} level={level}");
                     }
@@ -18580,13 +18701,14 @@ fn deblock_plane(
         // SAFETY: this band writes only columns `x_lo..x_hi`.
         #[allow(unsafe_code)]
         let plane = unsafe { sp.get() };
+        let hctx = EdgeCtx::new(lf, n, plane_idx, 1, chroma, seg_lf_active, fctx);
         let mut y0 = 4usize;
         while y0 < th {
             let mut x0 = x_lo;
             while x0 < x_hi {
                 if x0 + 16 <= x_hi && y0 >= 8 && y0 + 7 <= rows {
                     let ps: [Option<(u8, i32)>; 4] =
-                        std::array::from_fn(|k| edge_params(lf, n, plane_idx, 1, chroma, x0 + 4 * k, y0, seg_lf_active, fctx));
+                        std::array::from_fn(|k| edge_params(&hctx, x0 + 4 * k, y0));
                     if let Some((len, level)) = ps[0] {
                         if ps.iter().all(|p| *p == ps[0])
                             && filter_edge16(
@@ -18619,7 +18741,7 @@ fn deblock_plane(
                     x0 += 16;
                     continue;
                 }
-                if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0, seg_lf_active, fctx) {
+                if let Some((len, level)) = edge_params(&hctx, x0, y0) {
                     if crate::envflags::env_flag!("EC_AV1_DEBLOCK_TRACE")
                         && plane_idx == 0
                         && x0 == 44
