@@ -18606,10 +18606,65 @@ fn scratch_empty() -> Vec<u16> {
     v
 }
 
+/// A pooled buffer of exactly `n` samples whose contents are NOT cleared --
+/// for a caller that writes every element it later reads (lane-copy: the
+/// post-deblock snapshot writes 4 rows in 64 and reads no other).
+fn scratch_sized(n: usize) -> Vec<u16> {
+    let mut v = PLANE_SCRATCH.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    if v.len() > n {
+        v.truncate(n);
+    } else if v.len() < n {
+        v.resize(n, 0);
+    }
+    v
+}
+
 /// A plane's post-deblock snapshot, its samples taken from the pool (every
 /// other field is `usize`).
-fn plane_snapshot(p: &PlaneBuf<'_>) -> PlaneBuf<'static> {
-    PlaneBuf { data: std::borrow::Cow::Owned(scratch_from(&p.data)), ..*p }
+///
+/// lane-copy: loop restoration is the only reader, and spec 7.17.2's stripe
+/// boundary substitution reads the post-deblock plane at just four rows
+/// around each interior stripe boundary (`row` outside
+/// `[stripe_v_start, stripe_v_end)` resolves to `stripe_v_start-1`,
+/// `stripe_v_start-2`, `stripe_v_end` or `stripe_v_end+1` in
+/// `restoration::lr_src_row`); stripes are `64 >> ss_y` rows offset by
+/// `RESTORATION_UNIT_OFFSET = 8 >> ss_y`, so the boundaries sit at
+/// `k*stripe_h - offset`. Copying only those rows turns a full-plane
+/// memmove per plane per frame into 4 rows in 64 (luma). Every other row of
+/// the pooled buffer keeps whatever a previous frame left there -- an
+/// initialised value that no reader ever reaches.
+fn plane_snapshot(p: &PlaneBuf<'_>, ss_y: u32) -> PlaneBuf<'static> {
+    let mut data = scratch_sized(p.data.len());
+    let rows = if p.width == 0 { 0 } else { p.data.len() / p.width };
+    let stripe_h = 64usize >> ss_y;
+    let offset = 8usize >> ss_y;
+    let mut b = stripe_h - offset;
+    while b < rows {
+        let (lo, hi) = (b - 2, (b + 2).min(rows));
+        data[lo * p.width..hi * p.width].copy_from_slice(&p.data[lo * p.width..hi * p.width]);
+        b += stripe_h;
+    }
+    PlaneBuf { data: std::borrow::Cow::Owned(data), ..*p }
+}
+
+/// The output crop, taking the plane by value: a frame whose width is
+/// already superblock-aligned (only its height is padded) has a padded
+/// buffer whose stride equals the visible width, so the crop is a pure
+/// truncation of the buffer we already own -- no full-plane copy at all
+/// (lane-copy: three ~6 MB memmoves per 4K frame on the frame thread's
+/// serial tail). Any other shape falls back to the row-by-row copy.
+fn crop_owned(plane: PlaneBuf<'_>, w: usize, h: usize) -> Vec<u16> {
+    let stride = plane.width;
+    let mut data = plane.data.into_owned();
+    if stride == w {
+        data.truncate(w * h);
+        return data;
+    }
+    let mut out = Vec::with_capacity(w * h);
+    for row in 0..h {
+        out.extend(data[row * stride..][..w].iter().copied());
+    }
+    out
 }
 
 /// Hands a buffer back to the pool; the capacity is what is worth keeping.
@@ -21325,7 +21380,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             && lr.loop_restoration_size[p] != 0
     });
     let deblocked =
-        lr_active.then(|| (plane_snapshot(&y), plane_snapshot(&u), plane_snapshot(&v)));
+        lr_active.then(|| (plane_snapshot(&y, 0), plane_snapshot(&u, 1), plane_snapshot(&v, 1)));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -21384,9 +21439,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         );
     }
     if let Some((db_y, db_u, db_v)) = deblocked {
-        scratch_return(db_y.data.into_owned());
-        scratch_return(db_u.data.into_owned());
+        // LIFO pool: return in reverse so the next frame's `y`/`u`/`v`
+        // snapshots pop buffers of their own size and never resize.
         scratch_return(db_v.data.into_owned());
+        scratch_return(db_u.data.into_owned());
+        scratch_return(db_y.data.into_owned());
     }
 
     let (fw, fh) = (lr_w, frame_height as usize);
@@ -21462,9 +21519,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         Picture {
             width: fw,
             height: fh,
-            y: crop(&y, fw, fh),
-            u: crop(&u, fw.div_ceil(2), fh.div_ceil(2)),
-            v: crop(&v, fw.div_ceil(2), fh.div_ceil(2)),
+            y: crop_owned(y, fw, fh),
+            u: crop_owned(u, fw.div_ceil(2), fh.div_ceil(2)),
+            v: crop_owned(v, fw.div_ceil(2), fh.div_ceil(2)),
         },
         result_cdfs,
     ))
@@ -33461,7 +33518,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             && lr.loop_restoration_size[p] != 0
     });
     let deblocked =
-        lr_active.then(|| (plane_snapshot(&y), plane_snapshot(&u), plane_snapshot(&v)));
+        lr_active.then(|| (plane_snapshot(&y, 0), plane_snapshot(&u, 1), plane_snapshot(&v, 1)));
     // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
     // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
     // dump above these bisect WHICH filter stage introduced a mismatch.
@@ -33520,9 +33577,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         );
     }
     if let Some((db_y, db_u, db_v)) = deblocked {
-        scratch_return(db_y.data.into_owned());
-        scratch_return(db_u.data.into_owned());
+        // LIFO pool: return in reverse so the next frame's `y`/`u`/`v`
+        // snapshots pop buffers of their own size and never resize.
         scratch_return(db_v.data.into_owned());
+        scratch_return(db_u.data.into_owned());
+        scratch_return(db_y.data.into_owned());
     }
 
     let motion_field = build_motion_field(
@@ -33592,9 +33651,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         Picture {
             width: fw,
             height: fh,
-            y: crop(&y, fw, fh),
-            u: crop(&u, fw.div_ceil(2), fh.div_ceil(2)),
-            v: crop(&v, fw.div_ceil(2), fh.div_ceil(2)),
+            y: crop_owned(y, fw, fh),
+            u: crop_owned(u, fw.div_ceil(2), fh.div_ceil(2)),
+            v: crop_owned(v, fw.div_ceil(2), fh.div_ceil(2)),
         },
         result_cdfs,
         motion_field,
