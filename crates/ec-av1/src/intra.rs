@@ -136,8 +136,11 @@ const ANGLE_STEP: i32 = 3;
 /// Both arrays hold the corner first, so the spec's index `-1` is index 0 here
 /// and they run out to the spec's `w + h - 1`.
 struct Edges {
-    above: Vec<i32>,
-    left: Vec<i32>,
+    // lane-intra: `bw + bh + 1` is at most 129 samples, so both edges live on
+    // the stack -- two heap allocations per predicted block otherwise, and
+    // most blocks a stream predicts are 4x4 to 16x16.
+    above: [i32; 129],
+    left: [i32; 129],
 }
 
 impl Edges {
@@ -172,16 +175,21 @@ impl Edges {
         // first and the samples are extended/truncated to `want` in place, so
         // the contents are what `extend` + `with_corner` produced before.
         let build_edge = |samples: Option<&[u16]>, other: Option<&[u16]>, none_fill: i32| {
-            let mut v: Vec<i32> = Vec::with_capacity(want + 1);
-            v.push(corner);
+            let mut v = [0i32; 129];
+            v[0] = corner;
             match (samples, other) {
                 (Some(s), _) => {
-                    v.extend(s.iter().map(|&x| i32::from(x)));
-                    let last = *v.last().expect("an edge that exists has samples");
-                    v.resize(want + 1, last);
+                    let n = s.len().min(want);
+                    for (d, &x) in v[1..=n].iter_mut().zip(s.iter()) {
+                        *d = i32::from(x);
+                    }
+                    if n < want {
+                        let last = i32::from(*s.last().expect("an edge that exists has samples"));
+                        v[n + 1..=want].fill(last);
+                    }
                 }
-                (None, Some(o)) => v.resize(want + 1, i32::from(o[0])),
-                (None, None) => v.resize(want + 1, none_fill),
+                (None, Some(o)) => v[1..=want].fill(i32::from(o[0])),
+                (None, None) => v[1..=want].fill(none_fill),
             }
             v
         };
@@ -479,7 +487,8 @@ fn filter_intra_edge(buf: &mut [i32], strength: i32) {
     const KERNEL: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
     let filt = usize::try_from(strength - 1).expect("a filter strength is never negative");
     let sz = buf.len() as i32;
-    let edge = buf.to_vec();
+    let mut edge = [0i32; 129];
+    edge[..buf.len()].copy_from_slice(buf);
     for i in 1..buf.len() {
         let mut s = 0;
         for (j, &tap) in KERNEL[filt].iter().enumerate() {
