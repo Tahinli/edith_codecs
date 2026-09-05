@@ -18215,6 +18215,159 @@ fn scratch_return(v: Vec<u16>) {
     PLANE_SCRATCH.with(|p| p.borrow_mut().push(v));
 }
 
+/// One CDEF mi-row band, as a real function rather than the body of the
+/// `run_bands` closure: inside the closure the destination planes are
+/// `&mut` references derived from a `par::Shared` raw pointer in the same
+/// scope as the `src_*` snapshot reads, so LLVM cannot tell the two apart and
+/// re-loads through them on every tap. Reference parameters restore `noalias`
+/// (lane-perf11 (a): -x% instructions at one filter thread).
+#[allow(clippy::too_many_arguments)]
+fn cdef_band(
+    r_lo: usize,
+    r_hi: usize,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    src_y: &[u16],
+    src_u: &[u16],
+    src_v: &[u16],
+    cdef: &CdefParams,
+    skip_grid: &Neighbours,
+    idx_grid: &[u8],
+    sb_cols: usize,
+    coeff_shift: i32,
+    damping: i32,
+    damping_uv: i32,
+    (frame_w, frame_h): (usize, usize),
+    fctx: &crate::decode::FrameCtx,
+) {
+    let strength_idx = |mi_r: usize, mi_c: usize| -> usize {
+        if sb_cols == 0 {
+            return 0;
+        }
+        let (sb_r, sb_c) = (mi_r / SB_MI as usize, mi_c / SB_MI as usize);
+        idx_grid.get(sb_r * sb_cols + sb_c).copied().unwrap_or(0) as usize
+    };
+        // One scratch window per plane kind, reused by every unit (8x8 luma and
+        // 4x4 chroma, each grown by the [`CDEF_BORDER`] tap ring).
+        let mut win_y = [0i32; (8 + 2 * CDEF_BORDER) * (8 + 2 * CDEF_BORDER)];
+        let mut win_uv = [0i32; (4 + 2 * CDEF_BORDER) * (4 + 2 * CDEF_BORDER)];
+        let mut mi_r = r_lo;
+        while mi_r < r_hi {
+            let mut mi_c = 0usize;
+            while mi_c < skip_grid.mi_cols {
+                if skip_grid.is_skip_txfm(mi_r, mi_c) {
+                    CDEF_SKIPPED_UNITS.with(|c| c.set(c.get() + 1));
+                }
+                if !skip_grid.is_skip_txfm(mi_r, mi_c) {
+                    let sidx = strength_idx(mi_r, mi_c);
+                    let (ox, oy) = (mi_c * 4, mi_r * 4);
+                    // Nothing to do for this unit at all: the direction search is
+                    // only ever consumed through a strength, so a unit whose four
+                    // strengths are zero never needs its 8x8 window gathered.
+                    if cdef.y_pri_strength[sidx] == 0
+                        && cdef.y_sec_strength[sidx] == 0
+                        && cdef.uv_pri_strength[sidx] == 0
+                        && cdef.uv_sec_strength[sidx] == 0
+                    {
+                        mi_c += 2;
+                        continue;
+                    }
+                    let (y_stride, y_true_w, y_true_h) = (y.width, y.true_width, y.true_height);
+                    cdef_gather(src_y, y_stride, y_true_w, y_true_h, ox, oy, 8, 8, &mut win_y);
+                    let sample_y = |r: i32, c: i32| -> i32 {
+                        win_y[(r + CDEF_BORDER as i32) as usize * (8 + 2 * CDEF_BORDER)
+                            + (c + CDEF_BORDER as i32) as usize]
+                    };
+                    // lane-cdef r1: the direction search reads the SAME padded
+                    // block the taps do -- libaom runs `cdef_find_dir` on the
+                    // prepared filter block (`cdef_block.c:296-320` over
+                    // `cdef_prepare_fb`'s buffer, `cdef.c:249-256`), whose columns
+                    // and rows past the mi-rounded frame extent are CDEF_VERY_LARGE.
+                    // Clamping to the last real sample instead made every straddling
+                    // edge 8x8 (odd `mi_cols`/`mi_rows`) pick a different var, hence
+                    // a different `adjust_strength`, hence a +-1 band at the crop edge.
+                    let (dir, var) = cdef_find_dir(coeff_shift, |r, c| sample_y(r as i32, c as i32));
+
+                    // libaom `av1_cdef_filter_fb` passes `pri_strength ? dir : 0`
+                    // -- each plane zeroes the shared direction when *its own*
+                    // frame-level primary strength is 0, independent of the
+                    // per-block adjusted `t` and of the other plane's strength.
+                    let y_pri_strength = i32::from(cdef.y_pri_strength[sidx]) << coeff_shift;
+                    let y_sec_strength = i32::from(cdef.y_sec_strength[sidx]) << coeff_shift;
+                    let y_dir = if y_pri_strength != 0 { dir } else { 0 };
+                    let t = cdef_adjust_strength(y_pri_strength, var);
+                    // lane-cdef r1 rung: one line per filtered 8x8 luma CDEF unit.
+                    if crate::envflags::env_flag!("EC_AV1_CDEF_DBG") {
+                        eprintln!(
+                            "EC_CDEF mi_r={mi_r} mi_c={mi_c} x={ox} y={oy} sidx={sidx} dir={dir} var={var} t={t} pri={y_pri_strength} sec={y_sec_strength} damp={damping}"
+                        );
+                    }
+                    let enable_primary = t != 0;
+                    let enable_secondary = y_sec_strength != 0;
+                    if (ox + 8 > frame_w || oy + 8 > frame_h)
+                        && (enable_primary
+                            || enable_secondary
+                            || cdef.uv_pri_strength[sidx] != 0
+                            || cdef.uv_sec_strength[sidx] != 0)
+                    {
+                        CDEF_STRADDLE_UNITS.with(|c| c.set(c.get() + 1));
+                    }
+                    if enable_primary || enable_secondary {
+                        cdef_filter_block(
+                            &win_y,
+                            y,
+                            ox,
+                            oy,
+                            8,
+                            8,
+                            t,
+                            y_sec_strength,
+                            y_dir,
+                            damping,
+                            damping,
+                            enable_primary,
+                            enable_secondary,
+                            coeff_shift, fctx,
+                        );
+                    }
+
+                    let t_uv = i32::from(cdef.uv_pri_strength[sidx]) << coeff_shift;
+                    let uv_sec_strength = i32::from(cdef.uv_sec_strength[sidx]) << coeff_shift;
+                    let uv_dir = if t_uv != 0 { dir } else { 0 };
+                    let enable_primary_uv = t_uv != 0;
+                    let enable_secondary_uv = uv_sec_strength != 0;
+                    if enable_primary_uv || enable_secondary_uv {
+                        let (cox, coy) = (ox / 2, oy / 2);
+                        for (plane, src_p) in [(&mut *u, src_u), (&mut *v, src_v)] {
+                            let (tw, th) = (plane.true_width, plane.true_height);
+                            let stride = plane.width;
+                            cdef_gather(src_p, stride, tw, th, cox, coy, 4, 4, &mut win_uv);
+                            cdef_filter_block(
+                                &win_uv,
+                                plane,
+                                cox,
+                                coy,
+                                4,
+                                4,
+                                t_uv,
+                                uv_sec_strength,
+                                uv_dir,
+                                damping_uv,
+                                damping_uv,
+                                enable_primary_uv,
+                                enable_secondary_uv,
+                                coeff_shift, fctx,
+                            );
+                        }
+                    }
+                }
+                mi_c += 2;
+            }
+        mi_r += 2;
+        }
+}
+
 fn apply_cdef(
     y: &mut PlaneBuf<'static>,
     u: &mut PlaneBuf<'static>,
@@ -18288,16 +18441,6 @@ fn apply_cdef(
     // One entry per superblock (a few hundred at 4K), so this clone is not
     // one of the per-frame copies lane-perf6 pooled below.
     let idx_grid = fctx.cdef_idx_grid.with(|g| g.borrow().clone());
-    let strength_idx = |mi_r: usize, mi_c: usize| -> usize {
-        if sb_cols == 0 {
-            return 0;
-        }
-        let (sb_r, sb_c) = (mi_r / SB_MI as usize, mi_c / SB_MI as usize);
-        idx_grid
-            .get(sb_r * sb_cols + sb_c)
-            .copied()
-            .unwrap_or(0) as usize
-    };
     let src_y = scratch_from(&y.data);
     let src_u = scratch_from(&u.data);
     let src_v = scratch_from(&v.data);
@@ -18326,124 +18469,25 @@ fn apply_cdef(
         // disjoint from every other band's (see `Shared`).
         #[allow(unsafe_code)]
         let (y, u, v) = unsafe { (sy.get(), su.get(), sv.get()) };
-        // One scratch window per plane kind, reused by every unit (8x8 luma and
-        // 4x4 chroma, each grown by the [`CDEF_BORDER`] tap ring).
-        let mut win_y = [0i32; (8 + 2 * CDEF_BORDER) * (8 + 2 * CDEF_BORDER)];
-        let mut win_uv = [0i32; (4 + 2 * CDEF_BORDER) * (4 + 2 * CDEF_BORDER)];
-        let mut mi_r = r_lo;
-        while mi_r < r_hi {
-            let mut mi_c = 0usize;
-            while mi_c < skip_grid.mi_cols {
-                if skip_grid.is_skip_txfm(mi_r, mi_c) {
-                    CDEF_SKIPPED_UNITS.with(|c| c.set(c.get() + 1));
-                }
-                if !skip_grid.is_skip_txfm(mi_r, mi_c) {
-                    let sidx = strength_idx(mi_r, mi_c);
-                    let (ox, oy) = (mi_c * 4, mi_r * 4);
-                    // Nothing to do for this unit at all: the direction search is
-                    // only ever consumed through a strength, so a unit whose four
-                    // strengths are zero never needs its 8x8 window gathered.
-                    if cdef.y_pri_strength[sidx] == 0
-                        && cdef.y_sec_strength[sidx] == 0
-                        && cdef.uv_pri_strength[sidx] == 0
-                        && cdef.uv_sec_strength[sidx] == 0
-                    {
-                        mi_c += 2;
-                        continue;
-                    }
-                    let (y_stride, y_true_w, y_true_h) = (y.width, y.true_width, y.true_height);
-                    cdef_gather(&src_y, y_stride, y_true_w, y_true_h, ox, oy, 8, 8, &mut win_y);
-                    let sample_y = |r: i32, c: i32| -> i32 {
-                        win_y[(r + CDEF_BORDER as i32) as usize * (8 + 2 * CDEF_BORDER)
-                            + (c + CDEF_BORDER as i32) as usize]
-                    };
-                    // lane-cdef r1: the direction search reads the SAME padded
-                    // block the taps do -- libaom runs `cdef_find_dir` on the
-                    // prepared filter block (`cdef_block.c:296-320` over
-                    // `cdef_prepare_fb`'s buffer, `cdef.c:249-256`), whose columns
-                    // and rows past the mi-rounded frame extent are CDEF_VERY_LARGE.
-                    // Clamping to the last real sample instead made every straddling
-                    // edge 8x8 (odd `mi_cols`/`mi_rows`) pick a different var, hence
-                    // a different `adjust_strength`, hence a +-1 band at the crop edge.
-                    let (dir, var) = cdef_find_dir(coeff_shift, |r, c| sample_y(r as i32, c as i32));
-
-                    // libaom `av1_cdef_filter_fb` passes `pri_strength ? dir : 0`
-                    // -- each plane zeroes the shared direction when *its own*
-                    // frame-level primary strength is 0, independent of the
-                    // per-block adjusted `t` and of the other plane's strength.
-                    let y_pri_strength = i32::from(cdef.y_pri_strength[sidx]) << coeff_shift;
-                    let y_sec_strength = i32::from(cdef.y_sec_strength[sidx]) << coeff_shift;
-                    let y_dir = if y_pri_strength != 0 { dir } else { 0 };
-                    let t = cdef_adjust_strength(y_pri_strength, var);
-                    // lane-cdef r1 rung: one line per filtered 8x8 luma CDEF unit.
-                    if crate::envflags::env_flag!("EC_AV1_CDEF_DBG") {
-                        eprintln!(
-                            "EC_CDEF mi_r={mi_r} mi_c={mi_c} x={ox} y={oy} sidx={sidx} dir={dir} var={var} t={t} pri={y_pri_strength} sec={y_sec_strength} damp={damping}"
-                        );
-                    }
-                    let enable_primary = t != 0;
-                    let enable_secondary = y_sec_strength != 0;
-                    if (ox + 8 > frame_w || oy + 8 > frame_h)
-                        && (enable_primary
-                            || enable_secondary
-                            || cdef.uv_pri_strength[sidx] != 0
-                            || cdef.uv_sec_strength[sidx] != 0)
-                    {
-                        CDEF_STRADDLE_UNITS.with(|c| c.set(c.get() + 1));
-                    }
-                    if enable_primary || enable_secondary {
-                        cdef_filter_block(
-                            &win_y,
-                            y,
-                            ox,
-                            oy,
-                            8,
-                            8,
-                            t,
-                            y_sec_strength,
-                            y_dir,
-                            damping,
-                            damping,
-                            enable_primary,
-                            enable_secondary,
-                            coeff_shift, fctx,
-                        );
-                    }
-
-                    let t_uv = i32::from(cdef.uv_pri_strength[sidx]) << coeff_shift;
-                    let uv_sec_strength = i32::from(cdef.uv_sec_strength[sidx]) << coeff_shift;
-                    let uv_dir = if t_uv != 0 { dir } else { 0 };
-                    let enable_primary_uv = t_uv != 0;
-                    let enable_secondary_uv = uv_sec_strength != 0;
-                    if enable_primary_uv || enable_secondary_uv {
-                        let (cox, coy) = (ox / 2, oy / 2);
-                        for (plane, src_p) in [(&mut *u, &src_u), (&mut *v, &src_v)] {
-                            let (tw, th) = (plane.true_width, plane.true_height);
-                            let stride = plane.width;
-                            cdef_gather(src_p, stride, tw, th, cox, coy, 4, 4, &mut win_uv);
-                            cdef_filter_block(
-                                &win_uv,
-                                plane,
-                                cox,
-                                coy,
-                                4,
-                                4,
-                                t_uv,
-                                uv_sec_strength,
-                                uv_dir,
-                                damping_uv,
-                                damping_uv,
-                                enable_primary_uv,
-                                enable_secondary_uv,
-                                coeff_shift, fctx,
-                            );
-                        }
-                    }
-                }
-                mi_c += 2;
-            }
-        mi_r += 2;
-        }
+        cdef_band(
+            r_lo,
+            r_hi,
+            y,
+            u,
+            v,
+            &src_y,
+            &src_u,
+            &src_v,
+            cdef,
+            skip_grid,
+            &idx_grid,
+            sb_cols,
+            coeff_shift,
+            damping,
+            damping_uv,
+            (frame_w, frame_h),
+            fctx,
+        );
     });
     scratch_return(src_y);
     scratch_return(src_u);
