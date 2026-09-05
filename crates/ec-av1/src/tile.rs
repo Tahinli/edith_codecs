@@ -16,7 +16,7 @@ use ec_core::{Error, Result};
 use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::msac::SymbolEncoder;
-use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
+use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, single_ref_ctx};
 
 /// round-4 av1-truesize debugging aid: prints `msg()` to stderr when the
 /// `EC_RNG` environment variable is set, mirroring the `EC_PART`/`EC_TOK`
@@ -2434,8 +2434,8 @@ pub fn sb_coeff_inter_frame_tile(
                         MiInfo {
                             is_inter: true,
                             ref_frame: LAST_FRAME,
-                            ref_frame1: None,
-                            mv1: None,
+                            ref_frame1: NO_REF1,
+                            mv1: (0, 0),
                             mv,
                             is_new_mv,
                             size: 8,
@@ -2455,8 +2455,8 @@ pub fn sb_coeff_inter_frame_tile(
                                 MiInfo {
                                     is_inter: true,
                                     ref_frame: LAST_FRAME,
-                                    ref_frame1: None,
-                                    mv1: None,
+                                    ref_frame1: NO_REF1,
+                                    mv1: (0, 0),
                                     mv,
                                     is_new_mv,
                                     size: 8,
@@ -2487,8 +2487,8 @@ pub fn sb_coeff_inter_frame_tile(
                                 MiInfo {
                                     is_inter: false,
                                     ref_frame: -1,
-                                    ref_frame1: None,
-                                    mv1: None,
+                                    ref_frame1: NO_REF1,
+                                    mv1: (0, 0),
                                     mv: (0, 0),
                                     is_new_mv: false,
                                     size: 8,
@@ -2630,8 +2630,8 @@ fn write_inter_frame_leaf(
                     MiInfo {
                         is_inter: true,
                         ref_frame: LAST_FRAME,
-                        ref_frame1: None,
-                        mv1: None,
+                        ref_frame1: NO_REF1,
+                        mv1: (0, 0),
                         mv,
                         is_new_mv,
                         size: SUB_MI as usize as u8,
@@ -2662,8 +2662,8 @@ fn write_inter_frame_leaf(
                     MiInfo {
                         is_inter: false,
                         ref_frame: -1,
-                        ref_frame1: None,
-                        mv1: None,
+                        ref_frame1: NO_REF1,
+                        mv1: (0, 0),
                         mv: (0, 0),
                         is_new_mv: false,
                         size: SUB_MI as usize as u8,
@@ -2828,8 +2828,8 @@ fn write_inter_frame_leaf8(
                     MiInfo {
                         is_inter: true,
                         ref_frame: LAST_FRAME,
-                        ref_frame1: None,
-                        mv1: None,
+                        ref_frame1: NO_REF1,
+                        mv1: (0, 0),
                         mv,
                         is_new_mv,
                         size: 2,
@@ -2860,8 +2860,8 @@ fn write_inter_frame_leaf8(
                     MiInfo {
                         is_inter: false,
                         ref_frame: -1,
-                        ref_frame1: None,
-                        mv1: None,
+                        ref_frame1: NO_REF1,
+                        mv1: (0, 0),
                         mv: (0, 0),
                         is_new_mv: false,
                         size: 2,
@@ -5138,8 +5138,8 @@ mod tests {
                             MiInfo {
                                 is_inter: true,
                                 ref_frame: 1,
-                                ref_frame1: None,
-                                mv1: None,
+                                ref_frame1: NO_REF1,
+                                mv1: (0, 0),
                                 mv,
                                 is_new_mv,
                                 size: 8,
