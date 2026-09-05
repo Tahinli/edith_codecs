@@ -642,7 +642,7 @@ fn apply_wiener_stripe(
     acc.clear();
     acc.resize(w, 0i32);
     for r in 0..h {
-        crate::mc::vpass_row(&inter, w, r, &taps, &mut acc);
+        crate::mc::vpass_row(&inter[r * w..], w, w, 1, &taps, &mut acc);
         let dst = &mut out[(v_start + r) * stride + h_start..][..w];
         for (o, &a) in dst.iter_mut().zip(acc.iter()) {
             *o = round2(i64::from(a), 11).clamp(0, smax) as u16;
