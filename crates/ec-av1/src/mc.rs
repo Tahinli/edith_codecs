@@ -456,14 +456,15 @@ mod simd {
         intermediate: &[i16],
         block_w: usize,
         src_stride: usize,
-        row: usize,
+        rows: usize,
         taps: &[i32; 8],
         acc: &mut [i32],
     ) {
-        debug_assert!(intermediate.len() >= (row + 7) * src_stride + block_w && acc.len() >= block_w);
+        debug_assert!(intermediate.len() >= (rows + 6) * src_stride + block_w && acc.len() >= rows * block_w);
         let tp = tap_pairs(&taps16(taps));
+        for row in 0..rows {
         let ip = intermediate.as_ptr().add(row * src_stride);
-        let ap = acc.as_mut_ptr();
+        let ap = acc.as_mut_ptr().add(row * block_w);
         let mut c = 0usize;
         while c + 16 <= block_w {
             // `lo` accumulates columns c+0..4 and c+8..12 (one per 128-bit
@@ -486,6 +487,7 @@ mod simd {
             c += 16;
         }
         vpass_tail_sse(ip, block_w, src_stride, &tp, taps, ap, c);
+        }
     }
 
     /// [`vpass_avx2`]'s 8- and 4-column steps, 128-bit: every AV1 block width
@@ -693,13 +695,18 @@ mod simd {
         intermediate: &[i16],
         block_w: usize,
         src_stride: usize,
-        row: usize,
+        rows: usize,
         taps: &[i32; 8],
         acc: &mut [i32],
     ) {
-        debug_assert!(intermediate.len() >= (row + 7) * src_stride + block_w && acc.len() >= block_w);
+        debug_assert!(intermediate.len() >= (rows + 6) * src_stride + block_w && acc.len() >= rows * block_w);
         let tp = tap_pairs(&taps16(taps));
-        vpass_tail_sse(intermediate.as_ptr().add(row * src_stride), block_w, src_stride, &tp, taps, acc.as_mut_ptr(), 0);
+        for row in 0..rows {
+            vpass_tail_sse(
+                intermediate.as_ptr().add(row * src_stride), block_w, src_stride, &tp, taps,
+                acc.as_mut_ptr().add(row * block_w), 0,
+            );
+        }
     }
 
     /// Horizontal pass, SSE2: [`hpass_avx2`]'s scheme at 8 outputs per
@@ -874,7 +881,7 @@ fn horizontal_pass_unscaled(
 /// eight slots. `acc` is left holding the unrounded sums.
 #[inline]
 #[allow(unsafe_code)]
-pub(crate) fn vpass_row(intermediate: &[i16], block_w: usize, src_stride: usize, row: usize, taps: &[i32; 8], acc: &mut [i32]) {
+pub(crate) fn vpass_row(intermediate: &[i16], block_w: usize, src_stride: usize, rows: usize, taps: &[i32; 8], acc: &mut [i32]) {
     #[cfg(target_arch = "x86_64")]
     {
         match simd_level() {
@@ -883,17 +890,22 @@ pub(crate) fn vpass_row(intermediate: &[i16], block_w: usize, src_stride: usize,
             // + block_w]` for t in 0..8 and writes `acc[..block_w]`, which
             // the debug asserts pin.
             SimdLevel::Avx2 => {
-                unsafe { simd::vpass_avx2(intermediate, block_w, src_stride, row, taps, acc) };
+                unsafe { simd::vpass_avx2(intermediate, block_w, src_stride, rows, taps, acc) };
                 return;
             }
             SimdLevel::Sse41 => {
-                unsafe { simd::vpass_sse41(intermediate, block_w, src_stride, row, taps, acc) };
+                unsafe { simd::vpass_sse41(intermediate, block_w, src_stride, rows, taps, acc) };
                 return;
             }
             SimdLevel::Scalar => {}
         }
     }
-    vpass_row_scalar(intermediate, block_w, src_stride, row, taps, acc);
+    for row in 0..rows {
+        vpass_row_scalar(
+            &intermediate[row * src_stride..], block_w, src_stride, 0, taps,
+            &mut acc[row * block_w..(row + 1) * block_w],
+        );
+    }
 }
 
 /// lane-mc: [`vpass_row`] with the output rounding fused in, for the two
@@ -1687,19 +1699,15 @@ pub fn predict_compound_intermediate_kern(
                 #[allow(unsafe_code)]
                 let src: &[i16] =
                     unsafe { std::slice::from_raw_parts(reference.as_ptr().cast::<i16>(), reference.len()) };
-                let mut accbuf = [0i32; 128];
-                let acc = &mut accbuf[..block_w];
-                for row in 0..block_h {
-                    vpass_row(&src[base..], block_w, stride, row, &v16, acc);
-                    for (d, &a) in dst[row * block_w..(row + 1) * block_w].iter_mut().zip(acc.iter()) {
-                        *d = round2(a, INTER_ROUND_1_COMPOUND);
-                    }
+                vpass_row(&src[base..], block_w, stride, block_h, &v16, dst);
+                for d in dst.iter_mut() {
+                    *d = round2(*d, INTER_ROUND_1_COMPOUND);
                 }
                 return;
             }
         }
     }
-    with_scratch(rows, block_w, |intermediate, acc| {
+    with_scratch(rows, block_w, |intermediate, _acc| {
         horizontal_pass(
             reference, stride, true_width, true_height, x_q4,
             if yfrac == 0 { y0 + 3 } else { y0 }, x_scale_fp, block_w,
@@ -1712,11 +1720,9 @@ pub fn predict_compound_intermediate_kern(
             }
             return;
         }
-        for row in 0..block_h {
-            vpass_row(intermediate, block_w, block_w, row, v_filter, acc);
-            for (d, &a) in dst[row * block_w..(row + 1) * block_w].iter_mut().zip(acc.iter()) {
-                *d = round2(a, INTER_ROUND_1_COMPOUND);
-            }
+        vpass_row(intermediate, block_w, block_w, block_h, v_filter, dst);
+        for d in dst.iter_mut() {
+            *d = round2(*d, INTER_ROUND_1_COMPOUND);
         }
     });
 }
@@ -2424,20 +2430,20 @@ mod tests {
                                 .collect();
                             for row in [0usize, 1, 4] {
                                 let mut want = vec![0i32; w];
-                                super::vpass_row_scalar(&inter, w, st, row, taps, &mut want);
+                                super::vpass_row_scalar(&inter[row * st..], w, st, 0, taps, &mut want);
                                 let mut got = vec![0i32; w];
-                                super::vpass_row(&inter, w, st, row, taps, &mut got);
+                                super::vpass_row(&inter[row * st..], w, st, 1, taps, &mut got);
                                 assert_eq!(got, want, "dispatch w={w} frac={frac} row={row}");
                                 #[cfg(target_arch = "x86_64")]
                                 {
                                     if std::arch::is_x86_feature_detected!("sse4.1") {
                                         let mut sse = vec![0i32; w];
-                                        unsafe { super::simd::vpass_sse41(&inter, w, st, row, taps, &mut sse) };
+                                        unsafe { super::simd::vpass_sse41(&inter[row * st..], w, st, 1, taps, &mut sse) };
                                         assert_eq!(sse, want, "sse4.1 w={w} frac={frac} row={row}");
                                     }
                                     if std::arch::is_x86_feature_detected!("avx2") {
                                         let mut avx = vec![0i32; w];
-                                        unsafe { super::simd::vpass_avx2(&inter, w, st, row, taps, &mut avx) };
+                                        unsafe { super::simd::vpass_avx2(&inter[row * st..], w, st, 1, taps, &mut avx) };
                                         assert_eq!(avx, want, "avx2 w={w} frac={frac} row={row}");
                                     }
                                 }
