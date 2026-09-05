@@ -202,6 +202,11 @@ struct PoolQ {
     /// Jobs handed to a worker and not yet finished.
     busy: usize,
     closed: bool,
+    /// lane-memfix: the pool's threads live behind the same lock as its
+    /// queue, because the thread that has to GROW the pool is whichever one
+    /// submits -- including one of the pool's own workers (see
+    /// [`pool_push`]). Joined by [`Pool::drop`] on the owning thread.
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 struct PoolInner {
@@ -211,10 +216,13 @@ struct PoolInner {
 
 struct Pool {
     inner: std::sync::Arc<PoolInner>,
-    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
-fn pool_worker(inner: &PoolInner) {
+fn pool_worker(inner: &std::sync::Arc<PoolInner>) {
+    // lane-memfix: a job this worker runs submits its own sub-batches to THIS
+    // pool rather than opening a second one on the worker's thread-local --
+    // see [`Batch::submit`].
+    ON_POOL.with(|c| *c.borrow_mut() = Some(std::sync::Arc::clone(inner)));
     let mut q = inner.q.lock().unwrap();
     loop {
         if let Some(job) = q.jobs.pop_front() {
@@ -228,6 +236,7 @@ fn pool_worker(inner: &PoolInner) {
             continue;
         }
         if q.closed {
+            POOL_THREADS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return;
         }
         q = inner.cv.wait(q).unwrap();
@@ -242,46 +251,65 @@ impl Pool {
                     jobs: std::collections::VecDeque::new(),
                     busy: 0,
                     closed: false,
+                    handles: Vec::new(),
                 }),
                 cv: std::sync::Condvar::new(),
             }),
-            handles: Vec::new(),
         }
     }
+}
 
-    /// Queues `job` and makes sure a worker is free for it: the pool grows to
-    /// `busy + queued` threads and never shrinks, so a submitted job always
-    /// starts, even when every other running job is blocked waiting for it.
-    /// `class` names the submitting site of the job that grows the pool, so a
-    /// profiler attributes the thread to the work that created it
-    /// (`ec-av1-frame`, `ec-av1-recon`, `ec-av1-filter`). One pool serves
-    /// every class a thread submits, so later classes on the same pool reuse
-    /// the threads an earlier one named.
-    fn push(&mut self, job: Job, class: &'static str) {
-        let want = {
-            let mut q = self.inner.q.lock().unwrap();
-            q.jobs.push_back(job);
-            q.busy + q.jobs.len()
-        };
-        while self.handles.len() < want {
-            let inner = std::sync::Arc::clone(&self.inner);
-            let name = format!("{class}-{}", self.handles.len());
-            self.handles.push(
-                std::thread::Builder::new()
-                    .name(name)
-                    .spawn(move || pool_worker(&inner))
-                    .expect("spawning an ec-av1 pool worker"),
-            );
-        }
-        self.inner.cv.notify_one();
+/// Queues `job` on `inner` and makes sure a worker is free for it: the pool
+/// grows to `busy + queued` threads, so a submitted job always starts, even
+/// when every other running job is blocked waiting for it.
+/// `class` names the submitting site of the job that grows the pool, so a
+/// profiler attributes the thread to the work that created it
+/// (`ec-av1-frame`, `ec-av1-recon`, `ec-av1-filter`). One pool serves every
+/// class submitted to it, so later classes reuse the threads an earlier one
+/// named.
+///
+/// lane-memfix: the pool only grows for work that is queued and unserved AT
+/// THAT MOMENT, and a pool worker submits back into its own pool, so the
+/// process-wide thread count is the peak of `busy + queued` over the whole
+/// job tree -- not the product of one pool per nesting level (a filter band
+/// job used to open a third-level pool on the worker running it, and none of
+/// those pools ever shrank: 1038 threads at (16,4,2)).
+fn pool_push(inner: &std::sync::Arc<PoolInner>, job: Job, class: &'static str) {
+    let mut q = inner.q.lock().unwrap();
+    q.jobs.push_back(job);
+    let want = q.busy + q.jobs.len();
+    while q.handles.len() < want {
+        let inner = std::sync::Arc::clone(inner);
+        let name = format!("{class}-{}", q.handles.len());
+        q.handles.push(
+            std::thread::Builder::new()
+                .name(name)
+                .spawn(move || pool_worker(&inner))
+                .expect("spawning an ec-av1 pool worker"),
+        );
+        POOL_THREADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    drop(q);
+    inner.cv.notify_one();
+}
+
+/// Live threads across every ec-av1 pool -- what the bounded-growth test
+/// asserts on, and what a profiler counts as `ec-av1-*`.
+static POOL_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn pool_threads() -> usize {
+    POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.inner.q.lock().unwrap().closed = true;
+        let handles = {
+            let mut q = self.inner.q.lock().unwrap();
+            q.closed = true;
+            std::mem::take(&mut q.handles)
+        };
         self.inner.cv.notify_all();
-        for h in self.handles.drain(..) {
+        for h in handles {
             let _ = h.join();
         }
     }
@@ -292,6 +320,12 @@ thread_local! {
     /// when the thread exits (the process's main thread may skip that
     /// destructor, in which case the idle workers die with the process).
     static POOL: std::cell::RefCell<Option<Pool>> = const { std::cell::RefCell::new(None) };
+    /// lane-memfix: set on a pool WORKER for its whole life -- the pool it
+    /// serves. A job submitting a sub-batch (a pipeline stage banding itself
+    /// across the filter pool) then reuses that pool instead of opening a
+    /// nested one of its own.
+    static ON_POOL: std::cell::RefCell<Option<std::sync::Arc<PoolInner>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 struct BatchState {
@@ -350,10 +384,26 @@ impl<'a> Batch<'a> {
         // for `left == 0`), and `Batch<'a>` cannot outlive `'a`, so the
         // laundered lifetime is never observed past the real one.
         let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(job) };
-        POOL.with(|p| {
-            let mut p = p.borrow_mut();
-            p.get_or_insert_with(Pool::new).push(job, self.class);
-        });
+        // lane-memfix: on a pool worker, back into the pool it is serving; on
+        // any other thread, this thread's own pool.
+        //
+        // No deadlock: a job blocked in `Batch::drop` is counted in `busy`,
+        // so `pool_push` grows the pool by one thread for every queued job
+        // that has no idle worker -- the child of a blocked parent always
+        // gets a thread. The only waits inside a job are on its own sub-batch
+        // (same rule, one level deeper) and on wavefront row atomics /
+        // `PipeSync` counters, which are published by jobs that are already
+        // running, never by a job still in the queue.
+        let on = ON_POOL.with(|c| c.borrow().clone());
+        match on {
+            Some(inner) => pool_push(&inner, job, self.class),
+            None => POOL.with(|p| {
+                let mut p = p.borrow_mut();
+                let inner = std::sync::Arc::clone(&p.get_or_insert_with(Pool::new).inner);
+                drop(p);
+                pool_push(&inner, job, self.class);
+            }),
+        }
     }
 }
 
