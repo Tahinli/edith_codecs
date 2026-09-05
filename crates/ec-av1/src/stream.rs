@@ -296,11 +296,15 @@ fn decode_threads() -> usize {
 #[derive(Default)]
 struct Reorder {
     next: usize,
-    pending: std::collections::BTreeMap<usize, (Picture, usize, bool)>,
+    // lane-pool1: the picture is shared, not owned -- a decoded frame that
+    // refreshes a reference slot is already behind an `Arc` for the slot, and
+    // handing the output an owned `Picture` meant copying every plane of it
+    // (24 MB per 4K 10-bit frame) purely to put it in this queue.
+    pending: std::collections::BTreeMap<usize, (std::sync::Arc<Picture>, usize, bool)>,
 }
 
 impl Reorder {
-    fn push(&mut self, seq: usize, picture: Picture, decode_idx: usize, shown: bool) {
+    fn push(&mut self, seq: usize, picture: std::sync::Arc<Picture>, decode_idx: usize, shown: bool) {
         self.pending.insert(seq, (picture, decode_idx, shown));
     }
 
@@ -431,7 +435,7 @@ impl SlotPromise {
 /// against separate in-flight bounds, since a waiting output job costs no
 /// CPU), and either the (grain-synthesised) picture with the decode index to
 /// report or the error that aborts the stream.
-type LeafResult = (usize, bool, Result<(Picture, usize, bool)>);
+type LeafResult = (usize, bool, Result<(std::sync::Arc<Picture>, usize, bool)>);
 
 /// Waits for one in-flight job and emits whatever that unblocks.
 fn collect_one(
@@ -503,7 +507,10 @@ pub fn decode_stream_with_threads(
     // luma-only (chroma coincidentally shares this fixture's flat regions)
     // and small-magnitude (the two pictures mostly agree), which is exactly
     // what made it look like a rounding bug rather than a wrong reference.
-    let mut ref_slots: [Option<Picture>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
+    // lane-pool1: shared, not owned -- a frame refreshing k slots used to copy
+    // its whole picture k times, and its output a (k+1)-th time.
+    let mut ref_slots: [Option<std::sync::Arc<Picture>>; NUM_REF_FRAMES] =
+        std::array::from_fn(|_| None);
     // lane-av1tmvp: each of the 8 reference slots' own saved temporal motion
     // field (spec 7.9's per-frame `MotionFieldMvs` storage, libaom
     // `cur_frame->mvs`) plus the `OrderHint` the picture in that slot was
@@ -626,15 +633,15 @@ pub fn decode_stream_with_threads(
                     let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let value = promise.wait()?;
                         let output = if grain.apply_grain && !no_grain() {
-                            crate::film_grain::apply_grain(
+                            std::sync::Arc::new(crate::film_grain::apply_grain(
                                 &value.picture,
                                 &grain,
                                 seq.mc_identity,
                                 u32::from(seq.bit_depth),
                                 &crate::decode::FrameCtx::new(),
-                            )
+                            ))
                         } else {
-                            value.picture.as_ref().clone()
+                            std::sync::Arc::clone(&value.picture)
                         };
                         Ok((output, decode_idx, true))
                     }))
@@ -680,12 +687,12 @@ pub fn decode_stream_with_threads(
                 let mc_identity = parser
                     .sequence_header()
                     .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
-                crate::film_grain::apply_grain(
+                std::sync::Arc::new(crate::film_grain::apply_grain(
                     &picture,
                     &header.film_grain,
                     mc_identity,
                     bit_depth as u32, fctx,
-                )
+                ))
             } else {
                 picture
             };
@@ -901,15 +908,15 @@ pub fn decode_stream_with_threads(
                     // reported to the sink clean, exactly as the inline path
                     // below reports it (spec 7.18.3.1).
                     let output = if shown && header.film_grain.apply_grain && !no_grain() {
-                        crate::film_grain::apply_grain(
+                        std::sync::Arc::new(crate::film_grain::apply_grain(
                             &picture,
                             &header.film_grain,
                             seq.mc_identity,
                             u32::from(seq.bit_depth),
                             &fctx,
-                        )
+                        ))
                     } else {
-                        std::sync::Arc::try_unwrap(picture).unwrap_or_else(|p| (*p).clone())
+                        picture
                     };
                     Ok((output, decode_idx, shown))
                 }))
@@ -945,7 +952,7 @@ pub fn decode_stream_with_threads(
         let snap = RefSnapshot::take(
             &header,
             seq,
-            std::array::from_fn(|i| ref_slots[i].as_ref()),
+            std::array::from_fn(|i| ref_slots[i].as_deref()),
             std::array::from_fn(|i| cdf_slots[i].as_ref()),
             std::array::from_fn(|i| seg_map_slots[i].as_deref()),
             &std::array::from_fn(|i| motion_field_slots[i].as_ref()),
@@ -968,13 +975,16 @@ pub fn decode_stream_with_threads(
             final_dump.as_deref(),
         )?;
         pictures_decoded += 1;
+        // lane-pool1: one allocation, then every slot store and the output
+        // itself are refcount bumps instead of plane copies.
+        let picture = std::sync::Arc::new(picture);
         if threads > 1 {
             // lane-thread3: only a key frame reaches this inline path at
             // `threads > 1`, and the bank it fills is the promise array --
             // already resolved, since the picture exists right here.
             if header.refresh_frame_flags != 0 {
                 let promise = SlotPromise::ready(std::sync::Arc::new(SlotValue {
-                    picture: std::sync::Arc::new(picture.clone()),
+                    picture: std::sync::Arc::clone(&picture),
                     cdfs: stored_cdfs,
                     motion_field,
                     seg_map: decoded_seg_map,
@@ -995,7 +1005,7 @@ pub fn decode_stream_with_threads(
                     // clean, pre-grain decode, even though the frame pushed
                     // onto the caller's output below carries the grained
                     // picture.
-                    ref_slots[i] = Some(picture.clone());
+                    ref_slots[i] = Some(std::sync::Arc::clone(&picture));
                     motion_field_slots[i] = Some(motion_field.clone());
                     seg_map_slots[i] = Some(decoded_seg_map.clone());
                     order_hint_slots[i] = header.order_hint;
@@ -1012,12 +1022,12 @@ pub fn decode_stream_with_threads(
         if header.show_frame {
             let output = if header.film_grain.apply_grain && !no_grain() {
                 let mc_identity = seq.mc_identity;
-                crate::film_grain::apply_grain(
+                std::sync::Arc::new(crate::film_grain::apply_grain(
                     &picture,
                     &header.film_grain,
                     mc_identity,
                     bit_depth as u32, fctx,
-                )
+                ))
             } else {
                 picture
             };
