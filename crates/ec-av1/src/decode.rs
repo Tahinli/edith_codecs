@@ -221,7 +221,7 @@ use crate::msac::SymbolDecoder;
 use crate::mvstack::{
     ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME, LAST3_FRAME,
     MiGrid, MiInfo, NO_REF1, NO_SIGN_BIAS, NeighbourRef, SignBiasTable, comp_reference_type_ctx,
-    find_mv_stack_with_sign_bias, reference_mode_ctx,
+    find_mv_stack_with_sign_bias, mv16, mv32, reference_mode_ctx,
     single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx,
     single_ref_p6_ctx, uni_comp_ref_p1_ctx,
 };
@@ -3380,7 +3380,7 @@ fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>
             is_inter: dv.is_some(),
             ref_frame: 0,
             ref_frame1: NO_REF1,
-            mv: dv.unwrap_or((0, 0)),
+            mv: mv16(dv.unwrap_or((0, 0))),
             mv1: (0, 0),
             is_new_mv: dv.is_some(),
             is_global_mv0: false,
@@ -4854,8 +4854,8 @@ pub(crate) fn build_motion_field(
                 // projected with the wrong reference distance.
                 let mut saved: Option<crate::motion_field::SavedMv> = None;
                 for (rf, mv) in [
-                    (info.ref_frame, Some(info.mv)),
-                    (info.ref_frame1.max(0), Some(info.mv1)),
+                    (info.ref_frame, Some(mv32(info.mv))),
+                    (info.ref_frame1.max(0), Some(mv32(info.mv1))),
                 ] {
                     let (Some(mv), true) = (mv, rf > 0) else {
                         continue;
@@ -22636,7 +22636,7 @@ fn overlappable_above(
                 // neighbour PREDICTION at a frame edge, which picks the
                 // 4-tap kernel below 8 px (class narrow-block-sharp-kernel);
                 // the destination clip stays in `obmc_blend`.
-                out.push((col - mi_col, step.min(bw4), *info, src - mi_col));
+                out.push((col - mi_col, step.min(bw4), info, src - mi_col));
             }
         }
         col += step;
@@ -22685,7 +22685,7 @@ fn overlappable_left(
                 }
                 // lane-t900 r14: `AOMMIN(xd->height, mi_step)` -- see
                 // `overlappable_above`.
-                out.push((row - mi_row, step.min(bh4), *info, src - mi_row));
+                out.push((row - mi_row, step.min(bh4), info, src - mi_row));
             }
         }
         row += step;
@@ -22756,7 +22756,7 @@ fn find_samples(
         // neighbour donates its sample at ITS center (aom pts y=-72 for a
         // 32x16 above strip; the square assumption put it at -136).
         let nb_bh = (info.size_h * 4) as i32;
-        crate::warp::record_sample(nb_bw, nb_bh, info.mv, row_offset, sign_r, col_offset, sign_c)
+        crate::warp::record_sample(nb_bw, nb_bh, mv32(info.mv), row_offset, sign_r, col_offset, sign_c)
     };
 
     'outer: {
@@ -22772,8 +22772,8 @@ fn find_samples(
                     do_tr = false;
                 }
                 if let Some(info) = above {
-                    if single_ref_match(info) {
-                        samples.push(rec(info, 0, -1, col_offset as i32, 1));
+                    if single_ref_match(&info) {
+                        samples.push(rec(&info, 0, -1, col_offset as i32, 1));
                         if samples.len() >= MAX {
                             break 'outer;
                         }
@@ -22786,8 +22786,8 @@ fn find_samples(
                     let cell = grid.get(mi_row - 1, mi_col + i);
                     let sw = cell.map_or(1, |c| c.size as usize).max(1);
                     if let Some(info) = cell {
-                        if single_ref_match(info) {
-                            samples.push(rec(info, 0, -1, i as i32, 1));
+                        if single_ref_match(&info) {
+                            samples.push(rec(&info, 0, -1, i as i32, 1));
                             if samples.len() >= MAX {
                                 break 'outer;
                             }
@@ -22807,8 +22807,8 @@ fn find_samples(
                     do_tl = false;
                 }
                 if let Some(info) = left {
-                    if single_ref_match(info) {
-                        samples.push(rec(info, row_offset as i32, 1, 0, -1));
+                    if single_ref_match(&info) {
+                        samples.push(rec(&info, row_offset as i32, 1, 0, -1));
                         if samples.len() >= MAX {
                             break 'outer;
                         }
@@ -22821,8 +22821,8 @@ fn find_samples(
                     let cell = grid.get(mi_row + i, mi_col - 1);
                     let sh = cell.map_or(1, |c| c.size_h as usize).max(1);
                     if let Some(info) = cell {
-                        if single_ref_match(info) {
-                            samples.push(rec(info, i as i32, 1, 0, -1));
+                        if single_ref_match(&info) {
+                            samples.push(rec(&info, i as i32, 1, 0, -1));
                             if samples.len() >= MAX {
                                 break 'outer;
                             }
@@ -22835,8 +22835,8 @@ fn find_samples(
 
         if do_tl && left_available && up_available {
             if let Some(info) = grid.get(mi_row - 1, mi_col - 1) {
-                if single_ref_match(info) {
-                    samples.push(rec(info, 0, -1, 0, -1));
+                if single_ref_match(&info) {
+                    samples.push(rec(&info, 0, -1, 0, -1));
                     if samples.len() >= MAX {
                         break 'outer;
                     }
@@ -22859,8 +22859,8 @@ fn find_samples(
             let tr_col = mi_col + bw4;
             if mi_row > 0 && tr_col < mi_cols {
                 if let Some(info) = grid.get(mi_row - 1, tr_col) {
-                    if single_ref_match(info) {
-                        samples.push(rec(info, 0, -1, bw4 as i32, 1));
+                    if single_ref_match(&info) {
+                        samples.push(rec(&info, 0, -1, bw4 as i32, 1));
                     }
                 }
             }
@@ -23394,7 +23394,7 @@ fn obmc_blend(
         let above_syms = neighbours.above_filter[mi_col + src4];
         obmcrec_probe(
             "above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, above_syms,
-            grid.get(mi_row - 1, mi_col + src4).copied(), interp_fixed.is_some(),
+            grid.get(mi_row - 1, mi_col + src4), interp_fixed.is_some(),
         );
         let (h_kind, v_kind) = neighbour_filter(interp_fixed, above_syms)?;
         ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
@@ -23406,7 +23406,7 @@ fn obmc_blend(
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
         // lane-t900 r14: the prediction is `op_mi_size` wide (kernel choice
         // included); only the WRITE is clipped to this block's own buffer.
-        obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale, &mut tmp_y, fctx);
+        obmc_neighbour_pred(ny, px + ox, py, mv32(nb.mv), bw, bh, true, h_kind, v_kind, nb_scale, &mut tmp_y, fctx);
         obmc_blend_v(pred_y, side, ox, 0, bw.min(write_w - ox), bh, bw, &tmp_y);
         if !skip_chroma_above {
             // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
@@ -23418,9 +23418,9 @@ fn obmc_blend(
             // 13 B -> 11007 B.
             let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
             let cw = cbw.min(write_w / 2 - cox);
-            obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_u, fctx);
+            obmc_neighbour_pred(nu, cpx + cox, cpy, mv32(nb.mv), cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_u, fctx);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
-            obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_v, fctx);
+            obmc_neighbour_pred(nv, cpx + cox, cpy, mv32(nb.mv), cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_v, fctx);
             obmc_blend_v(pred_v, chroma_side, cox, 0, cw, cbh, cbw, &tmp_v);
         }
     }
@@ -23430,7 +23430,7 @@ fn obmc_blend(
         let left_syms = neighbours.left_filter[mi_row + src4];
         obmcrec_probe(
             "left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, left_syms,
-            grid.get(mi_row + src4, mi_col - 1).copied(), interp_fixed.is_some(),
+            grid.get(mi_row + src4, mi_col - 1), interp_fixed.is_some(),
         );
         let (h_kind, v_kind) = neighbour_filter(interp_fixed, left_syms)?;
         ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
@@ -23440,10 +23440,10 @@ fn obmc_blend(
             OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
         }
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
-        obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale, &mut tmp_y, fctx);
+        obmc_neighbour_pred(ny, px, py + oy, mv32(nb.mv), bw, bh, true, h_kind, v_kind, nb_scale, &mut tmp_y, fctx);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh.min(write_h - oy), &tmp_y);
         let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
-        obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_u, fctx);
+        obmc_neighbour_pred(nu, cpx, cpy + coy, mv32(nb.mv), cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_u, fctx);
         if let Some((_, _, idx)) = ec_mcb {
             eprintln!(
                 "OUR_MCB left f={idx} off4={off4} span4={span4} cbw={cbw} cbh={cbh} coy={coy} mv=({},{}) ref0={}",
@@ -23456,7 +23456,7 @@ fn obmc_blend(
         }
         let ch = cbh.min(write_h / 2 - coy);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
-        obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_v, fctx);
+        obmc_neighbour_pred(nv, cpx, cpy + coy, mv32(nb.mv), cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_v, fctx);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
@@ -24381,8 +24381,8 @@ fn decode_inter_block(
                     is_inter: true,
                     ref_frame: ref0,
                     ref_frame1: ref1,
-                    mv1,
-                    mv: mv0,
+                    mv1: mv16(mv1),
+                    mv: mv16(mv0),
                     is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                     size: bw4 as u8,
                     size_h: bh4 as u8,
@@ -25955,7 +25955,7 @@ fn decode_inter_block(
                     // num_proj_ref.
                     ref_frame1: if interintra_mode.is_some() { 0 } else { NO_REF1 },
                     mv1: (0, 0),
-                    mv,
+                    mv: mv16(mv),
                     is_new_mv,
                     size: bw4 as u8,
                     size_h: bh4 as u8,
@@ -27934,7 +27934,7 @@ fn decode_inter_sub8_split4(
                 ref_frame,
                 ref_frame1: NO_REF1,
                 mv1: (0, 0),
-                mv,
+                mv: mv16(mv),
                 is_new_mv,
                 size: 1,
                 size_h: 1,
@@ -29177,7 +29177,7 @@ fn grid_stamp_rect(
             ref_frame,
             ref_frame1: NO_REF1,
             mv1: (0, 0),
-            mv,
+            mv: mv16(mv),
             is_new_mv,
             size: w_mi as u8,
             size_h: h_mi as u8,
@@ -29755,8 +29755,8 @@ fn decode_inter_block8(
                         is_inter: true,
                         ref_frame: ref0,
                         ref_frame1: ref1,
-                        mv1,
-                        mv: mv0,
+                        mv1: mv16(mv1),
+                        mv: mv16(mv0),
                         is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                         size: 2,
                         size_h: 2,
@@ -30433,7 +30433,7 @@ fn decode_inter_block8(
                 // them out of warp-sample gathering (see 16/32 site).
                 ref_frame1: if interintra_mode.is_some() { 0 } else { NO_REF1 },
                 mv1: (0, 0),
-                mv,
+                mv: mv16(mv),
                 is_new_mv,
                 size: 2,
                 size_h: 2,
@@ -35711,12 +35711,12 @@ mod tests {
 
         let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
         let (above_mv, left_mv) = ((4, 4), (8, 8));
-        let neighbour = |mv| MiInfo {
+        let neighbour = |mv: (i32, i32)| MiInfo {
             is_inter: true,
             ref_frame: LAST_FRAME,
             ref_frame1: NO_REF1,
             mv1: (0, 0),
-            mv,
+            mv: mv16(mv),
             is_new_mv: false,
             size: 1,
             size_h: 1,
