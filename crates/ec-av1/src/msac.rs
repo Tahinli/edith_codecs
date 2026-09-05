@@ -229,6 +229,7 @@ impl SymbolEncoder {
 /// The CDF adaptation of spec 8.3.2: every boundary moves a `rate`-dependent
 /// fraction of the way towards the extreme the observed symbol implies, and the
 /// counter in the last entry slows the rate down for the first 32 symbols.
+#[inline]
 fn update_cdf(cdf: &mut [u16], symbol: usize) {
     let nsyms = cdf.len() - 1;
     let count = cdf[nsyms];
@@ -253,6 +254,15 @@ pub struct SymbolDecoder<'a> {
     data: &'a [u8],
     /// Next bit to read, as a bit offset into `data`.
     bit: usize,
+    /// The bits from `bit` onward, left-aligned at the MSB, zero past the end
+    /// of `data`; only the top `win_bits` are valid. The renormalisation of
+    /// every symbol read one to fifteen bits, and assembling them out of
+    /// `data` per read was five byte loads and two variable shifts each; the
+    /// window pays that once per eight bytes instead.
+    win: u64,
+    win_bits: u32,
+    /// Next byte of `data` to shift into `win`.
+    pos: usize,
     value: u32,
     range: u32,
     /// Bits left before the decoder starts padding with zeros (spec
@@ -267,6 +277,9 @@ impl<'a> SymbolDecoder<'a> {
         let mut d = SymbolDecoder {
             data,
             bit: 0,
+            win: 0,
+            win_bits: 0,
+            pos: 0,
             value: 0,
             range: 1 << 15,
             max_bits: 8 * data.len() as i32 - 15,
@@ -278,26 +291,51 @@ impl<'a> SymbolDecoder<'a> {
     }
 
     /// `f(n)`: the next `n` bits, most significant first, zero past the end.
+    #[inline]
     fn f(&mut self, n: u32) -> u32 {
         debug_assert!(n <= 32, "f(n) reads at most 32 bits");
         if n == 0 {
             return 0;
         }
-        // The bit-at-a-time form of this loop was the renormalisation cost
-        // inside every `symbol_fixed`. Five bytes cover any 32-bit field at
-        // any bit offset, and a byte past the end reads as zero exactly as
-        // the per-bit `unwrap_or(0)` did.
-        let start = self.bit >> 3;
-        let off = (self.bit & 7) as u32;
-        let mut acc = 0u64;
-        for k in 0..5 {
-            acc = (acc << 8) | u64::from(self.data.get(start + k).copied().unwrap_or(0));
+        if self.win_bits < n {
+            self.refill();
         }
+        let v = (self.win >> (64 - n)) as u32;
+        self.win <<= n;
+        self.win_bits -= n;
         self.bit += n as usize;
-        ((acc >> (40 - off - n)) & ((1u64 << n) - 1)) as u32
+        v
+    }
+
+    /// Tops the window back up to at least 57 bits, reading bytes past the end
+    /// of `data` as zero exactly as the per-read `unwrap_or(0)` did.
+    fn refill(&mut self) {
+        while self.win_bits <= 56 {
+            let byte = self.data.get(self.pos).copied().unwrap_or(0);
+            self.pos += 1;
+            self.win |= u64::from(byte) << (56 - self.win_bits);
+            self.win_bits += 8;
+        }
+    }
+
+    /// Repositions the window at an arbitrary bit offset (the `f(n)` test's
+    /// only way in now that `bit` alone no longer names the read position).
+    #[cfg(test)]
+    fn seek_bits(&mut self, bit: usize) {
+        self.bit = bit;
+        self.pos = bit >> 3;
+        self.win = 0;
+        self.win_bits = 0;
+        let skip = (bit & 7) as u32;
+        if skip > 0 {
+            self.refill();
+            self.win <<= skip;
+            self.win_bits -= skip;
+        }
     }
 
     /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
+    #[inline]
     pub fn symbol(&mut self, cdf: &mut [u16]) -> usize {
         let s = self.symbol_fixed(cdf);
         update_cdf(cdf, s);
@@ -307,23 +345,27 @@ impl<'a> SymbolDecoder<'a> {
     /// `decode_symbol`, without the adaptation of 8.3.2 — the form the spec
     /// uses for the literal and equiprobable reads, mirroring
     /// [`SymbolEncoder::symbol_fixed`].
+    #[inline]
     pub fn symbol_fixed(&mut self, cdf: &[u16]) -> usize {
         let nsyms = cdf.len() - 1;
         let mut cur = self.range;
-        let mut prev;
-        let mut symbol = 0;
+        let mut prev = cur;
+        // The last boundary is always `CDF_TOP`, whose `cur` is 0, so the walk
+        // always stops inside the alphabet; iterating the slice instead of
+        // indexing it says so to the bounds checker.
+        let mut symbol = nsyms - 1;
         // Loop-invariant: the coder's range does not move until the symbol is
         // chosen, so its top byte is computed once rather than per candidate.
         let base = self.range >> 8;
-        loop {
+        for (i, &c) in cdf[..nsyms].iter().enumerate() {
             prev = cur;
-            let f = u32::from(CDF_TOP - cdf[symbol]);
+            let f = u32::from(CDF_TOP - c);
             cur = ((base * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
-                + EC_MIN_PROB * (nsyms - 1 - symbol) as u32;
+                + EC_MIN_PROB * (nsyms - 1 - i) as u32;
             if self.value >= cur {
+                symbol = i;
                 break;
             }
-            symbol += 1;
         }
         self.range = prev - cur;
         self.value -= cur;
@@ -390,7 +432,7 @@ pub(crate) mod tests {
         for start in 0..(data.len() * 8 + 16) {
             for n in 0..=32u32 {
                 let mut d = SymbolDecoder::new(&data);
-                d.bit = start;
+                d.seek_bits(start);
                 let got = d.f(n);
                 assert_eq!(got, per_bit(start, n), "start {start} width {n}");
                 assert_eq!(d.bit, start + n as usize, "start {start} width {n} advance");
