@@ -152,12 +152,6 @@ impl Edges {
         bh: usize, fctx: &crate::decode::FrameCtx,
     ) -> Self {
         let want = bw + bh;
-        let extend = |samples: &[u16]| {
-            let mut row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
-            let last = *row.last().expect("an edge that exists has samples");
-            row.resize(want, last);
-            row
-        };
         // Spec 7.11.2.2's no-neighbour fallback is `base = 1 << (BitDepth - 1)`
         // (128 at 8-bit): `base - 1` above, `base + 1` left, `base` corner
         // (libaom `reconintra.c`'s own diagram: the shared top-left corner
@@ -167,31 +161,33 @@ impl Edges {
         // 127/129 for the corner instead and made a passing 16x16 fixture
         // regress, which is what caught the misreading).
         let base = 1i32 << (crate::decode::bit_depth(fctx) - 1);
-        let above_row = match (above, left) {
-            (Some(a), _) => extend(a),
-            (None, Some(l)) => vec![i32::from(l[0]); want],
-            (None, None) => vec![base - 1; want],
-        };
-        let left_col = match (left, above) {
-            (Some(l), _) => extend(l),
-            (None, Some(a)) => vec![i32::from(a[0]); want],
-            (None, None) => vec![base + 1; want],
-        };
         let corner = match (corner, above, left) {
             (Some(c), Some(_), Some(_)) => i32::from(c),
             (_, Some(a), _) => i32::from(a[0]),
             (_, None, Some(l)) => i32::from(l[0]),
             (_, None, None) => base,
         };
-        let with_corner = |edge: Vec<i32>| {
-            let mut v = Vec::with_capacity(want + 1);
+        // lane-alloc: one allocation per edge instead of four (collect, grow,
+        // then a second buffer to prepend the corner) -- the corner goes in
+        // first and the samples are extended/truncated to `want` in place, so
+        // the contents are what `extend` + `with_corner` produced before.
+        let build_edge = |samples: Option<&[u16]>, other: Option<&[u16]>, none_fill: i32| {
+            let mut v: Vec<i32> = Vec::with_capacity(want + 1);
             v.push(corner);
-            v.extend(edge);
+            match (samples, other) {
+                (Some(s), _) => {
+                    v.extend(s.iter().map(|&x| i32::from(x)));
+                    let last = *v.last().expect("an edge that exists has samples");
+                    v.resize(want + 1, last);
+                }
+                (None, Some(o)) => v.resize(want + 1, i32::from(o[0])),
+                (None, None) => v.resize(want + 1, none_fill),
+            }
             v
         };
         Self {
-            above: with_corner(above_row),
-            left: with_corner(left_col),
+            above: build_edge(above, left, base - 1),
+            left: build_edge(left, above, base + 1),
         }
     }
 
@@ -302,7 +298,7 @@ pub(crate) fn predict(
             let n_left = left.map_or(0, |a| a.len().min(bh));
             directional(
                 angle as u16,
-                &edges,
+                edges,
                 bw,
                 bh,
                 enable_edge_filter,
@@ -491,7 +487,7 @@ fn upsample_intra_edge(buf: &[i32], fctx: &crate::decode::FrameCtx) -> Vec<i32> 
 #[allow(clippy::too_many_arguments)]
 fn directional(
     angle: u16,
-    edges: &Edges,
+    edges: Edges,
     bw: usize,
     bh: usize,
     enable_edge_filter: bool,
@@ -507,9 +503,10 @@ fn directional(
     let need_right = angle < 90;
     let need_bottom = angle > 180;
 
-    // Spec position `-1..=w + h - 1`, `above[0]`/`left[0]` the shared corner.
-    let mut above: Vec<i32> = (-1..reach).map(|p| edges.above(p)).collect();
-    let mut left: Vec<i32> = (-1..reach).map(|p| edges.left(p)).collect();
+    // Spec position `-1..=w + h - 1`, `above[0]`/`left[0]` the shared corner:
+    // that is exactly `Edges`' own layout (lane-alloc), so take the buffers
+    // rather than copying them into two fresh ones per directional block.
+    let Edges { mut above, mut left } = edges;
 
     if enable_edge_filter && angle != 90 && angle != 180 {
         if need_above && need_left && reach >= 24 {
