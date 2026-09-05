@@ -21985,7 +21985,8 @@ fn overlappable_above(
     mi_cols: usize,
     max_neighbors: usize,
 ) -> Vec<(usize, usize, MiInfo, usize)> {
-    let mut out = Vec::new();
+    // lane-alloc: bounded by `max_neighbors`, so size it once.
+    let mut out = Vec::with_capacity(max_neighbors);
     if mi_row == 0 {
         return out;
     }
@@ -22037,7 +22038,8 @@ fn overlappable_left(
     mi_rows: usize,
     max_neighbors: usize,
 ) -> Vec<(usize, usize, MiInfo, usize)> {
-    let mut out = Vec::new();
+    // lane-alloc: bounded by `max_neighbors`, so size it once.
+    let mut out = Vec::with_capacity(max_neighbors);
     if mi_col == 0 {
         return out;
     }
@@ -22115,8 +22117,11 @@ fn find_samples(
     // sample candidates in libaom's own order (above, left, top-left,
     // top-right) -- `num_proj_ref >= 1` is what picks the 3-symbol
     // motion_mode alphabet over the 2-symbol obmc one.
-    let proj_dbg = crate::envflags::var("EC_PROJ_MI")
-        .is_ok_and(|v| v == format!("{mi_row},{mi_col}"));
+    // lane-alloc: the `format!` (and the map lookup's `String` clone) ran on
+    // every warp block; the flag itself is a process constant.
+    let proj_dbg = crate::envflags::env_flag!("EC_PROJ_MI")
+        && crate::envflags::var("EC_PROJ_MI")
+            .is_ok_and(|v| v == format!("{mi_row},{mi_col}"));
     let single_ref_match = |info: &MiInfo| {
         let m = info.ref_frame == ref_frame && info.ref_frame1.is_none();
         if proj_dbg {
@@ -22395,9 +22400,15 @@ fn obmc_neighbour_pred(
     // reference (derived from luma widths, applied unchanged to chroma whose
     // x_q4 is already in its own plane's pixel units). `REF_NO_SCALE` takes
     // the ordinary stride-1 path bit-exact.
-    x_scale_fp: i64, fctx: &crate::decode::FrameCtx,
-) -> Vec<u16> {
-    let mut out = vec![0u16; w * h];
+    x_scale_fp: i64,
+    // lane-alloc: the caller keeps one buffer per plane and reuses it across
+    // every neighbour of both passes -- this was a fresh `vec![0u16; w * h]`
+    // per neighbour per plane.
+    out: &mut Vec<u16>,
+    fctx: &crate::decode::FrameCtx,
+) {
+    out.clear();
+    out.resize(w * h, 0);
     if x_scale_fp == mc::REF_NO_SCALE {
         mc::predict_with_filters(
             &refplane.data,
@@ -22410,7 +22421,7 @@ fn obmc_neighbour_pred(
             h,
             h_kind,
             v_kind,
-            &mut out, fctx,
+            out, fctx,
         );
     } else {
         mc::predict_scaled(
@@ -22425,10 +22436,9 @@ fn obmc_neighbour_pred(
             h,
             h_kind,
             v_kind,
-            &mut out, fctx,
+            out, fctx,
         );
     }
-    out
 }
 
 /// Blends `tmp` into `dst` (stride `stride`) at `(ox, oy)`, mask varying by
@@ -22717,11 +22727,17 @@ fn obmc_blend(
     // BLOCK_4X4/8X4/4X8 (an 8x8, 16x8 or 8x16 luma block at 4:2:0): the
     // ABOVE pass skips chroma entirely, the LEFT pass still blends it.
     let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
+    // lane-alloc: one neighbour-prediction buffer per plane for the whole
+    // block, reused by every neighbour of the above and left passes.
+    let (mut tmp_y, mut tmp_u, mut tmp_v) = (Vec::new(), Vec::new(), Vec::new());
 
     // lane-t900 r13 rung: EC_MCB="<plane>:<px>:<py>[:<frame>]" (chroma plane
     // 1 only) prints this block's chroma prediction rows before and after the
     // OBMC blend, matching the instrumented aomdec's EC_MCB dump.
-    let ec_mcb: Option<(usize, usize, i64)> = crate::envflags::var("EC_MCB").ok().and_then(|v| {
+    let ec_mcb: Option<(usize, usize, i64)> = crate::envflags::env_flag!("EC_MCB")
+        .then(|| crate::envflags::var("EC_MCB").ok())
+        .flatten()
+        .and_then(|v| {
         let f: Vec<&str> = v.split(':').collect();
         if f.len() < 3 || f[0] != "1" {
             return None;
@@ -22774,7 +22790,7 @@ fn obmc_blend(
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
         // lane-t900 r14: the prediction is `op_mi_size` wide (kernel choice
         // included); only the WRITE is clipped to this block's own buffer.
-        let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale, fctx);
+        obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale, &mut tmp_y, fctx);
         obmc_blend_v(pred_y, side, ox, 0, bw.min(write_w - ox), bh, bw, &tmp_y);
         if !skip_chroma_above {
             // lane-t900 r13 (measured, NOT a defect): libaom's min-4 clamp
@@ -22786,9 +22802,9 @@ fn obmc_blend(
             // 13 B -> 11007 B.
             let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
             let cw = cbw.min(write_w / 2 - cox);
-            let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, fctx);
+            obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_u, fctx);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cw, cbh, cbw, &tmp_u);
-            let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, fctx);
+            obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_v, fctx);
             obmc_blend_v(pred_v, chroma_side, cox, 0, cw, cbh, cbw, &tmp_v);
         }
     }
@@ -22808,10 +22824,10 @@ fn obmc_blend(
             OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
         }
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
-        let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale, fctx);
+        obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale, &mut tmp_y, fctx);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh.min(write_h - oy), &tmp_y);
         let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
-        let tmp_u = obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, fctx);
+        obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_u, fctx);
         if let Some((_, _, idx)) = ec_mcb {
             eprintln!(
                 "OUR_MCB left f={idx} off4={off4} span4={span4} cbw={cbw} cbh={cbh} coy={coy} mv=({},{}) ref0={}",
@@ -22824,7 +22840,7 @@ fn obmc_blend(
         }
         let ch = cbh.min(write_h / 2 - coy);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, ch, &tmp_u);
-        let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, fctx);
+        obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale, &mut tmp_v, fctx);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, ch, &tmp_v);
     }
     if let Some((_, _, idx)) = ec_mcb {
