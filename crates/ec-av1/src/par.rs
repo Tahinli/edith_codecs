@@ -122,14 +122,17 @@ where
         [] => {}
         [(a, b)] => f(*a, *b, fctx),
         [(a0, b0), rest @ ..] => {
-            std::thread::scope(|s| {
-                for &(a, b) in rest {
-                    let ctx = crate::decode::filter_ctx_copy(fctx);
-                    let f = &f;
-                    s.spawn(move || f(a, b, &ctx));
-                }
-                f(*a0, *b0, fctx);
-            });
+            // lane-pool1: same shape as the `thread::scope` this replaced --
+            // band 0 inline, the rest on this thread's persistent pool, all
+            // waited out by `batch`'s drop at the end of the block.
+            let batch = Batch::new();
+            for &(a, b) in rest {
+                let ctx = crate::decode::filter_ctx_copy(fctx);
+                let f = &f;
+                batch.submit(move || f(a, b, &ctx));
+            }
+            f(*a0, *b0, fctx);
+            drop(batch);
         }
     }
 }
@@ -160,4 +163,182 @@ pub(crate) fn recon_threads() -> usize {
 #[cfg(test)]
 pub(crate) fn set_recon_threads(n: usize) {
     RECON_THREADS.store(n.clamp(1, 64), std::sync::atomic::Ordering::Relaxed);
+}
+
+// --- lane-pool1: persistent worker pools ---------------------------------
+//
+// Every threaded stage of the decoder used to spawn its threads per unit of
+// work: one `thread::scope` per filter STAGE per frame, `EC_AV1_RECON_THREADS`
+// workers per TILE, one frame worker per coded frame -- 2363 distinct threads
+// in a 13 s 4K decode. The cost is not the clone of the thread itself but what
+// dies with it: every `thread_local!` scratch pool in `decode.rs` (planes,
+// rows, dq, mc, wiener, sgr) is allocated and faulted in again on each new
+// thread, which is where the 3.65 M page faults and the 2.7x malloc traffic of
+// the composed setting came from.
+//
+// The replacement is one pool per POOL-OWNING THREAD, kept in a thread-local
+// and joined when that thread exits: a stage submits a [`Batch`] of jobs, the
+// pool hands each to an idle worker (growing to `busy + queued` so a job never
+// queues behind a blocking one -- the recon wavefront's workers block on their
+// dependencies), and the batch's `Drop` waits every job out. Scratch then
+// lives as long as the worker, not as long as the frame.
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+struct PoolQ {
+    jobs: std::collections::VecDeque<Job>,
+    /// Jobs handed to a worker and not yet finished.
+    busy: usize,
+    closed: bool,
+}
+
+struct PoolInner {
+    q: std::sync::Mutex<PoolQ>,
+    cv: std::sync::Condvar,
+}
+
+struct Pool {
+    inner: std::sync::Arc<PoolInner>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+fn pool_worker(inner: &PoolInner) {
+    let mut q = inner.q.lock().unwrap();
+    loop {
+        if let Some(job) = q.jobs.pop_front() {
+            q.busy += 1;
+            drop(q);
+            // A job's own panic is captured by the batch wrapper below, so
+            // this only guards against a wrapper that itself unwinds.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            q = inner.q.lock().unwrap();
+            q.busy -= 1;
+            continue;
+        }
+        if q.closed {
+            return;
+        }
+        q = inner.cv.wait(q).unwrap();
+    }
+}
+
+impl Pool {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(PoolInner {
+                q: std::sync::Mutex::new(PoolQ {
+                    jobs: std::collections::VecDeque::new(),
+                    busy: 0,
+                    closed: false,
+                }),
+                cv: std::sync::Condvar::new(),
+            }),
+            handles: Vec::new(),
+        }
+    }
+
+    /// Queues `job` and makes sure a worker is free for it: the pool grows to
+    /// `busy + queued` threads and never shrinks, so a submitted job always
+    /// starts, even when every other running job is blocked waiting for it.
+    fn push(&mut self, job: Job) {
+        let want = {
+            let mut q = self.inner.q.lock().unwrap();
+            q.jobs.push_back(job);
+            q.busy + q.jobs.len()
+        };
+        while self.handles.len() < want {
+            let inner = std::sync::Arc::clone(&self.inner);
+            self.handles
+                .push(std::thread::spawn(move || pool_worker(&inner)));
+        }
+        self.inner.cv.notify_one();
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.inner.q.lock().unwrap().closed = true;
+        self.inner.cv.notify_all();
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+thread_local! {
+    /// This thread's pool, created on its first [`Batch::submit`] and joined
+    /// when the thread exits (the process's main thread may skip that
+    /// destructor, in which case the idle workers die with the process).
+    static POOL: std::cell::RefCell<Option<Pool>> = const { std::cell::RefCell::new(None) };
+}
+
+struct BatchState {
+    left: std::sync::Mutex<usize>,
+    cv: std::sync::Condvar,
+    panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+/// A set of jobs running on the submitting thread's pool. `Drop` waits for
+/// every one of them and re-raises the first panic, which is what makes
+/// [`Batch::submit`]'s borrow of non-`'static` data sound -- exactly
+/// `thread::scope`'s contract, minus the spawns.
+///
+/// corner-cut: soundness rests on this `Drop` running; `std::mem::forget` of a
+/// `Batch` would let a job outlive its borrows. The type is crate-private and
+/// every construction site below binds it to a local. Upgrade path is the
+/// closure-taking `scope(|s| ...)` shape, which costs every caller a level of
+/// indentation for the same guarantee.
+pub(crate) struct Batch<'a> {
+    st: std::sync::Arc<BatchState>,
+    _p: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Batch<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            st: std::sync::Arc::new(BatchState {
+                left: std::sync::Mutex::new(0),
+                cv: std::sync::Condvar::new(),
+                panic: std::sync::Mutex::new(None),
+            }),
+            _p: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn submit<F: FnOnce() + Send + 'a>(&self, f: F) {
+        *self.st.left.lock().unwrap() += 1;
+        let st = std::sync::Arc::clone(&self.st);
+        let job: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            if let Err(p) = r {
+                let mut slot = st.panic.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(p);
+                }
+            }
+            let mut left = st.left.lock().unwrap();
+            *left -= 1;
+            st.cv.notify_all();
+        });
+        // SAFETY: the job is dropped before `Batch::drop` returns (it waits
+        // for `left == 0`), and `Batch<'a>` cannot outlive `'a`, so the
+        // laundered lifetime is never observed past the real one.
+        let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(job) };
+        POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            p.get_or_insert_with(Pool::new).push(job);
+        });
+    }
+}
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        let mut left = self.st.left.lock().unwrap();
+        while *left > 0 {
+            left = self.st.cv.wait(left).unwrap();
+        }
+        drop(left);
+        if let Some(p) = self.st.panic.lock().unwrap().take() {
+            std::panic::resume_unwind(p);
+        }
+    }
 }
