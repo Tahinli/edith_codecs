@@ -22227,6 +22227,21 @@ impl PlaneBuf<'_> {
         // three row bases are computed once per row instead of a
         // multiply-add per sample (the samples themselves are unchanged).
         let max = crate::decode::sample_max(fctx);
+        // lane-recoparse: an all-zero residual (60% of the units) is a plain
+        // prediction copy -- the same arithmetic with `r == 0`, without
+        // reading `side * h` zeros out of [`ZERO_RESIDUAL`].
+        if residual.is_empty() {
+            for row in 0..h {
+                let src = row * side;
+                let dst = (y + row) * self.width + x;
+                let pred = &prediction[src..src + w];
+                let out = &mut self.data.to_mut()[dst..dst + w];
+                for (o, &p) in out.iter_mut().zip(pred) {
+                    *o = i32::from(p).clamp(0, max) as u16;
+                }
+            }
+            return;
+        }
         let residual = dense_residual(residual, side * h);
         for row in 0..h {
             let src = row * side;
