@@ -908,7 +908,9 @@ pub fn find_mv_stack_with_sign_bias(
     gm: &GmMvTable,
     tpl: Option<TplArgs>,
 ) -> MvStack {
-    let mut candidates = Vec::new();
+    // lane-alloc: the stack is capped at MAX_STACK_SIZE entries, so the pushes
+    // below grew (and memcpy'd) a fresh allocation up to 4 times per block.
+    let mut candidates = Vec::with_capacity(MAX_STACK_SIZE);
     let mut newmv_count = 0u32;
 
     // libaom's `max_row_offset`/`max_col_offset` (`setup_ref_mv_list`): how
@@ -1724,7 +1726,7 @@ pub fn find_mv_stack_compound(
     gm: &GmMvTable,
     tpl: Option<CompoundTplArgs>,
 ) -> CompoundMvStack {
-    let mut candidates: Vec<CompoundStackEntry> = Vec::new();
+    let mut candidates: Vec<CompoundStackEntry> = Vec::with_capacity(MAX_STACK_SIZE);
     let mut newmv_count = 0u32;
 
     let row_adj = bh4 < 2 && mi_row % 2 == 1;
