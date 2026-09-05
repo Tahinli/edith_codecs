@@ -10,6 +10,7 @@
 //! Every constant and the 64x8 `av1_resize_filter_normative` coefficient
 //! table below is copied verbatim from libaom `aom_dsp/aom_filter.h` and
 //! `av1/common/resize.c` (`AOM_VERSION=v3.13.3`, `~/.cache/aom-oracle`).
+use crate::hits::hit;
 
 /// `RS_SUBPEL_BITS`.
 const RS_SUBPEL_BITS: u32 = 6;
@@ -184,7 +185,7 @@ pub(crate) fn superres_hits() -> usize {
 
 /// Counts one whole upscaled picture (all three planes) for [`SUPERRES_HITS`].
 pub(crate) fn note_upscaled_picture() {
-    SUPERRES_HITS.with(|c| c.set(c.get() + 1));
+    hit!(SUPERRES_HITS);
 }
 
 #[cfg(test)]
