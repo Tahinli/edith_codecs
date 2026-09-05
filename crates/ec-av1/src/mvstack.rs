@@ -196,11 +196,11 @@ pub struct MiInfo {
     /// inter -- libaom's `scan_row_mbmi` advances `processed_rows` from any
     /// candidate's `bsize` regardless of whether it also casts a vote (that
     /// requires a ref-frame match, checked separately in `add_ref_mv_candidate`).
-    pub size: usize,
+    pub size: u8,
     /// The unit's height in 4x4 mi cells (== `size` for every square block;
     /// differs only for rect partition strips, lane-rect r2). Row scans step
     /// and weight by `size` (width), column scans by `size_h`.
-    pub size_h: usize,
+    pub size_h: u8,
 }
 
 /// The whole frame's `mi` grid, one [`MiInfo`] per 4x4 unit, in raster order.
@@ -549,7 +549,7 @@ fn scan_row(
             i += 1;
             continue;
         };
-        let n4 = info.size;
+        let n4 = info.size as usize;
         let mut len = bw4.min(n4);
         if use_step_16 {
             len = len.max(4);
@@ -561,7 +561,7 @@ fn scan_row(
         // `xd->width >= mi_size_wide[BLOCK_8X8]` as well: a 4-wide block (a 1:4
         // strip, a sub-8x8 leaf) keeps weight 2 and leaves `processed_rows` alone.
         if bw4 >= 2 && bw4 <= n4 {
-            let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h);
+            let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h as usize);
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
@@ -637,7 +637,7 @@ fn scan_col(
             i += 1;
             continue;
         };
-        let n4 = info.size_h;
+        let n4 = info.size_h as usize;
         let mut len = bh4.min(n4);
         if use_step_16 {
             len = len.max(4);
@@ -649,7 +649,7 @@ fn scan_col(
         // mi_size_high[BLOCK_8X8]` gates this branch, so a 4-high block keeps
         // weight 2 and leaves `processed_cols` alone.
         if bh4 >= 2 && bh4 <= n4 {
-            let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size);
+            let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size as usize);
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
@@ -1217,7 +1217,7 @@ pub fn find_mv_stack_with_sign_bias(
         let mut idx = 0usize;
         while idx < mi_size && candidates.len() < MAX_MV_REF_CANDIDATES {
             let cand = grid.get(mi_row - 1, mi_col + idx);
-            let step = cand.map_or(1, |c| c.size).max(1);
+            let step = cand.map_or(1, |c| c.size as usize).max(1);
             if let Some(c) = cand {
                 process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
             }
@@ -1228,7 +1228,7 @@ pub fn find_mv_stack_with_sign_bias(
         let mut idx = 0usize;
         while idx < mi_size && candidates.len() < MAX_MV_REF_CANDIDATES {
             let cand = grid.get(mi_row + idx, mi_col - 1);
-            let step = cand.map_or(1, |c| c.size_h).max(1);
+            let step = cand.map_or(1, |c| c.size_h as usize).max(1);
             if let Some(c) = cand {
                 process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
             }
@@ -1441,7 +1441,7 @@ fn scan_row_compound(
             i += 1;
             continue;
         };
-        let n4 = info.size;
+        let n4 = info.size as usize;
         let mut len = bw4.min(n4);
         if use_step_16 {
             len = len.max(4);
@@ -1453,7 +1453,7 @@ fn scan_row_compound(
         // `xd->width >= mi_size_wide[BLOCK_8X8]` as well: a 4-wide block (a 1:4
         // strip, a sub-8x8 leaf) keeps weight 2 and leaves `processed_rows` alone.
         if bw4 >= 2 && bw4 <= n4 {
-            let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h);
+            let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h as usize);
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
@@ -1504,7 +1504,7 @@ fn scan_col_compound(
             i += 1;
             continue;
         };
-        let n4 = info.size_h;
+        let n4 = info.size_h as usize;
         let mut len = bh4.min(n4);
         if use_step_16 {
             len = len.max(4);
@@ -1516,7 +1516,7 @@ fn scan_col_compound(
         // mi_size_high[BLOCK_8X8]` gates this branch, so a 4-high block keeps
         // weight 2 and leaves `processed_cols` alone.
         if bh4 >= 2 && bh4 <= n4 {
-            let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size);
+            let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size as usize);
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
@@ -1995,7 +1995,7 @@ pub fn find_mv_stack_compound(
             let mut idx = 0usize;
             while idx < mi_size {
                 let cand = grid.get(mi_row - 1, mi_col + idx);
-                let step = cand.map_or(1, |c| c.size).max(1);
+                let step = cand.map_or(1, |c| c.size as usize).max(1);
                 if let Some(c) = cand {
                     process_compound_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut lists);
                 }
@@ -2006,7 +2006,7 @@ pub fn find_mv_stack_compound(
             let mut idx = 0usize;
             while idx < mi_size {
                 let cand = grid.get(mi_row + idx, mi_col - 1);
-                let step = cand.map_or(1, |c| c.size_h).max(1);
+                let step = cand.map_or(1, |c| c.size_h as usize).max(1);
                 if let Some(c) = cand {
                     process_compound_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut lists);
                 }
@@ -2390,6 +2390,19 @@ pub(crate) fn comp_reference_type_ctx(
 
 #[cfg(test)]
 mod tests {
+    /// lane-mi: a 4K frame's grid is ~518k cells, refilled per frame, and
+    /// every mv-stack scan walks it -- `size`/`size_h` as `u8` keep the
+    /// option under 32 bytes. Widening a field here is a measurable
+    /// regression, not a free change.
+    #[test]
+    fn mi_info_stays_small_enough_for_a_4k_grid() {
+        assert!(
+            std::mem::size_of::<Option<MiInfo>>() <= 32,
+            "Option<MiInfo> grew to {} bytes",
+            std::mem::size_of::<Option<MiInfo>>()
+        );
+    }
+
     use super::*;
 
     fn inter(mv: (i32, i32)) -> MiInfo {
