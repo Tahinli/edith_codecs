@@ -204,7 +204,7 @@ use crate::mvstack::{
     single_ref_p6_ctx, uni_comp_ref_p1_ctx,
 };
 use crate::tile::{INTRA_MODE_CTX, block_grid, has_half};
-use crate::transform::{TxType, dequant_and_inverse_typed, dequant_and_inverse_typed_wh};
+use crate::transform::{TxType, dequant_and_inverse_typed_wh};
 
 const PARTITION_NONE: usize = 0;
 const PARTITION_HORZ: usize = 1;
@@ -2057,6 +2057,61 @@ fn cfl_src_rect(px: usize, py: usize, bw: usize, bh: usize) -> CflSrc {
 /// entropy parsing no longer touches the frame's own planes (except the two
 /// sites named in [`flush_recon`]'s doc), which is what lets step (ii) run
 /// the replay on a superblock-row wavefront worker.
+/// The dequantization + inverse transform of one transform unit, kept as its
+/// INPUTS so that a recorded write carries the work instead of its result
+/// (lane-wave3): at `EC_AV1_RECON_THREADS > 1` the transform then runs on the
+/// recon worker, not on the parsing thread. `stride == 0` means the dense
+/// `w x h` residual; otherwise it is re-laid into the `stride x stride` grid
+/// `reconstruct_mc_rect` reads both of its buffers at.
+#[derive(Clone, Copy)]
+pub(crate) struct TxParams {
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) bit_depth: u8,
+    pub(crate) q_idx: i32,
+    pub(crate) dc_delta: i32,
+    pub(crate) ac_delta: i32,
+    pub(crate) tx_type: TxType,
+    pub(crate) stride: usize,
+}
+
+impl TxParams {
+    /// The one copy of the produce-the-residual code: the inline path calls it
+    /// on the parse thread, the wavefront worker calls it on its own, so both
+    /// are the same function on the same inputs and byte-identical.
+    fn run(self, grid: &[i32]) -> Vec<i32> {
+        let residual = dequant_and_inverse_typed_wh(
+            grid, self.w, self.h, self.bit_depth, self.q_idx, self.dc_delta, self.ac_delta,
+            self.tx_type,
+        );
+        if self.stride == 0 {
+            return residual;
+        }
+        let mut strided = vec![0i32; self.stride * self.stride];
+        for row in 0..self.h {
+            strided[row * self.stride..][..self.w]
+                .copy_from_slice(&residual[row * self.w..][..self.w]);
+        }
+        strided
+    }
+}
+
+/// A recorded write's residual: already transformed, or the coefficients and
+/// [`TxParams`] the worker transforms itself.
+pub(crate) enum Residual {
+    Done(Vec<i32>),
+    Coeffs(TxParams, Vec<i32>),
+}
+
+impl Residual {
+    fn resolve(self) -> Vec<i32> {
+        match self {
+            Self::Done(v) => v,
+            Self::Coeffs(p, grid) => p.run(&grid),
+        }
+    }
+}
+
 pub(crate) enum ReconOp {
     Intra {
         plane: usize,
@@ -2070,7 +2125,7 @@ pub(crate) enum ReconOp {
         mode: usize,
         angle_delta: i32,
         reach: Reach,
-        residual: Vec<i32>,
+        residual: Residual,
         cfl: Option<(i32, CflSrc)>,
         filter_intra: Option<usize>,
         smooth_neighbor: bool,
@@ -2087,7 +2142,7 @@ pub(crate) enum ReconOp {
         w: usize,
         h: usize,
         prediction: Vec<u16>,
-        residual: Vec<i32>,
+        residual: Residual,
     },
 }
 
@@ -2423,7 +2478,7 @@ fn push_intra(
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
-        residual: residual.to_vec(), cfl, filter_intra, smooth_neighbor, pred,
+        residual: Residual::Done(residual.to_vec()), cfl, filter_intra, smooth_neighbor, pred,
     });
 }
 
@@ -2452,7 +2507,7 @@ fn push_intra_owned(
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
-        residual, cfl, filter_intra, smooth_neighbor, pred,
+        residual: Residual::Done(residual), cfl, filter_intra, smooth_neighbor, pred,
     });
 }
 
@@ -2472,7 +2527,8 @@ fn push_mc_rect_owned(
         return;
     }
     push_op(fctx, ReconOp::Mc {
-        plane, x, y, stride, w, h, prediction: prediction.to_vec(), residual,
+        plane, x, y, stride, w, h, prediction: prediction.to_vec(),
+        residual: Residual::Done(residual),
     });
 }
 
@@ -2501,7 +2557,7 @@ fn push_intra_rect(
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw, bh, rect: true, mode, angle_delta, reach,
-        residual: residual.to_vec(), cfl, filter_intra, smooth_neighbor, pred,
+        residual: Residual::Done(residual.to_vec()), cfl, filter_intra, smooth_neighbor, pred,
     });
 }
 
@@ -2534,7 +2590,78 @@ fn push_mc_rect(
     }
     push_op(fctx, ReconOp::Mc {
         plane, x, y, stride, w, h,
-        prediction: prediction.to_vec(), residual: residual.to_vec(),
+        prediction: prediction.to_vec(), residual: Residual::Done(residual.to_vec()),
+    });
+}
+
+/// [`push_intra_rect`] carrying the transform's INPUTS: at one reconstruction
+/// thread the transform runs here, exactly as before; on the wavefront it
+/// travels with the op and runs on the worker (lane-wave3).
+#[allow(clippy::too_many_arguments)]
+fn push_intra_tx(
+    plane: usize,
+    x: usize,
+    y: usize,
+    bw: usize,
+    bh: usize,
+    rect: bool,
+    mode: usize,
+    angle_delta: i32,
+    reach: Reach,
+    tx: TxParams,
+    grid: &[i32],
+    cfl: Option<(i32, CflSrc)>,
+    filter_intra: Option<usize>,
+    smooth_neighbor: bool,
+    fctx: &crate::decode::FrameCtx,
+) {
+    if fctx.recon_planes.with(std::cell::Cell::get).is_some() {
+        inline_intra(
+            plane, x, y, bw, bh, rect, mode, angle_delta, reach, &tx.run(grid), cfl, filter_intra,
+            smooth_neighbor, fctx,
+        );
+        return;
+    }
+    let pred = take_palette_pred(fctx);
+    push_op(fctx, ReconOp::Intra {
+        plane, x, y, bw, bh, rect, mode, angle_delta, reach,
+        residual: Residual::Coeffs(tx, grid.to_vec()), cfl, filter_intra, smooth_neighbor, pred,
+    });
+}
+
+/// [`push_mc_rect`] carrying the transform's inputs -- see [`push_intra_tx`].
+#[allow(clippy::too_many_arguments)]
+fn push_mc_rect_tx(
+    plane: usize,
+    x: usize,
+    y: usize,
+    stride: usize,
+    w: usize,
+    h: usize,
+    prediction: &[u16],
+    tx: TxParams,
+    grid: &[i32],
+    fctx: &crate::decode::FrameCtx,
+) {
+    if fctx.recon_planes.with(std::cell::Cell::get).is_some() {
+        inline_mc(plane, x, y, stride, w, h, prediction, &tx.run(grid), fctx);
+        return;
+    }
+    // `reconstruct_mc_rect` reads exactly rows `0..h`, columns `0..w` of the
+    // two buffers at `stride`, so the record carries that window densely
+    // rather than the whole block's prediction: a 4x4 unit of a 64x64 block
+    // copied 64*64 samples on the PARSING thread before. The residual is then
+    // produced dense too (`TxParams::stride = 0`), which is the same numbers
+    // in the same places at stride `w`.
+    let mut window = Vec::with_capacity(w * h);
+    for row in 0..h {
+        window.extend_from_slice(&prediction[row * stride..][..w]);
+    }
+    let mut tx = tx;
+    tx.stride = 0;
+    push_op(fctx, ReconOp::Mc {
+        plane, x, y, stride: w, w, h, prediction: window,
+        residual: Residual::Coeffs(tx, grid.to_vec()),
     });
 }
 
@@ -2577,11 +2704,11 @@ fn exec_op(
             plane, x, y: oy, bw, bh, rect, mode, angle_delta, reach, residual, cfl,
             filter_intra, smooth_neighbor, pred,
         } => exec_intra(
-            y, u, v, plane, x, oy, bw, bh, rect, mode, angle_delta, reach, &residual, cfl,
-            filter_intra, smooth_neighbor, pred, fctx,
+            y, u, v, plane, x, oy, bw, bh, rect, mode, angle_delta, reach, &residual.resolve(),
+            cfl, filter_intra, smooth_neighbor, pred, fctx,
         ),
         ReconOp::Mc { plane, x, y: oy, stride, w, h, prediction, residual } => {
-            exec_mc(y, u, v, plane, x, oy, stride, w, h, &prediction, &residual, fctx);
+            exec_mc(y, u, v, plane, x, oy, stride, w, h, &prediction, &residual.resolve(), fctx);
         }
     }
 }
@@ -12672,21 +12799,28 @@ fn read_plane(
         full
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
-    let residual = dequant_and_inverse_typed(&levels, side, bit_depth(fctx), block_q_idx(fctx), dc_delta, ac_delta, tx_type);
+    let tx = TxParams {
+        w: side, h: side, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta,
+        ac_delta, tx_type, stride: 0,
+    };
     if crate::envflags::env_flag!("EC_AV1_TRACE") {
+        let residual = tx.run(&levels);
         eprintln!(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
         );
     }
-    push_intra_owned(
+    push_intra_tx(
         plane_idx,
         x,
         y,
         side,
+        side,
+        false,
         predict_mode,
         angle_delta,
         reach,
-        residual,
+        tx,
+        &levels,
         cfl,
         filter_intra,
         smooth_neighbor, fctx,
@@ -16877,26 +17011,17 @@ fn read_inter_plane_rect(
         full
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
-    let residual = dequant_and_inverse_typed_wh(
-        &grid,
-        w,
-        h,
-        bit_depth(fctx),
-        block_q_idx(fctx),
-        dc_delta,
-        ac_delta,
-        tx_type,
-    );
     if crate::envflags::env_flag!("EC_TRACE_TXTYPE") {
         eprintln!("OUR_TXTYPE plane={plane_idx} x={x} y={y} w={w} h={h} tx_type={tx_type:?} inh={inherited_luma_tx_type:?}");
     }
     // `reconstruct_mc_rect` reads both buffers at the square prediction
-    // stride, so the dense `w x h` residual is re-laid at that stride first.
-    let mut strided = vec![0i32; stride * stride];
-    for row in 0..h {
-        strided[row * stride..][..w].copy_from_slice(&residual[row * w..][..w]);
-    }
-    push_mc_rect_owned(plane_idx, x, y, stride, w, h, prediction, strided, fctx);
+    // stride, so the dense `w x h` residual is re-laid at that stride
+    // (`TxParams::stride`) after the inverse transform.
+    let tx = TxParams {
+        w, h, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta, ac_delta, tx_type,
+        stride,
+    };
+    push_mc_rect_tx(plane_idx, x, y, stride, w, h, prediction, tx, &grid, fctx);
     Ok((grid, tx_type))
 }
 
@@ -21466,8 +21591,11 @@ fn read_inter_plane(
         full
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
-    let residual = dequant_and_inverse_typed(&grid, side, bit_depth(fctx), block_q_idx(fctx), dc_delta, ac_delta, tx_type);
-    push_mc_rect_owned(plane_idx, x, y, side, side, side, prediction, residual, fctx);
+    let tx = TxParams {
+        w: side, h: side, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta,
+        ac_delta, tx_type, stride: 0,
+    };
+    push_mc_rect_tx(plane_idx, x, y, side, side, side, prediction, tx, &grid, fctx);
     Ok((grid, tx_type))
 }
 
