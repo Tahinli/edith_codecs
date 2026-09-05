@@ -34915,6 +34915,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+    /// lane-twostage: the reference bank these gates decode against --
+    /// `LAST_FRAME` alone, already in hand (`ref_frame` index 1).
+    fn last_only(reference: &Picture) -> RefPix<'_> {
+        let mut refs: [Option<&Picture>; 8] = [None; 8];
+        refs[1] = Some(reference);
+        RefPix::ready(refs)
+    }
+
 
     /// lane-perf6 step 2: the CDEF kernel now reads a pre-gathered window and
     /// a pre-resolved damping shift instead of a bounds-testing closure and a
@@ -35961,8 +35969,7 @@ mod tests {
             40,
             64,
             64,
-            &reference,
-            [None; 8],
+            &last_only(&reference),
             &CdefParams::default(),
             &LoopFilterParams::default(),
             false,
@@ -36303,8 +36310,7 @@ mod tests {
                 frame.base_q_idx,
                 width as u32,
                 height as u32,
-                &reference,
-                [None; 8],
+                &last_only(&reference),
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
@@ -36422,37 +36428,21 @@ mod tests {
 
         let (width, height) = (64usize, 64usize);
         let ref_pattern: Vec<u16> = (0..width * height).map(|i| (i % 251) as u16).collect();
-        let ref_plane = |scale: usize| PlaneBuf {
-            data: std::borrow::Cow::Owned(
-                ref_pattern
-                    .iter()
-                    .step_by(scale.max(1))
-                    .take((width / scale) * (height / scale))
-                    .copied()
-                    .collect(),
-            ),
-            width: width / scale,
-            height: height / scale,
-            true_width: width / scale,
-            true_height: height / scale,
-            tile_x0: 0,
-            tile_y0: 0,
-            tile_x1: width / scale,
-            tile_y1: height / scale,
-        };
-        let ref_y = PlaneBuf {
-            data: std::borrow::Cow::Owned(ref_pattern.clone()),
+        let chroma: Vec<u16> = ref_pattern
+            .iter()
+            .step_by(2)
+            .take((width / 2) * (height / 2))
+            .copied()
+            .collect();
+        let reference = Picture {
             width,
             height,
-            true_width: width,
-            true_height: height,
-            tile_x0: 0,
-            tile_y0: 0,
-            tile_x1: width,
-            tile_y1: height,
+            y: ref_pattern.clone(),
+            u: chroma.clone(),
+            v: chroma,
         };
-        let ref_u = ref_plane(2);
-        let ref_v = ref_plane(2);
+        let refpix = &last_only(&reference);
+        let ref_y = whole_plane(&reference.y, width, height);
 
         let mut y = PlaneBuf {
             data: std::borrow::Cow::Owned(vec![0u16; width * height]),
@@ -36504,7 +36494,6 @@ mod tests {
             &mut u,
             &mut v,
             refpix,
-            &[None; 8],
             &NO_SIGN_BIAS,
             &[ec_av1_syntax::WarpParams::default(); 7],
             100,
@@ -36630,8 +36619,7 @@ mod tests {
                 frame.base_q_idx,
                 coded_w,
                 coded_h,
-                &reference,
-                [None; 8],
+                &last_only(&reference),
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
