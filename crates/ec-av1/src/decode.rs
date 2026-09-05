@@ -12876,6 +12876,38 @@ fn dump_stage(var: &str, y: &PlaneBuf<'_>, u: &PlaneBuf<'_>, v: &PlaneBuf<'_>) {
     }
 }
 
+/// The value [`fresh_plane`] fills with under `EC_AV1_PLANE_SENTINEL`: no
+/// legal sample can equal it (reconstruction clamps to `(1 << bit_depth) - 1`,
+/// at most 4095), so a decode that hashes identically under the flag proves
+/// the output does not depend on the plane buffer's initial content.
+const PLANE_SENTINEL: u16 = 0xDEAD;
+
+/// A frame plane's own backing store, `n` samples, UNINITIALISED.
+///
+/// (lane-picalloc) The SB-padded coding surface is written sample-for-sample
+/// by the tile walk's reconstruction before anything reads it, so the
+/// `vec![0u16; n]` this replaces spent ~3% of the frame thread's cycles
+/// zeroing 25 MB (at 4K) that the very next pass overwrites -- serially, at
+/// the frame's head, on the critical path. `EC_AV1_PLANE_SENTINEL=1` swaps the
+/// uninitialised buffer for a [`PLANE_SENTINEL`] fill; the gate hashes both
+/// ways (see the lane report) and the two agree, which is the proof that no
+/// unwritten sample reaches the output.
+fn fresh_plane(n: usize) -> Vec<u16> {
+    if crate::envflags::env_flag!("EC_AV1_PLANE_SENTINEL") {
+        return vec![PLANE_SENTINEL; n];
+    }
+    let mut v: Vec<u16> = Vec::with_capacity(n);
+    // SAFETY: `u16` has no invalid bit patterns and no `Drop`, and the
+    // capacity was just reserved, so the vector owns `n` initialised-or-not
+    // `u16` slots. Every one is written by reconstruction before it is read
+    // (proven by the sentinel gate above).
+    #[allow(unsafe_code)]
+    unsafe {
+        v.set_len(n);
+    }
+    v
+}
+
 #[derive(Clone)]
 struct PlaneBuf<'a> {
     data: std::borrow::Cow<'a, [u16]>,
@@ -19943,7 +19975,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     let (width, height) = (cols32 as usize * BLOCK, rows32 as usize * BLOCK);
 
     let mut y = PlaneBuf {
-        data: std::borrow::Cow::Owned(vec![0u16; width * height]),
+        data: std::borrow::Cow::Owned(fresh_plane(width * height)),
         width,
         height,
         true_width,
@@ -19954,7 +19986,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y1: height,
     };
     let mut u = PlaneBuf {
-        data: std::borrow::Cow::Owned(vec![0u16; width * height / 4]),
+        data: std::borrow::Cow::Owned(fresh_plane(width * height / 4)),
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -19965,7 +19997,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y1: height / 2,
     };
     let mut v = PlaneBuf {
-        data: std::borrow::Cow::Owned(vec![0u16; width * height / 4]),
+        data: std::borrow::Cow::Owned(fresh_plane(width * height / 4)),
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -31522,7 +31554,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         std::array::from_fn(|i| owned_refs[i].as_ref().map(|(a, b, c)| (a, b, c)));
 
     let mut y = PlaneBuf {
-        data: std::borrow::Cow::Owned(vec![0u16; width * height]),
+        data: std::borrow::Cow::Owned(fresh_plane(width * height)),
         width,
         height,
         true_width,
@@ -31533,7 +31565,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: height,
     };
     let mut u = PlaneBuf {
-        data: std::borrow::Cow::Owned(vec![0u16; width * height / 4]),
+        data: std::borrow::Cow::Owned(fresh_plane(width * height / 4)),
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -31544,7 +31576,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: height / 2,
     };
     let mut v = PlaneBuf {
-        data: std::borrow::Cow::Owned(vec![0u16; width * height / 4]),
+        data: std::borrow::Cow::Owned(fresh_plane(width * height / 4)),
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
