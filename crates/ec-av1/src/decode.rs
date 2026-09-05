@@ -2425,7 +2425,13 @@ fn wave_worker(st: &WaveState) {
 /// Installs the wavefront for one tile and joins its workers on every exit
 /// from the tile decoder, including the `?` ones -- the jobs hold raw
 /// pointers into the tile's planes, so no worker may outlive them.
-pub(crate) struct WaveGuard<'a>(&'a crate::decode::FrameCtx, Vec<std::thread::JoinHandle<()>>);
+/// (lane-pool1: the workers come from this thread's persistent pool, so a
+/// tile costs a batch submit rather than `EC_AV1_RECON_THREADS` fresh threads
+/// with fresh scratch.)
+pub(crate) struct WaveGuard<'a>(
+    &'a crate::decode::FrameCtx,
+    Option<crate::par::Batch<'static>>,
+);
 
 #[allow(unsafe_code)]
 impl<'a> WaveGuard<'a> {
@@ -2460,14 +2466,13 @@ impl<'a> WaveGuard<'a> {
             enable_edge_filter: fctx.enable_edge_filter.with(std::cell::Cell::get),
             last_col: cols - 1,
         });
-        let workers = (0..threads)
-            .map(|_| {
-                let st = std::sync::Arc::clone(&st);
-                std::thread::spawn(move || wave_worker(&st))
-            })
-            .collect();
+        let batch = crate::par::Batch::new();
+        for _ in 0..threads {
+            let st = std::sync::Arc::clone(&st);
+            batch.submit(move || wave_worker(&st));
+        }
         fctx.wave.with(|w| *w.borrow_mut() = Some(st));
-        Some(Self(fctx, workers))
+        Some(Self(fctx, Some(batch)))
     }
 }
 
@@ -2478,9 +2483,8 @@ impl Drop for WaveGuard<'_> {
             st.q.lock().unwrap().closed = true;
             st.cv.notify_all();
         }
-        for h in self.1.drain(..) {
-            let _ = h.join();
-        }
+        // Dropping the batch waits every worker out, as the joins did.
+        drop(self.1.take());
     }
 }
 
