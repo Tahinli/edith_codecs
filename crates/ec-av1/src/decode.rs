@@ -22460,12 +22460,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     if waving {
         wave_submit(fctx, wave_job.0, wave_job.1);
     }
+    // lane-timeline: this tile's last symbol is read here; its wavefront
+    // workers are drained by `_wave`'s drop at the end of the iteration.
+    crate::timeline::tile_done();
     flush_recon(fctx, &mut y, &mut u, &mut v);
 
         if tile_num == tile_info.context_update_tile_id {
             result_cdfs = cdfs;
         }
     }
+    crate::timeline::recon_done();
 
     // lane-comppin r4: pre-loop-filter decode-order dump, matching aomdec's
     // own EC_AV1_PREFILT_DUMP shape (decodeframe.c ~5451) -- diffs against
@@ -22597,6 +22601,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         scratch_return(db_u.data.into_owned());
         scratch_return(db_y.data.into_owned());
     }
+    crate::timeline::filters_done();
 
     let (fw, fh) = (lr_w, frame_height as usize);
     // An upscaled frame is already at its final size with no mi-aligned
@@ -34752,12 +34757,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     if waving {
         wave_submit(fctx, wave_job.0, wave_job.1);
     }
+    // lane-timeline: this tile's last symbol is read here; its wavefront
+    // workers are drained by `_wave`'s drop at the end of the iteration.
+    crate::timeline::tile_done();
     flush_recon(fctx, &mut y, &mut u, &mut v);
 
         if tile_num == tile_info.context_update_tile_id {
             result_cdfs = cdfs;
         }
     }
+    crate::timeline::recon_done();
 
     // lane-comppin r4: pre-loop-filter decode-order dump, matching aomdec's
     // own EC_AV1_PREFILT_DUMP shape (decodeframe.c ~5451) -- diffs against
@@ -34791,6 +34800,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // out; from here the picture is deblocked and CDEF-filtered exactly as
     // the whole-frame path leaves it.
     let pipelined = pipe.is_some();
+    crate::timeline::note_pipe(pipelined);
     if let Some(p) = &mut pipe {
         p.finish();
     }
@@ -34902,6 +34912,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         scratch_return(db_y.data.into_owned());
     }
 
+    crate::timeline::filters_done();
     let motion_field = build_motion_field(
         &grid,
         mi_cols as usize,

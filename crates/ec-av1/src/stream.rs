@@ -317,6 +317,7 @@ impl Reorder {
         while let Some((picture, decode_idx, shown)) = self.pending.remove(&self.next) {
             self.next += 1;
             sink(&picture, decode_idx, shown)?;
+            crate::timeline::output(decode_idx);
         }
         Ok(())
     }
@@ -552,6 +553,10 @@ pub fn decode_stream_with_threads(
     // keeps every counter-reading gate meaningful).
     let mut slot_promises: [Option<std::sync::Arc<SlotPromise>>; NUM_REF_FRAMES] =
         std::array::from_fn(|_| None);
+    // lane-timeline: which decoded frame installed each slot's promise, so
+    // the timeline records a dependency EDGE (frame -> producing frame) and
+    // not just a slot number. `usize::MAX` = nobody yet.
+    let mut slot_owner = [usize::MAX; NUM_REF_FRAMES];
 
     let mut pos = 0usize;
     // A frame whose tiles are split across several `OBU_TILE_GROUP`s (spec
@@ -612,8 +617,11 @@ pub fn decode_stream_with_threads(
                 for i in 0..NUM_REF_FRAMES {
                     if header.refresh_frame_flags & (1 << i) != 0 {
                         slot_promises[i] = Some(promise.clone());
+                        slot_owner[i] = slot_owner[slot];
                     }
                 }
+                let cap_t0 = crate::timeline::now();
+                let capped = in_flight_shows >= in_flight_cap;
                 while in_flight_shows >= in_flight_cap {
                     collect_one(
                     &rx,
@@ -622,6 +630,9 @@ pub fn decode_stream_with_threads(
                     &mut reorder,
                     &mut sink,
                 )?;
+                }
+                if capped {
+                    crate::timeline::cap_wait("show", cap_t0, crate::timeline::now());
                 }
                 let (job_seq, decode_idx) = (emit_seq, pictures_decoded);
                 emit_seq += 1;
@@ -813,6 +824,8 @@ pub fn decode_stream_with_threads(
         // deadlock argument). A key frame stays inline: it resets the whole
         // bank and reads nothing, so there is nothing to gain.
         if threads > 1 && header.frame_type != FrameType::Key && !header.show_existing_frame {
+            let cap_t0 = crate::timeline::now();
+            let capped = in_flight_decodes >= in_flight_cap;
             while in_flight_decodes >= in_flight_cap {
                 collect_one(
                     &rx,
@@ -821,6 +834,9 @@ pub fn decode_stream_with_threads(
                     &mut reorder,
                     &mut sink,
                 )?;
+            }
+            if capped {
+                crate::timeline::cap_wait("decode", cap_t0, crate::timeline::now());
             }
             // Exactly the slots this frame reads: `ref_frame_idx` names its
             // references, and its `primary_ref_frame` CDFs/segment map, its
@@ -833,11 +849,13 @@ pub fn decode_stream_with_threads(
                 let slot = header.ref_frame_idx[i] as usize;
                 deps[slot] = slot_promises[slot].clone();
             }
+            let dep_owner = slot_owner;
             let produces = (header.refresh_frame_flags != 0).then(SlotPromise::pending);
             if let Some(promise) = &produces {
                 for i in 0..NUM_REF_FRAMES {
                     if header.refresh_frame_flags & (1 << i) != 0 {
                         slot_promises[i] = Some(promise.clone());
+                        slot_owner[i] = pictures_decoded;
                     }
                 }
             }
@@ -850,18 +868,28 @@ pub fn decode_stream_with_threads(
             }
             let tx = tx.clone();
             let dump = final_dump.clone();
+            crate::timeline::submit(decode_idx, if shown { 'P' } else { 'A' }, shown);
             jobs.submit(move || {
                 let promise = produces;
                 let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::timeline::start(decode_idx);
                     // The wait happens HERE, off the parsing thread, and only
                     // for this frame's own references.
                     let mut resolved: [Option<std::sync::Arc<SlotValue>>; NUM_REF_FRAMES] =
                         std::array::from_fn(|_| None);
                     for (slot, dep) in deps.iter().enumerate() {
                         if let Some(dep) = dep {
+                            let t0 = crate::timeline::now();
                             resolved[slot] = Some(dep.wait()?);
+                            crate::timeline::ref_wait(
+                                decode_idx,
+                                slot,
+                                dep_owner[slot],
+                                crate::timeline::now().saturating_sub(t0),
+                            );
                         }
                     }
+                    crate::timeline::refs_ready();
                     // Fresh per-thread state: every field this path reads is
                     // written from this frame's own header before it is read.
                     let fctx = crate::decode::FrameCtx::new();
@@ -903,6 +931,7 @@ pub fn decode_stream_with_threads(
                             seg_map: out.seg_map,
                             order_hint: header.order_hint,
                         }));
+                        crate::timeline::slot_fulfil();
                     }
                     // Grain is synthesised for OUTPUT only: a hidden frame is
                     // reported to the sink clean, exactly as the inline path
@@ -918,6 +947,7 @@ pub fn decode_stream_with_threads(
                     } else {
                         picture
                     };
+                    crate::timeline::grain_done();
                     Ok((output, decode_idx, shown))
                 }))
                 .unwrap_or_else(|_| {
@@ -993,6 +1023,7 @@ pub fn decode_stream_with_threads(
                 for i in 0..NUM_REF_FRAMES {
                     if header.refresh_frame_flags & (1 << i) != 0 {
                         slot_promises[i] = Some(promise.clone());
+                        slot_owner[i] = pictures_decoded - 1;
                     }
                 }
             }
@@ -1055,6 +1086,7 @@ pub fn decode_stream_with_threads(
         )?;
     }
     debug_assert!(reorder.pending.is_empty(), "a frame was never emitted");
+    crate::timeline::dump();
     Ok(())
 }
 
@@ -1482,6 +1514,18 @@ fn decode_frame(
     // reads temporal candidates.
     let ref_order_hints = snap.ref_order_hints;
 
+    crate::timeline::bind(
+        decode_idx,
+        if header.frame_type == FrameType::Key {
+            'K'
+        } else if header.show_frame {
+            'P'
+        } else {
+            'A'
+        },
+        header.show_frame,
+    );
+    crate::timeline::hdr_done();
     let (picture, end_cdfs, motion_field) = if header.frame_type == FrameType::Key {
         let (picture, end_cdfs) = decode_key_frame_tile_with_cdfs(
             &tile_bufs,
