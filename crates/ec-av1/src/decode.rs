@@ -12963,7 +12963,6 @@ struct PlaneBuf<'a> {
 /// (lane-av1refs: the same "empty slot" case `GOLDEN_FRAME` already
 /// refused by name, now generic across `LAST2`/`LAST3`/`GOLDEN`/`BWDREF`/
 /// `ALTREF2`/`ALTREF`).
-type RefSlots<'a> = [Option<(&'a PlaneBuf<'a>, &'a PlaneBuf<'a>, &'a PlaneBuf<'a>)>; 8];
 
 impl PlaneBuf<'_> {
     /// Sets this plane's own tile pixel origin ([`Self::tile_x0`]/
@@ -23164,27 +23163,124 @@ fn read_single_ref(
 /// own doc. Called from [`decode_inter_block`] once its own `reference_select`
 /// parameter is set; [`decode_inter_block8`]'s 8x8 leaf path gates the same
 /// way with a coarser (`LAST_FRAME`-only) neighbour shape.
-/// Resolves a compound reference's own planes -- the same `ref_frame ==
-/// LAST_FRAME -> ref_y/u/v, else other_refs[ref_frame]` lookup
-/// [`decode_inter_block`]'s single-ref path already does, factored out so
-/// the compound path can call it twice (lane-av1comp).
-fn ref_planes<'a>(
-    ref_frame: i8,
-    ref_y: &'a PlaneBuf<'a>,
-    ref_u: &'a PlaneBuf<'a>,
-    ref_v: &'a PlaneBuf<'a>,
-    other_refs: &'a RefSlots,
-) -> Result<(&'a PlaneBuf<'a>, &'a PlaneBuf<'a>, &'a PlaneBuf<'a>)> {
-    if ref_frame == LAST_FRAME {
-        Ok((ref_y, ref_u, ref_v))
-    } else {
-        match other_refs[ref_frame as usize] {
-            Some((ry, ru, rv)) => Ok((ry, ru, rv)),
-            None => Err(unsupported(
-                "a reference frame selected with no picture at this frame's own \
-                 ref_frame_idx slot for it",
-            )),
+/// lane-twostage: this frame's references as DIMENSIONS now and PIXELS on
+/// demand. An inter tile's parse reads reference SIZES (`mc::scale_factor`)
+/// but touches no reference PIXEL until its first prediction -- measured 4.2%
+/// of a 4K tile's parse into it -- so the pictures are resolved here, at the
+/// first [`ref_planes`] call, rather than at frame entry. On the threaded
+/// path that resolution is a WAIT on the producing frame's pixels, which is
+/// what lets a consumer parse while its references are still being filtered.
+pub(crate) struct RefPix<'p> {
+    /// `(width, height)` per `ref_frame` index (`LAST_FRAME` = 1). `None` is
+    /// a slot this frame may not use: empty, or -- for a non-`LAST_FRAME`
+    /// slot -- not the same size as `LAST_FRAME`'s own picture (spec 7.9's
+    /// compatible-size rule, the filter the eager `owned_refs` array applied).
+    dims: [Option<(usize, usize)>; 8],
+    src: RefSrc<'p>,
+    bufs: std::sync::OnceLock<[Option<(PlaneBuf<'p>, PlaneBuf<'p>, PlaneBuf<'p>)>; 8]>,
+}
+
+/// Where a [`RefPix`] gets its pictures: already in hand, or behind a wait
+/// the caller owns (`stream.rs`'s reference promises).
+enum RefSrc<'p> {
+    Ready([Option<&'p Picture>; 8]),
+    Lazy(&'p (dyn Fn() -> Result<[Option<&'p Picture>; 8]> + Send + Sync + 'p)),
+}
+
+/// `LAST_FRAME`'s own index in a [`RefPix`] (spec 6.10.24).
+const LAST_REF: usize = 1;
+
+impl<'p> RefPix<'p> {
+    /// References already decoded: the single-threaded path and the test
+    /// entry points, where [`ref_planes`] never waits.
+    pub(crate) fn ready(refs: [Option<&'p Picture>; 8]) -> Self {
+        let dims = Self::compatible(std::array::from_fn(|i| {
+            refs[i].map(|p| (p.width, p.height))
+        }));
+        Self { dims, src: RefSrc::Ready(refs), bufs: std::sync::OnceLock::new() }
+    }
+
+    /// References whose sizes are known (from their producers' headers) but
+    /// whose pixels `wait` still has to produce.
+    pub(crate) fn lazy(
+        dims: [Option<(usize, usize)>; 8],
+        wait: &'p (dyn Fn() -> Result<[Option<&'p Picture>; 8]> + Send + Sync + 'p),
+    ) -> Self {
+        Self { dims: Self::compatible(dims), src: RefSrc::Lazy(wait), bufs: std::sync::OnceLock::new() }
+    }
+
+    /// Spec 7.9's compatible-size rule: a non-`LAST_FRAME` slot at a
+    /// different size than `LAST_FRAME`'s is treated as absent, exactly as
+    /// the eager `owned_refs.filter(..)` did.
+    fn compatible(mut dims: [Option<(usize, usize)>; 8]) -> [Option<(usize, usize)>; 8] {
+        let last = dims[LAST_REF];
+        for (i, d) in dims.iter_mut().enumerate() {
+            if i != LAST_REF && *d != last {
+                *d = None;
+            }
         }
+        dims
+    }
+
+    /// This slot's picture size, without touching its pixels.
+    pub(crate) fn dims(&self, ref_frame: i8) -> Option<(usize, usize)> {
+        self.dims.get(ref_frame as usize).copied().flatten()
+    }
+
+    /// Every usable slot's three planes, resolving (and, on the threaded
+    /// path, waiting for) the pictures on the first call.
+    fn planes(&self) -> Result<&[Option<(PlaneBuf<'p>, PlaneBuf<'p>, PlaneBuf<'p>)>; 8]> {
+        if let Some(bufs) = self.bufs.get() {
+            return Ok(bufs);
+        }
+        let pics = match &self.src {
+            RefSrc::Ready(refs) => *refs,
+            RefSrc::Lazy(wait) => wait()?,
+        };
+        let dims = self.dims;
+        let bufs = std::array::from_fn(|i| {
+            dims[i].and(pics[i]).map(|g| {
+                (
+                    whole_plane(&g.y, g.width, g.height),
+                    whole_plane(&g.u, g.width / 2, g.height / 2),
+                    whole_plane(&g.v, g.width / 2, g.height / 2),
+                )
+            })
+        });
+        let _ = self.bufs.set(bufs);
+        Ok(self.bufs.get().expect("the plane array was just set"))
+    }
+}
+
+/// A whole reference plane as a [`PlaneBuf`]: no tile window, no margin.
+fn whole_plane(data: &[u16], width: usize, height: usize) -> PlaneBuf<'_> {
+    PlaneBuf {
+        data: std::borrow::Cow::Borrowed(data),
+        width,
+        height,
+        true_width: width,
+        true_height: height,
+        tile_x0: 0,
+        tile_y0: 0,
+        tile_x1: width,
+        tile_y1: height,
+    }
+}
+
+/// Resolves a reference's own planes -- the `ref_frame -> picture` lookup
+/// [`decode_inter_block`]'s single-ref path does, factored out so the
+/// compound path can call it twice (lane-av1comp), and the point where
+/// lane-twostage's pixel wait happens.
+fn ref_planes<'a, 'p>(
+    ref_frame: i8,
+    refpix: &'a RefPix<'p>,
+) -> Result<(&'a PlaneBuf<'p>, &'a PlaneBuf<'p>, &'a PlaneBuf<'p>)> {
+    match refpix.planes()?.get(ref_frame as usize).and_then(Option::as_ref) {
+        Some((y, u, v)) => Ok((y, u, v)),
+        None => Err(unsupported(
+            "a reference frame selected with no picture at this frame's own \
+                 ref_frame_idx slot for it",
+        )),
     }
 }
 
@@ -23898,10 +23994,7 @@ fn obmc_blend(
     py: usize,
     cpx: usize,
     cpy: usize,
-    ref_y: &PlaneBuf<'_>,
-    ref_u: &PlaneBuf<'_>,
-    ref_v: &PlaneBuf<'_>,
-    other_refs: &RefSlots,
+    refpix: &RefPix<'_>,
     interp_fixed: Option<mc::InterpFilterKind>,
     // lane-scaledref r1: this frame's own coded luma width -- each OBMC
     // neighbour is re-predicted against ITS OWN reference, which may be
@@ -24012,7 +24105,7 @@ fn obmc_blend(
         );
         let (h_kind, v_kind) = neighbour_filter(interp_fixed, above_syms)?;
         ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
-        let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (ny, nu, nv) = ref_planes(nb.ref_frame, refpix)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         if mi_col + off4 + span4 > mi_cols {
             OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
@@ -24048,7 +24141,7 @@ fn obmc_blend(
         );
         let (h_kind, v_kind) = neighbour_filter(interp_fixed, left_syms)?;
         ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
-        let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (ny, nu, nv) = ref_planes(nb.ref_frame, refpix)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         if mi_row + off4 + span4 > mi_rows {
             OBMC_EDGE_SPAN_HITS.with(|c| c.set(c.get() + 1));
@@ -24481,16 +24574,13 @@ fn decode_inter_block(
     y: &mut PlaneBuf<'static>,
     u: &mut PlaneBuf<'static>,
     v: &mut PlaneBuf<'static>,
-    ref_y: &PlaneBuf<'_>,
-    ref_u: &PlaneBuf<'_>,
-    ref_v: &PlaneBuf<'_>,
+    refpix: &RefPix<'_>,
     // lane-av1refs: every non-`LAST_FRAME` reference this frame header's own
     // `ref_frame_idx` names a live DPB slot for, indexed `[ref_frame]`
     // (`LAST2_FRAME`=2 .. `ALTREF_FRAME`=7; index 0/1 unused, `LAST_FRAME`
     // stays on `ref_y`/`u`/`v` above) -- `None` at a live index means the
     // slot's still empty (an error-resilient stream, or too early in the
     // GOP), matching `GOLDEN_FRAME`'s existing empty-slot refusal below.
-    other_refs: &RefSlots,
     sign_bias_table: &SignBiasTable,
     // lane-gm r2: this frame header's own `global_motion` table (spec
     // 5.9.24), indexed `[ref_frame - LAST_FRAME]` same as `sign_bias_table`
@@ -24902,8 +24992,8 @@ fn decode_inter_block(
             if gm_nontrans_models && !gm_nontrans {
                 GM_NONTRANS_SMALL_SIDE_HITS.with(|c| c.set(c.get() + 1));
             }
-            let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
-            let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
+            let (py0, pu0, pv0) = ref_planes(ref0, refpix)?;
+            let (py1, pu1, pv1) = ref_planes(ref1, refpix)?;
             // lane-cwarp r1: `is_global_mv_block` (blockd.h:421-429) is
             // PER REFERENCE SLOT -- mode GLOBAL_GLOBALMV, block >= 8x8, and
             // THAT slot's own gm model > TRANSLATION. `bw4`/`bh4` come from
@@ -24945,7 +25035,7 @@ fn decode_inter_block(
             // scaled (superres) is predicted translationally while its
             // sibling may still warp.
             let ref_unscaled = |rf: i8| {
-                ref_planes(rf, ref_y, ref_u, ref_v, other_refs)
+                ref_planes(rf, refpix)
                     .is_ok_and(|(py, _, _)| {
                         mc::scale_factor(py.width, frame_width) == mc::REF_NO_SCALE
                     })
@@ -26026,19 +26116,7 @@ fn decode_inter_block(
             // below same as every other non-`LAST_FRAME` reference. lane-av1refs
             // widens this from GOLDEN alone to every reference `read_single_ref`
             // can name.
-            let (py_ref, pu_ref, pv_ref) = if ref_frame == LAST_FRAME {
-                (ref_y, ref_u, ref_v)
-            } else {
-                match other_refs[ref_frame as usize] {
-                    Some((ry, ru, rv)) => (ry, ru, rv),
-                    None => {
-                        return Err(unsupported(
-                            "a reference frame selected with no picture at this frame's own \
-                         ref_frame_idx slot for it",
-                        ));
-                    }
-                }
-            };
+            let (py_ref, pu_ref, pv_ref) = ref_planes(ref_frame, refpix)?;
 
             let (mi_row, mi_col) = (rmi, cmi);
             // lane-rect r2: the mv stack must be queried with the block's
@@ -26835,10 +26913,7 @@ fn decode_inter_block(
                     py,
                     cpx,
                     cpy,
-                    ref_y,
-                    ref_u,
-                    ref_v,
-                    other_refs,
+                    refpix,
                     interp_fixed,
                     frame_width,
                     &mut pred_y,
@@ -26867,7 +26942,7 @@ fn decode_inter_block(
                 // reference was scaled, which silently left the whole-block
                 // prediction in place instead of refusing. It scales off the
                 // PREVIOUS strip's own reference, not this block's.
-                let (prev_y_plane, prev_u, prev_v_plane) = ref_planes(prev_ref, ref_y, ref_u, ref_v, other_refs)?;
+                let (prev_y_plane, prev_u, prev_v_plane) = ref_planes(prev_ref, refpix)?;
                 let prev_scale = mc::scale_factor(prev_y_plane.width, frame_width);
                 for (src, dst) in [(prev_u, &mut pred_u), (prev_v_plane, &mut pred_v)] {
                     let mut piece = vec![0u16; piece_w * piece_h];
@@ -28268,10 +28343,7 @@ fn decode_inter_sub8_split4(
     y: &mut PlaneBuf<'static>,
     u: &mut PlaneBuf<'static>,
     v: &mut PlaneBuf<'static>,
-    ref_y: &PlaneBuf<'_>,
-    ref_u: &PlaneBuf<'_>,
-    ref_v: &PlaneBuf<'_>,
-    other_refs: &RefSlots,
+    refpix: &RefPix<'_>,
     sign_bias_table: &SignBiasTable,
     global_motion: &[ec_av1_syntax::WarpParams; 7],
     base_q_idx: u8,
@@ -28389,7 +28461,7 @@ fn decode_inter_sub8_split4(
             neighbours.left_ref[rmi],
             neighbours.left_ref1[rmi],
         );
-        let (sref_y, _sref_u, _sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (sref_y, _sref_u, _sref_v) = ref_planes(ref_frame, refpix)?;
         // lane-t900 r28: refusal lifted -- this sub-block's own reference may
         // be scaled (superres); spec 7.11.3.3's walk is per reference, and
         // each of the group's pieces (luma and its 2x2 chroma) carries its
@@ -28659,7 +28731,7 @@ fn decode_inter_sub8_split4(
                 continue;
             };
             let (piece_ref_y, sref_u, sref_v) =
-                ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+                ref_planes(ref_frame, refpix)?;
             let piece_scale = mc::scale_factor(piece_ref_y.width, frame_width);
             let (ox, oy) = if mixed {
                 (cpx, cpy)
@@ -29223,10 +29295,7 @@ fn decode_inter_sub8_rect2(
     y: &mut PlaneBuf<'static>,
     u: &mut PlaneBuf<'static>,
     v: &mut PlaneBuf<'static>,
-    ref_y: &PlaneBuf<'_>,
-    ref_u: &PlaneBuf<'_>,
-    ref_v: &PlaneBuf<'_>,
-    other_refs: &RefSlots,
+    refpix: &RefPix<'_>,
     sign_bias_table: &SignBiasTable,
     global_motion: &[ec_av1_syntax::WarpParams; 7],
     base_q_idx: u8,
@@ -29362,7 +29431,7 @@ fn decode_inter_sub8_rect2(
             neighbours.left_ref[rmi],
             neighbours.left_ref1[rmi],
         );
-        let (sref_y, _, _) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (sref_y, _, _) = ref_planes(ref_frame, refpix)?;
         // lane-t900 r28: refusal lifted -- see the split arm above.
         let luma_scale = mc::scale_factor(sref_y.width, frame_width);
         if luma_scale != mc::REF_NO_SCALE {
@@ -29674,7 +29743,7 @@ fn decode_inter_sub8_rect2(
                 continue;
             };
             let (piece_ref_y, sref_u, sref_v) =
-                ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+                ref_planes(ref_frame, refpix)?;
             let piece_scale = mc::scale_factor(piece_ref_y.width, frame_width);
             let (ox, oy) = if mixed {
                 (cpx, cpy)
@@ -29828,10 +29897,7 @@ fn decode_inter_block8(
     y: &mut PlaneBuf<'static>,
     u: &mut PlaneBuf<'static>,
     v: &mut PlaneBuf<'static>,
-    ref_y: &PlaneBuf<'_>,
-    ref_u: &PlaneBuf<'_>,
-    ref_v: &PlaneBuf<'_>,
-    other_refs: &RefSlots,
+    refpix: &RefPix<'_>,
     base_q_idx: u8,
     scan8: &[u16],
     scan4: &[u16],
@@ -30293,8 +30359,8 @@ fn decode_inter_block8(
                     COMPOUND8_FILTER_HITS.with(|c| c.set(c.get() + 1));
                 }
 
-                let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
-                let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
+                let (py0, pu0, pv0) = ref_planes(ref0, refpix)?;
+                let (py1, pu1, pv1) = ref_planes(ref1, refpix)?;
                 let scale0 = mc::scale_factor(py0.width, frame_width);
                 let scale1 = mc::scale_factor(py1.width, frame_width);
                 if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
@@ -30347,7 +30413,7 @@ fn decode_inter_block8(
                 // lane-t900 r28: same per-slot `allow_warp` scale bail-out as
                 // the 16x16-and-bigger compound path above.
                 let leaf_ref_unscaled = |rf: i8| {
-                    ref_planes(rf, ref_y, ref_u, ref_v, other_refs)
+                    ref_planes(rf, refpix)
                         .is_ok_and(|(py, _, _)| {
                             mc::scale_factor(py.width, frame_width) == mc::REF_NO_SCALE
                         })
@@ -30722,7 +30788,7 @@ fn decode_inter_block8(
             neighbours.left_ref1[rmi],
         );
         leaf_refs = (ref_frame, None);
-        let (sref_y, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (sref_y, sref_u, sref_v) = ref_planes(ref_frame, refpix)?;
 
         let (mi_row, mi_col) = leaf_mi;
         // lane-inter8 r2: the frame's temporal mv candidates, keyed on THIS
@@ -31157,10 +31223,7 @@ fn decode_inter_block8(
                 py,
                 cpx,
                 cpy,
-                ref_y,
-                ref_u,
-                ref_v,
-                other_refs,
+                refpix,
                 interp_fixed,
                 frame_width,
                 &mut pred_y,
@@ -31862,8 +31925,7 @@ pub(crate) fn decode_inter_frame_tile(
     base_q_idx: u8,
     frame_width: u32,
     frame_height: u32,
-    reference: &Picture,
-    other_refs: [Option<&Picture>; 8],
+    refpix: &RefPix<'_>,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     allow_high_precision_mv: bool,
@@ -31886,8 +31948,7 @@ pub(crate) fn decode_inter_frame_tile(
         crate::quant::QuantDeltas::default(),
         frame_width,
         frame_height,
-        reference,
-        other_refs,
+        refpix,
         cdef,
         loop_filter,
         &LoopRestorationParams::default(),
@@ -31919,7 +31980,9 @@ pub(crate) fn decode_inter_frame_tile(
         // `enable_filter_intra`: this crate's own encoder never writes the
         // sequence bit (`encode.rs`), so no intra-in-inter block of a stream
         // reaching this entry point reads a `use_filter_intra` symbol.
-        false, fctx,
+        false,
+        None,
+        fctx,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -31939,8 +32002,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     deltas: crate::quant::QuantDeltas,
     frame_width: u32,
     frame_height: u32,
-    reference: &Picture,
-    other_refs: [Option<&Picture>; 8],
+    refpix: &RefPix<'_>,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     lr: &LoopRestorationParams,
@@ -32007,8 +32069,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // (spec 5.5.2), stashed in a thread-local with `tx_select` rather than
     // threaded through `decode_inter_block`'s fifty parameters -- read by the
     // intra-in-inter arms' `read_filter_intra_mode_info`.
-    enable_filter_intra: bool, fctx: &crate::decode::FrameCtx,
-) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
+    enable_filter_intra: bool,
+    // lane-twostage: called with this frame's own end-of-tile CDFs, motion
+    // field and picture size the moment its last tile symbol is read --
+    // BEFORE its filters run, so a frame that references this one can start
+    // parsing while this one is still being deblocked/CDEF'd/restored (it
+    // waits for the pixels themselves at its first prediction). `None`, and
+    // the motion field comes back in the return tuple as it always did:
+    // the single-threaded path, and a superres frame (whose final width is
+    // only known after the upscale).
+    stage1: Option<&dyn Fn(Cdfs, crate::motion_field::MotionField, usize, usize)>,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<(Picture, Cdfs, Option<crate::motion_field::MotionField>)> {
     set_inter_tx_mode(tx_select, reduced_tx_set, enable_filter_intra, fctx);
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -32038,7 +32110,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // refused every same-size reference (class av1-truesize-lane: true
     // frame size vs mi-rounded). Height must still MATCH: AV1 superres
     // never scales height, and no path here has a vertical scaling pass.
-    if reference.height != frame_height as usize {
+    if refpix.dims(1).is_none_or(|(_, h)| h != frame_height as usize) {
         return Err(unsupported(
             "a reference picture whose height does not match this frame's own true size",
         ));
@@ -32050,90 +32122,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     fctx.cdef_sb_cols.with(|c| c.set(sb_cols as usize));
     fctx.cdef_idx_grid.with(|g| *g.borrow_mut() = vec![0u8; sb_cols as usize * sb_rows as usize]);
     let (width, height) = (cols as usize * BLOCK, rows as usize * BLOCK);
-
-    let ref_y = PlaneBuf {
-        data: std::borrow::Cow::Borrowed(&reference.y),
-        width: reference.width,
-        height: reference.height,
-        true_width: reference.width,
-        true_height: reference.height,
-        tile_x0: 0,
-        tile_y0: 0,
-        tile_x1: reference.width,
-        tile_y1: reference.height,
-    };
-    let ref_u = PlaneBuf {
-        data: std::borrow::Cow::Borrowed(&reference.u),
-        width: reference.width / 2,
-        height: reference.height / 2,
-        true_width: reference.width / 2,
-        true_height: reference.height / 2,
-        tile_x0: 0,
-        tile_y0: 0,
-        tile_x1: reference.width / 2,
-        tile_y1: reference.height / 2,
-    };
-    let ref_v = PlaneBuf {
-        data: std::borrow::Cow::Borrowed(&reference.v),
-        width: reference.width / 2,
-        height: reference.height / 2,
-        true_width: reference.width / 2,
-        true_height: reference.height / 2,
-        tile_x0: 0,
-        tile_y0: 0,
-        tile_x1: reference.width / 2,
-        tile_y1: reference.height / 2,
-    };
-    // Every non-`LAST_FRAME` reference this frame header's own `ref_frame_idx`
-    // names a live DPB slot for (lane-av1refs: generalised from the old
-    // GOLDEN_FRAME-only block -- same empty-slot/size-mismatch refusal,
-    // now per-reference). `decode_inter_block` refuses by name when the
-    // block it is decoding selects an index that is still `None` here
-    // (spec 7.9 requires every *active* reference be a compatible size;
-    // an inactive one this frame never selects is simply left `None`).
-    let owned_refs: [Option<(PlaneBuf<'_>, PlaneBuf<'_>, PlaneBuf<'_>)>; 8] = std::array::from_fn(|i| {
-        other_refs[i]
-            .filter(|g| g.width == reference.width && g.height == reference.height)
-            .map(|g| {
-                (
-                    PlaneBuf {
-                        data: std::borrow::Cow::Borrowed(&g.y),
-                        width: g.width,
-                        height: g.height,
-                        true_width: g.width,
-                        true_height: g.height,
-                        tile_x0: 0,
-                        tile_y0: 0,
-                        tile_x1: g.width,
-                        tile_y1: g.height,
-                    },
-                    PlaneBuf {
-                        data: std::borrow::Cow::Borrowed(&g.u),
-                        width: g.width / 2,
-                        height: g.height / 2,
-                        true_width: g.width / 2,
-                        true_height: g.height / 2,
-                        tile_x0: 0,
-                        tile_y0: 0,
-                        tile_x1: g.width / 2,
-                        tile_y1: g.height / 2,
-                    },
-                    PlaneBuf {
-                        data: std::borrow::Cow::Borrowed(&g.v),
-                        width: g.width / 2,
-                        height: g.height / 2,
-                        true_width: g.width / 2,
-                        true_height: g.height / 2,
-                        tile_x0: 0,
-                        tile_y0: 0,
-                        tile_x1: g.width / 2,
-                        tile_y1: g.height / 2,
-                    },
-                )
-            })
-    });
-    let ref_slots: RefSlots =
-        std::array::from_fn(|i| owned_refs[i].as_ref().map(|(a, b, c)| (a, b, c)));
 
     let mut y = PlaneBuf {
         data: std::borrow::Cow::Owned(fresh_plane(width * height)),
@@ -32495,10 +32483,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         &mut y,
                         &mut u,
                         &mut v,
-                        &ref_y,
-                        &ref_u,
-                        &ref_v,
-                        &ref_slots,
+                        refpix,
                         &sign_bias_table,
                         &global_motion,
                         base_q_idx,
@@ -32568,10 +32553,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             &mut y,
                                             &mut u,
                                             &mut v,
-                                            &ref_y,
-                                            &ref_u,
-                                            &ref_v,
-                                            &ref_slots,
+                                            refpix,
                                             base_q_idx,
                                             &scan8,
                                             &scan4,
@@ -32870,10 +32852,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     &mut y,
                     &mut u,
                     &mut v,
-                    &ref_y,
-                    &ref_u,
-                    &ref_v,
-                    &ref_slots,
+                    refpix,
                     &sign_bias_table,
                     &global_motion,
                     base_q_idx,
@@ -33041,10 +33020,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -33191,10 +33167,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -33302,10 +33275,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &mut y,
                                     &mut u,
                                     &mut v,
-                                    &ref_y,
-                                    &ref_u,
-                                    &ref_v,
-                                    &ref_slots,
+                                    refpix,
                                     &sign_bias_table,
                             &global_motion,
                                     base_q_idx,
@@ -33389,10 +33359,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         &mut y,
                                         &mut u,
                                         &mut v,
-                                        &ref_y,
-                                        &ref_u,
-                                        &ref_v,
-                                        &ref_slots,
+                                        refpix,
                                         &sign_bias_table,
                                         &global_motion,
                                         base_q_idx,
@@ -33633,11 +33600,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 // 7.11.3.3's scaled walk. The counter is what
                                 // proves a gate actually reached a scaled
                                 // leaf rather than a same-size reference.
-                                if ref_y.width != frame_width as usize
-                                    || ref_slots.iter().flatten().any(|(py, _, _)| {
-                                        py.width != frame_width as usize
+                                if (1..8).any(|rf| {
+                                    refpix.dims(rf).is_some_and(|(w, _)| {
+                                        w != frame_width as usize
                                     })
-                                {
+                                }) {
                                     SCALED_LEAF8_HITS.with(|c| c.set(c.get() + 1));
                                 }
                                 let mut prev_leaves: Vec<((usize, usize), bool, bool, i8, Option<i8>)> = Vec::new();
@@ -33660,10 +33627,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             &mut y,
                                             &mut u,
                                             &mut v,
-                                            &ref_y,
-                                            &ref_u,
-                                            &ref_v,
-                                            &ref_slots,
+                                            refpix,
                                             &sign_bias_table,
                                             &global_motion,
                                             base_q_idx,
@@ -33701,10 +33665,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             &mut y,
                                             &mut u,
                                             &mut v,
-                                            &ref_y,
-                                            &ref_u,
-                                            &ref_v,
-                                            &ref_slots,
+                                            refpix,
                                             &sign_bias_table,
                                             &global_motion,
                                             base_q_idx,
@@ -33740,10 +33701,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             &mut y,
                                             &mut u,
                                             &mut v,
-                                            &ref_y,
-                                            &ref_u,
-                                            &ref_v,
-                                            &ref_slots,
+                                            refpix,
                                             base_q_idx,
                                             &scan8,
                                             &scan4,
@@ -33837,10 +33795,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -33890,10 +33845,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 &mut y,
                                 &mut u,
                                 &mut v,
-                                &ref_y,
-                                &ref_u,
-                                &ref_v,
-                                &ref_slots,
+                                refpix,
                                 &sign_bias_table,
                             &global_motion,
                                 base_q_idx,
@@ -33944,10 +33896,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &mut y,
                                     &mut u,
                                     &mut v,
-                                    &ref_y,
-                                    &ref_u,
-                                    &ref_v,
-                                    &ref_slots,
+                                    refpix,
                                     &sign_bias_table,
                             &global_motion,
                                     base_q_idx,
@@ -34008,10 +33957,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34064,10 +34010,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 &mut y,
                                 &mut u,
                                 &mut v,
-                                &ref_y,
-                                &ref_u,
-                                &ref_v,
-                                &ref_slots,
+                                refpix,
                                 &sign_bias_table,
                                 &global_motion,
                                 base_q_idx,
@@ -34121,10 +34064,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34177,10 +34117,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 &mut y,
                                 &mut u,
                                 &mut v,
-                                &ref_y,
-                                &ref_u,
-                                &ref_v,
-                                &ref_slots,
+                                refpix,
                                 &sign_bias_table,
                                 &global_motion,
                                 base_q_idx,
@@ -34235,10 +34172,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34288,10 +34222,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34341,10 +34272,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34396,10 +34324,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34449,10 +34374,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34502,10 +34424,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34558,10 +34477,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34607,10 +34523,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34660,10 +34573,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &mut y,
                             &mut u,
                             &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
+                            refpix,
                             &sign_bias_table,
                             &global_motion,
                             base_q_idx,
@@ -34767,6 +34677,28 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
     }
     crate::timeline::recon_done();
+    // lane-twostage: the motion field is built from the mode-info grid alone
+    // (no pixel), so it moves up here with the CDFs -- everything a
+    // consuming frame's SETUP needs, published before this frame's filters.
+    let mut motion_field = Some(build_motion_field(
+        &grid,
+        mi_cols as usize,
+        mi_rows as usize,
+        order_hint,
+        order_hint_bits,
+        ref_order_hints,
+           fctx,
+    ));
+    if let Some(stage1) = stage1
+        && superres(fctx).is_none()
+    {
+        stage1(
+            result_cdfs.clone(),
+            motion_field.take().expect("the motion field was just built"),
+            frame_width as usize,
+            frame_height as usize,
+        );
+    }
 
     // lane-comppin r4: pre-loop-filter decode-order dump, matching aomdec's
     // own EC_AV1_PREFILT_DUMP shape (decodeframe.c ~5451) -- diffs against
@@ -34913,15 +34845,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     }
 
     crate::timeline::filters_done();
-    let motion_field = build_motion_field(
-        &grid,
-        mi_cols as usize,
-        mi_rows as usize,
-        order_hint,
-        order_hint_bits,
-        ref_order_hints,
-           fctx,
-    );
 
     let (fw, fh) = (lr_w, frame_height as usize);
     // An upscaled frame is already at its final size with no mi-aligned
@@ -35773,27 +35696,25 @@ mod tests {
     fn a_selected_reference_with_an_empty_ref_frame_idx_slot_refuses_by_name() {
         const REFUSAL: &str =
             "a reference frame selected with no picture at this frame's own ref_frame_idx slot";
-        let plane = PlaneBuf {
-            data: std::borrow::Cow::Owned(vec![0u16; 16]),
+        let pic = Picture {
             width: 4,
             height: 4,
-            true_width: 4,
-            true_height: 4,
-            tile_x0: 0,
-            tile_y0: 0,
-            tile_x1: 4,
-            tile_y1: 4,
+            y: vec![0u16; 16],
+            u: vec![0u16; 4],
+            v: vec![0u16; 4],
         };
-        let empty: RefSlots = [None; 8];
+        let mut refs: [Option<&Picture>; 8] = [None; 8];
+        refs[1] = Some(&pic);
+        let refpix = RefPix::ready(refs);
         for ref_frame in [LAST2_FRAME, LAST3_FRAME, GOLDEN_FRAME, BWDREF_FRAME, ALTREF2_FRAME, ALTREF_FRAME] {
-            let err = match ref_planes(ref_frame, &plane, &plane, &plane, &empty) {
+            let err = match ref_planes(ref_frame, &refpix) {
                 Ok(_) => panic!("ref {ref_frame}: an empty slot resolved to a picture"),
                 Err(e) => e.to_string(),
             };
             assert!(err.contains(REFUSAL), "ref {ref_frame}: expected {REFUSAL:?}, got: {err}");
         }
         // `LAST_FRAME` never consults the slots: `decode_stream` checked it.
-        let Ok((y, _, _)) = ref_planes(LAST_FRAME, &plane, &plane, &plane, &empty) else {
+        let Ok((y, _, _)) = ref_planes(LAST_FRAME, &refpix) else {
             panic!("LAST_FRAME resolves to the frame's own reference planes")
         };
         assert_eq!(y.width, 4);
@@ -36582,9 +36503,7 @@ mod tests {
             &mut y,
             &mut u,
             &mut v,
-            &ref_y,
-            &ref_u,
-            &ref_v,
+            refpix,
             &[None; 8],
             &NO_SIGN_BIAS,
             &[ec_av1_syntax::WarpParams::default(); 7],
