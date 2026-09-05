@@ -348,38 +348,68 @@ impl<'a> SymbolDecoder<'a> {
     #[inline]
     pub fn symbol_fixed(&mut self, cdf: &[u16]) -> usize {
         let nsyms = cdf.len() - 1;
-        let mut cur = self.range;
-        let mut prev = cur;
-        // The last boundary is always `CDF_TOP`, whose `cur` is 0, so the walk
-        // always stops inside the alphabet; iterating the slice instead of
-        // indexing it says so to the bounds checker.
-        let mut symbol = nsyms - 1;
+        // Two-symbol alphabets are most of the stream (every flag, every bit of
+        // a literal), and their walk has exactly one boundary: computing it
+        // straight skips the loop and its bounds work.
+        if nsyms == 2 {
+            let f = u32::from(CDF_TOP - cdf[0]);
+            let cur = (((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+                + EC_MIN_PROB;
+            return self.bool_cur(cur);
+        }
         // Loop-invariant: the coder's range does not move until the symbol is
         // chosen, so its top byte is computed once rather than per candidate.
         let base = self.range >> 8;
-        for (i, &c) in cdf[..nsyms].iter().enumerate() {
-            prev = cur;
+        let mut prev = self.range;
+        // The floor every symbol above the candidate is owed, counted down
+        // instead of multiplied out per candidate.
+        let mut minp = EC_MIN_PROB * (nsyms - 1) as u32;
+        // The last boundary is always `CDF_TOP`, whose `cur` is 0, so the walk
+        // always stops inside the alphabet: the last candidate needs no test
+        // and its arithmetic is the fall-through below.
+        let mut symbol = nsyms - 1;
+        let mut cur = 0;
+        for (i, &c) in cdf[..nsyms - 1].iter().enumerate() {
             let f = u32::from(CDF_TOP - c);
-            cur = ((base * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
-                + EC_MIN_PROB * (nsyms - 1 - i) as u32;
-            if self.value >= cur {
+            let c = ((base * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT)) + minp;
+            if self.value >= c {
                 symbol = i;
+                cur = c;
                 break;
             }
+            prev = c;
+            minp -= EC_MIN_PROB;
         }
-        self.range = prev - cur;
-        self.value -= cur;
+        self.renorm(prev - cur, self.value - cur);
+        symbol
+    }
 
-        // Renormalise back into `[2^15, 2^16)`, the same shift the encoder
-        // applied when it narrowed to this symbol.
-        let bits = 16 - (32 - self.range.leading_zeros());
-        self.range <<= bits;
+    /// Finishes a two-symbol read whose single boundary is `cur`: symbol 0 owns
+    /// `[cur, range)` and symbol 1 owns `[0, cur)`.
+    #[inline(always)]
+    fn bool_cur(&mut self, cur: u32) -> usize {
+        let value = self.value;
+        let (symbol, rng, val) = if value >= cur {
+            (0, self.range - cur, value - cur)
+        } else {
+            (1, cur, value)
+        };
+        self.renorm(rng, val);
+        symbol
+    }
+
+    /// Renormalises `rng` back into `[2^15, 2^16)` and shifts the same number of
+    /// bits into `val`, the tail every symbol read shares — the same shift the
+    /// encoder applied when it narrowed to this symbol.
+    #[inline(always)]
+    fn renorm(&mut self, rng: u32, val: u32) {
+        let bits = 16 - (32 - rng.leading_zeros());
+        self.range = rng << bits;
         let num_bits = u32::min(bits, self.max_bits.max(0) as u32);
         let new_data = self.f(num_bits);
         let padded = new_data << (bits - num_bits);
-        self.value = padded ^ (((self.value + 1) << bits) - 1);
+        self.value = padded ^ (((val + 1) << bits) - 1);
         self.max_bits -= bits as i32;
-        symbol
     }
 
     /// Debug-only: the current bit offset into `data`, for cross-checking
@@ -402,7 +432,10 @@ impl<'a> SymbolDecoder<'a> {
     pub fn literal(&mut self, bits: u32) -> u32 {
         let mut v = 0;
         for _ in 0..bits {
-            v = (v << 1) | self.symbol_fixed(&EQUIPROBABLE) as u32;
+            // `EQUIPROBABLE`'s single boundary: `f >> EC_PROB_SHIFT` is 256, so
+            // the range multiply is a shift.
+            let cur = ((self.range >> 8) << 7) + EC_MIN_PROB;
+            v = (v << 1) | self.bool_cur(cur) as u32;
         }
         v
     }
@@ -611,5 +644,91 @@ pub(crate) mod tests {
     #[test]
     fn empty_payload_is_short() {
         assert!(SymbolEncoder::new().finish().len() <= 2);
+    }
+    /// The spec-literal 8.2.6 walk, as `symbol_fixed` read it before the
+    /// two-symbol shortcut and the last-candidate fall-through: every
+    /// candidate tested, `EC_MIN_PROB` multiplied out, one shared tail.
+    fn ref_symbol_fixed(d: &mut SymbolDecoder<'_>, cdf: &[u16]) -> usize {
+        let nsyms = cdf.len() - 1;
+        let mut cur = d.range;
+        let mut prev = cur;
+        let mut symbol = nsyms - 1;
+        let base = d.range >> 8;
+        for (i, &c) in cdf[..nsyms].iter().enumerate() {
+            prev = cur;
+            let f = u32::from(CDF_TOP - c);
+            cur = ((base * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+                + EC_MIN_PROB * (nsyms - 1 - i) as u32;
+            if d.value >= cur {
+                symbol = i;
+                break;
+            }
+        }
+        d.range = prev - cur;
+        d.value -= cur;
+        let bits = 16 - (32 - d.range.leading_zeros());
+        d.range <<= bits;
+        let num_bits = u32::min(bits, d.max_bits.max(0) as u32);
+        let new_data = d.f(num_bits);
+        let padded = new_data << (bits - num_bits);
+        d.value = padded ^ (((d.value + 1) << bits) - 1);
+        d.max_bits -= bits as i32;
+        symbol
+    }
+
+    /// The reader's fast paths must be the spec walk, symbol for symbol and
+    /// register for register: a long mixed stream is decoded twice in lockstep
+    /// and both the symbol and the coder state `(range, value)` are compared
+    /// after every read, so a divergence that has not yet changed a symbol
+    /// still fails here.
+    #[test]
+    fn fast_paths_match_the_spec_literal_walk() {
+        let mut state = 0x0123_4567_89ab_cdef;
+        let mut enc = SymbolEncoder::new();
+        let mut cdfs: Vec<Vec<u16>> = (2..=16).map(flat_cdf).collect();
+        let mut written: Vec<(usize, u32)> = Vec::new();
+        for _ in 0..20_000 {
+            let pick = (rng(&mut state) % 16) as usize;
+            if pick == 15 {
+                let width = 1 + (rng(&mut state) % 16) as u32;
+                let v = (rng(&mut state) as u32) & ((1u32 << width) - 1);
+                enc.literal(v, width);
+                written.push((usize::MAX, width));
+            } else {
+                let nsyms = pick + 2;
+                let sym = (rng(&mut state) % nsyms as u64) as usize;
+                enc.symbol(sym, &mut cdfs[pick]);
+                written.push((pick, sym as u32));
+            }
+        }
+        let payload = enc.finish();
+
+        let mut fast = SymbolDecoder::new(&payload);
+        let mut slow = SymbolDecoder::new(&payload);
+        let mut fast_cdfs: Vec<Vec<u16>> = (2..=16).map(flat_cdf).collect();
+        let mut slow_cdfs: Vec<Vec<u16>> = (2..=16).map(flat_cdf).collect();
+        for (i, &(pick, arg)) in written.iter().enumerate() {
+            let (a, b) = if pick == usize::MAX {
+                let a = fast.literal(arg);
+                let mut b = 0u32;
+                for _ in 0..arg {
+                    b = (b << 1) | ref_symbol_fixed(&mut slow, &EQUIPROBABLE) as u32;
+                }
+                (a, b)
+            } else {
+                let a = fast.symbol(&mut fast_cdfs[pick]) as u32;
+                let b = ref_symbol_fixed(&mut slow, &slow_cdfs[pick]);
+                update_cdf(&mut slow_cdfs[pick], b);
+                (a, b as u32)
+            };
+            assert_eq!(a, b, "item {i} (pick {pick})");
+            assert_eq!(a, if pick == usize::MAX { a } else { arg }, "item {i} vs written");
+            assert_eq!(
+                fast.debug_state(),
+                slow.debug_state(),
+                "coder state after item {i} (pick {pick})"
+            );
+            assert_eq!(fast_cdfs[pick.min(14)], slow_cdfs[pick.min(14)], "cdf after item {i}");
+        }
     }
 }
