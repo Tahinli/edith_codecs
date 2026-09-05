@@ -596,7 +596,7 @@ fn apply_wiener_stripe(
     // lane-perf8: `mc::vpass_row` reads a fixed 8 taps from `row`, so the
     // last vertical output needs two rows of padding past the `h + 6` the
     // 7-tap kernel actually uses. Tap 7 is zero, so they never contribute.
-    inter.resize((h + 8) * w, 0i32);
+    inter.resize((h + 8) * w, 0i16);
     // lane-perf8: this pass IS `mc.rs`'s horizontal one -- a 7-tap `i16`
     // convolution over contiguous samples rounded by `Round2(_, 3)`, which
     // is `INTER_ROUND_0` -- so it runs on that module's kernels with the
@@ -606,7 +606,11 @@ fn apply_wiener_stripe(
     let hf = &info.hfilter;
     let t16: [i16; 8] =
         [hf[0] as i16, hf[1] as i16, hf[2] as i16, hf[3] as i16, hf[4] as i16, hf[5] as i16, hf[6] as i16, 0];
-    let (lo_bound, hi_bound) = (-wiener_bias as i32, (wiener_limit - 1 - wiener_bias) as i32);
+    // lane-mc: the intermediate is `i16` now. Both bounds are inside that
+    // range at 8- and 10-bit (12-bit is refused in stream.rs), so the
+    // kernel's saturating store composes with this clamp instead of changing
+    // it: `[-2048, 8191]` at 8-bit, `[-8192, 32767]` at 10.
+    let (lo_bound, hi_bound) = (-wiener_bias as i16, (wiener_limit - 1 - wiener_bias) as i16);
     let mut hbuf = WIENER_ROW_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
     for r in 0..rows {
         let row = v_start as i64 - 3 + r as i64;
@@ -651,7 +655,7 @@ fn apply_wiener_stripe(
 thread_local! {
     /// [`apply_wiener_stripe`]'s horizontal-pass intermediate, kept across
     /// calls so a stripe does not allocate (lane-perf7).
-    static WIENER_INTER_SCRATCH: std::cell::RefCell<Vec<i32>> =
+    static WIENER_INTER_SCRATCH: std::cell::RefCell<Vec<i16>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// The clamped-column copy the horizontal pass needs at a plane edge.
     static WIENER_ROW_SCRATCH: std::cell::RefCell<Vec<u16>> =
