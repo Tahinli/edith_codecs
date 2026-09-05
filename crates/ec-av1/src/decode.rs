@@ -85,6 +85,11 @@ pub(crate) struct FrameCtx {
     /// The queue buffer [`flush_recon`] just drained, kept for its capacity
     /// so a superblock's records do not regrow the vector from nothing.
     pub(crate) recon_spare: std::cell::RefCell<Vec<ReconOp>>,
+    /// lane-wave1 step (ii): the tile decoder's own planes, registered by
+    /// [`ReconInline`] while reconstruction runs INLINE (one recon thread).
+    /// `None` while the queue is in use (wavefront workers) and outside a
+    /// tile. See [`push_op`].
+    pub(crate) recon_planes: std::cell::Cell<Option<ReconPlanes>>,
 }
 
 impl std::fmt::Debug for FrameCtx {
@@ -144,6 +149,7 @@ impl FrameCtx {
             grain_bit_depth: std::cell::Cell::new(8),
             recon_ops: std::cell::RefCell::new(Vec::new()),
             recon_spare: std::cell::RefCell::new(Vec::new()),
+            recon_planes: std::cell::Cell::new(None),
         }
     }
 }
@@ -2081,8 +2087,140 @@ pub(crate) enum ReconOp {
     },
 }
 
+/// The three planes of the tile currently being decoded, as raw pointers.
+///
+/// corner-cut: at one reconstruction thread a recorded write must cost
+/// nothing -- deferring it to the end of the superblock is +1.2%
+/// instructions and +4.5% wall on 4K, because the residual is written at
+/// parse and read back cache-cold at replay. So the recorded op is performed
+/// at the push site instead, through the pointers the tile decoder registers
+/// once ([`ReconInline`]), which is the same thread, the same order and the
+/// same writes as before lane-wave1 -- but the `&mut PlaneBuf` the parse
+/// stack still holds aliases them, exactly the [`crate::par::Shared`]
+/// trade-off (Miri's stacked borrows would flag both). The upgrade path is
+/// threading the three planes down every `read_plane`/`read_inter_plane`
+/// call site (~40) so the push site owns the borrow it writes through.
+#[derive(Clone, Copy)]
+pub(crate) struct ReconPlanes(
+    *mut PlaneBuf<'static>,
+    *mut PlaneBuf<'static>,
+    *mut PlaneBuf<'static>,
+);
+
+// SAFETY: a `FrameCtx` sent to another thread (a frame worker, or
+// [`filter_ctx_copy`]) is always one whose guard is not installed, so the
+// value travelling is `None`; the pointers never leave the tile decoder's
+// own thread.
+#[allow(unsafe_code)]
+unsafe impl Send for ReconPlanes {}
+
+/// Registers the tile's planes for inline reconstruction and unregisters them
+/// on every exit from the tile decoder, including the `?` ones -- a stale
+/// pointer here would outlive the planes, since [`FrameCtx`] outlives the
+/// tile.
+pub(crate) struct ReconInline<'a>(&'a crate::decode::FrameCtx);
+
+#[allow(unsafe_code)]
+impl<'a> ReconInline<'a> {
+    /// Installs the guard for this tile when reconstruction is inline
+    /// (`EC_AV1_RECON_THREADS == 1`, the default); `None` hands every write
+    /// to the queue instead, for the wavefront workers to replay.
+    fn install(
+        fctx: &'a crate::decode::FrameCtx,
+        y: &mut PlaneBuf<'static>,
+        u: &mut PlaneBuf<'static>,
+        v: &mut PlaneBuf<'static>,
+    ) -> Option<Self> {
+        if crate::par::recon_threads() != 1 {
+            return None;
+        }
+        // SAFETY: the planes are locals of the tile decoder and outlive the
+        // guard, which is dropped on every exit from it (including `?`); see
+        // [`ReconPlanes`] for the aliasing trade-off.
+        let planes = ReconPlanes(
+            std::ptr::from_mut(y),
+            std::ptr::from_mut(u),
+            std::ptr::from_mut(v),
+        );
+        fctx.recon_planes.with(|c| c.set(Some(planes)));
+        Some(Self(fctx))
+    }
+}
+
+impl Drop for ReconInline<'_> {
+    fn drop(&mut self) {
+        self.0.recon_planes.with(|c| c.set(None));
+    }
+}
+
+#[allow(unsafe_code)]
 fn push_op(fctx: &crate::decode::FrameCtx, op: ReconOp) {
+    if let Some(ReconPlanes(y, u, v)) = fctx.recon_planes.with(std::cell::Cell::get) {
+        // SAFETY: see [`ReconPlanes`] -- one thread, and the write is the one
+        // the parse site would have performed itself before lane-wave1.
+        unsafe { exec_op(op, &mut *y, &mut *u, &mut *v, fctx) };
+        return;
+    }
     fctx.recon_ops.with(|c| c.borrow_mut().push(op));
+}
+
+/// Performs an intra write at its push site when the tile registered its
+/// planes for inline reconstruction ([`ReconPlanes`]); `false` when the
+/// caller must record it for the wavefront workers instead.
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn inline_intra(
+    plane: usize,
+    x: usize,
+    oy: usize,
+    bw: usize,
+    bh: usize,
+    rect: bool,
+    mode: usize,
+    angle_delta: i32,
+    reach: Reach,
+    residual: &[i32],
+    cfl: Option<(i32, CflSrc)>,
+    filter_intra: Option<usize>,
+    smooth_neighbor: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> bool {
+    let Some(ReconPlanes(y, u, v)) = fctx.recon_planes.with(std::cell::Cell::get) else {
+        return false;
+    };
+    let pred = take_palette_pred(fctx);
+    // SAFETY: see [`ReconPlanes`].
+    unsafe {
+        exec_intra(
+            &mut *y, &mut *u, &mut *v, plane, x, oy, bw, bh, rect, mode, angle_delta, reach,
+            residual, cfl, filter_intra, smooth_neighbor, pred, fctx,
+        );
+    }
+    true
+}
+
+/// [`inline_intra`] for a motion-compensated write.
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn inline_mc(
+    plane: usize,
+    x: usize,
+    oy: usize,
+    stride: usize,
+    w: usize,
+    h: usize,
+    prediction: &[u16],
+    residual: &[i32],
+    fctx: &crate::decode::FrameCtx,
+) -> bool {
+    let Some(ReconPlanes(y, u, v)) = fctx.recon_planes.with(std::cell::Cell::get) else {
+        return false;
+    };
+    // SAFETY: see [`ReconPlanes`].
+    unsafe {
+        exec_mc(&mut *y, &mut *u, &mut *v, plane, x, oy, stride, w, h, prediction, residual, fctx);
+    }
+    true
 }
 
 /// [`PlaneBuf::reconstruct`], recorded (lane-wave1 step (i)).
@@ -2100,6 +2238,12 @@ fn push_intra(
     filter_intra: Option<usize>,
     smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
 ) {
+    if inline_intra(
+        plane, x, y, side, side, false, mode, angle_delta, reach, residual, cfl, filter_intra,
+        smooth_neighbor, fctx,
+    ) {
+        return;
+    }
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
@@ -2123,6 +2267,12 @@ fn push_intra_owned(
     filter_intra: Option<usize>,
     smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
 ) {
+    if inline_intra(
+        plane, x, y, side, side, false, mode, angle_delta, reach, &residual, cfl, filter_intra,
+        smooth_neighbor, fctx,
+    ) {
+        return;
+    }
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw: side, bh: side, rect: false, mode, angle_delta, reach,
@@ -2142,6 +2292,9 @@ fn push_mc_rect_owned(
     prediction: &[u16],
     residual: Vec<i32>, fctx: &crate::decode::FrameCtx,
 ) {
+    if inline_mc(plane, x, y, stride, w, h, prediction, &residual, fctx) {
+        return;
+    }
     push_op(fctx, ReconOp::Mc {
         plane, x, y, stride, w, h, prediction: prediction.to_vec(), residual,
     });
@@ -2163,6 +2316,12 @@ fn push_intra_rect(
     filter_intra: Option<usize>,
     smooth_neighbor: bool, fctx: &crate::decode::FrameCtx,
 ) {
+    if inline_intra(
+        plane, x, y, bw, bh, true, mode, angle_delta, reach, residual, cfl, filter_intra,
+        smooth_neighbor, fctx,
+    ) {
+        return;
+    }
     let pred = take_palette_pred(fctx);
     push_op(fctx, ReconOp::Intra {
         plane, x, y, bw, bh, rect: true, mode, angle_delta, reach,
@@ -2194,6 +2353,9 @@ fn push_mc_rect(
     prediction: &[u16],
     residual: &[i32], fctx: &crate::decode::FrameCtx,
 ) {
+    if inline_mc(plane, x, y, stride, w, h, prediction, residual, fctx) {
+        return;
+    }
     push_op(fctx, ReconOp::Mc {
         plane, x, y, stride, w, h,
         prediction: prediction.to_vec(), residual: residual.to_vec(),
@@ -2217,45 +2379,103 @@ fn flush_recon(
     let mut ops = fctx.recon_spare.with(|c| std::mem::take(&mut *c.borrow_mut()));
     fctx.recon_ops.with(|c| std::mem::swap(&mut *c.borrow_mut(), &mut ops));
     for op in ops.drain(..) {
-        match op {
-            ReconOp::Intra {
-                plane, x, y: oy, bw, bh, rect, mode, angle_delta, reach, residual, cfl,
-                filter_intra, smooth_neighbor, pred,
-            } => {
-                // The CfL AC signal is read HERE, off the luma this very
-                // replay has already written for this block -- at parse time
-                // it would have been the previous frame's samples.
-                let ac = cfl.map(|(alpha, src)| {
-                    let sig = if src.rect {
-                        cfl_ac_q3_rect(&*y, src.px, src.py, src.bw, src.bh)
-                    } else {
-                        cfl_ac_q3(&*y, src.px, src.py, src.bw)
-                    };
-                    (alpha, sig)
-                });
-                let cfl = ac.as_ref().map(|(a, sig)| (*a, sig.as_slice()));
-                let target: &mut PlaneBuf<'static> =
-                    match plane { 0 => &mut *y, 1 => &mut *u, _ => &mut *v };
-                if rect {
-                    target.reconstruct_rect(
-                        x, oy, bw, bh, mode, angle_delta, reach, &residual, cfl, filter_intra,
-                        smooth_neighbor, pred, fctx,
-                    );
-                } else {
-                    target.reconstruct(
-                        x, oy, bw, mode, angle_delta, reach, &residual, cfl, filter_intra,
-                        smooth_neighbor, pred, fctx,
-                    );
-                }
-            }
-            ReconOp::Mc { plane, x, y: oy, stride, w, h, prediction, residual } => {
-                let target: &mut PlaneBuf<'static> =
-                    match plane { 0 => &mut *y, 1 => &mut *u, _ => &mut *v };
-                target.reconstruct_mc_rect(x, oy, stride, w, h, &prediction, &residual, fctx);
-            }
-        }
+        exec_op(op, y, u, v, fctx);
     }
     fctx.recon_spare.with(|c| *c.borrow_mut() = ops);
+}
+
+/// Performs one recorded write: the body [`flush_recon`] replays, and the
+/// body [`push_op`] runs immediately when reconstruction is inline.
+fn exec_op(
+    op: ReconOp,
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    fctx: &crate::decode::FrameCtx,
+) {
+    match op {
+        ReconOp::Intra {
+            plane, x, y: oy, bw, bh, rect, mode, angle_delta, reach, residual, cfl,
+            filter_intra, smooth_neighbor, pred,
+        } => exec_intra(
+            y, u, v, plane, x, oy, bw, bh, rect, mode, angle_delta, reach, &residual, cfl,
+            filter_intra, smooth_neighbor, pred, fctx,
+        ),
+        ReconOp::Mc { plane, x, y: oy, stride, w, h, prediction, residual } => {
+            exec_mc(y, u, v, plane, x, oy, stride, w, h, &prediction, &residual, fctx);
+        }
+    }
+}
+
+/// [`ReconOp::Intra`] performed. Its arguments are borrowed, so the inline
+/// path ([`push_op`]'s registered planes) reaches it without ever building
+/// the record -- which is what keeps one reconstruction thread at the cost of
+/// the pre-lane-wave1 decoder.
+#[allow(clippy::too_many_arguments)]
+fn exec_intra(
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    plane: usize,
+    x: usize,
+    oy: usize,
+    bw: usize,
+    bh: usize,
+    rect: bool,
+    mode: usize,
+    angle_delta: i32,
+    reach: Reach,
+    residual: &[i32],
+    cfl: Option<(i32, CflSrc)>,
+    filter_intra: Option<usize>,
+    smooth_neighbor: bool,
+    pred: Option<Vec<u16>>,
+    fctx: &crate::decode::FrameCtx,
+) {
+    // The CfL AC signal is read HERE, off the luma that has already been
+    // written for this block -- at parse time it would have been the previous
+    // frame's samples.
+    let ac = cfl.map(|(alpha, src)| {
+        let sig = if src.rect {
+            cfl_ac_q3_rect(&*y, src.px, src.py, src.bw, src.bh)
+        } else {
+            cfl_ac_q3(&*y, src.px, src.py, src.bw)
+        };
+        (alpha, sig)
+    });
+    let cfl = ac.as_ref().map(|(a, sig)| (*a, sig.as_slice()));
+    let target: &mut PlaneBuf<'static> = match plane { 0 => &mut *y, 1 => &mut *u, _ => &mut *v };
+    if rect {
+        target.reconstruct_rect(
+            x, oy, bw, bh, mode, angle_delta, reach, residual, cfl, filter_intra,
+            smooth_neighbor, pred, fctx,
+        );
+    } else {
+        target.reconstruct(
+            x, oy, bw, mode, angle_delta, reach, residual, cfl, filter_intra,
+            smooth_neighbor, pred, fctx,
+        );
+    }
+}
+
+/// [`ReconOp::Mc`] performed -- see [`exec_intra`].
+#[allow(clippy::too_many_arguments)]
+fn exec_mc(
+    y: &mut PlaneBuf<'static>,
+    u: &mut PlaneBuf<'static>,
+    v: &mut PlaneBuf<'static>,
+    plane: usize,
+    x: usize,
+    oy: usize,
+    stride: usize,
+    w: usize,
+    h: usize,
+    prediction: &[u16],
+    residual: &[i32],
+    fctx: &crate::decode::FrameCtx,
+) {
+    let target: &mut PlaneBuf<'static> = match plane { 0 => &mut *y, 1 => &mut *u, _ => &mut *v };
+    target.reconstruct_mc_rect(x, oy, stride, w, h, prediction, residual, fctx);
 }
 
 thread_local! {
@@ -18631,6 +18851,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // its one block covers all four 64x64 quadrants, so the remaining three
     // visits of this superblock code nothing at all.
     let mut sb128_none = false;
+    // lane-wave1 step (ii): at one reconstruction thread the recorded writes
+    // are performed at their push sites (nothing reaches the queue below).
+    let _recon_inline = ReconInline::install(fctx, &mut y, &mut u, &mut v);
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
         // lane-wave1 step (i): the previous superblock's recorded writes.
         flush_recon(fctx, &mut y, &mut u, &mut v);
@@ -30084,6 +30307,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // three items of this superblock carry no syntax at all (same skip the
     // key-frame tile loop runs).
     let mut sb128_none = false;
+    // lane-wave1 step (ii): at one reconstruction thread the recorded writes
+    // are performed at their push sites (nothing reaches the queue below).
+    let _recon_inline = ReconInline::install(fctx, &mut y, &mut u, &mut v);
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
         // lane-wave1 step (i): the previous superblock's recorded writes.
         flush_recon(fctx, &mut y, &mut u, &mut v);
