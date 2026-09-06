@@ -799,7 +799,9 @@ impl Av1Encoder {
         // the other path never filled. Per-GOP re-decision needs the two
         // reference sets kept in step first; the gate's own recipe codes one
         // GOP per stream, where the two are the same decision.
-        if self.pyramid.is_some() && self.next_index == 0 && crate::encode::picture_is_screen(picture)
+        if self.pyramid.is_some()
+            && self.next_index == 0
+            && crate::encode::picture_is_screen(picture)
         {
             self.pyramid = None;
         }
