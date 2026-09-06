@@ -5478,6 +5478,54 @@ fn base_ctx(
     }
 }
 
+/// The five `base_ctx` neighbour taps and the three `br_ctx` ones as FLAT
+/// offsets into the padded level frame (lane-coefread): the tap pattern is a
+/// function of the tx class alone, which is fixed for a whole transform unit,
+/// so resolving it once per unit takes the class match and the `(dr, dc)`
+/// -> `dr * stride + dc` arithmetic out of the per-coefficient path. Same
+/// taps as [`base_ctx`]/[`br_ctx`] read, stated once;
+/// `flat_taps_match_the_row_col_neighbour_reads` pins them against the
+/// original `(dr, dc)` form.
+fn flat_taps(stride: usize, class: TxClass) -> ([usize; 5], [usize; 3]) {
+    match class {
+        TxClass::TwoD => (
+            [stride, 1, stride + 1, 2 * stride, 2],
+            [stride, 1, stride + 1],
+        ),
+        TxClass::Horiz => ([stride, 1, 2, 3, 4], [stride, 1, 2]),
+        TxClass::Vert => (
+            [stride, 1, 2 * stride, 3 * stride, 4 * stride],
+            [stride, 1, 2 * stride],
+        ),
+    }
+}
+
+/// [`base_ctx`]'s neighbour sum, off flat taps: `((sum of five clamped
+/// neighbours) + 1) >> 1`, clamped to 4.
+#[inline(always)]
+fn base_mag(grid: &[u8], idx: usize, taps: &[usize; 5]) -> usize {
+    let mut mag = 0u32;
+    for &t in taps {
+        mag += u32::from(grid[idx + t]).min(3);
+    }
+    (((mag + 1) >> 1) as usize).min(4)
+}
+
+/// [`br_ctx`]'s neighbour sum, off flat taps.
+#[inline(always)]
+fn br_mag(grid: &[u8], idx: usize, taps: &[usize; 3]) -> usize {
+    let mut mag = 0u32;
+    for &t in taps {
+        mag += u32::from(grid[idx + t]);
+    }
+    (((mag + 1) >> 1) as usize).min(6)
+}
+
+/// lane-coefread: superseded on the decode path by [`br_mag`] plus the
+/// origin-offset tail the two coefficient readers state inline; kept as the
+/// `(row, col)` form `flat_taps_match_the_row_col_neighbour_reads` pins the
+/// flat one against.
+#[cfg(test)]
 fn br_ctx(grid: &[u8], stride: usize, row: usize, col: usize, class: TxClass) -> usize {
     let extra = match class {
         TxClass::TwoD => neighbour(grid, stride, row + 1, col + 1),
@@ -5721,6 +5769,10 @@ fn base_ctx_rect(
 /// [`br_ctx`]'s `TxClass::TwoD` arm widened to `(w, h)` (lane-rectwire): the
 /// neighbour-offset math itself is shape-independent, only the boundary
 /// clamp needs the real bound in each axis.
+/// lane-coefread: superseded by [`br_mag`] on the rect decode path too --
+/// its body was character-for-character [`br_ctx`]'s, which
+/// `flat_taps_match_the_row_col_neighbour_reads` now asserts.
+#[cfg(test)]
 fn br_ctx_rect(
     grid: &[u8],
     stride: usize,
@@ -6022,9 +6074,21 @@ fn read_coeffs(
     let stride = side + 4;
     let mut levels_buf = [0u8; 36 * 36];
     let levels = &mut levels_buf[..stride * stride];
+    // lane-coefread: the sign pass used to re-walk `scan[..eob]`, redo the
+    // `pos >> sh` / `& mask` decomposition and load the level back out of the
+    // padded frame just to skip the zeros. The base pass already knows both,
+    // so it records `(scan_idx << 4) | level` for each NON-ZERO coefficient
+    // (`scan_idx < 1024`, `level <= 15` -- both loops assert it), and the sign
+    // pass walks that list in reverse (the base pass runs in reverse scan
+    // order, so reversing it is forward scan order: the same coefficients, in
+    // the same order, with the same `c` the trace prints).
+    let mut nz_buf = [0u16; 1024];
+    let mut nz_n = 0usize;
+    let (base_taps, br_taps) = flat_taps(stride, class);
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
         let (row, col) = (pos >> sh, pos & col_mask);
+        let idx = row * stride + col;
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, side * side);
             let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
@@ -6035,7 +6099,16 @@ fn read_coeffs(
             }
             v
         } else {
-            let ctx = base_ctx(levels, stride, row, col, class, rect_shape);
+            let ctx = if class == TxClass::TwoD && rect_shape.is_none() {
+                if row == 0 && col == 0 {
+                    0
+                } else {
+                    base_mag(levels, idx, &base_taps)
+                        + cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize
+                }
+            } else {
+                base_ctx(levels, stride, row, col, class, rect_shape)
+            };
             let v = dec.symbol(&mut coding.base[ctx]) as i32;
             if ec_trace_coeff {
                 let (rng, _) = dec.debug_state();
@@ -6054,7 +6127,19 @@ fn read_coeffs(
             v
         };
         let level = if level > NUM_BASE_LEVELS {
-            let ctx = br_ctx(levels, stride, row, col, class);
+            let ctx = {
+                let mag = br_mag(levels, idx, &br_taps);
+                if row == 0 && col == 0 {
+                    mag
+                } else {
+                    let near_origin = match class {
+                        TxClass::TwoD => row < 2 && col < 2,
+                        TxClass::Horiz => col == 0,
+                        TxClass::Vert => row == 0,
+                    };
+                    if near_origin { mag + 7 } else { mag + 14 }
+                }
+            };
             let mut level = level;
             let mut sent = 0;
             loop {
@@ -6095,19 +6180,21 @@ fn read_coeffs(
         // frame is bytes -- the five-tap sum in [`base_ctx`]/[`br_ctx`] is a
         // byte gather (lane-coefbuf).
         debug_assert!(level >= 0 && level <= 15, "level {level} past the u8 frame");
-        levels[row * stride + col] = level as u8;
+        levels[idx] = level as u8;
+        if level != 0 {
+            nz_buf[nz_n] = ((scan_idx as u16) << 4) | level as u16;
+            nz_n += 1;
+        }
     }
     if ec_trace_coeff {
         let (rng, _) = dec.debug_state();
         eprintln!("EC_COEFF_STEP tag=after_bases rng={rng}");
     }
 
-    for (c, &pos) in scan[..eob].iter().enumerate() {
-        let pos = pos as usize;
-        let level = levels[(pos >> sh) * stride + (pos & col_mask)] as i32;
-        if level == 0 {
-            continue;
-        }
+    for &packed in nz_buf[..nz_n].iter().rev() {
+        let c = (packed >> 4) as usize;
+        let pos = scan[c] as usize;
+        let level = (packed & 15) as i32;
         let negative = if pos == 0 {
             let v = dec.symbol(&mut coding.dc_sign[sign_ctx]) == 1;
             if trace {
@@ -6226,9 +6313,15 @@ fn read_coeffs_rect(
     };
     let wsh = w.trailing_zeros();
     let wmask = w - 1;
+    // lane-coefread: the non-zero list [`read_coeffs`] documents.
+    let mut nz_buf = [0u16; 1024];
+    let mut nz_n = 0usize;
+    let (base_taps, br_taps) = flat_taps(stride, class);
+    let (wlt, wgt) = (w < h, w > h);
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
         let (row, col) = (pos >> wsh, pos & wmask);
+        let idx = row * stride + col;
         // libaom's column-major `coeff_idx`, for ladder comparison.
         let _apos = col * h + row;
         let level = if scan_idx == eob - 1 {
@@ -6242,7 +6335,22 @@ fn read_coeffs_rect(
             }
             v
         } else {
-            let ctx = base_ctx_rect(levels, stride, w, h, row, col, class);
+            let ctx = if class == TxClass::TwoD {
+                if row == 0 && col == 0 {
+                    0
+                } else {
+                    let m = base_mag(levels, idx, &base_taps);
+                    if wlt && row < 2 {
+                        m + 11
+                    } else if wgt && col < 2 {
+                        m + 16
+                    } else {
+                        m + cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize
+                    }
+                }
+            } else {
+                base_ctx_rect(levels, stride, w, h, row, col, class)
+            };
             let v = dec.symbol(&mut coding.base[ctx]) as i32;
             if rect_trace {
                 eprintln!(
@@ -6253,7 +6361,19 @@ fn read_coeffs_rect(
             v
         };
         let level = if level > NUM_BASE_LEVELS {
-            let ctx = br_ctx_rect(levels, stride, row, col, class);
+            let ctx = {
+                let mag = br_mag(levels, idx, &br_taps);
+                if row == 0 && col == 0 {
+                    mag
+                } else {
+                    let near_origin = match class {
+                        TxClass::TwoD => row < 2 && col < 2,
+                        TxClass::Horiz => col == 0,
+                        TxClass::Vert => row == 0,
+                    };
+                    if near_origin { mag + 7 } else { mag + 14 }
+                }
+            };
             let mut level = level;
             let mut sent = 0;
             loop {
@@ -6275,7 +6395,11 @@ fn read_coeffs_rect(
             level
         };
         debug_assert!(level >= 0 && level <= 15, "level {level} past the u8 frame");
-        levels[row * stride + col] = level as u8;
+        levels[idx] = level as u8;
+        if level != 0 {
+            nz_buf[nz_n] = ((scan_idx as u16) << 4) | level as u16;
+            nz_n += 1;
+        }
         if rect_trace {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=base c={scan_idx} pos={pos} level={level} rng={rng}");
@@ -6285,12 +6409,9 @@ fn read_coeffs_rect(
         let (rng, _) = dec.debug_state();
         eprintln!("EC_COEFF_STEP tag=after_bases rng={rng}");
     }
-    for &pos in &scan[..eob] {
-        let pos = pos as usize;
-        let level = levels[(pos >> wsh) * stride + (pos & wmask)] as i32;
-        if level == 0 {
-            continue;
-        }
+    for &packed in nz_buf[..nz_n].iter().rev() {
+        let pos = scan[(packed >> 4) as usize] as usize;
+        let level = (packed & 15) as i32;
         let negative = if pos == 0 {
             dec.symbol(&mut coding.dc_sign[sign_ctx]) == 1
         } else {
@@ -35967,6 +36088,60 @@ mod tests {
     /// `[row][col]`, which is the transpose (the OTHER shape's rule, with 11
     /// and 16 swapped): it desynced the first superblock strip whose luma
     /// corner held a coefficient off the first row/column.
+    /// lane-coefread: the per-coefficient neighbour gather now reads FLAT
+    /// offsets ([`flat_taps`]) instead of `(row + dr, col + dc)`. Same cells,
+    /// every class, every square size, over the whole `(row, col)` domain.
+    #[test]
+    fn flat_taps_match_the_row_col_neighbour_reads() {
+        for &side in &[4usize, 8, 16, 32] {
+            let stride = side + 4;
+            let mut grid = vec![0u8; stride * stride];
+            let mut x = 12345u32;
+            for c in grid.iter_mut() {
+                x = x.wrapping_mul(1103515245).wrapping_add(12345);
+                *c = ((x >> 16) & 15) as u8;
+            }
+            for class in [TxClass::TwoD, TxClass::Horiz, TxClass::Vert] {
+                let (bt, rt) = flat_taps(stride, class);
+                for row in 0..side {
+                    for col in 0..side {
+                        let idx = row * stride + col;
+                        if !(class == TxClass::TwoD && row == 0 && col == 0) {
+                            let want = base_ctx(&grid, stride, row, col, class, None);
+                            let got = base_mag(&grid, idx, &bt)
+                                + match class {
+                                    TxClass::TwoD => {
+                                        cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize
+                                    }
+                                    TxClass::Horiz => nz_map_ctx_offset_1d(col.min(31)),
+                                    TxClass::Vert => nz_map_ctx_offset_1d(row.min(31)),
+                                };
+                            assert_eq!(got, want, "base side {side} at {row},{col}");
+                        }
+                        let want = br_ctx(&grid, stride, row, col, class);
+                        let mag = br_mag(&grid, idx, &rt);
+                        let got = if row == 0 && col == 0 {
+                            mag
+                        } else {
+                            let near = match class {
+                                TxClass::TwoD => row < 2 && col < 2,
+                                TxClass::Horiz => col == 0,
+                                TxClass::Vert => row == 0,
+                            };
+                            if near { mag + 7 } else { mag + 14 }
+                        };
+                        assert_eq!(got, want, "br side {side} at {row},{col}");
+                        assert_eq!(
+                            br_ctx_rect(&grid, stride, row, col, class),
+                            want,
+                            "br_rect side {side} at {row},{col}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn base_ctx_rect_offsets_match_the_transcribed_tables_over_the_whole_domain() {
         let grid = [0u8; 36 * 36];
