@@ -190,6 +190,21 @@ fn extra_new_skip_margin() -> f64 {
     }
 }
 
+/// Whether a 16x16 or 8x8 inter LEAF is offered the compound candidates the
+/// whole 32x32 block is (lane-av1comp3). The writer already codes a compound
+/// block at any leaf size (`tile::write_inter_frame_leaf`/`..._leaf8` both
+/// route through `write_compound_block`, which is sized by `bw4`/`bh4`); what
+/// was missing was the encoder ever forming one below 32x32.
+const LEAF_COMPOUND: bool = true;
+
+/// [`LEAF_COMPOUND`], or what `EC_AV1_LEAF_COMPOUND` names in any build.
+fn leaf_compound() -> bool {
+    match std::env::var("EC_AV1_LEAF_COMPOUND").ok() {
+        Some(v) => v != "0",
+        None => LEAF_COMPOUND,
+    }
+}
+
 /// [`LEAF_NEW_MV`], or what `EC_AV1_LEAF_NEWMV` names in a test build.
 fn leaf_new_mv() -> bool {
     match std::env::var("EC_AV1_LEAF_NEWMV").ok() {
@@ -2813,7 +2828,12 @@ fn code_square_inter(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    stack: &MvStack, fctx: &crate::decode::FrameCtx,
+    stack: &MvStack,
+    // The COMPOUND stack of each `LAST` + extra-reference pair, built at THIS
+    // leaf's own `bw4`/`bh4` (empty on a frame that does not code
+    // `reference_select`, and at the straddling call sites).
+    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
+    fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (intra_block, intra_cost) =
         code_square(
@@ -2950,7 +2970,12 @@ fn code_square_inter(
     // not code the movement it split for. Same candidate `search_inter_block`
     // prices for a whole block -- `motion::search` from `pred_mv`, rounded to
     // a vector the residual syntax can name -- at this leaf's own side.
-    let mut best = (inter_cost, None);
+    let mut best: (f64, Option<(Trial, Trial, Trial, bool, InterInfo)>) = (inter_cost, None);
+    // This leaf's own `NEWMV` vector, kept whether or not it won the
+    // single-reference comparison: it seeds the compound half-new candidate
+    // below, exactly as `search_inter_block` seeds its own from the searches
+    // it already ran.
+    let mut searched_new: Option<(i32, i32)> = None;
     if leaf_new_mv() {
         let source_block = luma.source_block(x, y, side);
         let (seeds, seed_n) = mv_seeds(stack);
@@ -2971,6 +2996,7 @@ fn code_square_inter(
         );
         let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
         if let Some(mv_bits) = mv_residual_bits(new_mv, stack.pred_mv) {
+            searched_new = Some(new_mv);
             // Same reuse as `search_inter_block`: a NEWMV equal to the
             // stack's NEARESTMV is the same three trials, already run above.
             let (luma_new, u_new, v_new) = if new_mv == mv {
@@ -3017,15 +3043,170 @@ fn code_square_inter(
                             luma_new.bits + u_new.bits + v_new.bits
                         });
             if cost_new < best.0 {
-                best = (cost_new, Some((luma_new, u_new, v_new, skip_new, new_mv)));
+                best = (
+                    cost_new,
+                    Some((
+                        luma_new,
+                        u_new,
+                        v_new,
+                        skip_new,
+                        InterInfo {
+                            ref1: None,
+                            mv1: (0, 0),
+                            ref_frame: crate::mvstack::LAST_FRAME,
+                            mode: InterMode::NewMv,
+                            mv: new_mv,
+                            ref_mv_idx: 0,
+                        },
+                    )),
+                );
             }
         }
     }
-    if let (cost, Some((luma_new, u_new, v_new, skip_new, new_mv))) = best {
-        if cost < intra_cost {
-            let (levels, tx_depth, dcost) = commit_inter_luma(
-                luma, (x, y), side, new_mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_new, skip_new, fctx,
+
+    // The COMPOUND candidates at this leaf (lane-av1comp3), the same set
+    // `search_inter_block` prices for a whole 32x32 block minus the two that
+    // need a motion search against the SECOND reference: a leaf never runs
+    // one (`NEAREST_NEWMV`/`NEW_NEWMV` would each cost another
+    // `motion::search` per extra reference per leaf), so the set here is
+    // `NEAREST_NEARESTMV`, `GLOBAL_GLOBALMV` and `NEW_NEARESTMV` off the
+    // vector this leaf already searched. Priced with the same static-CDF
+    // approximation, plus the compound-only syntax the writer emits.
+    for (ref1, g, cstack) in compound.iter().filter(|_| leaf_compound()) {
+        let (ref1, g) = (*ref1, *g);
+        let uni =
+            (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&ref1);
+        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
+            + if uni {
+                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
+                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
+                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
+                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
+            } else {
+                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
+            };
+        let mode_ctx =
+            cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
+        let mode_bits_of =
+            |mode: usize| pair_bits + symbol_bits(&cdf::INTER_COMPOUND_MODE[mode_ctx], mode);
+        let mut ccands: Vec<(((i32, i32), (i32, i32)), f64, InterInfo)> = vec![
+            (
+                cstack.nearest_mv,
+                mode_bits_of(0),
+                InterInfo {
+                    ref_frame: crate::mvstack::LAST_FRAME,
+                    mode: InterMode::NearestNearestMv,
+                    mv: cstack.nearest_mv.0,
+                    mv1: cstack.nearest_mv.1,
+                    ref1: Some(ref1),
+                    ref_mv_idx: 0,
+                },
+            ),
+            (
+                ((0, 0), (0, 0)),
+                mode_bits_of(6),
+                InterInfo {
+                    ref_frame: crate::mvstack::LAST_FRAME,
+                    mode: InterMode::GlobalGlobalMv,
+                    mv: (0, 0),
+                    mv1: (0, 0),
+                    ref1: Some(ref1),
+                    ref_mv_idx: 0,
+                },
+            ),
+        ];
+        // `NEW_NEARESTMV`: the NEW half is this leaf's own searched vector,
+        // its residual priced against compound stack entry 0 (what
+        // `assign_compound_mv` predicts from at `ref_mv_idx = 0`).
+        let cbase = cstack
+            .entries
+            .first()
+            .map_or(cstack.nearest_mv, |e| (e.mv0, e.mv1));
+        if let Some(new_mv) = searched_new {
+            if let Some(b0) = mv_residual_bits(new_mv, cbase.0) {
+                ccands.push((
+                    (new_mv, cstack.nearest_mv.1),
+                    mode_bits_of(3) + b0,
+                    InterInfo {
+                        ref_frame: crate::mvstack::LAST_FRAME,
+                        mode: InterMode::NewNearestMv,
+                        mv: new_mv,
+                        mv1: cstack.nearest_mv.1,
+                        ref1: Some(ref1),
+                        ref_mv_idx: 0,
+                    },
+                ));
+            }
+        }
+        ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        ccands.dedup_by_key(|c| c.0);
+        let g_luma = (g.y.as_slice(), g.width, luma.true_width, luma.true_height);
+        let g_u = (
+            g.u.as_slice(),
+            g.width / 2,
+            chroma[0].true_width,
+            chroma[0].true_height,
+        );
+        let g_v = (
+            g.v.as_slice(),
+            g.width / 2,
+            chroma[1].true_width,
+            chroma[1].true_height,
+        );
+        for (mvs, bits, info) in ccands {
+            let luma_c = mc_trial_compound(
+                luma, x, y, side, mvs, true,
+                (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), g_luma,
+                search.base_q_idx, search.deadzone, luma_set, fctx,
             );
+            let u_c = mc_trial_compound(
+                &chroma[0], x / 2, y / 2, side / 2, mvs, false,
+                (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3), g_u,
+                search.base_q_idx, search.deadzone, chroma_set, fctx,
+            );
+            let v_c = mc_trial_compound(
+                &chroma[1], x / 2, y / 2, side / 2, mvs, false,
+                (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3), g_v,
+                search.base_q_idx, search.deadzone, chroma_set, fctx,
+            );
+            let skip_c = luma_c.levels.iter().all(|&l| l == 0)
+                && u_c.levels.iter().all(|&l| l == 0)
+                && v_c.levels.iter().all(|&l| l == 0);
+            let cost_c = luma_c.sse
+                + u_c.sse
+                + v_c.sse
+                + search.lambda
+                    * (skip_bits(skip_c)
+                        + intra_inter_bits(true)
+                        + bits
+                        + if skip_c { 0.0 } else { luma_c.bits + u_c.bits + v_c.bits });
+            if cost_c < best.0 {
+                best = (cost_c, Some((luma_c, u_c, v_c, skip_c, info)));
+            }
+        }
+    }
+
+    if let (cost, Some((luma_new, u_new, v_new, skip_new, info))) = best {
+        if cost < intra_cost {
+            // A compound winner commits the flat trial it was priced from:
+            // `commit_inter_luma`'s var-tx trial set is single-reference
+            // (`mc_trial`), so a compound leaf codes `tx_depth = 0`.
+            // corner-cut: no var-tx split for a compound leaf -- ceiling is
+            // the split gain on 16x16 compound blocks; upgrade path is a
+            // compound `commit_inter_luma` taking both references.
+            let (levels, tx_depth, dcost) = if info.ref1.is_some() {
+                luma.commit(x, y, side, &luma_new);
+                (luma_new.levels.clone(), 0, 0.0)
+            } else {
+                commit_inter_luma(
+                    luma, (x, y), side, info.mv,
+                    (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
+                    search, &luma_new, skip_new, fctx,
+                )
+            };
             chroma[0].commit(x / 2, y / 2, side / 2, &u_new);
             chroma[1].commit(x / 2, y / 2, side / 2, &v_new);
             return (
@@ -3040,14 +3221,7 @@ fn code_square_inter(
                     palette: None,
             palette_uv: None,
                     tx_depth,
-                    inter: Some(InterInfo {
-                        ref1: None,
-                        mv1: (0, 0),
-                        ref_frame: crate::mvstack::LAST_FRAME,
-                        mode: InterMode::NewMv,
-                        mv: new_mv,
-                        ref_mv_idx: 0,
-                    }),
+                    inter: Some(info),
                 },
                 cost + dcost,
             );
@@ -5804,6 +5978,30 @@ pub(crate) fn encode_inter_frame(
                                 let stack = find_mv_stack(
                                     &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
                                 );
+                                let cstacks: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+                                    if header.reference_select && leaf_compound() {
+                                        [
+                                            (crate::mvstack::GOLDEN_FRAME, golden),
+                                            (crate::mvstack::ALTREF_FRAME, altref),
+                                        ]
+                                        .into_iter()
+                                        .filter_map(|(r, pic)| {
+                                            pic.map(|p| {
+                                                (
+                                                    r,
+                                                    p,
+                                                    crate::mvstack::find_mv_stack_compound(
+                                                        &grid, mi_row, mi_col, 4, 4,
+                                                        (crate::mvstack::LAST_FRAME, r), mi_cols, mi_rows,
+                                                        grid.sign_bias_table(), &[(0, 0); 7], None,
+                                                    ),
+                                                )
+                                            })
+                                        })
+                                        .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
                                 let (leaf, leaf_cost) = code_square_inter(
                                     &mut luma,
                                     &mut chroma,
@@ -5812,7 +6010,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                                &stack, fctx,
+                                                &stack, &cstacks, fctx,
                                 );
                                 let leaf_cost = leaf_cost
                                     + search.lambda * partition_bits(SUB, false);
@@ -5841,6 +6039,30 @@ pub(crate) fn encode_inter_frame(
                                             let stack8 = find_mv_stack(
                                                 &grid, mr, mc, 2, 2, LAST_FRAME, mi_cols, mi_rows,
                                             );
+                                            let cstacks8: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+                                                if header.reference_select && leaf_compound() {
+                                                    [
+                                                        (crate::mvstack::GOLDEN_FRAME, golden),
+                                                        (crate::mvstack::ALTREF_FRAME, altref),
+                                                    ]
+                                                    .into_iter()
+                                                    .filter_map(|(r, pic)| {
+                                                        pic.map(|p| {
+                                                            (
+                                                                r,
+                                                                p,
+                                                                crate::mvstack::find_mv_stack_compound(
+                                                                    &grid, mr, mc, 2, 2,
+                                                                    (crate::mvstack::LAST_FRAME, r), mi_cols, mi_rows,
+                                                                    grid.sign_bias_table(), &[(0, 0); 7], None,
+                                                                ),
+                                                            )
+                                                        })
+                                                    })
+                                                    .collect()
+                                                } else {
+                                                    Vec::new()
+                                                };
                                             let (leaf8, cost) = code_square_inter(
                                                 &mut luma,
                                                 &mut chroma,
@@ -5849,7 +6071,7 @@ pub(crate) fn encode_inter_frame(
                                                 &search,
                                                 &mode_bits_table,
                                                 reference,
-                                                                        &stack8, fctx,
+                                                                        &stack8, &cstacks8, fctx,
                                             );
                                             cost8 += cost;
                                             record_mi(&mut grid, mr, mc, 2, leaf8.inter);
@@ -5950,42 +6172,15 @@ pub(crate) fn encode_inter_frame(
                                 &search,
                                 &mode_bits_table,
                                 reference,
-                                        &stack, fctx,
+                                        &stack, &[], fctx,
                             );
-                            for dr in 0..4 {
-                                for dc in 0..4 {
-                                    grid.set(
-                                        mi_row + dr,
-                                        mi_col + dc,
-                                        match block.inter {
-                                            Some(info) => MiInfo {
-                                                is_inter: true,
-                                                ref_frame: LAST_FRAME,
-                                                ref_frame1: NO_REF1,
-                                                mv1: (0, 0),
-                                                mv: mv16(info.mv),
-                                                is_new_mv: matches!(info.mode, InterMode::NewMv),
-                                                size: 4,
-                                                size_h: 4,
-                                                is_global_mv0: false,
-                                                is_global_mv1: false,
-                                            },
-                                            None => MiInfo {
-                                                is_inter: false,
-                                                ref_frame: -1,
-                                                ref_frame1: NO_REF1,
-                                                mv1: (0, 0),
-                                                mv: (0, 0),
-                                                is_new_mv: false,
-                                                size: 4,
-                                                size_h: 4,
-                                                is_global_mv0: false,
-                                                is_global_mv1: false,
-                                            },
-                                        },
-                                    );
-                                }
-                            }
+                            // One publication point for every coded leaf
+                            // (`record_mi`): this site used to spell the vote
+                            // out with `ref_frame` pinned to LAST and `mv1`
+                            // to (0,0), which is the encoder-grid-drift class
+                            // -- correct only for as long as a leaf can never
+                            // be compound.
+                            record_mi(&mut grid, mi_row, mi_col, 4, block.inter);
                             leaves.push(block);
                         } else {
                             let (x_sub, y_sub) = (sc * SUB, sr * SUB);
@@ -6010,45 +6205,11 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                                &stack, fctx,
+                                                &stack, &[], fctx,
                                 );
-                                for dr in 0..2 {
-                                    for dc in 0..2 {
-                                        grid.set(
-                                            mi_row + dr,
-                                            mi_col + dc,
-                                            match leaf.inter {
-                                                Some(info) => MiInfo {
-                                                    is_inter: true,
-                                                    ref_frame: LAST_FRAME,
-                                                    ref_frame1: NO_REF1,
-                                                    mv1: (0, 0),
-                                                    mv: mv16(info.mv),
-                                                    is_new_mv: matches!(
-                                                        info.mode,
-                                                        InterMode::NewMv
-                                                    ),
-                                                    size: 2,
-                                                    size_h: 2,
-                                                    is_global_mv0: false,
-                                                    is_global_mv1: false,
-                                                },
-                                                None => MiInfo {
-                                                    is_inter: false,
-                                                    ref_frame: -1,
-                                                    ref_frame1: NO_REF1,
-                                                    mv1: (0, 0),
-                                                    mv: (0, 0),
-                                                    is_new_mv: false,
-                                                    size: 2,
-                                                    size_h: 2,
-                                                    is_global_mv0: false,
-                                                    is_global_mv1: false,
-                                                },
-                                            },
-                                        );
-                                    }
-                                }
+                                // Same publication point as the 16x16
+                                // straddling leaf above (`record_mi`).
+                                record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter);
                                 eight.push(leaf);
                             }
                             leaves.push(BlockCoeffs {
@@ -9390,7 +9551,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7103, 0xb9b7_763b_6f18_a887), (60, 26778, 0x4071_f16e_1e5d_87c3)];
+            [(150, 7084, 0xe6a9_2f62_3855_0eee), (60, 26116, 0xa831_9866_b799_80fc)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -9625,6 +9786,7 @@ mod tests {
             let _ = crate::tile::take_ref_hits();
             let _ = crate::tile::take_compound_mode_hits();
             let _ = crate::tile::take_compound_pair_hits();
+            let _ = crate::tile::take_compound_size_hits();
             let _ = crate::motion::take_census();
             let (ours, ours_wall) = match pyramid_from_env() {
                 None => our_ladder(&source, width, height, fctx),
@@ -9666,6 +9828,7 @@ mod tests {
             // picks cannot be what a BD number credits).
             let comp_modes = crate::tile::take_compound_mode_hits();
             let comp_pairs = crate::tile::take_compound_pair_hits();
+            let comp_sizes = crate::tile::take_compound_size_hits();
             let comp_total: usize = comp_modes.iter().sum();
             eprintln!(
                 "{name}: compound {comp_total} of {} inter blocks ({:.1}%); modes \
@@ -9676,6 +9839,10 @@ mod tests {
                 comp_modes[0], comp_modes[1], comp_modes[2], comp_modes[3],
                 comp_modes[6], comp_modes[7],
                 comp_pairs[3], comp_pairs[6],
+            );
+            eprintln!(
+                "{name}: compound by size 8x8 {} 16x16 {} 32x32 {}",
+                comp_sizes[1], comp_sizes[2], comp_sizes[3],
             );
             // Where the wall-owning stage actually goes: how many candidate
             // evaluations (one `mc::predict` + SAD each) a search spends, how
