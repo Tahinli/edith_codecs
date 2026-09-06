@@ -630,6 +630,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         next_cdfs: encoded.next_cdfs.clone(),
         loop_filter: encoded.loop_filter,
         loop_restoration: encoded.loop_restoration,
+        allow_intrabc: encoded.allow_intrabc,
         cdef: encoded.cdef,
     }
 }
@@ -709,6 +710,23 @@ pub struct Encoded {
     /// filters themselves are coded in `tile`, so a decode of it under a
     /// stale `RESTORE_NONE` header desyncs at the first superblock.
     pub(crate) loop_restoration: LoopRestorationParams,
+    /// This frame header's `allow_intrabc` -- every intra block of the tile
+    /// carries a `use_intrabc` symbol under it, so a raw tile decode that
+    /// guessed `false` would desync at the first block (same class as
+    /// `screen`/`tx_select`).
+    pub(crate) allow_intrabc: bool,
+}
+
+thread_local! {
+    /// The share of 16x16 source blocks [`intrabc_worth_it`] found a repeat
+    /// for on the last key frame encoded on this thread -- read by the gates,
+    /// which print it beside the block counts (class `gate-blind-to-feature`).
+    static IBC_SHARE: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+/// [`IBC_SHARE`] for the last key frame encoded on this thread.
+pub(crate) fn intrabc_source_share() -> f64 {
+    IBC_SHARE.with(std::cell::Cell::get)
 }
 
 thread_local! {
@@ -2444,6 +2462,385 @@ fn palette_candidates(block: &[u8]) -> Vec<crate::tile::PaletteY> {
 }
 
 #[allow(clippy::too_many_arguments)]
+// ---------------------------------------------------------------------------
+// lane-av1ibc: intra block copy (spec 5.11.13 `use_intrabc`, 7.11.4 DV
+// validity). A key frame that detected screen content and finds enough exact
+// repeats in its own source sets `allow_intrabc`, which the spec forces every
+// in-loop filter OFF for (frame.rs:194/210/252/272) -- so the bit only earns
+// its place when the copied blocks pay back the deblock/CDEF/LR the frame
+// gives up. `EC_AV1_INTRABC=0` turns the whole arm off.
+// ---------------------------------------------------------------------------
+
+/// Whether intra block copy is offered at all. On by default; off on a frame
+/// that detected no screen content, and off entirely under `EC_AV1_INTRABC=0`.
+fn intrabc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EC_AV1_INTRABC").ok().as_deref() != Some("0"))
+}
+
+/// How many of a screen frame's 16x16 blocks must have an exact repeat
+/// somewhere else in the source before `allow_intrabc` is worth the in-loop
+/// filters it costs, in percent (`EC_AV1_INTRABC_PCT`). Unswept-decision-
+/// constant class: `probe_intrabc_threshold` measures the arm at several
+/// values.
+fn intrabc_pct() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_INTRABC_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+    })
+}
+
+/// The pixel grid intrabc source positions are hashed on
+/// (`EC_AV1_INTRABC_STEP`): every DV this encoder writes is a multiple of it,
+/// which keeps the block-hash table (and so the search) linear in the frame
+/// at a `step`-th of the density. It must stay EVEN -- a chroma plane copies
+/// at `dv / 2` full pel, so an odd DV would land half-pel and need the
+/// bilinear interpolation decode.rs applies but this encoder does not.
+fn intrabc_step() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let n: usize = std::env::var("EC_AV1_INTRABC_STEP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        if n % 2 == 0 { n.max(2) } else { 4 }
+    })
+}
+
+/// The side of the luma square the block-hash table is keyed on.
+const IBC_HASH: usize = 16;
+
+/// libaom `INTRABC_DELAY_PIXELS / 64` -- how many 64x64 superblocks behind
+/// the current one the source's bottom-right corner must already be.
+const INTRABC_DELAY_SB64: i32 = 4;
+
+/// FNV-1a over one `IBC_HASH`-square of `plane` at `(x, y)`.
+fn ibc_hash(plane: &[u8], width: usize, x: usize, y: usize) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for row in 0..IBC_HASH {
+        let base = (y + row) * width + x;
+        for &v in &plane[base..base + IBC_HASH] {
+            h ^= u64::from(v);
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Every `intrabc_step()`-aligned position of `plane` inside
+/// `(x0, y0)..(x1, y1)`, keyed by [`ibc_hash`].
+fn ibc_index(
+    table: &mut std::collections::HashMap<u64, Vec<(u32, u32)>>,
+    plane: &[u8],
+    width: usize,
+    (x0, y0): (usize, usize),
+    (x1, y1): (usize, usize),
+) {
+    let step = intrabc_step();
+    if x1 < x0 + IBC_HASH || y1 < y0 + IBC_HASH {
+        return;
+    }
+    let mut y = y0.next_multiple_of(step);
+    while y + IBC_HASH <= y1 {
+        let mut x = x0.next_multiple_of(step);
+        while x + IBC_HASH <= x1 {
+            table
+                .entry(ibc_hash(plane, width, x, y))
+                .or_default()
+                .push((x as u32, y as u32));
+            x += step;
+        }
+        y += step;
+    }
+}
+
+/// Whether `screen`-detected source `y` repeats itself enough to be worth
+/// `allow_intrabc` -- the share of its 16-aligned 16x16 blocks whose exact
+/// content appears at some other position, against [`intrabc_pct`]. Returns
+/// the share as well, for the gate's own print.
+fn intrabc_worth_it(y: &[u8], width: usize, true_width: usize, true_height: usize) -> (bool, f64) {
+    if true_width < 4 * 64 || true_height < 2 * 64 {
+        return (false, 0.0);
+    }
+    let mut table = std::collections::HashMap::new();
+    ibc_index(&mut table, y, width, (0, 0), (true_width, true_height));
+    let (mut total, mut matched) = (0usize, 0usize);
+    let mut by = 0;
+    while by + IBC_HASH <= true_height {
+        let mut bx = 0;
+        while bx + IBC_HASH <= true_width {
+            total += 1;
+            if let Some(hits) = table.get(&ibc_hash(y, width, bx, by)) {
+                if hits.iter().any(|&(hx, hy)| (hx as usize, hy as usize) != (bx, by)) {
+                    matched += 1;
+                }
+            }
+            bx += IBC_HASH;
+        }
+        by += IBC_HASH;
+    }
+    let share = if total == 0 { 0.0 } else { matched as f64 / total as f64 };
+    (share * 100.0 >= intrabc_pct() as f64, share)
+}
+
+/// One tile's intrabc search state: a block-hash table over the part of the
+/// tile's own reconstruction that is already final (whole superblock rows --
+/// the in-loop filters are off on this frame, so a coded superblock row never
+/// changes again), plus the last DV chosen, which the RD price uses as its
+/// predictor estimate.
+struct Ibc {
+    table: std::collections::HashMap<u64, Vec<(u32, u32)>>,
+    /// The reconstruction row this table has been filled up to.
+    filled_to: usize,
+    /// The tile's own luma rect, in samples.
+    tile: (usize, usize, usize, usize),
+    /// The DV the previous intrabc block of this tile took -- the *estimate*
+    /// of decode.rs `read_intrabc_dv`'s predictor the RD price is taken
+    /// against. The writer computes the true predictor off its own mi grid
+    /// (`crate::tile::intrabc_dv_pred`); a wrong estimate here can only cost
+    /// a slightly mispriced candidate, never a wrong bitstream.
+    last_dv: Option<(i32, i32)>,
+    /// How many blocks took intrabc, and how many hash lookups found at least
+    /// one valid candidate -- the gate's own fire counts.
+    hits: usize,
+    lookups: usize,
+    found: usize,
+}
+
+impl Ibc {
+    fn new(tile: (usize, usize, usize, usize)) -> Self {
+        Self {
+            table: std::collections::HashMap::new(),
+            filled_to: tile.1,
+            tile,
+            last_dv: None,
+            hits: 0,
+            lookups: 0,
+            found: 0,
+        }
+    }
+
+    /// Indexes every reconstruction row above `y_limit` that is not indexed
+    /// yet. Called once per superblock row, with the row's own top edge.
+    fn fill_to(&mut self, recon: &[u8], width: usize, y_limit: usize) {
+        if y_limit <= self.filled_to {
+            return;
+        }
+        // A square straddling the boundary would be half-indexed, so start
+        // `IBC_HASH - 1` rows back: `ibc_index` re-adds a few positions, and a
+        // duplicate entry only costs one extra verified candidate.
+        let from = self.filled_to.saturating_sub(IBC_HASH - 1).max(self.tile.1);
+        ibc_index(
+            &mut self.table,
+            recon,
+            width,
+            (self.tile.0, from),
+            (self.tile.2, y_limit),
+        );
+        self.filled_to = y_limit;
+    }
+
+    /// libaom `av1_is_dv_valid` for a `w`x`h` block at `(x, y)` under `dv`
+    /// (1/8 pel), with this lane's own extra restriction on top: the source
+    /// must lie entirely in a COMPLETED superblock row, which is exactly the
+    /// region [`Self::fill_to`] indexes and a strict subset of what the spec
+    /// allows. corner-cut, ceiling named: same-superblock-row sources (the
+    /// wavefront's own diagonal) are legal and not searched; the upgrade path
+    /// is to index the current row's finished superblocks too.
+    fn dv_valid(&self, x: usize, y: usize, w: usize, h: usize, dv: (i32, i32)) -> bool {
+        let (dr, dc) = (dv.0 / 8, dv.1 / 8);
+        if dv.0 % 8 != 0 || dv.1 % 8 != 0 || dr % 2 != 0 || dc % 2 != 0 {
+            return false;
+        }
+        let (tx0, ty0, tx1, ty1) = (
+            self.tile.0 as i32,
+            self.tile.1 as i32,
+            self.tile.2 as i32,
+            self.tile.3 as i32,
+        );
+        let (sx, sy) = (x as i32 + dc, y as i32 + dr);
+        let (w, h) = (w as i32, h as i32);
+        if sx < tx0 || sy < ty0 || sx + w > tx1 || sy + h > ty1 {
+            return false;
+        }
+        let active_sb_row = (y as i32 - ty0) >> 6;
+        let active_sb_col = (x as i32 - tx0) >> 6;
+        let src_sb_row = (sy + h - 1 - ty0) >> 6;
+        let src_sb_col = (sx + w - 1 - tx0) >> 6;
+        // This lane's own restriction (see the doc comment).
+        if src_sb_row >= active_sb_row {
+            return false;
+        }
+        let total = ((tx1 - tx0 - 1) >> 6) + 1;
+        if src_sb_row * total + src_sb_col >= active_sb_row * total + active_sb_col - INTRABC_DELAY_SB64
+        {
+            return false;
+        }
+        // libaom's wavefront: only the top-left cone of the frame is legal.
+        let wf = (1 + INTRABC_DELAY_SB64) * (active_sb_row - src_sb_row);
+        src_sb_col < active_sb_col - INTRABC_DELAY_SB64 + wf
+    }
+}
+
+/// [`crate::tile::write_dv_component`]'s static price -- the same shape as
+/// [`mv_component_bits`] without the `mv_fr` symbol, which `force_integer_mv`
+/// infers rather than codes.
+fn dv_component_bits(diff: i32) -> f64 {
+    let z = diff.unsigned_abs() as i32 - 1;
+    let mut bits = symbol_bits(&cdf::MV_SIGN, usize::from(diff < 0));
+    let class = mv_class_of(z);
+    bits += symbol_bits(&cdf::MV_CLASS, class);
+    let local = z - mv_class_base(class);
+    if class == 0 {
+        bits += symbol_bits(&cdf::MV_CLASS0_BIT, ((local >> 3) & 1) as usize);
+    } else {
+        let d = local >> 3;
+        for i in 0..class {
+            bits += symbol_bits(&cdf::MV_BIT[i], ((d >> i) & 1) as usize);
+        }
+    }
+    bits
+}
+
+/// What one block vector costs against `pred`, plus the `skip` and
+/// `use_intrabc` flags the block carries and the ordinary intra block does
+/// not pay in this currency.
+fn dv_bits(dv: (i32, i32), pred: (i32, i32)) -> f64 {
+    let diff = (dv.0 - pred.0, dv.1 - pred.1);
+    let joint = match (diff.0 != 0, diff.1 != 0) {
+        (false, false) => 0,
+        (false, true) => 1,
+        (true, false) => 2,
+        (true, true) => 3,
+    };
+    let mut bits = symbol_bits(&cdf::MV_JOINT, joint) + 2.0;
+    if diff.0 != 0 {
+        bits += dv_component_bits(diff.0);
+    }
+    if diff.1 != 0 {
+        bits += dv_component_bits(diff.1);
+    }
+    bits
+}
+
+/// The squared error of copying the `side`-square block at `(sx, sy)` of each
+/// plane's reconstruction onto the source block at `(x, y)`, luma and both
+/// chroma planes together -- what an intrabc block's whole (residual-free)
+/// distortion is.
+fn ibc_sse(
+    luma: &Plane,
+    chroma: &[Plane; 2],
+    (x, y): (usize, usize),
+    (sx, sy): (usize, usize),
+    side: usize,
+) -> f64 {
+    let mut sse = 0.0f64;
+    for row in 0..side {
+        let src = &luma.source[(y + row) * luma.width + x..][..side];
+        let rec = &luma.reconstruction[(sy + row) * luma.width + sx..][..side];
+        for (&s, &r) in src.iter().zip(rec) {
+            let d = f64::from(i32::from(s) - i32::from(r));
+            sse += d * d;
+        }
+    }
+    let half = side / 2;
+    for plane in chroma {
+        for row in 0..half {
+            let src = &plane.source[(y / 2 + row) * plane.width + x / 2..][..half];
+            let rec = &plane.reconstruction[(sy / 2 + row) * plane.width + sx / 2..][..half];
+            for (&s, &r) in src.iter().zip(rec) {
+                let d = f64::from(i32::from(s) - i32::from(r));
+                sse += d * d;
+            }
+        }
+    }
+    sse
+}
+
+/// Copies the `side`-square block at `(sx, sy)` of each plane's
+/// reconstruction onto `(x, y)` -- an intrabc block's whole reconstruction,
+/// since it carries no residual (`skip`). Full-pel in both planes by
+/// construction ([`intrabc_step`] keeps every DV even), which is what makes
+/// this a plain copy where decode.rs runs the bilinear kernel over the same
+/// samples.
+fn ibc_commit(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    (x, y): (usize, usize),
+    (sx, sy): (usize, usize),
+    side: usize,
+) {
+    for row in 0..side {
+        let from = (sy + row) * luma.width + sx;
+        let to = (y + row) * luma.width + x;
+        let copied: Vec<u8> = luma.reconstruction[from..from + side].to_vec();
+        luma.reconstruction[to..to + side].copy_from_slice(&copied);
+    }
+    let half = side / 2;
+    for plane in chroma {
+        for row in 0..half {
+            let from = (sy / 2 + row) * plane.width + sx / 2;
+            let to = (y / 2 + row) * plane.width + x / 2;
+            let copied: Vec<u8> = plane.reconstruction[from..from + half].to_vec();
+            plane.reconstruction[to..to + half].copy_from_slice(&copied);
+        }
+    }
+}
+
+/// Searches this block's own DV: every hash-table position whose 16x16 luma
+/// square equals the block's source square, plus the previous block's DV as a
+/// local fallback, scored by [`ibc_sse`] against the DV's own price. Returns
+/// the winning `(dv, cost)`, or `None` when nothing valid was found.
+fn ibc_search(
+    ibc: &mut Ibc,
+    luma: &Plane,
+    chroma: &[Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+    lambda: f64,
+) -> Option<((i32, i32), f64, (usize, usize))> {
+    let pred = ibc.last_dv.unwrap_or((0, -(64 + 256) * 8));
+    let mut best: Option<((i32, i32), f64, (usize, usize))> = None;
+    let consider = |ibc: &Ibc, sx: usize, sy: usize, best: &mut Option<((i32, i32), f64, (usize, usize))>| {
+        let dv = (
+            (sy as i32 - y as i32) * 8,
+            (sx as i32 - x as i32) * 8,
+        );
+        if !ibc.dv_valid(x, y, side, side, dv) {
+            return;
+        }
+        let cost = ibc_sse(luma, chroma, (x, y), (sx, sy), side) + lambda * dv_bits(dv, pred);
+        if best.as_ref().is_none_or(|b| cost < b.1) {
+            *best = Some((dv, cost, (sx, sy)));
+        }
+    };
+    ibc.lookups += 1;
+    let key = ibc_hash(luma.source, luma.width, x, y);
+    // Newest first: a nearby copy costs the fewest DV bits, and the table is
+    // filled in raster order.
+    let hits: Vec<(u32, u32)> = ibc
+        .table
+        .get(&key)
+        .map(|h| h.iter().rev().take(16).copied().collect())
+        .unwrap_or_default();
+    for (hx, hy) in hits {
+        consider(&*ibc, hx as usize, hy as usize, &mut best);
+    }
+    if let Some(dv) = ibc.last_dv {
+        let (sx, sy) = (x as i32 + dv.1 / 8, y as i32 + dv.0 / 8);
+        if sx >= 0 && sy >= 0 {
+            consider(&*ibc, sx as usize, sy as usize, &mut best);
+        }
+    }
+    if best.is_some() {
+        ibc.found += 1;
+    }
+    best
+}
+
 fn code_square(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
@@ -2454,7 +2851,10 @@ fn code_square(
     // The frame header's `tx_mode == TxMode::Select`: the block then searches
     // its own transform depth ([`Plane::code_tx_depth`]) instead of coding one
     // transform over its whole side.
-    tx_select: bool, fctx: &crate::decode::FrameCtx,
+    tx_select: bool,
+    // This tile's intra block-copy state ([`Ibc`]), `None` on a frame whose
+    // header did not set `allow_intrabc`.
+    ibc: Option<&mut Ibc>, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (luma_set, chroma_set) = if side == BLOCK {
         (TxbSet::Luma32, TxbSet::Chroma16)
@@ -2558,6 +2958,29 @@ fn code_square(
     let ([u, v], uv_mode, chroma_cost, palette_uv) =
         search_chroma(chroma, (x, y), side, chroma_set, search, mode, fctx);
     cost += chroma_cost;
+
+    // The intrabc arm is priced against the WHOLE block -- luma and both
+    // chroma planes, residual-free -- so it is compared after the chroma
+    // search has added its own cost, not against the luma decision alone.
+    if let Some(ibc) = ibc {
+        if let Some((dv, cost_ibc, src)) =
+            ibc_search(ibc, luma, chroma, (x, y), side, search.lambda)
+        {
+            if cost_ibc < cost {
+                ibc_commit(luma, chroma, (x, y), src, side);
+                ibc.last_dv = Some(dv);
+                ibc.hits += 1;
+                return (
+                    BlockCoeffs {
+                        skip: true,
+                        dv: Some(dv),
+                        ..BlockCoeffs::default()
+                    },
+                    cost_ibc,
+                );
+            }
+        }
+    }
     (
         BlockCoeffs {
             u,
@@ -2824,6 +3247,7 @@ fn code_square_inter(
             search,
             mode_bits,
             tx_select() && tx_select_inter(),
+            None,
             fctx,
         );
     let luma_set = if side == 8 {
@@ -3037,6 +3461,7 @@ fn code_square_inter(
                     uv_mode: DC_PRED,
                     skip: skip_new,
                     eight: None,
+                    dv: None,
                     palette: None,
             palette_uv: None,
                     tx_depth,
@@ -3075,6 +3500,7 @@ fn code_square_inter(
             uv_mode: DC_PRED,
             skip,
             eight: None,
+            dv: None,
             palette: None,
             palette_uv: None,
             tx_depth,
@@ -3721,8 +4147,30 @@ pub(crate) fn encode_key_frame_inner(
         (picture.height).min(render.1),
     );
     arm_seq_screen(screen);
+    // spec 5.9.2 `allow_intrabc`, screen-detected key frames only: the bit
+    // forces deblocking, CDEF and loop restoration OFF for this frame
+    // (frame.rs:194/210/252/272), so it is only set when the source repeats
+    // itself enough for the copied blocks to pay that back
+    // ([`intrabc_worth_it`]).
+    // Single-tile frames only: decode.rs keeps ONE frame-scoped intrabc mi
+    // grid across every tile while this writer builds one per tile, so a
+    // multi-tile allow_intrabc frame would predict its DVs off a different
+    // grid than the decoder does. corner-cut, ceiling named: the upgrade
+    // path is a frame-scoped grid shared by the tile writers.
+    let (allow_intrabc, ibc_share) = if screen && intrabc_enabled() && armed_tiles() == (0, 0) {
+        intrabc_worth_it(
+            &picture.y.iter().map(|&v| v as u8).collect::<Vec<u8>>(),
+            picture.width,
+            picture.width.min(render.0),
+            picture.height.min(render.1),
+        )
+    } else {
+        (false, 0.0)
+    };
+    IBC_SHARE.with(|c| c.set(ibc_share));
     let (seq, mut header) = key_frame_headers_colour(render.0, render.1, base_q_idx, color_config)?;
     header.allow_screen_content_tools = screen;
+    header.allow_intrabc = allow_intrabc;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
     // `TxMode::Select`: every block codes a `tx_depth` symbol and may split
@@ -3847,8 +4295,22 @@ pub(crate) fn encode_key_frame_inner(
         clip_planes_to_tile(&mut luma, &mut chroma, rect);
         let mut above_mode = vec![DC_PRED; cols * 2];
         let mut left_mode = vec![DC_PRED; rows * 2];
+        let mut ibc = allow_intrabc.then(|| {
+            Ibc::new((
+                rect.mi_col0 as usize * 4,
+                rect.mi_row0 as usize * 4,
+                (rect.mi_col1 as usize * 4).min(true_width),
+                (rect.mi_row1 as usize * 4).min(true_height),
+            ))
+        });
         let mut coded: Vec<(usize, Superblock, Vec<u8>)> = Vec::new();
     for sb_row in rect.sb_row0 as usize..rect.sb_row1 as usize {
+        // Every superblock row above this one is final (the in-loop filters
+        // are off on an `allow_intrabc` frame), so it is indexed for the
+        // block-hash search exactly once, here.
+        if let Some(ibc) = ibc.as_mut() {
+            ibc.fill_to(&luma.reconstruction, luma.width, sb_row * 64);
+        }
         for sb_col in rect.sb_col0 as usize..rect.sb_col1 as usize {
             let mut modes = Vec::with_capacity(4);
             // The quadrants of a superblock are coded in the order the decoder
@@ -3934,7 +4396,8 @@ pub(crate) fn encode_key_frame_inner(
                     BLOCK,
                     &search,
                     &mode_bits(above_mode[c0], left_mode[r0]),
-                    tx_select, fctx,
+                    tx_select,
+                    ibc.as_mut(), fctx,
                 );
                 cost_whole += search.lambda * partition_bits(BLOCK, false);
                 let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
@@ -3968,7 +4431,8 @@ pub(crate) fn encode_key_frame_inner(
                             SUB,
                             &search,
                             &mode_bits(above_mode[sc], left_mode[sr]),
-                            tx_select, fctx,
+                            tx_select,
+                            ibc.as_mut(), fctx,
                         );
                         cost_split += cost;
                         split_modes.push(block.mode);
@@ -4000,7 +4464,8 @@ pub(crate) fn encode_key_frame_inner(
                                 8,
                                 &search,
                                 &leaf_mode_bits,
-                                tx_select, fctx,
+                                tx_select,
+                                None, fctx,
                             );
                             cost_split += cost;
                             split_modes.push(leaf.mode);
@@ -4099,6 +4564,7 @@ pub(crate) fn encode_key_frame_inner(
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             let mut cdfs = start_cdfs.0.clone();
             crate::tile::arm_screen(screen);
+            crate::tile::arm_intrabc(allow_intrabc);
             let bytes = crate::tile::sb_coeff_key_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
@@ -4123,7 +4589,11 @@ pub(crate) fn encode_key_frame_inner(
         &mut luma,
         &mut chroma,
         [&picture_y8, &picture_u8, &picture_v8],
-        true,
+        // spec 5.9.11/5.9.19/5.9.20: `allow_intrabc` forces deblocking, CDEF
+        // and loop restoration off and codes none of their parameters
+        // (frame.rs:194/210/252/272) -- there is no filter to search for, and
+        // the encoder's reconstruction is already what a decoder produces.
+        !allow_intrabc,
         &mut tiles,
         search.lambda,
         fctx,
@@ -4184,6 +4654,7 @@ pub(crate) fn encode_key_frame_inner(
         loop_filter: header.loop_filter,
         cdef: header.cdef,
         loop_restoration: header.loop_restoration,
+        allow_intrabc,
     })
 }
 
@@ -5383,6 +5854,7 @@ fn search_inter_block(
             skip: best.skip,
             inter: best.inter,
             eight: None,
+            dv: None,
             palette: None,
             palette_uv: None,
             tx_depth: 0,
@@ -6298,6 +6770,9 @@ pub(crate) fn encode_inter_frame(
         loop_filter: header.loop_filter,
         cdef: header.cdef,
         loop_restoration: header.loop_restoration,
+        // An inter frame never allows intrabc (spec 5.9.2 codes the bit on
+        // intra frames only).
+        allow_intrabc: false,
     })
 }
 
@@ -6942,6 +7417,7 @@ mod tests {
             uv_mode: 0,
             skip: false,
             eight: None,
+            dv: None,
             palette: None,
             palette_uv: None,
             tx_depth: 0,
