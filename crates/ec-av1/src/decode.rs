@@ -24773,9 +24773,18 @@ nbmv=({},{}) nbref={} nbbsize={} filt={}",
 /// how many bordering blocks actually get blended, separate from the
 /// eligibility scan's own unbounded ("any at all") walk.
 #[allow(clippy::too_many_arguments)]
-fn obmc_plan(
+pub(crate) fn obmc_plan(
     grid: &MiGrid,
-    neighbours: &Neighbours,
+    // The two switchable-filter bands (`Neighbours::above_filter`/
+    // `left_filter`), read only when `interp_fixed` is `None`. The ENCODER
+    // (`encode.rs`'s OBMC candidate) codes a fixed interpolation filter and
+    // has no `Neighbours` of its own, so it passes both empty; the reads
+    // below fall back to the `[3, 3]` never-recorded sentinel, which
+    // `neighbour_filter` never reaches under a fixed filter.
+    // corner-cut: ceiling is a switchable-filter ENCODER -- it must build and
+    // pass the real bands here, exactly as the decoder does.
+    above_filter: &[[u8; 2]],
+    left_filter: &[[u8; 2]],
     mi_row: usize,
     mi_col: usize,
     bw4: usize,
@@ -24842,7 +24851,7 @@ fn obmc_plan(
         // neighbour's OWN mi-granular filter (libaom
         // `av1_setup_build_prediction_by_above_pred` reads
         // `above_mbmi->interp_filters`).
-        let above_syms = neighbours.above_filter[mi_col + src4];
+        let above_syms = above_filter.get(mi_col + src4).copied().unwrap_or([3; 2]);
         obmcrec_probe(
             "above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, above_syms,
             grid.get(mi_row - 1, mi_col + src4), interp_fixed.is_some(),
@@ -24866,7 +24875,7 @@ fn obmc_plan(
     let mut left = Vec::new();
     for (off4, span4, nb, src4) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4))
     {
-        let left_syms = neighbours.left_filter[mi_row + src4];
+        let left_syms = left_filter.get(mi_row + src4).copied().unwrap_or([3; 2]);
         obmcrec_probe(
             "left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, left_syms,
             grid.get(mi_row + src4, mi_col - 1), interp_fixed.is_some(),
@@ -24941,7 +24950,7 @@ pub(crate) struct ObmcPlan {
 /// (libaom `av1_build_obmc_inter_prediction`). Reads nothing but reference
 /// pixels and the plan, so it runs wherever the block's prediction is built
 /// -- on a recon worker when that prediction is deferred (lane-defer8).
-fn obmc_run(
+pub(crate) fn obmc_run(
     plan: &ObmcPlan,
     refpix: &RefPix<'_>,
     pred_y: &mut [u16],
@@ -27623,7 +27632,8 @@ fn decode_inter_block(
             let obmc = if obmc_selected {
                 Some(obmc_plan(
                     grid,
-                    neighbours,
+                    &neighbours.above_filter,
+                    &neighbours.left_filter,
                     mi_row,
                     mi_col,
                     bw4,
@@ -32210,7 +32220,8 @@ fn decode_inter_block8(
         let obmc = if obmc_selected {
             Some(obmc_plan(
                 grid,
-                neighbours,
+                &neighbours.above_filter,
+                &neighbours.left_filter,
                 mi_row,
                 mi_col,
                 2,
