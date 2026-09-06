@@ -315,6 +315,54 @@ fn screen_armed() -> bool {
 }
 
 thread_local! {
+    /// This frame header's `allow_intrabc` (spec 5.9.2), armed exactly like
+    /// [`SCREEN`]: with it every intra block of the tile carries a
+    /// `use_intrabc` symbol right after `skip`/`cdef`/`delta_q` (decode.rs
+    /// `read_intra_mode`), so a tile written without it and read with it
+    /// desyncs at the first block.
+    static INTRABC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The mi grid the DV predictor is built off (decode.rs
+    /// `INTRABC_MI_GRID`/`record_intrabc_mi`): every coded block publishes
+    /// its own footprint into it, an intrabc one also its DV as an
+    /// `INTRA_FRAME` candidate. `Some` only while an `allow_intrabc` tile is
+    /// being written.
+    static INTRABC_GRID: std::cell::RefCell<Option<(crate::mvstack::MiGrid, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the frame's `allow_intrabc` bit for the next tile written on this
+/// thread; cleared by [`CdefIdxGuard`] when that writer returns.
+pub(crate) fn arm_intrabc(on: bool) {
+    INTRABC.with(|c| c.set(on));
+}
+
+fn intrabc_armed() -> bool {
+    INTRABC.with(std::cell::Cell::get)
+}
+
+/// How many blocks this writer coded `use_intrabc == 1`, and the histogram of
+/// their DV magnitudes in full pels (index 1..=6 = 1, 2, 4, 8, 16, 32 pels
+/// and up, by the larger component) -- the fire count a gate prints so that
+/// "intrabc is on" is a measurement rather than a claim (class
+/// `gate-blind-to-feature`). Index 0 is the block count.
+static INTRABC_HITS: [std::sync::atomic::AtomicUsize; 7] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+
+fn note_intrabc(dv: (i32, i32)) {
+    INTRABC_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let px = (dv.0.abs() / 8).max(dv.1.abs() / 8).max(1) as usize;
+    let bucket = (usize::BITS - px.leading_zeros()) as usize;
+    INTRABC_HITS[bucket.clamp(1, 6)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reads [`INTRABC_HITS`] and zeroes it, so a gate can attribute the counts
+/// to its own encode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn take_intrabc_hits() -> [usize; 7] {
+    std::array::from_fn(|i| INTRABC_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+thread_local! {
     /// This frame header's own `reference_select` bit (spec 5.9.22), armed
     /// the same way `arm_sign_bias` arms the sign-bias table rather than
     /// threaded through the five nested writer helpers between here and the
@@ -688,6 +736,8 @@ impl Drop for CdefIdxGuard {
         SIGN_BIAS.with(|c| c.set(crate::mvstack::NO_SIGN_BIAS));
         SCREEN.with(|c| c.set(false));
         REFERENCE_SELECT.with(|c| c.set(false));
+        INTRABC.with(|c| c.set(false));
+        INTRABC_GRID.with(|c| *c.borrow_mut() = None);
         ORDER_HINTS.with(|c| c.set((7, 0, [0; 7])));
     }
 }
@@ -1193,6 +1243,19 @@ pub struct BlockCoeffs {
     /// `luma` then carries the whole block's levels in BLOCK coordinates,
     /// which the writer slices per transform unit.
     pub tx_depth: u8,
+    /// This block's intra block-copy vector (spec 5.11.13 `use_intrabc` ->
+    /// `assign_dv`), in the spec's 1/8-pel `(row, col)` units, or `None` for
+    /// an ordinary intra block. Only a key frame whose header set
+    /// `allow_intrabc` ([`arm_intrabc`]) may carry one; the block is then
+    /// coded `skip` with no residual, no mode, no palette -- exactly what
+    /// decode.rs `read_intra_mode` reads back and returns early on.
+    ///
+    /// lane-av1ibc corner-cut, ceiling named: a residual-carrying intrabc
+    /// block needs the INTER coefficient tables plus the var-tx tree
+    /// decode.rs `decode_block`'s `intrabc_vartx` arm reads; the upgrade path
+    /// is to route the block through [`write_tx_syntax_inter`] instead of
+    /// returning early here.
+    pub dv: Option<(i32, i32)>,
 }
 
 /// A block's luma palette: its base colours (ascending, only the first
@@ -2199,6 +2262,20 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
     // Consumes whatever `arm_cdef_idx`/`arm_lr` armed, on every exit path.
     let _cdef_idx = CdefIdxGuard;
     check_blocks(mi_cols, mi_rows)?;
+    // The DV predictor's own mi grid, per tile exactly as decode.rs builds it
+    // per frame (`decode_key_frame_tile_lr`'s `intrabc_mi_grid`): a tile that
+    // allows no intrabc arms none and every `record_intrabc_mi` below is a
+    // no-op.
+    if intrabc_armed() {
+        // No `set_tile_bounds`: decode.rs builds this grid for the WHOLE
+        // frame with the default (whole-grid) bounds, so the writer must
+        // too. `encode_key_frame_inner` only allows intrabc on a
+        // single-tile frame, where the two grids are the same grid.
+        let grid = crate::mvstack::MiGrid::new(mi_cols as usize, mi_rows as usize);
+        INTRABC_GRID.with(|g| {
+            *g.borrow_mut() = Some((grid, mi_cols as usize, mi_rows as usize));
+        });
+    }
     let (cols, rows) = block_grid(mi_cols, mi_rows);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     if superblocks.len() != (sb_cols * sb_rows) as usize {
@@ -2852,6 +2929,170 @@ pub(crate) fn palette_uv_bits(pal: &PaletteUv, side: usize) -> f64 {
 /// skip flag, its luma intra mode against the CDF its neighbours' modes pick,
 /// the angle a directional mode is steered by, and its chroma mode. Hands back
 /// the luma mode, which is what the blocks beside it read.
+/// The DV predictor decode.rs `read_intrabc_dv` derives, mirrored line for
+/// line off the writer's own copy of the intrabc mi grid: the `INTRA_FRAME`
+/// stack's `nearest_mv` (or `near_mv` when that is zero), or -- when both are
+/// -- `av1_find_ref_dv`'s fallback one superblock up, or 256 pixels plus one
+/// superblock to the left on the tile's first superblock row, then floored to
+/// full pel. Returns `(0, 0)` when no grid is armed, which no `allow_intrabc`
+/// tile ever reaches.
+fn intrabc_dv_pred(mi_r: usize, mi_c: usize, side: usize) -> (i32, i32) {
+    const INTRABC_DELAY_PIXELS: i32 = 256;
+    let n4 = side / MI;
+    let stack_pred = INTRABC_GRID.with(|g| {
+        let g = g.borrow();
+        g.as_ref().map(|(grid, mi_cols, mi_rows)| {
+            let stack = crate::mvstack::find_mv_stack(
+                grid, mi_r, mi_c, n4, n4, 0, /* INTRA_FRAME */
+                *mi_cols, *mi_rows,
+            );
+            if stack.nearest_mv == (0, 0) {
+                stack.near_mv
+            } else {
+                stack.nearest_mv
+            }
+        })
+    });
+    let mut pred = stack_pred.unwrap_or((0, 0));
+    if pred == (0, 0) {
+        // 64x64 superblocks: the only size this encoder's sequence header
+        // signals (`use_128x128_superblock: false`), so `mib_size` is 16 mi.
+        // The tile row start is 0, exactly as decode.rs `read_intrabc_dv`
+        // takes it -- both are written for the single-tile-row streams this
+        // encoder produces.
+        let sb_mi = 16i32;
+        let sb_px = sb_mi * MI as i32;
+        pred = if (mi_r as i32) < sb_mi {
+            (0, -(sb_px + INTRABC_DELAY_PIXELS) * 8)
+        } else {
+            (-sb_px * 8, 0)
+        };
+    }
+    ((pred.0 >> 3) * 8, (pred.1 >> 3) * 8)
+}
+
+/// Publishes one coded block into [`INTRABC_GRID`], mirroring decode.rs
+/// `record_intrabc_mi`: every block contributes its size, an intrabc one also
+/// its DV as an `INTRA_FRAME` candidate.
+fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>) {
+    INTRABC_GRID.with(|g| {
+        let mut g = g.borrow_mut();
+        let Some((grid, _, _)) = g.as_mut() else {
+            return;
+        };
+        let info = crate::mvstack::MiInfo {
+            is_inter: dv.is_some(),
+            ref_frame: 0,
+            ref_frame1: crate::mvstack::NO_REF1,
+            mv: crate::mvstack::mv16(dv.unwrap_or((0, 0))),
+            mv1: (0, 0),
+            is_new_mv: dv.is_some(),
+            is_global_mv0: false,
+            is_global_mv1: false,
+            size: n4 as u8,
+            size_h: n4 as u8,
+        };
+        for r in mi_r..mi_r + n4 {
+            for c in mi_c..mi_c + n4 {
+                grid.set(r, c, info);
+            }
+        }
+    });
+}
+
+/// One full-pel block-vector component, [`write_mv_component`]'s
+/// `force_integer_mv` twin: decode.rs `read_mv_component` infers `mv_fr`/
+/// `mv_class0_fr` as 3 and the high-precision bit as 1 under
+/// `force_integer_mv`, so neither symbol is written here -- writing them
+/// would leave the decoder two symbols behind from this block on.
+fn write_dv_component(enc: &mut SymbolEncoder, c: &mut MvComponentCdfs, diff: i32) -> Result<()> {
+    let mag = diff.unsigned_abs() as i32;
+    if mag % 8 != 0 {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a block vector is coded at full-pel precision only",
+        ));
+    }
+    enc.symbol(usize::from(diff < 0), &mut c.sign);
+    let z = mag - 1;
+    let class = mv_class_of(z);
+    enc.symbol(class, &mut c.class);
+    let local = z - mv_class_base(class);
+    if class == 0 {
+        enc.symbol(((local >> 3) & 1) as usize, &mut c.class0_bit);
+    } else {
+        let d = local >> 3;
+        for i in 0..class {
+            enc.symbol(((d >> i) & 1) as usize, &mut c.bit[i]);
+        }
+    }
+    Ok(())
+}
+
+/// One intrabc block's DV as a residual against [`intrabc_dv_pred`], off the
+/// `dv` nmv context (decode.rs `read_intrabc_dv` -> `read_mv`).
+fn write_dv(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, dv: (i32, i32), pred: (i32, i32)) -> Result<()> {
+    let diff = (dv.0 - pred.0, dv.1 - pred.1);
+    let joint = match (diff.0 != 0, diff.1 != 0) {
+        (false, false) => 0,
+        (false, true) => 1,
+        (true, false) => 2,
+        (true, true) => 3,
+    };
+    enc.symbol(joint, &mut cdfs.dv_joint);
+    if diff.0 != 0 {
+        write_dv_component(enc, &mut cdfs.dv_comp[0], diff.0)?;
+    }
+    if diff.1 != 0 {
+        write_dv_component(enc, &mut cdfs.dv_comp[1], diff.1)?;
+    }
+    Ok(())
+}
+
+/// The mode-info half of an intrabc block (decode.rs `read_intra_mode`'s
+/// early return): `skip`, `cdef_idx`, `use_intrabc` and the DV, then nothing
+/// -- no y/uv mode, no angle delta, no palette, and (because it is skipped)
+/// no transform size and no residual. Publishes the block into every
+/// neighbour band an ordinary block leaves behind, at the DC_PRED/uncoded/
+/// skipped state a decoder reads back for it.
+fn write_intrabc_block(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    dv: (i32, i32),
+    mi: (usize, usize),
+    side: usize,
+) -> Result<()> {
+    let skip_ctx = usize::from(neighbours.above_skip[mi.1]) + usize::from(neighbours.left_skip[mi.0]);
+    enc.symbol(1, &mut cdfs.skip[skip_ctx]);
+    write_cdef_idx(enc, mi, true);
+    enc.symbol(1, &mut cdfs.intrabc);
+    write_dv(enc, cdfs, dv, intrabc_dv_pred(mi.0, mi.1, side))?;
+    note_intrabc(dv);
+    // The bands: DC_PRED mode (what the decoder forces), no coefficients
+    // anywhere (skip), the block's own side for the partition context, the
+    // largest transform (`side.min(64)`, decode.rs's `intrabc_skip_tx` arm)
+    // for the deblock grid, and `skip` itself for the next block's skip
+    // context.
+    // One zero level per plane: `neighbour_state` reads `grid[0]` for the DC
+    // sign vote, and a skipped block leaves every context cleared.
+    let empty: [Vec<i32>; 3] = [vec![0], vec![0], vec![0]];
+    for cell in 0..(side / SUB).max(1) {
+        let (r, c) = (mi.0 / (SUB / MI), mi.1 / (SUB / MI));
+        neighbours.above_mode[c + cell] = DC_PRED;
+        neighbours.left_mode[r + cell] = DC_PRED;
+        neighbours.above_side[c + cell] = side;
+        neighbours.left_side[r + cell] = side;
+    }
+    neighbours.record_mi_planes(mi, side, &empty, true);
+    neighbours.record_tx(mi, side, side.min(64));
+    for cell in 0..side / MI {
+        neighbours.above_skip[mi.1 + cell] = true;
+        neighbours.left_skip[mi.0 + cell] = true;
+    }
+    Ok(())
+}
+
 fn write_intra_mode(
     enc: &mut SymbolEncoder,
     cdfs: &mut Cdfs,
@@ -2868,8 +3109,18 @@ fn write_intra_mode(
     side: usize,
 ) -> usize {
     let mode = usize::from(block.mode);
-    enc.symbol(0, &mut cdfs.skip[0]);
+    // `av1_get_skip_txfm_context` (decode.rs `Neighbours::skip_txfm_ctx`):
+    // above + left. Every block this writer codes outside an `allow_intrabc`
+    // frame is unskipped, so both bands stay false and this stays 0 -- the
+    // literal every stream before this lane was written with.
+    let skip_ctx = usize::from(neighbours.above_skip[mi.1]) + usize::from(neighbours.left_skip[mi.0]);
+    enc.symbol(0, &mut cdfs.skip[skip_ctx]);
     write_cdef_idx(enc, mi, false);
+    // `read_intrabc_info` (spec 5.11.13): the flag is read for EVERY intra
+    // block of an `allow_intrabc` frame, not only the ones that use it.
+    if intrabc_armed() {
+        enc.symbol(0, &mut cdfs.intrabc);
+    }
     enc.symbol(
         mode,
         &mut cdfs.kf_y_mode[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]],
@@ -3070,6 +3321,11 @@ fn write_block(
 ) -> Result<()> {
     let (r, c) = at;
     let at_mi = (r * (SUB / MI), c * (SUB / MI));
+    if let Some(dv) = block.dv {
+        write_intrabc_block(enc, cdfs, neighbours, dv, at_mi, side)?;
+        record_intrabc_mi(at_mi.0, at_mi.1, side / MI, Some(dv));
+        return Ok(());
+    }
     let (above_mode, left_mode) = (neighbours.above_mode[c], neighbours.left_mode[r]);
     let mode = write_intra_mode(
         enc,
@@ -3109,7 +3365,22 @@ fn write_block(
         tx_select,
     );
     neighbours.record_planes(at, side, mode, grids, !split);
+    clear_skip_band(neighbours, at_mi, side);
+    record_intrabc_mi(at_mi.0, at_mi.1, side / MI, None);
     Ok(())
+}
+
+/// An unskipped block's own `skip` publication: only an `allow_intrabc`
+/// frame ever sets these bands, so a frame without one leaves them exactly
+/// as they were before this lane (all false).
+fn clear_skip_band(neighbours: &mut Neighbours, mi: (usize, usize), side: usize) {
+    if !intrabc_armed() {
+        return;
+    }
+    for cell in 0..side / MI {
+        neighbours.above_skip[mi.1 + cell] = false;
+        neighbours.left_skip[mi.0 + cell] = false;
+    }
 }
 
 /// Writes one 8x8 leaf of a straddling 16x16 block (lane-av1-rect): its own
@@ -3135,6 +3406,11 @@ fn write_leaf8(
     all_scans: &[Vec<u16>; 4],
 ) -> Result<usize> {
     let (r, c) = outer_at;
+    if let Some(dv) = block.dv {
+        write_intrabc_block(enc, cdfs, neighbours, dv, leaf_mi, 8)?;
+        record_intrabc_mi(leaf_mi.0, leaf_mi.1, 2, Some(dv));
+        return Ok(DC_PRED);
+    }
     let mut above_mode = neighbours.above_mode[c];
     let mut left_mode = neighbours.left_mode[r];
     // The previous leaf sits directly above (same column, two mi rows up)
@@ -3184,6 +3460,8 @@ fn write_leaf8(
         tx_select,
     );
     neighbours.record_mi_planes(leaf_mi, 8, grids, !split);
+    clear_skip_band(neighbours, leaf_mi, 8);
+    record_intrabc_mi(leaf_mi.0, leaf_mi.1, 2, None);
     Ok(mode)
 }
 
