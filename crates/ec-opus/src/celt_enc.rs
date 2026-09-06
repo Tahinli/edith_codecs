@@ -32,7 +32,7 @@
 
 use ec_core::{Error, Result};
 
-use crate::analysis::{AnalysisInfo, TonalityAnalysis};
+use crate::analysis::AnalysisInfo;
 use crate::celt::{
     self, BETA_COEF, BETA_INTRA, BITRES, CACHE_CAPS, E_BANDS, E_MEANS, E_PROB_MODEL, LOG_N,
     MAX_FINE_BITS, NB_BANDS, OVERLAP, PRED_COEF, PREEMPH, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE,
@@ -94,18 +94,21 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// tf boost. Aligned, the analysis moves naz/zaur/her@64 a long way but leaves
 /// the aligned blocking set (nik, her@96, dl8a, hein) exactly where the
 /// analysis-free aligned arms left it, so the alignment default stays off.
-fn analysis_params() -> (bool, bool, bool, bool) {
+pub(crate) fn analysis_params() -> (bool, bool, bool, bool) {
     static P: std::sync::OnceLock<(bool, bool, bool, bool)> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
         let b = |name: &str, dflt: bool| {
             std::env::var(name).map(|v| v != "0").unwrap_or(dflt)
         };
-        (
-            b("EC_OPUS_ANALYSIS", true),
-            b("EC_OPUS_TRIM_TONAL", false),
-            b("EC_OPUS_VBR_TONAL", false),
-            b("EC_OPUS_VBR_ACT", false),
-        )
+        let trim = b("EC_OPUS_TRIM_TONAL", false);
+        let vbr_tonal = b("EC_OPUS_VBR_TONAL", false);
+        let vbr_act = b("EC_OPUS_VBR_ACT", false);
+        // The analysis costs ~25% of the encoder (5.1 384k: 126x -> 100x
+        // realtime), so it only runs when something reads it: any consumer
+        // switch, an explicit `EC_OPUS_ANALYSIS=1`, or
+        // `Encoder::set_analysis(true)` for the diagnostics.
+        let any = trim || vbr_tonal || vbr_act;
+        (b("EC_OPUS_ANALYSIS", any), trim, vbr_tonal, vbr_act)
     })
 }
 
@@ -516,12 +519,10 @@ pub struct CeltEncoder {
     urow: Vec<u32>,
     /// Per-frame diagnostics captured at the end of the last `encode` call.
     last_diag: CeltFrameDiag,
-    /// libopus `st->analysis`: the tonality/music-probability estimator, run
-    /// on the *undelayed* API input at the top of every `encode` call exactly
-    /// where `opus_encode()` runs `run_analysis()`.
-    analysis: TonalityAnalysis,
-    /// The window that covers the frame being coded, or the default
-    /// (`valid == false`) state when the analysis is off.
+    /// libopus `st->analysis`'s per-frame output, handed in by
+    /// [`crate::Encoder`] (which owns the estimator and runs it once per API
+    /// frame, libopus's order); the `valid == false` default when the
+    /// analysis is off.
     info: AnalysisInfo,
 }
 
@@ -580,7 +581,6 @@ impl CeltEncoder {
             pvq_sign: vec![0; max_n],
             urow: vec![0; 1280],
             last_diag: CeltFrameDiag::default(),
-            analysis: TonalityAnalysis::new((48000 / upsample) as u32),
             info: AnalysisInfo::default(),
         }
     }
@@ -624,7 +624,6 @@ impl CeltEncoder {
         self.vbr_count = 0;
         self.stereo_saving = 0.0;
         self.spec_avg = 0.0;
-        self.analysis.reset();
         self.info = AnalysisInfo::default();
     }
 
@@ -638,7 +637,7 @@ impl CeltEncoder {
     /// postfilter bit, allocation over the coded span only. With
     /// `vbr_rate_bps` set, the frame may be shrunk below that budget
     /// (constrained VBR); the return value is the final frame size in bytes.
-    pub fn encode(
+    pub(crate) fn encode(
         &mut self,
         enc: &mut RangeEncoder,
         pcm: &[f32],
@@ -646,6 +645,7 @@ impl CeltEncoder {
         start: usize,
         end: usize,
         vbr_rate_bps: u32,
+        info: &AnalysisInfo,
     ) -> Result<usize> {
         let lm: usize = match frame_size {
             120 => 0,
@@ -672,14 +672,9 @@ impl CeltEncoder {
         let end = end.clamp(start + 1, NB_BANDS);
 
         // libopus `opus_encode_native` runs the tonality analysis on the raw
-        // API frame before anything else; the CELT layer's own delay does not
-        // apply to it, so this reads `pcm` and not the delayed buffer. 24 is
-        // libopus's `lsb_depth` default for the float API.
-        self.info = if analysis_params().0 {
-            self.analysis.run(pcm, in_n, c, 24)
-        } else {
-            AnalysisInfo::default()
-        };
+        // API frame before the mode decision, so the estimator lives in
+        // `Encoder` and its result is handed down here.
+        self.info = *info;
 
         let mut nb_compressed = enc.storage();
         let mut nb_available = nb_compressed as i32;

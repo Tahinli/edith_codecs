@@ -5758,6 +5758,10 @@ fn analysis_music_prob_separates_speech_from_music() {
         let mut enc = Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
         enc.set_bitrate(96_000);
         enc.set_vbr_constrained(true);
+        // The analysis is off unless a consumer needs it (it costs ~25% of the
+        // encoder); the diagnostics are exactly the "explicitly asked for it"
+        // case.
+        enc.set_analysis(true);
         let mut out = vec![0u8; 4000];
         let mut sum = [0.0f64; 4];
         let mut n = 0usize;

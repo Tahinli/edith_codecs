@@ -21,6 +21,7 @@
 
 use ec_core::{Error, Result};
 
+use crate::analysis::{AnalysisInfo, TonalityAnalysis};
 use crate::celt_enc::CeltEncoder;
 use crate::packet::{Bandwidth, Mode};
 use crate::range::RangeEncoder;
@@ -120,6 +121,15 @@ pub struct Encoder {
     hp_mem: [f32; 2],
     /// Scratch space for that filter's output, sized once.
     hp_buf: Vec<f32>,
+    /// libopus `st->analysis`: the tonality/music-probability estimator. It
+    /// lives here, not in the CELT layer, because `opus_encode_native` runs
+    /// `run_analysis()` on the API frame *before* the SILK/CELT mode and
+    /// bandwidth decisions, so its state advances on SILK frames too.
+    analysis: TonalityAnalysis,
+    /// The current frame's analysis output, handed to `celt.encode`.
+    info: AnalysisInfo,
+    /// Whether the analysis runs at all — see `celt_enc::analysis_params`.
+    analysis_on: bool,
 }
 
 /// SILK's internal sample rate (kHz) for a target bandwidth: Narrow → 8,
@@ -182,6 +192,9 @@ impl Encoder {
             align_input: false,
             hp_mem: [0.0; 2],
             hp_buf: Vec::new(),
+            analysis: TonalityAnalysis::new(sample_rate),
+            info: AnalysisInfo::default(),
+            analysis_on: crate::celt_enc::analysis_params().0,
         };
         // `EC_OPUS_ALIGN=1` turns the alignment on for a whole process — how
         // the gate rows at `set_libopus_input_alignment` were produced.
@@ -189,6 +202,15 @@ impl Encoder {
             enc.set_libopus_input_alignment(true);
         }
         Ok(enc)
+    }
+
+    /// Turns the tonality analysis on or off for this encoder. It is off
+    /// unless one of its consumers is switched on (see
+    /// `celt_enc::analysis_params`), because it costs ~25% of the encoder;
+    /// turn it on to read `music_prob`/`tonality` back through
+    /// [`Encoder::last_celt_diag`].
+    pub fn set_analysis(&mut self, on: bool) {
+        self.analysis_on = on;
     }
 
     /// Overrides the automatic SILK/Hybrid/CELT choice `wants_silk` and
@@ -361,6 +383,8 @@ impl Encoder {
         self.silk_delay.clear();
         self.hp_mem = [0.0; 2];
         self.final_range = 0;
+        self.analysis.reset();
+        self.info = AnalysisInfo::default();
     }
 
     /// Whether the application/bitrate (or an explicit [`Encoder::set_mode`])
@@ -591,6 +615,15 @@ impl Encoder {
         cap: usize,
     ) -> Result<(u8, &[u8])> {
         let frame_48k = frame_size * self.upsample;
+        // libopus `opus_encode_native`: `run_analysis()` runs on the API frame
+        // before the mode/bandwidth decisions, so the estimator state advances
+        // on every frame, SILK ones included. 24 is libopus's float-API
+        // `lsb_depth` default.
+        self.info = if self.analysis_on {
+            self.analysis.run(pcm, frame_size, self.channels, 24)
+        } else {
+            AnalysisInfo::default()
+        };
         if let Some(fs_khz) = self.silk_choice(frame_48k) {
             if self.channels == 2 {
                 Self::zero_stuff_stereo(pcm, frame_size, self.upsample, &mut self.silk_stuff);
@@ -947,6 +980,7 @@ impl Encoder {
             17,
             bandwidth.celt_end_band(),
             0,
+            &self.info,
         )?;
         self.final_range = self.range.range();
         let payload = &self.range.data()[..n];
@@ -989,9 +1023,9 @@ impl Encoder {
             (b.saturating_sub(1).clamp(2, cap), 0)
         };
         self.range.reset(budget);
-        let n = self
-            .celt
-            .encode(&mut self.range, pcm, frame_size, 0, end, vbr_rate)?;
+        let n =
+            self.celt
+                .encode(&mut self.range, pcm, frame_size, 0, end, vbr_rate, &self.info)?;
         self.final_range = self.range.range();
         Ok(n)
     }
