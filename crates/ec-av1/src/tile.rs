@@ -324,7 +324,7 @@ pub(crate) fn take_compound_pair_hits() -> [usize; 7] {
 /// order. Returns the two motion vectors the decoder derives (what the MI
 /// grid must record) and whether the mode was a `NEW*` one.
 ///
-/// Only the three modes [`InterMode::compound_index`] names are written, and
+/// Only the modes [`InterMode::compound_index`] names are written, and
 /// only the `comp_group_idx == 0`, `compound_idx == 1` blend (spec
 /// `COMPOUND_AVERAGE`) -- masked compound and the distance-weighted blend are
 /// not searched.
@@ -386,6 +386,41 @@ fn write_compound_block(
     let mvs = match info.mode {
         InterMode::NearestNearestMv => stack.nearest_mv,
         InterMode::GlobalGlobalMv => ((0, 0), (0, 0)),
+        InterMode::NearNearMv => {
+            // decode.rs `assign_compound_mv`'s second DRL loop: the index
+            // starts at 1 and the mode's own `ref_mv_idx` is `idx - 1`, so
+            // this walk starts at 1 too and reads entry `ref_mv_idx + 1`.
+            let idx = usize::from(info.ref_mv_idx) + 1;
+            let mut walk = 1usize;
+            while walk < 3 && stack.entries.len() > walk + 1 {
+                let advance = walk < idx;
+                enc.symbol(usize::from(advance), &mut cdfs.drl_mode[stack.drl_ctx[walk]]);
+                if !advance {
+                    break;
+                }
+                walk += 1;
+            }
+            stack
+                .entries
+                .get(idx)
+                .map_or(stack.near_mv, |e| (e.mv0, e.mv1))
+        }
+        InterMode::NearestNewMv | InterMode::NewNearestMv => {
+            // Neither mode codes a DRL index (the decoder leaves `ref_mv_idx`
+            // at 0): the NEAREST half is derived, the NEW half codes a
+            // residual against stack entry 0.
+            let base = stack
+                .entries
+                .first()
+                .map_or(stack.nearest_mv, |e| (e.mv0, e.mv1));
+            if matches!(info.mode, InterMode::NearestNewMv) {
+                write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv1, base.1)?;
+                (stack.nearest_mv.0, info.mv1)
+            } else {
+                write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv, base.0)?;
+                (info.mv, stack.nearest_mv.1)
+            }
+        }
         _ => {
             let idx = usize::from(info.ref_mv_idx);
             let mut walk = 0usize;
@@ -420,7 +455,15 @@ fn write_compound_block(
     COMPOUND_MODE_HITS[mode].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     COMPOUND_PAIR_HITS[(ref1.max(1) - 1) as usize % 7]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok((mvs.0, mvs.1, matches!(info.mode, InterMode::NewNewMv)))
+    // decode.rs' own `is_new_mv` for a compound block: modes 2, 3, 4, 5, 7.
+    Ok((
+        mvs.0,
+        mvs.1,
+        matches!(
+            info.mode,
+            InterMode::NewNewMv | InterMode::NearestNewMv | InterMode::NewNearestMv
+        ),
+    ))
 }
 
 /// Writer-side counterpart of decode.rs `read_comp_mode` (spec 5.11.25's
@@ -977,6 +1020,16 @@ pub enum InterMode {
     /// `NEAREST_NEARESTMV`: both sides take the compound stack's own nearest
     /// pair, no residual, no DRL.
     NearestNearestMv,
+    /// `NEAR_NEARMV`: both sides take compound stack entry
+    /// [`InterInfo::ref_mv_idx`]` + 1` (decode.rs `assign_compound_mv`'s own
+    /// `ref_mv_idx + 1`), reached by a DRL walk that starts at index 1.
+    NearNearMv,
+    /// `NEAREST_NEWMV`: the first side takes the stack's nearest vector, the
+    /// second codes a residual against stack entry 0.
+    NearestNewMv,
+    /// `NEW_NEARESTMV`: the first side codes a residual against stack entry 0,
+    /// the second takes the stack's nearest vector.
+    NewNearestMv,
     /// `GLOBAL_GLOBALMV`: both sides take the identity global model's zero
     /// vector.
     GlobalGlobalMv,
@@ -992,6 +1045,9 @@ impl InterMode {
     fn compound_index(self) -> Option<usize> {
         match self {
             InterMode::NearestNearestMv => Some(0),
+            InterMode::NearNearMv => Some(1),
+            InterMode::NearestNewMv => Some(2),
+            InterMode::NewNearestMv => Some(3),
             InterMode::GlobalGlobalMv => Some(6),
             InterMode::NewNewMv => Some(7),
             _ => None,
