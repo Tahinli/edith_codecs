@@ -2247,9 +2247,26 @@ impl Reach {
 /// every leaf; 16 or 32 turn the smaller leaves off). Only read when
 /// `EC_AV1_OBMC` is on, and never by the 32x32 whole-block candidate.
 ///
-/// MEASURED at native, `EC_AV1_OBMC=1` throughout (BD vs libaom / vs rav1e,
-/// against the +18.0/+0.7, +47.3/+19.2, +59.4/-10.0 of the tool OFF):
-/// see `search_inter_block`'s note for the whole table.
+/// MEASURED at native, `EC_AV1_OBMC=1` throughout, BD vs libaom / vs rav1e
+/// (12 frames, four quantizers, the standing keep table):
+///
+/// | min side | film 1080p | film 2160p | screen |
+/// |---|---|---|---|
+/// | OBMC off | +18.0 / +0.7 | +47.3 / +19.2 | +59.4 / -10.0 |
+/// | 32 (32x32 only) | +18.4 / +1.1 | +47.3 / +19.2 | +59.1 / -10.0 |
+/// | 16 | +18.4 / +1.1 | +47.3 / +19.2 | +59.3 / -10.0 |
+/// | 8 (every leaf) | +18.7 / +1.4 | +47.3 / +19.2 | +59.3 / -10.0 |
+///
+/// So the leaves are not the thing that was holding OBMC back: at 8x8 the
+/// candidate WINS 9704 of the 11462 leaves that code the symbol on the 1080p
+/// film -- 85% of them, far past libaom's own rate -- and costs another 0.3
+/// BD points on top of the 0.4 the 32x32 candidate already costs. A tool
+/// that wins the local RD on five blocks in six and loses ladder bytes is
+/// the `local-RD-on-references` class again, not a missing footprint. The
+/// tool stays OFF by default; the upgrade path is the price, not the size
+/// (the 640x384 arm reads +78.9/+36.4, +94.9/+56.3, +54.2/+0.8 at min side 8
+/// against +78.8/+36.1, +95.1/+56.4, +54.5/+1.1 off -- two rows down, the
+/// 1080p film up, i.e. the same disagreement between the two gates).
 fn obmc_min_side() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
