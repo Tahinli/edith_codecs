@@ -158,7 +158,7 @@ impl Encoder {
                 "one stream carries at most two channels; use MultistreamEncoder",
             ));
         }
-        Ok(Encoder {
+        let mut enc = Encoder {
             celt: CeltEncoder::new(channels, upsample),
             range: RangeEncoder::new(),
             sample_rate,
@@ -182,7 +182,13 @@ impl Encoder {
             align_input: false,
             hp_mem: [0.0; 2],
             hp_buf: Vec::new(),
-        })
+        };
+        // `EC_OPUS_ALIGN=1` turns the alignment on for a whole process — how
+        // the gate rows at `set_libopus_input_alignment` were produced.
+        if std::env::var_os("EC_OPUS_ALIGN").is_some() {
+            enc.set_libopus_input_alignment(true);
+        }
+        Ok(enc)
     }
 
     /// Overrides the automatic SILK/Hybrid/CELT choice `wants_silk` and
