@@ -1,0 +1,28 @@
+=== k=0.25 d=4 ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 553, 225, 622, 6280, 0, 0, 0], range 0.250..1.111, 58 within 0.9..1.1, lookahead wall 5.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 529, 240, 624, 6287, 0, 0, 0], range 0.250..1.109, 61 within 0.9..1.1, lookahead wall 11.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 526, 255, 628, 6271, 0, 0, 0], range 0.250..1.110, 44 within 0.9..1.1, lookahead wall 17.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 550, 257, 632, 6241, 0, 0, 0], range 0.250..1.113, 64 within 0.9..1.1, lookahead wall 23.0 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 570, 250, 643, 6217, 0, 0, 0], range 0.250..1.117, 62 within 0.9..1.1, lookahead wall 28.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 544, 256, 624, 6256, 0, 0, 0], range 0.250..1.112, 73 within 0.9..1.1, lookahead wall 34.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 531, 263, 595, 6291, 0, 0, 0], range 0.250..1.110, 49 within 0.9..1.1, lookahead wall 40.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 46.0 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 49.8 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 51.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 553, 225, 622, 6280, 0, 0, 0], range 0.250..1.111, 58 within 0.9..1.1, lookahead wall 57.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 529, 240, 624, 6287, 0, 0, 0], range 0.250..1.109, 61 within 0.9..1.1, lookahead wall 63.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 526, 255, 628, 6271, 0, 0, 0], range 0.250..1.110, 44 within 0.9..1.1, lookahead wall 69.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 550, 257, 632, 6241, 0, 0, 0], range 0.250..1.113, 64 within 0.9..1.1, lookahead wall 74.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 570, 250, 643, 6217, 0, 0, 0], range 0.250..1.117, 62 within 0.9..1.1, lookahead wall 80.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 544, 256, 624, 6256, 0, 0, 0], range 0.250..1.112, 73 within 0.9..1.1, lookahead wall 86.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 531, 263, 595, 6291, 0, 0, 0], range 0.250..1.110, 49 within 0.9..1.1, lookahead wall 92.4 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 98.2 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 102.0 ms cumulative
