@@ -15,6 +15,7 @@ use ec_core::{Error, Result};
 
 use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
+use crate::decode::{TXFM_CTX_INIT, txfm_partition_ctx_rect};
 use crate::msac::SymbolEncoder;
 use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16, single_ref_ctx};
 
@@ -661,6 +662,14 @@ struct Neighbours {
     /// The same, down the left edge (the transform's HEIGHT, `tx_h_px_at`;
     /// every transform this writer codes is square, so one value serves).
     left_tx: Vec<u8>,
+    /// libaom's `above_txfm_context`/`left_txfm_context` (`TXFM_CONTEXT`), per
+    /// 4x4 mode-info unit: what an INTER frame's `txfm_split` and `tx_depth`
+    /// symbols read their context from (decode.rs `txfm_partition_ctx_rect`/
+    /// `tx_size_context_txfm_rect`). Initialised to the widest transform, not
+    /// zero (decode.rs `TXFM_CTX_INIT`).
+    above_txfm: Vec<u8>,
+    /// The same, down the left edge (transform HEIGHT).
+    left_txfm: Vec<u8>,
     /// Whether the neighbour was coded inter, for the `is_inter` context.
     /// Unused by the key frame writers.
     above_inter: Vec<bool>,
@@ -711,6 +720,8 @@ impl Neighbours {
             left_inter: vec![false; rows * (SUB / MI)],
             above_tx: vec![0; cols * (SUB / MI)],
             left_tx: vec![0; rows * (SUB / MI)],
+            above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
+            left_txfm: vec![TXFM_CTX_INIT; rows * (SUB / MI)],
             mi_cols,
             mi_rows,
         }
@@ -725,6 +736,39 @@ impl Neighbours {
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
         self.left_tx.iter_mut().for_each(|t| *t = 0);
+        self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
+    }
+
+    /// `txfm_partition_update`/`set_txfm_ctxs` (decode.rs): what every block
+    /// of an INTER frame leaves in the two `TXFM_CONTEXT` bands -- its
+    /// resolved transform size over the span `(w_px, h_px)`, which for a
+    /// SKIPPED inter block is its own block size instead.
+    fn record_txfm(&mut self, (mi_r, mi_c): (usize, usize), tx_px: usize, w_px: usize, h_px: usize) {
+        for i in 0..h_px / MI {
+            if let Some(cell) = self.left_txfm.get_mut(mi_r + i) {
+                *cell = tx_px as u8;
+            }
+        }
+        for i in 0..w_px / MI {
+            if let Some(cell) = self.above_txfm.get_mut(mi_c + i) {
+                *cell = tx_px as u8;
+            }
+        }
+    }
+
+    /// `get_tx_size_context` as libaom writes it for a block inside an INTER
+    /// frame (decode.rs `tx_size_context_txfm_rect`): the `TXFM_CONTEXT`
+    /// bands, except that an *inter* neighbour contributes its own BLOCK size.
+    fn tx_size_ctx_txfm(&self, (mi_r, mi_c): (usize, usize), own_side: usize) -> usize {
+        let mut above = usize::from(self.above_txfm[mi_c]) >= own_side;
+        let mut left = usize::from(self.left_txfm[mi_r]) >= own_side;
+        if mi_r > 0 && self.above_inter[mi_c] {
+            above = self.above_side_mi[mi_c] >= own_side;
+        }
+        if mi_c > 0 && self.left_inter[mi_r] {
+            left = self.left_side_mi[mi_r] >= own_side;
+        }
+        usize::from(above) + usize::from(left)
     }
 
     /// `get_tx_size_context` (decode.rs [`crate::decode::tx_size_context`]):
@@ -1648,45 +1692,24 @@ fn write_block_planes(
     }
 }
 
-/// Writes one intra block's luma residual under `TxMode::Select`: the
-/// `tx_depth` symbol (spec 5.11.16 `read_selected_tx_size`, off the size
-/// category's own CDF at [`Neighbours::tx_size_ctx`]'s row), then the
-/// `(side / tx)^2` transform units in raster order -- each predicted and
-/// coded against what the units before it already left behind, which is why
-/// every unit publishes its own coefficient context before the next one reads
-/// it (decode.rs `decode_block`'s multi-transform-unit branch).
-///
-/// `grid` is the block's levels in BLOCK coordinates (`side` by `side`) when
-/// the transform splits, and the single transform's own coefficient grid when
-/// it does not. Hands back the resolved transform side in pixels.
+/// The `(side / tx)^2` transform units of one block's luma residual, raster
+/// order, each with its own coefficient context and each published before the
+/// next one reads it (decode.rs `decode_block`'s multi-transform-unit branch).
+/// `grid` is the block's levels in BLOCK coordinates when the transform
+/// splits, and the single transform's own coefficient grid when it does not.
 #[allow(clippy::too_many_arguments)]
-fn write_luma_select(
+fn write_luma_tus(
     enc: &mut SymbolEncoder,
     cdfs: &mut Cdfs,
     neighbours: &mut Neighbours,
     at_mi: (usize, usize),
     side: usize,
-    depth: usize,
+    tx: usize,
     grid: &[i32],
     mode: usize,
     scans: &[Vec<u16>; 4],
-) -> Result<usize> {
-    let max_tx = side.min(64);
-    let ctx = neighbours.tx_size_ctx(at_mi, max_tx);
-    match max_tx {
-        8 => enc.symbol(depth, &mut cdfs.tx_size_cat0[ctx]),
-        16 => enc.symbol(depth, &mut cdfs.tx_size_cat1[ctx]),
-        32 => enc.symbol(depth, &mut cdfs.tx_size_cat2[ctx]),
-        64 => enc.symbol(depth, &mut cdfs.tx_size_cat3[ctx]),
-        _ => {
-            return Err(Error::unsupported(
-                "AV1 tile",
-                "a tx_depth symbol is only coded at 8/16/32/64",
-            ));
-        }
-    }
-    let tx = max_tx >> depth;
-    if depth > 0 && side > 32 {
+) -> Result<()> {
+    if tx < side && side > 32 {
         // A 64x64 block's own levels reach the writer as the 32x32 corner a
         // 64-point transform codes, not as a 64x64 block grid, so there is
         // nothing to slice per unit here.
@@ -1746,8 +1769,105 @@ fn write_luma_select(
             }
         }
     }
+    Ok(())
+}
+
+/// Writes one intra block's luma residual under `TxMode::Select`: the
+/// `tx_depth` symbol (spec 5.11.16 `read_selected_tx_size`, off the size
+/// category's own CDF at [`Neighbours::tx_size_ctx`]'s row), then the
+/// `(side / tx)^2` transform units in raster order -- each predicted and
+/// coded against what the units before it already left behind, which is why
+/// every unit publishes its own coefficient context before the next one reads
+/// it (decode.rs `decode_block`'s multi-transform-unit branch).
+///
+/// `grid` is the block's levels in BLOCK coordinates (`side` by `side`) when
+/// the transform splits, and the single transform's own coefficient grid when
+/// it does not. Hands back the resolved transform side in pixels.
+#[allow(clippy::too_many_arguments)]
+fn write_luma_select(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    at_mi: (usize, usize),
+    side: usize,
+    depth: usize,
+    grid: &[i32],
+    mode: usize,
+    scans: &[Vec<u16>; 4],
+) -> Result<usize> {
+    let max_tx = side.min(64);
+    let ctx = neighbours.tx_size_ctx(at_mi, max_tx);
+    match max_tx {
+        8 => enc.symbol(depth, &mut cdfs.tx_size_cat0[ctx]),
+        16 => enc.symbol(depth, &mut cdfs.tx_size_cat1[ctx]),
+        32 => enc.symbol(depth, &mut cdfs.tx_size_cat2[ctx]),
+        64 => enc.symbol(depth, &mut cdfs.tx_size_cat3[ctx]),
+        _ => {
+            return Err(Error::unsupported(
+                "AV1 tile",
+                "a tx_depth symbol is only coded at 8/16/32/64",
+            ));
+        }
+    }
+    let tx = max_tx >> depth;
+    write_luma_tus(enc, cdfs, neighbours, at_mi, side, tx, grid, mode, scans)?;
     neighbours.record_tx(at_mi, side, tx);
     Ok(tx)
+}
+
+/// The transform syntax one block of an INTER frame coded with
+/// `tx_mode == TxMode::Select` carries, in the place spec 5.11.16's
+/// `read_block_tx_size` reads it -- after the modes and the motion vector,
+/// before the residual:
+///  * an inter block that codes a residual walks a var-tx tree; this writer
+///    keeps it at its own largest transform, so that is one `txfm_split` flag
+///    of zero, off `txfm_partition_ctx_rect`'s row, publishing the bands per
+///    unit the way `read_var_tx_size` does.
+///  * a skipped inter block codes nothing and records its own BLOCK size
+///    (`set_txfm_ctxs`'s `skip_inter` term).
+///  * an intra block codes `tx_depth` like a key frame's, but off the
+///    `TXFM_CONTEXT` bands rather than the deblock grid.
+///
+/// Hands back the block's resolved luma transform side.
+#[allow(clippy::too_many_arguments)]
+fn write_tx_syntax_inter(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    at_mi: (usize, usize),
+    side: usize,
+    is_inter: bool,
+    skip: bool,
+    depth: usize,
+) -> usize {
+    let max_tx = side.min(64);
+    let (mi_r, mi_c) = at_mi;
+    if is_inter {
+        if !skip {
+            let ctx = txfm_partition_ctx_rect(
+                neighbours.above_txfm[mi_c],
+                neighbours.left_txfm[mi_r],
+                side,
+                max_tx,
+                max_tx,
+            );
+            enc.symbol(0, &mut cdfs.txfm_partition[ctx]);
+            neighbours.record_txfm(at_mi, max_tx, max_tx, max_tx);
+        } else {
+            neighbours.record_txfm(at_mi, side, side, side);
+        }
+        return max_tx;
+    }
+    let ctx = neighbours.tx_size_ctx_txfm(at_mi, max_tx);
+    match max_tx {
+        8 => enc.symbol(depth, &mut cdfs.tx_size_cat0[ctx]),
+        16 => enc.symbol(depth, &mut cdfs.tx_size_cat1[ctx]),
+        32 => enc.symbol(depth, &mut cdfs.tx_size_cat2[ctx]),
+        _ => enc.symbol(depth, &mut cdfs.tx_size_cat3[ctx]),
+    }
+    let tx = max_tx >> depth;
+    neighbours.record_txfm(at_mi, tx, side, side);
+    tx
 }
 
 /// What a coded transform block leaves behind for the blocks that read it as a
@@ -2499,6 +2619,25 @@ pub fn sb_coeff_inter_frame_tile(
     base_q_idx: u8,
     blocks: &[Quadrant],
 ) -> Result<Vec<u8>> {
+    sb_coeff_inter_frame_tile_tx(mi_cols, mi_rows, base_q_idx, blocks, false)
+}
+
+/// [`sb_coeff_inter_frame_tile`] for a frame header carrying
+/// `tx_mode == TxMode::Select`: every block then codes the transform syntax
+/// [`write_tx_syntax_inter`] writes -- one `txfm_split` flag on an inter
+/// block that carries a residual, a `tx_depth` symbol on an intra one -- and
+/// an intra block whose depth is nonzero codes its luma as several transform
+/// units. With `tx_select` false this writes exactly the stream it always did.
+///
+/// # Errors
+/// As [`sb_coeff_inter_frame_tile`].
+pub fn sb_coeff_inter_frame_tile_tx(
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    blocks: &[Quadrant],
+    tx_select: bool,
+) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
     // `block_grid`'s ceiling, not a plain division: a true frame size that is
     // not a whole number of 32x32 blocks (or of 64x64 superblocks) still has
@@ -2552,6 +2691,14 @@ pub fn sb_coeff_inter_frame_tile(
     let scan16 = default_scan(TX16);
     let scan8 = default_scan(TX8);
     let scan4 = default_scan(TX4);
+    // The same four tables again as one array, which is what the per-unit
+    // luma writer indexes by transform side.
+    let all_scans = [
+        scan32.clone(),
+        scan16.clone(),
+        scan8.clone(),
+        scan4.clone(),
+    ];
     let zero_grids = [
         vec![0i32; TX32 * TX32],
         vec![0i32; TX16 * TX16],
@@ -2715,6 +2862,8 @@ pub fn sb_coeff_inter_frame_tile(
                                             leaf_mi,
                                             &scan8,
                                             &scan4,
+                                            tx_select,
+                                            &all_scans,
                                         )?;
                                         let _ = (skip, is_inter);
                                     }
@@ -2732,6 +2881,8 @@ pub fn sb_coeff_inter_frame_tile(
                                     at16,
                                     &scan16,
                                     &scan8,
+                                    tx_select,
+                                    &all_scans,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -2780,6 +2931,8 @@ pub fn sb_coeff_inter_frame_tile(
                                         leaf_mi,
                                         &scan8,
                                         &scan4,
+                                        tx_select,
+                                        &all_scans,
                                     )?;
                                     let _ = (skip, is_inter);
                                 }
@@ -2931,6 +3084,22 @@ pub fn sb_coeff_inter_frame_tile(
                     }
                 }
 
+                let at_mi = (at.0 * (SUB / MI), at.1 * (SUB / MI));
+                let tx = if tx_select {
+                    write_tx_syntax_inter(
+                        &mut enc,
+                        &mut cdfs,
+                        &mut neighbours,
+                        at_mi,
+                        BLOCK,
+                        is_inter,
+                        block.skip,
+                        usize::from(block.tx_depth),
+                    )
+                } else {
+                    BLOCK
+                };
+                let split = tx < BLOCK;
                 if block.skip {
                     neighbours.record(at, BLOCK, mode_for_tx, &zero_grids);
                 } else {
@@ -2939,6 +3108,19 @@ pub fn sb_coeff_inter_frame_tile(
                         level_grid(&block.u, TX16)?,
                         level_grid(&block.v, TX16)?,
                     ];
+                    if split {
+                        write_luma_tus(
+                            &mut enc,
+                            &mut cdfs,
+                            &mut neighbours,
+                            at_mi,
+                            BLOCK,
+                            tx,
+                            &grids[0],
+                            mode_for_tx,
+                            &all_scans,
+                        )?;
+                    }
                     write_block_planes(
                         &mut enc,
                         &mut cdfs,
@@ -2951,9 +3133,9 @@ pub fn sb_coeff_inter_frame_tile(
                         &[&scan32, &scan16, &scan16],
                         &neighbours.around(at, BLOCK),
                         mode_for_tx,
-                        false,
+                        split,
                     );
-                    neighbours.record(at, BLOCK, mode_for_tx, &grids);
+                    neighbours.record_planes(at, BLOCK, mode_for_tx, &grids, !split);
                 }
                 neighbours.record_inter(at, BLOCK, block.skip, is_inter);
             }
@@ -2984,6 +3166,8 @@ fn write_inter_frame_leaf(
     at: (usize, usize),
     scan16: &Vec<u16>,
     scan8: &Vec<u16>,
+    tx_select: bool,
+    all_scans: &[Vec<u16>; 4],
 ) -> Result<()> {
     if block.inter.is_none() && usize::from(block.mode) >= INTRA_MODES {
         return Err(Error::unsupported(
@@ -3112,6 +3296,22 @@ fn write_inter_frame_leaf(
         }
     }
 
+    let at_mi = (at.0 * (SUB / MI), at.1 * (SUB / MI));
+    let tx = if tx_select {
+        write_tx_syntax_inter(
+            enc,
+            cdfs,
+            neighbours,
+            at_mi,
+            SUB,
+            is_inter,
+            block.skip,
+            usize::from(block.tx_depth),
+        )
+    } else {
+        SUB
+    };
+    let split = tx < SUB;
     if block.skip {
         let zero_grids = [
             vec![0i32; TX16 * TX16],
@@ -3125,6 +3325,11 @@ fn write_inter_frame_leaf(
             level_grid(&block.u, TX8)?,
             level_grid(&block.v, TX8)?,
         ];
+        if split {
+            write_luma_tus(
+                enc, cdfs, neighbours, at_mi, SUB, tx, &grids[0], mode_for_tx, all_scans,
+            )?;
+        }
         write_block_planes(
             enc,
             cdfs,
@@ -3137,9 +3342,9 @@ fn write_inter_frame_leaf(
             &[scan16, scan8, scan8],
             &neighbours.around(at, SUB),
             mode_for_tx,
-            false,
+            split,
         );
-        neighbours.record(at, SUB, mode_for_tx, &grids);
+        neighbours.record_planes(at, SUB, mode_for_tx, &grids, !split);
     }
     neighbours.record_inter(at, SUB, block.skip, is_inter);
     Ok(())
@@ -3174,6 +3379,8 @@ fn write_inter_frame_leaf8(
     leaf_mi: (usize, usize),
     scan8: &Vec<u16>,
     scan4: &Vec<u16>,
+    tx_select: bool,
+    all_scans: &[Vec<u16>; 4],
 ) -> Result<(bool, bool)> {
     if block.inter.is_none() && usize::from(block.mode) >= INTRA_MODES {
         return Err(Error::unsupported(
@@ -3314,6 +3521,21 @@ fn write_inter_frame_leaf8(
     } else {
         [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4]
     };
+        let tx = if tx_select {
+        write_tx_syntax_inter(
+            enc,
+            cdfs,
+            neighbours,
+            leaf_mi,
+            8,
+            is_inter,
+            block.skip,
+            usize::from(block.tx_depth),
+        )
+    } else {
+        8
+    };
+    let split = tx < 8;
     if block.skip {
         let zero_grids = [
             vec![0i32; TX8 * TX8],
@@ -3328,6 +3550,11 @@ fn write_inter_frame_leaf8(
             level_grid(&block.u, TX4)?,
             level_grid(&block.v, TX4)?,
         ];
+        if split {
+            write_luma_tus(
+                enc, cdfs, neighbours, leaf_mi, 8, tx, &grids[0], mode_for_tx, all_scans,
+            )?;
+        }
         write_block_planes(
             enc,
             cdfs,
@@ -3336,9 +3563,9 @@ fn write_inter_frame_leaf8(
             &[scan8, scan4, scan4],
             &neighbours.around_mi(leaf_mi, 8),
             mode_for_tx,
-            false,
+            split,
         );
-        neighbours.record_mi(leaf_mi, 8, &grids);
+        neighbours.record_mi_planes(leaf_mi, 8, &grids, !split);
         neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter);
     }
     Ok((block.skip, is_inter))
