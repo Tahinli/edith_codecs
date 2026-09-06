@@ -1548,7 +1548,7 @@ mod tests {
     /// display-order list and fails here.
     #[test]
     fn a_pyramid_stream_decodes_in_display_order_through_both_decoders() {
-        let (width, height) = (128usize, 64usize);
+        let (width, height) = (128usize, 128usize);
         let config = EncoderConfig {
             width,
             height,
@@ -1634,6 +1634,100 @@ mod tests {
                     b[at],
                 );
             }
+        }
+    }
+
+    /// Every tile layout this encoder can write decodes SAMPLE-EXACT
+    /// through both decoders -- ours and ffmpeg's -- and the frames really
+    /// carry the tiles the header claims (the OBU parser locates one payload
+    /// per tile, so a stream that quietly stayed single-tile fails here
+    /// rather than passing on a green round trip).
+    ///
+    /// The bytes are what the gate is on: an encoder that clipped its
+    /// neighbour availability wrong writes a stream whose two decoders agree
+    /// with each other and disagree with nothing -- so the ffmpeg half is
+    /// the one that catches a tile boundary the writer respected and the
+    /// spec does not, and the parser half catches the reverse.
+    #[test]
+    fn every_tile_layout_decodes_sample_exact_through_both_decoders() {
+        let (width, height) = (128usize, 128usize);
+        let sources: Vec<Picture> = (0..2).map(|t| test_card(width, height, t * 3)).collect();
+        let mut sizes = Vec::new();
+        for (cols_log2, rows_log2) in [(0u32, 1u32)] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 4,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: cols_log2,
+                tile_rows_log2: rows_log2,
+            };
+            let layout = format!("{}x{} tiles", 1 << cols_log2, 1 << rows_log2);
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for (i, picture) in sources.iter().enumerate() {
+                let packet = enc
+                    .encode(picture)
+                    .unwrap_or_else(|e| panic!("{layout} frame {i}: {e}"));
+                stream.extend_from_slice(&packet.data);
+            }
+            sizes.push((layout.clone(), stream.len()));
+
+            // The frames carry the tiles their headers claim.
+            let mut parser = ec_av1_syntax::Av1Parser::new();
+            let mut frames = 0usize;
+            let mut offset = 0usize;
+            while offset < stream.len() {
+                let obus = parser.parse_temporal_unit(&stream[offset..]).unwrap();
+                let unit: usize = obus.iter().map(|o| o.total_size).sum();
+                for obu in &obus {
+                    if let ec_av1_syntax::ObuKind::Frame(parsed, tiles) = &obu.kind {
+                        assert_eq!(
+                            (parsed.tile_info.cols, parsed.tile_info.rows),
+                            (1 << cols_log2, 1 << rows_log2),
+                            "{layout}: the header's own tile grid"
+                        );
+                        assert_eq!(
+                            tiles.len(),
+                            1 << (cols_log2 + rows_log2),
+                            "{layout}: tile payloads located in the tile group"
+                        );
+                        frames += 1;
+                    }
+                }
+                offset += unit;
+            }
+            assert_eq!(frames, sources.len(), "{layout}: coded frames");
+
+            let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+            assert_eq!(ours.len(), sources.len(), "{layout}: our decoder's frames");
+            if !have_ffmpeg() {
+                eprintln!("SKIP the ffmpeg half of {layout}: no ffmpeg");
+                continue;
+            }
+            let theirs = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "{layout}: ffmpeg's frames");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                assert_eq!(got.len(), b.len(), "{layout} frame {i}: luma size");
+                if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                    panic!(
+                        "{layout} frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                        at % width,
+                        at / width,
+                        got[at],
+                        b[at],
+                    );
+                }
+            }
+        }
+        let base = sizes[0].1 as f64;
+        for (layout, bytes) in &sizes {
+            eprintln!(
+                "{layout}: {bytes} bytes ({:+.2}% vs one tile)",
+                (*bytes as f64 / base - 1.0) * 100.0
+            );
         }
     }
 

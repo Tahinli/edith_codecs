@@ -3335,6 +3335,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
         tx_select,
         &mut cdfs,
         TileRect::whole(mi_cols, mi_rows),
+        &mut MiGrid::new(mi_cols as usize, mi_rows as usize),
     )
 }
 
@@ -3352,6 +3353,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     cdfs: &mut Cdfs,
     // This tile's own span; see [`sb_coeff_key_frame_tile_cdfs`].
     tile: TileRect,
+    // The frame's MV grid, carried across the frame's tiles by the caller
+    // (see the comment at `set_tile_bounds` below).
+    grid: &mut MiGrid,
 ) -> Result<Vec<u8>> {
     // Consumes whatever `arm_cdef_idx`/`arm_lr` armed, on every exit path.
     let _cdef_idx = CdefIdxGuard;
@@ -3392,7 +3396,14 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
         mi_cols as usize,
         mi_rows as usize,
     );
-    let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+    // The MV grid spans the FRAME and carries every tile written before this
+    // one, exactly as a decoder's does (`decode_inter_frame_tile_with_cdfs`
+    // keeps one grid for the whole frame and narrows its read window per
+    // tile): the tile bounds below are what stops a candidate scan reaching
+    // across the boundary, and a grid that was merely empty out there would
+    // not read the same as the decoder's wherever a scan reads the array
+    // without asking `MiGrid::get` first.
+    let mut grid = &mut *grid;
     grid.set_tile_bounds(
         tile.mi_row0 as usize,
         tile.mi_col0 as usize,
@@ -3432,6 +3443,14 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
             write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
+            if std::env::var_os("TILEDBG").is_some() {
+                eprintln!(
+                    "TILEDBG enc sb at=({}, {}) ctx={sb_ctx} tell={}",
+                    sb_at.0 * 4,
+                    sb_at.1 * 4,
+                    enc.tell()
+                );
+            }
             // spec `decode_partition`'s hasRows/hasCols (5.11.4): a superblock
             // whose bottom or right half falls outside the true frame cannot
             // be left whole, but this writer only ever splits a superblock
@@ -3465,6 +3484,15 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 }
                 let site = &blocks[(r32 * cols + c32) as usize];
                 let at = (r32 as usize * 2, c32 as usize * 2);
+                if std::env::var_os("TILEDBG").is_some() {
+                    eprintln!(
+                        "TILEDBG enc block at=({}, {}) whole={} tell={}",
+                        at.0 * 4,
+                        at.1 * 4,
+                        matches!(site, Quadrant::Whole(_)),
+                        enc.tell()
+                    );
+                }
                 let ctx32 = neighbours.partition_ctx(at, BLOCK);
                 // spec `decode_partition`'s hasRows/hasCols recomputed at this
                 // quadrant's own half: a whole 32x32 block cannot be left

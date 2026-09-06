@@ -4878,12 +4878,17 @@ pub(crate) fn encode_inter_frame(
     // own tables, so no tile depends on any other.
     let code_tiles = |bits: u8,
                       sb_cols: usize,
-                      grid: &[u8],
+                      cdef_grid: &[u8],
                       units: &[Option<crate::restoration::WienerInfo>]|
      -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::with_capacity(layout.count());
+        // One grid for the whole frame, carried from tile to tile (the
+        // decoder keeps exactly one too) and rebuilt from nothing on every
+        // re-code.
+        let mut mv_grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+        mv_grid.set_sign_bias(sign_bias);
         for index in 0..layout.count() {
-            crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
+            crate::tile::arm_cdef_idx(bits, sb_cols, cdef_grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             crate::tile::arm_sign_bias(sign_bias);
             let mut cdfs = start_cdfs.0.clone();
@@ -4895,6 +4900,7 @@ pub(crate) fn encode_inter_frame(
                 tx_select,
                 &mut cdfs,
                 layout.rect(index),
+                &mut mv_grid,
             )?);
             if index == store_tile {
                 *end_cdfs.borrow_mut() = Some(cdfs);
@@ -4977,6 +4983,12 @@ pub(crate) fn encode_inter_frame(
         |bits, sb_cols, grid, units| code_tiles(bits, sb_cols, grid, units),
         |lf, cdef, h, tiles: &[Vec<u8>], lr| {
             let payloads: Vec<&[u8]> = tiles.iter().map(Vec::as_slice).collect();
+            eprintln!(
+                "TILEDBG inter decode tiles={:?} cdef_bits={} lr={}",
+                tiles.iter().map(Vec::len).collect::<Vec<_>>(),
+                cdef.bits,
+                lr.uses_lr
+            );
             crate::decode::decode_inter_frame_tiles_lr(
                 &payloads,
                 &header_tile_info,
