@@ -40,7 +40,34 @@ use ec_core::{Error, Result};
 ///
 /// `Cell`/`RefCell` make this `!Sync` on purpose: a `FrameCtx` belongs to
 /// exactly one thread's decode, and is never shared between workers.
+/// One frame's in-loop filter intermediates, as [`FrameCtx::capture_stages`]
+/// asks for them: each plane's post-deblock (pre-CDEF) and post-CDEF
+/// (pre-restoration) samples, at the decoder's own plane stride.
+pub(crate) struct FilterStages {
+    /// Post-deblock, pre-CDEF planes (Y, U, V).
+    pub(crate) deblocked: [Vec<u16>; 3],
+    /// Post-CDEF, pre-restoration planes (Y, U, V).
+    pub(crate) cdefed: [Vec<u16>; 3],
+    /// Each plane's stride (and so its width in the buffers above).
+    pub(crate) stride: [usize; 3],
+}
+
+/// Takes whatever the last capturing decode left (see
+/// [`FrameCtx::capture_stages`]).
+#[allow(dead_code)] // read from the encoder's loop restoration search
+pub(crate) fn take_filter_stages(fctx: &FrameCtx) -> Option<FilterStages> {
+    fctx.stages.borrow_mut().take()
+}
+
 pub(crate) struct FrameCtx {
+    /// lane-av1lr: when set, the frame filter chain leaves its post-deblock
+    /// and post-CDEF planes in [`FrameCtx::stages`] for the ENCODER's loop
+    /// restoration search (spec 7.17 reads both: the stripe interior from
+    /// the post-CDEF plane, its 3-row border from the post-deblock one).
+    /// Off for every decode but that search, and off it costs one bool read
+    /// per frame and not a single copy.
+    pub(crate) capture_stages: std::cell::Cell<bool>,
+    pub(crate) stages: std::cell::RefCell<Option<FilterStages>>,
     pub(crate) sb128_flag: std::cell::Cell<bool>,
     pub(crate) cdef_bits: std::cell::Cell<u8>,
     pub(crate) bit_depth: std::cell::Cell<u8>,
@@ -130,6 +157,8 @@ impl FrameCtx {
             superres: std::cell::Cell::new((0, 8)),
             cdef_transmitted: std::cell::Cell::new(false),
             cdef_sb_cols: std::cell::Cell::new(0),
+            capture_stages: std::cell::Cell::new(false),
+            stages: std::cell::RefCell::new(None),
             cdef_idx_grid: std::cell::RefCell::new(Vec::new()),
             delta_q_present: std::cell::Cell::new(false),
             delta_q_res: std::cell::Cell::new(1),
@@ -20545,6 +20574,37 @@ fn apply_cdef(
     scratch_return(src_v);
 }
 
+/// [`FrameCtx::capture_stages`]'s write side, called between CDEF and loop
+/// restoration on both tile paths: hands the encoder's restoration search the
+/// two pictures spec 7.17 filters from. `deblocked` is the decoder's own
+/// stripe-boundary snapshot ([`plane_snapshot`], only the rows LR reads), so
+/// a capture is worth three plane copies and nothing else -- and when the
+/// capture flag is off (every decode but that search) it is worth a bool.
+fn capture_stages(
+    y: &PlaneBuf<'_>,
+    u: &PlaneBuf<'_>,
+    v: &PlaneBuf<'_>,
+    deblocked: Option<&(PlaneBuf<'static>, PlaneBuf<'static>, PlaneBuf<'static>)>,
+    fctx: &FrameCtx,
+) {
+    if !fctx.capture_stages.get() {
+        return;
+    }
+    // Without an active restoration type the decoder took no pre-CDEF
+    // snapshot; the post-CDEF plane then stands in for it, which is exact
+    // everywhere but LR's own 3-row stripe borders (the encoder's search
+    // always asks with a type set, so this is the defensive arm).
+    let db = |i: usize, p: &PlaneBuf<'_>| match deblocked {
+        Some((a, b, c)) => [a, b, c][i].data.to_vec(),
+        None => p.data.to_vec(),
+    };
+    *fctx.stages.borrow_mut() = Some(FilterStages {
+        deblocked: [db(0, y), db(1, u), db(2, v)],
+        cdefed: [y.data.to_vec(), u.data.to_vec(), v.data.to_vec()],
+        stride: [y.width, u.width, v.width],
+    });
+}
+
 /// Spec 7.17: loop restoration, run after [`apply_cdef`] (a sibling lane's
 /// ordering note: libaom also runs `superres_post_decode` between the two,
 /// but this decoder never implements super-resolution, so there is nothing
@@ -20661,6 +20721,34 @@ pub(crate) fn decode_key_frame_tile(
     allow_screen_content_tools: bool,
     allow_intrabc: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
+    decode_key_frame_tile_lr(
+        data, mi_cols, mi_rows, base_q_idx, frame_width, frame_height, enable_filter_intra,
+        cdef, loop_filter, tx_select, reduced_tx_set, allow_screen_content_tools, allow_intrabc,
+        &LoopRestorationParams::default(), fctx,
+    )
+}
+
+/// [`decode_key_frame_tile`] with this frame header's own `lr_params` (spec
+/// 5.9.20) instead of the no-restoration default -- the per-unit filters
+/// themselves live in the tile payload, so the header is all this needs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_key_frame_tile_lr(
+    data: &[u8],
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    enable_filter_intra: bool,
+    cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
+    tx_select: bool,
+    reduced_tx_set: bool,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
+    lr: &LoopRestorationParams,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<Picture> {
     let delta = DeltaParams::default();
     let single_tile = TileInfo {
         mi_col_starts: vec![0, mi_cols],
@@ -20680,7 +20768,7 @@ pub(crate) fn decode_key_frame_tile(
         false,
         cdef,
         loop_filter,
-        &LoopRestorationParams::default(),
+        lr,
         None,
         tx_select,
         reduced_tx_set,
@@ -23020,6 +23108,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
+    capture_stages(&y, &u, &v, deblocked.as_ref(), fctx);
     // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
     // between `av1_cdef_frame` and `av1_loop_restoration_filter_frame`):
     // the horizontal upscale runs HERE -- after CDEF, before loop
@@ -32782,6 +32871,37 @@ pub(crate) fn decode_inter_frame_tile(
     initial_cdfs: Option<Cdfs>,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
+    decode_inter_frame_tile_lr(
+        data, mi_cols, mi_rows, base_q_idx, frame_width, frame_height, refpix, cdef,
+        loop_filter, allow_high_precision_mv, force_integer_mv, interp_fixed,
+        enable_dual_filter, reference_select, tx_select,
+        &LoopRestorationParams::default(), initial_cdfs, fctx,
+    )
+}
+
+/// [`decode_inter_frame_tile`] with this frame header's own `lr_params`, the
+/// inter sibling of [`decode_key_frame_tile_lr`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_inter_frame_tile_lr(
+    data: &[u8],
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    refpix: &RefPix<'_>,
+    cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
+    allow_high_precision_mv: bool,
+    force_integer_mv: bool,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    enable_dual_filter: bool,
+    reference_select: bool,
+    tx_select: bool,
+    lr: &LoopRestorationParams,
+    initial_cdfs: Option<Cdfs>,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<Picture> {
     let single_tile = TileInfo {
         mi_col_starts: vec![0, mi_cols],
         mi_row_starts: vec![0, mi_rows],
@@ -32799,7 +32919,7 @@ pub(crate) fn decode_inter_frame_tile(
         refpix,
         cdef,
         loop_filter,
-        &LoopRestorationParams::default(),
+        lr,
         initial_cdfs,
         allow_high_precision_mv,
         force_integer_mv,
@@ -35661,6 +35781,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     }
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
+    capture_stages(&y, &u, &v, deblocked.as_ref(), fctx);
     // spec 7.16 (libaom `superres_post_decode`, decodeframe.c: called
     // between `av1_cdef_frame` and `av1_loop_restoration_filter_frame`):
     // the horizontal upscale runs HERE -- after CDEF, before loop
@@ -36804,9 +36925,10 @@ mod tests {
             tx_select,
             loop_filter,
             cdef,
+            loop_restoration,
             ..
         }: Encoded = crate::encode::encode_key_frame_with_modes_with_ctx(&picture, 40, 0.0, modes, fctx).unwrap();
-        let decoded = decode_key_frame_tile(
+        let decoded = decode_key_frame_tile_lr(
             &tile,
             mi_cols,
             mi_rows,
@@ -36819,7 +36941,8 @@ mod tests {
             tx_select,
             true,
             false,
-            false, fctx,
+            false,
+            &loop_restoration, fctx,
         )
         .unwrap();
         assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
@@ -37174,7 +37297,7 @@ mod tests {
             let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let (coded_w, coded_h) = ffprobe_size(&encoded.stream);
             let ffmpeg_decoded = ffmpeg_decode(&encoded.stream, coded_w as usize, coded_h as usize);
-            let ours = decode_key_frame_tile(
+            let ours = decode_key_frame_tile_lr(
                 &encoded.tile,
                 encoded.mi_cols,
                 encoded.mi_rows,
@@ -37187,7 +37310,8 @@ mod tests {
                 encoded.tx_select,
                 true,
                 false,
-                false, fctx,
+                false,
+                &encoded.loop_restoration, fctx,
             )
             .unwrap();
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
@@ -37217,7 +37341,7 @@ mod tests {
              gate's premise moved, not the decoder"
         );
         let decode = |tx_select: bool| {
-            decode_key_frame_tile(
+            decode_key_frame_tile_lr(
                 &encoded.tile,
                 encoded.mi_cols,
                 encoded.mi_rows,
@@ -37231,6 +37355,7 @@ mod tests {
                 true,
                 false,
                 false,
+                &encoded.loop_restoration,
                 fctx,
             )
         };
@@ -37301,7 +37426,7 @@ mod tests {
         assert_eq!(encoded.frames.len(), 4);
 
         let key = &encoded.frames[0];
-        let mut reference = decode_key_frame_tile(
+        let mut reference = decode_key_frame_tile_lr(
             &key.tile,
             key.mi_cols,
             key.mi_rows,
@@ -37314,7 +37439,8 @@ mod tests {
             key.tx_select,
             true,
             false,
-            false, fctx,
+            false,
+            &key.loop_restoration, fctx,
         )
         .unwrap();
         assert_eq!(
@@ -37331,7 +37457,7 @@ mod tests {
         );
 
         for (i, frame) in encoded.frames.iter().enumerate().skip(1) {
-            let decoded = decode_inter_frame_tile(
+            let decoded = decode_inter_frame_tile_lr(
                 &frame.tile,
                 frame.mi_cols,
                 frame.mi_rows,
@@ -37351,6 +37477,7 @@ mod tests {
                 false,
                 false,
                 frame.tx_select,
+                &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
                 fctx,
             )
@@ -37628,7 +37755,7 @@ mod tests {
             ffmpeg_decode_sequence(&encoded.stream, coded_w as usize, coded_h as usize, 3);
 
         let key = &encoded.frames[0];
-        let mut reference = decode_key_frame_tile(
+        let mut reference = decode_key_frame_tile_lr(
             &key.tile,
             key.mi_cols,
             key.mi_rows,
@@ -37641,13 +37768,14 @@ mod tests {
             key.tx_select,
             true,
             false,
-            false, fctx,
+            false,
+            &key.loop_restoration, fctx,
         )
         .unwrap();
         assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
 
         for (i, frame) in encoded.frames.iter().enumerate().skip(1) {
-            let decoded = decode_inter_frame_tile(
+            let decoded = decode_inter_frame_tile_lr(
                 &frame.tile,
                 frame.mi_cols,
                 frame.mi_rows,
@@ -37667,6 +37795,7 @@ mod tests {
                 false,
                 false,
                 frame.tx_select,
+                &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
                 fctx,
             )
