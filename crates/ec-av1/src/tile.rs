@@ -1557,18 +1557,96 @@ fn default_scan(side: usize) -> Vec<u16> {
 /// so one table is all the search needs; a second block size would need its
 /// own entry point rather than a size argument, because the table and the scan
 /// have to agree.
+/// What the search paid for every coefficient of `blocks`, in bits: the same
+/// [`coeff_bits`] price the mode search ranked those blocks by, summed over
+/// the blocks that were actually kept.
+///
+/// The instrument behind `predicted_coeff_bits_track_the_tile_the_writer_wrote`
+/// (lane-av1rd1): the writer codes these levels against a state that has
+/// adapted away from the defaults `coeff_bits` prices with, and against real
+/// neighbour contexts instead of the empty ones, so the sum here and the tile
+/// the writer produced differ by exactly that drift plus the non-coefficient
+/// syntax (partition/mode/skip/mv symbols) the sum leaves out.
+#[cfg(test)]
+fn dense(coeffs: &[Coeff], side: usize) -> Vec<i32> {
+    let mut grid = vec![0i32; side * side];
+    for c in coeffs {
+        grid[usize::from(c.row) * side + usize::from(c.col)] = c.level;
+    }
+    grid
+}
+
+#[cfg(test)]
+pub(crate) fn predicted_coeff_bits_sb(superblocks: &[Superblock], base_q_idx: u8) -> f64 {
+    let q_ctx = crate::decode::q_ctx_of(base_q_idx);
+    superblocks
+        .iter()
+        .map(|sb| match sb {
+            // A whole 64x64 codes its luma through `TxbSet::Luma64` (only the
+            // top-left 32x32 carries coefficients) and each chroma plane at
+            // 32x32; `predicted_coeff_bits` has no 64 arm, so price it here.
+            Superblock::Whole(block) if !block.skip => {
+                coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx)
+                    + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx)
+                    + coeff_bits(&dense(&block.v, 32), TxbSet::Chroma32, q_ctx)
+            }
+            Superblock::Whole(_) => 0.0,
+            Superblock::Split(quadrants) => predicted_coeff_bits(quadrants, base_q_idx),
+        })
+        .sum()
+}
+
+#[cfg(test)]
+pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
+    let q_ctx = crate::decode::q_ctx_of(base_q_idx);
+    fn block_bits(block: &BlockCoeffs, side: usize, q_ctx: usize) -> f64 {
+        if let Some(leaves) = &block.eight {
+            return leaves.iter().map(|l| block_bits(l, 8, q_ctx)).sum();
+        }
+        if block.skip {
+            return 0.0;
+        }
+        let inter = block.inter.is_some();
+        let (luma, chroma) = match (side, inter) {
+            (32, false) => (TxbSet::Luma32, TxbSet::Chroma16),
+            (32, true) => (TxbSet::Luma32Inter, TxbSet::Chroma16),
+            (16, false) => (TxbSet::Luma16, TxbSet::Chroma8),
+            (16, true) => (TxbSet::Luma16Inter, TxbSet::Chroma8),
+            (_, false) => (TxbSet::Luma8, TxbSet::Chroma4),
+            (_, true) => (TxbSet::Luma8Inter, TxbSet::Chroma4),
+        };
+        coeff_bits(&dense(&block.luma, side), luma, q_ctx)
+            + coeff_bits(&dense(&block.u, side / 2), chroma, q_ctx)
+            + coeff_bits(&dense(&block.v, side / 2), chroma, q_ctx)
+    }
+    blocks
+        .iter()
+        .map(|q| {
+            let side = match q {
+                Quadrant::Whole(_) => 32,
+                Quadrant::Split(_) => 16,
+            };
+            q.blocks().iter().map(|b| block_bits(b, side, q_ctx)).sum::<f64>()
+        })
+        .sum()
+}
+
 #[cfg(test)]
 pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
-    coeff_bits(grid, TxbSet::Luma32)
+    coeff_bits(grid, TxbSet::Luma32, 2)
 }
 
 /// What one transform block's levels cost through the CDFs of `set`, in bits.
 ///
 /// The search runs before the tile is written, so the adapted state the block
 /// will really be coded against does not exist yet: the price is taken against
-/// the defaults every tile starts from, and against the contexts a block whose
-/// neighbours coded nothing reads.
-pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet) -> f64 {
+/// the defaults every tile starts from, at the frame's own coefficient
+/// q-context (`q_ctx_of(base_q_idx)`, what `Cdfs::new` is given at
+/// `sb_coeff_*_tile` -- lane-av1rd1: this used to be pinned at 2, so two of
+/// the four points of the BD ladder were priced against another quantizer's
+/// tables), and against the contexts a block whose neighbours coded nothing
+/// reads.
+pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
     /// Built once per size: the search prices thirteen modes for every block,
     /// and the scan is the same table every time.
     static SCANS: LazyLock<[Vec<u16>; 4]> = LazyLock::new(|| {
@@ -1579,7 +1657,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet) -> f64 {
             default_scan(TX32),
         ]
     });
-    let mut cdfs = Cdfs::new(2);
+    let mut cdfs = Cdfs::new(q_ctx);
     let mut coding = cdfs.txb(set, DC_PRED);
     let scan = match coding.side {
         TX4 => &SCANS[0],
