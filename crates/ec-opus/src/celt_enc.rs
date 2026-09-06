@@ -32,6 +32,7 @@
 
 use ec_core::{Error, Result};
 
+use crate::analysis::{AnalysisInfo, TonalityAnalysis};
 use crate::celt::{
     self, BETA_COEF, BETA_INTRA, BITRES, CACHE_CAPS, E_BANDS, E_MEANS, E_PROB_MODEL, LOG_N,
     MAX_FINE_BITS, NB_BANDS, OVERLAP, PRED_COEF, PREEMPH, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE,
@@ -56,6 +57,30 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
         };
         let gate = std::env::var("EC_OPUS_TF_GATE").map(|v| v == "transient").unwrap_or(false);
         (f("EC_OPUS_TF_K", 1.0), f("EC_OPUS_TF_OFF", 0.044), gate, f("EC_OPUS_TF_THRESH", 0.0))
+    })
+}
+
+/// Which consumers of the [`crate::analysis`] tonality analysis are live.
+///
+/// The analysis itself runs whenever `EC_OPUS_ANALYSIS` is not `0`; each
+/// downstream term was measured on the 12-row library gate on its own, so
+/// each keeps its own switch (`1`/`0`) around the shipped default:
+/// `EC_OPUS_TRIM_TONAL` (`alloc_trim`'s `tonality_slope` term),
+/// `EC_OPUS_TRIM13` (the continuous 1.3 trim the term belongs to),
+/// `EC_OPUS_VBR_TONAL` (`compute_vbr`'s tonality boost) and
+/// `EC_OPUS_VBR_ACT` (`compute_vbr`'s low-activity cut).
+fn analysis_params() -> (bool, bool, bool, bool) {
+    static P: std::sync::OnceLock<(bool, bool, bool, bool)> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let b = |name: &str, dflt: bool| {
+            std::env::var(name).map(|v| v != "0").unwrap_or(dflt)
+        };
+        (
+            b("EC_OPUS_ANALYSIS", true),
+            b("EC_OPUS_TRIM_TONAL", false),
+            b("EC_OPUS_VBR_TONAL", false),
+            b("EC_OPUS_VBR_ACT", false),
+        )
     })
 }
 
@@ -351,6 +376,18 @@ pub struct CeltFrameDiag {
     pub pulses: [i32; NB_BANDS],
     /// Per-band fine-energy precision bits.
     pub fine_quant: [i32; NB_BANDS],
+    /// Whether the tonality analysis produced a usable window for this frame.
+    pub analysis_valid: bool,
+    /// `AnalysisInfo::music_prob` — 0 is speech, 1 is music.
+    pub music_prob: f32,
+    /// `AnalysisInfo::tonality`.
+    pub tonality: f32,
+    /// `AnalysisInfo::tonality_slope`, `alloc_trim`'s input.
+    pub tonality_slope: f32,
+    /// `AnalysisInfo::activity`, `compute_vbr`'s input.
+    pub activity: f32,
+    /// `AnalysisInfo::bandwidth`, the detected bandwidth band index.
+    pub analysis_bandwidth: i32,
 }
 
 impl Default for CeltFrameDiag {
@@ -371,6 +408,12 @@ impl Default for CeltFrameDiag {
             band_log_e: [0.0; 2 * NB_BANDS],
             pulses: [0; NB_BANDS],
             fine_quant: [0; NB_BANDS],
+            analysis_valid: false,
+            music_prob: 0.0,
+            tonality: 0.0,
+            tonality_slope: 0.0,
+            activity: 0.0,
+            analysis_bandwidth: 0,
         }
     }
 }
@@ -448,6 +491,13 @@ pub struct CeltEncoder {
     urow: Vec<u32>,
     /// Per-frame diagnostics captured at the end of the last `encode` call.
     last_diag: CeltFrameDiag,
+    /// libopus `st->analysis`: the tonality/music-probability estimator, run
+    /// on the *undelayed* API input at the top of every `encode` call exactly
+    /// where `opus_encode()` runs `run_analysis()`.
+    analysis: TonalityAnalysis,
+    /// The window that covers the frame being coded, or the default
+    /// (`valid == false`) state when the analysis is off.
+    info: AnalysisInfo,
 }
 
 impl CeltEncoder {
@@ -505,6 +555,8 @@ impl CeltEncoder {
             pvq_sign: vec![0; max_n],
             urow: vec![0; 1280],
             last_diag: CeltFrameDiag::default(),
+            analysis: TonalityAnalysis::new((48000 / upsample) as u32),
+            info: AnalysisInfo::default(),
         }
     }
 
@@ -547,6 +599,8 @@ impl CeltEncoder {
         self.vbr_count = 0;
         self.stereo_saving = 0.0;
         self.spec_avg = 0.0;
+        self.analysis.reset();
+        self.info = AnalysisInfo::default();
     }
 
     /// Encodes one frame of interleaved `f32` (`frame_size` samples per
@@ -591,6 +645,16 @@ impl CeltEncoder {
             )));
         }
         let end = end.clamp(start + 1, NB_BANDS);
+
+        // libopus `opus_encode_native` runs the tonality analysis on the raw
+        // API frame before anything else; the CELT layer's own delay does not
+        // apply to it, so this reads `pcm` and not the delayed buffer. 24 is
+        // libopus's `lsb_depth` default for the float API.
+        self.info = if analysis_params().0 {
+            self.analysis.run(pcm, in_n, c, 24)
+        } else {
+            AnalysisInfo::default()
+        };
 
         let mut nb_compressed = enc.storage();
         let mut nb_available = nb_compressed as i32;
@@ -942,6 +1006,7 @@ impl CeltEncoder {
             let base_target =
                 vbr_rate + (self.vbr_offset >> lm_diff) - ((40 * c as i32 + 20) << BITRES);
             let mut target = base_target;
+            let (_, _, vbr_tonal, vbr_act) = analysis_params();
             // compute_vbr (libopus celt_encoder.c:1605-1716), float-mode.
             // Skipped: activity, tonality, surround_mask (analysis->valid=
             // false, has_surround_mask=0, pitch_change=0, lfe=0). The qext
@@ -955,6 +1020,10 @@ impl CeltEncoder {
             let mut coded_bins = E_BANDS[coded_bands] << lm;
             if c == 2 {
                 coded_bins += E_BANDS[self.intensity.min(coded_bands)] << lm;
+            }
+            // Low-activity cut (C:1632-1633).
+            if vbr_act && self.info.valid && self.info.activity < 0.4 {
+                target -= ((coded_bins << BITRES) as f32 * (0.4 - self.info.activity)) as i32;
             }
             // Stereo savings (C:1636-1649)
             if c == 2 {
@@ -1009,6 +1078,12 @@ impl CeltEncoder {
                 let fires = (!gate_transient || is_transient) && tf_estimate >= thresh;
                 let k_eff = if fires { k } else { 1.0 };
                 target += (k_eff * (tf_estimate - off) * target as f32) as i32;
+            }
+            // Tonality boost (C:1658-1669), compensating for the average.
+            // `pitch_change` is 0 here (no prefilter), so its term is absent.
+            if vbr_tonal && self.info.valid {
+                let tonal = (self.info.tonality - 0.15).max(0.0) - 0.12;
+                target += ((coded_bins << BITRES) as f32 * 1.2 * tonal) as i32;
             }
             // floor depth cap (C:1683-1695): SHR32/MULT16_32_Q15 are identity.
             {
@@ -1228,6 +1303,12 @@ impl CeltEncoder {
             band_log_e,
             pulses: self.pulses,
             fine_quant: self.fine_quant,
+            analysis_valid: self.info.valid,
+            music_prob: self.info.music_prob,
+            tonality: self.info.tonality,
+            tonality_slope: self.info.tonality_slope,
+            activity: self.info.activity,
+            analysis_bandwidth: self.info.bandwidth,
         };
         Ok(nb_compressed)
     }
@@ -1651,14 +1732,24 @@ impl CeltEncoder {
                     * (2 + 2 * i as i32 - NB_BANDS as i32) as f32;
             }
         }
+        // libopus's `analysis->valid` term (celt_encoder.c:935-939): a tonal
+        // spectrum wants a lower trim. It is only defined on the continuous
+        // 1.3 trim; on the discrete ladder it can only be applied rounded.
+        let tonal_trim = if analysis_params().1 && self.info.valid {
+            (2.0 * (self.info.tonality_slope + 0.05)).clamp(-2.0, 2.0)
+        } else {
+            0.0
+        };
         if cont {
             // libopus divides the same sum by `C*(end-1)`; the ladder above
             // carries an extra factor of two in its thresholds.
             let diff = diff / (c * (end - 1)) as f32;
             trim_f -= ((diff + 1.0) / 6.0).clamp(-2.0, 2.0);
             trim_f -= 2.0 * tf_estimate;
+            trim_f -= tonal_trim;
             return (trim_f + 0.5).floor().clamp(0.0, 10.0) as i32;
         }
+        trim -= tonal_trim.round_ties_even() as i32;
         diff /= (2 * c * (end - 1)) as f32;
         if diff > 2.0 {
             trim -= 1;
