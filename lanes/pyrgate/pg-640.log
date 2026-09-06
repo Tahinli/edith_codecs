@@ -1,0 +1,71 @@
+
+running 1 test
+
+12 frames of each clip at 640x384, gop=12, 1 tile, 1 thread
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e |
+|---|---|---|---|---|
+bars 1080p: facade, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) -- frames key 4 arf 12 leaf 32 show_existing 12; bytes key 28766 arf 73330 leaf 68831 show_existing 60
+bars 1080p: inter modes NEAREST 11635 (87.0%) NEAR 188 (1.4%) GLOBAL 164 (1.2%) NEW 1389 (10.4%); drl idx 0/1/2/3+ 13108/252/16/0
+bars 1080p: compound 13005 of 26381 inter blocks (49.3%); modes NEAREST_NEAREST 9793 NEAR_NEAR 0 NEAREST_NEW 863 NEW_NEAREST 734 GLOBAL_GLOBAL 853 NEW_NEW 762; pairs LAST+GOLDEN 4113 LAST+ALTREF 8892
+bars 1080p: leaf (16x16 and below) compound modes NEAREST_NEAREST 7089 NEAR_NEAR 0 NEAREST_NEW 806 NEW_NEAREST 623 GLOBAL_GLOBAL 709 NEW_NEW 642
+bars 1080p: compound by size 8x8 6726 16x16 3143 32x32 3136
+bars 1080p: motion search 88043 calls, 4942345 candidate evals (56.1/call, 28.5% of them subpel), 424238 integer rounds (4.82/call); winner within +-1 pel of pred_mv 86.0%, winner = starting seed 70.3%
+bars 1080p: references LAST 6503 GOLDEN 5825 (LAST2 0 LAST3 0 BWD 0 ALT2 0 ALT 1048)
+bars 1080p: inter 32x32 split into 16s 1818 of 10560 blocks (17.2%); 16x16 leaves split into 8s 2302 of 8908 (25.8%)
+bars 1080p: over 48 frames -- deblock luma mean 9.4 chroma 9.3; cdef luma pri 4.4/sec 3.3, chroma pri 3.1/sec 2.1
+bars 1080p: cdef_bits frames 5/17/12/14 (0/1/2/3); 829 of 2880 64x64 units on a non-default preset (28.8%)
+bars 1080p: lr units none=2861 wiener=19 (0.7% restored)
+bars 1080p: pricer armings default=18 real=180
+bars 1080p: screen frames on=0 off=4; palette blocks 0 sizes 
+bars 1080p: chroma palette blocks 0 sizes 
+bars 1080p: uv modes DC=14271 (40.4%) V=2701 (7.6%) H=3293 (9.3%) SMOOTH=3714 (10.5%) SMOOTH_V=2188 (6.2%) SMOOTH_H=2620 (7.4%) PAETH=6533 (18.5%)
+bars 1080p: intra tx depths 0=11051 (31.3%) 1=21035 (59.6%) 2=3234 (9.2%)
+bars 1080p: inter var-tx depths of 5216 blocks -- leaf single 0=377 1=220 (36.9% split) | leaf compound 0=1566 1=1091 (41.1% split) | 32x32 single 0=236 1=491 (67.5% split) | 32x32 compound 0=311 1=924 (74.8% split)
+bars 1080p: motion_mode 32x32 SIMPLE=8466 OBMC=0 WARP=241 | 16x16 SIMPLE=916 OBMC=0 WARP=239 | 8x8 SIMPLE=1507 OBMC=0 WARP=808 (0.0% OBMC / 10.6% WARP of 12177 eligible)
+| bars 1080p | 43.90 dB/18230 B, 46.66 dB/30260 B, 49.24 dB/49978 B, 51.84 dB/72519 B | +84.7% | +39.9% | 5.1s:1.1s:2.6s |
+|   references | libaom 42.76 dB/7179 B, 44.78 dB/10177 B, 48.45 dB/24647 B, 56.50 dB/94272 B | rav1e 37.98 dB/4274 B, 42.57 dB/8004 B, 45.74 dB/17715 B, 49.20 dB/39938 B | | |
+bars 2160p: facade, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) -- frames key 4 arf 12 leaf 32 show_existing 12; bytes key 24107 arf 51168 leaf 32123 show_existing 60
+bars 2160p: inter modes NEAREST 12089 (89.3%) NEAR 236 (1.7%) GLOBAL 196 (1.4%) NEW 1012 (7.5%); drl idx 0/1/2/3+ 13227/297/9/0
+bars 2160p: compound 8268 of 21801 inter blocks (37.9%); modes NEAREST_NEAREST 6210 NEAR_NEAR 0 NEAREST_NEW 697 NEW_NEAREST 359 GLOBAL_GLOBAL 567 NEW_NEW 435; pairs LAST+GOLDEN 2245 LAST+ALTREF 6023
+bars 2160p: leaf (16x16 and below) compound modes NEAREST_NEAREST 3332 NEAR_NEAR 0 NEAREST_NEW 599 NEW_NEAREST 298 GLOBAL_GLOBAL 432 NEW_NEW 326
+bars 2160p: compound by size 8x8 2804 16x16 2183 32x32 3281
+bars 2160p: motion search 71140 calls, 3978713 candidate evals (55.9/call, 28.6% of them subpel), 341363 integer rounds (4.80/call); winner within +-1 pel of pred_mv 86.4%, winner = starting seed 79.5%
+bars 2160p: references LAST 6308 GOLDEN 6089 (LAST2 0 LAST3 0 BWD 0 ALT2 0 ALT 1136)
+bars 2160p: inter 32x32 split into 16s 1393 of 10560 blocks (13.2%); 16x16 leaves split into 8s 1547 of 7268 (21.3%)
+bars 2160p: over 48 frames -- deblock luma mean 8.6 chroma 5.1; cdef luma pri 1.3/sec 1.5, chroma pri 2.0/sec 2.0
+bars 2160p: cdef_bits frames 3/18/20/7 (0/1/2/3); 737 of 2880 64x64 units on a non-default preset (25.6%)
+bars 2160p: lr units none=2849 wiener=31 (1.1% restored)
+bars 2160p: pricer armings default=18 real=181
+bars 2160p: screen frames on=0 off=4; palette blocks 0 sizes 
+bars 2160p: chroma palette blocks 0 sizes 
+bars 2160p: uv modes DC=16231 (55.7%) V=2662 (9.1%) H=1828 (6.3%) SMOOTH=1080 (3.7%) SMOOTH_V=1806 (6.2%) SMOOTH_H=972 (3.3%) PAETH=4577 (15.7%)
+bars 2160p: intra tx depths 0=12624 (43.3%) 1=14486 (49.7%) 2=2046 (7.0%)
+bars 2160p: inter var-tx depths of 3751 blocks -- leaf single 0=346 1=192 (35.7% split) | leaf compound 0=1040 1=600 (36.6% split) | 32x32 single 0=262 1=453 (63.4% split) | 32x32 compound 0=298 1=560 (65.3% split)
+bars 2160p: motion_mode 32x32 SIMPLE=9459 OBMC=0 WARP=238 | 16x16 SIMPLE=876 OBMC=0 WARP=277 | 8x8 SIMPLE=924 OBMC=0 WARP=602 (0.0% OBMC / 9.0% WARP of 12376 eligible)
+| bars 2160p | 45.02 dB/14125 B, 48.15 dB/19322 B, 50.51 dB/30242 B, 52.76 dB/43769 B | +124.4% | +75.2% | 4.4s:1.0s:2.2s |
+|   references | libaom 44.31 dB/5833 B, 47.75 dB/9035 B, 51.45 dB/13848 B, 56.50 dB/49099 B | rav1e 39.20 dB/2833 B, 43.62 dB/5536 B, 47.90 dB/10763 B, 50.92 dB/21183 B | | |
+screen capture (2026-07-25 02-09-04.mkv): facade, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective None -- frames key 4 arf 0 leaf 44 show_existing 0; bytes key 56621 arf 0 leaf 17143 show_existing 0
+screen capture (2026-07-25 02-09-04.mkv): inter modes NEAREST 12197 (99.5%) NEAR 2 (0.0%) GLOBAL 0 (0.0%) NEW 63 (0.5%); drl idx 0/1/2/3+ 12260/2/0/0
+screen capture (2026-07-25 02-09-04.mkv): compound 5746 of 18008 inter blocks (31.9%); modes NEAREST_NEAREST 5721 NEAR_NEAR 0 NEAREST_NEW 6 NEW_NEAREST 12 GLOBAL_GLOBAL 7 NEW_NEW 0; pairs LAST+GOLDEN 362 LAST+ALTREF 5384
+screen capture (2026-07-25 02-09-04.mkv): leaf (16x16 and below) compound modes NEAREST_NEAREST 1303 NEAR_NEAR 0 NEAREST_NEW 6 NEW_NEAREST 8 GLOBAL_GLOBAL 6 NEW_NEW 0
+screen capture (2026-07-25 02-09-04.mkv): compound by size 8x8 284 16x16 1039 32x32 4423
+screen capture (2026-07-25 02-09-04.mkv): motion search 95358 calls, 4956775 candidate evals (52.0/call, 30.8% of them subpel), 416890 integer rounds (4.37/call); winner within +-1 pel of pred_mv 97.7%, winner = starting seed 96.0%
+screen capture (2026-07-25 02-09-04.mkv): references LAST 5134 GOLDEN 6517 (LAST2 0 LAST3 0 BWD 0 ALT2 0 ALT 611)
+screen capture (2026-07-25 02-09-04.mkv): inter 32x32 split into 16s 479 of 10560 blocks (4.5%); 16x16 leaves split into 8s 360 of 12176 (3.0%)
+screen capture (2026-07-25 02-09-04.mkv): over 48 frames -- deblock luma mean 4.4 chroma 0.7; cdef luma pri 0.7/sec 0.4, chroma pri 2.4/sec 0.2
+screen capture (2026-07-25 02-09-04.mkv): cdef_bits frames 23/6/12/7 (0/1/2/3); 732 of 2880 64x64 units on a non-default preset (25.4%)
+screen capture (2026-07-25 02-09-04.mkv): lr units none=2878 wiener=2 (0.1% restored)
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=170 real=0
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0; palette blocks 2167 sizes 3=12 4=457 5=4 7=2 8=1692
+screen capture (2026-07-25 02-09-04.mkv): chroma palette blocks 392 sizes 2=6 3=6 4=292 6=4 7=4 8=80
+screen capture (2026-07-25 02-09-04.mkv): uv modes DC=9401 (26.3%) V=829 (2.3%) H=6417 (18.0%) SMOOTH=1468 (4.1%) SMOOTH_V=805 (2.3%) SMOOTH_H=1100 (3.1%) PAETH=15676 (43.9%)
+screen capture (2026-07-25 02-09-04.mkv): intra tx depths 0=6541 (18.3%) 1=21129 (59.2%) 2=8026 (22.5%)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 6023 blocks -- leaf single 0=874 1=746 (46.0% split) | leaf compound 0=936 1=580 (38.3% split) | 32x32 single 0=762 1=1041 (57.7% split) | 32x32 compound 0=473 1=611 (56.4% split)
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=9564 OBMC=0 WARP=616 | 16x16 SIMPLE=1338 OBMC=0 WARP=166 | 8x8 SIMPLE=211 OBMC=0 WARP=270 (0.0% OBMC / 8.6% WARP of 12165 eligible)
+| screen capture (2026-07-25 02-09-04.mkv) | 42.49 dB/11051 B, 45.53 dB/15531 B, 47.84 dB/20793 B, 49.94 dB/26389 B | +49.1% | -4.3% | 5.5s:1.0s:2.1s |
+|   references | libaom 45.12 dB/10679 B, 49.35 dB/15779 B, 55.26 dB/25633 B, 71.29 dB/52986 B | rav1e 34.51 dB/3233 B, 39.45 dB/7772 B, 44.72 dB/15210 B, 49.31 dB/24915 B | | |
+test encode::tests::bd_rate_vs_libaom_and_rav1e ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 580 filtered out; finished in 27.82s
+
+RC=0

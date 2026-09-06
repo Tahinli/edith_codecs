@@ -450,10 +450,44 @@ impl Default for Pyramid {
     /// helps for the same reason (2:-16:8 is the only arm that beats flat on
     /// any clip, and it beats it on the clip with the fastest motion).
     ///
-    /// quantizer offsets behave. Nothing selects the pyramid but an explicit
+    /// RE-SWEPT on lane-av1pyrgate, once the content gate below existed and
+    /// on the current defaults (`LAMBDA_SCALE` 0.0275, the 32x32 tx-depth
+    /// search and compound var-tx on): the earlier verdicts were taken with
+    /// the screen capture inside the arm, and it is the one clip a pyramid
+    /// never helps. With the gate, the screen row is the flat row by
+    /// construction, so the sweep is decided on the two real films
+    /// (`encode::tests::bd_rate_screen_native`, BD-rate vs libaom / vs
+    /// rav1e; bars are fixtures, recorded only):
+    ///
+    /// | arm | film A | film B | screen | bars 1080p | bars 2160p |
+    /// |---|---|---|---|---|---|
+    /// | flat (no pyramid) | +62.8 / +32.5 | +86.3 / +50.5 | +50.1 / -15.4 | +16.4 / -1.1 | +48.2 / +20.4 |
+    /// | 2:-16:8 | +60.3 / +29.1 | +83.6 / +50.2 | +50.1 / -15.4 | +24.0 / +5.9 | +47.2 / +20.2 |
+    /// | **4:-16:8** | **+54.1 / +24.2** | **+82.6 / +47.4** | +50.1 / -15.4 | +21.5 / +3.7 | +48.3 / +20.4 |
+    /// | 8:-16:8 | +55.9 / +25.8 | +83.6 / +47.3 | +50.1 / -15.4 | +19.8 / +2.0 | +48.7 / +20.4 |
+    /// | 4:-24:12 | +51.5 / +22.3 | +84.9 / +50.3 | +50.1 / -15.4 | +21.9 / +4.0 | +48.4 / +20.7 |
+    /// | 4:-12:6 | +57.6 / +27.1 | +84.8 / +49.3 | +50.1 / -15.4 | +21.7 / +3.9 | +48.8 / +20.9 |
+    ///
+    /// `4:-16:8` is the only arm that improves BOTH films on BOTH columns by
+    /// several points (-8.7 / -8.3 on film A, -3.7 / -3.1 on film B) and it
+    /// stays these defaults. `4:-24:12` buys another 2.6 on film A and gives
+    /// 2.3 back on film B (where it barely beats flat vs rav1e, -0.2), which
+    /// is the same "leaves cannot cash in the ARF's quality" shape as before,
+    /// now content-dependent rather than uniform. The screen column is
+    /// IDENTICAL in every arm -- that is the content gate, measured, not
+    /// asserted. `EC_AV1_LAMBDA=0.035` on top of `4:-16:8` was re-judged once
+    /// (the pyramid changes the reference structure): +54.5 / +24.5 and
+    /// +85.2 / +49.4, worse on both films, so 0.0275 stands.
+    ///
+    /// Nothing selects the pyramid but an explicit
     /// [`Av1Encoder::with_pyramid`] call (or `EC_AV1_PYRAMID` on the gate and
     /// on `ec-bench`); the default one-in-one-out path is byte-identical to
-    /// before it existed.
+    /// before it existed. Making it the DEFAULT needs the same reordering in
+    /// [`crate::encode::encode_sequence`] first -- the facade is pinned byte
+    /// for byte to that path
+    /// (`encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence`),
+    /// so a pyramid the facade takes by default and the sequence path cannot
+    /// would break that pin rather than ship a gain.
     fn default() -> Self {
         Self {
             mini_gop: 4,
@@ -669,6 +703,16 @@ impl Av1Encoder {
         Ok(encoder)
     }
 
+    /// The [`Pyramid`] this stream is actually coding under: what
+    /// [`Av1Encoder::with_pyramid`] asked for, or `None` once the content gate
+    /// in [`Av1Encoder::encode_frames`] has dropped a screen-content stream
+    /// back to the flat path. Meaningful after the first picture has been
+    /// handed in.
+    #[must_use]
+    pub fn pyramid(&self) -> Option<Pyramid> {
+        self.pyramid
+    }
+
     /// The coded (padded-to-64) frame size every picture in this stream is
     /// coded at — what a decoder allocates and what `ffprobe` reports.
     #[must_use]
@@ -740,6 +784,26 @@ impl Av1Encoder {
                     picture.width, picture.height, self.config.width, self.config.height
                 ),
             ));
+        }
+        // THE CONTENT GATE (lane-av1pyrgate): the pyramid is for camera
+        // material. A desktop capture is the one content class every pyramid
+        // sweep measured WORSE under it, and it is exactly the class the
+        // screen detector separates (`encode::screen_content`: 0/48 frames on
+        // both real films, 48/48 on the OBS capture), so a stream whose first
+        // picture reads as screen content drops back to the flat path and
+        // codes byte for byte what it coded before the pyramid existed.
+        //
+        // Decided ONCE, on the first picture, not per mini-GOP: the flat path
+        // keeps its references in `reference`/`golden`/`prev2` and the pyramid
+        // path in `dpb`, so a switch after the first frame would read slots
+        // the other path never filled. Per-GOP re-decision needs the two
+        // reference sets kept in step first; the gate's own recipe codes one
+        // GOP per stream, where the two are the same decision.
+        if self.pyramid.is_some()
+            && self.next_index == 0
+            && crate::encode::picture_is_screen(picture)
+        {
+            self.pyramid = None;
         }
         let Some(pyramid) = self.pyramid else {
             // The delay queue: the pictures behind this one are the
@@ -1250,6 +1314,48 @@ mod tests {
         }
     }
 
+    /// THE CONTENT GATE (lane-av1pyrgate): the coding pyramid is asked for by
+    /// the caller but applied only to camera material. Over screen content
+    /// the encoder must drop back to the flat path and code byte for byte
+    /// what a flat encoder codes — that is what keeps the BD gate's screen
+    /// row identical to the flat baseline — and over non-screen content the
+    /// same request must still reorder (class `gate-blind-to-feature`: a gate
+    /// that only checked the screen half would pass with the pyramid deleted).
+    #[test]
+    fn the_content_gate_keeps_screen_streams_flat() {
+        let frames = 8usize;
+        let pictures: Vec<Picture> = (0..frames).map(|t| test_card(64, 64, t)).collect();
+        let config = EncoderConfig {
+            width: 64,
+            height: 64,
+            base_q_idx: 120,
+            gop: frames,
+            colour: Colour::Unspecified,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        crate::encode::force_screen(Some(true));
+        let mut flat = Av1Encoder::new(config).unwrap();
+        let flat_packets = encode_all(&mut flat, &pictures);
+        let mut gated = Av1Encoder::with_pyramid(config, Pyramid::default()).unwrap();
+        let gated_packets = encode_all(&mut gated, &pictures);
+        assert_eq!(gated.pyramid(), None, "the gate left a screen stream on the pyramid");
+        assert_eq!(
+            concat(&gated_packets),
+            concat(&flat_packets),
+            "a screen stream's bytes are not the flat path's"
+        );
+        crate::encode::force_screen(Some(false));
+        let mut kept = Av1Encoder::with_pyramid(config, Pyramid::default()).unwrap();
+        let kept_packets = encode_all(&mut kept, &pictures);
+        assert_eq!(kept.pyramid(), Some(Pyramid::default()), "the gate ate a film stream");
+        assert!(
+            kept_packets.iter().any(|p| p.level == Level::Arf),
+            "a non-screen stream coded no hidden frame"
+        );
+        crate::encode::force_screen(None);
+    }
+
     /// A key frame every `gop` pictures, inter otherwise — checked against
     /// what the facade itself reports, and (below) against what `ffprobe`
     /// reads back out of the coded bytes.
@@ -1752,6 +1858,11 @@ mod tests {
             mini_gop: 4,
             ..Pyramid::default()
         };
+        // The content gate ([`Av1Encoder::encode_frames`]) would drop a
+        // screen-content stream to the flat path, and a synthetic test card
+        // is exactly the few-colour picture the detector fires on: this gate
+        // is about the reordering, so it asks for camera content explicitly.
+        crate::encode::force_screen(Some(false));
         let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
         let sources: Vec<Picture> = (0..9).map(|t| test_card(width, height, t * 3)).collect();
         let _ = crate::encode::take_ref_frame_hits();
