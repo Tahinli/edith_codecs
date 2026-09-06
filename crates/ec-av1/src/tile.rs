@@ -3600,6 +3600,19 @@ fn write_luma_tus(
     for tu_row in 0..n {
         for tu_col in 0..n {
             let tu_mi = (mi_r + tu_row * (tx / MI), mi_c + tu_col * (tx / MI));
+            // lane-av1straddle: libaom clips the transform loop to
+            // `max_blocks_wide/high` (`mb_to_right_edge`/`mb_to_bottom_edge`,
+            // off the frame's true `mi_cols`/`mi_rows`), and decode.rs does
+            // the same (`tu_px >= y.true_width` there): a unit whose TOP-LEFT
+            // sample is outside the frame is NEVER coded. Writing one -- as
+            // this loop did for the phantom right-hand column of a 32x32 at
+            // x=192 in a 216-wide frame -- desyncs the tile at the very next
+            // symbol, which is what made an odd-size GOP's last block
+            // reconstruct differently and both ffmpeg decoders (libdav1d and
+            // libaom) refuse the whole key frame.
+            if tu_mi.0 >= neighbours.mi_rows || tu_mi.1 >= neighbours.mi_cols {
+                continue;
+            }
             let unit = if n == 1 {
                 grid.to_vec()
             } else {
