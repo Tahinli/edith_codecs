@@ -165,6 +165,31 @@ fn split_inter_8() -> bool {
 /// NEARESTMV candidate it always had.
 const LEAF_NEW_MV: bool = true;
 
+/// Whether GOLDEN/ALTREF get a `NEWMV` search of their own. Measured on the
+/// BD gate: with the early-out below at its swept margin, -1.7/-2.5/-0.0
+/// points vs libaom and -1.6/-2.3/-0.0 vs rav1e for 4%/4%/0.3% more motion
+/// searches (the census `bd_rate_vs_libaom_and_rav1e` prints).
+const EXTRA_REF_NEW_MV: bool = true;
+
+/// How much cheaper an extra reference's `NEARESTMV` has to be than LAST's
+/// own best vector before that reference's `NEWMV` search is skipped: a
+/// factor on the search cost scale, `1.0` meaning "as good or better".
+/// Swept on the BD gate over 0.15/0.25/0.35/0.5/0.8/1.0/1.5 and off (`0.0`,
+/// never skip): the whole BD gain survives down to 0.35 (+124.8/+150.4/+80.9
+/// vs libaom, against +124.9/+150.3/+81.0 with no early-out at all) while the
+/// extra searches drop from +27% to +4% of the base count -- and on screen
+/// capture, where an extra reference's NEWMV wins nothing, it skips 99.7% of
+/// them. Below 0.35 the gain starts eroding (0.15: +125.3/+151.7).
+const EXTRA_NEW_SKIP_MARGIN: f64 = 0.35;
+
+/// [`EXTRA_NEW_SKIP_MARGIN`], swept by `EC_AV1_MV_SKIP_MARGIN`.
+fn extra_new_skip_margin() -> f64 {
+    match std::env::var("EC_AV1_MV_SKIP_MARGIN").ok() {
+        Some(v) if cfg!(test) => v.parse().unwrap_or(EXTRA_NEW_SKIP_MARGIN),
+        _ => EXTRA_NEW_SKIP_MARGIN,
+    }
+}
+
 /// [`LEAF_NEW_MV`], or what `EC_AV1_LEAF_NEWMV` names in a test build.
 fn leaf_new_mv() -> bool {
     match std::env::var("EC_AV1_LEAF_NEWMV").ok() {
@@ -2351,6 +2376,7 @@ fn code_square_inter(
     let mut best = (inter_cost, None);
     if leaf_new_mv() {
         let source_block = luma.source_block(x, y, side);
+        let (seeds, seed_n) = mv_seeds(stack);
         let found = motion::search(
             ref_luma.0,
             ref_luma.1,
@@ -2362,6 +2388,7 @@ fn code_square_inter(
             side,
             side,
             stack.pred_mv,
+            &seeds[..seed_n],
             search.lambda, fctx,
         );
         let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
@@ -3461,6 +3488,68 @@ fn mv_component_bits(diff: i32) -> Option<f64> {
     Some(bits)
 }
 
+/// Whether an extra reference (GOLDEN/ALTREF) is offered a `NEWMV` of its
+/// own -- a second motion search per block against that reference's picture,
+/// priced off that reference's own stack. `EC_AV1_MV_EXTRA_NEW=0` turns it
+/// off in a test build (what the lane measured both arms with).
+fn extra_ref_new_mv() -> bool {
+    match std::env::var("EC_AV1_MV_EXTRA_NEW").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => EXTRA_REF_NEW_MV,
+    }
+}
+
+/// [`tile::write_drl_idx`]'s cost against one stack: one `drl_mode` symbol
+/// per entry past `start`, `1` to advance and `0` to stop, at most two.
+fn drl_bits_for(stack: &MvStack, start: usize, target: usize) -> f64 {
+    let mut bits = 0.0;
+    let mut idx = start;
+    while idx < start + 2 && stack.entries.len() > idx + 1 {
+        let advance = idx < target;
+        bits += symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[idx]], usize::from(advance));
+        if !advance {
+            break;
+        }
+        idx += 1;
+    }
+    bits
+}
+
+/// The cheapest `(bits, drl index)` the `NEWMV` syntax can name `mv` with off
+/// `stack`: each DRL entry is a different `PredMv` (spec 7.10.2.10
+/// `assign_mv`), so the same vector costs a different residual from each.
+fn best_new_mv_syntax(stack: &MvStack, mv: (i32, i32)) -> Option<(f64, u8)> {
+    let mut best: Option<(f64, u8)> = None;
+    for idx in 0..3usize {
+        if idx > 0 && stack.entries.len() <= idx {
+            break;
+        }
+        let base = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+        if let Some(b) = mv_residual_bits(mv, base) {
+            let total = b + drl_bits_for(stack, 0, idx);
+            if best.is_none_or(|(t, _)| total < t) {
+                best = Some((total, idx as u8));
+            }
+        }
+    }
+    best
+}
+
+/// The starting points [`motion::search`] gets besides `stack.pred_mv`: the
+/// zero vector and the stack's own candidates. A neighbour block's vector is
+/// where this block's motion most often already is, which is what pays for
+/// the extra starting points (measured on the BD gate: -0.9/-0.8/-0.0 points
+/// vs libaom for 0.2 s off a 6 s ladder).
+fn mv_seeds(stack: &MvStack) -> ([(i32, i32); 4], usize) {
+    let mut seeds = [(0, 0); 4];
+    let mut n = 1;
+    for e in stack.entries.iter().take(3) {
+        seeds[n] = e.mv;
+        n += 1;
+    }
+    (seeds, n)
+}
+
 /// What [`crate::tile::write_mv`] (private to that module) would spend
 /// coding `mv` as a residual against `pred`: the joint symbol naming which
 /// components differ, then each differing component. `None` under the same
@@ -3754,19 +3843,7 @@ fn search_inter_block(
     // past `start`, `1` to advance and `0` to stop, at most two. A `target`
     // the loop cannot reach is never offered below -- every candidate's
     // index is one this same loop walks to.
-    let drl_bits = |start: usize, target: usize| {
-        let mut bits = 0.0;
-        let mut idx = start;
-        while idx < start + 2 && stack.entries.len() > idx + 1 {
-            let advance = idx < target;
-            bits += symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[idx]], usize::from(advance));
-            if !advance {
-                break;
-            }
-            idx += 1;
-        }
-        bits
-    };
+    let drl_bits = |start: usize, target: usize| drl_bits_for(stack, start, target);
     let last_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME);
     let mut cands: Vec<((i32, i32), f64, InterInfo)> = vec![
         (
@@ -3811,6 +3888,7 @@ fn search_inter_block(
     }
 
     let source_block = luma.source_block(x, y, BLOCK);
+    let (seeds, seed_n) = mv_seeds(stack);
     #[cfg(test)]
     let t = std::time::Instant::now();
     let found = motion::search(
@@ -3824,6 +3902,7 @@ fn search_inter_block(
         BLOCK,
         BLOCK,
         stack.pred_mv,
+        &seeds[..seed_n],
         search.lambda, fctx,
     );
     #[cfg(test)]
@@ -3832,20 +3911,7 @@ fn search_inter_block(
     // Each DRL entry is a different `PredMv` (spec 7.10.2.10 `assign_mv`), so
     // the same vector costs a different residual from each: take the index
     // whose residual plus DRL bits is cheapest, not entry 0 by default.
-    let mut best_new: Option<(f64, u8)> = None;
-    for idx in 0..3usize {
-        if idx > 0 && stack.entries.len() <= idx {
-            break;
-        }
-        let base = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
-        if let Some(b) = mv_residual_bits(mv, base) {
-            let total = b + drl_bits(0, idx);
-            if best_new.is_none_or(|(t, _)| total < t) {
-                best_new = Some((total, idx as u8));
-            }
-        }
-    }
-    if let Some((bits, ref_mv_idx)) = best_new {
+    if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(stack, mv) {
         cands.push((
             mv,
             last_ref_bits + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
@@ -3858,7 +3924,7 @@ fn search_inter_block(
         ));
     }
 
-    for &(ref_frame, _, gstack) in extra {
+    for &(ref_frame, g, gstack) in extra {
         let g_ref_bits = single_ref_bits(ref_frame);
         let g_not_new = symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 1);
         cands.push((
@@ -3884,6 +3950,67 @@ fn search_inter_block(
                 ref_mv_idx: 0,
             },
         ));
+        // A motion search of this reference's own: without it, GOLDEN/ALTREF
+        // can only be coded at a vector some neighbour already found, which
+        // is why they carried a third of the inter blocks at their two
+        // search-free modes alone.
+        // The search is skipped when this reference's own NEARESTMV already
+        // prices out `margin` times better than LAST's best vector does --
+        // one candidate evaluation (`motion::cost_at`) standing in for a
+        // whole search of ~50.
+        let margin = extra_new_skip_margin();
+        let skip_search = extra_ref_new_mv()
+            && margin > 0.0
+            && motion::cost_at(
+                &g.y,
+                g.width,
+                luma.true_width,
+                luma.true_height,
+                &source_block,
+                x,
+                y,
+                BLOCK,
+                BLOCK,
+                gstack.nearest_mv,
+                gstack.pred_mv,
+                search.lambda,
+                fctx,
+            ) * margin
+                <= found.cost;
+        if extra_ref_new_mv() && !skip_search {
+            let (gseeds, gn) = mv_seeds(gstack);
+            #[cfg(test)]
+            let t = std::time::Instant::now();
+            let gfound = motion::search(
+                &g.y,
+                g.width,
+                luma.true_width,
+                luma.true_height,
+                &source_block,
+                x,
+                y,
+                BLOCK,
+                BLOCK,
+                gstack.pred_mv,
+                &gseeds[..gn],
+                search.lambda, fctx,
+            );
+            #[cfg(test)]
+            stage_add(0, t.elapsed());
+            let gmv = round_to_valid_mv(gfound.mv, gstack.pred_mv);
+            if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(gstack, gmv) {
+                cands.push((
+                    gmv,
+                    g_ref_bits + symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 0) + bits,
+                    InterInfo {
+                        ref_frame,
+                        mode: InterMode::NewMv,
+                        mv: gmv,
+                        ref_mv_idx,
+                    },
+                ));
+            }
+        }
     }
 
     // One trial set per distinct (reference, vector) pair: sort, cheapest
@@ -6768,11 +6895,18 @@ mod tests {
         assert_eq!(predicted.len(), encoded.frames.len());
 
         eprintln!("frame  predicted bits  written bits  drift");
-        let mut worst: f64 = 0.0;
+        // Split by sign: a NEGATIVE drift is the search OVER-pricing (the
+        // defect this gate exists to catch), a positive one is the written
+        // side carrying syntax the coefficient sum leaves out -- and since
+        // lane-av1mv an extra reference's `NEWMV` puts a whole MV residual
+        // on that side, so the two directions no longer share a bound.
+        let mut worst_over: f64 = 0.0;
+        let mut worst_under: f64 = 0.0;
         for (i, (frame, &bits)) in encoded.frames.iter().zip(&predicted).enumerate() {
             let written = frame.tile.len() as f64 * 8.0;
             let drift = (written - bits) / written;
-            worst = worst.max(drift.abs());
+            worst_over = worst_over.max(-drift);
+            worst_under = worst_under.max(drift);
             eprintln!("{i:5}  {bits:14.0}  {written:12.0}  {:+6.2}%", drift * 100.0);
         }
         // Measured 2026-09-06 on this sequence: -13.5% at the key frame,
@@ -6784,9 +6918,18 @@ mod tests {
         // set just above the worst measured point -- a widening drift is the
         // thing this gate exists to catch.
         assert!(
-            worst <= 0.16,
-            "the search's rate term drifted {:.2}% from the bits the writer spent",
-            worst * 100.0
+            worst_over <= 0.16,
+            "the search's rate term OVER-priced by {:.2}% against the bits the writer spent",
+            worst_over * 100.0
+        );
+        // Measured 2026-09-06 with the extra-reference `NEWMV` in: +18.9% at
+        // the worst inter frame, where nearly every block now codes an MV
+        // residual and a reference the coefficient sum never counts.
+        assert!(
+            worst_under <= 0.22,
+            "the writer spent {:.2}% more than the search priced -- more than \
+             the mode/mv syntax outside the coefficient sum explains",
+            worst_under * 100.0
         );
     }
 
@@ -7631,18 +7774,11 @@ mod tests {
     ///
     /// The BD gate above measures quality, which a speed lane can move by a
     /// hair without failing anything; this pins the streams themselves.
-    /// Re-measured on the lane-av1lr merge with main d5fc99e0: the per-64x64
-    /// `cdef_idx` literals and the per-unit loop restoration syntax are new
-    /// bits in the tile, so the streams move (q=150 7416 -> 7458 bytes,
-    /// q=60 27927 -> 27807 -- the low-rate frame pays for the syntax, the
-    /// high-rate one more than earns it back).
-    ///
-    /// Every number below was measured 2026-09-06: first on lane-av1fwd
-    /// (whose three speed steps left them identical to `a6649c4e`'s), then
-    /// re-measured on the lane-av1lr merge, which legitimately moves them --
-    /// per-64x64 `cdef_idx` literals and the per-unit loop restoration
-    /// syntax are new bits in the tile, and both streams came out SMALLER
-    /// (7823 -> 7796, 28189 -> 28182 bytes) for it.
+    /// Re-measured on the lane-av1lr merge with main d5fc99e0 (per-64x64
+    /// `cdef_idx` literals and per-unit loop restoration syntax are new bits
+    /// in the tile) and again on lane-av1mv's merge of it: an extra
+    /// reference's `NEWMV` is a coded-bits change too, judged by the BD gate
+    /// above, not by this pin.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -7664,7 +7800,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7458, 0x7eb2_33c6_bd96_3baf), (60, 27807, 0xeee0_f1e5_e099_46bd)];
+            [(150, 7444, 0x76eb980832d719f1), (60, 27692, 0x8c88f7e73455d439)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -7828,6 +7964,7 @@ mod tests {
             let _ = crate::tile::take_inter_mode_hits();
             let _ = crate::tile::take_drl_hits();
             let _ = crate::tile::take_ref_hits();
+            let _ = crate::motion::take_census();
             let (ours, ours_wall) = match pyramid_from_env() {
                 None => our_ladder(&source, width, height, fctx),
                 Some(pyramid) => {
@@ -7861,6 +7998,22 @@ mod tests {
                 100.0 * near as f64 / modes_total as f64,
                 100.0 * global as f64 / modes_total as f64,
                 100.0 * new as f64 / modes_total as f64,
+            );
+            // Where the wall-owning stage actually goes: how many candidate
+            // evaluations (one `mc::predict` + SAD each) a search spends, how
+            // many of them are subpel, and how often the winner is the seed
+            // it started from -- the census the seeded search is judged by.
+            let [calls, evals, subpel, rounds, near_pred, unmoved] = crate::motion::take_census();
+            let per = |n: u64| n as f64 / calls.max(1) as f64;
+            eprintln!(
+                "{name}: motion search {calls} calls, {evals} candidate evals ({:.1}/call, \
+                 {:.1}% of them subpel), {rounds} integer rounds ({:.2}/call); winner within \
+                 +-1 pel of pred_mv {:.1}%, winner = starting seed {:.1}%",
+                per(evals),
+                100.0 * subpel as f64 / evals.max(1) as f64,
+                per(rounds),
+                100.0 * near_pred as f64 / calls.max(1) as f64,
+                100.0 * unmoved as f64 / calls.max(1) as f64,
             );
             eprintln!(
                 "{name}: references LAST {} GOLDEN {} (LAST2 {} LAST3 {} BWD {} ALT2 {} ALT {})",
