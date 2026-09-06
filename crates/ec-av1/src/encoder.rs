@@ -276,6 +276,32 @@ pub struct EncoderConfig {
     pub gop: usize,
     /// The colour the sequence header signals.
     pub colour: Colour,
+    /// `TileColsLog2` (spec 5.9.15): the frame is split into `1 <<
+    /// tile_cols_log2` uniformly spaced tile columns, each coded and
+    /// decodable on its own. `0` -- one tile column -- is the default and
+    /// is byte for byte the stream this encoder wrote before tiles existed.
+    pub tile_cols_log2: u32,
+    /// `TileRowsLog2`, the same down the rows.
+    pub tile_rows_log2: u32,
+}
+
+impl EncoderConfig {
+    /// A config at `width`x`height` with one tile, `gop` pictures between
+    /// key frames and no colour signalling -- what every caller that does
+    /// not care about tiles writes, so that adding a field here does not
+    /// rewrite them.
+    #[must_use]
+    pub fn new(width: usize, height: usize, base_q_idx: u8, gop: usize, colour: Colour) -> Self {
+        Self {
+            width,
+            height,
+            base_q_idx,
+            gop,
+            colour,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        }
+    }
 }
 
 /// One coded picture: its OBUs, in the order a demuxer that just wants bytes
@@ -510,6 +536,22 @@ impl Av1Encoder {
         // do, before the first `encode()` call rather than only surfacing it
         // then.
         Picture::grey(config.width, config.height).check_even()?;
+        // A tile is a whole number of superblocks, so a frame cannot carry
+        // more tile columns (rows) than it has 64x64 superblocks across
+        // (down) -- the header's own `max_log2_tile_cols` bound (spec
+        // 5.9.15), refused here rather than at the first `encode()` call.
+        let sb_cols = config.width.div_ceil(64) as u32;
+        let sb_rows = config.height.div_ceil(64) as u32;
+        if (1u32 << config.tile_cols_log2) > sb_cols || (1u32 << config.tile_rows_log2) > sb_rows {
+            return Err(Error::unsupported(
+                "AV1 encode",
+                format!(
+                    "{}x{} tiles need more than the {sb_cols}x{sb_rows} superblocks this frame has",
+                    1 << config.tile_cols_log2,
+                    1 << config.tile_rows_log2
+                ),
+            ));
+        }
         Ok(Self {
             carried_cdfs: None,
             golden: None,
@@ -632,6 +674,7 @@ impl Av1Encoder {
     /// # Errors
     /// As [`Av1Encoder::encode`], minus the pyramid refusal.
     pub fn encode_frames(&mut self, picture: &Picture) -> Result<Vec<Packet>> {
+        crate::encode::arm_tiles(self.config.tile_cols_log2, self.config.tile_rows_log2);
         if (picture.width, picture.height) != (self.config.width, self.config.height) {
             return Err(Error::unsupported(
                 "AV1 encode",
@@ -671,6 +714,7 @@ impl Av1Encoder {
     /// # Errors
     /// As [`Av1Encoder::encode_frames`].
     pub fn flush(&mut self) -> Result<Vec<Packet>> {
+        crate::encode::arm_tiles(self.config.tile_cols_log2, self.config.tile_rows_log2);
         self.drain_pending()
     }
 
@@ -1029,6 +1073,8 @@ mod tests {
             base_q_idx: 100,
             gop: 2,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         for t in 0..5u64 {
@@ -1049,6 +1095,8 @@ mod tests {
             base_q_idx: 100,
             gop: 3,
             colour: Colour::Unspecified,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let keys: Vec<bool> = (0..7)
@@ -1147,6 +1195,8 @@ mod tests {
             base_q_idx: 120,
             gop: 15,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         assert_eq!(enc.display_size(), (width, height));
@@ -1200,6 +1250,8 @@ mod tests {
             base_q_idx: 100,
             gop: 4,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let packet = enc.encode(&test_card(64, 64, 0)).unwrap();
@@ -1222,6 +1274,8 @@ mod tests {
             base_q_idx: 100,
             gop: 4,
             colour: Colour::Bt601Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let packet = enc.encode(&test_card(64, 64, 0)).unwrap();
@@ -1242,6 +1296,8 @@ mod tests {
             base_q_idx: 100,
             gop: 4,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let err = enc.encode(&Picture::grey(32, 32)).unwrap_err();
@@ -1257,6 +1313,8 @@ mod tests {
             base_q_idx: 100,
             gop: 0,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let err = Av1Encoder::new(config).unwrap_err();
         assert!(err.to_string().contains("gop"), "{err}");
@@ -1328,6 +1386,8 @@ mod tests {
             base_q_idx: 100,
             gop: 24,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc =
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(target_bytes)).unwrap();
@@ -1367,6 +1427,8 @@ mod tests {
                 base_q_idx: 100,
                 gop: frames,
                 colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
             };
             let rate = RateTarget::Bitrate {
                 bits_per_second,
@@ -1424,6 +1486,8 @@ mod tests {
             base_q_idx: 100,
             gop: 24,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc =
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(4_000)).unwrap();
@@ -1499,13 +1563,15 @@ mod tests {
     /// display-order list and fails here.
     #[test]
     fn a_pyramid_stream_decodes_in_display_order_through_both_decoders() {
-        let (width, height) = (128usize, 64usize);
+        let (width, height) = (128usize, 128usize);
         let config = EncoderConfig {
             width,
             height,
             base_q_idx: 120,
             gop: 32,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let pyramid = Pyramid {
             mini_gop: 4,
@@ -1586,6 +1652,246 @@ mod tests {
         }
     }
 
+    /// Every tile layout this encoder can write decodes SAMPLE-EXACT
+    /// through both decoders -- ours and ffmpeg's -- and the frames really
+    /// carry the tiles the header claims (the OBU parser locates one payload
+    /// per tile, so a stream that quietly stayed single-tile fails here
+    /// rather than passing on a green round trip).
+    ///
+    /// The bytes are what the gate is on: an encoder that clipped its
+    /// neighbour availability wrong writes a stream whose two decoders agree
+    /// with each other and disagree with nothing -- so the ffmpeg half is
+    /// the one that catches a tile boundary the writer respected and the
+    /// spec does not, and the parser half catches the reverse.
+    #[test]
+    fn every_tile_layout_decodes_sample_exact_through_both_decoders() {
+        let (width, height) = (640usize, 384usize);
+        let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
+        let mut sizes = Vec::new();
+        for (cols_log2, rows_log2) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1), (2, 1)] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 4,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: cols_log2,
+                tile_rows_log2: rows_log2,
+            };
+            let layout = format!("{}x{} tiles", 1 << cols_log2, 1 << rows_log2);
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for (i, picture) in sources.iter().enumerate() {
+                let packet = enc
+                    .encode(picture)
+                    .unwrap_or_else(|e| panic!("{layout} frame {i}: {e}"));
+                stream.extend_from_slice(&packet.data);
+            }
+            sizes.push((layout.clone(), stream.len()));
+
+            // The frames carry the tiles their headers claim.
+            let mut parser = ec_av1_syntax::Av1Parser::new();
+            let mut frames = 0usize;
+            let mut offset = 0usize;
+            while offset < stream.len() {
+                let obus = parser.parse_temporal_unit(&stream[offset..]).unwrap();
+                let unit: usize = obus.iter().map(|o| o.total_size).sum();
+                for obu in &obus {
+                    if let ec_av1_syntax::ObuKind::Frame(parsed, tiles) = &obu.kind {
+                        assert_eq!(
+                            (parsed.tile_info.cols, parsed.tile_info.rows),
+                            (1 << cols_log2, 1 << rows_log2),
+                            "{layout}: the header's own tile grid"
+                        );
+                        assert_eq!(
+                            tiles.len(),
+                            1 << (cols_log2 + rows_log2),
+                            "{layout}: tile payloads located in the tile group"
+                        );
+                        frames += 1;
+                    }
+                }
+                offset += unit;
+            }
+            assert_eq!(frames, sources.len(), "{layout}: coded frames");
+
+            let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+            assert_eq!(ours.len(), sources.len(), "{layout}: our decoder's frames");
+            if !have_ffmpeg() {
+                eprintln!("SKIP the ffmpeg half of {layout}: no ffmpeg");
+                continue;
+            }
+            let theirs = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "{layout}: ffmpeg's frames");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                assert_eq!(got.len(), b.len(), "{layout} frame {i}: luma size");
+                if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                    panic!(
+                        "{layout} frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                        at % width,
+                        at / width,
+                        got[at],
+                        b[at],
+                    );
+                }
+            }
+        }
+        let base = sizes[0].1 as f64;
+        for (layout, bytes) in &sizes {
+            eprintln!(
+                "{layout}: {bytes} bytes ({:+.2}% vs one tile)",
+                (*bytes as f64 / base - 1.0) * 100.0
+            );
+        }
+    }
+
+    /// What tiles and tile threads are worth at the size the editor exports
+    /// at: 1920x1080, eight real pictures, two passes per cell (ABAB), wall
+    /// per cell. Ignored by default (minutes).
+    #[test]
+    #[ignore = "1080p wall table: minutes, run it with --ignored"]
+    fn tile_wall_table_at_1080p() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (1920usize, 1080usize);
+        let Some(sources) = h264_clip_frames(width, height, 8) else {
+            eprintln!("SKIP tile_wall_table_at_1080p: no fixture");
+            return;
+        };
+        let layouts = [(0u32, 0u32), (1, 0), (1, 1), (2, 1)];
+        let threadings = [1usize, 2, 4, 8];
+        let mut table: Vec<(String, usize, f64, usize)> = Vec::new();
+        for pass in 0..2 {
+            for &(cols_log2, rows_log2) in &layouts {
+                for &threads in &threadings {
+                    crate::par::set_tile_threads(threads);
+                    let config = EncoderConfig {
+                        width,
+                        height,
+                        base_q_idx: 120,
+                        gop: 8,
+                        colour: Colour::Bt709Limited,
+                        tile_cols_log2: cols_log2,
+                        tile_rows_log2: rows_log2,
+                    };
+                    let mut enc = Av1Encoder::new(config).unwrap();
+                    let start = std::time::Instant::now();
+                    let mut bytes = 0usize;
+                    for picture in &sources {
+                        bytes += enc.encode(picture).unwrap().data.len();
+                    }
+                    let wall = start.elapsed().as_secs_f64();
+                    let name = format!("{}x{}", 1 << cols_log2, 1 << rows_log2);
+                    match table.iter_mut().find(|r| r.0 == name && r.1 == threads) {
+                        Some(row) => row.2 = row.2.min(wall),
+                        None => table.push((name, threads, wall, bytes)),
+                    }
+                    let _ = pass;
+                }
+            }
+        }
+        crate::par::set_tile_threads(1);
+        eprintln!("| tiles | threads | wall (s, best of 2) | bytes |");
+        for (name, threads, wall, bytes) in &table {
+            eprintln!("| {name} | {threads} | {wall:.2} | {bytes} |");
+        }
+    }
+
+    /// The tiles of a frame are entropy-independent, so the bytes must not
+    /// depend on how many workers wrote them: the same stream at one tile
+    /// thread and at four, per layout.
+    #[test]
+    fn tile_bytes_do_not_depend_on_the_thread_count() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (320usize, 192usize);
+        let sources: Vec<Picture> = (0..3).map(|t| test_card(width, height, t * 3)).collect();
+        let coded = |threads: usize, cols_log2: u32, rows_log2: u32| {
+            crate::par::set_tile_threads(threads);
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 3,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: cols_log2,
+                tile_rows_log2: rows_log2,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for picture in &sources {
+                stream.extend_from_slice(&enc.encode(picture).unwrap().data);
+            }
+            stream
+        };
+        for (cols_log2, rows_log2) in [(1u32, 0u32), (0, 1), (1, 1), (2, 1)] {
+            let one = coded(1, cols_log2, rows_log2);
+            let four = coded(4, cols_log2, rows_log2);
+            assert_eq!(
+                one,
+                four,
+                "{}x{} tiles: {} bytes at one thread, {} at four",
+                1 << cols_log2,
+                1 << rows_log2,
+                one.len(),
+                four.len()
+            );
+        }
+        crate::par::set_tile_threads(1);
+    }
+
+    /// The same round trip at a real 1920x1080 crop of the gate's own clip
+    /// -- the size the editor's export actually runs at, where a tile grid
+    /// is worth having. Ignored by default only for its wall (a 1080p
+    /// encode of three pictures), not for any weakness in the check.
+    #[test]
+    #[ignore = "1080p encode: minutes, run it with --ignored"]
+    fn a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders() {
+        let (width, height) = (1920usize, 1080usize);
+        let Some(sources) = h264_clip_frames(width, height, 3) else {
+            eprintln!("SKIP the 1080p tile round trip: no fixture");
+            return;
+        };
+        for (cols_log2, rows_log2) in [(1u32, 0u32), (1, 1), (2, 1)] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 3,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: cols_log2,
+                tile_rows_log2: rows_log2,
+            };
+            let layout = format!("{}x{} tiles", 1 << cols_log2, 1 << rows_log2);
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for (i, picture) in sources.iter().enumerate() {
+                let packet = enc
+                    .encode(picture)
+                    .unwrap_or_else(|e| panic!("{layout} frame {i}: {e}"));
+                stream.extend_from_slice(&packet.data);
+            }
+            let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+            assert_eq!(ours.len(), sources.len(), "{layout}: our decoder's frames");
+            if !have_ffmpeg() {
+                eprintln!("SKIP the ffmpeg half of 1080p {layout}: no ffmpeg");
+                continue;
+            }
+            let theirs = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "{layout}: ffmpeg's frames");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                    panic!(
+                        "1080p {layout} frame {i}: luma differs first at ({}, {})",
+                        at % width,
+                        at / width
+                    );
+                }
+            }
+            eprintln!("1080p {layout}: {} bytes, sample-exact", stream.len());
+        }
+    }
+
     /// [`RateTarget::Quality`] is monotone: a higher quality dial never
     /// produces a smaller stream or a worse mean PSNR than a lower one, on
     /// the same real clip.
@@ -1609,6 +1915,8 @@ mod tests {
                 base_q_idx: 100,
                 gop: 8,
                 colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
             };
             let mut enc =
                 Av1Encoder::with_rate_target(config, RateTarget::Quality(quality)).unwrap();

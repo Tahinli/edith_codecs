@@ -979,9 +979,28 @@ struct Plane<'a> {
     /// edge.
     true_width: usize,
     true_height: usize,
+    /// This plane's own tile's pixel bounds, in this plane's units -- the
+    /// encoder side of the decoder's `PlaneBuf::set_tile_origin`: intra
+    /// prediction never reaches across a tile edge even though the
+    /// neighbouring tile's real samples sit right there in the shared
+    /// reconstruction. `(0, 0, width, height)` is the single-tile case and
+    /// leaves every edge exactly as it was before tiles existed.
+    tile_x0: usize,
+    tile_y0: usize,
+    tile_x1: usize,
+    tile_y1: usize,
 }
 
 impl Plane<'_> {
+    /// Clips this plane's edge reads to one tile ([`Self::tile_x0`]),
+    /// called at every superblock of the frame-raster search with the rect
+    /// of the tile that superblock belongs to.
+    fn set_tile(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        self.tile_x0 = x0;
+        self.tile_y0 = y0;
+        self.tile_x1 = x1.min(self.width);
+        self.tile_y1 = y1.min(self.height);
+    }
     /// The reconstructed samples a block at `(x, y)` predicts from: the row
     /// above it, the column to its left and the sample between them, each
     /// missing where the block sits against an edge of the frame.
@@ -1033,14 +1052,17 @@ impl Plane<'_> {
         // `a_picture_off_the_block_grid_is_refused`), never through a block
         // this encoder actually commits. Such a block has no true-edge
         // samples above or left of it at all, same as `y == 0`/`x == 0`.
-        let above = (y > 0 && across > x)
+        let across = across.min(self.tile_x1);
+        let down = down.min(self.tile_y1);
+        let above = (y > self.tile_y0 && across > x)
             .then(|| self.reconstruction[(y - 1) * self.width + x..][..across - x].to_vec());
-        let left = (x > 0 && down > y).then(|| {
+        let left = (x > self.tile_x0 && down > y).then(|| {
             (y..down)
                 .map(|row| self.reconstruction[row * self.width + x - 1])
                 .collect::<Vec<_>>()
         });
-        let corner = (x > 0 && y > 0).then(|| self.reconstruction[(y - 1) * self.width + x - 1]);
+        let corner = (x > self.tile_x0 && y > self.tile_y0)
+            .then(|| self.reconstruction[(y - 1) * self.width + x - 1]);
         (above, left, corner)
     }
 
@@ -2971,6 +2993,126 @@ fn coeffs(levels: &[i32], side: usize) -> Vec<Coeff> {
         .collect()
 }
 
+thread_local! {
+    /// The tile grid the next frame is coded with, as `(TileColsLog2,
+    /// TileRowsLog2)` -- armed by [`crate::encoder::Av1Encoder`] from its
+    /// [`crate::encoder::EncoderConfig`], the same way `crate::tile`'s
+    /// `arm_cdef_idx`/`arm_lr`/`arm_sign_bias` arm the writers. `(0, 0)` is
+    /// one tile per frame, what every caller that never arms anything gets
+    /// and what every stream this crate wrote before tiles existed carries.
+    static TILE_LOG2: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Arms this thread's next frame encodes with a tile grid (log2 counts).
+pub(crate) fn arm_tiles(cols_log2: u32, rows_log2: u32) {
+    TILE_LOG2.with(|c| c.set((cols_log2, rows_log2)));
+}
+
+fn armed_tiles() -> (u32, u32) {
+    let armed = TILE_LOG2.with(std::cell::Cell::get);
+    if armed != (0, 0) {
+        return armed;
+    }
+    // `EC_AV1_TILES=<cols_log2>[:<rows_log2>]` in a TEST build, so the BD gate
+    // (which codes through `encode_sequence`, not the facade) can measure what
+    // a tile grid costs without a knob of its own -- same shape as
+    // `EC_AV1_LR`/`EC_AV1_PYRAMID`.
+    match std::env::var("EC_AV1_TILES").ok() {
+        Some(v) if cfg!(test) => {
+            let mut f = v.split(':');
+            let cols = f.next().and_then(|c| c.parse().ok()).unwrap_or(0);
+            let rows = f.next().and_then(|r| r.parse().ok()).unwrap_or(0);
+            (cols, rows)
+        }
+        _ => armed,
+    }
+}
+
+/// Codes a frame's `tiles` tiles, each entirely on its own (see
+/// [`crate::tile::TileRect`]), across [`crate::par::tile_threads`] workers of
+/// the crate's own pool, and hands back their payloads in tile order plus
+/// whatever `code` returned for tile `store` -- the CDF state
+/// `context_update_tile_id` names. The result cannot depend on the thread
+/// count: each job writes one tile from the frame's own starting tables into
+/// its own slot.
+fn write_tiles<F>(tiles: usize, store: usize, code: F) -> Result<(Vec<Vec<u8>>, Option<crate::cdf_state::Cdfs>)>
+where
+    F: Fn(usize) -> Result<(Vec<u8>, Option<crate::cdf_state::Cdfs>)> + Sync + Send,
+{
+    type Slot = Option<Result<(Vec<u8>, Option<crate::cdf_state::Cdfs>)>>;
+    let threads = crate::par::tile_threads().min(tiles);
+    let mut slots: Vec<Slot> = Vec::new();
+    if threads <= 1 {
+        for index in 0..tiles {
+            slots.push(Some(code(index)));
+        }
+    } else {
+        let done: std::sync::Mutex<Vec<Slot>> = std::sync::Mutex::new((0..tiles).map(|_| None).collect());
+        {
+            let batch = crate::par::Batch::new("ec-av1-tile");
+            for (from, to) in crate::par::bands(tiles, threads) {
+                let done = &done;
+                let code = &code;
+                batch.submit(move || {
+                    for index in from..to {
+                        let coded = code(index);
+                        done.lock().expect("tile slots")[index] = Some(coded);
+                    }
+                });
+            }
+        }
+        slots = done.into_inner().expect("tile slots");
+    }
+    let mut out = Vec::with_capacity(tiles);
+    let mut stored = None;
+    for (index, slot) in slots.into_iter().enumerate() {
+        let (bytes, cdfs) = slot.expect("every tile was coded")?;
+        if index == store {
+            stored = cdfs;
+        }
+        out.push(bytes);
+    }
+    Ok((out, stored))
+}
+
+/// The frame header's `tile_info` (spec 5.9.15) for `layout`:
+/// `context_update_tile_id` names the largest tile, whose end-of-tile CDF
+/// tables the frame stores (spec 7.20), which is what
+/// [`crate::tile::TileLayout::largest_tile`] picks and what the tile loops
+/// below publish.
+fn tile_info_of(layout: &crate::tile::TileLayout, tile_size_bytes: u32) -> ec_av1_syntax::TileInfo {
+    ec_av1_syntax::TileInfo {
+        uniform_spacing: true,
+        cols: layout.cols(),
+        rows: layout.rows(),
+        cols_log2: layout.cols_log2,
+        rows_log2: layout.rows_log2,
+        mi_col_starts: layout.mi_col_starts(),
+        mi_row_starts: layout.mi_row_starts(),
+        context_update_tile_id: layout.largest_tile() as u32,
+        tile_size_bytes,
+    }
+}
+
+/// Clips the three planes' intra edge reads to `rect`, the tile the
+/// superblock about to be searched belongs to (the encoder side of the
+/// decoder's `PlaneBuf::set_tile_origin`). The search itself stays in frame
+/// raster order -- which is a linear extension of every tile's own coding
+/// order, so a block still only ever predicts from samples already
+/// reconstructed -- and only availability is tile-relative.
+fn clip_planes_to_tile(
+    luma: &mut Plane<'_>,
+    chroma: &mut [Plane<'_>; 2],
+    rect: crate::tile::TileRect,
+) {
+    let (x0, y0) = (rect.mi_col0 as usize * 4, rect.mi_row0 as usize * 4);
+    let (x1, y1) = (rect.mi_col1 as usize * 4, rect.mi_row1 as usize * 4);
+    luma.set_tile(x0, y0, x1, y1);
+    for plane in chroma.iter_mut() {
+        plane.set_tile(x0 / 2, y0 / 2, x1.div_ceil(2), y1.div_ceil(2));
+    }
+}
+
 /// Encodes one picture as a key frame.
 ///
 /// `base_q_idx` is the frame's quantizer index (0..=255); the tile writer
@@ -3111,6 +3253,7 @@ pub(crate) fn encode_key_frame_inner(
     if tx_select {
         header.tx_mode = TxMode::Select;
     }
+    let (tile_cols_log2, tile_rows_log2) = armed_tiles();
 
     // Prediction reads no further than this, in each plane's own units --
     // see `Plane::true_width`/`true_height`.
@@ -3129,6 +3272,10 @@ pub(crate) fn encode_key_frame_inner(
         height: picture.height,
         true_width,
         true_height,
+        tile_x0: 0,
+        tile_y0: 0,
+        tile_x1: picture.width,
+        tile_y1: picture.height,
     };
     let mut chroma = [
         Plane {
@@ -3138,6 +3285,10 @@ pub(crate) fn encode_key_frame_inner(
             height: picture.height / 2,
             true_width: true_width / 2,
             true_height: true_height / 2,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: picture.width / 2,
+            tile_y1: picture.height / 2,
         },
         Plane {
             source: &picture_v8,
@@ -3146,6 +3297,10 @@ pub(crate) fn encode_key_frame_inner(
             height: picture.height / 2,
             true_width: true_width / 2,
             true_height: true_height / 2,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: picture.width / 2,
+            tile_y1: picture.height / 2,
         },
     ];
 
@@ -3177,10 +3332,24 @@ pub(crate) fn encode_key_frame_inner(
     let mut above_mode = vec![DC_PRED; cols * 2];
     let mut left_mode = vec![DC_PRED; rows * 2];
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
+    // This frame's tile grid (one tile unless the facade armed more).
+    let layout =
+        crate::tile::TileLayout::new(header.mi_cols, header.mi_rows, tile_cols_log2, tile_rows_log2);
+    header.tile_info = tile_info_of(&layout, 1);
+    // The filter search re-decodes this frame's tiles; the decoder derives
+    // every tile's own rect from this same `tile_info` (its `mi_col_starts`/
+    // `mi_row_starts`), which is what makes the writer's rects and the
+    // reader's the same rects.
+    let header_tile_info = header.tile_info.clone();
     let mut superblocks = Vec::with_capacity(sb_cols * sb_rows);
     let mut modes = Vec::with_capacity(cols * rows);
     for sb_row in 0..sb_rows {
         for sb_col in 0..sb_cols {
+            clip_planes_to_tile(
+                &mut luma,
+                &mut chroma,
+                layout.rect(layout.index_of_sb(sb_row as u32, sb_col as u32)),
+            );
             // The quadrants of a superblock are coded in the order the decoder
             // walks them, which for a 64x64 split into 32x32 blocks is raster
             // order among the quadrants that are inside the frame.
@@ -3376,56 +3545,65 @@ pub(crate) fn encode_key_frame_inner(
     // defaults again (spec 7.20's `started_from` arm) -- the first inter
     // frame after it therefore starts from the defaults too.
     let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
-    let mut cdfs = crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx));
-    let start_cdfs = CdfSnapshot(cdfs.clone());
-    let mut tile = crate::tile::sb_coeff_key_frame_tile_cdfs(
-        mi_cols,
-        mi_rows,
-        base_q_idx,
-        &superblocks,
-        tx_select,
-        &mut cdfs,
-    )?;
-    // spec 7.14 deblocking: pick this frame's `loop_filter_level` by handing
-    // the tile just coded back to the decoder under each candidate (see
-    // `crate::filter_search`), and keep the filtered picture that wins as
-    // the reconstruction -- what a decoder outputs, and what the next
-    // frame predicts from.
+    let cdfs = crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx));
+    let start_cdfs = CdfSnapshot(cdfs);
     // The luma restoration-unit grid this frame's `lr_params` implies
     // (`av1_lr_count_units` rounds to nearest, so a short last unit is
     // swallowed by the one before it), for the tile writer's own per-unit
     // walk.
     let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
     let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
-    pick_and_apply_filters(
-        &mut header,
-        &mut luma,
-        &mut chroma,
-        [&picture_y8, &picture_u8, &picture_v8],
-        true,
-        &mut tile,
-        search.lambda,
-        fctx,
-        // Every re-code starts from this frame's OWN starting tables, never
-        // from where the first write left them: the second tile is the same
-        // symbol sequence plus new ones, so it must adapt from the same
-        // point the decoder will.
-        |bits, sb_cols, grid, units| {
+    // Every tile is coded from this frame's OWN starting tables and leaves
+    // its own end state behind (spec 5.11.1: each tile resets the CDFs, the
+    // loop-restoration reference and its neighbour contexts), so the tiles
+    // are independent of each other and of the order they are written in.
+    let code_tiles = |bits: u8,
+                      sb_cols: usize,
+                      grid: &[u8],
+                      units: &[Option<crate::restoration::WienerInfo>]|
+     -> Result<Vec<Vec<u8>>> {
+        let (out, _) = write_tiles(layout.count(), usize::MAX, |index| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             let mut cdfs = start_cdfs.0.clone();
-            crate::tile::sb_coeff_key_frame_tile_cdfs(
+            let bytes = crate::tile::sb_coeff_key_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
                 base_q_idx,
                 &superblocks,
                 tx_select,
                 &mut cdfs,
-            )
-        },
-        |lf, cdef, h, tile, lr| {
-            crate::decode::decode_key_frame_tile_lr(
-                tile,
+                layout.rect(index),
+            )?;
+            Ok((bytes, None))
+        })?;
+        Ok(out)
+    };
+    let mut tiles = code_tiles(0, sb_cols, &[], &[])?;
+    // spec 7.14 deblocking: pick this frame's `loop_filter_level` by handing
+    // the tile just coded back to the decoder under each candidate (see
+    // `crate::filter_search`), and keep the filtered picture that wins as
+    // the reconstruction -- what a decoder outputs, and what the next
+    // frame predicts from.
+    pick_and_apply_filters(
+        &mut header,
+        &mut luma,
+        &mut chroma,
+        [&picture_y8, &picture_u8, &picture_v8],
+        true,
+        &mut tiles,
+        search.lambda,
+        fctx,
+        // Every re-code starts from this frame's OWN starting tables, never
+        // from where the first write left them: the second tile is the same
+        // symbol sequence plus new ones, so it must adapt from the same
+        // point the decoder will.
+        |bits, sb_cols, grid, units| code_tiles(bits, sb_cols, grid, units),
+        |lf, cdef, h, tiles: &[Vec<u8>], lr| {
+            let payloads: Vec<&[u8]> = tiles.iter().map(Vec::as_slice).collect();
+            crate::decode::decode_key_frame_tiles_lr(
+                &payloads,
+                &header_tile_info,
                 h.mi_cols,
                 h.mi_rows,
                 base_q_idx,
@@ -3443,6 +3621,9 @@ pub(crate) fn encode_key_frame_inner(
             )
         },
     )?;
+    let tile_size_bytes = crate::frame::tile_size_bytes_for(&tiles);
+    header.tile_info.tile_size_bytes = tile_size_bytes;
+    let tile = crate::frame::tile_group_payload(&tiles, tile_size_bytes);
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&sequence_header_obu(&seq)?);
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
@@ -3492,19 +3673,25 @@ fn pick_and_apply_filters(
     chroma: &mut [Plane<'_>; 2],
     source: [&[u8]; 3],
     search: bool,
-    // The coded tile, replaced in place when the search chooses a per-64x64
-    // `cdef_idx` list (`cdef_bits > 0`): those literals live in the tile
-    // payload, so the tile is written a second time under `recode` and the
-    // winner re-decoded from it.
-    tile: &mut Vec<u8>,
+    // The coded tiles, one payload per tile of the frame's grid, replaced in
+    // place when the search chooses a per-64x64 `cdef_idx` list
+    // (`cdef_bits > 0`): those literals live in the tile payloads, so every
+    // tile is written a second time under `recode` and the winner
+    // re-decoded from them.
+    tiles: &mut Vec<Vec<u8>>,
     lambda: f64,
     fctx: &crate::decode::FrameCtx,
-    recode: impl Fn(u8, usize, &[u8], &[Option<crate::restoration::WienerInfo>]) -> Result<Vec<u8>>,
+    recode: impl Fn(
+        u8,
+        usize,
+        &[u8],
+        &[Option<crate::restoration::WienerInfo>],
+    ) -> Result<Vec<Vec<u8>>>,
     decode: impl Fn(
         &LoopFilterParams,
         &CdefParams,
         &FrameHeader,
-        &[u8],
+        &[Vec<u8>],
         &LoopRestorationParams,
     ) -> Result<Picture>,
 ) -> Result<()> {
@@ -3531,7 +3718,7 @@ fn pick_and_apply_filters(
                 return Ok(picture);
             }
             crate::decode::arm_filter_replay();
-            decode(lf, cdef, &hdr, tile, &none_lr)
+            decode(lf, cdef, &hdr, tiles, &none_lr)
         },
         source,
         luma.width,
@@ -3562,14 +3749,14 @@ fn pick_and_apply_filters(
     fctx.capture_stages.set(lr_on);
     let mut filtered = if idx_grid.is_empty() {
         if lr_on {
-            decode(&lf, &cdef, &hdr, tile, &none_lr)?
+            decode(&lf, &cdef, &hdr, tiles, &none_lr)?
         } else {
             picture
         }
     } else {
         let coded = recode(cdef.bits, sb_cols, &idx_grid, &[])?;
         let picture = decode(&lf, &cdef, &hdr, &coded, &none_lr)?;
-        *tile = coded;
+        *tiles = coded;
         picture
     };
     fctx.capture_stages.set(false);
@@ -3600,7 +3787,7 @@ fn pick_and_apply_filters(
         if units.iter().any(Option::is_some) {
             let coded = recode(cdef.bits, sb_cols, &idx_grid, &units)?;
             filtered = decode(&lf, &cdef, &hdr, &coded, &want)?;
-            *tile = coded;
+            *tiles = coded;
             lr = want;
         }
     }
@@ -4814,6 +5001,10 @@ pub(crate) fn encode_inter_frame(
         height: picture.height,
         true_width,
         true_height,
+        tile_x0: 0,
+        tile_y0: 0,
+        tile_x1: picture.width,
+        tile_y1: picture.height,
     };
     let mut chroma = [
         Plane {
@@ -4823,6 +5014,10 @@ pub(crate) fn encode_inter_frame(
             height: picture.height / 2,
             true_width: true_width / 2,
             true_height: true_height / 2,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: picture.width / 2,
+            tile_y1: picture.height / 2,
         },
         Plane {
             source: &picture_v8,
@@ -4831,6 +5026,10 @@ pub(crate) fn encode_inter_frame(
             height: picture.height / 2,
             true_width: true_width / 2,
             true_height: true_height / 2,
+            tile_x0: 0,
+            tile_y0: 0,
+            tile_x1: picture.width / 2,
+            tile_y1: picture.height / 2,
         },
     ];
 
@@ -4853,6 +5052,12 @@ pub(crate) fn encode_inter_frame(
     let (cols, rows) = (cols as usize, rows as usize);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
+    // This frame's tile grid, as in `encode_key_frame_inner`.
+    let (tile_cols_log2, tile_rows_log2) = armed_tiles();
+    let layout =
+        crate::tile::TileLayout::new(header.mi_cols, header.mi_rows, tile_cols_log2, tile_rows_log2);
+    header.tile_info = tile_info_of(&layout, 1);
+    let header_tile_info = header.tile_info.clone();
     // lane-hbd r4: `motion::search` is 8-bit only (its SAD/cost math is
     // integer-`u8`-scale), so the DPB reference plane is narrowed for it --
     // once per frame (lane-av1rd2), not once per block, which is a whole
@@ -4863,6 +5068,18 @@ pub(crate) fn encode_inter_frame(
 
     for sb_r in 0..sb_rows {
         for sb_c in 0..sb_cols {
+            // Neighbour availability -- intra edges and the MV stack's
+            // scans alike -- stops at this superblock's own tile, exactly
+            // where the decoder stops it (`PlaneBuf::set_tile_origin`,
+            // `MiGrid::set_tile_bounds`).
+            let rect = layout.rect(layout.index_of_sb(sb_r as u32, sb_c as u32));
+            clip_planes_to_tile(&mut luma, &mut chroma, rect);
+            grid.set_tile_bounds(
+                rect.mi_row0 as usize,
+                rect.mi_col0 as usize,
+                rect.mi_row1 as usize,
+                rect.mi_col1 as usize,
+            );
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
                 // Same filter as the tile writer's: a quadrant whose own mi
@@ -5289,21 +5506,58 @@ pub(crate) fn encode_inter_frame(
     // next frame's writer starts from them -- exactly what
     // `crate::stream::stored_cdfs_for` hands the decoder.
     let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
-    let mut cdfs = start_cdfs
+    let cdfs = start_cdfs
         .cloned()
         .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
-    let start_cdfs = CdfSnapshot(cdfs.clone());
-    crate::tile::arm_sign_bias(sign_bias);
-    crate::tile::arm_reference_select(header.reference_select);
-    crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
-    let mut tile = crate::tile::sb_coeff_inter_frame_tile_cdfs(
-        mi_cols,
-        mi_rows,
-        base_q_idx,
-        &blocks,
-        tx_select,
-        &mut cdfs,
-    )?;
+    let start_cdfs = CdfSnapshot(cdfs);
+    let reference_select_bit = header.reference_select;
+    let order_hint_bits = seq.order_hint_bits;
+    let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
+    let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
+    // What this frame stores is the LARGEST tile's end-of-tile tables --
+    // its own header's `context_update_tile_id` (spec 7.20), which
+    // `tile_info_of` set to exactly that tile.
+    let store_tile = layout.largest_tile();
+    let end_cdfs = std::cell::RefCell::new(None);
+    // As in `encode_key_frame_inner`: every tile starts from this frame's
+    // own tables, so no tile depends on any other.
+    let code_tiles = |bits: u8,
+                      sb_cols: usize,
+                      cdef_grid: &[u8],
+                      units: &[Option<crate::restoration::WienerInfo>]|
+     -> Result<Vec<Vec<u8>>> {
+        let (out, stored) = write_tiles(layout.count(), store_tile, |index| {
+            crate::tile::arm_cdef_idx(bits, sb_cols, cdef_grid.to_vec());
+            crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
+            crate::tile::arm_sign_bias(sign_bias);
+            // Thread-locals: every tile job arms its own worker.
+            crate::tile::arm_reference_select(reference_select_bit);
+            crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
+            let mut cdfs = start_cdfs.0.clone();
+            // Each tile's own MV grid: a candidate scan never reaches past
+            // the tile's bounds, so a grid holding only this tile's own
+            // blocks reads exactly as the decoder's frame-wide one does
+            // under `MiGrid::set_tile_bounds`.
+            let mut mv_grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+            mv_grid.set_sign_bias(sign_bias);
+            let bytes = crate::tile::sb_coeff_inter_frame_tile_cdfs(
+                mi_cols,
+                mi_rows,
+                base_q_idx,
+                &blocks,
+                tx_select,
+                &mut cdfs,
+                layout.rect(index),
+                &mut mv_grid,
+            )?;
+            Ok((bytes, Some(cdfs)))
+        })?;
+        if let Some(cdfs) = stored {
+            *end_cdfs.borrow_mut() = Some(cdfs);
+        }
+        Ok(out)
+    };
+    let mut tiles = code_tiles(0, sb_cols, &[], &[])?;
     // Deblocking, as in `encode_key_frame_inner`: the decoder reconstructs
     // this tile against the same single-slot reference this encoder predicted
     // from, under each candidate level.
@@ -5312,7 +5566,6 @@ pub(crate) fn encode_inter_frame(
     // reference whose height is not the header's own `frame_height` (spec
     // 7.9's compatible-size rule), and the chained-decode round trips prove
     // the two predict identically.
-    let end_cdfs = std::cell::RefCell::new(cdfs);
     let (fw, fh) = (header.frame_width as usize, header.frame_height as usize);
     let trial_ref = if (reference.width, reference.height) == (fw, fh) {
         reference.clone()
@@ -5359,12 +5612,6 @@ pub(crate) fn encode_inter_frame(
     refs[4] = trial_golden.as_ref();
     refs[7] = trial_altref.as_ref();
     let refpix = crate::decode::RefPix::ready(refs);
-    // The luma restoration-unit grid this frame's `lr_params` implies
-    // (`av1_lr_count_units` rounds to nearest, so a short last unit is
-    // swallowed by the one before it), for the tile writer's own per-unit
-    // walk.
-    let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
-    let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
     pick_and_apply_filters(
         &mut header,
         &mut luma,
@@ -5375,36 +5622,19 @@ pub(crate) fn encode_inter_frame(
         // `TxMode::Select` too (it used to skip and leave every inter frame
         // unfiltered once Select became the default).
         true,
-        &mut tile,
+        &mut tiles,
         search.lambda,
         fctx,
         // As in `encode_key_frame_inner`, but this frame's end-of-tile tables
         // are what the NEXT frame writes from, so the winning re-code
         // publishes its own into `end_cdfs` -- the first write's are stale
         // the moment a second tile is coded.
-        |bits, sb_cols, grid, units| {
-            crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
-            crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
-            crate::tile::arm_sign_bias(sign_bias);
-            crate::tile::arm_reference_select(reference_select());
-            crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
-            let mut cdfs = start_cdfs.0.clone();
-            let coded = crate::tile::sb_coeff_inter_frame_tile_cdfs(
-                mi_cols,
-                mi_rows,
-                base_q_idx,
-                &blocks,
-                tx_select,
-                &mut cdfs,
-            );
-            if coded.is_ok() {
-                *end_cdfs.borrow_mut() = cdfs;
-            }
-            coded
-        },
-        |lf, cdef, h, tile, lr| {
-            crate::decode::decode_inter_frame_tile_lr(
-                tile,
+        |bits, sb_cols, grid, units| code_tiles(bits, sb_cols, grid, units),
+        |lf, cdef, h, tiles: &[Vec<u8>], lr| {
+            let payloads: Vec<&[u8]> = tiles.iter().map(Vec::as_slice).collect();
+            crate::decode::decode_inter_frame_tiles_lr(
+                &payloads,
+                &header_tile_info,
                 h.mi_cols,
                 h.mi_rows,
                 base_q_idx,
@@ -5429,9 +5659,14 @@ pub(crate) fn encode_inter_frame(
             )
         },
     )?;
-    let mut cdfs = end_cdfs.into_inner();
+    let mut cdfs = end_cdfs
+        .into_inner()
+        .unwrap_or_else(|| start_cdfs.0.clone());
     cdfs.reset_counts();
     let next_cdfs = CdfSnapshot(cdfs);
+    let tile_size_bytes = crate::frame::tile_size_bytes_for(&tiles);
+    header.tile_info.tile_size_bytes = tile_size_bytes;
+    let tile = crate::frame::tile_group_payload(&tiles, tile_size_bytes);
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
 
@@ -8328,6 +8563,8 @@ mod tests {
                 base_q_idx: q,
                 gop: source.len(),
                 colour: Colour::Unspecified,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
             };
             let start = std::time::Instant::now();
             let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
