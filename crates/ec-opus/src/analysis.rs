@@ -283,6 +283,13 @@ pub(crate) struct TonalityAnalysis {
     rnn_state: [f32; MAX_NEURONS],
     downmix_state: [f32; 3],
     info: Vec<AnalysisInfo>,
+    /// Per-frame scratch, sized once so the steady-state encode loop stays
+    /// allocation-free (`steady_state_encode_loop_zero_alloc`).
+    dm_tmp: Vec<f32>,
+    dm_tmp3x: Vec<f32>,
+    chunk: Vec<f32>,
+    fft_re: Vec<f32>,
+    fft_im: Vec<f32>,
 }
 
 impl TonalityAnalysis {
@@ -322,6 +329,11 @@ impl TonalityAnalysis {
             rnn_state: [0.0; MAX_NEURONS],
             downmix_state: [0.0; 3],
             info: vec![AnalysisInfo::default(); DETECT_SIZE],
+            dm_tmp: Vec::with_capacity(2 * ANALYSIS_BUF_SIZE),
+            dm_tmp3x: Vec::new(),
+            chunk: Vec::with_capacity(ANALYSIS_BUF_SIZE),
+            fft_re: vec![0.0; N],
+            fft_im: vec![0.0; N],
         }
     }
 
@@ -370,7 +382,9 @@ impl TonalityAnalysis {
             16000 => (subframe * 2 / 3, offset * 2 / 3),
             _ => (subframe, offset),
         };
-        let mut tmp = vec![0.0f32; subframe];
+        let mut tmp = std::mem::take(&mut self.dm_tmp);
+        tmp.clear();
+        tmp.resize(subframe, 0.0);
         for (j, t) in tmp.iter_mut().enumerate() {
             let base = (j + offset) * channels;
             let mut acc = pcm[base];
@@ -379,30 +393,30 @@ impl TonalityAnalysis {
             }
             *t = if channels == 2 { 0.5 * acc } else { acc };
         }
-        match self.fs {
-            48000 => {
-                let mut st = self.downmix_state;
-                let e = resampler_down2_hp(&mut st, y, &tmp);
-                self.downmix_state = st;
-                e
-            }
+        let mut st = self.downmix_state;
+        let ret = match self.fs {
+            48000 => resampler_down2_hp(&mut st, y, &tmp),
             16000 => {
-                let mut tmp3x = vec![0.0f32; 3 * subframe];
+                let mut tmp3x = std::mem::take(&mut self.dm_tmp3x);
+                tmp3x.clear();
+                tmp3x.resize(3 * subframe, 0.0);
                 for j in 0..subframe {
                     tmp3x[3 * j] = tmp[j];
                     tmp3x[3 * j + 1] = tmp[j];
                     tmp3x[3 * j + 2] = tmp[j];
                 }
-                let mut st = self.downmix_state;
                 resampler_down2_hp(&mut st, y, &tmp3x);
-                self.downmix_state = st;
+                self.dm_tmp3x = tmp3x;
                 0.0
             }
             _ => {
                 y[..subframe].copy_from_slice(&tmp);
                 0.0
             }
-        }
+        };
+        self.downmix_state = st;
+        self.dm_tmp = tmp;
+        ret
     }
 
     /// libopus `tonality_analysis()`: appends one 20 ms chunk of input and,
@@ -429,9 +443,12 @@ impl TonalityAnalysis {
         let (len, offset) = (len as usize, offset as usize);
 
         let take = len.min(ANALYSIS_BUF_SIZE - self.mem_fill);
-        let mut chunk = vec![0.0f32; take];
+        let mut chunk = std::mem::take(&mut self.chunk);
+        chunk.clear();
+        chunk.resize(take, 0.0);
         let ener = self.downmix_and_resample(pcm, &mut chunk, take, offset, channels);
         self.inmem[self.mem_fill..self.mem_fill + take].copy_from_slice(&chunk);
+        self.chunk = chunk;
         self.hp_ener_accum += ener;
         if self.mem_fill + len < ANALYSIS_BUF_SIZE {
             self.mem_fill += len;
@@ -446,8 +463,8 @@ impl TonalityAnalysis {
 
         let is_silence = self.inmem.iter().all(|&v| v == 0.0);
 
-        let mut re = vec![0.0f32; N];
-        let mut im = vec![0.0f32; N];
+        let mut re = std::mem::take(&mut self.fft_re);
+        let mut im = std::mem::take(&mut self.fft_im);
         for i in 0..N2 {
             let w = ANALYSIS_WINDOW[i];
             re[i] = w * self.inmem[i];
@@ -457,15 +474,20 @@ impl TonalityAnalysis {
         }
         self.inmem.copy_within(ANALYSIS_BUF_SIZE - 240.., 0);
         let remaining = len - (ANALYSIS_BUF_SIZE - self.mem_fill);
-        let mut chunk = vec![0.0f32; remaining];
+        let mut chunk = std::mem::take(&mut self.chunk);
+        chunk.clear();
+        chunk.resize(remaining, 0.0);
         let ener = self.downmix_and_resample(pcm, &mut chunk, remaining, offset + ANALYSIS_BUF_SIZE - self.mem_fill, channels);
         self.inmem[240..240 + remaining].copy_from_slice(&chunk);
+        self.chunk = chunk;
         self.hp_ener_accum = ener;
         self.mem_fill = 240 + remaining;
         if is_silence {
             // On silence, copy the previous analysis.
             let prev = (write + DETECT_SIZE - 1) % DETECT_SIZE;
             self.info[write] = self.info[prev];
+            self.fft_re = re;
+            self.fft_im = im;
             return;
         }
         // libopus takes `opus_fft` (forward, scaled by 1/N); ours is the
@@ -481,6 +503,8 @@ impl TonalityAnalysis {
         }
         if re[0].is_nan() {
             self.info[write].valid = false;
+            self.fft_re = re;
+            self.fft_im = im;
             return;
         }
 
@@ -567,6 +591,8 @@ impl TonalityAnalysis {
             // Check for extreme band energies that could cause NaNs later.
             if !(e < 1e9) || e.is_nan() {
                 self.info[write].valid = false;
+                self.fft_re = re;
+                self.fft_im = im;
                 return;
             }
             self.e[self.e_count][b] = e;
@@ -816,6 +842,8 @@ impl TonalityAnalysis {
             bandwidth,
             leak_boost,
         };
+        self.fft_re = re;
+        self.fft_im = im;
     }
 
     /// libopus `tonality_get_info()`: picks the window that covers the frame
