@@ -276,6 +276,32 @@ pub struct EncoderConfig {
     pub gop: usize,
     /// The colour the sequence header signals.
     pub colour: Colour,
+    /// `TileColsLog2` (spec 5.9.15): the frame is split into `1 <<
+    /// tile_cols_log2` uniformly spaced tile columns, each coded and
+    /// decodable on its own. `0` -- one tile column -- is the default and
+    /// is byte for byte the stream this encoder wrote before tiles existed.
+    pub tile_cols_log2: u32,
+    /// `TileRowsLog2`, the same down the rows.
+    pub tile_rows_log2: u32,
+}
+
+impl EncoderConfig {
+    /// A config at `width`x`height` with one tile, `gop` pictures between
+    /// key frames and no colour signalling -- what every caller that does
+    /// not care about tiles writes, so that adding a field here does not
+    /// rewrite them.
+    #[must_use]
+    pub fn new(width: usize, height: usize, base_q_idx: u8, gop: usize, colour: Colour) -> Self {
+        Self {
+            width,
+            height,
+            base_q_idx,
+            gop,
+            colour,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        }
+    }
 }
 
 /// One coded picture: its OBUs, in the order a demuxer that just wants bytes
@@ -510,6 +536,22 @@ impl Av1Encoder {
         // do, before the first `encode()` call rather than only surfacing it
         // then.
         Picture::grey(config.width, config.height).check_even()?;
+        // A tile is a whole number of superblocks, so a frame cannot carry
+        // more tile columns (rows) than it has 64x64 superblocks across
+        // (down) -- the header's own `max_log2_tile_cols` bound (spec
+        // 5.9.15), refused here rather than at the first `encode()` call.
+        let sb_cols = config.width.div_ceil(64) as u32;
+        let sb_rows = config.height.div_ceil(64) as u32;
+        if (1u32 << config.tile_cols_log2) > sb_cols || (1u32 << config.tile_rows_log2) > sb_rows {
+            return Err(Error::unsupported(
+                "AV1 encode",
+                format!(
+                    "{}x{} tiles need more than the {sb_cols}x{sb_rows} superblocks this frame has",
+                    1 << config.tile_cols_log2,
+                    1 << config.tile_rows_log2
+                ),
+            ));
+        }
         Ok(Self {
             carried_cdfs: None,
             golden: None,
@@ -632,6 +674,7 @@ impl Av1Encoder {
     /// # Errors
     /// As [`Av1Encoder::encode`], minus the pyramid refusal.
     pub fn encode_frames(&mut self, picture: &Picture) -> Result<Vec<Packet>> {
+        crate::encode::arm_tiles(self.config.tile_cols_log2, self.config.tile_rows_log2);
         if (picture.width, picture.height) != (self.config.width, self.config.height) {
             return Err(Error::unsupported(
                 "AV1 encode",
@@ -671,6 +714,7 @@ impl Av1Encoder {
     /// # Errors
     /// As [`Av1Encoder::encode_frames`].
     pub fn flush(&mut self) -> Result<Vec<Packet>> {
+        crate::encode::arm_tiles(self.config.tile_cols_log2, self.config.tile_rows_log2);
         self.drain_pending()
     }
 
@@ -1014,6 +1058,8 @@ mod tests {
             base_q_idx: 100,
             gop: 2,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         for t in 0..5u64 {
@@ -1034,6 +1080,8 @@ mod tests {
             base_q_idx: 100,
             gop: 3,
             colour: Colour::Unspecified,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let keys: Vec<bool> = (0..7)
@@ -1132,6 +1180,8 @@ mod tests {
             base_q_idx: 120,
             gop: 15,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         assert_eq!(enc.display_size(), (width, height));
@@ -1185,6 +1235,8 @@ mod tests {
             base_q_idx: 100,
             gop: 4,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let packet = enc.encode(&test_card(64, 64, 0)).unwrap();
@@ -1207,6 +1259,8 @@ mod tests {
             base_q_idx: 100,
             gop: 4,
             colour: Colour::Bt601Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let packet = enc.encode(&test_card(64, 64, 0)).unwrap();
@@ -1227,6 +1281,8 @@ mod tests {
             base_q_idx: 100,
             gop: 4,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
         let err = enc.encode(&Picture::grey(32, 32)).unwrap_err();
@@ -1242,6 +1298,8 @@ mod tests {
             base_q_idx: 100,
             gop: 0,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let err = Av1Encoder::new(config).unwrap_err();
         assert!(err.to_string().contains("gop"), "{err}");
@@ -1313,6 +1371,8 @@ mod tests {
             base_q_idx: 100,
             gop: 24,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc =
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(target_bytes)).unwrap();
@@ -1352,6 +1412,8 @@ mod tests {
                 base_q_idx: 100,
                 gop: frames,
                 colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
             };
             let rate = RateTarget::Bitrate {
                 bits_per_second,
@@ -1409,6 +1471,8 @@ mod tests {
             base_q_idx: 100,
             gop: 24,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let mut enc =
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(4_000)).unwrap();
@@ -1491,6 +1555,8 @@ mod tests {
             base_q_idx: 120,
             gop: 32,
             colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let pyramid = Pyramid {
             mini_gop: 4,
@@ -1594,6 +1660,8 @@ mod tests {
                 base_q_idx: 100,
                 gop: 8,
                 colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
             };
             let mut enc =
                 Av1Encoder::with_rate_target(config, RateTarget::Quality(quality)).unwrap();
