@@ -2365,6 +2365,7 @@ fn code_square_inter(
                     eight: None,
                     tx_depth,
                     inter: Some(InterInfo {
+                        ref_frame: crate::mvstack::LAST_FRAME,
                         mode: InterMode::NewMv,
                         mv: new_mv,
                         ref_mv_idx: 0,
@@ -2391,6 +2392,7 @@ fn code_square_inter(
             eight: None,
             tx_depth,
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv,
                 ref_mv_idx: 0,
@@ -3564,6 +3566,7 @@ fn search_inter_block(
             stack.nearest_mv,
             not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0),
             InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: stack.nearest_mv,
                 ref_mv_idx: 0,
@@ -3576,6 +3579,7 @@ fn search_inter_block(
             (0, 0),
             not_new + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 0),
             InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::GlobalMv,
                 mv: (0, 0),
                 ref_mv_idx: 0,
@@ -3589,6 +3593,7 @@ fn search_inter_block(
                 e.mv,
                 near_bits + drl_bits(1, idx),
                 InterInfo {
+                    ref_frame: crate::mvstack::LAST_FRAME,
                     mode: InterMode::NearMv,
                     mv: e.mv,
                     ref_mv_idx: idx as u8,
@@ -3637,6 +3642,7 @@ fn search_inter_block(
             mv,
             symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
             InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NewMv,
                 mv,
                 ref_mv_idx,
@@ -4815,6 +4821,7 @@ mod tests {
             eight: None,
             tx_depth: 0,
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
                 ref_mv_idx: 0,
@@ -4823,6 +4830,7 @@ mod tests {
         let skipped_block = BlockCoeffs {
             skip: true,
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
                 ref_mv_idx: 0,
