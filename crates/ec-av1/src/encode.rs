@@ -1627,9 +1627,16 @@ impl Plane<'_> {
             },
         };
         let n = (side / 4).max(1);
-        for row in 0..n {
+        // Only up to the frame's TRUE extent: the writer's own
+        // `Neighbours::record_planes` clamps to `blocks_wide`/`blocks_high`
+        // (spec `av1_set_entropy_contexts`, off the true `mi_cols`/`mi_rows`)
+        // and leaves the cells past it uncoded even mid-block, so a
+        // straddling block publishes context for its inside part only.
+        let rows = n.min(self.true_height.saturating_sub(y).div_ceil(4));
+        let cols = n.min(self.true_width.saturating_sub(x).div_ceil(4));
+        for row in 0..rows {
             let start = (y / 4 + row) * self.ctx.stride + x / 4;
-            let end = (start + n).min(self.ctx.cells.len());
+            let end = (start + cols).min(self.ctx.cells.len());
             if start < end {
                 self.ctx.cells[start..end].fill(state);
             }
@@ -10721,7 +10728,10 @@ mod tests {
     /// above, not by this pin. Re-pinned on lane-av1price2: the search now
     /// prices coefficients against the tables the frame's writer really
     /// starts from on every non-screen frame (`tile::arm_pricing_cdfs`), a
-    /// decision change the BD gate judges.
+    /// decision change the BD gate judges. Re-pinned again on
+    /// lane-av1skipctx: the search now prices `txb_skip`/`dc_sign` at the
+    /// real neighbour contexts ([`Plane::coef_ctx`]) instead of zero, which
+    /// is the same kind of decision change.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -10743,7 +10753,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7106, 0x1da4_9acd_a892_68e3), (60, 25963, 0x94df_8f46_174e_1a5e)];
+            [(150, 7141, 0x3a6a_df46_9b16_d9a7), (60, 25906, 0xbf71_9320_9e50_d237)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(

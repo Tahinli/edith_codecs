@@ -3981,20 +3981,28 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
 /// tables), and against the contexts a block whose neighbours coded nothing
 /// reads.
 ///
-/// That last assumption -- `skip_ctx` 0, `sign_ctx` 0 -- is the largest
-/// remaining row of the census and lane-av1price2 did NOT close it: every
-/// all-zero block is priced at the `txb_skip` cost of a block whose
-/// neighbours coded nothing, which is the most expensive context there is, so
-/// an all-zero chroma block is UNDER-priced by 41-81% on film and 51-73% on
-/// the screen capture (`pricer_error_census_on_clips`), and an all-zero
-/// Luma4 is over-priced by 400%+. Arming the frame's real tables does not
-/// touch those rows (Chroma8 nz=0 reads -73.0% in both modes). Pricing them
-/// right needs the real neighbour context, which needs something the search
-/// does not have: a per-plane non-zero context map committed in coding order.
-/// The search ranks partition TREES, so it prices candidates whose neighbours
-/// are not yet decided; the map would have to be built per trial, not per
-/// block. Deferred with the numbers above rather than approximated by a
-/// fitted constant.
+/// lane-av1skipctx CLOSED that row: `skip_ctx`/`sign_ctx` are the caller's
+/// now, and [`crate::encode::CoefCtxMap`] -- a per-plane, per-4x4-cell map
+/// committed in coding order and undone with a losing partition trial's
+/// pixels -- is the per-trial neighbour state the previous lane said the
+/// search did not have. The census (6 frames of each clip at 640x384, q=100,
+/// `pricer_error_census_on_clips`) moved:
+///
+/// | row | before | after |
+/// |---|---|---|
+/// | screen total | +10.3% | +9.5% |
+/// | screen Chroma8 nz=0 | -73.0% | -1.9% |
+/// | screen Chroma16 nz=0 | -48% | -23.4% |
+/// | screen Chroma4 nz=0 | -74% | -6.7% |
+/// | screen Chroma8 nz=1 / nz=2 | +32.2% / +26.2% | +4.9% / +7.9% |
+/// | screen Luma4 nz=0 | +464% | +89.5% |
+/// | film total | +5.3% | +1.5% |
+///
+/// What is left in the all-zero rows is table ADAPTATION, not context: the
+/// price is taken against the frame's starting tables, and a frame whose
+/// blocks mostly code nothing narrows `txb_skip` far below where it started.
+/// A whole-block luma transform still reads context 0 -- that is what the
+/// writer codes (`write_luma_tus`, `n == 1`), not an approximation.
 pub(crate) fn coeff_bits(
     grid: &[i32],
     set: TxbSet,
@@ -4133,8 +4141,10 @@ thread_local! {
 /// luma price accurate while leaving the bigger chroma and all-zero errors
 /// exactly where they were, which SKEWS the search's tradeoffs between them
 /// instead of correcting them -- and the bytes get worse. The fix for that
-/// row is the neighbour skip context, not another table set (see
-/// [`coeff_bits`]).
+/// row was the neighbour skip context, not another table set, and
+/// lane-av1skipctx landed it (see [`coeff_bits`]): with the real contexts
+/// under every price the screen capture comes down +59.4 -> +58.3 vs libaom
+/// at native, still with every one of its frames armed with the defaults.
 pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>, screen: bool) {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let mode = *MODE.get_or_init(|| match std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() {
