@@ -913,10 +913,32 @@ impl CeltEncoder {
             // hein@64 and .0014 on hein@96 and pushes 5 err_ratio rows the
             // wrong way, so the x1 stand-in stays. The sadie rows that carried
             // the first rejection are gone; hein reproduced it exactly.
-            // It is nonetheless the only lever measured to move the naz rows:
-            // with it, naz@64 goes 2.697 -> 1.764 and naz@96 4.499 -> 2.114
-            // (`lanes/opus-opustr-r2.sweep.txt`). Upgrade path: gate the x2 on
-            // content -- it pays on music transients and starves hein's speech.
+            // SWEPT WHOLE (lane opustr2, 12 detached gate runs, r1 = this
+            // default reproducing the base rows exactly; the gate is
+            // deterministic, so every delta below is real, not run noise).
+            // err_ratio deltas vs r1, worst rows only:
+            //   k=2   off=.04            her@96 +.021 hein@96 +.067, hein corr
+            //                            -.0024                     (r2)
+            //   k=1.5 off=.04/.06/.08    zaur@96 +.09 her@96 +.019, hein corr
+            //                            -.0012 -- the offset is inert   (r3,7,6)
+            //   k=2   off=.04 transient  zaur@96 +.095 dl8a@96 +.040     (r4)
+            //   k=1.5 off=.04 transient  hein@64 +.026 her@96 +.020      (r5)
+            //   k=2   tfe>=.6 / >=.35    nik@96 +.042/+.060 hein@96 +.075 (r9,10)
+            //   k=1.25 tfe>=.6 / >=.35   hein@64 +.090 / dl8a@96 +.065   (r11,12)
+            //   k=1.25 off=.044          her@64 +.001 her@96 +.021 ONLY, corr
+            //                            worst -.0005 (hein@64), and naz@64
+            //                            2.697->1.440, naz@96 4.499->2.516,
+            //                            hein@64 .853->.302, nik@64 .708->.643,
+            //                            dl8a@96 .374->.315               (r8)
+            // r8 is the nearest miss ever measured on this term and still
+            // fails the keep rule on her@96, so the x1 stand-in stays. Every
+            // variant that moves naz also costs her@96 ~+.02, and the naz gain
+            // comes entirely from frames with tf_estimate >= 0.6 (r11 keeps the
+            // full naz win) -- so her@96's loss lives on the same frames and
+            // no content gate built from `tf_estimate` or the transient flag
+            // can separate them. Upgrade path: libopus gates this boost with
+            // its tonality analysis (`analysis->valid`, music_prob), which this
+            // encoder does not run at all. Sweeps: lanes/opus-opustr2-r*.sweep.txt.
             // SWEPT (lane opustr2): k/offset/gate come from `tf_boost_params()`;
             // the defaults (k=1, off=.044, gate=all) are the shipped point and
             // reproduce the line above byte for byte.
