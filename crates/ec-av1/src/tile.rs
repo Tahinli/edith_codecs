@@ -177,6 +177,7 @@ pub(crate) fn arm_screen(on: bool) {
 
 fn screen_armed() -> bool {
     SCREEN.with(std::cell::Cell::get)
+}
 
 thread_local! {
     /// This frame header's own `reference_select` bit (spec 5.9.22), armed
