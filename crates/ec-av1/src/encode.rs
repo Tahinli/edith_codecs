@@ -2934,6 +2934,8 @@ fn code_square_inter(
                     palette: None,
                     tx_depth,
                     inter: Some(InterInfo {
+                        ref1: None,
+                        mv1: (0, 0),
                         ref_frame: crate::mvstack::LAST_FRAME,
                         mode: InterMode::NewMv,
                         mv: new_mv,
@@ -2969,6 +2971,8 @@ fn code_square_inter(
             palette: None,
             tx_depth,
             inter: Some(InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv,
@@ -3999,6 +4003,38 @@ fn extra_ref_new_mv() -> bool {
     }
 }
 
+/// The seven `ref_frame_idx` order hints of a frame coded on this crate's own
+/// flat slot plan (`inter_frame_headers_slots`): every reference but
+/// `GOLDEN_FRAME` and `ALTREF_FRAME` reads the frame just coded,
+/// `GOLDEN_FRAME` reads the GOP's key frame, and `ALTREF_FRAME` reads the
+/// frame two back when there is one (otherwise it, too, names the key frame's
+/// slot). Hints are 7-bit, the only `order_hint_bits` this encoder writes.
+pub(crate) fn flat_order_hints(order_hint: u32, key_hint: u32, has_altref: bool) -> [u32; 7] {
+    let last = order_hint.wrapping_sub(1) & 0x7f;
+    let alt = if has_altref {
+        order_hint.wrapping_sub(2) & 0x7f
+    } else {
+        key_hint
+    };
+    [last, last, last, key_hint, last, last, alt]
+}
+
+/// Whether an inter frame carries `reference_select` (spec 5.9.22): the
+/// header bit that lets each block choose between a single and a compound
+/// reference. Off by default until compound prediction is measured to pay;
+/// `EC_AV1_COMPOUND=1` arms it in a test build (which is what the BD gate
+/// runs as), and every block still codes SINGLE, so the only cost is one
+/// `comp_mode` symbol per inter block.
+const REFERENCE_SELECT: bool = true;
+
+/// [`REFERENCE_SELECT`], with the test-build environment override.
+pub(crate) fn reference_select() -> bool {
+    match std::env::var("EC_AV1_COMPOUND").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => REFERENCE_SELECT,
+    }
+}
+
 /// [`tile::write_drl_idx`]'s cost against one stack: one `drl_mode` symbol
 /// per entry past `start`, `1` to advance and `0` to stop, at most two.
 fn drl_bits_for(stack: &MvStack, start: usize, target: usize) -> f64 {
@@ -4143,6 +4179,56 @@ fn mc_trial(
     plane.code_from_prediction(x, y, side, prediction, skip, base_q_idx, deadzone, set)
 }
 
+/// [`mc_trial`]'s compound counterpart (spec 7.11.3.1's compound path): both
+/// references predict into the `CONV_BUF` intermediate domain
+/// ([`mc::predict_compound_intermediate`]) and are blended by
+/// [`mc::combine_compound`] at the simple-average split `(8, 8)` -- exactly
+/// what a decoder computes for a `comp_group_idx == 0`, `compound_idx == 1`
+/// block, so the encoder's reconstruction is the decoder's.
+#[allow(clippy::too_many_arguments)]
+fn mc_trial_compound(
+    plane: &Plane,
+    x: usize,
+    y: usize,
+    side: usize,
+    (mv0, mv1): ((i32, i32), (i32, i32)),
+    luma: bool,
+    ref0: (&[u16], usize, usize, usize),
+    ref1: (&[u16], usize, usize, usize),
+    base_q_idx: u8,
+    deadzone: f64,
+    set: TxbSet, fctx: &crate::decode::FrameCtx,
+) -> Trial {
+    let mut inter0 = [0i32; BLOCK * BLOCK];
+    let mut inter1 = [0i32; BLOCK * BLOCK];
+    let (inter0, inter1) = (&mut inter0[..side * side], &mut inter1[..side * side]);
+    for (mv, r, dst) in [(mv0, ref0, &mut *inter0), (mv1, ref1, &mut *inter1)] {
+        mc::predict_compound_intermediate(
+            r.0,
+            r.1,
+            r.2,
+            r.3,
+            mv_to_q4(x, mv.1, luma),
+            mv_to_q4(y, mv.0, luma),
+            mc::REF_NO_SCALE,
+            side,
+            side,
+            mc::InterpFilterKind::Regular,
+            mc::InterpFilterKind::Regular,
+            dst,
+        );
+    }
+    let mut blended16 = [0u16; BLOCK * BLOCK];
+    let blended16 = &mut blended16[..side * side];
+    mc::combine_compound(inter0, inter1, 8, 8, blended16, fctx);
+    let mut prediction = [0u8; BLOCK * BLOCK];
+    let prediction = &mut prediction[..side * side];
+    for (dst, &src) in prediction.iter_mut().zip(blended16.iter()) {
+        *dst = src as u8;
+    }
+    plane.code_from_prediction(x, y, side, prediction, false, base_q_idx, deadzone, set)
+}
+
 /// Codes one 32x32 block of an inter frame as whichever costs least of: each
 /// intra mode [`Search::modes`] offers (predicted exactly as a key frame's
 /// block is), `NEARESTMV`, and `NEWMV` searched from `reference` by
@@ -4175,7 +4261,11 @@ fn search_inter_block(
     // its two search-free modes are priced (`NEARESTMV`, `GLOBALMV`) -- a
     // second motion search would double the wall of the stage that already
     // owns most of it.
-    extra: &[(i8, &Picture, &MvStack)], fctx: &crate::decode::FrameCtx,
+    extra: &[(i8, &Picture, &MvStack)],
+    // The COMPOUND stack of each `LAST_FRAME` + extra-reference pair, built by
+    // the caller off the same MI grid the tile writer will (empty unless the
+    // frame carries `reference_select`).
+    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)], fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
     // below price their coefficients through `TxbSet::Luma32Inter`, which is
@@ -4352,6 +4442,8 @@ fn search_inter_block(
             stack.nearest_mv,
             last_ref_bits + not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0),
             InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: stack.nearest_mv,
@@ -4365,6 +4457,8 @@ fn search_inter_block(
             (0, 0),
             last_ref_bits + not_new + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 0),
             InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::GlobalMv,
                 mv: (0, 0),
@@ -4380,6 +4474,8 @@ fn search_inter_block(
                 e.mv,
                 near_bits + drl_bits(1, idx),
                 InterInfo {
+                    ref1: None,
+                    mv1: (0, 0),
                     ref_frame: crate::mvstack::LAST_FRAME,
                     mode: InterMode::NearMv,
                     mv: e.mv,
@@ -4418,6 +4514,8 @@ fn search_inter_block(
             mv,
             last_ref_bits + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
             InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NewMv,
                 mv,
@@ -4426,6 +4524,9 @@ fn search_inter_block(
         ));
     }
 
+    // Each extra reference's own `NEWMV` vector, for the compound
+    // `NEW_NEWMV` candidate below to pair with `LAST`'s.
+    let mut extra_new_mvs: Vec<(i8, (i32, i32))> = Vec::new();
     for &(ref_frame, g, gstack) in extra {
         let g_ref_bits = single_ref_bits(ref_frame);
         let g_not_new = symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 1);
@@ -4436,6 +4537,8 @@ fn search_inter_block(
                 + symbol_bits(&cdf::ZERO_MV[gstack.zero_mv_ctx], 1)
                 + symbol_bits(&cdf::REF_MV[gstack.ref_mv_ctx], 0),
             InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame,
                 mode: InterMode::NearestMv,
                 mv: gstack.nearest_mv,
@@ -4446,6 +4549,8 @@ fn search_inter_block(
             (0, 0),
             g_ref_bits + g_not_new + symbol_bits(&cdf::ZERO_MV[gstack.zero_mv_ctx], 0),
             InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame,
                 mode: InterMode::GlobalMv,
                 mv: (0, 0),
@@ -4500,11 +4605,14 @@ fn search_inter_block(
             #[cfg(test)]
             stage_add(0, t.elapsed());
             let gmv = round_to_valid_mv(gfound.mv, gstack.pred_mv);
+            extra_new_mvs.push((ref_frame, gmv));
             if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(gstack, gmv) {
                 cands.push((
                     gmv,
                     g_ref_bits + symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 0) + bits,
                     InterInfo {
+                        ref1: None,
+                        mv1: (0, 0),
                         ref_frame,
                         mode: InterMode::NewMv,
                         mv: gmv,
@@ -4512,6 +4620,130 @@ fn search_inter_block(
                     },
                 ));
             }
+        }
+    }
+
+    // The compound candidates (spec 5.11.24's `INTER_COMPOUND_MODES`), one
+    // trial set each: both references predict the block and the two
+    // predictions are averaged, which is what pays on content where neither
+    // reference alone is right. Priced with the same static-CDF approximation
+    // the single-reference candidates use, plus the compound-only symbols
+    // (`comp_mode`, the reference-pair tree, `comp_group_idx`/`compound_idx`).
+    for (ref1, g, cstack) in compound {
+        let (ref1, g) = (*ref1, *g);
+        let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME)
+            .contains(&ref1);
+        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
+            + if uni {
+                // LAST + a backward reference: `comp_ref_type` = bidirectional,
+                // `comp_ref` LAST, `comp_bwdref` ALTREF.
+                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
+                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
+                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
+                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
+            } else {
+                // LAST + GOLDEN: unidirectional, `uni_comp_ref` p0/p1/p2.
+                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
+            };
+        let mode_ctx =
+            cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
+        let mode_bits_of =
+            |mode: usize| pair_bits + symbol_bits(&cdf::INTER_COMPOUND_MODE[mode_ctx], mode);
+        let mut ccands: Vec<(((i32, i32), (i32, i32)), f64, InterInfo)> = vec![
+            (
+                cstack.nearest_mv,
+                mode_bits_of(0),
+                InterInfo {
+                    ref_frame: crate::mvstack::LAST_FRAME,
+                    mode: InterMode::NearestNearestMv,
+                    mv: cstack.nearest_mv.0,
+                    mv1: cstack.nearest_mv.1,
+                    ref1: Some(ref1),
+                    ref_mv_idx: 0,
+                },
+            ),
+            (
+                ((0, 0), (0, 0)),
+                mode_bits_of(6),
+                InterInfo {
+                    ref_frame: crate::mvstack::LAST_FRAME,
+                    mode: InterMode::GlobalGlobalMv,
+                    mv: (0, 0),
+                    mv1: (0, 0),
+                    ref1: Some(ref1),
+                    ref_mv_idx: 0,
+                },
+            ),
+        ];
+        // `NEW_NEWMV` seeded from the two single-reference searches this
+        // block already ran -- no joint search of its own.
+        if let Some(&(_, mv1)) = extra_new_mvs.iter().find(|(r, _)| *r == ref1) {
+            let base = cstack
+                .entries
+                .first()
+                .map_or(cstack.nearest_mv, |e| (e.mv0, e.mv1));
+            if let (Some(b0), Some(b1)) = (
+                mv_residual_bits(mv, base.0),
+                mv_residual_bits(mv1, base.1),
+            ) {
+                ccands.push((
+                    (mv, mv1),
+                    mode_bits_of(7) + b0 + b1,
+                    InterInfo {
+                        ref_frame: crate::mvstack::LAST_FRAME,
+                        mode: InterMode::NewNewMv,
+                        mv,
+                        mv1,
+                        ref1: Some(ref1),
+                        ref_mv_idx: 0,
+                    },
+                ));
+            }
+        }
+        ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        ccands.dedup_by_key(|c| c.0);
+        let g_luma = (g.y.as_slice(), g.width, luma.true_width, luma.true_height);
+        let g_u = (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height);
+        let g_v = (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height);
+        for (mvs, bits, info) in ccands {
+            let luma_trial = mc_trial_compound(
+                luma, x, y, BLOCK, mvs, true,
+                (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), g_luma,
+                search.base_q_idx, search.deadzone, TxbSet::Luma32Inter, fctx,
+            );
+            let u = mc_trial_compound(
+                &chroma[0], x / 2, y / 2, BLOCK / 2, mvs, false,
+                (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3), g_u,
+                search.base_q_idx, search.deadzone, chroma_set, fctx,
+            );
+            let v = mc_trial_compound(
+                &chroma[1], x / 2, y / 2, BLOCK / 2, mvs, false,
+                (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3), g_v,
+                search.base_q_idx, search.deadzone, chroma_set, fctx,
+            );
+            let skip = luma_trial.levels.iter().all(|&l| l == 0)
+                && u.levels.iter().all(|&l| l == 0)
+                && v.levels.iter().all(|&l| l == 0);
+            let cost = luma_trial.sse
+                + u.sse
+                + v.sse
+                + search.lambda
+                    * (skip_bits(skip)
+                        + intra_inter_bits(true)
+                        + bits
+                        + if skip { 0.0 } else { luma_trial.bits + u.bits + v.bits });
+            consider(Candidate {
+                cost,
+                luma: luma_trial,
+                u,
+                v,
+                mode: DC_PRED,
+                skip,
+                inter: Some(info),
+            });
         }
     }
 
@@ -4669,6 +4901,12 @@ pub(crate) fn encode_inter_frame(
     base_q_idx: u8,
     deadzone: f64,
     order_hint: u32,
+    // The order hint each of the seven `ref_frame_idx` entries names, which a
+    // decoder reads out of its own reference state -- only spec 5.9.22's
+    // `skipModeAllowed` (in `frame::write_frame_header`) reads it, and only
+    // on a `reference_select` frame. [`flat_order_hints`] builds it for the
+    // callers that follow this crate's own flat slot plan.
+    order_hints: [u32; 7],
     render: (usize, usize),
     // The tables this frame's writer starts from: what the previous frame
     // stored into the slot this one's `primary_ref_frame` names. `None`
@@ -4745,6 +4983,14 @@ pub(crate) fn encode_inter_frame(
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
     let sign_bias = pyramid.map_or(crate::mvstack::NO_SIGN_BIAS, |p| p.sign_bias);
+    // The order hint behind each `ref_frame_idx` entry. The flat path's own
+    // slot plan (`inter_frame_headers_slots`) is: every reference but
+    // `GOLDEN_FRAME` reads `last_slot` (the frame just coded) except
+    // `ALTREF_FRAME`, which reads the frame two back when there is one;
+    // `GOLDEN_FRAME` is the key frame, order hint 0. Only
+    // `frame::write_frame_header`'s `skipModeAllowed` reads this.
+    header.order_hints = order_hints;
+    header.reference_select = reference_select();
     if let Some(p) = pyramid {
         header.show_frame = p.show_frame;
         header.showable_frame = !p.show_frame;
@@ -4875,6 +5121,37 @@ pub(crate) fn encode_inter_frame(
                         .iter()
                         .map(|(r, p, st)| (*r, *p, st))
                         .collect();
+                    // The COMPOUND stack of each `LAST` + extra pair, off the
+                    // same grid (and the same armed sign bias) the tile writer
+                    // rebuilds it from. Empty unless this frame codes
+                    // `reference_select`, which is what gates the syntax.
+                    let compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+                        if header.reference_select {
+                            extra_stacks
+                                .iter()
+                                .map(|&(r, p, _)| {
+                                    (
+                                        r,
+                                        p,
+                                        crate::mvstack::find_mv_stack_compound(
+                                            &grid,
+                                            mi_row,
+                                            mi_col,
+                                            8,
+                                            8,
+                                            (crate::mvstack::LAST_FRAME, r),
+                                            mi_cols,
+                                            mi_rows,
+                                            grid.sign_bias_table(),
+                                            &[(0, 0); 7],
+                                            None,
+                                        ),
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
 
                     let base = snapshot(&luma, &chroma, (x, y), BLOCK);
                     let (block, mut cost_whole) = search_inter_block(
@@ -4885,7 +5162,8 @@ pub(crate) fn encode_inter_frame(
                         &mode_bits_table,
                         reference,
                         &stack,
-                        &extra, fctx,
+                        &extra,
+                        &compound, fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
                     let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
@@ -5223,6 +5501,8 @@ pub(crate) fn encode_inter_frame(
         .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
     let start_cdfs = CdfSnapshot(cdfs.clone());
     crate::tile::arm_sign_bias(sign_bias);
+    crate::tile::arm_reference_select(header.reference_select);
+    crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
     let mut tile = crate::tile::sb_coeff_inter_frame_tile_cdfs(
         mi_cols,
         mi_rows,
@@ -5313,6 +5593,8 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             crate::tile::arm_sign_bias(sign_bias);
+            crate::tile::arm_reference_select(reference_select());
+            crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
             let mut cdfs = start_cdfs.0.clone();
             let coded = crate::tile::sb_coeff_inter_frame_tile_cdfs(
                 mi_cols,
@@ -5468,6 +5750,7 @@ pub(crate) fn encode_sequence_with_ctx(
             base_q_idx,
             deadzone,
             order_hint,
+            flat_order_hints(order_hint, 0, prev2.is_some()),
             render,
             Some(&carried.0),
             Some(&golden),
@@ -5952,6 +6235,8 @@ mod tests {
             palette: None,
             tx_depth: 0,
             inter: Some(InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
@@ -5961,6 +6246,8 @@ mod tests {
         let skipped_block = BlockCoeffs {
             skip: true,
             inter: Some(InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
@@ -7599,7 +7886,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx, None).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -7697,7 +7984,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx, None).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -7874,6 +8161,7 @@ mod tests {
                     q,
                     0.5,
                     1,
+                    flat_order_hints(1, 0, false),
                     (width, height), None, None, None, fctx, None,
                 )
                 .unwrap();
@@ -7891,6 +8179,7 @@ mod tests {
                         q,
                         0.5,
                         1,
+                        flat_order_hints(1, 0, false),
                         (width, height), None, None, None, fctx, None,
                     )
                     .unwrap();
@@ -8384,7 +8673,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7444, 0x76eb980832d719f1), (60, 27692, 0x8c88f7e73455d439)];
+            [(150, 7209, 0xacdd_6952_78c1_49f2), (60, 27353, 0x9be8_7898_f08d_3b77)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -8692,6 +8981,8 @@ mod tests {
             let _ = crate::tile::take_inter_mode_hits();
             let _ = crate::tile::take_drl_hits();
             let _ = crate::tile::take_ref_hits();
+            let _ = crate::tile::take_compound_mode_hits();
+            let _ = crate::tile::take_compound_pair_hits();
             let _ = crate::motion::take_census();
             let (ours, ours_wall) = match pyramid_from_env() {
                 None => our_ladder(&source, width, height, fctx),
@@ -8726,6 +9017,22 @@ mod tests {
                 100.0 * near as f64 / modes_total as f64,
                 100.0 * global as f64 / modes_total as f64,
                 100.0 * new as f64 / modes_total as f64,
+            );
+            // The compound census: what share of the coded inter blocks took
+            // a compound reference at all, which compound mode they took, and
+            // which pair (gate-blind-to-feature -- a compound mode nobody
+            // picks cannot be what a BD number credits).
+            let comp_modes = crate::tile::take_compound_mode_hits();
+            let comp_pairs = crate::tile::take_compound_pair_hits();
+            let comp_total: usize = comp_modes.iter().sum();
+            eprintln!(
+                "{name}: compound {comp_total} of {} inter blocks ({:.1}%); modes \
+                 NEAREST_NEAREST {} NEAR_NEAR {} GLOBAL_GLOBAL {} NEW_NEW {}; pairs \
+                 LAST+GOLDEN {} LAST+ALTREF {}",
+                modes_total + comp_total,
+                100.0 * comp_total as f64 / (modes_total + comp_total) as f64,
+                comp_modes[0], comp_modes[1], comp_modes[6], comp_modes[7],
+                comp_pairs[3], comp_pairs[6],
             );
             // Where the wall-owning stage actually goes: how many candidate
             // evaluations (one `mc::predict` + SAD each) a search spends, how
