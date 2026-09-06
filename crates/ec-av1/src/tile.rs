@@ -238,15 +238,6 @@ impl TileLayout {
         }
     }
 
-    /// Which tile the superblock at `(sb_r, sb_c)` belongs to -- what the
-    /// encoder's frame-raster search consults to clip a block's neighbour
-    /// availability to its own tile.
-    pub(crate) fn index_of_sb(&self, sb_r: u32, sb_c: u32) -> usize {
-        let col = self.col_starts_sb[1..].partition_point(|&s| s <= sb_c);
-        let row = self.row_starts_sb[1..].partition_point(|&s| s <= sb_r);
-        row * self.cols() as usize + col
-    }
-
     /// The largest tile by mi area, `context_update_tile_id`'s own rule
     /// (spec 6.8.14 leaves the choice to the encoder; libaom and rav1e both
     /// name the biggest tile, whose end-of-tile tables the frame stores).
