@@ -1553,7 +1553,12 @@ impl<'a> CtuEncoder<'a> {
         for (i, &sample) in source[..n * n].iter().enumerate() {
             self.scratch.residual[i] = i32::from(sample) - i32::from(self.scratch.pred[i]);
         }
-        let skip = n == 4 && if self.ts_rd { self.ts_luma } else { self.transform_skip };
+        let skip = n == 4
+            && if self.ts_rd {
+                self.ts_luma
+            } else {
+                self.transform_skip
+            };
         let dst = uses_dst(n, true);
         if skip {
             forward_transform_skip(&self.scratch.residual, &mut self.scratch.coeffs, n);
