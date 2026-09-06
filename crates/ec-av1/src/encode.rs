@@ -2001,6 +2001,7 @@ fn code_square_inter(
                     uv_mode: DC_PRED,
                     skip: skip_new,
                     eight: None,
+                    tx_depth: 0,
                     inter: Some(InterInfo {
                         mode: InterMode::NewMv,
                         mv: new_mv,
@@ -2023,6 +2024,7 @@ fn code_square_inter(
             uv_mode: DC_PRED,
             skip,
             eight: None,
+            tx_depth: 0,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv,
@@ -3256,6 +3258,7 @@ fn search_inter_block(
             skip: best.skip,
             inter: best.inter,
             eight: None,
+            tx_depth: 0,
         },
         best.cost,
     )
