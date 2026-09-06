@@ -5875,7 +5875,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
 /// intra sets differ only in `IDTX`/`V_DCT`/`H_DCT`, none of which this
 /// table ever names), so unlike the CDF-coded luma path there is no
 /// ext-tx-set membership check to fall back from here.
-fn default_intra_tx_type(mode: u8) -> TxType {
+pub(crate) fn default_intra_tx_type(mode: u8) -> TxType {
     use crate::intra::{
         D45_PRED, D67_PRED, D113_PRED, D135_PRED, D157_PRED, D203_PRED, DC_PRED, H_PRED,
         PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, V_PRED,
