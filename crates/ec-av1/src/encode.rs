@@ -11758,18 +11758,21 @@ mod tests {
         })
     }
 
-    /// [`our_ladder`] through the streaming facade with a coding pyramid: the
-    /// four points are the same `base_q_idx` ladder, but each stream is
-    /// reordered (hidden `ALTREF` first, `show_existing_frame` last per
-    /// group) and each level is coded at its own quantizer offset. Returns
-    /// the ladder, the wall, and — per pyramid level over the whole ladder —
-    /// how many frames and how many bytes it spent.
-    fn our_ladder_pyramid(
+    /// [`our_ladder`] through the streaming facade — the surface the editor's
+    /// export drives (`EC_AV1_GATE_FACADE=1`). With a [`crate::encoder::Pyramid`]
+    /// each stream is also reordered (hidden `ALTREF` first,
+    /// `show_existing_frame` last per group) and each level is coded at its
+    /// own quantizer offset; without one it is the flat ladder, which
+    /// `encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence`
+    /// pins byte-identical to [`our_ladder`]'s, so this arm must print the
+    /// same BD numbers. Returns the ladder, the wall, and — per pyramid level
+    /// over the whole ladder — how many frames and how many bytes it spent.
+    fn our_ladder_facade(
         name: &str,
         source: &[Picture],
         width: usize,
         height: usize,
-        pyramid: crate::encoder::Pyramid,
+        pyramid: Option<crate::encoder::Pyramid>,
     ) -> (Vec<(f64, f64)>, f64, [usize; 4], [usize; 4]) {
         use crate::encoder::{Av1Encoder, Colour, EncoderConfig, Level};
         let slot = |l: Level| match l {
@@ -11792,7 +11795,10 @@ mod tests {
                 tile_rows_log2: 0,
             };
             let start = std::time::Instant::now();
-            let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
+            let mut enc = match pyramid {
+                None => Av1Encoder::new(config).unwrap(),
+                Some(p) => Av1Encoder::with_pyramid(config, p).unwrap(),
+            };
             let mut packets = Vec::new();
             for picture in source {
                 packets.extend(enc.encode_frames(picture).unwrap());
@@ -12121,13 +12127,18 @@ mod tests {
             let _ = crate::tile::take_compound_size_hits();
             let _ = crate::tile::take_compound_leaf_mode_hits();
             let _ = crate::motion::take_census();
-            let (ours, ours_wall) = match pyramid_from_env() {
-                None => our_ladder(name, &source, width, height, fctx),
-                Some(pyramid) => {
+            let pyramid_env = pyramid_from_env();
+            // The entry-surface arm: run the SAME ladder through the
+            // streaming facade the editor's export calls, which must print
+            // the same BD numbers as the sequence path.
+            let facade = std::env::var_os("EC_AV1_GATE_FACADE").is_some();
+            let (ours, ours_wall) = match (facade, pyramid_env) {
+                (false, None) => our_ladder(name, &source, width, height, fctx),
+                (_, pyramid) => {
                     let (ladder, wall, counts, bytes) =
-                        our_ladder_pyramid(name, &source, width, height, pyramid);
+                        our_ladder_facade(name, &source, width, height, pyramid);
                     eprintln!(
-                        "{name}: pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
+                        "{name}: facade, pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
                          show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
                         counts[0], counts[1], counts[2], counts[3],
                         bytes[0], bytes[1], bytes[2], bytes[3],
@@ -12555,7 +12566,7 @@ mod tests {
                 None => our_ladder(name, &source, cw, ch, fctx),
                 Some(pyramid) => {
                     let (ladder, wall, counts, bytes) =
-                        our_ladder_pyramid(name, &source, cw, ch, pyramid);
+                        our_ladder_facade(name, &source, cw, ch, Some(pyramid));
                     eprintln!(
                         "{name}: pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
                          show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
