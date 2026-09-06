@@ -2794,6 +2794,53 @@ fn armed_tiles() -> (u32, u32) {
     TILE_LOG2.with(std::cell::Cell::get)
 }
 
+/// Codes a frame's `tiles` tiles, each entirely on its own (see
+/// [`crate::tile::TileRect`]), across [`crate::par::tile_threads`] workers of
+/// the crate's own pool, and hands back their payloads in tile order plus
+/// whatever `code` returned for tile `store` -- the CDF state
+/// `context_update_tile_id` names. The result cannot depend on the thread
+/// count: each job writes one tile from the frame's own starting tables into
+/// its own slot.
+fn write_tiles<F>(tiles: usize, store: usize, code: F) -> Result<(Vec<Vec<u8>>, Option<crate::cdf_state::Cdfs>)>
+where
+    F: Fn(usize) -> Result<(Vec<u8>, Option<crate::cdf_state::Cdfs>)> + Sync + Send,
+{
+    type Slot = Option<Result<(Vec<u8>, Option<crate::cdf_state::Cdfs>)>>;
+    let threads = crate::par::tile_threads().min(tiles);
+    let mut slots: Vec<Slot> = Vec::new();
+    if threads <= 1 {
+        for index in 0..tiles {
+            slots.push(Some(code(index)));
+        }
+    } else {
+        let done: std::sync::Mutex<Vec<Slot>> = std::sync::Mutex::new((0..tiles).map(|_| None).collect());
+        {
+            let batch = crate::par::Batch::new("ec-av1-tile");
+            for (from, to) in crate::par::bands(tiles, threads) {
+                let done = &done;
+                let code = &code;
+                batch.submit(move || {
+                    for index in from..to {
+                        let coded = code(index);
+                        done.lock().expect("tile slots")[index] = Some(coded);
+                    }
+                });
+            }
+        }
+        slots = done.into_inner().expect("tile slots");
+    }
+    let mut out = Vec::with_capacity(tiles);
+    let mut stored = None;
+    for (index, slot) in slots.into_iter().enumerate() {
+        let (bytes, cdfs) = slot.expect("every tile was coded")?;
+        if index == store {
+            stored = cdfs;
+        }
+        out.push(bytes);
+    }
+    Ok((out, stored))
+}
+
 /// The frame header's `tile_info` (spec 5.9.15) for `layout`:
 /// `context_update_tile_id` names the largest tile, whose end-of-tile CDF
 /// tables the frame stores (spec 7.20), which is what
@@ -3281,12 +3328,11 @@ pub(crate) fn encode_key_frame_inner(
                       grid: &[u8],
                       units: &[Option<crate::restoration::WienerInfo>]|
      -> Result<Vec<Vec<u8>>> {
-        let mut out = Vec::with_capacity(layout.count());
-        for index in 0..layout.count() {
+        let (out, _) = write_tiles(layout.count(), usize::MAX, |index| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             let mut cdfs = start_cdfs.0.clone();
-            out.push(crate::tile::sb_coeff_key_frame_tile_cdfs(
+            let bytes = crate::tile::sb_coeff_key_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
                 base_q_idx,
@@ -3294,8 +3340,9 @@ pub(crate) fn encode_key_frame_inner(
                 tx_select,
                 &mut cdfs,
                 layout.rect(index),
-            )?);
-        }
+            )?;
+            Ok((bytes, None))
+        })?;
         Ok(out)
     };
     let mut tiles = code_tiles(0, sb_cols, &[], &[])?;
@@ -4881,18 +4928,18 @@ pub(crate) fn encode_inter_frame(
                       cdef_grid: &[u8],
                       units: &[Option<crate::restoration::WienerInfo>]|
      -> Result<Vec<Vec<u8>>> {
-        let mut out = Vec::with_capacity(layout.count());
-        // One grid for the whole frame, carried from tile to tile (the
-        // decoder keeps exactly one too) and rebuilt from nothing on every
-        // re-code.
-        let mut mv_grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
-        mv_grid.set_sign_bias(sign_bias);
-        for index in 0..layout.count() {
+        let (out, stored) = write_tiles(layout.count(), store_tile, |index| {
             crate::tile::arm_cdef_idx(bits, sb_cols, cdef_grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             crate::tile::arm_sign_bias(sign_bias);
             let mut cdfs = start_cdfs.0.clone();
-            out.push(crate::tile::sb_coeff_inter_frame_tile_cdfs(
+            // Each tile's own MV grid: a candidate scan never reaches past
+            // the tile's bounds, so a grid holding only this tile's own
+            // blocks reads exactly as the decoder's frame-wide one does
+            // under `MiGrid::set_tile_bounds`.
+            let mut mv_grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+            mv_grid.set_sign_bias(sign_bias);
+            let bytes = crate::tile::sb_coeff_inter_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
                 base_q_idx,
@@ -4901,10 +4948,11 @@ pub(crate) fn encode_inter_frame(
                 &mut cdfs,
                 layout.rect(index),
                 &mut mv_grid,
-            )?);
-            if index == store_tile {
-                *end_cdfs.borrow_mut() = Some(cdfs);
-            }
+            )?;
+            Ok((bytes, Some(cdfs)))
+        })?;
+        if let Some(cdfs) = stored {
+            *end_cdfs.borrow_mut() = Some(cdfs);
         }
         Ok(out)
     };

@@ -1900,7 +1900,7 @@ pub fn intra_rect4_in_inter_counters() -> (usize, usize, usize, usize) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::encode::{Picture as Pic, encode_key_frame_with_ctx, encode_sequence_with_ctx};
 
@@ -3131,7 +3131,7 @@ mod tests {
         );
     }
 
-    fn lock_gate_counters() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_gate_counters() -> std::sync::MutexGuard<'static, ()> {
         GATE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
