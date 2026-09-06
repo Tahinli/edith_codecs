@@ -12627,6 +12627,19 @@ mod tests {
     /// | + deblocking | +198.2 / +143.1 | +218.1 / +162.4 | +136.9 / +52.7 |
     /// | + CDEF | +143.6 / +94.0 | +179.5 / +128.8 | +88.0 / +21.5 |
     ///
+    /// Re-measured for the record 2026-09-07 (lane-av1resweep), after
+    /// [`LAMBDA_SCALE`] moved 0.05 -> 0.0275 and the two var-tx depth
+    /// searches ([`tx32_depth_search`], [`compound_var_tx`]) became defaults
+    /// -- all three decided on the REAL film rows of
+    /// [`bd_rate_screen_native`], which this downscaled recipe does not
+    /// carry:
+    ///
+    /// | clip | BD vs libaom | BD vs rav1e | wall ours:libaom:rav1e |
+    /// |---|---|---|---|
+    /// | bars 1080p | +68.8% | +26.2% | 5.8s:1.2s:2.7s |
+    /// | bars 2160p | +81.6% | +41.5% | 4.8s:1.0s:2.2s |
+    /// | screen capture | +49.1% | -4.3% | 5.5s:1.0s:2.1s |
+    ///
     /// Loop restoration is NOT in yet: it is the one filter whose parameters
     /// are per restoration UNIT inside the tile payload, so it needs both
     /// tile writers to code `lr` syntax and an encoder-visible post-CDEF
