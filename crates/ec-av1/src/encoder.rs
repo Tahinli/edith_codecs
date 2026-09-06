@@ -1,14 +1,16 @@
 //! The streaming encoder facade — I11 of `lanes/av1-inter-plan.md`, the
 //! surface `edith_replica`'s engine calls in place of rav1e.
 //!
-//! One picture in, one [`Packet`] out, same contract as the repo's other
-//! software encoder shims (`shims/rusty_h264`'s `Encoder::try_encode`,
-//! "nothing is ever held back"): [`Av1Encoder::encode`] never buffers a
-//! picture past its own call, so there is no flush to drain. That contract
-//! still holds for every caller that does not opt into a coding pyramid;
-//! [`Av1Encoder::with_pyramid`] does reorder pictures, and such a stream is
-//! driven through [`Av1Encoder::encode_frames`] (zero or more packets per
-//! picture) and [`Av1Encoder::flush`] instead. Internally it
+//! ONE FRAME OF LATENCY, everywhere: a picture handed to
+//! [`Av1Encoder::encode`]/[`Av1Encoder::encode_frames`] is held until the
+//! NEXT picture arrives, because an inter frame's per-superblock temporal
+//! lambda map reads the next source picture as its lookahead (lane-av1tpl)
+//! — exactly as [`crate::encode::encode_sequence`] does, so the facade and
+//! the sequence path now code the same bytes for the same pictures. A
+//! stream therefore ENDS with [`Av1Encoder::flush`], which codes whatever is
+//! still held. [`Av1Encoder::with_pyramid`] holds a whole mini-GOP for the
+//! same kind of reason (it reorders pictures) and is driven through
+//! [`Av1Encoder::encode_frames`]/[`Av1Encoder::flush`] too. Internally it
 //! is [`crate::encode::encode_key_frame_inner`] and
 //! [`crate::encode::encode_inter_frame`] driven by a small state machine —
 //! a key frame every `gop` pictures, an inter frame predicting from the
@@ -534,6 +536,10 @@ pub struct Av1Encoder {
     dpb: [Option<DpbSlot>; 8],
     /// Pictures held back waiting for their mini-GOP's hidden frame.
     pending: Vec<(u64, Picture)>,
+    /// The flat path's one-picture delay queue: the picture whose packet the
+    /// NEXT call returns, coded with that call's picture as its lookahead
+    /// (lane-av1facade). Unused in pyramid mode, which buffers in `pending`.
+    held: Option<Picture>,
     /// Which of [`ANCHOR_SLOTS`] the group about to be coded reads as its
     /// anchor.
     anchor: usize,
@@ -601,6 +607,7 @@ impl Av1Encoder {
             pyramid: None,
             dpb: [const { None }; 8],
             pending: Vec::new(),
+            held: None,
             anchor: 0,
             next_dts: 0,
         })
@@ -678,9 +685,15 @@ impl Av1Encoder {
         (self.config.width, self.config.height)
     }
 
-    /// Encodes one picture, key or inter by this stream's `gop` cadence, and
-    /// returns its packet — always exactly one, never held back for a later
-    /// call.
+    /// Takes one picture and returns the PREVIOUS picture's packet, key or
+    /// inter by this stream's `gop` cadence — the facade's one frame of
+    /// latency (the picture just handed in is what the previous one is coded
+    /// against as its lookahead). The FIRST call has no previous picture and
+    /// returns a packet with an EMPTY `data` (its other fields are
+    /// placeholders; test `data.is_empty()`), and the last picture's packet
+    /// comes out of [`Av1Encoder::flush`] — so a caller that concatenates
+    /// `data` in call order still gets the whole stream, provided it flushes
+    /// at the end.
     ///
     /// # Errors
     /// Returns an error when `picture`'s size does not match
@@ -697,12 +710,19 @@ impl Av1Encoder {
             ));
         }
         let mut packets = self.encode_frames(picture)?;
-        Ok(packets.pop().expect("the flat path emits exactly one packet"))
+        Ok(packets.pop().unwrap_or(Packet {
+            data: Vec::new(),
+            key: false,
+            order: 0,
+            dts: 0,
+            level: Level::Leaf,
+        }))
     }
 
-    /// Encodes one picture and returns every packet it completed, in coding
-    /// order. Without a [`Pyramid`] that is always exactly one packet and
-    /// this is [`Av1Encoder::encode`] with a `Vec` around it; with one it is
+    /// Takes one picture and returns every packet it completed, in coding
+    /// order. Without a [`Pyramid`] that is one packet — the PREVIOUS
+    /// picture's, since this one is its lookahead — and none at all on the
+    /// first call; with one it is
     /// empty for most pictures and a whole mini-GOP's worth (the hidden
     /// frame, its leaves and the `show_existing_frame` that re-outputs it)
     /// for the picture that closes a group.
@@ -721,7 +741,13 @@ impl Av1Encoder {
             ));
         }
         let Some(pyramid) = self.pyramid else {
-            return Ok(vec![self.encode_flat(picture)?]);
+            // The one-picture delay queue: this picture is the lookahead the
+            // previous one is coded with, which is what makes the facade's
+            // bytes identical to `encode_sequence`'s (lane-av1facade).
+            return Ok(match self.held.replace(picture.clone()) {
+                None => Vec::new(),
+                Some(previous) => vec![self.encode_flat(&previous, Some(picture))?],
+            });
         };
         let order = self.next_index;
         self.next_index += 1;
@@ -743,19 +769,26 @@ impl Av1Encoder {
         Ok(Vec::new())
     }
 
-    /// Codes and returns every picture still held back — the tail of a stream
-    /// whose last mini-GOP never filled up. Empty (and cheap) for a stream
-    /// with no [`Pyramid`], which never holds a picture at all.
+    /// Codes and returns every picture still held back — the last picture of
+    /// a flat stream (which has no lookahead and is coded without one), or
+    /// the tail of a pyramid stream whose last mini-GOP never filled up.
+    /// Empty once there is nothing held.
     ///
     /// # Errors
     /// As [`Av1Encoder::encode_frames`].
     pub fn flush(&mut self) -> Result<Vec<Packet>> {
         crate::encode::arm_tiles(self.config.tile_cols_log2, self.config.tile_rows_log2);
+        if let Some(previous) = self.held.take() {
+            return Ok(vec![self.encode_flat(&previous, None)?]);
+        }
         self.drain_pending()
     }
 
-    /// The pre-pyramid path, byte for byte: one picture in, one packet out.
-    fn encode_flat(&mut self, picture: &Picture) -> Result<Packet> {
+    /// The flat path: one picture and its lookahead (the next source picture,
+    /// `None` at the end of the stream) in, one packet out — the same inputs
+    /// [`crate::encode::encode_sequence`] gives each of its inter frames, so
+    /// the bytes are identical.
+    fn encode_flat(&mut self, picture: &Picture, lookahead: Option<&Picture>) -> Result<Packet> {
         let render = (self.config.width, self.config.height);
         let padded = picture.padded_to(SUPERBLOCK);
         let is_key = self.next_index.is_multiple_of(self.config.gop as u64);
@@ -803,9 +836,7 @@ impl Av1Encoder {
                 self.prev2.as_ref(),
                 &self.fctx,
                 None,
-                // The streaming facade holds no lookahead buffer
-                // (lane-av1tpl).
-                None,
+                lookahead.map(|n| n.padded_to(SUPERBLOCK)).as_ref(),
             )?
         };
 
@@ -1098,17 +1129,34 @@ mod tests {
         picture
     }
 
+    /// Drives a whole stream through the facade the way a caller must since
+    /// it holds one picture of lookahead: every picture through
+    /// [`Av1Encoder::encode_frames`], then [`Av1Encoder::flush`].
+    fn encode_all(enc: &mut Av1Encoder, pictures: &[Picture]) -> Vec<Packet> {
+        let mut packets = Vec::with_capacity(pictures.len());
+        for (i, picture) in pictures.iter().enumerate() {
+            packets.extend(
+                enc.encode_frames(picture)
+                    .unwrap_or_else(|e| panic!("picture {i}: {e}")),
+            );
+        }
+        packets.extend(enc.flush().unwrap_or_else(|e| panic!("flush: {e}")));
+        packets
+    }
+
     /// Every OBU stream this test writes to `ffmpeg`/`ffprobe`, concatenated
     /// in order.
     fn concat(packets: &[Packet]) -> Vec<u8> {
         packets.iter().flat_map(|p| p.data.clone()).collect()
     }
 
-    /// One call to [`Av1Encoder::encode`] returns exactly one packet, always
-    /// — the facade's whole "nothing held back" contract, checked without
-    /// ffmpeg since it is a property of the return type, not the bytes.
+    /// The facade's latency contract (lane-av1facade): the first
+    /// [`Av1Encoder::encode`] call returns an empty packet, every later call
+    /// returns the PREVIOUS picture's packet, and [`Av1Encoder::flush`]
+    /// yields the last one — so a caller still gets exactly one non-empty
+    /// packet per picture, one call later.
     #[test]
-    fn one_in_one_out() {
+    fn one_in_one_out_delayed_by_a_frame() {
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -1121,8 +1169,67 @@ mod tests {
         let mut enc = Av1Encoder::new(config).unwrap();
         for t in 0..5u64 {
             let packet = enc.encode(&test_card(64, 64, t as usize)).unwrap();
+            if t == 0 {
+                assert!(packet.data.is_empty(), "the first call holds its picture back");
+                continue;
+            }
             assert!(!packet.data.is_empty(), "picture {t}: empty packet");
-            assert_eq!(packet.order, t, "picture {t}: order");
+            assert_eq!(packet.order, t - 1, "picture {t}: order");
+        }
+        let tail = enc.flush().unwrap();
+        assert_eq!(tail.len(), 1, "flush yields the last picture");
+        assert_eq!(tail[0].order, 4);
+        assert!(enc.flush().unwrap().is_empty(), "nothing is held twice");
+    }
+
+    /// THE ENTRY-SURFACE GATE (lane-av1facade): the streaming facade — what
+    /// the editor's export drives — codes byte for byte what
+    /// [`crate::encode::encode_sequence`] codes, which is the path the BD
+    /// gate measures. It did not before: the facade passed no lookahead, so
+    /// every inter frame missed the per-superblock temporal lambda map
+    /// (lane-av1tpl) the gate's numbers were measured with.
+    ///
+    /// Runs on the gate's own clip at the gate's own size when the fixture is
+    /// there, and on a synthetic card otherwise — never skipped, since a
+    /// skipped identity gate is the defect it is meant to catch.
+    #[test]
+    fn the_facade_codes_the_same_bytes_as_encode_sequence() {
+        let frames = 12usize;
+        let pictures = h264_clip_frames(640, 384, frames).unwrap_or_else(|| {
+            eprintln!("no h264 clip: the facade identity gate runs on a synthetic card");
+            (0..frames).map(|t| test_card(64, 64, t)).collect()
+        });
+        let (width, height) = (pictures[0].width, pictures[0].height);
+        for q in [150u8, 60] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: q,
+                // One key frame then all inter, which is `encode_sequence`'s
+                // only shape, and the gate's recipe.
+                gop: frames,
+                // `encode_sequence` writes an unspecified colour config.
+                colour: Colour::Unspecified,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let packets = encode_all(&mut enc, &pictures);
+            let sequence = crate::encode::encode_sequence(&pictures, q, DEADZONE).unwrap();
+            assert_eq!(packets.len(), frames, "q={q}: one packet per picture");
+            for (i, (packet, coded)) in packets.iter().zip(&sequence.frames).enumerate() {
+                let cropped = crate::encode::crop_encoded(coded, width, height);
+                assert_eq!(
+                    (packet.data.len(), packet.data.clone()),
+                    (cropped.stream.len(), cropped.stream.clone()),
+                    "q={q} frame {i}: the facade's bytes are not the sequence path's"
+                );
+            }
+            assert_eq!(
+                concat(&packets),
+                sequence.stream,
+                "q={q}: whole stream"
+            );
         }
     }
 
@@ -1141,8 +1248,10 @@ mod tests {
             tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
-        let keys: Vec<bool> = (0..7)
-            .map(|t| enc.encode(&test_card(64, 64, t)).unwrap().key)
+        let pictures: Vec<Picture> = (0..7).map(|t| test_card(64, 64, t)).collect();
+        let keys: Vec<bool> = encode_all(&mut enc, &pictures)
+            .iter()
+            .map(|p| p.key)
             .collect();
         assert_eq!(keys, vec![true, false, false, true, false, false, true]);
     }
@@ -1251,9 +1360,8 @@ mod tests {
             )
         );
 
-        let packets: Vec<Packet> = (0..30)
-            .map(|t| enc.encode(&test_card(width, height, t)).unwrap())
-            .collect();
+        let pictures: Vec<Picture> = (0..30).map(|t| test_card(width, height, t)).collect();
+        let packets: Vec<Packet> = encode_all(&mut enc, &pictures);
         let expect_key: Vec<bool> = (0..30).map(|t| t % 15 == 0).collect();
         assert_eq!(
             packets.iter().map(|p| p.key).collect::<Vec<_>>(),
@@ -1296,8 +1404,8 @@ mod tests {
             tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
-        let packet = enc.encode(&test_card(64, 64, 0)).unwrap();
-        let colour = ffprobe_colour(&packet.data);
+        let packets = encode_all(&mut enc, &[test_card(64, 64, 0)]);
+        let colour = ffprobe_colour(&packets[0].data);
         assert_eq!(colour, "tv,bt709,bt709,bt709", "ffprobe colour fields");
     }
 
@@ -1320,8 +1428,8 @@ mod tests {
             tile_rows_log2: 0,
         };
         let mut enc = Av1Encoder::new(config).unwrap();
-        let packet = enc.encode(&test_card(64, 64, 0)).unwrap();
-        let colour = ffprobe_colour(&packet.data);
+        let packets = encode_all(&mut enc, &[test_card(64, 64, 0)]);
+        let colour = ffprobe_colour(&packets[0].data);
         assert_eq!(
             colour, "tv,smpte170m,smpte170m,smpte170m",
             "ffprobe colour fields"
@@ -1433,9 +1541,9 @@ mod tests {
         };
         let mut enc =
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(target_bytes)).unwrap();
-        let sizes: Vec<usize> = pictures
+        let sizes: Vec<usize> = encode_all(&mut enc, &pictures)
             .iter()
-            .map(|p| enc.encode(p).unwrap().data.len())
+            .map(|p| p.data.len())
             .collect();
         // Discard the key frame (always far larger than an inter target) and
         // the next 4 inter frames the loop needs to step toward it.
@@ -1535,7 +1643,7 @@ mod tests {
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(4_000)).unwrap();
         let mut prev_q = enc.rate_loop.as_ref().unwrap().q_idx(Level::Leaf);
         for picture in &pictures {
-            enc.encode(picture).unwrap();
+            enc.encode_frames(picture).unwrap();
             let q = enc.rate_loop.as_ref().unwrap().q_idx(Level::Leaf);
             let step = (i32::from(q) - i32::from(prev_q)).abs();
             assert!(
@@ -1723,10 +1831,7 @@ mod tests {
             let layout = format!("{}x{} tiles", 1 << cols_log2, 1 << rows_log2);
             let mut enc = Av1Encoder::new(config).unwrap();
             let mut stream = Vec::new();
-            for (i, picture) in sources.iter().enumerate() {
-                let packet = enc
-                    .encode(picture)
-                    .unwrap_or_else(|e| panic!("{layout} frame {i}: {e}"));
+            for packet in encode_all(&mut enc, &sources) {
                 stream.extend_from_slice(&packet.data);
             }
             sizes.push((layout.clone(), stream.len()));
@@ -1819,8 +1924,8 @@ mod tests {
                     let mut enc = Av1Encoder::new(config).unwrap();
                     let start = std::time::Instant::now();
                     let mut bytes = 0usize;
-                    for picture in &sources {
-                        bytes += enc.encode(picture).unwrap().data.len();
+                    for packet in encode_all(&mut enc, &sources) {
+                        bytes += packet.data.len();
                     }
                     let wall = start.elapsed().as_secs_f64();
                     let name = format!("{}x{}", 1 << cols_log2, 1 << rows_log2);
@@ -1860,8 +1965,8 @@ mod tests {
             };
             let mut enc = Av1Encoder::new(config).unwrap();
             let mut stream = Vec::new();
-            for picture in &sources {
-                stream.extend_from_slice(&enc.encode(picture).unwrap().data);
+            for packet in encode_all(&mut enc, &sources) {
+                stream.extend_from_slice(&packet.data);
             }
             stream
         };
@@ -1928,8 +2033,8 @@ mod tests {
             };
             let mut enc = Av1Encoder::new(config).unwrap();
             let mut stream = Vec::new();
-            for picture in &sources {
-                stream.extend_from_slice(&enc.encode(picture).unwrap().data);
+            for packet in encode_all(&mut enc, &sources) {
+                stream.extend_from_slice(&packet.data);
             }
             stream
         };
@@ -1964,8 +2069,8 @@ mod tests {
             };
             let mut enc = Av1Encoder::new(config).unwrap();
             let mut stream = Vec::new();
-            for picture in &sources {
-                stream.extend_from_slice(&enc.encode(picture).unwrap().data);
+            for packet in encode_all(&mut enc, &sources) {
+                stream.extend_from_slice(&packet.data);
             }
             crate::decode::set_filter_replay_disabled(false);
             stream
@@ -2031,8 +2136,8 @@ mod tests {
             let mut enc = Av1Encoder::new(config).unwrap();
             let _ = crate::par::take_stage_ns();
             let start = std::time::Instant::now();
-            for picture in &sources {
-                assert!(!enc.encode(picture).unwrap().data.is_empty());
+            for packet in encode_all(&mut enc, &sources) {
+                assert!(!packet.data.is_empty());
             }
             let wall = start.elapsed().as_secs_f64();
             let ns = crate::par::take_stage_ns();
@@ -2102,8 +2207,8 @@ mod tests {
             let mut enc = Av1Encoder::new(config).unwrap();
             let start = std::time::Instant::now();
             let mut bytes = 0usize;
-            for picture in &sources {
-                bytes += enc.encode(picture).unwrap().data.len();
+            for packet in encode_all(&mut enc, &sources) {
+                bytes += packet.data.len();
             }
             (start.elapsed(), bytes)
         };
@@ -2243,10 +2348,7 @@ mod tests {
             let layout = format!("{}x{} tiles", 1 << cols_log2, 1 << rows_log2);
             let mut enc = Av1Encoder::new(config).unwrap();
             let mut stream = Vec::new();
-            for (i, picture) in sources.iter().enumerate() {
-                let packet = enc
-                    .encode(picture)
-                    .unwrap_or_else(|e| panic!("{layout} frame {i}: {e}"));
+            for packet in encode_all(&mut enc, &sources) {
                 stream.extend_from_slice(&packet.data);
             }
             let ours = crate::stream::decode_stream(&stream).expect("our decoder");
@@ -2301,8 +2403,7 @@ mod tests {
                 Av1Encoder::with_rate_target(config, RateTarget::Quality(quality)).unwrap();
             let mut stream = Vec::new();
             let mut total_bytes = 0usize;
-            for picture in &pictures {
-                let packet = enc.encode(picture).unwrap();
+            for packet in encode_all(&mut enc, &pictures) {
                 total_bytes += packet.data.len();
                 stream.extend_from_slice(&packet.data);
             }
