@@ -1908,6 +1908,20 @@ pub(crate) fn take_tx_depth_hits() -> [usize; 3] {
 static INTER_TX_SPLIT_HITS: [std::sync::atomic::AtomicUsize; 2] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
 
+/// How many 32x32-and-below inter blocks each reference frame won, indexed by
+/// `ref_frame` (`crate::mvstack::LAST_FRAME` = 1 .. `ALTREF_FRAME` = 7), the
+/// fire count a gate prints to see an extra reference reach a block at all
+/// ([[gate-blind-to-feature]]: a pyramid whose backward `ALTREF` is never
+/// chosen is a pyramid that costs bytes and buys nothing).
+static REF_FRAME_HITS: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+
+/// Reads [`REF_FRAME_HITS`] and zeroes it.
+#[cfg(test)]
+pub(crate) fn take_ref_frame_hits() -> [usize; 8] {
+    std::array::from_fn(|r| REF_FRAME_HITS[r].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Reads [`INTER_TX_SPLIT_HITS`] and zeroes it.
 #[cfg(test)]
 pub(crate) fn take_inter_tx_split_hits() -> [usize; 2] {
@@ -4555,6 +4569,12 @@ pub(crate) fn encode_inter_frame(
         .filter(|b| b.inter.is_some())
         .count() as f64
         / modes.len() as f64;
+    for block in blocks.iter().flat_map(Quadrant::blocks) {
+        if let Some(info) = block.inter {
+            let r = (info.ref_frame as usize).min(7);
+            REF_FRAME_HITS[r].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits(&blocks, base_q_idx));
     // This frame's header leaves `disable_frame_end_update_cdf` off, so it
@@ -7524,6 +7544,88 @@ mod tests {
         (ladder, wall)
     }
 
+    /// The [`crate::encoder::Pyramid`] this run's ladder is coded under, from
+    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]`. Unset
+    /// keeps the flat one-key-then-all-inter ladder the baseline was measured
+    /// on, so the gate's default recipe is unchanged.
+    fn pyramid_from_env() -> Option<crate::encoder::Pyramid> {
+        let spec = std::env::var("EC_AV1_PYRAMID").ok()?;
+        let mut f = spec.split(':');
+        let mini_gop = f.next()?.parse().ok()?;
+        let d = crate::encoder::Pyramid::default();
+        Some(crate::encoder::Pyramid {
+            mini_gop,
+            arf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.arf_q_offset),
+            leaf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.leaf_q_offset),
+        })
+    }
+
+    /// [`our_ladder`] through the streaming facade with a coding pyramid: the
+    /// four points are the same `base_q_idx` ladder, but each stream is
+    /// reordered (hidden `ALTREF` first, `show_existing_frame` last per
+    /// group) and each level is coded at its own quantizer offset. Returns
+    /// the ladder, the wall, and — per pyramid level over the whole ladder —
+    /// how many frames and how many bytes it spent.
+    fn our_ladder_pyramid(
+        source: &[Picture],
+        width: usize,
+        height: usize,
+        pyramid: crate::encoder::Pyramid,
+    ) -> (Vec<(f64, f64)>, f64, [usize; 4], [usize; 4]) {
+        use crate::encoder::{Av1Encoder, Colour, EncoderConfig, Level};
+        let slot = |l: Level| match l {
+            Level::Key => 0,
+            Level::Arf => 1,
+            Level::Leaf => 2,
+            Level::ShowExisting => 3,
+        };
+        let mut ladder = Vec::new();
+        let mut wall = 0.0;
+        let (mut counts, mut bytes) = ([0usize; 4], [0usize; 4]);
+        for &q in &[150u8, 120, 90, 60] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: q,
+                gop: source.len(),
+                colour: Colour::Unspecified,
+            };
+            let start = std::time::Instant::now();
+            let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
+            let mut packets = Vec::new();
+            for picture in source {
+                packets.extend(enc.encode_frames(picture).unwrap());
+            }
+            packets.extend(enc.flush().unwrap());
+            wall += start.elapsed().as_secs_f64();
+            let mut stream = Vec::new();
+            for p in &packets {
+                counts[slot(p.level)] += 1;
+                bytes[slot(p.level)] += p.data.len();
+                stream.extend_from_slice(&p.data);
+            }
+            // [[gate-blind-to-hidden-frames]]: a reordered stream is only
+            // correct if the DISPLAY-order output still has one frame per
+            // source picture, in the right order -- checked against our own
+            // decoder as well as ffmpeg's, both below.
+            let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+            assert_eq!(ours.len(), source.len(), "q={q}: our display-order count");
+            let decoded = ffmpeg_decode_sequence(&stream, width, height, source.len());
+            for (i, (d, o)) in decoded.iter().zip(&ours).enumerate() {
+                assert!(d.y == o.y, "q={q} display frame {i}: ffmpeg differs from our decoder");
+            }
+            let mean: f64 = decoded
+                .iter()
+                .zip(source)
+                .map(|(d, s)| psnr_all(d, s))
+                .sum::<f64>()
+                / source.len() as f64;
+            ladder.push((mean, (stream.len() as f64).log10()));
+        }
+        ladder.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (ladder, wall, counts, bytes)
+    }
+
     /// Byte-exactness gate for encoder work that is meant to change only
     /// how long the encoder takes.
     ///
@@ -7726,7 +7828,20 @@ mod tests {
             let _ = crate::tile::take_inter_mode_hits();
             let _ = crate::tile::take_drl_hits();
             let _ = crate::tile::take_ref_hits();
-            let (ours, ours_wall) = our_ladder(&source, width, height, fctx);
+            let (ours, ours_wall) = match pyramid_from_env() {
+                None => our_ladder(&source, width, height, fctx),
+                Some(pyramid) => {
+                    let (ladder, wall, counts, bytes) =
+                        our_ladder_pyramid(&source, width, height, pyramid);
+                    eprintln!(
+                        "{name}: pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
+                         show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
+                        counts[0], counts[1], counts[2], counts[3],
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                    );
+                    (ladder, wall)
+                }
+            };
             // How often the inter split actually fired over this clip's four
             // encodes, against the whole 32x32 that was the only outcome
             // before (gate-blind-to-feature).
