@@ -3058,7 +3058,9 @@ fn write_intrabc_block(
     // largest transform (`side.min(64)`, decode.rs's `intrabc_skip_tx` arm)
     // for the deblock grid, and `skip` itself for the next block's skip
     // context.
-    let empty: [Vec<i32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    // One zero level per plane: `neighbour_state` reads `grid[0]` for the DC
+    // sign vote, and a skipped block leaves every context cleared.
+    let empty: [Vec<i32>; 3] = [vec![0], vec![0], vec![0]];
     for cell in 0..(side / SUB).max(1) {
         let (r, c) = (mi.0 / (SUB / MI), mi.1 / (SUB / MI));
         neighbours.above_mode[c + cell] = DC_PRED;
