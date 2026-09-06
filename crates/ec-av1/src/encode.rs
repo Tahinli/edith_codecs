@@ -1210,6 +1210,40 @@ impl Plane<'_> {
     /// spec 9.3, [`crate::decode::default_intra_tx_type`]). Luma keeps
     /// `DCT_DCT`, which is the one type this writer's `tx_type` symbol names.
     #[allow(clippy::too_many_arguments)]
+    /// Sum of absolute differences between the source block at `(x, y)` and a
+    /// `side x side` prediction, as the whole number it is.
+    ///
+    /// Bit-identical to the `f64` accumulation it replaces: every partial sum
+    /// is an integer below `255 * 64 * 64` (under 2^21), which `f64` holds
+    /// exactly, so no add here rounds and the order of the adds cannot change
+    /// the result. Dropping the per-pixel `i / side` and `i % side` -- an
+    /// integer division per sample -- is what lets the row walk vectorize.
+    fn block_sad(&self, x: usize, y: usize, side: usize, prediction: &[u8]) -> f64 {
+        let mut sad = 0u32;
+        for row in 0..side {
+            let source = &self.source[(y + row) * self.width + x..][..side];
+            for (&s, &p) in source.iter().zip(&prediction[row * side..][..side]) {
+                sad += u32::from(s.abs_diff(p));
+            }
+        }
+        f64::from(sad)
+    }
+
+    /// Squared error between the source block at `(x, y)` and a reconstruction
+    /// of it. Exact for the same reason [`Self::block_sad`] is: the largest
+    /// total is `255^2 * 64 * 64`, under 2^28.
+    fn block_sse(&self, x: usize, y: usize, side: usize, reconstruction: &[u8]) -> f64 {
+        let mut sse = 0u64;
+        for row in 0..side {
+            let source = &self.source[(y + row) * self.width + x..][..side];
+            for (&s, &r) in source.iter().zip(&reconstruction[row * side..][..side]) {
+                let d = u32::from(s.abs_diff(r));
+                sse += u64::from(d * d);
+            }
+        }
+        sse as f64
+    }
+
     fn trial_typed(
         &self,
         at: At,
@@ -1259,19 +1293,12 @@ impl Plane<'_> {
         #[cfg(test)]
         stage_add(2, t.elapsed());
 
-        let mut reconstruction = vec![0u8; side * side];
-        let mut sse = 0.0;
-        for row in 0..side {
-            for col in 0..side {
-                let i = row * side + col;
-                let sample = (i32::from(prediction[i]) + coded[i]).clamp(0, 255) as u8;
-                reconstruction[i] = sample;
-                let error = f64::from(
-                    i32::from(self.source[(y + row) * self.width + x + col]) - i32::from(sample),
-                );
-                sse += error * error;
-            }
-        }
+        let reconstruction: Vec<u8> = prediction
+            .iter()
+            .zip(&coded)
+            .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
+            .collect();
+        let sse = self.block_sse(x, y, side, &reconstruction);
         // What the levels cost is priced through the same CDFs the tile writer
         // will code them with, so the search ranks modes -- and the partition
         // trial ranks trees -- by the bits they actually spend.
@@ -1319,16 +1346,7 @@ impl Plane<'_> {
         set: TxbSet,
     ) -> Trial {
         if skip {
-            let mut sse = 0.0;
-            for row in 0..side {
-                for col in 0..side {
-                    let error = f64::from(
-                        i32::from(self.source[(y + row) * self.width + x + col])
-                            - i32::from(prediction[row * side + col]),
-                    );
-                    sse += error * error;
-                }
-            }
+            let sse = self.block_sse(x, y, side, prediction);
             return Trial {
                 levels: vec![0i32; side * side],
                 reconstruction: prediction.to_vec(),
@@ -1351,19 +1369,12 @@ impl Plane<'_> {
         let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
         #[cfg(test)]
         stage_add(2, t.elapsed());
-        let mut reconstruction = vec![0u8; side * side];
-        let mut sse = 0.0;
-        for row in 0..side {
-            for col in 0..side {
-                let i = row * side + col;
-                let sample = (i32::from(prediction[i]) + coded[i]).clamp(0, 255) as u8;
-                reconstruction[i] = sample;
-                let error = f64::from(
-                    i32::from(self.source[(y + row) * self.width + x + col]) - i32::from(sample),
-                );
-                sse += error * error;
-            }
-        }
+        let reconstruction: Vec<u8> = prediction
+            .iter()
+            .zip(&coded)
+            .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
+            .collect();
+        let sse = self.block_sse(x, y, side, &reconstruction);
         #[cfg(test)]
         let t = std::time::Instant::now();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
@@ -1500,16 +1511,7 @@ impl Plane<'_> {
                     false,
                     &mut prediction, fctx,
                 );
-                let sad: f64 = (0..side * side)
-                    .map(|i| {
-                        let (row, col) = (i / side, i % side);
-                        f64::from(
-                            (i32::from(self.source[(y + row) * self.width + x + col])
-                                - i32::from(prediction[i]))
-                            .abs(),
-                        )
-                    })
-                    .sum();
+                let sad = self.block_sad(x, y, side, &prediction);
                 (sad + lambda * mode_bits[usize::from(mode)], mode)
             })
             .collect()
@@ -1557,17 +1559,8 @@ impl Plane<'_> {
                     false,
                     &mut prediction, fctx,
                 );
-                let sad: f64 = if want_sad {
-                    (0..side * side)
-                        .map(|i| {
-                            let (row, col) = (i / side, i % side);
-                            f64::from(
-                                (i32::from(self.source[(y + row) * self.width + x + col])
-                                    - i32::from(prediction[i]))
-                                .abs(),
-                            )
-                        })
-                        .sum()
+                let sad = if want_sad {
+                    self.block_sad(x, y, side, &prediction)
                 } else {
                     0.0
                 };

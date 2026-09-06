@@ -1442,6 +1442,34 @@ fn axis_basis(n: usize, kind: TxType1d) -> &'static [f64] {
     cache[k][idx].get_or_init(|| build_axis_basis(n, kind))
 }
 
+/// [`axis_basis`] transposed: `[i * n + u]` is basis function `u`'s sample
+/// `i`. Both of [`forward_transform_2d_typed`]'s passes sum over the sample
+/// index and are independent across the basis index, so this layout makes the
+/// basis index the contiguous one and the two matmuls vectorize -- without
+/// touching either sum's order, which is what keeps the levels bit-identical
+/// to the strided `.map().sum()` this replaced.
+fn axis_basis_t(n: usize, kind: TxType1d) -> &'static [f64] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<[[OnceLock<Vec<f64>>; 5]; 3]> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
+    let k = match kind {
+        TxType1d::Dct => 0,
+        TxType1d::Adst => 1,
+        TxType1d::Identity => 2,
+    };
+    let idx = (n.trailing_zeros() as usize).saturating_sub(2);
+    cache[k][idx].get_or_init(|| {
+        let basis = axis_basis(n, kind);
+        let mut t = vec![0.0f64; n * n];
+        for u in 0..n {
+            for i in 0..n {
+                t[i * n + u] = basis[u * n + i];
+            }
+        }
+        t
+    })
+}
+
 /// [`forward_transform_2d`] for a block whose transform type is not
 /// `DCT_DCT` -- what an intra chroma block coded in a non-`DC_PRED` mode
 /// gets, since chroma never codes a `tx_type` symbol and the decoder derives
@@ -1461,8 +1489,14 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
         "a flipped ADST needs its residual mirrored before this basis applies"
     );
     let (row_kind, col_kind) = tx_type.axes();
-    let (hb, vb) = (axis_basis(side, row_kind), axis_basis(side, col_kind));
+    let (hb, vb) = (axis_basis_t(side, row_kind), axis_basis_t(side, col_kind));
     let mut rows = vec![0.0f64; side * side];
+    // Which rows of `rows` the pass below actually fills; the column pass
+    // walks only those. A row of `+0.0` contributes `0.0 * b` terms, which
+    // are `+-0.0`, and adding either to a running sum that is never `-0.0`
+    // (it starts at `+0.0` and `x + -x` is `+0.0`) leaves it unchanged.
+    let mut filled: [usize; 64] = [0; 64];
+    let mut nfilled = 0usize;
     // Zero in, zero out, and `rows` is already zero here -- the skip
     // [`forward_rows`] takes for the same reason, which this path was
     // missing: a census of the BD gate's own ladder (lane-av1fwd) found 68%
@@ -1476,12 +1510,16 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
             continue;
         }
         any = true;
-        for v in 0..side {
-            rows[i * side + v] = source
-                .iter()
-                .zip(&hb[v * side..][..side])
-                .map(|(&r, &b)| f64::from(r) * b)
-                .sum();
+        filled[nfilled] = i;
+        nfilled += 1;
+        let out = &mut rows[i * side..][..side];
+        // `k` ascending is the term order the strided `.map().sum()` had, so
+        // every lane's partial sums are the same values in the same order.
+        for (k, &r) in source.iter().enumerate() {
+            let r = f64::from(r);
+            for (o, &b) in out.iter_mut().zip(&hb[k * side..][..side]) {
+                *o += r * b;
+            }
         }
     }
     if !any {
@@ -1489,10 +1527,15 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
     }
     let mut out = vec![0.0f64; side * side];
     for u in 0..side {
-        let column = &vb[u * side..][..side];
-        for v in 0..side {
-            let sum: f64 = (0..side).map(|i| rows[i * side + v] * column[i]).sum();
-            out[u * side + v] = INVERSE_GAIN_RECIPROCAL * sum;
+        let acc = &mut out[u * side..][..side];
+        for &i in &filled[..nfilled] {
+            let c = vb[i * side + u];
+            for (a, &r) in acc.iter_mut().zip(&rows[i * side..][..side]) {
+                *a += r * c;
+            }
+        }
+        for a in acc.iter_mut() {
+            *a *= INVERSE_GAIN_RECIPROCAL;
         }
     }
     out
