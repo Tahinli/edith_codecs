@@ -78,10 +78,6 @@ const INV_TABLE: [u8; 128] = [
 /// One forward-MDCT plan, the exact adjoint of the decoder's `ImdctPlan`:
 /// window-fold, pre-rotation, an `l/2`-point FFT and post-rotation, scaled by
 /// `2/l` so that decode(encode(x)) reconstructs at unit gain.
-/// libopus `opus_encoder.c`'s `delay_compensation = Fs/250`: how far behind
-/// the API frame the CELT analysis window sits, in 48 kHz samples.
-const CELT_DELAY_48K: usize = 192;
-
 #[derive(Clone, Debug)]
 struct MdctPlan {
     l: usize,
@@ -386,11 +382,6 @@ pub struct CeltEncoder {
     plans: Vec<MdctPlan>,
     /// Preemphasised history, `channels * OVERLAP`.
     in_mem: Vec<f32>,
-    /// libopus `opus_encoder.c`'s `delay_buffer`: the CELT layer is fed the
-    /// input delayed by `delay_compensation = Fs/250` (192 samples at 48 kHz),
-    /// so its analysis window sits 4 ms behind the API frame. Interleaved,
-    /// `CELT_DELAY_48K / upsample` samples per channel.
-    delay_buf: Vec<f32>,
     preemph_mem: [f32; 2],
     /// Coarse-energy prediction state, `2 * NB_BANDS`.
     old_band_e: Vec<f32>,
@@ -459,7 +450,6 @@ impl CeltEncoder {
             window: celt::overlap_window(),
             plans: (0..4).map(|lm| MdctPlan::new(SHORT_MDCT << lm)).collect(),
             in_mem: vec![0.0; channels * OVERLAP],
-            delay_buf: vec![0.0; channels * CELT_DELAY_48K],
             preemph_mem: [0.0; 2],
             old_band_e: vec![0.0; 2 * NB_BANDS],
             delayed_intra: 1.0,
@@ -519,7 +509,6 @@ impl CeltEncoder {
     /// Drops all inter-frame state.
     pub fn reset(&mut self) {
         self.in_mem.fill(0.0);
-        self.delay_buf.fill(0.0);
         self.preemph_mem = [0.0; 2];
         self.old_band_e.fill(0.0);
         self.delayed_intra = 1.0;
@@ -610,29 +599,20 @@ impl CeltEncoder {
         // --- Preemphasis ----------------------------------------------------
         let stride = n + OVERLAP;
         let mut silence = true;
-        let mut delay = std::mem::take(&mut self.delay_buf);
-        let mut next_delay = [0.0f32; 2 * CELT_DELAY_48K];
         for ch in 0..c {
             let base = ch * stride;
             self.in_buf[base..base + OVERLAP]
                 .copy_from_slice(&self.in_mem[ch * OVERLAP..(ch + 1) * OVERLAP]);
             let mut mem = self.preemph_mem[ch];
             let up = self.upsample;
-            // `src(j)`: input sample `j` of the delayed stream libopus's CELT
-            // layer sees -- the `d` samples held over from the previous call
-            // first, then this frame's.
-            let d = CELT_DELAY_48K / up;
-            let src = |j: usize| {
-                if j < d { delay[j * c + ch] } else { pcm[(j - d) * c + ch] }
-            };
             for i in 0..n {
                 // Zero-stuffing to 48 kHz: the images above the input's own
                 // Nyquist are never coded (the caller caps `end`) and the
                 // decoder's decimation drops them.
                 let mut x = if up == 1 {
-                    src(i) * SIG_SCALE
+                    pcm[i * c + ch] * SIG_SCALE
                 } else if i.is_multiple_of(up) {
-                    src(i / up) * SIG_SCALE * up as f32
+                    pcm[(i / up) * c + ch] * SIG_SCALE * up as f32
                 } else {
                     0.0
                 };
@@ -646,15 +626,9 @@ impl CeltEncoder {
                 silence &= v == 0.0;
             }
             self.preemph_mem[ch] = mem;
-            for k in 0..d {
-                next_delay[k * c + ch] = src(in_n + k);
-            }
             self.in_mem[ch * OVERLAP..(ch + 1) * OVERLAP]
                 .copy_from_slice(&self.in_buf[base + n..base + n + OVERLAP]);
         }
-        delay[..c * (CELT_DELAY_48K / self.upsample)]
-            .copy_from_slice(&next_delay[..c * (CELT_DELAY_48K / self.upsample)]);
-        self.delay_buf = delay;
 
         // --- Silence flag (first symbol of the frame) -----------------------
         // Only exists when CELT opens the stream (decoder: `tell == 1`); under
@@ -737,12 +711,14 @@ impl CeltEncoder {
             }
         }
 
+        // `EC_OPUS_X_DEBUG`: the analysis chain stage by stage for a bisect
+        // against libopus on the same PCM -- the pre-emphasised window, the
+        // MDCT output, the band energies and the normalised `X`.
         if std::env::var_os("EC_OPUS_X_DEBUG").is_some() {
             let f: Vec<String> =
                 self.in_buf[OVERLAP..OVERLAP + 16].iter().map(|v| format!("{v:.5}")).collect();
             let e: f64 = self.in_buf[..n + OVERLAP].iter().map(|v| *v as f64 * *v as f64).sum();
-            let ovl: Vec<String> =
-                self.in_buf[..4].iter().map(|v| format!("{v:.5}")).collect();
+            let ovl: Vec<String> = self.in_buf[..4].iter().map(|v| format!("{v:.5}")).collect();
             eprintln!("XPRE {} | E {e:.6e} ovl {}", f.join(" "), ovl.join(" "));
             let fr: Vec<String> = self.freq[..16].iter().map(|v| format!("{v:.5}")).collect();
             let be: Vec<String> = self.band_e[..8].iter().map(|v| format!("{v:.5}")).collect();
