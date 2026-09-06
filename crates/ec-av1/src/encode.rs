@@ -954,33 +954,56 @@ fn seq_screen() -> bool {
 
 /// How many distinct colours a 16x16 luma block may hold and still count as
 /// screen content ([`screen_content`]), `EC_AV1_SCREEN_COLORS`. libaom's own
-/// `av1_set_screen_content_options` bound is 4, which separates NOTHING on a
-/// real (lossily coded, so noisy) desktop capture: `probe_screen_detect`
-/// measures the share of 16x16 blocks under each bound on the gate's own
-/// three clips, and only at 32 do the populations part -- film 20.3..21.9%,
-/// his OBS capture 51.1..51.5%.
+/// `av1_set_screen_content_options` bound is 4, which separates nothing on
+/// lossily coded (so noisy) material: `probe_screen_detect` sweeps N against
+/// the variance floor below on the five gate clips at BOTH the native crop
+/// and the 640x384 gate's scale, and 16 colours / var > 16 / an eighth of
+/// the frame is the widest-margin split of those ten rows -- every
+/// non-screen row at most 9.6% of blocks (bars 3.6/2.3 native, 9.6/9.5
+/// scaled; film A 0.6/0.3, film B 0.5/0.9) against the OBS capture's 23.6%
+/// native and 17.9% scaled.
 fn screen_colors() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("EC_AV1_SCREEN_COLORS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(32)
+            .unwrap_or(16)
     })
 }
 
 /// The reciprocal of the frame area those blocks must cover, in tenths --
-/// libaom's own `counts * blk_h * blk_w * 10 > width * height` is 10 (one
-/// tenth). 3 (a third) is the midpoint of the two populations
-/// `probe_screen_detect` measured at the colour bound above.
-/// `EC_AV1_SCREEN_PCT`.
+/// libaom's own `counts * blk_h * blk_w * 10 > width * height` is a tenth;
+/// 8 (an eighth) is the midpoint of the two populations
+/// `probe_screen_detect` measures at the colour bound and variance floor
+/// around it. `EC_AV1_SCREEN_PCT`.
 fn screen_pct() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("EC_AV1_SCREEN_PCT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3)
+            .unwrap_or(10)
+    })
+}
+
+/// The per-pixel variance a few-colour block must clear before it counts as
+/// screen content, `EC_AV1_SCREEN_VAR`. libaom keeps the same term (its
+/// `counts_2`/`var_thresh` in `av1_set_screen_content_options`); without it
+/// a smooth dark film frame is all few-colour blocks and reads as a desktop
+/// capture -- which is exactly what this detector did until 2026-09-07, when
+/// it called BOTH real films screen content on 48/48 frames, priced every
+/// coefficient against the default CDFs and ran the palette search over
+/// film. `probe_screen_detect`: at 16 colours the floor takes both films
+/// from 46.2/52.5% of blocks to 0.6/0.5% and the capture only from 29.9% to
+/// 23.6%.
+fn screen_var() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_SCREEN_VAR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
     })
 }
 
@@ -992,7 +1015,8 @@ pub(crate) static SCREEN_FRAMES: [std::sync::atomic::AtomicUsize; 2] =
 /// `av1_set_screen_content_options` (av1/encoder/encoder.c), luma only: count
 /// the distinct colours of every 16x16 block and turn the screen-content
 /// tools on when the blocks holding between 2 and [`screen_colors`] of them
-/// cover more than a [`screen_pct`]th of the frame. `width` is the plane's
+/// AND clearing [`screen_var`] cover more than a [`screen_pct`]th of the
+/// frame. `width` is the plane's
 /// stride, `true_*` the frame's real (decodable) extent.
 fn screen_content(y: &[u8], width: usize, true_width: usize, true_height: usize) -> bool {
     if let Some(forced) = SCREEN_FORCE.with(std::cell::Cell::get) {
@@ -1004,23 +1028,28 @@ fn screen_content(y: &[u8], width: usize, true_width: usize, true_height: usize)
         SCREEN_FRAMES[usize::from(on)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return on;
     }
-    let (blk, limit) = (16usize, screen_colors());
+    let (blk, limit, floor) = (16usize, screen_colors(), screen_var());
     let mut counted = 0usize;
     for by in (0..true_height).step_by(blk) {
         for bx in (0..true_width).step_by(blk) {
             let (h, w) = ((true_height - by).min(blk), (true_width - bx).min(blk));
             let mut seen = [false; 256];
-            let mut colors = 0usize;
+            let (mut colors, mut sum, mut sq) = (0usize, 0u64, 0u64);
             for row in 0..h {
                 for col in 0..w {
-                    let v = usize::from(y[(by + row) * width + bx + col]);
-                    if !seen[v] {
-                        seen[v] = true;
+                    let v = y[(by + row) * width + bx + col];
+                    sum += u64::from(v);
+                    sq += u64::from(v) * u64::from(v);
+                    if !seen[usize::from(v)] {
+                        seen[usize::from(v)] = true;
                         colors += 1;
                     }
                 }
             }
-            if colors > 1 && colors <= limit {
+            // Per-pixel variance over the block's real (edge-clipped) extent.
+            let n = (h * w) as u64;
+            let var = (sq - sum * sum / n) / n;
+            if colors > 1 && colors <= limit && var > floor {
                 counted += 1;
             }
         }
@@ -12408,68 +12437,90 @@ mod tests {
         }
     }
 
-     /// The sweep behind [`screen_content`]'s two constants
-    /// (`unswept-decision-constants`): the share of 16x16 luma blocks with at
-    /// most N distinct colours, per gate clip, at the size the gate codes.
+    /// The sweep behind [`screen_content`]'s constants
+    /// (`unswept-decision-constants`), on the SAME five clips
+    /// [`bd_rate_screen_native`] keeps off (`native_gate_clips`) and at the
+    /// same native crop: for each colour bound N the share of 16x16 luma
+    /// blocks with 2..=N distinct colours, and the share of those whose
+    /// per-pixel variance also clears a floor V -- libaom's
+    /// `av1_set_screen_content_options` counts the variance-cleared blocks
+    /// too (its `counts_2`, which gates intrabc), and without that term a
+    /// smooth dark film frame reads as screen content.
     /// `cargo test -p ec-av1 --release --lib -- --ignored probe_screen_detect --nocapture`
     #[test]
     #[ignore = "reads the real library"]
     fn probe_screen_detect() {
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
-        let mut clips: Vec<(String, std::path::PathBuf)> = Vec::new();
-        for name in ["h264-1080p-23.976-8bit.mp4", "h264-2160p-23.976-8bit.mp4"] {
-            let path = fixtures.join("video").join(name);
-            if path.exists() {
-                clips.push((name.to_string(), path));
-            }
+        if !have_ffmpeg() {
+            eprintln!("SKIP probe_screen_detect: no ffmpeg");
+            return;
         }
-        if let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"))
-            && let Some(p) = manifest
-                .lines()
-                .skip(1)
-                .filter_map(|l| l.split('\t').next())
-                .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
-        {
-            clips.push(("screen".to_string(), std::path::PathBuf::from(p)));
-        }
-        let (width, height) = (640usize, 384usize);
-        for (name, path) in &clips {
-            let frames = clip_frames(path.to_str().unwrap(), "0", width, height, 4);
-            for (f, picture) in frames.iter().enumerate() {
+        let limits = [4usize, 8, 16, 32, 64, 128];
+        let floors = [0u64, 4, 16, 64, 256];
+        // The census of one clip at one size: mean share, over the frames, of
+        // 16x16 blocks with 2..=N colours whose per-pixel variance is > V.
+        let census = |label: &str, frames: &[Picture], cw: usize, ch: usize| {
+            let mut acc = [[0f64; 5]; 6];
+            for picture in frames {
                 let y: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
-                let mut hist = [0usize; 257];
+                let mut hit = [[0usize; 5]; 6];
                 let mut blocks = 0usize;
-                for by in (0..height).step_by(16) {
-                    for bx in (0..width).step_by(16) {
+                for by in (0..ch).step_by(16) {
+                    for bx in (0..cw).step_by(16) {
                         let mut seen = [false; 256];
-                        let mut colors = 0usize;
+                        let (mut colors, mut sum, mut sq) = (0usize, 0u64, 0u64);
                         for row in 0..16 {
                             for col in 0..16 {
-                                let v = usize::from(y[(by + row) * width + bx + col]);
-                                if !seen[v] {
-                                    seen[v] = true;
+                                let v = y[(by + row) * cw + bx + col];
+                                sum += u64::from(v);
+                                sq += u64::from(v) * u64::from(v);
+                                if !seen[usize::from(v)] {
+                                    seen[usize::from(v)] = true;
                                     colors += 1;
                                 }
                             }
                         }
-                        hist[colors] += 1;
+                        let var = (sq - sum * sum / 256) / 256;
                         blocks += 1;
+                        for (li, &limit) in limits.iter().enumerate() {
+                            if colors > 1 && colors <= limit {
+                                for (fi, &floor) in floors.iter().enumerate() {
+                                    hit[li][fi] += usize::from(var > floor);
+                                }
+                            }
+                        }
                     }
                 }
-                let share = |limit: usize| {
-                    100.0 * hist[2..=limit.min(256)].iter().sum::<usize>() as f64
-                        / blocks.max(1) as f64
-                };
+                for li in 0..6 {
+                    for fi in 0..5 {
+                        acc[li][fi] += 100.0 * hit[li][fi] as f64 / blocks.max(1) as f64;
+                    }
+                }
+            }
+            let n = frames.len().max(1) as f64;
+            eprintln!("{label} {cw}x{ch}, {} frames -- share of 16x16 blocks with 2..=N colours and per-pixel var > V:", frames.len());
+            eprintln!("  N \\ V |{}", floors.iter().map(|f| format!("{f:>8}")).collect::<String>());
+            for (li, &limit) in limits.iter().enumerate() {
                 eprintln!(
-                    "{name} frame {f}: <=4 {:.1}%  <=8 {:.1}%  <=16 {:.1}%  <=32 {:.1}%  <=64 {:.1}%  <=128 {:.1}%",
-                    share(4),
-                    share(8),
-                    share(16),
-                    share(32),
-                    share(64),
-                    share(128),
+                    "  {limit:>5} |{}",
+                    (0..5).map(|fi| format!("{:>7.1}%", acc[li][fi] / n)).collect::<String>()
                 );
             }
+        };
+        for (name, path, seek) in native_gate_clips() {
+            let Some((nw, nh)) = probe_dims(&path) else {
+                eprintln!("SKIP {name}: ffprobe gave no size");
+                continue;
+            };
+            let cw = nw.min(1920) / 128 * 128;
+            let ch = nh.min(1024) / 128 * 128;
+            let (x, y0) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
+            let frames = clip_frames_vf(&path, &seek, &format!("crop={cw}:{ch}:{x}:{y0}"), cw, ch, 12);
+            census(&name, &frames, cw, ch);
+            // The 640x384 gate scales instead of cropping, and the scaling
+            // changes the census (bars smooth out): the constants have to
+            // separate at BOTH sizes.
+            let small = clip_frames(&path, &seek, 640, 384, 12);
+            census(&name, &small, 640, 384);
         }
     }
 
@@ -12932,56 +12983,11 @@ mod tests {
         Some((f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?))
     }
 
-    /// The NATIVE-resolution arm of the BD gate (all three clips). The default gate
-    /// downscales the OBS capture to 640x384, which destroys exactly the
-    /// pixel-identical 16x16 repeats intrabc and (part of) the palette exist
-    /// for (class `gate-recipe-confound`), so every screen-tool decision taken
-    /// on that recipe is taken on content the tool cannot serve. This arm
-    /// crops -- never scales -- a superblock-aligned window out of the middle
-    /// of the capture at its own resolution (at most 1920x1024, so the wall
-    /// stays in the minutes) and runs the same 12-frame, four-quantizer
-    /// ladder against libaom `cpu-used 6` and rav1e `speed=6`, one tile, one
-    /// thread, with the same three-way (encoder / ffmpeg / our decoder)
-    /// sample-exactness assertion `our_ladder` makes.
-    ///
-    /// It is its own `--ignored` test so the default gate's wall does not
-    /// grow. Every variant is an environment knob, and each of those is a
-    /// `OnceLock` read once per process, so a variant is a separate run:
-    ///
-    ///     cargo test -p ec-av1 --release --lib -- --ignored \
-    ///         bd_rate_screen_native --nocapture           # baseline
-    ///     EC_AV1_INTRABC=1 ... same command                # intra block copy
-    ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
-    ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
-    ///     EC_AV1_PYRAMID=4:-16:8 ... same command          # coding pyramid
-    ///
-    /// Under `EC_AV1_PYRAMID` this arm codes its ladder through the streaming
-    /// facade ([`our_ladder_pyramid`]), which exposes no per-packet
-    /// reconstruction: that path asserts ffmpeg's decode against our own
-    /// decoder on all three planes in display order, and prints the per-level
-    /// frame and byte census.
-    ///
-    /// WHICH ROWS ARE REAL CONTENT: the `bars 1080p` / `bars 2160p` rows are
-    /// the repo fixtures `scripts/gen-fixtures.sh` builds with ffmpeg
-    /// `testsrc2` -- COLOUR BARS, ~90% of whose 16x16 cells have no intra
-    /// cost -- so every "film" column in the historical tables of this file
-    /// is that generator, not film. The real content is `film A`, `film B`
-    /// (native crops out of the two AV1 films the real-library manifest
-    /// names, at a pinned seek; added 2026-09-07) and the screen capture. A
-    /// decision only the bars rows support is not supported.
-    ///
-    /// All five gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
-    /// `EC_AV1_NATIVE_FILM4K=1` and `EC_AV1_NATIVE_SCREEN=1` select a subset:
-    /// setting any one of them keeps only the selected rows (the two 1080p
-    /// rows, the two 2160p rows, the capture row respectively). A missing
-    /// real film SKIPs its row; it never fails the gate.
-    #[test]
-    #[ignore = "the native-resolution BD arm: minutes per row, needs ffmpeg"]
-    fn bd_rate_screen_native() {
-        if !have_ffmpeg() {
-            eprintln!("SKIP bd_rate_screen_native: no ffmpeg");
-            return;
-        }
+    /// The rows of [`bd_rate_screen_native`] -- (label, path, seek) -- shared
+    /// with `probe_screen_detect` so the detector sweep measures exactly the
+    /// clips the keep table is read off. Selector env vars as documented on
+    /// the gate; a missing clip prints a SKIP and drops its row.
+    fn native_gate_clips() -> Vec<(String, String, String)> {
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         let on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
         let (film, film4k, screen) = (
@@ -13062,6 +13068,79 @@ mod tests {
                 Err(e) => eprintln!("SKIP screen capture: no real-library manifest ({e})"),
             }
         }
+        clips
+    }
+
+    /// The NATIVE-resolution arm of the BD gate (all three clips). The default gate
+    /// downscales the OBS capture to 640x384, which destroys exactly the
+    /// pixel-identical 16x16 repeats intrabc and (part of) the palette exist
+    /// for (class `gate-recipe-confound`), so every screen-tool decision taken
+    /// on that recipe is taken on content the tool cannot serve. This arm
+    /// crops -- never scales -- a superblock-aligned window out of the middle
+    /// of the capture at its own resolution (at most 1920x1024, so the wall
+    /// stays in the minutes) and runs the same 12-frame, four-quantizer
+    /// ladder against libaom `cpu-used 6` and rav1e `speed=6`, one tile, one
+    /// thread, with the same three-way (encoder / ffmpeg / our decoder)
+    /// sample-exactness assertion `our_ladder` makes.
+    ///
+    /// It is its own `--ignored` test so the default gate's wall does not
+    /// grow. Every variant is an environment knob, and each of those is a
+    /// `OnceLock` read once per process, so a variant is a separate run:
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         bd_rate_screen_native --nocapture           # baseline
+    ///     EC_AV1_INTRABC=1 ... same command                # intra block copy
+    ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
+    ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
+    ///     EC_AV1_PYRAMID=4:-16:8 ... same command          # coding pyramid
+    ///
+    /// Under `EC_AV1_PYRAMID` this arm codes its ladder through the streaming
+    /// facade ([`our_ladder_pyramid`]), which exposes no per-packet
+    /// reconstruction: that path asserts ffmpeg's decode against our own
+    /// decoder on all three planes in display order, and prints the per-level
+    /// frame and byte census.
+    ///
+    /// WHICH ROWS ARE REAL CONTENT: the `bars 1080p` / `bars 2160p` rows are
+    /// the repo fixtures `scripts/gen-fixtures.sh` builds with ffmpeg
+    /// `testsrc2` -- COLOUR BARS, ~90% of whose 16x16 cells have no intra
+    /// cost -- so every "film" column in the historical tables of this file
+    /// is that generator, not film. The real content is `film A`, `film B`
+    /// (native crops out of the two AV1 films the real-library manifest
+    /// names, at a pinned seek; added 2026-09-07) and the screen capture. A
+    /// decision only the bars rows support is not supported.
+    ///
+    /// Measured 2026-09-07, the five rows before and after the screen
+    /// detector grew libaom's variance term ([`screen_var`]) -- before it,
+    /// BOTH real films were classified as screen content on 48/48 frames, so
+    /// their coefficients were priced against the DEFAULT CDFs and the
+    /// palette search ran over film; after, both are non-screen (0/48) and
+    /// the capture is unchanged at 48/48:
+    ///
+    /// | clip | vs libaom before -> after | vs rav1e before -> after | wall ours |
+    /// |---|---|---|---|
+    /// | bars 1080p | +15.6% -> +15.6% | -1.7% -> -1.7% | 37.9s |
+    /// | bars 2160p | +46.5% -> +46.5% | +18.8% -> +18.8% | 33.9s |
+    /// | film A | +69.5% -> +69.0% | +37.7% -> +37.5% | 72s -> 64.4s |
+    /// | film B | +102.4% -> +100.0% | +63.4% -> +61.5% | 72s -> 67.9s |
+    /// | screen capture | +51.0% -> +51.0% | -14.5% -> -14.5% | 27.5s |
+    ///
+    /// Both bars rows and the capture are byte-identical across that change
+    /// (their classification never moved); the palette search over film was
+    /// costing roughly a tenth of the film rows' wall.
+    ///
+    /// All five gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
+    /// `EC_AV1_NATIVE_FILM4K=1` and `EC_AV1_NATIVE_SCREEN=1` select a subset:
+    /// setting any one of them keeps only the selected rows (the two 1080p
+    /// rows, the two 2160p rows, the capture row respectively). A missing
+    /// real film SKIPs its row; it never fails the gate.
+    #[test]
+    #[ignore = "the native-resolution BD arm: minutes per row, needs ffmpeg"]
+    fn bd_rate_screen_native() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP bd_rate_screen_native: no ffmpeg");
+            return;
+        }
+        let clips = native_gate_clips();
         if clips.is_empty() {
             eprintln!("SKIP bd_rate_screen_native: no clip");
             return;
