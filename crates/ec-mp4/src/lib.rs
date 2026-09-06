@@ -16,6 +16,14 @@
 //!   an MP3 track, an `ac-3`/`ec-3`/`alac`/`Opus`/`fLaC` entry is that codec,
 //!   and an entry this build has no [`ec_core::CodecId`] for leaves its track
 //!   listed as nothing rather than decoded as something else.
+//! - **QuickTime's own sound descriptions are read as such.** A `.mov` out of
+//!   Resolve, Final Cut or `ffmpeg -f mov` states `mp4a` as a version-1 or
+//!   version-2 SoundDescription — the second one carrying its sample rate as a
+//!   double and its channel count as a 32-bit field — and keeps the `esds`
+//!   inside a `wave` box rather than directly under the entry. Both shapes give
+//!   the same codec, rate, channels and `AudioSpecificConfig` as the ISO
+//!   branding of the same stream; a reader that walks past `wave` has a silent
+//!   sound track instead.
 //! - **`esds` hands back bytes.** [`Esds::decoder_specific`] is the raw
 //!   `DecoderSpecificInfo` — an AAC track's `AudioSpecificConfig` verbatim, not
 //!   a triplet of parsed fields a caller has to reassemble.
