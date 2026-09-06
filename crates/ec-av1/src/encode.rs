@@ -9488,12 +9488,13 @@ mod tests {
         // (compound share 8.8% -> 11.5%): a compound block carries a second
         // reference tree, a compound mode symbol and -- for the half-new modes
         // -- an MV residual, none of which the coefficient sum counts.
-        // lane-av1txbits: under `EC_AV1_PRICE_FRAME_CDFS=1` this reads +32.6%
-        // instead -- pricing against the tables the frame's writer really
+        // lane-av1txbits: pricing against the tables the frame's writer really
         // starts from collapses the over-price above to nothing, so the whole
-        // remaining gap is the syntax the coefficient sum leaves out.
+        // remaining gap is the syntax the coefficient sum leaves out. That is
+        // the default on a non-screen frame since lane-av1price2 (this
+        // fixture is one), and it reads +32.6% here.
         assert!(
-            worst_under <= 0.32,
+            worst_under <= 0.34,
             "the writer spent {:.2}% more than the search priced -- more than \
              the mode/mv syntax outside the coefficient sum explains",
             worst_under * 100.0
@@ -10522,7 +10523,10 @@ mod tests {
     /// `cdef_idx` literals and per-unit loop restoration syntax are new bits
     /// in the tile) and again on lane-av1mv's merge of it: an extra
     /// reference's `NEWMV` is a coded-bits change too, judged by the BD gate
-    /// above, not by this pin.
+    /// above, not by this pin. Re-pinned on lane-av1price2: the search now
+    /// prices coefficients against the tables the frame's writer really
+    /// starts from on every non-screen frame (`tile::arm_pricing_cdfs`), a
+    /// decision change the BD gate judges.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -10544,7 +10548,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7084, 0x00bc_da74_e540_28d7), (60, 25905, 0x1623_f794_727e_0716)];
+            [(150, 7106, 0x1da4_9acd_a892_68e3), (60, 25963, 0x94df_8f46_174e_1a5e)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
