@@ -8690,7 +8690,13 @@ mod tests {
     #[test]
     fn every_frame_of_a_sequence_decodes_through_our_own_decoder() {
         let fctx = &crate::decode::FrameCtx::new();
-        let (width, height) = (128usize, 64usize);
+        // 256x128, not the 128x64 this started at: once a leaf could search
+        // its second reference (lane-av1comp4) the small card's every
+        // eligible block went to a compound winner, which commits its flat
+        // transform, and the split below stopped firing on content that
+        // still splits at every larger size ([[gate-blind-to-feature]] --
+        // the guard is right, the fixture had shrunk under it).
+        let (width, height) = (256usize, 128usize);
         let pictures: Vec<Picture> =
             (0..5).map(|i| panned_test_card(width, height, i * 3)).collect();
         let _ = take_inter_tx_split_hits();
@@ -9707,7 +9713,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7084, 0xe6a9_2f62_3855_0eee), (60, 26116, 0xa831_9866_b799_80fc)];
+            [(150, 7084, 0x00bc_da74_e540_28d7), (60, 25905, 0x1623_f794_727e_0716)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
