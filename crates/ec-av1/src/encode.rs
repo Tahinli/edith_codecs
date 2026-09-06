@@ -7071,6 +7071,46 @@ mod tests {
         (ladder, wall)
     }
 
+    /// Byte-exactness gate for encoder work that is meant to change only
+    /// how long the encoder takes.
+    ///
+    /// The BD gate above measures quality, which a speed lane can move by a
+    /// hair without failing anything; this pins the streams themselves.
+    /// Every number below was measured 2026-09-06 (lane-av1fwd) and is
+    /// identical at `a6649c4e`, the merge before that lane's three exact
+    /// speed steps.
+    #[test]
+    fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP the_encoders_own_streams_are_byte_identical_to_their_pins: no ffmpeg");
+            return;
+        }
+        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
+        if !clip.exists() {
+            eprintln!("SKIP the_encoders_own_streams_are_byte_identical_to_their_pins: no clip");
+            return;
+        }
+        let source = clip_frames(clip.to_str().unwrap(), "0", 640, 384, 4);
+        // FNV-1a over the stream: a witness that every coded bit is where it
+        // was, which a byte count alone is not.
+        let fnv = |b: &[u8]| {
+            b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &v| {
+                (h ^ u64::from(v)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        };
+        let pins: [(u8, usize, u64); 2] =
+            [(150, 7823, 0x81db_18bb_91be_0d89), (60, 28189, 0x25fb_2fce_1bd1_e000)];
+        for (q, bytes, hash) in pins {
+            let encoded = encode_sequence(&source, q, 0.5).unwrap();
+            assert_eq!(
+                (encoded.stream.len(), fnv(&encoded.stream)),
+                (bytes, hash),
+                "q={q}: the encoder's stream moved"
+            );
+        }
+    }
+
     /// A ladder is only a ladder if both axes rise together.
     fn assert_monotone(name: &str, ladder: &[(f64, f64)]) {
         assert_eq!(ladder.len(), 4, "{name}: wanted four quality points");
