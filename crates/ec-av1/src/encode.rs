@@ -39,7 +39,6 @@ use crate::quant::ac_q;
 use crate::sequence::sequence_header_obu;
 use crate::tile::{
     BlockCoeffs, Coeff, INTRA_MODE_CTX, InterInfo, InterMode, Quadrant, Superblock, partition_bits,
-    sb_coeff_inter_frame_tile,
 };
 use crate::transform::{
     TxType, dequant_and_inverse, dequant_and_inverse_typed, forward_and_quantize,
@@ -125,11 +124,31 @@ const SPLIT_INTER_8: bool = true;
 /// Whether a key frame codes `tx_mode == TxMode::Select` and searches each
 /// block's transform depth (lane-av1tx). On by default; `EC_AV1_TX_SELECT=0`
 /// turns it off for an A/B on one build.
+/// Whether an INTER frame also carries `TxMode::Select` (lane-av1tx step 2:
+/// one `txfm_split` flag per inter block, a searched `tx_depth` on every
+/// intra block inside the inter frame). OFF by default and opt-in through
+/// `EC_AV1_TX_SELECT_INTER=1`: the syntax is written but a stream carrying it
+/// is refused by dav1d and by this crate's own decoder, and the first
+/// diverging symbol was not located inside the lane's budget. Key frames are
+/// unaffected -- they are byte-exact with [`tx_select`] on.
+fn tx_select_inter() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("EC_AV1_TX_SELECT_INTER").as_deref(),
+            Ok("1") | Ok("on")
+        )
+    })
+}
+
 fn tx_select() -> bool {
-    !matches!(
-        std::env::var("EC_AV1_TX_SELECT").as_deref(),
-        Ok("0") | Ok("off")
-    )
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("EC_AV1_TX_SELECT").as_deref(),
+            Ok("0") | Ok("off")
+        )
+    })
 }
 
 fn split_inter_8() -> bool {
@@ -1930,7 +1949,16 @@ fn code_square_inter(
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (intra_block, intra_cost) =
-        code_square(luma, chroma, (x, y), side, search, mode_bits, false, fctx);
+        code_square(
+            luma,
+            chroma,
+            (x, y),
+            side,
+            search,
+            mode_bits,
+            tx_select() && tx_select_inter(),
+            fctx,
+        );
     let luma_set = if side == 8 {
         TxbSet::Luma8Inter
     } else {
@@ -3450,6 +3478,14 @@ pub(crate) fn encode_inter_frame(
         inter_frame_headers(render.0, render.1, base_q_idx, order_hint, LAST_SLOT)?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
+    // `TxMode::Select` here too: an inter block then codes one `txfm_split`
+    // flag (kept at zero -- its var-tx tree is not searched yet) and an INTRA
+    // block inside this frame codes and searches its own `tx_depth`, the same
+    // as in a key frame (`crate::tile::write_tx_syntax_inter`).
+    let tx_select = tx_select() && tx_select_inter();
+    if tx_select {
+        header.tx_mode = TxMode::Select;
+    }
 
     let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
     // lane-hbd r4: encoder stays 8-bit by design; narrow the source once
@@ -3871,7 +3907,13 @@ pub(crate) fn encode_inter_frame(
         / modes.len() as f64;
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits(&blocks, base_q_idx));
-    let tile = sb_coeff_inter_frame_tile(header.mi_cols, header.mi_rows, base_q_idx, &blocks)?;
+    let tile = crate::tile::sb_coeff_inter_frame_tile_tx(
+        header.mi_cols,
+        header.mi_rows,
+        base_q_idx,
+        &blocks,
+        tx_select,
+    )?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
 
@@ -4279,6 +4321,7 @@ mod tests {
         // (0..=20, 21..=60, 61..=120, 121..=255), on a single frame size.
         let (width, height) = (64usize, 64usize);
         let picture = test_card(width, height);
+        let _ = take_tx_depth_hits();
         for &q in &[15u8, 45, 100, 200] {
             let encoded = encode_key_frame_with_ctx(&picture, q, 0.5, fctx).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
@@ -4286,6 +4329,18 @@ mod tests {
             assert_eq!(decoded.u, encoded.reconstruction.u, "q={q}: U");
             assert_eq!(decoded.v, encoded.reconstruction.v, "q={q}: V");
         }
+        // lane-av1tx: the exactness above is only a claim about SPLIT
+        // transforms if some block actually split one (`gate-blind-to-feature`
+        // -- with `tx_depth` stuck at 0 every assert here passes on the
+        // pre-lane stream). The test card's edges split at these four
+        // quantizers; the counter is per-process (another test encoding in
+        // parallel can only ADD to it, so this can be masked, never falsely
+        // failed), so it is read once for the whole q ladder.
+        let depths = take_tx_depth_hits();
+        assert!(
+            depths[1] + depths[2] > 0,
+            "no block split its transform: depths {depths:?}"
+        );
     }
 
     /// The minimal repro that isolated the inter-residual desync: a key frame
@@ -4345,7 +4400,7 @@ mod tests {
             Quadrant::Whole(skipped_block),
         ];
         let tile =
-            sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
+            crate::tile::sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
                 .unwrap();
 
         // `key.stream` is already a temporal delimiter, the sequence header
