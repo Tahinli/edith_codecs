@@ -412,6 +412,42 @@ impl Default for Pyramid {
     /// (`encoder::tests::a_pyramid_stream_decodes_in_display_order_through_both_decoders`
     /// checks every shown frame in display order against ffmpeg AND our own
     /// decoder, with the hidden frame proven to win blocks), and the
+    /// Re-measured a third time at NATIVE resolution (`encode::tests::
+    /// bd_rate_screen_native`, 1920x1024 crops, 12 frames, four quantizers,
+    /// BD-rate vs libaom / vs rav1e), because every earlier verdict was taken
+    /// on the 4x-downscaled gate (class `gate-recipe-confound`) and because
+    /// leaf compound and the distance-scaled search have landed since:
+    ///
+    /// | arm | film 1080p | film 2160p | screen |
+    /// |---|---|---|---|
+    /// | flat (no pyramid) | +18.7 / +1.4 | +48.1 / +19.8 | +59.4 / -10.0 |
+    /// | 4:-16:8 | +23.2 / +5.3 | +48.1 / +19.7 | +62.7 / -6.5 |
+    /// | 2:-16:8 | +24.9 / +6.9 | +46.9 / +19.5 | +69.0 / -3.8 |
+    /// | 8:-16:8 | +22.6 / +4.6 | +48.7 / +19.8 | +59.3 / -8.2 |
+    /// | 4:-24:12 (before the leaf-compound merge) | +24.3 / +6.3 | +48.5 / +20.2 | +67.2 / -3.7 |
+    ///
+    /// The confound was real -- at native the gap is 5 BD points, not 30 --
+    /// but the sign is not: no arm beats flat on both films, every arm costs
+    /// 4-6 points on 1080p, and the best 2160p arm (`2:-16:8`, -1.1 vs
+    /// libaom) pays +10 on screen. So the pyramid still ships OFF.
+    ///
+    /// A native offset sweep on the 2160p clip alone (mini-GOP 4) says the
+    /// offsets are not what is missing -- the whole 3x3 grid spans 2.9 BD
+    /// points and none of it reaches flat's +48.1:
+    ///
+    /// | arf \ leaf | +4 | +8 | +12 |
+    /// |---|---|---|---|
+    /// | -8 | +48.9 / +20.4 | +49.2 / +20.1 | +50.2 / +20.5 |
+    /// | -16 | +47.8 / +20.0 | +48.1 / +19.7 | +49.2 / +20.2 |
+    /// | -24 | +47.3 / +20.0 | +47.6 / +19.7 | +48.5 / +20.2 |
+    ///
+    /// The gradient is monotone in both knobs (deeper ARF better, shallower
+    /// leaf better), which is the shape of a group whose leaves cannot cash
+    /// in the ARF's extra quality: what the leaves reach the hidden frame
+    /// with is still one forward search per reference. Shrinking the mini-GOP
+    /// helps for the same reason (2:-16:8 is the only arm that beats flat on
+    /// any clip, and it beats it on the clip with the fastest motion).
+    ///
     /// quantizer offsets behave. Nothing selects the pyramid but an explicit
     /// [`Av1Encoder::with_pyramid`] call (or `EC_AV1_PYRAMID` on the gate and
     /// on `ec-bench`); the default one-in-one-out path is byte-identical to
