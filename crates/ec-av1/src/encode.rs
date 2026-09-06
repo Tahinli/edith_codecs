@@ -3042,6 +3042,7 @@ pub(crate) fn encode_key_frame_inner(
         &mut chroma,
         [&picture_y8, &picture_u8, &picture_v8],
         true,
+        fctx,
         |lf, cdef, h| {
             crate::decode::decode_key_frame_tile(
                 &tile,
@@ -3107,6 +3108,7 @@ fn pick_and_apply_filters(
     chroma: &mut [Plane<'_>; 2],
     source: [&[u8]; 3],
     search: bool,
+    fctx: &crate::decode::FrameCtx,
     decode: impl Fn(&LoopFilterParams, &CdefParams, &FrameHeader) -> Result<Picture>,
 ) -> Result<()> {
     if !search {
@@ -3117,13 +3119,25 @@ fn pick_and_apply_filters(
     // libaom `av1_pick_filter_level`'s sibling `av1_cdef_search`:
     // `cdef_damping = 3 + (base_qindex >> 6)`, never searched.
     let damping = 3 + (header.quantization.base_q_idx >> 6);
-    let (lf, cdef, filtered) = crate::filter_search::pick_filters(
-        |lf, cdef| decode(lf, cdef, &hdr),
+    // Every candidate scores the same coded tile: decode it once and re-run
+    // the filters alone for the rest (`crate::decode::FilterReplay`, 24% of
+    // the encoder's profile before this).
+    crate::decode::clear_filter_replay();
+    let search_result = crate::filter_search::pick_filters(
+        |lf, cdef| {
+            if let Some(picture) = crate::decode::replay_filters(lf, cdef, fctx) {
+                return Ok(picture);
+            }
+            crate::decode::arm_filter_replay();
+            decode(lf, cdef, &hdr)
+        },
         source,
         luma.width,
         (fw, fh),
         damping,
-    )?;
+    );
+    crate::decode::clear_filter_replay();
+    let (lf, cdef, filtered) = search_result?;
     header.loop_filter = lf;
     header.cdef = cdef;
     let dec_cw = filtered.width.div_ceil(2);
@@ -4234,6 +4248,7 @@ pub(crate) fn encode_inter_frame(
         // `TxMode::Select` too (it used to skip and leave every inter frame
         // unfiltered once Select became the default).
         true,
+        fctx,
         |lf, cdef, h| {
             crate::decode::decode_inter_frame_tile(
                 &tile,
@@ -7056,6 +7071,46 @@ mod tests {
         (ladder, wall)
     }
 
+    /// Byte-exactness gate for encoder work that is meant to change only
+    /// how long the encoder takes.
+    ///
+    /// The BD gate above measures quality, which a speed lane can move by a
+    /// hair without failing anything; this pins the streams themselves.
+    /// Every number below was measured 2026-09-06 (lane-av1fwd) and is
+    /// identical at `a6649c4e`, the merge before that lane's three exact
+    /// speed steps.
+    #[test]
+    fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP the_encoders_own_streams_are_byte_identical_to_their_pins: no ffmpeg");
+            return;
+        }
+        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
+        if !clip.exists() {
+            eprintln!("SKIP the_encoders_own_streams_are_byte_identical_to_their_pins: no clip");
+            return;
+        }
+        let source = clip_frames(clip.to_str().unwrap(), "0", 640, 384, 4);
+        // FNV-1a over the stream: a witness that every coded bit is where it
+        // was, which a byte count alone is not.
+        let fnv = |b: &[u8]| {
+            b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &v| {
+                (h ^ u64::from(v)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        };
+        let pins: [(u8, usize, u64); 2] =
+            [(150, 7823, 0x81db_18bb_91be_0d89), (60, 28189, 0x25fb_2fce_1bd1_e000)];
+        for (q, bytes, hash) in pins {
+            let encoded = encode_sequence(&source, q, 0.5).unwrap();
+            assert_eq!(
+                (encoded.stream.len(), fnv(&encoded.stream)),
+                (bytes, hash),
+                "q={q}: the encoder's stream moved"
+            );
+        }
+    }
+
     /// A ladder is only a ladder if both axes rise together.
     fn assert_monotone(name: &str, ladder: &[(f64, f64)]) {
         assert_eq!(ladder.len(), 4, "{name}: wanted four quality points");
@@ -7091,6 +7146,25 @@ mod tests {
     /// | 1080p fixture | 42.11 dB/17774 B .. 50.99 dB/76838 B | +143.6% | +94.0% | 9.2s:1.1s:2.6s |
     /// | 2160p fixture | 42.84 dB/12480 B .. 51.43 dB/46557 B | +179.5% | +128.8% | 8.6s:1.0s:2.2s |
     /// | screen capture | 39.76 dB/9536 B .. 48.87 dB/29189 B | +88.0% | +21.5% | 7.2s:1.0s:2.1s |
+    ///
+    /// Re-measured 2026-09-06 after lane-av1fwd, which changed only how long
+    /// the encoder takes -- every stream it writes is byte-identical, so the
+    /// BD columns are this box's own re-run of the same recipe rather than a
+    /// quality move (+141.3/+174.2/+88.9 vs libaom, +91.9/+124.5/+21.6 vs
+    /// rav1e). What moved is the wall of the four encodes:
+    ///
+    /// | clip | wall ours before | after | instructions:u before -> after |
+    /// |---|---|---|---|
+    /// | 1080p fixture | 9.2s | 7.2s | 191.5G -> 139.8G (-27.0%) |
+    /// | 2160p fixture | 8.6s | 6.9s | 183.5G -> 136.4G (-25.6%) |
+    /// | screen capture | 7.2s | 6.7s | 157.2G -> 122.5G (-22.1%) |
+    ///
+    /// Three exact steps, none of which touches a coded bit: the coefficient
+    /// rate pricer stopped rebuilding every CDF table per candidate
+    /// (`tile::coeff_bits`), the filter search stopped re-decoding its own
+    /// tile once per candidate (`decode::FilterReplay`), and the forward
+    /// transform stopped transforming the all-zero residual that 70% of its
+    /// calls carry.
     ///
     /// The three steps of that lane, same recipe (vs libaom, then vs rav1e):
     ///
