@@ -4840,6 +4840,7 @@ pub(crate) fn encode_inter_frame(
                 // so it starts from the same tables the writer did (this
                 // frame's `start_cdfs`), not from the defaults.
                 Some(start_cdfs.0.clone()),
+                sign_bias,
                 fctx,
             )
         },

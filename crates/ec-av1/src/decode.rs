@@ -32875,7 +32875,7 @@ pub(crate) fn decode_inter_frame_tile(
         data, mi_cols, mi_rows, base_q_idx, frame_width, frame_height, refpix, cdef,
         loop_filter, allow_high_precision_mv, force_integer_mv, interp_fixed,
         enable_dual_filter, reference_select, tx_select,
-        &LoopRestorationParams::default(), initial_cdfs, fctx,
+        &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, fctx,
     )
 }
 
@@ -32900,6 +32900,16 @@ pub(crate) fn decode_inter_frame_tile_lr(
     tx_select: bool,
     lr: &LoopRestorationParams,
     initial_cdfs: Option<Cdfs>,
+    // spec 5.9.2's `ref_frame_sign_bias`, derived by a real decoder from the
+    // order hints its DPB slots hold. A raw tile decode cannot derive it (it
+    // is handed planes, not slots), and hard-coding `NO_SIGN_BIAS` here
+    // desyncs the encoder's own filter-search re-decode of any frame with a
+    // BACKWARD reference -- a pyramid leaf reading its group's hidden
+    // `ALTREF_FRAME` -- since the writer's MV-stack scans flip borrowed
+    // candidates across the bias boundary and this one's did not. Same class
+    // as `tx_select`/`initial_cdfs` above: a header-derived value a raw tile
+    // decode has to be told.
+    sign_bias: crate::mvstack::SignBiasTable,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -32923,7 +32933,7 @@ pub(crate) fn decode_inter_frame_tile_lr(
         initial_cdfs,
         allow_high_precision_mv,
         force_integer_mv,
-        NO_SIGN_BIAS,
+        sign_bias,
         [ec_av1_syntax::WarpParams::default(); 7],
         interp_fixed,
         enable_dual_filter,
@@ -37479,6 +37489,7 @@ mod tests {
                 frame.tx_select,
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
+                NO_SIGN_BIAS,
                 fctx,
             )
             .unwrap();
@@ -37797,6 +37808,7 @@ mod tests {
                 frame.tx_select,
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
+                NO_SIGN_BIAS,
                 fctx,
             )
             .unwrap();

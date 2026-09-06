@@ -817,7 +817,7 @@ impl Av1Encoder {
             .then(|| self.dpb[altref_slot as usize].as_ref().map(|s| s.picture.clone()))
             .flatten();
         let start_cdfs = self.dpb[last_slot as usize].as_ref().map(|s| s.cdfs.0.clone());
-        let encoded = encode_inter_frame(
+        let encoded = || -> Result<Encoded> { encode_inter_frame(
             &picture.padded_to(SUPERBLOCK),
             &reference,
             base_q_idx,
@@ -835,7 +835,21 @@ impl Av1Encoder {
                 show_frame,
                 sign_bias,
             }),
-        )?;
+        ) }();
+        // Name the pyramid position in any failure: an error out of the tile
+        // writer or the filter search is otherwise indistinguishable between
+        // the hidden frame and the leaves that read it.
+        let encoded = encoded.map_err(|e| {
+            Error::unsupported(
+                "AV1 encode",
+                format!(
+                    "{level:?} frame at order {order} (last slot {last_slot}, self {self_slot}, \
+                     altref {altref_slot}, shown {show_frame}, golden {}, altref pic {}): {e}",
+                    golden.is_some(),
+                    altref.is_some(),
+                ),
+            )
+        })?;
         self.refresh(&[self_slot], &encoded, order_hint);
         let cropped = crop_encoded(&encoded, render.0, render.1);
         if let Some(rate_loop) = self.rate_loop.as_mut() {
