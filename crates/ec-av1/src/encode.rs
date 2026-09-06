@@ -725,6 +725,21 @@ thread_local! {
     static SEQ_SCREEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// Overrides [`screen_content`] for the calling thread, which is what the
+    /// intra-MODE ablations use: on a two-colour synthetic picture the palette
+    /// codes every block losslessly, so both arms of a mode ablation reach
+    /// infinite PSNR and the ablation measures nothing at all (the
+    /// `fixture-proves-the-symbol-not-the-signal` class). An environment
+    /// variable cannot do this -- the tests run in one process, in parallel.
+    static SCREEN_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_screen(value: Option<bool>) {
+    SCREEN_FORCE.with(|c| c.set(value));
+}
+
 pub(crate) fn arm_seq_screen(on: bool) {
     SEQ_SCREEN.with(|c| c.set(on));
 }
@@ -776,6 +791,10 @@ pub(crate) static SCREEN_FRAMES: [std::sync::atomic::AtomicUsize; 2] =
 /// cover more than a [`screen_pct`]th of the frame. `width` is the plane's
 /// stride, `true_*` the frame's real (decodable) extent.
 fn screen_content(y: &[u8], width: usize, true_width: usize, true_height: usize) -> bool {
+    if let Some(forced) = SCREEN_FORCE.with(std::cell::Cell::get) {
+        SCREEN_FRAMES[usize::from(forced)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return forced;
+    }
     if let Ok(v) = std::env::var("EC_AV1_SCREEN") {
         let on = v != "0";
         SCREEN_FRAMES[usize::from(on)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6792,6 +6811,10 @@ mod tests {
     /// A ladder of (luma PSNR, log10 bytes) for one mode set, ordered by
     /// fidelity.
     fn ladder(picture: &Picture, modes: &[u8], fctx: &crate::decode::FrameCtx) -> Vec<(f64, f64)> {
+        // A mode ablation measures the MODE search: the palette would code
+        // these synthetic two-colour pictures losslessly under every arm and
+        // leave nothing to compare (see [`force_screen`]).
+        force_screen(Some(false));
         let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
             .iter()
             .map(|&q| {
@@ -6904,6 +6927,10 @@ mod tests {
     /// The mode picked by the most blocks of a picture, ignoring the first
     /// block, which has no neighbours to tell the modes apart with.
     fn favourite_mode(picture: &Picture, fctx: &crate::decode::FrameCtx) -> (u8, usize, usize) {
+        // A mode ablation measures the MODE search: the palette would code
+        // these synthetic two-colour pictures losslessly under every arm and
+        // leave nothing to compare (see [`force_screen`]).
+        force_screen(Some(false));
         let encoded = encode_key_frame_with_ctx(picture, 100, 0.5, fctx).unwrap();
         let blocks = &encoded.modes[1..];
         let mut counts = [0usize; 13];
