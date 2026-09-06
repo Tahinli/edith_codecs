@@ -693,6 +693,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         mi_rows: encoded.mi_rows,
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
+        switchable_motion_mode: encoded.switchable_motion_mode,
         screen: encoded.screen,
         start_cdfs: encoded.start_cdfs.clone(),
         next_cdfs: encoded.next_cdfs.clone(),
@@ -747,6 +748,12 @@ pub struct Encoded {
     /// a `tx_depth` frame as a `TxMode::Largest` one and desyncs at the first
     /// block.
     pub(crate) tx_select: bool,
+    /// This frame header's `is_motion_mode_switchable` (spec 5.9.2) -- the
+    /// bit that makes every eligible single-reference inter block carry a
+    /// `motion_mode` symbol. Same contract as `tx_select` above: a test
+    /// decoding `tile` directly must pass it along or it desyncs at the
+    /// first eligible block.
+    pub(crate) switchable_motion_mode: bool,
     /// The CDF state this frame's tile writer started from -- the defaults
     /// for a key frame and for the first inter frame, and the previous
     /// frame's stored tables after that. A test that decodes `tile` directly
@@ -1152,7 +1159,16 @@ pub fn inter_frame_headers_slots(
         },
         allow_high_precision_mv: false,
         interpolation_filter: ec_av1_syntax::InterpolationFilter::Eighttap,
-        is_motion_mode_switchable: false,
+        // lane-av1obmc: with this bit set every single-reference inter block
+        // libaom's `motion_mode_allowed` accepts carries a `motion_mode`
+        // symbol (`crate::tile::write_motion_mode`); `allow_warped_motion`
+        // stays false, so the alphabet is the 2-symbol `obmc_cdf`. It is tied
+        // to the OBMC knob rather than always on: with every block choosing
+        // SIMPLE_TRANSLATION the symbol is pure cost (+0.07% / +0.02% on the
+        // gate clip), so the DEFAULT path writes no motion_mode syntax at all
+        // and stays byte-identical to the streams before this lane. A future
+        // warp knob joins this disjunction.
+        is_motion_mode_switchable: crate::envflags::env_flag!("EC_AV1_OBMC"),
         use_ref_frame_mvs: false,
         // Forces `get_tx_set` (spec 5.11.48) to the two-symbol
         // `TX_SET_INTER_3` for every inter transform below 32x32 -- the only
@@ -2226,6 +2242,16 @@ impl Reach {
 }
 
 /// What one symbol costs against a CDF, in bits.
+/// What the `motion_mode`/`obmc` symbol costs (spec 5.11.24), off the default
+/// table rather than the tile's adapted one -- the same static-CDF estimate
+/// every other symbol in this search is priced with.
+fn obmc_bits(write_w: usize, write_h: usize, obmc: bool) -> f64 {
+    let Some(row) = crate::decode::motion_mode_cdf_row(write_w, write_h) else {
+        return 0.0;
+    };
+    symbol_bits(&cdf::OBMC[row], usize::from(obmc))
+}
+
 pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
     let low = if symbol == 0 { 0 } else { cdf[symbol - 1] };
     let width = cdf[symbol] - low;
@@ -3855,6 +3881,7 @@ fn code_square_inter(
             palette_uv: None,
                     tx_depth,
                     inter: Some(info),
+                    obmc: false,
                 },
                 cost + dcost,
             );
@@ -3886,6 +3913,7 @@ fn code_square_inter(
             palette: None,
             palette_uv: None,
             tx_depth,
+            obmc: false,
             inter: Some(InterInfo {
                 ref1: None,
                 mv1: (0, 0),
@@ -5047,6 +5075,8 @@ pub(crate) fn encode_key_frame_inner(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        // A key frame codes no inter block, so no motion_mode symbol.
+        switchable_motion_mode: false,
         screen,
         next_cdfs: start_cdfs.clone(),
         start_cdfs,
@@ -5599,7 +5629,15 @@ fn search_inter_block(
     // The COMPOUND stack of each `LAST_FRAME` + extra-reference pair, built by
     // the caller off the same MI grid the tile writer will (empty unless the
     // frame carries `reference_select`).
-    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)], fctx: &crate::decode::FrameCtx,
+    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
+    // lane-av1obmc: the mi grid this search's neighbours were published into
+    // (`record_mi`) and this block's own place in it -- what the OBMC
+    // candidate's eligibility walk and neighbour plan read, the same state
+    // the tile writer will read when it codes the `motion_mode` symbol.
+    grid: &MiGrid,
+    (mi_row, mi_col): (usize, usize),
+    (mi_rows, mi_cols): (usize, usize),
+    fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
     // below price their coefficients through `TxbSet::Luma32Inter`, which is
@@ -5632,6 +5670,10 @@ fn search_inter_block(
         mode: u8,
         skip: bool,
         inter: Option<InterInfo>,
+        /// The mode/mv syntax this candidate pays for, apart from its
+        /// residual -- what the OBMC candidate below has to re-pay when it
+        /// re-prices the winner's prediction.
+        mode_bits: f64,
     }
     let mut best: Option<Candidate> = None;
     let mut consider = |candidate: Candidate| {
@@ -5726,6 +5768,7 @@ fn search_inter_block(
             mode,
             skip: false,
             inter: None,
+            mode_bits: mode_bits[usize::from(mode)],
         });
     }
 
@@ -6137,6 +6180,7 @@ fn search_inter_block(
                 v,
                 mode: DC_PRED,
                 skip,
+                mode_bits: bits,
                 inter: Some(info),
             });
         }
@@ -6234,12 +6278,150 @@ fn search_inter_block(
                 v,
                 mode: DC_PRED,
                 skip,
+                mode_bits: mode_bits_inter,
                 inter: Some(info),
             });
         }
     }
 
     let best = best.expect("the search offers at least the intra modes");
+    // lane-av1obmc: the OBMC candidate (spec `motion_mode == OBMC_CAUSAL`),
+    // offered to the SINGLE-REFERENCE winner only -- libaom's
+    // `motion_mode_allowed` fails `is_motion_variation_allowed_compound` on a
+    // compound block, so the writer codes no symbol for one. The prediction
+    // is built by the DECODER's own plan and blend
+    // ([`crate::decode::obmc_plan`]/[`crate::decode::obmc_run`],
+    // `av1_build_obmc_inter_prediction`) off the committed neighbours' mvs
+    // this search's `grid` already carries, so what is priced here is what a
+    // decoder reconstructs -- never a second implementation of the blend.
+    //
+    // MEASURED 2026-09-06 and NOT KEPT ON BY DEFAULT (`EC_AV1_OBMC=1` turns it
+    // on). Native crop BD, the standing recipe, with it on against the same
+    // build with it off: film 1080p +18.2/+0.9 against +18.0/+0.7, film 2160p
+    // +47.3/+19.2 against +47.3/+19.2, screen +59.1/-10.0 against
+    // +59.4/-10.0. That is one row down (screen -0.3 vs libaom), one flat and
+    // one UP -- the keep rule wants two down and one flat, so it stays off.
+    // The 640x384 gate reads the same shape louder: +79.7/+95.5/+54.2 and
+    // +37.2/+56.8/+0.8 against +78.8/+95.1/+54.5 and +36.1/+56.4/+1.1. Two
+    // things bound it and are the upgrade path: only the 32x32 winner is
+    // offered OBMC (the 16x16/8x8 leaves in `code_square_inter` are not, and
+    // that is where libaom cashes most of its OBMC gain), and the symbol/
+    // residual price here is the static-CDF estimate.
+    let mut best = best;
+    let mut obmc_won = false;
+    if let Some(info) = best.inter.filter(|i| i.ref1.is_none()) {
+        if crate::envflags::env_flag!("EC_AV1_OBMC")
+            && crate::decode::has_overlappable_neighbour(grid, mi_row, mi_col, 8, 8, mi_cols, mi_rows)
+        {
+            let mut refs: [Option<&Picture>; 8] = [None; 8];
+            refs[LAST_FRAME as usize] = Some(reference);
+            for &(r, p, _) in extra {
+                refs[r as usize] = Some(p);
+            }
+            let refpix = crate::decode::RefPix::ready(refs);
+            let plan = crate::decode::obmc_plan(
+                grid,
+                &[],
+                &[],
+                mi_row,
+                mi_col,
+                8,
+                8,
+                mi_rows,
+                mi_cols,
+                BLOCK,
+                BLOCK,
+                BLOCK,
+                BLOCK / 2,
+                x,
+                y,
+                x / 2,
+                y / 2,
+                &refpix,
+                Some(mc::InterpFilterKind::Regular),
+                reference.width,
+            );
+            if let Ok(plan) = plan {
+                let (ref_luma, ref_u, ref_v) = match extra
+                    .iter()
+                    .find(|(r, _, _)| *r == info.ref_frame)
+                {
+                    Some(&(_, g, _)) => (
+                        (&g.y, g.width, luma.true_width, luma.true_height),
+                        (&g.u, g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                        (&g.v, g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                    ),
+                    None => (ref_luma, ref_u, ref_v),
+                };
+                let mv = info.mv;
+                let mut pred = [
+                    vec![0u16; BLOCK * BLOCK],
+                    vec![0u16; BLOCK * BLOCK / 4],
+                    vec![0u16; BLOCK * BLOCK / 4],
+                ];
+                for (i, (r, luma_plane)) in
+                    [(ref_luma, true), (ref_u, false), (ref_v, false)].into_iter().enumerate()
+                {
+                    let (px, py) = if luma_plane { (x, y) } else { (x / 2, y / 2) };
+                    let side = if luma_plane { BLOCK } else { BLOCK / 2 };
+                    mc::predict(
+                        r.0,
+                        r.1,
+                        r.2,
+                        r.3,
+                        mv_to_q4(px, mv.1, luma_plane),
+                        mv_to_q4(py, mv.0, luma_plane),
+                        side,
+                        side,
+                        &mut pred[i],
+                        fctx,
+                    );
+                }
+                let [mut py_buf, mut pu_buf, mut pv_buf] = pred;
+                crate::decode::obmc_run(
+                    &plan, &refpix, &mut py_buf, &mut pu_buf, &mut pv_buf, fctx,
+                );
+                let u8s = |b: &[u16]| b.iter().map(|&v| v as u8).collect::<Vec<u8>>();
+                let luma_trial = luma.code_from_prediction(
+                    x, y, BLOCK, &u8s(&py_buf), false, search.base_q_idx, search.deadzone,
+                    TxbSet::Luma32Inter,
+                );
+                let u = chroma[0].code_from_prediction(
+                    x / 2, y / 2, BLOCK / 2, &u8s(&pu_buf), false, search.base_q_idx,
+                    search.deadzone, chroma_set,
+                );
+                let v = chroma[1].code_from_prediction(
+                    x / 2, y / 2, BLOCK / 2, &u8s(&pv_buf), false, search.base_q_idx,
+                    search.deadzone, chroma_set,
+                );
+                let skip = luma_trial.levels.iter().all(|&l| l == 0)
+                    && u.levels.iter().all(|&l| l == 0)
+                    && v.levels.iter().all(|&l| l == 0);
+                let cost = luma_trial.sse
+                    + u.sse
+                    + v.sse
+                    + search.lambda
+                        * (skip_bits(skip)
+                            + intra_inter_bits(true)
+                            + best.mode_bits
+                            + obmc_bits(BLOCK, BLOCK, true)
+                            + if skip { 0.0 } else { luma_trial.bits + u.bits + v.bits });
+                if cost < best.cost + search.lambda * obmc_bits(BLOCK, BLOCK, false) {
+                    obmc_won = true;
+                    best = Candidate {
+                        cost,
+                        luma: luma_trial,
+                        u,
+                        v,
+                        mode: DC_PRED,
+                        skip,
+                        mode_bits: best.mode_bits,
+                        inter: best.inter,
+                    };
+                }
+            }
+        }
+    }
     // lane-av1txbits BUILT the transform-depth search this path lacks -- a
     // 32x32 single-reference winner offered `commit_inter_luma`'s four 16x16
     // units against its flat trial, exactly as a 16x16 winner is -- and
@@ -6261,6 +6443,7 @@ fn search_inter_block(
             uv_mode: DC_PRED,
             skip: best.skip,
             inter: best.inter,
+            obmc: obmc_won,
             eight: None,
             dv: None,
             palette: None,
@@ -6640,7 +6823,11 @@ pub(crate) fn encode_inter_frame(
                         reference,
                         &stack,
                         &extra,
-                        &compound, fctx,
+                        &compound,
+                        &grid,
+                        (mi_row, mi_col),
+                        (mi_rows, mi_cols),
+                        fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
                     let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
@@ -6975,6 +7162,7 @@ pub(crate) fn encode_inter_frame(
         .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
     let start_cdfs = CdfSnapshot(cdfs);
     let reference_select_bit = header.reference_select;
+    let switchable_motion_mode = header.is_motion_mode_switchable;
     let order_hint_bits = seq.order_hint_bits;
     let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
     let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
@@ -6996,6 +7184,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_sign_bias(sign_bias);
             // Thread-locals: every tile job arms its own worker.
             crate::tile::arm_reference_select(reference_select_bit);
+            crate::tile::arm_motion_mode(switchable_motion_mode);
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
             crate::tile::arm_screen(screen);
             let mut cdfs = start_cdfs.0.clone();
@@ -7122,6 +7311,7 @@ pub(crate) fn encode_inter_frame(
                 Some(start_cdfs.0.clone()),
                 sign_bias,
                 h.allow_screen_content_tools,
+                switchable_motion_mode,
                 fctx,
             )
         },
@@ -7154,6 +7344,7 @@ pub(crate) fn encode_inter_frame(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        switchable_motion_mode,
         screen,
         start_cdfs,
         next_cdfs,
@@ -7924,6 +8115,7 @@ mod tests {
                 mv: (0, 0),
                 ref_mv_idx: 0,
             }),
+            obmc: false,
         };
         let skipped_block = BlockCoeffs {
             skip: true,
@@ -7943,6 +8135,10 @@ mod tests {
             Quadrant::Whole(skipped_block.clone()),
             Quadrant::Whole(skipped_block),
         ];
+        // lane-av1obmc: the header this tile is decoded under carries
+        // `is_motion_mode_switchable`, so the writer must be armed with it
+        // too or the decoder reads a `motion_mode` symbol nobody wrote.
+        crate::tile::arm_motion_mode(inter_header.is_motion_mode_switchable);
         let tile =
             crate::tile::sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
                 .unwrap();
@@ -9493,6 +9689,14 @@ mod tests {
         // remaining gap is the syntax the coefficient sum leaves out. That is
         // the default on a non-screen frame since lane-av1price2 (this
         // fixture is one), and it reads +32.6% here.
+        // lane-av1obmc: every eligible single-reference inter block now also
+        // carries a `motion_mode` symbol the coefficient sum never counts,
+        // and an OBMC block carries the more expensive of the two values --
+        // re-measured at +35.0% here with `EC_AV1_OBMC=1`. Like
+        // `EC_AV1_PRICE_FRAME_CDFS=1` before it, that knob changes encoder
+        // decisions, so this bound and the byte pins above FAIL BY DESIGN
+        // under it; the default path (no motion_mode syntax at all) is the
+        // one they are measured on.
         assert!(
             worst_under <= 0.34,
             "the writer spent {:.2}% more than the search priced -- more than \
@@ -11016,6 +11220,18 @@ mod tests {
                     ))
                     .collect::<Vec<_>>()
                     .join(" ")
+            );
+            // lane-av1obmc: how many blocks actually CODED a motion_mode
+            // symbol and which value they took, by footprint -- "OBMC is on"
+            // as a measurement rather than a claim (class
+            // `gate-blind-to-feature`).
+            let mm = crate::tile::take_motion_mode_hits();
+            eprintln!(
+                "{name}: motion_mode 32x32 SIMPLE={} OBMC={} | 16x16 SIMPLE={} OBMC={} | \
+                 8x8 SIMPLE={} OBMC={} ({:.1}% OBMC of {} eligible)",
+                mm[0], mm[1], mm[2], mm[3], mm[4], mm[5],
+                100.0 * (mm[1] + mm[3] + mm[5]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
+                mm.iter().sum::<usize>(),
             );
             let (aom, aom_wall) =
                 external_ladder(&source, width, height, "libaom-av1", &aom_points);
