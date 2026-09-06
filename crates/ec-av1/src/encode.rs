@@ -7298,7 +7298,24 @@ fn search_inter_block(
 /// ([`tpl_sb_factors`]). 0 keeps every block at the frame's own lambda, which
 /// is what every measurement before this lane was taken on. Swept by
 /// `EC_AV1_TPL=<k>`.
-const TPL_STRENGTH: f64 = 0.0;
+///
+/// SWEPT on lane-av1tpl at the native gate (1920x1024, 12 frames, BD-rate vs
+/// libaom `cpu-used 6` / rav1e `speed 6`); `k=0` reproduces the pre-lane
+/// baseline exactly, which is the control the rest of the table is read
+/// against:
+///
+/// | k | film 1080p | film 2160p | screen |
+/// |---|---|---|---|
+/// | 0 | +16.2/-1.1 | +46.6/+18.8 | +51.3/-14.4 |
+/// | 0.25 | +16.4/-0.7 | +46.6/+18.8 | +51.2/-14.4 |
+/// | **0.5** | **+15.9/-1.3** | **+46.5/+18.7** | **+51.2/-14.4** |
+/// | 1 | +16.2/-0.9 | +46.6/+18.8 | +51.2/-14.4 |
+/// | 2 | +16.5/-0.7 | +46.7/+19.0 | +51.1/-14.4 |
+///
+/// 0.5 is the only arm that is at least flat on every row and down on five of
+/// the six columns, so it ships as the default. The lookahead pass that feeds
+/// it costs 1.5 ms per 1920x1024 frame against a ~0.8 s encode (0.2%).
+const TPL_STRENGTH: f64 = 0.5;
 
 fn tpl_strength() -> f64 {
     std::env::var("EC_AV1_TPL")
