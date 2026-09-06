@@ -449,6 +449,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         mi_cols: encoded.mi_cols,
         mi_rows: encoded.mi_rows,
         base_q_idx: encoded.base_q_idx,
+        tx_select: encoded.tx_select,
     }
 }
 
@@ -478,6 +479,13 @@ pub struct Encoded {
     pub(crate) mi_cols: u32,
     pub(crate) mi_rows: u32,
     pub(crate) base_q_idx: u8,
+    /// This frame header's `tx_mode == TxMode::Select` ([`tx_select`], and
+    /// [`tx_select_inter`] on an inter frame) — a decoder of `tile` needs it,
+    /// and reading it off `stream`'s header is what `decode_stream` does. A
+    /// test that decodes `tile` directly must pass this one along, or it reads
+    /// a `tx_depth` frame as a `TxMode::Largest` one and desyncs at the first
+    /// block.
+    pub(crate) tx_select: bool,
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -2869,6 +2877,7 @@ pub(crate) fn encode_key_frame_inner(
         mi_cols: header.mi_cols,
         mi_rows: header.mi_rows,
         base_q_idx,
+        tx_select,
     })
 }
 
@@ -3933,6 +3942,7 @@ pub(crate) fn encode_inter_frame(
         mi_cols: header.mi_cols,
         mi_rows: header.mi_rows,
         base_q_idx,
+        tx_select,
     })
 }
 

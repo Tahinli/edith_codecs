@@ -2996,7 +2996,7 @@ mod tests {
                 false,
                 &ec_av1_syntax::CdefParams::default(),
                 &ec_av1_syntax::LoopFilterParams::default(),
-                false,
+                encoded.tx_select,
                 // Our own encoder always writes `reduced_tx_set: true`.
                 true,
                 false,
