@@ -2856,6 +2856,49 @@ fn search_chroma(
 /// search, so `NEARESTMV`-or-intra is this function's deliberate first cut
 /// (see `write_inter_frame_leaf`'s doc comment).
 #[allow(clippy::too_many_arguments)]
+/// The compound MV stack of each `LAST` + extra-reference pair at one leaf,
+/// as [`code_square_inter`] wants them: empty on a frame that codes no
+/// `reference_select`, or when the leaf compound candidates are switched off.
+/// One helper because THREE leaf call sites need it -- the split quadrants
+/// and, since lane-av1comp4, both straddling-edge sites, which used to pass
+/// `&[]` and so coded no compound block anywhere along the frame's true edge.
+#[allow(clippy::too_many_arguments)]
+fn leaf_compound_stacks<'a>(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    bh4: usize,
+    mi_cols: usize,
+    mi_rows: usize,
+    reference_select: bool,
+    golden: Option<&'a Picture>,
+    altref: Option<&'a Picture>,
+) -> Vec<(i8, &'a Picture, crate::mvstack::CompoundMvStack)> {
+    if !(reference_select && leaf_compound()) {
+        return Vec::new();
+    }
+    [
+        (crate::mvstack::GOLDEN_FRAME, golden),
+        (crate::mvstack::ALTREF_FRAME, altref),
+    ]
+    .into_iter()
+    .filter_map(|(r, pic)| {
+        pic.map(|p| {
+            (
+                r,
+                p,
+                crate::mvstack::find_mv_stack_compound(
+                    grid, mi_row, mi_col, bw4, bh4,
+                    (crate::mvstack::LAST_FRAME, r), mi_cols, mi_rows,
+                    grid.sign_bias_table(), &[(0, 0); 7], None,
+                ),
+            )
+        })
+    })
+    .collect()
+}
+
 fn code_square_inter(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
@@ -6093,30 +6136,10 @@ pub(crate) fn encode_inter_frame(
                                 let stack = find_mv_stack(
                                     &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
                                 );
-                                let cstacks: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
-                                    if header.reference_select && leaf_compound() {
-                                        [
-                                            (crate::mvstack::GOLDEN_FRAME, golden),
-                                            (crate::mvstack::ALTREF_FRAME, altref),
-                                        ]
-                                        .into_iter()
-                                        .filter_map(|(r, pic)| {
-                                            pic.map(|p| {
-                                                (
-                                                    r,
-                                                    p,
-                                                    crate::mvstack::find_mv_stack_compound(
-                                                        &grid, mi_row, mi_col, 4, 4,
-                                                        (crate::mvstack::LAST_FRAME, r), mi_cols, mi_rows,
-                                                        grid.sign_bias_table(), &[(0, 0); 7], None,
-                                                    ),
-                                                )
-                                            })
-                                        })
-                                        .collect()
-                                    } else {
-                                        Vec::new()
-                                    };
+                                let cstacks = leaf_compound_stacks(
+                                    &grid, mi_row, mi_col, 4, 4, mi_cols, mi_rows,
+                                    header.reference_select, golden, altref,
+                                );
                                 let (leaf, leaf_cost) = code_square_inter(
                                     &mut luma,
                                     &mut chroma,
@@ -6279,6 +6302,10 @@ pub(crate) fn encode_inter_frame(
                             let stack = find_mv_stack(
                                 &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
                             );
+                            let cstacks = leaf_compound_stacks(
+                                &grid, mi_row, mi_col, 4, 4, mi_cols, mi_rows,
+                                header.reference_select, golden, altref,
+                            );
                             let (block, _) = code_square_inter(
                                 &mut luma,
                                 &mut chroma,
@@ -6287,7 +6314,7 @@ pub(crate) fn encode_inter_frame(
                                 &search,
                                 &mode_bits_table,
                                 reference,
-                                        &stack, &[], fctx,
+                                        &stack, &cstacks, fctx,
                             );
                             // One publication point for every coded leaf
                             // (`record_mi`): this site used to spell the vote
@@ -6312,6 +6339,10 @@ pub(crate) fn encode_inter_frame(
                                 let stack = find_mv_stack(
                                     &grid, mi_row, mi_col, 2, 2, LAST_FRAME, mi_cols, mi_rows,
                                 );
+                                let cstacks = leaf_compound_stacks(
+                                    &grid, mi_row, mi_col, 2, 2, mi_cols, mi_rows,
+                                    header.reference_select, golden, altref,
+                                );
                                 let (leaf, _) = code_square_inter(
                                     &mut luma,
                                     &mut chroma,
@@ -6320,7 +6351,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                                &stack, &[], fctx,
+                                                &stack, &cstacks, fctx,
                                 );
                                 // Same publication point as the 16x16
                                 // straddling leaf above (`record_mi`).
