@@ -993,20 +993,34 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
         0 => 28,
         1 => 28 + 16,
         _ => {
-            // QuickTime's version 2 sound entry states the channel count as a
-            // 32-bit field of its own; its sample rate is a double, which the
-            // `mdhd` timescale says exactly instead.
+            // QuickTime's version 2 sound entry replaces the classic fields
+            // with a block of its own: the channel count is a 32-bit field and
+            // the sample rate a double, and the fixed 16-bit rate the classic
+            // layout holds reads as 65536 for every one of them.
             audio.layout =
-                ChannelLayout::from_count(be32(payload, 28 + 12).unwrap_or(2).max(1) as usize);
-            audio.sample_rate = 0;
+                ChannelLayout::from_count(be32(payload, 28 + 4 + 8).unwrap_or(2).max(1) as usize);
+            audio.sample_rate = be64(payload, 28 + 4)
+                .map(|bits| f64::from_bits(bits).round())
+                .unwrap_or(0.0)
+                .clamp(0.0, f64::from(u32::MAX)) as u32;
             28 + 36
         }
     };
     let mut config = None;
     for child in Boxes::new(payload.get(children..).unwrap_or(&[])) {
-        let (kind, body) = child?;
-        config = Some((kind, body));
-        if !matches!(&kind, b"btrt" | b"wave" | b"chan") {
+        let (child_kind, body) = child?;
+        // QuickTime keeps the codec configuration one level down, in a `wave`
+        // box beside the `frma` naming the format again: a reader that walks
+        // past `wave` finds no `esds` at all and calls the track silent.
+        if &child_kind == b"wave" {
+            if let Some(found) = wave_config(kind, body) {
+                config = Some(found);
+                break;
+            }
+            continue;
+        }
+        config = Some((child_kind, body));
+        if !matches!(&child_kind, b"btrt" | b"chan") {
             break;
         }
     }
@@ -1076,6 +1090,37 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
         audio: Some(audio),
         color_tags: Tags::default(),
     }))
+}
+
+/// The configuration box a `wave` holds for the sample entry `kind`, or
+/// [`None`] where it holds none: `wave`'s other children are the `frma`
+/// restating the format, an ISO-shaped copy of the sample entry itself, and a
+/// zero-sized terminator, and a malformed one ends the walk rather than
+/// erroring the whole track.
+fn wave_config<'a>(kind: &FourCc, wave: &'a [u8]) -> Option<(FourCc, &'a [u8])> {
+    let want: &FourCc = match kind {
+        b"mp4a" => b"esds",
+        b"ac-3" => b"dac3",
+        b"ec-3" => b"dec3",
+        b"alac" => b"alac",
+        b"fLaC" => b"dfLa",
+        b"Opus" => b"dOps",
+        _ => return None,
+    };
+    for child in Boxes::new(wave) {
+        let Ok((child_kind, body)) = child else {
+            return None;
+        };
+        // The terminator: an eight-byte box of type zero, which is where a
+        // `wave` ends even when the parent box says there is room for more.
+        if child_kind == [0, 0, 0, 0] {
+            return None;
+        }
+        if &child_kind == want {
+            return Some((child_kind, body));
+        }
+    }
+    None
 }
 
 fn config_bytes(config: Option<(FourCc, &[u8])>, want: &FourCc) -> Option<Buf> {
@@ -1272,6 +1317,65 @@ fn elst(payload: &[u8]) -> Result<Vec<(u64, i64, u32)>> {
 mod tests {
     use super::*;
     use crate::boxes;
+
+    /// A QuickTime version-2 sound description, which no ffmpeg-written
+    /// fixture in this corpus has: its 36-byte block states the sample rate as
+    /// a double and the channel count as a 32-bit field, and the `esds` sits
+    /// two levels down, inside the `wave`.
+    #[test]
+    fn quicktime_version_2_sound_entry_reads_its_rate_and_its_wave_esds() {
+        fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(body);
+            out
+        }
+        // esds: an ES descriptor naming AAC-LC with a two-byte config.
+        let esds = boxed(
+            b"esds",
+            &[
+                0, 0, 0, 0, // FullBox version and flags
+                0x03, 0x16, 0x00, 0x01, 0x00, // ES_Descr
+                // DecoderConfigDescr: AAC-LC, audio stream, zero buffer and
+                // bitrates, then the config itself.
+                0x04, 0x11, 0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05, 0x02, 0x11,
+                0x90, // DecoderSpecificInfo
+            ],
+        );
+        let mut wave = boxed(b"frma", b"mp4a");
+        wave.extend_from_slice(&boxed(b"mp4a", &[0, 0, 0, 0]));
+        wave.extend_from_slice(&esds);
+        wave.extend_from_slice(&[0, 0, 0, 8, 0, 0, 0, 0]); // terminator
+
+        let mut entry = vec![0u8; 6];
+        entry.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+        entry.extend_from_slice(&2u16.to_be_bytes()); // version 2
+        entry.extend_from_slice(&[0; 6]); // revision, vendor
+        entry.extend_from_slice(&3u16.to_be_bytes()); // "always 3"
+        entry.extend_from_slice(&16u16.to_be_bytes());
+        entry.extend_from_slice(&0xFFFEu16.to_be_bytes());
+        entry.extend_from_slice(&[0, 0]);
+        entry.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // the fixed 65536
+        entry.extend_from_slice(&72u32.to_be_bytes()); // sizeOfStructOnly
+        entry.extend_from_slice(&48_000f64.to_bits().to_be_bytes());
+        entry.extend_from_slice(&2u32.to_be_bytes()); // numAudioChannels
+        entry.extend_from_slice(&0x7F00_0000u32.to_be_bytes());
+        entry.extend_from_slice(&[0; 16]); // the four constant LPCM fields
+        entry.extend_from_slice(&boxed(b"wave", &wave));
+
+        let read = sample_entry(b"mp4a", &entry)
+            .expect("entry parses")
+            .expect("mp4a is a codec this build has an id for");
+        let audio = read.audio.expect("a sound entry");
+        assert_eq!(read.codec, CodecId::Aac);
+        assert_eq!(audio.sample_rate, 48_000);
+        assert_eq!(audio.layout.channel_count(), 2);
+        assert_eq!(
+            read.extradata.as_deref(),
+            Some(&[0x11, 0x90][..]),
+            "the AudioSpecificConfig inside wave/esds"
+        );
+    }
 
     /// The named bug: NTSC film must come back off the sample table as itself.
     #[test]
