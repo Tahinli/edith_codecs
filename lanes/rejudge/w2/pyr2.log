@@ -1,0 +1,28 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1rejudge/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+film 1080p: pyramid Pyramid { mini_gop: 2, arf_q_offset: -16, leaf_q_offset: 8 } -- frames key 4 arf 20 leaf 24 show_existing 20; bytes key 195339 arf 954206 leaf 747499 show_existing 100
+film 1080p: pricer armings default=14 real=156
+film 1080p: motion_mode 32x32 SIMPLE=48710 OBMC=0 WARP=54 | 16x16 SIMPLE=1954 OBMC=0 WARP=51 | 8x8 SIMPLE=11539 OBMC=0 WARP=1732 (0.0% OBMC / 2.9% WARP of 64040 eligible)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 44.28 dB/281294 B, 47.90 dB/406730 B, 51.26 dB/535710 B, 54.26 dB/673410 B | +23.8% | +5.8% | 34.7s:6.6s:16.5s |
+film 2160p: pyramid Pyramid { mini_gop: 2, arf_q_offset: -16, leaf_q_offset: 8 } -- frames key 4 arf 20 leaf 24 show_existing 20; bytes key 175828 arf 987097 leaf 939511 show_existing 100
+film 2160p: pricer armings default=15 real=148
+film 2160p: motion_mode 32x32 SIMPLE=39075 OBMC=0 WARP=127 | 16x16 SIMPLE=436 OBMC=0 WARP=2 | 8x8 SIMPLE=4654 OBMC=0 WARP=467 (0.0% OBMC / 1.3% WARP of 44761 eligible)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.92 dB/321802 B, 47.92 dB/465049 B, 51.50 dB/594628 B, 54.74 dB/721057 B | +46.0% | +18.9% | 36.5s:9.2s:18.2s |
+screen capture (2026-07-25 02-09-04.mkv): pyramid Pyramid { mini_gop: 2, arf_q_offset: -16, leaf_q_offset: 8 } -- frames key 4 arf 20 leaf 24 show_existing 20; bytes key 193162 arf 88830 leaf 12529 show_existing 100
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=161 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=88106 OBMC=0 WARP=2735 | 16x16 SIMPLE=6921 OBMC=0 WARP=1000 | 8x8 SIMPLE=1592 OBMC=0 WARP=1938 (0.0% OBMC / 5.5% WARP of 102292 eligible)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6933 chroma 647; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.60 dB/47839 B, 48.78 dB/60923 B, 51.27 dB/78255 B, 54.31 dB/107604 B | +58.6% | -10.2% | 29.6s:8.3s:11.4s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 573 filtered out; finished in 179.57s
+

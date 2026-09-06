@@ -1,0 +1,120 @@
+   Compiling ec-av1 v0.1.0 (/home/tahinli/Documents/Code/Rust/edith_codecs-av1rejudge/crates/ec-av1)
+    Finished `release` profile [optimized] target(s) in 17.69s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1rejudge/release/deps/ec_av1-8fef0196ab10338d)
+
+running 93 tests
+test encode::tests::a_frame_of_real_video_decodes_to_what_the_encoder_reconstructed ... ok
+test encode::tests::a_mode_the_encoder_cannot_predict_is_refused ... ok
+test encode::tests::bd_rate_screen_native ... ignored, the native-resolution BD arm: minutes per row, needs ffmpeg
+test encode::tests::bd_rate_vs_libaom_and_rav1e ... ignored, the encoder BD-rate baseline: minutes per clip, needs ffmpeg
+test encode::tests::calibration_sweep_base_q_idx ... ignored, a calibration probe, not a gate
+test encode::tests::a_picture_off_the_block_grid_encodes_and_a_malformed_one_is_refused ... ok
+test encode::tests::a_flat_picture_costs_almost_nothing ... ok
+test encode::tests::a_nearestmv_block_with_one_nonzero_coefficient_decodes_clean ... ok
+test encode::tests::every_rect_shape_reaches_what_libaom_says_over_the_whole_superblock ... ok
+test encode::tests::every_frame_of_a_sequence_decodes_through_our_own_decoder ... ok
+test encode::tests::a_single_axis_straddle_round_trips_through_ffmpeg ... ok
+test encode::tests::every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed ... ok
+test encode::tests::fidelity_and_rate_move_with_the_quantizer ... ok
+test encode::tests::odd_dimensions_are_refused ... ok
+test encode::tests::of_tu_follows_the_block_row_including_under_vert_ab ... ok
+test encode::tests::of_tu_matches_libaom_has_top_right_and_has_bottom_left_per_unit ... ok
+test encode::tests::a_repeated_pattern_key_frame_codes_intrabc_blocks_ffmpeg_decodes_exactly ... ok
+test encode::tests::low_motion_makes_an_inter_frame_smaller_than_the_key_frame ... ok
+test encode::tests::pricer_error_census_on_clips ... ignored, reads the real library, needs ffmpeg
+test encode::tests::probe_directional ... ignored, a sweep, not a gate
+test encode::tests::probe_intrabc_key_frame ... ignored, needs the real-library manifest and ffmpeg
+test encode::tests::probe_ladder ... ignored, a sweep, not a gate
+test encode::tests::probe_lambda ... ignored, a sweep, not a gate
+test encode::tests::probe_screen_detect ... ignored, reads the real library
+test encode::tests::probe_split ... ignored, a sweep, not a gate
+test encode::tests::prune_k_quality_sweep ... ignored, needs real clips and ffmpeg; prints numbers for the lane report to judge
+test encode::tests::prune_k_quality_sweep_inter ... ignored, needs real clips and ffmpeg; prints numbers for the lane report to judge
+test encode::tests::reach_matches_libaom_has_top_right_and_has_bottom_left ... ok
+test encode::tests::key_frame_and_inter_frame_both_encode_at_half_straddle_size ... ok
+test encode::tests::an_854x480_picture_round_trips_through_its_padding ... ok
+test encode::tests::pricer_error_census_by_block_class ... ok
+test encode::tests::sequence_bench_sanity ... ignored, a perf probe, not a gate
+test encode::tests::rect_reach_tables_are_indexed_with_a_32_mi_row_stride ... ok
+test encode::tests::stage_timing_breakdown ... ignored, a perf probe, not a gate
+test encode::tests::stage_timing_breakdown_inter ... ignored, a perf probe, not a gate
+test encode::tests::predicted_coeff_bits_track_the_tile_the_writer_wrote ... FAILED
+test encode::tests::the_encoded_picture_is_the_one_that_went_in ... ok
+test encode::tests::a_screen_content_picture_codes_palette_blocks_ffmpeg_decodes_exactly ... ok
+test encode::tests::the_filter_search_picks_real_filters ... ok
+test encode::tests::a_640x360_half_straddle_sequence_round_trips_through_ffmpeg ... ok
+test encode::tests::the_search_beats_dc_alone ... ok
+test encode::tests::the_search_picks_the_direction_the_picture_runs ... ok
+test encode::tests::vert_ab_partition_flips_below_left_for_the_top_right_8x8 ... ok
+test tile::tests::a_block_gathers_the_cells_its_neighbours_cover ... ok
+test encode::tests::the_search_picks_the_diagonal_the_picture_runs ... ok
+test encode::tests::sequence_round_trips_at_a_non_multiple_size ... ok
+test encode::tests::a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames ... ok
+test tile::tests::a_dc_level_is_worth_half_as_much_each_time_the_transform_doubles ... ok
+test encode::tests::the_diagonals_beat_the_modes_that_read_no_further ... ok
+test tile::tests::a_frame_that_is_not_a_whole_number_of_blocks_is_refused ... ok
+test tile::tests::a_coefficient_in_the_far_corner_reaches_the_last_end_of_block_group ... ok
+test tile::tests::a_level_grid_that_does_not_cover_the_frame_is_refused ... ok
+test tile::tests::a_newmv_block_reads_back_the_exact_symbol_sequence_it_was_written_with ... ok
+test tile::tests::a_coefficient_off_the_origin_selects_its_own_basis_function ... ok
+test encode::tests::ffmpeg_decodes_exactly_what_the_encoder_reconstructed ... ok
+test tile::tests::a_single_ac_coefficient_varies_along_its_own_axis ... ok
+test tile::tests::a_frame_that_hangs_off_the_bottom_codes_every_block ... ok
+test tile::tests::a_whole_superblock_at_the_frame_edge_is_refused ... ok
+test tile::tests::a_frame_that_is_not_a_whole_number_of_superblocks_codes_every_block ... ok
+test tile::tests::an_all_skip_inter_superblock_is_small_and_reads_back ... ok
+test tile::tests::an_intra_block_in_an_inter_frame_is_caught_reading_kf_y_mode ... ok
+test tile::tests::an_intra_mode_outside_the_key_frame_set_is_refused ... ok
+test tile::tests::a_quadrant_splits_into_four_sixteens ... ok
+test tile::tests::coefficients_the_writer_cannot_code_are_refused ... ok
+test tile::tests::dc_levels_the_base_syntax_cannot_carry_are_refused ... ok
+test tile::tests::a_quantized_picture_decodes_to_what_the_encoder_reconstructed ... ok
+test tile::tests::a_split_superblock_decodes_each_quadrant_on_its_own_level ... ok
+test tile::tests::a_whole_superblock_covers_all_four_of_its_quadrants ... ok
+test tile::tests::chroma_dc_signs_read_their_neighbours ... ok
+test tile::tests::directional_modes_predict_from_the_neighbours_they_name ... ok
+test tile::tests::every_quadrant_carries_its_own_coefficients ... ok
+test tile::tests::negating_the_levels_negates_the_residual ... ok
+test tile::tests::partial_superblocks_are_refused ... ok
+test tile::tests::the_default_scan_walks_every_position_outwards ... ok
+test tile::tests::the_golomb_tail_reads_back_as_the_level_it_was_written_for ... ok
+test tile::tests::each_chroma_plane_codes_its_own_basis_function ... ok
+test tile::tests::flat_key_frame_decodes_to_mid_grey ... ok
+test tile::tests::each_superblock_decodes_to_the_grey_its_own_level_asks_for ... ok
+test tile::tests::the_inverse_transform_reproduces_the_pinned_split_residuals ... ok
+test tile::tests::the_inverse_transform_reproduces_the_pinned_whole_superblock_residuals ... ok
+test tile::tests::the_price_grows_with_the_levels ... ok
+test tile::tests::the_priced_coefficient_bits_match_the_bytes_written ... ok
+test tile::tests::the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_16x16_block ... ok
+test tile::tests::the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_32x32_block ... ok
+test tile::tests::the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_64x64_block ... ok
+test encode::tests::a_sequence_round_trips_at_the_exactly_half_straddle_size ... ok
+test encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins ... ok
+test tile::tests::levels_above_the_base_range_tail_carry_a_golomb_tail ... ok
+test encode::tests::real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size ... ok
+test encode::tests::every_mode_decodes_to_what_the_encoder_predicted ... ok
+test encode::tests::real_clip_encodes_within_its_quality_and_size_budget ... ok
+test tile::tests::a_dc_coefficient_moves_the_whole_block_off_mid_grey ... ok
+test encode::tests::a_frame_round_trips_at_its_own_size ... ok
+
+failures:
+
+---- encode::tests::predicted_coeff_bits_track_the_tile_the_writer_wrote stdout ----
+frame  predicted bits  written bits  drift
+    0            4443          4528   +1.88%
+    1            1467          1592   +7.82%
+    2             404           576  +29.80%
+    3             354           544  +34.86%
+    4             313           464  +32.59%
+
+thread 'encode::tests::predicted_coeff_bits_track_the_tile_the_writer_wrote' (1451781) panicked at crates/ec-av1/src/encode.rs:10466:9:
+the writer spent 34.86% more than the search priced -- more than the mode/mv syntax outside the coefficient sum explains
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    encode::tests::predicted_coeff_bits_track_the_tile_the_writer_wrote
+
+test result: FAILED. 77 passed; 1 failed; 15 ignored; 0 measured; 481 filtered out; finished in 4.09s
+
+error: test failed, to rerun pass `-p ec-av1 --lib`
