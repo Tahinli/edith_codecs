@@ -5948,6 +5948,65 @@ fn is_smooth_mode(mode: usize) -> bool {
     (crate::intra::SMOOTH_PRED as usize..=crate::intra::SMOOTH_H_PRED as usize).contains(&mode)
 }
 
+/// lane-coefread: the per-coefficient trace sites, one `#[cold]` call each.
+/// `eprintln!` builds its `fmt::Arguments` on the stack AT THE CALL SITE, so
+/// nine of them inside the base/sign loops pinned nine sets of values in the
+/// hot loop's frame (the annotated profile was full of `mov ...(%rsp)` spill
+/// traffic). Out of line, the loop keeps its values in registers and the
+/// trace output is character-for-character what it was.
+#[cold]
+#[inline(never)]
+fn trace_base_eob(scan_idx: usize, pos: usize, row: usize, col: usize, ctx: usize, v: i32) {
+    eprintln!("TRACE base_eob scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={v}");
+}
+
+#[cold]
+#[inline(never)]
+fn trace_base(scan_idx: usize, pos: usize, row: usize, col: usize, ctx: usize, v: i32) {
+    eprintln!("TRACE base scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={v}");
+}
+
+#[cold]
+#[inline(never)]
+fn trace_br(scan_idx: usize, pos: usize, row: usize, col: usize, ctx: usize, k: i32) {
+    eprintln!("TRACE br scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={k}");
+}
+
+#[cold]
+#[inline(never)]
+fn coeff_step_base(dec: &SymbolDecoder, scan_idx: usize, apos: usize, ctx: usize, v: i32) {
+    let (rng, _) = dec.debug_state();
+    eprintln!("EC_COEFF_STEP tag=base c={scan_idx} pos={apos} ctx={ctx} level={v} rng={rng}");
+}
+
+#[cold]
+#[inline(never)]
+fn coeff_step_br(dec: &SymbolDecoder, scan_idx: usize, apos: usize, ctx: usize, k: i32) {
+    let (rng, _) = dec.debug_state();
+    eprintln!("EC_COEFF_STEP tag=br c={scan_idx} pos={apos} ctx={ctx} k={k} rng={rng}");
+}
+
+#[cold]
+#[inline(never)]
+fn coeff_step_sign(dec: &SymbolDecoder, c: usize, negative: bool) {
+    let (rng, _) = dec.debug_state();
+    eprintln!("EC_COEFF_STEP tag=sign c={c} sign={} rng={rng}", negative as i32);
+}
+
+#[cold]
+#[inline(never)]
+fn coeff_step_post_golomb(dec: &SymbolDecoder, c: usize, level: i32) {
+    let (rng, _) = dec.debug_state();
+    eprintln!("EC_COEFF_STEP tag=post_golomb c={c} level={level} rng={rng}");
+}
+
+#[cold]
+#[inline(never)]
+fn coeff_step_base_eob_level(dec: &SymbolDecoder, level: i32) {
+    let (rng, _) = dec.debug_state();
+    eprintln!("EC_COEFF_STEP tag=base_eob level={level} rng={rng}");
+}
+
 fn read_coeffs(
     dec: &mut SymbolDecoder,
     coding: &mut TxbTables,
@@ -6093,9 +6152,7 @@ fn read_coeffs(
             let ctx = eob_coeff_ctx(scan_idx, side * side);
             let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
             if trace {
-                eprintln!(
-                    "TRACE base_eob scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={v}"
-                );
+                trace_base_eob(scan_idx, pos, row, col, ctx, v);
             }
             v
         } else {
@@ -6111,18 +6168,12 @@ fn read_coeffs(
             };
             let v = dec.symbol(&mut coding.base[ctx]) as i32;
             if ec_trace_coeff {
-                let (rng, _) = dec.debug_state();
                 // `pos` in libaom's column-major `coeff_idx` convention, so
                 // the ladder lines up with instrumented `aomdec`.
-                let apos = col * side + row;
-                eprintln!(
-                    "EC_COEFF_STEP tag=base c={scan_idx} pos={apos} ctx={ctx} level={v} rng={rng}"
-                );
+                coeff_step_base(dec, scan_idx, col * side + row, ctx, v);
             }
             if trace {
-                eprintln!(
-                    "TRACE base scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={v}"
-                );
+                trace_base(scan_idx, pos, row, col, ctx, v);
             }
             v
         };
@@ -6149,16 +6200,10 @@ fn read_coeffs(
                     // path's trace, so the cross-decoder range ladder was
                     // blind to every base-range symbol and mis-reported the
                     // first divergence (class [[gate-blind-to-feature]]).
-                    let (rng, _) = dec.debug_state();
-                    let apos = col * side + row;
-                    eprintln!(
-                        "EC_COEFF_STEP tag=br c={scan_idx} pos={apos} ctx={ctx} k={k} rng={rng}"
-                    );
+                    coeff_step_br(dec, scan_idx, col * side + row, ctx, k);
                 }
                 if trace {
-                    eprintln!(
-                        "TRACE br scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={k}"
-                    );
+                    trace_br(scan_idx, pos, row, col, ctx, k);
                 }
                 level += k;
                 sent += BR_STEP;
@@ -6171,8 +6216,7 @@ fn read_coeffs(
             level
         };
         if ec_trace_coeff && scan_idx == eob - 1 {
-            let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=base_eob level={level} rng={rng}");
+            coeff_step_base_eob_level(dec, level);
         }
         // Every coded level here is a magnitude in `0..=15` (base <= 3 plus
         // at most `COEFF_BASE_RANGE` from the `br` loop; the Golomb tail is
@@ -6205,8 +6249,7 @@ fn read_coeffs(
             dec.literal(1) == 1
         };
         if ec_trace_coeff {
-            let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=sign c={c} sign={} rng={rng}", negative as i32);
+            coeff_step_sign(dec, c, negative);
         }
         let level = if level > MAX_BR_LEVEL {
             let g = read_golomb(dec)?;
@@ -6218,8 +6261,7 @@ fn read_coeffs(
             level
         };
         if ec_trace_coeff {
-            let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=post_golomb c={c} level={level} rng={rng}");
+            coeff_step_post_golomb(dec, c, level);
         }
         grid[pos] = if negative { -level } else { level };
     }
@@ -6234,6 +6276,7 @@ fn read_coeffs(
 /// rather than guess-decode if a non-2D class ever shows up here, since
 /// neither `base_ctx_rect`/`br_ctx_rect` nor [`class_scan_table`] have a rect
 /// form for those.
+
 fn read_coeffs_rect(
     dec: &mut SymbolDecoder,
     coding: &mut TxbTables,
