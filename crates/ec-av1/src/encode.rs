@@ -2242,14 +2242,33 @@ impl Reach {
 }
 
 /// What one symbol costs against a CDF, in bits.
-/// What the `motion_mode`/`obmc` symbol costs (spec 5.11.24), off the default
-/// table rather than the tile's adapted one -- the same static-CDF estimate
-/// every other symbol in this search is priced with.
+/// The smallest LEAF an OBMC candidate is offered for, so the census can
+/// attribute the tool's effect by footprint (`EC_AV1_OBMC_MIN`, default 8 --
+/// every leaf; 16 or 32 turn the smaller leaves off). Only read when
+/// `EC_AV1_OBMC` is on, and never by the 32x32 whole-block candidate.
+///
+/// MEASURED at native, `EC_AV1_OBMC=1` throughout (BD vs libaom / vs rav1e,
+/// against the +18.0/+0.7, +47.3/+19.2, +59.4/-10.0 of the tool OFF):
+/// see `search_inter_block`'s note for the whole table.
+fn obmc_min_side() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_OBMC_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// What the `motion_mode`/`obmc` symbol costs (spec 5.11.24), off the tables
+/// this frame's writer really starts from (`tile::obmc_symbol_bits`) -- the
+/// same frame-CDF price the coefficients of a non-screen frame are estimated
+/// with, not the static default table.
 fn obmc_bits(write_w: usize, write_h: usize, obmc: bool) -> f64 {
     let Some(row) = crate::decode::motion_mode_cdf_row(write_w, write_h) else {
         return 0.0;
     };
-    symbol_bits(&cdf::OBMC[row], usize::from(obmc))
+    crate::tile::obmc_symbol_bits(row, obmc)
 }
 
 pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
@@ -3391,6 +3410,86 @@ fn leaf_compound_stacks<'a>(
     .collect()
 }
 
+/// The OBMC prediction of one square single-reference block: this block's own
+/// translation prediction (`mc::predict`) with every bordering above/left
+/// neighbour blended into the overlap strips by the DECODER's own plan and
+/// blend ([`crate::decode::obmc_plan`] / [`crate::decode::obmc_run`]), so what
+/// the search prices is what a decoder reconstructs -- never a second
+/// implementation of the blend. `None` when the block has no overlappable
+/// neighbour at all (the writer would then code no `motion_mode` symbol) or
+/// when the plan cannot be built (a neighbour naming a reference this encode
+/// does not hold).
+#[allow(clippy::too_many_arguments)]
+fn obmc_prediction(
+    grid: &MiGrid,
+    (mi_row, mi_col): (usize, usize),
+    (mi_rows, mi_cols): (usize, usize),
+    (x, y): (usize, usize),
+    side: usize,
+    mv: (i32, i32),
+    refs: &[Option<&Picture>; 8],
+    // This block's OWN reference planes, luma then both chroma, each as
+    // (samples, stride, true width, true height).
+    ref_planes: [(&[u16], usize, usize, usize); 3],
+    frame_width: usize,
+    fctx: &crate::decode::FrameCtx,
+) -> Option<[Vec<u8>; 3]> {
+    let n4 = side / 4;
+    if !crate::decode::has_overlappable_neighbour(grid, mi_row, mi_col, n4, n4, mi_cols, mi_rows) {
+        return None;
+    }
+    let refpix = crate::decode::RefPix::ready(*refs);
+    let plan = crate::decode::obmc_plan(
+        grid,
+        &[],
+        &[],
+        mi_row,
+        mi_col,
+        n4,
+        n4,
+        mi_rows,
+        mi_cols,
+        side,
+        side,
+        side,
+        side / 2,
+        x,
+        y,
+        x / 2,
+        y / 2,
+        &refpix,
+        Some(mc::InterpFilterKind::Regular),
+        frame_width,
+    )
+    .ok()?;
+    let mut pred = [
+        vec![0u16; side * side],
+        vec![0u16; side * side / 4],
+        vec![0u16; side * side / 4],
+    ];
+    for (i, r) in ref_planes.into_iter().enumerate() {
+        let luma_plane = i == 0;
+        let (px, py) = if luma_plane { (x, y) } else { (x / 2, y / 2) };
+        let s = if luma_plane { side } else { side / 2 };
+        mc::predict(
+            r.0,
+            r.1,
+            r.2,
+            r.3,
+            mv_to_q4(px, mv.1, luma_plane),
+            mv_to_q4(py, mv.0, luma_plane),
+            s,
+            s,
+            &mut pred[i],
+            fctx,
+        );
+    }
+    let [mut py_buf, mut pu_buf, mut pv_buf] = pred;
+    crate::decode::obmc_run(&plan, &refpix, &mut py_buf, &mut pu_buf, &mut pv_buf, fctx);
+    let u8s = |b: &[u16]| b.iter().map(|&v| v as u8).collect::<Vec<u8>>();
+    Some([u8s(&py_buf), u8s(&pu_buf), u8s(&pv_buf)])
+}
+
 fn code_square_inter(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
@@ -3404,6 +3503,17 @@ fn code_square_inter(
     // leaf's own `bw4`/`bh4` (empty on a frame that does not code
     // `reference_select`, and at the straddling call sites).
     compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
+    // lane-av1obmc2: the mi grid this leaf's neighbours were published into
+    // (`record_mi`, in the writer's own coding order) and this leaf's place in
+    // it -- what the OBMC candidate's eligibility walk and neighbour plan
+    // read, the same state the tile writer reads when it codes the leaf's
+    // `motion_mode` symbol.
+    grid: &MiGrid,
+    (mi_row, mi_col): (usize, usize),
+    (mi_rows, mi_cols): (usize, usize),
+    // Every picture an OBMC neighbour can name: a leaf only searches LAST,
+    // but the neighbours it blends may be GOLDEN/ALTREF blocks.
+    refs: &[Option<&Picture>; 8],
     fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (intra_block, intra_cost) =
@@ -3543,6 +3653,21 @@ fn code_square_inter(
     // prices for a whole block -- `motion::search` from `pred_mv`, rounded to
     // a vector the residual syntax can name -- at this leaf's own side.
     let mut best: (f64, Option<(Trial, Trial, Trial, bool, InterInfo)>) = (inter_cost, None);
+    // The `NEARESTMV` candidate `inter_cost` prices, named once so the OBMC
+    // re-price below can hand it back as the winner's own mode info.
+    let nearest_info = InterInfo {
+        ref1: None,
+        mv1: (0, 0),
+        ref_frame: crate::mvstack::LAST_FRAME,
+        mode: InterMode::NearestMv,
+        mv,
+        ref_mv_idx: 0,
+    };
+    // What the current SINGLE-REFERENCE winner pays in mode/reference/mv
+    // syntax, apart from its residual: the OBMC candidate re-prices the same
+    // syntax against a different prediction, so both sides of that comparison
+    // carry it.
+    let mut single_syntax = intra_inter_bits(true) + single_ref_bits + mode_bits_inter;
     // This leaf's own `NEWMV` vector, kept whether or not it won the
     // single-reference comparison: it seeds the compound half-new candidate
     // below, exactly as `search_inter_block` seeds its own from the searches
@@ -3619,6 +3744,11 @@ fn code_square_inter(
                             luma_new.bits + u_new.bits + v_new.bits
                         });
             if cost_new < best.0 {
+                single_syntax = intra_inter_bits(true)
+                    + single_ref_bits
+                    + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
+                    + drl_bits
+                    + mv_bits;
                 best = (
                     cost_new,
                     Some((
@@ -3833,6 +3963,74 @@ fn code_square_inter(
         }
     }
 
+    // lane-av1obmc2: the OBMC candidate at a 16x16 / 8x8 LEAF (spec
+    // `motion_mode == OBMC_CAUSAL`), offered to this leaf's single-reference
+    // winner -- libaom's `motion_mode_allowed` refuses a compound block, and
+    // the writer codes no symbol for one. The prediction is the decoder's own
+    // plan and blend over the neighbours this leaf's `grid` already carries
+    // (published by `record_mi` in the writer's coding order), so the
+    // reconstruction priced here is the one a decoder rebuilds. lane-av1obmc
+    // offered this only at 32x32, which is not where libaom cashes its OBMC
+    // gain.
+    let mut obmc_won = false;
+    let single = match &best.1 {
+        None => Some(nearest_info),
+        Some((_, _, _, _, info)) if info.ref1.is_none() => Some(*info),
+        Some(_) => None,
+    };
+    if let Some(info) = single.filter(|i| {
+        crate::envflags::env_flag!("EC_AV1_OBMC")
+            && side >= obmc_min_side()
+            && i.ref_frame == crate::mvstack::LAST_FRAME
+    }) {
+        let planes = [
+            (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
+            (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+            (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+        ];
+        if let Some(pred) = obmc_prediction(
+            grid,
+            (mi_row, mi_col),
+            (mi_rows, mi_cols),
+            (x, y),
+            side,
+            info.mv,
+            refs,
+            planes,
+            reference.width,
+            fctx,
+        ) {
+            let luma_o = luma.code_from_prediction(
+                x, y, side, &pred[0], false, search.base_q_idx, search.deadzone, luma_set,
+            );
+            let u_o = chroma[0].code_from_prediction(
+                x / 2, y / 2, side / 2, &pred[1], false, search.base_q_idx, search.deadzone,
+                chroma_set,
+            );
+            let v_o = chroma[1].code_from_prediction(
+                x / 2, y / 2, side / 2, &pred[2], false, search.base_q_idx, search.deadzone,
+                chroma_set,
+            );
+            let skip_o = luma_o.levels.iter().all(|&l| l == 0)
+                && u_o.levels.iter().all(|&l| l == 0)
+                && v_o.levels.iter().all(|&l| l == 0);
+            let cost_o = luma_o.sse
+                + u_o.sse
+                + v_o.sse
+                + search.lambda
+                    * (skip_bits(skip_o)
+                        + single_syntax
+                        + obmc_bits(side, side, true)
+                        + if skip_o { 0.0 } else { luma_o.bits + u_o.bits + v_o.bits });
+            // The incumbent pays the SIMPLE_TRANSLATION symbol it was priced
+            // without, so both sides carry the motion_mode syntax.
+            if cost_o < best.0 + search.lambda * obmc_bits(side, side, false) {
+                obmc_won = true;
+                best = (cost_o, Some((luma_o, u_o, v_o, skip_o, info)));
+            }
+        }
+    }
+
     if let (cost, Some((luma_new, u_new, v_new, skip_new, info))) = best {
         if cost < intra_cost {
             // A compound winner commits the flat trial it was priced from:
@@ -3855,7 +4053,10 @@ fn code_square_inter(
             // +1.4 against the +78.8/+95.1/+54.5 and +36.1/+56.4/+1.4 of the
             // same build without it. The static-CDF estimate was NOT what
             // held the compound var-tx trial back. The flat trial stays.
-            let (levels, tx_depth, dcost) = if info.ref1.is_some() {
+            // An OBMC winner commits the flat trial too: `commit_inter_luma`
+            // re-predicts each var-tx unit by plain translation, which is not
+            // the prediction this candidate was priced from.
+            let (levels, tx_depth, dcost) = if info.ref1.is_some() || obmc_won {
                 luma.commit(x, y, side, &luma_new);
                 (luma_new.levels.clone(), 0, 0.0)
             } else {
@@ -3881,7 +4082,7 @@ fn code_square_inter(
             palette_uv: None,
                     tx_depth,
                     inter: Some(info),
-                    obmc: false,
+                    obmc: obmc_won,
                 },
                 cost + dcost,
             );
@@ -6721,6 +6922,12 @@ pub(crate) fn encode_inter_frame(
         clip_planes_to_tile(&mut luma, &mut chroma, rect);
         let mut grid = MiGrid::new(mi_cols, mi_rows);
         grid.set_sign_bias(sign_bias);
+        // lane-av1obmc2: every picture an OBMC neighbour of a LEAF can name,
+        // built once per tile job (`obmc_prediction`).
+        let mut obmc_refs: [Option<&Picture>; 8] = [None; 8];
+        obmc_refs[crate::mvstack::LAST_FRAME as usize] = Some(reference);
+        obmc_refs[crate::mvstack::GOLDEN_FRAME as usize] = golden;
+        obmc_refs[crate::mvstack::ALTREF_FRAME as usize] = altref;
         grid.set_tile_bounds(
             rect.mi_row0 as usize,
             rect.mi_col0 as usize,
@@ -6889,7 +7096,13 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                                &stack, &cstacks, fctx,
+                                    &stack,
+                                    &cstacks,
+                                    &grid,
+                                    (mi_row, mi_col),
+                                    (mi_rows, mi_cols),
+                                    &obmc_refs,
+                                    fctx,
                                 );
                                 let leaf_cost = leaf_cost
                                     + search.lambda * partition_bits(SUB, false);
@@ -6950,7 +7163,13 @@ pub(crate) fn encode_inter_frame(
                                                 &search,
                                                 &mode_bits_table,
                                                 reference,
-                                                                        &stack8, &cstacks8, fctx,
+                                                &stack8,
+                                                &cstacks8,
+                                                &grid,
+                                                (mr, mc),
+                                                (mi_rows, mi_cols),
+                                                &obmc_refs,
+                                                fctx,
                                             );
                                             cost8 += cost;
                                             record_mi(&mut grid, mr, mc, 2, leaf8.inter);
@@ -7055,7 +7274,13 @@ pub(crate) fn encode_inter_frame(
                                 &search,
                                 &mode_bits_table,
                                 reference,
-                                        &stack, &cstacks, fctx,
+                                &stack,
+                                &cstacks,
+                                &grid,
+                                (mi_row, mi_col),
+                                (mi_rows, mi_cols),
+                                &obmc_refs,
+                                fctx,
                             );
                             // One publication point for every coded leaf
                             // (`record_mi`): this site used to spell the vote
@@ -7092,7 +7317,13 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                                &stack, &cstacks, fctx,
+                                    &stack,
+                                    &cstacks,
+                                    &grid,
+                                    (mi_row, mi_col),
+                                    (mi_rows, mi_cols),
+                                    &obmc_refs,
+                                    fctx,
                                 );
                                 // Same publication point as the 16x16
                                 // straddling leaf above (`record_mi`).
@@ -11440,6 +11671,19 @@ mod tests {
             // the real side, a screen clip none of them.
             let (price_default, price_real) = crate::tile::take_pricing_hits();
             eprintln!("{name}: pricer armings default={price_default} real={price_real}");
+            // lane-av1obmc2: the same motion_mode census the 640x384 gate
+            // prints (class `gate-blind-to-feature`) -- how many blocks coded
+            // the symbol at each footprint and how many took OBMC. Without it
+            // the native table, which is the standing keep table, could not
+            // say whether the tool fired at all.
+            let mm = crate::tile::take_motion_mode_hits();
+            eprintln!(
+                "{name}: motion_mode 32x32 SIMPLE={} OBMC={} | 16x16 SIMPLE={} OBMC={} | \
+                 8x8 SIMPLE={} OBMC={} ({:.1}% OBMC of {} eligible)",
+                mm[0], mm[1], mm[2], mm[3], mm[4], mm[5],
+                100.0 * (mm[1] + mm[3] + mm[5]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
+                mm.iter().sum::<usize>(),
+            );
             let palette = crate::tile::take_palette_hits();
             let palette_uv = crate::tile::take_palette_uv_hits();
             let ibc = crate::tile::take_intrabc_hits();
