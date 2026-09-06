@@ -61,6 +61,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub(crate) mod analysis;
 pub mod celt;
 pub mod celt_enc;
 pub mod encoder;
