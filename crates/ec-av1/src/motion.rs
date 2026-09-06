@@ -318,19 +318,54 @@ pub(crate) fn search(
     pred_mv: (i32, i32),
     seeds: &[(i32, i32)],
     lambda: f64, fctx: &crate::decode::FrameCtx,
+    // How many frames back (order-hint distance) this reference sits: a
+    // reference twice as far away holds content that has moved about twice
+    // as far, so the log stage starts from a proportionally wider step. See
+    // [`dist_initial_step`].
+    dist: u32,
 ) -> MotionSearch {
-    let (result, _trace) = search_traced(
+    let (result, _trace) = search_traced_from_step(
         reference, stride, ref_width, ref_height, source, block_x, block_y, block_w, block_h,
         pred_mv,
         if seeded() { seeds } else { &[] },
-        lambda, fctx,
+        lambda,
+        dist_initial_step(dist), fctx,
     );
     result
 }
 
+/// The integer-pel log stage's starting step for a reference at order-hint
+/// distance `dist`: `step * (1 + k * (dist - 1))`, `k` = `EC_AV1_MV_DIST_SCALE`
+/// in a test build. `k = 0` is the flat step every reference used before.
+fn dist_initial_step(dist: u32) -> i32 {
+    let base = if seeded() { seeded_step() } else { SEARCH_INITIAL_STEP_PEL };
+    static K: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let k = *K.get_or_init(|| match std::env::var("EC_AV1_MV_DIST_SCALE").ok() {
+        Some(v) if cfg!(test) => v.parse().unwrap_or(MV_DIST_SCALE),
+        _ => MV_DIST_SCALE,
+    });
+    if dist <= 1 || k <= 0.0 {
+        return base;
+    }
+    let scaled = f64::from(base) * k.mul_add(f64::from(dist - 1), 1.0);
+    // Past 4x the base the log stage spends its rounds on vectors no
+    // reference in this encoder's GOP reaches.
+    scaled.round().clamp(f64::from(base), f64::from(base * 4)) as i32
+}
+
+/// The distance scale [`dist_initial_step`] ships with. Swept on the BD gate
+/// (vs libaom, 1080p/2160p/screen): 0 = +100.7/+115.8/+73.3, 0.25
+/// +98.5/+112.2, 0.375 +98.2/+115.6, 0.5 +94.4/+104.3, 0.625 +95.9/+106.5,
+/// 0.75 +92.8/+112.7, 1.0 +98.8/+113.0 -- screen is byte-identical at every
+/// point (its motion is small enough that a wider start converges to the same
+/// vector). 0.5 wins both film clips together; the ranking either side of it
+/// is near-tie churn, not a gradient.
+const MV_DIST_SCALE: f64 = 0.5;
+
 /// [`search`], plus the running best cost after every round any of its three
 /// stages ran — what `cost_is_monotone_non_increasing_over_the_search` below
 /// checks.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // one reference plane, one block, one predictor
 fn search_traced(
     reference: &[u16],
@@ -594,6 +629,7 @@ mod tests {
                 (0, 0),
                 &[],
                 0.1, fctx,
+                1,
             );
             assert_eq!(
                 result.mv,
@@ -644,6 +680,7 @@ mod tests {
             (0, 0),
             &[],
             0.1, fctx,
+            1,
         );
         assert_eq!(
             result.mv,
