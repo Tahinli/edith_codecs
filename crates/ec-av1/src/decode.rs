@@ -8385,7 +8385,7 @@ struct PaletteUv {
 /// `read_palette_colors_y`'s shrinking `bits` and `av1_read_uniform`'s
 /// `get_unsigned_bits`, which is the same formula): smallest `n` with
 /// `2^n >= x`, `0` for `x <= 1`.
-fn ceil_log2(x: u32) -> u32 {
+pub(crate) fn ceil_log2(x: u32) -> u32 {
     if x < 2 { 0 } else { 32 - (x - 1).leading_zeros() }
 }
 
@@ -8559,7 +8559,7 @@ const PALETTE_COLOR_INDEX_CONTEXT_LOOKUP: [i32; 9] = [-1, -1, 0, -1, -1, 4, 3, 2
 /// palette block's map to a narrower plane edge, [`decode_color_index_map`]'s
 /// own doc). Returns `(ctx, color_order)`; `color_order[symbol]` is the
 /// actual colour index to store.
-fn palette_color_index_context(
+pub(crate) fn palette_color_index_context(
     map: &[u8],
     side: usize,
     row: usize,
