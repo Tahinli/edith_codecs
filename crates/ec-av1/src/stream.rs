@@ -3348,6 +3348,73 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-av1rect: the encoder used to REFUSE every size where a 32x32
+    /// block straddles BOTH true frame edges at once ("straddles the true
+    /// frame edge in a way that needs a rectangular (HORZ/VERT) transform
+    /// this encoder does not code yet"). That refusal was a misreading of
+    /// spec 5.11.4: a block whose `hasRows` and `hasCols` are BOTH false
+    /// reads no partition symbol at all and is `PARTITION_SPLIT` by
+    /// inference, down to the 8x8 leaves whose own mi origin is inside the
+    /// frame -- exactly the leaves this writer already codes for the
+    /// one-axis case, and no rectangular transform anywhere. The sweep walks
+    /// the corners around the 32-multiples (each width has a 16x16 column
+    /// whose right half is outside, each height a row whose bottom half is,
+    /// so the bottom-right 16x16 of every size here is cut on both axes) and
+    /// three-way compares: our decoder, the encoder's own reconstruction and
+    /// ffmpeg, over a 4-frame GOP so the inter writer's copy of the same
+    /// signaling is covered too. `edge_both_cut_hits` proves the decoder
+    /// really took the inferred-split path rather than the gate passing on
+    /// geometry that never fires it.
+    #[test]
+    fn a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg() {
+        let fctx = &crate::decode::FrameCtx::new();
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg: no ffmpeg");
+            return;
+        }
+        const FRAMES: usize = 4;
+        let mut both_cut = 0usize;
+        for &width in &[200usize, 216, 232, 248] {
+            for &height in &[104usize, 120, 136, 152] {
+                let pictures: Vec<_> = (0..FRAMES as i64)
+                    .map(|i| panned_test_card(width, height, i * 3))
+                    .collect();
+                let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx)
+                    .unwrap_or_else(|e| panic!("{width}x{height}: encoder refused: {e}"));
+                // Reset per attempt, never a delta across sizes (class
+                // counter-from-refused-stream).
+                crate::decode::reset_edge_both_cut_hits();
+                let decoded = decode_stream(&encoded.stream)
+                    .unwrap_or_else(|e| panic!("{width}x{height}: our decoder refused: {e}"));
+                both_cut += crate::decode::edge_both_cut_hits().iter().sum::<usize>();
+                let ffmpeg_frames = ffmpeg_decode_sequence(&encoded.stream, width, height, FRAMES);
+                assert_eq!(
+                    ffmpeg_frames.len(),
+                    FRAMES,
+                    "{width}x{height}: ffmpeg decoded {} of {FRAMES} frames",
+                    ffmpeg_frames.len()
+                );
+                assert_eq!(decoded.len(), FRAMES, "{width}x{height}: frame count");
+                for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{width}x{height} frame {i} luma vs ffmpeg");
+                    assert_eq!(got.u, want.u, "{width}x{height} frame {i} U vs ffmpeg");
+                    assert_eq!(got.v, want.v, "{width}x{height} frame {i} V vs ffmpeg");
+                }
+                for (i, (frame, want)) in encoded.frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    let rec = &frame.reconstruction;
+                    assert_eq!(rec.y, want.y, "{width}x{height} frame {i} luma: recon vs ffmpeg");
+                    assert_eq!(rec.u, want.u, "{width}x{height} frame {i} U: recon vs ffmpeg");
+                    assert_eq!(rec.v, want.v, "{width}x{height} frame {i} V: recon vs ffmpeg");
+                }
+            }
+        }
+        assert!(
+            both_cut > 0,
+            "no partition node in the whole sweep was coded as the both-axes-cut \
+             inferred split -- the gate is blind to the feature it pins"
+        );
+    }
+
     /// A hand-built 3-frame stream that actually fires `GOLDEN_FRAME`
     /// through [`decode_stream`], proving the round-4 flip (`decode.rs`'s
     /// `decode_inter_block` `GOLDEN_FRAME` arm) the way 120+ real aomenc
