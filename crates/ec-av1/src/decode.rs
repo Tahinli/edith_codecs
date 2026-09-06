@@ -35643,9 +35643,20 @@ mod tests {
     /// `ref_frame_idx[3]` names the slot the key frame left behind and its
     /// blocks may code `single_ref` out to it.
     fn last_and_golden<'a>(last: &'a Picture, golden: &'a Picture) -> RefPix<'a> {
+        last_golden_altref(last, golden, None)
+    }
+
+    /// [`last_and_golden`] plus `ALTREF_FRAME` (index 7): the frame two back,
+    /// which the encoder keeps in the slot the current frame refreshes.
+    fn last_golden_altref<'a>(
+        last: &'a Picture,
+        golden: &'a Picture,
+        altref: Option<&'a Picture>,
+    ) -> RefPix<'a> {
         let mut refs: [Option<&Picture>; 8] = [None; 8];
         refs[1] = Some(last);
         refs[4] = Some(golden);
+        refs[7] = altref;
         RefPix::ready(refs)
     }
 
@@ -37176,7 +37187,11 @@ mod tests {
                 frame.base_q_idx,
                 width as u32,
                 height as u32,
-                &last_and_golden(&reference, &encoded.frames[0].reconstruction),
+                &last_golden_altref(
+                    &reference,
+                    &encoded.frames[0].reconstruction,
+                    (i >= 2).then(|| &encoded.frames[i - 2].reconstruction),
+                ),
                 &frame.cdef,
                 &frame.loop_filter,
                 false,
@@ -37488,7 +37503,11 @@ mod tests {
                 frame.base_q_idx,
                 coded_w,
                 coded_h,
-                &last_and_golden(&reference, &encoded.frames[0].reconstruction),
+                &last_golden_altref(
+                    &reference,
+                    &encoded.frames[0].reconstruction,
+                    (i >= 2).then(|| &encoded.frames[i - 2].reconstruction),
+                ),
                 &frame.cdef,
                 &frame.loop_filter,
                 false,

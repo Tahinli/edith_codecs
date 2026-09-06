@@ -732,6 +732,26 @@ pub fn inter_frame_headers(
     order_hint: u32,
     last_slot: u8,
 ) -> Result<(SequenceHeader, FrameHeader)> {
+    inter_frame_headers_slots(width, height, base_q_idx, order_hint, last_slot, last_slot, last_slot)
+}
+
+/// [`inter_frame_headers`] with the three slots named apart: the one read as
+/// `LAST_FRAME`, the one this frame refreshes, and the one read as
+/// `ALTREF_FRAME`. The encoder alternates the refreshed slot between 0 and 2
+/// so that the frame two back is still intact in the slot this one is about
+/// to overwrite -- read before write, spec 7.20's decode order.
+///
+/// # Errors
+/// As [`inter_frame_headers`].
+pub fn inter_frame_headers_slots(
+    width: usize,
+    height: usize,
+    base_q_idx: u8,
+    order_hint: u32,
+    last_slot: u8,
+    self_slot: u8,
+    altref_slot: u8,
+) -> Result<(SequenceHeader, FrameHeader)> {
     let (seq, key) = key_frame_headers(width, height, base_q_idx)?;
     let header = FrameHeader {
         frame_type: FrameType::Inter,
@@ -746,7 +766,7 @@ pub fn inter_frame_headers(
         force_integer_mv: false,
         order_hint,
         primary_ref_frame: 0,
-        refresh_frame_flags: 1 << last_slot,
+        refresh_frame_flags: 1 << self_slot,
         // Every reference but `GOLDEN_FRAME` (index 3 of `ref_frame_idx`)
         // names the slot this frame both predicts from and refreshes;
         // GOLDEN names slot 1, which the key frame wrote when it refreshed
@@ -755,6 +775,7 @@ pub fn inter_frame_headers(
         ref_frame_idx: {
             let mut idx = [last_slot; ec_av1_syntax::REFS_PER_FRAME];
             idx[3] = GOLDEN_SLOT;
+            idx[6] = altref_slot;
             idx
         },
         allow_high_precision_mv: false,
@@ -3408,7 +3429,7 @@ fn search_inter_block(
     // its two search-free modes are priced (`NEARESTMV`, `GLOBALMV`) -- a
     // second motion search would double the wall of the stage that already
     // owns most of it.
-    golden: Option<(&Picture, &MvStack)>, fctx: &crate::decode::FrameCtx,
+    extra: &[(i8, &Picture, &MvStack)], fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
     // below price their coefficients through `TxbSet::Luma32Inter`, which is
@@ -3680,8 +3701,8 @@ fn search_inter_block(
         ));
     }
 
-    if let Some((_, gstack)) = golden {
-        let g_ref_bits = single_ref_bits(crate::mvstack::GOLDEN_FRAME);
+    for &(ref_frame, _, gstack) in extra {
+        let g_ref_bits = single_ref_bits(ref_frame);
         let g_not_new = symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 1);
         cands.push((
             gstack.nearest_mv,
@@ -3690,7 +3711,7 @@ fn search_inter_block(
                 + symbol_bits(&cdf::ZERO_MV[gstack.zero_mv_ctx], 1)
                 + symbol_bits(&cdf::REF_MV[gstack.ref_mv_ctx], 0),
             InterInfo {
-                ref_frame: crate::mvstack::GOLDEN_FRAME,
+                ref_frame,
                 mode: InterMode::NearestMv,
                 mv: gstack.nearest_mv,
                 ref_mv_idx: 0,
@@ -3700,7 +3721,7 @@ fn search_inter_block(
             (0, 0),
             g_ref_bits + g_not_new + symbol_bits(&cdf::ZERO_MV[gstack.zero_mv_ctx], 0),
             InterInfo {
-                ref_frame: crate::mvstack::GOLDEN_FRAME,
+                ref_frame,
                 mode: InterMode::GlobalMv,
                 mv: (0, 0),
                 ref_mv_idx: 0,
@@ -3718,13 +3739,16 @@ fn search_inter_block(
     cands.dedup_by_key(|c| (c.2.ref_frame, c.0));
     {
         for (mv, mode_bits_inter, info) in cands {
-            let (ref_luma, ref_u, ref_v) = match golden {
-                Some((g, _)) if info.ref_frame == crate::mvstack::GOLDEN_FRAME => (
+            let (ref_luma, ref_u, ref_v) = match extra
+                .iter()
+                .find(|(r, _, _)| *r == info.ref_frame)
+            {
+                Some(&(_, g, _)) => (
                     (&g.y, g.width, luma.true_width, luma.true_height),
                     (&g.u, g.width / 2, chroma[0].true_width, chroma[0].true_height),
                     (&g.v, g.width / 2, chroma[1].true_width, chroma[1].true_height),
                 ),
-                _ => (ref_luma, ref_u, ref_v),
+                None => (ref_luma, ref_u, ref_v),
             };
             let luma_trial = mc_trial(
                 luma,
@@ -3839,7 +3863,11 @@ pub(crate) fn encode_inter_frame(
     // The key frame's own (padded) reconstruction, which every frame of the
     // GOP still holds in DPB slot 1 -- `GOLDEN_FRAME`. `None` codes the frame
     // with `LAST_FRAME` alone, exactly as before.
-    golden: Option<&Picture>, fctx: &crate::decode::FrameCtx,
+    golden: Option<&Picture>,
+    // The frame two back, held in the slot this frame is about to refresh
+    // (the encoder alternates 0/2): `ALTREF_FRAME`. `None` for the first two
+    // inter frames of a GOP, where the frame two back IS the key frame.
+    altref: Option<&Picture>, fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -3862,14 +3890,33 @@ pub(crate) fn encode_inter_frame(
     // overwrites slot 0, so the frame just coded is always what the next one
     // predicts against.
     const LAST_SLOT: u8 = 0;
+    // Slot 0 and slot 2 alternate so the frame two back survives one more
+    // frame: frame n writes A(n) = 0 for odd n, 2 for even, so A(n) = A(n-2)
+    // and the picture this frame names as `ALTREF_FRAME` is the one sitting
+    // in the very slot it will overwrite.
+    let self_slot = if order_hint % 2 == 1 { 0 } else { 2 };
+    let last_slot = if order_hint <= 1 {
+        LAST_SLOT
+    } else if (order_hint - 1) % 2 == 1 {
+        0
+    } else {
+        2
+    };
     // `render`, not `picture.width`/`picture.height`: `picture` here is
     // already padded to a whole number of superblocks (`encode_sequence`'s
     // `padded_to(SUPERBLOCK)`), and the header's `mi_cols`/`mi_rows` (and so
     // every true-edge clamp downstream) must come from the frame's real,
     // unpadded size, same as `key_frame_headers_colour` takes `render` and
     // not the padded picture in `encode_key_frame_inner`.
-    let (seq, mut header) =
-        inter_frame_headers(render.0, render.1, base_q_idx, order_hint, LAST_SLOT)?;
+    let (seq, mut header) = inter_frame_headers_slots(
+        render.0,
+        render.1,
+        base_q_idx,
+        order_hint,
+        last_slot,
+        self_slot,
+        if altref.is_some() { self_slot } else { GOLDEN_SLOT },
+    )?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
     // `TxMode::Select` here too: an inter block then codes one `txfm_split`
@@ -3974,18 +4021,25 @@ pub(crate) fn encode_inter_frame(
                     let (mi_row, mi_col) = (r32 * 8, c32 * 8);
                     let stack =
                         find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
-                    let golden_stack = golden.map(|_| {
-                        find_mv_stack(
-                            &grid,
-                            mi_row,
-                            mi_col,
-                            8,
-                            8,
-                            crate::mvstack::GOLDEN_FRAME,
-                            mi_cols,
-                            mi_rows,
-                        )
-                    });
+                    let extra_stacks: Vec<(i8, &Picture, MvStack)> = [
+                        (crate::mvstack::GOLDEN_FRAME, golden),
+                        (crate::mvstack::ALTREF_FRAME, altref),
+                    ]
+                    .into_iter()
+                    .filter_map(|(r, pic)| {
+                        pic.map(|p| {
+                            (
+                                r,
+                                p,
+                                find_mv_stack(&grid, mi_row, mi_col, 8, 8, r, mi_cols, mi_rows),
+                            )
+                        })
+                    })
+                    .collect();
+                    let extra: Vec<(i8, &Picture, &MvStack)> = extra_stacks
+                        .iter()
+                        .map(|(r, p, st)| (*r, *p, st))
+                        .collect();
 
                     let base = snapshot(&luma, &chroma, (x, y), BLOCK);
                     let (block, mut cost_whole) = search_inter_block(
@@ -3996,7 +4050,7 @@ pub(crate) fn encode_inter_frame(
                         &mode_bits_table,
                         reference,
                         &stack,
-                        golden.zip(golden_stack.as_ref()), fctx,
+                        &extra, fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
                     let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
@@ -4368,9 +4422,23 @@ pub(crate) fn encode_inter_frame(
             }
         }
     });
+    let trial_altref = altref.map(|a| {
+        if (a.width, a.height) == (fw, fh) {
+            a.clone()
+        } else {
+            Picture {
+                width: fw,
+                height: fh,
+                y: crop_plane(&a.y, a.width, fw, fh),
+                u: crop_plane(&a.u, a.width / 2, fw / 2, fh / 2),
+                v: crop_plane(&a.v, a.width / 2, fw / 2, fh / 2),
+            }
+        }
+    });
     let mut refs: [Option<&Picture>; 8] = [None; 8];
     refs[1] = Some(&trial_ref);
     refs[4] = trial_golden.as_ref();
+    refs[7] = trial_altref.as_ref();
     let refpix = crate::decode::RefPix::ready(refs);
     pick_and_apply_filters(
         &mut header,
@@ -4495,6 +4563,9 @@ pub(crate) fn encode_sequence_with_ctx(
     // key frame refreshes every slot, each inter frame only slot 0), which is
     // what `GOLDEN_FRAME` names.
     let golden = key.reconstruction.clone();
+    // The frame two back, once there is one that is not the key frame
+    // itself (which `GOLDEN_FRAME` already names).
+    let mut prev2: Option<Picture> = None;
     let mut carried = key.next_cdfs.clone();
     let mut reference = key.reconstruction.clone();
     let mut frames = vec![crop_encoded(&key, render.0, render.1)];
@@ -4515,11 +4586,15 @@ pub(crate) fn encode_sequence_with_ctx(
             order_hint,
             render,
             Some(&carried.0),
-            Some(&golden), fctx,
+            Some(&golden),
+            prev2.as_ref(), fctx,
         )?;
         stream.extend_from_slice(&inter.stream);
         carried = inter.next_cdfs.clone();
-        reference = inter.reconstruction.clone();
+        prev2 = Some(std::mem::replace(
+            &mut reference,
+            inter.reconstruction.clone(),
+        ));
         frames.push(crop_encoded(&inter, render.0, render.1));
     }
     Ok(EncodedSequence { stream, frames })
@@ -6552,7 +6627,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, fctx).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -6650,7 +6725,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, fctx).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -6827,7 +6902,7 @@ mod tests {
                     q,
                     0.5,
                     1,
-                    (width, height), None, None, fctx,
+                    (width, height), None, None, None, fctx,
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -6844,7 +6919,7 @@ mod tests {
                         q,
                         0.5,
                         1,
-                        (width, height), None, None, fctx,
+                        (width, height), None, None, None, fctx,
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
