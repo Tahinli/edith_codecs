@@ -2213,8 +2213,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
             TX16 => &SCANS[2],
             _ => &SCANS[3],
         };
-        let mut enc = SymbolEncoder::new();
-        enc.reset_bits();
+        let mut enc = SymbolEncoder::pricer();
         write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
         enc.bits()
     })
