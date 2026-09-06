@@ -735,19 +735,25 @@ fn seq_screen() -> bool {
 
 /// How many distinct colours a 16x16 luma block may hold and still count as
 /// screen content ([`screen_content`]), `EC_AV1_SCREEN_COLORS`. libaom's own
-/// `av1_set_screen_content_options` bound is 4.
+/// `av1_set_screen_content_options` bound is 4, which separates NOTHING on a
+/// real (lossily coded, so noisy) desktop capture: `probe_screen_detect`
+/// measures the share of 16x16 blocks under each bound on the gate's own
+/// three clips, and only at 32 do the populations part -- film 20.3..21.9%,
+/// his OBS capture 51.1..51.5%.
 fn screen_colors() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("EC_AV1_SCREEN_COLORS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4)
+            .unwrap_or(32)
     })
 }
 
 /// The reciprocal of the frame area those blocks must cover, in tenths --
-/// libaom's `counts * blk_h * blk_w * 10 > width * height` is 10 (one tenth).
+/// libaom's own `counts * blk_h * blk_w * 10 > width * height` is 10 (one
+/// tenth). 3 (a third) is the midpoint of the two populations
+/// `probe_screen_detect` measured at the colour bound above.
 /// `EC_AV1_SCREEN_PCT`.
 fn screen_pct() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -755,7 +761,7 @@ fn screen_pct() -> usize {
         std::env::var("EC_AV1_SCREEN_PCT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(10)
+            .unwrap_or(3)
     })
 }
 
@@ -8370,6 +8376,146 @@ mod tests {
                 w[1].0 > w[0].0 && w[1].1 > w[0].1,
                 "{name}: not monotone, {ladder:?}"
             );
+        }
+    }
+
+    /// The missing instrument: what this encoder costs against libaom and
+    /// rav1e at matched fidelity, and how long it takes to get there.
+    ///
+    /// Recipe, identical on all three sides: 12 consecutive frames of each
+    /// clip scaled to 640x384 (a whole number of superblocks), one key frame
+    /// then 11 inter frames (`-g 12`, matching our own sequence shape), one
+    /// tile, `-threads 1`, no film grain synthesis (neither reference enables
+    /// it by default), 4:2:0 8-bit in and out. Reference points:
+    ///   libaom-av1: `-cpu-used 6 -b:v 0 -crf {5,20,35,45}`
+    ///   librav1e:   `-rav1e-params speed=6:quantizer={50,100,150,200}:
+    ///                tile_cols=1:tile_rows=1:threads=1`
+    /// ours: `base_q_idx {60,90,120,150}`. Every PSNR is all-plane, on
+    /// ffmpeg-decoded frames of each encoder's own stream.
+    ///
+    /// Measured 2026-09-06 after the in-loop filters (lane-av1filt: per-frame
+    /// deblocking levels and CDEF strengths, both chosen by re-decoding the
+    /// coded tile -- `crate::filter_search`), 12 frames, this box (wall = the
+    /// four encodes of that ladder together):
+    ///
+    /// | clip | ours (q 150/120/90/60) | BD-rate vs libaom | vs rav1e | wall ours:aom:rav1e |
+    /// |---|---|---|---|---|
+    /// | 1080p fixture | 42.11 dB/17774 B .. 50.99 dB/76838 B | +143.6% | +94.0% | 9.2s:1.1s:2.6s |
+    /// | 2160p fixture | 42.84 dB/12480 B .. 51.43 dB/46557 B | +179.5% | +128.8% | 8.6s:1.0s:2.2s |
+    /// | screen capture | 39.76 dB/9536 B .. 48.87 dB/29189 B | +88.0% | +21.5% | 7.2s:1.0s:2.1s |
+    ///
+    /// Re-measured 2026-09-06 after lane-av1fwd, which changed only how long
+    /// the encoder takes -- every stream it writes is byte-identical, so the
+    /// BD columns are this box's own re-run of the same recipe rather than a
+    /// quality move (+141.3/+174.2/+88.9 vs libaom, +91.9/+124.5/+21.6 vs
+    /// rav1e). What moved is the wall of the four encodes:
+    ///
+    /// | clip | wall ours before | after | instructions:u before -> after |
+    /// |---|---|---|---|
+    /// | 1080p fixture | 9.2s | 7.2s | 191.5G -> 139.8G (-27.0%) |
+    /// | 2160p fixture | 8.6s | 6.9s | 183.5G -> 136.4G (-25.6%) |
+    /// | screen capture | 7.2s | 6.7s | 157.2G -> 122.5G (-22.1%) |
+    ///
+    /// Three exact steps, none of which touches a coded bit: the coefficient
+    /// rate pricer stopped rebuilding every CDF table per candidate
+    /// (`tile::coeff_bits`), the filter search stopped re-decoding its own
+    /// tile once per candidate (`decode::FilterReplay`), and the forward
+    /// transform stopped transforming the all-zero residual that 70% of its
+    /// calls carry.
+    ///
+    /// The three steps of that lane, same recipe (vs libaom, then vs rav1e):
+    ///
+    /// | step | 1080p | 2160p | screen |
+    /// |---|---|---|---|
+    /// | no in-loop filter | +234.0 / +171.9 | +260.3 / +203.2 | +318.5 / +155.3 |
+    /// | + deblocking | +198.2 / +143.1 | +218.1 / +162.4 | +136.9 / +52.7 |
+    /// | + CDEF | +143.6 / +94.0 | +179.5 / +128.8 | +88.0 / +21.5 |
+    ///
+    /// Loop restoration is NOT in yet: it is the one filter whose parameters
+    /// are per restoration UNIT inside the tile payload, so it needs both
+    /// tile writers to code `lr` syntax and an encoder-visible post-CDEF
+    /// buffer to solve against -- neither of which this frame-header-level
+    /// search reaches.
+    ///
+    /// The baseline it replaced, before an inter frame's blocks chose their
+    /// own partition, was +501.4/+504.4/+440.9 against libaom and
+    /// +364.4/+401.0/+206.0 against rav1e at 5.1/4.6/5.9 s.
+    ///
+    /// So: roughly 2.5-3x libaom's rate and 1.5-2x rav1e's at matched
+    /// fidelity, while spending far more time than either (the partition
+    /// search's own cost, uncut: see the two intra-pruning variants measured
+    /// and rejected in the lane report). No
+    /// threshold is asserted yet -- this run sets the baseline; the gate
+    /// asserts only four monotone points per ladder and that ffmpeg decodes
+    /// our stream sample-exact against our reconstruction.
+    ///
+    /// Run:
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         bd_rate_vs_libaom_and_rav1e --nocapture
+    #[test]
+    #[ignore = "the encoder BD-rate baseline: minutes per clip, needs ffmpeg"]
+     /// The sweep behind [`screen_content`]'s two constants
+    /// (`unswept-decision-constants`): the share of 16x16 luma blocks with at
+    /// most N distinct colours, per gate clip, at the size the gate codes.
+    /// `cargo test -p ec-av1 --release --lib -- --ignored probe_screen_detect --nocapture`
+    #[test]
+    #[ignore = "reads the real library"]
+    fn probe_screen_detect() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut clips: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for name in ["h264-1080p-23.976-8bit.mp4", "h264-2160p-23.976-8bit.mp4"] {
+            let path = fixtures.join("video").join(name);
+            if path.exists() {
+                clips.push((name.to_string(), path));
+            }
+        }
+        if let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"))
+            && let Some(p) = manifest
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split('\t').next())
+                .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+        {
+            clips.push(("screen".to_string(), std::path::PathBuf::from(p)));
+        }
+        let (width, height) = (640usize, 384usize);
+        for (name, path) in &clips {
+            let frames = clip_frames(path.to_str().unwrap(), "0", width, height, 4);
+            for (f, picture) in frames.iter().enumerate() {
+                let y: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
+                let mut hist = [0usize; 257];
+                let mut blocks = 0usize;
+                for by in (0..height).step_by(16) {
+                    for bx in (0..width).step_by(16) {
+                        let mut seen = [false; 256];
+                        let mut colors = 0usize;
+                        for row in 0..16 {
+                            for col in 0..16 {
+                                let v = usize::from(y[(by + row) * width + bx + col]);
+                                if !seen[v] {
+                                    seen[v] = true;
+                                    colors += 1;
+                                }
+                            }
+                        }
+                        hist[colors] += 1;
+                        blocks += 1;
+                    }
+                }
+                let share = |limit: usize| {
+                    100.0 * hist[2..=limit.min(256)].iter().sum::<usize>() as f64
+                        / blocks.max(1) as f64
+                };
+                eprintln!(
+                    "{name} frame {f}: <=4 {:.1}%  <=8 {:.1}%  <=16 {:.1}%  <=32 {:.1}%  <=64 {:.1}%  <=128 {:.1}%",
+                    share(4),
+                    share(8),
+                    share(16),
+                    share(32),
+                    share(64),
+                    share(128),
+                );
+            }
         }
     }
 
