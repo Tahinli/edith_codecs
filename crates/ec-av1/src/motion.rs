@@ -276,13 +276,18 @@ fn search_traced_from_step(
             reference, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h,
             &mut dst16, fctx,
         );
-        let sad: f64 = source
+        // lane-av1speed: accumulated as an integer (a block is at most
+        // 32x32 samples of at most 255 each, nowhere near `u32`, and an
+        // integer sum this small is exact in `f64` whatever order it is
+        // summed in) instead of one `f64` conversion and dependent add per
+        // sample. Same value, several times the throughput.
+        let sad: u32 = source
             .iter()
             .zip(dst16.iter())
-            .map(|(&a, &b)| f64::from((i32::from(a) - i32::from(b)).unsigned_abs()))
+            .map(|(&a, &b)| (i32::from(a) - i32::from(b)).unsigned_abs())
             .sum();
         let diff = (mv.0 - pred_mv.0, mv.1 - pred_mv.1);
-        sad + lambda * mv_bits(diff)
+        f64::from(sad) + lambda * mv_bits(diff)
     };
 
     let mut trace = Vec::new();
