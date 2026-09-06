@@ -332,7 +332,12 @@ impl Default for Pyramid {
     /// The best point of the offset sweep run through the BD gate's own
     /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]` knob
     /// (`encode::tests::bd_rate_vs_libaom_and_rav1e`, 12 frames of each of
-    /// the three gate clips, BD-rate vs libaom / vs rav1e):
+    /// the three gate clips, BD-rate vs libaom / vs rav1e, wall = the four
+    /// encodes of the ladder together).
+    ///
+    /// First sweep, before the motion-search lane merged (its extra-reference
+    /// `NEWMV` is exactly what a pyramid leaf needs to reach its hidden
+    /// frame), so read it for the OFFSETS, not for the verdict:
     ///
     /// | mini_gop:arf:leaf | 1080p | 2160p | screen |
     /// |---|---|---|---|
@@ -344,23 +349,47 @@ impl Default for Pyramid {
     /// | 2:-8:4 | +143.1 / +89.1 | +196.2 / +141.6 | +82.5 / +20.4 |
     /// | 2:-16:8 | +137.6 / +84.5 | +187.2 / +130.6 | +84.9 / +23.1 |
     ///
-    /// Two things the sweep says. The quantizer offsets are real and in the
-    /// direction libaom's `gf_group` spends them (0/0 is the worst row at
-    /// every mini-GOP; -16/+8 buys 12-16 BD points over it), which is what
-    /// these defaults are. And the pyramid as a whole does NOT yet pay: no
-    /// row beats the flat baseline on all three clips, and 2160p is 40-70
-    /// points worse everywhere.
+    /// `0:0` is the worst row at both mini-GOP sizes and `-16/+8` buys 12-16
+    /// BD points over it, in the direction libaom's `gf_group` spends them
+    /// (lowest quantizer on the frame everything else predicts from). Those
+    /// are these defaults.
     ///
-    /// The reason is measurable, not mysterious: the leaves may only reach
-    /// the hidden frame through the SEARCH-FREE modes (`NEARESTMV` off the
-    /// stack and `GLOBALMV`) — this lane adds no motion search — so
-    /// `ALTREF_FRAME` wins about 4% of blocks, while the hidden frame itself
-    /// pays the full cost of predicting `mini_gop` pictures ahead of its own
-    /// reference. Backward `NEWMV` is the missing half, and it lives in the
-    /// motion-search lane. Until it lands the pyramid ships OFF: nothing
-    /// selects it but an explicit [`Av1Encoder::with_pyramid`] call (or
-    /// `EC_AV1_PYRAMID` on the gate and on `ec-bench`), and the default
-    /// one-in-one-out path is byte-identical to before it existed.
+    /// Re-measured after that lane merged (wall ours, 1080p/2160p/screen):
+    ///
+    /// | arm | 1080p | 2160p | screen | wall |
+    /// |---|---|---|---|---|
+    /// | flat (no pyramid) | +121.1 / +71.8 | +146.1 / +97.5 | +79.3 / +17.2 | 6.3 / 5.8 / 6.2 s |
+    /// | 4:-16:8 | +131.9 / +81.1 | +178.7 / +123.6 | +78.4 / +19.5 | 6.2 / 5.6 / 5.5 s |
+    /// | 2:-16:8 | +125.4 / +76.2 | +173.0 / +119.5 | +84.9 / +23.1 | 6.2 / 5.6 / 6.2 s |
+    ///
+    /// So the pyramid still does NOT pay, and ships OFF: it wins 0.9 points
+    /// on screen capture at `4:-16:8` and loses 11 on 1080p and 33 on 2160p.
+    /// What keeps it from paying, in the order the numbers point at it:
+    ///
+    ///   * The hidden frame predicts `mini_gop` pictures ahead of its own
+    ///     reference with the SAME forward search a neighbouring frame gets,
+    ///     and it is the largest frame in the group (73.8 kB of the 1080p
+    ///     ladder's 184 kB at `4:-16:8`). On the 2160p clip, whose motion the
+    ///     search only just reaches at distance 1, distance 4 is where it
+    ///     falls off — that clip loses twice what 1080p does, and shrinking
+    ///     the mini-GOP to 2 recovers most of the gap (+178.7 -> +173.0,
+    ///     +131.9 -> +125.4). A distance-scaled search range is the fix, and
+    ///     it lives in the motion-search lane, not here.
+    ///   * The leaves reach the hidden frame through the extra-reference
+    ///     modes only: `ALTREF_FRAME` wins about 13% of blocks
+    ///     (`encode::take_ref_frame_hits`, printed by the round-trip test),
+    ///     up from 4% before the motion lane merged. A compound
+    ///     (`LAST` + `ALTREF`) prediction mode is the other half of what a
+    ///     real B frame buys, and this crate codes no compound blocks at all.
+    ///
+    /// Neither is a defect in the pyramid itself: the reordering is exact
+    /// (`encoder::tests::a_pyramid_stream_decodes_in_display_order_through_both_decoders`
+    /// checks every shown frame in display order against ffmpeg AND our own
+    /// decoder, with the hidden frame proven to win blocks), and the
+    /// quantizer offsets behave. Nothing selects the pyramid but an explicit
+    /// [`Av1Encoder::with_pyramid`] call (or `EC_AV1_PYRAMID` on the gate and
+    /// on `ec-bench`); the default one-in-one-out path is byte-identical to
+    /// before it existed.
     fn default() -> Self {
         Self {
             mini_gop: 4,
