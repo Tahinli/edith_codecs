@@ -43,6 +43,21 @@ use crate::celt::{
 };
 use crate::range::RangeEncoder;
 
+/// TF-boost sweep knobs (lane opustr2): `k * (tf_estimate - off) * target`,
+/// optionally applied only on frames the transient analysis flagged (other
+/// frames keep the shipped k=1). Read once from the environment;
+/// `EC_OPUS_TF_K` / `EC_OPUS_TF_OFF` / `EC_OPUS_TF_GATE=transient`.
+fn tf_boost_params() -> (f32, f32, bool) {
+    static P: std::sync::OnceLock<(f32, f32, bool)> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let f = |name: &str, dflt: f32| {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt)
+        };
+        let gate = std::env::var("EC_OPUS_TF_GATE").map(|v| v == "transient").unwrap_or(false);
+        (f("EC_OPUS_TF_K", 1.0), f("EC_OPUS_TF_OFF", 0.044), gate)
+    })
+}
+
 const CACHE_BITS: &[u8] = &crate::celt::CACHE_BITS;
 const INV_TABLE: [u8; 128] = [
     255,255,156,110, 86, 70, 59, 51, 45, 40, 37, 33, 31, 28, 26, 25,
@@ -901,7 +916,14 @@ impl CeltEncoder {
             // with it, naz@64 goes 2.697 -> 1.764 and naz@96 4.499 -> 2.114
             // (`lanes/opus-opustr-r2.sweep.txt`). Upgrade path: gate the x2 on
             // content -- it pays on music transients and starves hein's speech.
-            target += ((tf_estimate - 0.044) * target as f32) as i32;
+            // SWEPT (lane opustr2): k/offset/gate come from `tf_boost_params()`;
+            // the defaults (k=1, off=.044, gate=all) are the shipped point and
+            // reproduce the line above byte for byte.
+            {
+                let (k, off, gate_transient) = tf_boost_params();
+                let k_eff = if !gate_transient || is_transient { k } else { 1.0 };
+                target += (k_eff * (tf_estimate - off) * target as f32) as i32;
+            }
             // floor depth cap (C:1683-1695): SHR32/MULT16_32_Q15 are identity.
             {
                 let bins = E_BANDS[NB_BANDS - 2] << lm;
@@ -1848,6 +1870,13 @@ impl CeltEncoder {
             tf_select = 1;
         }
         if std::env::var_os("EC_OPUS_TF_DEBUG").is_some() {
+            let fp: f32 = self.x[tf_chan * n..tf_chan * n + (E_BANDS[len] << lm)]
+                .iter()
+                .map(|v| v.abs())
+                .sum();
+            let ble: Vec<String> =
+                self.band_log_e[..8].iter().map(|v| format!("{v:.3}")).collect();
+            eprint!("BLE {} | FP {fp:.6} ", ble.join(" "));
             eprintln!(
                 "tf: trans {is_transient} lm {lm} tfe {tf_estimate:.4} bias {bias:.5} \
                  lambda {lambda} sel {tf_select} selcost {selcost:?} metric {:?} imp {:?}",
