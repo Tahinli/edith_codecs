@@ -2321,6 +2321,7 @@ fn code_square_inter(
                     inter: Some(InterInfo {
                         mode: InterMode::NewMv,
                         mv: new_mv,
+                        ref_mv_idx: 0,
                     }),
                 },
                 cost + dcost,
@@ -2346,6 +2347,7 @@ fn code_square_inter(
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv,
+                ref_mv_idx: 0,
             }),
         }, inter_cost + dcost)
     } else {
@@ -3397,100 +3399,67 @@ fn search_inter_block(
         chroma[1].true_width,
         chroma[1].true_height,
     );
-    let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
-            + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
-            + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0); // NEARESTMV
-
-    // The NEARESTMV candidate: `skip` is decided below from whether its
-    // trial actually found a nonzero level, once its residual is priced
-    // against the same CDFs the tile writer codes it with.
-    //
-    // lane-av1speed: its three trials are kept (rather than moved straight
-    // into the candidate) so that a NEWMV landing on the very same vector --
-    // common on static content, where the stack's nearest vector is also
-    // what the search finds -- reuses them instead of running the same
-    // motion compensation, transform, quantize and reconstruct again. The
-    // reused trials are the same values, so the choice is bit-identical.
-    let nearest_trials;
-    {
-        let mv = stack.nearest_mv;
-        let luma_trial = mc_trial(
-            luma,
-            x,
-            y,
-            BLOCK,
-            mv,
-            true,
-            ref_luma.0,
-            ref_luma.1,
-            ref_luma.2,
-            ref_luma.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            TxbSet::Luma32Inter, fctx,
-        );
-        let u = mc_trial(
-            &chroma[0],
-            x / 2,
-            y / 2,
-            BLOCK / 2,
-            mv,
-            false,
-            ref_u.0,
-            ref_u.1,
-            ref_u.2,
-            ref_u.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            chroma_set, fctx,
-        );
-        let v = mc_trial(
-            &chroma[1],
-            x / 2,
-            y / 2,
-            BLOCK / 2,
-            mv,
-            false,
-            ref_v.0,
-            ref_v.1,
-            ref_v.2,
-            ref_v.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            chroma_set, fctx,
-        );
-        let skip = luma_trial.levels.iter().all(|&l| l == 0)
-            && u.levels.iter().all(|&l| l == 0)
-            && v.levels.iter().all(|&l| l == 0);
-        let cost = luma_trial.sse
-            + u.sse
-            + v.sse
-            + search.lambda
-                * (skip_bits(skip)
-                    + intra_inter_bits(true)
-                    + single_ref_bits
-                    + mode_bits_inter
-                    + if skip {
-                        0.0
-                    } else {
-                        luma_trial.bits + u.bits + v.bits
-                    });
-        nearest_trials = (luma_trial.clone(), u.clone(), v.clone());
-        consider(Candidate {
-            cost,
-            luma: luma_trial,
-            u,
-            v,
-            mode: DC_PRED,
-            skip,
-            inter: Some(InterInfo {
+    // Every single-reference mode the writer can code (spec 5.11.24's symbol
+    // chain, mirrored by `tile::write_inter_mode`), priced with the static
+    // CDFs at this block's own stack contexts. A candidate is a motion
+    // vector plus the cheapest syntax that reaches it, so two modes landing
+    // on the same vector share one set of trials: the added modes cost
+    // mode-bit arithmetic, not another motion compensation.
+    let not_new = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1);
+    let not_zero = symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1);
+    // `tile::write_drl_idx`'s cost: one `drl_mode` symbol per stack entry
+    // past `start`, `1` to advance and `0` to stop, at most two. A `target`
+    // the loop cannot reach is never offered below -- every candidate's
+    // index is one this same loop walks to.
+    let drl_bits = |start: usize, target: usize| {
+        let mut bits = 0.0;
+        let mut idx = start;
+        while idx < start + 2 && stack.entries.len() > idx + 1 {
+            let advance = idx < target;
+            bits += symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[idx]], usize::from(advance));
+            if !advance {
+                break;
+            }
+            idx += 1;
+        }
+        bits
+    };
+    let mut cands: Vec<((i32, i32), f64, InterInfo)> = vec![
+        (
+            stack.nearest_mv,
+            not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0),
+            InterInfo {
                 mode: InterMode::NearestMv,
-                mv,
-            }),
-        });
+                mv: stack.nearest_mv,
+                ref_mv_idx: 0,
+            },
+        ),
+        // GLOBALMV is the identity model's zero vector -- this encoder writes
+        // no `gm_params` -- and the cheapest syntax of the four on the static
+        // content where that vector is also the right one.
+        (
+            (0, 0),
+            not_new + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 0),
+            InterInfo {
+                mode: InterMode::GlobalMv,
+                mv: (0, 0),
+                ref_mv_idx: 0,
+            },
+        ),
+    ];
+    let near_bits = not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 1);
+    for idx in 1..=3usize {
+        if let Some(e) = stack.entries.get(idx) {
+            cands.push((
+                e.mv,
+                near_bits + drl_bits(1, idx),
+                InterInfo {
+                    mode: InterMode::NearMv,
+                    mv: e.mv,
+                    ref_mv_idx: idx as u8,
+                },
+            ));
+        }
     }
 
     let source_block = luma.source_block(x, y, BLOCK);
@@ -3512,96 +3481,114 @@ fn search_inter_block(
     #[cfg(test)]
     stage_add(0, t.elapsed());
     let mv = round_to_valid_mv(found.mv, stack.pred_mv);
-    if let Some(mv_bits) = mv_residual_bits(mv, stack.pred_mv) {
-        let (luma_trial, u, v) = if mv == stack.nearest_mv {
-            nearest_trials
-        } else {
-            (
-                mc_trial(
-                    luma,
-                    x,
-                    y,
-                    BLOCK,
-                    mv,
-                    true,
-                    ref_luma.0,
-                    ref_luma.1,
-                    ref_luma.2,
-                    ref_luma.3,
-                    false,
-                    search.base_q_idx,
-                    search.deadzone,
-                    TxbSet::Luma32Inter, fctx,
-                ),
-                mc_trial(
-                    &chroma[0],
-                    x / 2,
-                    y / 2,
-                    BLOCK / 2,
-                    mv,
-                    false,
-                    ref_u.0,
-                    ref_u.1,
-                    ref_u.2,
-                    ref_u.3,
-                    false,
-                    search.base_q_idx,
-                    search.deadzone,
-                    chroma_set, fctx,
-                ),
-                mc_trial(
-                    &chroma[1],
-                    x / 2,
-                    y / 2,
-                    BLOCK / 2,
-                    mv,
-                    false,
-                    ref_v.0,
-                    ref_v.1,
-                    ref_v.2,
-                    ref_v.3,
-                    false,
-                    search.base_q_idx,
-                    search.deadzone,
-                    chroma_set, fctx,
-                ),
-            )
-        };
-        let drl_bits = if stack.entries.len() > 1 {
-            symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[0]], 0)
-        } else {
-            0.0
-        };
-        let skip = luma_trial.levels.iter().all(|&l| l == 0)
-            && u.levels.iter().all(|&l| l == 0)
-            && v.levels.iter().all(|&l| l == 0);
-        let cost = luma_trial.sse
-            + u.sse
-            + v.sse
-            + search.lambda
-                * (skip_bits(skip)
-                    + intra_inter_bits(true)
-                    + single_ref_bits
-                    + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
-                    + drl_bits
-                    + mv_bits
-                    + if skip {
-                        0.0
-                    } else {
-                        luma_trial.bits + u.bits + v.bits
-                    });
-        consider(Candidate {
-            cost,
-            luma: luma_trial,
-            u,
-            v,
-            mode: DC_PRED,
-            skip,
-            inter: Some(InterInfo {
+    // Each DRL entry is a different `PredMv` (spec 7.10.2.10 `assign_mv`), so
+    // the same vector costs a different residual from each: take the index
+    // whose residual plus DRL bits is cheapest, not entry 0 by default.
+    let mut best_new: Option<(f64, u8)> = None;
+    for idx in 0..3usize {
+        if idx > 0 && stack.entries.len() <= idx {
+            break;
+        }
+        let base = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+        if let Some(b) = mv_residual_bits(mv, base) {
+            let total = b + drl_bits(0, idx);
+            if best_new.is_none_or(|(t, _)| total < t) {
+                best_new = Some((total, idx as u8));
+            }
+        }
+    }
+    if let Some((bits, ref_mv_idx)) = best_new {
+        cands.push((
+            mv,
+            symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
+            InterInfo {
                 mode: InterMode::NewMv,
                 mv,
-            }),
-        });
+                ref_mv_idx,
+            },
+        ));
+    }
+
+    // One trial set per distinct vector: sort by vector, cheapest syntax
+    // first, and drop the rest of each vector's run.
+    cands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    cands.dedup_by_key(|c| c.0);
+    {
+        for (mv, mode_bits_inter, info) in cands {
+            let luma_trial = mc_trial(
+                luma,
+                x,
+                y,
+                BLOCK,
+                mv,
+                true,
+                ref_luma.0,
+                ref_luma.1,
+                ref_luma.2,
+                ref_luma.3,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                TxbSet::Luma32Inter, fctx,
+            );
+            let u = mc_trial(
+                &chroma[0],
+                x / 2,
+                y / 2,
+                BLOCK / 2,
+                mv,
+                false,
+                ref_u.0,
+                ref_u.1,
+                ref_u.2,
+                ref_u.3,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                chroma_set, fctx,
+            );
+            let v = mc_trial(
+                &chroma[1],
+                x / 2,
+                y / 2,
+                BLOCK / 2,
+                mv,
+                false,
+                ref_v.0,
+                ref_v.1,
+                ref_v.2,
+                ref_v.3,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                chroma_set, fctx,
+            );
+            let skip = luma_trial.levels.iter().all(|&l| l == 0)
+                && u.levels.iter().all(|&l| l == 0)
+                && v.levels.iter().all(|&l| l == 0);
+            let cost = luma_trial.sse
+                + u.sse
+                + v.sse
+                + search.lambda
+                    * (skip_bits(skip)
+                        + intra_inter_bits(true)
+                        + single_ref_bits
+                        + mode_bits_inter
+                        + if skip {
+                            0.0
+                        } else {
+                            luma_trial.bits + u.bits + v.bits
+                        });
+            consider(Candidate {
+                cost,
+                luma: luma_trial,
+                u,
+                v,
+                mode: DC_PRED,
+                skip,
+                inter: Some(info),
+            });
+        }
     }
 
     let best = best.expect("the search offers at least the intra modes");
@@ -4574,6 +4561,7 @@ mod tests {
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
+                ref_mv_idx: 0,
             }),
         };
         let skipped_block = BlockCoeffs {
@@ -4581,6 +4569,7 @@ mod tests {
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
+                ref_mv_idx: 0,
             }),
             ..BlockCoeffs::default()
         };
@@ -6979,11 +6968,28 @@ mod tests {
             let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
             let _ = take_partition_hits();
             let _ = take_uv_mode_hits();
+            let _ = crate::tile::take_inter_mode_hits();
+            let _ = crate::tile::take_drl_hits();
             let (ours, ours_wall) = our_ladder(&source, width, height, fctx);
             // How often the inter split actually fired over this clip's four
             // encodes, against the whole 32x32 that was the only outcome
             // before (gate-blind-to-feature).
             let [whole32, split32, whole16, split16] = take_partition_hits();
+            // Which inter modes actually fired over this clip's four encodes,
+            // and at which DRL index -- a mode nobody picks is a mode the BD
+            // number cannot be crediting (gate-blind-to-feature).
+            let [nearest, near, global, new] = crate::tile::take_inter_mode_hits();
+            let [drl0, drl1, drl2, drl3] = crate::tile::take_drl_hits();
+            let modes_total = (nearest + near + global + new).max(1);
+            eprintln!(
+                "{name}: inter modes NEAREST {nearest} ({:.1}%) NEAR {near} ({:.1}%) \
+                 GLOBAL {global} ({:.1}%) NEW {new} ({:.1}%); drl idx 0/1/2/3+ \
+                 {drl0}/{drl1}/{drl2}/{drl3}",
+                100.0 * nearest as f64 / modes_total as f64,
+                100.0 * near as f64 / modes_total as f64,
+                100.0 * global as f64 / modes_total as f64,
+                100.0 * new as f64 / modes_total as f64,
+            );
             eprintln!(
                 "{name}: inter 32x32 split into 16s {split32} of {} blocks ({:.1}%); \
                  16x16 leaves split into 8s {split16} of {} ({:.1}%)",
