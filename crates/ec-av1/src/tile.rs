@@ -116,6 +116,150 @@ fn write_lr(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, mi_row: u32, mi_col: u32) 
 /// `crate::decode`), the span [`write_lr`] resolves its units over.
 const SB_MI_W: u32 = 16;
 
+/// One tile's own superblock and mode-info span (spec 5.11.1's tile loop
+/// bounds): `MiColStarts[i]..MiColStarts[i+1]` and the same down the rows,
+/// with the superblock indices those mi bounds fall on. The writers walk
+/// exactly this rect, and everything a block reads outside it -- the
+/// neighbour bands, the MV grid -- is left at the "unavailable" state a
+/// tile's own first row and column see, which is how the decoder clips them
+/// (`MiGrid::set_tile_bounds`, `PlaneBuf::set_tile_origin`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TileRect {
+    pub(crate) sb_col0: u32,
+    pub(crate) sb_col1: u32,
+    pub(crate) sb_row0: u32,
+    pub(crate) sb_row1: u32,
+    pub(crate) mi_col0: u32,
+    pub(crate) mi_col1: u32,
+    pub(crate) mi_row0: u32,
+    pub(crate) mi_row1: u32,
+}
+
+impl TileRect {
+    /// The whole frame as one tile -- what every single-tile caller writes.
+    pub(crate) fn whole(mi_cols: u32, mi_rows: u32) -> Self {
+        let (cols, rows) = block_grid(mi_cols, mi_rows);
+        Self {
+            sb_col0: 0,
+            sb_col1: cols.div_ceil(2),
+            sb_row0: 0,
+            sb_row1: rows.div_ceil(2),
+            mi_col0: 0,
+            mi_col1: mi_cols,
+            mi_row0: 0,
+            mi_row1: mi_rows,
+        }
+    }
+}
+
+/// A frame's uniform tile grid (spec 5.9.15's `uniform_tile_spacing_flag`
+/// arm, mirrored from `ec_av1_syntax::frame::read_tile_info` so that what
+/// this encoder writes and what a decoder derives from the same two log2
+/// fields are the same rects). 64x64 superblocks only, which is the only
+/// size this encoder's sequence header signals.
+#[derive(Clone, Debug)]
+pub(crate) struct TileLayout {
+    pub(crate) cols_log2: u32,
+    pub(crate) rows_log2: u32,
+    /// Tile column starts in superblocks, `cols + 1` entries.
+    col_starts_sb: Vec<u32>,
+    /// Tile row starts in superblocks, `rows + 1` entries.
+    row_starts_sb: Vec<u32>,
+    mi_cols: u32,
+    mi_rows: u32,
+}
+
+impl TileLayout {
+    /// The layout `cols_log2`/`rows_log2` name for this frame's mi grid.
+    pub(crate) fn new(mi_cols: u32, mi_rows: u32, cols_log2: u32, rows_log2: u32) -> Self {
+        let (cols32, rows32) = block_grid(mi_cols, mi_rows);
+        let (sb_cols, sb_rows) = (cols32.div_ceil(2), rows32.div_ceil(2));
+        let starts = |total: u32, log2: u32| {
+            let step = total.div_ceil(1 << log2).max(1);
+            let mut v: Vec<u32> = (0..total).step_by(step as usize).collect();
+            v.push(total);
+            v
+        };
+        Self {
+            cols_log2,
+            rows_log2,
+            col_starts_sb: starts(sb_cols, cols_log2),
+            row_starts_sb: starts(sb_rows, rows_log2),
+            mi_cols,
+            mi_rows,
+        }
+    }
+
+    pub(crate) fn cols(&self) -> u32 {
+        self.col_starts_sb.len() as u32 - 1
+    }
+
+    pub(crate) fn rows(&self) -> u32 {
+        self.row_starts_sb.len() as u32 - 1
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        (self.cols() * self.rows()) as usize
+    }
+
+    /// `MiColStarts`/`MiRowStarts` as the frame header carries them.
+    pub(crate) fn mi_col_starts(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.col_starts_sb[..self.cols() as usize]
+            .iter()
+            .map(|sb| sb * SB_MI_W)
+            .collect();
+        v.push(self.mi_cols);
+        v
+    }
+
+    pub(crate) fn mi_row_starts(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.row_starts_sb[..self.rows() as usize]
+            .iter()
+            .map(|sb| sb * SB_MI_W)
+            .collect();
+        v.push(self.mi_rows);
+        v
+    }
+
+    /// Tile `index` (row major, `TileNum`) as a rect.
+    pub(crate) fn rect(&self, index: usize) -> TileRect {
+        let (r, c) = (index / self.cols() as usize, index % self.cols() as usize);
+        let (sb_col0, sb_col1) = (self.col_starts_sb[c], self.col_starts_sb[c + 1]);
+        let (sb_row0, sb_row1) = (self.row_starts_sb[r], self.row_starts_sb[r + 1]);
+        TileRect {
+            sb_col0,
+            sb_col1,
+            sb_row0,
+            sb_row1,
+            mi_col0: sb_col0 * SB_MI_W,
+            mi_col1: (sb_col1 * SB_MI_W).min(self.mi_cols),
+            mi_row0: sb_row0 * SB_MI_W,
+            mi_row1: (sb_row1 * SB_MI_W).min(self.mi_rows),
+        }
+    }
+
+    /// Which tile the superblock at `(sb_r, sb_c)` belongs to -- what the
+    /// encoder's frame-raster search consults to clip a block's neighbour
+    /// availability to its own tile.
+    pub(crate) fn index_of_sb(&self, sb_r: u32, sb_c: u32) -> usize {
+        let col = self.col_starts_sb[1..].partition_point(|&s| s <= sb_c);
+        let row = self.row_starts_sb[1..].partition_point(|&s| s <= sb_r);
+        row * self.cols() as usize + col
+    }
+
+    /// The largest tile by mi area, `context_update_tile_id`'s own rule
+    /// (spec 6.8.14 leaves the choice to the encoder; libaom and rav1e both
+    /// name the biggest tile, whose end-of-tile tables the frame stores).
+    pub(crate) fn largest_tile(&self) -> usize {
+        (0..self.count())
+            .max_by_key(|&i| {
+                let t = self.rect(i);
+                ((t.mi_col1 - t.mi_col0) as u64) * ((t.mi_row1 - t.mi_row0) as u64)
+            })
+            .unwrap_or(0)
+    }
+}
+
 /// One frame's per-superblock `cdef_idx` plan (see [`arm_cdef_idx`]).
 struct CdefIdxPlan {
     /// The header's `cdef_bits`; never 0 while armed.
@@ -1134,6 +1278,14 @@ impl Quadrant {
 /// What the blocks above and to the left of the one being coded left behind,
 /// kept on the 16x16 grid the smallest block sits on.
 struct Neighbours {
+    /// This tile's own top-left mode-info origin (spec 5.11.1's `MiRowStart`/
+    /// `MiColStart`): every "is there a neighbour above/left of me" answer is
+    /// TILE-relative, not frame-relative -- the decoder's own
+    /// `Neighbours::start_tile` sets the same pair, and a writer that asked
+    /// `mi_row > 0` instead coded a tile's own first row against a neighbour
+    /// the decoder does not have (class: new map ignores tile edge).
+    tile_row0_mi: usize,
+    tile_col0_mi: usize,
     /// Per plane, whether the neighbour coded anything and the sign of its DC.
     above: Vec<[Neighbour; 3]>,
     /// The same, down the left edge.
@@ -1243,6 +1395,8 @@ impl Neighbours {
     /// mode-info units.
     fn new(cols: usize, rows: usize, mi_cols: usize, mi_rows: usize) -> Self {
         Self {
+            tile_row0_mi: 0,
+            tile_col0_mi: 0,
             above: vec![[Neighbour::default(); 3]; cols * (SUB / MI)],
             left: vec![[Neighbour::default(); 3]; rows * (SUB / MI)],
             above_mode: vec![DC_PRED; cols],
@@ -1273,6 +1427,23 @@ impl Neighbours {
     }
 
     /// Clears the left edge, which a tile starts every superblock row with.
+    /// Points this writer's availability answers at one tile
+    /// ([`Self::tile_row0_mi`]).
+    fn set_tile_origin(&mut self, row0_mi: usize, col0_mi: usize) {
+        self.tile_row0_mi = row0_mi;
+        self.tile_col0_mi = col0_mi;
+    }
+
+    /// Whether the block at mode-info row `mi_r` has a neighbour above it
+    /// INSIDE its own tile, and the same to the left.
+    fn has_above(&self, mi_r: usize) -> bool {
+        mi_r > self.tile_row0_mi
+    }
+
+    fn has_left(&self, mi_c: usize) -> bool {
+        mi_c > self.tile_col0_mi
+    }
+
     fn start_row(&mut self) {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
@@ -1317,7 +1488,7 @@ impl Neighbours {
     /// off a CDF row one higher than the decoder's, which is the first
     /// divergence of the inter `TxMode::Select` stream.
     fn tx_size_ctx_txfm(&self, (mi_r, mi_c): (usize, usize), own_side: usize) -> usize {
-        let (has_above, has_left) = (mi_r > 0, mi_c > 0);
+        let (has_above, has_left) = (self.has_above(mi_r), self.has_left(mi_c));
         let mut above = usize::from(self.above_txfm[mi_c]) >= own_side;
         let mut left = usize::from(self.left_txfm[mi_r]) >= own_side;
         if has_above && self.above_inter[mi_c] {
@@ -1334,8 +1505,8 @@ impl Neighbours {
     /// largest transform, plus whether the one to the left is at least as
     /// tall. A neighbour outside the tile contributes nothing.
     fn tx_size_ctx(&self, (mi_r, mi_c): (usize, usize), max_tx: usize) -> usize {
-        usize::from(mi_r > 0 && usize::from(self.above_tx[mi_c]) >= max_tx)
-            + usize::from(mi_c > 0 && usize::from(self.left_tx[mi_r]) >= max_tx)
+        usize::from(self.has_above(mi_r) && usize::from(self.above_tx[mi_c]) >= max_tx)
+            + usize::from(self.has_left(mi_c) && usize::from(self.left_tx[mi_r]) >= max_tx)
     }
 
     /// Publishes one block's resolved transform side over every 4x4 unit it
@@ -1654,7 +1825,15 @@ pub fn sb_coeff_key_frame_tile_tx(
     tx_select: bool,
 ) -> Result<Vec<u8>> {
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
-    sb_coeff_key_frame_tile_cdfs(mi_cols, mi_rows, base_q_idx, superblocks, tx_select, &mut cdfs)
+    sb_coeff_key_frame_tile_cdfs(
+        mi_cols,
+        mi_rows,
+        base_q_idx,
+        superblocks,
+        tx_select,
+        &mut cdfs,
+        TileRect::whole(mi_cols, mi_rows),
+    )
 }
 
 /// [`sb_coeff_key_frame_tile_tx`] starting from -- and leaving behind -- the
@@ -1672,6 +1851,11 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
     superblocks: &[Superblock],
     tx_select: bool,
     cdfs: &mut Cdfs,
+    // This tile's own span (spec 5.11.1): the writer walks only these
+    // superblocks, and its neighbour bands start blank, so everything
+    // outside reads as unavailable exactly as the decoder's own per-tile
+    // reset makes it.
+    tile: TileRect,
 ) -> Result<Vec<u8>> {
     // Consumes whatever `arm_cdef_idx`/`arm_lr` armed, on every exit path.
     let _cdef_idx = CdefIdxGuard;
@@ -1729,15 +1913,16 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
         mi_cols as usize,
         mi_rows as usize,
     );
+    neighbours.set_tile_origin(tile.mi_row0 as usize, tile.mi_col0 as usize);
 
     // The tile adapts every non-literal CDF it writes, exactly as the decoder
     // adapts the ones it reads, so the frame header leaves `disable_cdf_update`
     // off.
     let mut cdfs = cdfs;
     let mut enc = SymbolEncoder::new();
-    for sb_r in 0..sb_rows {
+    for sb_r in tile.sb_row0..tile.sb_row1.min(sb_rows) {
         neighbours.start_row();
-        for sb_c in 0..sb_cols {
+        for sb_c in tile.sb_col0..tile.sb_col1.min(sb_cols) {
             write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
@@ -3598,7 +3783,16 @@ pub fn sb_coeff_inter_frame_tile_tx(
     tx_select: bool,
 ) -> Result<Vec<u8>> {
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
-    sb_coeff_inter_frame_tile_cdfs(mi_cols, mi_rows, base_q_idx, blocks, tx_select, &mut cdfs)
+    sb_coeff_inter_frame_tile_cdfs(
+        mi_cols,
+        mi_rows,
+        base_q_idx,
+        blocks,
+        tx_select,
+        &mut cdfs,
+        TileRect::whole(mi_cols, mi_rows),
+        &mut MiGrid::new(mi_cols as usize, mi_rows as usize),
+    )
 }
 
 /// [`sb_coeff_inter_frame_tile_tx`] starting from -- and leaving behind --
@@ -3613,6 +3807,11 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     blocks: &[Quadrant],
     tx_select: bool,
     cdfs: &mut Cdfs,
+    // This tile's own span; see [`sb_coeff_key_frame_tile_cdfs`].
+    tile: TileRect,
+    // The frame's MV grid, carried across the frame's tiles by the caller
+    // (see the comment at `set_tile_bounds` below).
+    grid: &mut MiGrid,
 ) -> Result<Vec<u8>> {
     // Consumes whatever `arm_cdef_idx`/`arm_lr` armed, on every exit path.
     let _cdef_idx = CdefIdxGuard;
@@ -3653,7 +3852,21 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
         mi_cols as usize,
         mi_rows as usize,
     );
-    let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+    neighbours.set_tile_origin(tile.mi_row0 as usize, tile.mi_col0 as usize);
+    // The MV grid spans the FRAME and carries every tile written before this
+    // one, exactly as a decoder's does (`decode_inter_frame_tile_with_cdfs`
+    // keeps one grid for the whole frame and narrows its read window per
+    // tile): the tile bounds below are what stops a candidate scan reaching
+    // across the boundary, and a grid that was merely empty out there would
+    // not read the same as the decoder's wherever a scan reads the array
+    // without asking `MiGrid::get` first.
+    let mut grid = &mut *grid;
+    grid.set_tile_bounds(
+        tile.mi_row0 as usize,
+        tile.mi_col0 as usize,
+        tile.mi_row1 as usize,
+        tile.mi_col1 as usize,
+    );
     grid.set_sign_bias(SIGN_BIAS.with(std::cell::Cell::get));
     let mut cdfs = cdfs;
     let mut enc = SymbolEncoder::new();
@@ -3681,9 +3894,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
         vec![0i32; TX16 * TX16],
     ];
 
-    for sb_r in 0..sb_rows {
+    for sb_r in tile.sb_row0..tile.sb_row1.min(sb_rows) {
         neighbours.start_row();
-        for sb_c in 0..sb_cols {
+        for sb_c in tile.sb_col0..tile.sb_col1.min(sb_cols) {
             write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
@@ -3926,9 +4139,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 };
 
                 let (r, c) = at;
-                let has_above = r32 > 0;
-                let has_left = c32 > 0;
                 let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+                let has_above = neighbours.has_above(mi_r);
+                let has_left = neighbours.has_left(mi_c);
                 let skip_ctx = usize::from(neighbours.above_skip[mi_c])
                     + usize::from(neighbours.left_skip[mi_r]);
                 enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
@@ -4165,7 +4378,7 @@ fn write_inter_frame_leaf(
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
     write_cdef_idx(enc, (mi_r, mi_c), block.skip);
 
-    let (has_above, has_left) = (r > 0, c > 0);
+    let (has_above, has_left) = (neighbours.has_above(mi_r), neighbours.has_left(mi_c));
     let (above_inter, left_inter) = (neighbours.above_inter[mi_c], neighbours.left_inter[mi_r]);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
     let is_inter = block.inter.is_some();
@@ -4386,7 +4599,7 @@ fn write_inter_frame_leaf8(
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
     write_cdef_idx(enc, leaf_mi, block.skip);
 
-    let (has_above, has_left) = (leaf_mi.0 > 0, leaf_mi.1 > 0);
+    let (has_above, has_left) = (neighbours.has_above(leaf_mi.0), neighbours.has_left(leaf_mi.1));
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
     let is_inter = block.inter.is_some();
     enc.symbol(usize::from(is_inter), &mut cdfs.intra_inter[ii_ctx]);
