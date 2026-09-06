@@ -3033,6 +3033,35 @@ pub(crate) mod tests {
         let decoded = decode_stream(&encoded.stream).unwrap();
         assert_eq!(decoded.len(), encoded.frames.len());
         for (i, (got, frame)) in decoded.iter().zip(&encoded.frames).enumerate() {
+            for (name, a, b) in [
+                ("y", &got.y, &frame.reconstruction.y),
+                ("u", &got.u, &frame.reconstruction.u),
+                ("v", &got.v, &frame.reconstruction.v),
+            ] {
+                let w = if name == "y" { width } else { width.div_ceil(2) };
+                if let Some(k) = a.iter().zip(b.iter()).position(|(p, q)| p != q) {
+                    eprintln!(
+                        "DBG {width}x{height} frame {i} {name}: {} of {} differ, first at row {} col {} stride {w} ({}, {}), rows {:?} cols {:?}",
+                        a.iter().zip(b.iter()).filter(|(p, q)| p != q).count(),
+                        a.len(),
+                        k / w,
+                        k % w,
+                        a[k],
+                        b[k],
+                        {
+                            let mut v: Vec<usize> = a.iter().zip(b.iter()).enumerate().filter(|(_, (p, q))| p != q).map(|(j, _)| j / w).collect();
+                            v.dedup();
+                            v
+                        },
+                        {
+                            let mut v: Vec<usize> = a.iter().zip(b.iter()).enumerate().filter(|(_, (p, q))| p != q).map(|(j, _)| j % w).collect();
+                            v.sort_unstable();
+                            v.dedup();
+                            v
+                        }
+                    );
+                }
+            }
             assert_eq!(
                 got.y, frame.reconstruction.y,
                 "{width}x{height} frame {i} luma"
