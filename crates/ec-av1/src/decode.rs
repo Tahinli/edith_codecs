@@ -6558,7 +6558,7 @@ fn neighbour_state(grid: &[i32]) -> Neighbour {
 /// spec `get_txb_ctx_general`'s `skip_contexts[top][left]` table (plane 0,
 /// transform unit smaller than the block it sits in): `top`/`left` are the
 /// above/left neighbours' magnitude tiers, each already clamped to 4.
-pub(crate) const SKIP_CONTEXTS: [[usize; 5]; 5] = [
+const SKIP_CONTEXTS: [[usize; 5]; 5] = [
     [1, 2, 2, 2, 3],
     [2, 4, 4, 4, 5],
     [2, 4, 4, 4, 5],
@@ -16962,7 +16962,7 @@ fn txfm_partition_ctx(above_px: u8, left_px: u8, blk_max_px: usize, tx_px: usize
 /// category from `txsize_sqr_up_map[tx_size]` -- all three collapse to one
 /// side for a square transform, which is why the square form above is a
 /// special case of this one.
-pub(crate) fn txfm_partition_ctx_rect(
+fn txfm_partition_ctx_rect(
     above_px: u8,
     left_px: u8,
     blk_max_px: usize,
@@ -17092,7 +17092,7 @@ fn set_txfm_ctxs(
 /// with `tx_size_high[TX_SIZES_LARGEST]` (`av1_common_int.h`), i.e. 64
 /// pixels, so an unwritten neighbour reads as the *widest* possible
 /// transform, not the narrowest.
-pub(crate) const TXFM_CTX_INIT: u8 = 64;
+const TXFM_CTX_INIT: u8 = 64;
 
 /// libaom's `MAX_VARTX_DEPTH`: an inter block's transform tree halves at most
 /// twice below its own largest transform.
