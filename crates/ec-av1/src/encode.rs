@@ -2711,10 +2711,24 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
         Some(info) => MiInfo {
             is_inter: true,
             ref_frame: info.ref_frame,
-            ref_frame1: NO_REF1,
-            mv1: (0, 0),
+            // A COMPOUND block votes with BOTH of its references and both of
+            // its vectors, exactly as the tile writer publishes it: recording
+            // a compound block as a single-reference one here left the
+            // encoder's own grid disagreeing with the writer's from the first
+            // compound block on, so every later stack it searched against was
+            // not the stack the decoder derives.
+            ref_frame1: info.ref1.unwrap_or(NO_REF1),
+            mv1: mv16(info.mv1),
             mv: mv16(info.mv),
-            is_new_mv: matches!(info.mode, InterMode::NewMv),
+            // decode.rs' own `is_new_mv`: `NEWMV` on the single-reference
+            // side, compound modes 2/3/7 on the other.
+            is_new_mv: matches!(
+                info.mode,
+                InterMode::NewMv
+                    | InterMode::NewNewMv
+                    | InterMode::NearestNewMv
+                    | InterMode::NewNearestMv
+            ),
             size,
             size_h: size,
             is_global_mv0: false,
@@ -4328,6 +4342,11 @@ fn search_inter_block(
     // reference alone is right. Priced with the same static-CDF approximation
     // the single-reference candidates use, plus the compound-only symbols
     // (`comp_mode`, the reference-pair tree, `comp_group_idx`/`compound_idx`).
+    // The two 2026-09-06 compound-mode arms, both measured on the BD gate
+    // before either could default on (see the lane report): presence of the
+    // flag arms the candidate.
+    let near_near = crate::envflags::env_flag!("EC_AV1_COMP_NEARNEAR");
+    let half_new = crate::envflags::env_flag!("EC_AV1_COMP_HALFNEW");
     for (ref1, g, cstack) in compound {
         let (ref1, g) = (*ref1, *g);
         let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME)
@@ -4377,13 +4396,66 @@ fn search_inter_block(
                 },
             ),
         ];
-        // `NEW_NEWMV` seeded from the two single-reference searches this
-        // block already ran -- no joint search of its own.
+        // `NEAR_NEARMV`: both halves off compound stack entry 1 (the
+        // decoder's `ref_mv_idx = 0`), which costs one DRL symbol whenever
+        // the stack is deep enough for that walk to read one.
+        if let Some(e) = cstack.entries.get(1).filter(|_| near_near) {
+            let drl = if cstack.entries.len() > 2 {
+                symbol_bits(&cdf::DRL_MODE[cstack.drl_ctx[1]], 0)
+            } else {
+                0.0
+            };
+            ccands.push((
+                (e.mv0, e.mv1),
+                mode_bits_of(1) + drl,
+                InterInfo {
+                    ref_frame: crate::mvstack::LAST_FRAME,
+                    mode: InterMode::NearNearMv,
+                    mv: e.mv0,
+                    mv1: e.mv1,
+                    ref1: Some(ref1),
+                    ref_mv_idx: 0,
+                },
+            ));
+        }
+        // The half-new modes and `NEW_NEWMV`, all seeded from the two
+        // single-reference searches this block already ran -- no joint search
+        // of its own. Every residual is priced against stack entry 0, which
+        // is what `assign_compound_mv` predicts from at `ref_mv_idx = 0`.
+        let cbase = cstack
+            .entries
+            .first()
+            .map_or(cstack.nearest_mv, |e| (e.mv0, e.mv1));
+        if let Some(b0) = mv_residual_bits(mv, cbase.0).filter(|_| half_new) {
+            ccands.push((
+                (mv, cstack.nearest_mv.1),
+                mode_bits_of(3) + b0,
+                InterInfo {
+                    ref_frame: crate::mvstack::LAST_FRAME,
+                    mode: InterMode::NewNearestMv,
+                    mv,
+                    mv1: cstack.nearest_mv.1,
+                    ref1: Some(ref1),
+                    ref_mv_idx: 0,
+                },
+            ));
+        }
         if let Some(&(_, mv1)) = extra_new_mvs.iter().find(|(r, _)| *r == ref1) {
-            let base = cstack
-                .entries
-                .first()
-                .map_or(cstack.nearest_mv, |e| (e.mv0, e.mv1));
+            if let Some(b1) = mv_residual_bits(mv1, cbase.1).filter(|_| half_new) {
+                ccands.push((
+                    (cstack.nearest_mv.0, mv1),
+                    mode_bits_of(2) + b1,
+                    InterInfo {
+                        ref_frame: crate::mvstack::LAST_FRAME,
+                        mode: InterMode::NearestNewMv,
+                        mv: cstack.nearest_mv.0,
+                        mv1,
+                        ref1: Some(ref1),
+                        ref_mv_idx: 0,
+                    },
+                ));
+            }
+            let base = cbase;
             if let (Some(b0), Some(b1)) = (
                 mv_residual_bits(mv, base.0),
                 mv_residual_bits(mv1, base.1),
@@ -8504,11 +8576,12 @@ mod tests {
             let comp_total: usize = comp_modes.iter().sum();
             eprintln!(
                 "{name}: compound {comp_total} of {} inter blocks ({:.1}%); modes \
-                 NEAREST_NEAREST {} NEAR_NEAR {} GLOBAL_GLOBAL {} NEW_NEW {}; pairs \
-                 LAST+GOLDEN {} LAST+ALTREF {}",
+                 NEAREST_NEAREST {} NEAR_NEAR {} NEAREST_NEW {} NEW_NEAREST {} \
+                 GLOBAL_GLOBAL {} NEW_NEW {}; pairs LAST+GOLDEN {} LAST+ALTREF {}",
                 modes_total + comp_total,
                 100.0 * comp_total as f64 / (modes_total + comp_total) as f64,
-                comp_modes[0], comp_modes[1], comp_modes[6], comp_modes[7],
+                comp_modes[0], comp_modes[1], comp_modes[2], comp_modes[3],
+                comp_modes[6], comp_modes[7],
                 comp_pairs[3], comp_pairs[6],
             );
             // Where the wall-owning stage actually goes: how many candidate
