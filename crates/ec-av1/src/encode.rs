@@ -19,8 +19,8 @@
 use crate::decode::WithRef;
 use ec_av1_syntax::sequence::{ColorConfig, OperatingPoint, SequenceHeader};
 use ec_av1_syntax::{
-    ChromaSamplePosition, FrameHeader, FrameType, PRIMARY_REF_NONE, QuantizationParams, TileInfo,
-    TxMode,
+    CdefParams, ChromaSamplePosition, FrameHeader, FrameType, LoopFilterParams, PRIMARY_REF_NONE,
+    QuantizationParams, TileInfo, TxMode,
 };
 use ec_core::{Error, Result};
 
@@ -474,6 +474,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         mi_rows: encoded.mi_rows,
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
+        loop_filter: encoded.loop_filter,
     }
 }
 
@@ -510,6 +511,12 @@ pub struct Encoded {
     /// a `tx_depth` frame as a `TxMode::Largest` one and desyncs at the first
     /// block.
     pub(crate) tx_select: bool,
+    /// This frame header's chosen deblocking parameters
+    /// ([`crate::filter_search::pick_deblock`]) — `reconstruction` is the
+    /// picture the decoder produces UNDER them, so a test that decodes
+    /// `tile` directly must pass these along, exactly as it must `tx_select`
+    /// (class: test asserts against a stale header).
+    pub(crate) loop_filter: LoopFilterParams,
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -2901,6 +2908,36 @@ pub(crate) fn encode_key_frame_inner(
         &superblocks,
         tx_select,
     )?;
+    // spec 7.14 deblocking: pick this frame's `loop_filter_level` by handing
+    // the tile just coded back to the decoder under each candidate (see
+    // `crate::filter_search`), and keep the filtered picture that wins as
+    // the reconstruction -- what a decoder outputs, and what the next
+    // frame predicts from.
+    pick_and_apply_deblock(
+        &mut header,
+        &mut luma,
+        &mut chroma,
+        [&picture_y8, &picture_u8, &picture_v8],
+        true,
+        |lf, h| {
+            crate::decode::decode_key_frame_tile(
+                &tile,
+                h.mi_cols,
+                h.mi_rows,
+                base_q_idx,
+                h.frame_width,
+                h.frame_height,
+                seq.enable_filter_intra,
+                &CdefParams::default(),
+                lf,
+                tx_select,
+                h.reduced_tx_set,
+                h.allow_screen_content_tools,
+                h.allow_intrabc,
+                fctx,
+            )
+        },
+    )?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&sequence_header_obu(&seq)?);
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
@@ -2922,7 +2959,49 @@ pub(crate) fn encode_key_frame_inner(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        loop_filter: header.loop_filter,
     })
+}
+
+/// Chooses this frame's deblocking levels, writes them into `header` and
+/// replaces the frame's own region of the encoder's reconstruction with the
+/// filtered picture the decoder produced under them
+/// ([`crate::filter_search::pick_deblock`]).
+///
+/// `search == false` leaves the header at level 0 (deblocking off) and the
+/// reconstruction untouched: the caller's stream is one this crate's own
+/// decoder cannot read back, so there is nothing to search against.
+///
+/// # Errors
+/// The decoder's own error, when it refuses the tile the encoder just wrote
+/// -- that is an encoder defect, not a filter one, so it is propagated
+/// rather than swallowed into "no deblocking".
+fn pick_and_apply_deblock(
+    header: &mut FrameHeader,
+    luma: &mut Plane<'_>,
+    chroma: &mut [Plane<'_>; 2],
+    source: [&[u8]; 3],
+    search: bool,
+    decode: impl Fn(&LoopFilterParams, &FrameHeader) -> Result<Picture>,
+) -> Result<()> {
+    if !search {
+        return Ok(());
+    }
+    let (fw, fh) = (header.frame_width as usize, header.frame_height as usize);
+    let hdr = header.clone();
+    let (lf, filtered) = crate::filter_search::pick_deblock(
+        |lf| decode(lf, &hdr),
+        source,
+        luma.width,
+        (fw, fh),
+    )?;
+    header.loop_filter = lf;
+    let dec_cw = filtered.width.div_ceil(2);
+    let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
+    crate::filter_search::splice(&mut luma.reconstruction, luma.width, &filtered.y, filtered.width, fw, fh);
+    crate::filter_search::splice(&mut chroma[0].reconstruction, chroma[0].width, &filtered.u, dec_cw, cw, ch);
+    crate::filter_search::splice(&mut chroma[1].reconstruction, chroma[1].width, &filtered.v, dec_cw, cw, ch);
+    Ok(())
 }
 
 /// `Y_MODE`'s size group (spec `Size_Group`) for a 32x32 block: the only
@@ -3992,6 +4071,58 @@ pub(crate) fn encode_inter_frame(
         &blocks,
         tx_select,
     )?;
+    // Deblocking, as in `encode_key_frame_inner`: the decoder reconstructs
+    // this tile against the same single-slot reference this encoder predicted
+    // from, under each candidate level.
+    // The reference a DECODER holds is this frame's cropped size, not the
+    // encoder's padded coding surface -- `decode_inter_frame_tile` refuses a
+    // reference whose height is not the header's own `frame_height` (spec
+    // 7.9's compatible-size rule), and the chained-decode round trips prove
+    // the two predict identically.
+    let (fw, fh) = (header.frame_width as usize, header.frame_height as usize);
+    let trial_ref = if (reference.width, reference.height) == (fw, fh) {
+        reference.clone()
+    } else {
+        Picture {
+            width: fw,
+            height: fh,
+            y: crop_plane(&reference.y, reference.width, fw, fh),
+            u: crop_plane(&reference.u, reference.width / 2, fw / 2, fh / 2),
+            v: crop_plane(&reference.v, reference.width / 2, fw / 2, fh / 2),
+        }
+    };
+    let mut refs: [Option<&Picture>; 8] = [None; 8];
+    refs[1] = Some(&trial_ref);
+    let refpix = crate::decode::RefPix::ready(refs);
+    pick_and_apply_deblock(
+        &mut header,
+        &mut luma,
+        &mut chroma,
+        [&picture_y8, &picture_u8, &picture_v8],
+        // `decode_inter_frame_tile` reads an inter tile as `TxMode::Largest`;
+        // under the (default-off) inter `TxMode::Select` knob there is no
+        // decoder to search against, so that stream keeps level 0.
+        !tx_select,
+        |lf, h| {
+            crate::decode::decode_inter_frame_tile(
+                &tile,
+                h.mi_cols,
+                h.mi_rows,
+                base_q_idx,
+                h.frame_width,
+                h.frame_height,
+                &refpix,
+                &CdefParams::default(),
+                lf,
+                h.allow_high_precision_mv,
+                h.force_integer_mv,
+                Some(mc::InterpFilterKind::Regular),
+                seq.enable_dual_filter,
+                h.reference_select,
+                fctx,
+            )
+        },
+    )?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
 
@@ -4012,6 +4143,7 @@ pub(crate) fn encode_inter_frame(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        loop_filter: header.loop_filter,
     })
 }
 
