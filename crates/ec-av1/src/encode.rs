@@ -3188,60 +3188,66 @@ fn pick_and_apply_filters(
     )?;
     header.loop_filter = lf;
     header.cdef = cdef;
-    // spec 7.17: loop restoration. Its per-unit filters live in the TILE, so
-    // this stage codes the tile a second time no matter what -- first with
-    // every unit at `RESTORE_NONE`, which is the shape whose decode hands
-    // back the post-deblock and post-CDEF pictures the search needs (and
-    // whose output IS the post-CDEF picture), then again with the filters it
-    // picked.
-    let mut lr = LoopRestorationParams::default();
-    if restoration_enabled() {
-        lr.frame_restoration_type[0] = ec_av1_syntax::RestorationType::Wiener;
-        lr.loop_restoration_size = [64, 64, 64];
-        lr.uses_lr = true;
-    }
-    let grid_dims = crate::restoration::RestorationGrid::new(&lr, fw as u32, fh as u32);
-    let n_units = if lr.uses_lr {
-        grid_dims.horz_units[0] * grid_dims.vert_units[0]
+    // spec 7.17: loop restoration. Its per-unit filters live in the TILE, not
+    // in the frame header, so a re-decode under candidate parameters cannot
+    // search them the way deblocking and CDEF are searched above. What the
+    // decoder hands back instead is its own filter chain's intermediates
+    // (`crate::decode::FrameCtx::capture_stages`), and the search runs on
+    // those, through the decoder's own Wiener kernel.
+    //
+    // The capture rides the decode this stage was already going to do: the
+    // re-decode of the `cdef_idx` tile when there is one, and otherwise one
+    // decode of the tile as it stands. That decode's header still says
+    // `RESTORE_NONE`, so the decoder takes no pre-CDEF snapshot and the
+    // post-CDEF picture stands in for it at LR's 3-row stripe borders --
+    // an approximation inside the SEARCH only; the reconstruction this
+    // function ends up splicing is always a real decode of the real tile.
+    let lr_on = restoration_enabled();
+    fctx.capture_stages.set(lr_on);
+    let mut filtered = if idx_grid.is_empty() {
+        if lr_on {
+            decode(&lf, &cdef, &hdr, tile, &none_lr)?
+        } else {
+            picture
+        }
     } else {
-        0
-    };
-    let filtered = if idx_grid.is_empty() && n_units == 0 {
+        let coded = recode(cdef.bits, sb_cols, &idx_grid, &[])?;
+        let picture = decode(&lf, &cdef, &hdr, &coded, &none_lr)?;
+        *tile = coded;
         picture
-    } else {
-        let probe = recode(cdef.bits, sb_cols, &idx_grid, &vec![None; n_units])?;
-        fctx.capture_stages.set(n_units > 0);
-        let probe_picture = decode(&lf, &cdef, &hdr, &probe, &lr)?;
-        fctx.capture_stages.set(false);
+    };
+    fctx.capture_stages.set(false);
+    let mut lr = LoopRestorationParams::default();
+    if lr_on {
+        let mut want = LoopRestorationParams {
+            loop_restoration_size: [64, 64, 64],
+            uses_lr: true,
+            ..LoopRestorationParams::default()
+        };
+        want.frame_restoration_type[0] = ec_av1_syntax::RestorationType::Wiener;
         let units = match crate::decode::take_filter_stages(fctx) {
             Some(stages) => crate::filter_search::pick_restoration(
                 &stages,
                 source[0],
                 luma.width,
                 (fw, fh),
-                &lr,
+                &want,
                 lambda,
                 fctx,
             ),
             None => Vec::new(),
         };
+        // A frame no unit restores keeps `RESTORE_NONE` on every plane
+        // rather than paying ~1 bit per 64x64 for a tile full of
+        // `restore_wiener = 0` symbols (the BD gate saw exactly that on the
+        // clip whose units never take a filter).
         if units.iter().any(Option::is_some) {
             let coded = recode(cdef.bits, sb_cols, &idx_grid, &units)?;
-            let picture = decode(&lf, &cdef, &hdr, &coded, &lr)?;
+            filtered = decode(&lf, &cdef, &hdr, &coded, &want)?;
             *tile = coded;
-            picture
-        } else {
-            // Nothing to restore: code the frame with `RESTORE_NONE` on every
-            // plane instead of a tile full of `restore_wiener = 0` symbols
-            // (worth ~1 bit per 64x64, which the BD gate saw on a clip whose
-            // units never take a filter). The probe's picture already IS the
-            // unrestored one -- a grid of `RESTORE_NONE` units restores
-            // nothing -- so this costs one tile write and no decode.
-            lr = LoopRestorationParams::default();
-            *tile = recode(cdef.bits, sb_cols, &idx_grid, &[])?;
-            probe_picture
+            lr = want;
         }
-    };
+    }
     header.loop_restoration = lr;
     let dec_cw = filtered.width.div_ceil(2);
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
