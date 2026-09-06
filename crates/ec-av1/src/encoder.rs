@@ -506,15 +506,20 @@ impl Default for Pyramid {
     /// (the pyramid changes the reference structure): +54.5 / +24.5 and
     /// +85.2 / +49.4, worse on both films, so 0.0275 stands.
     ///
-    /// Nothing selects the pyramid but an explicit
-    /// [`Av1Encoder::with_pyramid`] call (or `EC_AV1_PYRAMID` on the gate and
-    /// on `ec-bench`); the default one-in-one-out path is byte-identical to
-    /// before it existed. Making it the DEFAULT needs the same reordering in
-    /// [`crate::encode::encode_sequence`] first -- the facade is pinned byte
-    /// for byte to that path
-    /// (`encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence`),
-    /// so a pyramid the facade takes by default and the sequence path cannot
-    /// would break that pin rather than ship a gain.
+    /// SHIPPED AS THE DEFAULT on lane-av1pyrdef. `4:-16:8` is what
+    /// [`crate::encode::encode_sequence`] (through
+    /// [`Av1Encoder::encode_sequence_pyramid`], the one mini-GOP driver both
+    /// paths run), the BD gates and `ec-bench` code a non-screen stream
+    /// under; a screen stream still codes flat, decided once per stream by
+    /// the content gate in [`Av1Encoder::encode_frames`]. `EC_AV1_PYRAMID=0`
+    /// restores the flat path everywhere for an A/B, and
+    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf>:<leaf>]` another shape of it
+    /// ([`Pyramid::from_env`]).
+    ///
+    /// [`Av1Encoder::new`] is unchanged: the one-picture-one-packet facade
+    /// entry point still codes flat, since a picture no longer maps to a
+    /// packet under a pyramid — [`Av1Encoder::with_pyramid`] plus
+    /// [`Av1Encoder::encode_frames`] is the streaming surface that reorders.
     fn default() -> Self {
         Self {
             mini_gop: 4,

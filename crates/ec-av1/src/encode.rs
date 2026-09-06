@@ -5473,6 +5473,14 @@ pub fn encode_key_frame_with_modes(
 
 /// Codes `pictures` as one key frame followed by inter frames.
 ///
+/// Camera material is coded under [`crate::encoder::Pyramid::default`] since
+/// lane-av1pyrdef -- mini-GOPs of 4 with a hidden `ALTREF` and a
+/// `show_existing_frame` header, so `stream` is in CODING order while
+/// `frames` stays in display order (`EncodedSequence::coding_order` is the
+/// map). Screen content codes flat, decided once per sequence by the same
+/// detector the streaming facade's content gate uses, and `EC_AV1_PYRAMID=0`
+/// puts every stream back on the flat path for an A/B.
+///
 /// # Errors
 /// Returns an error under the same conditions [`encode_key_frame`] and the
 /// inter frame path do.
@@ -12735,12 +12743,24 @@ mod tests {
     /// | bars 2160p | +81.6% | +41.5% | 4.8s:1.0s:2.2s |
     /// | screen capture | +49.1% | -4.3% | 5.5s:1.0s:2.1s |
     ///
-    /// The same run under `EC_AV1_PYRAMID=4:-16:8 EC_AV1_GATE_FACADE=1`
-    /// (lane-av1pyrgate), which is what the content gate does at this scale:
-    /// the bars are non-screen so they take the pyramid (+84.7 / +39.9 and
-    /// +124.4 / +75.2 -- this downscaled recipe hates it, as it hates every
-    /// knob the real film rows keep), and the capture's row comes back
-    /// +49.1 / -4.3, the flat row to the byte. That equality IS the gate.
+    /// RE-RECORDED 2026-09-07 (lane-av1pyrdef), with the coding pyramid the
+    /// DEFAULT of the sequence path this gate codes through -- the bars are
+    /// non-screen so they take it, the capture is gated flat:
+    ///
+    /// | clip | effective pyramid | BD vs libaom | BD vs rav1e | wall |
+    /// |---|---|---|---|---|
+    /// | bars 1080p | 4:-16:8 | +84.7% | +39.9% | 5.1s:1.1s:2.6s |
+    /// | bars 2160p | 4:-16:8 | +124.4% | +75.2% | 4.4s:1.0s:2.8s |
+    /// | screen capture | none (gated) | +49.1% | -4.3% | 6.5s:1.2s:2.3s |
+    ///
+    /// Those are, to the byte, the numbers lane-av1pyrgate recorded for the
+    /// same clips under `EC_AV1_PYRAMID=4:-16:8 EC_AV1_GATE_FACADE=1` -- the
+    /// facade arm -- which is what "one mini-GOP driver, two entry points"
+    /// means here. This downscaled recipe HATES the pyramid (as it hates
+    /// every knob the real film rows of `bd_rate_screen_native` keep, which
+    /// is why it decides nothing); `EC_AV1_PYRAMID=0` restores the flat rows
+    /// above. The capture's row is the flat row to the byte in both runs --
+    /// that equality IS the content gate.
     ///
     /// Loop restoration is NOT in yet: it is the one filter whose parameters
     /// are per restoration UNIT inside the tile payload, so it needs both
