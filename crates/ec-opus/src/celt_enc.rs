@@ -794,8 +794,10 @@ impl CeltEncoder {
         // .708->.703, zaur@96 .940->.872, dl8a .551/.374->.503/.346, hein
         // .855/.528->.771/.419), corr within +.0001 everywhere. The KEEP rule
         // is "err_ratio not worse on every row", so the search ships off.
+        // `EC_OPUS_TWO_PASS=1` re-arms it for a sweep (lane opusx2 r2).
         const TWO_PASS_COARSE_ENERGY: bool = false;
-        let mut two_pass = TWO_PASS_COARSE_ENERGY;
+        let mut two_pass =
+            TWO_PASS_COARSE_ENERGY || std::env::var_os("EC_OPUS_TWO_PASS").is_some();
         let mut intra = self.force_intra
             || (!two_pass
                 && self.delayed_intra > (2 * c * (end - start)) as f32
@@ -896,7 +898,7 @@ impl CeltEncoder {
         // --- Allocation trim ------------------------------------------------
         let mut alloc_trim = 5i32;
         if tell_frac + (6 << BITRES) <= total_bits_frac - total_boost {
-            alloc_trim = self.alloc_trim_analysis(end, lm, c, n);
+            alloc_trim = self.alloc_trim_analysis(end, lm, c, n, tf_estimate);
             enc.enc_icdf(alloc_trim as usize, &TRIM_ICDF, 7);
             tell_frac = enc.tell_frac() as i32;
         }
@@ -1574,7 +1576,20 @@ impl CeltEncoder {
     /// dl8a@64 .9889->.9879). The KEEP rule rejects it; this is the third
     /// rejection of the same port (see `lanes/opus-trim-r2.{A,B}.sweep.txt`).
     /// Do not re-port it without a fix for the transient rows first.
-    fn alloc_trim_analysis(&mut self, end: usize, lm: usize, c: usize, n0: usize) -> i32 {
+    ///
+    /// `EC_OPUS_TRIM13=1` selects the continuous 1.3 form instead, for the
+    /// re-sweep on the aligned (delayed) spectrum the discrete ladder was
+    /// never measured against.
+    fn alloc_trim_analysis(
+        &mut self,
+        end: usize,
+        lm: usize,
+        c: usize,
+        n0: usize,
+        tf_estimate: f32,
+    ) -> i32 {
+        let cont = std::env::var_os("EC_OPUS_TRIM13").is_some();
+        let mut trim_f = 5.0f32;
         let mut trim = 5i32;
         if c == 2 {
             let mut sum = 0.0f32;
@@ -1586,6 +1601,10 @@ impl CeltEncoder {
                 sum += partial;
             }
             sum *= 1.0 / 8.0;
+            if cont {
+                let sum_c = sum.abs().min(1.0);
+                trim_f += (0.75 * (1.001 - sum_c * sum_c).log2()).max(-4.0);
+            }
             if sum > 0.995 {
                 trim -= 4;
             } else if sum > 0.92 {
@@ -1618,6 +1637,14 @@ impl CeltEncoder {
                 diff += self.band_log_e[i + ch * NB_BANDS]
                     * (2 + 2 * i as i32 - NB_BANDS as i32) as f32;
             }
+        }
+        if cont {
+            // libopus divides the same sum by `C*(end-1)`; the ladder above
+            // carries an extra factor of two in its thresholds.
+            let diff = diff / (c * (end - 1)) as f32;
+            trim_f -= ((diff + 1.0) / 6.0).clamp(-2.0, 2.0);
+            trim_f -= 2.0 * tf_estimate;
+            return (trim_f + 0.5).floor().clamp(0.0, 10.0) as i32;
         }
         diff /= (2 * c * (end - 1)) as f32;
         if diff > 2.0 {
