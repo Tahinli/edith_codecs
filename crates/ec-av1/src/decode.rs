@@ -32898,7 +32898,7 @@ pub(crate) fn decode_inter_frame_tile(
         data, mi_cols, mi_rows, base_q_idx, frame_width, frame_height, refpix, cdef,
         loop_filter, allow_high_precision_mv, force_integer_mv, interp_fixed,
         enable_dual_filter, reference_select, tx_select,
-        &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, fctx,
+        &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, false, fctx,
     )
 }
 
@@ -32933,6 +32933,12 @@ pub(crate) fn decode_inter_frame_tile_lr(
     // as `tx_select`/`initial_cdfs` above: a header-derived value a raw tile
     // decode has to be told.
     sign_bias: crate::mvstack::SignBiasTable,
+    // This frame header's own `allow_screen_content_tools`: its intra blocks
+    // then carry the palette syntax (spec 5.11.46), which a raw tile decode
+    // that guessed `false` reads one symbol short of. Placed after
+    // `sign_bias` rather than beside the other bools on purpose (the
+    // `adjacent-same-typed-args` class).
+    allow_screen_content_tools: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -32974,7 +32980,7 @@ pub(crate) fn decode_inter_frame_tile_lr(
         tx_select,
         false,
         false,
-        false,
+        allow_screen_content_tools,
         DeltaParams::default(),
         // `enable_filter_intra`: this crate's own encoder never writes the
         // sequence bit (`encode.rs`), so no intra-in-inter block of a stream
@@ -37518,6 +37524,9 @@ mod tests {
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
                 NO_SIGN_BIAS,
+                // This frame's own `allow_screen_content_tools`, off the
+                // `Encoded` the encoder handed back (stale-header class).
+                frame.screen,
                 fctx,
             )
             .unwrap();
@@ -37842,6 +37851,9 @@ mod tests {
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
                 NO_SIGN_BIAS,
+                // This frame's own `allow_screen_content_tools`, off the
+                // `Encoded` the encoder handed back (stale-header class).
+                frame.screen,
                 fctx,
             )
             .unwrap();

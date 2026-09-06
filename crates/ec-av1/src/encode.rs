@@ -5011,6 +5011,14 @@ pub(crate) fn encode_inter_frame(
     let picture_y8: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
     let picture_u8: Vec<u8> = picture.u.iter().map(|&v| v as u8).collect();
     let picture_v8: Vec<u8> = picture.v.iter().map(|&v| v as u8).collect();
+    // This frame's own `allow_screen_content_tools`. It can only be set when
+    // the SEQUENCE offers the bit at all, which is the key frame's decision
+    // ([`SEQ_SCREEN`]): a frame header that contradicts
+    // `seq_force_screen_content_tools` is a corrupt stream, not a tighter
+    // encode.
+    let screen = seq_screen()
+        && screen_content(&picture_y8, picture.width, true_width, true_height);
+    header.allow_screen_content_tools = screen;
     let mut luma = Plane {
         source: &picture_y8,
         reconstruction: vec![128; picture_y8.len()],
@@ -5045,9 +5053,7 @@ pub(crate) fn encode_inter_frame(
         lambda: lambda_scale() * step * step,
         modes: &KEY_FRAME_MODES,
         top_k: prune_top_k_inter(),
-        // An inter frame never sets `allow_screen_content_tools` yet, so its
-        // intra blocks code no palette syntax (deferred, see the lane report).
-        screen: false,
+        screen,
     };
     let mode_bits_table = inter_mode_bits();
 
@@ -5503,6 +5509,7 @@ pub(crate) fn encode_inter_frame(
     crate::tile::arm_sign_bias(sign_bias);
     crate::tile::arm_reference_select(header.reference_select);
     crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
+    crate::tile::arm_screen(screen);
     let mut tile = crate::tile::sb_coeff_inter_frame_tile_cdfs(
         mi_cols,
         mi_rows,
@@ -5595,6 +5602,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_sign_bias(sign_bias);
             crate::tile::arm_reference_select(reference_select());
             crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
+            crate::tile::arm_screen(screen);
             let mut cdfs = start_cdfs.0.clone();
             let coded = crate::tile::sb_coeff_inter_frame_tile_cdfs(
                 mi_cols,
@@ -5632,6 +5640,7 @@ pub(crate) fn encode_inter_frame(
                 // frame's `start_cdfs`), not from the defaults.
                 Some(start_cdfs.0.clone()),
                 sign_bias,
+                h.allow_screen_content_tools,
                 fctx,
             )
         },
@@ -5659,9 +5668,7 @@ pub(crate) fn encode_inter_frame(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
-        // An inter frame of this encoder never sets the bit (its intra blocks
-        // code no palette syntax yet -- see the lane report's deferred item).
-        screen: false,
+        screen,
         start_cdfs,
         next_cdfs,
         loop_filter: header.loop_filter,
@@ -6190,6 +6197,54 @@ mod tests {
         assert_eq!(decoded.y, encoded.reconstruction.y, "ffmpeg: luma");
         assert_eq!(decoded.u, encoded.reconstruction.u, "ffmpeg: U");
         assert_eq!(decoded.v, encoded.reconstruction.v, "ffmpeg: V");
+        // A whole GOP: the inter frames' own intra blocks carry the palette
+        // syntax too (the three intra arms of the inter writers), which only
+        // ffmpeg reading the frames back can prove.
+        let moved: Vec<Picture> = (0..4)
+            .map(|f| {
+                let base = screen_card(width, height);
+                let mut out = Picture::grey(width, height);
+                for y in 0..height {
+                    for x in 0..width {
+                        let sx = (x + f * 7) % width;
+                        out.y[y * width + x] = base.y[y * width + sx];
+                    }
+                }
+                for y in 0..height / 2 {
+                    for x in 0..width / 2 {
+                        let sx = (x + f * 3) % (width / 2);
+                        out.u[y * (width / 2) + x] = base.u[y * (width / 2) + sx];
+                        out.v[y * (width / 2) + x] = base.v[y * (width / 2) + sx];
+                    }
+                }
+                out
+            })
+            .collect();
+        let _ = crate::tile::take_palette_hits();
+        let gop = encode_sequence_with_ctx(&moved, 100, 0.5, fctx).unwrap();
+        let gop_hits = crate::tile::take_palette_hits();
+        let inter_screen = gop.frames.iter().skip(1).filter(|f| f.screen).count();
+        eprintln!(
+            "GOP: {} frames with screen tools after the key frame, {} palette blocks",
+            inter_screen, gop_hits[0]
+        );
+        assert!(
+            inter_screen > 0,
+            "no inter frame set allow_screen_content_tools"
+        );
+        let gop_decoded = crate::stream::decode_stream(&gop.stream).unwrap();
+        for (i, (ours, frame)) in gop_decoded.iter().zip(gop.frames.iter()).enumerate() {
+            assert_eq!(ours.y, frame.reconstruction.y, "our decoder: GOP frame {i} luma");
+        }
+        if have_ffmpeg() {
+            let ff = ffmpeg_decode_sequence(&gop.stream, width, height, moved.len());
+            for (i, (theirs, frame)) in ff.iter().zip(gop.frames.iter()).enumerate() {
+                assert_eq!(theirs.y, frame.reconstruction.y, "ffmpeg: GOP frame {i} luma");
+                assert_eq!(theirs.u, frame.reconstruction.u, "ffmpeg: GOP frame {i} U");
+                assert_eq!(theirs.v, frame.reconstruction.v, "ffmpeg: GOP frame {i} V");
+            }
+        }
+
         // The other half of the keep rule: film-shaped content leaves the
         // detector (and so the whole sequence header) alone.
         let film = encode_key_frame_with_ctx(&test_card(width, height), 100, 0.5, fctx).unwrap();
