@@ -1053,7 +1053,7 @@ pub(crate) const INTRA_MODE_CTX: [usize; INTRA_MODES] = [0, 1, 2, 3, 4, 4, 4, 4,
 
 /// The symbol an angle delta of zero codes as: the alphabet runs from -3 to
 /// +3, so `MAX_ANGLE_DELTA` is the middle of it.
-const ANGLE_DELTA_ZERO: usize = 3;
+pub(crate) const ANGLE_DELTA_ZERO: usize = 3;
 /// Side of a superblock in 4x4 mode-info units when 128x128 superblocks are off.
 const SB_MI: u32 = 16;
 
@@ -1452,6 +1452,10 @@ pub struct BlockCoeffs {
     /// [`UV_CFL_PRED`]; at least one of the pair is nonzero, since the joint
     /// sign symbol has no (ZERO, ZERO) value.
     pub cfl_alphas: Option<(i32, i32)>,
+    /// This block's `angle_delta_y` (spec `read_intra_angle_info`, -3..=3),
+    /// zero for every non-directional luma mode -- which is what
+    /// [`Default`] gives, and what every writer coded before lane-av1cfl.
+    pub angle_delta_y: i8,
     /// This block's intra block-copy vector (spec 5.11.13 `use_intrabc` ->
     /// `assign_dv`), in the spec's 1/8-pel `(row, col)` units, or `None` for
     /// an ordinary intra block. Only a key frame whose header set
@@ -3403,7 +3407,10 @@ fn write_intra_mode(
     );
     ec_rng_trace(|| format!("EC_YMODE mode={mode} tell={} rng={}", enc.tell(), enc.rng()));
     if (V_PRED..=D67_PRED).contains(&mode) {
-        enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+        enc.symbol(
+            (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
+            &mut cdfs.angle_delta[mode - V_PRED],
+        );
     }
     // A block small enough to be offered chroma from luma reads the wider
     // table even when it does not take the mode.
@@ -5791,7 +5798,10 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     let mode = usize::from(block.mode);
                     enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_32]);
                     if (V_PRED..=D67_PRED).contains(&mode) {
-                        enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+                        enc.symbol(
+            (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
+            &mut cdfs.angle_delta[mode - V_PRED],
+        );
                     }
                     let uv_mode = usize::from(block.uv_mode);
                     enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
@@ -6029,7 +6039,10 @@ fn write_inter_frame_leaf(
         let mode = usize::from(block.mode);
         enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_16]);
         if (V_PRED..=D67_PRED).contains(&mode) {
-            enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+            enc.symbol(
+            (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
+            &mut cdfs.angle_delta[mode - V_PRED],
+        );
         }
         let uv_mode = usize::from(block.uv_mode);
         enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
@@ -6273,7 +6286,10 @@ fn write_inter_frame_leaf8(
         let mode = usize::from(block.mode);
         enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_8]);
         if (V_PRED..=D67_PRED).contains(&mode) {
-            enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+            enc.symbol(
+            (ANGLE_DELTA_ZERO as i32 + i32::from(block.angle_delta_y)) as usize,
+            &mut cdfs.angle_delta[mode - V_PRED],
+        );
         }
         let uv_mode = usize::from(block.uv_mode);
         enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
