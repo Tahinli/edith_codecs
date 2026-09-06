@@ -10,6 +10,8 @@
 //! off as they arrive.
 
 use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use ec_core::{Error, Result};
@@ -3513,6 +3515,10 @@ fn write_block_planes(
         } else {
             usize::from(around[plane].above_coded) + usize::from(around[plane].left_coded)
         };
+        #[cfg(test)]
+        let before = enc.tell();
+        #[cfg(test)]
+        let q_ctx = cdfs.q_ctx;
         write_coeffs(
             enc,
             &mut cdfs.txb(planes[plane], mode),
@@ -3522,6 +3528,8 @@ fn write_block_planes(
             dc_sign_ctx(around[plane].dc_vote),
             Some(plane),
         );
+        #[cfg(test)]
+        census_record(planes[plane], q_ctx, grid, f64::from(enc.tell() - before));
         ec_rng_trace(|| {
             format!(
                 "EC_PLANE plane={plane} nz={} skip_ctx={skip_ctx} tell={}",
@@ -3602,6 +3610,10 @@ fn write_luma_tus(
                 neighbours.luma_skip_ctx(tu_mi, tx / MI)
             };
             let around = neighbours.around_mi(tu_mi, tx)[0];
+            #[cfg(test)]
+            let before = enc.tell();
+            #[cfg(test)]
+            let q_ctx = cdfs.q_ctx;
             write_coeffs(
                 enc,
                 &mut cdfs.txb(set, mode),
@@ -3611,6 +3623,8 @@ fn write_luma_tus(
                 dc_sign_ctx(around.dc_vote),
                 Some(0),
             );
+            #[cfg(test)]
+            census_record(set, q_ctx, &unit, f64::from(enc.tell() - before));
             if n > 1 {
                 neighbours.record_mi_luma(tu_mi, tx, &unit);
             }
@@ -3970,13 +3984,14 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
     // q-context per thread beside a pristine one and restore just those from
     // it. The state the price is taken against is identical to a fresh
     // `Cdfs::new(q_ctx)`, so every price is bit-identical.
-    thread_local! {
-        static PRICING: RefCell<[Option<Box<(Cdfs, Cdfs)>>; 4]> =
-            const { RefCell::new([None, None, None, None]) };
-    }
-    PRICING.with_borrow_mut(|slots| {
-        let slot = slots[q_ctx.min(3)]
-            .get_or_insert_with(|| Box::new((Cdfs::new(q_ctx), Cdfs::new(q_ctx))));
+    // lane-av1txbits: an inter frame's writer does NOT start from the
+    // defaults -- it starts from the tables the previous frame stored (spec
+    // 7.20, `start_cdfs` in `encode_inter_frame`) -- so pricing against the
+    // defaults charged the search for a narrowing the writer no longer pays.
+    // The census measured that at +31% on the one-coefficient inter blocks
+    // the search lives on. `arm_pricing_cdfs` puts the frame's own starting
+    // tables under the price; nothing armed keeps the old default behaviour.
+    let price = |slot: &mut (Cdfs, Cdfs)| {
         let (pristine, scratch) = (&mut slot.0, &mut slot.1);
         let src = pristine.txb(set, DC_PRED);
         let mut coding = scratch.txb(set, DC_PRED);
@@ -4002,7 +4017,116 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
         let mut enc = SymbolEncoder::pricer();
         write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
         enc.bits()
+    };
+    PRICING_BASE.with_borrow_mut(|base| {
+        if let Some(slot) = base.as_deref_mut().filter(|s| s.0.q_ctx == q_ctx) {
+            return price(slot);
+        }
+        PRICING.with_borrow_mut(|slots| {
+            let slot = slots[q_ctx.min(3)]
+                .get_or_insert_with(|| Box::new((Cdfs::new(q_ctx), Cdfs::new(q_ctx))));
+            price(slot)
+        })
     })
+}
+
+thread_local! {
+    /// The default tables every price falls back to, one pristine/scratch
+    /// pair per q-context (see [`coeff_bits`] for why the pair is kept).
+    static PRICING: RefCell<[Option<Box<(Cdfs, Cdfs)>>; 4]> =
+        const { RefCell::new([None, None, None, None]) };
+    /// The tables the frame being searched will really be written against,
+    /// armed per frame by the encoder ([`arm_pricing_cdfs`]) on every thread
+    /// that prices -- the search jobs re-arm their own worker, exactly like
+    /// the other tile thread-locals.
+    static PRICING_BASE: RefCell<Option<Box<(Cdfs, Cdfs)>>> = const { RefCell::new(None) };
+}
+
+/// Arms the tables [`coeff_bits`] prices against on this thread: the state
+/// this frame's tile writer starts from. `None` goes back to the per-q-context
+/// defaults (a key frame, whose writer really does start there).
+///
+/// OFF by default (`EC_AV1_PRICE_FRAME_CDFS=1`). It is the more accurate
+/// estimate by measurement -- the pricer census
+/// (`pricer_error_census_by_block_class`) goes from +7.6% to +4.8% over every
+/// transform block, and the one- and two-coefficient inter blocks the search
+/// lives on from +31.4%/+22.3% to +3.1%/+3.6% -- but the accuracy does not
+/// convert into ladder bytes on every clip: on the 640x384 gate it scores
+/// +78.8/+95.1/+54.5 vs libaom and +36.1/+56.4/+1.4 vs rav1e against the
+/// +79.9/+94.6/+54.5 and +37.3/+55.7/+1.1 the defaults score (film 1080p
+/// down 1.1, film 2160p up 0.5, screen flat), and on the native crops
+/// +18.0/+47.3/+60.7 and +0.7/+19.2/-7.3 against +18.9/+48.2/+59.3 and
+/// +1.5/+19.8/-10.0 (both film clips down against both references, screen up
+/// 1.4/2.7). Two clips better, one worse: it does not meet this lane's keep
+/// rule, so it ships as a knob rather than as the default.
+pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() == Ok("1"));
+    PRICING_BASE.with_borrow_mut(|slot| {
+        *slot = base.filter(|_| on).map(|c| Box::new((c.clone(), c.clone())));
+    });
+}
+
+/// The pricer census (`pricer_census_on`): for every transform block the tile
+/// writer really codes, the bits it spent against the bits [`coeff_bits`]
+/// prices those very levels at -- the search's rate term measured against the
+/// rate it is meant to predict. Keyed by (table set, non-zero bucket) so a
+/// class that is systematically mispriced (all-zero blocks' `txb_skip`, the
+/// eob of a one-coefficient block, a whole size) shows up on its own row
+/// rather than inside one average.
+/// Thread-local, so a census cannot pick up the blocks of another test's
+/// encode running beside it; a multi-tile, multi-threaded encode would
+/// therefore only census the tiles this thread wrote, which is every tile of
+/// the one-tile-one-thread encodes the gates print it from.
+#[cfg(test)]
+type CensusRows = BTreeMap<(String, usize), (u64, f64, f64)>;
+#[cfg(test)]
+thread_local! {
+    static CENSUS: RefCell<Option<CensusRows>> = const { RefCell::new(None) };
+}
+
+/// Starts a census on this thread, discarding anything a previous one left.
+#[cfg(test)]
+pub(crate) fn pricer_census_on() {
+    CENSUS.with_borrow_mut(|c| *c = Some(BTreeMap::new()));
+}
+
+/// Stops the census and hands back its rows: (set, non-zero bucket) ->
+/// (blocks, priced bits, written bits).
+#[cfg(test)]
+pub(crate) fn take_pricer_census() -> CensusRows {
+    CENSUS.with_borrow_mut(|c| c.take()).unwrap_or_default()
+}
+
+/// The label of a non-zero bucket, for the tables the gates print.
+#[cfg(test)]
+pub(crate) fn census_bucket_label(bucket: usize) -> &'static str {
+    ["0", "1", "2", "3-4", "5-8", "9-16", "17+"][bucket]
+}
+
+#[cfg(test)]
+fn census_record(set: TxbSet, q_ctx: usize, grid: &[i32], written: f64) {
+    if CENSUS.with_borrow(|c| c.is_none()) {
+        return;
+    }
+    let nz = grid.iter().filter(|&&l| l != 0).count();
+    let bucket = match nz {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3..=4 => 3,
+        5..=8 => 4,
+        9..=16 => 5,
+        _ => 6,
+    };
+    let priced = coeff_bits(grid, set, q_ctx);
+    CENSUS.with_borrow_mut(|rows| {
+        let rows = rows.as_mut().expect("the census is on");
+        let row = rows.entry((format!("{set:?}"), bucket)).or_default();
+        row.0 += 1;
+        row.1 += priced;
+        row.2 += written;
+    });
 }
 
 /// What the partition symbol of a block of `side` samples costs, in bits, when
