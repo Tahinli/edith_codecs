@@ -35638,6 +35638,17 @@ mod tests {
         RefPix::ready(refs)
     }
 
+    /// [`last_only`] plus `GOLDEN_FRAME` (index 4 of the name-keyed array):
+    /// what a frame this encoder writes needs, since every inter frame's
+    /// `ref_frame_idx[3]` names the slot the key frame left behind and its
+    /// blocks may code `single_ref` out to it.
+    fn last_and_golden<'a>(last: &'a Picture, golden: &'a Picture) -> RefPix<'a> {
+        let mut refs: [Option<&Picture>; 8] = [None; 8];
+        refs[1] = Some(last);
+        refs[4] = Some(golden);
+        RefPix::ready(refs)
+    }
+
 
     /// lane-perf6 step 2: the CDEF kernel now reads a pre-gathered window and
     /// a pre-resolved damping shift instead of a bounds-testing closure and a
@@ -37165,7 +37176,7 @@ mod tests {
                 frame.base_q_idx,
                 width as u32,
                 height as u32,
-                &last_only(&reference),
+                &last_and_golden(&reference, &encoded.frames[0].reconstruction),
                 &frame.cdef,
                 &frame.loop_filter,
                 false,
@@ -37477,7 +37488,7 @@ mod tests {
                 frame.base_q_idx,
                 coded_w,
                 coded_h,
-                &last_only(&reference),
+                &last_and_golden(&reference, &encoded.frames[0].reconstruction),
                 &frame.cdef,
                 &frame.loop_filter,
                 false,

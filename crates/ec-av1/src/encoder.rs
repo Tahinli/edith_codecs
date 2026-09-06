@@ -231,6 +231,9 @@ pub struct Av1Encoder {
     /// must start from, since the header leaves
     /// `disable_frame_end_update_cdf` off. `None` before the first frame.
     carried_cdfs: Option<crate::encode::CdfSnapshot>,
+    /// The last key frame's own (padded) reconstruction: `GOLDEN_FRAME`,
+    /// which stays in DPB slot 1 until the next key frame refreshes it.
+    golden: Option<Picture>,
 }
 
 /// The encoder stays `Send` now that it owns a `FrameCtx` (whose cells are
@@ -257,6 +260,7 @@ impl Av1Encoder {
         Picture::grey(config.width, config.height).check_even()?;
         Ok(Self {
             carried_cdfs: None,
+            golden: None,
             color_config: config.colour.color_config(),
             config,
             reference: None,
@@ -362,11 +366,15 @@ impl Av1Encoder {
                 order as u32,
                 render,
                 self.carried_cdfs.as_ref().map(|c| &c.0),
+                self.golden.as_ref(),
                 &self.fctx,
             )?
         };
 
         self.carried_cdfs = Some(encoded.next_cdfs.clone());
+        if is_key {
+            self.golden = Some(encoded.reconstruction.clone());
+        }
         self.reference = Some(encoded.reconstruction.clone());
         self.next_index += 1;
         let cropped = crop_encoded(&encoded, render.0, render.1);

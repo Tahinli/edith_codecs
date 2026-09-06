@@ -713,6 +713,11 @@ pub(crate) fn key_frame_headers_colour(
     Ok((seq, header))
 }
 
+/// The DPB slot `GOLDEN_FRAME` names in every frame this encoder writes: the
+/// key frame refreshes all eight slots, each inter frame only slot 0, so slot
+/// 1 still holds the key frame however long the GOP runs.
+pub const GOLDEN_SLOT: u8 = 1;
+
 /// The frame header for a shown inter frame that predicts from the single
 /// slot `last_slot` (every `ref_frame_idx` entry names it) and refreshes that
 /// same slot with itself once coded. The sequence header is [`key_frame_headers`]'s,
@@ -742,7 +747,16 @@ pub fn inter_frame_headers(
         order_hint,
         primary_ref_frame: 0,
         refresh_frame_flags: 1 << last_slot,
-        ref_frame_idx: [last_slot; ec_av1_syntax::REFS_PER_FRAME],
+        // Every reference but `GOLDEN_FRAME` (index 3 of `ref_frame_idx`)
+        // names the slot this frame both predicts from and refreshes;
+        // GOLDEN names slot 1, which the key frame wrote when it refreshed
+        // all eight and which no inter frame ever overwrites, so it holds
+        // the key frame's own picture for the whole GOP.
+        ref_frame_idx: {
+            let mut idx = [last_slot; ec_av1_syntax::REFS_PER_FRAME];
+            idx[3] = GOLDEN_SLOT;
+            idx
+        },
         allow_high_precision_mv: false,
         interpolation_filter: ec_av1_syntax::InterpolationFilter::Eighttap,
         is_motion_mode_switchable: false,
@@ -2411,7 +2425,7 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
     let info = match inter {
         Some(info) => MiInfo {
             is_inter: true,
-            ref_frame: LAST_FRAME,
+            ref_frame: info.ref_frame,
             ref_frame1: NO_REF1,
             mv1: (0, 0),
             mv: mv16(info.mv),
@@ -3388,7 +3402,13 @@ fn search_inter_block(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    stack: &MvStack, fctx: &crate::decode::FrameCtx,
+    stack: &MvStack,
+    // `GOLDEN_FRAME`: the key frame's own reconstruction, held in DPB slot 1
+    // for the whole GOP, with the stack this block derives against it. Only
+    // its two search-free modes are priced (`NEARESTMV`, `GLOBALMV`) -- a
+    // second motion search would double the wall of the stage that already
+    // owns most of it.
+    golden: Option<(&Picture, &MvStack)>, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
     // below price their coefficients through `TxbSet::Luma32Inter`, which is
@@ -3401,9 +3421,17 @@ fn search_inter_block(
     // function's doc comment.
     let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
     let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
-    let single_ref_bits = symbol_bits(&cdf::SINGLE_REF[0][0], 0)
-        + symbol_bits(&cdf::SINGLE_REF[0][2], 0)
-        + symbol_bits(&cdf::SINGLE_REF[0][3], 0);
+    // `write_single_ref`'s own tree, at the fixed context this pricer uses
+    // for every neighbour-derived symbol: LAST is p1=0,p3=0,p4=0 and GOLDEN
+    // p1=0,p3=1,p5=1.
+    let single_ref_bits = |ref_frame: i8| {
+        symbol_bits(&cdf::SINGLE_REF[0][0], 0)
+            + if ref_frame == crate::mvstack::GOLDEN_FRAME {
+                symbol_bits(&cdf::SINGLE_REF[0][2], 1) + symbol_bits(&cdf::SINGLE_REF[0][4], 1)
+            } else {
+                symbol_bits(&cdf::SINGLE_REF[0][2], 0) + symbol_bits(&cdf::SINGLE_REF[0][3], 0)
+            }
+    };
 
     struct Candidate {
         cost: f64,
@@ -3561,10 +3589,11 @@ fn search_inter_block(
         }
         bits
     };
+    let last_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME);
     let mut cands: Vec<((i32, i32), f64, InterInfo)> = vec![
         (
             stack.nearest_mv,
-            not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0),
+            last_ref_bits + not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0),
             InterInfo {
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
@@ -3577,7 +3606,7 @@ fn search_inter_block(
         // content where that vector is also the right one.
         (
             (0, 0),
-            not_new + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 0),
+            last_ref_bits + not_new + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 0),
             InterInfo {
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::GlobalMv,
@@ -3586,7 +3615,8 @@ fn search_inter_block(
             },
         ),
     ];
-    let near_bits = not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 1);
+    let near_bits =
+        last_ref_bits + not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 1);
     for idx in 1..=2usize {
         if let Some(e) = stack.entries.get(idx) {
             cands.push((
@@ -3640,7 +3670,7 @@ fn search_inter_block(
     if let Some((bits, ref_mv_idx)) = best_new {
         cands.push((
             mv,
-            symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
+            last_ref_bits + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
             InterInfo {
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NewMv,
@@ -3650,12 +3680,52 @@ fn search_inter_block(
         ));
     }
 
-    // One trial set per distinct vector: sort by vector, cheapest syntax
-    // first, and drop the rest of each vector's run.
-    cands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
-    cands.dedup_by_key(|c| c.0);
+    if let Some((_, gstack)) = golden {
+        let g_ref_bits = single_ref_bits(crate::mvstack::GOLDEN_FRAME);
+        let g_not_new = symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 1);
+        cands.push((
+            gstack.nearest_mv,
+            g_ref_bits
+                + g_not_new
+                + symbol_bits(&cdf::ZERO_MV[gstack.zero_mv_ctx], 1)
+                + symbol_bits(&cdf::REF_MV[gstack.ref_mv_ctx], 0),
+            InterInfo {
+                ref_frame: crate::mvstack::GOLDEN_FRAME,
+                mode: InterMode::NearestMv,
+                mv: gstack.nearest_mv,
+                ref_mv_idx: 0,
+            },
+        ));
+        cands.push((
+            (0, 0),
+            g_ref_bits + g_not_new + symbol_bits(&cdf::ZERO_MV[gstack.zero_mv_ctx], 0),
+            InterInfo {
+                ref_frame: crate::mvstack::GOLDEN_FRAME,
+                mode: InterMode::GlobalMv,
+                mv: (0, 0),
+                ref_mv_idx: 0,
+            },
+        ));
+    }
+
+    // One trial set per distinct (reference, vector) pair: sort, cheapest
+    // syntax first, and drop the rest of each pair's run.
+    cands.sort_by(|a, b| {
+        (a.2.ref_frame, a.0)
+            .cmp(&(b.2.ref_frame, b.0))
+            .then(a.1.total_cmp(&b.1))
+    });
+    cands.dedup_by_key(|c| (c.2.ref_frame, c.0));
     {
         for (mv, mode_bits_inter, info) in cands {
+            let (ref_luma, ref_u, ref_v) = match golden {
+                Some((g, _)) if info.ref_frame == crate::mvstack::GOLDEN_FRAME => (
+                    (&g.y, g.width, luma.true_width, luma.true_height),
+                    (&g.u, g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                    (&g.v, g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                ),
+                _ => (ref_luma, ref_u, ref_v),
+            };
             let luma_trial = mc_trial(
                 luma,
                 x,
@@ -3713,7 +3783,6 @@ fn search_inter_block(
                 + search.lambda
                     * (skip_bits(skip)
                         + intra_inter_bits(true)
-                        + single_ref_bits
                         + mode_bits_inter
                         + if skip {
                             0.0
@@ -3766,7 +3835,11 @@ pub(crate) fn encode_inter_frame(
     // stored into the slot this one's `primary_ref_frame` names. `None`
     // starts from the defaults, which is right only for the frame straight
     // after a key frame.
-    start_cdfs: Option<&crate::cdf_state::Cdfs>, fctx: &crate::decode::FrameCtx,
+    start_cdfs: Option<&crate::cdf_state::Cdfs>,
+    // The key frame's own (padded) reconstruction, which every frame of the
+    // GOP still holds in DPB slot 1 -- `GOLDEN_FRAME`. `None` codes the frame
+    // with `LAST_FRAME` alone, exactly as before.
+    golden: Option<&Picture>, fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -3901,6 +3974,18 @@ pub(crate) fn encode_inter_frame(
                     let (mi_row, mi_col) = (r32 * 8, c32 * 8);
                     let stack =
                         find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
+                    let golden_stack = golden.map(|_| {
+                        find_mv_stack(
+                            &grid,
+                            mi_row,
+                            mi_col,
+                            8,
+                            8,
+                            crate::mvstack::GOLDEN_FRAME,
+                            mi_cols,
+                            mi_rows,
+                        )
+                    });
 
                     let base = snapshot(&luma, &chroma, (x, y), BLOCK);
                     let (block, mut cost_whole) = search_inter_block(
@@ -3910,7 +3995,8 @@ pub(crate) fn encode_inter_frame(
                         &search,
                         &mode_bits_table,
                         reference,
-                        &stack, fctx,
+                        &stack,
+                        golden.zip(golden_stack.as_ref()), fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
                     let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
@@ -4266,8 +4352,25 @@ pub(crate) fn encode_inter_frame(
             v: crop_plane(&reference.v, reference.width / 2, fw / 2, fh / 2),
         }
     };
+    // `RefPix` is indexed by the reference NAME (`LAST_FRAME` = 1,
+    // `GOLDEN_FRAME` = 4), not by DPB slot: the trial decode of a frame whose
+    // blocks may name GOLDEN needs that plane too, cropped the same way.
+    let trial_golden = golden.map(|g| {
+        if (g.width, g.height) == (fw, fh) {
+            g.clone()
+        } else {
+            Picture {
+                width: fw,
+                height: fh,
+                y: crop_plane(&g.y, g.width, fw, fh),
+                u: crop_plane(&g.u, g.width / 2, fw / 2, fh / 2),
+                v: crop_plane(&g.v, g.width / 2, fw / 2, fh / 2),
+            }
+        }
+    });
     let mut refs: [Option<&Picture>; 8] = [None; 8];
     refs[1] = Some(&trial_ref);
+    refs[4] = trial_golden.as_ref();
     let refpix = crate::decode::RefPix::ready(refs);
     pick_and_apply_filters(
         &mut header,
@@ -4388,6 +4491,10 @@ pub(crate) fn encode_sequence_with_ctx(
         unspecified_color_config(), fctx,
     )?;
     let mut stream = key.stream.clone();
+    // Slot 1 keeps the key frame's own reconstruction for the whole GOP (the
+    // key frame refreshes every slot, each inter frame only slot 0), which is
+    // what `GOLDEN_FRAME` names.
+    let golden = key.reconstruction.clone();
     let mut carried = key.next_cdfs.clone();
     let mut reference = key.reconstruction.clone();
     let mut frames = vec![crop_encoded(&key, render.0, render.1)];
@@ -4407,7 +4514,8 @@ pub(crate) fn encode_sequence_with_ctx(
             deadzone,
             order_hint,
             render,
-            Some(&carried.0), fctx,
+            Some(&carried.0),
+            Some(&golden), fctx,
         )?;
         stream.extend_from_slice(&inter.stream);
         carried = inter.next_cdfs.clone();
@@ -6444,7 +6552,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, fctx).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, fctx).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -6542,7 +6650,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, fctx).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, fctx).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -6719,7 +6827,7 @@ mod tests {
                     q,
                     0.5,
                     1,
-                    (width, height), None, fctx,
+                    (width, height), None, None, fctx,
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -6736,7 +6844,7 @@ mod tests {
                         q,
                         0.5,
                         1,
-                        (width, height), None, fctx,
+                        (width, height), None, None, fctx,
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
@@ -7249,6 +7357,7 @@ mod tests {
             let _ = take_uv_mode_hits();
             let _ = crate::tile::take_inter_mode_hits();
             let _ = crate::tile::take_drl_hits();
+            let _ = crate::tile::take_ref_hits();
             let (ours, ours_wall) = our_ladder(&source, width, height, fctx);
             // How often the inter split actually fired over this clip's four
             // encodes, against the whole 32x32 that was the only outcome
@@ -7259,6 +7368,7 @@ mod tests {
             // number cannot be crediting (gate-blind-to-feature).
             let [nearest, near, global, new] = crate::tile::take_inter_mode_hits();
             let [drl0, drl1, drl2, drl3] = crate::tile::take_drl_hits();
+            let refs = crate::tile::take_ref_hits();
             let modes_total = (nearest + near + global + new).max(1);
             eprintln!(
                 "{name}: inter modes NEAREST {nearest} ({:.1}%) NEAR {near} ({:.1}%) \
@@ -7268,6 +7378,10 @@ mod tests {
                 100.0 * near as f64 / modes_total as f64,
                 100.0 * global as f64 / modes_total as f64,
                 100.0 * new as f64 / modes_total as f64,
+            );
+            eprintln!(
+                "{name}: references LAST {} GOLDEN {} (LAST2 {} LAST3 {} BWD {} ALT2 {} ALT {})",
+                refs[0], refs[3], refs[1], refs[2], refs[4], refs[5], refs[6]
             );
             eprintln!(
                 "{name}: inter 32x32 split into 16s {split32} of {} blocks ({:.1}%); \
