@@ -891,10 +891,16 @@ impl CeltEncoder {
             // dynalloc boost minus calibration average (C:1651)
             target += total_boost - (19 << lm);
             // TF boost (C:1653-1654): MULT16_32_Q15 is identity in float mode,
-            // SHL32(.., 1) is the x2: 2 * (tf_estimate - 0.044) * target.
-            // Measured deviation: C applies SHL32(.., 1) (x2). On the 14-row
-            // library gate x2 loses .003 corr on sadie/hein@64 vs x1 (lane
-            // opus-vbr r2 vs r3); our tf_estimate is not scaled like libopus's.
+            // SHL32(.., 1) is the x2 and tf_calibration is .04 at a fixed frame
+            // size. MEASURED TWICE (lane opus-vbr r2/r3 on the old 14-row gate,
+            // lane opustr r2 on the 12-row one): the x2 costs .0030 corr on
+            // hein@64 and .0014 on hein@96 and pushes 5 err_ratio rows the
+            // wrong way, so the x1 stand-in stays. The sadie rows that carried
+            // the first rejection are gone; hein reproduced it exactly.
+            // It is nonetheless the only lever measured to move the naz rows:
+            // with it, naz@64 goes 2.697 -> 1.764 and naz@96 4.499 -> 2.114
+            // (`lanes/opus-opustr-r2.sweep.txt`). Upgrade path: gate the x2 on
+            // content -- it pays on music transients and starves hein's speech.
             target += ((tf_estimate - 0.044) * target as f32) as i32;
             // floor depth cap (C:1683-1695): SHR32/MULT16_32_Q15 are identity.
             {
@@ -941,6 +947,11 @@ impl CeltEncoder {
                 // Release banked credit slowly (8 bytes per frame) so it stays
                 // available for transient boosts; libopus CVBR re-adds all of
                 // it to the next frame, which would defeat banking entirely.
+                // MEASURED (lane opustr r3, `lanes/opus-opustr-r3.sweep.txt`):
+                // restoring the libopus uncapped one-frame release on its own
+                // is neutral-to-worse -- 3 rows better, 5 worse (dl8a@96
+                // .374->.415, hein@96 .528->.555, her@96 1.051->1.064) and
+                // hein@64 corr -.0008. The drip stays.
                 let adjust = ((-self.vbr_reservoir) / (8 << BITRES)).min(8);
                 if !silence {
                     nb_avail += adjust;

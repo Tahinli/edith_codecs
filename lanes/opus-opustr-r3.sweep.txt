@@ -1,0 +1,14 @@
+# lane-opustr r3 REVERTED: only the uncapped one-frame CVBR reservoir release (tf boost left at x1).
+# vs lanes/opus-opus64-r3.sweep.txt. 12 rows (sadie.wav gone, its 2 rows SKIP).
+nik@64k: ref 69.2 ours 69.0 kbps (-0.3%), corr o=0.9886 r=0.9864 gap=-0.0022, Q o=-81.38 r=-154.78, err_ratio 0.646, minsec o=0.9766 r=0.9745, drop o=0 r=0
+nik@96k: ref 101.0 ours 100.9 kbps (-0.1%), corr o=0.9948 r=0.9940 gap=-0.0007, Q o=-30.21 r=-31.55, err_ratio 0.988, minsec o=0.9889 r=0.9888, drop o=0 r=0
+zaur@64k: ref 63.6 ours 63.4 kbps (-0.2%), corr o=0.9891 r=0.9866 gap=-0.0024, Q o=-202.79 r=-123.36, err_ratio 1.509, minsec o=0.9673 r=0.9686, drop o=0 r=0
+zaur@96k: ref 93.9 ours 93.7 kbps (-0.1%), corr o=0.9947 r=0.9937 gap=-0.0010, Q o=-108.03 r=-125.18, err_ratio 0.903, minsec o=0.9857 r=0.9854, drop o=0 r=0
+her@64k: ref 67.9 ours 67.8 kbps (-0.2%), corr o=0.9834 r=0.9794 gap=-0.0039, Q o=-367.31 r=-339.00, err_ratio 1.109, minsec o=0.9475 r=0.9406, drop o=0 r=0
+her@96k: ref 101.5 ours 101.3 kbps (-0.2%), corr o=0.9914 r=0.9902 gap=-0.0012, Q o=-204.58 r=-191.50, err_ratio 1.064, minsec o=0.9727 r=0.9728, drop o=0 r=0
+naz@64k: ref 71.3 ours 71.3 kbps (-0.1%), corr o=0.9908 r=0.9880 gap=-0.0028, Q o=-351.70 r=-128.39, err_ratio 2.697, minsec o=0.9710 r=0.9644, drop o=0 r=0
+naz@96k: ref 105.4 ours 105.2 kbps (-0.1%), corr o=0.9956 r=0.9948 gap=-0.0008, Q o=-301.83 r=-29.16, err_ratio 4.499, minsec o=0.9856 r=0.9804, drop o=0 r=0
+dl8a@64k: ref 65.8 ours 65.7 kbps (-0.1%), corr o=0.9887 r=0.9865 gap=-0.0022, Q o=-227.27 r=-378.84, err_ratio 0.551, minsec o=0.9785 r=0.9723, drop o=0 r=0
+dl8a@96k: ref 96.8 ours 96.8 kbps (-0.0%), corr o=0.9943 r=0.9934 gap=-0.0009, Q o=-199.03 r=-423.47, err_ratio 0.415, minsec o=0.9886 r=0.9864, drop o=0 r=0
+hein@64k: ref 64.9 ours 64.9 kbps (-0.0%), corr o=0.9880 r=0.9874 gap=-0.0006, Q o=-344.06 r=-388.31, err_ratio 0.853, minsec o=0.9277 r=0.9148, drop o=0 r=0
+hein@96k: ref 86.9 ours 86.9 kbps (-0.0%), corr o=0.9944 r=0.9930 gap=-0.0014, Q o=-126.54 r=-246.46, err_ratio 0.555, minsec o=0.9697 r=0.9499, drop o=0 r=0

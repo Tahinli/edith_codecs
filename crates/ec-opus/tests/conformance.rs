@@ -5587,8 +5587,14 @@ fn frame_decisions_vs_libopus() {
         ref_rows.push(if ok { Some((p.len(), d.last_celt_diag().clone())) } else { None });
     }
 
+    // Encode at the reference's REALISED rate, like the library gate does:
+    // ffmpeg's libopus overshoots its -b:a target by up to 12% on these
+    // sources, and a flat target makes every byte column meaningless.
+    let ref_bytes: usize = ref_pkts.iter().take(to).map(Vec::len).sum();
+    let ref_kbps = ref_bytes as f64 * 8.0 / (ref_pkts.len().min(to) as f64 * 0.02) / 1000.0;
+    println!("ffmpeg target {kbps} kbps, realised {ref_kbps:.1} kbps");
     let mut enc = Encoder::new(48000, CH, Application::Audio).unwrap();
-    enc.set_bitrate(kbps * 1000);
+    enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
     enc.set_vbr_constrained(true);
     let mut dec = Decoder::new(48000, CH).unwrap();
     let mut out = vec![0u8; 1500];
