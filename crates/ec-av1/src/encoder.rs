@@ -234,6 +234,9 @@ pub struct Av1Encoder {
     /// The last key frame's own (padded) reconstruction: `GOLDEN_FRAME`,
     /// which stays in DPB slot 1 until the next key frame refreshes it.
     golden: Option<Picture>,
+    /// The frame two back: `ALTREF_FRAME`, in the slot the next frame is
+    /// about to refresh (`encode_inter_frame`'s 0/2 alternation).
+    prev2: Option<Picture>,
 }
 
 /// The encoder stays `Send` now that it owns a `FrameCtx` (whose cells are
@@ -261,6 +264,7 @@ impl Av1Encoder {
         Ok(Self {
             carried_cdfs: None,
             golden: None,
+            prev2: None,
             color_config: config.colour.color_config(),
             config,
             reference: None,
@@ -367,6 +371,7 @@ impl Av1Encoder {
                 render,
                 self.carried_cdfs.as_ref().map(|c| &c.0),
                 self.golden.as_ref(),
+                self.prev2.as_ref(),
                 &self.fctx,
             )?
         };
@@ -374,6 +379,9 @@ impl Av1Encoder {
         self.carried_cdfs = Some(encoded.next_cdfs.clone());
         if is_key {
             self.golden = Some(encoded.reconstruction.clone());
+            self.prev2 = None;
+        } else {
+            self.prev2 = self.reference.take();
         }
         self.reference = Some(encoded.reconstruction.clone());
         self.next_index += 1;
