@@ -1336,6 +1336,105 @@ mod tests {
             .collect()
     }
 
+    /// A pyramid stream reorders pictures: the hidden `ALTREF` of each
+    /// mini-GOP is coded before the leaves that precede it in display order,
+    /// and a `show_existing_frame` header puts it back. This pins the shape
+    /// (one packet per source picture plus one `show_existing_frame` per
+    /// group, `dts` monotone, `order` NOT monotone) and then decodes the
+    /// whole stream through OUR decoder and through ffmpeg/dav1d and requires
+    /// the two display-order outputs to agree sample for sample — the
+    /// [[gate-blind-to-hidden-frames]] check: a hidden frame that is never
+    /// output, or output twice, or output in the wrong position, changes the
+    /// display-order list and fails here.
+    #[test]
+    fn a_pyramid_stream_decodes_in_display_order_through_both_decoders() {
+        let (width, height) = (128usize, 64usize);
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 120,
+            gop: 32,
+            colour: Colour::Bt709Limited,
+        };
+        let pyramid = Pyramid {
+            mini_gop: 4,
+            ..Pyramid::default()
+        };
+        let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
+        let sources: Vec<Picture> = (0..9).map(|t| test_card(width, height, t * 3)).collect();
+        let _ = crate::encode::take_ref_frame_hits();
+        let mut packets = Vec::new();
+        for picture in &sources {
+            packets.extend(enc.encode_frames(picture).unwrap());
+        }
+        packets.extend(enc.flush().unwrap());
+
+        // Shape: every source picture is coded exactly once, and each closed
+        // group adds one `show_existing_frame` packet.
+        let coded: Vec<u64> = packets
+            .iter()
+            .filter(|p| p.level != Level::ShowExisting)
+            .map(|p| p.order)
+            .collect();
+        let mut sorted = coded.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..9).collect::<Vec<u64>>(), "one packet per picture");
+        assert_ne!(coded, sorted, "the pyramid never reordered anything");
+        let shown = packets.iter().filter(|p| p.level == Level::ShowExisting).count();
+        assert_eq!(shown, 2, "one show_existing_frame per closed mini-GOP");
+        for (i, p) in packets.iter().enumerate() {
+            assert_eq!(p.dts, i as u64, "packet {i}: dts is the coding position");
+        }
+        let hist = |l: Level| packets.iter().filter(|p| p.level == l).count();
+        eprintln!(
+            "pyramid levels: key {} arf {} leaf {} show_existing {}",
+            hist(Level::Key),
+            hist(Level::Arf),
+            hist(Level::Leaf),
+            hist(Level::ShowExisting),
+        );
+        assert_eq!(hist(Level::Arf), 2, "two hidden frames");
+        let refs = crate::encode::take_ref_frame_hits();
+        eprintln!(
+            "blocks per reference: LAST {} GOLDEN {} ALTREF {}",
+            refs[crate::mvstack::LAST_FRAME as usize],
+            refs[crate::mvstack::GOLDEN_FRAME as usize],
+            refs[crate::mvstack::ALTREF_FRAME as usize],
+        );
+        // [[gate-blind-to-feature]]: the whole point of the hidden frame is
+        // that the leaves predict BACKWARD off it, which is also the only
+        // thing that exercises `ref_frame_sign_bias` in the MV stack. A green
+        // round trip in which `ALTREF_FRAME` never won a block would prove
+        // only that a hidden frame can be written and re-output.
+        assert!(
+            refs[crate::mvstack::ALTREF_FRAME as usize] > 0,
+            "no block predicted off the hidden ALTREF"
+        );
+
+        let stream = concat(&packets);
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's display-order count");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half of the pyramid round trip: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_luma(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "ffmpeg's display-order count");
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+            assert_eq!(got.len(), b.len(), "frame {i}: luma size");
+            if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                panic!(
+                    "display frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                    at % width,
+                    at / width,
+                    got[at],
+                    b[at],
+                );
+            }
+        }
+    }
+
     /// [`RateTarget::Quality`] is monotone: a higher quality dial never
     /// produces a smaller stream or a worse mean PSNR than a lower one, on
     /// the same real clip.
