@@ -625,6 +625,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         mi_rows: encoded.mi_rows,
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
+        screen: encoded.screen,
         start_cdfs: encoded.start_cdfs.clone(),
         next_cdfs: encoded.next_cdfs.clone(),
         loop_filter: encoded.loop_filter,
@@ -698,11 +699,131 @@ pub struct Encoded {
     /// This frame header's chosen CDEF parameters, threaded for the same
     /// reason as `loop_filter`.
     pub(crate) cdef: CdefParams,
+    /// This frame header's `allow_screen_content_tools`
+    /// ([`screen_content`]) -- every intra block of the tile carries the two
+    /// palette-mode symbols under it, so a raw tile decode that guessed
+    /// `false` would desync at the first block (same class as `tx_select`).
+    pub(crate) screen: bool,
     /// This frame header's chosen loop restoration parameters, threaded for
     /// the same reason as `loop_filter` -- and doubly so: the per-unit
     /// filters themselves are coded in `tile`, so a decode of it under a
     /// stale `RESTORE_NONE` header desyncs at the first superblock.
     pub(crate) loop_restoration: LoopRestorationParams,
+}
+
+thread_local! {
+    /// This SEQUENCE's `seq_force_screen_content_tools`: whether the sequence
+    /// header offers the per-frame `allow_screen_content_tools` bit at all.
+    /// Armed once by the key frame ([`encode_key_frame_inner`], from
+    /// [`screen_content`]) and read by every header builder after it, so that
+    /// the inter frames of a screen sequence lay their headers out the same
+    /// way the sequence header the key frame wrote says they do -- a per-call
+    /// parameter would have to thread through `inter_frame_headers`' four
+    /// public entry points and every hand-built-stream test that calls them.
+    /// A sequence with no screen content leaves this false and writes exactly
+    /// the bits it wrote before this lane.
+    static SEQ_SCREEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Overrides [`screen_content`] for the calling thread, which is what the
+    /// intra-MODE ablations use: on a two-colour synthetic picture the palette
+    /// codes every block losslessly, so both arms of a mode ablation reach
+    /// infinite PSNR and the ablation measures nothing at all (the
+    /// `fixture-proves-the-symbol-not-the-signal` class). An environment
+    /// variable cannot do this -- the tests run in one process, in parallel.
+    static SCREEN_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_screen(value: Option<bool>) {
+    SCREEN_FORCE.with(|c| c.set(value));
+}
+
+pub(crate) fn arm_seq_screen(on: bool) {
+    SEQ_SCREEN.with(|c| c.set(on));
+}
+
+fn seq_screen() -> bool {
+    SEQ_SCREEN.with(std::cell::Cell::get)
+}
+
+/// How many distinct colours a 16x16 luma block may hold and still count as
+/// screen content ([`screen_content`]), `EC_AV1_SCREEN_COLORS`. libaom's own
+/// `av1_set_screen_content_options` bound is 4, which separates NOTHING on a
+/// real (lossily coded, so noisy) desktop capture: `probe_screen_detect`
+/// measures the share of 16x16 blocks under each bound on the gate's own
+/// three clips, and only at 32 do the populations part -- film 20.3..21.9%,
+/// his OBS capture 51.1..51.5%.
+fn screen_colors() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_SCREEN_COLORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// The reciprocal of the frame area those blocks must cover, in tenths --
+/// libaom's own `counts * blk_h * blk_w * 10 > width * height` is 10 (one
+/// tenth). 3 (a third) is the midpoint of the two populations
+/// `probe_screen_detect` measured at the colour bound above.
+/// `EC_AV1_SCREEN_PCT`.
+fn screen_pct() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_SCREEN_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+    })
+}
+
+/// How many frames [`screen_content`] said yes/no to, so a gate can print
+/// whether the detector fired at all (class `gate-blind-to-feature`).
+pub(crate) static SCREEN_FRAMES: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+/// `av1_set_screen_content_options` (av1/encoder/encoder.c), luma only: count
+/// the distinct colours of every 16x16 block and turn the screen-content
+/// tools on when the blocks holding between 2 and [`screen_colors`] of them
+/// cover more than a [`screen_pct`]th of the frame. `width` is the plane's
+/// stride, `true_*` the frame's real (decodable) extent.
+fn screen_content(y: &[u8], width: usize, true_width: usize, true_height: usize) -> bool {
+    if let Some(forced) = SCREEN_FORCE.with(std::cell::Cell::get) {
+        SCREEN_FRAMES[usize::from(forced)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return forced;
+    }
+    if let Ok(v) = std::env::var("EC_AV1_SCREEN") {
+        let on = v != "0";
+        SCREEN_FRAMES[usize::from(on)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return on;
+    }
+    let (blk, limit) = (16usize, screen_colors());
+    let mut counted = 0usize;
+    for by in (0..true_height).step_by(blk) {
+        for bx in (0..true_width).step_by(blk) {
+            let (h, w) = ((true_height - by).min(blk), (true_width - bx).min(blk));
+            let mut seen = [false; 256];
+            let mut colors = 0usize;
+            for row in 0..h {
+                for col in 0..w {
+                    let v = usize::from(y[(by + row) * width + bx + col]);
+                    if !seen[v] {
+                        seen[v] = true;
+                        colors += 1;
+                    }
+                }
+            }
+            if colors > 1 && colors <= limit {
+                counted += 1;
+            }
+        }
+    }
+    let on = counted * blk * blk * screen_pct() > true_width * true_height;
+    SCREEN_FRAMES[usize::from(on)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    on
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -788,7 +909,17 @@ pub(crate) fn key_frame_headers_colour(
         // CDEF simply carries zero strengths.
         enable_cdef: true,
         enable_restoration: true,
-        seq_force_screen_content_tools: 0,
+        // SELECT (2) when this sequence's key frame detected screen content
+        // ([`screen_content`]): the per-frame `allow_screen_content_tools` bit
+        // is then coded in every frame header, and only the frames that want
+        // the palette syntax set it. 0 -- the forced-off form, no bit at all
+        // -- otherwise, which is what every non-screen stream this encoder
+        // writes still carries.
+        seq_force_screen_content_tools: if seq_screen() {
+            ec_av1_syntax::sequence::SELECT_SCREEN_CONTENT_TOOLS
+        } else {
+            0
+        },
         seq_force_integer_mv: 0,
         color_config,
         still_picture: false,
@@ -2204,6 +2335,105 @@ fn commit_inter_luma(
     (flat.levels.clone(), 0, 0.0)
 }
 
+/// The largest distinct-colour count a block may hold and still be offered a
+/// palette candidate at all: past it the k-means quantisation costs more
+/// error than the map saves rate, and every trial is wasted wall.
+/// `EC_AV1_PAL_MAXCOLORS`.
+fn palette_max_colors() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_PAL_MAXCOLORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// The palettes worth trying for one block's luma, in the shape libaom's
+/// `av1_k_means` picks them: a block holding at most `PALETTE_MAX_SIZE`
+/// distinct colours takes them ALL (the prediction is then exact and the
+/// residual empty), and a busier one is quantised to 8 and to 4 colours by a
+/// one-dimensional Lloyd iteration seeded evenly across its range -- both
+/// offered, because which wins is an RD question the caller answers.
+/// `block` is `side*side` source samples, row-major.
+fn palette_candidates(block: &[u8]) -> Vec<crate::tile::PaletteY> {
+    let mut histogram = [0u32; 256];
+    for &v in block {
+        histogram[usize::from(v)] += 1;
+    }
+    let present: Vec<u16> = (0..256u16).filter(|&v| histogram[usize::from(v)] > 0).collect();
+    if present.len() < 2 {
+        return Vec::new();
+    }
+    let exact = |colors: &[u16]| -> crate::tile::PaletteY {
+        let mut base = [0u16; 8];
+        base[..colors.len()].copy_from_slice(colors);
+        let map = block
+            .iter()
+            .map(|&v| {
+                colors
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &c)| (i32::from(c) - i32::from(v)).abs())
+                    .map(|(i, _)| i as u8)
+                    .expect("a palette holds at least two colours")
+            })
+            .collect();
+        crate::tile::PaletteY { size: colors.len() as u8, colors: base, map }
+    };
+    if present.len() <= 8 {
+        return vec![exact(&present)];
+    }
+    if present.len() > palette_max_colors() {
+        return Vec::new();
+    }
+    let (lo, hi) = (
+        i32::from(present[0]),
+        i32::from(present[present.len() - 1]),
+    );
+    let mut out = Vec::with_capacity(2);
+    for n in [8usize, 4] {
+        // Even seeding across the block's own range, then four Lloyd passes
+        // over the histogram (256 bins, not `side*side` pixels).
+        let mut centres: Vec<f64> = (0..n)
+            .map(|i| f64::from(lo) + f64::from(hi - lo) * (i as f64 + 0.5) / n as f64)
+            .collect();
+        for _ in 0..4 {
+            let mut sums = vec![0f64; n];
+            let mut counts = vec![0u32; n];
+            for (v, &count) in histogram.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                let k = (0..n)
+                    .min_by(|&a, &b| {
+                        (centres[a] - v as f64)
+                            .abs()
+                            .total_cmp(&(centres[b] - v as f64).abs())
+                    })
+                    .expect("n >= 2");
+                sums[k] += (v as u32 * count) as f64;
+                counts[k] += count;
+            }
+            for k in 0..n {
+                if counts[k] > 0 {
+                    centres[k] = sums[k] / f64::from(counts[k]);
+                }
+            }
+        }
+        let mut colors: Vec<u16> = centres
+            .iter()
+            .map(|&c| c.round().clamp(0.0, 255.0) as u16)
+            .collect();
+        colors.sort_unstable();
+        colors.dedup();
+        if colors.len() >= 2 {
+            out.push(exact(&colors));
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn code_square(
     luma: &mut Plane,
@@ -2265,6 +2495,55 @@ fn code_square(
         luma_coeffs = best.3;
         TX_DEPTH_HITS[best.1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    // The palette candidate is priced against the mode the luma search (and
+    // its transform-depth search) already settled on, so a block only takes
+    // one when it beats the best ordinary intra coding of the same pixels.
+    // A palette block is `DC_PRED` with `tx_depth` 0 by construction: its
+    // prediction is the colour map, not the DC of its neighbours.
+    let mut mode = mode;
+    let mut palette = None;
+    if search.screen && crate::decode::palette_bsize_ctx(side).is_some() {
+        let source: Vec<u8> = (y..y + side)
+            .flat_map(|row| luma.source[row * luma.width + x..][..side].to_vec())
+            .collect();
+        let kept = luma.snapshot(x, y, side);
+        for pal in palette_candidates(&source) {
+            let n = usize::from(pal.size);
+            let prediction: Vec<u8> = pal
+                .map
+                .iter()
+                .map(|&i| pal.colors[usize::from(i).min(n - 1)] as u8)
+                .collect();
+            let trial = luma.code_from_prediction(
+                x,
+                y,
+                side,
+                &prediction,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                luma_set,
+            );
+            let cost_p = trial.sse
+                + search.lambda
+                    * (trial.bits
+                        + mode_bits[DC_PRED as usize]
+                        + crate::tile::palette_bits(&pal, side)
+                        + if tx_select { tx_depth_bits(side, 0) } else { 0.0 });
+            if cost_p < cost {
+                cost = cost_p;
+                mode = DC_PRED as u8;
+                tx_depth = 0;
+                luma_coeffs = coeffs(&trial.levels, side);
+                luma.commit(x, y, side, &trial);
+                palette = Some(pal);
+            }
+        }
+        if palette.is_none() {
+            luma.restore(x, y, side, &kept);
+        }
+    }
+
     // Chroma searches its own mode over [`CHROMA_MODES`], one symbol for both
     // planes; what it costs still counts towards the partition decision.
     let ([u, v], uv_mode, chroma_cost) =
@@ -2278,6 +2557,7 @@ fn code_square(
             mode,
             uv_mode,
             tx_depth,
+            palette,
             ..BlockCoeffs::default()
         },
         cost,
@@ -2674,6 +2954,7 @@ fn code_square_inter(
                     uv_mode: DC_PRED,
                     skip: skip_new,
                     eight: None,
+                    palette: None,
                     tx_depth,
                     inter: Some(InterInfo {
                         ref1: None,
@@ -2710,6 +2991,7 @@ fn code_square_inter(
             uv_mode: DC_PRED,
             skip,
             eight: None,
+            palette: None,
             tx_depth,
             inter: Some(InterInfo {
                 ref1: None,
@@ -2841,6 +3123,9 @@ fn mode_bits(above_mode: u8, left_mode: u8) -> [f64; 13] {
 
 /// What the luma mode search picks between, and under what terms.
 struct Search<'a> {
+    /// This frame's `allow_screen_content_tools` ([`screen_content`]): the
+    /// luma search then offers a palette candidate beside the intra modes.
+    screen: bool,
     base_q_idx: u8,
     deadzone: f64,
     lambda: f64,
@@ -3241,7 +3526,19 @@ pub(crate) fn encode_key_frame_inner(
     // `render_and_frame_size_different` is false and no render_size bits are
     // written, mirroring libaom/rav1e: the padded `picture` below is only the
     // internal coding surface, never what the header names.
+    // Screen-content detection runs on the SOURCE luma, before any header is
+    // built: it decides this sequence's `seq_force_screen_content_tools` (and
+    // so the layout of every frame header after it, [`SEQ_SCREEN`]) as well as
+    // this frame's own `allow_screen_content_tools`.
+    let screen = screen_content(
+        &picture.y.iter().map(|&v| v as u8).collect::<Vec<u8>>(),
+        picture.width,
+        (picture.width).min(render.0),
+        (picture.height).min(render.1),
+    );
+    arm_seq_screen(screen);
     let (seq, mut header) = key_frame_headers_colour(render.0, render.1, base_q_idx, color_config)?;
+    header.allow_screen_content_tools = screen;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
     // `TxMode::Select`: every block codes a `tx_depth` symbol and may split
@@ -3313,6 +3610,7 @@ pub(crate) fn encode_key_frame_inner(
         lambda: lambda_scale() * step * step,
         modes,
         top_k: prune_top_k(),
+        screen,
     };
 
     // The block grid this frame is coded over: [`crate::tile::block_grid`]'s
@@ -3566,6 +3864,7 @@ pub(crate) fn encode_key_frame_inner(
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             let mut cdfs = start_cdfs.0.clone();
+            crate::tile::arm_screen(screen);
             let bytes = crate::tile::sb_coeff_key_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
@@ -3645,6 +3944,7 @@ pub(crate) fn encode_key_frame_inner(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        screen,
         next_cdfs: start_cdfs.clone(),
         start_cdfs,
         loop_filter: header.loop_filter,
@@ -4836,6 +5136,7 @@ fn search_inter_block(
             skip: best.skip,
             inter: best.inter,
             eight: None,
+            palette: None,
             tx_depth: 0,
         },
         best.cost,
@@ -4994,6 +5295,14 @@ pub(crate) fn encode_inter_frame(
     let picture_y8: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
     let picture_u8: Vec<u8> = picture.u.iter().map(|&v| v as u8).collect();
     let picture_v8: Vec<u8> = picture.v.iter().map(|&v| v as u8).collect();
+    // This frame's own `allow_screen_content_tools`. It can only be set when
+    // the SEQUENCE offers the bit at all, which is the key frame's decision
+    // ([`SEQ_SCREEN`]): a frame header that contradicts
+    // `seq_force_screen_content_tools` is a corrupt stream, not a tighter
+    // encode.
+    let screen = seq_screen()
+        && screen_content(&picture_y8, picture.width, true_width, true_height);
+    header.allow_screen_content_tools = screen;
     let mut luma = Plane {
         source: &picture_y8,
         reconstruction: vec![128; picture_y8.len()],
@@ -5040,6 +5349,7 @@ pub(crate) fn encode_inter_frame(
         lambda: lambda_scale() * step * step,
         modes: &KEY_FRAME_MODES,
         top_k: prune_top_k_inter(),
+        screen,
     };
     let mode_bits_table = inter_mode_bits();
 
@@ -5533,6 +5843,7 @@ pub(crate) fn encode_inter_frame(
             // Thread-locals: every tile job arms its own worker.
             crate::tile::arm_reference_select(reference_select_bit);
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
+            crate::tile::arm_screen(screen);
             let mut cdfs = start_cdfs.0.clone();
             // Each tile's own MV grid: a candidate scan never reaches past
             // the tile's bounds, so a grid holding only this tile's own
@@ -5655,6 +5966,7 @@ pub(crate) fn encode_inter_frame(
                 // frame's `start_cdfs`), not from the defaults.
                 Some(start_cdfs.0.clone()),
                 sign_bias,
+                h.allow_screen_content_tools,
                 fctx,
             )
         },
@@ -5687,6 +5999,7 @@ pub(crate) fn encode_inter_frame(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        screen,
         start_cdfs,
         next_cdfs,
         loop_filter: header.loop_filter,
@@ -6159,6 +6472,116 @@ mod tests {
         );
     }
 
+    /// A synthetic screen-content picture -- a few flat colours in a grid of
+    /// boxes with hard edges and text-like bars, the shape a desktop capture
+    /// has -- so the palette path is exercised on content it is for.
+    #[cfg(test)]
+    fn screen_card(width: usize, height: usize) -> Picture {
+        const INK: [u16; 4] = [16, 90, 180, 235];
+        let mut picture = Picture::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let cell = (x / 24 + y / 24) % 2;
+                let bar = usize::from(y % 24 < 6 && x % 24 >= 3 && x % 24 < 20);
+                picture.y[y * width + x] = INK[cell * 2 + bar];
+            }
+        }
+        for y in 0..height / 2 {
+            for x in 0..width / 2 {
+                let cell = (x / 12 + y / 12) % 2;
+                picture.u[y * (width / 2) + x] = if cell == 0 { 110 } else { 145 };
+                picture.v[y * (width / 2) + x] = if cell == 0 { 140 } else { 108 };
+            }
+        }
+        picture
+    }
+
+    /// The lane's own end-to-end check: on screen content the detector fires,
+    /// blocks really take a palette (fire count, class
+    /// `gate-blind-to-feature`), and ffmpeg -- libaom's own reader of every
+    /// symbol this lane writes -- reconstructs exactly what the encoder did.
+    /// The film-shaped `test_card` must NOT trip the detector, which is what
+    /// keeps every non-screen stream byte-identical.
+    #[test]
+    fn a_screen_content_picture_codes_palette_blocks_ffmpeg_decodes_exactly() {
+        let fctx = &crate::decode::FrameCtx::new();
+        let (width, height) = (192usize, 96usize);
+        let _ = crate::tile::take_palette_hits();
+        let picture = screen_card(width, height);
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
+        assert!(
+            encoded.screen,
+            "the detector did not fire on screen content -- no palette syntax was coded at all"
+        );
+        let hits = crate::tile::take_palette_hits();
+        assert!(hits[0] > 0, "no block took a palette: {hits:?}");
+        eprintln!("palette blocks {} sizes {:?}", hits[0], &hits[2..]);
+        let via_us = crate::stream::decode_stream(&encoded.stream).unwrap();
+        assert_eq!(via_us[0].y, encoded.reconstruction.y, "our decoder: luma");
+        assert_eq!(via_us[0].u, encoded.reconstruction.u, "our decoder: U");
+        assert_eq!(via_us[0].v, encoded.reconstruction.v, "our decoder: V");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let decoded = ffmpeg_decode(&encoded.stream, width, height);
+        assert_eq!(decoded.y, encoded.reconstruction.y, "ffmpeg: luma");
+        assert_eq!(decoded.u, encoded.reconstruction.u, "ffmpeg: U");
+        assert_eq!(decoded.v, encoded.reconstruction.v, "ffmpeg: V");
+        // A whole GOP: the inter frames' own intra blocks carry the palette
+        // syntax too (the three intra arms of the inter writers), which only
+        // ffmpeg reading the frames back can prove.
+        let moved: Vec<Picture> = (0..4)
+            .map(|f| {
+                let base = screen_card(width, height);
+                let mut out = Picture::grey(width, height);
+                for y in 0..height {
+                    for x in 0..width {
+                        let sx = (x + f * 7) % width;
+                        out.y[y * width + x] = base.y[y * width + sx];
+                    }
+                }
+                for y in 0..height / 2 {
+                    for x in 0..width / 2 {
+                        let sx = (x + f * 3) % (width / 2);
+                        out.u[y * (width / 2) + x] = base.u[y * (width / 2) + sx];
+                        out.v[y * (width / 2) + x] = base.v[y * (width / 2) + sx];
+                    }
+                }
+                out
+            })
+            .collect();
+        let _ = crate::tile::take_palette_hits();
+        let gop = encode_sequence_with_ctx(&moved, 100, 0.5, fctx).unwrap();
+        let gop_hits = crate::tile::take_palette_hits();
+        let inter_screen = gop.frames.iter().skip(1).filter(|f| f.screen).count();
+        eprintln!(
+            "GOP: {} frames with screen tools after the key frame, {} palette blocks",
+            inter_screen, gop_hits[0]
+        );
+        assert!(
+            inter_screen > 0,
+            "no inter frame set allow_screen_content_tools"
+        );
+        let gop_decoded = crate::stream::decode_stream(&gop.stream).unwrap();
+        for (i, (ours, frame)) in gop_decoded.iter().zip(gop.frames.iter()).enumerate() {
+            assert_eq!(ours.y, frame.reconstruction.y, "our decoder: GOP frame {i} luma");
+        }
+        if have_ffmpeg() {
+            let ff = ffmpeg_decode_sequence(&gop.stream, width, height, moved.len());
+            for (i, (theirs, frame)) in ff.iter().zip(gop.frames.iter()).enumerate() {
+                assert_eq!(theirs.y, frame.reconstruction.y, "ffmpeg: GOP frame {i} luma");
+                assert_eq!(theirs.u, frame.reconstruction.u, "ffmpeg: GOP frame {i} U");
+                assert_eq!(theirs.v, frame.reconstruction.v, "ffmpeg: GOP frame {i} V");
+            }
+        }
+
+        // The other half of the keep rule: film-shaped content leaves the
+        // detector (and so the whole sequence header) alone.
+        let film = encode_key_frame_with_ctx(&test_card(width, height), 100, 0.5, fctx).unwrap();
+        assert!(!film.screen, "the detector fired on the film-shaped test card");
+    }
+
     /// The minimal repro that isolated the inter-residual desync: a key frame
     /// followed by one inter frame whose single superblock carries one
     /// `NEARESTMV` block (`mv == (0, 0)`) with exactly one nonzero luma
@@ -6195,6 +6618,7 @@ mod tests {
             uv_mode: 0,
             skip: false,
             eight: None,
+            palette: None,
             tx_depth: 0,
             inter: Some(InterInfo {
                 ref1: None,
@@ -7060,6 +7484,10 @@ mod tests {
     /// A ladder of (luma PSNR, log10 bytes) for one mode set, ordered by
     /// fidelity.
     fn ladder(picture: &Picture, modes: &[u8], fctx: &crate::decode::FrameCtx) -> Vec<(f64, f64)> {
+        // A mode ablation measures the MODE search: the palette would code
+        // these synthetic two-colour pictures losslessly under every arm and
+        // leave nothing to compare (see [`force_screen`]).
+        force_screen(Some(false));
         let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
             .iter()
             .map(|&q| {
@@ -7172,6 +7600,10 @@ mod tests {
     /// The mode picked by the most blocks of a picture, ignoring the first
     /// block, which has no neighbours to tell the modes apart with.
     fn favourite_mode(picture: &Picture, fctx: &crate::decode::FrameCtx) -> (u8, usize, usize) {
+        // A mode ablation measures the MODE search: the palette would code
+        // these synthetic two-colour pictures losslessly under every arm and
+        // leave nothing to compare (see [`force_screen`]).
+        force_screen(Some(false));
         let encoded = encode_key_frame_with_ctx(picture, 100, 0.5, fctx).unwrap();
         let blocks = &encoded.modes[1..];
         let mut counts = [0usize; 13];
@@ -8655,6 +9087,71 @@ mod tests {
         }
     }
 
+     /// The sweep behind [`screen_content`]'s two constants
+    /// (`unswept-decision-constants`): the share of 16x16 luma blocks with at
+    /// most N distinct colours, per gate clip, at the size the gate codes.
+    /// `cargo test -p ec-av1 --release --lib -- --ignored probe_screen_detect --nocapture`
+    #[test]
+    #[ignore = "reads the real library"]
+    fn probe_screen_detect() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut clips: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for name in ["h264-1080p-23.976-8bit.mp4", "h264-2160p-23.976-8bit.mp4"] {
+            let path = fixtures.join("video").join(name);
+            if path.exists() {
+                clips.push((name.to_string(), path));
+            }
+        }
+        if let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"))
+            && let Some(p) = manifest
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split('\t').next())
+                .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+        {
+            clips.push(("screen".to_string(), std::path::PathBuf::from(p)));
+        }
+        let (width, height) = (640usize, 384usize);
+        for (name, path) in &clips {
+            let frames = clip_frames(path.to_str().unwrap(), "0", width, height, 4);
+            for (f, picture) in frames.iter().enumerate() {
+                let y: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
+                let mut hist = [0usize; 257];
+                let mut blocks = 0usize;
+                for by in (0..height).step_by(16) {
+                    for bx in (0..width).step_by(16) {
+                        let mut seen = [false; 256];
+                        let mut colors = 0usize;
+                        for row in 0..16 {
+                            for col in 0..16 {
+                                let v = usize::from(y[(by + row) * width + bx + col]);
+                                if !seen[v] {
+                                    seen[v] = true;
+                                    colors += 1;
+                                }
+                            }
+                        }
+                        hist[colors] += 1;
+                        blocks += 1;
+                    }
+                }
+                let share = |limit: usize| {
+                    100.0 * hist[2..=limit.min(256)].iter().sum::<usize>() as f64
+                        / blocks.max(1) as f64
+                };
+                eprintln!(
+                    "{name} frame {f}: <=4 {:.1}%  <=8 {:.1}%  <=16 {:.1}%  <=32 {:.1}%  <=64 {:.1}%  <=128 {:.1}%",
+                    share(4),
+                    share(8),
+                    share(16),
+                    share(32),
+                    share(64),
+                    share(128),
+                );
+            }
+        }
+    }
+
     /// The missing instrument: what this encoder costs against libaom and
     /// rav1e at matched fidelity, and how long it takes to get there.
     ///
@@ -8793,6 +9290,10 @@ mod tests {
             let fctx = &crate::decode::FrameCtx::new();
             let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
             let _ = take_partition_hits();
+            let _ = crate::tile::take_palette_hits();
+            SCREEN_FRAMES.iter().for_each(|c| {
+                c.store(0, std::sync::atomic::Ordering::Relaxed);
+            });
             let _ = take_uv_mode_hits();
             let _ = crate::tile::take_inter_mode_hits();
             let _ = crate::tile::take_drl_hits();
@@ -8931,6 +9432,22 @@ mod tests {
             // Which chroma modes the search actually wins with, against the
             // unconditional DC_PRED that was the only outcome before
             // (gate-blind-to-feature).
+            // Screen-content detection and the palette it turns on
+            // (gate-blind-to-feature): how many frames set
+            // `allow_screen_content_tools`, how many blocks took a palette,
+            // and of what size. A film clip must print `screen frames on=0`.
+            let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
+            let screen_off = SCREEN_FRAMES[0].load(std::sync::atomic::Ordering::Relaxed);
+            let palette = crate::tile::take_palette_hits();
+            eprintln!(
+                "{name}: screen frames on={screen_on} off={screen_off}; palette blocks {} sizes {}",
+                palette[0],
+                (2..=8)
+                    .filter(|&n| palette[n] > 0)
+                    .map(|n| format!("{n}={}", palette[n]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
             let uv = take_uv_mode_hits();
             let uv_total: usize = uv.iter().sum();
             eprintln!(
