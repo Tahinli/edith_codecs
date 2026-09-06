@@ -17,7 +17,7 @@ use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::decode::{TXFM_CTX_INIT, txfm_partition_ctx_rect};
 use crate::msac::SymbolEncoder;
-use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16, single_ref_ctx};
+use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16};
 
 /// round-4 av1-truesize debugging aid: prints `msg()` to stderr when the
 /// `EC_RNG` environment variable is set, mirroring the `EC_PART`/`EC_TOK`
@@ -515,6 +515,9 @@ pub struct InterInfo {
     pub mode: InterMode,
     /// The motion vector a [`InterMode::NewMv`] block's residual targets.
     pub mv: (i32, i32),
+    /// The reference this block predicts from (`LAST_FRAME`..=`ALTREF_FRAME`,
+    /// spec 6.10.24's alphabet), written by [`write_single_ref`].
+    pub ref_frame: i8,
     /// The block's `RefMvIdx` (spec 5.11.24 `read_drl_idx`): which
     /// `MvStack::entries` slot `NEWMV` codes its residual against, or
     /// `NEARMV` takes outright. Ignored by the two modes that code no DRL
@@ -685,6 +688,12 @@ struct Neighbours {
     above_inter: Vec<bool>,
     /// The same, down the left edge.
     left_inter: Vec<bool>,
+    /// The reference each neighbour named, `-1` for an intra or unavailable
+    /// one -- what the decoder keeps in its own `Neighbours::above_ref`
+    /// (decode.rs) and feeds `read_single_ref`'s context functions.
+    above_ref: Vec<i8>,
+    /// The same, down the left edge.
+    left_ref: Vec<i8>,
     /// The frame's true (unpadded) width and height, in 4x4 mode-info units,
     /// which is what clamps [`Self::above`]/[`Self::left`] at the edge (spec
     /// `av1_set_entropy_contexts`): a block whose row or column run spills
@@ -728,6 +737,8 @@ impl Neighbours {
             left_skip: vec![false; rows * (SUB / MI)],
             above_inter: vec![false; cols * (SUB / MI)],
             left_inter: vec![false; rows * (SUB / MI)],
+            above_ref: vec![-1; cols * (SUB / MI)],
+            left_ref: vec![-1; rows * (SUB / MI)],
             above_tx: vec![0; cols * (SUB / MI)],
             left_tx: vec![0; rows * (SUB / MI)],
             above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
@@ -745,6 +756,7 @@ impl Neighbours {
         self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
+        self.left_ref.iter_mut().for_each(|r| *r = -1);
         self.left_tx.iter_mut().for_each(|t| *t = 0);
         self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
     }
@@ -944,19 +956,21 @@ impl Neighbours {
     /// Writes one inter-frame block's skip flag and inter/intra state into
     /// every 16x16 column and row it covers, the same span [`Self::record`]
     /// fills for the coefficient and mode state.
-    fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool) {
+    fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool, ref_frame: i8) {
         let (r, c) = at;
-        self.record_inter_mi((r * (SUB / MI), c * (SUB / MI)), side, skip, is_inter);
+        self.record_inter_mi((r * (SUB / MI), c * (SUB / MI)), side, skip, is_inter, ref_frame);
     }
 
     /// [`Self::record_inter`] taking the block's position directly in 4x4
     /// mode-info units, for a block finer than one [`SUB`] slot.
-    fn record_inter_mi(&mut self, (mi_r, mi_c): (usize, usize), side: usize, skip: bool, is_inter: bool) {
+    fn record_inter_mi(&mut self, (mi_r, mi_c): (usize, usize), side: usize, skip: bool, is_inter: bool, ref_frame: i8) {
         for cell in 0..side / MI {
             self.above_skip[mi_c + cell] = skip;
             self.left_skip[mi_r + cell] = skip;
             self.above_inter[mi_c + cell] = is_inter;
             self.left_inter[mi_r + cell] = is_inter;
+            self.above_ref[mi_c + cell] = ref_frame;
+            self.left_ref[mi_r + cell] = ref_frame;
         }
     }
 
@@ -2662,6 +2676,69 @@ fn write_mv(
     Ok(())
 }
 
+/// What a block leaves in the neighbour reference bands: its own reference,
+/// or `-1` when it is intra (decode.rs `Neighbours::above_ref`'s convention).
+fn block_ref(block: &BlockCoeffs) -> i8 {
+    block.inter.map_or(-1, |i| i.ref_frame)
+}
+
+/// Writer-side counterpart of decode.rs `read_single_ref` (spec 5.11.25's
+/// `single_ref_p1`..`p6` tree): codes `ref_frame` bit by bit, each symbol at
+/// the context its own `single_ref_p*_ctx` derives from the immediate
+/// above/left neighbours' references -- the same functions the decoder calls,
+/// with `-1` standing for an intra or unavailable neighbour and no second
+/// reference (this writer codes no compound block).
+fn write_single_ref(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    ref_frame: i8,
+    above_ref: i8,
+    left_ref: i8,
+) {
+    use crate::mvstack::{
+        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
+        single_ref_p5_ctx, single_ref_p6_ctx,
+    };
+    let above = (above_ref > 0).then_some(above_ref);
+    let left = (left_ref > 0).then_some(left_ref);
+    let backward = ref_frame >= BWDREF_FRAME;
+    enc.symbol(
+        usize::from(backward),
+        &mut cdfs.single_ref[single_ref_p1_ctx(above, None, left, None)][0],
+    );
+    if backward {
+        let is_altref = ref_frame == ALTREF_FRAME;
+        enc.symbol(
+            usize::from(is_altref),
+            &mut cdfs.single_ref[single_ref_p2_ctx(above, None, left, None)][1],
+        );
+        if !is_altref {
+            enc.symbol(
+                usize::from(ref_frame == ALTREF2_FRAME),
+                &mut cdfs.single_ref[single_ref_p6_ctx(above, None, left, None)][5],
+            );
+        }
+        return;
+    }
+    let far = ref_frame == LAST3_FRAME || ref_frame == GOLDEN_FRAME;
+    enc.symbol(
+        usize::from(far),
+        &mut cdfs.single_ref[single_ref_p3_ctx(above, None, left, None)][2],
+    );
+    if far {
+        enc.symbol(
+            usize::from(ref_frame == GOLDEN_FRAME),
+            &mut cdfs.single_ref[single_ref_p5_ctx(above, None, left, None)][4],
+        );
+    } else {
+        enc.symbol(
+            usize::from(ref_frame == LAST2_FRAME),
+            &mut cdfs.single_ref[single_ref_p4_ctx(above, None, left, None)][3],
+        );
+    }
+}
+
 /// Per-mode fire counts of [`write_inter_mode`], indexed
 /// `NEARESTMV`/`NEARMV`/`GLOBALMV`/`NEWMV`, and the DRL index each block
 /// coded (bucket 3 collects any index past 2). Read by the BD gate, which
@@ -2878,9 +2955,6 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     /// `Y_MODE`'s size group (spec `Size_Group`) for a 32x32 block, the only
     /// size this writer's inter branch codes.
     const SIZE_GROUP_32: usize = 3;
-    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3): the only reference this
-    /// writer's single-reference chain ever names.
-    const LAST_FRAME: i8 = 1;
 
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let mut neighbours = Neighbours::new(
@@ -3175,10 +3249,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
 
                 let mode_for_tx;
                 if let Some(info) = block.inter {
-                    let sr_ctx = single_ref_ctx(above_inter || left_inter);
-                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
-                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
-                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+                    write_single_ref(&mut enc, &mut cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
 
                     let (mi_row, mi_col) = (r32 as usize * 8, c32 as usize * 8);
                     let stack = find_mv_stack(
@@ -3187,7 +3258,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         mi_col,
                         8,
                         8,
-                        LAST_FRAME,
+                        info.ref_frame,
                         mi_cols as usize,
                         mi_rows as usize,
                     );
@@ -3198,7 +3269,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         mi_col,
                         MiInfo {
                             is_inter: true,
-                            ref_frame: LAST_FRAME,
+                            ref_frame: info.ref_frame,
                             ref_frame1: NO_REF1,
                             mv1: (0, 0),
                             mv: mv16(mv),
@@ -3219,7 +3290,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                                 mi_col + dc,
                                 MiInfo {
                                     is_inter: true,
-                                    ref_frame: LAST_FRAME,
+                                    ref_frame: info.ref_frame,
                                     ref_frame1: NO_REF1,
                                     mv1: (0, 0),
                                     mv: mv16(mv),
@@ -3324,7 +3395,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     );
                     neighbours.record_planes(at, BLOCK, mode_for_tx, &grids, !split);
                 }
-                neighbours.record_inter(at, BLOCK, block.skip, is_inter);
+                neighbours.record_inter(at, BLOCK, block.skip, is_inter, block_ref(block));
             }
         }
     }
@@ -3368,9 +3439,6 @@ fn write_inter_frame_leaf(
     /// `Y_MODE`'s size group (spec `Size_Group`, `common_data.h`'s
     /// `size_group_lookup[BLOCK_16X16]`) for this leaf's own size.
     const SIZE_GROUP_16: usize = 2;
-    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3): the only reference this
-    /// writer's single-reference chain ever names, same as the 32x32 branch.
-    const LAST_FRAME: i8 = 1;
 
     let (r, c) = at;
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
@@ -3385,10 +3453,7 @@ fn write_inter_frame_leaf(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
-        let sr_ctx = single_ref_ctx(above_inter || left_inter);
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
 
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         let stack = find_mv_stack(
@@ -3397,7 +3462,7 @@ fn write_inter_frame_leaf(
             mi_col,
             SUB_MI as usize,
             SUB_MI as usize,
-            LAST_FRAME,
+            info.ref_frame,
             mi_cols as usize,
             mi_rows as usize,
         );
@@ -3410,7 +3475,7 @@ fn write_inter_frame_leaf(
                     mi_col + dc,
                     MiInfo {
                         is_inter: true,
-                        ref_frame: LAST_FRAME,
+                        ref_frame: info.ref_frame,
                         ref_frame1: NO_REF1,
                         mv1: (0, 0),
                         mv: mv16(mv),
@@ -3511,7 +3576,7 @@ fn write_inter_frame_leaf(
         );
         neighbours.record_planes(at, SUB, mode_for_tx, &grids, !split);
     }
-    neighbours.record_inter(at, SUB, block.skip, is_inter);
+    neighbours.record_inter(at, SUB, block.skip, is_inter, block_ref(block));
     Ok(())
 }
 
@@ -3559,9 +3624,6 @@ fn write_inter_frame_leaf8(
     /// `Y_MODE`'s size group (spec `Size_Group`, `common_data.h`'s
     /// `size_group_lookup[BLOCK_8X8]`) for this leaf's own size.
     const SIZE_GROUP_8: usize = 1;
-    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3), same as the 16x16/32x32
-    /// branches.
-    const LAST_FRAME: i8 = 1;
 
     // This leaf's own 4x4 mode-info cells, not the enclosing 16x16 slot's:
     // under a real PARTITION_SPLIT all four leaves are coded, so the
@@ -3583,10 +3645,7 @@ fn write_inter_frame_leaf8(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
-        let sr_ctx = single_ref_ctx(above_inter || left_inter);
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[leaf_mi.1], neighbours.left_ref[leaf_mi.0]);
 
         let (mi_row, mi_col) = leaf_mi;
         let stack = find_mv_stack(
@@ -3595,7 +3654,7 @@ fn write_inter_frame_leaf8(
             mi_col,
             2,
             2,
-            LAST_FRAME,
+            info.ref_frame,
             mi_cols as usize,
             mi_rows as usize,
         );
@@ -3608,7 +3667,7 @@ fn write_inter_frame_leaf8(
                     mi_col + dc,
                     MiInfo {
                         is_inter: true,
-                        ref_frame: LAST_FRAME,
+                        ref_frame: info.ref_frame,
                         ref_frame1: NO_REF1,
                         mv1: (0, 0),
                         mv: mv16(mv),
@@ -3686,7 +3745,7 @@ fn write_inter_frame_leaf8(
             vec![0i32; TX4 * TX4],
         ];
         neighbours.record_mi(leaf_mi, 8, &zero_grids);
-        neighbours.record_inter_mi(leaf_mi, 8, block.skip, block.inter.is_some());
+        neighbours.record_inter_mi(leaf_mi, 8, block.skip, block.inter.is_some(), block_ref(block));
     } else {
         let grids = [
             level_grid(&block.luma, TX8)?,
@@ -3709,7 +3768,7 @@ fn write_inter_frame_leaf8(
             split,
         );
         neighbours.record_mi_planes(leaf_mi, 8, &grids, !split);
-        neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter);
+        neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter, block_ref(block));
     }
     Ok((block.skip, is_inter))
 }
@@ -5877,7 +5936,7 @@ mod tests {
             let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
 
             let (mode, mv) = if is_inter {
-                let sr_ctx = single_ref_ctx(above_inter[c32] || left_inter[r32]);
+                let sr_ctx = crate::mvstack::single_ref_ctx(above_inter[c32] || left_inter[r32]);
                 count += 3;
                 assert_eq!(
                     dec.symbol(&mut cdfs.single_ref[sr_ctx][0]),
@@ -5991,6 +6050,7 @@ mod tests {
     fn an_all_skip_inter_superblock_is_small_and_reads_back() {
         let block = BlockCoeffs {
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
                 ref_mv_idx: 0,
@@ -6033,6 +6093,7 @@ mod tests {
     fn a_newmv_block_reads_back_the_exact_symbol_sequence_it_was_written_with() {
         let nearest = BlockCoeffs {
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
                 ref_mv_idx: 0,
@@ -6042,6 +6103,7 @@ mod tests {
         };
         let newmv = BlockCoeffs {
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NewMv,
                 mv: (0, 2),
                 ref_mv_idx: 0,

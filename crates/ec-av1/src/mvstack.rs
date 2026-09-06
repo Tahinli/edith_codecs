@@ -2399,6 +2399,7 @@ pub struct CompoundTplArgs<'a> {
 /// two-valued test: "is there an inter neighbour at all". `has_inter`
 /// gathers that over the block's whole span, the way spec 5.11.39 reads any
 /// neighbour-derived context.
+#[cfg(test)]
 pub(crate) fn single_ref_ctx(has_inter_neighbour: bool) -> usize {
     if has_inter_neighbour { 2 } else { 1 }
 }
