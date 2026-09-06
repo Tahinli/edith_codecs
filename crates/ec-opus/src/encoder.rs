@@ -902,33 +902,33 @@ mod tests {
         let mut e = Encoder::new(24000, 2, Application::Audio).unwrap();
         e.set_bitrate(256_000);
         assert_eq!(e.auto_bandwidth(), Bandwidth::SuperWide);
-        assert_eq!(e.look_ahead(960), 60);
+        assert_eq!(e.look_ahead(960), CELT_LOOK_AHEAD_48K / 2);
     }
 
     /// `look_ahead` must use the same 10-or-20 ms-frame predicate dispatch
     /// does (`silk_choice`/`hybrid_choice`), not just `wants_silk`: 2.5/5 ms
     /// frames still code as CELT, while 10/20 ms speech follows SILK and
-    /// hybrid follows CELT's overlap.
+    /// hybrid follows CELT's delay.
     #[test]
     fn look_ahead_matches_the_frame_size_dispatch_actually_uses() {
         let mut e = Encoder::new(48000, 1, Application::Voip).unwrap();
         e.set_bitrate(8000);
         assert_eq!(e.look_ahead(480), 58, "10ms NB SILK");
-        assert_eq!(e.look_ahead(240), 120, "5ms frame falls back to CELT");
+        assert_eq!(e.look_ahead(240), CELT_LOOK_AHEAD_48K, "5ms frame falls back to CELT");
         assert_eq!(e.look_ahead(960), 58, "20ms NB SILK");
 
         // 16k VoIP is hybrid-FB since the libopus threshold port (CELT overlap).
         e.set_bitrate(16000);
-        assert_eq!(e.look_ahead(960), 120, "20ms hybrid FB");
+        assert_eq!(e.look_ahead(960), CELT_LOOK_AHEAD_48K, "20ms hybrid FB");
 
         e.set_bitrate(32000);
-        assert_eq!(e.look_ahead(960), 120, "20ms hybrid, CELT's overlap");
+        assert_eq!(e.look_ahead(960), CELT_LOOK_AHEAD_48K, "20ms hybrid, CELT's delay");
 
         let mut e = Encoder::new(48000, 2, Application::Voip).unwrap();
         e.set_bitrate(8000);
         assert_eq!(e.look_ahead(960), 58, "stereo 20ms NB SILK");
         e.set_bitrate(64_000);
-        assert_eq!(e.look_ahead(960), 120, "stereo 20ms hybrid");
+        assert_eq!(e.look_ahead(960), CELT_LOOK_AHEAD_48K, "stereo 20ms hybrid");
     }
 
     #[test]

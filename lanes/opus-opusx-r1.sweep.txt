@@ -1,0 +1,15 @@
+# lane-opusx r1: CELT input delayed by Fs/250 (192 samples) like libopus opus_encoder.c
+# baseline lanes/opus-opustr2-r1.sweep.txt; same 12 rows, same recipe
+# VERDICT: FAILS the KEEP rule -- err_ratio worse on 5 of 12 rows (better on 7), corr never worse by >.0005
+nik@64k: ref 69.2 ours 69.1 kbps (-0.1%), corr o=0.9887 r=0.9864 gap=-0.0023, Q o=-114.88 r=-154.78, err_ratio 0.800, minsec o=0.9769 r=0.9745, drop o=0 r=0
+nik@96k: ref 101.0 ours 100.9 kbps (-0.1%), corr o=0.9947 r=0.9940 gap=-0.0007, Q o=-109.44 r=-31.55, err_ratio 1.763, minsec o=0.9891 r=0.9888, drop o=0 r=0
+zaur@64k: ref 63.6 ours 63.6 kbps (-0.0%), corr o=0.9894 r=0.9866 gap=-0.0028, Q o=-170.07 r=-123.36, err_ratio 1.287, minsec o=0.9709 r=0.9686, drop o=0 r=0
+zaur@96k: ref 93.9 ours 93.4 kbps (-0.5%), corr o=0.9950 r=0.9937 gap=-0.0013, Q o=-100.39 r=-125.18, err_ratio 0.861, minsec o=0.9875 r=0.9854, drop o=0 r=0
+her@64k: ref 67.9 ours 67.6 kbps (-0.4%), corr o=0.9837 r=0.9794 gap=-0.0042, Q o=-333.52 r=-339.00, err_ratio 0.980, minsec o=0.9481 r=0.9406, drop o=0 r=0
+her@96k: ref 101.5 ours 101.0 kbps (-0.5%), corr o=0.9925 r=0.9902 gap=-0.0022, Q o=-248.22 r=-191.50, err_ratio 1.292, minsec o=0.9774 r=0.9728, drop o=0 r=0
+naz@64k: ref 71.3 ours 71.3 kbps (-0.0%), corr o=0.9908 r=0.9880 gap=-0.0028, Q o=-263.61 r=-128.39, err_ratio 1.916, minsec o=0.9717 r=0.9644, drop o=0 r=0
+naz@96k: ref 105.4 ours 105.3 kbps (-0.0%), corr o=0.9956 r=0.9948 gap=-0.0008, Q o=-266.25 r=-29.16, err_ratio 3.900, minsec o=0.9856 r=0.9804, drop o=0 r=0
+dl8a@64k: ref 65.8 ours 65.7 kbps (-0.1%), corr o=0.9890 r=0.9865 gap=-0.0025, Q o=-204.82 r=-378.84, err_ratio 0.498, minsec o=0.9789 r=0.9723, drop o=0 r=0
+dl8a@96k: ref 96.8 ours 96.6 kbps (-0.3%), corr o=0.9943 r=0.9934 gap=-0.0009, Q o=-170.45 r=-423.47, err_ratio 0.361, minsec o=0.9882 r=0.9864, drop o=0 r=0
+hein@64k: ref 64.9 ours 64.8 kbps (-0.2%), corr o=0.9888 r=0.9874 gap=-0.0014, Q o=-382.47 r=-388.31, err_ratio 0.980, minsec o=0.9345 r=0.9148, drop o=0 r=0
+hein@96k: ref 86.9 ours 86.8 kbps (-0.2%), corr o=0.9945 r=0.9930 gap=-0.0015, Q o=-367.35 r=-246.46, err_ratio 1.602, minsec o=0.9700 r=0.9499, drop o=0 r=0
