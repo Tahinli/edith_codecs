@@ -2473,10 +2473,22 @@ fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
     if row == 0 && col == 0 {
         return 0;
     }
-    let mag: i32 = [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
-        .iter()
-        .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs().min(3))
-        .sum();
+    // A coefficient two rows and two columns clear of the far edges reaches
+    // all five neighbours, so the gather is five loads off one index with no
+    // per-neighbour edge test -- which is where this writer spends a third of
+    // its coefficient loop.
+    let p = row * side + col;
+    let mag: i32 = if row + 2 < side && col + 2 < side {
+        [p + side, p + 1, p + side + 1, p + 2 * side, p + 2]
+            .iter()
+            .map(|&i| grid[i].abs().min(3))
+            .sum()
+    } else {
+        [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
+            .iter()
+            .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs().min(3))
+            .sum()
+    };
     let offset = cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize;
     (((mag + 1) >> 1).min(4) as usize) + offset
 }
@@ -2485,10 +2497,15 @@ fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
 /// of its three closest neighbours below and to the right, uncapped, and a
 /// term separating the DC, the corner of the transform, and the rest.
 fn br_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
-    let mag: i32 = [(1, 0), (0, 1), (1, 1)]
-        .iter()
-        .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs())
-        .sum();
+    let p = row * side + col;
+    let mag: i32 = if row + 1 < side && col + 1 < side {
+        grid[p + side].abs() + grid[p + 1].abs() + grid[p + side + 1].abs()
+    } else {
+        [(1, 0), (0, 1), (1, 1)]
+            .iter()
+            .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs())
+            .sum()
+    };
     let mag = (((mag + 1) >> 1).min(6)) as usize;
     if row == 0 && col == 0 {
         mag
