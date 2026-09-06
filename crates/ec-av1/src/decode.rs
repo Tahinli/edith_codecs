@@ -37549,8 +37549,8 @@ mod tests {
                 &encoded.loop_filter,
                 encoded.tx_select,
                 true,
-                false,
-                false,
+                encoded.screen,
+                encoded.allow_intrabc,
                 &encoded.loop_restoration, fctx,
             )
             .unwrap();
@@ -37593,8 +37593,8 @@ mod tests {
                 &encoded.loop_filter,
                 tx_select,
                 true,
-                false,
-                false,
+                encoded.screen,
+                encoded.allow_intrabc,
                 &encoded.loop_restoration,
                 fctx,
             )
@@ -37681,7 +37681,9 @@ mod tests {
             // This key frame's own `allow_screen_content_tools`: its intra
             // blocks carry the palette syntax under it (stale-header class).
             key.screen,
-            false,
+            // ... and its own `allow_intrabc`: every intra block carries a
+            // `use_intrabc` symbol under it (stale-header class).
+            key.allow_intrabc,
             &key.loop_restoration, fctx,
         )
         .unwrap();
@@ -38021,7 +38023,9 @@ mod tests {
             // This key frame's own `allow_screen_content_tools`: its intra
             // blocks carry the palette syntax under it (stale-header class).
             key.screen,
-            false,
+            // ... and its own `allow_intrabc`: every intra block carries a
+            // `use_intrabc` symbol under it (stale-header class).
+            key.allow_intrabc,
             &key.loop_restoration, fctx,
         )
         .unwrap();
