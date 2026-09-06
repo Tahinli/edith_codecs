@@ -1028,7 +1028,10 @@ pub(crate) fn key_frame_headers_colour(
         additional_frame_id_length: 0,
         enable_interintra_compound: false,
         enable_masked_compound: false,
-        enable_warped_motion: false,
+        // lane-av1obmc2: the sequence bit `allow_warped_motion` is gated on
+        // (spec 5.5.2). Set only under the warp knob, so the DEFAULT sequence
+        // header is byte-identical to the streams before this lane.
+        enable_warped_motion: crate::envflags::env_flag!("EC_AV1_WARP"),
         enable_dual_filter: false,
         enable_jnt_comp: false,
         enable_ref_frame_mvs: false,
@@ -1166,9 +1169,14 @@ pub fn inter_frame_headers_slots(
         // to the OBMC knob rather than always on: with every block choosing
         // SIMPLE_TRANSLATION the symbol is pure cost (+0.07% / +0.02% on the
         // gate clip), so the DEFAULT path writes no motion_mode syntax at all
-        // and stays byte-identical to the streams before this lane. A future
-        // warp knob joins this disjunction.
-        is_motion_mode_switchable: crate::envflags::env_flag!("EC_AV1_OBMC"),
+        // and stays byte-identical to the streams before this lane.
+        // lane-av1obmc2: the warp knob joins that disjunction, and turns on
+        // `allow_warped_motion` besides -- which is what makes an eligible
+        // block read the 3-symbol `motion_mode_cdf` alphabet instead of the
+        // 2-symbol `obmc_cdf` one (libaom `motion_mode_allowed`).
+        is_motion_mode_switchable: crate::envflags::env_flag!("EC_AV1_OBMC")
+            || crate::envflags::env_flag!("EC_AV1_WARP"),
+        allow_warped_motion: crate::envflags::env_flag!("EC_AV1_WARP"),
         use_ref_frame_mvs: false,
         // Forces `get_tx_set` (spec 5.11.48) to the two-symbol
         // `TX_SET_INTER_3` for every inter transform below 32x32 -- the only
@@ -2281,11 +2289,113 @@ fn obmc_min_side() -> usize {
 /// this frame's writer really starts from (`tile::obmc_symbol_bits`) -- the
 /// same frame-CDF price the coefficients of a non-screen frame are estimated
 /// with, not the static default table.
-fn obmc_bits(write_w: usize, write_h: usize, obmc: bool) -> f64 {
+/// The same price for whichever alphabet the writer will really use for this
+/// block: `warp_alphabet` is `motion_mode_allowed`'s 3-symbol choice
+/// (`allow_warped_motion` and at least one warp sample), otherwise the
+/// 2-symbol `obmc` one. Both sides of every motion-mode comparison in the
+/// search pay it, so the alphabet cancels out of a comparison and only its
+/// per-value spread decides.
+fn motion_mode_bits(write_w: usize, write_h: usize, motion: u8, warp_alphabet: bool) -> f64 {
     let Some(row) = crate::decode::motion_mode_cdf_row(write_w, write_h) else {
         return 0.0;
     };
-    crate::tile::obmc_symbol_bits(row, obmc)
+    match warp_alphabet {
+        true => crate::tile::motion_mode_symbol_bits(row, motion),
+        false => crate::tile::obmc_symbol_bits(row, motion == 1),
+    }
+}
+
+/// The WARPED_CAUSAL prediction of one square single-reference block: the
+/// decoder's own warp-sample walk (`decode::find_samples` +
+/// `warp::select_samples`), least-squares model (`warp::find_projection`) and
+/// affine predictor (`warp::warp_affine`), driven off the encoder's own mi
+/// grid -- never a second implementation of any of the three. `None` when the
+/// block would code no motion_mode symbol at all, when it has no warp sample
+/// (the writer then codes the 2-symbol alphabet, which has no WARPED value),
+/// or when the projection is not filter-representable (the decoder would then
+/// predict translationally, so the mode is pure cost).
+#[allow(clippy::too_many_arguments)]
+fn warp_prediction(
+    grid: &MiGrid,
+    (mi_row, mi_col): (usize, usize),
+    (mi_rows, mi_cols): (usize, usize),
+    (x, y): (usize, usize),
+    side: usize,
+    mv: (i32, i32),
+    ref_frame: i8,
+    ref_planes: [(&[u16], usize, usize, usize); 3],
+    fctx: &crate::decode::FrameCtx,
+) -> Option<[Vec<u8>; 3]> {
+    let n4 = side / 4;
+    if !crate::decode::has_overlappable_neighbour(grid, mi_row, mi_col, n4, n4, mi_cols, mi_rows) {
+        return None;
+    }
+    let mut samples = crate::decode::find_samples(
+        grid, mi_row, mi_col, n4, n4, mi_cols, mi_rows, ref_frame, fctx,
+    );
+    if samples.is_empty() {
+        return None;
+    }
+    if samples.len() > 1 {
+        crate::warp::select_samples(mv, &mut samples, side as i32, side as i32);
+    }
+    let params = crate::warp::find_projection(
+        &samples,
+        side as i32,
+        side as i32,
+        mv.1,
+        mv.0,
+        mi_row as i32,
+        mi_col as i32,
+    )?;
+    let mut pred = [
+        vec![0u16; side * side],
+        vec![0u16; side * side / 4],
+        vec![0u16; side * side / 4],
+    ];
+    // The translational prediction first, exactly as the decoder builds it,
+    // then the affine one over the planes whose OWN block is at least 8x8
+    // (libaom `av1_init_warp_params` bails below that, so an 8x8 luma block's
+    // 4x4 chroma stays translational).
+    for (i, r) in ref_planes.into_iter().enumerate() {
+        let luma_plane = i == 0;
+        let (px, py) = if luma_plane { (x, y) } else { (x / 2, y / 2) };
+        let s = if luma_plane { side } else { side / 2 };
+        mc::predict(
+            r.0,
+            r.1,
+            r.2,
+            r.3,
+            mv_to_q4(px, mv.1, luma_plane),
+            mv_to_q4(py, mv.0, luma_plane),
+            s,
+            s,
+            &mut pred[i],
+            fctx,
+        );
+        if crate::decode::warp_plane_allowed(s, s) {
+            let (sub, cside) = (usize::from(!luma_plane) as i32, s as i32);
+            crate::warp::warp_affine(
+                &params,
+                r.0,
+                r.2 as i32,
+                r.3 as i32,
+                r.1 as i32,
+                &mut pred[i],
+                px as i32,
+                py as i32,
+                cside,
+                cside,
+                cside,
+                sub,
+                sub,
+                fctx,
+            );
+        }
+    }
+    let [py_buf, pu_buf, pv_buf] = pred;
+    let u8s = |b: &[u16]| b.iter().map(|&v| v as u8).collect::<Vec<u8>>();
+    Some([u8s(&py_buf), u8s(&pu_buf), u8s(&pv_buf)])
 }
 
 pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
@@ -3989,15 +4099,14 @@ fn code_square_inter(
     // reconstruction priced here is the one a decoder rebuilds. lane-av1obmc
     // offered this only at 32x32, which is not where libaom cashes its OBMC
     // gain.
-    let mut obmc_won = false;
+    let mut motion_won = 0u8;
     let single = match &best.1 {
         None => Some(nearest_info),
         Some((_, _, _, _, info)) if info.ref1.is_none() => Some(*info),
         Some(_) => None,
     };
     if let Some(info) = single.filter(|i| {
-        crate::envflags::env_flag!("EC_AV1_OBMC")
-            && side >= obmc_min_side()
+        (crate::envflags::env_flag!("EC_AV1_OBMC") || crate::envflags::env_flag!("EC_AV1_WARP"))
             && i.ref_frame == crate::mvstack::LAST_FRAME
     }) {
         let planes = [
@@ -4005,18 +4114,57 @@ fn code_square_inter(
             (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
             (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
         ];
-        if let Some(pred) = obmc_prediction(
-            grid,
-            (mi_row, mi_col),
-            (mi_rows, mi_cols),
-            (x, y),
-            side,
-            info.mv,
-            refs,
-            planes,
-            reference.width,
-            fctx,
-        ) {
+        // Which alphabet this block's writer will code the symbol against
+        // (`tile::write_motion_mode`, libaom `motion_mode_allowed`): the
+        // 3-symbol one only under `allow_warped_motion` and at least one warp
+        // sample. Mirrored here so the candidates are priced against the
+        // table the tile really narrows.
+        let warp_alphabet = crate::envflags::env_flag!("EC_AV1_WARP")
+            && crate::decode::num_proj_ref(
+                grid,
+                mi_row,
+                mi_col,
+                side / 4,
+                side / 4,
+                mi_cols,
+                mi_rows,
+                info.ref_frame,
+                fctx,
+            ) >= 1;
+        let mm = |m: u8| motion_mode_bits(side, side, m, warp_alphabet);
+        let mut candidates: Vec<(u8, [Vec<u8>; 3])> = Vec::new();
+        if crate::envflags::env_flag!("EC_AV1_OBMC") && side >= obmc_min_side() {
+            if let Some(pred) = obmc_prediction(
+                grid,
+                (mi_row, mi_col),
+                (mi_rows, mi_cols),
+                (x, y),
+                side,
+                info.mv,
+                refs,
+                planes,
+                reference.width,
+                fctx,
+            ) {
+                candidates.push((1, pred));
+            }
+        }
+        if warp_alphabet {
+            if let Some(pred) = warp_prediction(
+                grid,
+                (mi_row, mi_col),
+                (mi_rows, mi_cols),
+                (x, y),
+                side,
+                info.mv,
+                info.ref_frame,
+                planes,
+                fctx,
+            ) {
+                candidates.push((2, pred));
+            }
+        }
+        for (motion, pred) in candidates {
             let luma_o = luma.code_from_prediction(
                 x, y, side, &pred[0], false, search.base_q_idx, search.deadzone, luma_set,
             );
@@ -4037,12 +4185,12 @@ fn code_square_inter(
                 + search.lambda
                     * (skip_bits(skip_o)
                         + single_syntax
-                        + obmc_bits(side, side, true)
+                        + mm(motion)
                         + if skip_o { 0.0 } else { luma_o.bits + u_o.bits + v_o.bits });
-            // The incumbent pays the SIMPLE_TRANSLATION symbol it was priced
-            // without, so both sides carry the motion_mode syntax.
-            if cost_o < best.0 + search.lambda * obmc_bits(side, side, false) {
-                obmc_won = true;
+            // The incumbent pays the motion_mode symbol IT would code, so
+            // both sides of the comparison carry that syntax.
+            if cost_o < best.0 + search.lambda * mm(motion_won) {
+                motion_won = motion;
                 best = (cost_o, Some((luma_o, u_o, v_o, skip_o, info)));
             }
         }
@@ -4073,7 +4221,7 @@ fn code_square_inter(
             // An OBMC winner commits the flat trial too: `commit_inter_luma`
             // re-predicts each var-tx unit by plain translation, which is not
             // the prediction this candidate was priced from.
-            let (levels, tx_depth, dcost) = if info.ref1.is_some() || obmc_won {
+            let (levels, tx_depth, dcost) = if info.ref1.is_some() || motion_won != 0 {
                 luma.commit(x, y, side, &luma_new);
                 (luma_new.levels.clone(), 0, 0.0)
             } else {
@@ -4099,7 +4247,7 @@ fn code_square_inter(
             palette_uv: None,
                     tx_depth,
                     inter: Some(info),
-                    obmc: obmc_won,
+                    motion_mode: motion_won,
                 },
                 cost + dcost,
             );
@@ -4131,7 +4279,7 @@ fn code_square_inter(
             palette: None,
             palette_uv: None,
             tx_depth,
-            obmc: false,
+            motion_mode: 0,
             inter: Some(InterInfo {
                 ref1: None,
                 mv1: (0, 0),
@@ -6526,117 +6674,117 @@ fn search_inter_block(
     // that is where libaom cashes most of its OBMC gain), and the symbol/
     // residual price here is the static-CDF estimate.
     let mut best = best;
-    let mut obmc_won = false;
-    if let Some(info) = best.inter.filter(|i| i.ref1.is_none()) {
-        if crate::envflags::env_flag!("EC_AV1_OBMC")
-            && crate::decode::has_overlappable_neighbour(grid, mi_row, mi_col, 8, 8, mi_cols, mi_rows)
-        {
-            let mut refs: [Option<&Picture>; 8] = [None; 8];
-            refs[LAST_FRAME as usize] = Some(reference);
-            for &(r, p, _) in extra {
-                refs[r as usize] = Some(p);
-            }
-            let refpix = crate::decode::RefPix::ready(refs);
-            let plan = crate::decode::obmc_plan(
+    let mut motion_won = 0u8;
+    if let Some(info) = best.inter.filter(|i| {
+        i.ref1.is_none()
+            && (crate::envflags::env_flag!("EC_AV1_OBMC")
+                || crate::envflags::env_flag!("EC_AV1_WARP"))
+    }) {
+        let mut refs: [Option<&Picture>; 8] = [None; 8];
+        refs[LAST_FRAME as usize] = Some(reference);
+        for &(r, p, _) in extra {
+            refs[r as usize] = Some(p);
+        }
+        // This block's OWN reference planes: the single-reference winner may
+        // be one of the extra references, not LAST.
+        let planes: [(&[u16], usize, usize, usize); 3] =
+            match extra.iter().find(|(r, _, _)| *r == info.ref_frame) {
+                Some(&(_, g, _)) => [
+                    (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                    (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                    (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                ],
+                None => [
+                    (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
+                    (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                    (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                ],
+            };
+        // The alphabet `tile::write_motion_mode` will code this block's
+        // symbol against, mirrored term for term (libaom
+        // `motion_mode_allowed`).
+        let warp_alphabet = crate::envflags::env_flag!("EC_AV1_WARP")
+            && crate::decode::num_proj_ref(
                 grid,
-                &[],
-                &[],
                 mi_row,
                 mi_col,
                 8,
                 8,
-                mi_rows,
                 mi_cols,
+                mi_rows,
+                info.ref_frame,
+                fctx,
+            ) >= 1;
+        let mm = |m: u8| motion_mode_bits(BLOCK, BLOCK, m, warp_alphabet);
+        let mut candidates: Vec<(u8, [Vec<u8>; 3])> = Vec::new();
+        if crate::envflags::env_flag!("EC_AV1_OBMC") {
+            if let Some(pred) = obmc_prediction(
+                grid,
+                (mi_row, mi_col),
+                (mi_rows, mi_cols),
+                (x, y),
                 BLOCK,
-                BLOCK,
-                BLOCK,
-                BLOCK / 2,
-                x,
-                y,
-                x / 2,
-                y / 2,
-                &refpix,
-                Some(mc::InterpFilterKind::Regular),
+                info.mv,
+                &refs,
+                planes,
                 reference.width,
+                fctx,
+            ) {
+                candidates.push((1, pred));
+            }
+        }
+        if warp_alphabet {
+            if let Some(pred) = warp_prediction(
+                grid,
+                (mi_row, mi_col),
+                (mi_rows, mi_cols),
+                (x, y),
+                BLOCK,
+                info.mv,
+                info.ref_frame,
+                planes,
+                fctx,
+            ) {
+                candidates.push((2, pred));
+            }
+        }
+        for (motion, pred) in candidates {
+            let luma_trial = luma.code_from_prediction(
+                x, y, BLOCK, &pred[0], false, search.base_q_idx, search.deadzone,
+                TxbSet::Luma32Inter,
             );
-            if let Ok(plan) = plan {
-                let (ref_luma, ref_u, ref_v) = match extra
-                    .iter()
-                    .find(|(r, _, _)| *r == info.ref_frame)
-                {
-                    Some(&(_, g, _)) => (
-                        (&g.y, g.width, luma.true_width, luma.true_height),
-                        (&g.u, g.width / 2, chroma[0].true_width, chroma[0].true_height),
-                        (&g.v, g.width / 2, chroma[1].true_width, chroma[1].true_height),
-                    ),
-                    None => (ref_luma, ref_u, ref_v),
+            let u = chroma[0].code_from_prediction(
+                x / 2, y / 2, BLOCK / 2, &pred[1], false, search.base_q_idx, search.deadzone,
+                chroma_set,
+            );
+            let v = chroma[1].code_from_prediction(
+                x / 2, y / 2, BLOCK / 2, &pred[2], false, search.base_q_idx, search.deadzone,
+                chroma_set,
+            );
+            let skip = luma_trial.levels.iter().all(|&l| l == 0)
+                && u.levels.iter().all(|&l| l == 0)
+                && v.levels.iter().all(|&l| l == 0);
+            let cost = luma_trial.sse
+                + u.sse
+                + v.sse
+                + search.lambda
+                    * (skip_bits(skip)
+                        + intra_inter_bits(true)
+                        + best.mode_bits
+                        + mm(motion)
+                        + if skip { 0.0 } else { luma_trial.bits + u.bits + v.bits });
+            if cost < best.cost + search.lambda * mm(motion_won) {
+                motion_won = motion;
+                best = Candidate {
+                    cost,
+                    luma: luma_trial,
+                    u,
+                    v,
+                    mode: DC_PRED,
+                    skip,
+                    mode_bits: best.mode_bits,
+                    inter: best.inter,
                 };
-                let mv = info.mv;
-                let mut pred = [
-                    vec![0u16; BLOCK * BLOCK],
-                    vec![0u16; BLOCK * BLOCK / 4],
-                    vec![0u16; BLOCK * BLOCK / 4],
-                ];
-                for (i, (r, luma_plane)) in
-                    [(ref_luma, true), (ref_u, false), (ref_v, false)].into_iter().enumerate()
-                {
-                    let (px, py) = if luma_plane { (x, y) } else { (x / 2, y / 2) };
-                    let side = if luma_plane { BLOCK } else { BLOCK / 2 };
-                    mc::predict(
-                        r.0,
-                        r.1,
-                        r.2,
-                        r.3,
-                        mv_to_q4(px, mv.1, luma_plane),
-                        mv_to_q4(py, mv.0, luma_plane),
-                        side,
-                        side,
-                        &mut pred[i],
-                        fctx,
-                    );
-                }
-                let [mut py_buf, mut pu_buf, mut pv_buf] = pred;
-                crate::decode::obmc_run(
-                    &plan, &refpix, &mut py_buf, &mut pu_buf, &mut pv_buf, fctx,
-                );
-                let u8s = |b: &[u16]| b.iter().map(|&v| v as u8).collect::<Vec<u8>>();
-                let luma_trial = luma.code_from_prediction(
-                    x, y, BLOCK, &u8s(&py_buf), false, search.base_q_idx, search.deadzone,
-                    TxbSet::Luma32Inter,
-                );
-                let u = chroma[0].code_from_prediction(
-                    x / 2, y / 2, BLOCK / 2, &u8s(&pu_buf), false, search.base_q_idx,
-                    search.deadzone, chroma_set,
-                );
-                let v = chroma[1].code_from_prediction(
-                    x / 2, y / 2, BLOCK / 2, &u8s(&pv_buf), false, search.base_q_idx,
-                    search.deadzone, chroma_set,
-                );
-                let skip = luma_trial.levels.iter().all(|&l| l == 0)
-                    && u.levels.iter().all(|&l| l == 0)
-                    && v.levels.iter().all(|&l| l == 0);
-                let cost = luma_trial.sse
-                    + u.sse
-                    + v.sse
-                    + search.lambda
-                        * (skip_bits(skip)
-                            + intra_inter_bits(true)
-                            + best.mode_bits
-                            + obmc_bits(BLOCK, BLOCK, true)
-                            + if skip { 0.0 } else { luma_trial.bits + u.bits + v.bits });
-                if cost < best.cost + search.lambda * obmc_bits(BLOCK, BLOCK, false) {
-                    obmc_won = true;
-                    best = Candidate {
-                        cost,
-                        luma: luma_trial,
-                        u,
-                        v,
-                        mode: DC_PRED,
-                        skip,
-                        mode_bits: best.mode_bits,
-                        inter: best.inter,
-                    };
-                }
             }
         }
     }
@@ -6661,7 +6809,7 @@ fn search_inter_block(
             uv_mode: DC_PRED,
             skip: best.skip,
             inter: best.inter,
-            obmc: obmc_won,
+            motion_mode: motion_won,
             eight: None,
             dv: None,
             palette: None,
@@ -7411,6 +7559,7 @@ pub(crate) fn encode_inter_frame(
     let start_cdfs = CdfSnapshot(cdfs);
     let reference_select_bit = header.reference_select;
     let switchable_motion_mode = header.is_motion_mode_switchable;
+    let warped_motion = header.allow_warped_motion;
     let order_hint_bits = seq.order_hint_bits;
     let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
     let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
@@ -7433,6 +7582,7 @@ pub(crate) fn encode_inter_frame(
             // Thread-locals: every tile job arms its own worker.
             crate::tile::arm_reference_select(reference_select_bit);
             crate::tile::arm_motion_mode(switchable_motion_mode);
+            crate::tile::arm_warped_motion(warped_motion);
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
             crate::tile::arm_screen(screen);
             let mut cdfs = start_cdfs.0.clone();
@@ -8363,7 +8513,7 @@ mod tests {
                 mv: (0, 0),
                 ref_mv_idx: 0,
             }),
-            obmc: false,
+            motion_mode: 0,
         };
         let skipped_block = BlockCoeffs {
             skip: true,
@@ -8387,6 +8537,7 @@ mod tests {
         // `is_motion_mode_switchable`, so the writer must be armed with it
         // too or the decoder reads a `motion_mode` symbol nobody wrote.
         crate::tile::arm_motion_mode(inter_header.is_motion_mode_switchable);
+        crate::tile::arm_warped_motion(inter_header.allow_warped_motion);
         let tile =
             crate::tile::sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
                 .unwrap();
@@ -11475,10 +11626,12 @@ mod tests {
             // `gate-blind-to-feature`).
             let mm = crate::tile::take_motion_mode_hits();
             eprintln!(
-                "{name}: motion_mode 32x32 SIMPLE={} OBMC={} | 16x16 SIMPLE={} OBMC={} | \
-                 8x8 SIMPLE={} OBMC={} ({:.1}% OBMC of {} eligible)",
-                mm[0], mm[1], mm[2], mm[3], mm[4], mm[5],
-                100.0 * (mm[1] + mm[3] + mm[5]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
+                "{name}: motion_mode 32x32 SIMPLE={} OBMC={} WARP={} | 16x16 SIMPLE={} OBMC={} \
+                 WARP={} | 8x8 SIMPLE={} OBMC={} WARP={} ({:.1}% OBMC / {:.1}% WARP of {} \
+                 eligible)",
+                mm[0], mm[1], mm[2], mm[3], mm[4], mm[5], mm[6], mm[7], mm[8],
+                100.0 * (mm[1] + mm[4] + mm[7]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
+                100.0 * (mm[2] + mm[5] + mm[8]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
                 mm.iter().sum::<usize>(),
             );
             let (aom, aom_wall) =
@@ -11695,10 +11848,12 @@ mod tests {
             // say whether the tool fired at all.
             let mm = crate::tile::take_motion_mode_hits();
             eprintln!(
-                "{name}: motion_mode 32x32 SIMPLE={} OBMC={} | 16x16 SIMPLE={} OBMC={} | \
-                 8x8 SIMPLE={} OBMC={} ({:.1}% OBMC of {} eligible)",
-                mm[0], mm[1], mm[2], mm[3], mm[4], mm[5],
-                100.0 * (mm[1] + mm[3] + mm[5]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
+                "{name}: motion_mode 32x32 SIMPLE={} OBMC={} WARP={} | 16x16 SIMPLE={} OBMC={} \
+                 WARP={} | 8x8 SIMPLE={} OBMC={} WARP={} ({:.1}% OBMC / {:.1}% WARP of {} \
+                 eligible)",
+                mm[0], mm[1], mm[2], mm[3], mm[4], mm[5], mm[6], mm[7], mm[8],
+                100.0 * (mm[1] + mm[4] + mm[7]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
+                100.0 * (mm[2] + mm[5] + mm[8]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
                 mm.iter().sum::<usize>(),
             );
             let palette = crate::tile::take_palette_hits();
