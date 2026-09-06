@@ -539,6 +539,23 @@ pub(crate) fn take_compound_size_hits() -> [usize; 4] {
     std::array::from_fn(|i| COMPOUND_SIZE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// The compound mode histogram of the LEAVES alone (`bw4 <= 4`, so 16x16 and
+/// below). The frame-wide histogram above cannot say whether a mode reaches
+/// the leaves at all, which is exactly the question every leaf compound step
+/// asks (gate-blind-to-feature): before lane-av1comp4 gave a leaf its second
+/// reference search, the two half-new modes were structurally impossible
+/// there and screen capture's leaf compound was 100% `NEAREST_NEARESTMV`.
+static COMPOUND_LEAF_MODE_HITS: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+
+/// Takes and clears the leaf-only compound mode histogram.
+#[cfg(test)]
+pub(crate) fn take_compound_leaf_mode_hits() -> [usize; 8] {
+    std::array::from_fn(|i| {
+        COMPOUND_LEAF_MODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
 /// Writes one COMPOUND_REFERENCE block's whole mode chain -- the writer side
 /// of decode.rs' `read_compound_ref_frames` / `read_inter_compound_mode` /
 /// `assign_compound_mv` / `comp_group_idx` / `compound_idx` sequence, in that
@@ -678,6 +695,9 @@ fn write_compound_block(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     COMPOUND_SIZE_HITS[(bw4.max(1).trailing_zeros() as usize).min(3)]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if bw4 <= 4 {
+        COMPOUND_LEAF_MODE_HITS[mode].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if crate::envflags::env_flag!("EC_COMP_MISMATCH") && (mvs.0 != info.mv || mvs.1 != info.mv1) {
         eprintln!(
             "EC_COMP_MISMATCH mode={mode} enc=({:?},{:?}) wrote=({:?},{:?})",
