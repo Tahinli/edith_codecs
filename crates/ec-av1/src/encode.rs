@@ -82,7 +82,39 @@ fn reach_sb_px(fctx: &crate::decode::FrameCtx) -> usize {
 /// third sweep, after the levels were costed through the writer's own CDFs
 /// too, left it there: against 0.2 the ladders are worth -1.19% against -0.98%
 /// on film and -0.20% against -0.14% on screen capture.
-const LAMBDA_SCALE: f64 = 0.1;
+///
+/// The fourth sweep (lane-av1lambda) ran the BD gates themselves rather than
+/// those ladders, and 0.1 was far off the point: the rate term was carrying
+/// roughly twice the weight it is worth. 640x384 gate, BD-rate vs libaom /
+/// vs rav1e for 1080p film, 2160p film, screen capture:
+///
+/// | lambda | 1080p | 2160p | screen |
+/// |--------|-------|-------|--------|
+/// | 0.0125 | +78.0 / +31.3 | +90.8 / +46.5 | +57.2 / -0.3 |
+/// | 0.025  | +71.5 / +28.4 | +87.0 / +46.5 | +50.4 / -3.8 |
+/// | 0.0375 | +71.2 / +28.5 | +84.3 / +45.4 | +48.7 / -4.4 |
+/// | 0.05   | +71.9 / +29.6 | +87.1 / +49.3 | +48.7 / -4.0 |
+/// | 0.075  | +74.8 / +32.7 | +91.3 / +52.8 | +51.4 / -1.3 |
+/// | 0.1    | +79.2 / +36.9 | +97.7 / +58.8 | +53.1 / -0.4 |
+/// | 0.125  | +84.0 / +41.1 | +100.7 / +61.5 | +56.8 / +2.3 |
+/// | 0.15   | +86.0 / +42.9 | +104.4 / +65.2 | +59.5 / +4.2 |
+/// | 0.2    | +89.6 / +45.5 | +109.9 / +69.8 | +62.3 / +7.3 |
+///
+/// and on the native 1920x1024 crops, which is the table that decides:
+///
+/// | lambda | film 1080p | film 2160p | screen |
+/// |--------|------------|------------|--------|
+/// | 0.025  | +17.1 / -0.5 | +49.0 / +21.1 | +51.5 / -15.1 |
+/// | 0.0375 | +16.3 / -1.0 | +47.5 / +19.7 | +50.7 / -15.1 |
+/// | 0.05   | +17.0 / -0.3 | +47.0 / +19.2 | +51.6 / -14.2 |
+/// | 0.1    | +18.1 / +0.9 | +47.1 / +19.0 | +58.3 / -9.8 |
+///
+/// 0.0375 is the best point on two clips of three and costs the 2160p film
+/// +0.4/+0.7, outside the +-0.3 band every other lever here is kept inside,
+/// so 0.05 ships: two clips down on both columns, the 2160p film flat
+/// (-0.1 / +0.2). It also spends ~8% more encode wall, the bits it stopped
+/// refusing.
+const LAMBDA_SCALE: f64 = 0.05;
 
 /// [`LAMBDA_SCALE`], or whatever `EC_AV1_LAMBDA` names when the sweep that
 /// picks it is the thing running. A release build has no such knob.
@@ -93,6 +125,41 @@ fn lambda_scale() -> f64 {
     match swept {
         Some(scale) if cfg!(test) => scale,
         _ => LAMBDA_SCALE,
+    }
+}
+
+/// How a key frame's lambda differs from an inter frame's: libaom weighs the
+/// two apart (`rd_frame_type_factor`, key 128 against an inter frame's 144 out
+/// of 128), because every later frame predicts from the key frame, so an error
+/// left in it is paid for over the whole group. This encoder has no temporal
+/// propagation model at all, and this factor is the cheapest stand-in for one.
+/// Swept by `EC_AV1_LAMBDA_KEY` in a test build, like [`lambda_scale`].
+///
+/// MEASURED and NOT KEPT. 640x384 gate at [`LAMBDA_SCALE`] 0.05, BD vs
+/// libaom / vs rav1e:
+///
+/// | k_key | 1080p | 2160p | screen |
+/// |---|---|---|---|
+/// | 1.0 | +71.9 / +29.6 | +87.1 / +49.3 | +48.7 / -4.0 |
+/// | 0.85 | +71.5 / +29.4 | +87.0 / +48.3 | +49.7 / -3.9 |
+/// | 0.7 | +71.3 / +28.9 | +87.2 / +48.6 | +49.4 / -4.1 |
+/// | 0.5 | +71.4 / +28.9 | +88.7 / +49.6 | +50.1 / -3.4 |
+///
+/// The two films want the key frame coded finer and the screen capture wants
+/// the opposite, by about the same amount, and at native the whole lever is
+/// inside the +-0.3 band that decides nothing: k_key 0.7 reads +16.9 / -0.3,
+/// +47.2 / +19.2, +51.4 / -14.7 against 1.0's +17.0 / -0.3, +47.0 / +19.2,
+/// +51.6 / -14.2. A gate whose GOP is one key frame in twelve cannot see a
+/// per-frame-type weight; the real lever here is temporal propagation
+/// (libaom's `tpl`), which weighs each BLOCK by how much of it later frames
+/// predict from, not each frame.
+const KEY_LAMBDA_FACTOR: f64 = 1.0;
+
+/// [`KEY_LAMBDA_FACTOR`], or what `EC_AV1_LAMBDA_KEY` names in a test build.
+fn key_lambda_factor() -> f64 {
+    match std::env::var("EC_AV1_LAMBDA_KEY").ok().and_then(|v| v.parse::<f64>().ok()) {
+        Some(k) if cfg!(test) => k,
+        _ => KEY_LAMBDA_FACTOR,
     }
 }
 
@@ -2467,8 +2534,16 @@ impl Reach {
 /// film -- 85% of them, far past libaom's own rate -- and costs another 0.3
 /// BD points on top of the 0.4 the 32x32 candidate already costs. A tool
 /// that wins the local RD on five blocks in six and loses ladder bytes is
-/// the `local-RD-on-references` class again, not a missing footprint. The
-/// tool stays OFF by default; the upgrade path is the price, not the size
+/// the `local-RD-on-references` class again, not a missing footprint.
+///
+/// RE-MEASURED on lane-av1lambda at [`LAMBDA_SCALE`] 0.05 (min side 8):
+/// +16.7 / -0.5, +47.1 / +19.2, +51.8 / -14.2 against the same build with
+/// the knob off (+17.0 / -0.3, +47.0 / +19.2, +51.6 / -14.2). The 0.7-point
+/// loss on the 1080p film became a 0.3-point win and the other two rows went
+/// 0.1-0.2 the other way, so OBMC is now neutral rather than a loss -- half
+/// of the "local win, ladder loss" it was charged with was the rate weight.
+/// It still does not meet the keep rule (two down, one flat, both columns).
+/// The tool stays OFF by default; the upgrade path is the price, not the size
 /// (the 640x384 arm reads +78.9/+36.4, +94.9/+56.3, +54.2/+0.8 at min side 8
 /// against +78.8/+36.1, +95.1/+56.4, +54.5/+1.1 off -- two rows down, the
 /// 1080p film up, i.e. the same disagreement between the two gates).
@@ -2522,6 +2597,24 @@ fn motion_mode_bits(write_w: usize, write_h: usize, motion: u8, warp_alphabet: b
 /// this is a measured loss, not an inert knob. Same shape as the OBMC
 /// candidate above it (`obmc_min_side`): a local RD win that does not convert
 /// into ladder bytes.
+///
+/// RE-MEASURED on lane-av1lambda, after [`LAMBDA_SCALE`] moved 0.1 -> 0.05,
+/// because a tool whose gain is local and whose cost is the rate it adds is
+/// exactly what a halved rate weight re-judges. The verdict FLIPS SIGN:
+///
+/// | clip | warp on | off (both at lambda 0.05) |
+/// |---|---|---|
+/// | film 1080p | +16.7 / -0.5 | +17.0 / -0.3 |
+/// | film 2160p | +47.0 / +19.1 | +47.0 / +19.2 |
+/// | screen | +51.3 / -14.3 | +51.6 / -14.2 |
+///
+/// two rows down against libaom (0.3 each) with the third flat, and the rav1e
+/// column inside 0.1 everywhere -- which reads as a keep rather than the
+/// 0.7/0.9 loss it was. The knob still ships OFF here: the margin is 0.3 BD
+/// points on a table whose other levers move whole points, and turning warp
+/// on by default is a stream-feature change (`enable_warped_motion` in the
+/// sequence header) that wants its own conformance pass, not a lambda lane's
+/// side effect.
 ///
 /// The WARPED_CAUSAL prediction of one square single-reference block: the
 /// decoder's own warp-sample walk (`decode::find_samples` +
@@ -5261,7 +5354,7 @@ pub(crate) fn encode_key_frame_inner(
     let search = Search {
         base_q_idx,
         deadzone,
-        lambda: lambda_scale() * step * step,
+        lambda: lambda_scale() * key_lambda_factor() * step * step,
         modes,
         top_k: prune_top_k(),
         screen,
@@ -11342,7 +11435,9 @@ mod tests {
     /// decision change the BD gate judges. Re-pinned again on
     /// lane-av1skipctx: the search now prices `txb_skip`/`dc_sign` at the
     /// real neighbour contexts ([`Plane::coef_ctx`]) instead of zero, which
-    /// is the same kind of decision change.
+    /// is the same kind of decision change. Re-pinned on lane-av1lambda:
+    /// [`LAMBDA_SCALE`] moved 0.1 -> 0.05, so every RD decision in the
+    /// search moved with it.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -11364,7 +11459,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7141, 0x3a6a_df46_9b16_d9a7), (60, 25906, 0xbf71_9320_9e50_d237)];
+            [(150, 7130, 0x0415_8aec_b26b_195a), (60, 26185, 0x9e7b_b2c7_672b_c381)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
