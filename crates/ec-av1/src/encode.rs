@@ -3698,6 +3698,38 @@ fn extra_ref_new_mv() -> bool {
     }
 }
 
+/// The seven `ref_frame_idx` order hints of a frame coded on this crate's own
+/// flat slot plan (`inter_frame_headers_slots`): every reference but
+/// `GOLDEN_FRAME` and `ALTREF_FRAME` reads the frame just coded,
+/// `GOLDEN_FRAME` reads the GOP's key frame, and `ALTREF_FRAME` reads the
+/// frame two back when there is one (otherwise it, too, names the key frame's
+/// slot). Hints are 7-bit, the only `order_hint_bits` this encoder writes.
+pub(crate) fn flat_order_hints(order_hint: u32, key_hint: u32, has_altref: bool) -> [u32; 7] {
+    let last = order_hint.wrapping_sub(1) & 0x7f;
+    let alt = if has_altref {
+        order_hint.wrapping_sub(2) & 0x7f
+    } else {
+        key_hint
+    };
+    [last, last, last, key_hint, last, last, alt]
+}
+
+/// Whether an inter frame carries `reference_select` (spec 5.9.22): the
+/// header bit that lets each block choose between a single and a compound
+/// reference. Off by default until compound prediction is measured to pay;
+/// `EC_AV1_COMPOUND=1` arms it in a test build (which is what the BD gate
+/// runs as), and every block still codes SINGLE, so the only cost is one
+/// `comp_mode` symbol per inter block.
+const REFERENCE_SELECT: bool = false;
+
+/// [`REFERENCE_SELECT`], with the test-build environment override.
+pub(crate) fn reference_select() -> bool {
+    match std::env::var("EC_AV1_COMPOUND").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => REFERENCE_SELECT,
+    }
+}
+
 /// [`tile::write_drl_idx`]'s cost against one stack: one `drl_mode` symbol
 /// per entry past `start`, `1` to advance and `0` to stop, at most two.
 fn drl_bits_for(stack: &MvStack, start: usize, target: usize) -> f64 {
@@ -4367,6 +4399,12 @@ pub(crate) fn encode_inter_frame(
     base_q_idx: u8,
     deadzone: f64,
     order_hint: u32,
+    // The order hint each of the seven `ref_frame_idx` entries names, which a
+    // decoder reads out of its own reference state -- only spec 5.9.22's
+    // `skipModeAllowed` (in `frame::write_frame_header`) reads it, and only
+    // on a `reference_select` frame. [`flat_order_hints`] builds it for the
+    // callers that follow this crate's own flat slot plan.
+    order_hints: [u32; 7],
     render: (usize, usize),
     // The tables this frame's writer starts from: what the previous frame
     // stored into the slot this one's `primary_ref_frame` names. `None`
@@ -4443,6 +4481,14 @@ pub(crate) fn encode_inter_frame(
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
     let sign_bias = pyramid.map_or(crate::mvstack::NO_SIGN_BIAS, |p| p.sign_bias);
+    // The order hint behind each `ref_frame_idx` entry. The flat path's own
+    // slot plan (`inter_frame_headers_slots`) is: every reference but
+    // `GOLDEN_FRAME` reads `last_slot` (the frame just coded) except
+    // `ALTREF_FRAME`, which reads the frame two back when there is one;
+    // `GOLDEN_FRAME` is the key frame, order hint 0. Only
+    // `frame::write_frame_header`'s `skipModeAllowed` reads this.
+    header.order_hints = order_hints;
+    header.reference_select = reference_select();
     if let Some(p) = pyramid {
         header.show_frame = p.show_frame;
         header.showable_frame = !p.show_frame;
@@ -4918,6 +4964,7 @@ pub(crate) fn encode_inter_frame(
         .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
     let start_cdfs = CdfSnapshot(cdfs.clone());
     crate::tile::arm_sign_bias(sign_bias);
+    crate::tile::arm_reference_select(header.reference_select);
     let mut tile = crate::tile::sb_coeff_inter_frame_tile_cdfs(
         mi_cols,
         mi_rows,
@@ -5008,6 +5055,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             crate::tile::arm_sign_bias(sign_bias);
+            crate::tile::arm_reference_select(reference_select());
             let mut cdfs = start_cdfs.0.clone();
             let coded = crate::tile::sb_coeff_inter_frame_tile_cdfs(
                 mi_cols,
@@ -5160,6 +5208,7 @@ pub(crate) fn encode_sequence_with_ctx(
             base_q_idx,
             deadzone,
             order_hint,
+            flat_order_hints(order_hint, 0, prev2.is_some()),
             render,
             Some(&carried.0),
             Some(&golden),
@@ -7220,7 +7269,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx, None).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -7318,7 +7367,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx, None).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -7495,6 +7544,7 @@ mod tests {
                     q,
                     0.5,
                     1,
+                    flat_order_hints(1, 0, false),
                     (width, height), None, None, None, fctx, None,
                 )
                 .unwrap();
@@ -7512,6 +7562,7 @@ mod tests {
                         q,
                         0.5,
                         1,
+                        flat_order_hints(1, 0, false),
                         (width, height), None, None, None, fctx, None,
                     )
                     .unwrap();

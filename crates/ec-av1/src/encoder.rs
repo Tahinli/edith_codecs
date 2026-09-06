@@ -708,6 +708,15 @@ impl Av1Encoder {
                 base_q_idx,
                 DEADZONE,
                 order as u32,
+                // The flat path's own slot plan, in order hints: the key frame
+                // of the GOP this picture sits in is what `GOLDEN_FRAME`
+                // names, and every reference but `ALTREF_FRAME` is the frame
+                // just coded.
+                crate::encode::flat_order_hints(
+                    order as u32 & 0x7f,
+                    (order - order % self.config.gop as u64) as u32 & 0x7f,
+                    self.prev2.is_some(),
+                ),
                 render,
                 self.carried_cdfs.as_ref().map(|c| &c.0),
                 self.golden.as_ref(),
@@ -827,14 +836,19 @@ impl Av1Encoder {
                 .as_ref()
                 .is_some_and(|s| s.order_hint > order_hint)
         };
-        for (i, slot) in [
+        let slots = [
             last_slot, last_slot, last_slot, GOLDEN_SLOT, last_slot, last_slot, altref_slot,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        ];
+        for (i, slot) in slots.into_iter().enumerate() {
             sign_bias[i] = ahead(slot, &self.dpb);
         }
+        // The same seven slots' order hints, for `skipModeAllowed` (spec
+        // 5.9.22) in the frame-header writer.
+        let order_hints: [u32; 7] = slots.map(|slot| {
+            self.dpb[slot as usize]
+                .as_ref()
+                .map_or(0, |s| (s.order_hint & 0x7f) as u32)
+        });
         let reference = self.dpb[last_slot as usize]
             .as_ref()
             .map(|s| s.picture.clone())
@@ -852,6 +866,7 @@ impl Av1Encoder {
             base_q_idx,
             DEADZONE,
             order_hint,
+            order_hints,
             render,
             start_cdfs.as_ref(),
             golden.as_ref(),

@@ -160,6 +160,54 @@ pub(crate) fn arm_sign_bias(sign_bias: crate::mvstack::SignBiasTable) {
     SIGN_BIAS.with(|c| c.set(sign_bias));
 }
 
+thread_local! {
+    /// This frame header's own `reference_select` bit (spec 5.9.22), armed
+    /// the same way `arm_sign_bias` arms the sign-bias table rather than
+    /// threaded through the five nested writer helpers between here and the
+    /// per-block mode syntax. `true` makes every inter block of size at least
+    /// 8x8 code a `comp_mode` symbol, exactly where decode.rs `read_comp_mode`
+    /// reads one.
+    static REFERENCE_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms the frame's `reference_select` bit for the next tile written on this
+/// thread; cleared by [`CdefIdxGuard`] when that writer returns.
+pub(crate) fn arm_reference_select(on: bool) {
+    REFERENCE_SELECT.with(|c| c.set(on));
+}
+
+/// Writer-side counterpart of decode.rs `read_comp_mode` (spec 5.11.25's
+/// `comp_mode`): on a `reference_select` frame every inter block whose size
+/// allows compound (`is_comp_ref_allowed`, always true here -- this writer's
+/// smallest leaf is 8x8) names SINGLE or COMPOUND, at
+/// `mvstack::reference_mode_ctx`'s own context off the same two neighbour
+/// bands decode.rs builds its `NeighbourRef` pair from. No neighbour carries a
+/// second reference yet (`ref1: None`), because every block this writer codes
+/// is single-reference; a compound-writing lane fills that in from its own
+/// `ref1` band.
+fn write_comp_mode(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    (has_above, has_left): (bool, bool),
+    compound: bool,
+) {
+    if !REFERENCE_SELECT.with(std::cell::Cell::get) {
+        return;
+    }
+    let nbr = |is_inter: bool, r: i8| crate::mvstack::NeighbourRef {
+        is_inter,
+        ref0: if is_inter { r } else { 0 },
+        ref1: None,
+        uni: false,
+    };
+    let above = has_above.then(|| nbr(neighbours.above_inter[mi_c], neighbours.above_ref[mi_c]));
+    let left = has_left.then(|| nbr(neighbours.left_inter[mi_r], neighbours.left_ref[mi_r]));
+    let ctx = crate::mvstack::reference_mode_ctx(above, left);
+    enc.symbol(usize::from(compound), &mut cdfs.comp_mode[ctx]);
+}
+
 /// Clears the armed plan when the tile writer that consumed it returns.
 struct CdefIdxGuard;
 
@@ -168,6 +216,7 @@ impl Drop for CdefIdxGuard {
         CDEF_IDX.with(|c| *c.borrow_mut() = None);
         LR_PLAN.with(|c| *c.borrow_mut() = None);
         SIGN_BIAS.with(|c| c.set(crate::mvstack::NO_SIGN_BIAS));
+        REFERENCE_SELECT.with(|c| c.set(false));
     }
 }
 
@@ -3514,6 +3563,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
 
                 let mode_for_tx;
                 if let Some(info) = block.inter {
+                    write_comp_mode(&mut enc, &mut cdfs, &neighbours, (mi_r, mi_c), (has_above, has_left), false);
                     write_single_ref(&mut enc, &mut cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
 
                     let (mi_row, mi_col) = (r32 as usize * 8, c32 as usize * 8);
@@ -3719,6 +3769,7 @@ fn write_inter_frame_leaf(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
+        write_comp_mode(enc, cdfs, neighbours, (mi_r, mi_c), (has_above, has_left), false);
         write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
 
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
@@ -3912,6 +3963,7 @@ fn write_inter_frame_leaf8(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
+        write_comp_mode(enc, cdfs, neighbours, leaf_mi, (has_above, has_left), false);
         write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[leaf_mi.1], neighbours.left_ref[leaf_mi.0]);
 
         let (mi_row, mi_col) = leaf_mi;
