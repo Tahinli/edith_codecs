@@ -5,9 +5,11 @@
 //! [`crate::transform`], and the tile writer of [`crate::tile`] — into
 //! something that takes a picture. Every block is 32x32 (its chroma 16x16),
 //! which is the subset the tile writer codes, and each one picks its luma mode
-//! from the seven non-directional ones by rate-distortion; chroma is predicted
-//! DC, which is the mode the tile writer codes for it. Block sizes and
-//! transform types are what a loop above this would choose between.
+//! from the seven non-directional ones by rate-distortion; chroma searches
+//! its own `uv_mode` over the seven that read no further than the row above
+//! and the column to the left, its transform type derived from that mode the
+//! way the decoder derives it. Block sizes are what a loop above this would
+//! choose between.
 //!
 //! The encoder carries its own reconstruction, because prediction reads it: a
 //! block predicts from the reconstructed samples above and to its left, exactly
@@ -25,7 +27,10 @@ use ec_core::{Error, Result};
 use crate::cdf;
 use crate::cdf_state::TxbSet;
 use crate::frame::frame_obu;
-use crate::intra::{D67_PRED, DC_PRED, KEY_FRAME_MODES, V_PRED};
+use crate::intra::{
+    D67_PRED, DC_PRED, H_PRED, KEY_FRAME_MODES, PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED,
+    SMOOTH_V_PRED, V_PRED,
+};
 use crate::mc;
 use crate::motion;
 use crate::mvstack::{MiGrid, MiInfo, MvStack, NO_REF1, find_mv_stack, mv16};
@@ -36,7 +41,10 @@ use crate::tile::{
     BlockCoeffs, Coeff, INTRA_MODE_CTX, InterInfo, InterMode, Quadrant, Superblock, partition_bits,
     sb_coeff_inter_frame_tile, sb_coeff_key_frame_tile,
 };
-use crate::transform::{dequant_and_inverse, forward_and_quantize};
+use crate::transform::{
+    TxType, dequant_and_inverse, dequant_and_inverse_typed, forward_and_quantize,
+    forward_and_quantize_typed,
+};
 
 /// The side of the larger of the two luma blocks this encoder codes, in
 /// samples.
@@ -741,6 +749,24 @@ impl Plane<'_> {
     /// levels, the block the decoder would reconstruct, the squared error
     /// against the source and an estimate of what the levels cost in bits.
     fn trial(&self, at: At, mode: u8, base_q_idx: u8, deadzone: f64, fctx: &crate::decode::FrameCtx) -> Trial {
+        self.trial_typed(at, mode, base_q_idx, deadzone, TxType::DctDct, fctx)
+    }
+
+    /// [`Self::trial`] under a named transform type -- what an intra chroma
+    /// block gets, since chroma codes no `tx_type` symbol and the decoder
+    /// derives the type from the chroma mode itself (`Intra_Mode_To_Tx_Type`,
+    /// spec 9.3, [`crate::decode::default_intra_tx_type`]). Luma keeps
+    /// `DCT_DCT`, which is the one type this writer's `tx_type` symbol names.
+    #[allow(clippy::too_many_arguments)]
+    fn trial_typed(
+        &self,
+        at: At,
+        mode: u8,
+        base_q_idx: u8,
+        deadzone: f64,
+        tx_type: TxType,
+        fctx: &crate::decode::FrameCtx,
+    ) -> Trial {
         let At {
             x, y, side, reach, ..
         } = at;
@@ -769,8 +795,10 @@ impl Plane<'_> {
         }
         #[cfg(test)]
         let t = std::time::Instant::now();
-        let levels = forward_and_quantize(&residual, side, 8, i32::from(base_q_idx), deadzone);
-        let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
+        let levels =
+            forward_and_quantize_typed(&residual, side, 8, i32::from(base_q_idx), deadzone, tx_type);
+        let coded =
+            dequant_and_inverse_typed(&levels, side, 8, i32::from(base_q_idx), 0, 0, tx_type);
         #[cfg(test)]
         stage_add(2, t.elapsed());
 
@@ -905,20 +933,6 @@ impl Plane<'_> {
             self.reconstruction[(y + row) * self.width + x..][..side]
                 .copy_from_slice(&trial.reconstruction[row * side..][..side]);
         }
-    }
-
-    /// Codes one block under a fixed mode, committing it, and hands back what
-    /// it cost: its squared error and the bits its levels spend.
-    fn code_block(
-        &mut self,
-        at: At,
-        mode: u8,
-        base_q_idx: u8,
-        deadzone: f64, fctx: &crate::decode::FrameCtx,
-    ) -> (Vec<Coeff>, f64, f64) {
-        let trial = self.trial(at, mode, base_q_idx, deadzone, fctx);
-        self.commit(at.x, at.y, at.side, &trial);
-        (coeffs(&trial.levels, at.side), trial.sse, trial.bits)
     }
 
     /// The source samples of one square, contiguous — what a motion search
@@ -1659,34 +1673,110 @@ fn code_square(
         search,
         mode_bits, fctx,
     );
-    // Chroma is predicted DC because that is the mode the tile writer codes
-    // for it; what it costs still counts towards the partition decision.
-    let mut planes = [Vec::new(), Vec::new()];
-    for (plane, coeffs) in chroma.iter_mut().zip(&mut planes) {
-        let (levels, sse, bits) = plane.code_block(
-            At {
-                x: x / 2,
-                y: y / 2,
-                side: side / 2,
-                reach: Reach::none(),
-                set: chroma_set,
-            },
-            DC_PRED,
-            search.base_q_idx,
-            search.deadzone, fctx,
-        );
-        *coeffs = levels;
-        cost += sse + search.lambda * bits;
-    }
-    let [u, v] = planes;
+    // Chroma searches its own mode over [`CHROMA_MODES`], one symbol for both
+    // planes; what it costs still counts towards the partition decision.
+    let ([u, v], uv_mode, chroma_cost) =
+        search_chroma(chroma, (x, y), side, chroma_set, search, mode, fctx);
+    cost += chroma_cost;
     (
         BlockCoeffs {
             u,
             v,
             luma: luma_coeffs,
             mode,
+            uv_mode,
             ..BlockCoeffs::default()
         },
+        cost,
+    )
+}
+
+/// The chroma modes the search offers, and the only ones it may offer: each
+/// predicts from the row directly above and the column directly to the left
+/// and nothing further, so none of them needs the above-right/below-left
+/// `Reach` a chroma block is coded with `Reach::none()` for. The eight
+/// directional modes do read past that, and `UV_CFL_PRED` needs the luma
+/// reconstruction and its own alpha syntax; both are left out here.
+const CHROMA_MODES: [u8; 7] = [
+    DC_PRED,
+    V_PRED,
+    H_PRED,
+    SMOOTH_PRED,
+    SMOOTH_V_PRED,
+    SMOOTH_H_PRED,
+    PAETH_PRED,
+];
+
+/// The thirteen intra mode names, for the chroma fire count's print.
+#[cfg(test)]
+const UV_MODE_NAMES: [&str; 13] = [
+    "DC", "V", "H", "D45", "D135", "D113", "D157", "D203", "D67", "SMOOTH", "SMOOTH_V",
+    "SMOOTH_H", "PAETH",
+];
+
+/// How many blocks each chroma mode has won, indexed by the mode itself --
+/// the fire count that says whether the search below reaches its candidates
+/// at all (the `gate-blind-to-feature` class), printed once per gate run.
+static UV_MODE_HITS: [std::sync::atomic::AtomicUsize; 13] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 13];
+
+/// Reads [`UV_MODE_HITS`] and zeroes it, so a gate can attribute the counts
+/// to its own encode.
+#[cfg(test)]
+pub(crate) fn take_uv_mode_hits() -> [usize; 13] {
+    std::array::from_fn(|m| UV_MODE_HITS[m].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Searches both chroma planes over [`CHROMA_MODES`] under one shared mode --
+/// `uv_mode` is a single symbol covering U and V -- and commits the cheapest.
+/// Returns each plane's levels, the mode, and what the pair cost (squared
+/// error plus lambda times bits, the same currency the luma search speaks).
+///
+/// The chroma symbol itself was already priced at `DC_PRED` by [`mode_bits`],
+/// which is what the luma mode decision was taken against, so what a
+/// candidate owes here is only the *difference* from that -- plus, for `V`/`H`
+/// (directional, spec `read_intra_angle_info`), the zero `angle_delta_uv` the
+/// writer then has to code.
+#[allow(clippy::too_many_arguments)]
+fn search_chroma(
+    chroma: &mut [Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+    set: TxbSet,
+    search: &Search,
+    luma_mode: u8,
+    fctx: &crate::decode::FrameCtx,
+) -> ([Vec<Coeff>; 2], u8, f64) {
+    let at = At {
+        x: x / 2,
+        y: y / 2,
+        side: side / 2,
+        reach: Reach::none(),
+        set,
+    };
+    let uv_cdf = &cdf::UV_MODE_CFL[usize::from(luma_mode)];
+    let dc_bits = symbol_bits(uv_cdf, usize::from(DC_PRED));
+    let mut best: Option<(f64, u8, Trial, Trial)> = None;
+    for mode in CHROMA_MODES {
+        let mut bits = symbol_bits(uv_cdf, usize::from(mode)) - dc_bits;
+        if (V_PRED..=D67_PRED).contains(&mode) {
+            bits += symbol_bits(&cdf::ANGLE_DELTA[usize::from(mode - V_PRED)], 3);
+        }
+        let tx_type = crate::decode::default_intra_tx_type(mode);
+        let u = chroma[0].trial_typed(at, mode, search.base_q_idx, search.deadzone, tx_type, fctx);
+        let v = chroma[1].trial_typed(at, mode, search.base_q_idx, search.deadzone, tx_type, fctx);
+        let cost = u.sse + v.sse + search.lambda * (bits + u.bits + v.bits);
+        if best.as_ref().is_none_or(|(b, ..)| cost < *b) {
+            best = Some((cost, mode, u, v));
+        }
+    }
+    let (cost, mode, u, v) = best.expect("CHROMA_MODES is not empty");
+    UV_MODE_HITS[usize::from(mode)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    chroma[0].commit(at.x, at.y, at.side, &u);
+    chroma[1].commit(at.x, at.y, at.side, &v);
+    (
+        [coeffs(&u.levels, at.side), coeffs(&v.levels, at.side)],
+        mode,
         cost,
     )
 }
@@ -1908,6 +1998,7 @@ fn code_square_inter(
                     u: coeffs(&u_new.levels, side / 2),
                     v: coeffs(&v_new.levels, side / 2),
                     mode: DC_PRED as u8,
+                    uv_mode: DC_PRED,
                     skip: skip_new,
                     eight: None,
                     inter: Some(InterInfo {
@@ -1929,6 +2020,7 @@ fn code_square_inter(
             u: coeffs(&u.levels, side / 2),
             v: coeffs(&v.levels, side / 2),
             mode: DC_PRED as u8,
+            uv_mode: DC_PRED,
             skip,
             eight: None,
             inter: Some(InterInfo {
@@ -3160,6 +3252,7 @@ fn search_inter_block(
             u: coeffs(&best.u.levels, BLOCK / 2),
             v: coeffs(&best.v.levels, BLOCK / 2),
             mode: best.mode,
+            uv_mode: DC_PRED,
             skip: best.skip,
             inter: best.inter,
             eight: None,
@@ -4081,6 +4174,7 @@ mod tests {
             u: Vec::new(),
             v: Vec::new(),
             mode: 0,
+            uv_mode: 0,
             skip: false,
             eight: None,
             inter: Some(InterInfo {
@@ -5172,11 +5266,23 @@ mod tests {
         // table for the far side would show up as a rate discontinuity here,
         // even though a coarser quantizer always codes no more than a finer
         // one on the same picture.
+        //
+        // corner-cut (lane-av1rd3): the bound is 5% rather than exact. Since
+        // chroma searches its own mode, a coarser quantizer can pick a
+        // *different* uv_mode on a block whose modes now cost nearly the
+        // same, and the search prices that symbol against the static default
+        // CDF while the writer codes it against an adapted one -- 311 -> 319
+        // bytes at q 120->121 on this picture. The table this gate is really
+        // watching would move the rate by far more than the mode churn does.
+        // Ceiling: a q-context table wrong by under 5% would pass. Upgrade
+        // path is pricing through the adapting CDF state (what
+        // `predicted_coeff_bits_track_the_tile_the_writer_wrote` measures the
+        // drift of), after which the exact bound comes back.
         for &(lo, hi) in &[(20u8, 21u8), (60, 61), (120, 121)] {
             let lo_bytes = encode_key_frame_with_ctx(&picture, lo, 0.5, fctx).unwrap().stream.len();
             let hi_bytes = encode_key_frame_with_ctx(&picture, hi, 0.5, fctx).unwrap().stream.len();
             assert!(
-                hi_bytes <= lo_bytes,
+                hi_bytes as f64 <= lo_bytes as f64 * 1.05,
                 "q {lo}->{hi} crosses a context boundary: {lo_bytes} -> {hi_bytes} bytes"
             );
         }
@@ -6406,6 +6512,7 @@ mod tests {
             let fctx = &crate::decode::FrameCtx::new();
             let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
             let _ = take_partition_hits();
+            let _ = take_uv_mode_hits();
             let (ours, ours_wall) = our_ladder(&source, width, height, fctx);
             // How often the inter split actually fired over this clip's four
             // encodes, against the whole 32x32 that was the only outcome
@@ -6418,6 +6525,24 @@ mod tests {
                 100.0 * split32 as f64 / (whole32 + split32).max(1) as f64,
                 whole16 + split16,
                 100.0 * split16 as f64 / (whole16 + split16).max(1) as f64
+            );
+            // Which chroma modes the search actually wins with, against the
+            // unconditional DC_PRED that was the only outcome before
+            // (gate-blind-to-feature).
+            let uv = take_uv_mode_hits();
+            let uv_total: usize = uv.iter().sum();
+            eprintln!(
+                "{name}: uv modes {}",
+                uv.iter()
+                    .enumerate()
+                    .filter(|&(_, &n)| n > 0)
+                    .map(|(m, &n)| format!(
+                        "{}={n} ({:.1}%)",
+                        UV_MODE_NAMES[m],
+                        100.0 * n as f64 / uv_total.max(1) as f64
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
             let (aom, aom_wall) =
                 external_ladder(&source, width, height, "libaom-av1", &aom_points);

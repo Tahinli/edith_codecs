@@ -454,9 +454,14 @@ pub struct BlockCoeffs {
     pub v: Vec<Coeff>,
     /// The luma intra mode the block is predicted with, one of the thirteen
     /// modes a key frame codes (`DC_PRED` is zero, which is what
-    /// [`Default`] and a plain coefficient list give). Chroma stays on
-    /// `DC_PRED`.
+    /// [`Default`] and a plain coefficient list give).
     pub mode: u8,
+    /// The chroma intra mode both chroma planes are predicted with (spec
+    /// `uv_mode`, one symbol for the pair). `DC_PRED` is zero, which is what
+    /// [`Default`] gives; a non-`DC_PRED` mode also changes the transform
+    /// type the decoder derives for chroma (`Intra_Mode_To_Tx_Type`, spec
+    /// 9.3), which is never coded as a symbol.
+    pub uv_mode: u8,
     /// Whether the block carries no residual at all (spec `skip`). An intra
     /// block may still be skipped; `false` (the [`Default`]) codes whatever
     /// `luma`/`u`/`v` carry.
@@ -1311,10 +1316,16 @@ fn write_intra_mode(
     }
     // A block small enough to be offered chroma from luma reads the wider
     // table even when it does not take the mode.
+    let uv_mode = usize::from(block.uv_mode);
     if cfl {
-        enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+        enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
     } else {
-        enc.symbol(DC_PRED, &mut cdfs.uv_mode_no_cfl[mode]);
+        enc.symbol(uv_mode, &mut cdfs.uv_mode_no_cfl[mode]);
+    }
+    // `angle_delta_uv` (spec `read_intra_angle_info`) off the same CDF array
+    // the luma delta reads, indexed by the chroma mode.
+    if (V_PRED..=D67_PRED).contains(&uv_mode) {
+        enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
     }
     mode
 }
@@ -2602,7 +2613,11 @@ pub fn sb_coeff_inter_frame_tile(
                     if (V_PRED..=D67_PRED).contains(&mode) {
                         enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
                     }
-                    enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+                    let uv_mode = usize::from(block.uv_mode);
+                    enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
+                    if (V_PRED..=D67_PRED).contains(&uv_mode) {
+                        enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
+                    }
                     mode_for_tx = mode;
                     // Intra: no vote, but still a coded cell -- mvstack's
                     // extended-scan coverage must see it (module doc).
@@ -2778,7 +2793,11 @@ fn write_inter_frame_leaf(
         if (V_PRED..=D67_PRED).contains(&mode) {
             enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
         }
-        enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+        let uv_mode = usize::from(block.uv_mode);
+        enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
+        if (V_PRED..=D67_PRED).contains(&uv_mode) {
+            enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
+        }
         mode_for_tx = mode;
         // Intra: no vote, but still a coded cell -- mvstack's extended-scan
         // coverage must see it (module doc).
@@ -2970,7 +2989,11 @@ fn write_inter_frame_leaf8(
         if (V_PRED..=D67_PRED).contains(&mode) {
             enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
         }
-        enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+        let uv_mode = usize::from(block.uv_mode);
+        enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
+        if (V_PRED..=D67_PRED).contains(&uv_mode) {
+            enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
+        }
         mode_for_tx = mode;
         // Intra: no vote, but still a coded cell -- mvstack's extended-scan
         // coverage must see it (module doc).
