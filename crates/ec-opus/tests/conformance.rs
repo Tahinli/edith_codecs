@@ -864,17 +864,18 @@ fn roundtrip_own(
     (decoded, bytes)
 }
 
-/// Worst-channel correlation against the source with the encoder's
-/// 120-sample delay removed.
-fn delayed_corr(source: &[f32], decoded: &[f32], channels: usize) -> f64 {
-    const DELAY: usize = 120;
-    let n = (decoded.len() / channels).saturating_sub(DELAY);
+/// Worst-channel correlation against the source with the encoder's own
+/// delay removed — `delay` is [`Encoder::look_ahead`] for the frame size the
+/// round trip used, never a constant (it moved 120 -> 312 when the CELT layer
+/// took libopus's Fs/250 input delay).
+fn delayed_corr(source: &[f32], decoded: &[f32], channels: usize, delay: usize) -> f64 {
+    let n = (decoded.len() / channels).saturating_sub(delay);
     let n = n.min(source.len() / channels);
     let mut worst = 1.0f64;
     for c in 0..channels {
         let a: Vec<f32> = (0..n).map(|i| source[i * channels + c]).collect();
         let b: Vec<f32> = (0..n)
-            .map(|i| decoded[(i + DELAY) * channels + c])
+            .map(|i| decoded[(i + delay) * channels + c])
             .collect();
         worst = worst.min(correlation(&a, &b));
     }
@@ -894,7 +895,7 @@ fn encoder_roundtrips_at_every_rate() {
             let mut enc = Encoder::new(48000, channels, Application::Audio).unwrap();
             enc.set_bitrate(kbps * 1000);
             let (decoded, bytes) = roundtrip_own(&mut enc, &pcm, channels, 960);
-            let corr = delayed_corr(&pcm, &decoded, channels);
+            let corr = delayed_corr(&pcm, &decoded, channels, enc.look_ahead(960));
             let rate = bytes as f64 * 8.0 / 2.0 / 1000.0;
             println!("{channels} ch {kbps:>3} kbps: corr {corr:.4}, actual {rate:.1} kbps");
             let floor = if kbps < 64 { 0.8 } else { 0.9 };
@@ -904,6 +905,30 @@ fn encoder_roundtrips_at_every_rate() {
             );
         }
     }
+}
+
+/// The libopus input alignment ([`Encoder::set_libopus_input_alignment`]):
+/// with it on the CELT layer's advertised delay grows by libopus's
+/// `delay_compensation`, and the decoded signal tracks the source at exactly
+/// that lag and not at the old one — the knob is usable, not just present.
+/// It ships off; the gate tables that rejected it are at the setter.
+#[test]
+fn libopus_input_alignment_delays_and_still_decodes() {
+    let pcm = test_signal(2, 1.0);
+    let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
+    enc.set_bitrate(128_000);
+    assert_eq!(enc.look_ahead(960), 120, "default: one MDCT overlap");
+    enc.set_libopus_input_alignment(true);
+    assert_eq!(enc.look_ahead(960), 312, "overlap + delay_compensation");
+    let (decoded, _) = roundtrip_own(&mut enc, &pcm, 2, 960);
+    let aligned = delayed_corr(&pcm, &decoded, 2, enc.look_ahead(960));
+    let old = delayed_corr(&pcm, &decoded, 2, 120);
+    println!("aligned: corr at 312 {aligned:.4}, at 120 {old:.4}");
+    assert!(aligned >= 0.85, "aligned round trip corr {aligned:.4}");
+    assert!(
+        aligned > old,
+        "advertised delay 312 correlates {aligned:.4}, worse than the old 120 ({old:.4})"
+    );
 }
 
 #[test]
@@ -1271,7 +1296,7 @@ fn encoder_frame_sizes_and_vbr() {
         let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
         enc.set_bitrate(128_000);
         let (decoded, _) = roundtrip_own(&mut enc, &pcm, 2, frame);
-        let corr = delayed_corr(&pcm, &decoded, 2);
+        let corr = delayed_corr(&pcm, &decoded, 2, enc.look_ahead(frame));
         println!("frame {frame}: corr {corr:.4}");
         assert!(corr >= 0.85, "frame {frame}: correlation {corr:.4}");
     }
@@ -1279,7 +1304,7 @@ fn encoder_frame_sizes_and_vbr() {
     enc.set_bitrate(128_000);
     enc.set_vbr_constrained(true);
     let (decoded, bytes) = roundtrip_own(&mut enc, &pcm, 2, 960);
-    let corr = delayed_corr(&pcm, &decoded, 2);
+    let corr = delayed_corr(&pcm, &decoded, 2, enc.look_ahead(960));
     let rate = bytes as f64 * 8.0 / 1.0 / 1000.0;
     println!("cvbr 128k: corr {corr:.4}, actual {rate:.1} kbps");
     assert!(corr >= 0.9, "cvbr: correlation {corr:.4}");
@@ -1303,8 +1328,9 @@ use ec_ogg::OggMuxer;
 
 /// The RFC 7845 identification header for this encoder — built by the crate's
 /// own [`ec_opus::ogg`] helper, so a muxer and the encoder cannot disagree.
-/// `pre_skip` is the encoder's [`Encoder::look_ahead`]: 120, the CELT overlap
-/// delay, for every CELT call site; SILK's own (larger) delay for SILK.
+/// `pre_skip` is the encoder's [`Encoder::look_ahead`]: 312, the CELT overlap
+/// plus its input delay compensation, for every CELT call site; SILK's own
+/// delay for SILK.
 fn opus_head(channels: usize, pre_skip: u16, layout: Option<(usize, usize, &[u8])>) -> Vec<u8> {
     let mapping =
         layout.map(|(streams, coupled, table)| (1u8, streams as u8, coupled as u8, table));
@@ -1404,10 +1430,10 @@ fn oracle_decodes_our_packets_across_the_rate_table() {
             write_ogg_opus(
                 &path,
                 &packets,
-                opus_head(channels, 120, None),
+                opus_head(channels, enc.look_ahead(960) as u16, None),
                 channels,
                 total,
-                120,
+                enc.look_ahead(960) as i64,
             );
             let Some(reference) = ffmpeg_decode(&path, channels) else {
                 eprintln!("ffmpeg unavailable, skipped");
@@ -1533,9 +1559,10 @@ fn five_one_encode_end_to_end() {
     let len = enc.encode_float(&silence, 960, &mut out).expect("encode");
     packets.push(out[..len].to_vec());
     let (streams, coupled, mapping) = enc.layout();
-    let head = opus_head(6, 120, Some((streams, coupled, mapping)));
+    let pre_skip = enc.look_ahead(960);
+    let head = opus_head(6, pre_skip as u16, Some((streams, coupled, mapping)));
     let path = temp_path("5.1.opus");
-    write_ogg_opus(&path, &packets, head, 6, total, 120);
+    write_ogg_opus(&path, &packets, head, 6, total, pre_skip as i64);
     let Some(reference) = ffmpeg_decode(&path, 6) else {
         eprintln!("ffmpeg unavailable, skipped");
         let _ = fs::remove_file(&path);
@@ -1567,7 +1594,8 @@ fn ogg_opus_round_trip_duration_is_exact() {
     enc.set_bitrate(128_000);
     let packets = encode_packets(&mut enc, &pcm, 2);
     let path = temp_path("duration.opus");
-    write_ogg_opus(&path, &packets, opus_head(2, 120, None), 2, total, 120);
+    let pre_skip = enc.look_ahead(960);
+    write_ogg_opus(&path, &packets, opus_head(2, pre_skip as u16, None), 2, total, pre_skip as i64);
     let probe = Command::new("ffprobe")
         .args([
             "-v",
@@ -1591,9 +1619,9 @@ fn ogg_opus_round_trip_duration_is_exact() {
             .unwrap_or(0.0);
         // ffprobe reports Ogg-Opus durations *including* the pre-skip — its
         // own 3.000 s encode probes as 3.0065 (312/48000 more). Ours carries
-        // a 120-sample pre-skip, so exact is 2.0025; the decoded sample
-        // count below is the pre-skip-free half of the claim.
-        let expected = (total as f64 + 120.0) / 48000.0;
+        // the same pre-skip our encoder advertises, so exact is 2.000 s plus
+        // it; the decoded sample count below is the pre-skip-free half.
+        let expected = (total as f64 + pre_skip as f64) / 48000.0;
         assert!(
             (dur - expected).abs() < 1e-6,
             "ffprobe reports {dur} s, expected {expected} s (2.000 s + pre-skip)"
@@ -2081,7 +2109,7 @@ fn silk_mediumband_and_10ms_roundtrip() {
             frame_ms == 10 || voiced > 0,
             "{tag}: no frame coded with LTP"
         );
-        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len()) {
+        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len(), 120) {
             let (c, _) = aligned_corr(&oracle, &decoded, 2000);
             assert!(c >= 0.99, "{tag}: our decode vs oracle decode corr {c:.4}");
         }
@@ -2131,7 +2159,7 @@ fn silk_multiframe_packets_roundtrip() {
         );
         assert!(corr >= floor, "{tag}: corr {corr:.4} below {floor:.4}");
         assert!(voiced > 0, "{tag}: no frame coded with LTP");
-        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len()) {
+        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len(), 120) {
             let (c, _) = aligned_corr(&oracle, &decoded, 2500);
             assert!(
                 c >= 0.99,
@@ -2338,12 +2366,21 @@ fn silk_compares_to_celt_on_speech_at_speech_rates() {
 }
 
 /// Reference oracle decode of `packets` as Ogg-Opus, or `None` without ffmpeg.
-fn oracle_decode(name: &str, packets: &[Vec<u8>], samples: usize) -> Option<Vec<f32>> {
+/// `pre_skip` must be the encoder's advertised [`Encoder::look_ahead`] for
+/// these packets: it is what the oracle trims off the front, so a caller that
+/// compares sample-for-sample against its own decode at that same offset only
+/// lines up when the two agree.
+fn oracle_decode(
+    name: &str,
+    packets: &[Vec<u8>],
+    samples: usize,
+    pre_skip: usize,
+) -> Option<Vec<f32>> {
     if Command::new("ffmpeg").arg("-version").output().is_err() {
         return None;
     }
     let path = temp_path(&format!("{name}.opus"));
-    write_ogg_opus(&path, packets, opus_head(1, 120, None), 1, samples, 120);
+    write_ogg_opus(&path, packets, opus_head(1, pre_skip as u16, None), 1, samples, pre_skip as i64);
     let out = Command::new("ffmpeg")
         .args(["-v", "warning", "-c:a", "libopus", "-i"])
         .arg(&path)
@@ -2390,7 +2427,7 @@ fn silk_nsq_improves_quality_at_equal_rate() {
                 "{name}: corr {corr:.4} (floor {floor}) at {kbps:.1} kbps"
             ));
         }
-        if let Some(oracle) = oracle_decode(&format!("silk-nsq-{name}"), &packets, pcm.len()) {
+        if let Some(oracle) = oracle_decode(&format!("silk-nsq-{name}"), &packets, pcm.len(), 120) {
             let (c, _) = aligned_corr(&oracle, &decoded, 2000);
             assert!(c >= 0.99, "{name}: our decode vs oracle decode corr {c:.4}");
         }
@@ -2485,6 +2522,15 @@ fn hybrid_roundtrip(
 /// The two layers of a hybrid packet reach the decoder's output at the same
 /// delay: a click's low-band-only and high-band-only peaks coincide at the
 /// encoder's documented look-ahead.
+/// The delay [`hybrid_roundtrip`]'s encoder advertises for a 20 ms frame —
+/// [`Encoder::look_ahead`] of that same configuration, so the lag assertions
+/// track the layer's real delay instead of a constant.
+fn hybrid_delay(bps: u32) -> usize {
+    let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+    enc.set_bitrate(bps);
+    enc.look_ahead(960)
+}
+
 #[test]
 fn hybrid_layers_align() {
     let mut click = vec![0f32; 48000];
@@ -2500,29 +2546,26 @@ fn hybrid_layers_align() {
     };
     let (lb, _) = hybrid_roundtrip(&click, 32_000, None, (true, false));
     let (hb, _) = hybrid_roundtrip(&click, 32_000, None, (false, true));
-    let enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+    let delay = hybrid_delay(32_000) as i64;
     let (plb, phb) = (peak(&lb) as i64 - at as i64, peak(&hb) as i64 - at as i64);
-    eprintln!(
-        "hybrid click: LB peak +{plb}, HB peak +{phb}, look_ahead {}",
-        {
-            let mut e = enc.clone();
-            e.set_bitrate(32_000);
-            e.look_ahead(960)
-        }
-    );
-    // A fullband CELT click lands at exactly +120 (`celt_click_peak_offset`);
-    // the band-limited HB layer's main lobe sits up to 2 samples early once
-    // transient frames keep their short blocks, and SILK lands at +121.
+    eprintln!("hybrid click: LB peak +{plb}, HB peak +{phb}, look_ahead {delay}");
+    // A fullband CELT click lands at exactly the encoder's advertised delay
+    // (`celt_click_peak_offset`); the band-limited HB layer's main lobe sits
+    // up to 2 samples early once transient frames keep their short blocks,
+    // and SILK lands one sample late.
     assert!(
         (plb - phb).abs() <= 3,
         "layers misaligned: LB +{plb} vs HB +{phb}"
     );
-    assert!((phb - 120).abs() <= 2, "HB peak +{phb}, look_ahead 120");
+    assert!((phb - delay).abs() <= 2, "HB peak +{phb}, look_ahead {delay}");
 }
 
 /// 20 ms FB hybrid at 32 kbps: decodes in our decoder range-exactly, tracks
 /// the input full-band and in the SILK layer's band alone, and the reference
 /// oracle decodes the packets to the same signal.
+///
+/// The delay [`hybrid_roundtrip`]'s encoder advertises for a 20 ms frame is
+/// [`Encoder::look_ahead`] of that same configuration, never a constant.
 #[test]
 fn hybrid_fb_roundtrip() {
     for (name, pcm) in silk_sources() {
@@ -2540,18 +2583,19 @@ fn hybrid_fb_roundtrip() {
         );
         assert!(corr >= 0.95, "{name}: full-band corr {corr:.4}");
         // +-3: the wav16 fixture is a pure tone, whose phase moves the peak.
+        let delay = hybrid_delay(32_000);
         assert!(
-            (117..=123).contains(&lag),
-            "{name}: aligned at lag {lag}, not the documented 120"
+            (delay - 3..=delay + 3).contains(&lag),
+            "{name}: aligned at lag {lag}, not the advertised {delay}"
         );
         assert!(lb_corr >= 0.9, "{name}: low-band corr {lb_corr:.4}");
         assert!(
             (28.0..=36.0).contains(&kbps),
             "{name}: {kbps:.1} kbps for a 32 kbps CBR target"
         );
-        if let Some(oracle) = oracle_decode(&format!("hybrid-{name}"), &packets, pcm.len()) {
-            let n = oracle.len().min(decoded.len() - 120);
-            let c = correlation(&oracle[..n], &decoded[120..120 + n]);
+        if let Some(oracle) = oracle_decode(&format!("hybrid-{name}"), &packets, pcm.len(), delay) {
+            let n = oracle.len().min(decoded.len() - delay);
+            let c = correlation(&oracle[..n], &decoded[delay..delay + n]);
             eprintln!("hybrid FB {name}: oracle vs ours corr {c:.4}");
             assert!(c >= 0.95, "{name}: oracle corr {c:.4}");
         }
@@ -2659,13 +2703,20 @@ fn hybrid_shapes_roundtrip() {
         assert!(worst >= floor, "{tag}: worst corr {worst:.4}");
         let total = pcm.len() / channels;
         let path = temp_path(&format!("hybrid-{tag}.opus"));
+        // The pre-skip is what `hybrid_roundtrip_shape`'s own encoder
+        // advertises for this frame size, not a constant.
+        let pre_skip = {
+            let mut e = Encoder::new(48000, channels, Application::Voip).unwrap();
+            e.set_bitrate(bps);
+            e.look_ahead(frame)
+        };
         write_ogg_opus(
             &path,
             &packets,
-            opus_head(channels, 120, None),
+            opus_head(channels, pre_skip as u16, None),
             channels,
             total,
-            120,
+            pre_skip as i64,
         );
         if Command::new("ffmpeg").arg("-version").output().is_ok() {
             let out = Command::new("ffmpeg")
