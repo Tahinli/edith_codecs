@@ -5717,3 +5717,104 @@ fn frame_decisions_vs_libopus() {
 }
 
 const NB_BANDS_DIAG: usize = ec_opus::celt::NB_BANDS;
+
+/// The ported tonality analysis (`crates/ec-opus/src/analysis.rs`) must
+/// actually tell speech from music, since `music_prob` is what libopus's mode
+/// and bandwidth decisions read. Drives the real entry surface
+/// (`Encoder::encode_float`) over 30 s of each gate source and reads the
+/// per-frame value back through [`CeltFrameDiag`]. Speech (hein) must land
+/// clearly below the two music sources (naz, zaur).
+#[test]
+#[ignore = "needs the local library sources; run with --ignored"]
+fn analysis_music_prob_separates_speech_from_music() {
+    const SECS: f64 = 30.0;
+    const FRAME: usize = 960;
+    const CHANNELS: usize = 2;
+    let sources: &[(&str, &str, bool)] = &[
+        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3", false),
+        ("naz", "~/Music/naz_aglama_ben_aglarim.mp4", true),
+        ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3", true),
+    ];
+    // Oracle: libopus v1.6 built from source with one fprintf of `analysis_info`
+    // after `run_analysis()` in `opus_encode_native`, fed the same 30 s of
+    // ffmpeg-decoded f32 at the same settings, 1498-1499 valid windows each.
+    // Means of (music_prob, tonality, tonality_slope, activity).
+    let oracle = |tag: &str| -> Option<[f64; 4]> {
+        match tag {
+            "hein" => Some([0.160, 0.155, -0.0876, 0.567]),
+            "naz" => Some([0.991, 0.362, -0.1680, 0.701]),
+            "zaur" => Some([0.977, 0.313, -0.1333, 0.735]),
+            _ => None,
+        }
+    };
+    let mut means: Vec<(String, bool, f64)> = Vec::new();
+    for (tag, path, is_music) in sources {
+        let src = shellexpand(path);
+        if !src.exists() {
+            eprintln!("SKIP {tag}: missing {}", src.display());
+            continue;
+        }
+        let pcm = ffmpeg_decode_pcm(&src, SECS);
+        let mut enc = Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
+        enc.set_bitrate(96_000);
+        enc.set_vbr_constrained(true);
+        let mut out = vec![0u8; 4000];
+        let mut sum = [0.0f64; 4];
+        let mut n = 0usize;
+        let mut valid = 0usize;
+        for chunk in pcm.chunks_exact(FRAME * CHANNELS) {
+            enc.encode_float(chunk, FRAME, &mut out).expect("encode");
+            let d = enc.last_celt_diag();
+            n += 1;
+            if d.analysis_valid {
+                valid += 1;
+                sum[0] += f64::from(d.music_prob);
+                sum[1] += f64::from(d.tonality);
+                sum[2] += f64::from(d.tonality_slope);
+                sum[3] += f64::from(d.activity);
+            }
+        }
+        assert!(valid * 10 > n * 9, "{tag}: analysis valid on only {valid}/{n} frames");
+        let m = sum.map(|v| v / valid as f64);
+        println!(
+            "analysis {tag}: music {:.3} tonality {:.3} slope {:.4} activity {:.3} over {valid}/{n} frames (music={is_music})",
+            m[0], m[1], m[2], m[3]
+        );
+        if let Some(o) = oracle(tag) {
+            for (i, name) in ["music_prob", "tonality", "tonality_slope", "activity"]
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    (m[i] - o[i]).abs() < 0.02,
+                    "{tag} {name}: ours {:.4} vs libopus {:.4}",
+                    m[i],
+                    o[i]
+                );
+            }
+        }
+        means.push(((*tag).to_string(), *is_music, m[0]));
+    }
+    if means.len() < 2 {
+        eprintln!("SKIP: fewer than two sources present");
+        return;
+    }
+    let speech: Vec<_> = means.iter().filter(|m| !m.1).collect();
+    let music: Vec<_> = means.iter().filter(|m| m.1).collect();
+    for s in &speech {
+        assert!(s.2 < 0.5, "{}: speech music_prob {:.3} should be < 0.5", s.0, s.2);
+        for m in &music {
+            assert!(
+                m.2 - s.2 > 0.2,
+                "{} ({:.3}) does not separate from {} ({:.3}) by 0.2",
+                m.0,
+                m.2,
+                s.0,
+                s.2
+            );
+        }
+    }
+    for m in &music {
+        assert!(m.2 > 0.5, "{}: music music_prob {:.3} should be > 0.5", m.0, m.2);
+    }
+}
