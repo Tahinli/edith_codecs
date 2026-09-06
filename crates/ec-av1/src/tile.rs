@@ -411,6 +411,19 @@ pub(crate) fn take_motion_mode_hits() -> [usize; 6] {
     std::array::from_fn(|i| MOTION_MODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// What the `motion_mode`/`obmc` symbol costs, in bits, against the tables
+/// this frame's writer really starts from ([`arm_pricing_cdfs`]) -- the same
+/// tables the coefficients are priced off since lane-av1price2, rather than
+/// the static defaults the symbol used to be estimated with. Falls back to
+/// the default table whenever the search is armed with the defaults (a key
+/// frame, or a screen frame the gate turned off).
+pub(crate) fn obmc_symbol_bits(row: usize, obmc: bool) -> f64 {
+    PRICING_BASE.with_borrow(|slot| match slot.as_deref() {
+        Some(s) => crate::encode::symbol_bits(&s.0.obmc[row], usize::from(obmc)),
+        None => crate::encode::symbol_bits(&crate::cdf::OBMC[row], usize::from(obmc)),
+    })
+}
+
 /// `read_motion_mode`'s write side (spec 5.11.24), called on a
 /// single-reference inter block right after its MV syntax and before the
 /// (never switchable here) interpolation filter -- libaom's own sequential
