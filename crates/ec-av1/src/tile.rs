@@ -2692,6 +2692,7 @@ fn note_palette(n: usize) {
 
 /// Reads [`PALETTE_HITS`] and zeroes it, so a gate can attribute the counts to
 /// its own encode.
+#[cfg(test)]
 pub(crate) fn take_palette_hits() -> [usize; 9] {
     std::array::from_fn(|i| PALETTE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
