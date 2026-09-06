@@ -82,7 +82,39 @@ fn reach_sb_px(fctx: &crate::decode::FrameCtx) -> usize {
 /// third sweep, after the levels were costed through the writer's own CDFs
 /// too, left it there: against 0.2 the ladders are worth -1.19% against -0.98%
 /// on film and -0.20% against -0.14% on screen capture.
-const LAMBDA_SCALE: f64 = 0.1;
+///
+/// The fourth sweep (lane-av1lambda) ran the BD gates themselves rather than
+/// those ladders, and 0.1 was far off the point: the rate term was carrying
+/// roughly twice the weight it is worth. 640x384 gate, BD-rate vs libaom /
+/// vs rav1e for 1080p film, 2160p film, screen capture:
+///
+/// | lambda | 1080p | 2160p | screen |
+/// |--------|-------|-------|--------|
+/// | 0.0125 | +78.0 / +31.3 | +90.8 / +46.5 | +57.2 / -0.3 |
+/// | 0.025  | +71.5 / +28.4 | +87.0 / +46.5 | +50.4 / -3.8 |
+/// | 0.0375 | +71.2 / +28.5 | +84.3 / +45.4 | +48.7 / -4.4 |
+/// | 0.05   | +71.9 / +29.6 | +87.1 / +49.3 | +48.7 / -4.0 |
+/// | 0.075  | +74.8 / +32.7 | +91.3 / +52.8 | +51.4 / -1.3 |
+/// | 0.1    | +79.2 / +36.9 | +97.7 / +58.8 | +53.1 / -0.4 |
+/// | 0.125  | +84.0 / +41.1 | +100.7 / +61.5 | +56.8 / +2.3 |
+/// | 0.15   | +86.0 / +42.9 | +104.4 / +65.2 | +59.5 / +4.2 |
+/// | 0.2    | +89.6 / +45.5 | +109.9 / +69.8 | +62.3 / +7.3 |
+///
+/// and on the native 1920x1024 crops, which is the table that decides:
+///
+/// | lambda | film 1080p | film 2160p | screen |
+/// |--------|------------|------------|--------|
+/// | 0.025  | +17.1 / -0.5 | +49.0 / +21.1 | +51.5 / -15.1 |
+/// | 0.0375 | +16.3 / -1.0 | +47.5 / +19.7 | +50.7 / -15.1 |
+/// | 0.05   | +17.0 / -0.3 | +47.0 / +19.2 | +51.6 / -14.2 |
+/// | 0.1    | +18.1 / +0.9 | +47.1 / +19.0 | +58.3 / -9.8 |
+///
+/// 0.0375 is the best point on two clips of three and costs the 2160p film
+/// +0.4/+0.7, outside the +-0.3 band every other lever here is kept inside,
+/// so 0.05 ships: two clips down on both columns, the 2160p film flat
+/// (-0.1 / +0.2). It also spends ~8% more encode wall, the bits it stopped
+/// refusing.
+const LAMBDA_SCALE: f64 = 0.05;
 
 /// [`LAMBDA_SCALE`], or whatever `EC_AV1_LAMBDA` names when the sweep that
 /// picks it is the thing running. A release build has no such knob.
@@ -93,6 +125,22 @@ fn lambda_scale() -> f64 {
     match swept {
         Some(scale) if cfg!(test) => scale,
         _ => LAMBDA_SCALE,
+    }
+}
+
+/// How a key frame's lambda differs from an inter frame's: libaom weighs the
+/// two apart (`rd_frame_type_factor`, key 128 against an inter frame's 144 out
+/// of 128), because every later frame predicts from the key frame, so an error
+/// left in it is paid for over the whole group. This encoder has no temporal
+/// propagation model at all, and this factor is the cheapest stand-in for one.
+/// Swept by `EC_AV1_LAMBDA_KEY` in a test build, like [`lambda_scale`].
+const KEY_LAMBDA_FACTOR: f64 = 1.0;
+
+/// [`KEY_LAMBDA_FACTOR`], or what `EC_AV1_LAMBDA_KEY` names in a test build.
+fn key_lambda_factor() -> f64 {
+    match std::env::var("EC_AV1_LAMBDA_KEY").ok().and_then(|v| v.parse::<f64>().ok()) {
+        Some(k) if cfg!(test) => k,
+        _ => KEY_LAMBDA_FACTOR,
     }
 }
 
@@ -5261,7 +5309,7 @@ pub(crate) fn encode_key_frame_inner(
     let search = Search {
         base_q_idx,
         deadzone,
-        lambda: lambda_scale() * step * step,
+        lambda: lambda_scale() * key_lambda_factor() * step * step,
         modes,
         top_k: prune_top_k(),
         screen,
@@ -11365,7 +11413,9 @@ mod tests {
     /// decision change the BD gate judges. Re-pinned again on
     /// lane-av1skipctx: the search now prices `txb_skip`/`dc_sign` at the
     /// real neighbour contexts ([`Plane::coef_ctx`]) instead of zero, which
-    /// is the same kind of decision change.
+    /// is the same kind of decision change. Re-pinned on lane-av1lambda:
+    /// [`LAMBDA_SCALE`] moved 0.1 -> 0.05, so every RD decision in the
+    /// search moved with it.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -11387,7 +11437,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7141, 0x3a6a_df46_9b16_d9a7), (60, 25906, 0xbf71_9320_9e50_d237)];
+            [(150, 7130, 0x0415_8aec_b26b_195a), (60, 26185, 0x9e7b_b2c7_672b_c381)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
