@@ -39,6 +39,7 @@ use crate::quant::ac_q;
 use crate::sequence::sequence_header_obu;
 use crate::tile::{
     BlockCoeffs, Coeff, INTRA_MODE_CTX, InterInfo, InterMode, Quadrant, Superblock, partition_bits,
+    sb_coeff_inter_frame_tile, sb_coeff_key_frame_tile,
 };
 use crate::transform::{
     TxType, dequant_and_inverse, dequant_and_inverse_typed, forward_and_quantize,
@@ -121,36 +122,6 @@ pub(crate) fn take_predicted_bits() -> Vec<f64> {
 const SPLIT_INTER_8: bool = true;
 
 /// [`SPLIT_INTER_8`], or what `EC_AV1_SPLIT_INTER8` names in a test build.
-/// Whether a key frame codes `tx_mode == TxMode::Select` and searches each
-/// block's transform depth (lane-av1tx). On by default; `EC_AV1_TX_SELECT=0`
-/// turns it off for an A/B on one build.
-/// Whether an INTER frame also carries `TxMode::Select` (lane-av1tx step 2:
-/// one `txfm_split` flag per inter block, a searched `tx_depth` on every
-/// intra block inside the inter frame). OFF by default and opt-in through
-/// `EC_AV1_TX_SELECT_INTER=1`: the syntax is written but a stream carrying it
-/// is refused by dav1d and by this crate's own decoder, and the first
-/// diverging symbol was not located inside the lane's budget. Key frames are
-/// unaffected -- they are byte-exact with [`tx_select`] on.
-fn tx_select_inter() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("EC_AV1_TX_SELECT_INTER").as_deref(),
-            Ok("1") | Ok("on")
-        )
-    })
-}
-
-fn tx_select() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("EC_AV1_TX_SELECT").as_deref(),
-            Ok("0") | Ok("off")
-        )
-    })
-}
-
 fn split_inter_8() -> bool {
     match std::env::var("EC_AV1_SPLIT_INTER8").ok() {
         Some(v) if cfg!(test) => v != "0",
@@ -980,55 +951,6 @@ impl Plane<'_> {
         }
     }
 
-    /// Codes this block's luma at transform depth `depth`: the
-    /// `(side >> depth)^2` transform units in raster order, each predicted
-    /// from the reconstruction the units before it left behind -- exactly
-    /// what the decoder's multi-transform-unit branch does (decode.rs
-    /// `decode_block`, `tu_reach`) -- and each transformed, quantised and
-    /// reconstructed on its own. Commits the result and hands back the
-    /// block-coordinate levels, the block's squared error and what its
-    /// coefficients cost.
-    fn code_tx_depth(
-        &mut self,
-        at: At,
-        mode: u8,
-        depth: usize,
-        search: &Search, fctx: &crate::decode::FrameCtx,
-    ) -> (Vec<i32>, f64, f64) {
-        let At { x, y, side, reach, .. } = at;
-        let tx = side >> depth;
-        let n = 1usize << depth;
-        let set = match tx {
-            32 => TxbSet::Luma32,
-            16 => TxbSet::Luma16,
-            8 => TxbSet::Luma8,
-            _ => TxbSet::Luma4,
-        };
-        let mut levels = vec![0i32; side * side];
-        let (mut sse, mut bits) = (0.0, 0.0);
-        for tu_row in 0..n {
-            for tu_col in 0..n {
-                let (col_off, row_off) = (tu_col * tx, tu_row * tx);
-                let tu = At {
-                    x: x + col_off,
-                    y: y + row_off,
-                    side: tx,
-                    reach: Reach::of_tu(side, side, col_off, row_off, tx, tx, reach),
-                    set,
-                };
-                let trial = self.trial(tu, mode, search.base_q_idx, search.deadzone, fctx);
-                sse += trial.sse;
-                bits += trial.bits;
-                self.commit(tu.x, tu.y, tx, &trial);
-                for row in 0..tx {
-                    levels[(row_off + row) * side + col_off..][..tx]
-                        .copy_from_slice(&trial.levels[row * tx..][..tx]);
-                }
-            }
-        }
-        (levels, sse, bits)
-    }
-
     /// Writes a trial's reconstruction back into the plane.
     fn commit(&mut self, x: usize, y: usize, side: usize, trial: &Trial) {
         for row in 0..side {
@@ -1753,55 +1675,13 @@ pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
 /// Codes one square of the picture as a single block: searches the luma mode,
 /// codes both chroma planes DC, and hands back the block and what it cost --
 /// squared error plus lambda times the bits its symbols spend.
-/// How many halvings of a `side`-square block's transform the `tx_depth`
-/// symbol can name (libaom's per-size depth cap, `cdf::TX_SIZE_CAT0`'s two
-/// symbols against `CAT1`..`CAT3`'s three), floored at the 4x4 transform.
-fn max_tx_depth(side: usize) -> usize {
-    match side {
-        8 => 1,
-        16 | 32 => 2,
-        _ => 0,
-    }
-}
-
-/// What the `tx_depth` symbol itself costs, off the size category's own CDF.
-/// Priced at context row 0 -- the writer picks the real row from its
-/// neighbours' transform sizes, which the search has no view of; the term is
-/// the same for every depth of one block either way, so it only shifts the
-/// depth-0-versus-split margin, never the ordering between two splits.
-fn tx_depth_bits(side: usize, depth: usize) -> f64 {
-    match side {
-        8 => symbol_bits(&cdf::TX_SIZE_CAT0[0], depth),
-        16 => symbol_bits(&cdf::TX_SIZE_CAT1[0], depth),
-        32 => symbol_bits(&cdf::TX_SIZE_CAT2[0], depth),
-        _ => symbol_bits(&cdf::TX_SIZE_CAT3[0], depth),
-    }
-}
-
-/// How many blocks resolved to each `tx_depth`, the fire count that says
-/// whether the depth search below reaches its candidates at all.
-static TX_DEPTH_HITS: [std::sync::atomic::AtomicUsize; 3] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
-
-/// Reads [`TX_DEPTH_HITS`] and zeroes it, so a gate can attribute the counts
-/// to its own encode.
-#[cfg(test)]
-pub(crate) fn take_tx_depth_hits() -> [usize; 3] {
-    std::array::from_fn(|d| TX_DEPTH_HITS[d].swap(0, std::sync::atomic::Ordering::Relaxed))
-}
-
-#[allow(clippy::too_many_arguments)]
 fn code_square(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
     side: usize,
     search: &Search,
-    mode_bits: &[f64; 13],
-    // The frame header's `tx_mode == TxMode::Select`: the block then searches
-    // its own transform depth ([`Plane::code_tx_depth`]) instead of coding one
-    // transform over its whole side.
-    tx_select: bool, fctx: &crate::decode::FrameCtx,
+    mode_bits: &[f64; 13], fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (luma_set, chroma_set) = if side == BLOCK {
         (TxbSet::Luma32, TxbSet::Chroma16)
@@ -1817,40 +1697,17 @@ fn code_square(
     } else {
         (TxbSet::Luma16, TxbSet::Chroma8)
     };
-    let at = At {
-        x,
-        y,
-        side,
-        reach: Reach::of(side, x, y, luma.true_width, luma.true_height, fctx),
-        set: luma_set,
-    };
-    let (mut luma_coeffs, mode, mut cost) = luma.search_block(at, search, mode_bits, fctx);
-    // The depth search runs on the mode the whole-block transform picked --
-    // libaom's own ordering, and the reason it costs one extra pass per depth
-    // rather than one per (mode, depth) pair.
-    let mut tx_depth = 0u8;
-    if tx_select && max_tx_depth(side) > 0 {
-        let mut best = (
-            cost + search.lambda * tx_depth_bits(side, 0),
-            0usize,
-            luma.snapshot(x, y, side),
-            luma_coeffs,
-        );
-        for depth in 1..=max_tx_depth(side) {
-            let (levels, sse, bits) = luma.code_tx_depth(at, mode, depth, search, fctx);
-            let cost_d = sse
-                + search.lambda
-                    * (bits + mode_bits[usize::from(mode)] + tx_depth_bits(side, depth));
-            if cost_d < best.0 {
-                best = (cost_d, depth, luma.snapshot(x, y, side), coeffs(&levels, side));
-            }
-        }
-        luma.restore(x, y, side, &best.2);
-        cost = best.0;
-        tx_depth = best.1 as u8;
-        luma_coeffs = best.3;
-        TX_DEPTH_HITS[best.1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    let (luma_coeffs, mode, mut cost) = luma.search_block(
+        At {
+            x,
+            y,
+            side,
+            reach: Reach::of(side, x, y, luma.true_width, luma.true_height, fctx),
+            set: luma_set,
+        },
+        search,
+        mode_bits, fctx,
+    );
     // Chroma searches its own mode over [`CHROMA_MODES`], one symbol for both
     // planes; what it costs still counts towards the partition decision.
     let ([u, v], uv_mode, chroma_cost) =
@@ -1863,7 +1720,6 @@ fn code_square(
             luma: luma_coeffs,
             mode,
             uv_mode,
-            tx_depth,
             ..BlockCoeffs::default()
         },
         cost,
@@ -1982,17 +1838,7 @@ fn code_square_inter(
     reference: &Picture,
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
-    let (intra_block, intra_cost) =
-        code_square(
-            luma,
-            chroma,
-            (x, y),
-            side,
-            search,
-            mode_bits,
-            tx_select() && tx_select_inter(),
-            fctx,
-        );
+    let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), side, search, mode_bits, fctx);
     let luma_set = if side == 8 {
         TxbSet::Luma8Inter
     } else {
@@ -2199,7 +2045,6 @@ fn code_square_inter(
                     uv_mode: DC_PRED,
                     skip: skip_new,
                     eight: None,
-                    tx_depth: 0,
                     inter: Some(InterInfo {
                         mode: InterMode::NewMv,
                         mv: new_mv,
@@ -2222,7 +2067,6 @@ fn code_square_inter(
             uv_mode: DC_PRED,
             skip,
             eight: None,
-            tx_depth: 0,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv,
@@ -2618,15 +2462,6 @@ pub(crate) fn encode_key_frame_inner(
     let (seq, mut header) = key_frame_headers_colour(render.0, render.1, base_q_idx, color_config)?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
-    // `TxMode::Select`: every block codes a `tx_depth` symbol and may split
-    // its luma transform below its own side (`crate::tile::write_luma_select`).
-    // Set here rather than in `key_frame_headers_colour` so the header
-    // builders' other callers -- the hand-built tile writers, which code no
-    // depth symbol -- keep the `TxMode::Largest` stream they are written for.
-    let tx_select = tx_select();
-    if tx_select {
-        header.tx_mode = TxMode::Select;
-    }
 
     // Prediction reads no further than this, in each plane's own units --
     // see `Plane::true_width`/`true_height`.
@@ -2779,8 +2614,7 @@ pub(crate) fn encode_key_frame_inner(
                     (x, y),
                     BLOCK,
                     &search,
-                    &mode_bits(above_mode[c0], left_mode[r0]),
-                    tx_select, fctx,
+                    &mode_bits(above_mode[c0], left_mode[r0]), fctx,
                 );
                 cost_whole += search.lambda * partition_bits(BLOCK, false);
                 let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
@@ -2813,8 +2647,7 @@ pub(crate) fn encode_key_frame_inner(
                             (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
                             SUB,
                             &search,
-                            &mode_bits(above_mode[sc], left_mode[sr]),
-                            tx_select, fctx,
+                            &mode_bits(above_mode[sc], left_mode[sr]), fctx,
                         );
                         cost_split += cost;
                         split_modes.push(block.mode);
@@ -2845,8 +2678,7 @@ pub(crate) fn encode_key_frame_inner(
                                 (leaf_x, leaf_y),
                                 8,
                                 &search,
-                                &leaf_mode_bits,
-                                tx_select, fctx,
+                                &leaf_mode_bits, fctx,
                             );
                             cost_split += cost;
                             split_modes.push(leaf.mode);
@@ -2886,13 +2718,7 @@ pub(crate) fn encode_key_frame_inner(
 
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits_sb(&superblocks, base_q_idx));
-    let tile = crate::tile::sb_coeff_key_frame_tile_tx(
-        header.mi_cols,
-        header.mi_rows,
-        base_q_idx,
-        &superblocks,
-        tx_select,
-    )?;
+    let tile = sb_coeff_key_frame_tile(header.mi_cols, header.mi_rows, base_q_idx, &superblocks)?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&sequence_header_obu(&seq)?);
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
@@ -3497,7 +3323,6 @@ fn search_inter_block(
             skip: best.skip,
             inter: best.inter,
             eight: None,
-            tx_depth: 0,
         },
         best.cost,
     )
@@ -3545,14 +3370,6 @@ pub(crate) fn encode_inter_frame(
         inter_frame_headers(render.0, render.1, base_q_idx, order_hint, LAST_SLOT)?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
-    // `TxMode::Select` here too: an inter block then codes one `txfm_split`
-    // flag (kept at zero -- its var-tx tree is not searched yet) and an INTRA
-    // block inside this frame codes and searches its own `tx_depth`, the same
-    // as in a key frame (`crate::tile::write_tx_syntax_inter`).
-    let tx_select = tx_select() && tx_select_inter();
-    if tx_select {
-        header.tx_mode = TxMode::Select;
-    }
 
     let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
     // lane-hbd r4: encoder stays 8-bit by design; narrow the source once
@@ -3976,13 +3793,7 @@ pub(crate) fn encode_inter_frame(
         / modes.len() as f64;
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits(&blocks, base_q_idx));
-    let tile = crate::tile::sb_coeff_inter_frame_tile_tx(
-        header.mi_cols,
-        header.mi_rows,
-        base_q_idx,
-        &blocks,
-        tx_select,
-    )?;
+    let tile = sb_coeff_inter_frame_tile(header.mi_cols, header.mi_rows, base_q_idx, &blocks)?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
 
@@ -4390,7 +4201,6 @@ mod tests {
         // (0..=20, 21..=60, 61..=120, 121..=255), on a single frame size.
         let (width, height) = (64usize, 64usize);
         let picture = test_card(width, height);
-        let _ = take_tx_depth_hits();
         for &q in &[15u8, 45, 100, 200] {
             let encoded = encode_key_frame_with_ctx(&picture, q, 0.5, fctx).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
@@ -4398,18 +4208,6 @@ mod tests {
             assert_eq!(decoded.u, encoded.reconstruction.u, "q={q}: U");
             assert_eq!(decoded.v, encoded.reconstruction.v, "q={q}: V");
         }
-        // lane-av1tx: the exactness above is only a claim about SPLIT
-        // transforms if some block actually split one (`gate-blind-to-feature`
-        // -- with `tx_depth` stuck at 0 every assert here passes on the
-        // pre-lane stream). The test card's edges split at these four
-        // quantizers; the counter is per-process (another test encoding in
-        // parallel can only ADD to it, so this can be masked, never falsely
-        // failed), so it is read once for the whole q ladder.
-        let depths = take_tx_depth_hits();
-        assert!(
-            depths[1] + depths[2] > 0,
-            "no block split its transform: depths {depths:?}"
-        );
     }
 
     /// The minimal repro that isolated the inter-residual desync: a key frame
@@ -4448,7 +4246,6 @@ mod tests {
             uv_mode: 0,
             skip: false,
             eight: None,
-            tx_depth: 0,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
@@ -4469,7 +4266,7 @@ mod tests {
             Quadrant::Whole(skipped_block),
         ];
         let tile =
-            crate::tile::sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
+            sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
                 .unwrap();
 
         // `key.stream` is already a temporal delimiter, the sequence header
@@ -5265,25 +5062,7 @@ mod tests {
         let high = reference[reference.len() - 1]
             .0
             .min(other[other.len() - 1].0);
-        // lane-av1tx: `TxMode::Select` moved the directional ladder clear of
-        // the non-directional one on the synthetic diagonals -- every point
-        // both higher in PSNR *and* lower in rate -- so there is no PSNR band
-        // to integrate over any more. A curve that dominates that way has
-        // saved everything the measure can express (the
-        // `instrument-at-bound` class: the answer is at the instrument's own
-        // edge, not undefined), so name it rather than panicking; anything
-        // less clean than strict dominance still is.
-        if high <= low {
-            let ref_lo_rate = reference.iter().map(|p| p.1).fold(f64::MAX, f64::min);
-            let other_hi_rate = other.iter().map(|p| p.1).fold(f64::MIN, f64::max);
-            let dominates = other[0].0 > reference[reference.len() - 1].0
-                && other_hi_rate <= ref_lo_rate;
-            assert!(
-                dominates,
-                "the two ladders have to overlap in PSNR: {reference:?} vs {other:?}"
-            );
-            return -1.0;
-        }
+        assert!(high > low, "the two ladders have to overlap in PSNR");
         let log_rate_at = |curve: &[(f64, f64)], psnr: f64| {
             let i = curve
                 .windows(2)
@@ -5564,12 +5343,7 @@ mod tests {
         // CDF while the writer codes it against an adapted one -- 311 -> 319
         // bytes at q 120->121 on this picture. The table this gate is really
         // watching would move the rate by far more than the mode churn does.
-        // lane-av1tx widened it again, 5% -> 10%: under `TxMode::Select` the
-        // same block can also change transform DEPTH between two neighbouring
-        // quantizers (297 -> 315 bytes at q 120->121 here), and the depth
-        // symbol is priced off the static CDF row 0 for the same reason the
-        // uv_mode one is.
-        // Ceiling: a q-context table wrong by under 10% would pass. Upgrade
+        // Ceiling: a q-context table wrong by under 5% would pass. Upgrade
         // path is pricing through the adapting CDF state (what
         // `predicted_coeff_bits_track_the_tile_the_writer_wrote` measures the
         // drift of), after which the exact bound comes back.
@@ -5577,7 +5351,7 @@ mod tests {
             let lo_bytes = encode_key_frame_with_ctx(&picture, lo, 0.5, fctx).unwrap().stream.len();
             let hi_bytes = encode_key_frame_with_ctx(&picture, hi, 0.5, fctx).unwrap().stream.len();
             assert!(
-                hi_bytes as f64 <= lo_bytes as f64 * 1.10,
+                hi_bytes as f64 <= lo_bytes as f64 * 1.05,
                 "q {lo}->{hi} crosses a context boundary: {lo_bytes} -> {hi_bytes} bytes"
             );
         }
@@ -6835,23 +6609,6 @@ mod tests {
                         "{}={n} ({:.1}%)",
                         UV_MODE_NAMES[m],
                         100.0 * n as f64 / uv_total.max(1) as f64
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            // Which transform depth the intra blocks of this clip's key
-            // frames resolved to (lane-av1tx): depth 0 is one transform over
-            // the whole block, 1 and 2 its halvings.
-            let depths = take_tx_depth_hits();
-            let depth_total: usize = depths.iter().sum();
-            eprintln!(
-                "{name}: intra tx depths {}",
-                depths
-                    .iter()
-                    .enumerate()
-                    .map(|(d, &n)| format!(
-                        "{d}={n} ({:.1}%)",
-                        100.0 * n as f64 / depth_total.max(1) as f64
                     ))
                     .collect::<Vec<_>>()
                     .join(" ")
