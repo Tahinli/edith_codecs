@@ -450,10 +450,44 @@ impl Default for Pyramid {
     /// helps for the same reason (2:-16:8 is the only arm that beats flat on
     /// any clip, and it beats it on the clip with the fastest motion).
     ///
-    /// quantizer offsets behave. Nothing selects the pyramid but an explicit
+    /// RE-SWEPT on lane-av1pyrgate, once the content gate below existed and
+    /// on the current defaults (`LAMBDA_SCALE` 0.0275, the 32x32 tx-depth
+    /// search and compound var-tx on): the earlier verdicts were taken with
+    /// the screen capture inside the arm, and it is the one clip a pyramid
+    /// never helps. With the gate, the screen row is the flat row by
+    /// construction, so the sweep is decided on the two real films
+    /// (`encode::tests::bd_rate_screen_native`, BD-rate vs libaom / vs
+    /// rav1e; bars are fixtures, recorded only):
+    ///
+    /// | arm | film A | film B | screen | bars 1080p | bars 2160p |
+    /// |---|---|---|---|---|---|
+    /// | flat (no pyramid) | +62.8 / +32.5 | +86.3 / +50.5 | +50.1 / -15.4 | +16.4 / -1.1 | +48.2 / +20.4 |
+    /// | 2:-16:8 | +60.3 / +29.1 | +83.6 / +50.2 | +50.1 / -15.4 | +24.0 / +5.9 | +47.2 / +20.2 |
+    /// | **4:-16:8** | **+54.1 / +24.2** | **+82.6 / +47.4** | +50.1 / -15.4 | +21.5 / +3.7 | +48.3 / +20.4 |
+    /// | 8:-16:8 | +55.9 / +25.8 | +83.6 / +47.3 | +50.1 / -15.4 | +19.8 / +2.0 | +48.7 / +20.4 |
+    /// | 4:-24:12 | +51.5 / +22.3 | +84.9 / +50.3 | +50.1 / -15.4 | +21.9 / +4.0 | +48.4 / +20.7 |
+    /// | 4:-12:6 | +57.6 / +27.1 | +84.8 / +49.3 | +50.1 / -15.4 | +21.7 / +3.9 | +48.8 / +20.9 |
+    ///
+    /// `4:-16:8` is the only arm that improves BOTH films on BOTH columns by
+    /// several points (-8.7 / -8.3 on film A, -3.7 / -3.1 on film B) and it
+    /// stays these defaults. `4:-24:12` buys another 2.6 on film A and gives
+    /// 2.3 back on film B (where it barely beats flat vs rav1e, -0.2), which
+    /// is the same "leaves cannot cash in the ARF's quality" shape as before,
+    /// now content-dependent rather than uniform. The screen column is
+    /// IDENTICAL in every arm -- that is the content gate, measured, not
+    /// asserted. `EC_AV1_LAMBDA=0.035` on top of `4:-16:8` was re-judged once
+    /// (the pyramid changes the reference structure): +54.5 / +24.5 and
+    /// +85.2 / +49.4, worse on both films, so 0.0275 stands.
+    ///
+    /// Nothing selects the pyramid but an explicit
     /// [`Av1Encoder::with_pyramid`] call (or `EC_AV1_PYRAMID` on the gate and
     /// on `ec-bench`); the default one-in-one-out path is byte-identical to
-    /// before it existed.
+    /// before it existed. Making it the DEFAULT needs the same reordering in
+    /// [`crate::encode::encode_sequence`] first -- the facade is pinned byte
+    /// for byte to that path
+    /// (`encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence`),
+    /// so a pyramid the facade takes by default and the sequence path cannot
+    /// would break that pin rather than ship a gain.
     fn default() -> Self {
         Self {
             mini_gop: 4,
