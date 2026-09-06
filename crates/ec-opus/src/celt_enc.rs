@@ -1457,6 +1457,19 @@ impl CeltEncoder {
     }
 
     /// `alloc_trim_analysis()`: stereo correlation plus spectral tilt.
+    ///
+    /// This is the pre-1.1 libopus discrete ladder, not the continuous 1.3
+    /// form. MEASURED (lane opustr r1, `lanes/opus-opustr-r1.sweep.txt`): the
+    /// whole 1.3 float function -- `trim += max(-4, .75*log2(1.001-sum^2))`,
+    /// `trim -= clamp(-2, 2, (diff+1)/6)` with `diff /= C*(end-1)`, and the
+    /// transient term `trim -= 2*tf_estimate` -- moves the 12-row library gate
+    /// 5 rows better / 4 worse on err_ratio (zaur@64 1.510->1.049, naz@96
+    /// 4.499->2.458, nik@64 .708->.648, dl8a .552/.374->.487/.336; against
+    /// naz@64 2.697->2.872, her@96 1.051->1.085, nik@96 .985->1.006, her@64
+    /// 1.103->1.109) and costs corr on every row (nik@64 .9887->.9878,
+    /// dl8a@64 .9889->.9879). The KEEP rule rejects it; this is the third
+    /// rejection of the same port (see `lanes/opus-trim-r2.{A,B}.sweep.txt`).
+    /// Do not re-port it without a fix for the transient rows first.
     fn alloc_trim_analysis(&mut self, end: usize, lm: usize, c: usize, n0: usize) -> i32 {
         let mut trim = 5i32;
         if c == 2 {
@@ -1822,6 +1835,13 @@ impl CeltEncoder {
         }
         if selcost[1] < selcost[0] && is_transient {
             tf_select = 1;
+        }
+        if std::env::var_os("EC_OPUS_TF_DEBUG").is_some() {
+            eprintln!(
+                "tf: trans {is_transient} lm {lm} tfe {tf_estimate:.4} bias {bias:.5} \
+                 lambda {lambda} sel {tf_select} selcost {selcost:?} metric {:?} imp {:?}",
+                &metric[..len], &importance[..len]
+            );
         }
 
         // Final Viterbi forward pass

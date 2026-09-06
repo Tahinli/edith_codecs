@@ -5541,3 +5541,122 @@ fn err_map_vs_libopus() {
     let _ = fs::remove_file(&scratch);
     println!("wrote {}", out_path.display());
 }
+
+/// Per-frame ours-vs-libopus coded decisions over a window of frames, decoded
+/// with our own decoder on both sides. FRAME_SRC / FRAME_KBPS / FRAME_FROM /
+/// FRAME_TO pick the source, rate and frame range (diagnostic).
+#[test]
+#[ignore]
+fn frame_decisions_vs_libopus() {
+    const CH: usize = 2;
+    let src_s = std::env::var("FRAME_SRC")
+        .unwrap_or_else(|_| "~/Music/naz_aglama_ben_aglarim.mp4".into());
+    let src = shellexpand(&src_s);
+    if !src.exists() {
+        eprintln!("SKIP: missing {}", src.display());
+        return;
+    }
+    let kbps: u32 = std::env::var("FRAME_KBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let from: usize = std::env::var("FRAME_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let to: usize = std::env::var("FRAME_TO").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    let secs = (to as f64 * 0.02 + 1.0).max(2.0);
+    let pcm = ffmpeg_decode_pcm(&src, secs);
+    let scratch = std::env::temp_dir().join("ec-opus-frame-dec.opus");
+    ffmpeg_encode_libopus(&src, kbps, &scratch, secs);
+    let ref_pkts: Vec<Vec<u8>> =
+        ogg_packets(&fs::read(&scratch).unwrap()).into_iter().skip(2).collect();
+
+    let show = |tag: &str, f: usize, bytes: usize, d: &ec_opus::celt::CeltDecDiag| {
+        let e: Vec<String> = d.old_band_e[..NB_BANDS_DIAG].iter().map(|v| format!("{v:.1}")).collect();
+        println!(
+            "f{f} {tag}: bytes {bytes} sil {} intra {} trans {} ac {} trim {} spread {} cb {} \
+             tf {:?} pulses {:?} fine {:?} E {}",
+            d.silence, d.intra, d.transient, d.anti_collapse, d.alloc_trim, d.spread,
+            d.coded_bands, &d.tf_res[..NB_BANDS_DIAG], &d.pulses[..NB_BANDS_DIAG],
+            &d.fine_quant[..NB_BANDS_DIAG], e.join(",")
+        );
+    };
+
+    let mut d = Decoder::new(48000, CH).unwrap();
+    let mut buf = vec![0.0f32; 5760 * CH];
+    let mut ref_rows = Vec::new();
+    for p in ref_pkts.iter().take(to) {
+        let ok = !p.is_empty()
+            && ec_opus::Toc::new(p[0]).mode() != Mode::Silk
+            && d.decode_float(p, &mut buf).is_ok();
+        ref_rows.push(if ok { Some((p.len(), d.last_celt_diag().clone())) } else { None });
+    }
+
+    let mut enc = Encoder::new(48000, CH, Application::Audio).unwrap();
+    enc.set_bitrate(kbps * 1000);
+    enc.set_vbr_constrained(true);
+    let mut dec = Decoder::new(48000, CH).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut ours_rows = Vec::new();
+    for block in pcm.chunks_exact(960 * CH).take(to) {
+        let n = enc.encode_float(block, 960, &mut out).unwrap();
+        let ok = ec_opus::Toc::new(out[0]).mode() != Mode::Silk
+            && dec.decode_float(&out[..n], &mut buf).is_ok();
+        ours_rows.push(if ok { Some((n, dec.last_celt_diag().clone())) } else { None });
+    }
+
+    if to - from <= 40 {
+        for f in from..to {
+            match ours_rows.get(f).and_then(|x| x.as_ref()) {
+                Some((n, d)) => show("ours", f, *n, d),
+                None => println!("f{f} ours: (silk/absent)"),
+            }
+            match ref_rows.get(f).and_then(|x| x.as_ref()) {
+                Some((n, d)) => show("ref ", f, *n, d),
+                None => println!("f{f} ref : (silk/absent)"),
+            }
+        }
+    }
+
+    // Aggregate over the frames BOTH sides coded as CELT, split by whether
+    // either side called the frame transient: which coded decision differs.
+    let mut agg = [(0usize, [0.0f64; 8]); 2];
+    let mut trans_diff = 0usize;
+    for f in from..to {
+        let (Some((no, o)), Some((nr, r))) =
+            (ours_rows.get(f).and_then(|x| x.as_ref()), ref_rows.get(f).and_then(|x| x.as_ref()))
+        else {
+            continue;
+        };
+        if o.transient != r.transient {
+            trans_diff += 1;
+        }
+        let slot = usize::from(o.transient || r.transient);
+        let tf = |d: &ec_opus::celt::CeltDecDiag| {
+            d.tf_res[..NB_BANDS_DIAG].iter().sum::<i32>() as f64 / NB_BANDS_DIAG as f64
+        };
+        let a = &mut agg[slot];
+        a.0 += 1;
+        for (k, v) in [
+            *no as f64, *nr as f64,
+            o.alloc_trim as f64, r.alloc_trim as f64,
+            tf(o), tf(r),
+            f64::from(u8::from(o.anti_collapse)), f64::from(u8::from(r.anti_collapse)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            a.1[k] += v;
+        }
+    }
+    println!("frames {from}..{to}, transient-flag disagreements {trans_diff}");
+    for (slot, name) in [(1usize, "transient"), (0, "steady ")] {
+        let (n, v) = agg[slot];
+        if n == 0 {
+            continue;
+        }
+        let m = |k: usize| v[k] / n as f64;
+        println!(
+            "{name} n={n}: bytes o {:.1} r {:.1} | trim o {:.2} r {:.2} | mean tf_res o {:.3} \
+             r {:.3} | anti_collapse o {:.2} r {:.2}",
+            m(0), m(1), m(2), m(3), m(4), m(5), m(6), m(7)
+        );
+    }
+}
+
+const NB_BANDS_DIAG: usize = ec_opus::celt::NB_BANDS;
