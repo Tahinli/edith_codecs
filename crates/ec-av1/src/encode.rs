@@ -2616,6 +2616,10 @@ fn search_inter_block(
     reference: &Picture,
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> BlockCoeffs {
+    // `luma_set` is the INTRA candidates' table; the two inter candidates
+    // below price their coefficients through `TxbSet::Luma32Inter`, which is
+    // what `sb_coeff_inter_frame_tile` codes an inter block with (it carries
+    // the inter `tx_type` symbol `Luma32` has no table for -- lane-av1rd1).
     let (luma_set, chroma_set) = (TxbSet::Luma32, TxbSet::Chroma16);
     let reach = Reach::of(BLOCK, x, y, luma.true_width, luma.true_height, fctx);
 
@@ -2781,7 +2785,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            luma_set, fctx,
+            TxbSet::Luma32Inter, fctx,
         );
         let u = mc_trial(
             &chroma[0],
@@ -2882,7 +2886,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            luma_set, fctx,
+            TxbSet::Luma32Inter, fctx,
         );
         let u = mc_trial(
             &chroma[0],
