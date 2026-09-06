@@ -134,6 +134,25 @@ fn lambda_scale() -> f64 {
 /// left in it is paid for over the whole group. This encoder has no temporal
 /// propagation model at all, and this factor is the cheapest stand-in for one.
 /// Swept by `EC_AV1_LAMBDA_KEY` in a test build, like [`lambda_scale`].
+///
+/// MEASURED and NOT KEPT. 640x384 gate at [`LAMBDA_SCALE`] 0.05, BD vs
+/// libaom / vs rav1e:
+///
+/// | k_key | 1080p | 2160p | screen |
+/// |---|---|---|---|
+/// | 1.0 | +71.9 / +29.6 | +87.1 / +49.3 | +48.7 / -4.0 |
+/// | 0.85 | +71.5 / +29.4 | +87.0 / +48.3 | +49.7 / -3.9 |
+/// | 0.7 | +71.3 / +28.9 | +87.2 / +48.6 | +49.4 / -4.1 |
+/// | 0.5 | +71.4 / +28.9 | +88.7 / +49.6 | +50.1 / -3.4 |
+///
+/// The two films want the key frame coded finer and the screen capture wants
+/// the opposite, by about the same amount, and at native the whole lever is
+/// inside the +-0.3 band that decides nothing: k_key 0.7 reads +16.9 / -0.3,
+/// +47.2 / +19.2, +51.4 / -14.7 against 1.0's +17.0 / -0.3, +47.0 / +19.2,
+/// +51.6 / -14.2. A gate whose GOP is one key frame in twelve cannot see a
+/// per-frame-type weight; the real lever here is temporal propagation
+/// (libaom's `tpl`), which weighs each BLOCK by how much of it later frames
+/// predict from, not each frame.
 const KEY_LAMBDA_FACTOR: f64 = 1.0;
 
 /// [`KEY_LAMBDA_FACTOR`], or what `EC_AV1_LAMBDA_KEY` names in a test build.
@@ -2515,8 +2534,16 @@ impl Reach {
 /// film -- 85% of them, far past libaom's own rate -- and costs another 0.3
 /// BD points on top of the 0.4 the 32x32 candidate already costs. A tool
 /// that wins the local RD on five blocks in six and loses ladder bytes is
-/// the `local-RD-on-references` class again, not a missing footprint. The
-/// tool stays OFF by default; the upgrade path is the price, not the size
+/// the `local-RD-on-references` class again, not a missing footprint.
+///
+/// RE-MEASURED on lane-av1lambda at [`LAMBDA_SCALE`] 0.05 (min side 8):
+/// +16.7 / -0.5, +47.1 / +19.2, +51.8 / -14.2 against the same build with
+/// the knob off (+17.0 / -0.3, +47.0 / +19.2, +51.6 / -14.2). The 0.7-point
+/// loss on the 1080p film became a 0.3-point win and the other two rows went
+/// 0.1-0.2 the other way, so OBMC is now neutral rather than a loss -- half
+/// of the "local win, ladder loss" it was charged with was the rate weight.
+/// It still does not meet the keep rule (two down, one flat, both columns).
+/// The tool stays OFF by default; the upgrade path is the price, not the size
 /// (the 640x384 arm reads +78.9/+36.4, +94.9/+56.3, +54.2/+0.8 at min side 8
 /// against +78.8/+36.1, +95.1/+56.4, +54.5/+1.1 off -- two rows down, the
 /// 1080p film up, i.e. the same disagreement between the two gates).
@@ -2570,6 +2597,24 @@ fn motion_mode_bits(write_w: usize, write_h: usize, motion: u8, warp_alphabet: b
 /// this is a measured loss, not an inert knob. Same shape as the OBMC
 /// candidate above it (`obmc_min_side`): a local RD win that does not convert
 /// into ladder bytes.
+///
+/// RE-MEASURED on lane-av1lambda, after [`LAMBDA_SCALE`] moved 0.1 -> 0.05,
+/// because a tool whose gain is local and whose cost is the rate it adds is
+/// exactly what a halved rate weight re-judges. The verdict FLIPS SIGN:
+///
+/// | clip | warp on | off (both at lambda 0.05) |
+/// |---|---|---|
+/// | film 1080p | +16.7 / -0.5 | +17.0 / -0.3 |
+/// | film 2160p | +47.0 / +19.1 | +47.0 / +19.2 |
+/// | screen | +51.3 / -14.3 | +51.6 / -14.2 |
+///
+/// two rows down against libaom (0.3 each) with the third flat, and the rav1e
+/// column inside 0.1 everywhere -- which reads as a keep rather than the
+/// 0.7/0.9 loss it was. The knob still ships OFF here: the margin is 0.3 BD
+/// points on a table whose other levers move whole points, and turning warp
+/// on by default is a stream-feature change (`enable_warped_motion` in the
+/// sequence header) that wants its own conformance pass, not a lambda lane's
+/// side effect.
 ///
 /// The WARPED_CAUSAL prediction of one square single-reference block: the
 /// decoder's own warp-sample walk (`decode::find_samples` +
