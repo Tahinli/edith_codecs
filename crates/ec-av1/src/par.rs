@@ -56,11 +56,21 @@ pub(crate) fn set_filter_threads(n: usize) {
 }
 
 /// `EC_AV1_TILE_THREADS`, how many workers the ENCODER spreads a frame's
-/// tiles across (default 1 = the shipped single-threaded write). Tiles are
-/// entropy-independent by construction (each starts from the frame's own
-/// tables and resets its own contexts), so the bytes a frame comes out as do
-/// not depend on this -- `encoder::tests::tile_bytes_do_not_depend_on_the_
+/// tiles across -- both the RD/motion SEARCH (`encode::search_tiles`) and the
+/// entropy WRITE (`encode::write_tiles`); default 1 = the shipped
+/// single-threaded encode. Tiles are independent by construction (each starts
+/// from the frame's own tables, resets its own contexts, and reads no sample
+/// and no mode outside its own rectangle), so the bytes a frame comes out as
+/// do not depend on this -- `encoder::tests::tile_bytes_do_not_depend_on_the_
 /// thread_count` is the pin.
+///
+/// Measured (lane-av1tsearch, 12-core box, best of two interleaved passes):
+/// 1920x1080, 12 frames -- 11.49 s at one tile (any thread count), 6.98 s at
+/// 4x2 tiles and 8 threads (1.65x, 1.04 -> 1.72 fps); 3840x1608, 6 frames --
+/// 17.12 s at 4x2 tiles and one thread, 8.64 s at 8 (1.98x, 0.35 -> 0.69
+/// fps). Past ~8 tiles the extra tiles cost bytes without buying wall: what
+/// is left is the per-frame serial tail (the filter search re-decodes the
+/// whole frame), ~43% of an inter frame by Amdahl on those numbers.
 static TILE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn tile_threads() -> usize {
