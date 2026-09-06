@@ -1839,6 +1839,171 @@ mod tests {
         crate::par::set_tile_threads(1);
     }
 
+    /// What the per-tile search (lane-av1tsearch) is worth in wall and in
+    /// frames per second at the editor's own export sizes: every tile layout
+    /// crossed with every tile-thread count, plus librav1e at the matching
+    /// `tile_cols`/`tile_rows`/`threads` as the reference point. Two passes
+    /// over the whole table (A,B,A,B... rather than AA,BB) with the best of
+    /// the two kept, so a thermal drift cannot order the rows.
+    ///
+    /// Measurement, not a pass/fail gate: it asserts only that every cell
+    /// produced a stream.
+    #[test]
+    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    fn tile_search_wall_1080p() {
+        tile_search_wall(1920, 1080, 12, &[(0, 0), (1, 0), (1, 1), (2, 1)], &[1, 2, 4, 8]);
+    }
+
+    /// The same table at the 4K frame size the editor exports (3840x1608),
+    /// at the two layouts with enough tiles to fill this box.
+    #[test]
+    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    fn tile_search_wall_4k() {
+        tile_search_wall(3840, 1608, 6, &[(2, 1), (3, 2)], &[1, 8, 12]);
+    }
+
+    fn tile_search_wall(
+        width: usize,
+        height: usize,
+        frames: usize,
+        layouts: &[(u32, u32)],
+        threads: &[usize],
+    ) {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let Some(sources) = h264_clip_frames(width, height, frames) else {
+            eprintln!("SKIP the tile-search wall table: no fixture or no ffmpeg");
+            return;
+        };
+        let run = |cols_log2: u32, rows_log2: u32, t: usize| -> (std::time::Duration, usize) {
+            crate::par::set_tile_threads(t);
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: frames,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: cols_log2,
+                tile_rows_log2: rows_log2,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let start = std::time::Instant::now();
+            let mut bytes = 0usize;
+            for picture in &sources {
+                bytes += enc.encode(picture).unwrap().data.len();
+            }
+            (start.elapsed(), bytes)
+        };
+        let cells: Vec<((u32, u32), usize)> = layouts
+            .iter()
+            .flat_map(|&l| threads.iter().map(move |&t| (l, t)))
+            .collect();
+        let mut best: Vec<Option<(std::time::Duration, usize)>> = vec![None; cells.len()];
+        for _pass in 0..2 {
+            for (i, &((c, r), t)) in cells.iter().enumerate() {
+                let got = run(c, r, t);
+                assert!(got.1 > 0, "{}x{} tiles at {t} threads: empty stream", 1 << c, 1 << r);
+                if best[i].is_none_or(|(w, _)| got.0 < w) {
+                    best[i] = Some(got);
+                }
+            }
+        }
+        crate::par::set_tile_threads(1);
+        eprintln!("\n{width}x{height}, {frames} frames, base_q_idx 120 -- best of two passes");
+        eprintln!("| layout | tiles | threads | wall | fps | speedup vs 1 tile 1 thread | bytes |");
+        let base = best[0].expect("the first cell ran").0.as_secs_f64();
+        for (i, &((c, r), t)) in cells.iter().enumerate() {
+            let (wall, bytes) = best[i].expect("every cell ran");
+            let secs = wall.as_secs_f64();
+            eprintln!(
+                "| {}x{} | {} | {t} | {secs:.2}s | {:.2} | {:.2}x | {bytes} |",
+                1 << c,
+                1 << r,
+                1 << (c + r),
+                frames as f64 / secs,
+                base / secs,
+            );
+        }
+        // Parallel efficiency per layout: what the extra threads actually
+        // took off that layout's own single-threaded wall, and so what share
+        // of the added cores sat idle.
+        for &(c, r) in layouts {
+            let one = cells
+                .iter()
+                .position(|&(l, t)| l == (c, r) && t == threads[0])
+                .map(|i| best[i].expect("cell").0.as_secs_f64());
+            let Some(one) = one else { continue };
+            for &t in &threads[1..] {
+                let i = cells.iter().position(|&(l, tt)| l == (c, r) && tt == t).expect("cell");
+                let secs = best[i].expect("cell").0.as_secs_f64();
+                let workers = (t.min(1 << (c + r))) as f64 / threads[0] as f64;
+                let speedup = one / secs;
+                eprintln!(
+                    "{}x{} tiles, {} -> {t} threads: {speedup:.2}x of a possible {workers:.2}x, \
+                     idle share {:.0}%",
+                    1 << c,
+                    1 << r,
+                    threads[0],
+                    100.0 * (1.0 - speedup / workers).max(0.0),
+                );
+            }
+        }
+        rav1e_wall_reference(width, height, frames, layouts, threads);
+    }
+
+    /// librav1e at the same sizes, layouts and thread counts, through ffmpeg
+    /// -- the reference the wall table is read against.
+    fn rav1e_wall_reference(
+        width: usize,
+        height: usize,
+        frames: usize,
+        layouts: &[(u32, u32)],
+        threads: &[usize],
+    ) {
+        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
+        let listed = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output();
+        let has_rav1e = listed
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("librav1e"))
+            .unwrap_or(false);
+        if !has_rav1e || !clip.exists() {
+            eprintln!("SKIP the rav1e reference: no librav1e or no fixture");
+            return;
+        }
+        eprintln!("| rav1e layout | threads | wall | fps | bytes |");
+        for &(c, r) in layouts {
+            for &t in threads {
+                let out = std::env::temp_dir().join(format!("ec-av1-rav1e-{}.ivf", std::process::id()));
+                let params = format!(
+                    "speed=6:quantizer=100:tile_cols={}:tile_rows={}:threads={t}",
+                    1 << c,
+                    1 << r
+                );
+                let start = std::time::Instant::now();
+                let status = Command::new("ffmpeg")
+                    .args(["-v", "error", "-y", "-i", clip.to_str().unwrap()])
+                    .args(["-frames:v", &frames.to_string()])
+                    .args(["-vf", &format!("scale={width}:{height}")])
+                    .args(["-c:v", "librav1e", "-rav1e-params", &params])
+                    .arg(out.to_str().unwrap())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                let secs = start.elapsed().as_secs_f64();
+                if !status.status.success() {
+                    eprintln!("| {}x{} | {t} | FAILED: {} |", 1 << c, 1 << r, String::from_utf8_lossy(&status.stderr).lines().last().unwrap_or(""));
+                    continue;
+                }
+                let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                let _ = std::fs::remove_file(&out);
+                eprintln!(
+                    "| {}x{} | {t} | {secs:.2}s | {:.2} | {bytes} |",
+                    1 << c,
+                    1 << r,
+                    frames as f64 / secs
+                );
+            }
+        }
+    }
+
     /// The same round trip at a real 1920x1080 crop of the gate's own clip
     /// -- the size the editor's export actually runs at, where a tile grid
     /// is worth having. Ignored by default only for its wall (a 1080p
