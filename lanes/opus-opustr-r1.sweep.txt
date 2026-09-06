@@ -1,0 +1,14 @@
+# lane-opustr r1 REVERTED: libopus-1.3 alloc_trim_analysis port (continuous tilt + 0.75*logXC stereo + 2*tf_estimate transient term)
+# vs lanes/opus-opus64-r3.sweep.txt. 12 rows (sadie.wav gone, its 2 rows SKIP).
+nik@64k: ref 69.2 ours 69.1 kbps (-0.1%), corr o=0.9878 r=0.9864 gap=-0.0015, Q o=-82.01 r=-154.78, err_ratio 0.648, minsec o=0.9760 r=0.9745, drop o=0 r=0
+nik@96k: ref 101.0 ours 100.9 kbps (-0.1%), corr o=0.9942 r=0.9940 gap=-0.0001, Q o=-32.19 r=-31.55, err_ratio 1.006, minsec o=0.9880 r=0.9888, drop o=0 r=0
+zaur@64k: ref 63.6 ours 63.6 kbps (-0.0%), corr o=0.9890 r=0.9866 gap=-0.0023, Q o=-131.74 r=-123.36, err_ratio 1.049, minsec o=0.9700 r=0.9686, drop o=0 r=0
+zaur@96k: ref 93.9 ours 93.4 kbps (-0.5%), corr o=0.9944 r=0.9937 gap=-0.0007, Q o=-109.23 r=-125.18, err_ratio 0.910, minsec o=0.9859 r=0.9854, drop o=0 r=0
+her@64k: ref 67.9 ours 67.7 kbps (-0.4%), corr o=0.9827 r=0.9794 gap=-0.0033, Q o=-367.34 r=-339.00, err_ratio 1.109, minsec o=0.9463 r=0.9406, drop o=0 r=0
+her@96k: ref 101.5 ours 101.0 kbps (-0.5%), corr o=0.9910 r=0.9902 gap=-0.0007, Q o=-208.80 r=-191.50, err_ratio 1.085, minsec o=0.9719 r=0.9728, drop o=0 r=0
+naz@64k: ref 71.3 ours 71.3 kbps (-0.0%), corr o=0.9900 r=0.9880 gap=-0.0020, Q o=-369.03 r=-128.39, err_ratio 2.872, minsec o=0.9711 r=0.9644, drop o=0 r=0
+naz@96k: ref 105.4 ours 105.3 kbps (-0.0%), corr o=0.9951 r=0.9948 gap=-0.0003, Q o=-165.27 r=-29.16, err_ratio 2.458, minsec o=0.9847 r=0.9804, drop o=0 r=0
+dl8a@64k: ref 65.8 ours 65.7 kbps (-0.1%), corr o=0.9879 r=0.9865 gap=-0.0014, Q o=-200.20 r=-378.84, err_ratio 0.487, minsec o=0.9773 r=0.9723, drop o=0 r=0
+dl8a@96k: ref 96.8 ours 96.5 kbps (-0.3%), corr o=0.9936 r=0.9934 gap=-0.0002, Q o=-156.64 r=-423.47, err_ratio 0.336, minsec o=0.9870 r=0.9864, drop o=0 r=0
+hein@64k: ref 64.9 ours 64.8 kbps (-0.2%), corr o=0.9886 r=0.9874 gap=-0.0013, Q o=-344.06 r=-388.31, err_ratio 0.853, minsec o=0.9318 r=0.9148, drop o=0 r=0
+hein@96k: ref 86.9 ours 86.8 kbps (-0.2%), corr o=0.9945 r=0.9930 gap=-0.0015, Q o=-117.93 r=-246.46, err_ratio 0.528, minsec o=0.9689 r=0.9499, drop o=0 r=0

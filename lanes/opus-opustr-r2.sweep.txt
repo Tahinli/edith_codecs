@@ -1,0 +1,14 @@
+# lane-opustr r2 REVERTED: libopus CVBR restored whole -- tf boost 2*(tf_estimate-.04) AND
+# the uncapped one-frame reservoir release. vs lanes/opus-opus64-r3.sweep.txt. 12 rows.
+nik@64k: ref 69.2 ours 68.9 kbps (-0.3%), corr o=0.9885 r=0.9864 gap=-0.0022, Q o=-78.35 r=-154.78, err_ratio 0.632, minsec o=0.9764 r=0.9745, drop o=0 r=0
+nik@96k: ref 101.0 ours 100.9 kbps (-0.1%), corr o=0.9947 r=0.9940 gap=-0.0006, Q o=-17.96 r=-31.55, err_ratio 0.881, minsec o=0.9883 r=0.9888, drop o=0 r=0
+zaur@64k: ref 63.6 ours 63.4 kbps (-0.2%), corr o=0.9888 r=0.9866 gap=-0.0021, Q o=-202.91 r=-123.36, err_ratio 1.510, minsec o=0.9649 r=0.9686, drop o=0 r=0
+zaur@96k: ref 93.9 ours 93.7 kbps (-0.1%), corr o=0.9945 r=0.9937 gap=-0.0008, Q o=-129.08 r=-125.18, err_ratio 1.023, minsec o=0.9847 r=0.9854, drop o=0 r=0
+her@64k: ref 67.9 ours 67.8 kbps (-0.2%), corr o=0.9831 r=0.9794 gap=-0.0036, Q o=-367.21 r=-339.00, err_ratio 1.109, minsec o=0.9457 r=0.9406, drop o=0 r=0
+her@96k: ref 101.5 ours 101.3 kbps (-0.2%), corr o=0.9912 r=0.9902 gap=-0.0010, Q o=-205.38 r=-191.50, err_ratio 1.068, minsec o=0.9715 r=0.9728, drop o=0 r=0
+naz@64k: ref 71.3 ours 71.2 kbps (-0.1%), corr o=0.9907 r=0.9880 gap=-0.0027, Q o=-244.05 r=-128.39, err_ratio 1.764, minsec o=0.9709 r=0.9644, drop o=0 r=0
+naz@96k: ref 105.4 ours 105.2 kbps (-0.1%), corr o=0.9956 r=0.9948 gap=-0.0008, Q o=-137.01 r=-29.16, err_ratio 2.114, minsec o=0.9853 r=0.9804, drop o=0 r=0
+dl8a@64k: ref 65.8 ours 65.7 kbps (-0.1%), corr o=0.9884 r=0.9865 gap=-0.0019, Q o=-233.24 r=-378.84, err_ratio 0.566, minsec o=0.9778 r=0.9723, drop o=0 r=0
+dl8a@96k: ref 96.8 ours 96.8 kbps (-0.0%), corr o=0.9941 r=0.9934 gap=-0.0007, Q o=-192.92 r=-423.47, err_ratio 0.403, minsec o=0.9877 r=0.9864, drop o=0 r=0
+hein@64k: ref 64.9 ours 64.9 kbps (-0.0%), corr o=0.9858 r=0.9874 gap=+0.0016, Q o=-195.97 r=-388.31, err_ratio 0.462, minsec o=0.9139 r=0.9148, drop o=0 r=0
+hein@96k: ref 86.9 ours 86.9 kbps (-0.0%), corr o=0.9932 r=0.9930 gap=-0.0002, Q o=-92.58 r=-246.46, err_ratio 0.451, minsec o=0.9620 r=0.9499, drop o=0 r=0
