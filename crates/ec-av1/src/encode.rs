@@ -5892,6 +5892,46 @@ mod tests {
         }
     }
 
+    /// The same sequence through OUR OWN decoder, sample-exact against the
+    /// encoder's reconstruction. ffmpeg stays the bitstream oracle
+    /// ([[shared-oracle-blindness]]) -- but a stream ffmpeg REFUSES yields no
+    /// divergence point at all, while our decoder can be traced symbol by
+    /// symbol (`EC_TRACE_MODE_STEP`) on the very stream that broke. This is
+    /// the instrument the inter `TxMode::Select` hunt lacked; on failure it
+    /// names the first differing frame, plane and position.
+    #[test]
+    fn every_frame_of_a_sequence_decodes_through_our_own_decoder() {
+        let fctx = &crate::decode::FrameCtx::new();
+        let (width, height) = (128usize, 64usize);
+        let pictures: Vec<Picture> =
+            (0..5).map(|i| panned_test_card(width, height, i * 3)).collect();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            let recon = &frame.reconstruction;
+            for (plane, got, want, stride) in [
+                ("luma", &dec.y, &recon.y, width),
+                ("U", &dec.u, &recon.u, width / 2),
+                ("V", &dec.v, &recon.v, width / 2),
+            ] {
+                assert_eq!(got.len(), want.len(), "frame {i}: {plane} size");
+                if let Some(at) = got.iter().zip(want).position(|(a, b)| a != b) {
+                    panic!(
+                        "frame {i}: {plane} differs first at ({}, {}): decoded {} vs \
+                         reconstruction {} ({} of {} samples differ)",
+                        at % stride,
+                        at / stride,
+                        got[at],
+                        want[at],
+                        got.iter().zip(want).filter(|(a, b)| a != b).count(),
+                        got.len(),
+                    );
+                }
+            }
+        }
+    }
+
     /// The rate term the mode search ranks every decision by has to be the
     /// rate the writer then spends. The search prices a block's coefficients
     /// through `tile::coeff_bits` -- the writer's own symbol chain, but
