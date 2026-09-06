@@ -3821,7 +3821,14 @@ fn code_square_inter(
             // compound block's residual is small enough that the four extra
             // per-unit txb_skip/eob symbols cost more ladder bytes than this
             // encoder's static-CDF estimate prices them at, so the local RD
-            // win does not convert. The flat trial stays.
+            // win does not convert. lane-av1txbits REBUILT it on top of a
+            // search that prices against the tables the frame is really
+            // written with (`tile::arm_pricing_cdfs`, the estimate error on
+            // these very blocks measured down from +31% to +3%) and measured
+            // it neutral-to-worse again: +78.8/+95.0/+54.5 and +36.5/+56.3/
+            // +1.4 against the +78.8/+95.1/+54.5 and +36.1/+56.4/+1.4 of the
+            // same build without it. The static-CDF estimate was NOT what
+            // held the compound var-tx trial back. The flat trial stays.
             let (levels, tx_depth, dcost) = if info.ref1.is_some() {
                 luma.commit(x, y, side, &luma_new);
                 (luma_new.levels.clone(), 0, 0.0)
@@ -4535,6 +4542,10 @@ pub(crate) fn encode_key_frame_inner(
         (picture.height).min(render.1),
     );
     arm_seq_screen(screen);
+    // A key frame's writer really does start from the defaults, and a search
+    // worker may be carrying an inter frame's armed tables (lane-av1txbits):
+    // disarm, or a key frame's bits would depend on which thread searched it.
+    crate::tile::arm_pricing_cdfs(None);
     // spec 5.9.2 `allow_intrabc`, screen-detected key frames only: the bit
     // forces deblocking, CDEF and loop restoration OFF for this frame
     // (frame.rs:194/210/252/272), so it is only set when the source repeats
@@ -4674,6 +4685,7 @@ pub(crate) fn encode_key_frame_inner(
     let search_tile = |index: usize,
                        fctx: &crate::decode::FrameCtx|
      -> Result<Vec<(usize, Superblock, Vec<u8>)>> {
+        crate::tile::arm_pricing_cdfs(None);
         let rect = layout.rect(index);
         let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
         let mut chroma = [
@@ -4951,6 +4963,7 @@ pub(crate) fn encode_key_frame_inner(
             let mut cdfs = start_cdfs.0.clone();
             crate::tile::arm_screen(screen);
             crate::tile::arm_intrabc(allow_intrabc);
+            crate::tile::arm_pricing_cdfs(None);
             let bytes = crate::tile::sb_coeff_key_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
@@ -6227,6 +6240,15 @@ fn search_inter_block(
     }
 
     let best = best.expect("the search offers at least the intra modes");
+    // lane-av1txbits BUILT the transform-depth search this path lacks -- a
+    // 32x32 single-reference winner offered `commit_inter_luma`'s four 16x16
+    // units against its flat trial, exactly as a 16x16 winner is -- and
+    // MEASURED it flat to slightly worse: +78.7/+95.1/+54.6 vs libaom and
+    // +36.1/+56.2/+1.8 vs rav1e, against the +78.8/+95.1/+54.5 and
+    // +36.1/+56.4/+1.4 this code scores, while the split fired on 40.2% of
+    // the film's inter blocks and 17.6% of the screen's. The same shape as
+    // the compound trial set below: a local RD win that does not convert into
+    // ladder bytes. The flat 32x32 transform stays.
     luma.commit(x, y, BLOCK, &best.luma);
     chroma[0].commit(x / 2, y / 2, BLOCK / 2, &best.u);
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
@@ -6381,6 +6403,9 @@ pub(crate) fn encode_inter_frame(
     // read `(0, 0, [0; 7])` and came out 1 for every reference -- the knob
     // never reached the tool).
     crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
+    // The search prices coefficients against the tables this frame's writer
+    // starts from, not against the defaults (lane-av1txbits).
+    crate::tile::arm_pricing_cdfs(start_cdfs);
     if let Some(p) = pyramid {
         header.show_frame = p.show_frame;
         header.showable_frame = !p.show_frame;
@@ -6501,6 +6526,7 @@ pub(crate) fn encode_inter_frame(
         // search step) is read by the SEARCH, so every worker arms it or the
         // tile's bits depend on the thread count.
         crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
+        crate::tile::arm_pricing_cdfs(start_cdfs);
         let rect = layout.rect(index);
         let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
         let mut chroma = [
@@ -6971,6 +6997,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
             crate::tile::arm_screen(screen);
             let mut cdfs = start_cdfs.0.clone();
+            crate::tile::arm_pricing_cdfs(Some(&cdfs));
             // Each tile's own MV grid: a candidate scan never reaches past
             // the tile's bounds, so a grid holding only this tile's own
             // blocks reads exactly as the decoder's frame-wide one does
@@ -9459,12 +9486,59 @@ mod tests {
         // (compound share 8.8% -> 11.5%): a compound block carries a second
         // reference tree, a compound mode symbol and -- for the half-new modes
         // -- an MV residual, none of which the coefficient sum counts.
+        // lane-av1txbits: under `EC_AV1_PRICE_FRAME_CDFS=1` this reads +32.6%
+        // instead -- pricing against the tables the frame's writer really
+        // starts from collapses the over-price above to nothing, so the whole
+        // remaining gap is the syntax the coefficient sum leaves out.
         assert!(
             worst_under <= 0.32,
             "the writer spent {:.2}% more than the search priced -- more than \
              the mode/mv syntax outside the coefficient sum explains",
             worst_under * 100.0
         );
+    }
+
+    /// The census behind step (1) of the pricer lane: for every transform
+    /// block the writer really codes, what the search priced those levels at
+    /// against what the writer spent on them, split by table set and non-zero
+    /// count. One average hides the interesting part -- the classes the
+    /// estimate is systematically wrong about (all-zero blocks, the
+    /// one-coefficient blocks the inter search lives on) -- so the split is
+    /// printed and only the total is asserted on.
+    #[test]
+    fn pricer_error_census_by_block_class() {
+        let fctx = &crate::decode::FrameCtx::new();
+        let (width, height) = (256usize, 128usize);
+        let pictures: Vec<Picture> = (0..5)
+            .map(|i| panned_test_card(width, height, i * 2))
+            .collect();
+        crate::tile::pricer_census_on();
+        let _ = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
+        let rows = crate::tile::take_pricer_census();
+        assert!(!rows.is_empty(), "the census saw no transform block");
+
+        println!("| set | nz | blocks | priced bits | written bits | error |");
+        println!("|---|---|---|---|---|---|");
+        let (mut priced_all, mut written_all) = (0.0, 0.0);
+        for ((set, bucket), (blocks, priced, written)) in &rows {
+            priced_all += priced;
+            written_all += written;
+            println!(
+                "| {set} | {} | {blocks} | {priced:.0} | {written:.0} | {:+.1}% |",
+                crate::tile::census_bucket_label(*bucket),
+                if *written > 0.0 {
+                    (priced - written) / written * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+        println!(
+            "| ALL | | {} | {priced_all:.0} | {written_all:.0} | {:+.1}% |",
+            rows.values().map(|r| r.0).sum::<u64>(),
+            (priced_all - written_all) / written_all * 100.0
+        );
+        assert!(written_all > 0.0);
     }
 
     /// Low motion has to actually buy something: at least one inter frame of
