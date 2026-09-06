@@ -3630,7 +3630,14 @@ fn write_block_planes(
             Some(plane),
         );
         #[cfg(test)]
-        census_record(planes[plane], q_ctx, grid, f64::from(enc.tell() - before));
+        census_record(
+            planes[plane],
+            q_ctx,
+            grid,
+            f64::from(enc.tell() - before),
+            skip_ctx,
+            dc_sign_ctx(around[plane].dc_vote),
+        );
         ec_rng_trace(|| {
             format!(
                 "EC_PLANE plane={plane} nz={} skip_ctx={skip_ctx} tell={}",
@@ -3693,6 +3700,19 @@ fn write_luma_tus(
     for tu_row in 0..n {
         for tu_col in 0..n {
             let tu_mi = (mi_r + tu_row * (tx / MI), mi_c + tu_col * (tx / MI));
+            // lane-av1straddle: libaom clips the transform loop to
+            // `max_blocks_wide/high` (`mb_to_right_edge`/`mb_to_bottom_edge`,
+            // off the frame's true `mi_cols`/`mi_rows`), and decode.rs does
+            // the same (`tu_px >= y.true_width` there): a unit whose TOP-LEFT
+            // sample is outside the frame is NEVER coded. Writing one -- as
+            // this loop did for the phantom right-hand column of a 32x32 at
+            // x=192 in a 216-wide frame -- desyncs the tile at the very next
+            // symbol, which is what made an odd-size GOP's last block
+            // reconstruct differently and both ffmpeg decoders (libdav1d and
+            // libaom) refuse the whole key frame.
+            if tu_mi.0 >= neighbours.mi_rows || tu_mi.1 >= neighbours.mi_cols {
+                continue;
+            }
             let unit = if n == 1 {
                 grid.to_vec()
             } else {
@@ -3725,7 +3745,14 @@ fn write_luma_tus(
                 Some(0),
             );
             #[cfg(test)]
-            census_record(set, q_ctx, &unit, f64::from(enc.tell() - before));
+            census_record(
+                set,
+                q_ctx,
+                &unit,
+                f64::from(enc.tell() - before),
+                skip_ctx,
+                dc_sign_ctx(around.dc_vote),
+            );
             if n > 1 {
                 neighbours.record_mi_luma(tu_mi, tx, &unit);
             }
@@ -4006,9 +4033,9 @@ pub(crate) fn predicted_coeff_bits_sb(superblocks: &[Superblock], base_q_idx: u8
             // top-left 32x32 carries coefficients) and each chroma plane at
             // 32x32; `predicted_coeff_bits` has no 64 arm, so price it here.
             Superblock::Whole(block) if !block.skip => {
-                coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx)
-                    + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx)
-                    + coeff_bits(&dense(&block.v, 32), TxbSet::Chroma32, q_ctx)
+                coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx, 0, 0)
+                    + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx, 0, 0)
+                    + coeff_bits(&dense(&block.v, 32), TxbSet::Chroma32, q_ctx, 0, 0)
             }
             Superblock::Whole(_) => 0.0,
             Superblock::Split(quadrants) => predicted_coeff_bits(quadrants, base_q_idx),
@@ -4035,9 +4062,9 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
             (_, false) => (TxbSet::Luma8, TxbSet::Chroma4),
             (_, true) => (TxbSet::Luma8Inter, TxbSet::Chroma4),
         };
-        coeff_bits(&dense(&block.luma, side), luma, q_ctx)
-            + coeff_bits(&dense(&block.u, side / 2), chroma, q_ctx)
-            + coeff_bits(&dense(&block.v, side / 2), chroma, q_ctx)
+        coeff_bits(&dense(&block.luma, side), luma, q_ctx, 0, 0)
+            + coeff_bits(&dense(&block.u, side / 2), chroma, q_ctx, 0, 0)
+            + coeff_bits(&dense(&block.v, side / 2), chroma, q_ctx, 0, 0)
     }
     blocks
         .iter()
@@ -4053,7 +4080,7 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
 
 #[cfg(test)]
 pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
-    coeff_bits(grid, TxbSet::Luma32, 2)
+    coeff_bits(grid, TxbSet::Luma32, 2, 0, 0)
 }
 
 /// What one transform block's levels cost through the CDFs of `set`, in bits.
@@ -4067,21 +4094,41 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
 /// tables), and against the contexts a block whose neighbours coded nothing
 /// reads.
 ///
-/// That last assumption -- `skip_ctx` 0, `sign_ctx` 0 -- is the largest
-/// remaining row of the census and lane-av1price2 did NOT close it: every
-/// all-zero block is priced at the `txb_skip` cost of a block whose
-/// neighbours coded nothing, which is the most expensive context there is, so
-/// an all-zero chroma block is UNDER-priced by 41-81% on film and 51-73% on
-/// the screen capture (`pricer_error_census_on_clips`), and an all-zero
-/// Luma4 is over-priced by 400%+. Arming the frame's real tables does not
-/// touch those rows (Chroma8 nz=0 reads -73.0% in both modes). Pricing them
-/// right needs the real neighbour context, which needs something the search
-/// does not have: a per-plane non-zero context map committed in coding order.
-/// The search ranks partition TREES, so it prices candidates whose neighbours
-/// are not yet decided; the map would have to be built per trial, not per
-/// block. Deferred with the numbers above rather than approximated by a
-/// fitted constant.
-pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
+/// lane-av1skipctx CLOSED that row: `skip_ctx`/`sign_ctx` are the caller's
+/// now, and [`crate::encode::CoefCtxMap`] -- a per-plane, per-4x4-cell map
+/// committed in coding order and undone with a losing partition trial's
+/// pixels -- is the per-trial neighbour state the previous lane said the
+/// search did not have. The census (6 frames of each clip at 640x384, q=100,
+/// `pricer_error_census_on_clips`) moved:
+///
+/// | row | before | after |
+/// |---|---|---|
+/// | screen total | +10.3% | +9.5% |
+/// | screen Chroma8 nz=0 | -73.0% | -1.9% |
+/// | screen Chroma16 nz=0 | -48% | -23.4% |
+/// | screen Chroma4 nz=0 | -74% | -6.7% |
+/// | screen Chroma8 nz=1 / nz=2 | +32.2% / +26.2% | +4.9% / +7.9% |
+/// | screen Luma4 nz=0 | +464% | +89.5% |
+/// | film total | +5.3% | +1.5% |
+///
+/// What is left in the all-zero rows is table ADAPTATION, not context: the
+/// price is taken against the frame's starting tables, and a frame whose
+/// blocks mostly code nothing narrows `txb_skip` far below where it started.
+/// A whole-block luma transform still reads context 0 -- that is what the
+/// writer codes (`write_luma_tus`, `n == 1`), not an approximation.
+pub(crate) fn coeff_bits(
+    grid: &[i32],
+    set: TxbSet,
+    q_ctx: usize,
+    // lane-av1skipctx: the two neighbour-derived contexts, mirrored from the
+    // writer's own (`write_block_planes`/`write_luma_tus`) off the search's
+    // coding-order-committed map ([`crate::encode::CoefCtxMap`]). `(0, 0)` is
+    // what every caller passed before the map existed -- exact for a luma
+    // transform covering its whole block, and the census row that was the
+    // largest remaining pricer error for every other block.
+    skip_ctx: usize,
+    sign_ctx: usize,
+) -> f64 {
     /// Built once per size: the search prices thirteen modes for every block,
     /// and the scan is the same table every time.
     static SCANS: LazyLock<[Vec<u16>; 4]> = LazyLock::new(|| {
@@ -4131,7 +4178,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
             _ => &SCANS[3],
         };
         let mut enc = SymbolEncoder::pricer();
-        write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
+        write_coeffs(&mut enc, &mut coding, grid, scan, skip_ctx, sign_ctx, None);
         enc.bits()
     };
     PRICING_BASE.with_borrow_mut(|base| {
@@ -4207,8 +4254,10 @@ thread_local! {
 /// luma price accurate while leaving the bigger chroma and all-zero errors
 /// exactly where they were, which SKEWS the search's tradeoffs between them
 /// instead of correcting them -- and the bytes get worse. The fix for that
-/// row is the neighbour skip context, not another table set (see
-/// [`coeff_bits`]).
+/// row was the neighbour skip context, not another table set, and
+/// lane-av1skipctx landed it (see [`coeff_bits`]): with the real contexts
+/// under every price the screen capture comes down +59.4 -> +58.3 vs libaom
+/// at native, still with every one of its frames armed with the defaults.
 pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>, screen: bool) {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let mode = *MODE.get_or_init(|| match std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() {
@@ -4282,7 +4331,18 @@ pub(crate) fn census_bucket_label(bucket: usize) -> &'static str {
 }
 
 #[cfg(test)]
-fn census_record(set: TxbSet, q_ctx: usize, grid: &[i32], written: f64) {
+fn census_record(
+    set: TxbSet,
+    q_ctx: usize,
+    grid: &[i32],
+    written: f64,
+    // The writer's own neighbour contexts for this very transform block: the
+    // census prices the search's estimate the way the search now takes it
+    // (lane-av1skipctx), so a row's error is the table/adaptation drift that
+    // is left once the context is right.
+    skip_ctx: usize,
+    sign_ctx: usize,
+) {
     if CENSUS.with_borrow(|c| c.is_none()) {
         return;
     }
@@ -4296,7 +4356,7 @@ fn census_record(set: TxbSet, q_ctx: usize, grid: &[i32], written: f64) {
         9..=16 => 5,
         _ => 6,
     };
-    let priced = coeff_bits(grid, set, q_ctx);
+    let priced = coeff_bits(grid, set, q_ctx, skip_ctx, sign_ctx);
     CENSUS.with_borrow_mut(|rows| {
         let rows = rows.as_mut().expect("the census is on");
         let row = rows.entry((format!("{set:?}"), bucket)).or_default();

@@ -3318,18 +3318,33 @@ pub(crate) mod tests {
             eprintln!("SKIP decode_stream_agrees_with_ffmpeg_on_a_gop: no ffmpeg");
             return;
         }
-        let (width, height) = (128usize, 64usize);
-        let pictures: Vec<_> = (0..3)
-            .map(|i| panned_test_card(width, height, i * 3))
-            .collect();
-        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
-        let ffmpeg_frames = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
-        let decoded = decode_stream(&encoded.stream).unwrap();
-        assert_eq!(decoded.len(), 3);
-        for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
-            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg");
-            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg");
-            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg");
+        // lane-av1straddle: 216x96 joins 128x64 because only a size whose
+        // 32x32 blocks straddle the right-hand frame edge can see the writer
+        // coding a transform unit that starts outside the frame -- libdav1d
+        // AND libaom both refused the whole key frame while it did, and this
+        // crate's own (lenient) decoder only differed in the last block's V.
+        for &(width, height) in &[(128usize, 64usize), (216usize, 96usize)] {
+            let pictures: Vec<_> = (0..3)
+                .map(|i| panned_test_card(width, height, i * 3))
+                .collect();
+            let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
+            let ffmpeg_frames = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
+            let decoded = decode_stream(&encoded.stream).unwrap();
+            assert_eq!(decoded.len(), 3);
+            for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{width}x{height} frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "{width}x{height} frame {i} U vs ffmpeg");
+                assert_eq!(got.v, want.v, "{width}x{height} frame {i} V vs ffmpeg");
+            }
+            // ... and the encoder's own reconstruction is what ffmpeg sees,
+            // so the check fails on a writer-side desync too, not only on a
+            // decoder-side one.
+            for (i, (frame, want)) in encoded.frames.iter().zip(&ffmpeg_frames).enumerate() {
+                let rec = &frame.reconstruction;
+                assert_eq!(rec.y, want.y, "{width}x{height} frame {i} luma: reconstruction vs ffmpeg");
+                assert_eq!(rec.u, want.u, "{width}x{height} frame {i} U: reconstruction vs ffmpeg");
+                assert_eq!(rec.v, want.v, "{width}x{height} frame {i} V: reconstruction vs ffmpeg");
+            }
         }
     }
 
