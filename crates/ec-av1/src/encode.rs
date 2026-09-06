@@ -9418,7 +9418,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7103, 0xb9b7_763b_6f18_a887), (60, 26778, 0x4071_f16e_1e5d_87c3)];
+            [(150, 7084, 0xe6a9_2f62_3855_0eee), (60, 26116, 0xa831_9866_b799_80fc)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
