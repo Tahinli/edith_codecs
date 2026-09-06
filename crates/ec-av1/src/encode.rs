@@ -2338,6 +2338,15 @@ fn commit_inter_luma(
 /// The largest distinct-colour count a block may hold and still be offered a
 /// palette candidate at all: past it the k-means quantisation costs more
 /// error than the map saves rate, and every trial is wasted wall.
+///
+/// Swept on the gate's own screen capture (lane-av1pal2, the
+/// `unswept-decision-constants` class): 32 (the value this lane inherited)
+/// finds 515 palette blocks and scores +66.4%/+10.3% vs libaom/rav1e, 64
+/// finds 1264 and scores +57.1%/+3.2%, 128 finds 1102 and scores
+/// +56.9%/+2.3%, and 256 is byte-identical to 128 -- above 128 the bound
+/// binds on nothing this content holds. 128 ships: best BD against both
+/// references and no wall cost at all (6.1s, the same as at 32, because the
+/// blocks it newly admits are ones the RD then keeps).
 /// `EC_AV1_PAL_MAXCOLORS`.
 fn palette_max_colors() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -2345,7 +2354,7 @@ fn palette_max_colors() -> usize {
         std::env::var("EC_AV1_PAL_MAXCOLORS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(32)
+            .unwrap_or(128)
     })
 }
 
