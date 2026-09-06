@@ -190,6 +190,42 @@ fn extra_new_skip_margin() -> f64 {
     }
 }
 
+/// The margin on a LEAF's SECOND-reference motion search, the same early-out
+/// shape [`EXTRA_NEW_SKIP_MARGIN`] gives a whole block's extra-reference
+/// `NEWMV`: the search is skipped when that reference's own
+/// `NEAREST_NEARESTMV` vector already prices this many times better than the
+/// leaf's `LAST` search found. `0.0` never skips.
+///
+/// Swept on the BD gate over 0.15/0.35/0.6/0.8/1.2 and 0.0, reading BD vs
+/// libaom (1080p/2160p/screen) against the extra `motion::search` calls at
+/// 2160p (38195 with no second-reference search at all):
+/// 0.15 +81.7/+97.4/+54.5 at 41286, 0.35 +81.4/+96.7 at 43093,
+/// 0.6 +80.6/+95.5 at 44843, 0.8 +79.9/+94.6 at 47008, 1.2 +80.2/+94.2 at
+/// 77882, never-skip +79.7/+94.1 at 81801. 0.8 takes the whole gain the
+/// unskipped search buys (-3.1/-5.3 off the +83.0/+99.9 base) for a quarter
+/// of its extra searches; past it the calls double for another -0.3/-0.5.
+/// Screen capture is BYTE-IDENTICAL at every margin -- its leaf compound is
+/// all `NEAREST_NEARESTMV` and no searched second vector ever wins there --
+/// so the margin is pure wall on that content (+10% searches at 0.8).
+const LEAF_SECOND_NEW_MARGIN: f64 = 0.8;
+
+/// [`LEAF_SECOND_NEW_MARGIN`], swept by `EC_AV1_LEAF_SECOND_MARGIN`; the
+/// search itself is switched off by `EC_AV1_LEAF_SECOND_NEWMV=0`.
+fn leaf_second_new_margin() -> f64 {
+    match std::env::var("EC_AV1_LEAF_SECOND_MARGIN").ok() {
+        Some(v) => v.parse().unwrap_or(LEAF_SECOND_NEW_MARGIN),
+        None => LEAF_SECOND_NEW_MARGIN,
+    }
+}
+
+/// Whether a leaf searches its SECOND reference at all (lane-av1comp4).
+fn leaf_second_new_mv() -> bool {
+    match std::env::var("EC_AV1_LEAF_SECOND_NEWMV").ok() {
+        Some(v) => v != "0",
+        None => true,
+    }
+}
+
 /// Whether a 16x16 or 8x8 inter LEAF is offered the compound candidates the
 /// whole 32x32 block is (lane-av1comp3). The writer already codes a compound
 /// block at any leaf size (`tile::write_inter_frame_leaf`/`..._leaf8` both
@@ -2976,8 +3012,11 @@ fn code_square_inter(
     // below, exactly as `search_inter_block` seeds its own from the searches
     // it already ran.
     let mut searched_new: Option<(i32, i32)> = None;
+    // What that search cost, kept for the second reference's own early-out
+    // below (`None` when this leaf ran no search at all).
+    let mut searched_new_cost: Option<f64> = None;
+    let source_block = luma.source_block(x, y, side);
     if leaf_new_mv() {
-        let source_block = luma.source_block(x, y, side);
         let (seeds, seed_n) = mv_seeds(stack);
         let found = motion::search(
             ref_luma.0,
@@ -2995,6 +3034,7 @@ fn code_square_inter(
             1,
         );
         let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
+        searched_new_cost = Some(found.cost);
         if let Some(mv_bits) = mv_residual_bits(new_mv, stack.pred_mv) {
             searched_new = Some(new_mv);
             // Same reuse as `search_inter_block`: a NEWMV equal to the
@@ -3065,13 +3105,12 @@ fn code_square_inter(
     }
 
     // The COMPOUND candidates at this leaf (lane-av1comp3), the same set
-    // `search_inter_block` prices for a whole 32x32 block minus the two that
-    // need a motion search against the SECOND reference: a leaf never runs
-    // one (`NEAREST_NEWMV`/`NEW_NEWMV` would each cost another
-    // `motion::search` per extra reference per leaf), so the set here is
-    // `NEAREST_NEARESTMV`, `GLOBAL_GLOBALMV` and `NEW_NEARESTMV` off the
-    // vector this leaf already searched. Priced with the same static-CDF
-    // approximation, plus the compound-only syntax the writer emits.
+    // `search_inter_block` prices for a whole 32x32 block:
+    // `NEAREST_NEARESTMV`, `GLOBAL_GLOBALMV`, `NEW_NEARESTMV` off the vector
+    // this leaf already searched, and -- since lane-av1comp4 gave the leaf a
+    // SECOND-reference search of its own -- `NEAREST_NEWMV` and `NEW_NEWMV`
+    // too. Priced with the same static-CDF approximation, plus the
+    // compound-only syntax the writer emits.
     for (ref1, g, cstack) in compound.iter().filter(|_| leaf_compound()) {
         let (ref1, g) = (*ref1, *g);
         let uni =
@@ -3118,13 +3157,48 @@ fn code_square_inter(
                 },
             ),
         ];
-        // `NEW_NEARESTMV`: the NEW half is this leaf's own searched vector,
-        // its residual priced against compound stack entry 0 (what
-        // `assign_compound_mv` predicts from at `ref_mv_idx = 0`).
+        // Every compound MV residual here is priced against compound stack
+        // entry 0, which is what `assign_compound_mv` predicts from at
+        // `ref_mv_idx = 0` -- so it is also what the second-reference search
+        // below seeds from and rounds to, and no candidate it finds can then
+        // fail `mv_residual_bits`.
         let cbase = cstack
             .entries
             .first()
             .map_or(cstack.nearest_mv, |e| (e.mv0, e.mv1));
+        // This leaf's SECOND-reference motion search (lane-av1comp4). Without
+        // it a leaf could only name a stack vector for the second half, and
+        // screen capture showed the consequence: every leaf compound block
+        // there was `NEAREST_NEARESTMV`. Skipped, like `search_inter_block`'s
+        // extra-reference `NEWMV`, when this reference's own
+        // `NEAREST_NEARESTMV` vector already prices `margin` times better
+        // than the `LAST` search of this same leaf did -- one candidate
+        // evaluation standing in for a whole search.
+        let margin = leaf_second_new_margin();
+        let mut second_new: Option<(i32, i32)> = None;
+        if leaf_second_new_mv() {
+            let skip = margin > 0.0
+                && searched_new_cost.is_some_and(|last| {
+                    motion::cost_at(
+                        &g.y, g.width, luma.true_width, luma.true_height, &source_block, x, y,
+                        side, side, cstack.nearest_mv.1, cbase.1, search.lambda, fctx,
+                    ) * margin
+                        <= last
+                });
+            if !skip {
+                let mut seeds = [(0, 0); 4];
+                let mut seed_n = 1;
+                for e in cstack.entries.iter().take(3) {
+                    seeds[seed_n] = e.mv1;
+                    seed_n += 1;
+                }
+                let found = motion::search(
+                    &g.y, g.width, luma.true_width, luma.true_height, &source_block, x, y, side,
+                    side, cbase.1, &seeds[..seed_n], search.lambda, fctx, ref_distance(ref1),
+                );
+                second_new = Some(round_to_valid_mv(found.mv, cbase.1));
+            }
+        }
         if let Some(new_mv) = searched_new {
             if let Some(b0) = mv_residual_bits(new_mv, cbase.0) {
                 ccands.push((
@@ -3139,6 +3213,40 @@ fn code_square_inter(
                         ref_mv_idx: 0,
                     },
                 ));
+            }
+        }
+        // `NEAREST_NEWMV` and `NEW_NEWMV`: the NEW halves are the two
+        // searches this leaf ran, each residual priced against `cbase`.
+        if let Some(mv1) = second_new {
+            if let Some(b1) = mv_residual_bits(mv1, cbase.1) {
+                ccands.push((
+                    (cstack.nearest_mv.0, mv1),
+                    mode_bits_of(2) + b1,
+                    InterInfo {
+                        ref_frame: crate::mvstack::LAST_FRAME,
+                        mode: InterMode::NearestNewMv,
+                        mv: cstack.nearest_mv.0,
+                        mv1,
+                        ref1: Some(ref1),
+                        ref_mv_idx: 0,
+                    },
+                ));
+                if let Some((new_mv, b0)) =
+                    searched_new.and_then(|m| mv_residual_bits(m, cbase.0).map(|b| (m, b)))
+                {
+                    ccands.push((
+                        (new_mv, mv1),
+                        mode_bits_of(7) + b0 + b1,
+                        InterInfo {
+                            ref_frame: crate::mvstack::LAST_FRAME,
+                            mode: InterMode::NewNewMv,
+                            mv: new_mv,
+                            mv1,
+                            ref1: Some(ref1),
+                            ref_mv_idx: 0,
+                        },
+                    ));
+                }
             }
         }
         ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
