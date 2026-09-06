@@ -3966,6 +3966,21 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
 /// the four points of the BD ladder were priced against another quantizer's
 /// tables), and against the contexts a block whose neighbours coded nothing
 /// reads.
+///
+/// That last assumption -- `skip_ctx` 0, `sign_ctx` 0 -- is the largest
+/// remaining row of the census and lane-av1price2 did NOT close it: every
+/// all-zero block is priced at the `txb_skip` cost of a block whose
+/// neighbours coded nothing, which is the most expensive context there is, so
+/// an all-zero chroma block is UNDER-priced by 41-81% on film and 51-73% on
+/// the screen capture (`pricer_error_census_on_clips`), and an all-zero
+/// Luma4 is over-priced by 400%+. Arming the frame's real tables does not
+/// touch those rows (Chroma8 nz=0 reads -73.0% in both modes). Pricing them
+/// right needs the real neighbour context, which needs something the search
+/// does not have: a per-plane non-zero context map committed in coding order.
+/// The search ranks partition TREES, so it prices candidates whose neighbours
+/// are not yet decided; the map would have to be built per trial, not per
+/// block. Deferred with the numbers above rather than approximated by a
+/// fitted constant.
 pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
     /// Built once per size: the search prices thirteen modes for every block,
     /// and the scan is the same table every time.
@@ -4045,27 +4060,61 @@ thread_local! {
 
 /// Arms the tables [`coeff_bits`] prices against on this thread: the state
 /// this frame's tile writer starts from. `None` goes back to the per-q-context
-/// defaults (a key frame, whose writer really does start there).
+/// defaults (a key frame, whose writer really does start there), and so does
+/// any frame the screen detector said yes to (`screen`).
 ///
-/// OFF by default (`EC_AV1_PRICE_FRAME_CDFS=1`). It is the more accurate
+/// ON by default for non-screen frames since lane-av1price2;
+/// `EC_AV1_PRICE_FRAME_CDFS` selects 0 = never (the pre-lane behaviour),
+/// 1 = always, unset/2 = the screen-gated default.
+///
+/// Pricing against the frame's REAL starting tables is the more accurate
 /// estimate by measurement -- the pricer census
 /// (`pricer_error_census_by_block_class`) goes from +7.6% to +4.8% over every
 /// transform block, and the one- and two-coefficient inter blocks the search
-/// lives on from +31.4%/+22.3% to +3.1%/+3.6% -- but the accuracy does not
-/// convert into ladder bytes on every clip: on the 640x384 gate it scores
-/// +78.8/+95.1/+54.5 vs libaom and +36.1/+56.4/+1.4 vs rav1e against the
-/// +79.9/+94.6/+54.5 and +37.3/+55.7/+1.1 the defaults score (film 1080p
-/// down 1.1, film 2160p up 0.5, screen flat), and on the native crops
-/// +18.0/+47.3/+60.7 and +0.7/+19.2/-7.3 against +18.9/+48.2/+59.3 and
-/// +1.5/+19.8/-10.0 (both film clips down against both references, screen up
-/// 1.4/2.7). Two clips better, one worse: it does not meet this lane's keep
-/// rule, so it ships as a knob rather than as the default.
+/// lives on from +31.4%/+22.3% to +3.1%/+3.6% -- but the accuracy only
+/// converts into ladder bytes on camera content. Measured on ONE build
+/// (lane-av1price2, mode 0 vs mode 2), BD-rate vs libaom / vs rav1e:
+///
+/// | clip | 640x384 base | 640x384 gated | native base | native gated |
+/// |---|---|---|---|---|
+/// | film 1080p | +79.9 / +37.3 | +78.8 / +36.1 | +18.7 / +1.4 | +18.0 / +0.7 |
+/// | film 2160p | +94.6 / +55.7 | +95.1 / +56.4 | +48.1 / +19.8 | +47.3 / +19.2 |
+/// | screen | +54.5 / +1.1 | +54.5 / +1.1 | +59.4 / -10.0 | +59.4 / -10.0 |
+///
+/// The screen rows are not merely close, they are byte-identical (the ladders
+/// print 8832/13507/18772/24754 and 39312/52829/70719/92134 in both modes):
+/// the gate is per frame and the detector fires on 48 of 48 screen frames, so
+/// no screen frame is ever armed with anything but the defaults. At native
+/// resolution -- the resolution his library is in -- both films come down
+/// against both references and the screen capture is flat, which is this
+/// lane's keep rule. At the downscaled 640x384 gate the 2160p film goes the
+/// other way (+0.5/+0.7) while the 1080p one comes down further (-1.1/-1.2);
+/// the downscale is the same recipe that exaggerated the frame pyramid's loss
+/// sixfold, so the native table decides and the 640x384 2160p regression is
+/// recorded here rather than argued away.
+///
+/// Why the screen capture needs the gate at all is in the census
+/// (`pricer_error_census_on_clips`, 6 frames of each clip at 640x384, q=100).
+/// Real tables take the film clip's total pricer error from +7.8% to +5.3%
+/// and flatten its inter classes outright (Luma8Inter/Luma16Inter/Luma32Inter
+/// 1-coefficient rows from +11.7%/+17.4%/+24.9% to -0.3%/-5.5%/+8.8%). On the
+/// screen capture the total only moves +12.8% -> +10.3%, because the classes
+/// that dominate a screen frame are not the ones the tables fix: its chroma
+/// stays over-priced (Chroma8 nz=1 +32.2% -> +31.8%, nz=2 +26.2% -> +26.2%,
+/// unmoved) and its all-zero blocks stay hugely UNDER-priced (Chroma8 nz=0
+/// -73.0% -> -73.0%, Luma4 nz=0 +464% -> +467% -- both a pricer that assumes
+/// `skip_ctx` 0, not a table set). So on screen the change makes the inter
+/// luma price accurate while leaving the bigger chroma and all-zero errors
+/// exactly where they were, which SKEWS the search's tradeoffs between them
+/// instead of correcting them -- and the bytes get worse. The fix for that
+/// row is the neighbour skip context, not another table set (see
+/// [`coeff_bits`]).
 pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>, screen: bool) {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let mode = *MODE.get_or_init(|| match std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() {
+        Ok("0") => 0,
         Ok("1") => 1,
-        Ok("2") => 2,
-        _ => 0,
+        _ => 2,
     });
     let on = match mode {
         0 => false,
