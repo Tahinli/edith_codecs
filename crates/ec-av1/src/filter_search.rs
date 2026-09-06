@@ -55,24 +55,22 @@ pub(crate) fn take_cdef_presets() -> Vec<(u8, Vec<usize>)> {
 }
 
 /// Squared error between a decoded plane and the source it was coded from,
-/// over the frame's own cropped `w x h` (the two planes have different
-/// strides: the source is the encoder's padded coding surface).
-fn plane_sse(dec: &[u16], dec_w: usize, src: &[u8], src_w: usize, w: usize, h: usize) -> u64 {
-    let mut sse = 0u64;
-    for row in 0..h {
-        let (d, s) = (&dec[row * dec_w..][..w], &src[row * src_w..][..w]);
-        for (&a, &b) in d.iter().zip(s) {
-            let diff = i64::from(a) - i64::from(b);
-            sse += (diff * diff) as u64;
-        }
-    }
-    sse
-}
-
-/// [`plane_sse`], accumulated per CDEF unit instead of over the frame: `out`
-/// is one entry per 64x64 SUPERBLOCK (stride `sb_cols`) and `unit` is the
-/// unit side in this plane's own samples (64 for luma, 32 for 4:2:0 chroma),
-/// which is what makes the luma and chroma sums land in the same slot.
+/// accumulated BOTH per CDEF unit and over the frame's own cropped `w x h`
+/// in one pass: `out` is one entry per 64x64 SUPERBLOCK (stride `sb_cols`),
+/// `unit` the unit side in this plane's own samples (64 for luma, 32 for
+/// 4:2:0 chroma) -- which is what makes the luma and chroma sums land in the
+/// same slot -- and the return value the frame-level sum of the same terms.
+/// The two planes have different strides: the source is the encoder's padded
+/// coding surface.
+///
+/// The unit chunking is what makes this vectorise (lane-av1fsearch: this was
+/// the encoder's second-largest self-time symbol): the old shape divided
+/// `col / unit` per sample and accumulated straight into `out`, which LLVM
+/// cannot turn into a reduction. Here every unit's row segment is its own
+/// `u32` reduction -- `unit <= 64` samples of at most `(2^12-1)^2` each, so
+/// the accumulator cannot overflow -- and the `u64` sums are the same
+/// integers added in a different order.
+#[allow(clippy::too_many_arguments)]
 fn unit_sse(
     dec: &[u16],
     dec_w: usize,
@@ -83,15 +81,22 @@ fn unit_sse(
     unit: usize,
     sb_cols: usize,
     out: &mut [u64],
-) {
+) -> u64 {
+    let mut total = 0u64;
     for row in 0..h {
         let base = (row / unit) * sb_cols;
         let (d, s) = (&dec[row * dec_w..][..w], &src[row * src_w..][..w]);
-        for (col, (&a, &b)) in d.iter().zip(s).enumerate() {
-            let diff = i64::from(a) - i64::from(b);
-            out[base + col / unit] += (diff * diff) as u64;
+        for (i, (dc, sc)) in d.chunks(unit).zip(s.chunks(unit)).enumerate() {
+            let mut acc = 0u32;
+            for (&a, &b) in dc.iter().zip(sc) {
+                let diff = i32::from(a) - i32::from(b);
+                acc += (diff * diff) as u32;
+            }
+            out[base + i] += u64::from(acc);
+            total += u64::from(acc);
         }
     }
+    total
 }
 
 /// CDEF primary strengths tried (libaom's own range is 0..15 for 8-bit
@@ -159,22 +164,57 @@ pub(crate) fn pick_filters(
 ) -> Result<(LoopFilterParams, CdefParams, Vec<u8>, Picture)> {
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
     let nsb = sb_cols * sb_rows;
-    let mut trials: Vec<Trial> = Vec::new();
-    let eval = |cand: Cand, trials: &mut Vec<Trial>| -> Result<usize> {
-        if let Some(i) = trials.iter().position(|t| t.cand == cand) {
+    // The two sides of a candidate are scored independently: `apply_deblock`
+    // filters luma on `level[0..2]` alone and each chroma plane on
+    // `level[2..4]` alone, and CDEF's strengths are per plane type too (a
+    // zero strength pair is the identity filter), so a candidate that moves
+    // only the chroma slot leaves every luma sample -- and every luma error
+    // term -- exactly as the previous candidate had it. Each side's error is
+    // therefore memoized under the parameters that side actually reads,
+    // which is what takes ~32 candidates' worth of summing down to ~17 luma
+    // and ~12 chroma passes.
+    struct Search {
+        trials: Vec<Trial>,
+        /// `(luma deblock level, luma CDEF strengths) -> (frame sse, per-unit sse)`.
+        luma: Vec<((u8, (u8, u8)), (u64, Vec<u64>))>,
+        /// `(luma deblock level, chroma deblock level, chroma CDEF
+        /// strengths) -> the same`. The luma level is in the key because
+        /// CDEF's direction search runs on the post-deblock LUMA window and
+        /// chroma reuses that direction (`decode.rs`: `uv_dir`); it is
+        /// pinned to 0 for a chroma-CDEF-off candidate, whose chroma planes
+        /// CDEF never touches at all.
+        chroma: Vec<((u8, u8, (u8, u8)), (u64, Vec<u64>))>,
+    }
+    let mut st = Search { trials: Vec::new(), luma: Vec::new(), chroma: Vec::new() };
+    let eval = |cand: Cand, st: &mut Search| -> Result<usize> {
+        if let Some(i) = st.trials.iter().position(|t| t.cand == cand) {
             return Ok(i);
         }
         let picture = decode(&loop_filter(cand), &cdef(cand, damping))?;
         let dec_cw = picture.width.div_ceil(2);
-        let sse_y = plane_sse(&picture.y, picture.width, source[0], src_w, fw, fh);
-        let sse_uv = plane_sse(&picture.u, dec_cw, source[1], src_w / 2, cw, ch)
-            + plane_sse(&picture.v, dec_cw, source[2], src_w / 2, cw, ch);
-        let mut sse64 = vec![0u64; nsb];
-        unit_sse(&picture.y, picture.width, source[0], src_w, fw, fh, 64, sb_cols, &mut sse64);
-        unit_sse(&picture.u, dec_cw, source[1], src_w / 2, cw, ch, 32, sb_cols, &mut sse64);
-        unit_sse(&picture.v, dec_cw, source[2], src_w / 2, cw, ch, 32, sb_cols, &mut sse64);
-        trials.push(Trial { cand, picture, sse_y, sse_uv, sse64 });
-        Ok(trials.len() - 1)
+        let (lkey, ckey) = (
+            (cand.lf.0, cand.y),
+            (if cand.uv == (0, 0) { 0 } else { cand.lf.0 }, cand.lf.1, cand.uv),
+        );
+        if !st.luma.iter().any(|(k, _)| *k == lkey) {
+            let mut units = vec![0u64; nsb];
+            let sse =
+                unit_sse(&picture.y, picture.width, source[0], src_w, fw, fh, 64, sb_cols, &mut units);
+            st.luma.push((lkey, (sse, units)));
+        }
+        if !st.chroma.iter().any(|(k, _)| *k == ckey) {
+            let mut units = vec![0u64; nsb];
+            let sse = unit_sse(&picture.u, dec_cw, source[1], src_w / 2, cw, ch, 32, sb_cols, &mut units)
+                + unit_sse(&picture.v, dec_cw, source[2], src_w / 2, cw, ch, 32, sb_cols, &mut units);
+            st.chroma.push((ckey, (sse, units)));
+        }
+        let (sse_y, sse_uv, sse64) = {
+            let l = &st.luma.iter().find(|(k, _)| *k == lkey).expect("just inserted").1;
+            let c = &st.chroma.iter().find(|(k, _)| *k == ckey).expect("just inserted").1;
+            (l.0, c.0, l.1.iter().zip(&c.1).map(|(a, b)| a + b).collect())
+        };
+        st.trials.push(Trial { cand, picture, sse_y, sse_uv, sse64 });
+        Ok(st.trials.len() - 1)
     };
     // One stage of the coordinate search: try `values` in the slot `set`
     // moves and keep the one with the lowest error `sse` reads.
@@ -182,16 +222,16 @@ pub(crate) fn pick_filters(
                      values: &[u8],
                      set: fn(&mut Cand, u8),
                      sse: fn(&Trial) -> u64,
-                     trials: &mut Vec<Trial>|
+                     st: &mut Search|
      -> Result<()> {
         let mut winner = *best;
         let mut lowest = u64::MAX;
         for &v in values {
             let mut cand = *best;
             set(&mut cand, v);
-            let i = eval(cand, trials)?;
-            if sse(&trials[i]) < lowest {
-                lowest = sse(&trials[i]);
+            let i = eval(cand, st)?;
+            if sse(&st.trials[i]) < lowest {
+                lowest = sse(&st.trials[i]);
                 winner = cand;
             }
         }
@@ -201,23 +241,24 @@ pub(crate) fn pick_filters(
 
     let mut best = Cand { lf: (0, 0), y: (0, 0), uv: (0, 0) };
     // Deblocking luma: the coarse ladder, then +-1/+-2 around its winner.
-    stage(&mut best, &COARSE, |c, v| c.lf = (v, v), |t| t.sse_y, &mut trials)?;
+    stage(&mut best, &COARSE, |c, v| c.lf = (v, v), |t| t.sse_y, &mut st)?;
     let refine: Vec<u8> = [-2i32, -1, 1, 2]
         .iter()
         .filter_map(|d| u8::try_from(i32::from(best.lf.0) + d).ok())
         .filter(|&l| l <= 63)
         .collect();
-    stage(&mut best, &refine, |c, v| c.lf = (v, v), |t| t.sse_y, &mut trials)?;
+    stage(&mut best, &refine, |c, v| c.lf = (v, v), |t| t.sse_y, &mut st)?;
     // Deblocking chroma, three points around the luma winner.
     let chroma_levels = [0, best.lf.0 / 2, best.lf.0];
-    stage(&mut best, &chroma_levels, |c, v| c.lf.1 = v, |t| t.sse_uv, &mut trials)?;
+    stage(&mut best, &chroma_levels, |c, v| c.lf.1 = v, |t| t.sse_uv, &mut st)?;
     // CDEF, primary then secondary, luma on luma error and chroma on chroma.
-    stage(&mut best, &CDEF_PRI, |c, v| c.y.0 = v, |t| t.sse_y, &mut trials)?;
-    stage(&mut best, &CDEF_SEC, |c, v| c.y.1 = v, |t| t.sse_y, &mut trials)?;
-    stage(&mut best, &CDEF_PRI, |c, v| c.uv.0 = v, |t| t.sse_uv, &mut trials)?;
-    stage(&mut best, &CDEF_SEC, |c, v| c.uv.1 = v, |t| t.sse_uv, &mut trials)?;
+    stage(&mut best, &CDEF_PRI, |c, v| c.y.0 = v, |t| t.sse_y, &mut st)?;
+    stage(&mut best, &CDEF_SEC, |c, v| c.y.1 = v, |t| t.sse_y, &mut st)?;
+    stage(&mut best, &CDEF_PRI, |c, v| c.uv.0 = v, |t| t.sse_uv, &mut st)?;
+    stage(&mut best, &CDEF_SEC, |c, v| c.uv.1 = v, |t| t.sse_uv, &mut st)?;
 
     CHOSEN.with(|c| c.borrow_mut().push(best));
+    let trials = st.trials;
 
     // libaom `av1_cdef_search`'s shape, on the candidates this coordinate
     // search already decoded: every trial that ran under the WINNING
@@ -479,4 +520,39 @@ thread_local! {
 #[allow(dead_code)] // read from the `#[cfg(test)]` BD gate
 pub(crate) fn take_lr_histogram() -> (usize, usize) {
     LR_CHOSEN.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unit_sse;
+
+    /// [`unit_sse`]'s chunked, `u32`-accumulating shape against the naive
+    /// per-sample reference it replaced -- per unit AND in total, on a plane
+    /// whose width is not a whole number of units (the case where the last
+    /// chunk is short) and with strides wider than the region scored.
+    #[test]
+    fn unit_sse_matches_the_naive_sum() {
+        let (w, h, unit, sb_cols) = (100usize, 70usize, 32usize, 4usize);
+        let (dec_w, src_w) = (w + 7, w + 13);
+        let mut state = 0x1234_5678u32;
+        let mut rnd = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let dec: Vec<u16> = (0..dec_w * h).map(|_| u16::from(rnd())).collect();
+        let src: Vec<u8> = (0..src_w * h).map(|_| rnd()).collect();
+        let mut want = vec![7u64; sb_cols * 4]; // a non-zero start: this accumulates
+        let mut total = 0u64;
+        for row in 0..h {
+            let base = (row / unit) * sb_cols;
+            for col in 0..w {
+                let diff = i64::from(dec[row * dec_w + col]) - i64::from(src[row * src_w + col]);
+                want[base + col / unit] += (diff * diff) as u64;
+                total += (diff * diff) as u64;
+            }
+        }
+        let mut got = vec![7u64; sb_cols * 4];
+        assert_eq!(unit_sse(&dec, dec_w, &src, src_w, w, h, unit, sb_cols, &mut got), total);
+        assert_eq!(got, want);
+    }
 }
