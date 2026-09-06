@@ -625,6 +625,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         mi_rows: encoded.mi_rows,
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
+        screen: encoded.screen,
         start_cdfs: encoded.start_cdfs.clone(),
         next_cdfs: encoded.next_cdfs.clone(),
         loop_filter: encoded.loop_filter,
@@ -698,11 +699,106 @@ pub struct Encoded {
     /// This frame header's chosen CDEF parameters, threaded for the same
     /// reason as `loop_filter`.
     pub(crate) cdef: CdefParams,
+    /// This frame header's `allow_screen_content_tools`
+    /// ([`screen_content`]) -- every intra block of the tile carries the two
+    /// palette-mode symbols under it, so a raw tile decode that guessed
+    /// `false` would desync at the first block (same class as `tx_select`).
+    pub(crate) screen: bool,
     /// This frame header's chosen loop restoration parameters, threaded for
     /// the same reason as `loop_filter` -- and doubly so: the per-unit
     /// filters themselves are coded in `tile`, so a decode of it under a
     /// stale `RESTORE_NONE` header desyncs at the first superblock.
     pub(crate) loop_restoration: LoopRestorationParams,
+}
+
+thread_local! {
+    /// This SEQUENCE's `seq_force_screen_content_tools`: whether the sequence
+    /// header offers the per-frame `allow_screen_content_tools` bit at all.
+    /// Armed once by the key frame ([`encode_key_frame_inner`], from
+    /// [`screen_content`]) and read by every header builder after it, so that
+    /// the inter frames of a screen sequence lay their headers out the same
+    /// way the sequence header the key frame wrote says they do -- a per-call
+    /// parameter would have to thread through `inter_frame_headers`' four
+    /// public entry points and every hand-built-stream test that calls them.
+    /// A sequence with no screen content leaves this false and writes exactly
+    /// the bits it wrote before this lane.
+    static SEQ_SCREEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn arm_seq_screen(on: bool) {
+    SEQ_SCREEN.with(|c| c.set(on));
+}
+
+fn seq_screen() -> bool {
+    SEQ_SCREEN.with(std::cell::Cell::get)
+}
+
+/// How many distinct colours a 16x16 luma block may hold and still count as
+/// screen content ([`screen_content`]), `EC_AV1_SCREEN_COLORS`. libaom's own
+/// `av1_set_screen_content_options` bound is 4.
+fn screen_colors() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_SCREEN_COLORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+    })
+}
+
+/// The reciprocal of the frame area those blocks must cover, in tenths --
+/// libaom's `counts * blk_h * blk_w * 10 > width * height` is 10 (one tenth).
+/// `EC_AV1_SCREEN_PCT`.
+fn screen_pct() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_SCREEN_PCT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+    })
+}
+
+/// How many frames [`screen_content`] said yes/no to, so a gate can print
+/// whether the detector fired at all (class `gate-blind-to-feature`).
+pub(crate) static SCREEN_FRAMES: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+/// `av1_set_screen_content_options` (av1/encoder/encoder.c), luma only: count
+/// the distinct colours of every 16x16 block and turn the screen-content
+/// tools on when the blocks holding between 2 and [`screen_colors`] of them
+/// cover more than a [`screen_pct`]th of the frame. `width` is the plane's
+/// stride, `true_*` the frame's real (decodable) extent.
+fn screen_content(y: &[u8], width: usize, true_width: usize, true_height: usize) -> bool {
+    if let Ok(v) = std::env::var("EC_AV1_SCREEN") {
+        let on = v != "0";
+        SCREEN_FRAMES[usize::from(on)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return on;
+    }
+    let (blk, limit) = (16usize, screen_colors());
+    let mut counted = 0usize;
+    for by in (0..true_height).step_by(blk) {
+        for bx in (0..true_width).step_by(blk) {
+            let (h, w) = ((true_height - by).min(blk), (true_width - bx).min(blk));
+            let mut seen = [false; 256];
+            let mut colors = 0usize;
+            for row in 0..h {
+                for col in 0..w {
+                    let v = usize::from(y[(by + row) * width + bx + col]);
+                    if !seen[v] {
+                        seen[v] = true;
+                        colors += 1;
+                    }
+                }
+            }
+            if colors > 1 && colors <= limit {
+                counted += 1;
+            }
+        }
+    }
+    let on = counted * blk * blk * screen_pct() > true_width * true_height;
+    SCREEN_FRAMES[usize::from(on)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    on
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -788,7 +884,17 @@ pub(crate) fn key_frame_headers_colour(
         // CDEF simply carries zero strengths.
         enable_cdef: true,
         enable_restoration: true,
-        seq_force_screen_content_tools: 0,
+        // SELECT (2) when this sequence's key frame detected screen content
+        // ([`screen_content`]): the per-frame `allow_screen_content_tools` bit
+        // is then coded in every frame header, and only the frames that want
+        // the palette syntax set it. 0 -- the forced-off form, no bit at all
+        // -- otherwise, which is what every non-screen stream this encoder
+        // writes still carries.
+        seq_force_screen_content_tools: if seq_screen() {
+            ec_av1_syntax::sequence::SELECT_SCREEN_CONTENT_TOOLS
+        } else {
+            0
+        },
         seq_force_integer_mv: 0,
         color_config,
         still_picture: false,
@@ -3080,7 +3186,19 @@ pub(crate) fn encode_key_frame_inner(
     // `render_and_frame_size_different` is false and no render_size bits are
     // written, mirroring libaom/rav1e: the padded `picture` below is only the
     // internal coding surface, never what the header names.
+    // Screen-content detection runs on the SOURCE luma, before any header is
+    // built: it decides this sequence's `seq_force_screen_content_tools` (and
+    // so the layout of every frame header after it, [`SEQ_SCREEN`]) as well as
+    // this frame's own `allow_screen_content_tools`.
+    let screen = screen_content(
+        &picture.y.iter().map(|&v| v as u8).collect::<Vec<u8>>(),
+        picture.width,
+        (picture.width).min(render.0),
+        (picture.height).min(render.1),
+    );
+    arm_seq_screen(screen);
     let (seq, mut header) = key_frame_headers_colour(render.0, render.1, base_q_idx, color_config)?;
+    header.allow_screen_content_tools = screen;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
     // `TxMode::Select`: every block codes a `tx_depth` symbol and may split
@@ -3359,6 +3477,7 @@ pub(crate) fn encode_key_frame_inner(
     let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
     let mut cdfs = crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx));
     let start_cdfs = CdfSnapshot(cdfs.clone());
+    crate::tile::arm_screen(screen);
     let mut tile = crate::tile::sb_coeff_key_frame_tile_cdfs(
         mi_cols,
         mi_rows,
@@ -3395,6 +3514,7 @@ pub(crate) fn encode_key_frame_inner(
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             let mut cdfs = start_cdfs.0.clone();
+            crate::tile::arm_screen(screen);
             crate::tile::sb_coeff_key_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
@@ -3445,6 +3565,7 @@ pub(crate) fn encode_key_frame_inner(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        screen,
         next_cdfs: start_cdfs.clone(),
         start_cdfs,
         loop_filter: header.loop_filter,
@@ -5072,6 +5193,9 @@ pub(crate) fn encode_inter_frame(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        // An inter frame of this encoder never sets the bit (its intra blocks
+        // code no palette syntax yet -- see the lane report's deferred item).
+        screen: false,
         start_cdfs,
         next_cdfs,
         loop_filter: header.loop_filter,

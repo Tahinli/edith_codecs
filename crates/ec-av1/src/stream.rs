@@ -2999,7 +2999,12 @@ mod tests {
                 encoded.tx_select,
                 // Our own encoder always writes `reduced_tx_set: true`.
                 true,
-                false,
+                // `allow_screen_content_tools` off the frame the encoder
+                // actually wrote: a screen-content picture codes two palette
+                // symbols per intra block, and a raw tile decode that guessed
+                // `false` desyncs at the first one (class: test asserts
+                // against a stale header).
+                encoded.screen,
                 false,
                 &encoded.loop_restoration, fctx,
             )

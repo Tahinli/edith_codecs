@@ -160,6 +160,25 @@ pub(crate) fn arm_sign_bias(sign_bias: crate::mvstack::SignBiasTable) {
     SIGN_BIAS.with(|c| c.set(sign_bias));
 }
 
+thread_local! {
+    static SCREEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms the next tile write with this frame's `allow_screen_content_tools`
+/// (spec 5.9.2), which is what makes every intra block carry the
+/// `palette_y_mode`/`palette_uv_mode` symbols spec 5.11.46
+/// `read_palette_mode_info` reads. Armed the same way [`arm_cdef_idx`]/
+/// [`arm_sign_bias`] are -- and disarmed by the same guard -- so a frame that
+/// never detected screen content writes exactly the stream it wrote before
+/// this lane.
+pub(crate) fn arm_screen(on: bool) {
+    SCREEN.with(|c| c.set(on));
+}
+
+fn screen_armed() -> bool {
+    SCREEN.with(std::cell::Cell::get)
+}
+
 /// Clears the armed plan when the tile writer that consumed it returns.
 struct CdefIdxGuard;
 
@@ -168,6 +187,7 @@ impl Drop for CdefIdxGuard {
         CDEF_IDX.with(|c| *c.borrow_mut() = None);
         LR_PLAN.with(|c| *c.borrow_mut() = None);
         SIGN_BIAS.with(|c| c.set(crate::mvstack::NO_SIGN_BIAS));
+        SCREEN.with(|c| c.set(false));
     }
 }
 
@@ -1715,6 +1735,9 @@ fn write_intra_mode(
     // This block's own position in 4x4 mode-info units, for the `cdef_idx`
     // literal that follows the `skip` symbol (see [`write_cdef_idx`]).
     mi: (usize, usize),
+    // The block's side in samples, which gates the palette syntax below
+    // (`av1_allow_palette`, [`crate::decode::palette_bsize_ctx`]).
+    side: usize,
 ) -> usize {
     let mode = usize::from(block.mode);
     enc.symbol(0, &mut cdfs.skip[0]);
@@ -1739,6 +1762,23 @@ fn write_intra_mode(
     // the luma delta reads, indexed by the chroma mode.
     if (V_PRED..=D67_PRED).contains(&uv_mode) {
         enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
+    }
+    // `read_palette_mode_info` (spec 5.11.46), mirrored symbol for symbol from
+    // the decoder's own read in `read_intra_mode`: on a frame whose header set
+    // `allow_screen_content_tools`, a `DC_PRED` luma block and a `UV_DC_PRED`
+    // chroma pair each carry a use-palette flag. Both contexts are 0 here --
+    // `av1_get_palette_mode_ctx` counts palette NEIGHBOURS, and this writer
+    // codes none -- exactly the ctx-0 read the decoder does under the same
+    // condition.
+    if screen_armed()
+        && let Some(bsize_ctx) = crate::decode::palette_bsize_ctx(side)
+    {
+        if mode == DC_PRED {
+            enc.symbol(0, &mut cdfs.palette_y_mode[bsize_ctx][0]);
+        }
+        if uv_mode == DC_PRED {
+            enc.symbol(0, &mut cdfs.palette_uv_mode[0]);
+        }
     }
     mode
 }
@@ -1775,6 +1815,7 @@ fn write_block(
         neighbours.left_mode[r],
         cfl,
         at_mi,
+        side,
     );
     let split = if tx_select {
         let tx = write_luma_select(
@@ -1849,7 +1890,7 @@ fn write_leaf8(
     // true first divergence (a differently-sized alphabet under the same
     // DC_PRED decision desyncs the coder even though the decoded mode is
     // unchanged).
-    let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, true, leaf_mi);
+    let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, true, leaf_mi, 8);
     let planes = [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4];
     let split = if tx_select {
         let tx = write_luma_select(
