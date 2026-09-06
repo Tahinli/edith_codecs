@@ -12660,6 +12660,13 @@ mod tests {
     /// | bars 2160p | +81.6% | +41.5% | 4.8s:1.0s:2.2s |
     /// | screen capture | +49.1% | -4.3% | 5.5s:1.0s:2.1s |
     ///
+    /// The same run under `EC_AV1_PYRAMID=4:-16:8 EC_AV1_GATE_FACADE=1`
+    /// (lane-av1pyrgate), which is what the content gate does at this scale:
+    /// the bars are non-screen so they take the pyramid (+84.7 / +39.9 and
+    /// +124.4 / +75.2 -- this downscaled recipe hates it, as it hates every
+    /// knob the real film rows keep), and the capture's row comes back
+    /// +49.1 / -4.3, the flat row to the byte. That equality IS the gate.
+    ///
     /// Loop restoration is NOT in yet: it is the one filter whose parameters
     /// are per restoration UNIT inside the tile payload, so it needs both
     /// tile writers to code `lr` syntax and an encoder-visible post-CDEF
