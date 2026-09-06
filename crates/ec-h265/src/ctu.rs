@@ -23,6 +23,7 @@
 //! every core instead.
 
 use crate::cabac::{CabacEncoder, CabacState, Contexts, ctx};
+use crate::encoder::TransformSkip;
 use crate::intra::{self, Availability, Refs};
 use crate::residual::{self, encode_residual};
 use crate::transform::{
@@ -172,6 +173,11 @@ pub struct CtuEncoder<'a> {
     /// Whether the levels get a rate-distortion search after quantisation.
     rdoq: bool,
     transform_skip: bool,
+    /// Whether every 4x4 luma block decides transform skip by rate-distortion
+    /// instead of taking `transform_skip` unconditionally.
+    ts_rd: bool,
+    /// The skip decision for the 4x4 luma block currently in the scratch.
+    ts_luma: bool,
     rqt: bool,
     /// Whether a 64x64 coding tree block may stay one coding unit rather than
     /// always splitting to 32x32.
@@ -215,7 +221,7 @@ impl<'a> CtuEncoder<'a> {
         sign_hiding: bool,
         rdoq: bool,
         rdoq_estimate: bool,
-        transform_skip: bool,
+        transform_skip: TransformSkip,
         rqt: bool,
         cu64: bool,
         min_cb_log2: u32,
@@ -240,7 +246,9 @@ impl<'a> CtuEncoder<'a> {
             intra_nxn,
             sign_hiding,
             rdoq,
-            transform_skip,
+            transform_skip: transform_skip == TransformSkip::AlwaysFor4x4,
+            ts_rd: transform_skip == TransformSkip::Rd,
+            ts_luma: false,
             rqt,
             cu64,
             rdoq_enc: {
@@ -587,11 +595,15 @@ impl<'a> CtuEncoder<'a> {
         let mut mpms = [[0u8; 3]; 4];
         let mut levels = [[0i32; 16]; 4];
         let mut cbfs = [false; 4];
+        let mut tskip = [self.transform_skip; 4];
         for (part, &(dx, dy)) in offsets.iter().enumerate() {
             let (px, py) = (x + dx, y + dy);
             let mpm = self.mpm_at(px, py);
             let mode = self.choose_luma_mode(px, py, 4, 2, &mpm, enc);
             levels[part].copy_from_slice(&self.scratch.luma_levels[..16]);
+            if self.ts_rd {
+                tskip[part] = self.ts_luma;
+            }
             cbfs[part] = levels[part].iter().any(|&v| v != 0);
             modes[part] = mode;
             mpms[part] = mpm;
@@ -640,7 +652,7 @@ impl<'a> CtuEncoder<'a> {
                     0,
                     scan,
                     self.sign_hiding,
-                    self.transform_skip,
+                    self.ts_flag(tskip[part]),
                 );
             }
             if part == 3 {
@@ -654,7 +666,7 @@ impl<'a> CtuEncoder<'a> {
                         1,
                         chroma_scan,
                         self.sign_hiding,
-                        self.transform_skip,
+                        self.ts_flag(self.transform_skip),
                     );
                     self.scratch.cb_levels = l;
                 }
@@ -667,7 +679,7 @@ impl<'a> CtuEncoder<'a> {
                         2,
                         chroma_scan,
                         self.sign_hiding,
-                        self.transform_skip,
+                        self.ts_flag(self.transform_skip),
                     );
                     self.scratch.cr_levels = l;
                 }
@@ -714,6 +726,7 @@ impl<'a> CtuEncoder<'a> {
         self.write_chroma_mode_syntax(enc, chroma_idx);
 
         let mut child_levels = [[0i32; 1024]; 4];
+        let mut child_tskip = [self.transform_skip; 4];
         let mut child_cbf = [false; 4];
         let mut child_cb = [[0i32; 256]; 4];
         let mut child_cr = [[0i32; 256]; 4];
@@ -738,6 +751,9 @@ impl<'a> CtuEncoder<'a> {
                     );
                 }
                 let (_, cbf) = self.transform_luma(HALF, mode, &source, &refs, true);
+                if self.ts_rd {
+                    child_tskip[part] = self.ts_luma;
+                }
                 self.scratch.source = source;
                 child_levels[part][..HALF * HALF]
                     .copy_from_slice(&self.scratch.levels[..HALF * HALF]);
@@ -776,6 +792,7 @@ impl<'a> CtuEncoder<'a> {
             cr_cbf,
             &child_cbf,
             &child_levels,
+            &child_tskip,
             &child_cb_cbf,
             &child_cr_cbf,
             &child_cb,
@@ -885,6 +902,7 @@ impl<'a> CtuEncoder<'a> {
             let half = n / 2;
             let offsets = [(0usize, 0usize), (half, 0), (0, half), (half, half)];
             let mut child_levels = [[0i32; 1024]; 4];
+            let mut child_tskip = [self.transform_skip; 4];
             let mut child_cbf = [false; 4];
             let mut child_cb = [[0i32; 256]; 4];
             let mut child_cr = [[0i32; 256]; 4];
@@ -901,6 +919,9 @@ impl<'a> CtuEncoder<'a> {
                     );
                 }
                 let (_, cbf) = self.transform_luma(half, mode, &source, &refs, true);
+                if self.ts_rd {
+                    child_tskip[part] = self.ts_luma;
+                }
                 child_levels[part][..half * half]
                     .copy_from_slice(&self.scratch.levels[..half * half]);
                 child_cbf[part] = cbf;
@@ -953,6 +974,7 @@ impl<'a> CtuEncoder<'a> {
                 split_cr_cbf,
                 &child_cbf,
                 &child_levels,
+                &child_tskip,
                 &child_cb_cbf,
                 &child_cr_cbf,
                 &child_cb,
@@ -1006,6 +1028,7 @@ impl<'a> CtuEncoder<'a> {
                     split_cr_cbf,
                     &child_cbf,
                     &child_levels,
+                    &child_tskip,
                     &child_cb_cbf,
                     &child_cr_cbf,
                     &child_cb,
@@ -1069,7 +1092,7 @@ impl<'a> CtuEncoder<'a> {
                 0,
                 scan,
                 self.sign_hiding,
-                self.transform_skip,
+                self.ts_flag(self.transform_skip),
             );
             self.scratch.luma_levels = levels;
         }
@@ -1083,7 +1106,7 @@ impl<'a> CtuEncoder<'a> {
                 1,
                 chroma_scan,
                 self.sign_hiding,
-                chroma_tskip,
+                self.ts_flag(chroma_tskip),
             );
             self.scratch.cb_levels = levels;
         }
@@ -1096,7 +1119,7 @@ impl<'a> CtuEncoder<'a> {
                 2,
                 chroma_scan,
                 self.sign_hiding,
-                chroma_tskip,
+                self.ts_flag(chroma_tskip),
             );
             self.scratch.cr_levels = levels;
         }
@@ -1123,6 +1146,7 @@ impl<'a> CtuEncoder<'a> {
         cr_cbf: bool,
         child_cbf: &[bool; 4],
         child_levels: &[[i32; 1024]; 4],
+        child_tskip: &[bool; 4],
         child_cb_cbf: &[bool; 4],
         child_cr_cbf: &[bool; 4],
         child_cb: &[[i32; 256]; 4],
@@ -1152,7 +1176,7 @@ impl<'a> CtuEncoder<'a> {
                     0,
                     luma_scan,
                     self.sign_hiding,
-                    self.transform_skip,
+                    self.ts_flag(child_tskip[part]),
                 );
             }
             if chroma_split {
@@ -1168,7 +1192,7 @@ impl<'a> CtuEncoder<'a> {
                         1,
                         scan,
                         self.sign_hiding,
-                        chroma_tskip,
+                        self.ts_flag(chroma_tskip),
                     );
                 }
                 if cr_cbf && child_cr_cbf[part] {
@@ -1179,7 +1203,7 @@ impl<'a> CtuEncoder<'a> {
                         2,
                         scan,
                         self.sign_hiding,
-                        chroma_tskip,
+                        self.ts_flag(chroma_tskip),
                     );
                 }
             } else if part == 3 {
@@ -1192,7 +1216,7 @@ impl<'a> CtuEncoder<'a> {
                         1,
                         scan,
                         self.sign_hiding,
-                        chroma_tskip,
+                        self.ts_flag(chroma_tskip),
                     );
                 }
                 if cr_cbf {
@@ -1203,7 +1227,7 @@ impl<'a> CtuEncoder<'a> {
                         2,
                         scan,
                         self.sign_hiding,
-                        chroma_tskip,
+                        self.ts_flag(chroma_tskip),
                     );
                 }
             }
@@ -1431,7 +1455,7 @@ impl<'a> CtuEncoder<'a> {
         // The trial above scored every candidate without RDOQ's refinement
         // loop; now that the mode is decided, pay for that loop exactly once,
         // on the winner, so the committed levels are the ones RDOQ can reach.
-        if self.rdoq {
+        if self.rdoq || (self.ts_rd && n == 4) {
             self.transform_luma(n, best.1, &source, &refs, true);
             best_levels[..n * n].copy_from_slice(&self.scratch.levels[..n * n]);
             self.scratch.best_recon[..n * n].copy_from_slice(&self.scratch.recon[..n * n]);
@@ -1463,6 +1487,61 @@ impl<'a> CtuEncoder<'a> {
         refs: &Refs,
         refine: bool,
     ) -> (f64, bool) {
+        if self.ts_rd {
+            if n == 4 && refine {
+                return self.transform_luma_ts_rd(mode, source, refs);
+            }
+            // Candidate ranking prices the mode, not the skip decision, which
+            // the committed pass above makes once on the winner.
+            self.ts_luma = false;
+        }
+        self.transform_luma_at(n, mode, source, refs, refine)
+    }
+
+    /// The `transform_skip_flag` to write for a 4x4 block: `None` when the PPS
+    /// left transform skip off and the decoder reads no bin at all.
+    fn ts_flag(&self, skip: bool) -> Option<bool> {
+        (self.transform_skip || self.ts_rd).then_some(skip)
+    }
+
+    /// Code the 4x4 luma block both ways and keep the cheaper one, leaving its
+    /// levels and reconstruction in the scratch and its flag in `ts_luma`.
+    fn transform_luma_ts_rd(&mut self, mode: u8, source: &[u8], refs: &Refs) -> (f64, bool) {
+        let scan = intra::scan_index(mode, 2, true);
+        let (mut best_cost, mut best) = (f64::MAX, (0.0, false, false, [0i32; 16], [0u8; 16]));
+        for skip in [false, true] {
+            self.ts_luma = skip;
+            let (ssd, cbf) = self.transform_luma_at(4, mode, source, refs, true);
+            // The flag itself is one bin; the levels are priced by the same
+            // proxy the mode search uses.
+            let mut bits = 1.0;
+            if cbf {
+                bits += residual::estimate_residual_bits(&self.scratch.levels[..16], 2, scan);
+            }
+            let cost = ssd + self.lambda * bits;
+            if cost < best_cost {
+                let (mut levels, mut recon) = ([0i32; 16], [0u8; 16]);
+                levels.copy_from_slice(&self.scratch.levels[..16]);
+                recon.copy_from_slice(&self.scratch.recon[..16]);
+                best_cost = cost;
+                best = (ssd, skip, cbf, levels, recon);
+            }
+        }
+        let (ssd, skip, cbf, levels, recon) = best;
+        self.ts_luma = skip;
+        self.scratch.levels[..16].copy_from_slice(&levels);
+        self.scratch.recon[..16].copy_from_slice(&recon);
+        (ssd, cbf)
+    }
+
+    fn transform_luma_at(
+        &mut self,
+        n: usize,
+        mode: u8,
+        source: &[u8],
+        refs: &Refs,
+        refine: bool,
+    ) -> (f64, bool) {
         intra::predict(
             refs,
             mode,
@@ -1474,7 +1553,7 @@ impl<'a> CtuEncoder<'a> {
         for (i, &sample) in source[..n * n].iter().enumerate() {
             self.scratch.residual[i] = i32::from(sample) - i32::from(self.scratch.pred[i]);
         }
-        let skip = self.transform_skip && n == 4;
+        let skip = n == 4 && if self.ts_rd { self.ts_luma } else { self.transform_skip };
         let dst = uses_dst(n, true);
         if skip {
             forward_transform_skip(&self.scratch.residual, &mut self.scratch.coeffs, n);
@@ -1492,6 +1571,7 @@ impl<'a> CtuEncoder<'a> {
         } else {
             quantize(&self.scratch.coeffs, &mut self.scratch.levels, n, self.qp)
         };
+        let ts = self.ts_flag(skip);
         if self.rdoq && refine && nonzero > 0 {
             nonzero = residual::rdoq(
                 &self.scratch.coeffs,
@@ -1502,7 +1582,7 @@ impl<'a> CtuEncoder<'a> {
                 intra::scan_index(mode, n.trailing_zeros(), true),
                 ctx::CBF_LUMA + 1,
                 self.lambda,
-                skip,
+                ts,
                 &mut self.rdoq_enc,
             );
         }
@@ -1589,6 +1669,7 @@ impl<'a> CtuEncoder<'a> {
                 self.qp_c,
             )
         };
+        let ts = self.ts_flag(skip && cn == 4);
         if self.rdoq && nonzero > 0 {
             nonzero = residual::rdoq(
                 &self.scratch.coeffs,
@@ -1599,7 +1680,7 @@ impl<'a> CtuEncoder<'a> {
                 intra::scan_index(pred_mode, cn.trailing_zeros(), false),
                 ctx::CBF_CHROMA,
                 self.lambda,
-                skip && cn == 4,
+                ts,
                 &mut self.rdoq_enc,
             );
         }
@@ -1713,7 +1794,7 @@ impl<'a> CtuEncoder<'a> {
                     1,
                     scan,
                     self.sign_hiding,
-                    chroma_tskip,
+                    self.ts_flag(chroma_tskip),
                 );
                 self.scratch.cb_levels = levels;
             }
@@ -1726,7 +1807,7 @@ impl<'a> CtuEncoder<'a> {
                     2,
                     scan,
                     self.sign_hiding,
-                    chroma_tskip,
+                    self.ts_flag(chroma_tskip),
                 );
                 self.scratch.cr_levels = levels;
             }

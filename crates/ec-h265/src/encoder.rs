@@ -56,6 +56,12 @@ pub enum TransformSkip {
     Off,
     /// Skip the transform on every 4x4 TU that has non-zero residual.
     AlwaysFor4x4,
+    /// Decide per 4x4 luma transform block by rate-distortion: quantise and
+    /// reconstruct the block both ways and keep the cheaper one. Unconditional
+    /// skip is a big win on screen capture and a loss on camera content
+    /// (measured, see `transform_skip`), which is exactly what a per-block
+    /// decision resolves.
+    Rd,
 }
 
 /// Encoder settings.
@@ -624,7 +630,7 @@ impl Encoder {
                             self.cfg.sign_hiding,
                             self.cfg.rdoq,
                             self.cfg.rdoq_estimate,
-                            self.cfg.transform_skip != TransformSkip::Off,
+                            self.cfg.transform_skip,
                             self.cfg.rqt,
                             self.cfg.cu64,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),

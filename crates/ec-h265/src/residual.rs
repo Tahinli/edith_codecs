@@ -289,7 +289,7 @@ fn levels_bits(
     scan_idx: usize,
     cbf_ctx: usize,
     coded: bool,
-    transform_skip: bool,
+    transform_skip: Option<bool>,
 ) -> f64 {
     enc.restore(base);
     let before = enc.bit_count_f64();
@@ -321,7 +321,7 @@ fn levels_bits_with(
     scan_idx: usize,
     cbf_ctx: usize,
     coded: bool,
-    transform_skip: bool,
+    transform_skip: Option<bool>,
     last_full: i32,
     csbf: [bool; 64],
 ) -> f64 {
@@ -366,7 +366,7 @@ pub fn rdoq(
     scan_idx: usize,
     cbf_ctx: usize,
     lambda: f64,
-    transform_skip: bool,
+    transform_skip: Option<bool>,
     enc: &mut CabacEncoder,
 ) -> usize {
     let log2_size = n.trailing_zeros();
@@ -628,7 +628,7 @@ pub fn encode_residual(
     c_idx: usize,
     scan_idx: usize,
     sign_hiding: bool,
-    transform_skip: bool,
+    transform_skip: Option<bool>,
 ) {
     let (last_full, csbf) = residual_header(levels, log2_size, scan_idx);
     encode_residual_with(
@@ -654,13 +654,17 @@ fn encode_residual_with(
     c_idx: usize,
     scan_idx: usize,
     sign_hiding: bool,
-    transform_skip: bool,
+    transform_skip: Option<bool>,
     last_full: i32,
     mut csbf: [bool; 64],
 ) {
-    if transform_skip && log2_size == 2 {
-        let ctx_idx = ctx::TRANSFORM_SKIP + if c_idx == 0 { 0 } else { 1 };
-        enc.encode_bin(ctx_idx, 1);
+    // `Some` means the PPS turned transform skip on, so the decoder reads a
+    // bin for every 4x4 transform block whether or not this one skips.
+    if let Some(skip) = transform_skip {
+        if log2_size == 2 {
+            let ctx_idx = ctx::TRANSFORM_SKIP + if c_idx == 0 { 0 } else { 1 };
+            enc.encode_bin(ctx_idx, u32::from(skip));
+        }
     }
     let n = 1usize << log2_size;
     let sub_wide = n >> 2;
@@ -1392,7 +1396,7 @@ mod tests {
         let mut costs = Vec::new();
         for levels in [&sparse, &dense] {
             let mut enc = CabacEncoder::counter(Contexts::new(30));
-            encode_residual(&mut enc, levels, 3, 0, 0, false, false);
+            encode_residual(&mut enc, levels, 3, 0, 0, false, None);
             costs.push(enc.bit_count());
         }
         assert!(costs[0] < costs[1], "{costs:?}");
@@ -1432,7 +1436,7 @@ mod tests {
                             c_idx,
                             scan_idx,
                             sign_hiding,
-                            false,
+                            None,
                         );
                         enc.encode_terminate(1);
                         let bytes = enc.finish();
@@ -1478,7 +1482,7 @@ mod tests {
                         };
                     }
                     let mut enc = CabacEncoder::counter(Contexts::new(27));
-                    encode_residual(&mut enc, &levels, log2, c_idx, scan_idx, false, false);
+                    encode_residual(&mut enc, &levels, log2, c_idx, scan_idx, false, None);
                     assert!(enc.bit_count() > 0);
                 }
             }
@@ -1499,7 +1503,7 @@ mod tests {
         scan_idx: usize,
         cbf_ctx: usize,
         lambda: f64,
-        transform_skip: bool,
+        transform_skip: Option<bool>,
         enc: &mut CabacEncoder,
     ) -> usize {
         let log2_size = n.trailing_zeros();
@@ -1687,7 +1691,7 @@ mod tests {
                         scan_idx,
                         ctx::CBF_LUMA,
                         1.0,
-                        false,
+                        None,
                         &mut enc_a,
                     );
 
@@ -1702,7 +1706,7 @@ mod tests {
                         scan_idx,
                         ctx::CBF_LUMA,
                         1.0,
-                        false,
+                        None,
                         &mut enc_b,
                     );
 
@@ -1731,7 +1735,7 @@ mod tests {
                             0,
                             scan_idx,
                             sign_hiding,
-                            false,
+                            None,
                         );
                         assert!(fenc.bit_count() > 0);
                     }
