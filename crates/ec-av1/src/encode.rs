@@ -7751,9 +7751,54 @@ fn tpl_lambda_factors(frames: &[&[u8]], width: usize, height: usize, k: f64) -> 
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|p| p.is_finite() && *p > 0.0)
         .unwrap_or(TPL_POWER);
-    let mut out: Vec<f64> = (0..cells)
-        .map(|c| {
-            let r = mc_dep[0][c] / f64::from(intra[0][c].max(1));
+    // lane-av1tpl3, the three shape fixes, each its own knob so the gate can
+    // read them apart:
+    //
+    // * `EC_AV1_TPL_FLOOR=<f>` floors the denominator at `f` times the
+    //   frame's own mean intra cost. A flat, heavily filtered cell has a
+    //   near-zero MAD, so its ratio explodes exactly where coding is cheap.
+    // * `EC_AV1_TPL_SB=1` sums intra and mc_dep over the 64x64 superblock
+    //   before the ratio is formed -- libaom's granularity (`mc_dep_cost` and
+    //   `intra_cost` are SB sums there, not per-16x16 numbers).
+    // * `EC_AV1_TPL_LOG=1` reads the ratio through `log2(1 + r)` instead of
+    //   raw, libaom's log-compressed beta, which flattens the tail harder
+    //   than the `p` exponent alone can.
+    let floor_frac = std::env::var("EC_AV1_TPL_FLOOR")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .unwrap_or(0.0);
+    let sb_agg = std::env::var("EC_AV1_TPL_SB").ok().as_deref() == Some("1");
+    let log_beta = std::env::var("EC_AV1_TPL_LOG").ok().as_deref() == Some("1");
+    let intra_mean =
+        intra[0].iter().map(|&c| f64::from(c)).sum::<f64>() / cells.max(1) as f64;
+    let floor = floor_frac * intra_mean;
+    let denom = |c: usize| f64::from(intra[0][c].max(1)).max(floor).max(1.0);
+    // Per-cell ratios, or one ratio per 64x64 superblock (4x4 cells) shared by
+    // every cell under it. The edge groups are partial and summed as they are.
+    let ratio: Vec<f64> = if sb_agg {
+        let (sb_cols, sb_rows) = (cells_x.div_ceil(4), cells_y.div_ceil(4));
+        let mut sb = vec![(0.0f64, 0.0f64); sb_cols * sb_rows];
+        for cy in 0..cells_y {
+            for cx in 0..cells_x {
+                let e = &mut sb[(cy / 4) * sb_cols + cx / 4];
+                e.0 += mc_dep[0][cy * cells_x + cx];
+                e.1 += denom(cy * cells_x + cx);
+            }
+        }
+        (0..cells)
+            .map(|c| {
+                let (dep, den) = sb[(c / cells_x / 4) * sb_cols + (c % cells_x) / 4];
+                dep / den.max(1.0)
+            })
+            .collect()
+    } else {
+        (0..cells).map(|c| mc_dep[0][c] / denom(c)).collect()
+    };
+    let mut out: Vec<f64> = ratio
+        .iter()
+        .map(|&r| {
+            let r = if log_beta { (1.0 + r).log2() } else { r };
             (1.0 + k * r).powf(-power)
         })
         .collect();
@@ -13012,6 +13057,75 @@ mod tests {
                 "| {name} {cw}x{ch} | {points} | {:+.1}% | {:+.1}% | {ours_wall:.1}s:{aom_wall:.1}s:{rav1e_wall:.1}s |",
                 bd_rate(&aom, &ours) * 100.0,
                 bd_rate(&rav1e, &ours) * 100.0,
+            );
+        }
+    }
+
+    /// lane-av1tpl3 step 1: the SHAPE of the propagating map's denominator
+    /// ([`super::tpl_intra_costs`], the per-16x16 MAD from the cell's own DC)
+    /// on the two film clips at their native gate crop. The 2160p clip loses
+    /// at every arm of the propagating map and the named suspect was that its
+    /// heavily filtered flat cells give a tiny denominator, so the dependence
+    /// ratio explodes exactly where coding is cheap; this prints the numbers
+    /// that confirm or refute it.
+    #[test]
+    #[ignore = "needs ffmpeg and the film fixtures"]
+    fn tpl_intra_denominator_histogram() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP tpl_intra_denominator_histogram: no ffmpeg");
+            return;
+        }
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        for (label, file) in [
+            ("film 1080p", "h264-1080p-23.976-8bit.mp4"),
+            ("film 2160p", "h264-2160p-23.976-8bit.mp4"),
+        ] {
+            let path = fixtures.join("video").join(file);
+            if !path.exists() {
+                eprintln!("SKIP {label}: {file} missing");
+                continue;
+            }
+            let path = path.to_str().unwrap();
+            let Some((nw, nh)) = probe_dims(path) else {
+                eprintln!("SKIP {label}: ffprobe gave no size");
+                continue;
+            };
+            let (cw, ch) = (nw.min(1920) / 128 * 128, nh.min(1024) / 128 * 128);
+            let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
+            let source =
+                clip_frames_vf(path, "0", &format!("crop={cw}:{ch}:{x}:{y}"), cw, ch, 8);
+            let mut costs: Vec<f64> = Vec::new();
+            for pic in &source {
+                let y8: Vec<u8> = pic.y.iter().map(|&v| v as u8).collect();
+                costs.extend(
+                    super::tpl_intra_costs(&y8, cw, ch).iter().map(|&c| f64::from(c)),
+                );
+            }
+            let mean = costs.iter().sum::<f64>() / costs.len() as f64;
+            let mut sorted = costs.clone();
+            sorted.sort_by(f64::total_cmp);
+            let q = |f: f64| sorted[((sorted.len() - 1) as f64 * f) as usize] / mean;
+            let below = |f: f64| costs.iter().filter(|&&c| c < f * mean).count();
+            eprintln!(
+                "{label} {cw}x{ch}: {} cells over 8 frames, mean intra MAD {mean:.0}; \
+                 as a fraction of the mean p0={:.3} p1={:.3} p5={:.3} p25={:.3} p50={:.3} \
+                 p75={:.3} p99={:.3} max={:.3}; below 0.25x {} ({:.1}%), below 0.5x {} ({:.1}%), \
+                 below 1.0x {} ({:.1}%)",
+                costs.len(),
+                q(0.0),
+                q(0.01),
+                q(0.05),
+                q(0.25),
+                q(0.50),
+                q(0.75),
+                q(0.99),
+                q(1.0),
+                below(0.25),
+                100.0 * below(0.25) as f64 / costs.len() as f64,
+                below(0.5),
+                100.0 * below(0.5) as f64 / costs.len() as f64,
+                below(1.0),
+                100.0 * below(1.0) as f64 / costs.len() as f64,
             );
         }
     }
