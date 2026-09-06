@@ -196,6 +196,7 @@ pub(crate) fn pick_filters(
             (cand.lf.0, cand.y),
             (if cand.uv == (0, 0) { 0 } else { cand.lf.0 }, cand.lf.1, cand.uv),
         );
+        let sst = crate::par::timer(crate::par::S_SSE);
         if !st.luma.iter().any(|(k, _)| *k == lkey) {
             let mut units = vec![0u64; nsb];
             let sse =
@@ -208,6 +209,7 @@ pub(crate) fn pick_filters(
                 + unit_sse(&picture.v, dec_cw, source[2], src_w / 2, cw, ch, 32, sb_cols, &mut units);
             st.chroma.push((ckey, (sse, units)));
         }
+        drop(sst);
         let (sse_y, sse_uv, sse64) = {
             let l = &st.luma.iter().find(|(k, _)| *k == lkey).expect("just inserted").1;
             let c = &st.chroma.iter().find(|(k, _)| *k == ckey).expect("just inserted").1;
