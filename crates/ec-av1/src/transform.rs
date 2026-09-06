@@ -1390,7 +1390,7 @@ fn build_dct_basis(n: usize) -> Vec<f64> {
 /// one of the transform sizes this crate codes (4 to 64, a power of two), so
 /// a small fixed table indexed by `log2(n)` covers every caller without a
 /// hash lookup.
-#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+// Also the reference [`forward_gain`] measures the fixed-point network against.
 fn dct_basis(n: usize) -> &'static [f64] {
     use std::sync::OnceLock;
     // log2(4)=2 .. log2(64)=6, so index by trailing_zeros() - 2.
@@ -1511,121 +1511,259 @@ pub fn forward_and_quantize_typed(
 /// to agree on for a level to mean what the encoder thinks it means.
 const INVERSE_GAIN_RECIPROCAL: f64 = 8.0;
 
-/// A complex sample, `(re, im)`, for the radix-2 FFT beneath [`dct1d`].
-type Complex = (f64, f64);
-
-fn cmul(a: Complex, b: Complex) -> Complex {
-    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
-}
-
-/// An in-place iterative radix-2 Cooley-Tukey FFT (forward, i.e. the `exp(-i
-/// theta)` convention), `a.len()` a power of two. Only [`dct1d`] calls this,
-/// on sizes 4 to 64, so no bounds beyond "power of two" are enforced.
-fn fft(a: &mut [Complex]) {
-    let n = a.len();
-    if n <= 1 {
-        return;
-    }
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
+/// The forward DCT network: [`inverse_dct_n`]'s stages in reverse order, each
+/// one transposed.
+///
+/// The encoder's forward transform is its own business -- only the quantized
+/// levels reach the decoder, and the reconstruction the search scores comes
+/// back through the decoder's exact inverse -- so what it owes is a good
+/// analysis basis, not a specified one. The cheapest good one is the
+/// decoder's: a butterfly network's transpose is that network run backwards
+/// with every elementary matrix transposed, and all of this one's elements
+/// are symmetric except the unflipped rotation, whose transpose is the same
+/// rotation at the negated angle. (`hadamard` is `[[1, 1], [1, -1]]` without
+/// its flip and `[[-1, 1], [1, 1]]` with it; a flipped `butterfly` is
+/// `[[s, c], [c, -s]]`; `permute` is a bit reversal, an involution.) So the
+/// body below -- the inverse's stages reversed, its unflipped angles negated,
+/// its permutation moved to the end -- is the analysis half of the same
+/// orthogonal transform, in `i32` arithmetic against the decoder's own cosine
+/// table: no libm, no complex FFT, and the eight-wide [`Lane`] impls apply to
+/// it unchanged.
+///
+/// The gain is the inverse network's, since a transpose preserves it;
+/// [`forward_gain`] measures it from this network rather than asserting it.
+#[inline(always)]
+fn forward_dct_n<T: Lane, const N: u32>(t: &mut [T; 64], r: usize) {
+    if N == 6 {
+        for i in 0..32 {
+            hadamard(t, i, 63 - i, false, r);
         }
-        j |= bit;
-        if i < j {
-            a.swap(i, j);
+    }
+    if N == 6 {
+        for i in 0..8 {
+            butterfly(t, 55 - i, 40 + i, 32, true, r);
         }
     }
-    let mut len = 2;
-    while len <= n {
-        // lane-av1speed: the stage twiddle depends on `len` alone, so the
-        // eight values this loop can ever ask for are computed once instead
-        // of two libm `sincos` calls per stage per call (`__sincos_fma` was
-        // 9% of the encoder's profile). Same values, so the recurrence below
-        // -- and every coefficient it produces -- is bit-identical.
-        static WLEN: std::sync::OnceLock<[(f64, f64); 7]> = std::sync::OnceLock::new();
-        let wlen = WLEN.get_or_init(|| {
-            std::array::from_fn(|i| {
-                let ang = -2.0 * std::f64::consts::PI / (2u32 << i) as f64;
-                (ang.cos(), ang.sin())
-            })
-        })[len.trailing_zeros() as usize - 1];
-        let mut i = 0;
-        while i < n {
-            let mut w = (1.0, 0.0);
-            for k in 0..len / 2 {
-                let u = a[i + k];
-                let v = cmul(a[i + k + len / 2], w);
-                a[i + k] = (u.0 + v.0, u.1 + v.1);
-                a[i + k + len / 2] = (u.0 - v.0, u.1 - v.1);
-                w = cmul(w, wlen);
+    if N >= 5 {
+        for i in 0..16 {
+            hadamard(t, i, 31 - i, false, r);
+        }
+    }
+    if N == 6 {
+        for i in 0..8 {
+            hadamard(t, 32 + i, 47 - i, false, r);
+            hadamard(t, 48 + i, 63 - i, true, r);
+        }
+    }
+    if N >= 5 {
+        for i in 0..4 {
+            butterfly(t, 27 - i, 20 + i, 32, true, r);
+        }
+    }
+    if N >= 4 {
+        for i in 0..8 {
+            hadamard(t, i, 15 - i, false, r);
+        }
+    }
+    if N == 6 {
+        for i in 0..8 {
+            butterfly(t, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true, r);
+        }
+    }
+    if N >= 5 {
+        for i in 0..2 {
+            for j in 0..4 {
+                hadamard(t, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, r);
             }
-            i += len;
         }
-        len <<= 1;
+    }
+    if N >= 4 {
+        for i in 0..2 {
+            butterfly(t, 13 - i, 10 + i, 32, true, r);
+        }
+    }
+    if N >= 3 {
+        for i in 0..4 {
+            hadamard(t, i, 7 - i, false, r);
+        }
+    }
+    if N == 6 {
+        for i in 0..4 {
+            for j in 0..4 {
+                hadamard(t, 32 + 8 * i + j, 39 + 8 * i - j, i & 1 == 1, r);
+            }
+        }
+    }
+    if N >= 5 {
+        for i in 0..4 {
+            butterfly(t, 29 - i, 18 + i, 48 + ((i as i32) >> 1) * 64, true, r);
+        }
+    }
+    if N >= 4 {
+        for i in 0..2 {
+            for j in 0..2 {
+                hadamard(t, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, r);
+            }
+        }
+    }
+    if N >= 3 {
+        butterfly(t, 6, 5, 32, true, r);
+    }
+    for i in 0..2 {
+        hadamard(t, i, 3 - i, false, r);
+    }
+    if N == 6 {
+        for i in 0..2 {
+            for j in 0..4 {
+                let angle = 56 - (i as i32) * 32 + ((j as i32) >> 1) * 64;
+                butterfly(t, 61 - i * 8 - j, 34 + i * 8 + j, angle, true, r);
+            }
+        }
+    }
+    if N >= 5 {
+        for i in 0..4 {
+            for j in 0..2 {
+                hadamard(t, 16 + 4 * i + j, 19 + 4 * i - j, i & 1 == 1, r);
+            }
+        }
+    }
+    if N >= 4 {
+        for i in 0..2 {
+            butterfly(t, 14 - i, 9 + i, 48 + 64 * i as i32, true, r);
+        }
+    }
+    if N >= 3 {
+        for i in 0..2 {
+            hadamard(t, 4 + 2 * i, 5 + 2 * i, i == 1, r);
+        }
+    }
+    for i in 0..2 {
+        butterfly(t, 2 * i, 2 * i + 1, if i == 0 { 32 + 16 * i as i32 } else { -(32 + 16 * i as i32) }, i == 0, r);
+    }
+    if N == 6 {
+        for i in 0..8 {
+            for j in 0..2 {
+                hadamard(t, 32 + i * 4 + j, 35 + i * 4 - j, i & 1 == 1, r);
+            }
+        }
+    }
+    if N >= 5 {
+        for i in 0..2 {
+            for j in 0..2 {
+                let angle = 24 + ((j as i32) << 6) + ((1 - i as i32) << 5);
+                butterfly(t, 30 - 4 * i - j, 17 + 4 * i + j, angle, true, r);
+            }
+        }
+    }
+    if N >= 4 {
+        for i in 0..4 {
+            hadamard(t, 8 + 2 * i, 9 + 2 * i, i & 1 == 1, r);
+        }
+    }
+    if N >= 3 {
+        for i in 0..2 {
+            butterfly(t, 4 + i, 7 - i, -(56 - 32 * i as i32), false, r);
+        }
+    }
+    if N == 6 {
+        for i in 0..4 {
+            for j in 0..2 {
+                let angle = 60 - 16 * brev(2, i) as i32 + 64 * j as i32;
+                butterfly(t, 62 - i * 4 - j, 33 + i * 4 + j, angle, true, r);
+            }
+        }
+    }
+    if N >= 5 {
+        for i in 0..8 {
+            hadamard(t, 16 + 2 * i, 17 + 2 * i, i & 1 == 1, r);
+        }
+    }
+    if N >= 4 {
+        for i in 0..4 {
+            butterfly(
+                t,
+                8 + i,
+                15 - i, -(12 + ((brev(2, 3 - i) as i32) << 4)),
+                false,
+                r);
+        }
+    }
+    if N == 6 {
+        for i in 0..16 {
+            hadamard(t, 32 + i * 2, 33 + i * 2, i & 1 == 1, r);
+        }
+    }
+    if N >= 5 {
+        for i in 0..8 {
+            butterfly(
+                t,
+                16 + i,
+                31 - i, -(6 + ((brev(3, 7 - i) as i32) << 3)),
+                false,
+                r);
+        }
+    }
+    if N == 6 {
+        for i in 0..16 {
+            butterfly(t, 32 + i, 63 - i, -(63 - 4 * brev(4, i) as i32), false, r);
+        }
+    }
+
+    permute(t, N);
+}
+
+/// [`forward_dct_n`] dispatched on the size, as [`inverse_dct_fixed`] is.
+fn forward_dct_fixed(t: &mut [i32; 64], n: u32, r: usize) {
+    match n {
+        2 => forward_dct_n::<i32, 2>(t, r),
+        3 => forward_dct_n::<i32, 3>(t, r),
+        4 => forward_dct_n::<i32, 4>(t, r),
+        5 => forward_dct_n::<i32, 5>(t, r),
+        6 => forward_dct_n::<i32, 6>(t, r),
+        _ => unreachable!("the forward DCT is defined for 4..64"),
     }
 }
 
-/// The orthonormal DCT-II of one line of `n` samples, in `O(n log n)` via
-/// Makhoul's FFT reduction rather than the `n^2` direct dot product against
-/// [`build_dct_basis`]'s rows.
+/// The range the forward network's intermediates are clamped to. The residual
+/// is at most +-2^bit_depth and one pass multiplies by the network's gain
+/// (`sqrt(n / 2)`, at most 5.66), so two passes stay under 2^20 for 8-bit and
+/// nothing here ever reaches this bound -- it exists so `Lane::had` has the
+/// same shape it has in the decoder.
+const FORWARD_RANGE: usize = 32;
+
+/// Headroom bits the residual is shifted up by before the row pass.
 ///
-/// The reduction: reorder `x` into `v[i] = x[2i]`, `v[n-1-i] = x[2i+1]` for
-/// `i < n/2`; an `n`-point FFT of `v` then gives the unnormalized DCT-II as
-/// `X_k = Re(V_k * exp(-i*pi*k/(2n)))` (measured against the direct
-/// definition, not the textbook `2 * Re(...)` form, which double-counts here
-/// because `v`'s construction already folds each input pair once). What is
-/// returned here is that,
-/// scaled to match [`build_dct_basis`]'s convention exactly (`alpha_0 =
-/// 1/sqrt(2)`, `alpha_k = 1` otherwise, both times `sqrt(2/n)`) so the result
-/// is bit-for-bit the same *contract* as the old matmul, only reordered in
-/// its summation (equal up to floating-point rounding, checked in
-/// `fast_forward_matches_the_naive_matmul`).
-/// The post-FFT twist for [`dct1d`], `(cos(theta_k), sin(theta_k), alpha_k *
-/// sqrt(2/n))` per output `k` -- cached per size for the same reason
-/// [`dct_basis`] is: computed from a `k`-dependent angle, so a call-time
-/// `cos`/`sin` per output (`n` of them, every call) was measured as this
-/// factorization's actual bottleneck, worse than the matmul it was meant to
-/// beat.
-fn dct_twist(n: usize) -> &'static [(f64, f64, f64)] {
+/// The network rounds to an integer at every butterfly, so its output LSB is
+/// what the quantizer's input resolution costs: unshifted, one LSB at 4x4 is
+/// four whole units of the `8 * orthonormal` scale the levels are formed on
+/// -- coarser than a fine quantizer's own step, and worth 3.9 BD points on
+/// screen capture. Ten bits put it at 1/256 of a unit, which is where the BD
+/// gate stops moving (13 bits measured identical), and cost nothing: the
+/// widest case, a 12-bit residual through two 64-point passes (gain 32),
+/// stays under 2^27 -- inside `i32` and far inside [`FORWARD_RANGE`].
+const FORWARD_PRECISION_BITS: u32 = 10;
+
+/// [`forward_dct_n`]'s uniform gain at one size, measured from the network
+/// itself rather than derived: an impulse through it is `g` times
+/// [`dct_basis`]'s corresponding column, so a least-squares fit over the
+/// whole column returns `g` without trusting any single output's rounding.
+/// Cached per size, like every other table here.
+fn forward_gain(n: usize) -> f64 {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<[OnceLock<Vec<(f64, f64, f64)>>; 5]> = OnceLock::new();
+    static CACHE: OnceLock<[OnceLock<f64>; 5]> = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
-    let idx = (n.trailing_zeros() as usize).saturating_sub(2);
-    cache[idx].get_or_init(|| {
-        (0..n)
-            .map(|k| {
-                let theta = std::f64::consts::PI * k as f64 / (2.0 * n as f64);
-                let alpha = if k == 0 { 1.0 / 2.0f64.sqrt() } else { 1.0 };
-                (theta.cos(), theta.sin(), alpha * (2.0 / n as f64).sqrt())
-            })
-            .collect()
+    *cache[(n.trailing_zeros() as usize).saturating_sub(2)].get_or_init(|| {
+        // Large enough that the network's rounding is negligible against it,
+        // far below anything `FORWARD_RANGE` clamps.
+        const AMP: i32 = 1 << 14;
+        let mut t = [0i32; 64];
+        t[0] = AMP;
+        forward_dct_fixed(&mut t, n.trailing_zeros(), FORWARD_RANGE);
+        let basis = dct_basis(n);
+        let num: f64 = (0..n).map(|u| f64::from(t[u]) * basis[u * n]).sum();
+        let den: f64 = (0..n).map(|u| basis[u * n] * basis[u * n]).sum();
+        num / (f64::from(AMP) * den)
     })
-}
-
-///
-/// `x` and `out` are both exactly `n` long (`n` at most 64, the largest
-/// transform side this crate codes); the FFT itself runs on a fixed 64-slot
-/// stack array rather than a heap `Vec` -- this call happens twice per row
-/// and twice per column of every RD trial's transform, and the allocations
-/// that a `Vec` per call cost here were measured as a first source of a first
-/// cut of this factorization being *slower* than the matmul it replaced (the
-/// call-time trig in [`dct_twist`]'s table was the other, larger one).
-fn dct1d(x: &[f64], out: &mut [f64]) {
-    let n = x.len();
-    let half = n / 2;
-    let mut v = [(0.0f64, 0.0f64); 64];
-    for i in 0..half {
-        v[i] = (x[2 * i], 0.0);
-        v[n - 1 - i] = (x[2 * i + 1], 0.0);
-    }
-    fft(&mut v[..n]);
-    let twist = dct_twist(n);
-    for (k, &(c, s, scale)) in twist.iter().enumerate() {
-        out[k] = scale * (v[k].0 * c + v[k].1 * s);
-    }
 }
 
 /// The forward transform (encoder side, spec-free): the transpose of what the
@@ -1640,36 +1778,84 @@ fn dct1d(x: &[f64], out: &mut [f64]) {
 /// fixed-point gain. It is deterministic, and its accuracy is measured
 /// against the decoder's own inverse rather than asserted.
 pub fn forward_transform_2d(residual: &[i32], side: usize) -> Vec<f64> {
+    let rows = forward_rows(residual, side);
+    let scale = forward_scale(side);
+    let mut out = vec![0.0f64; side * side];
+    let mut t = [0i32; 64];
+    for v in 0..side {
+        if !forward_column(&rows, side, v, &mut t) {
+            continue;
+        }
+        for u in 0..side {
+            out[u * side + v] = f64::from(t[u]) * scale;
+        }
+    }
+    out
+}
+
+/// The row pass, in fixed point: each of `side` residual rows through
+/// [`forward_dct_fixed`], at [`FORWARD_PRECISION_BITS`] extra precision and
+/// the network's own gain (both of which [`forward_scale`] divides back out).
+///
+/// The `Vec` is per call on purpose: holding it in a thread-local scratch, as
+/// the inverse transform's row pass does, was MEASURED +5.0% instructions on
+/// the sequence bench -- a fresh zeroed allocation costs less here than the
+/// `memset` reusing one needs plus the thread-local access, because the
+/// zeroing is what the all-zero-row skip below reads.
+fn forward_rows(residual: &[i32], side: usize) -> Vec<i32> {
     assert_eq!(
         residual.len(),
         side * side,
         "one residual sample per position"
     );
-    let mut rows = vec![0.0f64; side * side];
-    let mut buf = [0.0f64; 64];
-    let mut line = [0.0f64; 64];
+    let log2 = side.trailing_zeros();
+    let mut rows = vec![0i32; side * side];
+    let mut t = [0i32; 64];
     for i in 0..side {
-        for (j, &r) in residual[i * side..][..side].iter().enumerate() {
-            buf[j] = f64::from(r);
+        let source = &residual[i * side..][..side];
+        // Zero in, zero out, and `rows` is already zero here -- the skip the
+        // decoder's column pass takes for the same reason.
+        if source.iter().all(|&r| r == 0) {
+            continue;
         }
-        dct1d(&buf[..side], &mut line[..side]);
-        rows[i * side..][..side].copy_from_slice(&line[..side]);
-    }
-    let mut out = vec![0.0f64; side * side];
-    for v in 0..side {
-        for (i, c) in buf[..side].iter_mut().enumerate() {
-            *c = rows[i * side + v];
+        for (dst, &r) in t[..side].iter_mut().zip(source) {
+            *dst = r << FORWARD_PRECISION_BITS;
         }
-        dct1d(&buf[..side], &mut line[..side]);
-        for (u, &t) in line[..side].iter().enumerate() {
-            out[u * side + v] = t;
-        }
+        forward_dct_fixed(&mut t, log2, FORWARD_RANGE);
+        rows[i * side..][..side].copy_from_slice(&t[..side]);
     }
-    let scale = INVERSE_GAIN_RECIPROCAL;
-    for v in &mut out {
-        *v *= scale;
+    rows
+}
+
+/// One column of [`forward_rows`]'s output through the network, into `t`;
+/// `false` when the column is all zero and `t` was left untouched.
+///
+/// One column at a time, and the caller consumes `t` before asking for the
+/// next: eight columns through the same `[i32; 8]` [`Lane`] the decoder's
+/// column pass uses was MEASURED SLOWER (+3.4% instructions on the sequence
+/// bench, and +2.3% for an in-place whole-buffer column pass). This encoder's
+/// transforms are mostly small -- a group of eight loses the per-column zero
+/// skip that a 4x4 or 8x8 residual keeps hitting, and the levels stop being
+/// formed while the column is still in registers.
+fn forward_column(rows: &[i32], side: usize, v: usize, t: &mut [i32; 64]) -> bool {
+    let mut any = 0i32;
+    for i in 0..side {
+        t[i] = rows[i * side + v];
+        any |= t[i];
     }
-    out
+    if any == 0 {
+        return false;
+    }
+    forward_dct_fixed(t, side.trailing_zeros(), FORWARD_RANGE);
+    true
+}
+
+/// What one fixed-point coefficient is worth on the `8 * orthonormal` scale
+/// the levels are formed on: both passes carry the network's gain, and the
+/// row pass carried the headroom shift too.
+fn forward_scale(side: usize) -> f64 {
+    let g = forward_gain(side);
+    INVERSE_GAIN_RECIPROCAL / (g * g * f64::from(1u32 << FORWARD_PRECISION_BITS))
 }
 
 /// The old direct `O(n^2)` matmul against [`build_dct_basis`], kept only as
@@ -1755,8 +1941,34 @@ pub fn forward_and_quantize(
     q_idx: i32,
     deadzone: f64,
 ) -> Vec<i32> {
-    let coeffs = forward_transform_2d(residual, side);
-    quantize(&coeffs, side, bit_depth, q_idx, deadzone)
+    // Fused: the levels are formed straight off the fixed-point coefficients,
+    // so neither the `Vec<f64>` of coefficients nor the pass that reads it
+    // exists.
+    let rows = forward_rows(residual, side);
+    let scale = forward_scale(side);
+    let dc = scale / f64::from(crate::quant::dc_q(bit_depth, q_idx));
+    let ac = scale / f64::from(crate::quant::ac_q(bit_depth, q_idx));
+    // A 64-point transform carries its top-left 32x32 alone, so the other
+    // half's columns are not even transformed.
+    let coded = side.min(32);
+    let mut levels = vec![0i32; side * side];
+    let mut t = [0i32; 64];
+    for v in 0..coded {
+        if !forward_column(&rows, side, v, &mut t) {
+            continue;
+        }
+        for u in 0..coded {
+            let scaled = f64::from(t[u]) * if u == 0 && v == 0 { dc } else { ac };
+            let magnitude = scaled.abs() + deadzone;
+            let level = if magnitude < 1.0 {
+                0
+            } else {
+                magnitude.floor().min(f64::from(i32::MAX)) as i32
+            };
+            levels[u * side + v] = if scaled < 0.0 { -level } else { level };
+        }
+    }
+    levels
 }
 
 #[cfg(test)]
@@ -1913,31 +2125,70 @@ mod tests {
     /// [`forward_transform_2d_naive`]'s direct matmul: same summation
     /// reordered, so equal up to floating-point rounding, not bit-exact.
     #[test]
-    fn fast_forward_matches_the_naive_matmul() {
+    fn the_fixed_point_forward_matches_the_exact_matmul() {
         for &side in &[4usize, 8, 16, 32, 64] {
             for seed in [1u64, 2, 3] {
                 let residual = noise(side * side, seed * 1000 + side as u64);
                 let fast = forward_transform_2d(&residual, side);
                 let naive = forward_transform_2d_naive(&residual, side);
-                for (i, (&f, &n)) in fast.iter().zip(&naive).enumerate() {
+                let worst = fast
+                    .iter()
+                    .zip(&naive)
+                    .map(|(f, n)| (f - n).abs())
+                    .fold(0.0f64, f64::max);
+                let energy: f64 = naive.iter().map(|n| n * n).sum::<f64>().sqrt();
+                let err: f64 = fast
+                    .iter()
+                    .zip(&naive)
+                    .map(|(f, n)| (f - n) * (f - n))
+                    .sum::<f64>()
+                    .sqrt();
+                // The network rounds at every butterfly, so it is not the
+                // matmul to the last bit -- it is the same transform to well
+                // inside one quantizer step. One unit here is an eighth of an
+                // orthonormal coefficient ([`INVERSE_GAIN_RECIPROCAL`]), and
+                // the finest step any level is formed on is `dc_q(8, 0) = 4`.
+                assert!(worst < 1.0, "{side}x{side} seed {seed}: worst {worst}");
+                assert!(
+                    err < 1e-3 * energy,
+                    "{side}x{side} seed {seed}: rmse {err} of energy {energy}"
+                );
+            }
+        }
+    }
+
+    /// The gain [`forward_transform_2d`] divides out is the network's own, and
+    /// it is ONE number per size -- if the network's gain varied by output the
+    /// single scale would tilt the spectrum. Pinned per size against the
+    /// orthonormal basis it is measured from.
+    #[test]
+    fn the_forward_network_has_one_uniform_gain() {
+        for &n in &[4usize, 8, 16, 32, 64] {
+            let g = forward_gain(n);
+            assert!(
+                (g - (n as f64 / 2.0).sqrt()).abs() < 1e-3,
+                "{n}-point gain {g}"
+            );
+            let basis = dct_basis(n);
+            for i in 0..n {
+                let mut t = [0i32; 64];
+                t[i] = 1 << 14;
+                forward_dct_fixed(&mut t, n.trailing_zeros(), FORWARD_RANGE);
+                for u in 0..n {
+                    let want = g * f64::from(1 << 14) * basis[u * n + i];
+                    // A thousandth of the impulse's own amplitude: the
+                    // network's rounding accumulates over its stages, and
+                    // what is pinned here is that the SHAPE is the basis.
                     assert!(
-                        (f - n).abs() < 1e-6 * n.abs().max(1.0),
-                        "{side}x{side} seed {seed} coefficient {i}: fast {f} vs naive {n}"
+                        (f64::from(t[u]) - want).abs() < 1e-3 * g * f64::from(1 << 14),
+                        "{n}-point impulse {i} output {u}: {} vs {want}",
+                        t[u]
                     );
                 }
             }
         }
     }
 
-    /// The one thing the encoder and the decoder have to agree on.
-    ///
-    /// The spec's inverse network is not documented as a scaled orthonormal
-    /// DCT, so this measures it: each dequantized coefficient, on its own,
-    /// comes back out as its orthonormal basis function scaled by
-    /// `dq_denom(side) / 8` — the same factor for every coefficient of a
-    /// size, which is what makes a single constant enough for the encoder.
-    /// The fit is checked as well as the scale, so an inverse that scaled
-    /// right but mixed positions apart could not pass.
     #[test]
     fn the_inverse_network_is_an_orthonormal_dct_over_eight() {
         for &side in &[4usize, 8, 16, 32, 64] {
