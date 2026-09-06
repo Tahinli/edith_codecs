@@ -135,7 +135,7 @@ const MAX_LEVEL: i32 = MAX_BR_LEVEL + (1 << 19);
 /// The coefficient q-context (spec 8.3.2's `Get_Qctx`, `Default_..._Cdf`'s
 /// leading index) a frame's `base_q_idx` picks its default CDFs from.
 /// [`crate::cdf`] carries all four, one constant set per context.
-fn q_ctx_of(base_q_idx: u8) -> usize {
+pub(crate) fn q_ctx_of(base_q_idx: u8) -> usize {
     match base_q_idx {
         0..=20 => 0,
         21..=60 => 1,
@@ -1050,6 +1050,26 @@ pub fn sb_coeff_key_frame_tile_tx(
     superblocks: &[Superblock],
     tx_select: bool,
 ) -> Result<Vec<u8>> {
+    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    sb_coeff_key_frame_tile_cdfs(mi_cols, mi_rows, base_q_idx, superblocks, tx_select, &mut cdfs)
+}
+
+/// [`sb_coeff_key_frame_tile_tx`] starting from -- and leaving behind -- the
+/// caller's own CDF state, which is what a frame whose
+/// `disable_frame_end_update_cdf` is off needs: the next frame's writer must
+/// start where this tile ended (spec 7.20, mirrored by
+/// `crate::stream::stored_cdfs_for`).
+///
+/// # Errors
+/// As [`sb_coeff_key_frame_tile_tx`].
+pub(crate) fn sb_coeff_key_frame_tile_cdfs(
+    mi_cols: u32,
+    mi_rows: u32,
+    _base_q_idx: u8,
+    superblocks: &[Superblock],
+    tx_select: bool,
+    cdfs: &mut Cdfs,
+) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
     let (cols, rows) = block_grid(mi_cols, mi_rows);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
@@ -1108,7 +1128,7 @@ pub fn sb_coeff_key_frame_tile_tx(
     // The tile adapts every non-literal CDF it writes, exactly as the decoder
     // adapts the ones it reads, so the frame header leaves `disable_cdf_update`
     // off.
-    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut cdfs = cdfs;
     let mut enc = SymbolEncoder::new();
     for sb_r in 0..sb_rows {
         neighbours.start_row();
@@ -2812,6 +2832,23 @@ pub fn sb_coeff_inter_frame_tile_tx(
     blocks: &[Quadrant],
     tx_select: bool,
 ) -> Result<Vec<u8>> {
+    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    sb_coeff_inter_frame_tile_cdfs(mi_cols, mi_rows, base_q_idx, blocks, tx_select, &mut cdfs)
+}
+
+/// [`sb_coeff_inter_frame_tile_tx`] starting from -- and leaving behind --
+/// the caller's own CDF state; see [`sb_coeff_key_frame_tile_cdfs`].
+///
+/// # Errors
+/// As [`sb_coeff_inter_frame_tile_tx`].
+pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
+    mi_cols: u32,
+    mi_rows: u32,
+    _base_q_idx: u8,
+    blocks: &[Quadrant],
+    tx_select: bool,
+    cdfs: &mut Cdfs,
+) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
     // `block_grid`'s ceiling, not a plain division: a true frame size that is
     // not a whole number of 32x32 blocks (or of 64x64 superblocks) still has
@@ -2853,7 +2890,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
         mi_rows as usize,
     );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
-    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut cdfs = cdfs;
     let mut enc = SymbolEncoder::new();
     // An `is_inter` block's 32x32 luma transform reads a different
     // `tx_type` set than an intra block's (`get_tx_set`, spec 5.11.48; see

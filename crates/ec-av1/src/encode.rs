@@ -477,6 +477,19 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         mi_rows: encoded.mi_rows,
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
+        start_cdfs: encoded.start_cdfs.clone(),
+        next_cdfs: encoded.next_cdfs.clone(),
+    }
+}
+
+/// A `Cdfs` inside a `Debug` type: the tables are tens of kilobytes of
+/// numbers nobody wants printed, and [`Encoded`] derives `Debug`.
+#[derive(Clone)]
+pub(crate) struct CdfSnapshot(pub(crate) crate::cdf_state::Cdfs);
+
+impl std::fmt::Debug for CdfSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CdfSnapshot")
     }
 }
 
@@ -513,6 +526,18 @@ pub struct Encoded {
     /// a `tx_depth` frame as a `TxMode::Largest` one and desyncs at the first
     /// block.
     pub(crate) tx_select: bool,
+    /// The CDF state this frame's tile writer started from -- the defaults
+    /// for a key frame and for the first inter frame, and the previous
+    /// frame's stored tables after that. A test that decodes `tile` directly
+    /// must feed the decoder this, exactly as `decode_stream` feeds it what
+    /// the frame's `primary_ref_frame` slot holds (same class as
+    /// `tx_select`: a header bit a raw tile decode cannot guess).
+    pub(crate) start_cdfs: CdfSnapshot,
+    /// What this frame stores into the slots it refreshes (spec 7.20,
+    /// `crate::stream::stored_cdfs_for`): its end-of-tile tables with the
+    /// counts reset when `disable_frame_end_update_cdf` is off, and what it
+    /// started from when it is on.
+    pub(crate) next_cdfs: CdfSnapshot,
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -691,7 +716,10 @@ pub fn inter_frame_headers(
         show_frame: true,
         error_resilient_mode: false,
         disable_cdf_update: false,
-        disable_frame_end_update_cdf: true,
+        // The tile writer hands its end-of-tile tables to the next frame
+        // (`encode_sequence_with_ctx`), so the frame stores them the way the
+        // decoder will load them (spec 7.20).
+        disable_frame_end_update_cdf: false,
         force_integer_mv: false,
         order_hint,
         primary_ref_frame: 0,
@@ -3008,12 +3036,20 @@ pub(crate) fn encode_key_frame_inner(
 
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits_sb(&superblocks, base_q_idx));
-    let tile = crate::tile::sb_coeff_key_frame_tile_tx(
+    // A key frame always starts from the defaults (`primary_ref_frame` is
+    // `PRIMARY_REF_NONE`), and its header keeps `disable_frame_end_update_cdf`
+    // set, so what it stores into the slots it refreshes is exactly those
+    // defaults again (spec 7.20's `started_from` arm) -- the first inter
+    // frame after it therefore starts from the defaults too.
+    let mut cdfs = crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx));
+    let start_cdfs = CdfSnapshot(cdfs.clone());
+    let tile = crate::tile::sb_coeff_key_frame_tile_cdfs(
         header.mi_cols,
         header.mi_rows,
         base_q_idx,
         &superblocks,
         tx_select,
+        &mut cdfs,
     )?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&sequence_header_obu(&seq)?);
@@ -3036,6 +3072,8 @@ pub(crate) fn encode_key_frame_inner(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        next_cdfs: start_cdfs.clone(),
+        start_cdfs,
     })
 }
 
@@ -3620,7 +3658,12 @@ pub(crate) fn encode_inter_frame(
     base_q_idx: u8,
     deadzone: f64,
     order_hint: u32,
-    render: (usize, usize), fctx: &crate::decode::FrameCtx,
+    render: (usize, usize),
+    // The tables this frame's writer starts from: what the previous frame
+    // stored into the slot this one's `primary_ref_frame` names. `None`
+    // starts from the defaults, which is right only for the frame straight
+    // after a key frame.
+    start_cdfs: Option<&crate::cdf_state::Cdfs>, fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -4084,13 +4127,24 @@ pub(crate) fn encode_inter_frame(
         / modes.len() as f64;
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits(&blocks, base_q_idx));
-    let tile = crate::tile::sb_coeff_inter_frame_tile_tx(
+    // This frame's header leaves `disable_frame_end_update_cdf` off, so it
+    // stores its end-of-tile tables with the counts reset (spec 7.20) and the
+    // next frame's writer starts from them -- exactly what
+    // `crate::stream::stored_cdfs_for` hands the decoder.
+    let mut cdfs = start_cdfs
+        .cloned()
+        .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
+    let start_cdfs = CdfSnapshot(cdfs.clone());
+    let tile = crate::tile::sb_coeff_inter_frame_tile_cdfs(
         header.mi_cols,
         header.mi_rows,
         base_q_idx,
         &blocks,
         tx_select,
+        &mut cdfs,
     )?;
+    cdfs.reset_counts();
+    let next_cdfs = CdfSnapshot(cdfs);
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
 
@@ -4111,6 +4165,8 @@ pub(crate) fn encode_inter_frame(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        start_cdfs,
+        next_cdfs,
     })
 }
 
@@ -4169,6 +4225,7 @@ pub(crate) fn encode_sequence_with_ctx(
         unspecified_color_config(), fctx,
     )?;
     let mut stream = key.stream.clone();
+    let mut carried = key.next_cdfs.clone();
     let mut reference = key.reconstruction.clone();
     let mut frames = vec![crop_encoded(&key, render.0, render.1)];
     for (i, picture) in rest.iter().enumerate() {
@@ -4186,9 +4243,11 @@ pub(crate) fn encode_sequence_with_ctx(
             base_q_idx,
             deadzone,
             order_hint,
-            render, fctx,
+            render,
+            Some(&carried.0), fctx,
         )?;
         stream.extend_from_slice(&inter.stream);
+        carried = inter.next_cdfs.clone();
         reference = inter.reconstruction.clone();
         frames.push(crop_encoded(&inter, render.0, render.1));
     }
@@ -6180,7 +6239,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), fctx).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, fctx).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -6278,7 +6337,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), fctx).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, fctx).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -6455,7 +6514,7 @@ mod tests {
                     q,
                     0.5,
                     1,
-                    (width, height), fctx,
+                    (width, height), None, fctx,
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -6472,7 +6531,7 @@ mod tests {
                         q,
                         0.5,
                         1,
-                        (width, height), fctx,
+                        (width, height), None, fctx,
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
