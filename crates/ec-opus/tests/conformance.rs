@@ -5758,10 +5758,17 @@ fn analysis_music_prob_separates_speech_from_music() {
         let mut enc = Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
         enc.set_bitrate(96_000);
         enc.set_vbr_constrained(true);
+        // The analysis is off unless a consumer needs it (it costs ~25% of the
+        // encoder); the diagnostics are exactly the "explicitly asked for it"
+        // case.
+        enc.set_analysis(true);
         let mut out = vec![0u8; 4000];
         let mut sum = [0.0f64; 4];
         let mut n = 0usize;
         let mut valid = 0usize;
+        // Histogram of the detected bandwidth index, which drives
+        // `opus_encoder.c`'s `detected_bandwidth` clamp.
+        let mut bw_hist = [0u32; 21];
         for chunk in pcm.chunks_exact(FRAME * CHANNELS) {
             enc.encode_float(chunk, FRAME, &mut out).expect("encode");
             let d = enc.last_celt_diag();
@@ -5772,9 +5779,17 @@ fn analysis_music_prob_separates_speech_from_music() {
                 sum[1] += f64::from(d.tonality);
                 sum[2] += f64::from(d.tonality_slope);
                 sum[3] += f64::from(d.activity);
+                bw_hist[(d.analysis_bandwidth.clamp(0, 20)) as usize] += 1;
             }
         }
         assert!(valid * 10 > n * 9, "{tag}: analysis valid on only {valid}/{n} frames");
+        let bw: Vec<String> = bw_hist
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(i, c)| format!("{i}:{c}"))
+            .collect();
+        println!("analysis {tag}: bandwidth histogram {}", bw.join(" "));
         let m = sum.map(|v| v / valid as f64);
         println!(
             "analysis {tag}: music {:.3} tonality {:.3} slope {:.4} activity {:.3} over {valid}/{n} frames (music={is_music})",

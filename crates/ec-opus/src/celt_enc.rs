@@ -32,7 +32,7 @@
 
 use ec_core::{Error, Result};
 
-use crate::analysis::{AnalysisInfo, TonalityAnalysis};
+use crate::analysis::AnalysisInfo;
 use crate::celt::{
     self, BETA_COEF, BETA_INTRA, BITRES, CACHE_CAPS, E_BANDS, E_MEANS, E_PROB_MODEL, LOG_N,
     MAX_FINE_BITS, NB_BANDS, OVERLAP, PRED_COEF, PREEMPH, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE,
@@ -68,7 +68,9 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// `EC_OPUS_TRIM_TONAL` (`alloc_trim`'s `tonality_slope` term),
 /// `EC_OPUS_TRIM13` (the continuous 1.3 trim the term belongs to),
 /// `EC_OPUS_VBR_TONAL` (`compute_vbr`'s tonality boost) and
-/// `EC_OPUS_VBR_ACT` (`compute_vbr`'s low-activity cut).
+/// `EC_OPUS_VBR_ACT` (`compute_vbr`'s low-activity cut),
+/// `EC_OPUS_LEAK` (`dynalloc_analysis`'s per-band leakage boost) and
+/// `EC_OPUS_BW_DETECT` (the detected bandwidth lowering the coded one).
 ///
 /// MEASURED (lane opustonal, four detached 12-row library-gate runs against
 /// the shipped rows `lanes/opus-opustr2-r1.sweep.txt`). The analysis itself is
@@ -81,6 +83,9 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// | 1.3 trim + tonality term (`-r1`) | nik@64 .708→.647, zaur@64 1.510→1.071, zaur@96 .940→.898, naz@96 4.499→2.458, dl8a .552/.374→.512/.336 | nik@96 .985→1.006, her@64 1.103→1.109, her@96 1.051→1.085, naz@64 2.697→2.872 |
 /// | vbr tonality + activity (`-r2`) | hein@64 .853→.327, hein@96 .528→.426, nik@64 →.672, dl8a@64 →.541 | nik@96 →1.061, zaur@96 →1.165, her@64 →1.104, her@96 →1.060, dl8a@96 →.414 |
 /// | vbr activity alone (`-r3`) | hein@64 →.430, hein@96 →.408, nik@64 →.657, dl8a@64 →.511 | nik@96 →.990, her@64 →1.104, her@96 →1.071, dl8a@96 →.382 |
+/// | `EC_OPUS_BW_DETECT` (`opusmode -r1`) | -- | -- (byte-identical: `analysis.bandwidth` is 20 on every valid frame of every gate source, so the clamp never fires) |
+/// | `EC_OPUS_LEAK` (`opusmode -r2`) | -- | nik@64 .708→.709, nik@96 .985→.986, her@96 1.051→1.052 (the rest identical) |
+/// | `EC_OPUS_BW_DETECT` + `EC_OPUS_VBR_ACT` + `EC_OPUS_TF_K=1.25` (`opusmode -r3`) | naz@96 4.499→2.516, naz@64 2.697→1.440, hein@64 .853→.470, hein@96 .528→.404, dl8a@96 .374→.315, dl8a@64 →.535, nik@64 →.651, **nik@96 .985→.957**, zaur@96 →.928, zaur@64 →1.509 | her@96 1.051→1.071, her@64 1.103→1.104 |
 /// | all four + `EC_OPUS_ALIGN=1` (`-r4`) | naz@64 →1.865, naz@96 →3.986, zaur@64 →1.123, zaur@96 →.891, her@64 →.952 | nik@64 →1.014, nik@96 →1.842, her@96 →1.217, dl8a →1.162/.988, hein →.971/1.514 |
 ///
 /// `corr_ours` is never worse by more than .0005 on any unaligned arm (it is
@@ -91,21 +96,32 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// discrete-ladder arm was run. The activity cut is the nearest miss ever
 /// measured on this gate for a speech source (hein halves) and is blocked by
 /// her@96 +.020 and nik@96 +.005 -- the same two rows that have blocked the
-/// tf boost. Aligned, the analysis moves naz/zaur/her@64 a long way but leaves
+/// The combined arm (`opusmode -r3`) is the first arm ever measured on this
+/// gate that moves a blocking row the right way: nik@96 .985→.957. It is
+/// **rejected by the per-row KEEP rule** (her@96 +.020, her@64 +.001) and
+/// **passes the aggregate rule** (geometric-mean err_ratio 1.0218→0.8378,
+/// -18.0%; worst row her@96 +1.9%, under the 5% bound; `corr_ours` within
+/// .0001 on every row). Which rule ships is the user's call; the default is
+/// off either way. Aligned, the analysis moves naz/zaur/her@64 a long way but leaves
 /// the aligned blocking set (nik, her@96, dl8a, hein) exactly where the
 /// analysis-free aligned arms left it, so the alignment default stays off.
-fn analysis_params() -> (bool, bool, bool, bool) {
-    static P: std::sync::OnceLock<(bool, bool, bool, bool)> = std::sync::OnceLock::new();
+pub(crate) fn analysis_params() -> (bool, bool, bool, bool, bool, bool) {
+    static P: std::sync::OnceLock<(bool, bool, bool, bool, bool, bool)> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
         let b = |name: &str, dflt: bool| {
             std::env::var(name).map(|v| v != "0").unwrap_or(dflt)
         };
-        (
-            b("EC_OPUS_ANALYSIS", true),
-            b("EC_OPUS_TRIM_TONAL", false),
-            b("EC_OPUS_VBR_TONAL", false),
-            b("EC_OPUS_VBR_ACT", false),
-        )
+        let trim = b("EC_OPUS_TRIM_TONAL", false);
+        let vbr_tonal = b("EC_OPUS_VBR_TONAL", false);
+        let vbr_act = b("EC_OPUS_VBR_ACT", false);
+        // The analysis costs ~25% of the encoder (5.1 384k: 126x -> 100x
+        // realtime), so it only runs when something reads it: any consumer
+        // switch, an explicit `EC_OPUS_ANALYSIS=1`, or
+        // `Encoder::set_analysis(true)` for the diagnostics.
+        let leak = b("EC_OPUS_LEAK", false);
+        let bw = b("EC_OPUS_BW_DETECT", false);
+        let any = trim || vbr_tonal || vbr_act || leak || bw;
+        (b("EC_OPUS_ANALYSIS", any), trim, vbr_tonal, vbr_act, leak, bw)
     })
 }
 
@@ -516,12 +532,10 @@ pub struct CeltEncoder {
     urow: Vec<u32>,
     /// Per-frame diagnostics captured at the end of the last `encode` call.
     last_diag: CeltFrameDiag,
-    /// libopus `st->analysis`: the tonality/music-probability estimator, run
-    /// on the *undelayed* API input at the top of every `encode` call exactly
-    /// where `opus_encode()` runs `run_analysis()`.
-    analysis: TonalityAnalysis,
-    /// The window that covers the frame being coded, or the default
-    /// (`valid == false`) state when the analysis is off.
+    /// libopus `st->analysis`'s per-frame output, handed in by
+    /// [`crate::Encoder`] (which owns the estimator and runs it once per API
+    /// frame, libopus's order); the `valid == false` default when the
+    /// analysis is off.
     info: AnalysisInfo,
 }
 
@@ -580,7 +594,6 @@ impl CeltEncoder {
             pvq_sign: vec![0; max_n],
             urow: vec![0; 1280],
             last_diag: CeltFrameDiag::default(),
-            analysis: TonalityAnalysis::new((48000 / upsample) as u32),
             info: AnalysisInfo::default(),
         }
     }
@@ -624,7 +637,6 @@ impl CeltEncoder {
         self.vbr_count = 0;
         self.stereo_saving = 0.0;
         self.spec_avg = 0.0;
-        self.analysis.reset();
         self.info = AnalysisInfo::default();
     }
 
@@ -638,7 +650,7 @@ impl CeltEncoder {
     /// postfilter bit, allocation over the coded span only. With
     /// `vbr_rate_bps` set, the frame may be shrunk below that budget
     /// (constrained VBR); the return value is the final frame size in bytes.
-    pub fn encode(
+    pub(crate) fn encode(
         &mut self,
         enc: &mut RangeEncoder,
         pcm: &[f32],
@@ -646,6 +658,7 @@ impl CeltEncoder {
         start: usize,
         end: usize,
         vbr_rate_bps: u32,
+        info: &AnalysisInfo,
     ) -> Result<usize> {
         let lm: usize = match frame_size {
             120 => 0,
@@ -672,14 +685,9 @@ impl CeltEncoder {
         let end = end.clamp(start + 1, NB_BANDS);
 
         // libopus `opus_encode_native` runs the tonality analysis on the raw
-        // API frame before anything else; the CELT layer's own delay does not
-        // apply to it, so this reads `pcm` and not the delayed buffer. 24 is
-        // libopus's `lsb_depth` default for the float API.
-        self.info = if analysis_params().0 {
-            self.analysis.run(pcm, in_n, c, 24)
-        } else {
-            AnalysisInfo::default()
-        };
+        // API frame before the mode decision, so the estimator lives in
+        // `Encoder` and its result is handed down here.
+        self.info = *info;
 
         let mut nb_compressed = enc.storage();
         let mut nb_available = nb_compressed as i32;
@@ -1031,7 +1039,7 @@ impl CeltEncoder {
             let base_target =
                 vbr_rate + (self.vbr_offset >> lm_diff) - ((40 * c as i32 + 20) << BITRES);
             let mut target = base_target;
-            let (_, _, vbr_tonal, vbr_act) = analysis_params();
+            let (_, _, vbr_tonal, vbr_act, _, _) = analysis_params();
             // compute_vbr (libopus celt_encoder.c:1605-1716), float-mode.
             // Skipped: activity, tonality, surround_mask (analysis->valid=
             // false, has_surround_mask=0, pitch_change=0, lfe=0). The qext
@@ -1551,6 +1559,13 @@ impl CeltEncoder {
             }
             if i >= 12 {
                 follower[i] *= 0.5;
+            }
+        }
+        // libopus `celt_encoder.c:1226-1230`: the analysis's per-band
+        // leakage boost, in 1/64 dB units, on top of the follower.
+        if analysis_params().4 && self.info.valid {
+            for i in start..crate::analysis::LEAK_BANDS.min(end) {
+                follower[i] += f32::from(self.info.leak_boost[i]) / 64.0;
             }
         }
         let mut tot_boost = 0i32;
