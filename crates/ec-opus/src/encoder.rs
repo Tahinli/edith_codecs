@@ -272,6 +272,11 @@ impl Encoder {
     /// | + continuous 1.3 `alloc_trim` (`-r3`) | 5 | same 7, and corr worse by >.0005 on 9 rows |
     /// | + tf boost k=1.25 (`-r4`) | 5 | same 7 |
     /// | + tf boost k=1.5 (`-r5`) | 5 | same 7 |
+    /// | + two-pass *and* k=1.25, the combined best (`-r7`) | 5 | same 7: nik@64 .773, nik@96 1.801, her@96 1.114, dl8a@64 1.181, dl8a@96 1.014, hein@64 .977, hein@96 1.398 |
+    ///
+    /// The best aligned arm on the KEEP rule is the delay alone without
+    /// `dc_reject` (5 rows worse); every arm that adds `dc_reject` puts dl8a
+    /// in the blocking set too.
     ///
     /// The blocking set (nik, her@96, dl8a, hein) is the same in every arm and
     /// no arm moves any of those rows back towards its shipped value, so the

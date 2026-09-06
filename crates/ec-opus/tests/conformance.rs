@@ -2109,7 +2109,7 @@ fn silk_mediumband_and_10ms_roundtrip() {
             frame_ms == 10 || voiced > 0,
             "{tag}: no frame coded with LTP"
         );
-        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len()) {
+        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len(), 120) {
             let (c, _) = aligned_corr(&oracle, &decoded, 2000);
             assert!(c >= 0.99, "{tag}: our decode vs oracle decode corr {c:.4}");
         }
@@ -2159,7 +2159,7 @@ fn silk_multiframe_packets_roundtrip() {
         );
         assert!(corr >= floor, "{tag}: corr {corr:.4} below {floor:.4}");
         assert!(voiced > 0, "{tag}: no frame coded with LTP");
-        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len()) {
+        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len(), 120) {
             let (c, _) = aligned_corr(&oracle, &decoded, 2500);
             assert!(
                 c >= 0.99,
@@ -2366,12 +2366,21 @@ fn silk_compares_to_celt_on_speech_at_speech_rates() {
 }
 
 /// Reference oracle decode of `packets` as Ogg-Opus, or `None` without ffmpeg.
-fn oracle_decode(name: &str, packets: &[Vec<u8>], samples: usize) -> Option<Vec<f32>> {
+/// `pre_skip` must be the encoder's advertised [`Encoder::look_ahead`] for
+/// these packets: it is what the oracle trims off the front, so a caller that
+/// compares sample-for-sample against its own decode at that same offset only
+/// lines up when the two agree.
+fn oracle_decode(
+    name: &str,
+    packets: &[Vec<u8>],
+    samples: usize,
+    pre_skip: usize,
+) -> Option<Vec<f32>> {
     if Command::new("ffmpeg").arg("-version").output().is_err() {
         return None;
     }
     let path = temp_path(&format!("{name}.opus"));
-    write_ogg_opus(&path, packets, opus_head(1, 120, None), 1, samples, 120);
+    write_ogg_opus(&path, packets, opus_head(1, pre_skip as u16, None), 1, samples, pre_skip as i64);
     let out = Command::new("ffmpeg")
         .args(["-v", "warning", "-c:a", "libopus", "-i"])
         .arg(&path)
@@ -2418,7 +2427,7 @@ fn silk_nsq_improves_quality_at_equal_rate() {
                 "{name}: corr {corr:.4} (floor {floor}) at {kbps:.1} kbps"
             ));
         }
-        if let Some(oracle) = oracle_decode(&format!("silk-nsq-{name}"), &packets, pcm.len()) {
+        if let Some(oracle) = oracle_decode(&format!("silk-nsq-{name}"), &packets, pcm.len(), 120) {
             let (c, _) = aligned_corr(&oracle, &decoded, 2000);
             assert!(c >= 0.99, "{name}: our decode vs oracle decode corr {c:.4}");
         }
@@ -2584,7 +2593,7 @@ fn hybrid_fb_roundtrip() {
             (28.0..=36.0).contains(&kbps),
             "{name}: {kbps:.1} kbps for a 32 kbps CBR target"
         );
-        if let Some(oracle) = oracle_decode(&format!("hybrid-{name}"), &packets, pcm.len()) {
+        if let Some(oracle) = oracle_decode(&format!("hybrid-{name}"), &packets, pcm.len(), delay) {
             let n = oracle.len().min(decoded.len() - delay);
             let c = correlation(&oracle[..n], &decoded[delay..delay + n]);
             eprintln!("hybrid FB {name}: oracle vs ours corr {c:.4}");
