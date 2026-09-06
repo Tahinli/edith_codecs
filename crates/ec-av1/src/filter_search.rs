@@ -40,6 +40,20 @@ pub(crate) fn take_chosen_levels() -> Vec<((u8, u8), (u8, u8), (u8, u8))> {
     })
 }
 
+thread_local! {
+    /// Per frame, in coding order: the `cdef_bits` chosen and how many 64x64
+    /// superblocks ended up on each strength preset -- the BD gate prints the
+    /// distribution once per clip (gate-blind-to-feature).
+    static PRESET_COUNTS: std::cell::RefCell<Vec<(u8, Vec<usize>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes and clears [`PRESET_COUNTS`].
+#[allow(dead_code)] // read from the `#[cfg(test)]` BD gate
+pub(crate) fn take_cdef_presets() -> Vec<(u8, Vec<usize>)> {
+    PRESET_COUNTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
 /// Squared error between a decoded plane and the source it was coded from,
 /// over the frame's own cropped `w x h` (the two planes have different
 /// strides: the source is the encoder's padded coding surface).
@@ -53,6 +67,31 @@ fn plane_sse(dec: &[u16], dec_w: usize, src: &[u8], src_w: usize, w: usize, h: u
         }
     }
     sse
+}
+
+/// [`plane_sse`], accumulated per CDEF unit instead of over the frame: `out`
+/// is one entry per 64x64 SUPERBLOCK (stride `sb_cols`) and `unit` is the
+/// unit side in this plane's own samples (64 for luma, 32 for 4:2:0 chroma),
+/// which is what makes the luma and chroma sums land in the same slot.
+fn unit_sse(
+    dec: &[u16],
+    dec_w: usize,
+    src: &[u8],
+    src_w: usize,
+    w: usize,
+    h: usize,
+    unit: usize,
+    sb_cols: usize,
+    out: &mut [u64],
+) {
+    for row in 0..h {
+        let base = (row / unit) * sb_cols;
+        let (d, s) = (&dec[row * dec_w..][..w], &src[row * src_w..][..w]);
+        for (col, (&a, &b)) in d.iter().zip(s).enumerate() {
+            let diff = i64::from(a) - i64::from(b);
+            out[base + col / unit] += (diff * diff) as u64;
+        }
+    }
 }
 
 /// CDEF primary strengths tried (libaom's own range is 0..15 for 8-bit
@@ -82,6 +121,10 @@ struct Trial {
     picture: Picture,
     sse_y: u64,
     sse_uv: u64,
+    /// Luma + chroma error per 64x64 CDEF unit, in the tile writer's own
+    /// superblock raster order -- what the per-unit `cdef_idx` choice below
+    /// is made on.
+    sse64: Vec<u64>,
 }
 
 /// Picks this frame's deblocking levels and CDEF strengths and hands back
@@ -111,8 +154,11 @@ pub(crate) fn pick_filters(
     src_w: usize,
     (fw, fh): (usize, usize),
     damping: u8,
-) -> Result<(LoopFilterParams, CdefParams, Picture)> {
+    (sb_cols, sb_rows): (usize, usize),
+    lambda: f64,
+) -> Result<(LoopFilterParams, CdefParams, Vec<u8>, Picture)> {
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
+    let nsb = sb_cols * sb_rows;
     let mut trials: Vec<Trial> = Vec::new();
     let eval = |cand: Cand, trials: &mut Vec<Trial>| -> Result<usize> {
         if let Some(i) = trials.iter().position(|t| t.cand == cand) {
@@ -123,7 +169,11 @@ pub(crate) fn pick_filters(
         let sse_y = plane_sse(&picture.y, picture.width, source[0], src_w, fw, fh);
         let sse_uv = plane_sse(&picture.u, dec_cw, source[1], src_w / 2, cw, ch)
             + plane_sse(&picture.v, dec_cw, source[2], src_w / 2, cw, ch);
-        trials.push(Trial { cand, picture, sse_y, sse_uv });
+        let mut sse64 = vec![0u64; nsb];
+        unit_sse(&picture.y, picture.width, source[0], src_w, fw, fh, 64, sb_cols, &mut sse64);
+        unit_sse(&picture.u, dec_cw, source[1], src_w / 2, cw, ch, 32, sb_cols, &mut sse64);
+        unit_sse(&picture.v, dec_cw, source[2], src_w / 2, cw, ch, 32, sb_cols, &mut sse64);
+        trials.push(Trial { cand, picture, sse_y, sse_uv, sse64 });
         Ok(trials.len() - 1)
     };
     // One stage of the coordinate search: try `values` in the slot `set`
@@ -168,11 +218,100 @@ pub(crate) fn pick_filters(
     stage(&mut best, &CDEF_SEC, |c, v| c.uv.1 = v, |t| t.sse_uv, &mut trials)?;
 
     CHOSEN.with(|c| c.borrow_mut().push(best));
+
+    // libaom `av1_cdef_search`'s shape, on the candidates this coordinate
+    // search already decoded: every trial that ran under the WINNING
+    // deblocking levels is a legal strength pair for this frame, and each
+    // one already carries its own per-64x64 error. Pick up to eight of them
+    // as the header's strength list and give every superblock the one that
+    // costs it least -- the `cdef_idx` literal the tile writer then codes
+    // (`crate::tile::arm_cdef_idx`).
+    let mut presets: Vec<Cand> = vec![best];
+    let pool: Vec<Cand> = trials
+        .iter()
+        .map(|t| t.cand)
+        .filter(|c| c.lf == best.lf && *c != best)
+        .collect();
+    // How often each pool candidate would win a superblock outright, which
+    // is the order the list is grown in (libaom picks its presets by the
+    // same per-unit histogram, not by frame-level error).
+    let sse_of = |c: &Cand| -> &Vec<u64> {
+        &trials
+            .iter()
+            .find(|t| t.cand == *c)
+            .expect("every pool candidate was evaluated")
+            .sse64
+    };
+    let mut counts = vec![0usize; pool.len()];
+    let best_sse = sse_of(&best).clone();
+    for sb in 0..nsb {
+        let mut winner = (best_sse[sb], usize::MAX);
+        for (i, c) in pool.iter().enumerate() {
+            if sse_of(c)[sb] < winner.0 {
+                winner = (sse_of(c)[sb], i);
+            }
+        }
+        if winner.1 != usize::MAX {
+            counts[winner.1] += 1;
+        }
+    }
+    let mut order: Vec<usize> = (0..pool.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(counts[i]));
+    presets.extend(order.iter().take(7).map(|&i| pool[i]));
+    // The cheapest list length: `bits` costs one literal per superblock plus
+    // twelve header bits per extra pair, and buys whatever per-unit error the
+    // wider choice removes.
+    let unit_min = |n: usize, sb: usize| -> u64 {
+        presets[..n].iter().map(|c| sse_of(c)[sb]).min().unwrap_or(0)
+    };
+    let mut bits = 0u8;
+    let mut cost = best_sse.iter().sum::<u64>() as f64;
+    for b in 1..=3u8 {
+        let n = 1usize << b;
+        if n > presets.len() {
+            break;
+        }
+        let sse: u64 = (0..nsb).map(|sb| unit_min(n, sb)).sum();
+        let c = sse as f64 + lambda * ((b as usize * nsb) as f64 + 12.0 * (n - 1) as f64);
+        if c < cost {
+            cost = c;
+            bits = b;
+        }
+    }
+    let grid: Vec<u8> = if bits == 0 {
+        Vec::new()
+    } else {
+        let n = 1usize << bits;
+        (0..nsb)
+            .map(|sb| {
+                (0..n)
+                    .min_by_key(|&i| sse_of(&presets[i])[sb])
+                    .expect("at least one preset") as u8
+            })
+            .collect()
+    };
+    let mut params = cdef(best, damping);
+    params.bits = bits;
+    for (i, c) in presets.iter().take(1usize << bits).enumerate() {
+        params.y_pri_strength[i] = c.y.0;
+        params.y_sec_strength[i] = c.y.1;
+        params.uv_pri_strength[i] = c.uv.0;
+        params.uv_sec_strength[i] = c.uv.1;
+    }
+    let mut counts_used = vec![0usize; 1usize << bits];
+    for &g in &grid {
+        counts_used[usize::from(g)] += 1;
+    }
+    if grid.is_empty() {
+        counts_used = vec![nsb];
+    }
+    PRESET_COUNTS.with(|c| c.borrow_mut().push((bits, counts_used)));
+
     let win = trials
         .into_iter()
         .find(|t| t.cand == best)
         .expect("the winning candidate was evaluated");
-    Ok((loop_filter(best), cdef(best, damping), win.picture))
+    Ok((loop_filter(best), params, grid, win.picture))
 }
 
 /// The header's `loop_filter_params` for one candidate.

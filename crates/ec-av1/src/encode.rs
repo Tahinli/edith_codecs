@@ -3024,9 +3024,10 @@ pub(crate) fn encode_key_frame_inner(
 
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits_sb(&superblocks, base_q_idx));
-    let tile = crate::tile::sb_coeff_key_frame_tile_tx(
-        header.mi_cols,
-        header.mi_rows,
+    let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
+    let mut tile = crate::tile::sb_coeff_key_frame_tile_tx(
+        mi_cols,
+        mi_rows,
         base_q_idx,
         &superblocks,
         tx_select,
@@ -3042,9 +3043,21 @@ pub(crate) fn encode_key_frame_inner(
         &mut chroma,
         [&picture_y8, &picture_u8, &picture_v8],
         true,
-        |lf, cdef, h| {
+        &mut tile,
+        search.lambda,
+        |bits, sb_cols, grid| {
+            crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
+            crate::tile::sb_coeff_key_frame_tile_tx(
+                mi_cols,
+                mi_rows,
+                base_q_idx,
+                &superblocks,
+                tx_select,
+            )
+        },
+        |lf, cdef, h, tile| {
             crate::decode::decode_key_frame_tile(
-                &tile,
+                tile,
                 h.mi_cols,
                 h.mi_rows,
                 base_q_idx,
@@ -3107,7 +3120,14 @@ fn pick_and_apply_filters(
     chroma: &mut [Plane<'_>; 2],
     source: [&[u8]; 3],
     search: bool,
-    decode: impl Fn(&LoopFilterParams, &CdefParams, &FrameHeader) -> Result<Picture>,
+    // The coded tile, replaced in place when the search chooses a per-64x64
+    // `cdef_idx` list (`cdef_bits > 0`): those literals live in the tile
+    // payload, so the tile is written a second time under `recode` and the
+    // winner re-decoded from it.
+    tile: &mut Vec<u8>,
+    lambda: f64,
+    recode: impl Fn(u8, usize, &[u8]) -> Result<Vec<u8>>,
+    decode: impl Fn(&LoopFilterParams, &CdefParams, &FrameHeader, &[u8]) -> Result<Picture>,
 ) -> Result<()> {
     if !search {
         return Ok(());
@@ -3117,15 +3137,27 @@ fn pick_and_apply_filters(
     // libaom `av1_pick_filter_level`'s sibling `av1_cdef_search`:
     // `cdef_damping = 3 + (base_qindex >> 6)`, never searched.
     let damping = 3 + (header.quantization.base_q_idx >> 6);
-    let (lf, cdef, filtered) = crate::filter_search::pick_filters(
-        |lf, cdef| decode(lf, cdef, &hdr),
+    let (cols32, rows32) = crate::tile::block_grid(header.mi_cols, header.mi_rows);
+    let (sb_cols, sb_rows) = (cols32.div_ceil(2) as usize, rows32.div_ceil(2) as usize);
+    let (lf, cdef, idx_grid, picture) = crate::filter_search::pick_filters(
+        |lf, cdef| decode(lf, cdef, &hdr, tile),
         source,
         luma.width,
         (fw, fh),
         damping,
+        (sb_cols, sb_rows),
+        lambda,
     )?;
     header.loop_filter = lf;
     header.cdef = cdef;
+    let filtered = if idx_grid.is_empty() {
+        picture
+    } else {
+        let coded = recode(cdef.bits, sb_cols, &idx_grid)?;
+        let picture = decode(&lf, &cdef, &hdr, &coded)?;
+        *tile = coded;
+        picture
+    };
     let dec_cw = filtered.width.div_ceil(2);
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
     crate::filter_search::splice(&mut luma.reconstruction, luma.width, &filtered.y, filtered.width, fw, fh);
@@ -4194,9 +4226,10 @@ pub(crate) fn encode_inter_frame(
         / modes.len() as f64;
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits(&blocks, base_q_idx));
-    let tile = crate::tile::sb_coeff_inter_frame_tile_tx(
-        header.mi_cols,
-        header.mi_rows,
+    let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
+    let mut tile = crate::tile::sb_coeff_inter_frame_tile_tx(
+        mi_cols,
+        mi_rows,
         base_q_idx,
         &blocks,
         tx_select,
@@ -4234,9 +4267,21 @@ pub(crate) fn encode_inter_frame(
         // `TxMode::Select` too (it used to skip and leave every inter frame
         // unfiltered once Select became the default).
         true,
-        |lf, cdef, h| {
+        &mut tile,
+        search.lambda,
+        |bits, sb_cols, grid| {
+            crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
+            crate::tile::sb_coeff_inter_frame_tile_tx(
+                mi_cols,
+                mi_rows,
+                base_q_idx,
+                &blocks,
+                tx_select,
+            )
+        },
+        |lf, cdef, h, tile| {
             crate::decode::decode_inter_frame_tile(
-                &tile,
+                tile,
                 h.mi_cols,
                 h.mi_rows,
                 base_q_idx,
@@ -7217,6 +7262,30 @@ mod tests {
                 mean(|l| l.1.1),
                 mean(|l| l.2.0),
                 mean(|l| l.2.1),
+            );
+            // How many strength presets each frame's CDEF list carried and
+            // how the 64x64 units spread over them (lane-av1lr): `bits 0`
+            // everywhere would mean the per-unit choice never fires.
+            let presets = crate::filter_search::take_cdef_presets();
+            let mut by_bits = [0usize; 4];
+            for (b, _) in &presets {
+                by_bits[usize::from(*b)] += 1;
+            }
+            let units: usize = presets.iter().flat_map(|(_, c)| c).sum();
+            let on_extra: usize = presets
+                .iter()
+                .flat_map(|(_, c)| c.iter().skip(1))
+                .sum();
+            eprintln!(
+                "{name}: cdef_bits frames {}/{}/{}/{} (0/1/2/3); {} of {} 64x64 units \
+                 on a non-default preset ({:.1}%)",
+                by_bits[0],
+                by_bits[1],
+                by_bits[2],
+                by_bits[3],
+                on_extra,
+                units,
+                100.0 * on_extra as f64 / units.max(1) as f64
             );
             // Which chroma modes the search actually wins with, against the
             // unconditional DC_PRED that was the only outcome before
