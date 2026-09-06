@@ -2555,7 +2555,7 @@ fn code_square(
 
     // Chroma searches its own mode over [`CHROMA_MODES`], one symbol for both
     // planes; what it costs still counts towards the partition decision.
-    let ([u, v], uv_mode, chroma_cost) =
+    let ([u, v], uv_mode, chroma_cost, palette_uv) =
         search_chroma(chroma, (x, y), side, chroma_set, search, mode, fctx);
     cost += chroma_cost;
     (
@@ -2567,6 +2567,7 @@ fn code_square(
             uv_mode,
             tx_depth,
             palette,
+            palette_uv,
             ..BlockCoeffs::default()
         },
         cost,
@@ -2656,7 +2657,7 @@ fn search_chroma(
     search: &Search,
     luma_mode: u8,
     fctx: &crate::decode::FrameCtx,
-) -> ([Vec<Coeff>; 2], u8, f64) {
+) -> ([Vec<Coeff>; 2], u8, f64, Option<crate::tile::PaletteUv>) {
     let at = At {
         x: x / 2,
         y: y / 2,
@@ -2704,7 +2705,79 @@ fn search_chroma(
             best = Some((cost, mode, u, v));
         }
     }
-    let (cost, mode, u, v) = best.expect("CHROMA_MODES is not empty");
+    let (mut cost, mut mode, mut u, mut v) = best.expect("CHROMA_MODES is not empty");
+    // The chroma palette arm (spec 5.11.46's plane-1 half): one k-means over
+    // U -- the same 1-D Lloyd [`palette_candidates`] runs for luma, which is
+    // what keeps `u_colors` ascending and distinct the way
+    // `read_palette_colors_uv`'s merge/delta reader needs -- and V taken as
+    // each cluster's own mean, since the colour-index map is SHARED by the
+    // two planes. Priced against the best ordinary chroma mode above, so a
+    // block only takes one when it beats it; a palette block's chroma mode is
+    // `UV_DC_PRED` by construction.
+    let mut palette_uv = None;
+    if search.screen && crate::decode::palette_bsize_ctx(side).is_some() {
+        debug_assert_eq!(crate::tile::palette_uv_side(side), at.side);
+        let plane_source = |p: &Plane| -> Vec<u8> {
+            (at.y..at.y + at.side)
+                .flat_map(|row| p.source[row * p.width + at.x..][..at.side].to_vec())
+                .collect()
+        };
+        let (u_source, v_source) = (plane_source(&chroma[0]), plane_source(&chroma[1]));
+        for pal in palette_candidates(&u_source) {
+            let n = usize::from(pal.size);
+            // V's base colour per cluster: the mean of the samples the shared
+            // map assigns to it (an empty cluster cannot happen -- every
+            // colour `palette_candidates` returns is some pixel's nearest).
+            let mut sums = [0u32; 8];
+            let mut counts = [0u32; 8];
+            for (&i, &sample) in pal.map.iter().zip(v_source.iter()) {
+                let k = usize::from(i).min(n - 1);
+                sums[k] += u32::from(sample);
+                counts[k] += 1;
+            }
+            let mut v_colors = [0u16; 8];
+            for k in 0..n {
+                v_colors[k] = if counts[k] > 0 {
+                    ((sums[k] + counts[k] / 2) / counts[k]) as u16
+                } else {
+                    0
+                };
+            }
+            let candidate = crate::tile::PaletteUv {
+                size: pal.size,
+                u_colors: pal.colors,
+                v_colors,
+                map: pal.map,
+            };
+            let predict = |colors: &[u16; 8]| -> Vec<u8> {
+                candidate
+                    .map
+                    .iter()
+                    .map(|&i| colors[usize::from(i).min(n - 1)] as u8)
+                    .collect()
+            };
+            let (pu, pv) = (predict(&candidate.u_colors), predict(&candidate.v_colors));
+            let u_trial = chroma[0].code_from_prediction(
+                at.x, at.y, at.side, &pu, false, search.base_q_idx, search.deadzone, set,
+            );
+            let v_trial = chroma[1].code_from_prediction(
+                at.x, at.y, at.side, &pv, false, search.base_q_idx, search.deadzone, set,
+            );
+            let cost_p = u_trial.sse
+                + v_trial.sse
+                + search.lambda
+                    * (u_trial.bits
+                        + v_trial.bits
+                        + crate::tile::palette_uv_bits(&candidate, side));
+            if cost_p < cost {
+                cost = cost_p;
+                mode = DC_PRED;
+                u = u_trial;
+                v = v_trial;
+                palette_uv = Some(candidate);
+            }
+        }
+    }
     if census_on() {
         CHROMA_RANK[sad_rank(&ranking, mode).min(6)]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2716,6 +2789,7 @@ fn search_chroma(
         [coeffs(&u.levels, at.side), coeffs(&v.levels, at.side)],
         mode,
         cost,
+        palette_uv,
     )
 }
 
@@ -2963,6 +3037,7 @@ fn code_square_inter(
                     skip: skip_new,
                     eight: None,
                     palette: None,
+            palette_uv: None,
                     tx_depth,
                     inter: Some(InterInfo {
                         ref1: None,
@@ -3000,6 +3075,7 @@ fn code_square_inter(
             skip,
             eight: None,
             palette: None,
+            palette_uv: None,
             tx_depth,
             inter: Some(InterInfo {
                 ref1: None,
@@ -5054,6 +5130,7 @@ fn search_inter_block(
             inter: best.inter,
             eight: None,
             palette: None,
+            palette_uv: None,
             tx_depth: 0,
         },
         best.cost,
@@ -6397,11 +6474,18 @@ mod tests {
                 picture.y[y * width + x] = INK[cell * 2 + bar];
             }
         }
+        // Four chroma colours, not two: a two-colour chroma block only ever
+        // codes a `PaletteSizeUV` of 2, which leaves
+        // `write_palette_colors_uv`'s cache/delta half (the n-1 shrinking
+        // deltas and the neighbour cache flags, exercised only when
+        // neighbouring blocks share colours) unproven by the ffmpeg oracle.
+        const CHROMA_U: [u16; 4] = [96, 118, 150, 176];
+        const CHROMA_V: [u16; 4] = [148, 126, 104, 92];
         for y in 0..height / 2 {
             for x in 0..width / 2 {
-                let cell = (x / 12 + y / 12) % 2;
-                picture.u[y * (width / 2) + x] = if cell == 0 { 110 } else { 145 };
-                picture.v[y * (width / 2) + x] = if cell == 0 { 140 } else { 108 };
+                let cell = (x / 12 + 2 * (y / 12)) % 4;
+                picture.u[y * (width / 2) + x] = CHROMA_U[cell];
+                picture.v[y * (width / 2) + x] = CHROMA_V[cell];
             }
         }
         picture
@@ -6427,6 +6511,23 @@ mod tests {
         let hits = crate::tile::take_palette_hits();
         assert!(hits[0] > 0, "no block took a palette: {hits:?}");
         eprintln!("palette blocks {} sizes {:?}", hits[0], &hits[2..]);
+        // The chroma half is a claim about the plane-1 syntax only if some
+        // block really took a chroma palette (`gate-blind-to-feature`): every
+        // exactness assert below passes on a stream that codes
+        // `palette_uv_mode == 0` everywhere.
+        let uv_hits = crate::tile::take_palette_uv_hits();
+        assert!(uv_hits[0] > 0, "no block took a chroma palette: {uv_hits:?}");
+        let uv_cached = crate::tile::take_palette_uv_cache_hits();
+        eprintln!(
+            "chroma palette blocks {} sizes {:?}, {uv_cached} colours from the neighbour cache",
+            uv_hits[0],
+            &uv_hits[2..]
+        );
+        assert!(
+            uv_cached > 0,
+            "no chroma base colour came out of the neighbour cache -- \
+             `write_palette_colors_uv`'s cache half is unproven by the oracle below"
+        );
         let via_us = crate::stream::decode_stream(&encoded.stream).unwrap();
         assert_eq!(via_us[0].y, encoded.reconstruction.y, "our decoder: luma");
         assert_eq!(via_us[0].u, encoded.reconstruction.u, "our decoder: U");
@@ -6463,12 +6564,19 @@ mod tests {
             })
             .collect();
         let _ = crate::tile::take_palette_hits();
+        let _ = crate::tile::take_palette_uv_hits();
         let gop = encode_sequence_with_ctx(&moved, 100, 0.5, fctx).unwrap();
         let gop_hits = crate::tile::take_palette_hits();
+        let gop_uv_hits = crate::tile::take_palette_uv_hits();
         let inter_screen = gop.frames.iter().skip(1).filter(|f| f.screen).count();
         eprintln!(
-            "GOP: {} frames with screen tools after the key frame, {} palette blocks",
-            inter_screen, gop_hits[0]
+            "GOP: {} frames with screen tools after the key frame, {} palette blocks, \
+             {} chroma palette blocks",
+            inter_screen, gop_hits[0], gop_uv_hits[0]
+        );
+        assert!(
+            gop_uv_hits[0] > 0,
+            "no block of the GOP took a chroma palette: {gop_uv_hits:?}"
         );
         assert!(
             inter_screen > 0,
@@ -6530,6 +6638,7 @@ mod tests {
             skip: false,
             eight: None,
             palette: None,
+            palette_uv: None,
             tx_depth: 0,
             inter: Some(InterInfo {
                 ref1: None,
@@ -9351,6 +9460,16 @@ mod tests {
                 (2..=8)
                     .filter(|&n| palette[n] > 0)
                     .map(|n| format!("{n}={}", palette[n]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let palette_uv = crate::tile::take_palette_uv_hits();
+            eprintln!(
+                "{name}: chroma palette blocks {} sizes {}",
+                palette_uv[0],
+                (2..=8)
+                    .filter(|&n| palette_uv[n] > 0)
+                    .map(|n| format!("{n}={}", palette_uv[n]))
                     .collect::<Vec<_>>()
                     .join(" ")
             );
