@@ -28,7 +28,7 @@ use crate::decode::{
     q_ctx_of,
 };
 #[cfg(test)]
-use crate::decode::decode_key_frame_tile;
+use crate::decode::decode_key_frame_tile_lr;
 use crate::encode::Picture;
 
 /// lane-midcut r1: `EC_AV1_NO_GRAIN=1` skips film grain synthesis at output, so a
@@ -2986,7 +2986,7 @@ mod tests {
         for &(width, height) in &[(64usize, 64usize), (216, 96)] {
             let picture = test_card(width, height);
             let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
-            let via_tile = decode_key_frame_tile(
+            let via_tile = decode_key_frame_tile_lr(
                 &encoded.tile,
                 encoded.mi_cols,
                 encoded.mi_rows,
@@ -3000,7 +3000,8 @@ mod tests {
                 // Our own encoder always writes `reduced_tx_set: true`.
                 true,
                 false,
-                false, fctx,
+                false,
+                &encoded.loop_restoration, fctx,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
