@@ -429,6 +429,11 @@ impl<'a> SymbolDecoder<'a> {
 
     /// Reads `bits` raw bits, most significant first — the `L(n)` descriptor
     /// of spec 4.10.4.
+    ///
+    /// lane-coefread: `#[inline]`, because without it this was a real CALL per
+    /// raw bit across a codegen-unit boundary (the crate builds without LTO) --
+    /// the coefficient sign pass and the Golomb tail read one bit at a time.
+    #[inline]
     pub fn literal(&mut self, bits: u32) -> u32 {
         let mut v = 0;
         for _ in 0..bits {
