@@ -4257,14 +4257,29 @@ pub(crate) fn coeff_bits(
         write_coeffs(&mut enc, &mut coding, grid, scan, skip_ctx, sign_ctx, None);
         enc.bits()
     };
+    // lane-av1speed2: 60% of the transform units of an inter stream hold no
+    // coefficient, and for those `write_coeffs` codes ONE symbol -- the
+    // all-zero flag -- and returns. Restoring the eight tables it might have
+    // touched (~800 bytes of `copy_from_slice`, the largest `memmove` in the
+    // encoder's profile) buys nothing there, so price that symbol straight
+    // off the pristine table on a copy of its own row. Identical bits: the
+    // scratch's `txb_skip[skip_ctx]` was restored from exactly this row, and
+    // nothing after the flag runs.
+    let zero_price = |slot: &mut (Cdfs, Cdfs)| {
+        let mut row = slot.0.txb(set, DC_PRED).txb_skip[skip_ctx];
+        let mut enc = SymbolEncoder::pricer();
+        enc.symbol(1, &mut row);
+        enc.bits()
+    };
+    let all_zero = grid.iter().all(|&level| level == 0);
     PRICING_BASE.with_borrow_mut(|base| {
         if let Some(slot) = base.as_deref_mut().filter(|s| s.0.q_ctx == q_ctx) {
-            return price(slot);
+            return if all_zero { zero_price(slot) } else { price(slot) };
         }
         PRICING.with_borrow_mut(|slots| {
             let slot = slots[q_ctx.min(3)]
                 .get_or_insert_with(|| Box::new((Cdfs::new(q_ctx), Cdfs::new(q_ctx))));
-            price(slot)
+            if all_zero { zero_price(slot) } else { price(slot) }
         })
     })
 }
