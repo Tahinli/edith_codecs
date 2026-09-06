@@ -80,6 +80,139 @@ fn decode_signed_subexp_with_ref_msac(dec: &mut SymbolDecoder, low: i32, high: i
     decode_unsigned_subexp_with_ref_msac(dec, n, k, r) as i32 + low
 }
 
+// ---------------------------------------------------------------------------
+// lane-av1lr: the WRITE side of the three primitives above, for the encoder's
+// per-restoration-unit syntax (`crate::tile`). Each is libaom's own writer
+// (`aom_dsp/bitwriter.h`'s `write_primitive_*`) and the exact inverse of the
+// reader it sits under; `wiener_filter_roundtrips` below pins the pair.
+
+/// `aom_write_primitive_quniform`, the inverse of [`ns_msac`].
+fn write_ns(enc: &mut crate::msac::SymbolEncoder, n: u32, v: u32) {
+    if n <= 1 {
+        return;
+    }
+    let w = floor_log2(n) + 1;
+    let m = (1u32 << w) - n;
+    if v < m {
+        enc.literal(v, w - 1);
+    } else {
+        enc.literal(m + ((v - m) >> 1), w - 1);
+        enc.literal((v - m) & 1, 1);
+    }
+}
+
+/// `aom_write_primitive_subexpfin`, the inverse of [`decode_subexp_msac`].
+fn write_subexp(enc: &mut crate::msac::SymbolEncoder, num_syms: u32, k: u32, v: u32) {
+    let mut i = 0u32;
+    let mut mk = 0u32;
+    loop {
+        let b = if i > 0 { k + i - 1 } else { k };
+        let a = 1u32 << b;
+        if num_syms <= mk + 3 * a {
+            write_ns(enc, num_syms - mk, v - mk);
+            return;
+        }
+        if v < mk + a {
+            enc.literal(0, 1);
+            enc.literal(v - mk, b);
+            return;
+        }
+        enc.literal(1, 1);
+        i += 1;
+        mk += a;
+    }
+}
+
+/// `recenter_nonneg`, the inverse of [`inverse_recenter`].
+fn recenter(r: u32, v: u32) -> u32 {
+    if v > 2 * r {
+        v
+    } else if v >= r {
+        (v - r) << 1
+    } else {
+        ((r - v) << 1) - 1
+    }
+}
+
+/// Inverse of [`decode_unsigned_subexp_with_ref_msac`].
+fn write_unsigned_subexp_with_ref(
+    enc: &mut crate::msac::SymbolEncoder,
+    n: u32,
+    k: u32,
+    reference: u32,
+    v: u32,
+) {
+    let recentred = if (reference << 1) <= n {
+        recenter(reference, v)
+    } else {
+        recenter(n - 1 - reference, n - 1 - v)
+    };
+    write_subexp(enc, n, k, recentred);
+}
+
+/// Inverse of [`decode_signed_subexp_with_ref_msac`].
+fn write_signed_subexp_with_ref(
+    enc: &mut crate::msac::SymbolEncoder,
+    low: i32,
+    high: i32,
+    k: u32,
+    reference: i32,
+    v: i32,
+) {
+    let n = (high - low) as u32;
+    let r = (reference - low).clamp(0, n as i32) as u32;
+    write_unsigned_subexp_with_ref(enc, n, k, r, (v - low).clamp(0, n as i32 - 1) as u32);
+}
+
+/// Inverse of [`read_wiener_filter`]: writes one unit's two directions and
+/// advances the caller's running per-plane reference, exactly as the reader
+/// advances its own.
+pub(crate) fn write_wiener_filter(
+    enc: &mut crate::msac::SymbolEncoder,
+    chroma: bool,
+    reference: &mut WienerInfo,
+    info: &WienerInfo,
+) {
+    write_wiener_direction(enc, chroma, &reference.vfilter, &info.vfilter);
+    write_wiener_direction(enc, chroma, &reference.hfilter, &info.hfilter);
+    *reference = *info;
+}
+
+/// Inverse of [`read_wiener_direction`].
+fn write_wiener_direction(
+    enc: &mut crate::msac::SymbolEncoder,
+    chroma: bool,
+    reference: &[i32; 7],
+    taps: &[i32; 7],
+) {
+    for i in 0..3 {
+        if i == 0 && chroma {
+            continue;
+        }
+        write_signed_subexp_with_ref(
+            enc,
+            WIENER_TAP_MINV[i],
+            WIENER_TAP_MAXV[i] + 1,
+            WIENER_TAP_K[i],
+            reference[i],
+            taps[i],
+        );
+    }
+}
+
+/// A Wiener unit's three free taps per direction, as [`WienerInfo`] (the
+/// centre tap is derived, spec 7.17.4).
+pub(crate) fn wiener_from_taps(v: [i32; 3], h: [i32; 3]) -> WienerInfo {
+    let fill = |t: [i32; 3]| {
+        let centre = 128 - 2 * (t[0] + t[1] + t[2]);
+        [t[0], t[1], t[2], centre, t[2], t[1], t[0]]
+    };
+    WienerInfo {
+        vfilter: fill(v),
+        hfilter: fill(h),
+    }
+}
+
 #[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
 const WIENER_HALFWIN: usize = 3;
 #[allow(dead_code)] // gate counter accessor with no reader yet; the counter itself is live
@@ -291,7 +424,7 @@ impl RestorationGrid {
         }
     }
 
-    fn set(&mut self, plane: usize, rrow: usize, rcol: usize, filter: UnitFilter) {
+    pub(crate) fn set(&mut self, plane: usize, rrow: usize, rcol: usize, filter: UnitFilter) {
         let idx = rcol + rrow * self.horz_units[plane];
         self.units[plane][idx] = filter;
     }
@@ -303,7 +436,7 @@ impl RestorationGrid {
 }
 
 /// `av1_lr_count_units` (restoration.c:63): round, not ceil, to nearest.
-fn count_units(plane_size: u32, unit_size: u32) -> usize {
+pub(crate) fn count_units(plane_size: u32, unit_size: u32) -> usize {
     (((plane_size + (unit_size >> 1)) / unit_size).max(1)) as usize
 }
 
@@ -1366,63 +1499,10 @@ mod tests {
     use super::*;
     use crate::msac::{SymbolDecoder, SymbolEncoder};
 
-    /// `write_primitive_quniform`, the exact inverse of [`ns_msac`] -- used
-    /// only to build roundtrip fixtures for the decode-only helpers above
-    /// (this decoder never writes loop restoration itself).
-    fn write_ns(enc: &mut SymbolEncoder, n: u32, v: u32) {
-        if n <= 1 {
-            return;
-        }
-        let w = floor_log2(n) + 1;
-        let m = (1u32 << w) - n;
-        if v < m {
-            enc.literal(v, w - 1);
-        } else {
-            enc.literal((v + m) >> 1, w - 1);
-            enc.literal((v + m) & 1, 1);
-        }
-    }
-
-    fn write_subexp(enc: &mut SymbolEncoder, num_syms: u32, k: u32, v: u32) {
-        let mut i = 0u32;
-        let mut mk = 0u32;
-        loop {
-            let b = if i > 0 { k + i - 1 } else { k };
-            let a = 1u32 << b;
-            if num_syms <= mk + 3 * a {
-                write_ns(enc, num_syms - mk, v - mk);
-                return;
-            }
-            if v < mk + a {
-                enc.literal(0, 1);
-                enc.literal(v - mk, b);
-                return;
-            }
-            enc.literal(1, 1);
-            i += 1;
-            mk += a;
-        }
-    }
-
-    fn recenter(r: u32, v: u32) -> u32 {
-        if v > 2 * r {
-            v
-        } else if v >= r {
-            (v - r) << 1
-        } else {
-            ((r - v) << 1) - 1
-        }
-    }
-
-    fn write_unsigned_subexp_with_ref(enc: &mut SymbolEncoder, n: u32, k: u32, reference: u32, v: u32) {
-        let r = reference.clamp(0, n.saturating_sub(1));
-        let coded = if (r << 1) <= n {
-            recenter(r, v)
-        } else {
-            recenter(n - 1 - r, n - 1 - v)
-        };
-        write_subexp(enc, n, k, coded);
-    }
+    /// The write side these roundtrips exercise now lives beside the
+    /// readers (`write_ns`/`write_subexp`/`write_unsigned_subexp_with_ref`,
+    /// used by the encoder's per-unit LR syntax) instead of being a
+    /// test-only transcription of it -- one implementation, pinned here.
 
     /// `decode_subexp_msac`/`ns_msac` roundtrip every value in a handful of
     /// `(num_syms, k)` alphabets -- the shapes LR's tap ranges (`k` 1..=4,
@@ -1486,6 +1566,36 @@ mod tests {
                     let got = decode_signed_subexp_with_ref_msac(&mut dec, low, high, k, reference_v);
                     assert_eq!(got, v, "low={low} high={high} k={k} reference={reference_v} v={v}");
                 }
+            }
+        }
+    }
+
+    /// [`write_wiener_filter`] against [`read_wiener_filter`], including the
+    /// running per-tile reference both sides advance: three units in a row,
+    /// luma (7-tap) and chroma (5-tap, tap 0 forced to zero).
+    #[test]
+    fn wiener_filter_roundtrips() {
+        for chroma in [false, true] {
+            let units = [
+                wiener_from_taps([0, 0, 8], [0, 0, 8]),
+                wiener_from_taps([0, 4, 12], [0, 0, -8]),
+                wiener_from_taps([0, 0, 0], [0, 0, 0]),
+            ];
+            let units: Vec<WienerInfo> = if chroma {
+                units.iter().copied().collect()
+            } else {
+                units.to_vec()
+            };
+            let mut enc = SymbolEncoder::new();
+            let mut wref = WienerInfo::default();
+            for u in &units {
+                write_wiener_filter(&mut enc, chroma, &mut wref, u);
+            }
+            let payload = enc.finish();
+            let mut dec = SymbolDecoder::new(&payload);
+            let mut rref = WienerInfo::default();
+            for u in &units {
+                assert_eq!(read_wiener_filter(&mut dec, chroma, &mut rref), *u, "chroma={chroma}");
             }
         }
     }
