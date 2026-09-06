@@ -4342,11 +4342,12 @@ fn search_inter_block(
     // reference alone is right. Priced with the same static-CDF approximation
     // the single-reference candidates use, plus the compound-only symbols
     // (`comp_mode`, the reference-pair tree, `comp_group_idx`/`compound_idx`).
-    // The two 2026-09-06 compound-mode arms, both measured on the BD gate
-    // before either could default on (see the lane report): presence of the
-    // flag arms the candidate.
+    // The two compound-mode arms, each measured alone on the BD gate before
+    // it could default on. `NEAREST_NEWMV`/`NEW_NEARESTMV` keep (-1.0/-0.8
+    // vs libaom, screen byte-identical) and ship on; `NEAR_NEARMV` does not
+    // (+0.5/-0.2/flat) and stays behind `EC_AV1_COMP_NEARNEAR`.
     let near_near = crate::envflags::env_flag!("EC_AV1_COMP_NEARNEAR");
-    let half_new = crate::envflags::env_flag!("EC_AV1_COMP_HALFNEW");
+    let half_new = true;
     for (ref1, g, cstack) in compound {
         let (ref1, g) = (*ref1, *g);
         let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME)
@@ -7488,9 +7489,13 @@ mod tests {
         );
         // Measured 2026-09-06 with the extra-reference `NEWMV` in: +18.9% at
         // the worst inter frame, where nearly every block now codes an MV
-        // residual and a reference the coefficient sum never counts.
+        // residual and a reference the coefficient sum never counts. Re-measured
+        // at +29.6% once the encoder's grid published compound blocks properly
+        // (compound share 8.8% -> 11.5%): a compound block carries a second
+        // reference tree, a compound mode symbol and -- for the half-new modes
+        // -- an MV residual, none of which the coefficient sum counts.
         assert!(
-            worst_under <= 0.22,
+            worst_under <= 0.32,
             "the writer spent {:.2}% more than the search priced -- more than \
              the mode/mv syntax outside the coefficient sum explains",
             worst_under * 100.0
@@ -8366,7 +8371,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7209, 0xacdd_6952_78c1_49f2), (60, 27353, 0x9be8_7898_f08d_3b77)];
+            [(150, 7166, 0xc608_4e2a_071e_1d72), (60, 26950, 0x019f_a19c_251b_f61d)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
