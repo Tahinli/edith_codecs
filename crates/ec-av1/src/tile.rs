@@ -390,6 +390,28 @@ thread_local! {
     static MOTION_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// This frame header's own `allow_warped_motion` bit (spec 5.9.2): with
+    /// it set, every block libaom's `motion_mode_allowed` accepts AND that
+    /// has at least one warp sample (`num_proj_ref >= 1`) reads the 3-symbol
+    /// `motion_mode_cdf` alphabet instead of the 2-symbol `obmc_cdf` one.
+    /// lane-av1obmc2.
+    static WARPED_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The frame geometry the warp-sample walk needs (`num_proj_ref` ->
+    /// `has_top_right`), which is only ever this writer's own superblock
+    /// size. Every stream this crate writes uses a 64 superblock, which is
+    /// `FrameCtx::new`'s default.
+    /// corner-cut: ceiling is a 128-superblock WRITER -- it must arm the real
+    /// frame context here (or take one as a parameter) or the warp-sample
+    /// walk reads the wrong `has_top_right` geometry.
+    static WRITER_FCTX: crate::decode::FrameCtx = crate::decode::FrameCtx::new();
+}
+
+/// Arms [`WARPED_MOTION`] for the next tile written on this thread.
+pub(crate) fn arm_warped_motion(on: bool) {
+    WARPED_MOTION.with(|c| c.set(on));
+}
+
 /// Arms the frame's `is_motion_mode_switchable` bit for the next tile written
 /// on this thread; cleared by [`CdefIdxGuard`] when that writer returns.
 pub(crate) fn arm_motion_mode(on: bool) {
@@ -401,14 +423,25 @@ pub(crate) fn arm_motion_mode(on: bool) {
 /// -- the histogram a gate prints so that "OBMC is on" is a measurement, not
 /// a claim (class `gate-blind-to-feature`). Index: `0 + 2 * bucket` for
 /// SIMPLE, `1 + 2 * bucket` for OBMC, bucket 0/1/2 = 32x32/16x16/8x8.
-static MOTION_MODE_HITS: [std::sync::atomic::AtomicUsize; 6] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+static MOTION_MODE_HITS: [std::sync::atomic::AtomicUsize; 9] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 9];
 
 /// Reads [`MOTION_MODE_HITS`] and zeroes it, so a gate can attribute the
 /// counts to its own encode.
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
-pub(crate) fn take_motion_mode_hits() -> [usize; 6] {
+pub(crate) fn take_motion_mode_hits() -> [usize; 9] {
     std::array::from_fn(|i| MOTION_MODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// What the 3-symbol `motion_mode` symbol costs, in bits, against the same
+/// frame tables [`obmc_symbol_bits`] prices the 2-symbol alphabet off --
+/// which alphabet a block reads is `motion_mode_allowed`'s own choice
+/// ([`write_motion_mode`]).
+pub(crate) fn motion_mode_symbol_bits(row: usize, motion: u8) -> f64 {
+    PRICING_BASE.with_borrow(|slot| match slot.as_deref() {
+        Some(s) => crate::encode::symbol_bits(&s.0.motion_mode[row], usize::from(motion)),
+        None => crate::encode::symbol_bits(&crate::cdf::MOTION_MODE[row], usize::from(motion)),
+    })
 }
 
 /// What the `motion_mode`/`obmc` symbol costs, in bits, against the tables
@@ -445,7 +478,12 @@ fn write_motion_mode(
     (bw4, bh4): (usize, usize),
     (write_w, write_h): (usize, usize),
     (mi_cols, mi_rows): (usize, usize),
-    obmc: bool,
+    // This block's own reference, for the warp-sample walk that picks the
+    // alphabet (`num_proj_ref`).
+    ref_frame: i8,
+    // 0 SIMPLE_TRANSLATION, 1 OBMC_CAUSAL, 2 WARPED_CAUSAL -- what the
+    // encoder's search committed for this block.
+    motion: u8,
 ) -> Result<()> {
     let eligible = MOTION_MODE.with(std::cell::Cell::get)
         && write_w.min(write_h) >= 8
@@ -453,9 +491,15 @@ fn write_motion_mode(
             grid, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows,
         );
     if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
+        let proj = WRITER_FCTX.with(|fctx| {
+            crate::decode::num_proj_ref(
+                grid, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows, ref_frame, fctx,
+            )
+        });
         eprintln!(
-            "EC_MMW mi_row={mi_row} mi_col={mi_col} w={write_w} h={write_h} elig={}",
-            eligible as u8
+            "EC_MMW mi_row={mi_row} mi_col={mi_col} w={write_w} h={write_h} elig={} proj={proj} warp_armed={} motion={motion}",
+            eligible as u8,
+            WARPED_MOTION.with(std::cell::Cell::get) as u8,
         );
     }
     if !eligible {
@@ -463,7 +507,7 @@ fn write_motion_mode(
         // codes as SIMPLE_TRANSLATION: its reconstruction is not the
         // decoder's (class encoder-grid-drift), which is exactly what the
         // `EC_COMP_MISMATCH` rung exists to catch.
-        if obmc && crate::envflags::env_flag!("EC_COMP_MISMATCH") {
+        if motion != 0 && crate::envflags::env_flag!("EC_COMP_MISMATCH") {
             eprintln!(
                 "EC_COMP_MISMATCH motion_mode enc=OBMC wrote=SIMPLE                  mi=({mi_row},{mi_col}) wh=({write_w}x{write_h})"
             );
@@ -476,13 +520,37 @@ fn write_motion_mode(
             format!("a {write_w}x{write_h} block has no motion_mode CDF row"),
         )
     })?;
-    enc.symbol(usize::from(obmc), &mut cdfs.obmc[row]);
+    // libaom `motion_mode_allowed`: the 3-symbol `motion_mode_cdf` alphabet
+    // exactly when `allow_warped_motion` is on and the block has at least one
+    // warp sample. The other two vetoes libaom applies there cannot fire for
+    // a stream this encoder writes -- it codes no scaled reference and no
+    // inter frame with `force_integer_mv` -- and the decoder checks all three
+    // (`decode.rs`'s `warp_eligible`), so the two sides agree term for term.
+    let warp_alphabet = WARPED_MOTION.with(std::cell::Cell::get)
+        && WRITER_FCTX.with(|fctx| {
+            crate::decode::num_proj_ref(
+                grid, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows, ref_frame, fctx,
+            )
+        }) >= 1;
+    if warp_alphabet {
+        enc.symbol(usize::from(motion), &mut cdfs.motion_mode[row]);
+    } else {
+        // A warp winner whose block the writer resolves to the 2-symbol
+        // alphabet would reconstruct as SIMPLE at the decoder: the same
+        // encoder-grid-drift rung the OBMC case above prints.
+        if motion == 2 && crate::envflags::env_flag!("EC_COMP_MISMATCH") {
+            eprintln!(
+                "EC_COMP_MISMATCH motion_mode enc=WARP wrote=SIMPLE mi=({mi_row},{mi_col}) wh=({write_w}x{write_h})"
+            );
+        }
+        enc.symbol(usize::from(motion == 1), &mut cdfs.obmc[row]);
+    }
     let bucket = match write_w.min(write_h) {
         32.. => 0,
         16 => 1,
         _ => 2,
     };
-    MOTION_MODE_HITS[usize::from(obmc) + 2 * bucket]
+    MOTION_MODE_HITS[usize::from(motion.min(2)) + 3 * bucket]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
@@ -1347,12 +1415,11 @@ pub struct BlockCoeffs {
     /// block. Only [`sb_coeff_inter_frame_tile`] codes `is_inter`; the key
     /// frame writers never read this field.
     pub inter: Option<InterInfo>,
-    /// Whether this (single-reference inter) block's prediction was built
-    /// with OBMC -- spec `motion_mode == OBMC_CAUSAL`, written by
-    /// [`write_motion_mode`]. `false` (the [`Default`]) is
-    /// `SIMPLE_TRANSLATION`, the only motion mode this writer coded before
-    /// lane-av1obmc.
-    pub obmc: bool,
+    /// This (single-reference inter) block's spec `motion_mode`, written by
+    /// [`write_motion_mode`]: 0 `SIMPLE_TRANSLATION` (the [`Default`], and
+    /// the only mode this writer coded before lane-av1obmc), 1 `OBMC_CAUSAL`,
+    /// 2 `WARPED_CAUSAL` (lane-av1obmc2).
+    pub motion_mode: u8,
     /// The 8x8 leaves a straddling 16x16 block is split into (lane-av1-rect),
     /// each with its own 8x8 luma transform and 4x4 chroma transforms, in
     /// raster order among the leaves that are inside the true frame. `Some`
@@ -5560,7 +5627,8 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         (8, 8),
                         (BLOCK, BLOCK),
                         (mi_cols as usize, mi_rows as usize),
-                        block.obmc,
+                        info.ref_frame,
+                        block.motion_mode,
                     )?;
                     mode_for_tx = 0;
                     }
@@ -5794,7 +5862,8 @@ fn write_inter_frame_leaf(
             (SUB_MI as usize, SUB_MI as usize),
             (SUB, SUB),
             (mi_cols as usize, mi_rows as usize),
-            block.obmc,
+            info.ref_frame,
+            block.motion_mode,
         )?;
         mode_for_tx = 0;
         }
@@ -6034,7 +6103,8 @@ fn write_inter_frame_leaf8(
             (2, 2),
             (8, 8),
             (mi_cols as usize, mi_rows as usize),
-            block.obmc,
+            info.ref_frame,
+            block.motion_mode,
         )?;
         mode_for_tx = 0;
         }

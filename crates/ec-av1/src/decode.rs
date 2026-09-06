@@ -552,7 +552,7 @@ pub(crate) fn warp_plane_suppress_hits() -> usize {
 /// block dimensions decide it -- never the square `side`/`chroma_side`, which
 /// for a rectangular luma block (8x16, 16x8) or a PARTITION_HORZ/VERT strip is
 /// bigger than the real block in one axis.
-fn warp_plane_allowed(w: usize, h: usize) -> bool {
+pub(crate) fn warp_plane_allowed(w: usize, h: usize) -> bool {
     if w >= 8 && h >= 8 {
         return true;
     }
@@ -24221,7 +24221,7 @@ fn has_top_right(mi_row: usize, mi_col: usize, bs: usize, fctx: &crate::decode::
 /// own `bw`/`bh` (fed to [`crate::warp::record_sample`]'s offset formula)
 /// come from the *neighbour* cell's own coded size, not this block's.
 #[allow(clippy::too_many_arguments)]
-fn find_samples(
+pub(crate) fn find_samples(
     grid: &MiGrid,
     mi_row: usize,
     mi_col: usize,
@@ -24379,7 +24379,7 @@ fn find_samples(
 /// `motion_mode_allowed` needs to pick the 3-symbol `motion_mode_cdf` over
 /// the 2-symbol `obmc_cdf` (spec 5.11.24).
 #[allow(clippy::too_many_arguments)]
-fn num_proj_ref(
+pub(crate) fn num_proj_ref(
     grid: &MiGrid,
     mi_row: usize,
     mi_col: usize,
@@ -32054,6 +32054,12 @@ fn decode_inter_block8(
                 mc::scale_factor(ref_width, frame_width) != mc::REF_NO_SCALE;
             let warp_eligible =
                 allow_warped_motion && !ref_is_scaled && !force_integer_mv && proj_ok;
+            if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
+                eprintln!(
+                    "EC_MM8 mi_row={mi_row} mi_col={mi_col} proj={} warp_elig={} awm={}",
+                    proj_ok as u8, warp_eligible as u8, allow_warped_motion as u8
+                );
+            }
             if allow_warped_motion && proj_ok && ref_is_scaled {
                 hit!(SCALED_WARP_SUPPRESSED_HITS);
             }
