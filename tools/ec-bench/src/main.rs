@@ -368,19 +368,13 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
         tile_cols_log2,
         tile_rows_log2,
     };
-    // `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]` benches the
-    // encoder's coding pyramid (hidden ALTREF + show_existing_frame) instead
-    // of the flat one-picture-one-packet stream, the same knob shape as
-    // `EC_H265_RDOQ_ESTIMATE`. Unset keeps the flat default.
-    let pyramid = std::env::var("EC_AV1_PYRAMID").ok().and_then(|spec| {
-        let mut f = spec.split(':');
-        let d = Pyramid::default();
-        Some(Pyramid {
-            mini_gop: f.next()?.parse().ok()?,
-            arf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.arf_q_offset),
-            leaf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.leaf_q_offset),
-        })
-    });
+    // The encoder's coding pyramid (hidden ALTREF + show_existing_frame) is
+    // the default, as it is in `encode_sequence`; `EC_AV1_PYRAMID=0` benches
+    // the flat one-picture-one-packet stream instead, and
+    // `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]` another
+    // shape of it. The `hidden` column below is how many frames of the row
+    // were coded ahead of their display position.
+    let pyramid = Pyramid::from_env();
     let mut enc = match pyramid {
         None => Av1Encoder::new(cfg).expect("av1 encoder"),
         Some(p) => Av1Encoder::with_pyramid(cfg, p).expect("av1 encoder"),
