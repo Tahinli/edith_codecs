@@ -3005,7 +3005,8 @@ pub(crate) mod tests {
                 // `false` desyncs at the first one (class: test asserts
                 // against a stale header).
                 encoded.screen,
-                false,
+                // ... and its own `allow_intrabc` (stale-header class).
+                encoded.allow_intrabc,
                 &encoded.loop_restoration, fctx,
             )
             .unwrap();
