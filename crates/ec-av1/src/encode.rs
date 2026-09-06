@@ -7107,6 +7107,25 @@ mod tests {
     /// | 2160p fixture | 42.84 dB/12480 B .. 51.43 dB/46557 B | +179.5% | +128.8% | 8.6s:1.0s:2.2s |
     /// | screen capture | 39.76 dB/9536 B .. 48.87 dB/29189 B | +88.0% | +21.5% | 7.2s:1.0s:2.1s |
     ///
+    /// Re-measured 2026-09-06 after lane-av1fwd, which changed only how long
+    /// the encoder takes -- every stream it writes is byte-identical, so the
+    /// BD columns are this box's own re-run of the same recipe rather than a
+    /// quality move (+141.3/+174.2/+88.9 vs libaom, +91.9/+124.5/+21.6 vs
+    /// rav1e). What moved is the wall of the four encodes:
+    ///
+    /// | clip | wall ours before | after | instructions:u before -> after |
+    /// |---|---|---|---|
+    /// | 1080p fixture | 9.2s | 7.2s | 191.5G -> 139.8G (-27.0%) |
+    /// | 2160p fixture | 8.6s | 6.9s | 183.5G -> 136.4G (-25.6%) |
+    /// | screen capture | 7.2s | 6.7s | 157.2G -> 122.5G (-22.1%) |
+    ///
+    /// Three exact steps, none of which touches a coded bit: the coefficient
+    /// rate pricer stopped rebuilding every CDF table per candidate
+    /// (`tile::coeff_bits`), the filter search stopped re-decoding its own
+    /// tile once per candidate (`decode::FilterReplay`), and the forward
+    /// transform stopped transforming the all-zero residual that 70% of its
+    /// calls carry.
+    ///
     /// The three steps of that lane, same recipe (vs libaom, then vs rav1e):
     ///
     /// | step | 1080p | 2160p | screen |
