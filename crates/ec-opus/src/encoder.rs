@@ -116,6 +116,12 @@ pub struct Encoder {
     /// Scratch space for the zero-stuffed SILK/hybrid input, sized once so
     /// the steady-state loop doesn't allocate a `Vec` per frame.
     silk_stuff: Vec<f32>,
+    /// libopus `opus_encoder.c`'s `hp_mem`: the one-pole state of the
+    /// [`Encoder::dc_reject`] filter every frame of API input goes through,
+    /// one per channel.
+    hp_mem: [f32; 2],
+    /// Scratch space for that filter's output, sized once.
+    hp_buf: Vec<f32>,
 }
 
 /// SILK's internal sample rate (kHz) for a target bandwidth: Narrow → 8,
@@ -175,6 +181,8 @@ impl Encoder {
             silk_buf: [0u8; MAX_SILK_PACKET_BYTES],
             silk_delay: Vec::new(),
             silk_stuff: Vec::new(),
+            hp_mem: [0.0; 2],
+            hp_buf: Vec::new(),
         })
     }
 
@@ -283,6 +291,7 @@ impl Encoder {
         self.silk_stereo_mb = None;
         self.silk_stereo_wb = None;
         self.silk_delay.clear();
+        self.hp_mem = [0.0; 2];
         self.final_range = 0;
     }
 
@@ -692,6 +701,32 @@ impl Encoder {
         BWS[idx].min(ceiling)
     }
 
+    /// libopus `opus_encoder.c`'s `dc_reject(pcm, 3, ...)`: a 3 Hz one-pole
+    /// high-pass on the API input, applied once before *both* layers (libopus
+    /// filters into `pcm_buf`, which is what `silk_Encode` and
+    /// `celt_encode_with_ec` both read). `coef = 6.3 * cutoff / Fs` at the
+    /// API rate; the output is the input minus a leaky integrator of it, and
+    /// the integrator state carries across frames.
+    ///
+    /// libopus takes the `hp_cutoff` branch instead for
+    /// `OPUS_APPLICATION_VOIP` (a bandwidth-dependent second-order section);
+    /// not ported — every VoIP frame still gets this DC reject.
+    fn dc_reject(&mut self, pcm: &[f32], frame_size: usize, out: &mut Vec<f32>) {
+        let c = self.channels;
+        let coef = 6.3 * 3.0 / self.sample_rate as f32;
+        out.clear();
+        out.resize(frame_size * c, 0.0);
+        for ch in 0..c {
+            let mut m = self.hp_mem[ch];
+            for i in 0..frame_size {
+                let x = pcm[i * c + ch];
+                out[i * c + ch] = x - m;
+                m += coef * (x - m);
+            }
+            self.hp_mem[ch] = m;
+        }
+    }
+
     /// Encodes one frame — `frame_size` samples per channel of interleaved
     /// `f32` at the input rate, 2.5, 5, 10 or 20 ms of it — as a code-0 Opus
     /// packet in `out`, returning the packet length.
@@ -701,19 +736,27 @@ impl Encoder {
         frame_size: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        let (toc, payload) =
-            self.encode_toc_and_payload(pcm, frame_size, out.len().saturating_sub(1))?;
-        let n = payload.len();
-        if out.len() < 1 + n {
-            return Err(Error::corrupt(format!(
-                "opus encode: packet needs {} bytes, buffer holds {}",
-                1 + n,
-                out.len()
-            )));
-        }
-        out[0] = toc;
-        out[1..1 + n].copy_from_slice(payload);
-        Ok(1 + n)
+        let mut hp = std::mem::take(&mut self.hp_buf);
+        self.dc_reject(pcm, frame_size, &mut hp);
+        let r = match self.encode_toc_and_payload(&hp, frame_size, out.len().saturating_sub(1)) {
+            Err(e) => Err(e),
+            Ok((toc, payload)) => {
+                let n = payload.len();
+                if out.len() < 1 + n {
+                    Err(Error::corrupt(format!(
+                        "opus encode: packet needs {} bytes, buffer holds {}",
+                        1 + n,
+                        out.len()
+                    )))
+                } else {
+                    out[0] = toc;
+                    out[1..1 + n].copy_from_slice(payload);
+                    Ok(1 + n)
+                }
+            }
+        };
+        self.hp_buf = hp;
+        r
     }
 
     /// [`Encoder::encode_float`] from 16-bit samples.
@@ -731,27 +774,35 @@ impl Encoder {
         frame_size: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        let (toc, payload) =
-            self.encode_toc_and_payload(pcm, frame_size, out.len().saturating_sub(3))?;
-        let n = payload.len();
-        let len_bytes = if n < 252 { 1 } else { 2 };
-        if out.len() < 1 + len_bytes + n {
-            return Err(Error::corrupt(format!(
-                "opus encode: self-delimited packet needs {} bytes, buffer holds {}",
-                1 + len_bytes + n,
-                out.len()
-            )));
-        }
-        out[0] = toc;
-        if n < 252 {
-            out[1] = n as u8;
-        } else {
-            let b0 = 252 + ((n - 252) & 3);
-            out[1] = b0 as u8;
-            out[2] = ((n - b0) / 4) as u8;
-        }
-        out[1 + len_bytes..1 + len_bytes + n].copy_from_slice(payload);
-        Ok(1 + len_bytes + n)
+        let mut hp = std::mem::take(&mut self.hp_buf);
+        self.dc_reject(pcm, frame_size, &mut hp);
+        let r = match self.encode_toc_and_payload(&hp, frame_size, out.len().saturating_sub(3)) {
+            Err(e) => Err(e),
+            Ok((toc, payload)) => {
+                let n = payload.len();
+                let len_bytes = if n < 252 { 1 } else { 2 };
+                if out.len() < 1 + len_bytes + n {
+                    Err(Error::corrupt(format!(
+                        "opus encode: self-delimited packet needs {} bytes, buffer holds {}",
+                        1 + len_bytes + n,
+                        out.len()
+                    )))
+                } else {
+                    out[0] = toc;
+                    if n < 252 {
+                        out[1] = n as u8;
+                    } else {
+                        let b0 = 252 + ((n - 252) & 3);
+                        out[1] = b0 as u8;
+                        out[2] = ((n - b0) / 4) as u8;
+                    }
+                    out[1 + len_bytes..1 + len_bytes + n].copy_from_slice(payload);
+                    Ok(1 + len_bytes + n)
+                }
+            }
+        };
+        self.hp_buf = hp;
+        r
     }
 
     /// One hybrid frame (10 or 20 ms, mono or stereo, `bandwidth` SWB or FB)
