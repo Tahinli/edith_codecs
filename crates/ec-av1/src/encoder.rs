@@ -4,7 +4,11 @@
 //! One picture in, one [`Packet`] out, same contract as the repo's other
 //! software encoder shims (`shims/rusty_h264`'s `Encoder::try_encode`,
 //! "nothing is ever held back"): [`Av1Encoder::encode`] never buffers a
-//! picture past its own call, so there is no flush to drain. Internally it
+//! picture past its own call, so there is no flush to drain. That contract
+//! still holds for every caller that does not opt into a coding pyramid;
+//! [`Av1Encoder::with_pyramid`] does reorder pictures, and such a stream is
+//! driven through [`Av1Encoder::encode_frames`] (zero or more packets per
+//! picture) and [`Av1Encoder::flush`] instead. Internally it
 //! is [`crate::encode::encode_key_frame_inner`] and
 //! [`crate::encode::encode_inter_frame`] driven by a small state machine —
 //! a key frame every `gop` pictures, an inter frame predicting from the
@@ -325,8 +329,38 @@ pub struct Pyramid {
 }
 
 impl Default for Pyramid {
-    /// The offsets `encode::tests::pyramid_q_offset_sweep` measured (see the
-    /// sweep's own report) at the mini-GOP size that won it.
+    /// The best point of the offset sweep run through the BD gate's own
+    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]` knob
+    /// (`encode::tests::bd_rate_vs_libaom_and_rav1e`, 12 frames of each of
+    /// the three gate clips, BD-rate vs libaom / vs rav1e):
+    ///
+    /// | mini_gop:arf:leaf | 1080p | 2160p | screen |
+    /// |---|---|---|---|
+    /// | flat (no pyramid) | +122.7 / +73.4 | +147.3 / +98.5 | +79.4 / +17.2 |
+    /// | 4:0:0 | +152.2 / +97.9 | +214.7 / +158.1 | +91.4 / +26.2 |
+    /// | 4:-16:8 | +139.9 / +87.1 | +201.5 / +143.7 | +78.5 / +19.5 |
+    /// | 4:-24:12 | +141.3 / +85.0 | +190.0 / +132.9 | +84.5 / +22.8 |
+    /// | 2:0:0 | +149.3 / +93.1 | +203.0 / +149.4 | +88.3 / +23.6 |
+    /// | 2:-8:4 | +143.1 / +89.1 | +196.2 / +141.6 | +82.5 / +20.4 |
+    /// | 2:-16:8 | +137.6 / +84.5 | +187.2 / +130.6 | +84.9 / +23.1 |
+    ///
+    /// Two things the sweep says. The quantizer offsets are real and in the
+    /// direction libaom's `gf_group` spends them (0/0 is the worst row at
+    /// every mini-GOP; -16/+8 buys 12-16 BD points over it), which is what
+    /// these defaults are. And the pyramid as a whole does NOT yet pay: no
+    /// row beats the flat baseline on all three clips, and 2160p is 40-70
+    /// points worse everywhere.
+    ///
+    /// The reason is measurable, not mysterious: the leaves may only reach
+    /// the hidden frame through the SEARCH-FREE modes (`NEARESTMV` off the
+    /// stack and `GLOBALMV`) — this lane adds no motion search — so
+    /// `ALTREF_FRAME` wins about 4% of blocks, while the hidden frame itself
+    /// pays the full cost of predicting `mini_gop` pictures ahead of its own
+    /// reference. Backward `NEWMV` is the missing half, and it lives in the
+    /// motion-search lane. Until it lands the pyramid ships OFF: nothing
+    /// selects it but an explicit [`Av1Encoder::with_pyramid`] call (or
+    /// `EC_AV1_PYRAMID` on the gate and on `ec-bench`), and the default
+    /// one-in-one-out path is byte-identical to before it existed.
     fn default() -> Self {
         Self {
             mini_gop: 4,
