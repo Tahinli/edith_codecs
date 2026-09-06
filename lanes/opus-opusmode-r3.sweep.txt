@@ -1,3 +1,4 @@
+# lane-opusmode r3: EC_OPUS_BW_DETECT=1 EC_OPUS_VBR_ACT=1 EC_OPUS_TF_K=1.25 (combined arm)
 # ec-opus encoder vs ffmpeg libopus — encoders-only gate (r1)
 # both bitstreams decoded by ec-opus; 120s cap; VBR; 48kHz stereo
 # source	kbps	ours_kbps	ref_kbps	rate%	corr_ours	corr_ref	gap	Q_ours	Q_ref	err_ratio	minsec_ours	minsec_ref	drop_ours	drop_ref
