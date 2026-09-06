@@ -31,6 +31,90 @@ use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16, single_ref_ct
 // ([`CdefIdxGuard`] clears it on every exit path, error included), so a frame
 // that arms nothing writes no literals.
 
+// ---------------------------------------------------------------------------
+// lane-av1lr: per-restoration-unit loop restoration syntax (spec 5.11.57,
+// `read_lr`), armed by the encoder's restoration search the same way
+// [`arm_cdef_idx`] arms the CDEF indices. LUMA ONLY and Wiener only: the
+// frame header this encoder writes sets `FrameRestorationType[0] = WIENER`
+// and leaves both chroma planes at `RESTORE_NONE`, so a unit codes one
+// `restore_wiener` symbol and, when it takes the filter, its two directions
+// against the running per-tile reference (`crate::restoration::
+// write_wiener_filter`, the exact inverse of the reader's own
+// `read_wiener_filter`).
+
+/// One frame's per-unit restoration plan (see [`arm_lr`]).
+struct LrPlan {
+    /// `LoopRestorationSize[0]`, in luma samples.
+    unit_size: u32,
+    /// `horz_units`/`vert_units` for the luma plane.
+    horz_units: u32,
+    vert_units: u32,
+    /// One entry per unit, `rcol + rrow * horz_units`: the filter it takes,
+    /// or `None` for `RESTORE_NONE`.
+    units: Vec<Option<crate::restoration::WienerInfo>>,
+    /// `ref_wiener_info`: the running reference the taps are coded against,
+    /// reset to the midpoint filter at the start of each tile (this writer
+    /// codes one tile per frame).
+    reference: crate::restoration::WienerInfo,
+}
+
+thread_local! {
+    static LR_PLAN: std::cell::RefCell<Option<LrPlan>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the next tile write with one Wiener decision per luma restoration
+/// unit. An empty `units` disarms (the frame codes no restoration at all).
+pub(crate) fn arm_lr(
+    unit_size: u32,
+    horz_units: u32,
+    vert_units: u32,
+    units: Vec<Option<crate::restoration::WienerInfo>>,
+) {
+    LR_PLAN.with(|c| {
+        *c.borrow_mut() = (!units.is_empty()).then(|| LrPlan {
+            unit_size,
+            horz_units,
+            vert_units,
+            units,
+            reference: crate::restoration::WienerInfo::default(),
+        });
+    });
+}
+
+/// `read_lr`'s write side, called once at the top of every superblock,
+/// before its partition symbol: writes the units this superblock's own
+/// mi span covers (`av1_loop_restoration_corners_in_sb`; no superres, so the
+/// column scaling is the plain mi one).
+fn write_lr(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, mi_row: u32, mi_col: u32) {
+    LR_PLAN.with(|c| {
+        let mut plan = c.borrow_mut();
+        let Some(plan) = plan.as_mut() else { return };
+        let unit = plan.unit_size;
+        let rcol0 = (mi_col * 4).div_ceil(unit);
+        let rcol1 = ((mi_col + SB_MI_W) * 4).div_ceil(unit).min(plan.horz_units);
+        let rrow0 = (mi_row * 4).div_ceil(unit);
+        let rrow1 = ((mi_row + SB_MI_W) * 4).div_ceil(unit).min(plan.vert_units);
+        for rrow in rrow0..rrow1 {
+            for rcol in rcol0..rcol1 {
+                let info = plan.units[(rcol + rrow * plan.horz_units) as usize];
+                enc.symbol(usize::from(info.is_some()), &mut cdfs.restore_wiener);
+                if let Some(info) = info {
+                    crate::restoration::write_wiener_filter(
+                        enc,
+                        false,
+                        &mut plan.reference,
+                        &info,
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// A 64x64 superblock's width in 4x4 mode-info units (`SB_MI` in
+/// `crate::decode`), the span [`write_lr`] resolves its units over.
+const SB_MI_W: u32 = 16;
+
 /// One frame's per-superblock `cdef_idx` plan (see [`arm_cdef_idx`]).
 struct CdefIdxPlan {
     /// The header's `cdef_bits`; never 0 while armed.
@@ -65,6 +149,7 @@ struct CdefIdxGuard;
 impl Drop for CdefIdxGuard {
     fn drop(&mut self) {
         CDEF_IDX.with(|c| *c.borrow_mut() = None);
+        LR_PLAN.with(|c| *c.borrow_mut() = None);
     }
 }
 
@@ -1177,6 +1262,7 @@ pub fn sb_coeff_key_frame_tile_tx(
     for sb_r in 0..sb_rows {
         neighbours.start_row();
         for sb_c in 0..sb_cols {
+            write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
             ec_rng_trace(|| {
@@ -2836,6 +2922,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
     for sb_r in 0..sb_rows {
         neighbours.start_row();
         for sb_c in 0..sb_cols {
+            write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             // spec `decode_partition`'s hasRows/hasCols (5.11.4): a superblock
