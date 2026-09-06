@@ -7710,6 +7710,7 @@ pub(crate) fn encode_inter_frame(
                 sign_bias,
                 h.allow_screen_content_tools,
                 switchable_motion_mode,
+                h.allow_warped_motion,
                 fctx,
             )
         },
