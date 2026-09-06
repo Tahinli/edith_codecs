@@ -5799,4 +5799,253 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // The encoder's standing BD-rate baseline against libaom and rav1e.
+    // Every PSNR below is measured on FFMPEG-DECODED pixels, never on an
+    // encoder's own reconstruction ([[shared-oracle-blindness]]): our decoder
+    // agreeing with our encoder proves nothing about the bitstream.
+    // -----------------------------------------------------------------------
+
+    /// All-plane PSNR of a decoded picture against its source, on the same
+    /// 8-bit scale [`psnr`] uses.
+    fn psnr_all(decoded: &Picture, source: &Picture) -> f64 {
+        let cat = |p: &Picture| {
+            let mut v = Vec::with_capacity(p.y.len() + p.u.len() + p.v.len());
+            v.extend_from_slice(&p.y);
+            v.extend_from_slice(&p.u);
+            v.extend_from_slice(&p.v);
+            v
+        };
+        psnr(&cat(decoded), &cat(source))
+    }
+
+    /// The pictures back as the planar 8-bit bytes an encoder reads.
+    fn raw_yuv420p(source: &[Picture]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for p in source {
+            for plane in [&p.y, &p.u, &p.v] {
+                raw.extend(plane.iter().map(|&s| s as u8));
+            }
+        }
+        raw
+    }
+
+    /// A (all-plane PSNR, log10 bytes) ladder from another AV1 encoder driven
+    /// through ffmpeg: one point per entry of `points`, each a quality flag
+    /// set. Returns the ladder ordered by fidelity and the total encode wall
+    /// clock. The stream is decoded back through [`ffmpeg_decode_sequence`],
+    /// so both curves are measured by the same decoder.
+    fn external_ladder(
+        source: &[Picture],
+        width: usize,
+        height: usize,
+        encoder: &str,
+        points: &[Vec<String>],
+    ) -> (Vec<(f64, f64)>, f64) {
+        // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
+        let dir = std::env::temp_dir();
+        let raw_path = dir.join(format!("ec-av1-bd-{}-{encoder}.yuv", std::process::id()));
+        std::fs::write(&raw_path, raw_yuv420p(source)).expect("raw source");
+        let mut ladder = Vec::new();
+        let mut wall = 0.0;
+        for (i, params) in points.iter().enumerate() {
+            let obu = dir.join(format!("ec-av1-bd-{}-{encoder}-{i}.obu", std::process::id()));
+            let start = std::time::Instant::now();
+            let out = Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+                .args(["-s", &format!("{width}x{height}"), "-r", "24", "-i"])
+                .arg(&raw_path)
+                .args(["-an", "-threads", "1"])
+                .args(["-g", &source.len().to_string(), "-c:v", encoder])
+                .args(params)
+                .args(["-f", "obu"])
+                .arg(&obu)
+                .output()
+                .expect("ffmpeg failed to run");
+            wall += start.elapsed().as_secs_f64();
+            assert!(
+                out.status.success(),
+                "{encoder} {params:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = std::fs::read(&obu).expect("reference stream");
+            let decoded = ffmpeg_decode_sequence(&stream, width, height, source.len());
+            let mean: f64 = decoded
+                .iter()
+                .zip(source)
+                .map(|(d, s)| psnr_all(d, s))
+                .sum::<f64>()
+                / source.len() as f64;
+            ladder.push((mean, (stream.len() as f64).log10()));
+            let _ = std::fs::remove_file(&obu);
+        }
+        let _ = std::fs::remove_file(&raw_path);
+        ladder.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (ladder, wall)
+    }
+
+    /// The same ladder for this encoder, at four `base_q_idx` points. The PSNR
+    /// comes from ffmpeg's decode of our own stream, and every frame of that
+    /// decode is asserted sample-exact against our reconstruction -- which is
+    /// itself a gate: it proves the bitstream says what the encoder thinks.
+    fn our_ladder(
+        source: &[Picture],
+        width: usize,
+        height: usize,
+        fctx: &crate::decode::FrameCtx,
+    ) -> (Vec<(f64, f64)>, f64) {
+        let mut ladder = Vec::new();
+        let mut wall = 0.0;
+        for &q in &[150u8, 120, 90, 60] {
+            let start = std::time::Instant::now();
+            let encoded = encode_sequence_with_ctx(source, q, 0.5, fctx).unwrap();
+            wall += start.elapsed().as_secs_f64();
+            let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, source.len());
+            for (i, (d, e)) in decoded.iter().zip(&encoded.frames).enumerate() {
+                assert!(
+                    d.y == e.reconstruction.y
+                        && d.u == e.reconstruction.u
+                        && d.v == e.reconstruction.v,
+                    "q={q} frame {i}: ffmpeg's decode differs from our reconstruction"
+                );
+            }
+            let mean: f64 = decoded
+                .iter()
+                .zip(source)
+                .map(|(d, s)| psnr_all(d, s))
+                .sum::<f64>()
+                / source.len() as f64;
+            ladder.push((mean, (encoded.stream.len() as f64).log10()));
+        }
+        ladder.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (ladder, wall)
+    }
+
+    /// A ladder is only a ladder if both axes rise together.
+    fn assert_monotone(name: &str, ladder: &[(f64, f64)]) {
+        assert_eq!(ladder.len(), 4, "{name}: wanted four quality points");
+        for w in ladder.windows(2) {
+            assert!(
+                w[1].0 > w[0].0 && w[1].1 > w[0].1,
+                "{name}: not monotone, {ladder:?}"
+            );
+        }
+    }
+
+    /// The missing instrument: what this encoder costs against libaom and
+    /// rav1e at matched fidelity, and how long it takes to get there.
+    ///
+    /// Recipe, identical on all three sides: 12 consecutive frames of each
+    /// clip scaled to 640x384 (a whole number of superblocks), one key frame
+    /// then 11 inter frames (`-g 12`, matching our own sequence shape), one
+    /// tile, `-threads 1`, no film grain synthesis (neither reference enables
+    /// it by default), 4:2:0 8-bit in and out. Reference points:
+    ///   libaom-av1: `-cpu-used 6 -b:v 0 -crf {5,20,35,45}`
+    ///   librav1e:   `-rav1e-params speed=6:quantizer={50,100,150,200}:
+    ///                tile_cols=1:tile_rows=1:threads=1`
+    /// ours: `base_q_idx {60,90,120,150}`. Every PSNR is all-plane, on
+    /// ffmpeg-decoded frames of each encoder's own stream.
+    ///
+    /// Measured baseline 2026-09-06 (see the lane report for the full table).
+    ///
+    /// Run:
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         bd_rate_vs_libaom_and_rav1e --nocapture
+    #[test]
+    #[ignore = "the encoder BD-rate baseline: minutes per clip, needs ffmpeg"]
+    fn bd_rate_vs_libaom_and_rav1e() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP bd_rate_vs_libaom_and_rav1e: no ffmpeg");
+            return;
+        }
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut clips: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for name in ["h264-1080p-23.976-8bit.mp4", "h264-2160p-23.976-8bit.mp4"] {
+            let path = fixtures.join("video").join(name);
+            if path.exists() {
+                clips.push((name.to_string(), path));
+            } else {
+                eprintln!("SKIP clip {name}: missing");
+            }
+        }
+        // Screen capture: the repo carries no screen-capture fixture, so take
+        // the first OBS recording the real-library manifest names.
+        match std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) {
+            Ok(manifest) => {
+                let screen = manifest
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| l.split('\t').next())
+                    .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists());
+                match screen {
+                    Some(p) => clips.push((
+                        format!("screen capture ({})", p.rsplit('/').next().unwrap_or(p)),
+                        std::path::PathBuf::from(p),
+                    )),
+                    None => eprintln!("SKIP screen capture: no OBS recording in the manifest exists"),
+                }
+            }
+            Err(e) => eprintln!("SKIP screen capture: no real-library manifest ({e})"),
+        }
+        assert!(!clips.is_empty(), "no source clip available");
+
+        let (width, height, frames) = (640usize, 384usize, 12usize);
+        let aom_points: Vec<Vec<String>> = [5, 20, 35, 45]
+            .iter()
+            .map(|q| {
+                ["-cpu-used", "6", "-b:v", "0", "-crf", &q.to_string()]
+                    .map(String::from)
+                    .to_vec()
+            })
+            .collect();
+        let rav1e_points: Vec<Vec<String>> = [50, 100, 150, 200]
+            .iter()
+            .map(|q| {
+                vec![
+                    "-rav1e-params".to_string(),
+                    format!("speed=6:quantizer={q}:tile_cols=1:tile_rows=1:threads=1"),
+                ]
+            })
+            .collect();
+        println!(
+            "\n{frames} frames of each clip at {width}x{height}, gop={frames}, 1 tile, 1 thread"
+        );
+        println!("| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e |");
+        println!("|---|---|---|---|---|");
+        for (name, path) in &clips {
+            let fctx = &crate::decode::FrameCtx::new();
+            let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
+            let (ours, ours_wall) = our_ladder(&source, width, height, fctx);
+            let (aom, aom_wall) =
+                external_ladder(&source, width, height, "libaom-av1", &aom_points);
+            let (rav1e, rav1e_wall) =
+                external_ladder(&source, width, height, "librav1e", &rav1e_points);
+            assert_monotone(&format!("{name}: ours"), &ours);
+            assert_monotone(&format!("{name}: libaom"), &aom);
+            assert_monotone(&format!("{name}: rav1e"), &rav1e);
+            let points = ours
+                .iter()
+                .map(|(p, b)| format!("{p:.2} dB/{:.0} B", 10f64.powf(*b)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "| {name} | {points} | {:+.1}% | {:+.1}% | {ours_wall:.1}s:{aom_wall:.1}s:{rav1e_wall:.1}s |",
+                bd_rate(&aom, &ours) * 100.0,
+                bd_rate(&rav1e, &ours) * 100.0,
+            );
+            println!(
+                "|   references | libaom {} | rav1e {} | | |",
+                aom.iter()
+                    .map(|(p, b)| format!("{p:.2} dB/{:.0} B", 10f64.powf(*b)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                rav1e
+                    .iter()
+                    .map(|(p, b)| format!("{p:.2} dB/{:.0} B", 10f64.powf(*b)))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+    }
 }
