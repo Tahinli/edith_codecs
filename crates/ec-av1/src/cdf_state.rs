@@ -300,6 +300,26 @@ pub(crate) struct TxbTables<'a> {
     pub tx_type: Option<&'a mut [u16]>,
 }
 
+impl TxbSet {
+    /// Whether this set codes a CHROMA plane's transform, which is what
+    /// picks the `txb_skip` context rule the writer uses: chroma reads
+    /// "did the above/left neighbour code anything" (`write_block_planes`),
+    /// luma reads context 0 for a transform covering its whole block and
+    /// `SKIP_CONTEXTS` for a smaller unit (`write_luma_tus`).
+    pub(crate) fn is_chroma(self) -> bool {
+        matches!(
+            self,
+            Self::Chroma4
+                | Self::Chroma8
+                | Self::Chroma16
+                | Self::Chroma32
+                | Self::ChromaRect8x4
+                | Self::ChromaRect16x8
+                | Self::ChromaRect32x16
+        )
+    }
+}
+
 /// Every table a key frame's tile writer adapts.
 #[derive(Clone)]
 pub(crate) struct Cdfs {
