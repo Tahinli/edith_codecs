@@ -37494,7 +37494,12 @@ mod tests {
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
-                false,
+                // The encoder's own `reference_select` (spec 5.9.22): these
+                // GOP round trips decode a tile the ENCODER wrote, so the
+                // header bit must be the one it wrote, not a hard-coded
+                // `false` (stale-header class -- a `reference_select` stream
+                // reads a `comp_mode` symbol this decode would skip).
+                crate::encode::reference_select(),
                 frame.tx_select,
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
@@ -37813,7 +37818,12 @@ mod tests {
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
-                false,
+                // The encoder's own `reference_select` (spec 5.9.22): these
+                // GOP round trips decode a tile the ENCODER wrote, so the
+                // header bit must be the one it wrote, not a hard-coded
+                // `false` (stale-header class -- a `reference_select` stream
+                // reads a `comp_mode` symbol this decode would skip).
+                crate::encode::reference_select(),
                 frame.tx_select,
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
