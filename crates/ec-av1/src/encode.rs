@@ -1180,6 +1180,45 @@ fn too_large() -> Error {
 
 /// One plane of the picture being coded, and the reconstruction being built
 /// beside it.
+/// What one committed 4x4 cell left behind for the coefficient contexts of
+/// the blocks that read it as a neighbour -- tile.rs `neighbour_state`, which
+/// is the same state decode.rs records.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct CoefCtx {
+    /// spec `cul_level`: the sum of the unit's coded magnitudes, clamped to 7.
+    level: u8,
+    /// The DC sign this cell votes with: `-1` negative, `1` positive, `0` when
+    /// the DC itself was zero (tile.rs `dc_vote`).
+    dc: i8,
+}
+
+/// One plane's coefficient contexts, committed in CODING ORDER: the search
+/// prices partition TREES, so the neighbour state a candidate reads has to be
+/// whatever the blocks coded before it left -- the parent's committed
+/// neighbours for a tree's first child, the just-committed sibling for the
+/// later ones. Keeping the map as a full per-4x4-cell grid rather than the
+/// writer's two running bands is what makes that fall out: a trial commits
+/// over its own rectangle ([`Plane::commit`]) and a losing trial is undone
+/// with the pixels ([`Plane::restore`]), so what a candidate reads above and
+/// to its left is exactly what the tile writer's `Neighbours` bands will hold
+/// when it gets there.
+///
+/// Before this map the pricer took both contexts as zero, which is exact for
+/// a luma transform covering its whole block and the largest remaining row of
+/// the pricer census everywhere else (all-zero chroma under-priced 41-81%).
+#[derive(Default)]
+struct CoefCtxMap {
+    cells: Vec<CoefCtx>,
+    stride: usize,
+    /// Whether the transforms being priced right now are SMALLER than the
+    /// block they sit in -- a `TxMode::Select` depth split
+    /// ([`Plane::code_tx_depth`]) or an inter var-tx split
+    /// ([`commit_inter_luma`]). That is the one thing the (x, y, side) of a
+    /// trial cannot tell, and it is what decides whether luma reads context 0
+    /// or `SKIP_CONTEXTS` (tile.rs `write_luma_tus`).
+    tu_split: bool,
+}
+
 struct Plane<'a> {
     source: &'a [u8],
     reconstruction: Vec<u8>,
@@ -1207,6 +1246,11 @@ struct Plane<'a> {
     tile_y0: usize,
     tile_x1: usize,
     tile_y1: usize,
+    /// [`CoefCtxMap`]: what the blocks already committed left for the
+    /// coefficient contexts of the ones still being priced. Sized on the
+    /// first commit, so a plane literal does not have to know its own extent
+    /// twice.
+    ctx: CoefCtxMap,
 }
 
 impl Plane<'_> {
@@ -1402,7 +1446,16 @@ impl Plane<'_> {
                 .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
                 .sum()
         } else {
-            crate::tile::coeff_bits(&levels, at.set, crate::decode::q_ctx_of(base_q_idx))
+            {
+                let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, at.set);
+                crate::tile::coeff_bits(
+                    &levels,
+                    at.set,
+                    crate::decode::q_ctx_of(base_q_idx),
+                    skip_ctx,
+                    sign_ctx,
+                )
+            }
         };
         #[cfg(test)]
         stage_add(3, t.elapsed());
@@ -1471,7 +1524,16 @@ impl Plane<'_> {
                 .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
                 .sum()
         } else {
-            crate::tile::coeff_bits(&levels, set, crate::decode::q_ctx_of(base_q_idx))
+            {
+                let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, set);
+                crate::tile::coeff_bits(
+                    &levels,
+                    set,
+                    crate::decode::q_ctx_of(base_q_idx),
+                    skip_ctx,
+                    sign_ctx,
+                )
+            }
         };
         #[cfg(test)]
         stage_add(3, t.elapsed());
@@ -1509,6 +1571,9 @@ impl Plane<'_> {
         };
         let mut levels = vec![0i32; side * side];
         census_add(4, n * n);
+        // A unit smaller than its block reads the neighbour magnitude table
+        // for its `txb_skip` context, not context 0 ([`Plane::coef_ctx`]).
+        self.ctx.tu_split = n > 1;
         let (mut sse, mut bits) = (0.0, 0.0);
         for tu_row in 0..n {
             for tu_col in 0..n {
@@ -1530,15 +1595,100 @@ impl Plane<'_> {
                 }
             }
         }
+        self.ctx.tu_split = false;
         (levels, sse, bits)
     }
 
-    /// Writes a trial's reconstruction back into the plane.
+    /// Writes a trial's reconstruction back into the plane, and the
+    /// coefficient context it leaves for its neighbours ([`CoefCtxMap`]).
     fn commit(&mut self, x: usize, y: usize, side: usize, trial: &Trial) {
         for row in 0..side {
             self.reconstruction[(y + row) * self.width + x..][..side]
                 .copy_from_slice(&trial.reconstruction[row * side..][..side]);
         }
+        self.commit_ctx(x, y, side, &trial.levels);
+    }
+
+    /// Publishes one committed transform's own context over every 4x4 cell it
+    /// covers -- tile.rs `neighbour_state` + `Neighbours::record_planes`,
+    /// which is what the writer will read when it reaches the next block.
+    fn commit_ctx(&mut self, x: usize, y: usize, side: usize, levels: &[i32]) {
+        if self.ctx.cells.is_empty() {
+            self.ctx.stride = self.width.div_ceil(4);
+            self.ctx.cells = vec![CoefCtx::default(); self.ctx.stride * self.height.div_ceil(4)];
+        }
+        let cul = levels.iter().map(|l| l.unsigned_abs()).sum::<u32>().min(7) as u8;
+        let state = CoefCtx {
+            level: cul,
+            dc: match levels[0].signum() {
+                0 => 0,
+                -1 => -1,
+                _ => 1,
+            },
+        };
+        let n = (side / 4).max(1);
+        for row in 0..n {
+            let start = (y / 4 + row) * self.ctx.stride + x / 4;
+            let end = (start + n).min(self.ctx.cells.len());
+            if start < end {
+                self.ctx.cells[start..end].fill(state);
+            }
+        }
+    }
+
+    /// A block committed without any residual at all ([`ibc_commit`]): the
+    /// cells it covers coded nothing, and leaving an earlier trial's state
+    /// there would price its neighbours off a block that was never coded.
+    fn commit_ctx_zero(&mut self, x: usize, y: usize, side: usize) {
+        self.commit_ctx(x, y, side, &[0i32]);
+    }
+
+    /// The `txb_skip` and `dc_sign` contexts a transform at `(x, y)` of this
+    /// plane reads, off what the blocks before it in coding order committed
+    /// ([`CoefCtxMap`]) -- the writer's own derivation: chroma reads whether
+    /// the above/left neighbours coded anything (tile.rs
+    /// `write_block_planes`), luma reads context 0 when its transform covers
+    /// its whole block and decode.rs `SKIP_CONTEXTS` off the neighbour
+    /// magnitude tiers when it does not (tile.rs `write_luma_tus` /
+    /// `Neighbours::luma_skip_ctx`), and both planes read the DC sign vote of
+    /// the same neighbours (tile.rs `dc_sign_ctx`).
+    ///
+    /// A neighbour outside this plane's own TILE does not exist, exactly as
+    /// the writer's per-tile `Neighbours` bands start blank.
+    fn coef_ctx(&self, x: usize, y: usize, side: usize, set: TxbSet) -> (usize, usize) {
+        if self.ctx.cells.is_empty() {
+            return (0, 0);
+        }
+        let n = (side / 4).max(1);
+        let (cx, cy) = (x / 4, y / 4);
+        let (mut top, mut left) = (0u8, 0u8);
+        let mut vote = 0i32;
+        if y > self.tile_y0 && cy > 0 {
+            for cell in &self.ctx.cells[(cy - 1) * self.ctx.stride + cx..][..n] {
+                top |= cell.level;
+                vote += i32::from(cell.dc);
+            }
+        }
+        if x > self.tile_x0 && cx > 0 {
+            for row in 0..n {
+                let cell = self.ctx.cells[(cy + row) * self.ctx.stride + cx - 1];
+                left |= cell.level;
+                vote += i32::from(cell.dc);
+            }
+        }
+        let skip_ctx = if set.is_chroma() {
+            usize::from(top != 0) + usize::from(left != 0)
+        } else if self.ctx.tu_split {
+            crate::decode::SKIP_CONTEXTS[usize::from(top).min(4)][usize::from(left).min(4)]
+        } else {
+            0
+        };
+        let sign_ctx = match vote.signum() {
+            0 => 0,
+            -1 => 1,
+            _ => 2,
+        };
+        (skip_ctx, sign_ctx)
     }
 
     /// The source samples of one square, contiguous — what a motion search
@@ -1551,15 +1701,46 @@ impl Plane<'_> {
 
     /// The reconstructed samples of one square, so that a partition trial can
     /// be undone.
-    fn snapshot(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
-        rows_of(&self.reconstruction, self.width, x, y, side)
+    /// The reconstructed samples of one square AND the coefficient contexts
+    /// its cells hold, so that a partition trial can be undone whole: a
+    /// losing trial that left its own nz/DC state behind would price the
+    /// blocks after it off a block the tile writer never codes.
+    fn snapshot(&self, x: usize, y: usize, side: usize) -> (Vec<u8>, Vec<CoefCtx>) {
+        (
+            rows_of(&self.reconstruction, self.width, x, y, side),
+            self.ctx_rows(x, y, side),
+        )
+    }
+
+    fn ctx_rows(&self, x: usize, y: usize, side: usize) -> Vec<CoefCtx> {
+        if self.ctx.cells.is_empty() {
+            return Vec::new();
+        }
+        let n = (side / 4).max(1);
+        (0..n)
+            .flat_map(|row| {
+                let start = (y / 4 + row) * self.ctx.stride + x / 4;
+                self.ctx.cells[start..(start + n).min(self.ctx.cells.len())].to_vec()
+            })
+            .collect()
     }
 
     /// Puts a snapshot back.
-    fn restore(&mut self, x: usize, y: usize, side: usize, samples: &[u8]) {
+    fn restore(&mut self, x: usize, y: usize, side: usize, saved: &(Vec<u8>, Vec<CoefCtx>)) {
         for row in 0..side {
             self.reconstruction[(y + row) * self.width + x..][..side]
-                .copy_from_slice(&samples[row * side..][..side]);
+                .copy_from_slice(&saved.0[row * side..][..side]);
+        }
+        if saved.1.is_empty() {
+            return;
+        }
+        let n = (side / 4).max(1);
+        for row in 0..n {
+            let start = (y / 4 + row) * self.ctx.stride + x / 4;
+            let end = (start + n).min(self.ctx.cells.len());
+            if start < end {
+                self.ctx.cells[start..end].copy_from_slice(&saved.1[row * n..][..end - start]);
+            }
         }
     }
 
@@ -2381,6 +2562,10 @@ fn commit_inter_luma(
     let mut levels = vec![0i32; side * side];
     let (mut sse, mut bits) = (0.0, 0.0);
     let mut units = Vec::with_capacity(4);
+    // The split units are smaller than their block, so their `txb_skip`
+    // context is the neighbour magnitude table ([`Plane::coef_ctx`]) -- and
+    // each unit's own commit publishes what the next one reads, coding order.
+    luma.ctx.tu_split = true;
     for tu_row in 0..2 {
         for tu_col in 0..2 {
             let (tu_x, tu_y) = (x + tu_col * tx, y + tu_row * tx);
@@ -2397,6 +2582,7 @@ fn commit_inter_luma(
             units.push((tu_x, tu_y, trial));
         }
     }
+    luma.ctx.tu_split = false;
     let split_cost = sse + search.lambda * (bits + txfm_split_bits(side, 1));
     let flat_cost = flat.sse + search.lambda * (flat.bits + txfm_split_bits(side, 0));
     if split_cost < flat_cost {
@@ -2874,7 +3060,9 @@ fn ibc_commit(
             let copied: Vec<u8> = plane.reconstruction[from..from + half].to_vec();
             plane.reconstruction[to..to + half].copy_from_slice(&copied);
         }
+        plane.commit_ctx_zero(x / 2, y / 2, half);
     }
+    luma.commit_ctx_zero(x, y, side);
 }
 
 /// Searches this block's own DV: every hash-table position whose 16x16 luma
@@ -3972,7 +4160,7 @@ fn snapshot(
     chroma: &[Plane; 2],
     (x, y): (usize, usize),
     side: usize,
-) -> [Vec<u8>; 3] {
+) -> [(Vec<u8>, Vec<CoefCtx>); 3] {
     [
         luma.snapshot(x, y, side),
         chroma[0].snapshot(x / 2, y / 2, side / 2),
@@ -3986,7 +4174,7 @@ fn restore(
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
     side: usize,
-    saved: &[Vec<u8>; 3],
+    saved: &[(Vec<u8>, Vec<CoefCtx>); 3],
 ) {
     luma.restore(x, y, side, &saved[0]);
     chroma[0].restore(x / 2, y / 2, side / 2, &saved[1]);
@@ -4333,6 +4521,7 @@ fn fresh_plane(source: &[u8], width: usize, height: usize, true_width: usize, tr
         tile_y0: 0,
         tile_x1: width,
         tile_y1: height,
+        ctx: CoefCtxMap::default(),
     }
 }
 
@@ -4604,6 +4793,7 @@ pub(crate) fn encode_key_frame_inner(
         tile_y0: 0,
         tile_x1: picture.width,
         tile_y1: picture.height,
+        ctx: CoefCtxMap::default(),
     };
     let mut chroma = [
         Plane {
@@ -4617,6 +4807,7 @@ pub(crate) fn encode_key_frame_inner(
             tile_y0: 0,
             tile_x1: picture.width / 2,
             tile_y1: picture.height / 2,
+            ctx: CoefCtxMap::default(),
         },
         Plane {
             source: &picture_v8,
@@ -4629,6 +4820,7 @@ pub(crate) fn encode_key_frame_inner(
             tile_y0: 0,
             tile_x1: picture.width / 2,
             tile_y1: picture.height / 2,
+            ctx: CoefCtxMap::default(),
         },
     ];
 
@@ -6447,6 +6639,7 @@ pub(crate) fn encode_inter_frame(
         tile_y0: 0,
         tile_x1: picture.width,
         tile_y1: picture.height,
+        ctx: CoefCtxMap::default(),
     };
     let mut chroma = [
         Plane {
@@ -6460,6 +6653,7 @@ pub(crate) fn encode_inter_frame(
             tile_y0: 0,
             tile_x1: picture.width / 2,
             tile_y1: picture.height / 2,
+            ctx: CoefCtxMap::default(),
         },
         Plane {
             source: &picture_v8,
@@ -6472,6 +6666,7 @@ pub(crate) fn encode_inter_frame(
             tile_y0: 0,
             tile_x1: picture.width / 2,
             tile_y1: picture.height / 2,
+            ctx: CoefCtxMap::default(),
         },
     ];
 
@@ -9739,7 +9934,7 @@ mod tests {
             };
             let t = Instant::now();
             for _ in 0..N {
-                std::hint::black_box(crate::tile::coeff_bits(&levels, set, 2));
+                std::hint::black_box(crate::tile::coeff_bits(&levels, set, 2, 0, 0));
             }
             let entropy_t = t.elapsed() / N;
 
