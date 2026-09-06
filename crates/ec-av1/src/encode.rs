@@ -4484,9 +4484,6 @@ fn search_inter_block(
         mode: u8,
         skip: bool,
         inter: Option<InterInfo>,
-        /// The luma palette this candidate is predicted from, `None` for
-        /// every ordinary intra/inter candidate (the palette arm below).
-        palette: Option<crate::tile::PaletteY>,
     }
     let mut best: Option<Candidate> = None;
     let mut consider = |candidate: Candidate| {
@@ -4581,63 +4578,7 @@ fn search_inter_block(
             mode,
             skip: false,
             inter: None,
-            palette: None,
         });
-    }
-
-    // The palette arm of this search -- the corner-cut `code_square` closed
-    // for an inter frame's 16/8 intra leaves but this hand-rolled 32x32 loop
-    // did not. A 32x32 intra block inside an inter frame codes the same
-    // `palette_mode_info` syntax a key frame's does (tile.rs writes it from
-    // `block.palette` at every one of the three sides already), so the only
-    // thing missing was a candidate. Priced against the same `DC_PRED`
-    // chroma trials the ordinary intra candidates reuse, and a palette block
-    // is `DC_PRED` with `tx_depth` 0 by construction (its prediction is the
-    // colour map, not the DC of its neighbours).
-    if search.screen && crate::decode::palette_bsize_ctx(BLOCK).is_some() {
-        let source: Vec<u8> = (y..y + BLOCK)
-            .flat_map(|row| luma.source[row * luma.width + x..][..BLOCK].to_vec())
-            .collect();
-        for pal in palette_candidates(&source) {
-            let n = usize::from(pal.size);
-            let prediction: Vec<u8> = pal
-                .map
-                .iter()
-                .map(|&i| pal.colors[usize::from(i).min(n - 1)] as u8)
-                .collect();
-            let luma_trial = luma.code_from_prediction(
-                x,
-                y,
-                BLOCK,
-                &prediction,
-                false,
-                search.base_q_idx,
-                search.deadzone,
-                luma_set,
-            );
-            let (u, v) = (u_trial.clone(), v_trial.clone());
-            let cost = luma_trial.sse
-                + u.sse
-                + v.sse
-                + search.lambda
-                    * (luma_trial.bits
-                        + u.bits
-                        + v.bits
-                        + mode_bits[DC_PRED as usize]
-                        + crate::tile::palette_bits(&pal, BLOCK)
-                        + skip_bits(false)
-                        + intra_inter_bits(false));
-            consider(Candidate {
-                cost,
-                luma: luma_trial,
-                u,
-                v,
-                mode: DC_PRED,
-                skip: false,
-                inter: None,
-                palette: Some(pal),
-            });
-        }
     }
 
     // The reference frame buffer a spec decoder holds is exactly the true
@@ -4988,7 +4929,6 @@ fn search_inter_block(
                 mode: DC_PRED,
                 skip,
                 inter: Some(info),
-                palette: None,
             });
         }
     }
@@ -5086,7 +5026,6 @@ fn search_inter_block(
                 mode: DC_PRED,
                 skip,
                 inter: Some(info),
-                palette: None,
             });
         }
     }
@@ -5105,7 +5044,7 @@ fn search_inter_block(
             skip: best.skip,
             inter: best.inter,
             eight: None,
-            palette: best.palette,
+            palette: None,
             tx_depth: 0,
         },
         best.cost,
