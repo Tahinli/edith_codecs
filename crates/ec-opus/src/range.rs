@@ -268,6 +268,22 @@ impl<'a> RangeDecoder<'a> {
 /// [`RangeEncoder::error`] reports rather than corrupting either stream. The
 /// buffer is owned and reused across frames — [`RangeEncoder::reset`] costs a
 /// `fill(0)` of the frame, so a steady-state encoder never allocates here.
+/// Scalar state of a [`RangeEncoder`], saved and restored around a trial
+/// encode (the coarse-energy two-pass search).
+#[derive(Clone, Copy)]
+pub struct EncSnapshot {
+    offs: usize,
+    end_offs: usize,
+    end_window: u32,
+    nend_bits: u32,
+    nbits_total: u32,
+    val: u32,
+    rng: u32,
+    rem: i32,
+    ext: u32,
+    error: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct RangeEncoder {
     buf: Vec<u8>,
@@ -510,6 +526,55 @@ impl RangeEncoder {
     #[inline]
     pub fn tell(&self) -> u32 {
         self.nbits_total - ilog(self.rng)
+    }
+
+    /// Snapshot of the coder's scalar state for the two-pass coarse-energy
+    /// search (libopus `enc_start_state`/`enc_intra_state`). Restoring also
+    /// needs the front bytes written since the snapshot; the caller keeps
+    /// those (libopus's `intra_bits` copy).
+    pub fn snapshot(&self) -> EncSnapshot {
+        EncSnapshot {
+            offs: self.offs,
+            end_offs: self.end_offs,
+            end_window: self.end_window,
+            nend_bits: self.nend_bits,
+            nbits_total: self.nbits_total,
+            val: self.val,
+            rng: self.rng,
+            rem: self.rem,
+            ext: self.ext,
+            error: self.error,
+        }
+    }
+
+    /// Restores a [`RangeEncoder::snapshot`]; the caller must also put back
+    /// the front bytes with [`RangeEncoder::front_write`].
+    pub fn restore(&mut self, s: &EncSnapshot) {
+        self.offs = s.offs;
+        self.end_offs = s.end_offs;
+        self.end_window = s.end_window;
+        self.nend_bits = s.nend_bits;
+        self.nbits_total = s.nbits_total;
+        self.val = s.val;
+        self.rng = s.rng;
+        self.rem = s.rem;
+        self.ext = s.ext;
+        self.error = s.error;
+    }
+
+    /// Bytes the range coder has written from the front so far.
+    pub fn front(&self) -> &[u8] {
+        &self.buf[..self.offs]
+    }
+
+    /// Where the range coder will write next, from the front.
+    pub fn front_offs(&self) -> usize {
+        self.offs
+    }
+
+    /// Puts saved front bytes back at `from` (pairs with [`RangeEncoder::restore`]).
+    pub fn front_write(&mut self, from: usize, bytes: &[u8]) {
+        self.buf[from..from + bytes.len()].copy_from_slice(bytes);
     }
 
     /// `ec_tell_frac()`: the same bound in 1/8th bits.
