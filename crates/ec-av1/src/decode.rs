@@ -19735,6 +19735,12 @@ pub(crate) struct FilterReplay {
     /// 1080p frame's wall in allocation, not in filtering. Recycled here
     /// instead; the pool holds at most the six planes one candidate has live.
     scratch: Vec<Vec<u16>>,
+    /// lane-av1cap2: the final replay's post-CDEF luma plane and the TRUE
+    /// post-deblock rows loop restoration substitutes at its stripe
+    /// borders ([`plane_snapshot`], exactly `restoration::lr_src_row`'s
+    /// rows) -- what [`replay_restoration`] filters, instead of decoding
+    /// the re-coded tile a second time.
+    final_luma: Option<(PlaneBuf<'static>, PlaneBuf<'static>)>,
     /// The last deblocked planes and the levels that produced them.
     /// Deblocking depends on nothing else the search moves, and the search
     /// fixes the levels before it walks the CDEF strengths, so every
@@ -19824,6 +19830,7 @@ fn capture_filter_replay(
             true_width,
             true_height,
             scratch: Vec::new(),
+            final_luma: None,
             deblocked: None,
         });
     });
@@ -19908,6 +19915,10 @@ fn replay_inner(
     REPLAY.with_borrow_mut(|slot| {
         let r = slot.as_mut()?;
         let hit = matches!(&r.deblocked, Some((lf, ..)) if lf == loop_filter);
+        // Set when the working planes ARE the deblocked planes (see below):
+        // they go into the cache at the end, and the picture is cropped out
+        // of them rather than taking their buffers.
+        let mut share = false;
         let cpt = crate::par::timer(crate::par::S_COPY);
         let (mut y, mut u, mut v) = if hit {
             let (deblocked, scratch) = (&r.deblocked, &mut r.scratch);
@@ -19935,9 +19946,23 @@ fn replay_inner(
                 r.frame_height,
                 fctx,
             );
-            let scratch = &mut r.scratch;
-            r.deblocked =
-                Some((*loop_filter, pooled(&y, scratch), pooled(&u, scratch), pooled(&v, scratch)));
+            // lane-av1cap2: an all-zero-strength CDEF writes no sample at
+            // all ([`cdef_all_zero`]'s own early return), so THESE planes
+            // are already this candidate's output -- they become the
+            // deblock cache at the end instead of being copied into it
+            // here, which is three ~6 MB copies less per candidate that
+            // moves the levels (the whole deblocking half of the search:
+            // its CDEF strengths are still (0,0)).
+            share = cdef_all_zero(cdef);
+            if !share {
+                let scratch = &mut r.scratch;
+                r.deblocked = Some((
+                    *loop_filter,
+                    pooled(&y, scratch),
+                    pooled(&u, scratch),
+                    pooled(&v, scratch),
+                ));
+            }
             (y, u, v)
         };
         drop(cpt);
@@ -19957,6 +19982,21 @@ fn replay_inner(
             pre,
         );
         drop(ct);
+        if final_pass.is_some_and(|(_, want)| want) {
+            // The loop-restoration search runs on the stages above (where
+            // post-CDEF stands in for post-deblock, as the capture decode
+            // had it); the FILTER this frame ends up applying reads the
+            // real post-deblock rows, which is what the decoder does.
+            let snapshot = if share {
+                // Nothing filtered these planes after the deblock, so they
+                // are the post-deblock picture themselves.
+                Some(plane_snapshot(&y, 0))
+            } else {
+                r.deblocked.as_ref().map(|(_, dy, ..)| plane_snapshot(dy, 0))
+            };
+            let scratch = &mut r.scratch;
+            r.final_luma = snapshot.map(|d| (pooled(&y, scratch), d));
+        }
         let stages = final_pass.and_then(|(_, want)| {
             want.then(|| FilterStages {
                 deblocked: [y.data.to_vec(), u.data.to_vec(), v.data.to_vec()],
@@ -19977,6 +20017,17 @@ fn replay_inner(
         let (fw, fh) = (r.frame_width, r.frame_height);
         if fw == r.width && fh == r.height {
             fctx.last_frame_wide_margin.with(|m| *m.borrow_mut() = None);
+            if share {
+                let picture = Picture {
+                    width: r.width,
+                    height: r.height,
+                    y: y.data.to_vec(),
+                    u: u.data.to_vec(),
+                    v: v.data.to_vec(),
+                };
+                r.deblocked = Some((*loop_filter, y, u, v));
+                return Some((picture, stages));
+            }
             return Some((
                 Picture {
                     width: r.width,
@@ -20012,13 +20063,93 @@ fn replay_inner(
             u: crop(&u, fw.div_ceil(2), fh.div_ceil(2)),
             v: crop(&v, fw.div_ceil(2), fh.div_ceil(2)),
         };
-        // The working planes outlive the crop, so they go back to the pool.
-        for plane in [y, u, v] {
-            if r.scratch.len() < 6 {
-                r.scratch.push(plane.data.into_owned());
+        // The working planes outlive the crop: either they ARE the
+        // deblocked planes this candidate's successors reuse, or they go
+        // back to the pool.
+        if share {
+            r.deblocked = Some((*loop_filter, y, u, v));
+        } else {
+            for plane in [y, u, v] {
+                if r.scratch.len() < 6 {
+                    r.scratch.push(plane.data.into_owned());
+                }
             }
         }
         Some((out, stages))
+    })
+}
+
+/// lane-av1cap2: the loop-restoration half of the final replay. Once the
+/// units are chosen the tile is coded a second time to carry them, and that
+/// re-coded tile used to be DECODED to reach the restored reference frame
+/// (5.6% of a 4K frame's encode). Loop restoration reads nothing of that
+/// tile but the per-unit filters the encoder just picked: it is the
+/// decoder's own [`crate::restoration::apply_loop_restoration_plane`] on
+/// the post-CDEF plane the final replay produced, with the TRUE
+/// post-deblock stripe-border rows -- the same call the decoder's
+/// `apply_loop_restoration` makes, on the same input. Only luma moves: the
+/// encoder never writes a chroma restoration type other than
+/// `RESTORE_NONE`, whose kernel hands its input straight back.
+///
+/// Returns the cropped luma plane and refreshes the wide-margin stash's own
+/// luma (restoration writes strictly inside `frame_width x frame_height`,
+/// so the margin columns past it stand). `None` when nothing was captured
+/// -- the caller then decodes for real.
+pub(crate) fn replay_restoration(
+    lr: &LoopRestorationParams,
+    units: &[Option<crate::restoration::WienerInfo>],
+    fctx: &FrameCtx,
+) -> Option<Vec<u16>> {
+    #[cfg(test)]
+    if REPLAY_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    REPLAY.with_borrow_mut(|slot| {
+        let r = slot.as_mut()?;
+        let (cdefed, deblocked) = r.final_luma.as_ref()?;
+        let (fw, fh) = (r.frame_width, r.frame_height);
+        let mut grid = crate::restoration::RestorationGrid::new(lr, fw as u32, fh as u32);
+        let (horz, vert) = (grid.horz_units[0], grid.vert_units[0]);
+        if horz == 0 || units.len() != horz * vert {
+            return None;
+        }
+        for (i, filter) in units.iter().enumerate() {
+            if let Some(info) = filter {
+                grid.set(0, i / horz, i % horz, crate::restoration::UnitFilter::Wiener(*info));
+            }
+        }
+        let stride = cdefed.width;
+        let mut out = scratch_empty();
+        crate::restoration::apply_loop_restoration_plane(
+            &cdefed.data,
+            &deblocked.data,
+            stride,
+            fw,
+            fh,
+            0,
+            lr.frame_restoration_type[0],
+            lr.loop_restoration_size[0],
+            &grid,
+            0,
+            &mut out,
+            None,
+            fctx,
+        );
+        fctx.last_frame_wide_margin.with(|m| {
+            if let Some(p) = m.borrow_mut().as_mut() {
+                let tw = p.width;
+                for row in 0..p.height.min(fh) {
+                    let n = tw.min(fw);
+                    p.y[row * tw..][..n].copy_from_slice(&out[row * stride..][..n]);
+                }
+            }
+        });
+        let mut y = Vec::with_capacity(fw * fh);
+        for row in 0..fh {
+            y.extend(out[row * stride..][..fw].iter().copied());
+        }
+        scratch_return(out);
+        Some(y)
     })
 }
 
