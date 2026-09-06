@@ -1933,6 +1933,20 @@ pub(crate) fn take_tx_depth_hits() -> [usize; 3] {
 static INTER_TX_SPLIT_HITS: [std::sync::atomic::AtomicUsize; 2] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
 
+/// How many 32x32-and-below inter blocks each reference frame won, indexed by
+/// `ref_frame` (`crate::mvstack::LAST_FRAME` = 1 .. `ALTREF_FRAME` = 7), the
+/// fire count a gate prints to see an extra reference reach a block at all
+/// ([[gate-blind-to-feature]]: a pyramid whose backward `ALTREF` is never
+/// chosen is a pyramid that costs bytes and buys nothing).
+static REF_FRAME_HITS: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+
+/// Reads [`REF_FRAME_HITS`] and zeroes it.
+#[cfg(test)]
+pub(crate) fn take_ref_frame_hits() -> [usize; 8] {
+    std::array::from_fn(|r| REF_FRAME_HITS[r].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Reads [`INTER_TX_SPLIT_HITS`] and zeroes it.
 #[cfg(test)]
 pub(crate) fn take_inter_tx_split_hits() -> [usize; 2] {
@@ -4115,6 +4129,33 @@ fn search_inter_block(
     )
 }
 
+/// Where one inter frame sits in a coding-order pyramid: which DPB slots its
+/// references name, which slot it refreshes, whether it is shown when it is
+/// coded, and the `ref_frame_sign_bias` that follows from all of it. `None`
+/// keeps `encode_inter_frame`'s pre-pyramid flat behaviour verbatim (slot
+/// 0/2 alternation, every frame shown, every reference in the past).
+///
+/// The sign bias is carried rather than derived here because only the caller
+/// knows what order hint each slot holds; it is armed onto the tile writer
+/// ([`crate::tile::arm_sign_bias`]) and set on the encoder's own MV grid, so
+/// the writer scans the same stacks the decoder will.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PyramidFrame {
+    /// The slot `LAST_FRAME` (and every reference this encoder does not name
+    /// apart) reads.
+    pub last_slot: u8,
+    /// The single slot `refresh_frame_flags` sets.
+    pub self_slot: u8,
+    /// The slot `ALTREF_FRAME` reads -- a FUTURE frame for a leaf of a
+    /// pyramid, which is what makes `sign_bias`'s last entry true.
+    pub altref_slot: u8,
+    /// `show_frame`: false for a hidden frame, output later by a
+    /// `show_existing_frame` header.
+    pub show_frame: bool,
+    /// This frame's `ref_frame_sign_bias` (spec 5.9.2).
+    pub sign_bias: crate::mvstack::SignBiasTable,
+}
+
 /// Encodes one picture as an inter frame predicting from `reference`'s
 /// reconstruction, which the caller decoded (or, for the frame right after
 /// the key frame, is the key frame's own reconstruction).
@@ -4138,6 +4179,9 @@ pub(crate) fn encode_inter_frame(
     // (the encoder alternates 0/2): `ALTREF_FRAME`. `None` for the first two
     // inter frames of a GOP, where the frame two back IS the key frame.
     altref: Option<&Picture>, fctx: &crate::decode::FrameCtx,
+    // Where this frame sits in the coding-order pyramid; `None` is the flat
+    // one-shown-frame-per-picture stream this encoder wrote before.
+    pyramid: Option<PyramidFrame>,
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -4164,14 +4208,17 @@ pub(crate) fn encode_inter_frame(
     // frame: frame n writes A(n) = 0 for odd n, 2 for even, so A(n) = A(n-2)
     // and the picture this frame names as `ALTREF_FRAME` is the one sitting
     // in the very slot it will overwrite.
-    let self_slot = if order_hint % 2 == 1 { 0 } else { 2 };
-    let last_slot = if order_hint <= 1 {
-        LAST_SLOT
-    } else if (order_hint - 1) % 2 == 1 {
-        0
-    } else {
-        2
-    };
+    let self_slot = pyramid.map_or(if order_hint % 2 == 1 { 0 } else { 2 }, |p| p.self_slot);
+    let last_slot = pyramid.map_or(
+        if order_hint <= 1 {
+            LAST_SLOT
+        } else if (order_hint - 1) % 2 == 1 {
+            0
+        } else {
+            2
+        },
+        |p| p.last_slot,
+    );
     // `render`, not `picture.width`/`picture.height`: `picture` here is
     // already padded to a whole number of superblocks (`encode_sequence`'s
     // `padded_to(SUPERBLOCK)`), and the header's `mi_cols`/`mi_rows` (and so
@@ -4185,10 +4232,20 @@ pub(crate) fn encode_inter_frame(
         order_hint,
         last_slot,
         self_slot,
-        if altref.is_some() { self_slot } else { GOLDEN_SLOT },
+        match pyramid {
+            Some(p) => p.altref_slot,
+            None if altref.is_some() => self_slot,
+            None => GOLDEN_SLOT,
+        },
     )?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
+    let sign_bias = pyramid.map_or(crate::mvstack::NO_SIGN_BIAS, |p| p.sign_bias);
+    if let Some(p) = pyramid {
+        header.show_frame = p.show_frame;
+        header.showable_frame = !p.show_frame;
+        header.ref_frame_sign_bias = p.sign_bias;
+    }
     // `TxMode::Select` here too: an inter block then codes one `txfm_split`
     // flag (kept at zero -- its var-tx tree is not searched yet) and an INTRA
     // block inside this frame codes and searches its own `tx_depth`, the same
@@ -4255,6 +4312,7 @@ pub(crate) fn encode_inter_frame(
     // once per frame (lane-av1rd2), not once per block, which is a whole
     // plane's map per 32x32 block and now per leaf too.
     let mut grid = MiGrid::new(mi_cols, mi_rows);
+    grid.set_sign_bias(sign_bias);
     let mut blocks = vec![Quadrant::Whole(BlockCoeffs::default()); cols * rows];
 
     for sb_r in 0..sb_rows {
@@ -4638,6 +4696,12 @@ pub(crate) fn encode_inter_frame(
         .filter(|b| b.inter.is_some())
         .count() as f64
         / modes.len() as f64;
+    for block in blocks.iter().flat_map(Quadrant::blocks) {
+        if let Some(info) = block.inter {
+            let r = (info.ref_frame as usize).min(7);
+            REF_FRAME_HITS[r].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits(&blocks, base_q_idx));
     // This frame's header leaves `disable_frame_end_update_cdf` off, so it
@@ -4649,6 +4713,7 @@ pub(crate) fn encode_inter_frame(
         .cloned()
         .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
     let start_cdfs = CdfSnapshot(cdfs.clone());
+    crate::tile::arm_sign_bias(sign_bias);
     let mut tile = crate::tile::sb_coeff_inter_frame_tile_cdfs(
         mi_cols,
         mi_rows,
@@ -4738,6 +4803,7 @@ pub(crate) fn encode_inter_frame(
         |bits, sb_cols, grid, units| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
+            crate::tile::arm_sign_bias(sign_bias);
             let mut cdfs = start_cdfs.0.clone();
             let coded = crate::tile::sb_coeff_inter_frame_tile_cdfs(
                 mi_cols,
@@ -4774,6 +4840,7 @@ pub(crate) fn encode_inter_frame(
                 // so it starts from the same tables the writer did (this
                 // frame's `start_cdfs`), not from the defaults.
                 Some(start_cdfs.0.clone()),
+                sign_bias,
                 fctx,
             )
         },
@@ -4893,6 +4960,7 @@ pub(crate) fn encode_sequence_with_ctx(
             Some(&carried.0),
             Some(&golden),
             prev2.as_ref(), fctx,
+            None,
         )?;
         stream.extend_from_slice(&inter.stream);
         carried = inter.next_cdfs.clone();
@@ -6948,7 +7016,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx, None).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -7046,7 +7114,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx, None).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -7223,7 +7291,7 @@ mod tests {
                     q,
                     0.5,
                     1,
-                    (width, height), None, None, None, fctx,
+                    (width, height), None, None, None, fctx, None,
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -7240,7 +7308,7 @@ mod tests {
                         q,
                         0.5,
                         1,
-                        (width, height), None, None, None, fctx,
+                        (width, height), None, None, None, fctx, None,
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
@@ -7620,6 +7688,88 @@ mod tests {
         (ladder, wall)
     }
 
+    /// The [`crate::encoder::Pyramid`] this run's ladder is coded under, from
+    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]`. Unset
+    /// keeps the flat one-key-then-all-inter ladder the baseline was measured
+    /// on, so the gate's default recipe is unchanged.
+    fn pyramid_from_env() -> Option<crate::encoder::Pyramid> {
+        let spec = std::env::var("EC_AV1_PYRAMID").ok()?;
+        let mut f = spec.split(':');
+        let mini_gop = f.next()?.parse().ok()?;
+        let d = crate::encoder::Pyramid::default();
+        Some(crate::encoder::Pyramid {
+            mini_gop,
+            arf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.arf_q_offset),
+            leaf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.leaf_q_offset),
+        })
+    }
+
+    /// [`our_ladder`] through the streaming facade with a coding pyramid: the
+    /// four points are the same `base_q_idx` ladder, but each stream is
+    /// reordered (hidden `ALTREF` first, `show_existing_frame` last per
+    /// group) and each level is coded at its own quantizer offset. Returns
+    /// the ladder, the wall, and — per pyramid level over the whole ladder —
+    /// how many frames and how many bytes it spent.
+    fn our_ladder_pyramid(
+        source: &[Picture],
+        width: usize,
+        height: usize,
+        pyramid: crate::encoder::Pyramid,
+    ) -> (Vec<(f64, f64)>, f64, [usize; 4], [usize; 4]) {
+        use crate::encoder::{Av1Encoder, Colour, EncoderConfig, Level};
+        let slot = |l: Level| match l {
+            Level::Key => 0,
+            Level::Arf => 1,
+            Level::Leaf => 2,
+            Level::ShowExisting => 3,
+        };
+        let mut ladder = Vec::new();
+        let mut wall = 0.0;
+        let (mut counts, mut bytes) = ([0usize; 4], [0usize; 4]);
+        for &q in &[150u8, 120, 90, 60] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: q,
+                gop: source.len(),
+                colour: Colour::Unspecified,
+            };
+            let start = std::time::Instant::now();
+            let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
+            let mut packets = Vec::new();
+            for picture in source {
+                packets.extend(enc.encode_frames(picture).unwrap());
+            }
+            packets.extend(enc.flush().unwrap());
+            wall += start.elapsed().as_secs_f64();
+            let mut stream = Vec::new();
+            for p in &packets {
+                counts[slot(p.level)] += 1;
+                bytes[slot(p.level)] += p.data.len();
+                stream.extend_from_slice(&p.data);
+            }
+            // [[gate-blind-to-hidden-frames]]: a reordered stream is only
+            // correct if the DISPLAY-order output still has one frame per
+            // source picture, in the right order -- checked against our own
+            // decoder as well as ffmpeg's, both below.
+            let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+            assert_eq!(ours.len(), source.len(), "q={q}: our display-order count");
+            let decoded = ffmpeg_decode_sequence(&stream, width, height, source.len());
+            for (i, (d, o)) in decoded.iter().zip(&ours).enumerate() {
+                assert!(d.y == o.y, "q={q} display frame {i}: ffmpeg differs from our decoder");
+            }
+            let mean: f64 = decoded
+                .iter()
+                .zip(source)
+                .map(|(d, s)| psnr_all(d, s))
+                .sum::<f64>()
+                / source.len() as f64;
+            ladder.push((mean, (stream.len() as f64).log10()));
+        }
+        ladder.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (ladder, wall, counts, bytes)
+    }
+
     /// Byte-exactness gate for encoder work that is meant to change only
     /// how long the encoder takes.
     ///
@@ -7816,7 +7966,20 @@ mod tests {
             let _ = crate::tile::take_drl_hits();
             let _ = crate::tile::take_ref_hits();
             let _ = crate::motion::take_census();
-            let (ours, ours_wall) = our_ladder(&source, width, height, fctx);
+            let (ours, ours_wall) = match pyramid_from_env() {
+                None => our_ladder(&source, width, height, fctx),
+                Some(pyramid) => {
+                    let (ladder, wall, counts, bytes) =
+                        our_ladder_pyramid(&source, width, height, pyramid);
+                    eprintln!(
+                        "{name}: pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
+                         show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
+                        counts[0], counts[1], counts[2], counts[3],
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                    );
+                    (ladder, wall)
+                }
+            };
             // How often the inter split actually fired over this clip's four
             // encodes, against the whole 32x32 that was the only outcome
             // before (gate-blind-to-feature).
