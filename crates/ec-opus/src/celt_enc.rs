@@ -68,7 +68,9 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// `EC_OPUS_TRIM_TONAL` (`alloc_trim`'s `tonality_slope` term),
 /// `EC_OPUS_TRIM13` (the continuous 1.3 trim the term belongs to),
 /// `EC_OPUS_VBR_TONAL` (`compute_vbr`'s tonality boost) and
-/// `EC_OPUS_VBR_ACT` (`compute_vbr`'s low-activity cut).
+/// `EC_OPUS_VBR_ACT` (`compute_vbr`'s low-activity cut),
+/// `EC_OPUS_LEAK` (`dynalloc_analysis`'s per-band leakage boost) and
+/// `EC_OPUS_BW_DETECT` (the detected bandwidth lowering the coded one).
 ///
 /// MEASURED (lane opustonal, four detached 12-row library-gate runs against
 /// the shipped rows `lanes/opus-opustr2-r1.sweep.txt`). The analysis itself is
@@ -94,8 +96,8 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// tf boost. Aligned, the analysis moves naz/zaur/her@64 a long way but leaves
 /// the aligned blocking set (nik, her@96, dl8a, hein) exactly where the
 /// analysis-free aligned arms left it, so the alignment default stays off.
-pub(crate) fn analysis_params() -> (bool, bool, bool, bool) {
-    static P: std::sync::OnceLock<(bool, bool, bool, bool)> = std::sync::OnceLock::new();
+pub(crate) fn analysis_params() -> (bool, bool, bool, bool, bool, bool) {
+    static P: std::sync::OnceLock<(bool, bool, bool, bool, bool, bool)> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
         let b = |name: &str, dflt: bool| {
             std::env::var(name).map(|v| v != "0").unwrap_or(dflt)
@@ -107,8 +109,10 @@ pub(crate) fn analysis_params() -> (bool, bool, bool, bool) {
         // realtime), so it only runs when something reads it: any consumer
         // switch, an explicit `EC_OPUS_ANALYSIS=1`, or
         // `Encoder::set_analysis(true)` for the diagnostics.
-        let any = trim || vbr_tonal || vbr_act;
-        (b("EC_OPUS_ANALYSIS", any), trim, vbr_tonal, vbr_act)
+        let leak = b("EC_OPUS_LEAK", false);
+        let bw = b("EC_OPUS_BW_DETECT", false);
+        let any = trim || vbr_tonal || vbr_act || leak || bw;
+        (b("EC_OPUS_ANALYSIS", any), trim, vbr_tonal, vbr_act, leak, bw)
     })
 }
 
@@ -1026,7 +1030,7 @@ impl CeltEncoder {
             let base_target =
                 vbr_rate + (self.vbr_offset >> lm_diff) - ((40 * c as i32 + 20) << BITRES);
             let mut target = base_target;
-            let (_, _, vbr_tonal, vbr_act) = analysis_params();
+            let (_, _, vbr_tonal, vbr_act, _, _) = analysis_params();
             // compute_vbr (libopus celt_encoder.c:1605-1716), float-mode.
             // Skipped: activity, tonality, surround_mask (analysis->valid=
             // false, has_surround_mask=0, pitch_change=0, lfe=0). The qext
@@ -1546,6 +1550,13 @@ impl CeltEncoder {
             }
             if i >= 12 {
                 follower[i] *= 0.5;
+            }
+        }
+        // libopus `celt_encoder.c:1226-1230`: the analysis's per-band
+        // leakage boost, in 1/64 dB units, on top of the follower.
+        if analysis_params().4 && self.info.valid {
+            for i in start..crate::analysis::LEAK_BANDS.min(end) {
+                follower[i] += f32::from(self.info.leak_boost[i]) / 64.0;
             }
         }
         let mut tot_boost = 0i32;
