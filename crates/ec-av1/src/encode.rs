@@ -1856,18 +1856,28 @@ fn code_square_inter(
         );
         let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
         if let Some(mv_bits) = mv_residual_bits(new_mv, stack.pred_mv) {
-            let luma_new = mc_trial(
-                luma, x, y, side, new_mv, true, ref_luma.0, ref_luma.1, ref_luma.2, ref_luma.3,
-                false, search.base_q_idx, search.deadzone, luma_set, fctx,
-            );
-            let u_new = mc_trial(
-                &chroma[0], x / 2, y / 2, side / 2, new_mv, false, ref_u.0, ref_u.1, ref_u.2,
-                ref_u.3, false, search.base_q_idx, search.deadzone, chroma_set, fctx,
-            );
-            let v_new = mc_trial(
-                &chroma[1], x / 2, y / 2, side / 2, new_mv, false, ref_v.0, ref_v.1, ref_v.2,
-                ref_v.3, false, search.base_q_idx, search.deadzone, chroma_set, fctx,
-            );
+            // Same reuse as `search_inter_block`: a NEWMV equal to the
+            // stack's NEARESTMV is the same three trials, already run above.
+            let (luma_new, u_new, v_new) = if new_mv == mv {
+                (luma_trial.clone(), u.clone(), v.clone())
+            } else {
+                (
+                    mc_trial(
+                        luma, x, y, side, new_mv, true, ref_luma.0, ref_luma.1, ref_luma.2,
+                        ref_luma.3, false, search.base_q_idx, search.deadzone, luma_set, fctx,
+                    ),
+                    mc_trial(
+                        &chroma[0], x / 2, y / 2, side / 2, new_mv, false, ref_u.0, ref_u.1,
+                        ref_u.2, ref_u.3, false, search.base_q_idx, search.deadzone, chroma_set,
+                        fctx,
+                    ),
+                    mc_trial(
+                        &chroma[1], x / 2, y / 2, side / 2, new_mv, false, ref_v.0, ref_v.1,
+                        ref_v.2, ref_v.3, false, search.base_q_idx, search.deadzone, chroma_set,
+                        fctx,
+                    ),
+                )
+            };
             let skip_new = luma_new.levels.iter().all(|&l| l == 0)
                 && u_new.levels.iter().all(|&l| l == 0)
                 && v_new.levels.iter().all(|&l| l == 0);
@@ -2972,6 +2982,14 @@ fn search_inter_block(
     // The NEARESTMV candidate: `skip` is decided below from whether its
     // trial actually found a nonzero level, once its residual is priced
     // against the same CDFs the tile writer codes it with.
+    //
+    // lane-av1speed: its three trials are kept (rather than moved straight
+    // into the candidate) so that a NEWMV landing on the very same vector --
+    // common on static content, where the stack's nearest vector is also
+    // what the search finds -- reuses them instead of running the same
+    // motion compensation, transform, quantize and reconstruct again. The
+    // reused trials are the same values, so the choice is bit-identical.
+    let nearest_trials;
     {
         let mv = stack.nearest_mv;
         let luma_trial = mc_trial(
@@ -3038,6 +3056,7 @@ fn search_inter_block(
                     } else {
                         luma_trial.bits + u.bits + v.bits
                     });
+        nearest_trials = (luma_trial.clone(), u.clone(), v.clone());
         consider(Candidate {
             cost,
             luma: luma_trial,
@@ -3072,54 +3091,60 @@ fn search_inter_block(
     stage_add(0, t.elapsed());
     let mv = round_to_valid_mv(found.mv, stack.pred_mv);
     if let Some(mv_bits) = mv_residual_bits(mv, stack.pred_mv) {
-        let luma_trial = mc_trial(
-            luma,
-            x,
-            y,
-            BLOCK,
-            mv,
-            true,
-            ref_luma.0,
-            ref_luma.1,
-            ref_luma.2,
-            ref_luma.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            TxbSet::Luma32Inter, fctx,
-        );
-        let u = mc_trial(
-            &chroma[0],
-            x / 2,
-            y / 2,
-            BLOCK / 2,
-            mv,
-            false,
-            ref_u.0,
-            ref_u.1,
-            ref_u.2,
-            ref_u.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            chroma_set, fctx,
-        );
-        let v = mc_trial(
-            &chroma[1],
-            x / 2,
-            y / 2,
-            BLOCK / 2,
-            mv,
-            false,
-            ref_v.0,
-            ref_v.1,
-            ref_v.2,
-            ref_v.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            chroma_set, fctx,
-        );
+        let (luma_trial, u, v) = if mv == stack.nearest_mv {
+            nearest_trials
+        } else {
+            (
+                mc_trial(
+                    luma,
+                    x,
+                    y,
+                    BLOCK,
+                    mv,
+                    true,
+                    ref_luma.0,
+                    ref_luma.1,
+                    ref_luma.2,
+                    ref_luma.3,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    TxbSet::Luma32Inter, fctx,
+                ),
+                mc_trial(
+                    &chroma[0],
+                    x / 2,
+                    y / 2,
+                    BLOCK / 2,
+                    mv,
+                    false,
+                    ref_u.0,
+                    ref_u.1,
+                    ref_u.2,
+                    ref_u.3,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    chroma_set, fctx,
+                ),
+                mc_trial(
+                    &chroma[1],
+                    x / 2,
+                    y / 2,
+                    BLOCK / 2,
+                    mv,
+                    false,
+                    ref_v.0,
+                    ref_v.1,
+                    ref_v.2,
+                    ref_v.3,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    chroma_set, fctx,
+                ),
+            )
+        };
         let drl_bits = if stack.entries.len() > 1 {
             symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[0]], 0)
         } else {
