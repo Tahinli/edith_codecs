@@ -150,6 +150,30 @@ fn split_inter_blocks() -> bool {
     }
 }
 
+/// libaom's `partition_search_breakout` shape: how many non-zero luma
+/// coefficients per 256 luma samples a block may code and still be judged
+/// well enough predicted that the split below it is not worth trying. `0`
+/// disables the breakout (only the existing all-skip prune applies), which
+/// is the default until the sweep below justifies otherwise.
+///
+/// Swept on the BD gate (`EC_AV1_SPLIT_BREAKOUT`, test builds only), which
+/// is where this lane's wall would have gone: 1 cuts the three clips'
+/// encode wall 6.3/6.0/6.2 s -> 3.6/3.2/4.4 s but costs +18.4/+24.0/+7.9
+/// BD-rate points against libaom; 2 costs +23.4/+29.4/+18.8 and 4 costs
+/// +31.7/+40.6/+27.8, for barely more speed. The split trial is where this
+/// encoder's inter quality lives, so `0` ships and the knob stays for a
+/// future explicit speed preset.
+const SPLIT_BREAKOUT_COEFFS: usize = 0;
+
+/// [`SPLIT_BREAKOUT_COEFFS`], swept by `EC_AV1_SPLIT_BREAKOUT` in a test
+/// build.
+fn split_breakout_coeffs() -> usize {
+    match std::env::var("EC_AV1_SPLIT_BREAKOUT").ok() {
+        Some(v) if cfg!(test) => v.parse().unwrap_or(SPLIT_BREAKOUT_COEFFS),
+        _ => SPLIT_BREAKOUT_COEFFS,
+    }
+}
+
 /// How often each partition decision was taken since the last
 /// [`take_partition_hits`], so a gate can report how often a new partition
 /// fires rather than assume it does (gate-blind-to-feature). Index 0 is an
@@ -3387,7 +3411,13 @@ pub(crate) fn encode_inter_frame(
                             header.mi_rows,
                         )
                     });
-                    let split = (!block.skip && leaves_legal && split_inter_blocks())
+                    // The breakout above: a 32x32 block that codes almost
+                    // nothing is not offered the split at all.
+                    let breakout = split_breakout_coeffs();
+                    let split = (!block.skip
+                        && (breakout == 0 || block.luma.len() > 4 * breakout)
+                        && leaves_legal
+                        && split_inter_blocks())
                         .then(|| {
                             restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
                             let mut cost = search.lambda * partition_bits(BLOCK, true);
@@ -3418,7 +3448,9 @@ pub(crate) fn encode_inter_frame(
                                 // the writer codes as a real PARTITION_SPLIT
                                 // at BLOCK_16X16 (lane-av1rd2). Same
                                 // skipped-block prune as the level above.
-                                let eight = (!leaf.skip && split_inter_8())
+                                let eight = (!leaf.skip
+                                    && (breakout == 0 || leaf.luma.len() > breakout)
+                                    && split_inter_8())
                                     .then(|| {
                                         restore(
                                             &mut luma, &mut chroma, (lx, ly), SUB, &leaf_base,
