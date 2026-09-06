@@ -19741,6 +19741,21 @@ pub(crate) struct FilterReplay {
     /// rows) -- what [`replay_restoration`] filters, instead of decoding
     /// the re-coded tile a second time.
     final_luma: Option<(PlaneBuf<'static>, PlaneBuf<'static>)>,
+    /// lane-av1speed3: the previous candidate's DESTINATION planes, still
+    /// holding its post-CDEF samples, and one byte per 8x8 CDEF unit its
+    /// filter wrote (see [`cdef_band`]). The CDEF half of the search moves
+    /// no deblocking level, so every candidate of it used to copy the three
+    /// post-deblock planes (~19 MB at 4K) into fresh destinations. Here the
+    /// destinations are kept and only the units the last candidate touched
+    /// are restored -- the same bytes, since a unit nobody wrote still holds
+    /// the deblocked sample it was copied from.
+    work: Option<(PlaneBuf<'static>, PlaneBuf<'static>, PlaneBuf<'static>)>,
+    wrote: Vec<u8>,
+    /// The strengths [`FilterReplay::work`] was filtered under: a plane whose
+    /// new candidate can only write MORE units than the old one needs no
+    /// restore at all, since every unit CDEF writes it writes from the
+    /// post-deblock source alone.
+    work_cdef: Option<CdefParams>,
     /// The last deblocked planes and the levels that produced them.
     /// Deblocking depends on nothing else the search moves, and the search
     /// fixes the levels before it walks the CDEF strengths, so every
@@ -19830,10 +19845,64 @@ fn capture_filter_replay(
             true_width,
             true_height,
             scratch: Vec::new(),
+            work: None,
+            wrote: Vec::new(),
+            work_cdef: None,
             final_luma: None,
             deblocked: None,
         });
     });
+}
+
+/// Restores, from the post-deblock cache, every sample the previous CDEF
+/// candidate may have written: for each unit row, the column span between
+/// its first and last written unit (a superset of the written units, which
+/// is what makes the copy contiguous -- and never more than the whole-plane
+/// copy it replaces). `unit` is this plane's CDEF unit side, 8 for luma and
+/// 4 for 4:2:0 chroma.
+fn restore_written(
+    dst: &mut PlaneBuf<'static>,
+    src: &PlaneBuf<'_>,
+    wrote: &[u8],
+    mask: u8,
+    unit_cols: usize,
+    unit: usize,
+) {
+    let w = dst.width;
+    if w == 0 || unit_cols == 0 || wrote.is_empty() {
+        return;
+    }
+    let rows = dst.data.len() / w;
+    let s: &[u16] = &src.data;
+    let d = dst.data.to_mut();
+    let band = |d: &mut [u16], wr: &[u8], ur0: usize| {
+        for (i, row) in wr.chunks(unit_cols).enumerate() {
+            let Some(c0) = row.iter().position(|&b| b & mask != 0) else {
+                continue;
+            };
+            let c1 = row.iter().rposition(|&b| b & mask != 0).expect("just found one");
+            let (x0, x1) = ((c0 * unit).min(w), ((c1 + 1) * unit).min(w));
+            let ur = ur0 + i;
+            let (y0, y1) = ((ur * unit).min(rows), ((ur + 1) * unit).min(rows));
+            for r in y0..y1 {
+                let off = (r - ur0 * unit) * w;
+                d[off + x0..off + x1].copy_from_slice(&s[r * w + x0..r * w + x1]);
+            }
+        }
+    };
+    let urows = wrote.len() / unit_cols;
+    let threads = crate::par::filter_threads().min(urows.max(1));
+    if threads <= 1 {
+        band(d, wrote, 0);
+        return;
+    }
+    let per = urows.div_ceil(threads);
+    let batch = crate::par::Batch::new("ec-av1-filter");
+    for (i, (dc, wr)) in d.chunks_mut(per * unit * w).zip(wrote.chunks(per * unit_cols)).enumerate()
+    {
+        let band = &band;
+        batch.submit(move || band(dc, wr, i * per));
+    }
 }
 
 /// One candidate's working copy of a captured plane, off [`FilterReplay`]'s
@@ -19920,13 +19989,54 @@ fn replay_inner(
         // of them rather than taking their buffers.
         let mut share = false;
         let cpt = crate::par::timer(crate::par::S_COPY);
+        let unit_cols = r.neighbours.mi_cols.div_ceil(2);
+        let unit_rows = r.neighbours.mi_rows.div_ceil(2);
         let (mut y, mut u, mut v) = if hit {
+            let work = r.work.take();
+            let wrote = std::mem::take(&mut r.wrote);
+            // `cdef_adjust_strength` is monotone in the strength it is given,
+            // so a candidate whose primary strength is no lower and whose
+            // secondary is zero only if the last one's was writes every unit
+            // the last one wrote -- and writes it from the same post-deblock
+            // source, so the samples under it need not be put back first.
+            // Only while both candidates carry ONE strength pair (`bits ==
+            // 0`, every scoring candidate) and read the same `cdef_idx` grid.
+            let superset = |cur: (u8, u8), old: (u8, u8)| cur.0 >= old.0 && (cur.1 != 0 || old.1 == 0);
+            let (skip_y, skip_uv) = match (final_pass, &r.work_cdef) {
+                (None, Some(old)) if old.bits == 0 && cdef.bits == 0 => (
+                    superset(
+                        (cdef.y_pri_strength[0], cdef.y_sec_strength[0]),
+                        (old.y_pri_strength[0], old.y_sec_strength[0]),
+                    ),
+                    superset(
+                        (cdef.uv_pri_strength[0], cdef.uv_sec_strength[0]),
+                        (old.uv_pri_strength[0], old.uv_sec_strength[0]),
+                    ),
+                ),
+                _ => (false, false),
+            };
             let (deblocked, scratch) = (&r.deblocked, &mut r.scratch);
             let (_, dy, du, dv) = deblocked.as_ref().expect("just matched");
-            (pooled(dy, scratch), pooled(du, scratch), pooled(dv, scratch))
+            match work {
+                Some((mut wy, mut wu, mut wv)) => {
+                    if !skip_y {
+                        restore_written(&mut wy, dy, &wrote, 1, unit_cols, 8);
+                    }
+                    if !skip_uv {
+                        restore_written(&mut wu, du, &wrote, 2, unit_cols, 4);
+                        restore_written(&mut wv, dv, &wrote, 2, unit_cols, 4);
+                    }
+                    (wy, wu, wv)
+                }
+                None => (pooled(dy, scratch), pooled(du, scratch), pooled(dv, scratch)),
+            }
         } else {
             // The levels moved, so the cached deblocked planes are dead:
             // their buffers are this candidate's working copies.
+            for plane in r.work.take().into_iter().flat_map(|(a, b, c)| [a, b, c]) {
+                r.scratch.push(plane.data.into_owned());
+            }
+            r.work_cdef = None;
             if let Some((_, dy, du, dv)) = r.deblocked.take() {
                 r.scratch.push(dy.data.into_owned());
                 r.scratch.push(du.data.into_owned());
@@ -19974,12 +20084,17 @@ fn replay_inner(
             fctx.cdef_idx_grid.with(|g| *g.borrow_mut() = grid.to_vec());
         }
         let ct = crate::par::timer(crate::par::S_CDEF);
+        let mut wrote = std::mem::take(&mut r.wrote);
+        wrote.clear();
+        wrote.resize(unit_cols * unit_rows, 0);
+        r.work_cdef = Some(*cdef);
         let pre = r.deblocked.as_ref().map(|(_, dy, du, dv)| {
             (dy.data.as_ref(), du.data.as_ref(), dv.data.as_ref())
         });
         apply_cdef(
             &mut y, &mut u, &mut v, cdef, &r.neighbours, (r.frame_width, r.frame_height), fctx,
             pre,
+            Some(&mut wrote),
         );
         drop(ct);
         if final_pass.is_some_and(|(_, want)| want) {
@@ -20017,6 +20132,8 @@ fn replay_inner(
         let (fw, fh) = (r.frame_width, r.frame_height);
         if fw == r.width && fh == r.height {
             fctx.last_frame_wide_margin.with(|m| *m.borrow_mut() = None);
+            r.wrote = Vec::new();
+            r.work_cdef = None;
             if share {
                 let picture = Picture {
                     width: r.width,
@@ -20067,13 +20184,14 @@ fn replay_inner(
         // deblocked planes this candidate's successors reuse, or they go
         // back to the pool.
         if share {
+            r.wrote = Vec::new();
+            r.work_cdef = None;
             r.deblocked = Some((*loop_filter, y, u, v));
         } else {
-            for plane in [y, u, v] {
-                if r.scratch.len() < 6 {
-                    r.scratch.push(plane.data.into_owned());
-                }
-            }
+            // lane-av1speed3: kept whole (post-CDEF samples and all) for the
+            // next candidate, together with the map of what CDEF wrote.
+            r.wrote = wrote;
+            r.work = Some((y, u, v));
         }
         Some((out, stages))
     })
@@ -20208,7 +20326,16 @@ fn cdef_band(
     damping_uv: i32,
     (frame_w, frame_h): (usize, usize),
     fctx: &crate::decode::FrameCtx,
+    // lane-av1speed3: one byte per 8x8 CDEF unit of the WHOLE frame (stride
+    // `mi_cols.div_ceil(2)`), set for every unit this band actually filters.
+    // Bit 0 = this unit's LUMA square was filtered, bit 1 = its chroma ones.
+    // `cdef_adjust_strength` zeroes a unit's primary strength off its own
+    // variance, so which units a candidate writes is not a function of its
+    // strengths alone -- the encoder's filter replay reuses one destination
+    // plane across candidates and needs the map to restore it.
+    mut wrote: Option<&mut [u8]>,
 ) {
+    let unit_cols = skip_grid.mi_cols.div_ceil(2);
     let strength_idx = |mi_r: usize, mi_c: usize| -> usize {
         if sb_cols == 0 {
             return 0;
@@ -20304,6 +20431,11 @@ fn cdef_band(
                     let uv_dir = if t_uv != 0 { dir } else { 0 };
                     let enable_primary_uv = t_uv != 0;
                     let enable_secondary_uv = uv_sec_strength != 0;
+                    if let Some(w) = wrote.as_deref_mut() {
+                        let mark = u8::from(enable_primary || enable_secondary)
+                            | (u8::from(enable_primary_uv || enable_secondary_uv) << 1);
+                        w[(mi_r / 2) * unit_cols + mi_c / 2] = mark;
+                    }
                     if enable_primary_uv || enable_secondary_uv {
                         let (cox, coy) = (ox / 2, oy / 2);
                         for (plane, src_p) in [(&mut *u, src_u), (&mut *v, src_v)] {
@@ -20508,6 +20640,7 @@ fn pipe_run(
                 cdef_rows(
                     y, u, v, &sy2.data, &su2.data, &sv2.data, cfg.cdef, n, idx_grid, cfg.sb_cols,
                     coeff_shift, damping, damping_uv, (fw, fh), j * 16, (j + 1) * 16, fctx,
+                    None,
                 );
             }
         }
@@ -20818,6 +20951,9 @@ fn cdef_rows(
     (frame_w, frame_h): (usize, usize),
     r_lo0: usize,
     r_hi0: usize, fctx: &crate::decode::FrameCtx,
+    // See [`cdef_band`]. Shared because the bands below write disjoint unit
+    // ROWS of it, exactly as they write disjoint plane rows.
+    wrote: Option<crate::par::Shared<'_, [u8]>>,
 ) {
     let mi_rows = skip_grid.mi_rows;
     let (lo, hi) = (r_lo0.min(mi_rows), r_hi0.min(mi_rows));
@@ -20838,6 +20974,10 @@ fn cdef_rows(
         // disjoint from every other band's (see `Shared`).
         #[allow(unsafe_code)]
         let (y, u, v) = unsafe { (sy.get(), su.get(), sv.get()) };
+        // SAFETY: this band marks only the unit rows its own mi rows cover,
+        // disjoint from every other band's (see `Shared`).
+        #[allow(unsafe_code)]
+        let wr = wrote.as_ref().map(|w| unsafe { w.get() });
         cdef_band(
             r_lo,
             r_hi,
@@ -20856,6 +20996,7 @@ fn cdef_rows(
             damping_uv,
             (frame_w, frame_h),
             fctx,
+            wr,
         );
     });
 }
@@ -20876,6 +21017,10 @@ fn apply_cdef(
     // -- so it hands them straight in and the copy does not happen. `None`
     // (every decode) copies as before.
     src: Option<(&[u16], &[u16], &[u16])>,
+    // See [`cdef_band`]: `Some` only from the encoder's filter replay, which
+    // clears and sizes it (`mi_cols.div_ceil(2) * mi_rows.div_ceil(2)`)
+    // before the call.
+    mut wrote: Option<&mut [u8]>,
 ) {
     // lane-part32 r2 debug rung, env-gated: see `apply_deblock`'s sibling.
     if crate::envflags::env_flag!("EC_AV1_DEBUG_SKIP_CDEF") {
@@ -20917,6 +21062,7 @@ fn apply_cdef(
     cdef_rows(
         y, u, v, &src_y, &src_u, &src_v, cdef, skip_grid, &idx_grid, sb_cols, coeff_shift,
         damping, damping_uv, (frame_w, frame_h), 0, skip_grid.mi_rows, fctx,
+        wrote.as_deref_mut().map(crate::par::Shared::new),
     );
     if owned {
         scratch_return(src_y.into_owned());
@@ -23499,6 +23645,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         cdef,
         &neighbours,
         (frame_width as usize, frame_height as usize), fctx,
+        None,
         None,
     );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
@@ -36315,6 +36462,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             cdef,
             &neighbours,
             (frame_width as usize, frame_height as usize), fctx,
+            None,
             None,
         );
     }
