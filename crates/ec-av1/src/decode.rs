@@ -19725,6 +19725,11 @@ pub(crate) struct FilterReplay {
     frame_height: usize,
     width: usize,
     height: usize,
+    /// The last deblocked planes and the levels that produced them.
+    /// Deblocking depends on nothing else the search moves, and the search
+    /// fixes the levels before it walks the CDEF strengths, so every
+    /// candidate after the first of a level pair replays CDEF alone.
+    deblocked: Option<(LoopFilterParams, PlaneBuf<'static>, PlaneBuf<'static>, PlaneBuf<'static>)>,
 }
 
 thread_local! {
@@ -19772,6 +19777,7 @@ fn capture_filter_replay(
             frame_height,
             width,
             height,
+            deblocked: None,
         });
     });
 }
@@ -19785,23 +19791,31 @@ pub(crate) fn replay_filters(
     cdef: &CdefParams,
     fctx: &FrameCtx,
 ) -> Option<Picture> {
-    REPLAY.with_borrow(|slot| {
-        let r = slot.as_ref()?;
+    REPLAY.with_borrow_mut(|slot| {
+        let r = slot.as_mut()?;
         let copy = |p: &PlaneBuf<'_>| PlaneBuf {
             data: std::borrow::Cow::Owned(p.data.to_vec()),
             ..*p
         };
-        let (mut y, mut u, mut v) = (copy(&r.y), copy(&r.u), copy(&r.v));
-        apply_deblock(
-            &mut y,
-            &mut u,
-            &mut v,
-            loop_filter,
-            &r.neighbours,
-            r.frame_width,
-            r.frame_height,
-            fctx,
-        );
+        let hit = matches!(&r.deblocked, Some((lf, ..)) if lf == loop_filter);
+        let (mut y, mut u, mut v) = if hit {
+            let (_, dy, du, dv) = r.deblocked.as_ref().expect("just matched");
+            (copy(dy), copy(du), copy(dv))
+        } else {
+            let (mut y, mut u, mut v) = (copy(&r.y), copy(&r.u), copy(&r.v));
+            apply_deblock(
+                &mut y,
+                &mut u,
+                &mut v,
+                loop_filter,
+                &r.neighbours,
+                r.frame_width,
+                r.frame_height,
+                fctx,
+            );
+            r.deblocked = Some((*loop_filter, copy(&y), copy(&u), copy(&v)));
+            (y, u, v)
+        };
         apply_cdef(&mut y, &mut u, &mut v, cdef, &r.neighbours, (r.frame_width, r.frame_height), fctx);
         // The capture only happens on the shape the decoder's own tail
         // returns whole (no superres, no loop restoration, no crop), so this
