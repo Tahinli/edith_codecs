@@ -1137,7 +1137,7 @@ pub(crate) fn predict_with_filters_kern(
     hit!(INTER_PRED_HITS);
 
     #[cfg(test)]
-    let stage_t = std::time::Instant::now();
+    let stage_t = crate::encode::stage_start();
 
     let x0 = x_q4.div_euclid(16);
     let xfrac = x_q4.rem_euclid(16) as usize;
@@ -1188,7 +1188,7 @@ pub(crate) fn predict_with_filters_kern(
             }
         }
         #[cfg(test)]
-        crate::encode::stage_add(1, stage_t.elapsed());
+        crate::encode::stage_since(1, stage_t);
         return;
     }
 
@@ -1244,7 +1244,7 @@ pub(crate) fn predict_with_filters_kern(
                     unsafe { std::slice::from_raw_parts(reference.as_ptr().cast::<i16>(), reference.len()) };
                 vpass_row_u16(&src[base..], block_w, stride, block_h, &v16, max, dst);
                 #[cfg(test)]
-                crate::encode::stage_add(1, stage_t.elapsed());
+                crate::encode::stage_since(1, stage_t);
                 return;
             }
         }
@@ -1265,7 +1265,7 @@ pub(crate) fn predict_with_filters_kern(
     });
 
     #[cfg(test)]
-    crate::encode::stage_add(1, stage_t.elapsed());
+    crate::encode::stage_since(1, stage_t);
 }
 
 /// `REF_SCALE_SHIFT`'s "no scaling" value (spec 7.11.3.3, libaom `scale.h`
