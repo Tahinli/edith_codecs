@@ -1662,6 +1662,22 @@ impl Plane<'_> {
     ///
     /// A neighbour outside this plane's own TILE does not exist, exactly as
     /// the writer's per-tile `Neighbours` bands start blank.
+    ///
+    /// OPEN (lane-av1skipctx): the decisions this price changes make
+    /// `decode_stream_round_trips_an_odd_size_gop` and
+    /// `an_odd_size_gop_round_trips_bit_exact_against_the_encoder_reconstruction`
+    /// fail at 216x96, frame 0, V plane only -- the last, right-edge-
+    /// STRADDLING 32x32 at luma (192, 64), whose writer trace says both
+    /// chroma planes code nothing (`EC_RNG`: plane=1 skip_ctx=1, plane=2
+    /// skip_ctx=0, both `eob0=1`) while the decoder reconstructs a different
+    /// V; the differing samples are exactly that block plus its deblock halo
+    /// (chroma rows 29-47, cols 92-107). It is NOT this map: with `coef_ctx`
+    /// ablated no `EC_AV1_PRUNE_K` in 1..=6 and no `EC_AV1_ESTIMATE=1`
+    /// reproduces it, and a pricer writes no symbol -- it is a pre-existing
+    /// writer/decoder desync in the straddling last block (class:
+    /// last-block desync reads as reconstruction) that only a decision
+    /// change reaches. Needs a decoder-side `txb_skip` context trace aligned
+    /// to the writer's `EC_RNG` one to close.
     fn coef_ctx(&self, x: usize, y: usize, side: usize, set: TxbSet) -> (usize, usize) {
         if self.ctx.cells.is_empty() {
             return (0, 0);
