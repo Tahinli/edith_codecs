@@ -37476,7 +37476,9 @@ mod tests {
             &key.loop_filter,
             key.tx_select,
             true,
-            false,
+            // This key frame's own `allow_screen_content_tools`: its intra
+            // blocks carry the palette syntax under it (stale-header class).
+            key.screen,
             false,
             &key.loop_restoration, fctx,
         )
@@ -37814,7 +37816,9 @@ mod tests {
             &key.loop_filter,
             key.tx_select,
             true,
-            false,
+            // This key frame's own `allow_screen_content_tools`: its intra
+            // blocks carry the palette syntax under it (stale-header class).
+            key.screen,
             false,
             &key.loop_restoration, fctx,
         )
