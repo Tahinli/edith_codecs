@@ -13,6 +13,7 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ec_core::{Error, Result};
 
@@ -4059,12 +4060,39 @@ thread_local! {
 /// +1.5/+19.8/-10.0 (both film clips down against both references, screen up
 /// 1.4/2.7). Two clips better, one worse: it does not meet this lane's keep
 /// rule, so it ships as a knob rather than as the default.
-pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() == Ok("1"));
+pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>, screen: bool) {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    });
+    let on = match mode {
+        0 => false,
+        1 => true,
+        _ => !screen,
+    };
+    PRICING_HITS[usize::from(on && base.is_some())].fetch_add(1, Ordering::Relaxed);
     PRICING_BASE.with_borrow_mut(|slot| {
         *slot = base.filter(|_| on).map(|c| Box::new((c.clone(), c.clone())));
     });
+}
+
+/// How many times a frame's search was armed with the DEFAULT tables and how
+/// many with the frame's REAL starting tables ([`arm_pricing_cdfs`]), so a
+/// gate can print which side of the screen gate every frame landed on. Counts
+/// arming calls, not frames: a multi-tile frame arms one worker per tile.
+pub(crate) static PRICING_HITS: [AtomicUsize; 2] =
+    [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// Reads and clears [`PRICING_HITS`]: (default-table armings, real-table
+/// armings).
+#[cfg(test)]
+pub(crate) fn take_pricing_hits() -> (usize, usize) {
+    (
+        PRICING_HITS[0].swap(0, Ordering::Relaxed),
+        PRICING_HITS[1].swap(0, Ordering::Relaxed),
+    )
 }
 
 /// The pricer census (`pricer_census_on`): for every transform block the tile

@@ -4545,7 +4545,7 @@ pub(crate) fn encode_key_frame_inner(
     // A key frame's writer really does start from the defaults, and a search
     // worker may be carrying an inter frame's armed tables (lane-av1txbits):
     // disarm, or a key frame's bits would depend on which thread searched it.
-    crate::tile::arm_pricing_cdfs(None);
+    crate::tile::arm_pricing_cdfs(None, false);
     // spec 5.9.2 `allow_intrabc`, screen-detected key frames only: the bit
     // forces deblocking, CDEF and loop restoration OFF for this frame
     // (frame.rs:194/210/252/272), so it is only set when the source repeats
@@ -4685,7 +4685,7 @@ pub(crate) fn encode_key_frame_inner(
     let search_tile = |index: usize,
                        fctx: &crate::decode::FrameCtx|
      -> Result<Vec<(usize, Superblock, Vec<u8>)>> {
-        crate::tile::arm_pricing_cdfs(None);
+        crate::tile::arm_pricing_cdfs(None, false);
         let rect = layout.rect(index);
         let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
         let mut chroma = [
@@ -4963,7 +4963,7 @@ pub(crate) fn encode_key_frame_inner(
             let mut cdfs = start_cdfs.0.clone();
             crate::tile::arm_screen(screen);
             crate::tile::arm_intrabc(allow_intrabc);
-            crate::tile::arm_pricing_cdfs(None);
+            crate::tile::arm_pricing_cdfs(None, false);
             let bytes = crate::tile::sb_coeff_key_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
@@ -6403,9 +6403,6 @@ pub(crate) fn encode_inter_frame(
     // read `(0, 0, [0; 7])` and came out 1 for every reference -- the knob
     // never reached the tool).
     crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
-    // The search prices coefficients against the tables this frame's writer
-    // starts from, not against the defaults (lane-av1txbits).
-    crate::tile::arm_pricing_cdfs(start_cdfs);
     if let Some(p) = pyramid {
         header.show_frame = p.show_frame;
         header.showable_frame = !p.show_frame;
@@ -6434,6 +6431,11 @@ pub(crate) fn encode_inter_frame(
     let screen = seq_screen()
         && screen_content(&picture_y8, picture.width, true_width, true_height);
     header.allow_screen_content_tools = screen;
+    // The search prices coefficients against the tables this frame's writer
+    // starts from, not against the defaults (lane-av1txbits) -- but only on a
+    // frame the screen detector said no to (lane-av1price2): armed HERE, after
+    // `screen` exists, and again on every search/tile worker below.
+    crate::tile::arm_pricing_cdfs(start_cdfs, screen);
     let mut luma = Plane {
         source: &picture_y8,
         reconstruction: vec![128; picture_y8.len()],
@@ -6526,7 +6528,7 @@ pub(crate) fn encode_inter_frame(
         // search step) is read by the SEARCH, so every worker arms it or the
         // tile's bits depend on the thread count.
         crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
-        crate::tile::arm_pricing_cdfs(start_cdfs);
+        crate::tile::arm_pricing_cdfs(start_cdfs, screen);
         let rect = layout.rect(index);
         let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
         let mut chroma = [
@@ -6997,7 +6999,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
             crate::tile::arm_screen(screen);
             let mut cdfs = start_cdfs.0.clone();
-            crate::tile::arm_pricing_cdfs(Some(&cdfs));
+            crate::tile::arm_pricing_cdfs(Some(&cdfs), screen);
             // Each tile's own MV grid: a candidate scan never reaches past
             // the tile's bounds, so a grid holding only this tile's own
             // blocks reads exactly as the decoder's frame-wide one does
@@ -9541,6 +9543,80 @@ mod tests {
         assert!(written_all > 0.0);
     }
 
+    /// Step (2) of the pricer lane: the same census, but on the REAL clips
+    /// the BD gate scores -- one film clip and the screen capture -- so the
+    /// question the film/screen split raises can be answered from data. Real
+    /// tables (`EC_AV1_PRICE_FRAME_CDFS=1`) make both film clips smaller and
+    /// the screen capture larger, and the census says why: on a screen
+    /// capture the frame's own starting tables are the tables of a frame that
+    /// coded PALETTE and long runs of zero blocks, so they are far from the
+    /// tables the writer ends the frame with; the pricer error does not fall
+    /// the way it does on film.
+    ///
+    /// Not a gate -- it prints. Run it once per mode:
+    ///     EC_AV1_PRICE_FRAME_CDFS=0 cargo test -p ec-av1 --release --lib -- \
+    ///         --ignored pricer_error_census_on_clips --nocapture
+    #[test]
+    #[ignore = "reads the real library, needs ffmpeg"]
+    fn pricer_error_census_on_clips() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP pricer_error_census_on_clips: no ffmpeg");
+            return;
+        }
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut clips: Vec<(String, std::path::PathBuf)> = Vec::new();
+        let film = fixtures.join("video/h264-1080p-23.976-8bit.mp4");
+        if film.exists() {
+            clips.push(("film 1080p".to_string(), film));
+        }
+        if let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"))
+            && let Some(p) = manifest
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split('\t').next())
+                .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+        {
+            clips.push(("screen".to_string(), std::path::PathBuf::from(p)));
+        }
+        assert!(!clips.is_empty(), "no source clip available");
+        let (width, height, frames) = (640usize, 384usize, 6usize);
+        for (name, path) in &clips {
+            let fctx = &crate::decode::FrameCtx::new();
+            let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
+            SCREEN_FRAMES.iter().for_each(|c| {
+                c.store(0, std::sync::atomic::Ordering::Relaxed);
+            });
+            let _ = crate::tile::take_pricing_hits();
+            crate::tile::pricer_census_on();
+            let _ = encode_sequence_with_ctx(&source, 100, 0.5, fctx).unwrap();
+            let rows = crate::tile::take_pricer_census();
+            let (price_default, price_real) = crate::tile::take_pricing_hits();
+            let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
+            println!(
+                "\n## {name} ({frames} frames at {width}x{height}, q=100): screen frames \
+                 {screen_on}, pricer armings default={price_default} real={price_real}"
+            );
+            println!("| set | nz | blocks | priced bits | written bits | error |");
+            println!("|---|---|---|---|---|---|");
+            let (mut priced_all, mut written_all) = (0.0, 0.0);
+            for ((set, bucket), (blocks, priced, written)) in &rows {
+                priced_all += priced;
+                written_all += written;
+                println!(
+                    "| {set} | {} | {blocks} | {priced:.0} | {written:.0} | {:+.1}% |",
+                    crate::tile::census_bucket_label(*bucket),
+                    if *written > 0.0 { (priced - written) / written * 100.0 } else { 0.0 }
+                );
+            }
+            println!(
+                "| ALL | | {} | {priced_all:.0} | {written_all:.0} | {:+.1}% |",
+                rows.values().map(|r| r.0).sum::<u64>(),
+                (priced_all - written_all) / written_all * 100.0
+            );
+            assert!(written_all > 0.0, "{name}: the census saw no transform block");
+        }
+    }
+
     /// Low motion has to actually buy something: at least one inter frame of
     /// a panning sequence has to cost fewer bytes than the key frame that
     /// starts it, and the inter-block share it prints has to be non-zero --
@@ -10862,6 +10938,12 @@ mod tests {
             // and of what size. A film clip must print `screen frames on=0`.
             let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
             let screen_off = SCREEN_FRAMES[0].load(std::sync::atomic::Ordering::Relaxed);
+            // Which tables the SEARCH priced against, per frame arming
+            // (`tile::arm_pricing_cdfs`): the default tables or the frame's
+            // real starting ones. A film clip must show every inter arming on
+            // the real side, a screen clip none of them.
+            let (price_default, price_real) = crate::tile::take_pricing_hits();
+            eprintln!("{name}: pricer armings default={price_default} real={price_real}");
             let palette = crate::tile::take_palette_hits();
             eprintln!(
                 "{name}: screen frames on={screen_on} off={screen_off}; palette blocks {} sizes {}",
@@ -11132,6 +11214,12 @@ mod tests {
             // native resolution, over this clip's four encodes.
             let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
             let screen_off = SCREEN_FRAMES[0].load(std::sync::atomic::Ordering::Relaxed);
+            // Which tables the SEARCH priced against, per frame arming
+            // (`tile::arm_pricing_cdfs`): the default tables or the frame's
+            // real starting ones. A film clip must show every inter arming on
+            // the real side, a screen clip none of them.
+            let (price_default, price_real) = crate::tile::take_pricing_hits();
+            eprintln!("{name}: pricer armings default={price_default} real={price_real}");
             let palette = crate::tile::take_palette_hits();
             let palette_uv = crate::tile::take_palette_uv_hits();
             let ibc = crate::tile::take_intrabc_hits();
