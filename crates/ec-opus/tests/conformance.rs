@@ -4658,6 +4658,22 @@ fn spectral_divergence_vs_libopus() {
              corr o={corr_o:.4} r={corr_r:.4}; err o={err_o:.3} r={err_r:.3} ratio={:.2}\n",
             err_o / err_r
         ));
+        // opus_compare's err is (mean ef²)^(1/16), so one window can carry a
+        // whole file. Recompute both sides with the worst k windows dropped
+        // (same denominator) to separate a broadband gap from an outlier one.
+        let drop_err = |v: &[f64], k: usize| -> f64 {
+            let mut w = v.to_vec();
+            w.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            (w[k..].iter().sum::<f64>() / v.len() as f64).powf(1.0 / 16.0)
+        };
+        for k in [0usize, 1, 8, ef2_o.len() / 100] {
+            let (eo, er) = (drop_err(&ef2_o, k), drop_err(&ef2_r, k));
+            report.push_str(&format!(
+                "# drop-{k} worst windows ({} total): err o={eo:.3} r={er:.3} ratio={:.3}\n",
+                ef2_o.len(),
+                eo / er
+            ));
+        }
         report.push_str(
             "# dln = mean ln(E_test/E_src) per channel (neg = energy missing); \
              err = mean |dln|; eb2 = band's mean share of the pre-squared frame error\n",

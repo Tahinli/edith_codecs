@@ -18,10 +18,9 @@
 //!   per-band `importance[]` and feeds it to the search, matching the
 //!   reference's analysis path.
 //! - **Fixed spreading.** `SPREAD_NORMAL` every frame, coded explicitly.
-//! - **Two-pass coarse energy** ported whole from the reference: both the
-//!   intra and the inter-predicted pass are coded and the one with the lower
-//!   badness (bit-budget clamping of the energy deltas) is kept, with the
-//!   reference's delayed-intra heuristic choosing the forced-intra case.
+//! - **Coarse energy**: the reference's two-pass encode-both-and-compare is
+//!   ported (`TWO_PASS_COARSE_ENERGY`) but ships off — it measured mixed on
+//!   the library gate's err_ratio; the delayed-intra heuristic decides.
 //!
 //! What stays: transient detection, the closed-form allocation-trim and
 //! dynalloc spike heuristics, the stereo-mode analysis, intensity thresholds
@@ -725,9 +724,15 @@ impl CeltEncoder {
         };
 
         // --- Coarse energy --------------------------------------------------
-        // libopus runs the two-pass coarse-energy search at complexity >= 4,
-        // and drops it (with intra) when the coarse bit can't even be coded.
-        let mut two_pass = true;
+        // libopus runs the two-pass coarse-energy search at complexity >= 4.
+        // MEASURED OFF (lane opus64, 12-row library gate vs libopus): it moves
+        // err_ratio 6 rows better / 4 worse (nik@96 .982->.990, zaur@64
+        // 1.510->1.581, her@64 1.102->1.135, her@96 1.052->1.059; nik@64
+        // .708->.703, zaur@96 .940->.872, dl8a .551/.374->.503/.346, hein
+        // .855/.528->.771/.419), corr within +.0001 everywhere. The KEEP rule
+        // is "err_ratio not worse on every row", so the search ships off.
+        const TWO_PASS_COARSE_ENERGY: bool = false;
+        let mut two_pass = TWO_PASS_COARSE_ENERGY;
         let mut intra = self.force_intra
             || (!two_pass
                 && self.delayed_intra > (2 * c * (end - start)) as f32
