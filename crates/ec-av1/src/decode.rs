@@ -23883,6 +23883,7 @@ impl<'p> RefPix<'p> {
 /// (lane-defer8).
 fn ref_dims(ref_frame: i8, refpix: &RefPix<'_>) -> Result<(usize, usize)> {
     refpix.dims(ref_frame).ok_or_else(|| {
+        eprintln!("TILEDBG missing ref_frame={ref_frame}");
         unsupported(
             "a reference frame selected with no picture at this frame's own \
                  ref_frame_idx slot for it",
@@ -25415,6 +25416,10 @@ fn decode_inter_block(
     // combinations that don't implement scaled MC yet.
     frame_width: usize, fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
+    if std::env::var_os("TILEDBG").is_some() {
+        eprintln!("TILEDBG dec block at={at:?} side={side} tell={}", dec.debug_bitpos());
+    }
+
     // lane-inter4 r1: `at` is in MI units (4 px) so a 32-level 1:4 strip can
     // name an 8-px offset; `(r, c)` stays the enclosing 16-px cell for the
     // few 16-px-granular uses below.
@@ -33442,6 +33447,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let waving = fctx.wave.with(|w| w.borrow().is_some());
     let mut wave_job = (0usize, 0usize);
     for (sb_r, sb_c, row_start, sb_start) in sb_visit_order(sb_r0, sb_r1, sb_c0, sb_c1, sb128) {
+        if std::env::var_os("TILEDBG").is_some() {
+            eprintln!("TILEDBG dec tile={tile_idx} sb_r={sb_r} sb_c={sb_c} tell={}", dec.debug_bitpos());
+        }
         // lane-wave1: the previous superblock's recorded writes -- handed to
         // the wavefront workers, or replayed here at one recon thread (where
         // the queue is empty, every write having run at its push site).

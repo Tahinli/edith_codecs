@@ -345,12 +345,26 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
         rows.push(missing("ec-av1", "decode"));
         return;
     }
+    // `EC_AV1_TILES=<cols_log2>[:<rows_log2>]` benches the encoder's tile
+    // grid (spec 5.9.15's uniform spacing): `1:0` is two tile columns, `1:1`
+    // a 2x2 grid. Unset keeps the one-tile default, whose bytes are the ones
+    // the byte pins carry.
+    let (tile_cols_log2, tile_rows_log2) = std::env::var("EC_AV1_TILES")
+        .ok()
+        .and_then(|spec| {
+            let mut f = spec.split(':');
+            let cols = f.next()?.parse().ok()?;
+            Some((cols, f.next().and_then(|v| v.parse().ok()).unwrap_or(0)))
+        })
+        .unwrap_or((0, 0));
     let cfg = Av1Config {
         width: w as usize,
         height: h as usize,
         base_q_idx: 100,
         gop: 10,
         colour: Colour::default(),
+        tile_cols_log2,
+        tile_rows_log2,
     };
     // `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]` benches the
     // encoder's coding pyramid (hidden ALTREF + show_existing_frame) instead
