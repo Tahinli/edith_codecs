@@ -13281,13 +13281,17 @@ mod tests {
     ///     EC_AV1_INTRABC=1 ... same command                # intra block copy
     ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
     ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
-    ///     EC_AV1_PYRAMID=4:-16:8 ... same command          # coding pyramid
+    ///     EC_AV1_PYRAMID=0 ... same command                # no coding pyramid
+    ///     EC_AV1_GATE_FACADE=1 ... same command            # the facade arm
     ///
-    /// Under `EC_AV1_PYRAMID` this arm codes its ladder through the streaming
-    /// facade ([`our_ladder_pyramid`]), which exposes no per-packet
-    /// reconstruction: that path asserts ffmpeg's decode against our own
-    /// decoder on all three planes in display order, and prints the per-level
-    /// frame and byte census.
+    /// The coding pyramid is the DEFAULT of the sequence path this arm codes
+    /// through (lane-av1pyrdef); the run prints the requested and the
+    /// effective pyramid per clip, and a screen clip's effective one is
+    /// `None`. `EC_AV1_GATE_FACADE=1` runs the same ladder through the
+    /// streaming facade instead, which prints the per-level frame and byte
+    /// census and asserts ffmpeg's decode against our own decoder on all
+    /// three planes in display order; both arms code the same bytes
+    /// (`encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence`).
     ///
     /// WHICH ROWS ARE REAL CONTENT: the `bars 1080p` / `bars 2160p` rows are
     /// the repo fixtures `scripts/gen-fixtures.sh` builds with ffmpeg
@@ -13316,6 +13320,23 @@ mod tests {
     /// Both bars rows and the capture are byte-identical across that change
     /// (their classification never moved); the palette search over film was
     /// costing roughly a tenth of the film rows' wall.
+    ///
+    /// CONFIRM RUN 2026-09-07 (lane-av1pyrdef), with the pyramid now the
+    /// sequence path's default -- the four non-screen rows take `4:-16:8`,
+    /// the capture is gated flat and does not move a byte:
+    ///
+    /// | clip | effective | flat -> default | vs rav1e | wall ours:libaom:rav1e |
+    /// |---|---|---|---|---|
+    /// | bars 1080p | 4:-16:8 | +16.4% -> +21.5% | -1.1% -> +3.7% | 37.8s:8.4s:16.4s |
+    /// | bars 2160p | 4:-16:8 | +48.2% -> +48.3% | +20.4% -> +20.4% | 32.2s:5.6s:16.2s |
+    /// | film A | 4:-16:8 | +62.8% -> +54.1% | +32.5% -> +24.2% | 58.9s:9.5s:13.6s |
+    /// | film B | 4:-16:8 | +86.3% -> +82.6% | +50.5% -> +47.4% | 63.2s:18.7s:16.4s |
+    /// | screen capture | none (gated) | +50.1% -> +50.1% | -15.4% -> -15.4% | 31.1s:8.4s:11.3s |
+    ///
+    /// Every row lands on lane-av1pyrgate's facade-arm number to the digit,
+    /// which is the point of the shared driver: the two entry points code one
+    /// stream. The bars rows are fixtures (recorded, never a decision); the
+    /// two real films are what the pyramid ships for.
     ///
     /// All five gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
     /// `EC_AV1_NATIVE_FILM4K=1` and `EC_AV1_NATIVE_SCREEN=1` select a subset:
