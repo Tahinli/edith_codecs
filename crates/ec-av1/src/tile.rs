@@ -304,6 +304,300 @@ pub(crate) fn arm_sign_bias(sign_bias: crate::mvstack::SignBiasTable) {
     SIGN_BIAS.with(|c| c.set(sign_bias));
 }
 
+thread_local! {
+    /// This frame header's own `reference_select` bit (spec 5.9.22), armed
+    /// the same way `arm_sign_bias` arms the sign-bias table rather than
+    /// threaded through the five nested writer helpers between here and the
+    /// per-block mode syntax. `true` makes every inter block of size at least
+    /// 8x8 code a `comp_mode` symbol, exactly where decode.rs `read_comp_mode`
+    /// reads one.
+    static REFERENCE_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms the frame's `reference_select` bit for the next tile written on this
+/// thread; cleared by [`CdefIdxGuard`] when that writer returns.
+pub(crate) fn arm_reference_select(on: bool) {
+    REFERENCE_SELECT.with(|c| c.set(on));
+}
+
+/// The compound half of a block's end-of-block neighbour record: nothing for
+/// a single-reference or intra block, and `record_compound_mi`'s overwrite of
+/// the ALTREF default for a compound one (this writer only codes
+/// `comp_group_idx == 0`, `compound_idx == 1`).
+fn record_block_compound(neighbours: &mut Neighbours, at_mi: (usize, usize), side: usize, block: &BlockCoeffs) {
+    if let Some(r1) = block.inter.and_then(|i| i.ref1) {
+        neighbours.record_compound_mi(at_mi, side, r1, 0, 1);
+    }
+}
+
+/// decode.rs' own `is_uni_comp_ref`: a pair is `UNIDIR_COMP_REFERENCE`
+/// exactly when both references sit on the same temporal side.
+fn is_uni_comp_ref(ref0: i8, ref1: i8) -> bool {
+    let backward =
+        |r: i8| (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&r);
+    backward(ref0) == backward(ref1)
+}
+
+thread_local! {
+    /// `(order_hint_bits, this frame's order hint, each reference's order
+    /// hint)` -- what `get_comp_index_context` (decode.rs) needs to context
+    /// the `compound_idx` symbol, armed the same way the sign-bias table is.
+    static ORDER_HINTS: std::cell::Cell<(u32, u32, [u32; 7])> =
+        const { std::cell::Cell::new((7, 0, [0; 7])) };
+}
+
+/// Arms this frame's order hints for the next tile written on this thread.
+pub(crate) fn arm_order_hints(bits: u32, order_hint: u32, hints: [u32; 7]) {
+    ORDER_HINTS.with(|c| c.set((bits, order_hint, hints)));
+}
+
+/// Writer-side counterpart of decode.rs `read_compound_ref_frames` (spec
+/// 5.11.25's `comp_reference_type`/`uni_comp_ref`/`comp_ref`/`comp_bwdref`
+/// trees), symbol for symbol at the same contexts -- which are, as that
+/// function's own doc records, `single_ref_p1_ctx`..`single_ref_p6_ctx`/
+/// `uni_comp_ref_p1_ctx` under libaom's compound names.
+///
+/// # Errors
+/// A pair this writer never forms (its `ref0` is not `LAST_FRAME`).
+fn write_compound_ref_frames(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    above: Option<crate::mvstack::NeighbourRef>,
+    left: Option<crate::mvstack::NeighbourRef>,
+    above_ref: i8,
+    left_ref: i8,
+    (ref0, ref1): (i8, i8),
+) -> Result<()> {
+    use crate::mvstack::{
+        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        LAST_FRAME, comp_reference_type_ctx, single_ref_p1_ctx, single_ref_p2_ctx,
+        single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
+        uni_comp_ref_p1_ctx,
+    };
+    let a = (above_ref > 0).then_some(above_ref);
+    let l = (left_ref > 0).then_some(left_ref);
+    let a1 = above.and_then(|n| n.ref1);
+    let l1 = left.and_then(|n| n.ref1);
+    let unidir = is_uni_comp_ref(ref0, ref1);
+    enc.symbol(
+        usize::from(!unidir),
+        &mut cdfs.comp_ref_type[comp_reference_type_ctx(above, left)],
+    );
+    if unidir {
+        let both_backward = (ref0, ref1) == (BWDREF_FRAME, ALTREF_FRAME);
+        enc.symbol(
+            usize::from(both_backward),
+            &mut cdfs.uni_comp_ref[single_ref_p1_ctx(a, a1, l, l1)][0],
+        );
+        if both_backward {
+            return Ok(());
+        }
+        if ref0 != LAST_FRAME {
+            return Err(Error::unsupported(
+                "AV1 tile",
+                "a unidirectional compound pair this writer does not form",
+            ));
+        }
+        let past_last2 = ref1 != LAST2_FRAME;
+        enc.symbol(
+            usize::from(past_last2),
+            &mut cdfs.uni_comp_ref[uni_comp_ref_p1_ctx(a, a1, l, l1)][1],
+        );
+        if past_last2 {
+            enc.symbol(
+                usize::from(ref1 == GOLDEN_FRAME),
+                &mut cdfs.uni_comp_ref[single_ref_p5_ctx(a, a1, l, l1)][2],
+            );
+        }
+        return Ok(());
+    }
+    let far = ref0 == LAST3_FRAME || ref0 == GOLDEN_FRAME;
+    enc.symbol(
+        usize::from(far),
+        &mut cdfs.comp_ref[single_ref_p3_ctx(a, a1, l, l1)][0],
+    );
+    if far {
+        enc.symbol(
+            usize::from(ref0 == GOLDEN_FRAME),
+            &mut cdfs.comp_ref[single_ref_p5_ctx(a, a1, l, l1)][2],
+        );
+    } else {
+        enc.symbol(
+            usize::from(ref0 == LAST2_FRAME),
+            &mut cdfs.comp_ref[single_ref_p4_ctx(a, a1, l, l1)][1],
+        );
+    }
+    let is_altref = ref1 == ALTREF_FRAME;
+    enc.symbol(
+        usize::from(is_altref),
+        &mut cdfs.comp_bwdref[single_ref_p2_ctx(a, a1, l, l1)][0],
+    );
+    if !is_altref {
+        enc.symbol(
+            usize::from(ref1 == ALTREF2_FRAME),
+            &mut cdfs.comp_bwdref[single_ref_p6_ctx(a, a1, l, l1)][1],
+        );
+    }
+    Ok(())
+}
+
+/// Per-mode and per-pair fire counts of [`write_compound_block`], for the
+/// gate's own census (gate-blind-to-feature): modes indexed by the spec's
+/// `INTER_COMPOUND_MODES`, pairs by `ref1` (`LAST`..`ALTREF`).
+static COMPOUND_MODE_HITS: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+static COMPOUND_PAIR_HITS: [std::sync::atomic::AtomicUsize; 7] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+
+/// Takes and clears the compound mode histogram.
+#[cfg(test)]
+pub(crate) fn take_compound_mode_hits() -> [usize; 8] {
+    std::array::from_fn(|i| COMPOUND_MODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Takes and clears the compound pair histogram, indexed by the SECOND
+/// reference (`LAST` = 0 .. `ALTREF` = 6).
+#[cfg(test)]
+pub(crate) fn take_compound_pair_hits() -> [usize; 7] {
+    std::array::from_fn(|i| COMPOUND_PAIR_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Writes one COMPOUND_REFERENCE block's whole mode chain -- the writer side
+/// of decode.rs' `read_compound_ref_frames` / `read_inter_compound_mode` /
+/// `assign_compound_mv` / `comp_group_idx` / `compound_idx` sequence, in that
+/// order. Returns the two motion vectors the decoder derives (what the MI
+/// grid must record) and whether the mode was a `NEW*` one.
+///
+/// Only the three modes [`InterMode::compound_index`] names are written, and
+/// only the `comp_group_idx == 0`, `compound_idx == 1` blend (spec
+/// `COMPOUND_AVERAGE`) -- masked compound and the distance-weighted blend are
+/// not searched.
+///
+/// # Errors
+/// As [`write_mv`], or a pair/mode this writer does not form.
+#[allow(clippy::too_many_arguments)]
+fn write_compound_block(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &Neighbours,
+    grid: &crate::mvstack::MiGrid,
+    (mi_row, mi_col): (usize, usize),
+    (bw4, bh4): (usize, usize),
+    (has_above, has_left): (bool, bool),
+    info: InterInfo,
+    (mi_cols, mi_rows): (usize, usize),
+) -> Result<((i32, i32), (i32, i32), bool)> {
+    let (Some(ref1), Some(mode)) = (info.ref1, info.mode.compound_index()) else {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a compound block needs a second reference and a compound mode",
+        ));
+    };
+    let above = has_above.then(|| neighbours.above_nbr(mi_col));
+    let left = has_left.then(|| neighbours.left_nbr(mi_row));
+    write_compound_ref_frames(
+        enc,
+        cdfs,
+        above,
+        left,
+        neighbours.above_ref[mi_col],
+        neighbours.left_ref[mi_row],
+        (info.ref_frame, ref1),
+    )?;
+    let stack = crate::mvstack::find_mv_stack_compound(
+        grid,
+        mi_row,
+        mi_col,
+        bw4,
+        bh4,
+        (info.ref_frame, ref1),
+        mi_cols,
+        mi_rows,
+        grid.sign_bias_table(),
+        &[(0, 0); 7],
+        None,
+    );
+    let ctx = crate::cdf::COMPOUND_MODE_CTX_MAP[stack.ref_mv_ctx >> 1][stack.new_mv_ctx.min(4)];
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
+        eprintln!(
+            "EC_WCOMP mi_row={mi_row} mi_col={mi_col} mode={mode} ref0={} ref1={ref1} ctx={ctx} new_mv_ctx={} ref_mv_ctx={} stack={}",
+            info.ref_frame, stack.new_mv_ctx, stack.ref_mv_ctx, stack.entries.len()
+        );
+    }
+    enc.symbol(mode, &mut cdfs.inter_compound_mode[ctx]);
+    // `assign_compound_mv`'s own DRL half: `NEW_NEWMV` walks from index 0,
+    // the two derived modes code no index at all.
+    let mvs = match info.mode {
+        InterMode::NearestNearestMv => stack.nearest_mv,
+        InterMode::GlobalGlobalMv => ((0, 0), (0, 0)),
+        _ => {
+            let idx = usize::from(info.ref_mv_idx);
+            let mut walk = 0usize;
+            while walk < 2 && stack.entries.len() > walk + 1 {
+                let advance = walk < idx;
+                enc.symbol(usize::from(advance), &mut cdfs.drl_mode[stack.drl_ctx[walk]]);
+                if !advance {
+                    break;
+                }
+                walk += 1;
+            }
+            let base = stack
+                .entries
+                .get(idx)
+                .map_or(stack.nearest_mv, |e| (e.mv0, e.mv1));
+            write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv, base.0)?;
+            write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv1, base.1)?;
+            (info.mv, info.mv1)
+        }
+    };
+    // spec 5.11.25's `comp_group_idx`/`compound_idx` are NOT coded: this
+    // crate's sequence header carries `enable_masked_compound = false` and
+    // `enable_jnt_comp = false` (encode.rs), and decode.rs reads neither
+    // symbol under those bits -- it infers `comp_group_idx = 0`,
+    // `compound_idx = 1` (the simple average), which is the only blend this
+    // writer forms anyway. A lane that turns either sequence bit on has to
+    // write the matching symbol here, at
+    // `get_comp_group_idx_context`/`get_comp_index_context`'s contexts (which
+    // is what `Neighbours::above_comp_group_idx`/`above_compound_idx` and the
+    // armed order hints below are already kept for).
+    let _ = ORDER_HINTS.with(std::cell::Cell::get);
+    COMPOUND_MODE_HITS[mode].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    COMPOUND_PAIR_HITS[(ref1.max(1) - 1) as usize % 7]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok((mvs.0, mvs.1, matches!(info.mode, InterMode::NewNewMv)))
+}
+
+/// Writer-side counterpart of decode.rs `read_comp_mode` (spec 5.11.25's
+/// `comp_mode`): on a `reference_select` frame every inter block whose size
+/// allows compound (`is_comp_ref_allowed`, always true here -- this writer's
+/// smallest leaf is 8x8) names SINGLE or COMPOUND, at
+/// `mvstack::reference_mode_ctx`'s own context off the same two neighbour
+/// bands decode.rs builds its `NeighbourRef` pair from.
+fn write_comp_mode(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    (has_above, has_left): (bool, bool),
+    compound: bool,
+) {
+    if !REFERENCE_SELECT.with(std::cell::Cell::get) {
+        return;
+    }
+    let above = has_above.then(|| neighbours.above_nbr(mi_c));
+    let left = has_left.then(|| neighbours.left_nbr(mi_r));
+    let ctx = crate::mvstack::reference_mode_ctx(above, left);
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
+        eprintln!(
+            "EC_WCM mi=({mi_r},{mi_c}) ctx={ctx} val={} a={:?} l={:?}",
+            usize::from(compound),
+            above.map(|n| (n.is_inter, n.ref0, n.ref1)),
+            left.map(|n| (n.is_inter, n.ref0, n.ref1))
+        );
+    }
+    enc.symbol(usize::from(compound), &mut cdfs.comp_mode[ctx]);
+}
+
 /// Clears the armed plan when the tile writer that consumed it returns.
 struct CdefIdxGuard;
 
@@ -312,6 +606,8 @@ impl Drop for CdefIdxGuard {
         CDEF_IDX.with(|c| *c.borrow_mut() = None);
         LR_PLAN.with(|c| *c.borrow_mut() = None);
         SIGN_BIAS.with(|c| c.set(crate::mvstack::NO_SIGN_BIAS));
+        REFERENCE_SELECT.with(|c| c.set(false));
+        ORDER_HINTS.with(|c| c.set((7, 0, [0; 7])));
     }
 }
 
@@ -822,6 +1118,29 @@ pub enum InterMode {
     /// `NEWMV`: codes `mv` as a residual against the stack entry
     /// [`InterInfo::ref_mv_idx`] names.
     NewMv,
+    /// `NEAREST_NEARESTMV`: both sides take the compound stack's own nearest
+    /// pair, no residual, no DRL.
+    NearestNearestMv,
+    /// `GLOBAL_GLOBALMV`: both sides take the identity global model's zero
+    /// vector.
+    GlobalGlobalMv,
+    /// `NEW_NEWMV`: both sides code a residual against the compound stack
+    /// entry [`InterInfo::ref_mv_idx`] names.
+    NewNewMv,
+}
+
+impl InterMode {
+    /// The spec's `INTER_COMPOUND_MODES` index (libaom `enums.h` order,
+    /// `NEAREST_NEARESTMV = 0`..`NEW_NEWMV = 7`) for a compound mode, `None`
+    /// for a single-reference one.
+    fn compound_index(self) -> Option<usize> {
+        match self {
+            InterMode::NearestNearestMv => Some(0),
+            InterMode::GlobalGlobalMv => Some(6),
+            InterMode::NewNewMv => Some(7),
+            _ => None,
+        }
+    }
 }
 
 /// An inter-coded block's mode and motion vector, `mv` in the spec's 1/8-pel
@@ -842,6 +1161,13 @@ pub struct InterInfo {
     /// `NEARMV` takes outright. Ignored by the two modes that code no DRL
     /// index (`NEARESTMV`, `GLOBALMV`).
     pub ref_mv_idx: u8,
+    /// The block's second reference (spec `RefFrames[1]`), `None` for a
+    /// single-reference block. `Some` only on a `reference_select` frame, and
+    /// only beside one of [`InterMode`]'s compound modes.
+    pub ref1: Option<i8>,
+    /// The motion vector into `ref1`, for the compound modes that code one
+    /// (`NEW_NEWMV`); the other two derive both sides.
+    pub mv1: (i32, i32),
 }
 
 impl From<Vec<Coeff>> for BlockCoeffs {
@@ -1021,6 +1347,23 @@ struct Neighbours {
     above_ref: Vec<i8>,
     /// The same, down the left edge.
     left_ref: Vec<i8>,
+    /// Each neighbour's SECOND reference, `None` for a single-reference or
+    /// intra one -- decode.rs `Neighbours::above_ref1`, read by every compound
+    /// context function (`reference_mode_ctx`, `comp_reference_type_ctx`, the
+    /// `comp_ref`/`comp_bwdref` votes).
+    above_ref1: Vec<Option<i8>>,
+    /// The same, down the left edge.
+    left_ref1: Vec<Option<i8>>,
+    /// What decode.rs `Neighbours::above_comp_group_idx` holds: a compound
+    /// neighbour's own `comp_group_idx`, or libaom's single-reference special
+    /// case (`3` for an ALTREF block, `0` otherwise).
+    above_comp_group_idx: Vec<u8>,
+    /// The same, down the left edge.
+    left_comp_group_idx: Vec<u8>,
+    /// The same for `compound_idx` (`1` for a single-ref ALTREF block).
+    above_compound_idx: Vec<u8>,
+    /// The same, down the left edge.
+    left_compound_idx: Vec<u8>,
     /// The frame's true (unpadded) width and height, in 4x4 mode-info units,
     /// which is what clamps [`Self::above`]/[`Self::left`] at the edge (spec
     /// `av1_set_entropy_contexts`): a block whose row or column run spills
@@ -1068,6 +1411,12 @@ impl Neighbours {
             left_inter: vec![false; rows * (SUB / MI)],
             above_ref: vec![-1; cols * (SUB / MI)],
             left_ref: vec![-1; rows * (SUB / MI)],
+            above_ref1: vec![None; cols * (SUB / MI)],
+            left_ref1: vec![None; rows * (SUB / MI)],
+            above_comp_group_idx: vec![0; cols * (SUB / MI)],
+            left_comp_group_idx: vec![0; rows * (SUB / MI)],
+            above_compound_idx: vec![0; cols * (SUB / MI)],
+            left_compound_idx: vec![0; rows * (SUB / MI)],
             above_tx: vec![0; cols * (SUB / MI)],
             left_tx: vec![0; rows * (SUB / MI)],
             above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
@@ -1103,6 +1452,9 @@ impl Neighbours {
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
         self.left_ref.iter_mut().for_each(|r| *r = -1);
+        self.left_ref1.iter_mut().for_each(|r| *r = None);
+        self.left_comp_group_idx.iter_mut().for_each(|r| *r = 0);
+        self.left_compound_idx.iter_mut().for_each(|r| *r = 0);
         self.left_tx.iter_mut().for_each(|t| *t = 0);
         self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
     }
@@ -1307,6 +1659,29 @@ impl Neighbours {
         self.record_inter_mi((r * (SUB / MI), c * (SUB / MI)), side, skip, is_inter, ref_frame);
     }
 
+    /// [`Self::record_inter_mi`]'s compound half (decode.rs
+    /// `Neighbours::record_compound_ctx_rect_mi`): overwrites the ALTREF
+    /// single-reference default with a real compound block's own second
+    /// reference and `comp_group_idx`/`compound_idx` bits, called right after
+    /// it for every compound-coded block.
+    fn record_compound_mi(
+        &mut self,
+        (mi_r, mi_c): (usize, usize),
+        side: usize,
+        ref1: i8,
+        comp_group_idx: u8,
+        compound_idx: u8,
+    ) {
+        for cell in 0..side / MI {
+            self.above_ref1[mi_c + cell] = Some(ref1);
+            self.left_ref1[mi_r + cell] = Some(ref1);
+            self.above_comp_group_idx[mi_c + cell] = comp_group_idx;
+            self.left_comp_group_idx[mi_r + cell] = comp_group_idx;
+            self.above_compound_idx[mi_c + cell] = compound_idx;
+            self.left_compound_idx[mi_r + cell] = compound_idx;
+        }
+    }
+
     /// [`Self::record_inter`] taking the block's position directly in 4x4
     /// mode-info units, for a block finer than one [`SUB`] slot.
     fn record_inter_mi(&mut self, (mi_r, mi_c): (usize, usize), side: usize, skip: bool, is_inter: bool, ref_frame: i8) {
@@ -1317,6 +1692,45 @@ impl Neighbours {
             self.left_inter[mi_r + cell] = is_inter;
             self.above_ref[mi_c + cell] = ref_frame;
             self.left_ref[mi_r + cell] = ref_frame;
+            // decode.rs `record_inter`'s single-reference default: no second
+            // reference, and libaom's ALTREF special case in the two compound
+            // context bands. `record_compound_mi` overwrites both for a real
+            // compound block.
+            let altref = is_inter && ref_frame == crate::mvstack::ALTREF_FRAME;
+            self.above_ref1[mi_c + cell] = None;
+            self.left_ref1[mi_r + cell] = None;
+            self.above_comp_group_idx[mi_c + cell] = if altref { 3 } else { 0 };
+            self.left_comp_group_idx[mi_r + cell] = if altref { 3 } else { 0 };
+            self.above_compound_idx[mi_c + cell] = u8::from(altref);
+            self.left_compound_idx[mi_r + cell] = u8::from(altref);
+        }
+    }
+
+    /// The above neighbour as decode.rs' own `NeighbourRef`, for every
+    /// compound context function (`reference_mode_ctx`,
+    /// `comp_reference_type_ctx`, the `comp_ref`/`comp_bwdref` votes).
+    fn above_nbr(&self, mi_c: usize) -> crate::mvstack::NeighbourRef {
+        let is_inter = self.above_inter[mi_c];
+        let ref0 = if is_inter { self.above_ref[mi_c] } else { 0 };
+        let ref1 = self.above_ref1[mi_c];
+        crate::mvstack::NeighbourRef {
+            is_inter,
+            ref0,
+            ref1,
+            uni: ref1.is_some_and(|r1| is_uni_comp_ref(ref0, r1)),
+        }
+    }
+
+    /// [`Self::above_nbr`], down the left edge.
+    fn left_nbr(&self, mi_r: usize) -> crate::mvstack::NeighbourRef {
+        let is_inter = self.left_inter[mi_r];
+        let ref0 = if is_inter { self.left_ref[mi_r] } else { 0 };
+        let ref1 = self.left_ref1[mi_r];
+        crate::mvstack::NeighbourRef {
+            is_inter,
+            ref0,
+            ref1,
+            uni: ref1.is_some_and(|r1| is_uni_comp_ref(ref0, r1)),
         }
     }
 
@@ -3119,7 +3533,9 @@ fn write_single_ref(
     cdfs: &mut Cdfs,
     ref_frame: i8,
     above_ref: i8,
+    above_ref1: Option<i8>,
     left_ref: i8,
+    left_ref1: Option<i8>,
 ) {
     REF_HITS[(ref_frame.max(1) - 1) as usize % 7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     use crate::mvstack::{
@@ -3129,21 +3545,26 @@ fn write_single_ref(
     };
     let above = (above_ref > 0).then_some(above_ref);
     let left = (left_ref > 0).then_some(left_ref);
+    // libaom `av1_collect_neighbors_ref_counts` counts BOTH of a compound
+    // neighbour's references (decode.rs `read_single_ref`'s own
+    // `above_ref1`/`left_ref1`): dropping the second one reads a different
+    // context row for every block sitting under a compound neighbour, and so
+    // decodes a different reference NAME.
     let backward = ref_frame >= BWDREF_FRAME;
     enc.symbol(
         usize::from(backward),
-        &mut cdfs.single_ref[single_ref_p1_ctx(above, None, left, None)][0],
+        &mut cdfs.single_ref[single_ref_p1_ctx(above, above_ref1, left, left_ref1)][0],
     );
     if backward {
         let is_altref = ref_frame == ALTREF_FRAME;
         enc.symbol(
             usize::from(is_altref),
-            &mut cdfs.single_ref[single_ref_p2_ctx(above, None, left, None)][1],
+            &mut cdfs.single_ref[single_ref_p2_ctx(above, above_ref1, left, left_ref1)][1],
         );
         if !is_altref {
             enc.symbol(
                 usize::from(ref_frame == ALTREF2_FRAME),
-                &mut cdfs.single_ref[single_ref_p6_ctx(above, None, left, None)][5],
+                &mut cdfs.single_ref[single_ref_p6_ctx(above, above_ref1, left, left_ref1)][5],
             );
         }
         return;
@@ -3151,17 +3572,17 @@ fn write_single_ref(
     let far = ref_frame == LAST3_FRAME || ref_frame == GOLDEN_FRAME;
     enc.symbol(
         usize::from(far),
-        &mut cdfs.single_ref[single_ref_p3_ctx(above, None, left, None)][2],
+        &mut cdfs.single_ref[single_ref_p3_ctx(above, above_ref1, left, left_ref1)][2],
     );
     if far {
         enc.symbol(
             usize::from(ref_frame == GOLDEN_FRAME),
-            &mut cdfs.single_ref[single_ref_p5_ctx(above, None, left, None)][4],
+            &mut cdfs.single_ref[single_ref_p5_ctx(above, above_ref1, left, left_ref1)][4],
         );
     } else {
         enc.symbol(
             usize::from(ref_frame == LAST2_FRAME),
-            &mut cdfs.single_ref[single_ref_p4_ctx(above, None, left, None)][3],
+            &mut cdfs.single_ref[single_ref_p4_ctx(above, above_ref1, left, left_ref1)][3],
         );
     }
 }
@@ -3265,6 +3686,12 @@ fn write_inter_mode(
     stack: &crate::mvstack::MvStack,
 ) -> Result<((i32, i32), bool)> {
     let idx = usize::from(info.ref_mv_idx);
+    if info.mode.compound_index().is_some() {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a compound mode is written by `write_compound_block`, not here",
+        ));
+    }
     match info.mode {
         InterMode::NewMv => {
             enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]);
@@ -3298,6 +3725,7 @@ fn write_inter_mode(
             note_inter_mode(1, idx);
             Ok((mv, false))
         }
+        _ => unreachable!("compound modes are refused above"),
     }
 }
 
@@ -3727,9 +4155,33 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
 
                 let mode_for_tx;
                 if let Some(info) = block.inter {
-                    write_single_ref(&mut enc, &mut cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
-
+                    write_comp_mode(&mut enc, &mut cdfs, &neighbours, (mi_r, mi_c), (has_above, has_left), info.ref1.is_some());
                     let (mi_row, mi_col) = (r32 as usize * 8, c32 as usize * 8);
+                    if info.ref1.is_some() {
+                        let (mv, mv1, is_new_mv) = write_compound_block(
+                            &mut enc, &mut cdfs, &neighbours, &grid, (mi_row, mi_col), (8, 8),
+                            (has_above, has_left), info, (mi_cols as usize, mi_rows as usize),
+                        )?;
+                        for dr in 0..8 {
+                            for dc in 0..8 {
+                                grid.set(mi_row + dr, mi_col + dc, MiInfo {
+                                    is_inter: true,
+                                    ref_frame: info.ref_frame,
+                                    ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                                    mv1: mv16(mv1),
+                                    mv: mv16(mv),
+                                    is_new_mv,
+                                    size: 8,
+                                    size_h: 8,
+                                    is_global_mv0: false,
+                                    is_global_mv1: false,
+                                });
+                            }
+                        }
+                        mode_for_tx = 0;
+                    } else {
+                    write_single_ref(&mut enc, &mut cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.above_ref1[mi_c], neighbours.left_ref[mi_r], neighbours.left_ref1[mi_r]);
+
                     let stack = find_mv_stack(
                         &grid,
                         mi_row,
@@ -3782,6 +4234,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         }
                     }
                     mode_for_tx = 0;
+                    }
                 } else {
                     let mode = usize::from(block.mode);
                     enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_32]);
@@ -3874,6 +4327,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     neighbours.record_planes(at, BLOCK, mode_for_tx, &grids, !split);
                 }
                 neighbours.record_inter(at, BLOCK, block.skip, is_inter, block_ref(block));
+                record_block_compound(&mut neighbours, (mi_r, mi_c), BLOCK, block);
             }
         }
     }
@@ -3932,9 +4386,34 @@ fn write_inter_frame_leaf(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
-        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
-
+        write_comp_mode(enc, cdfs, neighbours, (mi_r, mi_c), (has_above, has_left), info.ref1.is_some());
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+        if info.ref1.is_some() {
+            let n = SUB_MI as usize;
+            let (mv, mv1, is_new_mv) = write_compound_block(
+                enc, cdfs, neighbours, grid, (mi_row, mi_col), (n, n),
+                (has_above, has_left), info, (mi_cols as usize, mi_rows as usize),
+            )?;
+            for dr in 0..n {
+                for dc in 0..n {
+                    grid.set(mi_row + dr, mi_col + dc, MiInfo {
+                        is_inter: true,
+                        ref_frame: info.ref_frame,
+                        ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                        mv1: mv16(mv1),
+                        mv: mv16(mv),
+                        is_new_mv,
+                        size: n as u8,
+                        size_h: n as u8,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
+                    });
+                }
+            }
+            mode_for_tx = 0;
+        } else {
+        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.above_ref1[mi_c], neighbours.left_ref[mi_r], neighbours.left_ref1[mi_r]);
+
         let stack = find_mv_stack(
             grid,
             mi_row,
@@ -3968,6 +4447,7 @@ fn write_inter_frame_leaf(
             }
         }
         mode_for_tx = 0;
+        }
     } else {
         let mode = usize::from(block.mode);
         enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_16]);
@@ -4056,6 +4536,7 @@ fn write_inter_frame_leaf(
         neighbours.record_planes(at, SUB, mode_for_tx, &grids, !split);
     }
     neighbours.record_inter(at, SUB, block.skip, is_inter, block_ref(block));
+    record_block_compound(neighbours, (mi_r, mi_c), SUB, block);
     Ok(())
 }
 
@@ -4125,9 +4606,33 @@ fn write_inter_frame_leaf8(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
-        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[leaf_mi.1], neighbours.left_ref[leaf_mi.0]);
-
+        write_comp_mode(enc, cdfs, neighbours, leaf_mi, (has_above, has_left), info.ref1.is_some());
         let (mi_row, mi_col) = leaf_mi;
+        if info.ref1.is_some() {
+            let (mv, mv1, is_new_mv) = write_compound_block(
+                enc, cdfs, neighbours, grid, (mi_row, mi_col), (2, 2),
+                (has_above, has_left), info, (mi_cols as usize, mi_rows as usize),
+            )?;
+            for dr in 0..2 {
+                for dc in 0..2 {
+                    grid.set(mi_row + dr, mi_col + dc, MiInfo {
+                        is_inter: true,
+                        ref_frame: info.ref_frame,
+                        ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                        mv1: mv16(mv1),
+                        mv: mv16(mv),
+                        is_new_mv,
+                        size: 2,
+                        size_h: 2,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
+                    });
+                }
+            }
+            mode_for_tx = 0;
+        } else {
+        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[leaf_mi.1], neighbours.above_ref1[leaf_mi.1], neighbours.left_ref[leaf_mi.0], neighbours.left_ref1[leaf_mi.0]);
+
         let stack = find_mv_stack(
             grid,
             mi_row,
@@ -4161,6 +4666,7 @@ fn write_inter_frame_leaf8(
             }
         }
         mode_for_tx = 0;
+        }
     } else {
         let mode = usize::from(block.mode);
         enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_8]);
@@ -4226,6 +4732,7 @@ fn write_inter_frame_leaf8(
         ];
         neighbours.record_mi(leaf_mi, 8, &zero_grids);
         neighbours.record_inter_mi(leaf_mi, 8, block.skip, block.inter.is_some(), block_ref(block));
+        record_block_compound(neighbours, leaf_mi, 8, block);
     } else {
         let grids = [
             level_grid(&block.luma, TX8)?,
@@ -4249,6 +4756,7 @@ fn write_inter_frame_leaf8(
         );
         neighbours.record_mi_planes(leaf_mi, 8, &grids, !split);
         neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter, block_ref(block));
+        record_block_compound(neighbours, leaf_mi, 8, block);
     }
     Ok((block.skip, is_inter))
 }
@@ -6530,6 +7038,8 @@ mod tests {
     fn an_all_skip_inter_superblock_is_small_and_reads_back() {
         let block = BlockCoeffs {
             inter: Some(InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
@@ -6573,6 +7083,8 @@ mod tests {
     fn a_newmv_block_reads_back_the_exact_symbol_sequence_it_was_written_with() {
         let nearest = BlockCoeffs {
             inter: Some(InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
@@ -6583,6 +7095,8 @@ mod tests {
         };
         let newmv = BlockCoeffs {
             inter: Some(InterInfo {
+                ref1: None,
+                mv1: (0, 0),
                 ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NewMv,
                 mv: (0, 2),
