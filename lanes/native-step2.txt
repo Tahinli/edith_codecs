@@ -1,0 +1,29 @@
+Running as unit: run-p2119666-i90086399.scope; invocation ID: a6b318e6b4a34fb080d078ad882b03d7
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1txdepth/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+film 1080p: pricer armings default=14 real=167
+film 1080p: motion_mode 32x32 SIMPLE=28499 OBMC=0 WARP=303 | 16x16 SIMPLE=4084 OBMC=0 WARP=318 | 8x8 SIMPLE=15557 OBMC=0 WARP=1936 (0.0% OBMC / 5.0% WARP of 50697 eligible)
+film 1080p: inter var-tx depths of 7112 blocks -- leaf single 0=2898 1=745 (20.5% split) | leaf compound 0=2186 1=1283 (37.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.82 dB/247279 B, 47.66 dB/370822 B, 51.05 dB/490858 B, 53.78 dB/613266 B | +16.0% | -1.1% | 39.0s:6.7s:16.8s |
+film 2160p: pricer armings default=15 real=154
+film 2160p: motion_mode 32x32 SIMPLE=15534 OBMC=0 WARP=4 | 16x16 SIMPLE=328 OBMC=0 WARP=16 | 8x8 SIMPLE=4547 OBMC=0 WARP=652 (0.0% OBMC / 3.2% WARP of 21081 eligible)
+film 2160p: inter var-tx depths of 6367 blocks -- leaf single 0=382 1=110 (22.4% split) | leaf compound 0=5221 1=654 (11.1% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.46 dB/303386 B, 47.71 dB/457686 B, 51.38 dB/585816 B, 54.26 dB/704290 B | +46.6% | +18.8% | 35.2s:5.6s:16.0s |
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=159 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=77534 OBMC=0 WARP=1894 | 16x16 SIMPLE=3725 OBMC=0 WARP=412 | 8x8 SIMPLE=463 OBMC=0 WARP=447 (0.0% OBMC / 3.3% WARP of 84475 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 13394 blocks -- leaf single 0=4044 1=2401 (37.3% split) | leaf compound 0=4663 1=2286 (32.9% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6803 chroma 644; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.81 dB/41648 B, 48.13 dB/54166 B, 50.67 dB/70905 B, 52.98 dB/93026 B | +51.4% | -14.4% | 28.3s:8.3s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 573 filtered out; finished in 175.09s
+
