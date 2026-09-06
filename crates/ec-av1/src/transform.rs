@@ -1540,8 +1540,18 @@ fn fft(a: &mut [Complex]) {
     }
     let mut len = 2;
     while len <= n {
-        let ang = -2.0 * std::f64::consts::PI / len as f64;
-        let wlen = (ang.cos(), ang.sin());
+        // lane-av1speed: the stage twiddle depends on `len` alone, so the
+        // eight values this loop can ever ask for are computed once instead
+        // of two libm `sincos` calls per stage per call (`__sincos_fma` was
+        // 9% of the encoder's profile). Same values, so the recurrence below
+        // -- and every coefficient it produces -- is bit-identical.
+        static WLEN: std::sync::OnceLock<[(f64, f64); 7]> = std::sync::OnceLock::new();
+        let wlen = WLEN.get_or_init(|| {
+            std::array::from_fn(|i| {
+                let ang = -2.0 * std::f64::consts::PI / (2u32 << i) as f64;
+                (ang.cos(), ang.sin())
+            })
+        })[len.trailing_zeros() as usize - 1];
         let mut i = 0;
         while i < n {
             let mut w = (1.0, 0.0);

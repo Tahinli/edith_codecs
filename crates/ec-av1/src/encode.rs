@@ -158,6 +158,30 @@ fn split_inter_blocks() -> bool {
     }
 }
 
+/// libaom's `partition_search_breakout` shape: how many non-zero luma
+/// coefficients per 256 luma samples a block may code and still be judged
+/// well enough predicted that the split below it is not worth trying. `0`
+/// disables the breakout (only the existing all-skip prune applies), which
+/// is the default until the sweep below justifies otherwise.
+///
+/// Swept on the BD gate (`EC_AV1_SPLIT_BREAKOUT`, test builds only), which
+/// is where this lane's wall would have gone: 1 cuts the three clips'
+/// encode wall 6.3/6.0/6.2 s -> 3.6/3.2/4.4 s but costs +18.4/+24.0/+7.9
+/// BD-rate points against libaom; 2 costs +23.4/+29.4/+18.8 and 4 costs
+/// +31.7/+40.6/+27.8, for barely more speed. The split trial is where this
+/// encoder's inter quality lives, so `0` ships and the knob stays for a
+/// future explicit speed preset.
+const SPLIT_BREAKOUT_COEFFS: usize = 0;
+
+/// [`SPLIT_BREAKOUT_COEFFS`], swept by `EC_AV1_SPLIT_BREAKOUT` in a test
+/// build.
+fn split_breakout_coeffs() -> usize {
+    match std::env::var("EC_AV1_SPLIT_BREAKOUT").ok() {
+        Some(v) if cfg!(test) => v.parse().unwrap_or(SPLIT_BREAKOUT_COEFFS),
+        _ => SPLIT_BREAKOUT_COEFFS,
+    }
+}
+
 /// How often each partition decision was taken since the last
 /// [`take_partition_hits`], so a gate can report how often a new partition
 /// fires rather than assume it does (gate-blind-to-feature). Index 0 is an
@@ -1624,8 +1648,19 @@ impl Reach {
 /// What one symbol costs against a CDF, in bits.
 pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
     let low = if symbol == 0 { 0 } else { cdf[symbol - 1] };
-    let probability = f64::from(cdf[symbol] - low) / 32768.0;
-    -probability.log2()
+    let width = cdf[symbol] - low;
+    // lane-av1speed: a CDF interval is a 15-bit width, so there are only
+    // 32769 prices a symbol can carry; the `log2` behind each is computed
+    // once instead of per call (libm's `__log2_fma` was 5% of the encoder's
+    // profile -- this function is called for every symbol of every candidate
+    // the RD search prices). Each entry is exactly the expression this used
+    // to evaluate, so every price is bit-identical.
+    static PRICES: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    PRICES.get_or_init(|| {
+        (0..=32768u32)
+            .map(|w| -(f64::from(w) / 32768.0).log2())
+            .collect()
+    })[usize::from(width)]
 }
 
 /// What the tile writer spends to say a block is coded in each of the thirteen
@@ -1801,7 +1836,6 @@ fn code_square_inter(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    ref_y8: &[u8],
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), side, search, mode_bits, fctx);
@@ -1933,7 +1967,7 @@ fn code_square_inter(
     if leaf_new_mv() {
         let source_block = luma.source_block(x, y, side);
         let found = motion::search(
-            ref_y8,
+            ref_luma.0,
             ref_luma.1,
             ref_luma.2,
             ref_luma.3,
@@ -1947,18 +1981,28 @@ fn code_square_inter(
         );
         let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
         if let Some(mv_bits) = mv_residual_bits(new_mv, stack.pred_mv) {
-            let luma_new = mc_trial(
-                luma, x, y, side, new_mv, true, ref_luma.0, ref_luma.1, ref_luma.2, ref_luma.3,
-                false, search.base_q_idx, search.deadzone, luma_set, fctx,
-            );
-            let u_new = mc_trial(
-                &chroma[0], x / 2, y / 2, side / 2, new_mv, false, ref_u.0, ref_u.1, ref_u.2,
-                ref_u.3, false, search.base_q_idx, search.deadzone, chroma_set, fctx,
-            );
-            let v_new = mc_trial(
-                &chroma[1], x / 2, y / 2, side / 2, new_mv, false, ref_v.0, ref_v.1, ref_v.2,
-                ref_v.3, false, search.base_q_idx, search.deadzone, chroma_set, fctx,
-            );
+            // Same reuse as `search_inter_block`: a NEWMV equal to the
+            // stack's NEARESTMV is the same three trials, already run above.
+            let (luma_new, u_new, v_new) = if new_mv == mv {
+                (luma_trial.clone(), u.clone(), v.clone())
+            } else {
+                (
+                    mc_trial(
+                        luma, x, y, side, new_mv, true, ref_luma.0, ref_luma.1, ref_luma.2,
+                        ref_luma.3, false, search.base_q_idx, search.deadzone, luma_set, fctx,
+                    ),
+                    mc_trial(
+                        &chroma[0], x / 2, y / 2, side / 2, new_mv, false, ref_u.0, ref_u.1,
+                        ref_u.2, ref_u.3, false, search.base_q_idx, search.deadzone, chroma_set,
+                        fctx,
+                    ),
+                    mc_trial(
+                        &chroma[1], x / 2, y / 2, side / 2, new_mv, false, ref_v.0, ref_v.1,
+                        ref_v.2, ref_v.3, false, search.base_q_idx, search.deadzone, chroma_set,
+                        fctx,
+                    ),
+                )
+            };
             let skip_new = luma_new.levels.iter().all(|&l| l == 0)
                 && u_new.levels.iter().all(|&l| l == 0)
                 && v_new.levels.iter().all(|&l| l == 0);
@@ -2859,7 +2903,12 @@ fn mc_trial(
     // lane-hbd r4: `reference` (a DPB `Picture`'s plane) is `u16` now that
     // `Picture` is widened; `prediction`/the encoder stay `u8` (encoder is
     // 8-bit only this round, see `intra_predict_u8`'s doc comment).
-    let mut prediction16 = vec![0u16; side * side];
+    // lane-av1speed: both buffers are per-candidate scratch on the hottest
+    // path in the encoder, so they live on the stack -- `side` is at most
+    // `BLOCK` (32) for luma and half that for chroma. Two heap allocations
+    // per motion-compensated trial otherwise.
+    let mut prediction16 = [0u16; BLOCK * BLOCK];
+    let prediction16 = &mut prediction16[..side * side];
     mc::predict(
         reference,
         stride,
@@ -2869,10 +2918,14 @@ fn mc_trial(
         y_q4,
         side,
         side,
-        &mut prediction16, fctx,
+        prediction16, fctx,
     );
-    let prediction: Vec<u8> = prediction16.iter().map(|&v| v as u8).collect();
-    plane.code_from_prediction(x, y, side, &prediction, skip, base_q_idx, deadzone, set)
+    let mut prediction = [0u8; BLOCK * BLOCK];
+    let prediction = &mut prediction[..side * side];
+    for (dst, &src) in prediction.iter_mut().zip(prediction16.iter()) {
+        *dst = src as u8;
+    }
+    plane.code_from_prediction(x, y, side, prediction, skip, base_q_idx, deadzone, set)
 }
 
 /// Codes one 32x32 block of an inter frame as whichever costs least of: each
@@ -2901,7 +2954,6 @@ fn search_inter_block(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    ref_y8: &[u8],
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
@@ -3057,6 +3109,14 @@ fn search_inter_block(
     // The NEARESTMV candidate: `skip` is decided below from whether its
     // trial actually found a nonzero level, once its residual is priced
     // against the same CDFs the tile writer codes it with.
+    //
+    // lane-av1speed: its three trials are kept (rather than moved straight
+    // into the candidate) so that a NEWMV landing on the very same vector --
+    // common on static content, where the stack's nearest vector is also
+    // what the search finds -- reuses them instead of running the same
+    // motion compensation, transform, quantize and reconstruct again. The
+    // reused trials are the same values, so the choice is bit-identical.
+    let nearest_trials;
     {
         let mv = stack.nearest_mv;
         let luma_trial = mc_trial(
@@ -3123,6 +3183,7 @@ fn search_inter_block(
                     } else {
                         luma_trial.bits + u.bits + v.bits
                     });
+        nearest_trials = (luma_trial.clone(), u.clone(), v.clone());
         consider(Candidate {
             cost,
             luma: luma_trial,
@@ -3141,7 +3202,7 @@ fn search_inter_block(
     #[cfg(test)]
     let t = std::time::Instant::now();
     let found = motion::search(
-        ref_y8,
+        ref_luma.0,
         ref_luma.1,
         ref_luma.2,
         ref_luma.3,
@@ -3157,54 +3218,60 @@ fn search_inter_block(
     stage_add(0, t.elapsed());
     let mv = round_to_valid_mv(found.mv, stack.pred_mv);
     if let Some(mv_bits) = mv_residual_bits(mv, stack.pred_mv) {
-        let luma_trial = mc_trial(
-            luma,
-            x,
-            y,
-            BLOCK,
-            mv,
-            true,
-            ref_luma.0,
-            ref_luma.1,
-            ref_luma.2,
-            ref_luma.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            TxbSet::Luma32Inter, fctx,
-        );
-        let u = mc_trial(
-            &chroma[0],
-            x / 2,
-            y / 2,
-            BLOCK / 2,
-            mv,
-            false,
-            ref_u.0,
-            ref_u.1,
-            ref_u.2,
-            ref_u.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            chroma_set, fctx,
-        );
-        let v = mc_trial(
-            &chroma[1],
-            x / 2,
-            y / 2,
-            BLOCK / 2,
-            mv,
-            false,
-            ref_v.0,
-            ref_v.1,
-            ref_v.2,
-            ref_v.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            chroma_set, fctx,
-        );
+        let (luma_trial, u, v) = if mv == stack.nearest_mv {
+            nearest_trials
+        } else {
+            (
+                mc_trial(
+                    luma,
+                    x,
+                    y,
+                    BLOCK,
+                    mv,
+                    true,
+                    ref_luma.0,
+                    ref_luma.1,
+                    ref_luma.2,
+                    ref_luma.3,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    TxbSet::Luma32Inter, fctx,
+                ),
+                mc_trial(
+                    &chroma[0],
+                    x / 2,
+                    y / 2,
+                    BLOCK / 2,
+                    mv,
+                    false,
+                    ref_u.0,
+                    ref_u.1,
+                    ref_u.2,
+                    ref_u.3,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    chroma_set, fctx,
+                ),
+                mc_trial(
+                    &chroma[1],
+                    x / 2,
+                    y / 2,
+                    BLOCK / 2,
+                    mv,
+                    false,
+                    ref_v.0,
+                    ref_v.1,
+                    ref_v.2,
+                    ref_v.3,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    chroma_set, fctx,
+                ),
+            )
+        };
         let drl_bits = if stack.entries.len() > 1 {
             symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[0]], 0)
         } else {
@@ -3360,7 +3427,6 @@ pub(crate) fn encode_inter_frame(
     // integer-`u8`-scale), so the DPB reference plane is narrowed for it --
     // once per frame (lane-av1rd2), not once per block, which is a whole
     // plane's map per 32x32 block and now per leaf too.
-    let ref_y8: Vec<u8> = reference.y.iter().map(|&v| v as u8).collect();
     let mut grid = MiGrid::new(mi_cols, mi_rows);
     let mut blocks = vec![Quadrant::Whole(BlockCoeffs::default()); cols * rows];
 
@@ -3407,7 +3473,6 @@ pub(crate) fn encode_inter_frame(
                         &search,
                         &mode_bits_table,
                         reference,
-                        &ref_y8,
                         &stack, fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
@@ -3439,7 +3504,13 @@ pub(crate) fn encode_inter_frame(
                             header.mi_rows,
                         )
                     });
-                    let split = (!block.skip && leaves_legal && split_inter_blocks())
+                    // The breakout above: a 32x32 block that codes almost
+                    // nothing is not offered the split at all.
+                    let breakout = split_breakout_coeffs();
+                    let split = (!block.skip
+                        && (breakout == 0 || block.luma.len() > 4 * breakout)
+                        && leaves_legal
+                        && split_inter_blocks())
                         .then(|| {
                             restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
                             let mut cost = search.lambda * partition_bits(BLOCK, true);
@@ -3459,8 +3530,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                    &ref_y8,
-                                    &stack, fctx,
+                                                &stack, fctx,
                                 );
                                 let leaf_cost = leaf_cost
                                     + search.lambda * partition_bits(SUB, false);
@@ -3471,7 +3541,9 @@ pub(crate) fn encode_inter_frame(
                                 // the writer codes as a real PARTITION_SPLIT
                                 // at BLOCK_16X16 (lane-av1rd2). Same
                                 // skipped-block prune as the level above.
-                                let eight = (!leaf.skip && split_inter_8())
+                                let eight = (!leaf.skip
+                                    && (breakout == 0 || leaf.luma.len() > breakout)
+                                    && split_inter_8())
                                     .then(|| {
                                         restore(
                                             &mut luma, &mut chroma, (lx, ly), SUB, &leaf_base,
@@ -3494,8 +3566,7 @@ pub(crate) fn encode_inter_frame(
                                                 &search,
                                                 &mode_bits_table,
                                                 reference,
-                                                &ref_y8,
-                                                &stack8, fctx,
+                                                                        &stack8, fctx,
                                             );
                                             cost8 += cost;
                                             record_mi(&mut grid, mr, mc, 2, leaf8.inter);
@@ -3596,8 +3667,7 @@ pub(crate) fn encode_inter_frame(
                                 &search,
                                 &mode_bits_table,
                                 reference,
-                                &ref_y8,
-                                &stack, fctx,
+                                        &stack, fctx,
                             );
                             for dr in 0..4 {
                                 for dc in 0..4 {
@@ -3657,8 +3727,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                    &ref_y8,
-                                    &stack, fctx,
+                                                &stack, fctx,
                                 );
                                 for dr in 0..2 {
                                     for dc in 0..2 {
