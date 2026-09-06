@@ -1717,6 +1717,9 @@ fn write_luma_tus(
     grid: &[i32],
     mode: usize,
     scans: &[Vec<u16>; 4],
+    // lane-av1tx2 r2: an INTER block's split units read the inter coefficient
+    // tables, not the intra ones (`TxbSet::Luma*Inter`).
+    inter: bool,
 ) -> Result<()> {
     if tx < side && side > 32 {
         // A 64x64 block's own levels reach the writer as the 32x32 corner a
@@ -1729,11 +1732,15 @@ fn write_luma_tus(
     }
     let coeff_side = tx.min(32);
     let n = side / tx;
-    let set = match tx {
-        32 => TxbSet::Luma32,
-        16 => TxbSet::Luma16,
-        8 => TxbSet::Luma8,
-        4 => TxbSet::Luma4,
+    let set = match (tx, inter) {
+        (32, false) => TxbSet::Luma32,
+        (16, false) => TxbSet::Luma16,
+        (8, false) => TxbSet::Luma8,
+        (4, false) => TxbSet::Luma4,
+        (32, true) => TxbSet::Luma32Inter,
+        (16, true) => TxbSet::Luma16Inter,
+        (8, true) => TxbSet::Luma8Inter,
+        (4, true) => TxbSet::Luma4Inter,
         _ => TxbSet::Luma64,
     };
     let scan = match coeff_side {
@@ -1819,7 +1826,7 @@ fn write_luma_select(
         }
     }
     let tx = max_tx >> depth;
-    write_luma_tus(enc, cdfs, neighbours, at_mi, side, tx, grid, mode, scans)?;
+    write_luma_tus(enc, cdfs, neighbours, at_mi, side, tx, grid, mode, scans, false)?;
     neighbours.record_tx(at_mi, side, tx);
     Ok(tx)
 }
@@ -1860,11 +1867,42 @@ fn write_tx_syntax_inter(
                 max_tx,
                 max_tx,
             );
-            enc.symbol(0, &mut cdfs.txfm_partition[ctx]);
-            neighbours.record_txfm(at_mi, max_tx, max_tx, max_tx);
-        } else {
-            neighbours.record_txfm(at_mi, side, side, side);
+            enc.symbol(usize::from(depth != 0), &mut cdfs.txfm_partition[ctx]);
+            if depth == 0 {
+                neighbours.record_txfm(at_mi, max_tx, max_tx, max_tx);
+                return max_tx;
+            }
+            // lane-av1tx2 r2: one halving of the var-tx tree. Each child of a
+            // split root codes its own `txfm_split` (decode.rs
+            // `read_var_tx_size` only stops symbol-free at `MAX_VARTX_DEPTH`
+            // or at a 4x4 sub-size), off the bands the children before it
+            // published -- so the context read and the update interleave per
+            // unit, exactly as the reader's recursion does.
+            let tx = max_tx / 2;
+            for row in (0..max_tx / MI).step_by(tx / MI) {
+                for col in (0..max_tx / MI).step_by(tx / MI) {
+                    let unit = (mi_r + row, mi_c + col);
+                    // The encoder only picks depth 1 for a block wholly
+                    // inside the frame; the reader skips a unit past the true
+                    // edge, which would leave the residual units unpaired.
+                    debug_assert!(
+                        unit.0 < neighbours.mi_rows && unit.1 < neighbours.mi_cols,
+                        "a split inter transform unit past the frame edge"
+                    );
+                    let ctx = txfm_partition_ctx_rect(
+                        neighbours.above_txfm[unit.1],
+                        neighbours.left_txfm[unit.0],
+                        side,
+                        tx,
+                        tx,
+                    );
+                    enc.symbol(0, &mut cdfs.txfm_partition[ctx]);
+                    neighbours.record_txfm(unit, tx, tx, tx);
+                }
+            }
+            return tx;
         }
+        neighbours.record_txfm(at_mi, side, side, side);
         return max_tx;
     }
     let ctx = neighbours.tx_size_ctx_txfm(at_mi, max_tx);
@@ -3128,6 +3166,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
                             &grids[0],
                             mode_for_tx,
                             &all_scans,
+                            is_inter,
                         )?;
                     }
                     write_block_planes(
@@ -3336,7 +3375,7 @@ fn write_inter_frame_leaf(
         ];
         if split {
             write_luma_tus(
-                enc, cdfs, neighbours, at_mi, SUB, tx, &grids[0], mode_for_tx, all_scans,
+                enc, cdfs, neighbours, at_mi, SUB, tx, &grids[0], mode_for_tx, all_scans, is_inter,
             )?;
         }
         write_block_planes(
@@ -3561,7 +3600,7 @@ fn write_inter_frame_leaf8(
         ];
         if split {
             write_luma_tus(
-                enc, cdfs, neighbours, leaf_mi, 8, tx, &grids[0], mode_for_tx, all_scans,
+                enc, cdfs, neighbours, leaf_mi, 8, tx, &grids[0], mode_for_tx, all_scans, is_inter,
             )?;
         }
         write_block_planes(
