@@ -693,6 +693,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         mi_rows: encoded.mi_rows,
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
+        switchable_motion_mode: encoded.switchable_motion_mode,
         screen: encoded.screen,
         start_cdfs: encoded.start_cdfs.clone(),
         next_cdfs: encoded.next_cdfs.clone(),
@@ -747,6 +748,12 @@ pub struct Encoded {
     /// a `tx_depth` frame as a `TxMode::Largest` one and desyncs at the first
     /// block.
     pub(crate) tx_select: bool,
+    /// This frame header's `is_motion_mode_switchable` (spec 5.9.2) -- the
+    /// bit that makes every eligible single-reference inter block carry a
+    /// `motion_mode` symbol. Same contract as `tx_select` above: a test
+    /// decoding `tile` directly must pass it along or it desyncs at the
+    /// first eligible block.
+    pub(crate) switchable_motion_mode: bool,
     /// The CDF state this frame's tile writer started from -- the defaults
     /// for a key frame and for the first inter frame, and the previous
     /// frame's stored tables after that. A test that decodes `tile` directly
@@ -1152,7 +1159,11 @@ pub fn inter_frame_headers_slots(
         },
         allow_high_precision_mv: false,
         interpolation_filter: ec_av1_syntax::InterpolationFilter::Eighttap,
-        is_motion_mode_switchable: false,
+        // lane-av1obmc: every single-reference inter block libaom's
+        // `motion_mode_allowed` accepts carries a `motion_mode` symbol
+        // (`crate::tile::write_motion_mode`). `allow_warped_motion` stays
+        // false, so the alphabet is the 2-symbol `obmc_cdf`.
+        is_motion_mode_switchable: true,
         use_ref_frame_mvs: false,
         // Forces `get_tx_set` (spec 5.11.48) to the two-symbol
         // `TX_SET_INTER_3` for every inter transform below 32x32 -- the only
@@ -3855,6 +3866,7 @@ fn code_square_inter(
             palette_uv: None,
                     tx_depth,
                     inter: Some(info),
+                    obmc: false,
                 },
                 cost + dcost,
             );
@@ -3886,6 +3898,7 @@ fn code_square_inter(
             palette: None,
             palette_uv: None,
             tx_depth,
+            obmc: false,
             inter: Some(InterInfo {
                 ref1: None,
                 mv1: (0, 0),
@@ -5047,6 +5060,8 @@ pub(crate) fn encode_key_frame_inner(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        // A key frame codes no inter block, so no motion_mode symbol.
+        switchable_motion_mode: false,
         screen,
         next_cdfs: start_cdfs.clone(),
         start_cdfs,
@@ -6261,6 +6276,7 @@ fn search_inter_block(
             uv_mode: DC_PRED,
             skip: best.skip,
             inter: best.inter,
+            obmc: false,
             eight: None,
             dv: None,
             palette: None,
@@ -6975,6 +6991,7 @@ pub(crate) fn encode_inter_frame(
         .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
     let start_cdfs = CdfSnapshot(cdfs);
     let reference_select_bit = header.reference_select;
+    let switchable_motion_mode = header.is_motion_mode_switchable;
     let order_hint_bits = seq.order_hint_bits;
     let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
     let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
@@ -6996,6 +7013,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_sign_bias(sign_bias);
             // Thread-locals: every tile job arms its own worker.
             crate::tile::arm_reference_select(reference_select_bit);
+            crate::tile::arm_motion_mode(switchable_motion_mode);
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
             crate::tile::arm_screen(screen);
             let mut cdfs = start_cdfs.0.clone();
@@ -7122,6 +7140,7 @@ pub(crate) fn encode_inter_frame(
                 Some(start_cdfs.0.clone()),
                 sign_bias,
                 h.allow_screen_content_tools,
+                switchable_motion_mode,
                 fctx,
             )
         },
@@ -7154,6 +7173,7 @@ pub(crate) fn encode_inter_frame(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        switchable_motion_mode,
         screen,
         start_cdfs,
         next_cdfs,
@@ -7924,6 +7944,7 @@ mod tests {
                 mv: (0, 0),
                 ref_mv_idx: 0,
             }),
+            obmc: false,
         };
         let skipped_block = BlockCoeffs {
             skip: true,
@@ -7943,6 +7964,10 @@ mod tests {
             Quadrant::Whole(skipped_block.clone()),
             Quadrant::Whole(skipped_block),
         ];
+        // lane-av1obmc: the header this tile is decoded under carries
+        // `is_motion_mode_switchable`, so the writer must be armed with it
+        // too or the decoder reads a `motion_mode` symbol nobody wrote.
+        crate::tile::arm_motion_mode(inter_header.is_motion_mode_switchable);
         let tile =
             crate::tile::sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
                 .unwrap();
@@ -10548,7 +10573,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7106, 0x1da4_9acd_a892_68e3), (60, 25963, 0x94df_8f46_174e_1a5e)];
+            [(150, 7111, 0xd375_2e36_13c4_9fc4), (60, 25969, 0x83b2_8522_cec6_38d4)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(

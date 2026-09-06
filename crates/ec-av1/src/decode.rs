@@ -24180,6 +24180,25 @@ fn overlappable_left(
     out
 }
 
+/// libaom `motion_mode_allowed`'s neighbour term: does ANY bordering inter
+/// block sit on this block's above row or left column ("check_num_overlappable
+/// _neighbors", `obmc.h`). The single source of truth for the DECODER's own
+/// `motion_mode_eligible` and for the tile WRITER's (`tile::write_motion_mode`)
+/// -- the two disagreeing by one block writes a `motion_mode` symbol the
+/// decoder never reads (class `symbol-consumption-gap`).
+pub(crate) fn has_overlappable_neighbour(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    bh4: usize,
+    mi_cols: usize,
+    mi_rows: usize,
+) -> bool {
+    !overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, 1).is_empty()
+        || !overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, 1).is_empty()
+}
+
 /// The warp-sample gather's own `has_top_right` probe (libaom `av1_findSamples`
 /// calls the same `mvref_common.c` function the MV stack does). lane-sb128 r2:
 /// this used to hardcode `SB_MI` (a 64x64 superblock) -- at `sb_size == 128`
@@ -27250,9 +27269,9 @@ fn decode_inter_block(
                 // min(bw, bh) >= 8, false for a 16x4 / 4x16 strip.
                 && write_w.min(write_h) >= 8
                 && interintra_mode.is_none()
-                && (!overlappable_above(grid, mi_row, mi_col, bw4, mi_cols as usize, 1).is_empty()
-                    || !overlappable_left(grid, mi_row, mi_col, bh4, mi_rows as usize, 1)
-                        .is_empty())
+                && has_overlappable_neighbour(
+                    grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize,
+                )
                 // libaom `motion_mode_allowed`: a GLOBALMV block whose model
                 // is non-IDENTITY-non-TRANSLATION under free (non-integer)
                 // mv reads no motion_mode/obmc symbol at all -- implicit
@@ -31989,8 +32008,9 @@ fn decode_inter_block8(
             && !skip_mode
             && interintra_mode.is_none()
             && !(is_global_mv_block && !force_integer_mv)
-            && (!overlappable_above(grid, mi_row, mi_col, 2, mi_cols as usize, 1).is_empty()
-                || !overlappable_left(grid, mi_row, mi_col, 2, mi_rows as usize, 1).is_empty());
+            && has_overlappable_neighbour(
+                grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize,
+            );
         let mut warp_params: Option<crate::warp::WarpParams> = None;
         let mut warped_selected = false;
         let mut obmc_selected = false;
@@ -33044,13 +33064,19 @@ pub(crate) fn decode_inter_frame_tile(
     // starts from what the previous frame stored, not from the defaults. Same
     // class as `tx_select` above, third instance.
     initial_cdfs: Option<Cdfs>,
+    // lane-av1obmc: this frame header's own `is_motion_mode_switchable`
+    // (spec 5.9.2). Hard-coding `false` here desynced every stream this
+    // crate's own encoder writes once inter blocks started carrying a
+    // `motion_mode` symbol (class: test asserts against a stale header).
+    switchable_motion_mode: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     decode_inter_frame_tile_lr(
         data, mi_cols, mi_rows, base_q_idx, frame_width, frame_height, refpix, cdef,
         loop_filter, allow_high_precision_mv, force_integer_mv, interp_fixed,
         enable_dual_filter, reference_select, tx_select,
-        &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, false, fctx,
+        &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, false,
+        switchable_motion_mode, fctx,
     )
 }
 
@@ -33091,6 +33117,11 @@ pub(crate) fn decode_inter_frame_tile_lr(
     // `sign_bias` rather than beside the other bools on purpose (the
     // `adjacent-same-typed-args` class).
     allow_screen_content_tools: bool,
+    // lane-av1obmc: this frame header's own `is_motion_mode_switchable`
+    // (spec 5.9.2). Hard-coding `false` here desynced every stream this
+    // crate's own encoder writes once inter blocks started carrying a
+    // `motion_mode` symbol (class: test asserts against a stale header).
+    switchable_motion_mode: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -33119,6 +33150,7 @@ pub(crate) fn decode_inter_frame_tile_lr(
         initial_cdfs,
         sign_bias,
         allow_screen_content_tools,
+        switchable_motion_mode,
         fctx,
     )
 }
@@ -33149,6 +33181,11 @@ pub(crate) fn decode_inter_frame_tiles_lr(
     // This frame header's own `allow_screen_content_tools` (see the
     // single-tile wrapper): the palette syntax its intra blocks carry.
     allow_screen_content_tools: bool,
+    // lane-av1obmc: this frame header's own `is_motion_mode_switchable`
+    // (spec 5.9.2). Hard-coding `false` here desynced every stream this
+    // crate's own encoder writes once inter blocks started carrying a
+    // `motion_mode` symbol (class: test asserts against a stale header).
+    switchable_motion_mode: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     decode_inter_frame_tile_with_cdfs(
@@ -33183,7 +33220,7 @@ pub(crate) fn decode_inter_frame_tiles_lr(
         [0; 2],
         true,
         tx_select,
-        false,
+        switchable_motion_mode,
         false,
         allow_screen_content_tools,
         DeltaParams::default(),
@@ -37315,6 +37352,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             fctx,
         )
         .unwrap_err();
@@ -37733,6 +37771,9 @@ mod tests {
                 // This frame's own `allow_screen_content_tools`, off the
                 // `Encoded` the encoder handed back (stale-header class).
                 frame.screen,
+                // Same stale-header class: the bit that makes this frame's
+                // inter blocks carry a `motion_mode` symbol.
+                frame.switchable_motion_mode,
                 fctx,
             )
             .unwrap();
@@ -38064,6 +38105,9 @@ mod tests {
                 // This frame's own `allow_screen_content_tools`, off the
                 // `Encoded` the encoder handed back (stale-header class).
                 frame.screen,
+                // Same stale-header class: the bit that makes this frame's
+                // inter blocks carry a `motion_mode` symbol.
+                frame.switchable_motion_mode,
                 fctx,
             )
             .unwrap();
