@@ -2695,6 +2695,7 @@ fn write_single_ref(
     above_ref: i8,
     left_ref: i8,
 ) {
+    REF_HITS[(ref_frame.max(1) - 1) as usize % 7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     use crate::mvstack::{
         ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
         single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
@@ -2756,6 +2757,24 @@ static DRL_HITS: [std::sync::atomic::AtomicUsize; 4] = [
     std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
 ];
+
+/// One counter per reference name (`LAST`..`ALTREF`), for the gate's own
+/// census of what the encoder actually picks.
+static REF_HITS: [std::sync::atomic::AtomicUsize; 7] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Takes and clears the per-reference histogram.
+#[cfg(test)]
+pub(crate) fn take_ref_hits() -> [usize; 7] {
+    std::array::from_fn(|i| REF_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
 
 /// Bumps the two histograms for one coded inter block.
 fn note_inter_mode(mode: usize, drl: usize) {
