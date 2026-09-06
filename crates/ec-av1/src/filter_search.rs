@@ -500,13 +500,33 @@ pub(crate) fn pick_restoration(
         sse
     };
     // Cost of leaving every unit alone, then one whole-plane pass per
-    // candidate to price taking it.
-    let mut best: Vec<(f64, Option<crate::restoration::WienerInfo>)> = (0..horz * vert)
-        .map(|i| {
-            let sse = unit_sse(&stages.cdefed[0], i / horz, i % horz) as f64;
-            (sse + lambda * LR_NONE_BITS, None)
-        })
-        .collect();
+    // candidate to price taking it. Both walks are banded by unit ROW
+    // (lane-av1fpar): a unit's cost is read off its own samples alone and
+    // written to its own slot, so the bands are `chunks_mut` of the same
+    // `best` and the choice cannot depend on how many of them there are.
+    let rows_of = |plane: &[u16], r0: usize, slice: &mut [(f64, Option<crate::restoration::WienerInfo>)], score: &dyn Fn(u64, &mut (f64, Option<crate::restoration::WienerInfo>))| {
+        for (i, slot) in slice.iter_mut().enumerate() {
+            score(unit_sse(plane, r0 + i / horz, i % horz), slot);
+        }
+    };
+    let banded = |plane: &[u16], best: &mut [(f64, Option<crate::restoration::WienerInfo>)], score: &(dyn Fn(u64, &mut (f64, Option<crate::restoration::WienerInfo>)) + Sync)| {
+        let threads = crate::par::filter_threads().min(vert);
+        if threads <= 1 {
+            rows_of(plane, 0, best, score);
+            return;
+        }
+        let per = vert.div_ceil(threads);
+        let batch = crate::par::Batch::new("ec-av1-filter");
+        for (band, slice) in best.chunks_mut(per * horz).enumerate() {
+            let rows_of = &rows_of;
+            batch.submit(move || rows_of(plane, band * per, slice, score));
+        }
+    };
+    let mut best: Vec<(f64, Option<crate::restoration::WienerInfo>)> =
+        vec![(0.0, None); horz * vert];
+    banded(&stages.cdefed[0], &mut best, &|sse, slot| {
+        *slot = (sse as f64 + lambda * LR_NONE_BITS, None);
+    });
     let mut out = Vec::new();
     for taps in WIENER_CANDIDATES {
         let info = crate::restoration::wiener_from_taps(taps, taps);
@@ -531,15 +551,12 @@ pub(crate) fn pick_restoration(
             None,
             fctx,
         );
-        for rrow in 0..vert {
-            for rcol in 0..horz {
-                let cost = unit_sse(&out, rrow, rcol) as f64 + lambda * LR_WIENER_BITS;
-                let slot = &mut best[rcol + rrow * horz];
-                if cost < slot.0 {
-                    *slot = (cost, Some(info));
-                }
+        banded(&out, &mut best, &|sse, slot| {
+            let cost = sse as f64 + lambda * LR_WIENER_BITS;
+            if cost < slot.0 {
+                *slot = (cost, Some(info));
             }
-        }
+        });
     }
     let chosen: Vec<Option<crate::restoration::WienerInfo>> =
         best.into_iter().map(|(_, f)| f).collect();
