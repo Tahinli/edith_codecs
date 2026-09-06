@@ -7471,16 +7471,18 @@ fn tpl_strength() -> f64 {
 /// lane-av1tpl2: how many SOURCE pictures the lambda map looks at, counting
 /// the frame being coded. 1 turns the weighting off; 2 is the shipped
 /// one-frame area map ([`tpl_area_map`]); 3 and up only mean anything under
-/// [`tpl_propagating`], which is the map that can actually use them. Swept
-/// by `EC_AV1_TPL_D=<d>`.
+/// [`tpl_propagating`], which is the map that can actually use them and is
+/// the default since lane-av1tpl3, so the default window is 8. Swept by
+/// `EC_AV1_TPL_D=<d>`.
 ///
 /// The streaming facade holds `depth - 1` pictures back so it feeds
 /// `encode_inter_frame` the same window `encode_sequence` does; both read
 /// THIS function, so the two paths cannot disagree about the window.
-const TPL_DEPTH: usize = 2;
+const TPL_DEPTH: usize = 8;
 
 /// The exponent the dependence ratio is read through ([`tpl_lambda_factors`]).
-const TPL_POWER: f64 = 1.0;
+/// 0.5 is libaom's own square-root compression of its dependence ratio.
+const TPL_POWER: f64 = 0.5;
 
 /// lane-av1tpl2: the propagating map ([`tpl_lambda_factors`]) instead of the
 /// one-frame area map ([`tpl_area_map`]), behind `EC_AV1_TPL_PROP=1`.
@@ -7504,15 +7506,43 @@ const TPL_POWER: f64 = 1.0;
 /// | 0.5 | 4 | 0.5 | +15.6/-1.6 | +46.8/+19.0 | +51.0/-14.6 |
 /// | 1 | 8 | 0.5 | +15.9/-1.5 | +47.0/+19.2 | +51.0/-14.5 |
 ///
-/// The map is genuinely non-flat now (0.25..1.12 across 7680 cells, only 58
-/// of them within 0.9..1.1, where the one-frame map had 7127 of 7680 inside
-/// 1..1.5x its own mean), and its best arm is 0.4 down on both film 1080p
-/// columns and 0.4/0.2 down on screen -- but EVERY arm is 0.1..0.4 UP on
-/// film 2160p, including the vanishingly weak ones, so no arm is at least
-/// flat on every row. It therefore ships OFF: the default stays the
-/// one-frame map the gate's numbers were measured on.
+/// The map is genuinely non-flat (0.25..1.12 across 7680 cells, only 58 of
+/// them within 0.9..1.1, where the one-frame map had 7127 of 7680 inside
+/// 1..1.5x its own mean), and its best arm was 0.4 down on both film 1080p
+/// columns and 0.4/0.2 down on screen -- but EVERY arm of that lane was
+/// 0.1..0.4 UP on film 2160p, so it shipped off.
+///
+/// lane-av1tpl3 found why and turned it on. The denominator is the cell's own
+/// MAD from its DC, and on the gate's film clips (ffmpeg `testsrc2`, colour
+/// bars) 89.4% (1080p) / 90.8% (2160p) of all 16x16 cells have a MAD of
+/// EXACTLY ZERO -- so a per-16x16 ratio is a huge number divided by 1
+/// wherever the window leans on a flat bar, which is exactly where coding is
+/// cheap. Summing intra and mc_dep over the 64x64 superblock before the ratio
+/// (libaom's own granularity) puts a busy cell's denominator next to the flat
+/// one's, and reading the ratio through `log2(1 + r)` (libaom's compressed
+/// beta) flattens what is left of the tail. Both on, at k=0.5 D=8 p=0.5, on
+/// the same native gate (baseline = the shipped one-frame map):
+///
+/// | arm | film 1080p | film 2160p | screen |
+/// |---|---|---|---|
+/// | one-frame map (was default) | +15.9/-1.3 | +46.5/+18.7 | +51.2/-14.4 |
+/// | propagating, per-16x16 | +15.5/-1.7 | +46.7/+19.0 | +50.8/-14.6 |
+/// | + denominator floor 0.25x mean | +15.7/-1.5 | +46.9/+19.1 | +50.9/-14.6 |
+/// | + floor 0.5x mean | +15.7/-1.5 | +46.8/+19.0 | +50.8/-14.5 |
+/// | + floor 1.0x mean | +15.8/-1.4 | +46.9/+19.1 | +51.0/-14.5 |
+/// | + 64x64 aggregation | +15.9/-1.3 | +46.6/+18.8 | +51.1/-14.6 |
+/// | + log2 beta | +16.0/-1.3 | +46.9/+19.0 | +51.0/-14.6 |
+/// | + aggregation + floor 0.25x | +15.7/-1.5 | +46.6/+18.9 | +50.9/-14.6 |
+/// | + aggregation + floor 0.5x | +16.0/-1.3 | +46.9/+19.1 | +50.8/-14.7 |
+/// | **+ aggregation + log2 beta** | **+15.6/-1.7** | **+46.5/+18.8** | **+51.0/-14.5** |
+///
+/// The last row is the only arm that is down on two rows (film 1080p 0.3/0.4,
+/// screen 0.2/0.1) and flat on the third (film 2160p 0.0/+0.1), so it ships
+/// as the default: `EC_AV1_TPL_PROP=0` goes back to the one-frame map. The
+/// floor is a real effect on the ratio and never a win once the aggregation
+/// is in -- the aggregation is the same fix, done where libaom does it.
 fn tpl_propagating() -> bool {
-    std::env::var("EC_AV1_TPL_PROP").ok().as_deref() == Some("1")
+    std::env::var("EC_AV1_TPL_PROP").ok().as_deref() != Some("0")
 }
 
 pub(crate) fn tpl_depth() -> usize {
@@ -7752,24 +7782,27 @@ fn tpl_lambda_factors(frames: &[&[u8]], width: usize, height: usize, k: f64) -> 
         .filter(|p| p.is_finite() && *p > 0.0)
         .unwrap_or(TPL_POWER);
     // lane-av1tpl3, the three shape fixes, each its own knob so the gate can
-    // read them apart:
+    // read them apart. `SB` and `LOG` are the shipped shape (set the knob to
+    // `0` to take either back out); `FLOOR` defaults to off.
     //
     // * `EC_AV1_TPL_FLOOR=<f>` floors the denominator at `f` times the
-    //   frame's own mean intra cost. A flat, heavily filtered cell has a
-    //   near-zero MAD, so its ratio explodes exactly where coding is cheap.
-    // * `EC_AV1_TPL_SB=1` sums intra and mc_dep over the 64x64 superblock
-    //   before the ratio is formed -- libaom's granularity (`mc_dep_cost` and
-    //   `intra_cost` are SB sums there, not per-16x16 numbers).
-    // * `EC_AV1_TPL_LOG=1` reads the ratio through `log2(1 + r)` instead of
-    //   raw, libaom's log-compressed beta, which flattens the tail harder
-    //   than the `p` exponent alone can.
+    //   frame's own mean intra cost. A cell of flat content has a near-zero
+    //   MAD, so its ratio explodes exactly where coding is cheap.
+    // * `EC_AV1_TPL_SB=0` goes back to a per-16x16 ratio; by default intra
+    //   and mc_dep are summed over the 64x64 superblock first -- libaom's
+    //   granularity (`mc_dep_cost` and `intra_cost` are SB sums there, not
+    //   per-16x16 numbers), which is also what makes the ratio survive one
+    //   flat cell next to a busy one.
+    // * `EC_AV1_TPL_LOG=0` reads the raw ratio; by default it goes through
+    //   `log2(1 + r)`, libaom's log-compressed beta, which flattens the tail
+    //   harder than the `p` exponent alone can.
     let floor_frac = std::env::var("EC_AV1_TPL_FLOOR")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|f| f.is_finite() && *f >= 0.0)
         .unwrap_or(0.0);
-    let sb_agg = std::env::var("EC_AV1_TPL_SB").ok().as_deref() == Some("1");
-    let log_beta = std::env::var("EC_AV1_TPL_LOG").ok().as_deref() == Some("1");
+    let sb_agg = std::env::var("EC_AV1_TPL_SB").ok().as_deref() != Some("0");
+    let log_beta = std::env::var("EC_AV1_TPL_LOG").ok().as_deref() != Some("0");
     let intra_mean =
         intra[0].iter().map(|&c| f64::from(c)).sum::<f64>() / cells.max(1) as f64;
     let floor = floor_frac * intra_mean;
@@ -8927,11 +8960,15 @@ mod tests {
     /// distortion-averse than the half nothing gains from.
     #[test]
     fn tpl_factors_are_flat_on_a_uniform_repeat_and_fall_where_the_window_leans() {
-        let (w, h) = (64usize, 64usize);
+        // Four 64x64 superblocks across: the shipped map forms its ratio per
+        // SUPERBLOCK (`EC_AV1_TPL_SB`), so a frame one superblock wide could
+        // only ever produce one ratio -- and one ratio, mean-normalised, is
+        // the flat map, whatever the content underneath it.
+        let (w, h) = (256usize, 64usize);
         let uniform: Vec<u8> = (0..w * h).map(|i| ((i * 37) % 251) as u8).collect();
         let frames: Vec<&[u8]> = vec![&uniform, &uniform, &uniform];
         let f = super::tpl_lambda_factors(&frames, w, h, 1.0);
-        assert_eq!(f.len(), 16, "4x4 cells of 16x16");
+        assert_eq!(f.len(), 64, "16x4 cells of 16x16");
         for (i, &v) in f.iter().enumerate() {
             assert!((v - 1.0).abs() < 1e-6, "cell {i} factor {v}, a flat map must move no lambda");
         }
@@ -8939,13 +8976,14 @@ mod tests {
         // Left half textured, right half constant: the window saves bits
         // predicting the left half and nothing at all on the right.
         let split: Vec<u8> = (0..w * h)
-            .map(|i| if i % w < 32 { ((i * 37) % 251) as u8 } else { 128 })
+            .map(|i| if i % w < w / 2 { ((i * 37) % 251) as u8 } else { 128 })
             .collect();
         let frames: Vec<&[u8]> = vec![&split, &split, &split];
+        let cells_x = w / 16;
         for k in [0.25f64, 0.5, 1.0, 2.0] {
             let f = super::tpl_lambda_factors(&frames, w, h, k);
-            for r in 0..4 {
-                let (lean, idle) = (f[r * 4], f[r * 4 + 3]);
+            for r in 0..h / 16 {
+                let (lean, idle) = (f[r * cells_x], f[r * cells_x + cells_x - 1]);
                 assert!(lean < 1.0, "k={k} row {r}: leaned-on cell factor {lean} must be < 1");
                 assert!(idle > 1.0, "k={k} row {r}: idle cell factor {idle} must be > 1");
             }
@@ -12307,7 +12345,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7128, 0x8ee1_5c87_bdb4_a8c5), (60, 26353, 0x50fc_c10f_9eab_b638)];
+            [(150, 7173, 0x3d5a_1440_7773_1816), (60, 26362, 0x2619_8199_39ad_828c)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
