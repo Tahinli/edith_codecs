@@ -130,6 +130,8 @@ pub struct Encoder {
     info: AnalysisInfo,
     /// Whether the analysis runs at all — see `celt_enc::analysis_params`.
     analysis_on: bool,
+    /// Whether the detected bandwidth may lower the coded one (`EC_OPUS_BW_DETECT`).
+    bw_detect: bool,
 }
 
 /// SILK's internal sample rate (kHz) for a target bandwidth: Narrow → 8,
@@ -195,6 +197,7 @@ impl Encoder {
             analysis: TonalityAnalysis::new(sample_rate),
             info: AnalysisInfo::default(),
             analysis_on: crate::celt_enc::analysis_params().0,
+            bw_detect: crate::celt_enc::analysis_params().5,
         };
         // `EC_OPUS_ALIGN=1` turns the alignment on for a whole process — how
         // the gate rows at `set_libopus_input_alignment` were produced.
@@ -799,7 +802,47 @@ impl Encoder {
             12000 => Bandwidth::Medium,
             _ => Bandwidth::Narrow,
         };
-        BWS[idx].min(ceiling)
+        let bw = BWS[idx].min(ceiling);
+        match self.detected_bandwidth(equiv, !self.auto_silk(equiv, ve)) {
+            Some(d) => bw.min(d),
+            None => bw,
+        }
+    }
+
+    /// libopus `opus_encoder.c:1278-1305`: the tonality analysis's own
+    /// bandwidth estimate as an Opus bandwidth, raised by the conservative
+    /// floor of `opus_encoder.c:1652-1674` (which depends on `equiv_rate` per
+    /// channel and on whether the frame is CELT-only) before it is allowed to
+    /// lower the coded bandwidth. `None` when the analysis did not run, which
+    /// is libopus's `st->detected_bandwidth == 0`.
+    ///
+    /// Only the caller's automatic path consults this — libopus guards the
+    /// clamp with `st->user_bandwidth == OPUS_AUTO`, which is exactly the
+    /// `self.bandwidth.is_none()` branch that reaches `auto_bandwidth_at`.
+    fn detected_bandwidth(&self, equiv: i32, celt_only: bool) -> Option<Bandwidth> {
+        if !self.bw_detect || !self.info.valid {
+            return None;
+        }
+        let detected = match self.info.bandwidth {
+            i32::MIN..=12 => Bandwidth::Narrow,
+            13..=14 => Bandwidth::Medium,
+            15..=16 => Bandwidth::Wide,
+            17..=18 => Bandwidth::SuperWide,
+            _ => Bandwidth::Full,
+        };
+        let ch = self.channels as i32;
+        let floor = if celt_only && equiv <= 18000 * ch {
+            Bandwidth::Narrow
+        } else if celt_only && equiv <= 24000 * ch {
+            Bandwidth::Medium
+        } else if equiv <= 30000 * ch {
+            Bandwidth::Wide
+        } else if equiv <= 44000 * ch {
+            Bandwidth::SuperWide
+        } else {
+            Bandwidth::Full
+        };
+        Some(detected.max(floor))
     }
 
     /// libopus `opus_encoder.c`'s `dc_reject(pcm, 3, ...)`: a 3 Hz one-pole
@@ -1034,6 +1077,36 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The detected-bandwidth clamp (`opus_encoder.c:1652-1674`): a band-limited
+    /// analysis result lowers the coded bandwidth, but never below the
+    /// rate-dependent floor, and never when the analysis did not run.
+    #[test]
+    fn detected_bandwidth_lowers_the_coded_bandwidth_but_not_below_its_floor() {
+        let mut e = Encoder::new(48000, 2, Application::Audio).unwrap();
+        e.set_vbr_constrained(true); // the library gate's setting
+        e.set_bitrate(64_000);
+        // Analysis off (the default): fullband, whatever the estimate says.
+        e.info.valid = true;
+        e.info.bandwidth = 15; // wideband
+        assert_eq!(e.auto_bandwidth(), Bandwidth::Full);
+        // On: 64 kbps stereo is under 44000*2, so the floor is superwide —
+        // a wideband estimate is raised to it, not honoured as wideband.
+        e.bw_detect = true;
+        assert_eq!(e.auto_bandwidth(), Bandwidth::SuperWide);
+        // Above the floor the estimate passes through unchanged.
+        e.info.bandwidth = 20;
+        assert_eq!(e.auto_bandwidth(), Bandwidth::Full);
+        // 96 kbps stereo is above 44000*2: the floor is fullband, so the
+        // clamp is inert there — which is why it cannot move the @96 rows.
+        e.info.bandwidth = 15;
+        e.set_bitrate(96_000);
+        assert_eq!(e.auto_bandwidth(), Bandwidth::Full);
+        // An invalid analysis is libopus's `detected_bandwidth == 0`.
+        e.set_bitrate(64_000);
+        e.info.valid = false;
+        assert_eq!(e.auto_bandwidth(), Bandwidth::Full);
+    }
 
     /// The private half of the bandwidth decision: the thresholds themselves,
     /// which the TOC config only reports.
