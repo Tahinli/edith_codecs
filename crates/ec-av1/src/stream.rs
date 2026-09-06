@@ -2994,7 +2994,7 @@ mod tests {
                 width as u32,
                 height as u32,
                 false,
-                &ec_av1_syntax::CdefParams::default(),
+                &encoded.cdef,
                 &encoded.loop_filter,
                 encoded.tx_select,
                 // Our own encoder always writes `reduced_tx_set: true`.

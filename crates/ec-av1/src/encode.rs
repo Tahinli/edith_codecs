@@ -475,6 +475,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
         loop_filter: encoded.loop_filter,
+        cdef: encoded.cdef,
     }
 }
 
@@ -517,6 +518,9 @@ pub struct Encoded {
     /// `tile` directly must pass these along, exactly as it must `tx_select`
     /// (class: test asserts against a stale header).
     pub(crate) loop_filter: LoopFilterParams,
+    /// This frame header's chosen CDEF parameters, threaded for the same
+    /// reason as `loop_filter`.
+    pub(crate) cdef: CdefParams,
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -593,7 +597,12 @@ pub(crate) fn key_frame_headers_colour(
         enable_order_hint: true,
         order_hint_bits: 7,
         enable_superres: false,
-        enable_cdef: false,
+        // spec 5.9.19: with the sequence bit set every frame header carries
+        // `cdef_params`. This encoder writes `cdef_bits == 0` -- one strength
+        // pair for the whole frame, chosen by `crate::filter_search` -- so no
+        // `cdef_idx` literal is coded in the tile and a frame that wants no
+        // CDEF simply carries zero strengths.
+        enable_cdef: true,
         enable_restoration: false,
         seq_force_screen_content_tools: 0,
         seq_force_integer_mv: 0,
@@ -2913,13 +2922,13 @@ pub(crate) fn encode_key_frame_inner(
     // `crate::filter_search`), and keep the filtered picture that wins as
     // the reconstruction -- what a decoder outputs, and what the next
     // frame predicts from.
-    pick_and_apply_deblock(
+    pick_and_apply_filters(
         &mut header,
         &mut luma,
         &mut chroma,
         [&picture_y8, &picture_u8, &picture_v8],
         true,
-        |lf, h| {
+        |lf, cdef, h| {
             crate::decode::decode_key_frame_tile(
                 &tile,
                 h.mi_cols,
@@ -2928,7 +2937,7 @@ pub(crate) fn encode_key_frame_inner(
                 h.frame_width,
                 h.frame_height,
                 seq.enable_filter_intra,
-                &CdefParams::default(),
+                cdef,
                 lf,
                 tx_select,
                 h.reduced_tx_set,
@@ -2960,10 +2969,12 @@ pub(crate) fn encode_key_frame_inner(
         base_q_idx,
         tx_select,
         loop_filter: header.loop_filter,
+        cdef: header.cdef,
     })
 }
 
-/// Chooses this frame's deblocking levels, writes them into `header` and
+/// Chooses this frame's deblocking levels and CDEF strengths, writes them
+/// into `header` and
 /// replaces the frame's own region of the encoder's reconstruction with the
 /// filtered picture the decoder produced under them
 /// ([`crate::filter_search::pick_deblock`]).
@@ -2976,26 +2987,31 @@ pub(crate) fn encode_key_frame_inner(
 /// The decoder's own error, when it refuses the tile the encoder just wrote
 /// -- that is an encoder defect, not a filter one, so it is propagated
 /// rather than swallowed into "no deblocking".
-fn pick_and_apply_deblock(
+fn pick_and_apply_filters(
     header: &mut FrameHeader,
     luma: &mut Plane<'_>,
     chroma: &mut [Plane<'_>; 2],
     source: [&[u8]; 3],
     search: bool,
-    decode: impl Fn(&LoopFilterParams, &FrameHeader) -> Result<Picture>,
+    decode: impl Fn(&LoopFilterParams, &CdefParams, &FrameHeader) -> Result<Picture>,
 ) -> Result<()> {
     if !search {
         return Ok(());
     }
     let (fw, fh) = (header.frame_width as usize, header.frame_height as usize);
     let hdr = header.clone();
-    let (lf, filtered) = crate::filter_search::pick_deblock(
-        |lf| decode(lf, &hdr),
+    // libaom `av1_pick_filter_level`'s sibling `av1_cdef_search`:
+    // `cdef_damping = 3 + (base_qindex >> 6)`, never searched.
+    let damping = 3 + (header.quantization.base_q_idx >> 6);
+    let (lf, cdef, filtered) = crate::filter_search::pick_filters(
+        |lf, cdef| decode(lf, cdef, &hdr),
         source,
         luma.width,
         (fw, fh),
+        damping,
     )?;
     header.loop_filter = lf;
+    header.cdef = cdef;
     let dec_cw = filtered.width.div_ceil(2);
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
     crate::filter_search::splice(&mut luma.reconstruction, luma.width, &filtered.y, filtered.width, fw, fh);
@@ -4094,7 +4110,7 @@ pub(crate) fn encode_inter_frame(
     let mut refs: [Option<&Picture>; 8] = [None; 8];
     refs[1] = Some(&trial_ref);
     let refpix = crate::decode::RefPix::ready(refs);
-    pick_and_apply_deblock(
+    pick_and_apply_filters(
         &mut header,
         &mut luma,
         &mut chroma,
@@ -4103,7 +4119,7 @@ pub(crate) fn encode_inter_frame(
         // under the (default-off) inter `TxMode::Select` knob there is no
         // decoder to search against, so that stream keeps level 0.
         !tx_select,
-        |lf, h| {
+        |lf, cdef, h| {
             crate::decode::decode_inter_frame_tile(
                 &tile,
                 h.mi_cols,
@@ -4112,7 +4128,7 @@ pub(crate) fn encode_inter_frame(
                 h.frame_width,
                 h.frame_height,
                 &refpix,
-                &CdefParams::default(),
+                cdef,
                 lf,
                 h.allow_high_precision_mv,
                 h.force_integer_mv,
@@ -4144,6 +4160,7 @@ pub(crate) fn encode_inter_frame(
         base_q_idx,
         tx_select,
         loop_filter: header.loop_filter,
+        cdef: header.cdef,
     })
 }
 
@@ -6962,6 +6979,24 @@ mod tests {
                 100.0 * split32 as f64 / (whole32 + split32).max(1) as f64,
                 whole16 + split16,
                 100.0 * split16 as f64 / (whole16 + split16).max(1) as f64
+            );
+            // The deblocking level each of this clip's frames chose
+            // (lane-av1filt): 0 everywhere would mean the filter never fires.
+            let levels = crate::filter_search::take_chosen_levels();
+            type Chosen = ((u8, u8), (u8, u8), (u8, u8));
+            let mean = |f: fn(&Chosen) -> u8| {
+                levels.iter().map(|l| f(l) as f64).sum::<f64>() / levels.len().max(1) as f64
+            };
+            eprintln!(
+                "{name}: over {} frames -- deblock luma mean {:.1} chroma {:.1}; \
+                 cdef luma pri {:.1}/sec {:.1}, chroma pri {:.1}/sec {:.1}",
+                levels.len(),
+                mean(|l| l.0.0),
+                mean(|l| l.0.1),
+                mean(|l| l.1.0),
+                mean(|l| l.1.1),
+                mean(|l| l.2.0),
+                mean(|l| l.2.1),
             );
             // Which chroma modes the search actually wins with, against the
             // unconditional DC_PRED that was the only outcome before
