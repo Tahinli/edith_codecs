@@ -1736,11 +1736,12 @@ const FORWARD_RANGE: usize = 32;
 /// The network rounds to an integer at every butterfly, so its output LSB is
 /// what the quantizer's input resolution costs: unshifted, one LSB at 4x4 is
 /// four whole units of the `8 * orthonormal` scale the levels are formed on
-/// -- coarser than a fine quantizer's own step. Six bits put that back at
-/// 1/16 of a unit and cost nothing: the widest case (a 13-bit residual
-/// through two 64-point passes, gain 32) stays under 2^25, well inside `i32`
-/// and far inside [`FORWARD_RANGE`].
-const FORWARD_PRECISION_BITS: u32 = 6;
+/// -- coarser than a fine quantizer's own step, and worth 3.9 BD points on
+/// screen capture. Ten bits put it at 1/256 of a unit, which is where the BD
+/// gate stops moving (13 bits measured identical), and cost nothing: the
+/// widest case, a 12-bit residual through two 64-point passes (gain 32),
+/// stays under 2^27 -- inside `i32` and far inside [`FORWARD_RANGE`].
+const FORWARD_PRECISION_BITS: u32 = 10;
 
 /// [`forward_dct_n`]'s uniform gain at one size, measured from the network
 /// itself rather than derived: an impulse through it is `g` times
@@ -1795,6 +1796,12 @@ pub fn forward_transform_2d(residual: &[i32], side: usize) -> Vec<f64> {
 /// The row pass, in fixed point: each of `side` residual rows through
 /// [`forward_dct_fixed`], at [`FORWARD_PRECISION_BITS`] extra precision and
 /// the network's own gain (both of which [`forward_scale`] divides back out).
+///
+/// The `Vec` is per call on purpose: holding it in a thread-local scratch, as
+/// the inverse transform's row pass does, was MEASURED +5.0% instructions on
+/// the sequence bench -- a fresh zeroed allocation costs less here than the
+/// `memset` reusing one needs plus the thread-local access, because the
+/// zeroing is what the all-zero-row skip below reads.
 fn forward_rows(residual: &[i32], side: usize) -> Vec<i32> {
     assert_eq!(
         residual.len(),
