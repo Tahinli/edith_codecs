@@ -1610,8 +1610,19 @@ impl Reach {
 /// What one symbol costs against a CDF, in bits.
 pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
     let low = if symbol == 0 { 0 } else { cdf[symbol - 1] };
-    let probability = f64::from(cdf[symbol] - low) / 32768.0;
-    -probability.log2()
+    let width = cdf[symbol] - low;
+    // lane-av1speed: a CDF interval is a 15-bit width, so there are only
+    // 32769 prices a symbol can carry; the `log2` behind each is computed
+    // once instead of per call (libm's `__log2_fma` was 5% of the encoder's
+    // profile -- this function is called for every symbol of every candidate
+    // the RD search prices). Each entry is exactly the expression this used
+    // to evaluate, so every price is bit-identical.
+    static PRICES: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    PRICES.get_or_init(|| {
+        (0..=32768u32)
+            .map(|w| -(f64::from(w) / 32768.0).log2())
+            .collect()
+    })[usize::from(width)]
 }
 
 /// What the tile writer spends to say a block is coded in each of the thirteen
