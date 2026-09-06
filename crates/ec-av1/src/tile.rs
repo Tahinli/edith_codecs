@@ -487,16 +487,21 @@ pub struct BlockCoeffs {
     pub tx_depth: u8,
 }
 
-/// One inter mode [`sb_coeff_inter_frame_tile`]'s blocks may take (spec
-/// 5.11.24 `read_inter_mode`), reduced to the two branches its symbol chain
-/// needs to prove out: the stack's own top candidate outright, or a coded
-/// residual against it. `NEARMV`/`GLOBALMV` are never written.
+/// One inter mode [`sb_coeff_inter_frame_tile`]'s blocks may take: the whole
+/// single-reference set of spec 5.11.24 `read_inter_mode`, each written by
+/// [`write_inter_mode`] with the decoder's own contexts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterMode {
     /// `NEARESTMV`: takes `MvStack::nearest_mv` outright, no residual, no DRL.
     NearestMv,
-    /// `NEWMV`: codes `mv` as a residual against `MvStack::pred_mv`, through
-    /// a DRL index this writer always leaves at zero.
+    /// `NEARMV`: takes the stack entry [`InterInfo::ref_mv_idx`] names
+    /// (clamped to at least 1, the spec's own `RefMvIdx` base for this mode).
+    NearMv,
+    /// `GLOBALMV`: the identity global model's zero vector, two symbols and
+    /// no MV at all.
+    GlobalMv,
+    /// `NEWMV`: codes `mv` as a residual against the stack entry
+    /// [`InterInfo::ref_mv_idx`] names.
     NewMv,
 }
 
@@ -510,6 +515,11 @@ pub struct InterInfo {
     pub mode: InterMode,
     /// The motion vector a [`InterMode::NewMv`] block's residual targets.
     pub mv: (i32, i32),
+    /// The block's `RefMvIdx` (spec 5.11.24 `read_drl_idx`): which
+    /// `MvStack::entries` slot `NEWMV` codes its residual against, or
+    /// `NEARMV` takes outright. Ignored by the two modes that code no DRL
+    /// index (`NEARESTMV`, `GLOBALMV`).
+    pub ref_mv_idx: u8,
 }
 
 impl From<Vec<Coeff>> for BlockCoeffs {
@@ -2632,6 +2642,123 @@ fn write_mv(
     Ok(())
 }
 
+/// Per-mode fire counts of [`write_inter_mode`], indexed
+/// `NEARESTMV`/`NEARMV`/`GLOBALMV`/`NEWMV`, and the DRL index each block
+/// coded (bucket 3 collects any index past 2). Read by the BD gate, which
+/// is the only thing that proves a newly added mode ever fires
+/// (gate-blind-to-feature).
+static INTER_MODE_HITS: [std::sync::atomic::AtomicUsize; 4] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+static DRL_HITS: [std::sync::atomic::AtomicUsize; 4] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Bumps the two histograms for one coded inter block.
+fn note_inter_mode(mode: usize, drl: usize) {
+    INTER_MODE_HITS[mode].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRL_HITS[drl.min(3)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes and clears the inter-mode histogram (NEAREST/NEAR/GLOBAL/NEW).
+#[cfg(test)]
+pub(crate) fn take_inter_mode_hits() -> [usize; 4] {
+    [0, 1, 2, 3].map(|i| INTER_MODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Takes and clears the DRL-index histogram (0, 1, 2, 3+).
+#[cfg(test)]
+pub(crate) fn take_drl_hits() -> [usize; 4] {
+    [0, 1, 2, 3].map(|i| DRL_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Writes the DRL index of one block: the loop the decoder runs (spec
+/// 5.11.24 `read_drl_idx`, decode.rs' two copies at ~26655 and ~26695), one
+/// `drl_mode` bit per stack entry past `start`, `1` to advance and `0` to
+/// stop, at most two bits. `drl_ctx[idx]` is the context between
+/// `entries[idx]` and `entries[idx + 1]`, exactly the pair the bit chooses
+/// between.
+fn write_drl_idx(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    stack: &crate::mvstack::MvStack,
+    start: usize,
+    target: usize,
+) {
+    let mut idx = start;
+    while idx < start + 2 && stack.entries.len() > idx + 1 {
+        let advance = idx < target;
+        enc.symbol(usize::from(advance), &mut cdfs.drl_mode[stack.drl_ctx[idx]]);
+        if !advance {
+            return;
+        }
+        idx += 1;
+    }
+}
+
+/// Writer-side counterpart of the decoder's single-reference
+/// `read_inter_mode`/`assign_mv` chain (decode.rs ~26645): writes `info`'s
+/// mode symbols against `stack`'s own contexts and, for `NEWMV`, the MV
+/// residual against the DRL-selected predictor. Returns the motion vector
+/// the decoder will derive for the block (what the MI grid must record) and
+/// whether it is `NEWMV`.
+///
+/// `GLOBALMV` resolves to `(0, 0)` because this encoder writes no global
+/// motion parameters at all, so every `gm_get_motion_vector` the decoder
+/// runs is the identity model's zero vector; a lane that starts writing
+/// real `gm_params` has to feed the same vector in here.
+///
+/// # Errors
+/// As [`write_mv`]: a `NEWMV` residual needing eighth-pel precision.
+fn write_inter_mode(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    info: InterInfo,
+    stack: &crate::mvstack::MvStack,
+) -> Result<((i32, i32), bool)> {
+    let idx = usize::from(info.ref_mv_idx);
+    match info.mode {
+        InterMode::NewMv => {
+            enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]);
+            write_drl_idx(enc, cdfs, stack, 0, idx);
+            let base = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+            write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv, base)?;
+            note_inter_mode(3, idx);
+            Ok((info.mv, true))
+        }
+        InterMode::GlobalMv => {
+            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not NEWMV
+            enc.symbol(0, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // GLOBALMV
+            note_inter_mode(2, 0);
+            Ok(((0, 0), false))
+        }
+        InterMode::NearestMv => {
+            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not NEWMV
+            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not GLOBALMV
+            enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
+            note_inter_mode(0, 0);
+            Ok((stack.nearest_mv, false))
+        }
+        InterMode::NearMv => {
+            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not NEWMV
+            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not GLOBALMV
+            enc.symbol(1, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARMV
+            // `RefMvIdx` starts at 1 for NEARMV (spec 5.11.24).
+            let idx = idx.max(1);
+            write_drl_idx(enc, cdfs, stack, 1, idx);
+            let mv = stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv);
+            note_inter_mode(1, idx);
+            Ok((mv, false))
+        }
+    }
+}
+
 /// Writes the payload of a one-tile inter frame built from `blocks`, one
 /// 32x32 block per entry in raster order across the frame — every superblock
 /// is split into its four quadrants the way [`split_coeff_key_frame_tile`]
@@ -3028,32 +3155,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
                         mi_rows as usize,
                     );
 
-                    let is_new_mv = matches!(info.mode, InterMode::NewMv);
-                    if is_new_mv {
-                        enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
-                    } else {
-                        enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
-                        enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
-                        enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
-                    }
-                    // This writer always keeps the first DRL candidate, so the
-                    // loop (spec 5.11.24 `read_drl_idx`) only ever runs its
-                    // first, breaking iteration.
-                    if is_new_mv && stack.entries.len() > 1 {
-                        enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
-                    }
-                    let mv = if is_new_mv {
-                        write_mv(
-                            &mut enc,
-                            &mut cdfs.mv_comp,
-                            &mut cdfs.mv_joint,
-                            info.mv,
-                            stack.pred_mv,
-                        )?;
-                        info.mv
-                    } else {
-                        stack.nearest_mv
-                    };
+                    let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
                     grid.set(
                         mi_row,
                         mi_col,
@@ -3263,29 +3365,7 @@ fn write_inter_frame_leaf(
             mi_rows as usize,
         );
 
-        let is_new_mv = matches!(info.mode, InterMode::NewMv);
-        if is_new_mv {
-            enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
-        } else {
-            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
-            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
-            enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
-        }
-        if is_new_mv && stack.entries.len() > 1 {
-            enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
-        }
-        let mv = if is_new_mv {
-            write_mv(
-                enc,
-                &mut cdfs.mv_comp,
-                &mut cdfs.mv_joint,
-                info.mv,
-                stack.pred_mv,
-            )?;
-            info.mv
-        } else {
-            stack.nearest_mv
-        };
+        let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
         for dr in 0..SUB_MI as usize {
             for dc in 0..SUB_MI as usize {
                 grid.set(
@@ -3483,29 +3563,7 @@ fn write_inter_frame_leaf8(
             mi_rows as usize,
         );
 
-        let is_new_mv = matches!(info.mode, InterMode::NewMv);
-        if is_new_mv {
-            enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
-        } else {
-            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
-            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
-            enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
-        }
-        if is_new_mv && stack.entries.len() > 1 {
-            enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
-        }
-        let mv = if is_new_mv {
-            write_mv(
-                enc,
-                &mut cdfs.mv_comp,
-                &mut cdfs.mv_joint,
-                info.mv,
-                stack.pred_mv,
-            )?;
-            info.mv
-        } else {
-            stack.nearest_mv
-        };
+        let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
         for dr in 0..2 {
             for dc in 0..2 {
                 grid.set(
@@ -5898,6 +5956,7 @@ mod tests {
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
+                ref_mv_idx: 0,
             }),
             skip: true,
             ..BlockCoeffs::default()
@@ -5939,6 +5998,7 @@ mod tests {
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
+                ref_mv_idx: 0,
             }),
             skip: true,
             ..BlockCoeffs::default()
@@ -5947,6 +6007,7 @@ mod tests {
             inter: Some(InterInfo {
                 mode: InterMode::NewMv,
                 mv: (0, 2),
+                ref_mv_idx: 0,
             }),
             skip: true,
             ..BlockCoeffs::default()
