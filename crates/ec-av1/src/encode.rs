@@ -12835,8 +12835,13 @@ mod tests {
         // four frames; four pictures is one short mini-GOP, which is the
         // shape that pays least (the ARF's own quality has no later group to
         // carry it), so this is not the BD gate's number.
+        // Re-taken again on lane-av1cfl: the chroma search offers
+        // `UV_CFL_PRED` and directional luma winners search `angle_delta_y`,
+        // so every block taking either codes different syntax and different
+        // coefficients -- 8194 -> 7321 at q=150 and 28285 -> 27285 at q=60.
+        // `EC_AV1_CFL=0` / `EC_AV1_ANGLE=0` restore each half.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8194, 0x08ba_a7a8_26f6_f414), (60, 28285, 0x64af_fc52_eef6_2967)];
+            [(150, 7321, 0x34e2_e4e0_d7c5_09f3), (60, 27285, 0xbfd2_41af_dcac_a0c6)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
