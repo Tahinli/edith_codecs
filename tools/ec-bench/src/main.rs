@@ -405,6 +405,14 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
         stream.extend_from_slice(&packet.data);
     }
     let wall = start.elapsed().as_secs_f64();
+    // What the content gate left this clip coding under: a screen-content
+    // source asks for the pyramid and codes flat, and then `hidden` is 0 for
+    // a reason the row itself names.
+    let coded_under = match (pyramid, enc.pyramid()) {
+        (_, Some(p)) => format!("pyramid {}:{}:{}", p.mini_gop, p.arf_q_offset, p.leaf_q_offset),
+        (Some(_), None) => "flat (gated: screen content)".to_string(),
+        (None, None) => "flat".to_string(),
+    };
     let media_s = n as f64 / 30.0;
     let fps = if wall > 0.0 { f64::from(n) / wall } else { 0.0 };
     let bytes_per_frame = stream.len() as f64 / f64::from(n);
@@ -412,7 +420,8 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
         component: "ec-av1",
         direction: "encode",
         content: format!(
-            "{w}x{h}, {n} frames, gop=10, {hidden} hidden, {fps:.1} fps, {bytes_per_frame:.0} B/frame"
+            "{w}x{h}, {n} frames, gop=10, {coded_under}, {hidden} hidden, {fps:.1} fps, \
+             {bytes_per_frame:.0} B/frame"
         ),
         media: format!("{media_s:.1}s"),
         wall_ms: wall * 1000.0,
