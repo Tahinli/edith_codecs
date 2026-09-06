@@ -2706,30 +2706,26 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
                                         continue;
                                     }
                                     // The true edge falls inside this 16x16
-                                    // leaf itself (mod-32==8 target sizes):
-                                    // one axis only, per r6's charter -- an
-                                    // 8x8 leaf never itself straddles, so the
-                                    // block splits cleanly along whichever
-                                    // axis is short and only the in-frame
-                                    // 8x8s are coded, each its own leaf.
-                                    if !has_cols16 && !has_rows16 {
-                                        return Err(Error::unsupported(
-                                            "AV1 tile",
-                                            "a 16x16 block whose true edge cuts through both \
-                                             axes needs a rectangular transform this writer \
-                                             does not code yet",
-                                        ));
-                                    }
-                                    if has_cols16 {
-                                        enc.symbol_fixed(
+                                    // leaf itself: the block splits into the
+                                    // 8x8s that are inside, each its own
+                                    // leaf. Same three-way spec signaling as
+                                    // every level above -- a single gathered
+                                    // bit when one half is outside, and
+                                    // nothing at all when BOTH are, where
+                                    // `decode_partition` infers the split
+                                    // (lane-av1rect: no rectangular
+                                    // transform is needed for this, the
+                                    // earlier refusal here misread 5.11.4).
+                                    match (has_cols16, has_rows16) {
+                                        (true, false) => enc.symbol_fixed(
                                             1,
                                             &gather(&cdfs.partition_w16[ctx], VERT_ALIKE),
-                                        );
-                                    } else {
-                                        enc.symbol_fixed(
+                                        ),
+                                        (false, true) => enc.symbol_fixed(
                                             1,
                                             &gather(&cdfs.partition_w16[ctx], HORZ_ALIKE),
-                                        );
+                                        ),
+                                        _ => {}
                                     }
                                     let leaves = block.eight.as_ref().ok_or_else(|| {
                                         Error::unsupported(
@@ -5359,23 +5355,16 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         }
                         for (leaf, (sr, sc)) in sub_blocks.iter().zip(sub_positions) {
                             // A 16x16 leaf whose own half straddles the true
-                            // frame edge on both axes needs a rectangular
-                            // transform this writer does not code yet; one
-                            // axis only is two (or, at a true corner, one)
-                            // 8x8 leaves (lane-av1inter8), same split the key
-                            // frame search takes at this geometry.
+                            // frame edge splits into the 8x8 leaves that are
+                            // inside it (lane-av1inter8), same split the key
+                            // frame search takes at this geometry -- on both
+                            // axes too, where `decode_partition` infers the
+                            // split and reads no symbol at all
+                            // (lane-av1rect).
                             let (has_cols16, has_rows16) = (
                                 has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
                                 has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
                             );
-                            if !has_cols16 && !has_rows16 {
-                                return Err(Error::unsupported(
-                                    "AV1 tile",
-                                    "a 16x16 inter-frame block whose true edge cuts through \
-                                     both axes needs a rectangular transform this writer \
-                                     does not code yet",
-                                ));
-                            }
                             let at16 = (sr, sc);
                             if has_cols16 && has_rows16 {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -5442,16 +5431,17 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
-                                if has_cols16 {
-                                    enc.symbol_fixed(
+                                match (has_cols16, has_rows16) {
+                                    (true, false) => enc.symbol_fixed(
                                         1,
                                         &gather(&cdfs.partition_w16[ctx16], VERT_ALIKE),
-                                    );
-                                } else {
-                                    enc.symbol_fixed(
+                                    ),
+                                    (false, true) => enc.symbol_fixed(
                                         1,
                                         &gather(&cdfs.partition_w16[ctx16], HORZ_ALIKE),
-                                    );
+                                    ),
+                                    // Both halves outside: SPLIT is inferred.
+                                    _ => {}
                                 }
                                 let leaves = leaf.eight.as_ref().ok_or_else(|| {
                                     Error::unsupported(
