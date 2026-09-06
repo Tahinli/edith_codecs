@@ -1862,6 +1862,43 @@ mod tests {
         tile_search_wall(3840, 1608, 6, &[(2, 1), (3, 2)], &[1, 8, 12]);
     }
 
+    /// lane-av1fpar: the frame-level FILTER stage is banded across the same
+    /// workers the tile search uses (`par::override_filter_threads`), so the
+    /// deblock/CDEF replays, the per-64 SSE and the plane copies all run in
+    /// pieces. Every piece is a disjoint band of the same integers, so the
+    /// stream must not move -- at a size that crops and is several superblock
+    /// rows tall, which is what makes the bands non-trivial.
+    #[test]
+    fn filter_stage_bytes_do_not_depend_on_the_thread_count() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (384usize, 288usize);
+        let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
+        let coded = |threads: usize| {
+            crate::par::set_tile_threads(threads);
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 2,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for picture in &sources {
+                stream.extend_from_slice(&enc.encode(picture).unwrap().data);
+            }
+            stream
+        };
+        // One tile, so only the filter stage can differ between these.
+        let one = coded(1);
+        for threads in [2usize, 4, 8] {
+            assert_eq!(one, coded(threads), "the filter stage moved at {threads} threads");
+        }
+        crate::par::set_tile_threads(1);
+    }
+
     /// lane-av1fpar: the filter search scores its ~30 candidates by replaying
     /// the loop filters on one captured reconstruction instead of decoding
     /// the coded tile again per candidate. The replay must be that decode,

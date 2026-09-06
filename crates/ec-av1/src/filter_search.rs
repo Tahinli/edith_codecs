@@ -82,9 +82,51 @@ fn unit_sse(
     sb_cols: usize,
     out: &mut [u64],
 ) -> u64 {
+    // lane-av1fpar: the whole-frame pass, split across the filter workers by
+    // UNIT ROW -- each band owns its own rows of `out` (`chunks_mut`, so the
+    // disjointness is the borrow checker's) and its partial totals are `u64`
+    // integers, which add up to the same value in any order.
+    let threads = crate::par::filter_threads().min(h.div_ceil(unit));
+    if threads <= 1 {
+        return unit_sse_rows(dec, dec_w, src, src_w, w, 0, h, unit, sb_cols, out);
+    }
+    let per = h.div_ceil(unit).div_ceil(threads);
+    let total = std::sync::atomic::AtomicU64::new(0);
+    {
+        let batch = crate::par::Batch::new("ec-av1-filter");
+        for (band, rows) in out.chunks_mut(per * sb_cols).enumerate() {
+            let (r0, r1) = ((band * per * unit).min(h), ((band + 1) * per * unit).min(h));
+            if r0 == r1 {
+                continue;
+            }
+            let total = &total;
+            batch.submit(move || {
+                let sse = unit_sse_rows(dec, dec_w, src, src_w, w, r0, r1, unit, sb_cols, rows);
+                total.fetch_add(sse, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+    }
+    total.into_inner()
+}
+
+/// [`unit_sse`] over rows `r0..r1` alone, accumulating into `out` as if it
+/// started at unit row `r0 / unit`.
+#[allow(clippy::too_many_arguments)]
+fn unit_sse_rows(
+    dec: &[u16],
+    dec_w: usize,
+    src: &[u8],
+    src_w: usize,
+    w: usize,
+    r0: usize,
+    r1: usize,
+    unit: usize,
+    sb_cols: usize,
+    out: &mut [u64],
+) -> u64 {
     let mut total = 0u64;
-    for row in 0..h {
-        let base = (row / unit) * sb_cols;
+    for row in r0..r1 {
+        let base = ((row - r0) / unit) * sb_cols;
         let (d, s) = (&dec[row * dec_w..][..w], &src[row * src_w..][..w]);
         for (i, (dc, sc)) in d.chunks(unit).zip(s.chunks(unit)).enumerate() {
             let mut acc = 0u32;
@@ -556,5 +598,17 @@ mod tests {
         let mut got = vec![7u64; sb_cols * 4];
         assert_eq!(unit_sse(&dec, dec_w, &src, src_w, w, h, unit, sb_cols, &mut got), total);
         assert_eq!(got, want);
+        // lane-av1fpar: and banded across workers -- same per-unit slots,
+        // same frame total (the partial sums are integers).
+        for threads in [2usize, 4, 8] {
+            let _bands = crate::par::override_filter_threads(threads);
+            let mut banded = vec![7u64; sb_cols * 4];
+            assert_eq!(
+                unit_sse(&dec, dec_w, &src, src_w, w, h, unit, sb_cols, &mut banded),
+                total,
+                "{threads} bands: the frame total moved"
+            );
+            assert_eq!(banded, want, "{threads} bands: a unit's error moved");
+        }
     }
 }

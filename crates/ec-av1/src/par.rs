@@ -32,7 +32,40 @@
 /// touching the process environment.
 static FILTER_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+thread_local! {
+    /// This thread's override of [`filter_threads`], 0 = none. The ENCODER's
+    /// frame-level filter search sets it for the span of that search
+    /// (lane-av1fpar): the tile search is over by then, so every core is
+    /// free, and each candidate's deblock/CDEF replay is exactly the banded
+    /// stage the decoder already splits -- same bands, same byte-exact
+    /// output, gated by
+    /// `a_real_stream_filters_identically_with_one_and_four_filter_threads`
+    /// on the decode side and by
+    /// `encoder::tests::tile_bytes_do_not_depend_on_the_thread_count` here.
+    static FILTER_BANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restores the previous [`FILTER_BANDS`] override when it drops.
+pub(crate) struct FilterBands(usize);
+
+impl Drop for FilterBands {
+    fn drop(&mut self) {
+        FILTER_BANDS.set(self.0);
+    }
+}
+
+/// Bands every filter stage on THIS thread across `n` workers until the
+/// returned guard drops; `n <= 1` leaves the process default in place.
+pub(crate) fn override_filter_threads(n: usize) -> FilterBands {
+    let previous = FILTER_BANDS.replace(if n > 1 { n.clamp(1, 64) } else { 0 });
+    FilterBands(previous)
+}
+
 pub(crate) fn filter_threads() -> usize {
+    let over = FILTER_BANDS.get();
+    if over > 0 {
+        return over;
+    }
     match FILTER_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {
             let n = crate::envflags::var("EC_AV1_FILTER_THREADS")
@@ -469,7 +502,7 @@ impl Drop for Batch<'_> {
 // Off (the default) each `stage` call is one relaxed atomic load.
 
 /// The stages [`stage`] accumulates, in the order a frame runs them.
-pub(crate) const STAGES: [&str; 8] = [
+pub(crate) const STAGES: [&str; 10] = [
     "tile search",
     "tile write",
     "filter: deblock replay",
@@ -478,6 +511,8 @@ pub(crate) const STAGES: [&str; 8] = [
     "filter search (total)",
     "capture decode",
     "lr search",
+    "filter: plane copies",
+    "filter: first decode",
 ];
 pub(crate) const S_TILE_SEARCH: usize = 0;
 pub(crate) const S_TILE_WRITE: usize = 1;
@@ -487,6 +522,8 @@ pub(crate) const S_SSE: usize = 4;
 pub(crate) const S_FILTER: usize = 5;
 pub(crate) const S_CAPTURE: usize = 6;
 pub(crate) const S_LR: usize = 7;
+pub(crate) const S_COPY: usize = 8;
+pub(crate) const S_FIRST: usize = 9;
 
 static STAGE_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =
     [const { std::sync::atomic::AtomicU64::new(0) }; STAGES.len()];
