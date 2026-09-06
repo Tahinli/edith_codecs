@@ -55,6 +55,56 @@ const SEARCH_INITIAL_STEP_PEL: i32 = 8;
 /// cost function.
 const SEARCH_MIN_STEP_PEL: i32 = 1;
 
+/// [`SEARCH_INITIAL_STEP_PEL`], swept by `EC_AV1_MV_STEP` in a test build.
+/// Swept 1/2/4/8 on the BD gate with the stack seeds below in place: the
+/// narrow seeded shape a predictor-seeded search is supposed to allow costs
+/// far more rate than it saves wall (step 1 +145.2/+219.4/+81.1 vs libaom,
+/// step 2 +134.2/+196.1/+81.1, step 4 +126.0/+161.2/+81.1 against 8's
+/// +125.6/+152.1/+80.9) for 0.2 s of a 6 s ladder -- the wide log stage is
+/// what finds the 2160p clip's motion, and the search is not the wall.
+fn seeded_step() -> i32 {
+    static STEP: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| match std::env::var("EC_AV1_MV_STEP").ok() {
+        Some(v) if cfg!(test) => v.parse().unwrap_or(SEARCH_INITIAL_STEP_PEL),
+        _ => SEARCH_INITIAL_STEP_PEL,
+    })
+}
+
+/// Whether [`search`] starts from the best of the MV-stack's own candidates
+/// (libaom's shape) as well as `pred_mv`. `EC_AV1_MV_SEEDED=0` restores the
+/// `pred_mv`-only start in a test build (what the lane measured both arms
+/// with).
+fn seeded() -> bool {
+    // Read once: this is on the per-block search path, and `std::env::var`
+    // allocates and locks.
+    static SEEDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SEEDED.get_or_init(|| match std::env::var("EC_AV1_MV_SEEDED").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => true,
+    })
+}
+
+/// How the search spends itself since the last [`take_census`]: 0 calls,
+/// 1 total candidate evaluations (one `predict` + SAD each), 2 of which in
+/// the two subpel stages, 3 integer-stage rounds, 4 calls whose winner is
+/// within one whole sample of `pred_mv`, 5 calls whose winner is the
+/// starting centre itself. A gate prints these rather than assume where the
+/// wall-owning stage goes (gate-blind-to-feature).
+static CENSUS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Takes (and clears) the census.
+#[cfg(test)]
+pub(crate) fn take_census() -> [u64; 6] {
+    [0, 1, 2, 3, 4, 5].map(|i| CENSUS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// The eight offsets, at `step` in each axis, a diamond/log search round
 /// checks around its current centre (the ninth point, no offset, is the
 /// centre itself and is already priced).
@@ -158,6 +208,72 @@ pub struct MotionSearch {
     pub cost: f64,
 }
 
+/// One candidate's `SAD + lambda * mv_bits(mv - pred_mv)`, predicted into the
+/// caller's `dst16` scratch (`block_w * block_h`) so a whole search allocates
+/// once.
+#[allow(clippy::too_many_arguments)]
+fn cost_of_mv(
+    reference: &[u16],
+    stride: usize,
+    ref_width: usize,
+    ref_height: usize,
+    source: &[u8],
+    block_x: usize,
+    block_y: usize,
+    block_w: usize,
+    block_h: usize,
+    mv: (i32, i32),
+    pred_mv: (i32, i32),
+    lambda: f64,
+    dst16: &mut [u16],
+    fctx: &crate::decode::FrameCtx,
+) -> f64 {
+    let x_q4 = (block_x as i32) * 16 + mv.1 * Q4_PER_Q3;
+    let y_q4 = (block_y as i32) * 16 + mv.0 * Q4_PER_Q3;
+    predict(
+        reference, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h, dst16, fctx,
+    );
+    // lane-av1speed: accumulated as an integer (a block is at most
+    // 32x32 samples of at most 255 each, nowhere near `u32`, and an
+    // integer sum this small is exact in `f64` whatever order it is
+    // summed in) instead of one `f64` conversion and dependent add per
+    // sample. Same value, several times the throughput.
+    let sad: u32 = source
+        .iter()
+        .zip(dst16.iter())
+        .map(|(&a, &b)| (i32::from(a) - i32::from(b)).unsigned_abs())
+        .sum();
+    let diff = (mv.0 - pred_mv.0, mv.1 - pred_mv.1);
+    f64::from(sad) + lambda * mv_bits(diff)
+}
+
+/// [`cost_of_mv`] for one vector, on its own scratch -- what a caller uses to
+/// price a single candidate (an extra reference's `NEARESTMV`, say) on the
+/// same scale [`search`] reports its own cost on, for one evaluation instead
+/// of a whole search.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cost_at(
+    reference: &[u16],
+    stride: usize,
+    ref_width: usize,
+    ref_height: usize,
+    source: &[u8],
+    block_x: usize,
+    block_y: usize,
+    block_w: usize,
+    block_h: usize,
+    mv: (i32, i32),
+    pred_mv: (i32, i32),
+    lambda: f64,
+    fctx: &crate::decode::FrameCtx,
+) -> f64 {
+    let mut dst16 = vec![0u16; block_w * block_h];
+    cost_of_mv(
+        reference, stride, ref_width, ref_height, source, block_x, block_y, block_w, block_h, mv,
+        pred_mv, lambda, &mut dst16, fctx,
+    )
+}
+
 /// Searches one `block_w * block_h` block, at `(block_x, block_y)` in the
 /// current picture's plane, against `reference` for the motion vector that
 /// minimises `SAD + lambda * mv_bits(mv - pred_mv)`.
@@ -200,11 +316,14 @@ pub(crate) fn search(
     block_w: usize,
     block_h: usize,
     pred_mv: (i32, i32),
+    seeds: &[(i32, i32)],
     lambda: f64, fctx: &crate::decode::FrameCtx,
 ) -> MotionSearch {
     let (result, _trace) = search_traced(
         reference, stride, ref_width, ref_height, source, block_x, block_y, block_w, block_h,
-        pred_mv, lambda, fctx,
+        pred_mv,
+        if seeded() { seeds } else { &[] },
+        lambda, fctx,
     );
     result
 }
@@ -224,6 +343,7 @@ fn search_traced(
     block_w: usize,
     block_h: usize,
     pred_mv: (i32, i32),
+    seeds: &[(i32, i32)],
     lambda: f64, fctx: &crate::decode::FrameCtx,
 ) -> (MotionSearch, Vec<f64>) {
     search_traced_from_step(
@@ -237,8 +357,13 @@ fn search_traced(
         block_w,
         block_h,
         pred_mv,
+        seeds,
         lambda,
-        SEARCH_INITIAL_STEP_PEL, fctx,
+        if seeded() {
+            seeded_step()
+        } else {
+            SEARCH_INITIAL_STEP_PEL
+        }, fctx,
     )
 }
 
@@ -257,6 +382,7 @@ fn search_traced_from_step(
     block_w: usize,
     block_h: usize,
     pred_mv: (i32, i32),
+    seeds: &[(i32, i32)],
     lambda: f64,
     initial_step_pel: i32, fctx: &crate::decode::FrameCtx,
 ) -> (MotionSearch, Vec<f64>) {
@@ -269,30 +395,34 @@ fn search_traced_from_step(
     // allocate-and-convert per searched block, which profiled as the single
     // largest symbol in the encoder (30% of `sequence_bench_sanity`).
     let mut dst16 = vec![0u16; block_w * block_h];
+    let evals = std::cell::Cell::new(0u64);
     let mut cost_of = |mv: (i32, i32)| -> f64 {
-        let x_q4 = (block_x as i32) * 16 + mv.1 * Q4_PER_Q3;
-        let y_q4 = (block_y as i32) * 16 + mv.0 * Q4_PER_Q3;
-        predict(
-            reference, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h,
-            &mut dst16, fctx,
-        );
-        // lane-av1speed: accumulated as an integer (a block is at most
-        // 32x32 samples of at most 255 each, nowhere near `u32`, and an
-        // integer sum this small is exact in `f64` whatever order it is
-        // summed in) instead of one `f64` conversion and dependent add per
-        // sample. Same value, several times the throughput.
-        let sad: u32 = source
-            .iter()
-            .zip(dst16.iter())
-            .map(|(&a, &b)| (i32::from(a) - i32::from(b)).unsigned_abs())
-            .sum();
-        let diff = (mv.0 - pred_mv.0, mv.1 - pred_mv.1);
-        f64::from(sad) + lambda * mv_bits(diff)
+        evals.set(evals.get() + 1);
+        cost_of_mv(
+            reference, stride, ref_width, ref_height, source, block_x, block_y, block_w, block_h,
+            mv, pred_mv, lambda, &mut dst16, fctx,
+        )
     };
 
     let mut trace = Vec::new();
     let mut centre = (round_to_pel(pred_mv.0), round_to_pel(pred_mv.1));
     let mut best_cost = cost_of(centre);
+    // The stack's own candidates, whole-pel rounded, as extra starting
+    // points: a neighbour block's vector is where this block's motion most
+    // often already is, and starting there is what lets the log stage below
+    // start from is usually the vector this block wants.
+    for &seed in seeds {
+        let candidate = (round_to_pel(seed.0), round_to_pel(seed.1));
+        if candidate == centre {
+            continue;
+        }
+        let cost = cost_of(candidate);
+        if cost < best_cost {
+            best_cost = cost;
+            centre = candidate;
+        }
+    }
+    let start_centre = centre;
     trace.push(best_cost);
 
     // Stage 1: log/diamond search over whole-pel steps, halving the step
@@ -317,6 +447,7 @@ fn search_traced_from_step(
             }
             let moved = best_in_round < best_cost;
             best_cost = best_in_round;
+            CENSUS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             trace.push(best_cost);
             if !moved {
                 break;
@@ -328,6 +459,7 @@ fn search_traced_from_step(
     // Stages 2 and 3: one ±1-step refinement each at half-pel then
     // quarter-pel, through the same cost function (so the refinement is
     // costed at the precision it commits to, not the integer-pel SAD alone).
+    let integer_evals = evals.get();
     for step in [HALF_PEL_Q3, QUARTER_PEL_Q3] {
         let round_centre = centre;
         for (dr, dc) in neighbor_offsets(step) {
@@ -339,6 +471,17 @@ fn search_traced_from_step(
             }
         }
         trace.push(best_cost);
+    }
+
+    use std::sync::atomic::Ordering::Relaxed;
+    CENSUS[0].fetch_add(1, Relaxed);
+    CENSUS[1].fetch_add(evals.get(), Relaxed);
+    CENSUS[2].fetch_add(evals.get() - integer_evals, Relaxed);
+    if (centre.0 - pred_mv.0).abs() <= PEL_Q3 && (centre.1 - pred_mv.1).abs() <= PEL_Q3 {
+        CENSUS[4].fetch_add(1, Relaxed);
+    }
+    if centre == start_centre {
+        CENSUS[5].fetch_add(1, Relaxed);
     }
 
     (
@@ -449,6 +592,7 @@ mod tests {
                 block_w,
                 block_h,
                 (0, 0),
+                &[],
                 0.1, fctx,
             );
             assert_eq!(
@@ -498,6 +642,7 @@ mod tests {
             block_w,
             block_h,
             (0, 0),
+            &[],
             0.1, fctx,
         );
         assert_eq!(
@@ -536,6 +681,7 @@ mod tests {
             block_w,
             block_h,
             (0, 0),
+            &[],
             0.1, fctx,
         );
         assert!(trace.len() > 1, "the search must run more than one round");
@@ -605,6 +751,7 @@ mod tests {
                     block_w,
                     block_h,
                     (0, 0),
+                    &[],
                     0.1,
                     candidate_step, fctx,
                 );
