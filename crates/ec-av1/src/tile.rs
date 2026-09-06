@@ -20,6 +20,163 @@ use crate::decode::{TXFM_CTX_INIT, txfm_partition_ctx_rect};
 use crate::msac::SymbolEncoder;
 use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16};
 
+// ---------------------------------------------------------------------------
+// lane-av1lr: per-64x64 `cdef_idx` (spec 5.11.56, `read_cdef`). The decoder
+// reads ONE `cdef_idx` literal per 64x64 superblock, at that superblock's
+// first non-skip block, and only when the frame header's `cdef_bits > 0`
+// (`crate::decode::maybe_read_cdef_idx`). The writers below mirror that from
+// a plan the filter search hands over, kept in a thread-local rather than
+// threaded through every `write_*` signature -- the same shape the decoder's
+// own `FrameCtx::cdef_transmitted` uses, and the encoder codes one tile at a
+// time on one thread. The plan is CONSUMED by the tile writer that runs next
+// ([`CdefIdxGuard`] clears it on every exit path, error included), so a frame
+// that arms nothing writes no literals.
+
+// ---------------------------------------------------------------------------
+// lane-av1lr: per-restoration-unit loop restoration syntax (spec 5.11.57,
+// `read_lr`), armed by the encoder's restoration search the same way
+// [`arm_cdef_idx`] arms the CDEF indices. LUMA ONLY and Wiener only: the
+// frame header this encoder writes sets `FrameRestorationType[0] = WIENER`
+// and leaves both chroma planes at `RESTORE_NONE`, so a unit codes one
+// `restore_wiener` symbol and, when it takes the filter, its two directions
+// against the running per-tile reference (`crate::restoration::
+// write_wiener_filter`, the exact inverse of the reader's own
+// `read_wiener_filter`).
+
+/// One frame's per-unit restoration plan (see [`arm_lr`]).
+struct LrPlan {
+    /// `LoopRestorationSize[0]`, in luma samples.
+    unit_size: u32,
+    /// `horz_units`/`vert_units` for the luma plane.
+    horz_units: u32,
+    vert_units: u32,
+    /// One entry per unit, `rcol + rrow * horz_units`: the filter it takes,
+    /// or `None` for `RESTORE_NONE`.
+    units: Vec<Option<crate::restoration::WienerInfo>>,
+    /// `ref_wiener_info`: the running reference the taps are coded against,
+    /// reset to the midpoint filter at the start of each tile (this writer
+    /// codes one tile per frame).
+    reference: crate::restoration::WienerInfo,
+}
+
+thread_local! {
+    static LR_PLAN: std::cell::RefCell<Option<LrPlan>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the next tile write with one Wiener decision per luma restoration
+/// unit. An empty `units` disarms (the frame codes no restoration at all).
+pub(crate) fn arm_lr(
+    unit_size: u32,
+    horz_units: u32,
+    vert_units: u32,
+    units: Vec<Option<crate::restoration::WienerInfo>>,
+) {
+    LR_PLAN.with(|c| {
+        *c.borrow_mut() = (!units.is_empty()).then(|| LrPlan {
+            unit_size,
+            horz_units,
+            vert_units,
+            units,
+            reference: crate::restoration::WienerInfo::default(),
+        });
+    });
+}
+
+/// `read_lr`'s write side, called once at the top of every superblock,
+/// before its partition symbol: writes the units this superblock's own
+/// mi span covers (`av1_loop_restoration_corners_in_sb`; no superres, so the
+/// column scaling is the plain mi one).
+fn write_lr(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, mi_row: u32, mi_col: u32) {
+    LR_PLAN.with(|c| {
+        let mut plan = c.borrow_mut();
+        let Some(plan) = plan.as_mut() else { return };
+        let unit = plan.unit_size;
+        let rcol0 = (mi_col * 4).div_ceil(unit);
+        let rcol1 = ((mi_col + SB_MI_W) * 4).div_ceil(unit).min(plan.horz_units);
+        let rrow0 = (mi_row * 4).div_ceil(unit);
+        let rrow1 = ((mi_row + SB_MI_W) * 4).div_ceil(unit).min(plan.vert_units);
+        for rrow in rrow0..rrow1 {
+            for rcol in rcol0..rcol1 {
+                let info = plan.units[(rcol + rrow * plan.horz_units) as usize];
+                enc.symbol(usize::from(info.is_some()), &mut cdfs.restore_wiener);
+                if let Some(info) = info {
+                    crate::restoration::write_wiener_filter(
+                        enc,
+                        false,
+                        &mut plan.reference,
+                        &info,
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// A 64x64 superblock's width in 4x4 mode-info units (`SB_MI` in
+/// `crate::decode`), the span [`write_lr`] resolves its units over.
+const SB_MI_W: u32 = 16;
+
+/// One frame's per-superblock `cdef_idx` plan (see [`arm_cdef_idx`]).
+struct CdefIdxPlan {
+    /// The header's `cdef_bits`; never 0 while armed.
+    bits: u8,
+    /// Superblocks per row, the stride of `grid`.
+    sb_cols: usize,
+    /// One index per 64x64 superblock, in raster order.
+    grid: Vec<u8>,
+    /// The superblock whose literal was already written -- the decoder's
+    /// `cdef_transmitted`, which resets at every superblock and which coding
+    /// order (each superblock's blocks are contiguous) makes a single slot.
+    last: Option<usize>,
+}
+
+thread_local! {
+    static CDEF_IDX: std::cell::RefCell<Option<CdefIdxPlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the next tile write with one `cdef_idx` per 64x64 superblock.
+/// `bits == 0` disarms (the header codes a single strength pair, so the tile
+/// carries no literal at all).
+pub(crate) fn arm_cdef_idx(bits: u8, sb_cols: usize, grid: Vec<u8>) {
+    CDEF_IDX.with(|c| {
+        *c.borrow_mut() = (bits > 0).then(|| CdefIdxPlan { bits, sb_cols, grid, last: None });
+    });
+}
+
+/// Clears the armed plan when the tile writer that consumed it returns.
+struct CdefIdxGuard;
+
+impl Drop for CdefIdxGuard {
+    fn drop(&mut self) {
+        CDEF_IDX.with(|c| *c.borrow_mut() = None);
+        LR_PLAN.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// `read_cdef`'s write side, called right after every block's `skip` symbol:
+/// writes this superblock's `cdef_idx` literal the first time a non-skip
+/// block of it is coded. `mi` is the block's own position in 4x4 mode-info
+/// units.
+fn write_cdef_idx(enc: &mut SymbolEncoder, mi: (usize, usize), skip: bool) {
+    if skip {
+        return;
+    }
+    CDEF_IDX.with(|c| {
+        let mut plan = c.borrow_mut();
+        let Some(plan) = plan.as_mut() else { return };
+        let sb = (mi.0 / 16) * plan.sb_cols + (mi.1 / 16);
+        if plan.last == Some(sb) {
+            return;
+        }
+        plan.last = Some(sb);
+        enc.literal(
+            u32::from(plan.grid.get(sb).copied().unwrap_or(0)),
+            u32::from(plan.bits),
+        );
+    });
+}
+
 /// round-4 av1-truesize debugging aid: prints `msg()` to stderr when the
 /// `EC_RNG` environment variable is set, mirroring the `EC_PART`/`EC_TOK`
 /// trace `/tmp/libaom-src`'s debug `aomdec` build already emits under the
@@ -1085,6 +1242,8 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
     tx_select: bool,
     cdfs: &mut Cdfs,
 ) -> Result<Vec<u8>> {
+    // Consumes whatever `arm_cdef_idx`/`arm_lr` armed, on every exit path.
+    let _cdef_idx = CdefIdxGuard;
     check_blocks(mi_cols, mi_rows)?;
     let (cols, rows) = block_grid(mi_cols, mi_rows);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
@@ -1148,6 +1307,7 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
     for sb_r in 0..sb_rows {
         neighbours.start_row();
         for sb_c in 0..sb_cols {
+            write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
             ec_rng_trace(|| {
@@ -1535,9 +1695,13 @@ fn write_intra_mode(
     above_mode: usize,
     left_mode: usize,
     cfl: bool,
+    // This block's own position in 4x4 mode-info units, for the `cdef_idx`
+    // literal that follows the `skip` symbol (see [`write_cdef_idx`]).
+    mi: (usize, usize),
 ) -> usize {
     let mode = usize::from(block.mode);
     enc.symbol(0, &mut cdfs.skip[0]);
+    write_cdef_idx(enc, mi, false);
     enc.symbol(
         mode,
         &mut cdfs.kf_y_mode[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]],
@@ -1585,6 +1749,7 @@ fn write_block(
     all_scans: &[Vec<u16>; 4],
 ) -> Result<()> {
     let (r, c) = at;
+    let at_mi = (r * (SUB / MI), c * (SUB / MI));
     let mode = write_intra_mode(
         enc,
         cdfs,
@@ -1592,8 +1757,8 @@ fn write_block(
         neighbours.above_mode[c],
         neighbours.left_mode[r],
         cfl,
+        at_mi,
     );
-    let at_mi = (r * (SUB / MI), c * (SUB / MI));
     let split = if tx_select {
         let tx = write_luma_select(
             enc,
@@ -1667,7 +1832,7 @@ fn write_leaf8(
     // true first divergence (a differently-sized alphabet under the same
     // DC_PRED decision desyncs the coder even though the decoded mode is
     // unchanged).
-    let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, true);
+    let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, true, leaf_mi);
     let planes = [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4];
     let split = if tx_select {
         let tx = write_luma_select(
@@ -3004,6 +3169,8 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     tx_select: bool,
     cdfs: &mut Cdfs,
 ) -> Result<Vec<u8>> {
+    // Consumes whatever `arm_cdef_idx`/`arm_lr` armed, on every exit path.
+    let _cdef_idx = CdefIdxGuard;
     check_blocks(mi_cols, mi_rows)?;
     // `block_grid`'s ceiling, not a plain division: a true frame size that is
     // not a whole number of 32x32 blocks (or of 64x64 superblocks) still has
@@ -3071,6 +3238,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     for sb_r in 0..sb_rows {
         neighbours.start_row();
         for sb_c in 0..sb_cols {
+            write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             // spec `decode_partition`'s hasRows/hasCols (5.11.4): a superblock
@@ -3318,6 +3486,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 let skip_ctx = usize::from(neighbours.above_skip[mi_c])
                     + usize::from(neighbours.left_skip[mi_r]);
                 enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+                write_cdef_idx(&mut enc, (mi_r, mi_c), block.skip);
 
                 let is_inter = block.inter.is_some();
                 let (above_inter, left_inter) =
@@ -3522,6 +3691,7 @@ fn write_inter_frame_leaf(
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
     let skip_ctx = usize::from(neighbours.above_skip[mi_c]) + usize::from(neighbours.left_skip[mi_r]);
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+    write_cdef_idx(enc, (mi_r, mi_c), block.skip);
 
     let (has_above, has_left) = (r > 0, c > 0);
     let (above_inter, left_inter) = (neighbours.above_inter[mi_c], neighbours.left_inter[mi_r]);
@@ -3715,6 +3885,7 @@ fn write_inter_frame_leaf8(
     let left_inter = neighbours.left_inter[leaf_mi.0];
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+    write_cdef_idx(enc, leaf_mi, block.skip);
 
     let (has_above, has_left) = (leaf_mi.0 > 0, leaf_mi.1 > 0);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
