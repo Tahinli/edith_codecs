@@ -8334,7 +8334,7 @@ fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
 /// `av1_get_palette_bsize_ctx` (pred_common.h: `num_pels_log2_lookup[bsize]
 /// - num_pels_log2_lookup[BLOCK_8X8]`, i.e. `log2(bw*bh) - 6`) -- `None` past
 /// the bound (never gates a palette read), `Some(bsize_ctx)` otherwise.
-fn palette_bsize_ctx(side: usize) -> Option<usize> {
+pub(crate) fn palette_bsize_ctx(side: usize) -> Option<usize> {
     palette_bsize_ctx_wh(side, side)
 }
 
