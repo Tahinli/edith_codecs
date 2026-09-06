@@ -537,20 +537,37 @@ fn intra_predict_u8(
     smooth_neighbor: bool,
     dst: &mut [u8], fctx: &crate::decode::FrameCtx,
 ) {
-    let above16: Option<Vec<u16>> = above.map(|s| s.iter().map(|&v| u16::from(v)).collect());
-    let left16: Option<Vec<u16>> = left.map(|s| s.iter().map(|&v| u16::from(v)).collect());
-    let mut dst16 = vec![0u16; dst.len()];
+    // Three heap allocations per call became three stack buffers: this runs
+    // once per mode per trial, and an edge is at most `bw + bh` samples while
+    // a block is at most `BLOCK * BLOCK`. Same samples either way.
+    let mut above_buf = [0u16; 2 * BLOCK];
+    let mut left_buf = [0u16; 2 * BLOCK];
+    let mut dst_buf = [0u16; BLOCK * BLOCK];
+    let widen = |src: &[u8], buf: &mut [u16; 2 * BLOCK]| {
+        for (d, &v) in buf[..src.len()].iter_mut().zip(src) {
+            *d = u16::from(v);
+        }
+    };
+    if let Some(s) = above {
+        widen(s, &mut above_buf);
+    }
+    if let Some(s) = left {
+        widen(s, &mut left_buf);
+    }
+    let above16 = above.map(|s| &above_buf[..s.len()]);
+    let left16 = left.map(|s| &left_buf[..s.len()]);
+    let dst16 = &mut dst_buf[..dst.len()];
     crate::intra::predict(
         mode,
         angle_delta,
-        above16.as_deref(),
-        left16.as_deref(),
+        above16,
+        left16,
         corner.map(u16::from),
         bw,
         bh,
         enable_edge_filter,
         smooth_neighbor,
-        &mut dst16, fctx,
+        dst16, fctx,
     );
     for (d, &s) in dst.iter_mut().zip(dst16.iter()) {
         *d = s as u8;
@@ -1459,17 +1476,13 @@ impl Plane<'_> {
     /// `source`), since [`Self::source`] itself is the whole plane, strided
     /// by [`Self::width`].
     fn source_block(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
-        (y..y + side)
-            .flat_map(|row| self.source[row * self.width + x..][..side].to_vec())
-            .collect()
+        rows_of(self.source, self.width, x, y, side)
     }
 
     /// The reconstructed samples of one square, so that a partition trial can
     /// be undone.
     fn snapshot(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
-        (y..y + side)
-            .flat_map(|row| self.reconstruction[row * self.width + x..][..side].to_vec())
-            .collect()
+        rows_of(&self.reconstruction, self.width, x, y, side)
     }
 
     /// Puts a snapshot back.
@@ -3139,6 +3152,19 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
 
 /// The reconstructed samples one 32x32 square covers in all three planes, so
 /// that a partition trial can be undone.
+/// One square of a plane, row-major, the inverse of [`Plane::restore`].
+///
+/// Same bytes as the `flat_map(|row| ..to_vec()).collect()` this replaces,
+/// which allocated and freed a `Vec` per row of every block it copied --
+/// `Plane::snapshot` runs once per partition trial.
+fn rows_of(plane: &[u8], width: usize, x: usize, y: usize, side: usize) -> Vec<u8> {
+    let mut out = vec![0u8; side * side];
+    for row in 0..side {
+        out[row * side..][..side].copy_from_slice(&plane[(y + row) * width + x..][..side]);
+    }
+    out
+}
+
 fn snapshot(
     luma: &Plane,
     chroma: &[Plane; 2],
