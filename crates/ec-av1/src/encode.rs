@@ -3324,6 +3324,7 @@ fn write_tiles<F>(tiles: usize, store: usize, code: F) -> Result<(Vec<Vec<u8>>, 
 where
     F: Fn(usize) -> Result<(Vec<u8>, Option<crate::cdf_state::Cdfs>)> + Sync + Send,
 {
+    let _t = crate::par::timer(crate::par::S_TILE_WRITE);
     type Slot = Option<Result<(Vec<u8>, Option<crate::cdf_state::Cdfs>)>>;
     let threads = crate::par::tile_threads().min(tiles);
     let mut slots: Vec<Slot> = Vec::new();
@@ -3379,6 +3380,7 @@ where
     T: Send,
     F: Fn(usize, &crate::decode::FrameCtx) -> Result<T> + Sync,
 {
+    let _t = crate::par::timer(crate::par::S_TILE_SEARCH);
     let threads = crate::par::tile_threads().min(tiles);
     if threads <= 1 {
         return (0..tiles).map(|index| job(index, fctx)).collect();
@@ -4159,12 +4161,19 @@ fn pick_and_apply_filters(
     // preset search reads comes off the REPLAYED picture, which is the same
     // picture a decode produces -- that is what the replay is pinned on.
     crate::decode::clear_filter_replay();
+    // lane-av1fpar: the per-tile search is over, so every core is idle from
+    // here to the end of the frame -- band each candidate's deblock/CDEF
+    // replay, the capture decode's own filter chain and the loop-restoration
+    // passes across the same workers the search used.
+    let _bands = crate::par::override_filter_threads(crate::par::tile_threads());
+    let ft = crate::par::timer(crate::par::S_FILTER);
     let search_result = crate::filter_search::pick_filters(
         |lf, cdef| {
             if let Some(picture) = crate::decode::replay_filters(lf, cdef, fctx) {
                 return Ok(picture);
             }
             crate::decode::arm_filter_replay();
+            let _t = crate::par::timer(crate::par::S_FIRST);
             decode(lf, cdef, &hdr, tiles, &none_lr)
         },
         source,
@@ -4174,6 +4183,7 @@ fn pick_and_apply_filters(
         (sb_cols, sb_rows),
         lambda,
     );
+    drop(ft);
     crate::decode::clear_filter_replay();
     let (lf, cdef, idx_grid, picture) = search_result?;
     header.loop_filter = lf;
@@ -4196,12 +4206,14 @@ fn pick_and_apply_filters(
     fctx.capture_stages.set(lr_on);
     let mut filtered = if idx_grid.is_empty() {
         if lr_on {
+            let _t = crate::par::timer(crate::par::S_CAPTURE);
             decode(&lf, &cdef, &hdr, tiles, &none_lr)?
         } else {
             picture
         }
     } else {
         let coded = recode(cdef.bits, sb_cols, &idx_grid, &[])?;
+        let _t = crate::par::timer(crate::par::S_CAPTURE);
         let picture = decode(&lf, &cdef, &hdr, &coded, &none_lr)?;
         *tiles = coded;
         picture
@@ -4215,6 +4227,7 @@ fn pick_and_apply_filters(
             ..LoopRestorationParams::default()
         };
         want.frame_restoration_type[0] = ec_av1_syntax::RestorationType::Wiener;
+        let lrt = crate::par::timer(crate::par::S_LR);
         let units = match crate::decode::take_filter_stages(fctx) {
             Some(stages) => crate::filter_search::pick_restoration(
                 &stages,
@@ -4231,8 +4244,10 @@ fn pick_and_apply_filters(
         // rather than paying ~1 bit per 64x64 for a tile full of
         // `restore_wiener = 0` symbols (the BD gate saw exactly that on the
         // clip whose units never take a filter).
+        drop(lrt);
         if units.iter().any(Option::is_some) {
             let coded = recode(cdef.bits, sb_cols, &idx_grid, &units)?;
+            let _t = crate::par::timer(crate::par::S_CAPTURE);
             filtered = decode(&lf, &cdef, &hdr, &coded, &want)?;
             *tiles = coded;
             lr = want;

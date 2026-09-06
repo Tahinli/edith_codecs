@@ -1862,6 +1862,178 @@ mod tests {
         tile_search_wall(3840, 1608, 6, &[(2, 1), (3, 2)], &[1, 8, 12]);
     }
 
+    /// lane-av1fpar: the frame-level FILTER stage is banded across the same
+    /// workers the tile search uses (`par::override_filter_threads`), so the
+    /// deblock/CDEF replays, the per-64 SSE and the plane copies all run in
+    /// pieces. Every piece is a disjoint band of the same integers, so the
+    /// stream must not move -- at a size that crops and is several superblock
+    /// rows tall, which is what makes the bands non-trivial.
+    #[test]
+    fn filter_stage_bytes_do_not_depend_on_the_thread_count() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (384usize, 288usize);
+        let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
+        let coded = |threads: usize| {
+            crate::par::set_tile_threads(threads);
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 2,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for picture in &sources {
+                stream.extend_from_slice(&enc.encode(picture).unwrap().data);
+            }
+            stream
+        };
+        // One tile, so only the filter stage can differ between these.
+        let one = coded(1);
+        for threads in [2usize, 4, 8] {
+            assert_eq!(one, coded(threads), "the filter stage moved at {threads} threads");
+        }
+        crate::par::set_tile_threads(1);
+    }
+
+    /// lane-av1fpar: the filter search scores its ~30 candidates by replaying
+    /// the loop filters on one captured reconstruction instead of decoding
+    /// the coded tile again per candidate. The replay must be that decode,
+    /// byte for byte -- including at a size that CROPS (1080 and 1608 both
+    /// pad to a superblock row, i.e. every export size the editor uses),
+    /// which is the arm this lane opened.
+    #[test]
+    fn filter_replay_codes_the_same_stream_as_a_full_decode() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let run = |width: usize, height: usize, off: bool| {
+            let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
+            crate::decode::set_filter_replay_disabled(off);
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 2,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for picture in &sources {
+                stream.extend_from_slice(&enc.encode(picture).unwrap().data);
+            }
+            crate::decode::set_filter_replay_disabled(false);
+            stream
+        };
+        // 320x160 crops (the coding surface is 320x192, one superblock row
+        // taller); 320x192 is a whole number of superblocks, the shape the
+        // replay already covered.
+        for (width, height) in [(320usize, 160usize), (320, 192)] {
+            let replayed = run(width, height, false);
+            let decoded = run(width, height, true);
+            assert_eq!(
+                replayed,
+                decoded,
+                "{width}x{height}: the filter replay is not the decode it stands in for \
+                 ({} bytes replayed, {} decoded)",
+                replayed.len(),
+                decoded.len(),
+            );
+        }
+    }
+
+    /// lane-av1fpar: where a frame's wall actually goes, stage by stage --
+    /// the per-tile search, the tile write, the frame-level filter search
+    /// (with its deblock/CDEF replay and per-64 SSE inside it), the capture
+    /// decode the loop-restoration search rides on, and that search itself.
+    /// Measurement, not a pass/fail gate.
+    #[test]
+    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    fn filter_stage_wall_1080p() {
+        filter_stage_wall(1920, 1080, 8, (2, 1), &[8]);
+    }
+
+    #[test]
+    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    fn filter_stage_wall_4k() {
+        filter_stage_wall(3840, 1608, 4, (2, 1), &[8, 12]);
+    }
+
+    fn filter_stage_wall(
+        width: usize,
+        height: usize,
+        frames: usize,
+        (cols_log2, rows_log2): (u32, u32),
+        threads: &[usize],
+    ) {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let Some(sources) = h264_clip_frames(width, height, frames) else {
+            eprintln!("SKIP the filter-stage breakdown: no fixture or no ffmpeg");
+            return;
+        };
+        crate::par::set_stage_times(true);
+        for &t in threads {
+            crate::par::set_tile_threads(t);
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: frames,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: cols_log2,
+                tile_rows_log2: rows_log2,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let _ = crate::par::take_stage_ns();
+            let start = std::time::Instant::now();
+            for picture in &sources {
+                assert!(!enc.encode(picture).unwrap().data.is_empty());
+            }
+            let wall = start.elapsed().as_secs_f64();
+            let ns = crate::par::take_stage_ns();
+            let ms = |i: usize| ns[i] as f64 / 1e6;
+            eprintln!(
+                "\n{width}x{height}, {frames} frames, {}x{} tiles, {t} tile threads: \
+                 {wall:.2}s wall, {:.2} fps",
+                1 << cols_log2,
+                1 << rows_log2,
+                frames as f64 / wall,
+            );
+            eprintln!("| stage | ms | ms/frame | % of wall |");
+            for (i, name) in crate::par::STAGES.iter().enumerate() {
+                eprintln!(
+                    "| {name} | {:.0} | {:.1} | {:.1}% |",
+                    ms(i),
+                    ms(i) / frames as f64,
+                    100.0 * ms(i) / (wall * 1e3),
+                );
+            }
+            // Top-level stages only (the deblock/CDEF/SSE rows are inside
+            // the filter-search total); the rest is per-frame setup, the
+            // source conversion and the splice.
+            let top: f64 = [
+                crate::par::S_TILE_SEARCH,
+                crate::par::S_TILE_WRITE,
+                crate::par::S_FILTER,
+                crate::par::S_CAPTURE,
+                crate::par::S_LR,
+            ]
+            .iter()
+            .map(|&i| ms(i))
+            .sum();
+            eprintln!(
+                "accounted {:.1}% of wall; outside the tile search {:.1}%",
+                100.0 * top / (wall * 1e3),
+                100.0 * (1.0 - ms(crate::par::S_TILE_SEARCH) / (wall * 1e3)),
+            );
+        }
+        crate::par::set_stage_times(false);
+        crate::par::set_tile_threads(1);
+    }
+
     fn tile_search_wall(
         width: usize,
         height: usize,

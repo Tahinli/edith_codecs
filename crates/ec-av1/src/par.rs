@@ -32,7 +32,40 @@
 /// touching the process environment.
 static FILTER_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+thread_local! {
+    /// This thread's override of [`filter_threads`], 0 = none. The ENCODER's
+    /// frame-level filter search sets it for the span of that search
+    /// (lane-av1fpar): the tile search is over by then, so every core is
+    /// free, and each candidate's deblock/CDEF replay is exactly the banded
+    /// stage the decoder already splits -- same bands, same byte-exact
+    /// output, gated by
+    /// `a_real_stream_filters_identically_with_one_and_four_filter_threads`
+    /// on the decode side and by
+    /// `encoder::tests::tile_bytes_do_not_depend_on_the_thread_count` here.
+    static FILTER_BANDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restores the previous [`FILTER_BANDS`] override when it drops.
+pub(crate) struct FilterBands(usize);
+
+impl Drop for FilterBands {
+    fn drop(&mut self) {
+        FILTER_BANDS.set(self.0);
+    }
+}
+
+/// Bands every filter stage on THIS thread across `n` workers until the
+/// returned guard drops; `n <= 1` leaves the process default in place.
+pub(crate) fn override_filter_threads(n: usize) -> FilterBands {
+    let previous = FILTER_BANDS.replace(if n > 1 { n.clamp(1, 64) } else { 0 });
+    FilterBands(previous)
+}
+
 pub(crate) fn filter_threads() -> usize {
+    let over = FILTER_BANDS.get();
+    if over > 0 {
+        return over;
+    }
     match FILTER_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {
             let n = crate::envflags::var("EC_AV1_FILTER_THREADS")
@@ -458,4 +491,81 @@ impl Drop for Batch<'_> {
             std::panic::resume_unwind(p);
         }
     }
+}
+
+// --- lane-av1fpar: encoder per-stage wall breakdown -----------------------
+//
+// Amdahl on the per-tile search (lane-av1tsearch) put ~43% of an inter frame
+// OUTSIDE the tile search without saying what it was. These counters name it:
+// one accumulator per serial stage of `encode_*_frame`, added to on whatever
+// thread runs the stage and printed by `encoder::tests::filter_stage_wall_*`.
+// Off (the default) each `stage` call is one relaxed atomic load.
+
+/// The stages [`stage`] accumulates, in the order a frame runs them.
+pub(crate) const STAGES: [&str; 10] = [
+    "tile search",
+    "tile write",
+    "filter: deblock replay",
+    "filter: cdef replay",
+    "filter: sse",
+    "filter search (total)",
+    "capture decode",
+    "lr search",
+    "filter: plane copies",
+    "filter: first decode",
+];
+pub(crate) const S_TILE_SEARCH: usize = 0;
+pub(crate) const S_TILE_WRITE: usize = 1;
+pub(crate) const S_DEBLOCK: usize = 2;
+pub(crate) const S_CDEF: usize = 3;
+pub(crate) const S_SSE: usize = 4;
+pub(crate) const S_FILTER: usize = 5;
+pub(crate) const S_CAPTURE: usize = 6;
+pub(crate) const S_LR: usize = 7;
+pub(crate) const S_COPY: usize = 8;
+pub(crate) const S_FIRST: usize = 9;
+
+static STAGE_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; STAGES.len()];
+/// 0 = not read yet, 1 = off, 2 = on. `EC_AV1_STAGE_TIMES`, or
+/// [`set_stage_times`] from a gate (the env snapshot is process-constant).
+static STAGE_ON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn stage_times() -> bool {
+    match STAGE_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let on = 1 + usize::from(crate::envflags::is_set("EC_AV1_STAGE_TIMES"));
+            STAGE_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+            on == 2
+        }
+        n => n == 2,
+    }
+}
+
+/// Test-only override of [`stage_times`]; process-global.
+#[cfg(test)]
+pub(crate) fn set_stage_times(on: bool) {
+    STAGE_ON.store(1 + usize::from(on), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A live stage measurement: added to stage `i` when it drops. `None` when
+/// the breakdown is off, so a call site is `let _t = par::timer(S_X);`.
+pub(crate) struct Timer(usize, std::time::Instant);
+
+#[inline]
+pub(crate) fn timer(i: usize) -> Option<Timer> {
+    stage_times().then(|| Timer(i, std::time::Instant::now()))
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        STAGE_NS[self.0]
+            .fetch_add(self.1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Takes and clears the breakdown, in [`STAGES`] order.
+#[cfg(test)]
+pub(crate) fn take_stage_ns() -> [u64; STAGES.len()] {
+    std::array::from_fn(|i| STAGE_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
