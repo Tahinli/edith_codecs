@@ -32639,6 +32639,11 @@ pub(crate) fn decode_inter_frame_tile(
     // inter frames coded Select by default (class: test asserts against a
     // stale header, second instance).
     tx_select: bool,
+    // The CDF state this frame's tile was WRITTEN from (`Encoded::start_cdfs`):
+    // an inter frame whose header leaves `disable_frame_end_update_cdf` off
+    // starts from what the previous frame stored, not from the defaults. Same
+    // class as `tx_select` above, third instance.
+    initial_cdfs: Option<Cdfs>,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -32659,7 +32664,7 @@ pub(crate) fn decode_inter_frame_tile(
         cdef,
         loop_filter,
         &LoopRestorationParams::default(),
-        None,
+        initial_cdfs,
         allow_high_precision_mv,
         force_integer_mv,
         NO_SIGN_BIAS,
@@ -36770,6 +36775,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             fctx,
         )
         .unwrap_err();
@@ -37166,6 +37172,7 @@ mod tests {
                 false,
                 false,
                 frame.tx_select,
+                Some(frame.start_cdfs.0.clone()),
                 fctx,
             )
             .unwrap();
@@ -37477,6 +37484,7 @@ mod tests {
                 false,
                 false,
                 frame.tx_select,
+                Some(frame.start_cdfs.0.clone()),
                 fctx,
             )
             .unwrap();

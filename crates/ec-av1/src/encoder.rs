@@ -226,6 +226,11 @@ pub struct Av1Encoder {
     /// thread-local. One per encoder, never per frame: several of its fields
     /// (the inter-frame inheritance guards) carry state ACROSS frames.
     fctx: crate::decode::FrameCtx,
+    /// What the last coded frame stored into the reference slot the next
+    /// inter frame reads (spec 7.20): the tables that frame's tile writer
+    /// must start from, since the header leaves
+    /// `disable_frame_end_update_cdf` off. `None` before the first frame.
+    carried_cdfs: Option<crate::encode::CdfSnapshot>,
 }
 
 /// The encoder stays `Send` now that it owns a `FrameCtx` (whose cells are
@@ -251,6 +256,7 @@ impl Av1Encoder {
         // then.
         Picture::grey(config.width, config.height).check_even()?;
         Ok(Self {
+            carried_cdfs: None,
             color_config: config.colour.color_config(),
             config,
             reference: None,
@@ -355,10 +361,12 @@ impl Av1Encoder {
                 DEADZONE,
                 order as u32,
                 render,
+                self.carried_cdfs.as_ref().map(|c| &c.0),
                 &self.fctx,
             )?
         };
 
+        self.carried_cdfs = Some(encoded.next_cdfs.clone());
         self.reference = Some(encoded.reconstruction.clone());
         self.next_index += 1;
         let cropped = crop_encoded(&encoded, render.0, render.1);
