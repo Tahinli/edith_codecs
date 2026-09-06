@@ -244,6 +244,45 @@ fn restoration_enabled() -> bool {
 /// future explicit speed preset.
 const SPLIT_BREAKOUT_COEFFS: usize = 0;
 
+/// libaom's `partition_search_breakout_rate_thr` shape, in this encoder's own
+/// currency: a 32x32 inter block whose whole-block RD cost per pixel comes
+/// out under `threshold * lambda` is not offered the split at all, and a
+/// 16x16 leaf under it is not offered the 8x8 split. `0.0` offers both
+/// always, as before this lever.
+///
+/// The census is what points here: the split trial runs on nearly every
+/// non-skip block (15132 leaf searches per ladder point on the 1080p clip)
+/// and wins 7.6% of the time on film, 3.0% on screen -- yet the coefficient
+/// -count breakout ([`SPLIT_BREAKOUT_COEFFS`]) that prunes it costs 18-31 BD
+/// points, so the gate has to read the block's own RD cost, not its levels.
+///
+/// Swept on the BD gate over 0.125/0.25/0.5/1.0 (vs libaom, against a base of
+/// +121.1/+146.1/+79.3): 0.125 is +121.2/+146.4/+79.1 (+0.1/+0.3/-0.2) for
+/// -10.0%/-5.7% instructions (1080p/screen, `perf stat` ABAB x2) and
+/// -7.7/-8.6/-4.5% wall; 0.25 already costs +0.7/+0.6/+0.6, 0.5 costs
+/// +3.5/+4.7/+1.8 for -15% wall, and 1.0 costs +19/+27/+6. So 0.125 ships --
+/// the largest threshold whose BD stays inside the +0.3 keep rule on every
+/// clip.
+const SPLIT_RD_THRESHOLD: f64 = 0.125;
+
+/// [`SPLIT_RD_THRESHOLD`], swept by `EC_AV1_SPLIT_RD` in any build.
+fn split_rd_threshold() -> f64 {
+    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("EC_AV1_SPLIT_RD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SPLIT_RD_THRESHOLD)
+    })
+}
+
+/// Whether `cost` over a `side` x `side` block is cheap enough per pixel that
+/// [`split_rd_threshold`] withholds the split trial.
+fn split_rd_breakout(cost: f64, side: usize, lambda: f64) -> bool {
+    let t = split_rd_threshold();
+    t > 0.0 && cost < t * lambda * (side * side) as f64
+}
+
 /// [`SPLIT_BREAKOUT_COEFFS`], swept by `EC_AV1_SPLIT_BREAKOUT` in a test
 /// build.
 fn split_breakout_coeffs() -> usize {
@@ -287,7 +326,7 @@ pub fn census_on() -> bool {
 }
 
 /// What each [`CENSUS`] counter counts.
-pub const CENSUS_KINDS: [&str; 8] = [
+pub const CENSUS_KINDS: [&str; 11] = [
     "intra blocks searched (key frame + inter leaves)",
     "intra luma mode trials",
     "chroma searches",
@@ -296,11 +335,14 @@ pub const CENSUS_KINDS: [&str; 8] = [
     "inter 32x32 blocks searched",
     "inter block intra-mode trials",
     "inter mv candidates (each = 3 mc trials)",
+    "inter leaves searched (intra vs NEARESTMV/NEWMV)",
+    "  of those, intra won",
+    "  of those, the NEARESTMV trial coded no residual",
 ];
 
 /// The census counters themselves, indexed by [`CENSUS_KINDS`].
-static CENSUS: [std::sync::atomic::AtomicUsize; 8] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+static CENSUS: [std::sync::atomic::AtomicUsize; 11] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 11];
 
 /// Where the RD winner sat in the SAD ranking, for the luma intra search and
 /// the chroma mode search -- what says whether a top-N prune would have kept
@@ -317,7 +359,7 @@ fn census_add(kind: usize, n: usize) {
 }
 
 /// Reads (and clears) the census, so a driver can attribute it to its own encode.
-pub fn take_census() -> ([usize; 8], [usize; 13], [usize; 7]) {
+pub fn take_census() -> ([usize; 11], [usize; 13], [usize; 7]) {
     let take = |c: &std::sync::atomic::AtomicUsize| c.swap(0, std::sync::atomic::Ordering::Relaxed);
     (
         std::array::from_fn(|i| take(&CENSUS[i])),
@@ -1028,7 +1070,11 @@ impl Plane<'_> {
             x, y, side, reach, ..
         } = at;
         let (above, left, corner) = self.edges(x, y, side, reach);
-        let mut prediction = vec![0u8; side * side];
+        // Per-candidate scratch on the search's hottest path, so both buffers
+        // live on the stack -- `side` is at most `BLOCK` -- rather than
+        // costing a malloc/free pair per trial (`mc_trial` already does this).
+        let mut prediction = [0u8; BLOCK * BLOCK];
+        let prediction = &mut prediction[..side * side];
         intra_predict_u8(
             mode,
             0,
@@ -1039,10 +1085,11 @@ impl Plane<'_> {
             side,
             false,
             false,
-            &mut prediction, fctx,
+            prediction, fctx,
         );
 
-        let mut residual = vec![0i32; side * side];
+        let mut residual = [0i32; BLOCK * BLOCK];
+        let residual = &mut residual[..side * side];
         for row in 0..side {
             for col in 0..side {
                 residual[row * side + col] =
@@ -1053,7 +1100,7 @@ impl Plane<'_> {
         #[cfg(test)]
         let t = std::time::Instant::now();
         let levels =
-            forward_and_quantize_typed(&residual, side, 8, i32::from(base_q_idx), deadzone, tx_type);
+            forward_and_quantize_typed(residual, side, 8, i32::from(base_q_idx), deadzone, tx_type);
         let coded =
             dequant_and_inverse_typed(&levels, side, 8, i32::from(base_q_idx), 0, 0, tx_type);
         #[cfg(test)]
@@ -1136,7 +1183,8 @@ impl Plane<'_> {
                 bits: 0.0,
             };
         }
-        let mut residual = vec![0i32; side * side];
+        let mut residual = [0i32; BLOCK * BLOCK];
+        let residual = &mut residual[..side * side];
         for row in 0..side {
             for col in 0..side {
                 residual[row * side + col] =
@@ -1146,7 +1194,7 @@ impl Plane<'_> {
         }
         #[cfg(test)]
         let t = std::time::Instant::now();
-        let levels = forward_and_quantize(&residual, side, 8, i32::from(base_q_idx), deadzone);
+        let levels = forward_and_quantize(residual, side, 8, i32::from(base_q_idx), deadzone);
         let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
         #[cfg(test)]
         stage_add(2, t.elapsed());
@@ -2247,6 +2295,34 @@ pub(crate) fn take_uv_mode_hits() -> [usize; 13] {
 /// (directional, spec `read_intra_angle_info`), the zero `angle_delta_uv` the
 /// writer then has to code.
 #[allow(clippy::too_many_arguments)]
+/// How many of [`CHROMA_MODES`] the chroma search runs a full trial pair on,
+/// ranked by the SAD of their predictions summed over both planes (`DC_PRED`
+/// always kept, the same rule [`prune_by_sad`] applies to luma). `None`
+/// trials all seven, as before this lever.
+///
+/// The census (`EC_AV1_CENSUS=1`) is what justifies the lever: chroma was
+/// the search's largest trial population by far -- seven modes times two
+/// planes for every intra block, against 3.7 luma trials -- and the RD
+/// winner sat at SAD rank 0 for 67-77% of blocks and inside the top three
+/// for 88%. `EC_AV1_CHROMA_K` sweeps it in any build.
+fn chroma_top_k() -> Option<usize> {
+    static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *K.get_or_init(|| match std::env::var("EC_AV1_CHROMA_K").ok() {
+        Some(v) => v.parse::<usize>().ok().filter(|&k| k > 0),
+        None => CHROMA_TOP_K,
+    })
+}
+
+/// [`chroma_top_k`]'s default. `None`: no `K` cleared the keep rule on the BD
+/// gate. Swept over 2/3/4/5 (vs libaom, base +121.1/+146.1/+79.3):
+/// K=2 is +122.3/+147.5/+79.8 for -7.0/-8.3/-7.9% wall, K=3 +121.4/+146.8/
+/// +80.6 for -5.4/-5.2/-4.6%, K=4 +120.5/+145.2/+79.3 (BD-neutral or better)
+/// for only -3.4% wall and -2.8% instructions, K=5 +122.0/+145.1/+80.0. The
+/// BD swings by about a point in either direction as near-tie chroma modes
+/// flip, which is the measurement's own sensitivity, not a trend: nothing
+/// here buys >=5% wall at <=+0.3 BD, so the default stays unpruned.
+const CHROMA_TOP_K: Option<usize> = None;
+
 fn search_chroma(
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
@@ -2263,25 +2339,34 @@ fn search_chroma(
         reach: Reach::none(),
         set,
     };
-    census_add(2, 1);
-    census_add(3, CHROMA_MODES.len());
     // The census's cheap proxy for a chroma mode: the SAD of its prediction
     // summed over both planes, ranked by the same rule the luma histogram
     // uses. Only built under `EC_AV1_CENSUS`.
-    let ranking: Vec<(f64, u8)> = if census_on() {
+    // The SAD of each mode's prediction, summed over both planes -- the
+    // census's ranking rule, and what [`chroma_top_k`] prunes by.
+    let sad_scores = |chroma: &[Plane; 2]| -> Vec<(f64, u8)> {
         let u = chroma[0].intra_scores(at, &CHROMA_MODES, &[0.0; 13], 0.0, fctx);
         let v = chroma[1].intra_scores(at, &CHROMA_MODES, &[0.0; 13], 0.0, fctx);
         u.iter()
             .zip(v.iter())
             .map(|(&(us, mode), &(vs, _))| (us + vs, mode))
             .collect()
-    } else {
-        Vec::new()
+    };
+    let modes: Vec<u8> = match chroma_top_k() {
+        Some(k) if k < CHROMA_MODES.len() => prune_by_sad(&CHROMA_MODES, sad_scores(chroma), k),
+        _ => CHROMA_MODES.to_vec(),
     };
     let uv_cdf = &cdf::UV_MODE_CFL[usize::from(luma_mode)];
     let dc_bits = symbol_bits(uv_cdf, usize::from(DC_PRED));
+    let ranking: Vec<(f64, u8)> = if census_on() {
+        sad_scores(chroma)
+    } else {
+        Vec::new()
+    };
+    census_add(2, 1);
+    census_add(3, modes.len());
     let mut best: Option<(f64, u8, Trial, Trial)> = None;
-    for mode in CHROMA_MODES {
+    for mode in modes {
         let mut bits = symbol_bits(uv_cdf, usize::from(mode)) - dc_bits;
         if (V_PRED..=D67_PRED).contains(&mode) {
             bits += symbol_bits(&cdf::ANGLE_DELTA[usize::from(mode - V_PRED)], 3);
@@ -2565,6 +2650,13 @@ fn code_square_inter(
         }
     }
 
+    census_add(8, 1);
+    if skip {
+        census_add(10, 1);
+    }
+    if inter_cost >= intra_cost {
+        census_add(9, 1);
+    }
     if inter_cost < intra_cost {
         let (levels, tx_depth, dcost) = commit_inter_luma(
             luma, (x, y), side, mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_trial, skip, fctx,
@@ -4465,6 +4557,7 @@ pub(crate) fn encode_inter_frame(
                     // nothing is not offered the split at all.
                     let breakout = split_breakout_coeffs();
                     let split = (!block.skip
+                        && !split_rd_breakout(cost_whole, BLOCK, search.lambda)
                         && (breakout == 0 || block.luma.len() > 4 * breakout)
                         && leaves_legal
                         && split_inter_blocks())
@@ -4499,6 +4592,7 @@ pub(crate) fn encode_inter_frame(
                                 // at BLOCK_16X16 (lane-av1rd2). Same
                                 // skipped-block prune as the level above.
                                 let eight = (!leaf.skip
+                                    && !split_rd_breakout(leaf_cost, SUB, search.lambda)
                                     && (breakout == 0 || leaf.luma.len() > breakout)
                                     && split_inter_8())
                                     .then(|| {
