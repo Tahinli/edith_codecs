@@ -144,6 +144,22 @@ pub(crate) fn arm_cdef_idx(bits: u8, sb_cols: usize, grid: Vec<u8>) {
     });
 }
 
+thread_local! {
+    static SIGN_BIAS: std::cell::Cell<crate::mvstack::SignBiasTable> =
+        const { std::cell::Cell::new(crate::mvstack::NO_SIGN_BIAS) };
+}
+
+/// Arms the next tile write with this frame's `ref_frame_sign_bias` (spec
+/// 5.9.2), the table its MV-stack scans run under. Armed the same way
+/// [`arm_cdef_idx`]/[`arm_lr`] are -- and disarmed by the same guard -- so
+/// that a frame with a backward reference needs no new parameter on the four
+/// nested writer helpers between here and `find_mv_stack`. A frame that never
+/// names a future reference leaves this alone: all-`false` is what every
+/// stream this crate wrote before pyramids existed codes under.
+pub(crate) fn arm_sign_bias(sign_bias: crate::mvstack::SignBiasTable) {
+    SIGN_BIAS.with(|c| c.set(sign_bias));
+}
+
 /// Clears the armed plan when the tile writer that consumed it returns.
 struct CdefIdxGuard;
 
@@ -151,6 +167,7 @@ impl Drop for CdefIdxGuard {
     fn drop(&mut self) {
         CDEF_IDX.with(|c| *c.borrow_mut() = None);
         LR_PLAN.with(|c| *c.borrow_mut() = None);
+        SIGN_BIAS.with(|c| c.set(crate::mvstack::NO_SIGN_BIAS));
     }
 }
 
@@ -3209,6 +3226,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
         mi_rows as usize,
     );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+    grid.set_sign_bias(SIGN_BIAS.with(std::cell::Cell::get));
     let mut cdfs = cdfs;
     let mut enc = SymbolEncoder::new();
     // An `is_inter` block's 32x32 luma transform reads a different

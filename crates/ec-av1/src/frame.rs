@@ -324,18 +324,59 @@ fn write_frame_size(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHeader) ->
     Ok(())
 }
 
+/// `uncompressed_header()` (spec 5.9.2) for a `show_existing_frame` header:
+/// the whole header is the flag, the three-bit DPB slot to output, and
+/// nothing else -- no tile payload follows, and the OBU carrying it is an
+/// `OBU_FRAME_HEADER`, not an `OBU_FRAME`. `frame_id_numbers_present_flag`
+/// and `film_grain_params_present` are both false in every sequence header
+/// this crate writes, and `decoder_model_info` is refused, so none of the
+/// three conditional fields spec 5.9.2 lists after the index is coded.
+///
+/// # Errors
+/// Returns an error when the sequence header carries any of the three, since
+/// the extra fields are not written.
+pub fn write_show_existing_frame_header(
+    w: &mut BitWriter,
+    seq: &SequenceHeader,
+    frame_to_show_map_idx: u8,
+) -> Result<()> {
+    if seq.frame_id_numbers_present_flag
+        || seq.film_grain_params_present
+        || seq.decoder_model_info.is_some()
+    {
+        return Err(Error::unsupported(
+            "AV1 frame header",
+            "a show_existing_frame header with frame ids, film grain or decoder model timing is not written",
+        ));
+    }
+    if frame_to_show_map_idx >= 8 {
+        return Err(Error::corrupt(
+            "AV1 frame header: show_existing_frame names a slot above 7",
+        ));
+    }
+    w.write_bit(true); // show_existing_frame
+    w.write_bits(u32::from(frame_to_show_map_idx), 3);
+    Ok(())
+}
+
 /// `uncompressed_header()` (spec 5.9.2) for a shown key or inter frame: no
 /// decoder model, no frame ids, no still-picture shortcut, and (for an inter
 /// frame) short reference signalling, non-identity global motion, compound
 /// reference selection and warped motion are all refused rather than written.
 pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHeader) -> Result<()> {
-    if !matches!(h.frame_type, FrameType::Key | FrameType::Inter)
-        || !h.show_frame
-        || h.show_existing_frame
-    {
+    if !matches!(h.frame_type, FrameType::Key | FrameType::Inter) || h.show_existing_frame {
         return Err(Error::unsupported(
             "AV1 frame header",
-            "only a shown key or inter frame is written",
+            "only a key or inter frame is written",
+        ));
+    }
+    // A hidden frame is an inter frame only: a key frame with `show_frame`
+    // clear changes the header layout further up (`error_resilient_mode` and
+    // `refresh_frame_flags` stop being forced), and nothing writes one.
+    if !h.show_frame && h.frame_type == FrameType::Key {
+        return Err(Error::unsupported(
+            "AV1 frame header",
+            "a key frame is only written shown",
         ));
     }
     let is_key = h.frame_type == FrameType::Key;
@@ -360,8 +401,14 @@ pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHead
 
     w.write_bit(false); // show_existing_frame
     w.write_bits(if is_key { 0 } else { 1 }, 2); // frame_type
-    w.write_bit(true); // show_frame
-    // showable_frame is derived by the reader when show_frame is set, and not coded.
+    w.write_bit(h.show_frame);
+    // spec 5.9.2: `showable_frame` is derived (`frame_type != KEY_FRAME`)
+    // when `show_frame` is set and coded when it is not. A hidden frame this
+    // encoder writes is always shown later by a `show_existing_frame` header
+    // ([`write_show_existing_frame_header`]), so the bit it codes is 1.
+    if !h.show_frame {
+        w.write_bit(true);
+    }
     if is_key {
         // error_resilient_mode is forced true for a shown key frame.
     } else {
@@ -521,6 +568,31 @@ pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHead
         }
     }
     Ok(())
+}
+
+/// An `OBU_FRAME_HEADER` carrying nothing but a `show_existing_frame` header
+/// (spec 5.9.2 + 5.3.4's `trailing_bits`): the OBU that re-outputs a hidden
+/// frame from DPB slot `frame_to_show_map_idx`. Unlike [`frame_obu`] this is
+/// `OBU_FRAME_HEADER`, so its payload ends with `trailing_bits` (a one bit
+/// then zeroes) rather than a plain byte alignment.
+///
+/// # Errors
+/// As [`write_show_existing_frame_header`].
+pub fn show_existing_frame_obu(seq: &SequenceHeader, frame_to_show_map_idx: u8) -> Result<Vec<u8>> {
+    let mut w = BitWriter::new();
+    write_show_existing_frame_header(&mut w, seq, frame_to_show_map_idx)?;
+    w.write_bit(true); // trailing_one_bit
+    write_byte_alignment(&mut w);
+    Ok(wrap_obu(
+        &ObuHeader {
+            obu_type: ObuType::FrameHeader,
+            extension_flag: false,
+            has_size_field: true,
+            temporal_id: 0,
+            spatial_id: 0,
+        },
+        &w.into_bytes(),
+    ))
 }
 
 /// A `OBU_FRAME`: the header above, byte-aligned, followed by the tile group
