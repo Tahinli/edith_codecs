@@ -6135,7 +6135,9 @@ fn pick_and_apply_filters(
             _ => panic!("one path captured filter stages and the other did not"),
         }
     }
-    crate::decode::clear_filter_replay();
+    // lane-av1cap2: the capture stays live past the restoration search --
+    // `crate::decode::replay_restoration` filters the same post-CDEF plane
+    // rather than decoding the re-coded tile. Cleared at the end instead.
     let mut lr = LoopRestorationParams::default();
     if lr_on {
         let mut want = LoopRestorationParams {
@@ -6165,11 +6167,50 @@ fn pick_and_apply_filters(
         if units.iter().any(Option::is_some) {
             let coded = recode(cdef.bits, sb_cols, &idx_grid, &units)?;
             let _t = crate::par::timer(crate::par::S_CAPTURE);
-            filtered = decode(&lf, &cdef, &hdr, &coded, &want)?;
+            // lane-av1cap2: that re-coded tile used to be DECODED here to
+            // reach the restored reference frame -- 5.6% of a 4K frame,
+            // for a filter that reads nothing of the tile but the per-unit
+            // Wiener filters this stage just chose. Run the decoder's own
+            // restoration kernel on the replay's post-CDEF plane instead
+            // (`crate::decode::replay_restoration`), with the real
+            // post-deblock stripe borders.
+            match crate::decode::replay_restoration(&want, &units, fctx) {
+                Some(y) => {
+                    #[cfg(test)]
+                    let margin = fctx
+                        .last_frame_wide_margin
+                        .with(|m| m.borrow().as_ref().map(|p| p.y.clone()));
+                    #[cfg(test)]
+                    if crate::decode::verify_final_replay() {
+                        let want_pic = decode(&lf, &cdef, &hdr, &coded, &want)?;
+                        assert!(
+                            (want_pic.width, want_pic.height) == (filtered.width, filtered.height)
+                                && want_pic.u == filtered.u
+                                && want_pic.v == filtered.v,
+                            "the restoration replay moved a chroma plane or the picture size",
+                        );
+                        assert!(
+                            want_pic.y == y,
+                            "the restoration replay is not the decode of the re-coded tile",
+                        );
+                        assert!(
+                            fctx.last_frame_wide_margin
+                                .with(|m| m.borrow().as_ref().map(|p| p.y.clone()))
+                                == margin,
+                            "the restoration replay's wide-margin luma is not the decode's",
+                        );
+                    }
+                    filtered.y = y;
+                }
+                // Nothing captured: the winner came out of a full decode,
+                // so this one does too.
+                None => filtered = decode(&lf, &cdef, &hdr, &coded, &want)?,
+            }
             *tiles = coded;
             lr = want;
         }
     }
+    crate::decode::clear_filter_replay();
     header.loop_restoration = lr;
     let dec_cw = filtered.width.div_ceil(2);
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
