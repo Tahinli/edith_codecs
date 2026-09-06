@@ -9,6 +9,7 @@
 //! It is the skeleton the block modes, transform sizes and coefficients hang
 //! off as they arrive.
 
+use std::cell::RefCell;
 use std::sync::LazyLock;
 
 use ec_core::{Error, Result};
@@ -2296,18 +2297,48 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
             default_scan(TX32),
         ]
     });
-    let mut cdfs = Cdfs::new(q_ctx);
-    let mut coding = cdfs.txb(set, DC_PRED);
-    let scan = match coding.side {
-        TX4 => &SCANS[0],
-        TX8 => &SCANS[1],
-        TX16 => &SCANS[2],
-        _ => &SCANS[3],
-    };
-    let mut enc = SymbolEncoder::new();
-    enc.reset_bits();
-    write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
-    enc.bits()
+    // `Cdfs::new` builds every table a tile writer adapts -- tens of
+    // kilobytes -- and this function is called once per priced candidate:
+    // together with the copy behind it that was 9% of the encoder's profile
+    // (`__memmove` 6.0% + `Cdfs::new` 3.4%, both under this call). Only the
+    // tables `write_coeffs` touches change, so keep one scratch `Cdfs` per
+    // q-context per thread beside a pristine one and restore just those from
+    // it. The state the price is taken against is identical to a fresh
+    // `Cdfs::new(q_ctx)`, so every price is bit-identical.
+    thread_local! {
+        static PRICING: RefCell<[Option<Box<(Cdfs, Cdfs)>>; 4]> =
+            const { RefCell::new([None, None, None, None]) };
+    }
+    PRICING.with_borrow_mut(|slots| {
+        let slot = slots[q_ctx.min(3)]
+            .get_or_insert_with(|| Box::new((Cdfs::new(q_ctx), Cdfs::new(q_ctx))));
+        let (pristine, scratch) = (&mut slot.0, &mut slot.1);
+        let src = pristine.txb(set, DC_PRED);
+        let mut coding = scratch.txb(set, DC_PRED);
+        coding.txb_skip.copy_from_slice(src.txb_skip);
+        coding.eob_pt.copy_from_slice(src.eob_pt);
+        if let (Some(dst), Some(src)) = (coding.eob_pt_class1.as_mut(), src.eob_pt_class1) {
+            dst.copy_from_slice(src);
+        }
+        *coding.eob_extra = *src.eob_extra;
+        *coding.base = *src.base;
+        *coding.base_eob = *src.base_eob;
+        *coding.br = *src.br;
+        *coding.dc_sign = *src.dc_sign;
+        if let (Some(dst), Some(src)) = (coding.tx_type.as_mut(), src.tx_type) {
+            dst.copy_from_slice(src);
+        }
+        let scan = match coding.side {
+            TX4 => &SCANS[0],
+            TX8 => &SCANS[1],
+            TX16 => &SCANS[2],
+            _ => &SCANS[3],
+        };
+        let mut enc = SymbolEncoder::new();
+        enc.reset_bits();
+        write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
+        enc.bits()
+    })
 }
 
 /// What the partition symbol of a block of `side` samples costs, in bits, when
@@ -2317,7 +2348,10 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
 /// than it is — because the search that reads it runs before the tile knows
 /// what its neighbours will be.
 pub(crate) fn partition_bits(side: usize, split: bool) -> f64 {
-    let cdfs = Cdfs::new(2);
+    // Read-only, and the same tables every call: built once (see
+    // [`coeff_bits`] for why that matters here).
+    static CDFS: LazyLock<Cdfs> = LazyLock::new(|| Cdfs::new(2));
+    let cdfs = &*CDFS;
     let cdf: &[u16] = match side {
         SB => &cdfs.partition_w64[0],
         BLOCK => &cdfs.partition_w32[0],
