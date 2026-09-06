@@ -276,6 +276,73 @@ pub(crate) fn take_partition_hits() -> [usize; 4] {
     [0, 1, 2, 3].map(|i| PARTITION_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Whether the trial-set census (`EC_AV1_CENSUS=1`) is on: how many full
+/// rate-distortion trials the block search actually runs, by kind, and where
+/// the winner sat in the cheap SAD ranking the pruning levers rank by. Off by
+/// default, and a measurement build rather than a speed one -- the census
+/// runs the SAD pre-pass the unpruned search otherwise skips.
+pub fn census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("EC_AV1_CENSUS").as_deref(), Ok("1")))
+}
+
+/// What each [`CENSUS`] counter counts.
+pub const CENSUS_KINDS: [&str; 8] = [
+    "intra blocks searched (key frame + inter leaves)",
+    "intra luma mode trials",
+    "chroma searches",
+    "chroma mode trials (each = 2 plane trials)",
+    "tx-depth trials (transform units, depth >= 1)",
+    "inter 32x32 blocks searched",
+    "inter block intra-mode trials",
+    "inter mv candidates (each = 3 mc trials)",
+];
+
+/// The census counters themselves, indexed by [`CENSUS_KINDS`].
+static CENSUS: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+
+/// Where the RD winner sat in the SAD ranking, for the luma intra search and
+/// the chroma mode search -- what says whether a top-N prune would have kept
+/// the block the search actually chose.
+static LUMA_RANK: [std::sync::atomic::AtomicUsize; 13] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 13];
+static CHROMA_RANK: [std::sync::atomic::AtomicUsize; 7] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+
+fn census_add(kind: usize, n: usize) {
+    if census_on() {
+        CENSUS[kind].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Reads (and clears) the census, so a driver can attribute it to its own encode.
+pub fn take_census() -> ([usize; 8], [usize; 13], [usize; 7]) {
+    let take = |c: &std::sync::atomic::AtomicUsize| c.swap(0, std::sync::atomic::Ordering::Relaxed);
+    (
+        std::array::from_fn(|i| take(&CENSUS[i])),
+        std::array::from_fn(|i| take(&LUMA_RANK[i])),
+        std::array::from_fn(|i| take(&CHROMA_RANK[i])),
+    )
+}
+
+/// The rank of `winner` in `scored` ordered by its cheap score, cheapest
+/// first -- the census's one shared rule, so the luma and chroma histograms
+/// mean the same thing.
+fn sad_rank(scored: &[(f64, u8)], winner: u8) -> usize {
+    scored
+        .iter()
+        .filter(|&&(score, mode)| {
+            mode != winner
+                && score
+                    < scored
+                        .iter()
+                        .find(|&&(_, m)| m == winner)
+                        .map_or(f64::INFINITY, |&(s, _)| s)
+        })
+        .count()
+}
+
 /// Whether a 32x32 block may be split into four 16x16 ones when the trial says
 /// four cost less. Set from the measurement in the lane report.
 const SPLIT_BLOCKS: bool = true;
@@ -1142,6 +1209,7 @@ impl Plane<'_> {
             _ => TxbSet::Luma4,
         };
         let mut levels = vec![0i32; side * side];
+        census_add(4, n * n);
         let (mut sse, mut bits) = (0.0, 0.0);
         for tu_row in 0..n {
             for tu_col in 0..n {
@@ -1266,6 +1334,11 @@ impl Plane<'_> {
             x, y, side, reach, ..
         } = at;
         let (above, left, corner) = self.edges(x, y, side, reach);
+        // Nothing ranks by the SAD pre-pass unless `top_k` prunes by it (or
+        // the census reports it), so summing it under the default unpruned
+        // search is `side * side` absolute differences per mode spent on a
+        // number no one reads.
+        let want_sad = search.top_k.is_some() || census_on();
         let mut scored: Vec<(f64, u8, Vec<u8>)> = search
             .modes
             .iter()
@@ -1283,16 +1356,20 @@ impl Plane<'_> {
                     false,
                     &mut prediction, fctx,
                 );
-                let sad: f64 = (0..side * side)
-                    .map(|i| {
-                        let (row, col) = (i / side, i % side);
-                        f64::from(
-                            (i32::from(self.source[(y + row) * self.width + x + col])
-                                - i32::from(prediction[i]))
-                            .abs(),
-                        )
-                    })
-                    .sum();
+                let sad: f64 = if want_sad {
+                    (0..side * side)
+                        .map(|i| {
+                            let (row, col) = (i / side, i % side);
+                            f64::from(
+                                (i32::from(self.source[(y + row) * self.width + x + col])
+                                    - i32::from(prediction[i]))
+                                .abs(),
+                            )
+                        })
+                        .sum()
+                } else {
+                    0.0
+                };
                 (
                     sad + search.lambda * mode_bits[usize::from(mode)],
                     mode,
@@ -1315,6 +1392,13 @@ impl Plane<'_> {
                 }
             }
         }
+        let ranking: Vec<(f64, u8)> = if census_on() {
+            scored.iter().map(|&(score, mode, _)| (score, mode)).collect()
+        } else {
+            Vec::new()
+        };
+        census_add(0, 1);
+        census_add(1, scored.len());
         let mut best: Option<(f64, u8, Trial)> = None;
         for (_, mode, prediction) in scored {
             let trial = self.code_from_prediction(
@@ -1336,6 +1420,10 @@ impl Plane<'_> {
             }
         }
         let (cost, mode, trial) = best.expect("the search offers at least one mode");
+        if census_on() {
+            LUMA_RANK[sad_rank(&ranking, mode).min(12)]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.commit(x, y, side, &trial);
         (coeffs(&trial.levels, side), mode, cost)
     }
@@ -2175,6 +2263,21 @@ fn search_chroma(
         reach: Reach::none(),
         set,
     };
+    census_add(2, 1);
+    census_add(3, CHROMA_MODES.len());
+    // The census's cheap proxy for a chroma mode: the SAD of its prediction
+    // summed over both planes, ranked by the same rule the luma histogram
+    // uses. Only built under `EC_AV1_CENSUS`.
+    let ranking: Vec<(f64, u8)> = if census_on() {
+        let u = chroma[0].intra_scores(at, &CHROMA_MODES, &[0.0; 13], 0.0, fctx);
+        let v = chroma[1].intra_scores(at, &CHROMA_MODES, &[0.0; 13], 0.0, fctx);
+        u.iter()
+            .zip(v.iter())
+            .map(|(&(us, mode), &(vs, _))| (us + vs, mode))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let uv_cdf = &cdf::UV_MODE_CFL[usize::from(luma_mode)];
     let dc_bits = symbol_bits(uv_cdf, usize::from(DC_PRED));
     let mut best: Option<(f64, u8, Trial, Trial)> = None;
@@ -2192,6 +2295,10 @@ fn search_chroma(
         }
     }
     let (cost, mode, u, v) = best.expect("CHROMA_MODES is not empty");
+    if census_on() {
+        CHROMA_RANK[sad_rank(&ranking, mode).min(6)]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     UV_MODE_HITS[usize::from(mode)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     chroma[0].commit(at.x, at.y, at.side, &u);
     chroma[1].commit(at.x, at.y, at.side, &v);
@@ -3753,6 +3860,8 @@ fn search_inter_block(
         }
         _ => search.modes.to_vec(),
     };
+    census_add(5, 1);
+    census_add(6, intra_modes.len());
     for &mode in &intra_modes {
         let luma_trial = luma.trial(
             At {
@@ -4007,6 +4116,7 @@ fn search_inter_block(
             .then(a.1.total_cmp(&b.1))
     });
     cands.dedup_by_key(|c| (c.2.ref_frame, c.0));
+    census_add(7, cands.len());
     {
         for (mv, mode_bits_inter, info) in cands {
             let (ref_luma, ref_u, ref_v) = match extra
