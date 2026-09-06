@@ -8334,7 +8334,7 @@ fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
 /// `av1_get_palette_bsize_ctx` (pred_common.h: `num_pels_log2_lookup[bsize]
 /// - num_pels_log2_lookup[BLOCK_8X8]`, i.e. `log2(bw*bh) - 6`) -- `None` past
 /// the bound (never gates a palette read), `Some(bsize_ctx)` otherwise.
-fn palette_bsize_ctx(side: usize) -> Option<usize> {
+pub(crate) fn palette_bsize_ctx(side: usize) -> Option<usize> {
     palette_bsize_ctx_wh(side, side)
 }
 
@@ -8385,7 +8385,7 @@ struct PaletteUv {
 /// `read_palette_colors_y`'s shrinking `bits` and `av1_read_uniform`'s
 /// `get_unsigned_bits`, which is the same formula): smallest `n` with
 /// `2^n >= x`, `0` for `x <= 1`.
-fn ceil_log2(x: u32) -> u32 {
+pub(crate) fn ceil_log2(x: u32) -> u32 {
     if x < 2 { 0 } else { 32 - (x - 1).leading_zeros() }
 }
 
@@ -8559,7 +8559,7 @@ const PALETTE_COLOR_INDEX_CONTEXT_LOOKUP: [i32; 9] = [-1, -1, 0, -1, -1, 4, 3, 2
 /// palette block's map to a narrower plane edge, [`decode_color_index_map`]'s
 /// own doc). Returns `(ctx, color_order)`; `color_order[symbol]` is the
 /// actual colour index to store.
-fn palette_color_index_context(
+pub(crate) fn palette_color_index_context(
     map: &[u8],
     side: usize,
     row: usize,
@@ -32942,7 +32942,7 @@ pub(crate) fn decode_inter_frame_tile(
         data, mi_cols, mi_rows, base_q_idx, frame_width, frame_height, refpix, cdef,
         loop_filter, allow_high_precision_mv, force_integer_mv, interp_fixed,
         enable_dual_filter, reference_select, tx_select,
-        &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, fctx,
+        &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, false, fctx,
     )
 }
 
@@ -32977,6 +32977,12 @@ pub(crate) fn decode_inter_frame_tile_lr(
     // as `tx_select`/`initial_cdfs` above: a header-derived value a raw tile
     // decode has to be told.
     sign_bias: crate::mvstack::SignBiasTable,
+    // This frame header's own `allow_screen_content_tools`: its intra blocks
+    // then carry the palette syntax (spec 5.11.46), which a raw tile decode
+    // that guessed `false` reads one symbol short of. Placed after
+    // `sign_bias` rather than beside the other bools on purpose (the
+    // `adjacent-same-typed-args` class).
+    allow_screen_content_tools: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -33004,6 +33010,7 @@ pub(crate) fn decode_inter_frame_tile_lr(
         lr,
         initial_cdfs,
         sign_bias,
+        allow_screen_content_tools,
         fctx,
     )
 }
@@ -33031,6 +33038,9 @@ pub(crate) fn decode_inter_frame_tiles_lr(
     lr: &LoopRestorationParams,
     initial_cdfs: Option<Cdfs>,
     sign_bias: crate::mvstack::SignBiasTable,
+    // This frame header's own `allow_screen_content_tools` (see the
+    // single-tile wrapper): the palette syntax its intra blocks carry.
+    allow_screen_content_tools: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     decode_inter_frame_tile_with_cdfs(
@@ -33067,7 +33077,7 @@ pub(crate) fn decode_inter_frame_tiles_lr(
         tx_select,
         false,
         false,
-        false,
+        allow_screen_content_tools,
         DeltaParams::default(),
         // `enable_filter_intra`: this crate's own encoder never writes the
         // sequence bit (`encode.rs`), so no intra-in-inter block of a stream
@@ -37564,7 +37574,9 @@ mod tests {
             &key.loop_filter,
             key.tx_select,
             true,
-            false,
+            // This key frame's own `allow_screen_content_tools`: its intra
+            // blocks carry the palette syntax under it (stale-header class).
+            key.screen,
             false,
             &key.loop_restoration, fctx,
         )
@@ -37611,6 +37623,9 @@ mod tests {
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
                 NO_SIGN_BIAS,
+                // This frame's own `allow_screen_content_tools`, off the
+                // `Encoded` the encoder handed back (stale-header class).
+                frame.screen,
                 fctx,
             )
             .unwrap();
@@ -37899,7 +37914,9 @@ mod tests {
             &key.loop_filter,
             key.tx_select,
             true,
-            false,
+            // This key frame's own `allow_screen_content_tools`: its intra
+            // blocks carry the palette syntax under it (stale-header class).
+            key.screen,
             false,
             &key.loop_restoration, fctx,
         )
@@ -37935,6 +37952,9 @@ mod tests {
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
                 NO_SIGN_BIAS,
+                // This frame's own `allow_screen_content_tools`, off the
+                // `Encoded` the encoder handed back (stale-header class).
+                frame.screen,
                 fctx,
             )
             .unwrap();
