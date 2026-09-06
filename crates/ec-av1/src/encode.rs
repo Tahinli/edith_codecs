@@ -1159,11 +1159,16 @@ pub fn inter_frame_headers_slots(
         },
         allow_high_precision_mv: false,
         interpolation_filter: ec_av1_syntax::InterpolationFilter::Eighttap,
-        // lane-av1obmc: every single-reference inter block libaom's
-        // `motion_mode_allowed` accepts carries a `motion_mode` symbol
-        // (`crate::tile::write_motion_mode`). `allow_warped_motion` stays
-        // false, so the alphabet is the 2-symbol `obmc_cdf`.
-        is_motion_mode_switchable: true,
+        // lane-av1obmc: with this bit set every single-reference inter block
+        // libaom's `motion_mode_allowed` accepts carries a `motion_mode`
+        // symbol (`crate::tile::write_motion_mode`); `allow_warped_motion`
+        // stays false, so the alphabet is the 2-symbol `obmc_cdf`. It is tied
+        // to the OBMC knob rather than always on: with every block choosing
+        // SIMPLE_TRANSLATION the symbol is pure cost (+0.07% / +0.02% on the
+        // gate clip), so the DEFAULT path writes no motion_mode syntax at all
+        // and stays byte-identical to the streams before this lane. A future
+        // warp knob joins this disjunction.
+        is_motion_mode_switchable: crate::envflags::env_flag!("EC_AV1_OBMC"),
         use_ref_frame_mvs: false,
         // Forces `get_tx_set` (spec 5.11.48) to the two-symbol
         // `TX_SET_INTER_3` for every inter transform below 32x32 -- the only
@@ -9687,8 +9692,11 @@ mod tests {
         // lane-av1obmc: every eligible single-reference inter block now also
         // carries a `motion_mode` symbol the coefficient sum never counts,
         // and an OBMC block carries the more expensive of the two values --
-        // re-measured at +35.0% here with `EC_AV1_OBMC=1`; the default path
-        // (OBMC off, SIMPLE symbols only) reads +33.x.
+        // re-measured at +35.0% here with `EC_AV1_OBMC=1`. Like
+        // `EC_AV1_PRICE_FRAME_CDFS=1` before it, that knob changes encoder
+        // decisions, so this bound and the byte pins above FAIL BY DESIGN
+        // under it; the default path (no motion_mode syntax at all) is the
+        // one they are measured on.
         assert!(
             worst_under <= 0.34,
             "the writer spent {:.2}% more than the search priced -- more than \
@@ -10744,7 +10752,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7111, 0xd375_2e36_13c4_9fc4), (60, 25969, 0x83b2_8522_cec6_38d4)];
+            [(150, 7106, 0x1da4_9acd_a892_68e3), (60, 25963, 0x94df_8f46_174e_1a5e)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
