@@ -1777,6 +1777,25 @@ fn forward_gain(n: usize) -> f64 {
 /// fixed-point gain. It is deterministic, and its accuracy is measured
 /// against the decoder's own inverse rather than asserted.
 pub fn forward_transform_2d(residual: &[i32], side: usize) -> Vec<f64> {
+    let rows = forward_rows(residual, side);
+    let scale = forward_scale(side);
+    let mut out = vec![0.0f64; side * side];
+    let mut t = [0i32; 64];
+    for v in 0..side {
+        if !forward_column(&rows, side, v, &mut t) {
+            continue;
+        }
+        for u in 0..side {
+            out[u * side + v] = f64::from(t[u]) * scale;
+        }
+    }
+    out
+}
+
+/// The row pass, in fixed point: each of `side` residual rows through
+/// [`forward_dct_fixed`], at [`FORWARD_PRECISION_BITS`] extra precision and
+/// the network's own gain (both of which [`forward_scale`] divides back out).
+fn forward_rows(residual: &[i32], side: usize) -> Vec<i32> {
     assert_eq!(
         residual.len(),
         side * side,
@@ -1798,27 +1817,38 @@ pub fn forward_transform_2d(residual: &[i32], side: usize) -> Vec<f64> {
         forward_dct_fixed(&mut t, log2, FORWARD_RANGE);
         rows[i * side..][..side].copy_from_slice(&t[..side]);
     }
-    // Both passes carry the network's gain, and the decoder owes the levels
-    // `INVERSE_GAIN_RECIPROCAL` times the ORTHONORMAL coefficient, so the one
-    // multiply that leaves fixed point divides it back out.
-    let g = forward_gain(side);
-    let scale = INVERSE_GAIN_RECIPROCAL / (g * g * f64::from(1u32 << FORWARD_PRECISION_BITS));
-    let mut out = vec![0.0f64; side * side];
-    for v in 0..side {
-        let mut any = 0i32;
-        for i in 0..side {
-            t[i] = rows[i * side + v];
-            any |= t[i];
-        }
-        if any == 0 {
-            continue;
-        }
-        forward_dct_fixed(&mut t, log2, FORWARD_RANGE);
-        for u in 0..side {
-            out[u * side + v] = f64::from(t[u]) * scale;
-        }
+    rows
+}
+
+/// One column of [`forward_rows`]'s output through the network, into `t`;
+/// `false` when the column is all zero and `t` was left untouched.
+///
+/// One column at a time, and the caller consumes `t` before asking for the
+/// next: eight columns through the same `[i32; 8]` [`Lane`] the decoder's
+/// column pass uses was MEASURED SLOWER (+3.4% instructions on the sequence
+/// bench, and +2.3% for an in-place whole-buffer column pass). This encoder's
+/// transforms are mostly small -- a group of eight loses the per-column zero
+/// skip that a 4x4 or 8x8 residual keeps hitting, and the levels stop being
+/// formed while the column is still in registers.
+fn forward_column(rows: &[i32], side: usize, v: usize, t: &mut [i32; 64]) -> bool {
+    let mut any = 0i32;
+    for i in 0..side {
+        t[i] = rows[i * side + v];
+        any |= t[i];
     }
-    out
+    if any == 0 {
+        return false;
+    }
+    forward_dct_fixed(t, side.trailing_zeros(), FORWARD_RANGE);
+    true
+}
+
+/// What one fixed-point coefficient is worth on the `8 * orthonormal` scale
+/// the levels are formed on: both passes carry the network's gain, and the
+/// row pass carried the headroom shift too.
+fn forward_scale(side: usize) -> f64 {
+    let g = forward_gain(side);
+    INVERSE_GAIN_RECIPROCAL / (g * g * f64::from(1u32 << FORWARD_PRECISION_BITS))
 }
 
 /// The old direct `O(n^2)` matmul against [`build_dct_basis`], kept only as
@@ -1904,8 +1934,34 @@ pub fn forward_and_quantize(
     q_idx: i32,
     deadzone: f64,
 ) -> Vec<i32> {
-    let coeffs = forward_transform_2d(residual, side);
-    quantize(&coeffs, side, bit_depth, q_idx, deadzone)
+    // Fused: the levels are formed straight off the fixed-point coefficients,
+    // so neither the `Vec<f64>` of coefficients nor the pass that reads it
+    // exists.
+    let rows = forward_rows(residual, side);
+    let scale = forward_scale(side);
+    let dc = scale / f64::from(crate::quant::dc_q(bit_depth, q_idx));
+    let ac = scale / f64::from(crate::quant::ac_q(bit_depth, q_idx));
+    // A 64-point transform carries its top-left 32x32 alone, so the other
+    // half's columns are not even transformed.
+    let coded = side.min(32);
+    let mut levels = vec![0i32; side * side];
+    let mut t = [0i32; 64];
+    for v in 0..coded {
+        if !forward_column(&rows, side, v, &mut t) {
+            continue;
+        }
+        for u in 0..coded {
+            let scaled = f64::from(t[u]) * if u == 0 && v == 0 { dc } else { ac };
+            let magnitude = scaled.abs() + deadzone;
+            let level = if magnitude < 1.0 {
+                0
+            } else {
+                magnitude.floor().min(f64::from(i32::MAX)) as i32
+            };
+            levels[u * side + v] = if scaled < 0.0 { -level } else { level };
+        }
+    }
+    levels
 }
 
 #[cfg(test)]
