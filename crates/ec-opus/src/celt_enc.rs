@@ -69,6 +69,31 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// `EC_OPUS_TRIM13` (the continuous 1.3 trim the term belongs to),
 /// `EC_OPUS_VBR_TONAL` (`compute_vbr`'s tonality boost) and
 /// `EC_OPUS_VBR_ACT` (`compute_vbr`'s low-activity cut).
+///
+/// MEASURED (lane opustonal, four detached 12-row library-gate runs against
+/// the shipped rows `lanes/opus-opustr2-r1.sweep.txt`). The analysis itself is
+/// byte-neutral -- no consumer reads it unless its own switch is on -- and
+/// **every consumer arm is rejected by the KEEP rule**, so all three default
+/// off. err_ratio, better rows first, blocking rows named:
+///
+/// | arm | better | blocking |
+/// |---|---|---|
+/// | 1.3 trim + tonality term (`-r1`) | nik@64 .708→.647, zaur@64 1.510→1.071, zaur@96 .940→.898, naz@96 4.499→2.458, dl8a .552/.374→.512/.336 | nik@96 .985→1.006, her@64 1.103→1.109, her@96 1.051→1.085, naz@64 2.697→2.872 |
+/// | vbr tonality + activity (`-r2`) | hein@64 .853→.327, hein@96 .528→.426, nik@64 →.672, dl8a@64 →.541 | nik@96 →1.061, zaur@96 →1.165, her@64 →1.104, her@96 →1.060, dl8a@96 →.414 |
+/// | vbr activity alone (`-r3`) | hein@64 →.430, hein@96 →.408, nik@64 →.657, dl8a@64 →.511 | nik@96 →.990, her@64 →1.104, her@96 →1.071, dl8a@96 →.382 |
+/// | all four + `EC_OPUS_ALIGN=1` (`-r4`) | naz@64 →1.865, naz@96 →3.986, zaur@64 →1.123, zaur@96 →.891, her@64 →.952 | nik@64 →1.014, nik@96 →1.842, her@96 →1.217, dl8a →1.162/.988, hein →.971/1.514 |
+///
+/// `corr_ours` is never worse by more than .0005 on any unaligned arm (it is
+/// *better* on every row of `-r2`/`-r3`), so corr is not what rejects them.
+/// The `alloc_trim` term is small by construction -- `tonality_slope` averages
+/// -.09 (speech) to -.17 (music), so the term is ±.08 of a trim step and
+/// rounds away entirely on the shipped discrete ladder, which is why no
+/// discrete-ladder arm was run. The activity cut is the nearest miss ever
+/// measured on this gate for a speech source (hein halves) and is blocked by
+/// her@96 +.020 and nik@96 +.005 -- the same two rows that have blocked the
+/// tf boost. Aligned, the analysis moves naz/zaur/her@64 a long way but leaves
+/// the aligned blocking set (nik, her@96, dl8a, hein) exactly where the
+/// analysis-free aligned arms left it, so the alignment default stays off.
 fn analysis_params() -> (bool, bool, bool, bool) {
     static P: std::sync::OnceLock<(bool, bool, bool, bool)> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
@@ -1021,7 +1046,9 @@ impl CeltEncoder {
             if c == 2 {
                 coded_bins += E_BANDS[self.intensity.min(coded_bands)] << lm;
             }
-            // Low-activity cut (C:1632-1633).
+            // Low-activity cut (C:1632-1633). REJECTED on the 12-row gate
+            // (lane opustonal r2/r3): halves hein's err_ratio but costs
+            // her@96 +.020 and nik@96 +.005 -- see `analysis_params`.
             if vbr_act && self.info.valid && self.info.activity < 0.4 {
                 target -= ((coded_bins << BITRES) as f32 * (0.4 - self.info.activity)) as i32;
             }
@@ -1080,6 +1107,8 @@ impl CeltEncoder {
                 target += (k_eff * (tf_estimate - off) * target as f32) as i32;
             }
             // Tonality boost (C:1658-1669), compensating for the average.
+            // REJECTED on the 12-row gate (lane opustonal r2): it is what
+            // pushes zaur@96 .940->1.165 -- see `analysis_params`.
             // `pitch_change` is 0 here (no prefilter), so its term is absent.
             if vbr_tonal && self.info.valid {
                 let tonal = (self.info.tonality - 0.15).max(0.0) - 0.12;
@@ -1734,7 +1763,9 @@ impl CeltEncoder {
         }
         // libopus's `analysis->valid` term (celt_encoder.c:935-939): a tonal
         // spectrum wants a lower trim. It is only defined on the continuous
-        // 1.3 trim; on the discrete ladder it can only be applied rounded.
+        // 1.3 trim; on the discrete ladder it can only be applied rounded,
+        // where it is inert (|term| <= .08). REJECTED with the 1.3 trim it
+        // belongs to -- see `analysis_params`, lane opustonal r1.
         let tonal_trim = if analysis_params().1 && self.info.valid {
             (2.0 * (self.info.tonality_slope + 0.05)).clamp(-2.0, 2.0)
         } else {

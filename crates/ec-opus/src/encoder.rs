@@ -273,10 +273,19 @@ impl Encoder {
     /// | + tf boost k=1.25 (`-r4`) | 5 | same 7 |
     /// | + tf boost k=1.5 (`-r5`) | 5 | same 7 |
     /// | + two-pass *and* k=1.25, the combined best (`-r7`) | 5 | same 7: nik@64 .773, nik@96 1.801, her@96 1.114, dl8a@64 1.181, dl8a@96 1.014, hein@64 .977, hein@96 1.398 |
+    /// | + the whole libopus tonality analysis and its `alloc_trim`/`compute_vbr` consumers (`opus-opustonal-r4`) | 5 | same 7: nik@64 1.014, nik@96 1.842, her@96 1.217, dl8a@64 1.162, dl8a@96 .988, hein@64 .971, hein@96 1.514 |
     ///
     /// The best aligned arm on the KEEP rule is the delay alone without
     /// `dc_reject` (5 rows worse); every arm that adds `dc_reject` puts dl8a
     /// in the blocking set too.
+    ///
+    /// The last row is the one that was expected to rescue this: libopus's
+    /// actual operating point is the aligned spectrum *with* `analysis->valid`
+    /// true, and running the real analysis (`crates/ec-opus/src/analysis.rs`,
+    /// `music_prob` matching a patched-libopus trace to .001) moves naz@64
+    /// 2.697→1.865, naz@96 4.499→3.986, zaur@64 1.510→1.123 and her@64
+    /// 1.103→.952 — the largest movement any arm has produced on those rows —
+    /// and still leaves the same seven rows worse.
     ///
     /// The blocking set (nik, her@96, dl8a, hein) is the same in every arm and
     /// no arm moves any of those rows back towards its shipped value, so the
