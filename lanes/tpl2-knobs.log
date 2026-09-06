@@ -1,0 +1,121 @@
+=== prop map + NONE ===
+    Finished `release` profile [optimized] target(s) in 0.02s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+film 1080p: pricer armings default=14 real=164
+film 1080p: motion_mode 32x32 SIMPLE=25136 OBMC=0 WARP=226 | 16x16 SIMPLE=4232 OBMC=0 WARP=430 | 8x8 SIMPLE=17399 OBMC=0 WARP=1017 (0.0% OBMC / 3.5% WARP of 48440 eligible)
+film 1080p: inter var-tx depths of 3322 blocks -- leaf single 0=2536 1=786 (23.7% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.95 dB/247987 B, 47.79 dB/373023 B, 51.16 dB/496040 B, 53.86 dB/617501 B | +15.5% | -1.7% | 41.8s:7.2s:16.6s |
+film 2160p: pricer armings default=15 real=153
+film 2160p: motion_mode 32x32 SIMPLE=15645 OBMC=0 WARP=3 | 16x16 SIMPLE=296 OBMC=0 WARP=17 | 8x8 SIMPLE=4947 OBMC=0 WARP=747 (0.0% OBMC / 3.5% WARP of 21655 eligible)
+film 2160p: inter var-tx depths of 485 blocks -- leaf single 0=375 1=110 (22.7% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.50 dB/305670 B, 47.75 dB/459659 B, 51.40 dB/587546 B, 54.30 dB/706578 B | +46.7% | +19.0% | 36.8s:5.7s:15.9s |
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=70411 OBMC=0 WARP=1919 | 16x16 SIMPLE=4597 OBMC=0 WARP=670 | 8x8 SIMPLE=668 OBMC=0 WARP=718 (0.0% OBMC / 4.2% WARP of 78983 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 5592 blocks -- leaf single 0=3149 1=2443 (43.7% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6895 chroma 652; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.91 dB/41799 B, 48.21 dB/54576 B, 50.79 dB/71651 B, 53.14 dB/93216 B | +50.8% | -14.6% | 29.1s:9.4s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 181.64s
+
+RC=0 NONE
+=== prop map + EC_AV1_OBMC ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+film 1080p: pricer armings default=14 real=163
+film 1080p: motion_mode 32x32 SIMPLE=24695 OBMC=120 WARP=271 | 16x16 SIMPLE=3790 OBMC=53 WARP=273 | 8x8 SIMPLE=5172 OBMC=12886 WARP=256 (27.5% OBMC / 1.7% WARP of 47516 eligible)
+film 1080p: inter var-tx depths of 2986 blocks -- leaf single 0=2282 1=704 (23.6% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.92 dB/246795 B, 47.79 dB/373389 B, 51.15 dB/498402 B, 53.86 dB/621121 B | +15.8% | -1.6% | 40.9s:6.6s:16.5s |
+film 2160p: pricer armings default=15 real=154
+film 2160p: motion_mode 32x32 SIMPLE=15763 OBMC=0 WARP=2 | 16x16 SIMPLE=264 OBMC=7 WARP=14 | 8x8 SIMPLE=1175 OBMC=4630 WARP=56 (21.2% OBMC / 0.3% WARP of 21911 eligible)
+film 2160p: inter var-tx depths of 467 blocks -- leaf single 0=379 1=88 (18.8% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.50 dB/305623 B, 47.75 dB/459478 B, 51.40 dB/589399 B, 54.30 dB/707001 B | +46.9% | +19.0% | 37.0s:5.7s:16.0s |
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=69893 OBMC=164 WARP=1886 | 16x16 SIMPLE=4545 OBMC=42 WARP=672 | 8x8 SIMPLE=68 OBMC=887 WARP=435 (1.4% OBMC / 3.8% WARP of 78592 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 5539 blocks -- leaf single 0=3170 1=2369 (42.8% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6892 chroma 654; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.90 dB/41829 B, 48.21 dB/54563 B, 50.79 dB/71606 B, 53.14 dB/93192 B | +50.7% | -14.7% | 29.0s:8.5s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 179.08s
+
+RC=0 EC_AV1_OBMC
+=== prop map + EC_AV1_TX32_DEPTH ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+film 1080p: pricer armings default=14 real=164
+film 1080p: motion_mode 32x32 SIMPLE=25638 OBMC=0 WARP=252 | 16x16 SIMPLE=3732 OBMC=0 WARP=307 | 8x8 SIMPLE=17319 OBMC=0 WARP=1026 (0.0% OBMC / 3.3% WARP of 48274 eligible)
+film 1080p: inter var-tx depths of 6696 blocks -- leaf single 0=2438 1=784 (24.3% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=1206 1=2268 (65.3% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.94 dB/248531 B, 47.79 dB/374857 B, 51.15 dB/495522 B, 53.85 dB/619308 B | +15.8% | -1.4% | 40.7s:6.6s:16.6s |
+film 2160p: pricer armings default=15 real=153
+film 2160p: motion_mode 32x32 SIMPLE=15734 OBMC=0 WARP=3 | 16x16 SIMPLE=294 OBMC=0 WARP=19 | 8x8 SIMPLE=4875 OBMC=0 WARP=713 (0.0% OBMC / 3.4% WARP of 21638 eligible)
+film 2160p: inter var-tx depths of 2575 blocks -- leaf single 0=372 1=113 (23.3% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=688 1=1402 (67.1% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.50 dB/305733 B, 47.75 dB/459554 B, 51.41 dB/587640 B, 54.30 dB/706528 B | +46.7% | +18.9% | 36.7s:5.6s:15.9s |
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=156 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=73329 OBMC=0 WARP=1942 | 16x16 SIMPLE=3282 OBMC=0 WARP=523 | 8x8 SIMPLE=682 OBMC=0 WARP=669 (0.0% OBMC / 3.9% WARP of 80427 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 13420 blocks -- leaf single 0=3155 1=2401 (43.2% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=3531 1=4333 (55.1% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6885 chroma 657; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.87 dB/42160 B, 48.22 dB/54603 B, 50.79 dB/71684 B, 53.15 dB/92728 B | +50.5% | -14.5% | 28.0s:8.4s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 177.48s
+
+RC=0 EC_AV1_TX32_DEPTH
+=== prop map + EC_AV1_COMP_VARTX ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+film 1080p: pricer armings default=14 real=163
+film 1080p: motion_mode 32x32 SIMPLE=25059 OBMC=0 WARP=194 | 16x16 SIMPLE=4173 OBMC=0 WARP=344 | 8x8 SIMPLE=17257 OBMC=0 WARP=1027 (0.0% OBMC / 3.3% WARP of 48054 eligible)
+film 1080p: inter var-tx depths of 6456 blocks -- leaf single 0=2490 1=766 (23.5% split) | leaf compound 0=2024 1=1176 (36.8% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.94 dB/247568 B, 47.79 dB/373898 B, 51.16 dB/496600 B, 53.85 dB/619191 B | +15.7% | -1.6% | 40.3s:6.6s:16.4s |
+film 2160p: pricer armings default=15 real=153
+film 2160p: motion_mode 32x32 SIMPLE=15669 OBMC=0 WARP=4 | 16x16 SIMPLE=267 OBMC=0 WARP=18 | 8x8 SIMPLE=4934 OBMC=0 WARP=734 (0.0% OBMC / 3.5% WARP of 21626 eligible)
+film 2160p: inter var-tx depths of 6401 blocks -- leaf single 0=347 1=115 (24.9% split) | leaf compound 0=5132 1=807 (13.6% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.50 dB/305416 B, 47.75 dB/460187 B, 51.40 dB/589716 B, 54.30 dB/706632 B | +46.9% | +19.1% | 36.9s:5.6s:15.9s |
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=69860 OBMC=0 WARP=1910 | 16x16 SIMPLE=4707 OBMC=0 WARP=707 | 8x8 SIMPLE=635 OBMC=0 WARP=669 (0.0% OBMC / 4.2% WARP of 78488 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 11485 blocks -- leaf single 0=3158 1=2475 (43.9% split) | leaf compound 0=3609 1=2243 (38.3% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6895 chroma 651; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.90 dB/41871 B, 48.21 dB/54591 B, 50.79 dB/71724 B, 53.14 dB/93317 B | +50.9% | -14.6% | 27.8s:8.3s:11.2s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 176.58s
+
+RC=0 EC_AV1_COMP_VARTX
+KNOBSDONE

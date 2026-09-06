@@ -1,0 +1,1201 @@
+=== k=0.25 d=4 ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 553, 225, 622, 6280, 0, 0, 0], range 0.250..1.111, 58 within 0.9..1.1, lookahead wall 5.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 529, 240, 624, 6287, 0, 0, 0], range 0.250..1.109, 61 within 0.9..1.1, lookahead wall 11.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 526, 255, 628, 6271, 0, 0, 0], range 0.250..1.110, 44 within 0.9..1.1, lookahead wall 17.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 550, 257, 632, 6241, 0, 0, 0], range 0.250..1.113, 64 within 0.9..1.1, lookahead wall 23.0 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 570, 250, 643, 6217, 0, 0, 0], range 0.250..1.117, 62 within 0.9..1.1, lookahead wall 28.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 544, 256, 624, 6256, 0, 0, 0], range 0.250..1.112, 73 within 0.9..1.1, lookahead wall 34.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 531, 263, 595, 6291, 0, 0, 0], range 0.250..1.110, 49 within 0.9..1.1, lookahead wall 40.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 46.0 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 49.8 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 51.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 553, 225, 622, 6280, 0, 0, 0], range 0.250..1.111, 58 within 0.9..1.1, lookahead wall 57.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 529, 240, 624, 6287, 0, 0, 0], range 0.250..1.109, 61 within 0.9..1.1, lookahead wall 63.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 526, 255, 628, 6271, 0, 0, 0], range 0.250..1.110, 44 within 0.9..1.1, lookahead wall 69.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 550, 257, 632, 6241, 0, 0, 0], range 0.250..1.113, 64 within 0.9..1.1, lookahead wall 74.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 570, 250, 643, 6217, 0, 0, 0], range 0.250..1.117, 62 within 0.9..1.1, lookahead wall 80.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 544, 256, 624, 6256, 0, 0, 0], range 0.250..1.112, 73 within 0.9..1.1, lookahead wall 86.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 531, 263, 595, 6291, 0, 0, 0], range 0.250..1.110, 49 within 0.9..1.1, lookahead wall 92.4 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 98.2 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 102.0 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 104.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 553, 225, 622, 6280, 0, 0, 0], range 0.250..1.111, 58 within 0.9..1.1, lookahead wall 111.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 529, 240, 624, 6287, 0, 0, 0], range 0.250..1.109, 61 within 0.9..1.1, lookahead wall 117.0 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 526, 255, 628, 6271, 0, 0, 0], range 0.250..1.110, 44 within 0.9..1.1, lookahead wall 122.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 550, 257, 632, 6241, 0, 0, 0], range 0.250..1.113, 64 within 0.9..1.1, lookahead wall 128.4 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 570, 250, 643, 6217, 0, 0, 0], range 0.250..1.117, 62 within 0.9..1.1, lookahead wall 134.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 544, 256, 624, 6256, 0, 0, 0], range 0.250..1.112, 73 within 0.9..1.1, lookahead wall 141.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 531, 263, 595, 6291, 0, 0, 0], range 0.250..1.110, 49 within 0.9..1.1, lookahead wall 146.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 152.6 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 156.5 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 158.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 553, 225, 622, 6280, 0, 0, 0], range 0.250..1.111, 58 within 0.9..1.1, lookahead wall 164.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 529, 240, 624, 6287, 0, 0, 0], range 0.250..1.109, 61 within 0.9..1.1, lookahead wall 170.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 526, 255, 628, 6271, 0, 0, 0], range 0.250..1.110, 44 within 0.9..1.1, lookahead wall 176.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 550, 257, 632, 6241, 0, 0, 0], range 0.250..1.113, 64 within 0.9..1.1, lookahead wall 181.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 570, 250, 643, 6217, 0, 0, 0], range 0.250..1.117, 62 within 0.9..1.1, lookahead wall 187.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 544, 256, 624, 6256, 0, 0, 0], range 0.250..1.112, 73 within 0.9..1.1, lookahead wall 193.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 531, 263, 595, 6291, 0, 0, 0], range 0.250..1.110, 49 within 0.9..1.1, lookahead wall 200.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 206.7 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 210.7 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 212.6 ms cumulative
+film 1080p: pricer armings default=14 real=165
+film 1080p: motion_mode 32x32 SIMPLE=25380 OBMC=0 WARP=230 | 16x16 SIMPLE=4238 OBMC=0 WARP=404 | 8x8 SIMPLE=17849 OBMC=0 WARP=991 (0.0% OBMC / 3.3% WARP of 49092 eligible)
+film 1080p: inter var-tx depths of 3452 blocks -- leaf single 0=2626 1=826 (23.9% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.92 dB/246714 B, 47.76 dB/371500 B, 51.14 dB/494832 B, 53.85 dB/619616 B | +15.5% | -1.8% | 38.9s:6.6s:16.5s |
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 288, 257, 54, 7081, 0, 0, 0], range 0.250..1.053, 7084 within 0.9..1.1, lookahead wall 218.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 319, 255, 53, 7053, 0, 0, 0], range 0.250..1.058, 7055 within 0.9..1.1, lookahead wall 223.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 232, 71, 7037, 0, 0, 0], range 0.250..1.061, 7038 within 0.9..1.1, lookahead wall 229.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 357, 224, 77, 7022, 0, 0, 0], range 0.250..1.063, 7022 within 0.9..1.1, lookahead wall 235.4 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 369, 216, 82, 7013, 0, 0, 0], range 0.250..1.064, 7013 within 0.9..1.1, lookahead wall 242.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 374, 212, 86, 7008, 0, 0, 0], range 0.250..1.065, 7010 within 0.9..1.1, lookahead wall 249.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 368, 213, 83, 7016, 0, 0, 0], range 0.250..1.064, 7018 within 0.9..1.1, lookahead wall 255.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 348, 221, 92, 7019, 0, 0, 0], range 0.250..1.061, 7032 within 0.9..1.1, lookahead wall 261.0 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 61, 230, 7150, 0, 0, 0], range 0.250..1.042, 7152 within 0.9..1.1, lookahead wall 264.8 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 0, 295, 7264, 0, 0, 0], range 0.250..1.021, 7341 within 0.9..1.1, lookahead wall 266.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 288, 257, 54, 7081, 0, 0, 0], range 0.250..1.053, 7084 within 0.9..1.1, lookahead wall 273.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 319, 255, 53, 7053, 0, 0, 0], range 0.250..1.058, 7055 within 0.9..1.1, lookahead wall 279.0 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 232, 71, 7037, 0, 0, 0], range 0.250..1.061, 7038 within 0.9..1.1, lookahead wall 284.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 357, 224, 77, 7022, 0, 0, 0], range 0.250..1.063, 7022 within 0.9..1.1, lookahead wall 290.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 369, 216, 82, 7013, 0, 0, 0], range 0.250..1.064, 7013 within 0.9..1.1, lookahead wall 296.4 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 374, 212, 86, 7008, 0, 0, 0], range 0.250..1.065, 7010 within 0.9..1.1, lookahead wall 302.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 368, 213, 83, 7016, 0, 0, 0], range 0.250..1.064, 7018 within 0.9..1.1, lookahead wall 309.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 348, 221, 92, 7019, 0, 0, 0], range 0.250..1.061, 7032 within 0.9..1.1, lookahead wall 316.1 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 61, 230, 7150, 0, 0, 0], range 0.250..1.042, 7152 within 0.9..1.1, lookahead wall 321.1 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 0, 295, 7264, 0, 0, 0], range 0.250..1.021, 7341 within 0.9..1.1, lookahead wall 323.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 288, 257, 54, 7081, 0, 0, 0], range 0.250..1.053, 7084 within 0.9..1.1, lookahead wall 329.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 319, 255, 53, 7053, 0, 0, 0], range 0.250..1.058, 7055 within 0.9..1.1, lookahead wall 335.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 232, 71, 7037, 0, 0, 0], range 0.250..1.061, 7038 within 0.9..1.1, lookahead wall 340.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 357, 224, 77, 7022, 0, 0, 0], range 0.250..1.063, 7022 within 0.9..1.1, lookahead wall 346.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 369, 216, 82, 7013, 0, 0, 0], range 0.250..1.064, 7013 within 0.9..1.1, lookahead wall 352.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 374, 212, 86, 7008, 0, 0, 0], range 0.250..1.065, 7010 within 0.9..1.1, lookahead wall 358.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 368, 213, 83, 7016, 0, 0, 0], range 0.250..1.064, 7018 within 0.9..1.1, lookahead wall 364.4 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 348, 221, 92, 7019, 0, 0, 0], range 0.250..1.061, 7032 within 0.9..1.1, lookahead wall 370.2 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 61, 230, 7150, 0, 0, 0], range 0.250..1.042, 7152 within 0.9..1.1, lookahead wall 374.0 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 0, 295, 7264, 0, 0, 0], range 0.250..1.021, 7341 within 0.9..1.1, lookahead wall 376.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 288, 257, 54, 7081, 0, 0, 0], range 0.250..1.053, 7084 within 0.9..1.1, lookahead wall 381.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 319, 255, 53, 7053, 0, 0, 0], range 0.250..1.058, 7055 within 0.9..1.1, lookahead wall 387.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 232, 71, 7037, 0, 0, 0], range 0.250..1.061, 7038 within 0.9..1.1, lookahead wall 393.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 357, 224, 77, 7022, 0, 0, 0], range 0.250..1.063, 7022 within 0.9..1.1, lookahead wall 399.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 369, 216, 82, 7013, 0, 0, 0], range 0.250..1.064, 7013 within 0.9..1.1, lookahead wall 405.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 374, 212, 86, 7008, 0, 0, 0], range 0.250..1.065, 7010 within 0.9..1.1, lookahead wall 411.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 368, 213, 83, 7016, 0, 0, 0], range 0.250..1.064, 7018 within 0.9..1.1, lookahead wall 417.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 348, 221, 92, 7019, 0, 0, 0], range 0.250..1.061, 7032 within 0.9..1.1, lookahead wall 423.1 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 61, 230, 7150, 0, 0, 0], range 0.250..1.042, 7152 within 0.9..1.1, lookahead wall 427.0 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 0, 295, 7264, 0, 0, 0], range 0.250..1.021, 7341 within 0.9..1.1, lookahead wall 428.9 ms cumulative
+film 2160p: pricer armings default=15 real=148
+film 2160p: motion_mode 32x32 SIMPLE=15643 OBMC=0 WARP=2 | 16x16 SIMPLE=246 OBMC=0 WARP=25 | 8x8 SIMPLE=4324 OBMC=0 WARP=730 (0.0% OBMC / 3.6% WARP of 20970 eligible)
+film 2160p: inter var-tx depths of 462 blocks -- leaf single 0=374 1=88 (19.0% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.50 dB/305737 B, 47.75 dB/459581 B, 51.40 dB/589494 B, 54.30 dB/705490 B | +46.8% | +19.1% | 35.5s:5.6s:16.0s |
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 28, 3773, 78, 26, 3775, 0, 0], range 0.250..1.278, 25 within 0.9..1.1, lookahead wall 434.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 5, 3849, 43, 15, 3768, 0, 0], range 0.250..1.279, 12 within 0.9..1.1, lookahead wall 440.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3872, 33, 6, 3767, 0, 0], range 0.419..1.279, 12 within 0.9..1.1, lookahead wall 446.0 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3888, 20, 5, 3765, 0, 0], range 0.401..1.279, 2 within 0.9..1.1, lookahead wall 451.9 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3903, 11, 1, 3765, 0, 0], range 0.522..1.279, 1 within 0.9..1.1, lookahead wall 457.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3911, 4, 0, 3765, 0, 0], range 0.589..1.280, 0 within 0.9..1.1, lookahead wall 463.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.666..1.280, 0 within 0.9..1.1, lookahead wall 469.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.683..1.280, 0 within 0.9..1.1, lookahead wall 474.8 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.777..1.205, 0 within 0.9..1.1, lookahead wall 478.6 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.881..1.113, 13 within 0.9..1.1, lookahead wall 480.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 28, 3773, 78, 26, 3775, 0, 0], range 0.250..1.278, 25 within 0.9..1.1, lookahead wall 486.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 5, 3849, 43, 15, 3768, 0, 0], range 0.250..1.279, 12 within 0.9..1.1, lookahead wall 491.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3872, 33, 6, 3767, 0, 0], range 0.419..1.279, 12 within 0.9..1.1, lookahead wall 497.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3888, 20, 5, 3765, 0, 0], range 0.401..1.279, 2 within 0.9..1.1, lookahead wall 503.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3903, 11, 1, 3765, 0, 0], range 0.522..1.279, 1 within 0.9..1.1, lookahead wall 509.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3911, 4, 0, 3765, 0, 0], range 0.589..1.280, 0 within 0.9..1.1, lookahead wall 515.0 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.666..1.280, 0 within 0.9..1.1, lookahead wall 520.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.683..1.280, 0 within 0.9..1.1, lookahead wall 527.0 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.777..1.205, 0 within 0.9..1.1, lookahead wall 530.7 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.881..1.113, 13 within 0.9..1.1, lookahead wall 532.7 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 28, 3773, 78, 26, 3775, 0, 0], range 0.250..1.278, 25 within 0.9..1.1, lookahead wall 538.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 5, 3849, 43, 15, 3768, 0, 0], range 0.250..1.279, 12 within 0.9..1.1, lookahead wall 543.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3872, 33, 6, 3767, 0, 0], range 0.419..1.279, 12 within 0.9..1.1, lookahead wall 549.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3888, 20, 5, 3765, 0, 0], range 0.401..1.279, 2 within 0.9..1.1, lookahead wall 554.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3903, 11, 1, 3765, 0, 0], range 0.522..1.279, 1 within 0.9..1.1, lookahead wall 560.4 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3911, 4, 0, 3765, 0, 0], range 0.589..1.280, 0 within 0.9..1.1, lookahead wall 566.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.666..1.280, 0 within 0.9..1.1, lookahead wall 572.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.683..1.280, 0 within 0.9..1.1, lookahead wall 577.7 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.777..1.205, 0 within 0.9..1.1, lookahead wall 581.5 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.881..1.113, 13 within 0.9..1.1, lookahead wall 583.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 28, 3773, 78, 26, 3775, 0, 0], range 0.250..1.278, 25 within 0.9..1.1, lookahead wall 589.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 5, 3849, 43, 15, 3768, 0, 0], range 0.250..1.279, 12 within 0.9..1.1, lookahead wall 594.6 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3872, 33, 6, 3767, 0, 0], range 0.419..1.279, 12 within 0.9..1.1, lookahead wall 600.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3888, 20, 5, 3765, 0, 0], range 0.401..1.279, 2 within 0.9..1.1, lookahead wall 605.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3903, 11, 1, 3765, 0, 0], range 0.522..1.279, 1 within 0.9..1.1, lookahead wall 611.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3911, 4, 0, 3765, 0, 0], range 0.589..1.280, 0 within 0.9..1.1, lookahead wall 617.1 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.666..1.280, 0 within 0.9..1.1, lookahead wall 623.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.683..1.280, 0 within 0.9..1.1, lookahead wall 629.1 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.777..1.205, 0 within 0.9..1.1, lookahead wall 633.2 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.881..1.113, 13 within 0.9..1.1, lookahead wall 635.1 ms cumulative
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=71176 OBMC=0 WARP=1958 | 16x16 SIMPLE=4113 OBMC=0 WARP=576 | 8x8 SIMPLE=585 OBMC=0 WARP=590 (0.0% OBMC / 4.0% WARP of 78998 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 5886 blocks -- leaf single 0=3453 1=2433 (41.3% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6854 chroma 648; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.88 dB/41662 B, 48.19 dB/54535 B, 50.73 dB/71482 B, 53.09 dB/92927 B | +51.2% | -14.5% | 27.7s:8.4s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 174.12s
+
+RC=0 k=0.25 d=4
+=== k=0.5 d=4 ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 727, 574, 103, 6276, 0, 0, 0], range 0.250..1.135, 11 within 0.9..1.1, lookahead wall 5.9 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 722, 583, 93, 6282, 0, 0, 0], range 0.250..1.133, 19 within 0.9..1.1, lookahead wall 11.9 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 725, 605, 83, 6267, 0, 0, 0], range 0.250..1.134, 15 within 0.9..1.1, lookahead wall 19.0 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 749, 594, 100, 6237, 0, 0, 0], range 0.250..1.138, 10 within 0.9..1.1, lookahead wall 26.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 782, 572, 115, 6211, 0, 0, 0], range 0.250..1.142, 13 within 0.9..1.1, lookahead wall 32.2 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 758, 561, 115, 6246, 0, 0, 0], range 0.250..1.137, 21 within 0.9..1.1, lookahead wall 38.2 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 751, 555, 88, 6286, 0, 0, 0], range 0.250..1.134, 14 within 0.9..1.1, lookahead wall 44.0 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 742, 577, 95, 6266, 0, 0, 0], range 0.250..1.133, 10 within 0.9..1.1, lookahead wall 50.1 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 401, 499, 380, 6400, 0, 0, 0], range 0.250..1.098, 6413 within 0.9..1.1, lookahead wall 54.0 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 189, 316, 592, 6583, 0, 0, 0], range 0.250..1.053, 6706 within 0.9..1.1, lookahead wall 56.0 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 727, 574, 103, 6276, 0, 0, 0], range 0.250..1.135, 11 within 0.9..1.1, lookahead wall 61.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 722, 583, 93, 6282, 0, 0, 0], range 0.250..1.133, 19 within 0.9..1.1, lookahead wall 67.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 725, 605, 83, 6267, 0, 0, 0], range 0.250..1.134, 15 within 0.9..1.1, lookahead wall 73.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 749, 594, 100, 6237, 0, 0, 0], range 0.250..1.138, 10 within 0.9..1.1, lookahead wall 80.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 782, 572, 115, 6211, 0, 0, 0], range 0.250..1.142, 13 within 0.9..1.1, lookahead wall 85.9 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 758, 561, 115, 6246, 0, 0, 0], range 0.250..1.137, 21 within 0.9..1.1, lookahead wall 91.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 751, 555, 88, 6286, 0, 0, 0], range 0.250..1.134, 14 within 0.9..1.1, lookahead wall 98.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 742, 577, 95, 6266, 0, 0, 0], range 0.250..1.133, 10 within 0.9..1.1, lookahead wall 104.7 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 401, 499, 380, 6400, 0, 0, 0], range 0.250..1.098, 6413 within 0.9..1.1, lookahead wall 108.7 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 189, 316, 592, 6583, 0, 0, 0], range 0.250..1.053, 6706 within 0.9..1.1, lookahead wall 110.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 727, 574, 103, 6276, 0, 0, 0], range 0.250..1.135, 11 within 0.9..1.1, lookahead wall 116.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 722, 583, 93, 6282, 0, 0, 0], range 0.250..1.133, 19 within 0.9..1.1, lookahead wall 122.6 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 725, 605, 83, 6267, 0, 0, 0], range 0.250..1.134, 15 within 0.9..1.1, lookahead wall 128.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 749, 594, 100, 6237, 0, 0, 0], range 0.250..1.138, 10 within 0.9..1.1, lookahead wall 134.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 782, 572, 115, 6211, 0, 0, 0], range 0.250..1.142, 13 within 0.9..1.1, lookahead wall 140.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 758, 561, 115, 6246, 0, 0, 0], range 0.250..1.137, 21 within 0.9..1.1, lookahead wall 146.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 751, 555, 88, 6286, 0, 0, 0], range 0.250..1.134, 14 within 0.9..1.1, lookahead wall 152.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 742, 577, 95, 6266, 0, 0, 0], range 0.250..1.133, 10 within 0.9..1.1, lookahead wall 158.6 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 401, 499, 380, 6400, 0, 0, 0], range 0.250..1.098, 6413 within 0.9..1.1, lookahead wall 162.6 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 189, 316, 592, 6583, 0, 0, 0], range 0.250..1.053, 6706 within 0.9..1.1, lookahead wall 164.6 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 727, 574, 103, 6276, 0, 0, 0], range 0.250..1.135, 11 within 0.9..1.1, lookahead wall 170.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 722, 583, 93, 6282, 0, 0, 0], range 0.250..1.133, 19 within 0.9..1.1, lookahead wall 176.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 725, 605, 83, 6267, 0, 0, 0], range 0.250..1.134, 15 within 0.9..1.1, lookahead wall 182.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 749, 594, 100, 6237, 0, 0, 0], range 0.250..1.138, 10 within 0.9..1.1, lookahead wall 188.2 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 782, 572, 115, 6211, 0, 0, 0], range 0.250..1.142, 13 within 0.9..1.1, lookahead wall 194.0 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 758, 561, 115, 6246, 0, 0, 0], range 0.250..1.137, 21 within 0.9..1.1, lookahead wall 200.2 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 751, 555, 88, 6286, 0, 0, 0], range 0.250..1.134, 14 within 0.9..1.1, lookahead wall 206.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 742, 577, 95, 6266, 0, 0, 0], range 0.250..1.133, 10 within 0.9..1.1, lookahead wall 211.9 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 401, 499, 380, 6400, 0, 0, 0], range 0.250..1.098, 6413 within 0.9..1.1, lookahead wall 215.7 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 189, 316, 592, 6583, 0, 0, 0], range 0.250..1.053, 6706 within 0.9..1.1, lookahead wall 217.7 ms cumulative
+film 1080p: pricer armings default=14 real=163
+film 1080p: motion_mode 32x32 SIMPLE=23011 OBMC=0 WARP=225 | 16x16 SIMPLE=4003 OBMC=0 WARP=414 | 8x8 SIMPLE=17592 OBMC=0 WARP=1011 (0.0% OBMC / 3.6% WARP of 46256 eligible)
+film 1080p: inter var-tx depths of 3117 blocks -- leaf single 0=2311 1=806 (25.9% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.99 dB/249914 B, 47.81 dB/376583 B, 51.18 dB/499151 B, 53.88 dB/623671 B | +16.1% | -1.2% | 39.5s:6.7s:16.6s |
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 370, 226, 19, 7065, 0, 0, 0], range 0.250..1.061, 7084 within 0.9..1.1, lookahead wall 223.4 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 395, 229, 17, 7039, 0, 0, 0], range 0.250..1.066, 7055 within 0.9..1.1, lookahead wall 229.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 414, 228, 13, 7025, 0, 0, 0], range 0.250..1.069, 7038 within 0.9..1.1, lookahead wall 234.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 428, 230, 7, 7015, 0, 0, 0], range 0.250..1.071, 7022 within 0.9..1.1, lookahead wall 240.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 437, 229, 8, 7006, 0, 0, 0], range 0.250..1.072, 7013 within 0.9..1.1, lookahead wall 247.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 450, 220, 12, 6998, 0, 0, 0], range 0.250..1.073, 7009 within 0.9..1.1, lookahead wall 253.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 440, 220, 14, 7006, 0, 0, 0], range 0.250..1.072, 7017 within 0.9..1.1, lookahead wall 259.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 411, 235, 26, 7008, 0, 0, 0], range 0.250..1.070, 7023 within 0.9..1.1, lookahead wall 265.3 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 287, 17, 7137, 0, 0, 0], range 0.250..1.048, 7152 within 0.9..1.1, lookahead wall 269.1 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 90, 214, 7255, 0, 0, 0], range 0.250..1.026, 7273 within 0.9..1.1, lookahead wall 271.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 370, 226, 19, 7065, 0, 0, 0], range 0.250..1.061, 7084 within 0.9..1.1, lookahead wall 276.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 395, 229, 17, 7039, 0, 0, 0], range 0.250..1.066, 7055 within 0.9..1.1, lookahead wall 282.6 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 414, 228, 13, 7025, 0, 0, 0], range 0.250..1.069, 7038 within 0.9..1.1, lookahead wall 288.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 428, 230, 7, 7015, 0, 0, 0], range 0.250..1.071, 7022 within 0.9..1.1, lookahead wall 294.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 437, 229, 8, 7006, 0, 0, 0], range 0.250..1.072, 7013 within 0.9..1.1, lookahead wall 300.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 450, 220, 12, 6998, 0, 0, 0], range 0.250..1.073, 7009 within 0.9..1.1, lookahead wall 306.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 440, 220, 14, 7006, 0, 0, 0], range 0.250..1.072, 7017 within 0.9..1.1, lookahead wall 312.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 411, 235, 26, 7008, 0, 0, 0], range 0.250..1.070, 7023 within 0.9..1.1, lookahead wall 318.0 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 287, 17, 7137, 0, 0, 0], range 0.250..1.048, 7152 within 0.9..1.1, lookahead wall 322.5 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 90, 214, 7255, 0, 0, 0], range 0.250..1.026, 7273 within 0.9..1.1, lookahead wall 324.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 370, 226, 19, 7065, 0, 0, 0], range 0.250..1.061, 7084 within 0.9..1.1, lookahead wall 331.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 395, 229, 17, 7039, 0, 0, 0], range 0.250..1.066, 7055 within 0.9..1.1, lookahead wall 337.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 414, 228, 13, 7025, 0, 0, 0], range 0.250..1.069, 7038 within 0.9..1.1, lookahead wall 343.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 428, 230, 7, 7015, 0, 0, 0], range 0.250..1.071, 7022 within 0.9..1.1, lookahead wall 348.9 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 437, 229, 8, 7006, 0, 0, 0], range 0.250..1.072, 7013 within 0.9..1.1, lookahead wall 354.6 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 450, 220, 12, 6998, 0, 0, 0], range 0.250..1.073, 7009 within 0.9..1.1, lookahead wall 360.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 440, 220, 14, 7006, 0, 0, 0], range 0.250..1.072, 7017 within 0.9..1.1, lookahead wall 366.2 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 411, 235, 26, 7008, 0, 0, 0], range 0.250..1.070, 7023 within 0.9..1.1, lookahead wall 372.7 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 287, 17, 7137, 0, 0, 0], range 0.250..1.048, 7152 within 0.9..1.1, lookahead wall 376.5 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 90, 214, 7255, 0, 0, 0], range 0.250..1.026, 7273 within 0.9..1.1, lookahead wall 378.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 370, 226, 19, 7065, 0, 0, 0], range 0.250..1.061, 7084 within 0.9..1.1, lookahead wall 384.2 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 395, 229, 17, 7039, 0, 0, 0], range 0.250..1.066, 7055 within 0.9..1.1, lookahead wall 390.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 414, 228, 13, 7025, 0, 0, 0], range 0.250..1.069, 7038 within 0.9..1.1, lookahead wall 396.4 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 428, 230, 7, 7015, 0, 0, 0], range 0.250..1.071, 7022 within 0.9..1.1, lookahead wall 402.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 437, 229, 8, 7006, 0, 0, 0], range 0.250..1.072, 7013 within 0.9..1.1, lookahead wall 408.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 450, 220, 12, 6998, 0, 0, 0], range 0.250..1.073, 7009 within 0.9..1.1, lookahead wall 414.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 440, 220, 14, 7006, 0, 0, 0], range 0.250..1.072, 7017 within 0.9..1.1, lookahead wall 420.2 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 411, 235, 26, 7008, 0, 0, 0], range 0.250..1.070, 7023 within 0.9..1.1, lookahead wall 425.9 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 287, 17, 7137, 0, 0, 0], range 0.250..1.048, 7152 within 0.9..1.1, lookahead wall 429.9 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 90, 214, 7255, 0, 0, 0], range 0.250..1.026, 7273 within 0.9..1.1, lookahead wall 432.1 ms cumulative
+film 2160p: pricer armings default=15 real=154
+film 2160p: motion_mode 32x32 SIMPLE=15671 OBMC=0 WARP=2 | 16x16 SIMPLE=262 OBMC=0 WARP=20 | 8x8 SIMPLE=5186 OBMC=0 WARP=735 (0.0% OBMC / 3.5% WARP of 21876 eligible)
+film 2160p: inter var-tx depths of 478 blocks -- leaf single 0=386 1=92 (19.2% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.54 dB/307392 B, 47.78 dB/461191 B, 51.43 dB/591122 B, 54.32 dB/708138 B | +47.0% | +19.2% | 35.4s:5.7s:16.0s |
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 65, 3788, 33, 5, 3789, 0, 0], range 0.250..1.437, 13 within 0.9..1.1, lookahead wall 437.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 23, 3867, 10, 11, 3769, 0, 0], range 0.250..1.439, 7 within 0.9..1.1, lookahead wall 444.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 16, 3882, 12, 2, 3768, 0, 0], range 0.282..1.439, 7 within 0.9..1.1, lookahead wall 450.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 7, 3902, 1, 3, 3767, 0, 0], range 0.268..1.440, 1 within 0.9..1.1, lookahead wall 456.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3911, 1, 0, 3766, 0, 0], range 0.369..1.440, 1 within 0.9..1.1, lookahead wall 461.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 3765, 0, 0], range 0.431..1.441, 0 within 0.9..1.1, lookahead wall 467.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.506..1.441, 0 within 0.9..1.1, lookahead wall 473.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.525..1.441, 0 within 0.9..1.1, lookahead wall 479.2 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.638..1.342, 0 within 0.9..1.1, lookahead wall 483.0 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.788..1.205, 1 within 0.9..1.1, lookahead wall 485.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 65, 3788, 33, 5, 3789, 0, 0], range 0.250..1.437, 13 within 0.9..1.1, lookahead wall 490.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 23, 3867, 10, 11, 3769, 0, 0], range 0.250..1.439, 7 within 0.9..1.1, lookahead wall 496.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 16, 3882, 12, 2, 3768, 0, 0], range 0.282..1.439, 7 within 0.9..1.1, lookahead wall 502.4 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 7, 3902, 1, 3, 3767, 0, 0], range 0.268..1.440, 1 within 0.9..1.1, lookahead wall 508.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3911, 1, 0, 3766, 0, 0], range 0.369..1.440, 1 within 0.9..1.1, lookahead wall 514.9 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 3765, 0, 0], range 0.431..1.441, 0 within 0.9..1.1, lookahead wall 521.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.506..1.441, 0 within 0.9..1.1, lookahead wall 527.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.525..1.441, 0 within 0.9..1.1, lookahead wall 533.9 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.638..1.342, 0 within 0.9..1.1, lookahead wall 537.7 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.788..1.205, 1 within 0.9..1.1, lookahead wall 539.6 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 65, 3788, 33, 5, 3789, 0, 0], range 0.250..1.437, 13 within 0.9..1.1, lookahead wall 545.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 23, 3867, 10, 11, 3769, 0, 0], range 0.250..1.439, 7 within 0.9..1.1, lookahead wall 550.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 16, 3882, 12, 2, 3768, 0, 0], range 0.282..1.439, 7 within 0.9..1.1, lookahead wall 556.0 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 7, 3902, 1, 3, 3767, 0, 0], range 0.268..1.440, 1 within 0.9..1.1, lookahead wall 561.6 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3911, 1, 0, 3766, 0, 0], range 0.369..1.440, 1 within 0.9..1.1, lookahead wall 567.4 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 3765, 0, 0], range 0.431..1.441, 0 within 0.9..1.1, lookahead wall 572.9 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.506..1.441, 0 within 0.9..1.1, lookahead wall 578.4 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.525..1.441, 0 within 0.9..1.1, lookahead wall 584.5 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.638..1.342, 0 within 0.9..1.1, lookahead wall 588.2 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.788..1.205, 1 within 0.9..1.1, lookahead wall 590.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 65, 3788, 33, 5, 3789, 0, 0], range 0.250..1.437, 13 within 0.9..1.1, lookahead wall 595.6 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 23, 3867, 10, 11, 3769, 0, 0], range 0.250..1.439, 7 within 0.9..1.1, lookahead wall 601.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 16, 3882, 12, 2, 3768, 0, 0], range 0.282..1.439, 7 within 0.9..1.1, lookahead wall 606.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 7, 3902, 1, 3, 3767, 0, 0], range 0.268..1.440, 1 within 0.9..1.1, lookahead wall 612.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 2, 3911, 1, 0, 3766, 0, 0], range 0.369..1.440, 1 within 0.9..1.1, lookahead wall 617.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 3765, 0, 0], range 0.431..1.441, 0 within 0.9..1.1, lookahead wall 623.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.506..1.441, 0 within 0.9..1.1, lookahead wall 628.8 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.525..1.441, 0 within 0.9..1.1, lookahead wall 634.4 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.638..1.342, 0 within 0.9..1.1, lookahead wall 638.0 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.788..1.205, 1 within 0.9..1.1, lookahead wall 640.1 ms cumulative
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=69420 OBMC=0 WARP=1818 | 16x16 SIMPLE=5134 OBMC=0 WARP=863 | 8x8 SIMPLE=823 OBMC=0 WARP=842 (0.0% OBMC / 4.5% WARP of 78900 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 5381 blocks -- leaf single 0=2998 1=2383 (44.3% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6944 chroma 656; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.94 dB/41890 B, 48.26 dB/54859 B, 50.84 dB/72144 B, 53.19 dB/93930 B | +51.1% | -14.6% | 27.7s:8.3s:11.2s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 174.70s
+
+RC=0 k=0.5 d=4
+=== k=1 d=4 ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1085, 311, 12, 6272, 0, 0, 0], range 0.250..1.160, 4 within 0.9..1.1, lookahead wall 5.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1097, 290, 15, 6278, 0, 0, 0], range 0.250..1.158, 9 within 0.9..1.1, lookahead wall 11.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1090, 316, 15, 6259, 0, 0, 0], range 0.250..1.161, 8 within 0.9..1.1, lookahead wall 17.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1122, 313, 10, 6235, 0, 0, 0], range 0.250..1.165, 4 within 0.9..1.1, lookahead wall 23.3 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1131, 329, 12, 6208, 0, 0, 0], range 0.250..1.169, 4 within 0.9..1.1, lookahead wall 29.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1087, 333, 18, 6242, 0, 0, 0], range 0.250..1.163, 8 within 0.9..1.1, lookahead wall 35.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1094, 290, 12, 6284, 0, 0, 0], range 0.250..1.159, 8 within 0.9..1.1, lookahead wall 41.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 330, 8, 6264, 0, 0, 0], range 0.250..1.160, 6 within 0.9..1.1, lookahead wall 47.4 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 591, 24, 6398, 0, 0, 0], range 0.250..1.122, 8 within 0.9..1.1, lookahead wall 51.3 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 238, 586, 276, 6580, 0, 0, 0], range 0.250..1.073, 6607 within 0.9..1.1, lookahead wall 53.2 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1085, 311, 12, 6272, 0, 0, 0], range 0.250..1.160, 4 within 0.9..1.1, lookahead wall 58.9 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1097, 290, 15, 6278, 0, 0, 0], range 0.250..1.158, 9 within 0.9..1.1, lookahead wall 64.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1090, 316, 15, 6259, 0, 0, 0], range 0.250..1.161, 8 within 0.9..1.1, lookahead wall 71.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1122, 313, 10, 6235, 0, 0, 0], range 0.250..1.165, 4 within 0.9..1.1, lookahead wall 76.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1131, 329, 12, 6208, 0, 0, 0], range 0.250..1.169, 4 within 0.9..1.1, lookahead wall 82.9 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1087, 333, 18, 6242, 0, 0, 0], range 0.250..1.163, 8 within 0.9..1.1, lookahead wall 88.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1094, 290, 12, 6284, 0, 0, 0], range 0.250..1.159, 8 within 0.9..1.1, lookahead wall 94.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 330, 8, 6264, 0, 0, 0], range 0.250..1.160, 6 within 0.9..1.1, lookahead wall 100.4 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 591, 24, 6398, 0, 0, 0], range 0.250..1.122, 8 within 0.9..1.1, lookahead wall 104.3 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 238, 586, 276, 6580, 0, 0, 0], range 0.250..1.073, 6607 within 0.9..1.1, lookahead wall 106.3 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1085, 311, 12, 6272, 0, 0, 0], range 0.250..1.160, 4 within 0.9..1.1, lookahead wall 112.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1097, 290, 15, 6278, 0, 0, 0], range 0.250..1.158, 9 within 0.9..1.1, lookahead wall 117.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1090, 316, 15, 6259, 0, 0, 0], range 0.250..1.161, 8 within 0.9..1.1, lookahead wall 123.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1122, 313, 10, 6235, 0, 0, 0], range 0.250..1.165, 4 within 0.9..1.1, lookahead wall 129.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1131, 329, 12, 6208, 0, 0, 0], range 0.250..1.169, 4 within 0.9..1.1, lookahead wall 136.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1087, 333, 18, 6242, 0, 0, 0], range 0.250..1.163, 8 within 0.9..1.1, lookahead wall 141.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1094, 290, 12, 6284, 0, 0, 0], range 0.250..1.159, 8 within 0.9..1.1, lookahead wall 147.9 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 330, 8, 6264, 0, 0, 0], range 0.250..1.160, 6 within 0.9..1.1, lookahead wall 153.9 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 591, 24, 6398, 0, 0, 0], range 0.250..1.122, 8 within 0.9..1.1, lookahead wall 157.8 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 238, 586, 276, 6580, 0, 0, 0], range 0.250..1.073, 6607 within 0.9..1.1, lookahead wall 160.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1085, 311, 12, 6272, 0, 0, 0], range 0.250..1.160, 4 within 0.9..1.1, lookahead wall 165.9 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1097, 290, 15, 6278, 0, 0, 0], range 0.250..1.158, 9 within 0.9..1.1, lookahead wall 171.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1090, 316, 15, 6259, 0, 0, 0], range 0.250..1.161, 8 within 0.9..1.1, lookahead wall 177.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1122, 313, 10, 6235, 0, 0, 0], range 0.250..1.165, 4 within 0.9..1.1, lookahead wall 183.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1131, 329, 12, 6208, 0, 0, 0], range 0.250..1.169, 4 within 0.9..1.1, lookahead wall 189.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1087, 333, 18, 6242, 0, 0, 0], range 0.250..1.163, 8 within 0.9..1.1, lookahead wall 194.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1094, 290, 12, 6284, 0, 0, 0], range 0.250..1.159, 8 within 0.9..1.1, lookahead wall 200.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 330, 8, 6264, 0, 0, 0], range 0.250..1.160, 6 within 0.9..1.1, lookahead wall 206.3 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 591, 24, 6398, 0, 0, 0], range 0.250..1.122, 8 within 0.9..1.1, lookahead wall 210.2 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 238, 586, 276, 6580, 0, 0, 0], range 0.250..1.073, 6607 within 0.9..1.1, lookahead wall 212.3 ms cumulative
+film 1080p: pricer armings default=14 real=172
+film 1080p: motion_mode 32x32 SIMPLE=27341 OBMC=0 WARP=183 | 16x16 SIMPLE=4483 OBMC=0 WARP=500 | 8x8 SIMPLE=21018 OBMC=0 WARP=869 (0.0% OBMC / 2.9% WARP of 54394 eligible)
+film 1080p: inter var-tx depths of 3031 blocks -- leaf single 0=2203 1=828 (27.3% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 44.06 dB/252050 B, 47.90 dB/379115 B, 51.25 dB/503944 B, 53.93 dB/628251 B | +16.2% | -1.3% | 39.7s:6.6s:16.7s |
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 595, 1, 49, 7035, 0, 0, 0], range 0.250..1.070, 7081 within 0.9..1.1, lookahead wall 218.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 616, 9, 51, 7004, 0, 0, 0], range 0.250..1.074, 7052 within 0.9..1.1, lookahead wall 224.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 638, 4, 45, 6993, 0, 0, 0], range 0.250..1.077, 7033 within 0.9..1.1, lookahead wall 230.4 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 5, 39, 6983, 0, 0, 0], range 0.250..1.079, 7022 within 0.9..1.1, lookahead wall 236.2 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 660, 7, 36, 6977, 0, 0, 0], range 0.250..1.080, 7009 within 0.9..1.1, lookahead wall 242.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 661, 10, 37, 6972, 0, 0, 0], range 0.250..1.081, 7006 within 0.9..1.1, lookahead wall 247.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 655, 8, 37, 6980, 0, 0, 0], range 0.250..1.080, 7011 within 0.9..1.1, lookahead wall 254.4 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 637, 19, 45, 6979, 0, 0, 0], range 0.250..1.078, 7016 within 0.9..1.1, lookahead wall 260.0 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 443, 85, 35, 7117, 0, 0, 0], range 0.250..1.056, 7150 within 0.9..1.1, lookahead wall 263.8 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 277, 47, 7235, 0, 0, 0], range 0.250..1.032, 7272 within 0.9..1.1, lookahead wall 265.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 595, 1, 49, 7035, 0, 0, 0], range 0.250..1.070, 7081 within 0.9..1.1, lookahead wall 272.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 616, 9, 51, 7004, 0, 0, 0], range 0.250..1.074, 7052 within 0.9..1.1, lookahead wall 278.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 638, 4, 45, 6993, 0, 0, 0], range 0.250..1.077, 7033 within 0.9..1.1, lookahead wall 284.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 5, 39, 6983, 0, 0, 0], range 0.250..1.079, 7022 within 0.9..1.1, lookahead wall 290.9 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 660, 7, 36, 6977, 0, 0, 0], range 0.250..1.080, 7009 within 0.9..1.1, lookahead wall 296.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 661, 10, 37, 6972, 0, 0, 0], range 0.250..1.081, 7006 within 0.9..1.1, lookahead wall 302.4 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 655, 8, 37, 6980, 0, 0, 0], range 0.250..1.080, 7011 within 0.9..1.1, lookahead wall 308.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 637, 19, 45, 6979, 0, 0, 0], range 0.250..1.078, 7016 within 0.9..1.1, lookahead wall 314.2 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 443, 85, 35, 7117, 0, 0, 0], range 0.250..1.056, 7150 within 0.9..1.1, lookahead wall 318.0 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 277, 47, 7235, 0, 0, 0], range 0.250..1.032, 7272 within 0.9..1.1, lookahead wall 320.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 595, 1, 49, 7035, 0, 0, 0], range 0.250..1.070, 7081 within 0.9..1.1, lookahead wall 325.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 616, 9, 51, 7004, 0, 0, 0], range 0.250..1.074, 7052 within 0.9..1.1, lookahead wall 331.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 638, 4, 45, 6993, 0, 0, 0], range 0.250..1.077, 7033 within 0.9..1.1, lookahead wall 337.3 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 5, 39, 6983, 0, 0, 0], range 0.250..1.079, 7022 within 0.9..1.1, lookahead wall 344.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 660, 7, 36, 6977, 0, 0, 0], range 0.250..1.080, 7009 within 0.9..1.1, lookahead wall 349.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 661, 10, 37, 6972, 0, 0, 0], range 0.250..1.081, 7006 within 0.9..1.1, lookahead wall 355.4 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 655, 8, 37, 6980, 0, 0, 0], range 0.250..1.080, 7011 within 0.9..1.1, lookahead wall 361.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 637, 19, 45, 6979, 0, 0, 0], range 0.250..1.078, 7016 within 0.9..1.1, lookahead wall 367.5 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 443, 85, 35, 7117, 0, 0, 0], range 0.250..1.056, 7150 within 0.9..1.1, lookahead wall 371.4 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 277, 47, 7235, 0, 0, 0], range 0.250..1.032, 7272 within 0.9..1.1, lookahead wall 373.4 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 595, 1, 49, 7035, 0, 0, 0], range 0.250..1.070, 7081 within 0.9..1.1, lookahead wall 379.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 616, 9, 51, 7004, 0, 0, 0], range 0.250..1.074, 7052 within 0.9..1.1, lookahead wall 385.4 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 638, 4, 45, 6993, 0, 0, 0], range 0.250..1.077, 7033 within 0.9..1.1, lookahead wall 390.9 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 5, 39, 6983, 0, 0, 0], range 0.250..1.079, 7022 within 0.9..1.1, lookahead wall 396.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 660, 7, 36, 6977, 0, 0, 0], range 0.250..1.080, 7009 within 0.9..1.1, lookahead wall 402.3 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 661, 10, 37, 6972, 0, 0, 0], range 0.250..1.081, 7006 within 0.9..1.1, lookahead wall 408.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 655, 8, 37, 6980, 0, 0, 0], range 0.250..1.080, 7011 within 0.9..1.1, lookahead wall 413.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 637, 19, 45, 6979, 0, 0, 0], range 0.250..1.078, 7016 within 0.9..1.1, lookahead wall 419.6 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 443, 85, 35, 7117, 0, 0, 0], range 0.250..1.056, 7150 within 0.9..1.1, lookahead wall 423.6 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 277, 47, 7235, 0, 0, 0], range 0.250..1.032, 7272 within 0.9..1.1, lookahead wall 425.6 ms cumulative
+film 2160p: pricer armings default=15 real=147
+film 2160p: motion_mode 32x32 SIMPLE=15584 OBMC=0 WARP=2 | 16x16 SIMPLE=192 OBMC=0 WARP=23 | 8x8 SIMPLE=4864 OBMC=0 WARP=741 (0.0% OBMC / 3.6% WARP of 21406 eligible)
+film 2160p: inter var-tx depths of 470 blocks -- leaf single 0=366 1=104 (22.1% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.58 dB/309818 B, 47.82 dB/463112 B, 51.45 dB/593380 B, 54.36 dB/709279 B | +47.2% | +19.4% | 34.9s:5.6s:15.9s |
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3836, 43, 10, 3, 13, 3775, 0], range 0.250..1.613, 0 within 0.9..1.1, lookahead wall 431.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3878, 19, 7, 7, 1, 3768, 0], range 0.250..1.616, 7 within 0.9..1.1, lookahead wall 436.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3891, 15, 6, 0, 1, 3767, 0], range 0.250..1.617, 1 within 0.9..1.1, lookahead wall 442.3 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3907, 3, 1, 2, 2, 3765, 0], range 0.250..1.618, 2 within 0.9..1.1, lookahead wall 448.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3911, 3, 0, 0, 1, 3765, 0], range 0.250..1.619, 0 within 0.9..1.1, lookahead wall 454.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.284..1.619, 0 within 0.9..1.1, lookahead wall 459.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.345..1.619, 0 within 0.9..1.1, lookahead wall 465.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.361..1.619, 0 within 0.9..1.1, lookahead wall 471.0 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3912, 0, 0, 0, 3765, 0], range 0.473..1.515, 0 within 0.9..1.1, lookahead wall 474.7 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.653..1.342, 0 within 0.9..1.1, lookahead wall 476.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3836, 43, 10, 3, 13, 3775, 0], range 0.250..1.613, 0 within 0.9..1.1, lookahead wall 482.2 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3878, 19, 7, 7, 1, 3768, 0], range 0.250..1.616, 7 within 0.9..1.1, lookahead wall 487.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3891, 15, 6, 0, 1, 3767, 0], range 0.250..1.617, 1 within 0.9..1.1, lookahead wall 493.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3907, 3, 1, 2, 2, 3765, 0], range 0.250..1.618, 2 within 0.9..1.1, lookahead wall 499.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3911, 3, 0, 0, 1, 3765, 0], range 0.250..1.619, 0 within 0.9..1.1, lookahead wall 505.2 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.284..1.619, 0 within 0.9..1.1, lookahead wall 510.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.345..1.619, 0 within 0.9..1.1, lookahead wall 516.2 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.361..1.619, 0 within 0.9..1.1, lookahead wall 521.8 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3912, 0, 0, 0, 3765, 0], range 0.473..1.515, 0 within 0.9..1.1, lookahead wall 525.7 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.653..1.342, 0 within 0.9..1.1, lookahead wall 527.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3836, 43, 10, 3, 13, 3775, 0], range 0.250..1.613, 0 within 0.9..1.1, lookahead wall 533.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3878, 19, 7, 7, 1, 3768, 0], range 0.250..1.616, 7 within 0.9..1.1, lookahead wall 539.3 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3891, 15, 6, 0, 1, 3767, 0], range 0.250..1.617, 1 within 0.9..1.1, lookahead wall 545.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3907, 3, 1, 2, 2, 3765, 0], range 0.250..1.618, 2 within 0.9..1.1, lookahead wall 550.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3911, 3, 0, 0, 1, 3765, 0], range 0.250..1.619, 0 within 0.9..1.1, lookahead wall 556.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.284..1.619, 0 within 0.9..1.1, lookahead wall 561.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.345..1.619, 0 within 0.9..1.1, lookahead wall 567.2 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.361..1.619, 0 within 0.9..1.1, lookahead wall 572.8 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3912, 0, 0, 0, 3765, 0], range 0.473..1.515, 0 within 0.9..1.1, lookahead wall 576.8 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.653..1.342, 0 within 0.9..1.1, lookahead wall 578.9 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3836, 43, 10, 3, 13, 3775, 0], range 0.250..1.613, 0 within 0.9..1.1, lookahead wall 585.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3878, 19, 7, 7, 1, 3768, 0], range 0.250..1.616, 7 within 0.9..1.1, lookahead wall 590.6 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3891, 15, 6, 0, 1, 3767, 0], range 0.250..1.617, 1 within 0.9..1.1, lookahead wall 596.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3907, 3, 1, 2, 2, 3765, 0], range 0.250..1.618, 2 within 0.9..1.1, lookahead wall 601.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3911, 3, 0, 0, 1, 3765, 0], range 0.250..1.619, 0 within 0.9..1.1, lookahead wall 607.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.284..1.619, 0 within 0.9..1.1, lookahead wall 613.3 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.345..1.619, 0 within 0.9..1.1, lookahead wall 618.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.361..1.619, 0 within 0.9..1.1, lookahead wall 624.4 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3912, 0, 0, 0, 3765, 0], range 0.473..1.515, 0 within 0.9..1.1, lookahead wall 628.1 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.653..1.342, 0 within 0.9..1.1, lookahead wall 630.1 ms cumulative
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=154 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=66255 OBMC=0 WARP=1707 | 16x16 SIMPLE=6395 OBMC=0 WARP=1241 | 8x8 SIMPLE=1379 OBMC=0 WARP=1460 (0.0% OBMC / 5.6% WARP of 78437 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 4641 blocks -- leaf single 0=2284 1=2357 (50.8% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 7237 chroma 689; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.03 dB/42747 B, 48.38 dB/56080 B, 51.01 dB/73676 B, 53.38 dB/95744 B | +51.9% | -13.9% | 26.8s:8.3s:12.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 174.67s
+
+RC=0 k=1 d=4
+=== k=2 d=4 ===
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1390, 14, 4, 6272, 0, 0, 0], range 0.250..1.183, 0 within 0.9..1.1, lookahead wall 11.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1380, 18, 7, 6275, 0, 0, 0], range 0.250..1.182, 6 within 0.9..1.1, lookahead wall 17.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1401, 12, 8, 6259, 0, 0, 0], range 0.250..1.184, 0 within 0.9..1.1, lookahead wall 24.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1434, 8, 4, 6234, 0, 0, 0], range 0.250..1.189, 1 within 0.9..1.1, lookahead wall 30.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1454, 15, 4, 6207, 0, 0, 0], range 0.250..1.194, 1 within 0.9..1.1, lookahead wall 36.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1411, 22, 8, 6239, 0, 0, 0], range 0.250..1.187, 3 within 0.9..1.1, lookahead wall 42.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1382, 11, 6, 6281, 0, 0, 0], range 0.250..1.182, 6 within 0.9..1.1, lookahead wall 49.1 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1404, 10, 5, 6261, 0, 0, 0], range 0.250..1.184, 5 within 0.9..1.1, lookahead wall 60.2 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1208, 69, 6, 6397, 0, 0, 0], range 0.250..1.147, 4 within 0.9..1.1, lookahead wall 68.6 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 562, 502, 41, 6575, 0, 0, 0], range 0.250..1.096, 6583 within 0.9..1.1, lookahead wall 71.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1390, 14, 4, 6272, 0, 0, 0], range 0.250..1.183, 0 within 0.9..1.1, lookahead wall 77.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1380, 18, 7, 6275, 0, 0, 0], range 0.250..1.182, 6 within 0.9..1.1, lookahead wall 83.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1401, 12, 8, 6259, 0, 0, 0], range 0.250..1.184, 0 within 0.9..1.1, lookahead wall 89.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1434, 8, 4, 6234, 0, 0, 0], range 0.250..1.189, 1 within 0.9..1.1, lookahead wall 95.1 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1454, 15, 4, 6207, 0, 0, 0], range 0.250..1.194, 1 within 0.9..1.1, lookahead wall 101.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1411, 22, 8, 6239, 0, 0, 0], range 0.250..1.187, 3 within 0.9..1.1, lookahead wall 107.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1382, 11, 6, 6281, 0, 0, 0], range 0.250..1.182, 6 within 0.9..1.1, lookahead wall 118.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1404, 10, 5, 6261, 0, 0, 0], range 0.250..1.184, 5 within 0.9..1.1, lookahead wall 124.7 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1208, 69, 6, 6397, 0, 0, 0], range 0.250..1.147, 4 within 0.9..1.1, lookahead wall 128.8 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 562, 502, 41, 6575, 0, 0, 0], range 0.250..1.096, 6583 within 0.9..1.1, lookahead wall 130.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1390, 14, 4, 6272, 0, 0, 0], range 0.250..1.183, 0 within 0.9..1.1, lookahead wall 144.3 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1380, 18, 7, 6275, 0, 0, 0], range 0.250..1.182, 6 within 0.9..1.1, lookahead wall 156.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1401, 12, 8, 6259, 0, 0, 0], range 0.250..1.184, 0 within 0.9..1.1, lookahead wall 167.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1434, 8, 4, 6234, 0, 0, 0], range 0.250..1.189, 1 within 0.9..1.1, lookahead wall 180.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1454, 15, 4, 6207, 0, 0, 0], range 0.250..1.194, 1 within 0.9..1.1, lookahead wall 193.8 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1411, 22, 8, 6239, 0, 0, 0], range 0.250..1.187, 3 within 0.9..1.1, lookahead wall 208.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1382, 11, 6, 6281, 0, 0, 0], range 0.250..1.182, 6 within 0.9..1.1, lookahead wall 214.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1404, 10, 5, 6261, 0, 0, 0], range 0.250..1.184, 5 within 0.9..1.1, lookahead wall 222.8 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1208, 69, 6, 6397, 0, 0, 0], range 0.250..1.147, 4 within 0.9..1.1, lookahead wall 227.0 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 562, 502, 41, 6575, 0, 0, 0], range 0.250..1.096, 6583 within 0.9..1.1, lookahead wall 229.1 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1390, 14, 4, 6272, 0, 0, 0], range 0.250..1.183, 0 within 0.9..1.1, lookahead wall 235.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1380, 18, 7, 6275, 0, 0, 0], range 0.250..1.182, 6 within 0.9..1.1, lookahead wall 242.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1401, 12, 8, 6259, 0, 0, 0], range 0.250..1.184, 0 within 0.9..1.1, lookahead wall 248.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1434, 8, 4, 6234, 0, 0, 0], range 0.250..1.189, 1 within 0.9..1.1, lookahead wall 255.5 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1454, 15, 4, 6207, 0, 0, 0], range 0.250..1.194, 1 within 0.9..1.1, lookahead wall 262.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1411, 22, 8, 6239, 0, 0, 0], range 0.250..1.187, 3 within 0.9..1.1, lookahead wall 268.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1382, 11, 6, 6281, 0, 0, 0], range 0.250..1.182, 6 within 0.9..1.1, lookahead wall 274.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1404, 10, 5, 6261, 0, 0, 0], range 0.250..1.184, 5 within 0.9..1.1, lookahead wall 280.8 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1208, 69, 6, 6397, 0, 0, 0], range 0.250..1.147, 4 within 0.9..1.1, lookahead wall 284.7 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 562, 502, 41, 6575, 0, 0, 0], range 0.250..1.096, 6583 within 0.9..1.1, lookahead wall 287.0 ms cumulative
+film 1080p: pricer armings default=14 real=168
+film 1080p: motion_mode 32x32 SIMPLE=25467 OBMC=0 WARP=195 | 16x16 SIMPLE=4092 OBMC=0 WARP=436 | 8x8 SIMPLE=20901 OBMC=0 WARP=981 (0.0% OBMC / 3.1% WARP of 52072 eligible)
+film 1080p: inter var-tx depths of 2712 blocks -- leaf single 0=1850 1=862 (31.8% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 44.14 dB/257376 B, 47.96 dB/383648 B, 51.30 dB/511636 B, 53.99 dB/637269 B | +17.2% | -0.5% | 47.7s:6.7s:16.6s |
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 596, 3, 89, 6992, 0, 0, 0], range 0.250..1.077, 7053 within 0.9..1.1, lookahead wall 292.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 625, 2, 93, 6960, 0, 0, 0], range 0.250..1.081, 7032 within 0.9..1.1, lookahead wall 298.5 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 642, 4, 85, 6949, 0, 0, 0], range 0.250..1.084, 7011 within 0.9..1.1, lookahead wall 304.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 658, 0, 74, 6948, 0, 0, 0], range 0.250..1.086, 6999 within 0.9..1.1, lookahead wall 310.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 3, 77, 6933, 0, 0, 0], range 0.250..1.088, 6992 within 0.9..1.1, lookahead wall 316.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 671, 2, 72, 6935, 0, 0, 0], range 0.250..1.088, 6985 within 0.9..1.1, lookahead wall 322.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 663, 3, 78, 6936, 0, 0, 0], range 0.250..1.087, 6992 within 0.9..1.1, lookahead wall 327.8 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 9, 82, 6936, 0, 0, 0], range 0.250..1.086, 6997 within 0.9..1.1, lookahead wall 333.6 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 528, 0, 82, 7070, 0, 0, 0], range 0.250..1.063, 7137 within 0.9..1.1, lookahead wall 337.4 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 68, 51, 7221, 0, 0, 0], range 0.250..1.039, 7262 within 0.9..1.1, lookahead wall 339.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 596, 3, 89, 6992, 0, 0, 0], range 0.250..1.077, 7053 within 0.9..1.1, lookahead wall 345.1 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 625, 2, 93, 6960, 0, 0, 0], range 0.250..1.081, 7032 within 0.9..1.1, lookahead wall 351.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 642, 4, 85, 6949, 0, 0, 0], range 0.250..1.084, 7011 within 0.9..1.1, lookahead wall 356.8 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 658, 0, 74, 6948, 0, 0, 0], range 0.250..1.086, 6999 within 0.9..1.1, lookahead wall 363.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 3, 77, 6933, 0, 0, 0], range 0.250..1.088, 6992 within 0.9..1.1, lookahead wall 369.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 671, 2, 72, 6935, 0, 0, 0], range 0.250..1.088, 6985 within 0.9..1.1, lookahead wall 375.5 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 663, 3, 78, 6936, 0, 0, 0], range 0.250..1.087, 6992 within 0.9..1.1, lookahead wall 381.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 9, 82, 6936, 0, 0, 0], range 0.250..1.086, 6997 within 0.9..1.1, lookahead wall 387.4 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 528, 0, 82, 7070, 0, 0, 0], range 0.250..1.063, 7137 within 0.9..1.1, lookahead wall 391.8 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 68, 51, 7221, 0, 0, 0], range 0.250..1.039, 7262 within 0.9..1.1, lookahead wall 393.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 596, 3, 89, 6992, 0, 0, 0], range 0.250..1.077, 7053 within 0.9..1.1, lookahead wall 399.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 625, 2, 93, 6960, 0, 0, 0], range 0.250..1.081, 7032 within 0.9..1.1, lookahead wall 405.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 642, 4, 85, 6949, 0, 0, 0], range 0.250..1.084, 7011 within 0.9..1.1, lookahead wall 411.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 658, 0, 74, 6948, 0, 0, 0], range 0.250..1.086, 6999 within 0.9..1.1, lookahead wall 418.3 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 3, 77, 6933, 0, 0, 0], range 0.250..1.088, 6992 within 0.9..1.1, lookahead wall 425.1 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 671, 2, 72, 6935, 0, 0, 0], range 0.250..1.088, 6985 within 0.9..1.1, lookahead wall 431.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 663, 3, 78, 6936, 0, 0, 0], range 0.250..1.087, 6992 within 0.9..1.1, lookahead wall 439.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 9, 82, 6936, 0, 0, 0], range 0.250..1.086, 6997 within 0.9..1.1, lookahead wall 445.8 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 528, 0, 82, 7070, 0, 0, 0], range 0.250..1.063, 7137 within 0.9..1.1, lookahead wall 449.9 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 68, 51, 7221, 0, 0, 0], range 0.250..1.039, 7262 within 0.9..1.1, lookahead wall 452.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 596, 3, 89, 6992, 0, 0, 0], range 0.250..1.077, 7053 within 0.9..1.1, lookahead wall 458.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 625, 2, 93, 6960, 0, 0, 0], range 0.250..1.081, 7032 within 0.9..1.1, lookahead wall 463.8 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 642, 4, 85, 6949, 0, 0, 0], range 0.250..1.084, 7011 within 0.9..1.1, lookahead wall 469.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 658, 0, 74, 6948, 0, 0, 0], range 0.250..1.086, 6999 within 0.9..1.1, lookahead wall 475.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 3, 77, 6933, 0, 0, 0], range 0.250..1.088, 6992 within 0.9..1.1, lookahead wall 481.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 671, 2, 72, 6935, 0, 0, 0], range 0.250..1.088, 6985 within 0.9..1.1, lookahead wall 487.1 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 663, 3, 78, 6936, 0, 0, 0], range 0.250..1.087, 6992 within 0.9..1.1, lookahead wall 493.3 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 9, 82, 6936, 0, 0, 0], range 0.250..1.086, 6997 within 0.9..1.1, lookahead wall 499.9 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 528, 0, 82, 7070, 0, 0, 0], range 0.250..1.063, 7137 within 0.9..1.1, lookahead wall 503.8 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 68, 51, 7221, 0, 0, 0], range 0.250..1.039, 7262 within 0.9..1.1, lookahead wall 505.9 ms cumulative
+film 2160p: pricer armings default=15 real=154
+film 2160p: motion_mode 32x32 SIMPLE=15730 OBMC=0 WARP=9 | 16x16 SIMPLE=189 OBMC=0 WARP=20 | 8x8 SIMPLE=5589 OBMC=0 WARP=712 (0.0% OBMC / 3.3% WARP of 22249 eligible)
+film 2160p: inter var-tx depths of 549 blocks -- leaf single 0=422 1=127 (23.1% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.62 dB/312415 B, 47.85 dB/465417 B, 51.49 dB/592957 B, 54.38 dB/710920 B | +47.2% | +19.5% | 35.8s:5.7s:16.0s |
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3874, 15, 0, 3, 13, 1, 3774], range 0.250..1.768, 2 within 0.9..1.1, lookahead wall 511.5 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3897, 5, 6, 3, 1, 1, 3767], range 0.250..1.773, 4 within 0.9..1.1, lookahead wall 517.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 1, 0, 1, 0, 3767], range 0.250..1.774, 0 within 0.9..1.1, lookahead wall 523.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3909, 1, 3, 1, 1, 0, 3765], range 0.250..1.775, 1 within 0.9..1.1, lookahead wall 529.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 535.3 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 541.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 547.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 553.0 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.312..1.689, 0 within 0.9..1.1, lookahead wall 556.7 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 0, 3765, 0], range 0.487..1.515, 0 within 0.9..1.1, lookahead wall 558.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3874, 15, 0, 3, 13, 1, 3774], range 0.250..1.768, 2 within 0.9..1.1, lookahead wall 564.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3897, 5, 6, 3, 1, 1, 3767], range 0.250..1.773, 4 within 0.9..1.1, lookahead wall 569.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 1, 0, 1, 0, 3767], range 0.250..1.774, 0 within 0.9..1.1, lookahead wall 575.5 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3909, 1, 3, 1, 1, 0, 3765], range 0.250..1.775, 1 within 0.9..1.1, lookahead wall 581.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 586.8 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 592.5 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 597.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 603.4 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.312..1.689, 0 within 0.9..1.1, lookahead wall 607.1 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 0, 3765, 0], range 0.487..1.515, 0 within 0.9..1.1, lookahead wall 609.1 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3874, 15, 0, 3, 13, 1, 3774], range 0.250..1.768, 2 within 0.9..1.1, lookahead wall 615.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3897, 5, 6, 3, 1, 1, 3767], range 0.250..1.773, 4 within 0.9..1.1, lookahead wall 620.5 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 1, 0, 1, 0, 3767], range 0.250..1.774, 0 within 0.9..1.1, lookahead wall 626.1 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3909, 1, 3, 1, 1, 0, 3765], range 0.250..1.775, 1 within 0.9..1.1, lookahead wall 631.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 637.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 642.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 649.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 654.8 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.312..1.689, 0 within 0.9..1.1, lookahead wall 658.7 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 0, 3765, 0], range 0.487..1.515, 0 within 0.9..1.1, lookahead wall 660.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3874, 15, 0, 3, 13, 1, 3774], range 0.250..1.768, 2 within 0.9..1.1, lookahead wall 672.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3897, 5, 6, 3, 1, 1, 3767], range 0.250..1.773, 4 within 0.9..1.1, lookahead wall 678.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 1, 0, 1, 0, 3767], range 0.250..1.774, 0 within 0.9..1.1, lookahead wall 683.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3909, 1, 3, 1, 1, 0, 3765], range 0.250..1.775, 1 within 0.9..1.1, lookahead wall 689.7 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 695.3 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 700.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 706.8 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 712.5 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.312..1.689, 0 within 0.9..1.1, lookahead wall 716.2 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 0, 3765, 0], range 0.487..1.515, 0 within 0.9..1.1, lookahead wall 718.3 ms cumulative
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=152 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=61293 OBMC=0 WARP=1466 | 16x16 SIMPLE=6280 OBMC=0 WARP=1354 | 8x8 SIMPLE=2182 OBMC=0 WARP=2348 (0.0% OBMC / 6.9% WARP of 74923 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 3816 blocks -- leaf single 0=1739 1=2077 (54.4% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 8356 chroma 799; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.38 dB/46418 B, 48.61 dB/59458 B, 51.28 dB/78331 B, 53.63 dB/100288 B | +57.0% | -10.7% | 26.7s:8.4s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 183.03s
+
+RC=0 k=2 d=4
+=== k=0.25 d=8 ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1041, 535, 157, 5947, 0, 0, 0], range 0.250..1.197, 21 within 0.9..1.1, lookahead wall 14.2 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1041, 545, 147, 5947, 0, 0, 0], range 0.250..1.195, 28 within 0.9..1.1, lookahead wall 29.1 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1050, 542, 157, 5931, 0, 0, 0], range 0.250..1.197, 26 within 0.9..1.1, lookahead wall 43.4 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1044, 548, 162, 5926, 0, 0, 0], range 0.250..1.196, 36 within 0.9..1.1, lookahead wall 58.5 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 955, 470, 246, 6009, 0, 0, 0], range 0.250..1.175, 41 within 0.9..1.1, lookahead wall 80.5 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 724, 507, 331, 6118, 0, 0, 0], range 0.250..1.153, 46 within 0.9..1.1, lookahead wall 91.6 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 627, 394, 446, 6213, 0, 0, 0], range 0.250..1.131, 29 within 0.9..1.1, lookahead wall 99.5 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 105.5 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 109.4 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 111.4 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1041, 535, 157, 5947, 0, 0, 0], range 0.250..1.197, 21 within 0.9..1.1, lookahead wall 125.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1041, 545, 147, 5947, 0, 0, 0], range 0.250..1.195, 28 within 0.9..1.1, lookahead wall 140.1 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1050, 542, 157, 5931, 0, 0, 0], range 0.250..1.197, 26 within 0.9..1.1, lookahead wall 154.2 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1044, 548, 162, 5926, 0, 0, 0], range 0.250..1.196, 36 within 0.9..1.1, lookahead wall 168.9 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 955, 470, 246, 6009, 0, 0, 0], range 0.250..1.175, 41 within 0.9..1.1, lookahead wall 183.9 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 724, 507, 331, 6118, 0, 0, 0], range 0.250..1.153, 46 within 0.9..1.1, lookahead wall 202.3 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 627, 394, 446, 6213, 0, 0, 0], range 0.250..1.131, 29 within 0.9..1.1, lookahead wall 210.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 216.4 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 220.5 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 222.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1041, 535, 157, 5947, 0, 0, 0], range 0.250..1.197, 21 within 0.9..1.1, lookahead wall 237.3 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1041, 545, 147, 5947, 0, 0, 0], range 0.250..1.195, 28 within 0.9..1.1, lookahead wall 251.8 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1050, 542, 157, 5931, 0, 0, 0], range 0.250..1.197, 26 within 0.9..1.1, lookahead wall 266.0 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1044, 548, 162, 5926, 0, 0, 0], range 0.250..1.196, 36 within 0.9..1.1, lookahead wall 280.3 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 955, 470, 246, 6009, 0, 0, 0], range 0.250..1.175, 41 within 0.9..1.1, lookahead wall 294.6 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 724, 507, 331, 6118, 0, 0, 0], range 0.250..1.153, 46 within 0.9..1.1, lookahead wall 305.5 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 627, 394, 446, 6213, 0, 0, 0], range 0.250..1.131, 29 within 0.9..1.1, lookahead wall 313.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 318.9 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 322.9 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 325.4 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1041, 535, 157, 5947, 0, 0, 0], range 0.250..1.197, 21 within 0.9..1.1, lookahead wall 339.8 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1041, 545, 147, 5947, 0, 0, 0], range 0.250..1.195, 28 within 0.9..1.1, lookahead wall 354.0 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1050, 542, 157, 5931, 0, 0, 0], range 0.250..1.197, 26 within 0.9..1.1, lookahead wall 368.4 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1044, 548, 162, 5926, 0, 0, 0], range 0.250..1.196, 36 within 0.9..1.1, lookahead wall 382.2 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 955, 470, 246, 6009, 0, 0, 0], range 0.250..1.175, 41 within 0.9..1.1, lookahead wall 393.8 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 724, 507, 331, 6118, 0, 0, 0], range 0.250..1.153, 46 within 0.9..1.1, lookahead wall 404.6 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 627, 394, 446, 6213, 0, 0, 0], range 0.250..1.131, 29 within 0.9..1.1, lookahead wall 412.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 515, 280, 617, 6268, 0, 0, 0], range 0.250..1.108, 58 within 0.9..1.1, lookahead wall 418.3 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 351, 267, 657, 6405, 0, 0, 0], range 0.250..1.077, 6615 within 0.9..1.1, lookahead wall 422.2 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 157, 56, 872, 6595, 0, 0, 0], range 0.250..1.039, 7133 within 0.9..1.1, lookahead wall 424.2 ms cumulative
+film 1080p: pricer armings default=14 real=164
+film 1080p: motion_mode 32x32 SIMPLE=26342 OBMC=0 WARP=252 | 16x16 SIMPLE=4270 OBMC=0 WARP=404 | 8x8 SIMPLE=17173 OBMC=0 WARP=1984 (0.0% OBMC / 5.2% WARP of 50425 eligible)
+film 1080p: inter var-tx depths of 3275 blocks -- leaf single 0=2501 1=774 (23.6% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.95 dB/248130 B, 47.81 dB/374233 B, 51.17 dB/498150 B, 53.87 dB/620426 B | +15.7% | -1.6% | 39.9s:6.5s:16.5s |
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 829, 223, 6, 6622, 0, 0, 0], range 0.250..1.134, 69 within 0.9..1.1, lookahead wall 438.2 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 853, 229, 7, 6591, 0, 0, 0], range 0.250..1.140, 63 within 0.9..1.1, lookahead wall 452.5 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 873, 224, 6, 6577, 0, 0, 0], range 0.250..1.142, 57 within 0.9..1.1, lookahead wall 466.3 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 880, 230, 4, 6566, 0, 0, 0], range 0.250..1.144, 50 within 0.9..1.1, lookahead wall 480.1 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 760, 237, 7, 6676, 0, 0, 0], range 0.250..1.124, 89 within 0.9..1.1, lookahead wall 492.9 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 644, 239, 11, 6786, 0, 0, 0], range 0.250..1.104, 167 within 0.9..1.1, lookahead wall 503.4 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 478, 279, 17, 6906, 0, 0, 0], range 0.250..1.083, 6909 within 0.9..1.1, lookahead wall 511.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 348, 221, 92, 7019, 0, 0, 0], range 0.250..1.061, 7032 within 0.9..1.1, lookahead wall 516.9 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 61, 230, 7150, 0, 0, 0], range 0.250..1.042, 7152 within 0.9..1.1, lookahead wall 520.7 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 0, 295, 7264, 0, 0, 0], range 0.250..1.021, 7341 within 0.9..1.1, lookahead wall 522.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 829, 223, 6, 6622, 0, 0, 0], range 0.250..1.134, 69 within 0.9..1.1, lookahead wall 537.8 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 853, 229, 7, 6591, 0, 0, 0], range 0.250..1.140, 63 within 0.9..1.1, lookahead wall 552.8 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 873, 224, 6, 6577, 0, 0, 0], range 0.250..1.142, 57 within 0.9..1.1, lookahead wall 566.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 880, 230, 4, 6566, 0, 0, 0], range 0.250..1.144, 50 within 0.9..1.1, lookahead wall 580.9 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 760, 237, 7, 6676, 0, 0, 0], range 0.250..1.124, 89 within 0.9..1.1, lookahead wall 592.9 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 644, 239, 11, 6786, 0, 0, 0], range 0.250..1.104, 167 within 0.9..1.1, lookahead wall 602.6 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 478, 279, 17, 6906, 0, 0, 0], range 0.250..1.083, 6909 within 0.9..1.1, lookahead wall 610.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 348, 221, 92, 7019, 0, 0, 0], range 0.250..1.061, 7032 within 0.9..1.1, lookahead wall 616.2 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 61, 230, 7150, 0, 0, 0], range 0.250..1.042, 7152 within 0.9..1.1, lookahead wall 620.2 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 0, 295, 7264, 0, 0, 0], range 0.250..1.021, 7341 within 0.9..1.1, lookahead wall 622.3 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 829, 223, 6, 6622, 0, 0, 0], range 0.250..1.134, 69 within 0.9..1.1, lookahead wall 637.1 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 853, 229, 7, 6591, 0, 0, 0], range 0.250..1.140, 63 within 0.9..1.1, lookahead wall 650.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 873, 224, 6, 6577, 0, 0, 0], range 0.250..1.142, 57 within 0.9..1.1, lookahead wall 665.1 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 880, 230, 4, 6566, 0, 0, 0], range 0.250..1.144, 50 within 0.9..1.1, lookahead wall 679.7 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 760, 237, 7, 6676, 0, 0, 0], range 0.250..1.124, 89 within 0.9..1.1, lookahead wall 692.5 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 644, 239, 11, 6786, 0, 0, 0], range 0.250..1.104, 167 within 0.9..1.1, lookahead wall 702.4 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 478, 279, 17, 6906, 0, 0, 0], range 0.250..1.083, 6909 within 0.9..1.1, lookahead wall 710.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 348, 221, 92, 7019, 0, 0, 0], range 0.250..1.061, 7032 within 0.9..1.1, lookahead wall 715.9 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 61, 230, 7150, 0, 0, 0], range 0.250..1.042, 7152 within 0.9..1.1, lookahead wall 720.2 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 0, 295, 7264, 0, 0, 0], range 0.250..1.021, 7341 within 0.9..1.1, lookahead wall 722.2 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 829, 223, 6, 6622, 0, 0, 0], range 0.250..1.134, 69 within 0.9..1.1, lookahead wall 735.9 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 853, 229, 7, 6591, 0, 0, 0], range 0.250..1.140, 63 within 0.9..1.1, lookahead wall 749.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 873, 224, 6, 6577, 0, 0, 0], range 0.250..1.142, 57 within 0.9..1.1, lookahead wall 763.4 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 880, 230, 4, 6566, 0, 0, 0], range 0.250..1.144, 50 within 0.9..1.1, lookahead wall 776.9 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 760, 237, 7, 6676, 0, 0, 0], range 0.250..1.124, 89 within 0.9..1.1, lookahead wall 788.8 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 644, 239, 11, 6786, 0, 0, 0], range 0.250..1.104, 167 within 0.9..1.1, lookahead wall 798.6 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 478, 279, 17, 6906, 0, 0, 0], range 0.250..1.083, 6909 within 0.9..1.1, lookahead wall 806.3 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 348, 221, 92, 7019, 0, 0, 0], range 0.250..1.061, 7032 within 0.9..1.1, lookahead wall 812.1 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 61, 230, 7150, 0, 0, 0], range 0.250..1.042, 7152 within 0.9..1.1, lookahead wall 816.0 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 0, 295, 7264, 0, 0, 0], range 0.250..1.021, 7341 within 0.9..1.1, lookahead wall 818.0 ms cumulative
+film 2160p: pricer armings default=15 real=154
+film 2160p: motion_mode 32x32 SIMPLE=15679 OBMC=0 WARP=2 | 16x16 SIMPLE=226 OBMC=0 WARP=26 | 8x8 SIMPLE=5013 OBMC=0 WARP=724 (0.0% OBMC / 3.5% WARP of 21670 eligible)
+film 2160p: inter var-tx depths of 452 blocks -- leaf single 0=363 1=89 (19.7% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.51 dB/306191 B, 47.76 dB/459845 B, 51.41 dB/590468 B, 54.31 dB/707156 B | +46.9% | +19.1% | 35.3s:5.6s:16.1s |
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 91, 3765, 26, 10, 3788, 0, 0], range 0.250..1.476, 12 within 0.9..1.1, lookahead wall 831.4 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 45, 3840, 14, 12, 3769, 0, 0], range 0.250..1.478, 9 within 0.9..1.1, lookahead wall 846.3 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 26, 3874, 9, 3, 3768, 0, 0], range 0.250..1.479, 6 within 0.9..1.1, lookahead wall 860.5 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 18, 3891, 1, 4, 3766, 0, 0], range 0.250..1.480, 2 within 0.9..1.1, lookahead wall 876.3 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3910, 1, 0, 3766, 0, 0], range 0.369..1.441, 0 within 0.9..1.1, lookahead wall 888.8 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 3765, 0, 0], range 0.448..1.395, 0 within 0.9..1.1, lookahead wall 899.0 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.584..1.342, 0 within 0.9..1.1, lookahead wall 906.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.683..1.280, 0 within 0.9..1.1, lookahead wall 912.7 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.777..1.205, 0 within 0.9..1.1, lookahead wall 916.6 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.881..1.113, 13 within 0.9..1.1, lookahead wall 918.8 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 91, 3765, 26, 10, 3788, 0, 0], range 0.250..1.476, 12 within 0.9..1.1, lookahead wall 932.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 45, 3840, 14, 12, 3769, 0, 0], range 0.250..1.478, 9 within 0.9..1.1, lookahead wall 947.0 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 26, 3874, 9, 3, 3768, 0, 0], range 0.250..1.479, 6 within 0.9..1.1, lookahead wall 961.2 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 18, 3891, 1, 4, 3766, 0, 0], range 0.250..1.480, 2 within 0.9..1.1, lookahead wall 974.7 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3910, 1, 0, 3766, 0, 0], range 0.369..1.441, 0 within 0.9..1.1, lookahead wall 986.3 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 3765, 0, 0], range 0.448..1.395, 0 within 0.9..1.1, lookahead wall 996.1 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.584..1.342, 0 within 0.9..1.1, lookahead wall 1004.0 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.683..1.280, 0 within 0.9..1.1, lookahead wall 1009.6 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.777..1.205, 0 within 0.9..1.1, lookahead wall 1013.3 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.881..1.113, 13 within 0.9..1.1, lookahead wall 1015.2 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 91, 3765, 26, 10, 3788, 0, 0], range 0.250..1.476, 12 within 0.9..1.1, lookahead wall 1029.8 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 45, 3840, 14, 12, 3769, 0, 0], range 0.250..1.478, 9 within 0.9..1.1, lookahead wall 1046.1 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 26, 3874, 9, 3, 3768, 0, 0], range 0.250..1.479, 6 within 0.9..1.1, lookahead wall 1059.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 18, 3891, 1, 4, 3766, 0, 0], range 0.250..1.480, 2 within 0.9..1.1, lookahead wall 1073.3 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3910, 1, 0, 3766, 0, 0], range 0.369..1.441, 0 within 0.9..1.1, lookahead wall 1084.8 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 3765, 0, 0], range 0.448..1.395, 0 within 0.9..1.1, lookahead wall 1094.7 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.584..1.342, 0 within 0.9..1.1, lookahead wall 1102.2 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.683..1.280, 0 within 0.9..1.1, lookahead wall 1108.1 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.777..1.205, 0 within 0.9..1.1, lookahead wall 1111.8 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.881..1.113, 13 within 0.9..1.1, lookahead wall 1113.7 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 91, 3765, 26, 10, 3788, 0, 0], range 0.250..1.476, 12 within 0.9..1.1, lookahead wall 1127.1 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 45, 3840, 14, 12, 3769, 0, 0], range 0.250..1.478, 9 within 0.9..1.1, lookahead wall 1140.6 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 26, 3874, 9, 3, 3768, 0, 0], range 0.250..1.479, 6 within 0.9..1.1, lookahead wall 1154.8 ms cumulative
+tpl k=0.25 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 18, 3891, 1, 4, 3766, 0, 0], range 0.250..1.480, 2 within 0.9..1.1, lookahead wall 1169.5 ms cumulative
+tpl k=0.25 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3910, 1, 0, 3766, 0, 0], range 0.369..1.441, 0 within 0.9..1.1, lookahead wall 1181.8 ms cumulative
+tpl k=0.25 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 3765, 0, 0], range 0.448..1.395, 0 within 0.9..1.1, lookahead wall 1193.1 ms cumulative
+tpl k=0.25 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.584..1.342, 0 within 0.9..1.1, lookahead wall 1201.8 ms cumulative
+tpl k=0.25 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.683..1.280, 0 within 0.9..1.1, lookahead wall 1207.5 ms cumulative
+tpl k=0.25 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.777..1.205, 0 within 0.9..1.1, lookahead wall 1211.2 ms cumulative
+tpl k=0.25 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.881..1.113, 13 within 0.9..1.1, lookahead wall 1213.2 ms cumulative
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=69552 OBMC=0 WARP=1822 | 16x16 SIMPLE=5430 OBMC=0 WARP=921 | 8x8 SIMPLE=929 OBMC=0 WARP=928 (0.0% OBMC / 4.6% WARP of 79582 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 5395 blocks -- leaf single 0=2963 1=2432 (45.1% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6966 chroma 660; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.95 dB/42156 B, 48.27 dB/54947 B, 50.86 dB/72183 B, 53.23 dB/93624 B | +50.7% | -14.6% | 27.8s:11.1s:11.4s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 178.00s
+
+RC=0 k=0.25 d=8
+=== k=0.5 d=8 ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1421, 299, 17, 5943, 0, 0, 0], range 0.250..1.225, 6 within 0.9..1.1, lookahead wall 14.3 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1409, 306, 26, 5939, 0, 0, 0], range 0.250..1.223, 9 within 0.9..1.1, lookahead wall 28.6 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1415, 320, 22, 5923, 0, 0, 0], range 0.250..1.226, 9 within 0.9..1.1, lookahead wall 43.0 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1415, 312, 32, 5921, 0, 0, 0], range 0.250..1.225, 7 within 0.9..1.1, lookahead wall 58.3 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1224, 415, 40, 6001, 0, 0, 0], range 0.250..1.204, 8 within 0.9..1.1, lookahead wall 71.5 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1014, 519, 39, 6108, 0, 0, 0], range 0.250..1.180, 19 within 0.9..1.1, lookahead wall 81.7 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 853, 590, 26, 6211, 0, 0, 0], range 0.250..1.157, 13 within 0.9..1.1, lookahead wall 90.2 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 742, 577, 95, 6266, 0, 0, 0], range 0.250..1.133, 10 within 0.9..1.1, lookahead wall 96.2 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 401, 499, 380, 6400, 0, 0, 0], range 0.250..1.098, 6413 within 0.9..1.1, lookahead wall 100.1 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 189, 316, 592, 6583, 0, 0, 0], range 0.250..1.053, 6706 within 0.9..1.1, lookahead wall 102.1 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1421, 299, 17, 5943, 0, 0, 0], range 0.250..1.225, 6 within 0.9..1.1, lookahead wall 129.4 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1409, 306, 26, 5939, 0, 0, 0], range 0.250..1.223, 9 within 0.9..1.1, lookahead wall 157.4 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1415, 320, 22, 5923, 0, 0, 0], range 0.250..1.226, 9 within 0.9..1.1, lookahead wall 183.6 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1415, 312, 32, 5921, 0, 0, 0], range 0.250..1.225, 7 within 0.9..1.1, lookahead wall 210.0 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1224, 415, 40, 6001, 0, 0, 0], range 0.250..1.204, 8 within 0.9..1.1, lookahead wall 233.7 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1014, 519, 39, 6108, 0, 0, 0], range 0.250..1.180, 19 within 0.9..1.1, lookahead wall 253.1 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 853, 590, 26, 6211, 0, 0, 0], range 0.250..1.157, 13 within 0.9..1.1, lookahead wall 262.9 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 742, 577, 95, 6266, 0, 0, 0], range 0.250..1.133, 10 within 0.9..1.1, lookahead wall 269.1 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 401, 499, 380, 6400, 0, 0, 0], range 0.250..1.098, 6413 within 0.9..1.1, lookahead wall 273.2 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 189, 316, 592, 6583, 0, 0, 0], range 0.250..1.053, 6706 within 0.9..1.1, lookahead wall 275.5 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1421, 299, 17, 5943, 0, 0, 0], range 0.250..1.225, 6 within 0.9..1.1, lookahead wall 290.1 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1409, 306, 26, 5939, 0, 0, 0], range 0.250..1.223, 9 within 0.9..1.1, lookahead wall 305.6 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1415, 320, 22, 5923, 0, 0, 0], range 0.250..1.226, 9 within 0.9..1.1, lookahead wall 320.3 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1415, 312, 32, 5921, 0, 0, 0], range 0.250..1.225, 7 within 0.9..1.1, lookahead wall 334.7 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1224, 415, 40, 6001, 0, 0, 0], range 0.250..1.204, 8 within 0.9..1.1, lookahead wall 346.6 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1014, 519, 39, 6108, 0, 0, 0], range 0.250..1.180, 19 within 0.9..1.1, lookahead wall 356.9 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 853, 590, 26, 6211, 0, 0, 0], range 0.250..1.157, 13 within 0.9..1.1, lookahead wall 364.7 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 742, 577, 95, 6266, 0, 0, 0], range 0.250..1.133, 10 within 0.9..1.1, lookahead wall 371.3 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 401, 499, 380, 6400, 0, 0, 0], range 0.250..1.098, 6413 within 0.9..1.1, lookahead wall 375.3 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 189, 316, 592, 6583, 0, 0, 0], range 0.250..1.053, 6706 within 0.9..1.1, lookahead wall 377.4 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1421, 299, 17, 5943, 0, 0, 0], range 0.250..1.225, 6 within 0.9..1.1, lookahead wall 394.9 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1409, 306, 26, 5939, 0, 0, 0], range 0.250..1.223, 9 within 0.9..1.1, lookahead wall 423.2 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1415, 320, 22, 5923, 0, 0, 0], range 0.250..1.226, 9 within 0.9..1.1, lookahead wall 438.5 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1415, 312, 32, 5921, 0, 0, 0], range 0.250..1.225, 7 within 0.9..1.1, lookahead wall 465.3 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1224, 415, 40, 6001, 0, 0, 0], range 0.250..1.204, 8 within 0.9..1.1, lookahead wall 488.3 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1014, 519, 39, 6108, 0, 0, 0], range 0.250..1.180, 19 within 0.9..1.1, lookahead wall 507.2 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 853, 590, 26, 6211, 0, 0, 0], range 0.250..1.157, 13 within 0.9..1.1, lookahead wall 515.6 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 742, 577, 95, 6266, 0, 0, 0], range 0.250..1.133, 10 within 0.9..1.1, lookahead wall 522.0 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 401, 499, 380, 6400, 0, 0, 0], range 0.250..1.098, 6413 within 0.9..1.1, lookahead wall 526.1 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 189, 316, 592, 6583, 0, 0, 0], range 0.250..1.053, 6706 within 0.9..1.1, lookahead wall 528.2 ms cumulative
+film 1080p: pricer armings default=14 real=169
+film 1080p: motion_mode 32x32 SIMPLE=25328 OBMC=0 WARP=247 | 16x16 SIMPLE=4303 OBMC=0 WARP=457 | 8x8 SIMPLE=20292 OBMC=0 WARP=643 (0.0% OBMC / 2.6% WARP of 51270 eligible)
+film 1080p: inter var-tx depths of 3110 blocks -- leaf single 0=2299 1=811 (26.1% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 44.03 dB/251245 B, 47.88 dB/377843 B, 51.24 dB/501776 B, 53.92 dB/627417 B | +16.0% | -1.4% | 46.9s:8.8s:16.8s |
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1046, 11, 14, 6609, 0, 0, 0], range 0.250..1.144, 112 within 0.9..1.1, lookahead wall 542.9 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 8, 17, 6577, 0, 0, 0], range 0.250..1.150, 102 within 0.9..1.1, lookahead wall 557.6 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1094, 7, 15, 6564, 0, 0, 0], range 0.250..1.152, 99 within 0.9..1.1, lookahead wall 572.7 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1101, 10, 14, 6555, 0, 0, 0], range 0.250..1.154, 87 within 0.9..1.1, lookahead wall 587.2 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 986, 16, 12, 6666, 0, 0, 0], range 0.250..1.133, 117 within 0.9..1.1, lookahead wall 599.2 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 857, 34, 16, 6773, 0, 0, 0], range 0.250..1.113, 149 within 0.9..1.1, lookahead wall 609.3 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 118, 14, 6895, 0, 0, 0], range 0.250..1.092, 6908 within 0.9..1.1, lookahead wall 617.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 411, 235, 26, 7008, 0, 0, 0], range 0.250..1.070, 7023 within 0.9..1.1, lookahead wall 623.1 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 287, 17, 7137, 0, 0, 0], range 0.250..1.048, 7152 within 0.9..1.1, lookahead wall 627.0 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 90, 214, 7255, 0, 0, 0], range 0.250..1.026, 7273 within 0.9..1.1, lookahead wall 629.0 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1046, 11, 14, 6609, 0, 0, 0], range 0.250..1.144, 112 within 0.9..1.1, lookahead wall 646.1 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 8, 17, 6577, 0, 0, 0], range 0.250..1.150, 102 within 0.9..1.1, lookahead wall 660.0 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1094, 7, 15, 6564, 0, 0, 0], range 0.250..1.152, 99 within 0.9..1.1, lookahead wall 673.9 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1101, 10, 14, 6555, 0, 0, 0], range 0.250..1.154, 87 within 0.9..1.1, lookahead wall 688.4 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 986, 16, 12, 6666, 0, 0, 0], range 0.250..1.133, 117 within 0.9..1.1, lookahead wall 700.2 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 857, 34, 16, 6773, 0, 0, 0], range 0.250..1.113, 149 within 0.9..1.1, lookahead wall 712.8 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 118, 14, 6895, 0, 0, 0], range 0.250..1.092, 6908 within 0.9..1.1, lookahead wall 721.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 411, 235, 26, 7008, 0, 0, 0], range 0.250..1.070, 7023 within 0.9..1.1, lookahead wall 727.4 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 287, 17, 7137, 0, 0, 0], range 0.250..1.048, 7152 within 0.9..1.1, lookahead wall 731.5 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 90, 214, 7255, 0, 0, 0], range 0.250..1.026, 7273 within 0.9..1.1, lookahead wall 733.5 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1046, 11, 14, 6609, 0, 0, 0], range 0.250..1.144, 112 within 0.9..1.1, lookahead wall 748.7 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 8, 17, 6577, 0, 0, 0], range 0.250..1.150, 102 within 0.9..1.1, lookahead wall 762.8 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1094, 7, 15, 6564, 0, 0, 0], range 0.250..1.152, 99 within 0.9..1.1, lookahead wall 777.3 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1101, 10, 14, 6555, 0, 0, 0], range 0.250..1.154, 87 within 0.9..1.1, lookahead wall 792.4 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 986, 16, 12, 6666, 0, 0, 0], range 0.250..1.133, 117 within 0.9..1.1, lookahead wall 804.5 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 857, 34, 16, 6773, 0, 0, 0], range 0.250..1.113, 149 within 0.9..1.1, lookahead wall 814.6 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 118, 14, 6895, 0, 0, 0], range 0.250..1.092, 6908 within 0.9..1.1, lookahead wall 822.4 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 411, 235, 26, 7008, 0, 0, 0], range 0.250..1.070, 7023 within 0.9..1.1, lookahead wall 828.1 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 287, 17, 7137, 0, 0, 0], range 0.250..1.048, 7152 within 0.9..1.1, lookahead wall 831.9 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 90, 214, 7255, 0, 0, 0], range 0.250..1.026, 7273 within 0.9..1.1, lookahead wall 834.0 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1046, 11, 14, 6609, 0, 0, 0], range 0.250..1.144, 112 within 0.9..1.1, lookahead wall 848.0 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 8, 17, 6577, 0, 0, 0], range 0.250..1.150, 102 within 0.9..1.1, lookahead wall 862.5 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1094, 7, 15, 6564, 0, 0, 0], range 0.250..1.152, 99 within 0.9..1.1, lookahead wall 877.4 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1101, 10, 14, 6555, 0, 0, 0], range 0.250..1.154, 87 within 0.9..1.1, lookahead wall 891.4 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 986, 16, 12, 6666, 0, 0, 0], range 0.250..1.133, 117 within 0.9..1.1, lookahead wall 903.7 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 857, 34, 16, 6773, 0, 0, 0], range 0.250..1.113, 149 within 0.9..1.1, lookahead wall 913.4 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 118, 14, 6895, 0, 0, 0], range 0.250..1.092, 6908 within 0.9..1.1, lookahead wall 921.3 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 411, 235, 26, 7008, 0, 0, 0], range 0.250..1.070, 7023 within 0.9..1.1, lookahead wall 927.1 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 239, 287, 17, 7137, 0, 0, 0], range 0.250..1.048, 7152 within 0.9..1.1, lookahead wall 930.9 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 90, 214, 7255, 0, 0, 0], range 0.250..1.026, 7273 within 0.9..1.1, lookahead wall 932.9 ms cumulative
+film 2160p: pricer armings default=15 real=153
+film 2160p: motion_mode 32x32 SIMPLE=15671 OBMC=0 WARP=2 | 16x16 SIMPLE=237 OBMC=0 WARP=23 | 8x8 SIMPLE=5246 OBMC=0 WARP=770 (0.0% OBMC / 3.6% WARP of 21949 eligible)
+film 2160p: inter var-tx depths of 477 blocks -- leaf single 0=383 1=94 (19.7% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.56 dB/308567 B, 47.80 dB/461925 B, 51.43 dB/592172 B, 54.34 dB/709500 B | +47.1% | +19.3% | 36.1s:6.2s:18.5s |
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3850, 25, 11, 6, 13, 3775, 0], range 0.250..1.650, 2 within 0.9..1.1, lookahead wall 947.5 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3882, 14, 9, 6, 1, 3768, 0], range 0.250..1.654, 3 within 0.9..1.1, lookahead wall 961.3 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3898, 9, 5, 0, 1, 3767, 0], range 0.250..1.656, 1 within 0.9..1.1, lookahead wall 975.2 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3909, 1, 2, 2, 1, 3765, 0], range 0.250..1.656, 2 within 0.9..1.1, lookahead wall 988.9 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 3765, 0], range 0.250..1.619, 0 within 0.9..1.1, lookahead wall 1000.6 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.301..1.573, 0 within 0.9..1.1, lookahead wall 1010.8 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 6, 3909, 0, 0, 0, 3765, 0], range 0.421..1.515, 0 within 0.9..1.1, lookahead wall 1019.0 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.525..1.441, 0 within 0.9..1.1, lookahead wall 1024.6 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.638..1.342, 0 within 0.9..1.1, lookahead wall 1028.3 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.788..1.205, 1 within 0.9..1.1, lookahead wall 1030.4 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3850, 25, 11, 6, 13, 3775, 0], range 0.250..1.650, 2 within 0.9..1.1, lookahead wall 1043.7 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3882, 14, 9, 6, 1, 3768, 0], range 0.250..1.654, 3 within 0.9..1.1, lookahead wall 1057.8 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3898, 9, 5, 0, 1, 3767, 0], range 0.250..1.656, 1 within 0.9..1.1, lookahead wall 1071.2 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3909, 1, 2, 2, 1, 3765, 0], range 0.250..1.656, 2 within 0.9..1.1, lookahead wall 1086.4 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 3765, 0], range 0.250..1.619, 0 within 0.9..1.1, lookahead wall 1099.3 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.301..1.573, 0 within 0.9..1.1, lookahead wall 1110.0 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 6, 3909, 0, 0, 0, 3765, 0], range 0.421..1.515, 0 within 0.9..1.1, lookahead wall 1117.5 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.525..1.441, 0 within 0.9..1.1, lookahead wall 1123.3 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.638..1.342, 0 within 0.9..1.1, lookahead wall 1127.0 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.788..1.205, 1 within 0.9..1.1, lookahead wall 1129.0 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3850, 25, 11, 6, 13, 3775, 0], range 0.250..1.650, 2 within 0.9..1.1, lookahead wall 1143.0 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3882, 14, 9, 6, 1, 3768, 0], range 0.250..1.654, 3 within 0.9..1.1, lookahead wall 1158.4 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3898, 9, 5, 0, 1, 3767, 0], range 0.250..1.656, 1 within 0.9..1.1, lookahead wall 1174.4 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3909, 1, 2, 2, 1, 3765, 0], range 0.250..1.656, 2 within 0.9..1.1, lookahead wall 1188.1 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 3765, 0], range 0.250..1.619, 0 within 0.9..1.1, lookahead wall 1199.4 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.301..1.573, 0 within 0.9..1.1, lookahead wall 1208.8 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 6, 3909, 0, 0, 0, 3765, 0], range 0.421..1.515, 0 within 0.9..1.1, lookahead wall 1216.1 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.525..1.441, 0 within 0.9..1.1, lookahead wall 1221.7 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.638..1.342, 0 within 0.9..1.1, lookahead wall 1225.4 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.788..1.205, 1 within 0.9..1.1, lookahead wall 1227.3 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3850, 25, 11, 6, 13, 3775, 0], range 0.250..1.650, 2 within 0.9..1.1, lookahead wall 1240.9 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3882, 14, 9, 6, 1, 3768, 0], range 0.250..1.654, 3 within 0.9..1.1, lookahead wall 1254.6 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3898, 9, 5, 0, 1, 3767, 0], range 0.250..1.656, 1 within 0.9..1.1, lookahead wall 1268.2 ms cumulative
+tpl k=0.5 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3909, 1, 2, 2, 1, 3765, 0], range 0.250..1.656, 2 within 0.9..1.1, lookahead wall 1282.4 ms cumulative
+tpl k=0.5 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 3765, 0], range 0.250..1.619, 0 within 0.9..1.1, lookahead wall 1294.6 ms cumulative
+tpl k=0.5 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.301..1.573, 0 within 0.9..1.1, lookahead wall 1304.4 ms cumulative
+tpl k=0.5 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 6, 3909, 0, 0, 0, 3765, 0], range 0.421..1.515, 0 within 0.9..1.1, lookahead wall 1311.9 ms cumulative
+tpl k=0.5 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3915, 0, 0, 3765, 0, 0], range 0.525..1.441, 0 within 0.9..1.1, lookahead wall 1318.0 ms cumulative
+tpl k=0.5 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.638..1.342, 0 within 0.9..1.1, lookahead wall 1321.7 ms cumulative
+tpl k=0.5 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 0, 3915, 3765, 0, 0, 0], range 0.788..1.205, 1 within 0.9..1.1, lookahead wall 1323.6 ms cumulative
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=67771 OBMC=0 WARP=1696 | 16x16 SIMPLE=6826 OBMC=0 WARP=1351 | 8x8 SIMPLE=1595 OBMC=0 WARP=1745 (0.0% OBMC / 5.9% WARP of 80984 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 4472 blocks -- leaf single 0=2184 1=2288 (51.2% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 7392 chroma 691; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.08 dB/43144 B, 48.40 dB/56343 B, 51.06 dB/73881 B, 53.44 dB/96109 B | +51.8% | -13.9% | 27.6s:8.7s:11.5s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 189.43s
+
+RC=0 k=0.5 d=8
+=== k=1 d=8 ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1707, 26, 6, 5941, 0, 0, 0], range 0.250..1.249, 1 within 0.9..1.1, lookahead wall 14.5 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1708, 29, 7, 5936, 0, 0, 0], range 0.250..1.249, 3 within 0.9..1.1, lookahead wall 29.6 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1723, 30, 7, 5, 5915, 0, 0], range 0.250..1.251, 4 within 0.9..1.1, lookahead wall 45.5 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1719, 38, 5, 3, 5915, 0, 0], range 0.250..1.251, 2 within 0.9..1.1, lookahead wall 59.7 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1630, 44, 6, 6000, 0, 0, 0], range 0.250..1.230, 3 within 0.9..1.1, lookahead wall 72.4 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1517, 45, 17, 6101, 0, 0, 0], range 0.250..1.206, 8 within 0.9..1.1, lookahead wall 82.2 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1361, 102, 11, 6206, 0, 0, 0], range 0.250..1.182, 8 within 0.9..1.1, lookahead wall 90.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 330, 8, 6264, 0, 0, 0], range 0.250..1.160, 6 within 0.9..1.1, lookahead wall 96.5 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 591, 24, 6398, 0, 0, 0], range 0.250..1.122, 8 within 0.9..1.1, lookahead wall 100.9 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 238, 586, 276, 6580, 0, 0, 0], range 0.250..1.073, 6607 within 0.9..1.1, lookahead wall 103.2 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1707, 26, 6, 5941, 0, 0, 0], range 0.250..1.249, 1 within 0.9..1.1, lookahead wall 117.8 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1708, 29, 7, 5936, 0, 0, 0], range 0.250..1.249, 3 within 0.9..1.1, lookahead wall 132.2 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1723, 30, 7, 5, 5915, 0, 0], range 0.250..1.251, 4 within 0.9..1.1, lookahead wall 146.5 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1719, 38, 5, 3, 5915, 0, 0], range 0.250..1.251, 2 within 0.9..1.1, lookahead wall 160.7 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1630, 44, 6, 6000, 0, 0, 0], range 0.250..1.230, 3 within 0.9..1.1, lookahead wall 173.8 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1517, 45, 17, 6101, 0, 0, 0], range 0.250..1.206, 8 within 0.9..1.1, lookahead wall 184.4 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1361, 102, 11, 6206, 0, 0, 0], range 0.250..1.182, 8 within 0.9..1.1, lookahead wall 200.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 330, 8, 6264, 0, 0, 0], range 0.250..1.160, 6 within 0.9..1.1, lookahead wall 211.5 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 591, 24, 6398, 0, 0, 0], range 0.250..1.122, 8 within 0.9..1.1, lookahead wall 215.9 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 238, 586, 276, 6580, 0, 0, 0], range 0.250..1.073, 6607 within 0.9..1.1, lookahead wall 220.3 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1707, 26, 6, 5941, 0, 0, 0], range 0.250..1.249, 1 within 0.9..1.1, lookahead wall 236.6 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1708, 29, 7, 5936, 0, 0, 0], range 0.250..1.249, 3 within 0.9..1.1, lookahead wall 252.3 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1723, 30, 7, 5, 5915, 0, 0], range 0.250..1.251, 4 within 0.9..1.1, lookahead wall 267.4 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1719, 38, 5, 3, 5915, 0, 0], range 0.250..1.251, 2 within 0.9..1.1, lookahead wall 286.3 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1630, 44, 6, 6000, 0, 0, 0], range 0.250..1.230, 3 within 0.9..1.1, lookahead wall 298.8 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1517, 45, 17, 6101, 0, 0, 0], range 0.250..1.206, 8 within 0.9..1.1, lookahead wall 310.0 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1361, 102, 11, 6206, 0, 0, 0], range 0.250..1.182, 8 within 0.9..1.1, lookahead wall 318.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 330, 8, 6264, 0, 0, 0], range 0.250..1.160, 6 within 0.9..1.1, lookahead wall 324.5 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 591, 24, 6398, 0, 0, 0], range 0.250..1.122, 8 within 0.9..1.1, lookahead wall 329.1 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 238, 586, 276, 6580, 0, 0, 0], range 0.250..1.073, 6607 within 0.9..1.1, lookahead wall 331.4 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1707, 26, 6, 5941, 0, 0, 0], range 0.250..1.249, 1 within 0.9..1.1, lookahead wall 345.1 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1708, 29, 7, 5936, 0, 0, 0], range 0.250..1.249, 3 within 0.9..1.1, lookahead wall 359.5 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1723, 30, 7, 5, 5915, 0, 0], range 0.250..1.251, 4 within 0.9..1.1, lookahead wall 373.3 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1719, 38, 5, 3, 5915, 0, 0], range 0.250..1.251, 2 within 0.9..1.1, lookahead wall 387.3 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1630, 44, 6, 6000, 0, 0, 0], range 0.250..1.230, 3 within 0.9..1.1, lookahead wall 399.0 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1517, 45, 17, 6101, 0, 0, 0], range 0.250..1.206, 8 within 0.9..1.1, lookahead wall 409.0 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1361, 102, 11, 6206, 0, 0, 0], range 0.250..1.182, 8 within 0.9..1.1, lookahead wall 416.7 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1078, 330, 8, 6264, 0, 0, 0], range 0.250..1.160, 6 within 0.9..1.1, lookahead wall 422.9 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 667, 591, 24, 6398, 0, 0, 0], range 0.250..1.122, 8 within 0.9..1.1, lookahead wall 426.6 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 238, 586, 276, 6580, 0, 0, 0], range 0.250..1.073, 6607 within 0.9..1.1, lookahead wall 428.7 ms cumulative
+film 1080p: pricer armings default=14 real=172
+film 1080p: motion_mode 32x32 SIMPLE=26500 OBMC=0 WARP=201 | 16x16 SIMPLE=4601 OBMC=0 WARP=512 | 8x8 SIMPLE=21024 OBMC=0 WARP=1057 (0.0% OBMC / 3.3% WARP of 53895 eligible)
+film 1080p: inter var-tx depths of 2902 blocks -- leaf single 0=2066 1=836 (28.8% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 44.11 dB/256169 B, 47.94 dB/382325 B, 51.29 dB/507269 B, 53.97 dB/635106 B | +16.8% | -0.8% | 43.8s:6.6s:19.2s |
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1057, 1, 49, 6573, 0, 0, 0], range 0.250..1.153, 132 within 0.9..1.1, lookahead wall 442.4 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1086, 4, 53, 6537, 0, 0, 0], range 0.250..1.158, 121 within 0.9..1.1, lookahead wall 456.3 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1101, 2, 53, 6524, 0, 0, 0], range 0.250..1.161, 113 within 0.9..1.1, lookahead wall 470.0 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1111, 3, 45, 6521, 0, 0, 0], range 0.250..1.162, 116 within 0.9..1.1, lookahead wall 483.8 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1002, 2, 41, 6635, 0, 0, 0], range 0.250..1.142, 131 within 0.9..1.1, lookahead wall 495.6 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 890, 3, 38, 6749, 0, 0, 0], range 0.250..1.122, 144 within 0.9..1.1, lookahead wall 505.4 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 770, 2, 41, 6867, 0, 0, 0], range 0.250..1.100, 167 within 0.9..1.1, lookahead wall 513.1 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 637, 19, 45, 6979, 0, 0, 0], range 0.250..1.078, 7016 within 0.9..1.1, lookahead wall 519.8 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 443, 85, 35, 7117, 0, 0, 0], range 0.250..1.056, 7150 within 0.9..1.1, lookahead wall 523.7 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 277, 47, 7235, 0, 0, 0], range 0.250..1.032, 7272 within 0.9..1.1, lookahead wall 525.7 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1057, 1, 49, 6573, 0, 0, 0], range 0.250..1.153, 132 within 0.9..1.1, lookahead wall 539.8 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1086, 4, 53, 6537, 0, 0, 0], range 0.250..1.158, 121 within 0.9..1.1, lookahead wall 553.6 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1101, 2, 53, 6524, 0, 0, 0], range 0.250..1.161, 113 within 0.9..1.1, lookahead wall 568.1 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1111, 3, 45, 6521, 0, 0, 0], range 0.250..1.162, 116 within 0.9..1.1, lookahead wall 583.1 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1002, 2, 41, 6635, 0, 0, 0], range 0.250..1.142, 131 within 0.9..1.1, lookahead wall 594.9 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 890, 3, 38, 6749, 0, 0, 0], range 0.250..1.122, 144 within 0.9..1.1, lookahead wall 604.8 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 770, 2, 41, 6867, 0, 0, 0], range 0.250..1.100, 167 within 0.9..1.1, lookahead wall 612.4 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 637, 19, 45, 6979, 0, 0, 0], range 0.250..1.078, 7016 within 0.9..1.1, lookahead wall 618.4 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 443, 85, 35, 7117, 0, 0, 0], range 0.250..1.056, 7150 within 0.9..1.1, lookahead wall 622.3 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 277, 47, 7235, 0, 0, 0], range 0.250..1.032, 7272 within 0.9..1.1, lookahead wall 624.3 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1057, 1, 49, 6573, 0, 0, 0], range 0.250..1.153, 132 within 0.9..1.1, lookahead wall 637.8 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1086, 4, 53, 6537, 0, 0, 0], range 0.250..1.158, 121 within 0.9..1.1, lookahead wall 651.6 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1101, 2, 53, 6524, 0, 0, 0], range 0.250..1.161, 113 within 0.9..1.1, lookahead wall 665.7 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1111, 3, 45, 6521, 0, 0, 0], range 0.250..1.162, 116 within 0.9..1.1, lookahead wall 679.9 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1002, 2, 41, 6635, 0, 0, 0], range 0.250..1.142, 131 within 0.9..1.1, lookahead wall 691.5 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 890, 3, 38, 6749, 0, 0, 0], range 0.250..1.122, 144 within 0.9..1.1, lookahead wall 702.0 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 770, 2, 41, 6867, 0, 0, 0], range 0.250..1.100, 167 within 0.9..1.1, lookahead wall 710.0 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 637, 19, 45, 6979, 0, 0, 0], range 0.250..1.078, 7016 within 0.9..1.1, lookahead wall 715.8 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 443, 85, 35, 7117, 0, 0, 0], range 0.250..1.056, 7150 within 0.9..1.1, lookahead wall 719.7 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 277, 47, 7235, 0, 0, 0], range 0.250..1.032, 7272 within 0.9..1.1, lookahead wall 721.7 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1057, 1, 49, 6573, 0, 0, 0], range 0.250..1.153, 132 within 0.9..1.1, lookahead wall 735.6 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1086, 4, 53, 6537, 0, 0, 0], range 0.250..1.158, 121 within 0.9..1.1, lookahead wall 749.7 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1101, 2, 53, 6524, 0, 0, 0], range 0.250..1.161, 113 within 0.9..1.1, lookahead wall 775.2 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1111, 3, 45, 6521, 0, 0, 0], range 0.250..1.162, 116 within 0.9..1.1, lookahead wall 802.5 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1002, 2, 41, 6635, 0, 0, 0], range 0.250..1.142, 131 within 0.9..1.1, lookahead wall 816.2 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 890, 3, 38, 6749, 0, 0, 0], range 0.250..1.122, 144 within 0.9..1.1, lookahead wall 836.1 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 770, 2, 41, 6867, 0, 0, 0], range 0.250..1.100, 167 within 0.9..1.1, lookahead wall 851.5 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 637, 19, 45, 6979, 0, 0, 0], range 0.250..1.078, 7016 within 0.9..1.1, lookahead wall 863.0 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 443, 85, 35, 7117, 0, 0, 0], range 0.250..1.056, 7150 within 0.9..1.1, lookahead wall 867.2 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 121, 277, 47, 7235, 0, 0, 0], range 0.250..1.032, 7272 within 0.9..1.1, lookahead wall 869.3 ms cumulative
+film 2160p: pricer armings default=15 real=147
+film 2160p: motion_mode 32x32 SIMPLE=15512 OBMC=0 WARP=5 | 16x16 SIMPLE=199 OBMC=0 WARP=17 | 8x8 SIMPLE=4860 OBMC=0 WARP=769 (0.0% OBMC / 3.7% WARP of 21362 eligible)
+film 2160p: inter var-tx depths of 570 blocks -- leaf single 0=424 1=146 (25.6% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.59 dB/310676 B, 47.83 dB/464087 B, 51.47 dB/594663 B, 54.36 dB/706274 B | +47.2% | +19.5% | 37.5s:8.4s:16.2s |
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3868, 17, 7, 0, 13, 1, 3774], range 0.250..1.797, 3 within 0.9..1.1, lookahead wall 883.0 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3894, 10, 7, 0, 1, 1, 3767], range 0.250..1.802, 5 within 0.9..1.1, lookahead wall 897.4 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 1, 0, 1, 0, 3767], range 0.250..1.804, 0 within 0.9..1.1, lookahead wall 911.4 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3910, 2, 2, 0, 1, 0, 3765], range 0.250..1.805, 1 within 0.9..1.1, lookahead wall 924.9 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 936.6 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.250..1.739, 0 within 0.9..1.1, lookahead wall 946.4 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.273..1.689, 0 within 0.9..1.1, lookahead wall 953.9 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.361..1.619, 0 within 0.9..1.1, lookahead wall 959.5 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3912, 0, 0, 0, 3765, 0], range 0.473..1.515, 0 within 0.9..1.1, lookahead wall 963.1 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.653..1.342, 0 within 0.9..1.1, lookahead wall 965.1 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3868, 17, 7, 0, 13, 1, 3774], range 0.250..1.797, 3 within 0.9..1.1, lookahead wall 978.8 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3894, 10, 7, 0, 1, 1, 3767], range 0.250..1.802, 5 within 0.9..1.1, lookahead wall 992.4 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 1, 0, 1, 0, 3767], range 0.250..1.804, 0 within 0.9..1.1, lookahead wall 1005.9 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3910, 2, 2, 0, 1, 0, 3765], range 0.250..1.805, 1 within 0.9..1.1, lookahead wall 1020.1 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 1031.4 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.250..1.739, 0 within 0.9..1.1, lookahead wall 1040.8 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.273..1.689, 0 within 0.9..1.1, lookahead wall 1048.2 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.361..1.619, 0 within 0.9..1.1, lookahead wall 1053.9 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3912, 0, 0, 0, 3765, 0], range 0.473..1.515, 0 within 0.9..1.1, lookahead wall 1057.5 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.653..1.342, 0 within 0.9..1.1, lookahead wall 1059.5 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3868, 17, 7, 0, 13, 1, 3774], range 0.250..1.797, 3 within 0.9..1.1, lookahead wall 1073.5 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3894, 10, 7, 0, 1, 1, 3767], range 0.250..1.802, 5 within 0.9..1.1, lookahead wall 1086.9 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 1, 0, 1, 0, 3767], range 0.250..1.804, 0 within 0.9..1.1, lookahead wall 1100.7 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3910, 2, 2, 0, 1, 0, 3765], range 0.250..1.805, 1 within 0.9..1.1, lookahead wall 1114.5 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 1125.8 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.250..1.739, 0 within 0.9..1.1, lookahead wall 1135.4 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.273..1.689, 0 within 0.9..1.1, lookahead wall 1142.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.361..1.619, 0 within 0.9..1.1, lookahead wall 1149.0 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3912, 0, 0, 0, 3765, 0], range 0.473..1.515, 0 within 0.9..1.1, lookahead wall 1153.0 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.653..1.342, 0 within 0.9..1.1, lookahead wall 1155.1 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3868, 17, 7, 0, 13, 1, 3774], range 0.250..1.797, 3 within 0.9..1.1, lookahead wall 1169.1 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3894, 10, 7, 0, 1, 1, 3767], range 0.250..1.802, 5 within 0.9..1.1, lookahead wall 1182.2 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 1, 0, 1, 0, 3767], range 0.250..1.804, 0 within 0.9..1.1, lookahead wall 1196.6 ms cumulative
+tpl k=1 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3910, 2, 2, 0, 1, 0, 3765], range 0.250..1.805, 1 within 0.9..1.1, lookahead wall 1210.2 ms cumulative
+tpl k=1 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3913, 1, 0, 0, 1, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 1221.8 ms cumulative
+tpl k=1 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.250..1.739, 0 within 0.9..1.1, lookahead wall 1231.2 ms cumulative
+tpl k=1 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.273..1.689, 0 within 0.9..1.1, lookahead wall 1238.8 ms cumulative
+tpl k=1 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.361..1.619, 0 within 0.9..1.1, lookahead wall 1244.2 ms cumulative
+tpl k=1 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3, 3912, 0, 0, 0, 3765, 0], range 0.473..1.515, 0 within 0.9..1.1, lookahead wall 1247.8 ms cumulative
+tpl k=1 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 0, 3914, 1, 0, 3765, 0, 0], range 0.653..1.342, 0 within 0.9..1.1, lookahead wall 1249.8 ms cumulative
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=152 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=61442 OBMC=0 WARP=1482 | 16x16 SIMPLE=6180 OBMC=0 WARP=1361 | 8x8 SIMPLE=2167 OBMC=0 WARP=2335 (0.0% OBMC / 6.9% WARP of 74967 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 3805 blocks -- leaf single 0=1792 1=2013 (52.9% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 8381 chroma 799; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.39 dB/46395 B, 48.62 dB/59334 B, 51.29 dB/78418 B, 53.63 dB/99945 B | +56.8% | -10.8% | 26.4s:8.3s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 186.23s
+
+RC=0 k=1 d=8
+=== k=2 d=8 ===
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1tpl2/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1733, 6, 0, 3, 5938, 0, 0], range 0.250..1.267, 0 within 0.9..1.1, lookahead wall 13.7 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1734, 9, 3, 6, 5928, 0, 0], range 0.250..1.267, 2 within 0.9..1.1, lookahead wall 28.0 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1749, 9, 3, 4, 5915, 0, 0], range 0.250..1.270, 2 within 0.9..1.1, lookahead wall 41.8 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1754, 8, 2, 1, 5915, 0, 0], range 0.250..1.270, 2 within 0.9..1.1, lookahead wall 56.0 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1670, 9, 3, 0, 5998, 0, 0], range 0.250..1.250, 1 within 0.9..1.1, lookahead wall 67.6 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1559, 16, 7, 6098, 0, 0, 0], range 0.250..1.226, 1 within 0.9..1.1, lookahead wall 77.5 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1461, 10, 5, 6204, 0, 0, 0], range 0.250..1.203, 5 within 0.9..1.1, lookahead wall 86.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1404, 10, 5, 6261, 0, 0, 0], range 0.250..1.184, 5 within 0.9..1.1, lookahead wall 91.7 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1208, 69, 6, 6397, 0, 0, 0], range 0.250..1.147, 4 within 0.9..1.1, lookahead wall 95.6 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 562, 502, 41, 6575, 0, 0, 0], range 0.250..1.096, 6583 within 0.9..1.1, lookahead wall 97.8 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1733, 6, 0, 3, 5938, 0, 0], range 0.250..1.267, 0 within 0.9..1.1, lookahead wall 111.8 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1734, 9, 3, 6, 5928, 0, 0], range 0.250..1.267, 2 within 0.9..1.1, lookahead wall 125.6 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1749, 9, 3, 4, 5915, 0, 0], range 0.250..1.270, 2 within 0.9..1.1, lookahead wall 139.2 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1754, 8, 2, 1, 5915, 0, 0], range 0.250..1.270, 2 within 0.9..1.1, lookahead wall 152.8 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1670, 9, 3, 0, 5998, 0, 0], range 0.250..1.250, 1 within 0.9..1.1, lookahead wall 164.7 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1559, 16, 7, 6098, 0, 0, 0], range 0.250..1.226, 1 within 0.9..1.1, lookahead wall 175.1 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1461, 10, 5, 6204, 0, 0, 0], range 0.250..1.203, 5 within 0.9..1.1, lookahead wall 182.9 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1404, 10, 5, 6261, 0, 0, 0], range 0.250..1.184, 5 within 0.9..1.1, lookahead wall 188.8 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1208, 69, 6, 6397, 0, 0, 0], range 0.250..1.147, 4 within 0.9..1.1, lookahead wall 192.6 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 562, 502, 41, 6575, 0, 0, 0], range 0.250..1.096, 6583 within 0.9..1.1, lookahead wall 194.6 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1733, 6, 0, 3, 5938, 0, 0], range 0.250..1.267, 0 within 0.9..1.1, lookahead wall 209.3 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1734, 9, 3, 6, 5928, 0, 0], range 0.250..1.267, 2 within 0.9..1.1, lookahead wall 225.8 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1749, 9, 3, 4, 5915, 0, 0], range 0.250..1.270, 2 within 0.9..1.1, lookahead wall 240.1 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1754, 8, 2, 1, 5915, 0, 0], range 0.250..1.270, 2 within 0.9..1.1, lookahead wall 254.4 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1670, 9, 3, 0, 5998, 0, 0], range 0.250..1.250, 1 within 0.9..1.1, lookahead wall 277.0 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1559, 16, 7, 6098, 0, 0, 0], range 0.250..1.226, 1 within 0.9..1.1, lookahead wall 287.1 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1461, 10, 5, 6204, 0, 0, 0], range 0.250..1.203, 5 within 0.9..1.1, lookahead wall 302.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1404, 10, 5, 6261, 0, 0, 0], range 0.250..1.184, 5 within 0.9..1.1, lookahead wall 308.7 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1208, 69, 6, 6397, 0, 0, 0], range 0.250..1.147, 4 within 0.9..1.1, lookahead wall 312.8 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 562, 502, 41, 6575, 0, 0, 0], range 0.250..1.096, 6583 within 0.9..1.1, lookahead wall 314.9 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1733, 6, 0, 3, 5938, 0, 0], range 0.250..1.267, 0 within 0.9..1.1, lookahead wall 330.9 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1734, 9, 3, 6, 5928, 0, 0], range 0.250..1.267, 2 within 0.9..1.1, lookahead wall 345.1 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1749, 9, 3, 4, 5915, 0, 0], range 0.250..1.270, 2 within 0.9..1.1, lookahead wall 361.1 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1754, 8, 2, 1, 5915, 0, 0], range 0.250..1.270, 2 within 0.9..1.1, lookahead wall 387.5 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1670, 9, 3, 0, 5998, 0, 0], range 0.250..1.250, 1 within 0.9..1.1, lookahead wall 399.5 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1559, 16, 7, 6098, 0, 0, 0], range 0.250..1.226, 1 within 0.9..1.1, lookahead wall 418.9 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1461, 10, 5, 6204, 0, 0, 0], range 0.250..1.203, 5 within 0.9..1.1, lookahead wall 427.3 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1404, 10, 5, 6261, 0, 0, 0], range 0.250..1.184, 5 within 0.9..1.1, lookahead wall 433.2 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1208, 69, 6, 6397, 0, 0, 0], range 0.250..1.147, 4 within 0.9..1.1, lookahead wall 437.1 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 562, 502, 41, 6575, 0, 0, 0], range 0.250..1.096, 6583 within 0.9..1.1, lookahead wall 439.2 ms cumulative
+film 1080p: pricer armings default=14 real=172
+film 1080p: motion_mode 32x32 SIMPLE=25307 OBMC=0 WARP=268 | 16x16 SIMPLE=4248 OBMC=0 WARP=405 | 8x8 SIMPLE=21193 OBMC=0 WARP=1091 (0.0% OBMC / 3.4% WARP of 52512 eligible)
+film 1080p: inter var-tx depths of 2756 blocks -- leaf single 0=1907 1=849 (30.8% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 44.18 dB/258126 B, 47.97 dB/386186 B, 51.32 dB/513510 B, 54.01 dB/641123 B | +17.5% | -0.3% | 42.1s:6.7s:16.6s |
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1057, 18, 95, 6510, 0, 0, 0], range 0.250..1.160, 110 within 0.9..1.1, lookahead wall 454.3 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1089, 16, 96, 6479, 0, 0, 0], range 0.250..1.165, 110 within 0.9..1.1, lookahead wall 468.1 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1103, 17, 87, 6473, 0, 0, 0], range 0.250..1.168, 97 within 0.9..1.1, lookahead wall 483.5 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1113, 15, 84, 6468, 0, 0, 0], range 0.250..1.170, 106 within 0.9..1.1, lookahead wall 497.2 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1003, 11, 91, 6575, 0, 0, 0], range 0.250..1.149, 121 within 0.9..1.1, lookahead wall 509.5 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 892, 13, 86, 6689, 0, 0, 0], range 0.250..1.129, 134 within 0.9..1.1, lookahead wall 519.1 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 772, 7, 88, 6813, 0, 0, 0], range 0.250..1.107, 142 within 0.9..1.1, lookahead wall 526.8 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 9, 82, 6936, 0, 0, 0], range 0.250..1.086, 6997 within 0.9..1.1, lookahead wall 532.5 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 528, 0, 82, 7070, 0, 0, 0], range 0.250..1.063, 7137 within 0.9..1.1, lookahead wall 536.5 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 68, 51, 7221, 0, 0, 0], range 0.250..1.039, 7262 within 0.9..1.1, lookahead wall 538.6 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1057, 18, 95, 6510, 0, 0, 0], range 0.250..1.160, 110 within 0.9..1.1, lookahead wall 555.7 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1089, 16, 96, 6479, 0, 0, 0], range 0.250..1.165, 110 within 0.9..1.1, lookahead wall 569.6 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1103, 17, 87, 6473, 0, 0, 0], range 0.250..1.168, 97 within 0.9..1.1, lookahead wall 583.3 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1113, 15, 84, 6468, 0, 0, 0], range 0.250..1.170, 106 within 0.9..1.1, lookahead wall 598.6 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1003, 11, 91, 6575, 0, 0, 0], range 0.250..1.149, 121 within 0.9..1.1, lookahead wall 610.4 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 892, 13, 86, 6689, 0, 0, 0], range 0.250..1.129, 134 within 0.9..1.1, lookahead wall 621.4 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 772, 7, 88, 6813, 0, 0, 0], range 0.250..1.107, 142 within 0.9..1.1, lookahead wall 629.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 9, 82, 6936, 0, 0, 0], range 0.250..1.086, 6997 within 0.9..1.1, lookahead wall 634.8 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 528, 0, 82, 7070, 0, 0, 0], range 0.250..1.063, 7137 within 0.9..1.1, lookahead wall 638.6 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 68, 51, 7221, 0, 0, 0], range 0.250..1.039, 7262 within 0.9..1.1, lookahead wall 641.8 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1057, 18, 95, 6510, 0, 0, 0], range 0.250..1.160, 110 within 0.9..1.1, lookahead wall 655.7 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1089, 16, 96, 6479, 0, 0, 0], range 0.250..1.165, 110 within 0.9..1.1, lookahead wall 669.8 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1103, 17, 87, 6473, 0, 0, 0], range 0.250..1.168, 97 within 0.9..1.1, lookahead wall 683.4 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1113, 15, 84, 6468, 0, 0, 0], range 0.250..1.170, 106 within 0.9..1.1, lookahead wall 697.0 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1003, 11, 91, 6575, 0, 0, 0], range 0.250..1.149, 121 within 0.9..1.1, lookahead wall 709.5 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 892, 13, 86, 6689, 0, 0, 0], range 0.250..1.129, 134 within 0.9..1.1, lookahead wall 719.5 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 772, 7, 88, 6813, 0, 0, 0], range 0.250..1.107, 142 within 0.9..1.1, lookahead wall 728.0 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 9, 82, 6936, 0, 0, 0], range 0.250..1.086, 6997 within 0.9..1.1, lookahead wall 733.8 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 528, 0, 82, 7070, 0, 0, 0], range 0.250..1.063, 7137 within 0.9..1.1, lookahead wall 737.6 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 68, 51, 7221, 0, 0, 0], range 0.250..1.039, 7262 within 0.9..1.1, lookahead wall 739.8 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1057, 18, 95, 6510, 0, 0, 0], range 0.250..1.160, 110 within 0.9..1.1, lookahead wall 753.3 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1089, 16, 96, 6479, 0, 0, 0], range 0.250..1.165, 110 within 0.9..1.1, lookahead wall 767.7 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1103, 17, 87, 6473, 0, 0, 0], range 0.250..1.168, 97 within 0.9..1.1, lookahead wall 781.4 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1113, 15, 84, 6468, 0, 0, 0], range 0.250..1.170, 106 within 0.9..1.1, lookahead wall 795.0 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1003, 11, 91, 6575, 0, 0, 0], range 0.250..1.149, 121 within 0.9..1.1, lookahead wall 806.9 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 892, 13, 86, 6689, 0, 0, 0], range 0.250..1.129, 134 within 0.9..1.1, lookahead wall 816.6 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 772, 7, 88, 6813, 0, 0, 0], range 0.250..1.107, 142 within 0.9..1.1, lookahead wall 824.3 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 653, 9, 82, 6936, 0, 0, 0], range 0.250..1.086, 6997 within 0.9..1.1, lookahead wall 830.1 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 528, 0, 82, 7070, 0, 0, 0], range 0.250..1.063, 7137 within 0.9..1.1, lookahead wall 833.9 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 340, 68, 51, 7221, 0, 0, 0], range 0.250..1.039, 7262 within 0.9..1.1, lookahead wall 836.0 ms cumulative
+film 2160p: pricer armings default=15 real=147
+film 2160p: motion_mode 32x32 SIMPLE=15601 OBMC=0 WARP=7 | 16x16 SIMPLE=183 OBMC=0 WARP=20 | 8x8 SIMPLE=5012 OBMC=0 WARP=652 (0.0% OBMC / 3.2% WARP of 21475 eligible)
+film 2160p: inter var-tx depths of 523 blocks -- leaf single 0=406 1=117 (22.4% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.63 dB/313036 B, 47.85 dB/465719 B, 51.48 dB/596107 B, 54.37 dB/708345 B | +47.5% | +19.8% | 35.9s:5.7s:16.0s |
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3885, 7, 0, 13, 0, 1, 3774], range 0.250..1.899, 11 within 0.9..1.1, lookahead wall 849.2 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 0, 1, 0, 1, 3767], range 0.250..1.905, 1 within 0.9..1.1, lookahead wall 863.4 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3911, 1, 0, 1, 0, 0, 3767], range 0.250..1.906, 1 within 0.9..1.1, lookahead wall 877.5 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3912, 2, 0, 1, 0, 0, 3765], range 0.250..1.907, 1 within 0.9..1.1, lookahead wall 891.4 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3914, 0, 0, 1, 0, 0, 3765], range 0.250..1.889, 0 within 0.9..1.1, lookahead wall 903.0 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.864, 0 within 0.9..1.1, lookahead wall 912.8 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.829, 0 within 0.9..1.1, lookahead wall 921.4 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 926.9 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.312..1.689, 0 within 0.9..1.1, lookahead wall 931.1 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 0, 3765, 0], range 0.487..1.515, 0 within 0.9..1.1, lookahead wall 933.0 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3885, 7, 0, 13, 0, 1, 3774], range 0.250..1.899, 11 within 0.9..1.1, lookahead wall 946.4 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 0, 1, 0, 1, 3767], range 0.250..1.905, 1 within 0.9..1.1, lookahead wall 961.6 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3911, 1, 0, 1, 0, 0, 3767], range 0.250..1.906, 1 within 0.9..1.1, lookahead wall 975.0 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3912, 2, 0, 1, 0, 0, 3765], range 0.250..1.907, 1 within 0.9..1.1, lookahead wall 988.7 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3914, 0, 0, 1, 0, 0, 3765], range 0.250..1.889, 0 within 0.9..1.1, lookahead wall 1000.0 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.864, 0 within 0.9..1.1, lookahead wall 1009.7 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.829, 0 within 0.9..1.1, lookahead wall 1017.2 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 1022.9 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.312..1.689, 0 within 0.9..1.1, lookahead wall 1026.6 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 0, 3765, 0], range 0.487..1.515, 0 within 0.9..1.1, lookahead wall 1028.5 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3885, 7, 0, 13, 0, 1, 3774], range 0.250..1.899, 11 within 0.9..1.1, lookahead wall 1042.4 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 0, 1, 0, 1, 3767], range 0.250..1.905, 1 within 0.9..1.1, lookahead wall 1056.7 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3911, 1, 0, 1, 0, 0, 3767], range 0.250..1.906, 1 within 0.9..1.1, lookahead wall 1070.7 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3912, 2, 0, 1, 0, 0, 3765], range 0.250..1.907, 1 within 0.9..1.1, lookahead wall 1084.1 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3914, 0, 0, 1, 0, 0, 3765], range 0.250..1.889, 0 within 0.9..1.1, lookahead wall 1097.0 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.864, 0 within 0.9..1.1, lookahead wall 1109.2 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.829, 0 within 0.9..1.1, lookahead wall 1116.6 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 1123.2 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.312..1.689, 0 within 0.9..1.1, lookahead wall 1127.0 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 0, 3765, 0], range 0.487..1.515, 0 within 0.9..1.1, lookahead wall 1129.1 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3885, 7, 0, 13, 0, 1, 3774], range 0.250..1.899, 11 within 0.9..1.1, lookahead wall 1142.9 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3904, 7, 0, 1, 0, 1, 3767], range 0.250..1.905, 1 within 0.9..1.1, lookahead wall 1156.4 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3911, 1, 0, 1, 0, 0, 3767], range 0.250..1.906, 1 within 0.9..1.1, lookahead wall 1170.0 ms cumulative
+tpl k=2 d=8: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3912, 2, 0, 1, 0, 0, 3765], range 0.250..1.907, 1 within 0.9..1.1, lookahead wall 1184.8 ms cumulative
+tpl k=2 d=7: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3914, 0, 0, 1, 0, 0, 3765], range 0.250..1.889, 0 within 0.9..1.1, lookahead wall 1196.6 ms cumulative
+tpl k=2 d=6: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.864, 0 within 0.9..1.1, lookahead wall 1206.1 ms cumulative
+tpl k=2 d=5: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.829, 0 within 0.9..1.1, lookahead wall 1213.5 ms cumulative
+tpl k=2 d=4: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 0, 3765], range 0.250..1.776, 0 within 0.9..1.1, lookahead wall 1219.0 ms cumulative
+tpl k=2 d=3: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 3915, 0, 0, 0, 0, 3765, 0], range 0.312..1.689, 0 within 0.9..1.1, lookahead wall 1222.7 ms cumulative
+tpl k=2 d=2: 7680 cells, factor hist (0-.25,.25-.5,..,>1.75) [0, 1, 3914, 0, 0, 0, 3765, 0], range 0.487..1.515, 0 within 0.9..1.1, lookahead wall 1224.8 ms cumulative
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=152 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=61327 OBMC=0 WARP=1493 | 16x16 SIMPLE=6305 OBMC=0 WARP=1341 | 8x8 SIMPLE=2196 OBMC=0 WARP=2372 (0.0% OBMC / 6.9% WARP of 75034 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 3750 blocks -- leaf single 0=1731 1=2019 (53.8% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=0 1=0 (0.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 8443 chroma 806; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.39 dB/46531 B, 48.63 dB/59764 B, 51.29 dB/78739 B, 53.64 dB/100267 B | +57.5% | -10.4% | 27.2s:8.5s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 575 filtered out; finished in 177.59s
+
+RC=0 k=2 d=8
+SWEEPDONE

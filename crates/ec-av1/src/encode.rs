@@ -7438,7 +7438,7 @@ fn search_inter_block(
 }
 
 /// lane-av1tpl: the strength `k` of the temporal lambda weighting
-/// ([`tpl_sb_factors`]). 0 keeps every block at the frame's own lambda, which
+/// ([`tpl_lambda_factors`]). 0 keeps every block at the frame's own lambda, which
 /// is what every measurement before this lane was taken on. Swept by
 /// `EC_AV1_TPL=<k>`.
 ///
@@ -7468,28 +7468,80 @@ fn tpl_strength() -> f64 {
         .unwrap_or(TPL_STRENGTH)
 }
 
-/// Nanoseconds the lookahead pass ([`tpl_reference_map`]) has spent this
+/// lane-av1tpl2: how many SOURCE pictures the lambda map looks at, counting
+/// the frame being coded. 1 turns the weighting off; 2 is the shipped
+/// one-frame area map ([`tpl_area_map`]); 3 and up only mean anything under
+/// [`tpl_propagating`], which is the map that can actually use them. Swept
+/// by `EC_AV1_TPL_D=<d>`.
+///
+/// The streaming facade holds `depth - 1` pictures back so it feeds
+/// `encode_inter_frame` the same window `encode_sequence` does; both read
+/// THIS function, so the two paths cannot disagree about the window.
+const TPL_DEPTH: usize = 2;
+
+/// The exponent the dependence ratio is read through ([`tpl_lambda_factors`]).
+const TPL_POWER: f64 = 1.0;
+
+/// lane-av1tpl2: the propagating map ([`tpl_lambda_factors`]) instead of the
+/// one-frame area map ([`tpl_area_map`]), behind `EC_AV1_TPL_PROP=1`.
+///
+/// MEASURED at the native gate (1920x1024, 12 frames, BD-rate vs libaom
+/// `cpu-used 6` / rav1e `speed 6`), against the shipped one-frame map
+/// (+15.9/-1.3, +46.5/+18.7, +51.2/-14.4). `p` is [`TPL_POWER`]:
+///
+/// | k | D | p | film 1080p | film 2160p | screen |
+/// |---|---|---|---|---|---|
+/// | 0.0625 | 8 | 1 | +15.7/-1.6 | +46.6/+18.8 | +51.1/-14.5 |
+/// | 0.125 | 4 | 1 | +15.7/-1.6 | +46.7/+18.9 | +51.2/-14.5 |
+/// | 0.125 | 8 | 1 | +15.9/-1.3 | +46.8/+19.0 | +50.7/-14.7 |
+/// | 0.25 | 4 | 1 | +15.5/-1.8 | +46.8/+19.1 | +51.2/-14.5 |
+/// | 0.25 | 8 | 1 | +15.7/-1.6 | +46.9/+19.1 | +50.7/-14.6 |
+/// | 0.5 | 4 | 1 | +16.1/-1.2 | +47.0/+19.2 | +51.1/-14.6 |
+/// | 0.5 | 8 | 1 | +16.0/-1.4 | +47.1/+19.3 | +51.8/-13.9 |
+/// | 1 | 4 | 1 | +16.2/-1.3 | +47.2/+19.4 | +51.9/-13.9 |
+/// | 2 | 4 | 1 | +17.2/-0.5 | +47.2/+19.5 | +57.0/-10.7 |
+/// | **0.5** | **8** | **0.5** | **+15.5/-1.7** | **+46.7/+19.0** | **+50.8/-14.6** |
+/// | 0.5 | 4 | 0.5 | +15.6/-1.6 | +46.8/+19.0 | +51.0/-14.6 |
+/// | 1 | 8 | 0.5 | +15.9/-1.5 | +47.0/+19.2 | +51.0/-14.5 |
+///
+/// The map is genuinely non-flat now (0.25..1.12 across 7680 cells, only 58
+/// of them within 0.9..1.1, where the one-frame map had 7127 of 7680 inside
+/// 1..1.5x its own mean), and its best arm is 0.4 down on both film 1080p
+/// columns and 0.4/0.2 down on screen -- but EVERY arm is 0.1..0.4 UP on
+/// film 2160p, including the vanishingly weak ones, so no arm is at least
+/// flat on every row. It therefore ships OFF: the default stays the
+/// one-frame map the gate's numbers were measured on.
+fn tpl_propagating() -> bool {
+    std::env::var("EC_AV1_TPL_PROP").ok().as_deref() == Some("1")
+}
+
+pub(crate) fn tpl_depth() -> usize {
+    std::env::var("EC_AV1_TPL_D")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|d| *d >= 1)
+        .unwrap_or(TPL_DEPTH)
+        .max(1)
+}
+
+/// Nanoseconds the lookahead pass ([`tpl_lambda_factors`]) has spent this
 /// process, so the gate can price it against the encode it rides on.
 static TPL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// How much of THIS frame the next one will predict from, per 16x16 cell: one
-/// coarse full-pel motion pass of the next SOURCE frame against this one
-/// (libaom's `tpl` lookahead in its cheapest possible shape -- no transform,
-/// no propagation chain, just referenced area). A cell's value is the area of
-/// it that the next frame's blocks land on, in units of its own area, so 1.0
-/// is "referenced exactly once".
+/// One coarse full-pel 16x16 motion pass of `next` against `cur`: per cell,
+/// the winning displacement and its SAD.
 ///
 /// Deterministic: integer SADs, a fixed 3-step pattern seeded at zero and at
-/// the left/above winners, first-best tie-break. The map is built once on the
-/// frame's own thread and read-only afterwards, so it cannot make a tile's
-/// bytes depend on the thread count.
-fn tpl_reference_map(cur: &[u8], next: &[u8], width: usize, height: usize) -> Vec<f64> {
-    let start = std::time::Instant::now();
+/// the left/above winners, first-best tie-break. Built once on the frame's
+/// own thread and read-only afterwards, so it cannot make a tile's bytes
+/// depend on the thread count.
+fn tpl_coarse_pass(
+    cur: &[u8],
+    next: &[u8],
+    width: usize,
+    height: usize,
+) -> Vec<((i32, i32), u32)> {
     let (cells_x, cells_y) = (width / 16, height / 16);
-    let mut area = vec![0.0f64; cells_x * cells_y];
-    // SAD of the next frame's 16x16 block at (bx, by) against this frame at
-    // that block displaced by (mx, my); a displacement that leaves the frame
-    // is not a candidate at all.
     let sad = |bx: usize, by: usize, (mx, my): (i32, i32)| -> u32 {
         let (sx, sy) = (bx as i32 + mx, by as i32 + my);
         if sx < 0 || sy < 0 || sx as usize + 16 > width || sy as usize + 16 > height {
@@ -7504,6 +7556,7 @@ fn tpl_reference_map(cur: &[u8], next: &[u8], width: usize, height: usize) -> Ve
         }
         sum
     };
+    let mut out = Vec::with_capacity(cells_x * cells_y);
     let mut above = vec![(0i32, 0i32); cells_x];
     for cy in 0..cells_y {
         let mut left = (0i32, 0i32);
@@ -7531,12 +7584,56 @@ fn tpl_reference_map(cur: &[u8], next: &[u8], width: usize, height: usize) -> Ve
                     }
                 }
             }
-            let (mv, _) = (best.1, best.0);
-            left = mv;
-            above[cx] = mv;
-            // The 16x16 window of THIS frame that block referenced, spread
-            // over the (at most four) cells it overlaps.
-            let (x0, y0) = ((bx as i32 + mv.0) as usize, (by as i32 + mv.1) as usize);
+            left = best.1;
+            above[cx] = best.1;
+            out.push((best.1, best.0));
+        }
+    }
+    out
+}
+
+/// The intra-cost proxy libaom's tpl gets from a DC prediction plus a
+/// transform: here, the mean absolute deviation of the cell from its own DC.
+/// It is the denominator every propagated cost is read against, so only its
+/// SHAPE across the frame matters, not its scale.
+fn tpl_intra_costs(frame: &[u8], width: usize, height: usize) -> Vec<u32> {
+    let (cells_x, cells_y) = (width / 16, height / 16);
+    let mut out = Vec::with_capacity(cells_x * cells_y);
+    for cy in 0..cells_y {
+        for cx in 0..cells_x {
+            let (bx, by) = (cx * 16, cy * 16);
+            let mut sum = 0u32;
+            for r in 0..16 {
+                sum += frame[(by + r) * width + bx..][..16].iter().map(|&p| u32::from(p)).sum::<u32>();
+            }
+            let dc = ((sum + 128) / 256) as u8;
+            let mut cost = 0u32;
+            for r in 0..16 {
+                cost += frame[(by + r) * width + bx..][..16]
+                    .iter()
+                    .map(|&p| u32::from(p.abs_diff(dc)))
+                    .sum::<u32>();
+            }
+            out.push(cost);
+        }
+    }
+    out
+}
+
+/// lane-av1tpl's one-frame map, in terms of the pass above: how much of THIS
+/// frame the next one predicts from, per 16x16 cell -- each cell of `next`
+/// splats its own area, at its winning displacement, onto the (at most four)
+/// cells of `cur` it lands on. 1.0 is "referenced exactly once".
+fn tpl_area_map(cur: &[u8], next: &[u8], width: usize, height: usize) -> Vec<f64> {
+    let start = std::time::Instant::now();
+    let (cells_x, cells_y) = (width / 16, height / 16);
+    let pass = tpl_coarse_pass(cur, next, width, height);
+    let mut area = vec![0.0f64; cells_x * cells_y];
+    for cy in 0..cells_y {
+        for cx in 0..cells_x {
+            let (mv, _) = pass[cy * cells_x + cx];
+            let (x0, y0) = ((cx * 16) as i32 + mv.0, (cy * 16) as i32 + mv.1);
+            let (x0, y0) = (x0.max(0) as usize, y0.max(0) as usize);
             for ci in x0 / 16..=((x0 + 15) / 16).min(cells_x - 1) {
                 let ox = (x0 + 16).min(ci * 16 + 16) - x0.max(ci * 16);
                 for ri in y0 / 16..=((y0 + 15) / 16).min(cells_y - 1) {
@@ -7553,7 +7650,7 @@ fn tpl_reference_map(cur: &[u8], next: &[u8], width: usize, height: usize) -> Ve
     area
 }
 
-/// [`tpl_reference_map`]'s per-cell referenced-ness turned into one lambda
+/// [`tpl_area_map`]'s per-cell referenced-ness turned into one lambda
 /// factor per 64x64 superblock: `f = (1 + k) / (1 + k * w_rel)`, where
 /// `w_rel` is the superblock's mean referenced-ness over the FRAME's mean.
 /// Decreasing in referenced-ness (a block the next frame leans on is coded
@@ -7586,6 +7683,98 @@ fn tpl_sb_factors(map: &[f64], cells_x: usize, cells_y: usize, k: f64) -> Vec<f6
             "tpl k={k}: {} cells mean w={mean:.3}, w/mean hist (0-.5,.5-1,..,>3.5) {hist:?}, \
              sb factor {lo:.3}..{hi:.3}, lookahead wall {:.1} ms cumulative",
             map.len(),
+            TPL_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        );
+    }
+    out
+}
+
+/// libaom's `tpl_model_update` in this crate's cheapest shape: one lambda
+/// factor per 16x16 cell of `frames[0]` (the frame being coded), from how
+/// much of the WHOLE lookahead window leans on that cell.
+///
+/// Per lookahead level `f` (source `frames[f]` against `frames[f-1]`) the
+/// coarse pass gives a displacement and an inter cost; a cell's own
+/// propagated cost is `max(intra - inter, 0) + mc_dep` -- what coding that
+/// cell well saves the frames that predict from it -- and it is splatted,
+/// area-weighted, onto the (at most four) cells of `frames[f-1]` its
+/// displacement lands on. Walking `f` from the far end of the window back to
+/// 1 accumulates the whole chain into level 0, which lane-av1tpl's one-frame
+/// area map could not do at all.
+///
+/// The factor is `f = 1 / (1 + k * mc_dep / intra)`, normalised so the mean
+/// factor over the frame is exactly 1: a cell the window leans on is coded
+/// more distortion-averse (smaller lambda), and the frame's TOTAL lambda
+/// scale only moves around, never up or down -- a global move is what
+/// lane-av1lambda already measured inert.
+fn tpl_lambda_factors(frames: &[&[u8]], width: usize, height: usize, k: f64) -> Vec<f64> {
+    let start = std::time::Instant::now();
+    let (cells_x, cells_y) = (width / 16, height / 16);
+    let cells = cells_x * cells_y;
+    let levels = frames.len();
+    let intra: Vec<Vec<u32>> = frames.iter().map(|f| tpl_intra_costs(f, width, height)).collect();
+    let passes: Vec<Vec<((i32, i32), u32)>> = (1..levels)
+        .map(|f| tpl_coarse_pass(frames[f - 1], frames[f], width, height))
+        .collect();
+    let mut mc_dep = vec![vec![0.0f64; cells]; levels];
+    for f in (1..levels).rev() {
+        for cy in 0..cells_y {
+            for cx in 0..cells_x {
+                let ci = cy * cells_x + cx;
+                let (mv, inter) = passes[f - 1][ci];
+                let saved = f64::from(intra[f][ci].saturating_sub(inter));
+                let propagate = saved + mc_dep[f][ci];
+                if propagate <= 0.0 {
+                    continue;
+                }
+                // The 16x16 window of the PREVIOUS frame this cell predicted
+                // from, spread over the cells it overlaps.
+                let (x0, y0) = ((cx * 16) as i32 + mv.0, (cy * 16) as i32 + mv.1);
+                let (x0, y0) = (x0.max(0) as usize, y0.max(0) as usize);
+                for rc in x0 / 16..=((x0 + 15) / 16).min(cells_x - 1) {
+                    let ox = (x0 + 16).min(rc * 16 + 16) - x0.max(rc * 16);
+                    for rr in y0 / 16..=((y0 + 15) / 16).min(cells_y - 1) {
+                        let oy = (y0 + 16).min(rr * 16 + 16) - y0.max(rr * 16);
+                        mc_dep[f - 1][rr * cells_x + rc] += propagate * (ox * oy) as f64 / 256.0;
+                    }
+                }
+            }
+        }
+    }
+    // The tail compression `p`: `mc_dep/intra` is a ratio with a very long
+    // tail (a nearly flat cell the window leans on has a tiny denominator),
+    // and at p = 1 that tail slams into the clamp. libaom reads its own
+    // dependence ratio through a sqrt (`dr_from_beta`); `EC_AV1_TPL_P`
+    // sweeps the exponent, 1 being the raw ratio.
+    let power = std::env::var("EC_AV1_TPL_P")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .unwrap_or(TPL_POWER);
+    let mut out: Vec<f64> = (0..cells)
+        .map(|c| {
+            let r = mc_dep[0][c] / f64::from(intra[0][c].max(1));
+            (1.0 + k * r).powf(-power)
+        })
+        .collect();
+    let mean = (out.iter().sum::<f64>() / cells.max(1) as f64).max(1e-9);
+    for f in &mut out {
+        *f = (*f / mean).clamp(0.25, 4.0);
+    }
+    TPL_NANOS.fetch_add(
+        start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if std::env::var("EC_AV1_TPL_HIST").ok().as_deref() == Some("1") {
+        let mut hist = [0usize; 8];
+        for &f in &out {
+            hist[((f * 4.0) as usize).min(7)] += 1;
+        }
+        let (lo, hi) = out.iter().fold((f64::MAX, 0.0f64), |(l, h), &f| (l.min(f), h.max(f)));
+        let flat = out.iter().filter(|&&f| (0.9..=1.1).contains(&f)).count();
+        eprintln!(
+            "tpl k={k} d={levels}: {cells} cells, factor hist (0-.25,.25-.5,..,>1.75) {hist:?}, \
+             range {lo:.3}..{hi:.3}, {flat} within 0.9..1.1, lookahead wall {:.1} ms cumulative",
             TPL_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
         );
     }
@@ -7651,11 +7840,11 @@ pub(crate) fn encode_inter_frame(
     // Where this frame sits in the coding-order pyramid; `None` is the flat
     // one-shown-frame-per-picture stream this encoder wrote before.
     pyramid: Option<PyramidFrame>,
-    // lane-av1tpl: the NEXT picture's source, padded like this one. Present,
-    // it buys the one-frame lookahead the per-superblock lambda weighting
-    // reads ([`tpl_reference_map`]); `None` (every streaming caller, which
-    // has no lookahead buffer) codes the frame at one lambda, as before.
-    lookahead: Option<&Picture>,
+    // lane-av1tpl2: the NEXT pictures' sources (up to [`tpl_depth`] - 1 of
+    // them), padded like this one -- the lookahead window the per-block
+    // lambda weighting propagates back through ([`tpl_lambda_factors`]). An
+    // EMPTY slice codes the frame at one lambda, as before.
+    lookahead: &[Picture],
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -7818,15 +8007,32 @@ pub(crate) fn encode_inter_frame(
     // this frame the NEXT one predicts from. Off (`None`) without a
     // lookahead picture or at strength 0.
     let tpl_k = tpl_strength();
-    let tpl_factors: Option<Vec<f64>> = lookahead
-        .filter(|_| tpl_k > 0.0)
-        .filter(|n| n.width == picture.width && n.height == picture.height)
-        .map(|n| {
-            let next_y8: Vec<u8> = n.y.iter().map(|&v| v as u8).collect();
-            let map = tpl_reference_map(&picture_y8, &next_y8, picture.width, picture.height);
-            tpl_sb_factors(&map, picture.width / 16, picture.height / 16, tpl_k)
-        });
-    let tpl_sb_cols = picture.width / SUPERBLOCK;
+    let window: Vec<&Picture> = lookahead
+        .iter()
+        .take_while(|n| n.width == picture.width && n.height == picture.height)
+        .collect();
+    let tpl_sources: Vec<Vec<u8>> =
+        window.iter().map(|n| n.y.iter().map(|&v| v as u8).collect()).collect();
+    let tpl_cells_x = picture.width / 16;
+    let tpl_factors: Option<Vec<f64>> = (tpl_k > 0.0 && !tpl_sources.is_empty()).then(|| {
+        if tpl_propagating() {
+            let mut frames: Vec<&[u8]> = vec![&picture_y8];
+            frames.extend(tpl_sources.iter().map(Vec::as_slice));
+            tpl_lambda_factors(&frames, picture.width, picture.height, tpl_k)
+        } else {
+            // The shipped map is one factor per 64x64; it is spread over that
+            // superblock's own 16 cells so the application site below (which
+            // averages the four cells of a 32x32 block) reads exactly the
+            // superblock factor, whichever map fed it.
+            let map =
+                tpl_area_map(&picture_y8, &tpl_sources[0], picture.width, picture.height);
+            let cells_y = picture.height / 16;
+            let sb = tpl_sb_factors(&map, tpl_cells_x, cells_y, tpl_k);
+            (0..tpl_cells_x * cells_y)
+                .map(|c| sb[(c / tpl_cells_x / 4) * (tpl_cells_x / 4) + (c % tpl_cells_x) / 4])
+                .collect()
+        }
+    });
 
     // The true grid ([`crate::tile::block_grid`]'s ceiling), not the padded
     // coding surface's: `blocks` carries one entry per 32x32 block the tile
@@ -7895,18 +8101,25 @@ pub(crate) fn encode_inter_frame(
         let mut blocks: Vec<(usize, Quadrant)> = Vec::new();
     for sb_r in rect.sb_row0 as usize..rect.sb_row1 as usize {
         for sb_c in rect.sb_col0 as usize..rect.sb_col1 as usize {
-            // lane-av1tpl: this superblock's own lambda -- every RD decision
-            // under it (partition, mode, tx, motion) reads `search.lambda`,
-            // so scaling the one field here scales all of them.
-            let search = match &tpl_factors {
-                Some(f) => Search {
-                    lambda: search.lambda * f[sb_r * tpl_sb_cols + sb_c],
-                    ..search
-                },
-                None => search,
-            };
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                // lane-av1tpl2: this 32x32 block's own lambda -- every RD
+                // decision under it (partition, mode, tx, motion) reads
+                // `search.lambda`, so scaling the one field here scales all
+                // of them. 32x32 and not the 16x16 the map is built at
+                // because the whole-vs-split comparison right below weighs
+                // one 32x32 cost against four 16x16 ones: a per-leaf lambda
+                // would make those two numbers incomparable.
+                let search = match &tpl_factors {
+                    Some(f) => {
+                        let mean = (0..4)
+                            .map(|i| f[(r32 * 2 + i / 2) * tpl_cells_x + c32 * 2 + i % 2])
+                            .sum::<f64>()
+                            / 4.0;
+                        Search { lambda: search.lambda * mean, ..search }
+                    }
+                    None => search,
+                };
                 // Same filter as the tile writer's: a quadrant whose own mi
                 // origin is not inside the true frame is never coded.
                 if r32 >= rows || c32 >= cols {
@@ -8616,10 +8829,15 @@ pub(crate) fn encode_sequence_with_ctx(
     let mut frames = vec![crop_encoded(&key, render.0, render.1)];
     for (i, picture) in rest.iter().enumerate() {
         picture.check_even()?;
-        // lane-av1tpl: the one-frame lookahead the per-superblock lambda
-        // weighting reads -- the NEXT picture's source at this frame's coded
-        // (padded) size. The last frame of the sequence has none.
-        let lookahead = rest.get(i + 1).map(|n| n.padded_to(SUPERBLOCK));
+        // lane-av1tpl2: the lookahead window the per-block lambda weighting
+        // propagates back through -- the next [`tpl_depth`] - 1 pictures'
+        // sources at this frame's coded (padded) size. The tail of the
+        // sequence gets a shorter window, and the last frame none at all.
+        let lookahead: Vec<Picture> = rest[(i + 1).min(rest.len())..]
+            .iter()
+            .take(tpl_depth() - 1)
+            .map(|n| n.padded_to(SUPERBLOCK))
+            .collect();
         if (picture.width, picture.height) != render {
             return Err(Error::unsupported(
                 "AV1 encode",
@@ -8639,7 +8857,7 @@ pub(crate) fn encode_sequence_with_ctx(
             Some(&golden),
             prev2.as_ref(), fctx,
             None,
-            lookahead.as_ref(),
+            &lookahead,
         )?;
         stream.extend_from_slice(&inter.stream);
         carried = inter.next_cdfs.clone();
@@ -8655,38 +8873,37 @@ pub(crate) fn encode_sequence_with_ctx(
 #[cfg(test)]
 mod tests {
 
-    /// lane-av1tpl's map and its lambda factors, on the two properties every
-    /// decision under them rests on: a frame the next one repeats exactly is
-    /// referenced once per cell (w = 1 everywhere, so every factor is 1 and
-    /// the weighting is a no-op), and the factor DECREASES in
-    /// referenced-ness -- a block the next frame leans on twice as hard as
-    /// the frame's mean is coded at a smaller lambda (more distortion-averse)
-    /// than one nothing points at.
+    /// lane-av1tpl2's propagated map, on the two properties every decision
+    /// under it rests on: a frame the whole lookahead window repeats exactly
+    /// (uniform texture) leans on every cell alike, so every factor is 1 and
+    /// the weighting is a no-op; and where the window really does save bits
+    /// by predicting -- the textured half of a frame whose other half is
+    /// flat -- the factor FALLS below 1, i.e. that half is coded more
+    /// distortion-averse than the half nothing gains from.
     #[test]
-    fn tpl_map_is_flat_on_a_repeated_frame_and_its_factor_falls_with_referencedness() {
+    fn tpl_factors_are_flat_on_a_uniform_repeat_and_fall_where_the_window_leans() {
         let (w, h) = (64usize, 64usize);
-        let frame: Vec<u8> = (0..w * h).map(|i| ((i * 37) % 251) as u8).collect();
-        let map = super::tpl_reference_map(&frame, &frame, w, h);
-        assert_eq!(map.len(), 16, "4x4 cells of 16x16");
-        for (i, &v) in map.iter().enumerate() {
-            assert!((v - 1.0).abs() < 1e-9, "cell {i} referenced {v} times, want exactly 1");
+        let uniform: Vec<u8> = (0..w * h).map(|i| ((i * 37) % 251) as u8).collect();
+        let frames: Vec<&[u8]> = vec![&uniform, &uniform, &uniform];
+        let f = super::tpl_lambda_factors(&frames, w, h, 1.0);
+        assert_eq!(f.len(), 16, "4x4 cells of 16x16");
+        for (i, &v) in f.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-6, "cell {i} factor {v}, a flat map must move no lambda");
         }
-        let factors = super::tpl_sb_factors(&map, 4, 4, 1.0);
-        assert_eq!(factors.len(), 1);
-        assert!((factors[0] - 1.0).abs() < 1e-9, "a flat map must not move any lambda");
 
-        // Two superblocks of cells side by side, 8 cells wide and 4 tall:
-        // superblock 0 covers columns 0..4 and is referenced four times as
-        // much as superblock 1 in columns 4..8, so its factor must be the
-        // smaller of the two and the frame mean must sit between them.
-        let by_col: Vec<f64> = (0..32)
-            .map(|i| if (i % 8) < 4 { 2.0 } else { 0.5 })
+        // Left half textured, right half constant: the window saves bits
+        // predicting the left half and nothing at all on the right.
+        let split: Vec<u8> = (0..w * h)
+            .map(|i| if i % w < 32 { ((i * 37) % 251) as u8 } else { 128 })
             .collect();
+        let frames: Vec<&[u8]> = vec![&split, &split, &split];
         for k in [0.25f64, 0.5, 1.0, 2.0] {
-            let f = super::tpl_sb_factors(&by_col, 8, 4, k);
-            assert_eq!(f.len(), 2);
-            assert!(f[0] < 1.0 && f[1] > 1.0, "k={k}: factors {f:?} must straddle 1");
-            assert!(f[0] < f[1], "k={k}: the referenced half must get the smaller lambda");
+            let f = super::tpl_lambda_factors(&frames, w, h, k);
+            for r in 0..4 {
+                let (lean, idle) = (f[r * 4], f[r * 4 + 3]);
+                assert!(lean < 1.0, "k={k} row {r}: leaned-on cell factor {lean} must be < 1");
+                assert!(idle > 1.0, "k={k} row {r}: idle cell factor {idle} must be > 1");
+            }
         }
     }
 
@@ -11174,7 +11391,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None, None).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None, &[]).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -11272,7 +11489,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None, None).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None, &[]).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -11450,7 +11667,7 @@ mod tests {
                     0.5,
                     1,
                     flat_order_hints(1, 0, false),
-                    (width, height), None, None, None, fctx, None, None,
+                    (width, height), None, None, None, fctx, None, &[],
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -11468,7 +11685,7 @@ mod tests {
                         0.5,
                         1,
                         flat_order_hints(1, 0, false),
-                        (width, height), None, None, None, fctx, None, None,
+                        (width, height), None, None, None, fctx, None, &[],
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);

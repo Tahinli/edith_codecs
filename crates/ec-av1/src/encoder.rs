@@ -536,10 +536,11 @@ pub struct Av1Encoder {
     dpb: [Option<DpbSlot>; 8],
     /// Pictures held back waiting for their mini-GOP's hidden frame.
     pending: Vec<(u64, Picture)>,
-    /// The flat path's one-picture delay queue: the picture whose packet the
-    /// NEXT call returns, coded with that call's picture as its lookahead
-    /// (lane-av1facade). Unused in pyramid mode, which buffers in `pending`.
-    held: Option<Picture>,
+    /// The flat path's delay queue: pictures whose packets later calls
+    /// return, each coded with the ones behind it as its lookahead window
+    /// (lane-av1facade, deepened to [`crate::encode::tpl_depth`] - 1 on
+    /// lane-av1tpl2). Unused in pyramid mode, which buffers in `pending`.
+    held: std::collections::VecDeque<Picture>,
     /// Which of [`ANCHOR_SLOTS`] the group about to be coded reads as its
     /// anchor.
     anchor: usize,
@@ -607,7 +608,7 @@ impl Av1Encoder {
             pyramid: None,
             dpb: [const { None }; 8],
             pending: Vec::new(),
-            held: None,
+            held: std::collections::VecDeque::new(),
             anchor: 0,
             next_dts: 0,
         })
@@ -741,13 +742,17 @@ impl Av1Encoder {
             ));
         }
         let Some(pyramid) = self.pyramid else {
-            // The one-picture delay queue: this picture is the lookahead the
-            // previous one is coded with, which is what makes the facade's
-            // bytes identical to `encode_sequence`'s (lane-av1facade).
-            return Ok(match self.held.replace(picture.clone()) {
-                None => Vec::new(),
-                Some(previous) => vec![self.encode_flat(&previous, Some(picture))?],
-            });
+            // The delay queue: the pictures behind this one are the
+            // lookahead window the one at its head is coded with, which is
+            // what makes the facade's bytes identical to
+            // `encode_sequence`'s (lane-av1facade, lane-av1tpl2).
+            self.held.push_back(picture.clone());
+            if self.held.len() <= crate::encode::tpl_depth() - 1 {
+                return Ok(Vec::new());
+            }
+            let previous = self.held.pop_front().expect("queue is over depth");
+            let window: Vec<Picture> = self.held.iter().cloned().collect();
+            return Ok(vec![self.encode_flat(&previous, &window)?]);
         };
         let order = self.next_index;
         self.next_index += 1;
@@ -778,8 +783,13 @@ impl Av1Encoder {
     /// As [`Av1Encoder::encode_frames`].
     pub fn flush(&mut self) -> Result<Vec<Packet>> {
         crate::encode::arm_tiles(self.config.tile_cols_log2, self.config.tile_rows_log2);
-        if let Some(previous) = self.held.take() {
-            return Ok(vec![self.encode_flat(&previous, None)?]);
+        if !self.held.is_empty() {
+            let mut packets = Vec::with_capacity(self.held.len());
+            while let Some(previous) = self.held.pop_front() {
+                let window: Vec<Picture> = self.held.iter().cloned().collect();
+                packets.push(self.encode_flat(&previous, &window)?);
+            }
+            return Ok(packets);
         }
         self.drain_pending()
     }
@@ -788,7 +798,7 @@ impl Av1Encoder {
     /// `None` at the end of the stream) in, one packet out — the same inputs
     /// [`crate::encode::encode_sequence`] gives each of its inter frames, so
     /// the bytes are identical.
-    fn encode_flat(&mut self, picture: &Picture, lookahead: Option<&Picture>) -> Result<Packet> {
+    fn encode_flat(&mut self, picture: &Picture, lookahead: &[Picture]) -> Result<Packet> {
         let render = (self.config.width, self.config.height);
         let padded = picture.padded_to(SUPERBLOCK);
         let is_key = self.next_index.is_multiple_of(self.config.gop as u64);
@@ -836,7 +846,7 @@ impl Av1Encoder {
                 self.prev2.as_ref(),
                 &self.fctx,
                 None,
-                lookahead.map(|n| n.padded_to(SUPERBLOCK)).as_ref(),
+                &lookahead.iter().map(|n| n.padded_to(SUPERBLOCK)).collect::<Vec<_>>(),
             )?
         };
 
@@ -993,9 +1003,10 @@ impl Av1Encoder {
                 show_frame,
                 sign_bias,
             }),
-            // The streaming facade holds no lookahead buffer, so the
-            // temporal lambda weighting is off on this path (lane-av1tpl).
-            None,
+            // The pyramid path reorders pictures, so its own buffer is not
+            // a lookahead window: the temporal lambda weighting is off on
+            // this path (lane-av1tpl).
+            &[],
         ) }();
         // Name the pyramid position in any failure: an error out of the tile
         // writer or the filter search is otherwise indistinguishable between
@@ -1150,13 +1161,14 @@ mod tests {
         packets.iter().flat_map(|p| p.data.clone()).collect()
     }
 
-    /// The facade's latency contract (lane-av1facade): the first
-    /// [`Av1Encoder::encode`] call returns an empty packet, every later call
-    /// returns the PREVIOUS picture's packet, and [`Av1Encoder::flush`]
-    /// yields the last one — so a caller still gets exactly one non-empty
-    /// packet per picture, one call later.
+    /// The facade's latency contract (lane-av1facade, deepened on
+    /// lane-av1tpl2): the first [`crate::encode::tpl_depth`] - 1 calls hold
+    /// their picture back and return an empty packet, every later call
+    /// returns the packet of the picture that many frames earlier, and
+    /// [`Av1Encoder::flush`] yields the whole queue — so a caller still gets
+    /// exactly one non-empty packet per picture, `depth - 1` calls later.
     #[test]
-    fn one_in_one_out_delayed_by_a_frame() {
+    fn one_in_one_out_delayed_by_the_lookahead_depth() {
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -1166,19 +1178,24 @@ mod tests {
             tile_cols_log2: 0,
             tile_rows_log2: 0,
         };
+        let delay = crate::encode::tpl_depth() as u64 - 1;
+        let pictures = delay + 5;
         let mut enc = Av1Encoder::new(config).unwrap();
-        for t in 0..5u64 {
+        for t in 0..pictures {
             let packet = enc.encode(&test_card(64, 64, t as usize)).unwrap();
-            if t == 0 {
-                assert!(packet.data.is_empty(), "the first call holds its picture back");
+            if t < delay {
+                assert!(packet.data.is_empty(), "call {t} holds its picture back");
                 continue;
             }
             assert!(!packet.data.is_empty(), "picture {t}: empty packet");
-            assert_eq!(packet.order, t - 1, "picture {t}: order");
+            assert_eq!(packet.order, t - delay, "picture {t}: order");
         }
         let tail = enc.flush().unwrap();
-        assert_eq!(tail.len(), 1, "flush yields the last picture");
-        assert_eq!(tail[0].order, 4);
+        assert_eq!(tail.len() as u64, delay, "flush yields the whole queue");
+        for (i, p) in tail.iter().enumerate() {
+            assert_eq!(p.order, pictures - delay + i as u64, "flushed packet {i}: order");
+            assert!(!p.data.is_empty(), "flushed packet {i}: empty");
+        }
         assert!(enc.flush().unwrap().is_empty(), "nothing is held twice");
     }
 
