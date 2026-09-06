@@ -10741,7 +10741,7 @@ mod tests {
         Some((f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?))
     }
 
-    /// The NATIVE-resolution screen arm of the BD gate. The default gate
+    /// The NATIVE-resolution arm of the BD gate (all three clips). The default gate
     /// downscales the OBS capture to 640x384, which destroys exactly the
     /// pixel-identical 16x16 repeats intrabc and (part of) the palette exist
     /// for (class `gate-recipe-confound`), so every screen-tool decision taken
@@ -10762,39 +10762,55 @@ mod tests {
     ///     EC_AV1_INTRABC=1 ... same command                # intra block copy
     ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
     ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
-    ///     EC_AV1_NATIVE_FILM=1 ... same command            # + a film crop row
+    ///
+    /// All three gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
+    /// `EC_AV1_NATIVE_FILM4K=1` and `EC_AV1_NATIVE_SCREEN=1` select a subset:
+    /// setting any one of them keeps only the selected rows.
     #[test]
-    #[ignore = "the native-resolution screen BD arm: minutes per row, needs ffmpeg"]
+    #[ignore = "the native-resolution BD arm: minutes per row, needs ffmpeg"]
     fn bd_rate_screen_native() {
         if !have_ffmpeg() {
             eprintln!("SKIP bd_rate_screen_native: no ffmpeg");
             return;
         }
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+        let (film, film4k, screen) = (
+            on("EC_AV1_NATIVE_FILM"),
+            on("EC_AV1_NATIVE_FILM4K"),
+            on("EC_AV1_NATIVE_SCREEN"),
+        );
+        // No selector at all means every clip; any selector means that subset.
+        let all = !(film || film4k || screen);
         let mut clips: Vec<(String, String)> = Vec::new();
-        match std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) {
-            Ok(manifest) => match manifest
-                .lines()
-                .skip(1)
-                .filter_map(|l| l.split('\t').next())
-                .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
-            {
-                Some(p) => clips.push((
-                    format!("screen capture ({})", p.rsplit('/').next().unwrap_or(p)),
-                    p.to_string(),
-                )),
-                None => eprintln!("SKIP screen capture: no OBS recording in the manifest exists"),
-            },
-            Err(e) => eprintln!("SKIP bd_rate_screen_native: no real-library manifest ({e})"),
+        for (want, label, file) in [
+            (all || film, "film 1080p", "h264-1080p-23.976-8bit.mp4"),
+            (all || film4k, "film 2160p", "h264-2160p-23.976-8bit.mp4"),
+        ] {
+            if !want {
+                continue;
+            }
+            let path = fixtures.join("video").join(file);
+            match path.exists() {
+                true => clips.push((label.to_string(), path.to_str().unwrap().to_string())),
+                false => eprintln!("SKIP {label}: {file} missing"),
+            }
         }
-        // The film crop is an extra row, not a default-moving measurement.
-        if std::env::var("EC_AV1_NATIVE_FILM").ok().as_deref() == Some("1") {
-            let path = fixtures.join("video").join("h264-1080p-23.976-8bit.mp4");
-            if path.exists() {
-                clips.push((
-                    "film 1080p (native crop)".to_string(),
-                    path.to_str().unwrap().to_string(),
-                ));
+        if all || screen {
+            match std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) {
+                Ok(manifest) => match manifest
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| l.split('\t').next())
+                    .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+                {
+                    Some(p) => clips.push((
+                        format!("screen capture ({})", p.rsplit('/').next().unwrap_or(p)),
+                        p.to_string(),
+                    )),
+                    None => eprintln!("SKIP screen capture: no OBS recording in the manifest exists"),
+                },
+                Err(e) => eprintln!("SKIP screen capture: no real-library manifest ({e})"),
             }
         }
         if clips.is_empty() {
@@ -10828,8 +10844,8 @@ mod tests {
             intrabc_enabled(),
             palette_max_colors(),
         );
-        println!("| clip | size | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e |");
-        println!("|---|---|---|---|---|---|");
+        println!("| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |");
+        println!("|---|---|---|---|---|");
         for (name, path) in &clips {
             let fctx = &crate::decode::FrameCtx::new();
             let Some((nw, nh)) = probe_dims(path) else {
@@ -10889,7 +10905,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ");
             println!(
-                "| {name} | {cw}x{ch} | {points} | {:+.1}% | {:+.1}% | {ours_wall:.1}s:{aom_wall:.1}s:{rav1e_wall:.1}s |",
+                "| {name} {cw}x{ch} | {points} | {:+.1}% | {:+.1}% | {ours_wall:.1}s:{aom_wall:.1}s:{rav1e_wall:.1}s |",
                 bd_rate(&aom, &ours) * 100.0,
                 bd_rate(&rav1e, &ours) * 100.0,
             );
