@@ -18,7 +18,7 @@ use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::decode::{TXFM_CTX_INIT, txfm_partition_ctx_rect};
 use crate::msac::SymbolEncoder;
-use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16, single_ref_ctx};
+use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16};
 
 // ---------------------------------------------------------------------------
 // lane-av1lr: per-64x64 `cdef_idx` (spec 5.11.56, `read_cdef`). The decoder
@@ -293,7 +293,7 @@ const MAX_LEVEL: i32 = MAX_BR_LEVEL + (1 << 19);
 /// The coefficient q-context (spec 8.3.2's `Get_Qctx`, `Default_..._Cdf`'s
 /// leading index) a frame's `base_q_idx` picks its default CDFs from.
 /// [`crate::cdf`] carries all four, one constant set per context.
-fn q_ctx_of(base_q_idx: u8) -> usize {
+pub(crate) fn q_ctx_of(base_q_idx: u8) -> usize {
     match base_q_idx {
         0..=20 => 0,
         21..=60 => 1,
@@ -645,16 +645,21 @@ pub struct BlockCoeffs {
     pub tx_depth: u8,
 }
 
-/// One inter mode [`sb_coeff_inter_frame_tile`]'s blocks may take (spec
-/// 5.11.24 `read_inter_mode`), reduced to the two branches its symbol chain
-/// needs to prove out: the stack's own top candidate outright, or a coded
-/// residual against it. `NEARMV`/`GLOBALMV` are never written.
+/// One inter mode [`sb_coeff_inter_frame_tile`]'s blocks may take: the whole
+/// single-reference set of spec 5.11.24 `read_inter_mode`, each written by
+/// [`write_inter_mode`] with the decoder's own contexts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterMode {
     /// `NEARESTMV`: takes `MvStack::nearest_mv` outright, no residual, no DRL.
     NearestMv,
-    /// `NEWMV`: codes `mv` as a residual against `MvStack::pred_mv`, through
-    /// a DRL index this writer always leaves at zero.
+    /// `NEARMV`: takes the stack entry [`InterInfo::ref_mv_idx`] names
+    /// (clamped to at least 1, the spec's own `RefMvIdx` base for this mode).
+    NearMv,
+    /// `GLOBALMV`: the identity global model's zero vector, two symbols and
+    /// no MV at all.
+    GlobalMv,
+    /// `NEWMV`: codes `mv` as a residual against the stack entry
+    /// [`InterInfo::ref_mv_idx`] names.
     NewMv,
 }
 
@@ -668,6 +673,14 @@ pub struct InterInfo {
     pub mode: InterMode,
     /// The motion vector a [`InterMode::NewMv`] block's residual targets.
     pub mv: (i32, i32),
+    /// The reference this block predicts from (`LAST_FRAME`..=`ALTREF_FRAME`,
+    /// spec 6.10.24's alphabet), written by [`write_single_ref`].
+    pub ref_frame: i8,
+    /// The block's `RefMvIdx` (spec 5.11.24 `read_drl_idx`): which
+    /// `MvStack::entries` slot `NEWMV` codes its residual against, or
+    /// `NEARMV` takes outright. Ignored by the two modes that code no DRL
+    /// index (`NEARESTMV`, `GLOBALMV`).
+    pub ref_mv_idx: u8,
 }
 
 impl From<Vec<Coeff>> for BlockCoeffs {
@@ -833,6 +846,12 @@ struct Neighbours {
     above_inter: Vec<bool>,
     /// The same, down the left edge.
     left_inter: Vec<bool>,
+    /// The reference each neighbour named, `-1` for an intra or unavailable
+    /// one -- what the decoder keeps in its own `Neighbours::above_ref`
+    /// (decode.rs) and feeds `read_single_ref`'s context functions.
+    above_ref: Vec<i8>,
+    /// The same, down the left edge.
+    left_ref: Vec<i8>,
     /// The frame's true (unpadded) width and height, in 4x4 mode-info units,
     /// which is what clamps [`Self::above`]/[`Self::left`] at the edge (spec
     /// `av1_set_entropy_contexts`): a block whose row or column run spills
@@ -876,6 +895,8 @@ impl Neighbours {
             left_skip: vec![false; rows * (SUB / MI)],
             above_inter: vec![false; cols * (SUB / MI)],
             left_inter: vec![false; rows * (SUB / MI)],
+            above_ref: vec![-1; cols * (SUB / MI)],
+            left_ref: vec![-1; rows * (SUB / MI)],
             above_tx: vec![0; cols * (SUB / MI)],
             left_tx: vec![0; rows * (SUB / MI)],
             above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
@@ -893,6 +914,7 @@ impl Neighbours {
         self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
+        self.left_ref.iter_mut().for_each(|r| *r = -1);
         self.left_tx.iter_mut().for_each(|t| *t = 0);
         self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
     }
@@ -1092,19 +1114,21 @@ impl Neighbours {
     /// Writes one inter-frame block's skip flag and inter/intra state into
     /// every 16x16 column and row it covers, the same span [`Self::record`]
     /// fills for the coefficient and mode state.
-    fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool) {
+    fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool, ref_frame: i8) {
         let (r, c) = at;
-        self.record_inter_mi((r * (SUB / MI), c * (SUB / MI)), side, skip, is_inter);
+        self.record_inter_mi((r * (SUB / MI), c * (SUB / MI)), side, skip, is_inter, ref_frame);
     }
 
     /// [`Self::record_inter`] taking the block's position directly in 4x4
     /// mode-info units, for a block finer than one [`SUB`] slot.
-    fn record_inter_mi(&mut self, (mi_r, mi_c): (usize, usize), side: usize, skip: bool, is_inter: bool) {
+    fn record_inter_mi(&mut self, (mi_r, mi_c): (usize, usize), side: usize, skip: bool, is_inter: bool, ref_frame: i8) {
         for cell in 0..side / MI {
             self.above_skip[mi_c + cell] = skip;
             self.left_skip[mi_r + cell] = skip;
             self.above_inter[mi_c + cell] = is_inter;
             self.left_inter[mi_r + cell] = is_inter;
+            self.above_ref[mi_c + cell] = ref_frame;
+            self.left_ref[mi_r + cell] = ref_frame;
         }
     }
 
@@ -1198,7 +1222,27 @@ pub fn sb_coeff_key_frame_tile_tx(
     superblocks: &[Superblock],
     tx_select: bool,
 ) -> Result<Vec<u8>> {
-    // Consumes whatever `arm_cdef_idx` armed, on every exit path.
+    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    sb_coeff_key_frame_tile_cdfs(mi_cols, mi_rows, base_q_idx, superblocks, tx_select, &mut cdfs)
+}
+
+/// [`sb_coeff_key_frame_tile_tx`] starting from -- and leaving behind -- the
+/// caller's own CDF state, which is what a frame whose
+/// `disable_frame_end_update_cdf` is off needs: the next frame's writer must
+/// start where this tile ended (spec 7.20, mirrored by
+/// `crate::stream::stored_cdfs_for`).
+///
+/// # Errors
+/// As [`sb_coeff_key_frame_tile_tx`].
+pub(crate) fn sb_coeff_key_frame_tile_cdfs(
+    mi_cols: u32,
+    mi_rows: u32,
+    _base_q_idx: u8,
+    superblocks: &[Superblock],
+    tx_select: bool,
+    cdfs: &mut Cdfs,
+) -> Result<Vec<u8>> {
+    // Consumes whatever `arm_cdef_idx`/`arm_lr` armed, on every exit path.
     let _cdef_idx = CdefIdxGuard;
     check_blocks(mi_cols, mi_rows)?;
     let (cols, rows) = block_grid(mi_cols, mi_rows);
@@ -1258,7 +1302,7 @@ pub fn sb_coeff_key_frame_tile_tx(
     // The tile adapts every non-literal CDF it writes, exactly as the decoder
     // adapts the ones it reads, so the frame header leaves `disable_cdf_update`
     // off.
-    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut cdfs = cdfs;
     let mut enc = SymbolEncoder::new();
     for sb_r in 0..sb_rows {
         neighbours.start_row();
@@ -2831,6 +2875,205 @@ fn write_mv(
     Ok(())
 }
 
+/// What a block leaves in the neighbour reference bands: its own reference,
+/// or `-1` when it is intra (decode.rs `Neighbours::above_ref`'s convention).
+fn block_ref(block: &BlockCoeffs) -> i8 {
+    block.inter.map_or(-1, |i| i.ref_frame)
+}
+
+/// Writer-side counterpart of decode.rs `read_single_ref` (spec 5.11.25's
+/// `single_ref_p1`..`p6` tree): codes `ref_frame` bit by bit, each symbol at
+/// the context its own `single_ref_p*_ctx` derives from the immediate
+/// above/left neighbours' references -- the same functions the decoder calls,
+/// with `-1` standing for an intra or unavailable neighbour and no second
+/// reference (this writer codes no compound block).
+fn write_single_ref(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    ref_frame: i8,
+    above_ref: i8,
+    left_ref: i8,
+) {
+    REF_HITS[(ref_frame.max(1) - 1) as usize % 7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    use crate::mvstack::{
+        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
+        single_ref_p5_ctx, single_ref_p6_ctx,
+    };
+    let above = (above_ref > 0).then_some(above_ref);
+    let left = (left_ref > 0).then_some(left_ref);
+    let backward = ref_frame >= BWDREF_FRAME;
+    enc.symbol(
+        usize::from(backward),
+        &mut cdfs.single_ref[single_ref_p1_ctx(above, None, left, None)][0],
+    );
+    if backward {
+        let is_altref = ref_frame == ALTREF_FRAME;
+        enc.symbol(
+            usize::from(is_altref),
+            &mut cdfs.single_ref[single_ref_p2_ctx(above, None, left, None)][1],
+        );
+        if !is_altref {
+            enc.symbol(
+                usize::from(ref_frame == ALTREF2_FRAME),
+                &mut cdfs.single_ref[single_ref_p6_ctx(above, None, left, None)][5],
+            );
+        }
+        return;
+    }
+    let far = ref_frame == LAST3_FRAME || ref_frame == GOLDEN_FRAME;
+    enc.symbol(
+        usize::from(far),
+        &mut cdfs.single_ref[single_ref_p3_ctx(above, None, left, None)][2],
+    );
+    if far {
+        enc.symbol(
+            usize::from(ref_frame == GOLDEN_FRAME),
+            &mut cdfs.single_ref[single_ref_p5_ctx(above, None, left, None)][4],
+        );
+    } else {
+        enc.symbol(
+            usize::from(ref_frame == LAST2_FRAME),
+            &mut cdfs.single_ref[single_ref_p4_ctx(above, None, left, None)][3],
+        );
+    }
+}
+
+/// Per-mode fire counts of [`write_inter_mode`], indexed
+/// `NEARESTMV`/`NEARMV`/`GLOBALMV`/`NEWMV`, and the DRL index each block
+/// coded (bucket 3 collects any index past 2). Read by the BD gate, which
+/// is the only thing that proves a newly added mode ever fires
+/// (gate-blind-to-feature).
+static INTER_MODE_HITS: [std::sync::atomic::AtomicUsize; 4] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+static DRL_HITS: [std::sync::atomic::AtomicUsize; 4] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// One counter per reference name (`LAST`..`ALTREF`), for the gate's own
+/// census of what the encoder actually picks.
+static REF_HITS: [std::sync::atomic::AtomicUsize; 7] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Takes and clears the per-reference histogram.
+#[cfg(test)]
+pub(crate) fn take_ref_hits() -> [usize; 7] {
+    std::array::from_fn(|i| REF_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Bumps the two histograms for one coded inter block.
+fn note_inter_mode(mode: usize, drl: usize) {
+    INTER_MODE_HITS[mode].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRL_HITS[drl.min(3)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes and clears the inter-mode histogram (NEAREST/NEAR/GLOBAL/NEW).
+#[cfg(test)]
+pub(crate) fn take_inter_mode_hits() -> [usize; 4] {
+    [0, 1, 2, 3].map(|i| INTER_MODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Takes and clears the DRL-index histogram (0, 1, 2, 3+).
+#[cfg(test)]
+pub(crate) fn take_drl_hits() -> [usize; 4] {
+    [0, 1, 2, 3].map(|i| DRL_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Writes the DRL index of one block: the loop the decoder runs (spec
+/// 5.11.24 `read_drl_idx`, decode.rs' two copies at ~26655 and ~26695), one
+/// `drl_mode` bit per stack entry past `start`, `1` to advance and `0` to
+/// stop, at most two bits. `drl_ctx[idx]` is the context between
+/// `entries[idx]` and `entries[idx + 1]`, exactly the pair the bit chooses
+/// between.
+fn write_drl_idx(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    stack: &crate::mvstack::MvStack,
+    start: usize,
+    target: usize,
+) {
+    let mut idx = start;
+    while idx < start + 2 && stack.entries.len() > idx + 1 {
+        let advance = idx < target;
+        enc.symbol(usize::from(advance), &mut cdfs.drl_mode[stack.drl_ctx[idx]]);
+        if !advance {
+            return;
+        }
+        idx += 1;
+    }
+}
+
+/// Writer-side counterpart of the decoder's single-reference
+/// `read_inter_mode`/`assign_mv` chain (decode.rs ~26645): writes `info`'s
+/// mode symbols against `stack`'s own contexts and, for `NEWMV`, the MV
+/// residual against the DRL-selected predictor. Returns the motion vector
+/// the decoder will derive for the block (what the MI grid must record) and
+/// whether it is `NEWMV`.
+///
+/// `GLOBALMV` resolves to `(0, 0)` because this encoder writes no global
+/// motion parameters at all, so every `gm_get_motion_vector` the decoder
+/// runs is the identity model's zero vector; a lane that starts writing
+/// real `gm_params` has to feed the same vector in here.
+///
+/// # Errors
+/// As [`write_mv`]: a `NEWMV` residual needing eighth-pel precision.
+fn write_inter_mode(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    info: InterInfo,
+    stack: &crate::mvstack::MvStack,
+) -> Result<((i32, i32), bool)> {
+    let idx = usize::from(info.ref_mv_idx);
+    match info.mode {
+        InterMode::NewMv => {
+            enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]);
+            write_drl_idx(enc, cdfs, stack, 0, idx);
+            let base = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+            write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv, base)?;
+            note_inter_mode(3, idx);
+            Ok((info.mv, true))
+        }
+        InterMode::GlobalMv => {
+            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not NEWMV
+            enc.symbol(0, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // GLOBALMV
+            note_inter_mode(2, 0);
+            Ok(((0, 0), false))
+        }
+        InterMode::NearestMv => {
+            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not NEWMV
+            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not GLOBALMV
+            enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
+            note_inter_mode(0, 0);
+            Ok((stack.nearest_mv, false))
+        }
+        InterMode::NearMv => {
+            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not NEWMV
+            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not GLOBALMV
+            enc.symbol(1, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARMV
+            // `RefMvIdx` starts at 1 for NEARMV (spec 5.11.24).
+            let idx = idx.max(1);
+            write_drl_idx(enc, cdfs, stack, 1, idx);
+            let mv = stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv);
+            note_inter_mode(1, idx);
+            Ok((mv, false))
+        }
+    }
+}
+
 /// Writes the payload of a one-tile inter frame built from `blocks`, one
 /// 32x32 block per entry in raster order across the frame — every superblock
 /// is split into its four quadrants the way [`split_coeff_key_frame_tile`]
@@ -2884,7 +3127,24 @@ pub fn sb_coeff_inter_frame_tile_tx(
     blocks: &[Quadrant],
     tx_select: bool,
 ) -> Result<Vec<u8>> {
-    // Consumes whatever `arm_cdef_idx` armed, on every exit path.
+    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    sb_coeff_inter_frame_tile_cdfs(mi_cols, mi_rows, base_q_idx, blocks, tx_select, &mut cdfs)
+}
+
+/// [`sb_coeff_inter_frame_tile_tx`] starting from -- and leaving behind --
+/// the caller's own CDF state; see [`sb_coeff_key_frame_tile_cdfs`].
+///
+/// # Errors
+/// As [`sb_coeff_inter_frame_tile_tx`].
+pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
+    mi_cols: u32,
+    mi_rows: u32,
+    _base_q_idx: u8,
+    blocks: &[Quadrant],
+    tx_select: bool,
+    cdfs: &mut Cdfs,
+) -> Result<Vec<u8>> {
+    // Consumes whatever `arm_cdef_idx`/`arm_lr` armed, on every exit path.
     let _cdef_idx = CdefIdxGuard;
     check_blocks(mi_cols, mi_rows)?;
     // `block_grid`'s ceiling, not a plain division: a true frame size that is
@@ -2915,9 +3175,6 @@ pub fn sb_coeff_inter_frame_tile_tx(
     /// `Y_MODE`'s size group (spec `Size_Group`) for a 32x32 block, the only
     /// size this writer's inter branch codes.
     const SIZE_GROUP_32: usize = 3;
-    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3): the only reference this
-    /// writer's single-reference chain ever names.
-    const LAST_FRAME: i8 = 1;
 
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let mut neighbours = Neighbours::new(
@@ -2927,7 +3184,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
         mi_rows as usize,
     );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
-    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut cdfs = cdfs;
     let mut enc = SymbolEncoder::new();
     // An `is_inter` block's 32x32 luma transform reads a different
     // `tx_type` set than an intra block's (`get_tx_set`, spec 5.11.48; see
@@ -3214,10 +3471,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
 
                 let mode_for_tx;
                 if let Some(info) = block.inter {
-                    let sr_ctx = single_ref_ctx(above_inter || left_inter);
-                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
-                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
-                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+                    write_single_ref(&mut enc, &mut cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
 
                     let (mi_row, mi_col) = (r32 as usize * 8, c32 as usize * 8);
                     let stack = find_mv_stack(
@@ -3226,43 +3480,18 @@ pub fn sb_coeff_inter_frame_tile_tx(
                         mi_col,
                         8,
                         8,
-                        LAST_FRAME,
+                        info.ref_frame,
                         mi_cols as usize,
                         mi_rows as usize,
                     );
 
-                    let is_new_mv = matches!(info.mode, InterMode::NewMv);
-                    if is_new_mv {
-                        enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
-                    } else {
-                        enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
-                        enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
-                        enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
-                    }
-                    // This writer always keeps the first DRL candidate, so the
-                    // loop (spec 5.11.24 `read_drl_idx`) only ever runs its
-                    // first, breaking iteration.
-                    if is_new_mv && stack.entries.len() > 1 {
-                        enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
-                    }
-                    let mv = if is_new_mv {
-                        write_mv(
-                            &mut enc,
-                            &mut cdfs.mv_comp,
-                            &mut cdfs.mv_joint,
-                            info.mv,
-                            stack.pred_mv,
-                        )?;
-                        info.mv
-                    } else {
-                        stack.nearest_mv
-                    };
+                    let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
                     grid.set(
                         mi_row,
                         mi_col,
                         MiInfo {
                             is_inter: true,
-                            ref_frame: LAST_FRAME,
+                            ref_frame: info.ref_frame,
                             ref_frame1: NO_REF1,
                             mv1: (0, 0),
                             mv: mv16(mv),
@@ -3283,7 +3512,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
                                 mi_col + dc,
                                 MiInfo {
                                     is_inter: true,
-                                    ref_frame: LAST_FRAME,
+                                    ref_frame: info.ref_frame,
                                     ref_frame1: NO_REF1,
                                     mv1: (0, 0),
                                     mv: mv16(mv),
@@ -3388,7 +3617,7 @@ pub fn sb_coeff_inter_frame_tile_tx(
                     );
                     neighbours.record_planes(at, BLOCK, mode_for_tx, &grids, !split);
                 }
-                neighbours.record_inter(at, BLOCK, block.skip, is_inter);
+                neighbours.record_inter(at, BLOCK, block.skip, is_inter, block_ref(block));
             }
         }
     }
@@ -3432,9 +3661,6 @@ fn write_inter_frame_leaf(
     /// `Y_MODE`'s size group (spec `Size_Group`, `common_data.h`'s
     /// `size_group_lookup[BLOCK_16X16]`) for this leaf's own size.
     const SIZE_GROUP_16: usize = 2;
-    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3): the only reference this
-    /// writer's single-reference chain ever names, same as the 32x32 branch.
-    const LAST_FRAME: i8 = 1;
 
     let (r, c) = at;
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
@@ -3450,10 +3676,7 @@ fn write_inter_frame_leaf(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
-        let sr_ctx = single_ref_ctx(above_inter || left_inter);
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
 
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         let stack = find_mv_stack(
@@ -3462,34 +3685,12 @@ fn write_inter_frame_leaf(
             mi_col,
             SUB_MI as usize,
             SUB_MI as usize,
-            LAST_FRAME,
+            info.ref_frame,
             mi_cols as usize,
             mi_rows as usize,
         );
 
-        let is_new_mv = matches!(info.mode, InterMode::NewMv);
-        if is_new_mv {
-            enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
-        } else {
-            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
-            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
-            enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
-        }
-        if is_new_mv && stack.entries.len() > 1 {
-            enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
-        }
-        let mv = if is_new_mv {
-            write_mv(
-                enc,
-                &mut cdfs.mv_comp,
-                &mut cdfs.mv_joint,
-                info.mv,
-                stack.pred_mv,
-            )?;
-            info.mv
-        } else {
-            stack.nearest_mv
-        };
+        let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
         for dr in 0..SUB_MI as usize {
             for dc in 0..SUB_MI as usize {
                 grid.set(
@@ -3497,7 +3698,7 @@ fn write_inter_frame_leaf(
                     mi_col + dc,
                     MiInfo {
                         is_inter: true,
-                        ref_frame: LAST_FRAME,
+                        ref_frame: info.ref_frame,
                         ref_frame1: NO_REF1,
                         mv1: (0, 0),
                         mv: mv16(mv),
@@ -3598,7 +3799,7 @@ fn write_inter_frame_leaf(
         );
         neighbours.record_planes(at, SUB, mode_for_tx, &grids, !split);
     }
-    neighbours.record_inter(at, SUB, block.skip, is_inter);
+    neighbours.record_inter(at, SUB, block.skip, is_inter, block_ref(block));
     Ok(())
 }
 
@@ -3646,9 +3847,6 @@ fn write_inter_frame_leaf8(
     /// `Y_MODE`'s size group (spec `Size_Group`, `common_data.h`'s
     /// `size_group_lookup[BLOCK_8X8]`) for this leaf's own size.
     const SIZE_GROUP_8: usize = 1;
-    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3), same as the 16x16/32x32
-    /// branches.
-    const LAST_FRAME: i8 = 1;
 
     // This leaf's own 4x4 mode-info cells, not the enclosing 16x16 slot's:
     // under a real PARTITION_SPLIT all four leaves are coded, so the
@@ -3671,10 +3869,7 @@ fn write_inter_frame_leaf8(
 
     let mode_for_tx;
     if let Some(info) = block.inter {
-        let sr_ctx = single_ref_ctx(above_inter || left_inter);
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
-        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[leaf_mi.1], neighbours.left_ref[leaf_mi.0]);
 
         let (mi_row, mi_col) = leaf_mi;
         let stack = find_mv_stack(
@@ -3683,34 +3878,12 @@ fn write_inter_frame_leaf8(
             mi_col,
             2,
             2,
-            LAST_FRAME,
+            info.ref_frame,
             mi_cols as usize,
             mi_rows as usize,
         );
 
-        let is_new_mv = matches!(info.mode, InterMode::NewMv);
-        if is_new_mv {
-            enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
-        } else {
-            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
-            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
-            enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
-        }
-        if is_new_mv && stack.entries.len() > 1 {
-            enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
-        }
-        let mv = if is_new_mv {
-            write_mv(
-                enc,
-                &mut cdfs.mv_comp,
-                &mut cdfs.mv_joint,
-                info.mv,
-                stack.pred_mv,
-            )?;
-            info.mv
-        } else {
-            stack.nearest_mv
-        };
+        let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
         for dr in 0..2 {
             for dc in 0..2 {
                 grid.set(
@@ -3718,7 +3891,7 @@ fn write_inter_frame_leaf8(
                     mi_col + dc,
                     MiInfo {
                         is_inter: true,
-                        ref_frame: LAST_FRAME,
+                        ref_frame: info.ref_frame,
                         ref_frame1: NO_REF1,
                         mv1: (0, 0),
                         mv: mv16(mv),
@@ -3796,7 +3969,7 @@ fn write_inter_frame_leaf8(
             vec![0i32; TX4 * TX4],
         ];
         neighbours.record_mi(leaf_mi, 8, &zero_grids);
-        neighbours.record_inter_mi(leaf_mi, 8, block.skip, block.inter.is_some());
+        neighbours.record_inter_mi(leaf_mi, 8, block.skip, block.inter.is_some(), block_ref(block));
     } else {
         let grids = [
             level_grid(&block.luma, TX8)?,
@@ -3819,7 +3992,7 @@ fn write_inter_frame_leaf8(
             split,
         );
         neighbours.record_mi_planes(leaf_mi, 8, &grids, !split);
-        neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter);
+        neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter, block_ref(block));
     }
     Ok((block.skip, is_inter))
 }
@@ -5987,7 +6160,7 @@ mod tests {
             let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
 
             let (mode, mv) = if is_inter {
-                let sr_ctx = single_ref_ctx(above_inter[c32] || left_inter[r32]);
+                let sr_ctx = crate::mvstack::single_ref_ctx(above_inter[c32] || left_inter[r32]);
                 count += 3;
                 assert_eq!(
                     dec.symbol(&mut cdfs.single_ref[sr_ctx][0]),
@@ -6101,8 +6274,10 @@ mod tests {
     fn an_all_skip_inter_superblock_is_small_and_reads_back() {
         let block = BlockCoeffs {
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
+                ref_mv_idx: 0,
             }),
             skip: true,
             ..BlockCoeffs::default()
@@ -6142,16 +6317,20 @@ mod tests {
     fn a_newmv_block_reads_back_the_exact_symbol_sequence_it_was_written_with() {
         let nearest = BlockCoeffs {
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
+                ref_mv_idx: 0,
             }),
             skip: true,
             ..BlockCoeffs::default()
         };
         let newmv = BlockCoeffs {
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NewMv,
                 mv: (0, 2),
+                ref_mv_idx: 0,
             }),
             skip: true,
             ..BlockCoeffs::default()
