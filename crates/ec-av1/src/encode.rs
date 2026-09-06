@@ -11852,7 +11852,9 @@ mod tests {
     /// search moved with it. Re-pinned on lane-av1rejudge: local warp is on
     /// by default ([`warp_on`], a sequence/frame header bit and a new
     /// motion_mode symbol on eligible blocks) and
-    /// [`LEAF_SECOND_NEW_MARGIN`] moved 0.8 -> 1.2.
+    /// [`LEAF_SECOND_NEW_MARGIN`] moved 0.8 -> 1.2. Re-pinned on lane-av1tpl:
+    /// every inter frame's superblocks now code at their own lambda
+    /// ([`TPL_STRENGTH`]), so every RD decision in an inter frame moved.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -11874,7 +11876,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7139, 0x4d35_5d6d_8a54_1c6d), (60, 26461, 0xa52e_1445_7f69_b4c1)];
+            [(150, 7128, 0x8ee1_5c87_bdb4_a8c5), (60, 26353, 0x50fc_c10f_9eab_b638)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
