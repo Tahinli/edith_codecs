@@ -191,6 +191,10 @@ struct RateLoop {
     /// one shared controller (the flat path, unchanged from before levels
     /// existed).
     per_level: bool,
+    /// Whether each slot has already steered off a real coded frame. The
+    /// FIRST update of a slot is the seeding one and takes the model's whole
+    /// step ([`RateLoop::update`]); every later one is clamped.
+    seeded: [bool; 3],
 }
 
 impl RateLoop {
@@ -209,6 +213,7 @@ impl RateLoop {
                 target: [target_bytes; 3],
                 q: [start_q; 3],
                 per_level: false,
+                seeded: [false; 3],
             };
         };
         // A group of `m` pictures gets `m * target_bytes`, split one
@@ -219,6 +224,7 @@ impl RateLoop {
             target: [target_bytes * KEY_WEIGHT, share * ARF_WEIGHT, share],
             q: [start_q; 3],
             per_level: true,
+            seeded: [false; 3],
         }
     }
 
@@ -249,7 +255,23 @@ impl RateLoop {
             return;
         }
         let ratio = actual_bytes as f64 / self.target[slot];
-        let step = (ratio.ln() * Self::GAIN).clamp(-Self::STEP_CLAMP, Self::STEP_CLAMP);
+        // `STEP_CLAMP` protects an operating point this slot has not found
+        // yet: its `q` is still the caller's `base_q_idx` guess, and the
+        // clamp makes the loop WALK to the right quantizer at twelve steps a
+        // frame. Measured on the 48-frame bitrate gate, the pyramid's ARF
+        // slot spent five of its twelve frames pinned at `-STEP_CLAMP` and
+        // the stream landed -10.2% under target -- convergence lag, not a
+        // steady-state offset (the fixed point of this loop is `actual ==
+        // target` exactly). So a slot's FIRST frame takes the model's whole
+        // step and seeds `q` where the log-linear slope says it belongs; from
+        // the second frame on the clamp is back, and nothing is accumulated
+        // between frames, so [[vorbis-rate-loop-windup]]'s bound still holds.
+        let raw = ratio.ln() * Self::GAIN;
+        let step = if std::mem::replace(&mut self.seeded[slot], true) {
+            raw.clamp(-Self::STEP_CLAMP, Self::STEP_CLAMP)
+        } else {
+            raw
+        };
         self.q[slot] = (self.q[slot] + step).clamp(0.0, 255.0);
     }
 }
@@ -1914,6 +1936,13 @@ mod tests {
     /// `base_q_idx` step exceeds [`RateLoop::STEP_CLAMP`], across a real
     /// clip's full range of content (so a scene cut can't be the one frame
     /// that breaks the bound).
+    ///
+    /// The SEEDING frame is the one exemption ([`RateLoop::update`]): a slot
+    /// that has coded nothing yet is still sitting on the caller's
+    /// `base_q_idx` guess, and its first step is the acquisition jump, not
+    /// windup. Exactly one frame is exempt -- the loop below asserts the
+    /// bound on every frame after it, which is where a scene cut would
+    /// break it.
     #[test]
     fn bytes_per_frame_controller_never_oscillates_past_its_clamp() {
         let Some(pictures) = h264_clip_frames(640, 384, 24) else {
@@ -1934,17 +1963,31 @@ mod tests {
         let mut enc =
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(4_000)).unwrap();
         let mut prev_q = enc.rate_loop.as_ref().unwrap().q_idx(Level::Leaf);
-        for picture in &pictures {
+        // The first frame this encoder EMITS is several `encode_frames` calls
+        // in (the lookahead queue holds the earlier ones), so the seeding
+        // step is not frame zero -- it is the first frame `q` moves at all.
+        let mut seeded = false;
+        let mut seed_frame = None;
+        for (frame, picture) in pictures.iter().enumerate() {
             enc.encode_frames(picture).unwrap();
             let q = enc.rate_loop.as_ref().unwrap().q_idx(Level::Leaf);
             let step = (i32::from(q) - i32::from(prev_q)).abs();
-            assert!(
-                f64::from(step) <= RateLoop::STEP_CLAMP + 1.0, // +1 for u8 rounding
-                "q stepped from {prev_q} to {q}, past the {} clamp",
-                RateLoop::STEP_CLAMP
-            );
+            if step > 0 && !seeded {
+                seeded = true;
+                seed_frame = Some(frame);
+            } else {
+                assert!(
+                    f64::from(step) <= RateLoop::STEP_CLAMP + 1.0, // +1 for u8 rounding
+                    "frame {frame}: q stepped from {prev_q} to {q}, past the {} clamp",
+                    RateLoop::STEP_CLAMP
+                );
+            }
             prev_q = q;
         }
+        assert!(
+            seed_frame.is_some(),
+            "the controller never steered at all -- the bound below is vacuous"
+        );
     }
 
     fn psnr(a: &[u16], b: &[u16]) -> f64 {
