@@ -5368,11 +5368,13 @@ pub(crate) fn encode_key_frame_inner(
                 );
                 let whole_legal = has_cols32 && has_rows32;
                 // A 16x16 sub-block's own hasCols/hasRows (spec
-                // `decode_partition`, recomputed at this leaf's own half): one
-                // axis false is a straddling leaf this writer codes as two
-                // 8x8 leaves (`crate::tile::write_leaf8`, lane-av1-rect r7);
-                // both axes false needs a rectangular transform this writer
-                // has no size for at all, whether whole or split.
+                // `decode_partition`, recomputed at this leaf's own half):
+                // either axis false is a straddling leaf this writer codes as
+                // the 8x8 leaves that are inside it
+                // (`crate::tile::write_leaf8`, lane-av1-rect r7). Both axes
+                // false is the same split with the partition symbol inferred
+                // rather than coded -- no rectangular transform is needed
+                // (lane-av1rect).
                 let sub_half = |sr: usize, sc: usize| {
                     (
                         crate::tile::has_half(
@@ -5387,27 +5389,6 @@ pub(crate) fn encode_key_frame_inner(
                         ),
                     )
                 };
-                let both_axes_cut = (0..4)
-                    .map(|i| (r0 + i / 2, c0 + i % 2))
-                    .filter(|&(sr, sc)| {
-                        (sr as u32) * crate::tile::SUB_MI < header.mi_rows
-                            && (sc as u32) * crate::tile::SUB_MI < header.mi_cols
-                    })
-                    .any(|(sr, sc)| {
-                        let (has_cols16, has_rows16) = sub_half(sr, sc);
-                        !has_cols16 && !has_rows16
-                    });
-                if !whole_legal && both_axes_cut {
-                    return Err(Error::unsupported(
-                        "AV1 encode",
-                        format!(
-                            "the 32x32 block at ({col},{row}) straddles the true frame edge \
-                             in a way that needs a rectangular (HORZ/VERT) transform this \
-                             encoder does not code yet"
-                        ),
-                    ));
-                }
-
                 // What the whole 32x32 costs, including the partition symbol
                 // that says it is not split.
                 let (whole, mut cost_whole) = code_square(
@@ -7643,16 +7624,6 @@ pub(crate) fn encode_inter_frame(
                                 header.mi_rows,
                             ),
                         );
-                        if !has_cols16 && !has_rows16 {
-                            return Err(Error::unsupported(
-                                "AV1 encode",
-                                format!(
-                                    "the 16x16 block at ({sc},{sr}) straddles the true \
-                                     frame edge in a way that needs a rectangular \
-                                     (HORZ/VERT) transform this encoder does not code yet"
-                                ),
-                            ));
-                        }
                         if has_cols16 && has_rows16 {
                             let (x, y) = (sc * SUB, sr * SUB);
                             let (mi_row, mi_col) = (sr * 4, sc * 4);
@@ -9915,24 +9886,30 @@ mod tests {
     }
 
     /// The sizes the encoder refuses, refused for a reason rather than by
-    /// panicking somewhere below. Most sizes off the 32x32 block grid encode
-    /// fine now (see `a_frame_round_trips_at_its_own_size`) -- the true frame
-    /// edge lands past the halfway point of whichever block it falls in, so
+    /// panicking somewhere below. Sizes off the 32x32 block grid encode fine
+    /// (see `a_frame_round_trips_at_its_own_size`) -- the true frame edge
+    /// lands past the halfway point of whichever block it falls in, so
     /// `PARTITION_NONE` or a single gathered split flag still says everything
-    /// the spec needs. lane-av1-rect r7 wires the 8x8-leaf path live, so a
-    /// 16x16 leaf straddling on exactly one axis (e.g. 40x32, cols mod 32 ==
-    /// 8) now encodes too (see `a_frame_round_trips_at_its_own_size`'s
-    /// sibling below). Only a leaf whose true edge cuts *both* axes (e.g.
-    /// 40x40, both dims mod 32 == 8) needs the rectangular transform neither
-    /// writer has, so that class is still refused, by name rather than by
-    /// corrupting the stream.
+    /// the spec needs. lane-av1-rect r7 wired the 8x8-leaf path for a 16x16
+    /// leaf straddling on exactly one axis (e.g. 40x32), and lane-av1rect the
+    /// both-axes cut (e.g. 40x40, both dims mod 32 == 8), which spec 5.11.4
+    /// codes with NO partition symbol at all -- `PARTITION_SPLIT` inferred,
+    /// down to the in-frame 8x8s, no rectangular transform anywhere (the old
+    /// refusal here claimed otherwise and was wrong; see
+    /// `crate::stream::tests::a_sweep_of_doubly_straddling_sizes_round_trips_
+    /// through_ffmpeg`). No size refusal is left: an 8x8 leaf can never
+    /// straddle either, because `MiCols`/`MiRows` are always EVEN (spec
+    /// 5.9.5 `compute_image_size`: `2 * ((frame_width + 7) >> 3)`), so the
+    /// true edge always lands on an 8-luma-sample boundary in mi terms and a
+    /// 4x4 leaf -- which neither writer has -- is never asked for. What is
+    /// still refused is a malformed picture.
     #[test]
-    fn a_picture_off_the_block_grid_is_refused() {
+    fn a_picture_off_the_block_grid_encodes_and_a_malformed_one_is_refused() {
     let fctx = &crate::decode::FrameCtx::new();
-        let msg = encode_key_frame_with_ctx(&Picture::grey(40, 40), 100, 0.5, fctx)
-            .expect_err("40x40 straddles both axes of a 16x16 leaf, needs a rectangular transform")
-            .to_string();
-        assert!(msg.contains("rectangular"), "refusal: {msg}");
+        encode_key_frame_with_ctx(&Picture::grey(40, 40), 100, 0.5, fctx)
+            .expect("40x40 cuts a 16x16 leaf on both axes, which is an inferred split");
+        encode_key_frame_with_ctx(&Picture::grey(36, 40), 100, 0.5, fctx)
+            .expect("36 luma columns still round up to an even MiCols");
 
         let mut short = Picture::grey(64, 64);
         short.u.truncate(10);
