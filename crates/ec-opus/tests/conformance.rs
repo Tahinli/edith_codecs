@@ -907,6 +907,30 @@ fn encoder_roundtrips_at_every_rate() {
     }
 }
 
+/// The libopus input alignment ([`Encoder::set_libopus_input_alignment`]):
+/// with it on the CELT layer's advertised delay grows by libopus's
+/// `delay_compensation`, and the decoded signal tracks the source at exactly
+/// that lag and not at the old one — the knob is usable, not just present.
+/// It ships off; the gate tables that rejected it are at the setter.
+#[test]
+fn libopus_input_alignment_delays_and_still_decodes() {
+    let pcm = test_signal(2, 1.0);
+    let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
+    enc.set_bitrate(128_000);
+    assert_eq!(enc.look_ahead(960), 120, "default: one MDCT overlap");
+    enc.set_libopus_input_alignment(true);
+    assert_eq!(enc.look_ahead(960), 312, "overlap + delay_compensation");
+    let (decoded, _) = roundtrip_own(&mut enc, &pcm, 2, 960);
+    let aligned = delayed_corr(&pcm, &decoded, 2, enc.look_ahead(960));
+    let old = delayed_corr(&pcm, &decoded, 2, 120);
+    println!("aligned: corr at 312 {aligned:.4}, at 120 {old:.4}");
+    assert!(aligned >= 0.85, "aligned round trip corr {aligned:.4}");
+    assert!(
+        aligned > old,
+        "advertised delay 312 correlates {aligned:.4}, worse than the old 120 ({old:.4})"
+    );
+}
+
 #[test]
 // Expectations are libopus 1.6's (opus_encoder.c mode_thresholds and the
 // voice/music bandwidth tables blended by voice_est) since lane opus-mode;

@@ -391,6 +391,9 @@ pub struct CeltEncoder {
     /// so its analysis window sits 4 ms behind the API frame. Interleaved,
     /// `CELT_DELAY_48K / upsample` samples per channel.
     delay_buf: Vec<f32>,
+    /// Whether that delay is applied at all — see
+    /// [`crate::Encoder::set_libopus_input_alignment`] for why it ships off.
+    align_input: bool,
     preemph_mem: [f32; 2],
     /// Coarse-energy prediction state, `2 * NB_BANDS`.
     old_band_e: Vec<f32>,
@@ -460,6 +463,7 @@ impl CeltEncoder {
             plans: (0..4).map(|lm| MdctPlan::new(SHORT_MDCT << lm)).collect(),
             in_mem: vec![0.0; channels * OVERLAP],
             delay_buf: vec![0.0; channels * CELT_DELAY_48K],
+            align_input: false,
             preemph_mem: [0.0; 2],
             old_band_e: vec![0.0; 2 * NB_BANDS],
             delayed_intra: 1.0,
@@ -514,6 +518,13 @@ impl CeltEncoder {
     /// [`encode`]: CeltEncoder::encode
     pub fn last_diag(&self) -> &CeltFrameDiag {
         &self.last_diag
+    }
+
+    /// Feeds the layer the input delayed by `CELT_DELAY_48K`, as libopus
+    /// does; see [`crate::Encoder::set_libopus_input_alignment`].
+    pub fn set_align_input(&mut self, on: bool) {
+        self.align_input = on;
+        self.delay_buf.fill(0.0);
     }
 
     /// Drops all inter-frame state.
@@ -621,7 +632,7 @@ impl CeltEncoder {
             // `src(j)`: input sample `j` of the delayed stream libopus's CELT
             // layer sees -- the `d` samples held over from the previous call
             // first, then this frame's.
-            let d = CELT_DELAY_48K / up;
+            let d = if self.align_input { CELT_DELAY_48K / up } else { 0 };
             let src = |j: usize| {
                 if j < d { delay[j * c + ch] } else { pcm[(j - d) * c + ch] }
             };
@@ -652,8 +663,10 @@ impl CeltEncoder {
             self.in_mem[ch * OVERLAP..(ch + 1) * OVERLAP]
                 .copy_from_slice(&self.in_buf[base + n..base + n + OVERLAP]);
         }
-        delay[..c * (CELT_DELAY_48K / self.upsample)]
-            .copy_from_slice(&next_delay[..c * (CELT_DELAY_48K / self.upsample)]);
+        if self.align_input {
+            delay[..c * (CELT_DELAY_48K / self.upsample)]
+                .copy_from_slice(&next_delay[..c * (CELT_DELAY_48K / self.upsample)]);
+        }
         self.delay_buf = delay;
 
         // --- Silence flag (first symbol of the frame) -----------------------
