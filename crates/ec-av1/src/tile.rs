@@ -207,6 +207,12 @@ pub(crate) fn arm_order_hints(bits: u32, order_hint: u32, hints: [u32; 7]) {
     ORDER_HINTS.with(|c| c.set((bits, order_hint, hints)));
 }
 
+/// What [`arm_order_hints`] last armed: `(order_hint_bits, order_hint,
+/// ref_order_hints)`, for the encoder's own per-reference distance.
+pub(crate) fn order_hints() -> (u32, u32, [u32; 7]) {
+    ORDER_HINTS.with(std::cell::Cell::get)
+}
+
 /// Writer-side counterpart of decode.rs `read_compound_ref_frames` (spec
 /// 5.11.25's `comp_reference_type`/`uni_comp_ref`/`comp_ref`/`comp_bwdref`
 /// trees), symbol for symbol at the same contexts -- which are, as that
