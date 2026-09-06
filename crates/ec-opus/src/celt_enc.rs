@@ -711,6 +711,29 @@ impl CeltEncoder {
             }
         }
 
+        // `EC_OPUS_X_DEBUG`: the analysis chain stage by stage for a bisect
+        // against libopus on the same PCM -- the pre-emphasised window, the
+        // MDCT output, the band energies and the normalised `X`.
+        if std::env::var_os("EC_OPUS_X_DEBUG").is_some() {
+            let f: Vec<String> =
+                self.in_buf[OVERLAP..OVERLAP + 16].iter().map(|v| format!("{v:.5}")).collect();
+            let e: f64 = self.in_buf[..n + OVERLAP].iter().map(|v| *v as f64 * *v as f64).sum();
+            let ovl: Vec<String> = self.in_buf[..4].iter().map(|v| format!("{v:.5}")).collect();
+            eprintln!("XPRE {} | E {e:.6e} ovl {}", f.join(" "), ovl.join(" "));
+            let fr: Vec<String> = self.freq[..16].iter().map(|v| format!("{v:.5}")).collect();
+            let be: Vec<String> = self.band_e[..8].iter().map(|v| format!("{v:.5}")).collect();
+            let bl: Vec<String> = self.band_log_e[..8].iter().map(|v| format!("{v:.5}")).collect();
+            eprintln!(
+                "XMDCT sb {short_blocks} {} | bandE {} | bandLogE {}",
+                fr.join(" "),
+                be.join(" "),
+                bl.join(" ")
+            );
+            let sx: f64 = self.x[..n].iter().map(|v| v.abs() as f64).sum();
+            let x0: Vec<String> = self.x[..8].iter().map(|v| format!("{v:.5}")).collect();
+            eprintln!("XNORM sumX {sx:.5} X0..8 {}", x0.join(" "));
+        }
+
         // --- Dynalloc analysis (offsets + spread_weight + importance) -----
         self.offsets = [0; NB_BANDS];
         let mut spread_weight = [0i32; NB_BANDS];
