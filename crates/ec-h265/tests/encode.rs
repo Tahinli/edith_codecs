@@ -452,10 +452,10 @@ fn bd_psnr_vs_x265() {
             cfg.rdoq_estimate = v != "0";
         }
         if let Ok(v) = std::env::var("EC_H265_TSKIP") {
-            cfg.transform_skip = if v != "0" {
-                TransformSkip::AlwaysFor4x4
-            } else {
-                TransformSkip::Off
+            cfg.transform_skip = match v.as_str() {
+                "0" => TransformSkip::Off,
+                "always" => TransformSkip::AlwaysFor4x4,
+                _ => TransformSkip::Rd,
             };
         }
         if let Ok(v) = std::env::var("EC_H265_NXN") {

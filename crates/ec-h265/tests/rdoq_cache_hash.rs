@@ -64,8 +64,13 @@ fn rdoq_cache_hash_416x240() {
 /// (`EncoderConfig::rdoq_estimate`, now on by default) — deliberately
 /// bit-different, not exact-mode-preserving; see that field's doc comment
 /// for the BD/speed numbers that justified flipping the default.
+///
+/// lane-h265screen: re-pinned after every committed 4x4 luma block gained a
+/// rate-distortion decision on `transform_skip_flag` (`TransformSkip::Rd`, now
+/// the default) — deliberately bit-different; see that field's doc comment for
+/// the BD numbers per clip.
 #[test]
 fn rdoq_cache_hash_is_pinned() {
-    assert_eq!(encode_hash(416, 240), 0x3dc2876c9104b7b3);
-    assert_eq!(encode_hash(1920, 1080), 0x03188155f21c2174);
+    assert_eq!(encode_hash(416, 240), 0x39d93f8b600b072e);
+    assert_eq!(encode_hash(1920, 1080), 0x8c5e05c6f65515c8);
 }
