@@ -19725,6 +19725,16 @@ pub(crate) struct FilterReplay {
     frame_height: usize,
     width: usize,
     height: usize,
+    /// The reconstructed extent (`mi_cols`/`mi_rows` * 4), for the wide-margin
+    /// stash the cropped return path leaves behind.
+    true_width: usize,
+    true_height: usize,
+    /// lane-av1fpar: plane buffers this replay is done with. Every candidate
+    /// works on its own copy of three ~6 MB planes, and a fresh `Vec` per
+    /// copy is a fresh mmap the kernel faults in page by page -- 12.6% of a
+    /// 1080p frame's wall in allocation, not in filtering. Recycled here
+    /// instead; the pool holds at most the six planes one candidate has live.
+    scratch: Vec<Vec<u16>>,
     /// The last deblocked planes and the levels that produced them.
     /// Deblocking depends on nothing else the search moves, and the search
     /// fixes the levels before it walks the CDEF strengths, so every
@@ -19745,6 +19755,17 @@ pub(crate) fn arm_filter_replay() {
     REPLAY_ARMED.set(true);
 }
 
+/// Test-only: force every filter candidate through a full decode, so a gate
+/// can hold the replay against the decode it stands in for
+/// (`encoder::tests::filter_replay_codes_the_same_stream_as_a_full_decode`).
+#[cfg(test)]
+static REPLAY_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn set_filter_replay_disabled(off: bool) {
+    REPLAY_DISABLED.store(off, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Drop the armed flag and anything captured: the tile it belongs to is done.
 pub(crate) fn clear_filter_replay() {
     REPLAY_ARMED.set(false);
@@ -19762,6 +19783,8 @@ fn capture_filter_replay(
     frame_height: usize,
     width: usize,
     height: usize,
+    true_width: usize,
+    true_height: usize,
 ) {
     if !REPLAY_ARMED.replace(false) {
         return;
@@ -19777,9 +19800,36 @@ fn capture_filter_replay(
             frame_height,
             width,
             height,
+            true_width,
+            true_height,
+            scratch: Vec::new(),
             deblocked: None,
         });
     });
+}
+
+/// One candidate's working copy of a captured plane, off [`FilterReplay`]'s
+/// own buffer pool: a cleared `Vec` that already has the capacity keeps the
+/// allocator and the page fault handler out of the filter search.
+fn pooled(p: &PlaneBuf<'_>, scratch: &mut Vec<Vec<u16>>) -> PlaneBuf<'static> {
+    let mut buf = scratch.pop().unwrap_or_default();
+    let src: &[u16] = &p.data;
+    let threads = crate::par::filter_threads();
+    if buf.len() != src.len() || threads <= 1 {
+        buf.clear();
+        buf.extend_from_slice(src);
+    } else {
+        // A recycled buffer is already the right length, so the copy is a
+        // plain `copy_from_slice` -- and one worth banding: ~6 MB per
+        // candidate is memory bandwidth, not arithmetic, and the halves are
+        // disjoint `&mut` slices (no `par::Shared` needed).
+        let per = src.len().div_ceil(threads);
+        let batch = crate::par::Batch::new("ec-av1-filter");
+        for (dst, src) in buf.chunks_mut(per).zip(src.chunks(per)) {
+            batch.submit(move || dst.copy_from_slice(src));
+        }
+    }
+    PlaneBuf { data: std::borrow::Cow::Owned(buf), ..*p }
 }
 
 /// The filter half of a captured decode, under new parameters: exactly the
@@ -19791,18 +19841,30 @@ pub(crate) fn replay_filters(
     cdef: &CdefParams,
     fctx: &FrameCtx,
 ) -> Option<Picture> {
+    #[cfg(test)]
+    if REPLAY_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     REPLAY.with_borrow_mut(|slot| {
         let r = slot.as_mut()?;
-        let copy = |p: &PlaneBuf<'_>| PlaneBuf {
-            data: std::borrow::Cow::Owned(p.data.to_vec()),
-            ..*p
-        };
         let hit = matches!(&r.deblocked, Some((lf, ..)) if lf == loop_filter);
+        let cpt = crate::par::timer(crate::par::S_COPY);
         let (mut y, mut u, mut v) = if hit {
-            let (_, dy, du, dv) = r.deblocked.as_ref().expect("just matched");
-            (copy(dy), copy(du), copy(dv))
+            let (deblocked, scratch) = (&r.deblocked, &mut r.scratch);
+            let (_, dy, du, dv) = deblocked.as_ref().expect("just matched");
+            (pooled(dy, scratch), pooled(du, scratch), pooled(dv, scratch))
         } else {
-            let (mut y, mut u, mut v) = (copy(&r.y), copy(&r.u), copy(&r.v));
+            // The levels moved, so the cached deblocked planes are dead:
+            // their buffers are this candidate's working copies.
+            if let Some((_, dy, du, dv)) = r.deblocked.take() {
+                r.scratch.push(dy.data.into_owned());
+                r.scratch.push(du.data.into_owned());
+                r.scratch.push(dv.data.into_owned());
+            }
+            let (cap_y, cap_u, cap_v, scratch) = (&r.y, &r.u, &r.v, &mut r.scratch);
+            let (mut y, mut u, mut v) =
+                (pooled(cap_y, scratch), pooled(cap_u, scratch), pooled(cap_v, scratch));
+            let _t = crate::par::timer(crate::par::S_DEBLOCK);
             apply_deblock(
                 &mut y,
                 &mut u,
@@ -19813,21 +19875,67 @@ pub(crate) fn replay_filters(
                 r.frame_height,
                 fctx,
             );
-            r.deblocked = Some((*loop_filter, copy(&y), copy(&u), copy(&v)));
+            let scratch = &mut r.scratch;
+            r.deblocked =
+                Some((*loop_filter, pooled(&y, scratch), pooled(&u, scratch), pooled(&v, scratch)));
             (y, u, v)
         };
+        drop(cpt);
+        let ct = crate::par::timer(crate::par::S_CDEF);
         apply_cdef(&mut y, &mut u, &mut v, cdef, &r.neighbours, (r.frame_width, r.frame_height), fctx);
-        // The capture only happens on the shape the decoder's own tail
-        // returns whole (no superres, no loop restoration, no crop), so this
-        // is that tail.
-        fctx.last_frame_wide_margin.with(|m| *m.borrow_mut() = None);
-        Some(Picture {
-            width: r.width,
-            height: r.height,
-            y: y.data.into_owned(),
-            u: u.data.into_owned(),
-            v: v.data.into_owned(),
-        })
+        drop(ct);
+        // The capture only happens on the shape whose tail is the two
+        // filter calls and the crop (no superres, no loop restoration), so
+        // what is left is that crop -- byte for byte the cropped return path
+        // of the decode this replaces, wide-margin stash included.
+        //
+        // lane-av1fpar: the crop is why this arm exists at all. The capture
+        // used to demand `frame == plane` dimensions, which no editor size
+        // meets (1080 and 1608 both pad to a superblock row), so every
+        // candidate of every frame at those sizes fell through to a full
+        // re-decode -- 57% of a 1080p frame's wall.
+        let (fw, fh) = (r.frame_width, r.frame_height);
+        if fw == r.width && fh == r.height {
+            fctx.last_frame_wide_margin.with(|m| *m.borrow_mut() = None);
+            return Some(Picture {
+                width: r.width,
+                height: r.height,
+                y: y.data.into_owned(),
+                u: u.data.into_owned(),
+                v: v.data.into_owned(),
+            });
+        }
+        let crop = |plane: &PlaneBuf<'_>, w: usize, h: usize| -> Vec<u16> {
+            let mut out = Vec::with_capacity(w * h);
+            for row in 0..h {
+                out.extend(plane.data[row * plane.width..][..w].iter().copied());
+            }
+            out
+        };
+        let (tw, th) = (r.true_width, r.true_height);
+        fctx.last_frame_wide_margin.with(|m| {
+            *m.borrow_mut() = (tw > fw || th > fh).then(|| Picture {
+                width: tw,
+                height: th,
+                y: crop(&y, tw, th),
+                u: crop(&u, tw.div_ceil(2), th.div_ceil(2)),
+                v: crop(&v, tw.div_ceil(2), th.div_ceil(2)),
+            });
+        });
+        let out = Picture {
+            width: fw,
+            height: fh,
+            y: crop(&y, fw, fh),
+            u: crop(&u, fw.div_ceil(2), fh.div_ceil(2)),
+            v: crop(&v, fw.div_ceil(2), fh.div_ceil(2)),
+        };
+        // The working planes outlive the crop, so they go back to the pool.
+        for plane in [y, u, v] {
+            if r.scratch.len() < 6 {
+                r.scratch.push(plane.data.into_owned());
+            }
+        }
+        Some(out)
     })
 }
 
@@ -23111,8 +23219,6 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // frame tile per candidate -- capture it once (see [`FilterReplay`]),
     // on the shape whose tail is the two filter calls and nothing else.
     if superres(fctx).is_none()
-        && frame_width as usize == width
-        && frame_height as usize == height
         && !(0..3).any(|p| {
             lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
                 && lr.loop_restoration_size[p] != 0
@@ -23127,6 +23233,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             frame_height as usize,
             width,
             height,
+            true_width,
+            true_height,
         );
     }
     apply_deblock(
@@ -35848,12 +35956,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // same coded tile ([`FilterReplay`]). Capture the reconstruction here,
     // before either filter has touched it -- but only on the shape whose
     // tail is exactly `apply_deblock` + `apply_cdef` and nothing else.
-    if !pipelined
-        && !lr_active
-        && superres(fctx).is_none()
-        && frame_width as usize == width
-        && frame_height as usize == height
-    {
+    if !pipelined && !lr_active && superres(fctx).is_none() {
         capture_filter_replay(
             &y,
             &u,
@@ -35863,6 +35966,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             frame_height as usize,
             width,
             height,
+            true_width,
+            true_height,
         );
     }
     if pipelined {
