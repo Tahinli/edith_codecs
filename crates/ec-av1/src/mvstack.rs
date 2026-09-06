@@ -284,6 +284,14 @@ impl MiGrid {
     }
 
     /// Sets this frame's `ref_frame_sign_bias` (see the field).
+    /// This grid's armed `ref_frame_sign_bias`, for the callers that build a
+    /// COMPOUND stack (which takes the table explicitly, unlike
+    /// [`find_mv_stack`]).
+    pub fn sign_bias_table(&self) -> &SignBiasTable {
+        &self.sign_bias
+    }
+
+    /// Arms this grid's `ref_frame_sign_bias` for every stack built off it.
     pub fn set_sign_bias(&mut self, sign_bias: SignBiasTable) {
         self.sign_bias = sign_bias;
     }
