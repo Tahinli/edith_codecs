@@ -41,7 +41,7 @@ use crate::tile::{
     BlockCoeffs, Coeff, INTRA_MODE_CTX, InterInfo, InterMode, Quadrant, Superblock, partition_bits,
 };
 use crate::transform::{
-    TxType, dequant_and_inverse, dequant_and_inverse_typed, forward_and_quantize,
+    TxType, dequant_and_inverse_typed_wh, forward_and_quantize,
     forward_and_quantize_typed,
 };
 
@@ -1539,16 +1539,28 @@ impl Plane<'_> {
         let t = std::time::Instant::now();
         let levels =
             forward_and_quantize_typed(residual, side, 8, i32::from(base_q_idx), deadzone, tx_type);
-        let coded =
-            dequant_and_inverse_typed(&levels, side, 8, i32::from(base_q_idx), 0, 0, tx_type);
+        // lane-av1speed2: 60% of the transform units of an inter stream carry
+        // no coefficient at all, and the square entry point re-inflates that
+        // case into `side * side` zeros (one allocate-and-memset per trial)
+        // only for the sum below to add them to the prediction. The `_wh`
+        // entry hands back the empty all-zero marker instead, and a zero
+        // residual reconstructs to the prediction itself -- `clamp(p + 0)` is
+        // `p` for a `u8`, so the bytes are the same.
+        let coded = dequant_and_inverse_typed_wh(
+            &levels, side, side, 8, i32::from(base_q_idx), 0, 0, tx_type,
+        );
         #[cfg(test)]
         stage_add(2, t.elapsed());
 
-        let reconstruction: Vec<u8> = prediction
-            .iter()
-            .zip(&coded)
-            .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
-            .collect();
+        let reconstruction: Vec<u8> = if coded.is_empty() {
+            prediction.to_vec()
+        } else {
+            prediction
+                .iter()
+                .zip(&coded)
+                .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
+                .collect()
+        };
         let sse = self.block_sse(x, y, side, &reconstruction);
         // What the levels cost is priced through the same CDFs the tile writer
         // will code them with, so the search ranks modes -- and the partition
@@ -1626,14 +1638,28 @@ impl Plane<'_> {
         #[cfg(test)]
         let t = std::time::Instant::now();
         let levels = forward_and_quantize(residual, side, 8, i32::from(base_q_idx), deadzone);
-        let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
+        // The same all-zero shortcut [`Self::trial_typed`] takes.
+        let coded = dequant_and_inverse_typed_wh(
+            &levels,
+            side,
+            side,
+            8,
+            i32::from(base_q_idx),
+            0,
+            0,
+            TxType::DctDct,
+        );
         #[cfg(test)]
         stage_add(2, t.elapsed());
-        let reconstruction: Vec<u8> = prediction
-            .iter()
-            .zip(&coded)
-            .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
-            .collect();
+        let reconstruction: Vec<u8> = if coded.is_empty() {
+            prediction.to_vec()
+        } else {
+            prediction
+                .iter()
+                .zip(&coded)
+                .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
+                .collect()
+        };
         let sse = self.block_sse(x, y, side, &reconstruction);
         #[cfg(test)]
         let t = std::time::Instant::now();
@@ -11039,7 +11065,7 @@ mod tests {
 
             let t = Instant::now();
             for _ in 0..N {
-                std::hint::black_box(dequant_and_inverse(&levels, side, 8, 100));
+                std::hint::black_box(crate::transform::dequant_and_inverse(&levels, side, 8, 100));
             }
             let inverse_t = t.elapsed() / N;
 
