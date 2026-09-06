@@ -10,6 +10,7 @@
 //! off as they arrive.
 
 use std::cell::RefCell;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -3514,7 +3515,9 @@ fn write_block_planes(
         } else {
             usize::from(around[plane].above_coded) + usize::from(around[plane].left_coded)
         };
+        #[cfg(test)]
         let before = enc.tell();
+        #[cfg(test)]
         let q_ctx = cdfs.q_ctx;
         write_coeffs(
             enc,
@@ -3525,6 +3528,7 @@ fn write_block_planes(
             dc_sign_ctx(around[plane].dc_vote),
             Some(plane),
         );
+        #[cfg(test)]
         census_record(planes[plane], q_ctx, grid, f64::from(enc.tell() - before));
         ec_rng_trace(|| {
             format!(
@@ -3606,7 +3610,9 @@ fn write_luma_tus(
                 neighbours.luma_skip_ctx(tu_mi, tx / MI)
             };
             let around = neighbours.around_mi(tu_mi, tx)[0];
+            #[cfg(test)]
             let before = enc.tell();
+            #[cfg(test)]
             let q_ctx = cdfs.q_ctx;
             write_coeffs(
                 enc,
@@ -3617,6 +3623,7 @@ fn write_luma_tus(
                 dc_sign_ctx(around.dc_vote),
                 Some(0),
             );
+            #[cfg(test)]
             census_record(set, q_ctx, &unit, f64::from(enc.tell() - before));
             if n > 1 {
                 neighbours.record_mi_luma(tu_mi, tx, &unit);
@@ -4038,9 +4045,25 @@ thread_local! {
 /// Arms the tables [`coeff_bits`] prices against on this thread: the state
 /// this frame's tile writer starts from. `None` goes back to the per-q-context
 /// defaults (a key frame, whose writer really does start there).
+///
+/// OFF by default (`EC_AV1_PRICE_FRAME_CDFS=1`). It is the more accurate
+/// estimate by measurement -- the pricer census
+/// (`pricer_error_census_by_block_class`) goes from +7.6% to +4.8% over every
+/// transform block, and the one- and two-coefficient inter blocks the search
+/// lives on from +31.4%/+22.3% to +3.1%/+3.6% -- but the accuracy does not
+/// convert into ladder bytes on every clip: on the 640x384 gate it scores
+/// +78.8/+95.1/+54.5 vs libaom and +36.1/+56.4/+1.4 vs rav1e against the
+/// +79.9/+94.6/+54.5 and +37.3/+55.7/+1.1 the defaults score (film 1080p
+/// down 1.1, film 2160p up 0.5, screen flat), and on the native crops
+/// +18.0/+47.3/+60.7 and +0.7/+19.2/-7.3 against +18.9/+48.2/+59.3 and
+/// +1.5/+19.8/-10.0 (both film clips down against both references, screen up
+/// 1.4/2.7). Two clips better, one worse: it does not meet this lane's keep
+/// rule, so it ships as a knob rather than as the default.
 pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("EC_AV1_PRICE_FRAME_CDFS").as_deref() == Ok("1"));
     PRICING_BASE.with_borrow_mut(|slot| {
-        *slot = base.map(|c| Box::new((c.clone(), c.clone())));
+        *slot = base.filter(|_| on).map(|c| Box::new((c.clone(), c.clone())));
     });
 }
 
@@ -4055,27 +4078,33 @@ pub(crate) fn arm_pricing_cdfs(base: Option<&Cdfs>) {
 /// encode running beside it; a multi-tile, multi-threaded encode would
 /// therefore only census the tiles this thread wrote, which is every tile of
 /// the one-tile-one-thread encodes the gates print it from.
+#[cfg(test)]
 type CensusRows = BTreeMap<(String, usize), (u64, f64, f64)>;
+#[cfg(test)]
 thread_local! {
     static CENSUS: RefCell<Option<CensusRows>> = const { RefCell::new(None) };
 }
 
 /// Starts a census on this thread, discarding anything a previous one left.
+#[cfg(test)]
 pub(crate) fn pricer_census_on() {
     CENSUS.with_borrow_mut(|c| *c = Some(BTreeMap::new()));
 }
 
 /// Stops the census and hands back its rows: (set, non-zero bucket) ->
 /// (blocks, priced bits, written bits).
+#[cfg(test)]
 pub(crate) fn take_pricer_census() -> CensusRows {
     CENSUS.with_borrow_mut(|c| c.take()).unwrap_or_default()
 }
 
 /// The label of a non-zero bucket, for the tables the gates print.
+#[cfg(test)]
 pub(crate) fn census_bucket_label(bucket: usize) -> &'static str {
     ["0", "1", "2", "3-4", "5-8", "9-16", "17+"][bucket]
 }
 
+#[cfg(test)]
 fn census_record(set: TxbSet, q_ctx: usize, grid: &[i32], written: f64) {
     if CENSUS.with_borrow(|c| c.is_none()) {
         return;

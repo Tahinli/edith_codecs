@@ -3821,7 +3821,14 @@ fn code_square_inter(
             // compound block's residual is small enough that the four extra
             // per-unit txb_skip/eob symbols cost more ladder bytes than this
             // encoder's static-CDF estimate prices them at, so the local RD
-            // win does not convert. The flat trial stays.
+            // win does not convert. lane-av1txbits REBUILT it on top of a
+            // search that prices against the tables the frame is really
+            // written with (`tile::arm_pricing_cdfs`, the estimate error on
+            // these very blocks measured down from +31% to +3%) and measured
+            // it neutral-to-worse again: +78.8/+95.0/+54.5 and +36.5/+56.3/
+            // +1.4 against the +78.8/+95.1/+54.5 and +36.1/+56.4/+1.4 of the
+            // same build without it. The static-CDF estimate was NOT what
+            // held the compound var-tx trial back. The flat trial stays.
             let (levels, tx_depth, dcost) = if info.ref1.is_some() {
                 luma.commit(x, y, side, &luma_new);
                 (luma_new.levels.clone(), 0, 0.0)
@@ -6233,6 +6240,15 @@ fn search_inter_block(
     }
 
     let best = best.expect("the search offers at least the intra modes");
+    // lane-av1txbits BUILT the transform-depth search this path lacks -- a
+    // 32x32 single-reference winner offered `commit_inter_luma`'s four 16x16
+    // units against its flat trial, exactly as a 16x16 winner is -- and
+    // MEASURED it flat to slightly worse: +78.7/+95.1/+54.6 vs libaom and
+    // +36.1/+56.2/+1.8 vs rav1e, against the +78.8/+95.1/+54.5 and
+    // +36.1/+56.4/+1.4 this code scores, while the split fired on 40.2% of
+    // the film's inter blocks and 17.6% of the screen's. The same shape as
+    // the compound trial set below: a local RD win that does not convert into
+    // ladder bytes. The flat 32x32 transform stays.
     luma.commit(x, y, BLOCK, &best.luma);
     chroma[0].commit(x / 2, y / 2, BLOCK / 2, &best.u);
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
@@ -9470,13 +9486,12 @@ mod tests {
         // (compound share 8.8% -> 11.5%): a compound block carries a second
         // reference tree, a compound mode symbol and -- for the half-new modes
         // -- an MV residual, none of which the coefficient sum counts.
-        // lane-av1txbits: re-measured at +32.6% once the search started
-        // pricing against the tables the frame's writer really starts from
-        // (`arm_pricing_cdfs`) instead of the defaults -- the over-price the
-        // bound above catches collapsed to nothing, so the whole remaining
-        // gap is the non-coefficient syntax the sum leaves out.
+        // lane-av1txbits: under `EC_AV1_PRICE_FRAME_CDFS=1` this reads +32.6%
+        // instead -- pricing against the tables the frame's writer really
+        // starts from collapses the over-price above to nothing, so the whole
+        // remaining gap is the syntax the coefficient sum leaves out.
         assert!(
-            worst_under <= 0.40,
+            worst_under <= 0.32,
             "the writer spent {:.2}% more than the search priced -- more than \
              the mode/mv syntax outside the coefficient sum explains",
             worst_under * 100.0
