@@ -477,6 +477,13 @@ pub struct BlockCoeffs {
     /// at their defaults and unused, the same way a `Whole` [`Superblock`]'s
     /// per-quadrant fields are unused.
     pub eight: Option<Vec<BlockCoeffs>>,
+    /// How many times this block's luma transform is halved under
+    /// `TxMode::Select` (spec `tx_depth`, 0 = one transform over the whole
+    /// block). Read only by the writers a `tx_select` frame calls; a
+    /// `TxMode::Largest` frame codes no symbol and leaves this at zero.
+    /// `luma` then carries the whole block's levels in BLOCK coordinates,
+    /// which the writer slices per transform unit.
+    pub tx_depth: u8,
 }
 
 /// One inter mode [`sb_coeff_inter_frame_tile`]'s blocks may take (spec
@@ -543,6 +550,11 @@ const MI: usize = 4;
 struct Neighbour {
     /// Whether the plane's transform block carried a coefficient.
     coded: bool,
+    /// Its cumulative coefficient level (spec `cul_level`, clamped to 7) --
+    /// what the *luma* `txb_skip_ctx` of a transform unit smaller than its
+    /// own block reads (`get_txb_ctx_general`, decode.rs `luma_skip_ctx`),
+    /// where "coded or not" is not enough.
+    level: u8,
     /// The sign of its DC, absent when the DC itself is zero.
     dc: Option<bool>,
 }
@@ -640,6 +652,15 @@ struct Neighbours {
     above_skip: Vec<bool>,
     /// The same, down the left edge.
     left_skip: Vec<bool>,
+    /// The side, in pixels, of the transform last written in this 4x4
+    /// mode-info column -- the deblock `tx_grid` a key frame's
+    /// `get_tx_size_context` reads (decode.rs `tx_size_context`/`tx_px_at`),
+    /// which is what picks the CDF row of a `TxMode::Select` block's
+    /// `tx_depth` symbol.
+    above_tx: Vec<u8>,
+    /// The same, down the left edge (the transform's HEIGHT, `tx_h_px_at`;
+    /// every transform this writer codes is square, so one value serves).
+    left_tx: Vec<u8>,
     /// Whether the neighbour was coded inter, for the `is_inter` context.
     /// Unused by the key frame writers.
     above_inter: Vec<bool>,
@@ -688,6 +709,8 @@ impl Neighbours {
             left_skip: vec![false; rows * (SUB / MI)],
             above_inter: vec![false; cols * (SUB / MI)],
             left_inter: vec![false; rows * (SUB / MI)],
+            above_tx: vec![0; cols * (SUB / MI)],
+            left_tx: vec![0; rows * (SUB / MI)],
             mi_cols,
             mi_rows,
         }
@@ -701,6 +724,57 @@ impl Neighbours {
         self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
+        self.left_tx.iter_mut().for_each(|t| *t = 0);
+    }
+
+    /// `get_tx_size_context` (decode.rs [`crate::decode::tx_size_context`]):
+    /// whether the transform above is at least as wide as this block's own
+    /// largest transform, plus whether the one to the left is at least as
+    /// tall. A neighbour outside the tile contributes nothing.
+    fn tx_size_ctx(&self, (mi_r, mi_c): (usize, usize), max_tx: usize) -> usize {
+        usize::from(mi_r > 0 && usize::from(self.above_tx[mi_c]) >= max_tx)
+            + usize::from(mi_c > 0 && usize::from(self.left_tx[mi_r]) >= max_tx)
+    }
+
+    /// Publishes one block's resolved transform side over every 4x4 unit it
+    /// covers, the way the decoder's `fill_lf_grid` does at the end of every
+    /// block.
+    fn record_tx(&mut self, (mi_r, mi_c): (usize, usize), side: usize, tx_px: usize) {
+        for cell in 0..side / MI {
+            if mi_r + cell < self.left_tx.len() {
+                self.left_tx[mi_r + cell] = tx_px as u8;
+            }
+            if mi_c + cell < self.above_tx.len() {
+                self.above_tx[mi_c + cell] = tx_px as u8;
+            }
+        }
+    }
+
+    /// The luma `txb_skip_ctx` of a transform unit smaller than its own block
+    /// (decode.rs `Neighbours::luma_skip_ctx`): the above and left magnitude
+    /// tiers, each ORed over the unit's own span and clamped to 4.
+    fn luma_skip_ctx(&self, (mi_r, mi_c): (usize, usize), side_mi: usize) -> usize {
+        let mut top = 0u8;
+        let mut left = 0u8;
+        for cell in 0..side_mi {
+            top |= self.above[mi_c + cell][0].level;
+            left |= self.left[mi_r + cell][0].level;
+        }
+        crate::decode::SKIP_CONTEXTS[usize::from(top).min(4)][usize::from(left).min(4)]
+    }
+
+    /// Publishes ONE luma transform unit's coefficient context, the way the
+    /// decoder's `record_mi_luma` does between the units of a split block.
+    fn record_mi_luma(&mut self, (mi_r, mi_c): (usize, usize), tx_px: usize, grid: &[i32]) {
+        let state = neighbour_state(grid);
+        for cell in 0..tx_px / MI {
+            if mi_r + cell < self.mi_rows {
+                self.left[mi_r + cell][0] = state;
+            }
+            if mi_c + cell < self.mi_cols {
+                self.above[mi_c + cell][0] = state;
+            }
+        }
     }
 
     /// Writes one coded block into every 16x16 column and row it covers, and,
@@ -711,6 +785,22 @@ impl Neighbours {
     /// derived from the true `mi_cols`/`mi_rows`, not from this block's own
     /// side).
     fn record(&mut self, at: (usize, usize), side: usize, mode: usize, grids: &[Vec<i32>; 3]) {
+        self.record_planes(at, side, mode, grids, true);
+    }
+
+    /// [`Self::record`] with a switch for plane 0: a block whose luma was
+    /// written as several transform units published each unit's own context
+    /// as it went ([`Self::record_mi_luma`]), so the whole-block write here
+    /// would clobber what the next block reads (decode.rs
+    /// `record_split_luma`).
+    fn record_planes(
+        &mut self,
+        at: (usize, usize),
+        side: usize,
+        mode: usize,
+        grids: &[Vec<i32>; 3],
+        luma: bool,
+    ) {
         let (r, c) = at;
         for cell in 0..side / SUB {
             self.above_mode[c + cell] = mode;
@@ -718,7 +808,7 @@ impl Neighbours {
             self.above_side[c + cell] = side;
             self.left_side[r + cell] = side;
         }
-        self.record_mi((r * (SUB / MI), c * (SUB / MI)), side, grids);
+        self.record_mi_planes((r * (SUB / MI), c * (SUB / MI)), side, grids, luma);
     }
 
     /// The coefficient-context half of [`Self::record`], taking the block's
@@ -729,6 +819,17 @@ impl Neighbours {
     /// grid, so no resizing is needed to write into them at this
     /// finer-than-SUB granularity.
     fn record_mi(&mut self, at_mi: (usize, usize), side: usize, grids: &[Vec<i32>; 3]) {
+        self.record_mi_planes(at_mi, side, grids, true);
+    }
+
+    /// [`Self::record_mi`] with [`Self::record_planes`]'s plane-0 switch.
+    fn record_mi_planes(
+        &mut self,
+        at_mi: (usize, usize),
+        side: usize,
+        grids: &[Vec<i32>; 3],
+        luma: bool,
+    ) {
         let (mi_r, mi_c) = at_mi;
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         let side_mi = side / MI;
@@ -754,6 +855,8 @@ impl Neighbours {
             round_up_even(self.mi_cols),
         ];
         for cell in 0..side_mi {
+            let keep_left = self.left[mi_r + cell][0];
+            let keep_above = self.above[mi_c + cell][0];
             self.left[mi_r + cell] = std::array::from_fn(|plane| {
                 if cell < side_mi.min(bound_h[plane].saturating_sub(mi_r)) {
                     states[plane]
@@ -768,6 +871,10 @@ impl Neighbours {
                     Default::default()
                 }
             });
+            if !luma {
+                self.left[mi_r + cell][0] = keep_left;
+                self.above[mi_c + cell][0] = keep_above;
+            }
         }
     }
 
@@ -860,6 +967,25 @@ pub fn sb_coeff_key_frame_tile(
     mi_rows: u32,
     base_q_idx: u8,
     superblocks: &[Superblock],
+) -> Result<Vec<u8>> {
+    sb_coeff_key_frame_tile_tx(mi_cols, mi_rows, base_q_idx, superblocks, false)
+}
+
+/// [`sb_coeff_key_frame_tile`] for a frame header carrying
+/// `tx_mode == TxMode::Select` (`tx_select`): every block then codes a
+/// `tx_depth` symbol and, where that depth is nonzero, its luma residual as
+/// several transform units ([`write_luma_select`]). With `tx_select` false
+/// this writes exactly the stream it always did.
+///
+/// # Errors
+/// As [`sb_coeff_key_frame_tile`], plus a 64x64 block whose `tx_depth` is
+/// nonzero (not written yet).
+pub fn sb_coeff_key_frame_tile_tx(
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    superblocks: &[Superblock],
+    tx_select: bool,
 ) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
     let (cols, rows) = block_grid(mi_cols, mi_rows);
@@ -978,7 +1104,9 @@ pub fn sb_coeff_key_frame_tile(
                         // A 64x64 block is too big to be offered chroma from
                         // luma, so its chroma mode reads the table without it.
                         false,
-                    );
+                        tx_select,
+                        &scans,
+                    )?;
                     ec_rng_trace(|| {
                         format!(
                             "EC_TOK mi_row={} mi_col={} tell={}",
@@ -1056,7 +1184,9 @@ pub fn sb_coeff_key_frame_tile(
                                     &grids,
                                     [&scans[0], &scans[1], &scans[1]],
                                     true,
-                                );
+                                    tx_select,
+                                    &scans,
+                                )?;
                                 ec_rng_trace(|| {
                                     format!(
                                         "EC_TOK mi_row={} mi_col={} tell={}",
@@ -1149,7 +1279,9 @@ pub fn sb_coeff_key_frame_tile(
                                             &grids,
                                             [&scans[1], &scans[2], &scans[2]],
                                             true,
-                                        );
+                                            tx_select,
+                                            &scans,
+                                        )?;
                                         ec_rng_trace(|| {
                                             format!(
                                                 "EC_TOK mi_row={} mi_col={} tell={}",
@@ -1251,7 +1383,9 @@ pub fn sb_coeff_key_frame_tile(
                                             &grids,
                                             [&scans[2], &scans[3], &scans[3]],
                                             prev_leaf,
-                                        );
+                                            tx_select,
+                                            &scans,
+                                        )?;
                                         prev_leaf = Some((leaf_mi, leaf_mode));
                                         ec_rng_trace(|| {
                                             format!(
@@ -1345,7 +1479,13 @@ fn write_block(
     grids: &[Vec<i32>; 3],
     scans: [&Vec<u16>; 3],
     cfl: bool,
-) {
+    // The frame's `tx_mode == TxMode::Select`, and the block's own chosen
+    // depth: with it the luma residual goes through [`write_luma_select`]
+    // (one `tx_depth` symbol, then one transform unit per tile of the block)
+    // instead of the single whole-block transform below.
+    tx_select: bool,
+    all_scans: &[Vec<u16>; 4],
+) -> Result<()> {
     let (r, c) = at;
     let mode = write_intra_mode(
         enc,
@@ -1355,6 +1495,23 @@ fn write_block(
         neighbours.left_mode[r],
         cfl,
     );
+    let at_mi = (r * (SUB / MI), c * (SUB / MI));
+    let split = if tx_select {
+        let tx = write_luma_select(
+            enc,
+            cdfs,
+            neighbours,
+            at_mi,
+            side,
+            usize::from(block.tx_depth),
+            &grids[0],
+            mode,
+            all_scans,
+        )?;
+        tx < side
+    } else {
+        false
+    };
     write_block_planes(
         enc,
         cdfs,
@@ -1363,8 +1520,10 @@ fn write_block(
         &scans,
         &neighbours.around(at, side),
         mode,
+        tx_select,
     );
-    neighbours.record(at, side, mode, grids);
+    neighbours.record_planes(at, side, mode, grids, !split);
+    Ok(())
 }
 
 /// Writes one 8x8 leaf of a straddling 16x16 block (lane-av1-rect): its own
@@ -1386,7 +1545,9 @@ fn write_leaf8(
     grids: &[Vec<i32>; 3],
     scans: [&Vec<u16>; 3],
     prev_leaf: Option<((usize, usize), usize)>,
-) -> usize {
+    tx_select: bool,
+    all_scans: &[Vec<u16>; 4],
+) -> Result<usize> {
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
     let mut left_mode = neighbours.left_mode[r];
@@ -1410,6 +1571,22 @@ fn write_leaf8(
     // unchanged).
     let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, true);
     let planes = [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4];
+    let split = if tx_select {
+        let tx = write_luma_select(
+            enc,
+            cdfs,
+            neighbours,
+            leaf_mi,
+            8,
+            usize::from(block.tx_depth),
+            &grids[0],
+            mode,
+            all_scans,
+        )?;
+        tx < 8
+    } else {
+        false
+    };
     write_block_planes(
         enc,
         cdfs,
@@ -1418,9 +1595,10 @@ fn write_leaf8(
         &scans,
         &neighbours.around_mi(leaf_mi, 8),
         mode,
+        tx_select,
     );
-    neighbours.record_mi(leaf_mi, 8, grids);
-    mode
+    neighbours.record_mi_planes(leaf_mi, 8, grids, !split);
+    Ok(mode)
 }
 
 /// Writes the three transform blocks of one coded block, in the order a
@@ -1434,8 +1612,14 @@ fn write_block_planes(
     scans: &[&Vec<u16>; 3],
     around: &[Around; 3],
     mode: usize,
+    // A block whose luma was already written as several transform units
+    // ([`write_luma_select`]) has only its chroma planes left here.
+    skip_luma: bool,
 ) {
     for (plane, (grid, scan)) in grids.iter().zip(scans.iter()).enumerate() {
+        if plane == 0 && skip_luma {
+            continue;
+        }
         // Luma's transform covers its whole block, which fixes the all-zero
         // flag's context at zero; a chroma transform reads whether its
         // neighbours coded anything, on top of the offset the chroma tables
@@ -1464,11 +1648,114 @@ fn write_block_planes(
     }
 }
 
+/// Writes one intra block's luma residual under `TxMode::Select`: the
+/// `tx_depth` symbol (spec 5.11.16 `read_selected_tx_size`, off the size
+/// category's own CDF at [`Neighbours::tx_size_ctx`]'s row), then the
+/// `(side / tx)^2` transform units in raster order -- each predicted and
+/// coded against what the units before it already left behind, which is why
+/// every unit publishes its own coefficient context before the next one reads
+/// it (decode.rs `decode_block`'s multi-transform-unit branch).
+///
+/// `grid` is the block's levels in BLOCK coordinates (`side` by `side`) when
+/// the transform splits, and the single transform's own coefficient grid when
+/// it does not. Hands back the resolved transform side in pixels.
+#[allow(clippy::too_many_arguments)]
+fn write_luma_select(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    at_mi: (usize, usize),
+    side: usize,
+    depth: usize,
+    grid: &[i32],
+    mode: usize,
+    scans: &[Vec<u16>; 4],
+) -> Result<usize> {
+    let max_tx = side.min(64);
+    let ctx = neighbours.tx_size_ctx(at_mi, max_tx);
+    match max_tx {
+        8 => enc.symbol(depth, &mut cdfs.tx_size_cat0[ctx]),
+        16 => enc.symbol(depth, &mut cdfs.tx_size_cat1[ctx]),
+        32 => enc.symbol(depth, &mut cdfs.tx_size_cat2[ctx]),
+        64 => enc.symbol(depth, &mut cdfs.tx_size_cat3[ctx]),
+        _ => {
+            return Err(Error::unsupported(
+                "AV1 tile",
+                "a tx_depth symbol is only coded at 8/16/32/64",
+            ));
+        }
+    }
+    let tx = max_tx >> depth;
+    if depth > 0 && side > 32 {
+        // A 64x64 block's own levels reach the writer as the 32x32 corner a
+        // 64-point transform codes, not as a 64x64 block grid, so there is
+        // nothing to slice per unit here.
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a 64x64 block's split luma transform is not written yet",
+        ));
+    }
+    let coeff_side = tx.min(32);
+    let n = side / tx;
+    let set = match tx {
+        32 => TxbSet::Luma32,
+        16 => TxbSet::Luma16,
+        8 => TxbSet::Luma8,
+        4 => TxbSet::Luma4,
+        _ => TxbSet::Luma64,
+    };
+    let scan = match coeff_side {
+        32 => &scans[0],
+        16 => &scans[1],
+        8 => &scans[2],
+        _ => &scans[3],
+    };
+    let (mi_r, mi_c) = at_mi;
+    for tu_row in 0..n {
+        for tu_col in 0..n {
+            let tu_mi = (mi_r + tu_row * (tx / MI), mi_c + tu_col * (tx / MI));
+            let unit = if n == 1 {
+                grid.to_vec()
+            } else {
+                (0..tx)
+                    .flat_map(|row| {
+                        grid[(tu_row * tx + row) * side + tu_col * tx..][..tx].to_vec()
+                    })
+                    .collect()
+            };
+            // spec `get_txb_ctx_general`: a lone transform unit covering its
+            // whole block reads context 0, a smaller one the neighbour
+            // magnitude table.
+            let skip_ctx = if n == 1 {
+                0
+            } else {
+                neighbours.luma_skip_ctx(tu_mi, tx / MI)
+            };
+            let around = neighbours.around_mi(tu_mi, tx)[0];
+            write_coeffs(
+                enc,
+                &mut cdfs.txb(set, mode),
+                &unit,
+                scan,
+                skip_ctx,
+                dc_sign_ctx(around.dc_vote),
+                Some(0),
+            );
+            if n > 1 {
+                neighbours.record_mi_luma(tu_mi, tx, &unit);
+            }
+        }
+    }
+    neighbours.record_tx(at_mi, side, tx);
+    Ok(tx)
+}
+
 /// What a coded transform block leaves behind for the blocks that read it as a
 /// neighbour.
 fn neighbour_state(grid: &[i32]) -> Neighbour {
     Neighbour {
         coded: grid.iter().any(|&l| l != 0),
+        level: grid.iter().map(|l| l.unsigned_abs()).sum::<u32>().min(7) as u8,
         dc: (grid[0] != 0).then_some(grid[0] < 0),
     }
 }
@@ -2664,6 +2951,7 @@ pub fn sb_coeff_inter_frame_tile(
                         &[&scan32, &scan16, &scan16],
                         &neighbours.around(at, BLOCK),
                         mode_for_tx,
+                        false,
                     );
                     neighbours.record(at, BLOCK, mode_for_tx, &grids);
                 }
@@ -2849,6 +3137,7 @@ fn write_inter_frame_leaf(
             &[scan16, scan8, scan8],
             &neighbours.around(at, SUB),
             mode_for_tx,
+            false,
         );
         neighbours.record(at, SUB, mode_for_tx, &grids);
     }
@@ -3047,6 +3336,7 @@ fn write_inter_frame_leaf8(
             &[scan8, scan4, scan4],
             &neighbours.around_mi(leaf_mi, 8),
             mode_for_tx,
+            false,
         );
         neighbours.record_mi(leaf_mi, 8, &grids);
         neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter);

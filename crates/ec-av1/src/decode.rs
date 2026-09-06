@@ -6360,7 +6360,7 @@ fn neighbour_state(grid: &[i32]) -> Neighbour {
 /// spec `get_txb_ctx_general`'s `skip_contexts[top][left]` table (plane 0,
 /// transform unit smaller than the block it sits in): `top`/`left` are the
 /// above/left neighbours' magnitude tiers, each already clamped to 4.
-const SKIP_CONTEXTS: [[usize; 5]; 5] = [
+pub(crate) const SKIP_CONTEXTS: [[usize; 5]; 5] = [
     [1, 2, 2, 2, 3],
     [2, 4, 4, 4, 5],
     [2, 4, 4, 4, 5],
