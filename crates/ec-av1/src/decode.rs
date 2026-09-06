@@ -32775,6 +32775,11 @@ pub(crate) fn decode_inter_frame_tile(
     // inter frames coded Select by default (class: test asserts against a
     // stale header, second instance).
     tx_select: bool,
+    // The CDF state this frame's tile was WRITTEN from (`Encoded::start_cdfs`):
+    // an inter frame whose header leaves `disable_frame_end_update_cdf` off
+    // starts from what the previous frame stored, not from the defaults. Same
+    // class as `tx_select` above, third instance.
+    initial_cdfs: Option<Cdfs>,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -32795,7 +32800,7 @@ pub(crate) fn decode_inter_frame_tile(
         cdef,
         loop_filter,
         &LoopRestorationParams::default(),
-        None,
+        initial_cdfs,
         allow_high_precision_mv,
         force_integer_mv,
         NO_SIGN_BIAS,
@@ -35790,6 +35795,22 @@ mod tests {
         RefPix::ready(refs)
     }
 
+    /// [`last_only`] plus `GOLDEN_FRAME` (index 4 of the name-keyed array)
+    /// and `ALTREF_FRAME` (index 7, the frame two back, which the encoder
+    /// keeps in the slot the current frame refreshes): what a frame this
+    /// encoder writes needs, since its blocks may name any of the three.
+    fn last_golden_altref<'a>(
+        last: &'a Picture,
+        golden: &'a Picture,
+        altref: Option<&'a Picture>,
+    ) -> RefPix<'a> {
+        let mut refs: [Option<&Picture>; 8] = [None; 8];
+        refs[1] = Some(last);
+        refs[4] = Some(golden);
+        refs[7] = altref;
+        RefPix::ready(refs)
+    }
+
 
     /// lane-perf6 step 2: the CDEF kernel now reads a pre-gathered window and
     /// a pre-resolved damping shift instead of a bounds-testing closure and a
@@ -36929,6 +36950,7 @@ mod tests {
             false,
             false,
             false,
+            None,
             fctx,
         )
         .unwrap_err();
@@ -37316,7 +37338,11 @@ mod tests {
                 frame.base_q_idx,
                 width as u32,
                 height as u32,
-                &last_only(&reference),
+                &last_golden_altref(
+                    &reference,
+                    &encoded.frames[0].reconstruction,
+                    (i >= 2).then(|| &encoded.frames[i - 2].reconstruction),
+                ),
                 &frame.cdef,
                 &frame.loop_filter,
                 false,
@@ -37325,6 +37351,7 @@ mod tests {
                 false,
                 false,
                 frame.tx_select,
+                Some(frame.start_cdfs.0.clone()),
                 fctx,
             )
             .unwrap();
@@ -37627,7 +37654,11 @@ mod tests {
                 frame.base_q_idx,
                 coded_w,
                 coded_h,
-                &last_only(&reference),
+                &last_golden_altref(
+                    &reference,
+                    &encoded.frames[0].reconstruction,
+                    (i >= 2).then(|| &encoded.frames[i - 2].reconstruction),
+                ),
                 &frame.cdef,
                 &frame.loop_filter,
                 false,
@@ -37636,6 +37667,7 @@ mod tests {
                 false,
                 false,
                 frame.tx_select,
+                Some(frame.start_cdfs.0.clone()),
                 fctx,
             )
             .unwrap();
