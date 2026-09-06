@@ -46,15 +46,16 @@ use crate::range::RangeEncoder;
 /// TF-boost sweep knobs (lane opustr2): `k * (tf_estimate - off) * target`,
 /// optionally applied only on frames the transient analysis flagged (other
 /// frames keep the shipped k=1). Read once from the environment;
-/// `EC_OPUS_TF_K` / `EC_OPUS_TF_OFF` / `EC_OPUS_TF_GATE=transient`.
-fn tf_boost_params() -> (f32, f32, bool) {
-    static P: std::sync::OnceLock<(f32, f32, bool)> = std::sync::OnceLock::new();
+/// `EC_OPUS_TF_K` / `EC_OPUS_TF_OFF` / `EC_OPUS_TF_GATE=transient` /
+/// `EC_OPUS_TF_THRESH` (k applies only from that `tf_estimate` up).
+fn tf_boost_params() -> (f32, f32, bool, f32) {
+    static P: std::sync::OnceLock<(f32, f32, bool, f32)> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
         let f = |name: &str, dflt: f32| {
             std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt)
         };
         let gate = std::env::var("EC_OPUS_TF_GATE").map(|v| v == "transient").unwrap_or(false);
-        (f("EC_OPUS_TF_K", 1.0), f("EC_OPUS_TF_OFF", 0.044), gate)
+        (f("EC_OPUS_TF_K", 1.0), f("EC_OPUS_TF_OFF", 0.044), gate, f("EC_OPUS_TF_THRESH", 0.0))
     })
 }
 
@@ -920,8 +921,9 @@ impl CeltEncoder {
             // the defaults (k=1, off=.044, gate=all) are the shipped point and
             // reproduce the line above byte for byte.
             {
-                let (k, off, gate_transient) = tf_boost_params();
-                let k_eff = if !gate_transient || is_transient { k } else { 1.0 };
+                let (k, off, gate_transient, thresh) = tf_boost_params();
+                let fires = (!gate_transient || is_transient) && tf_estimate >= thresh;
+                let k_eff = if fires { k } else { 1.0 };
                 target += (k_eff * (tf_estimate - off) * target as f32) as i32;
             }
             // floor depth cap (C:1683-1695): SHR32/MULT16_32_Q15 are identity.
