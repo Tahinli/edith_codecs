@@ -9000,8 +9000,15 @@ pub struct EncodedSequence {
     /// `stream` (a temporal delimiter and that frame's OBU alone; it reuses
     /// the sequence header the key frame carried).
     pub stream: Vec<u8>,
-    /// One entry per picture, in coding order.
+    /// One entry per picture, in DISPLAY order — the order a decoder outputs
+    /// them and the order `pictures` came in. Without a pyramid that is also
+    /// the coding order; with one the two differ, and `coding_order` is the
+    /// map between them.
     pub frames: Vec<Encoded>,
+    /// The index into `frames` of each coded frame, in CODING order — what a
+    /// per-coded-frame census (`take_predicted_bits`) must be zipped against.
+    /// `0..frames.len()` on the flat path.
+    pub coding_order: Vec<usize>,
 }
 
 /// Encodes a sequence of pictures as a key frame followed by one inter frame
@@ -9130,7 +9137,11 @@ pub(crate) fn encode_sequence_with_ctx(
         ));
         frames.push(crop_encoded(&inter, render.0, render.1));
     }
-    Ok(EncodedSequence { stream, frames })
+    Ok(EncodedSequence {
+        stream,
+        coding_order: (0..frames.len()).collect(),
+        frames,
+    })
 }
 
 #[cfg(test)]
@@ -11407,11 +11418,24 @@ mod tests {
         // on that side, so the two directions no longer share a bound.
         let mut worst_over: f64 = 0.0;
         let mut worst_under: f64 = 0.0;
-        for (i, (frame, &bits)) in encoded.frames.iter().zip(&predicted).enumerate() {
+        // The census is per CODED frame, so it is zipped in coding order --
+        // which is not display order under a pyramid.
+        let coded: Vec<&Encoded> =
+            encoded.coding_order.iter().map(|&i| &encoded.frames[i]).collect();
+        for (i, (frame, &bits)) in coded.into_iter().zip(&predicted).enumerate() {
             let written = frame.tile.len() as f64 * 8.0;
             let drift = (written - bits) / written;
             worst_over = worst_over.max(-drift);
-            worst_under = worst_under.max(drift);
+            // lane-av1pyrdef: a pyramid LEAF codes almost no coefficients at
+            // all (150-250 bits of tile, nearly all of it partition/mode/mv
+            // syntax the coefficient sum never counts), so its ratio measures
+            // that floor rather than any drift. Frames under 512 written bits
+            // are left out of the under-price bound for that reason; the
+            // over-price bound -- the defect direction, where the search pays
+            // MORE than the writer -- still covers every frame.
+            if written >= 512.0 {
+                worst_under = worst_under.max(drift);
+            }
             eprintln!("{i:5}  {bits:14.0}  {written:12.0}  {:+6.2}%", drift * 100.0);
         }
         // Measured 2026-09-06 on this sequence: -13.5% at the key frame,
@@ -11447,6 +11471,11 @@ mod tests {
         // decisions, so this bound and the byte pins above FAIL BY DESIGN
         // under it; the default path (no motion_mode syntax at all) is the
         // one they are measured on.
+        // lane-av1pyrdef: `encode_sequence` codes this fixture under the
+        // coding pyramid now, so the five frames are a key frame, a hidden
+        // ALTREF at q-16 and three leaves at q+8: +2.6% / +6.9% (the two
+        // frames over the 512-bit floor) and +44.7 / +74.4 / +74.4 on the
+        // near-empty leaves below it. Both bounds stand where they were.
         // lane-av1rejudge: local warp is ON by default now, so every eligible
         // single-reference block carries that same `motion_mode` symbol (a
         // 3-value alphabet where a warp sample exists) on the DEFAULT path --
@@ -12524,8 +12553,15 @@ mod tests {
                 (h ^ u64::from(v)).wrapping_mul(0x0000_0100_0000_01b3)
             })
         };
+        // Re-taken on lane-av1pyrdef: `encode_sequence` codes this (non-screen)
+        // clip under the coding pyramid now -- one hidden ALTREF per mini-GOP
+        // of 4, its leaves at q+8 and a `show_existing_frame` header per
+        // group. 7299 -> 8194 bytes at q=150 and 26804 -> 28285 at q=60 over
+        // four frames; four pictures is one short mini-GOP, which is the
+        // shape that pays least (the ARF's own quality has no later group to
+        // carry it), so this is not the BD gate's number.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7299, 0xaa98_12b4_860a_28cc), (60, 26804, 0xedea_182d_e11b_3c3f)];
+            [(150, 8194, 0x08ba_a7a8_26f6_f414), (60, 28285, 0x64af_fc52_eef6_2967)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(

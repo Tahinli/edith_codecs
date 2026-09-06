@@ -1016,11 +1016,17 @@ impl Av1Encoder {
             stream.extend_from_slice(&packet.data);
         }
         let mut collected = encoder.collected.take().expect("collecting");
+        // Every source picture is coded exactly once, so a frame's display
+        // order IS its index once the list is sorted by it.
+        let coding_order: Vec<usize> =
+            collected.iter().map(|(order, _)| *order as usize).collect();
         collected.sort_by_key(|(order, _)| *order);
-        Ok(crate::encode::EncodedSequence {
-            stream,
-            frames: collected.into_iter().map(|(_, encoded)| encoded).collect(),
-        })
+        let frames: Vec<Encoded> = collected.into_iter().map(|(_, encoded)| encoded).collect();
+        assert!(
+            coding_order.iter().all(|&i| i < frames.len()),
+            "a coded frame's display position is outside the sequence"
+        );
+        Ok(crate::encode::EncodedSequence { stream, frames, coding_order })
     }
 
     /// Stamps a packet with its display and coding positions and advances the
