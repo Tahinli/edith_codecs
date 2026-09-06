@@ -2266,10 +2266,19 @@ fn write_coeffs(
         ec_rng_trace(|| format!("EC_PLANE plane={plane} tell_before={}", enc.tell()));
     }
     let side = coding.side;
-    let eob = scan
-        .iter()
-        .rposition(|&pos| grid[pos as usize] != 0)
-        .map_or(0, |i| i + 1);
+    // The scan-order search reads the grid in scan order, one dependent load
+    // per position, and an all-zero block makes it walk every one of them --
+    // which the pricer does for candidate after candidate. A straight-line
+    // pass settles that case first: it vectorises, and a block that codes
+    // anything at all almost always codes its DC, so it stops at the first
+    // element.
+    let eob = if grid.iter().all(|&level| level == 0) {
+        0
+    } else {
+        scan.iter()
+            .rposition(|&pos| grid[pos as usize] != 0)
+            .map_or(0, |i| i + 1)
+    };
     enc.symbol(usize::from(eob == 0), &mut coding.txb_skip[skip_ctx]);
     if plane.is_some() {
         ec_rng_trace(|| {
