@@ -19915,6 +19915,10 @@ fn replay_inner(
     REPLAY.with_borrow_mut(|slot| {
         let r = slot.as_mut()?;
         let hit = matches!(&r.deblocked, Some((lf, ..)) if lf == loop_filter);
+        // Set when the working planes ARE the deblocked planes (see below):
+        // they go into the cache at the end, and the picture is cropped out
+        // of them rather than taking their buffers.
+        let mut share = false;
         let cpt = crate::par::timer(crate::par::S_COPY);
         let (mut y, mut u, mut v) = if hit {
             let (deblocked, scratch) = (&r.deblocked, &mut r.scratch);
@@ -19942,9 +19946,23 @@ fn replay_inner(
                 r.frame_height,
                 fctx,
             );
-            let scratch = &mut r.scratch;
-            r.deblocked =
-                Some((*loop_filter, pooled(&y, scratch), pooled(&u, scratch), pooled(&v, scratch)));
+            // lane-av1cap2: an all-zero-strength CDEF writes no sample at
+            // all ([`cdef_all_zero`]'s own early return), so THESE planes
+            // are already this candidate's output -- they become the
+            // deblock cache at the end instead of being copied into it
+            // here, which is three ~6 MB copies less per candidate that
+            // moves the levels (the whole deblocking half of the search:
+            // its CDEF strengths are still (0,0)).
+            share = cdef_all_zero(cdef);
+            if !share {
+                let scratch = &mut r.scratch;
+                r.deblocked = Some((
+                    *loop_filter,
+                    pooled(&y, scratch),
+                    pooled(&u, scratch),
+                    pooled(&v, scratch),
+                ));
+            }
             (y, u, v)
         };
         drop(cpt);
@@ -19969,7 +19987,13 @@ fn replay_inner(
             // post-CDEF stands in for post-deblock, as the capture decode
             // had it); the FILTER this frame ends up applying reads the
             // real post-deblock rows, which is what the decoder does.
-            let snapshot = r.deblocked.as_ref().map(|(_, dy, ..)| plane_snapshot(dy, 0));
+            let snapshot = if share {
+                // Nothing filtered these planes after the deblock, so they
+                // are the post-deblock picture themselves.
+                Some(plane_snapshot(&y, 0))
+            } else {
+                r.deblocked.as_ref().map(|(_, dy, ..)| plane_snapshot(dy, 0))
+            };
             let scratch = &mut r.scratch;
             r.final_luma = snapshot.map(|d| (pooled(&y, scratch), d));
         }
@@ -19993,6 +20017,17 @@ fn replay_inner(
         let (fw, fh) = (r.frame_width, r.frame_height);
         if fw == r.width && fh == r.height {
             fctx.last_frame_wide_margin.with(|m| *m.borrow_mut() = None);
+            if share {
+                let picture = Picture {
+                    width: r.width,
+                    height: r.height,
+                    y: y.data.to_vec(),
+                    u: u.data.to_vec(),
+                    v: v.data.to_vec(),
+                };
+                r.deblocked = Some((*loop_filter, y, u, v));
+                return Some((picture, stages));
+            }
             return Some((
                 Picture {
                     width: r.width,
@@ -20028,10 +20063,16 @@ fn replay_inner(
             u: crop(&u, fw.div_ceil(2), fh.div_ceil(2)),
             v: crop(&v, fw.div_ceil(2), fh.div_ceil(2)),
         };
-        // The working planes outlive the crop, so they go back to the pool.
-        for plane in [y, u, v] {
-            if r.scratch.len() < 6 {
-                r.scratch.push(plane.data.into_owned());
+        // The working planes outlive the crop: either they ARE the
+        // deblocked planes this candidate's successors reuse, or they go
+        // back to the pool.
+        if share {
+            r.deblocked = Some((*loop_filter, y, u, v));
+        } else {
+            for plane in [y, u, v] {
+                if r.scratch.len() < 6 {
+                    r.scratch.push(plane.data.into_owned());
+                }
             }
         }
         Some((out, stages))
