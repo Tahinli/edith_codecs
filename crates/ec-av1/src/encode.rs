@@ -3724,7 +3724,7 @@ pub(crate) fn flat_order_hints(order_hint: u32, key_hint: u32, has_altref: bool)
 /// `EC_AV1_COMPOUND=1` arms it in a test build (which is what the BD gate
 /// runs as), and every block still codes SINGLE, so the only cost is one
 /// `comp_mode` symbol per inter block.
-const REFERENCE_SELECT: bool = false;
+const REFERENCE_SELECT: bool = true;
 
 /// [`REFERENCE_SELECT`], with the test-build environment override.
 pub(crate) fn reference_select() -> bool {
@@ -8294,7 +8294,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7444, 0x76eb980832d719f1), (60, 27692, 0x8c88f7e73455d439)];
+            [(150, 7209, 0xacdd_6952_78c1_49f2), (60, 27353, 0x9be8_7898_f08d_3b77)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
