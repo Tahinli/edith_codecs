@@ -32633,7 +32633,13 @@ pub(crate) fn decode_inter_frame_tile(
     force_integer_mv: bool,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
-    reference_select: bool, fctx: &crate::decode::FrameCtx,
+    reference_select: bool,
+    // This frame header's `tx_mode == TxMode::Select`: `Encoded::tx_select`.
+    // Hard-coding `false` here desynced at the first `tx_depth` symbol once
+    // inter frames coded Select by default (class: test asserts against a
+    // stale header, second instance).
+    tx_select: bool,
+    fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
         mi_col_starts: vec![0, mi_cols],
@@ -32671,9 +32677,7 @@ pub(crate) fn decode_inter_frame_tile(
         false,
         [0; 2],
         true,
-        // `tx_select`: this raw entry point decodes this crate's own encoder's
-        // streams, which always write `TxMode::Largest`.
-        false,
+        tx_select,
         false,
         false,
         false,
@@ -36764,7 +36768,9 @@ mod tests {
             false,
             Some(mc::InterpFilterKind::Regular),
             false,
-            false, fctx,
+            false,
+            false,
+            fctx,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -37158,7 +37164,9 @@ mod tests {
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
-                false, fctx,
+                false,
+                frame.tx_select,
+                fctx,
             )
             .unwrap();
             assert_eq!(
@@ -37467,7 +37475,9 @@ mod tests {
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
-                false, fctx,
+                false,
+                frame.tx_select,
+                fctx,
             )
             .unwrap();
             assert_eq!(decoded.y, ffmpeg_frames[i].y, "frame {i} luma vs ffmpeg");
