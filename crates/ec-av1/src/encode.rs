@@ -9718,10 +9718,25 @@ mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Picture> {
+        clip_frames_vf(clip, skip, &format!("scale={width}:{height}"), width, height, frames)
+    }
+
+    /// [`clip_frames`] with the filter chain spelled out, so a caller can ask
+    /// for a native-resolution CROP instead of a downscale (the downscale is
+    /// what destroys a screen capture's exact repeats -- class
+    /// `gate-recipe-confound`). `width`/`height` must be what `vf` produces.
+    fn clip_frames_vf(
+        clip: &str,
+        skip: &str,
+        vf: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Picture> {
         let out = Command::new("ffmpeg")
             .args(["-v", "error", "-ss", skip, "-i", clip])
             .args(["-frames:v", &frames.to_string()])
-            .args(["-vf", &format!("scale={width}:{height}")])
+            .args(["-vf", vf])
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
             .output()
             .expect("ffmpeg failed to run");
@@ -10710,6 +10725,173 @@ mod tests {
                     .map(|(p, b)| format!("{p:.2} dB/{:.0} B", 10f64.powf(*b)))
                     .collect::<Vec<_>>()
                     .join(", "),
+            );
+        }
+    }
+    /// The video stream's coded size, from ffprobe.
+    fn probe_dims(clip: &str) -> Option<(usize, usize)> {
+        let out = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=width,height", "-of", "csv=p=0"])
+            .arg(clip)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut f = text.trim().split(',');
+        Some((f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?))
+    }
+
+    /// The NATIVE-resolution screen arm of the BD gate. The default gate
+    /// downscales the OBS capture to 640x384, which destroys exactly the
+    /// pixel-identical 16x16 repeats intrabc and (part of) the palette exist
+    /// for (class `gate-recipe-confound`), so every screen-tool decision taken
+    /// on that recipe is taken on content the tool cannot serve. This arm
+    /// crops -- never scales -- a superblock-aligned window out of the middle
+    /// of the capture at its own resolution (at most 1920x1024, so the wall
+    /// stays in the minutes) and runs the same 12-frame, four-quantizer
+    /// ladder against libaom `cpu-used 6` and rav1e `speed=6`, one tile, one
+    /// thread, with the same three-way (encoder / ffmpeg / our decoder)
+    /// sample-exactness assertion `our_ladder` makes.
+    ///
+    /// It is its own `--ignored` test so the default gate's wall does not
+    /// grow. Every variant is an environment knob, and each of those is a
+    /// `OnceLock` read once per process, so a variant is a separate run:
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         bd_rate_screen_native --nocapture           # baseline
+    ///     EC_AV1_INTRABC=1 ... same command                # intra block copy
+    ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
+    ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
+    ///     EC_AV1_NATIVE_FILM=1 ... same command            # + a film crop row
+    #[test]
+    #[ignore = "the native-resolution screen BD arm: minutes per row, needs ffmpeg"]
+    fn bd_rate_screen_native() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP bd_rate_screen_native: no ffmpeg");
+            return;
+        }
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut clips: Vec<(String, String)> = Vec::new();
+        match std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) {
+            Ok(manifest) => match manifest
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split('\t').next())
+                .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+            {
+                Some(p) => clips.push((
+                    format!("screen capture ({})", p.rsplit('/').next().unwrap_or(p)),
+                    p.to_string(),
+                )),
+                None => eprintln!("SKIP screen capture: no OBS recording in the manifest exists"),
+            },
+            Err(e) => eprintln!("SKIP bd_rate_screen_native: no real-library manifest ({e})"),
+        }
+        // The film crop is an extra row, not a default-moving measurement.
+        if std::env::var("EC_AV1_NATIVE_FILM").ok().as_deref() == Some("1") {
+            let path = fixtures.join("video").join("h264-1080p-23.976-8bit.mp4");
+            if path.exists() {
+                clips.push((
+                    "film 1080p (native crop)".to_string(),
+                    path.to_str().unwrap().to_string(),
+                ));
+            }
+        }
+        if clips.is_empty() {
+            eprintln!("SKIP bd_rate_screen_native: no clip");
+            return;
+        }
+
+        let frames = 12usize;
+        let aom_points: Vec<Vec<String>> = [5, 20, 35, 45]
+            .iter()
+            .map(|q| {
+                ["-cpu-used", "6", "-b:v", "0", "-crf", &q.to_string()]
+                    .map(String::from)
+                    .to_vec()
+            })
+            .collect();
+        let rav1e_points: Vec<Vec<String>> = [50, 100, 150, 200]
+            .iter()
+            .map(|q| {
+                vec![
+                    "-rav1e-params".to_string(),
+                    format!("speed=6:quantizer={q}:tile_cols=1:tile_rows=1:threads=1"),
+                ]
+            })
+            .collect();
+        println!(
+            "\nnative crop, {frames} frames, gop={frames}; tiles {:?}, tile threads {}, \
+             intrabc {}, palette maxcolors {}",
+            armed_tiles(),
+            crate::par::tile_threads(),
+            intrabc_enabled(),
+            palette_max_colors(),
+        );
+        println!("| clip | size | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e |");
+        println!("|---|---|---|---|---|---|");
+        for (name, path) in &clips {
+            let fctx = &crate::decode::FrameCtx::new();
+            let Some((nw, nh)) = probe_dims(path) else {
+                eprintln!("SKIP {name}: ffprobe gave no size");
+                continue;
+            };
+            // A whole number of 128-wide superblocks, at most 1920x1024, out
+            // of the middle of the frame; the offsets stay even for 4:2:0.
+            let cw = nw.min(1920) / 128 * 128;
+            let ch = nh.min(1024) / 128 * 128;
+            assert!(cw >= 128 && ch >= 128, "{name}: {nw}x{nh} is smaller than a superblock");
+            let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
+            let source = clip_frames_vf(
+                path,
+                "0",
+                &format!("crop={cw}:{ch}:{x}:{y}"),
+                cw,
+                ch,
+                frames,
+            );
+            SCREEN_FRAMES.iter().for_each(|c| {
+                c.store(0, std::sync::atomic::Ordering::Relaxed);
+            });
+            let _ = crate::tile::take_palette_hits();
+            let _ = crate::tile::take_palette_uv_hits();
+            let _ = crate::tile::take_intrabc_hits();
+            let _ = take_intrabc_search();
+            let (ours, ours_wall) = our_ladder(name, &source, cw, ch, fctx);
+            // gate-blind-to-feature: what the screen tools actually did at
+            // native resolution, over this clip's four encodes.
+            let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
+            let screen_off = SCREEN_FRAMES[0].load(std::sync::atomic::Ordering::Relaxed);
+            let palette = crate::tile::take_palette_hits();
+            let palette_uv = crate::tile::take_palette_uv_hits();
+            let ibc = crate::tile::take_intrabc_hits();
+            let search = take_intrabc_search();
+            eprintln!(
+                "{name}: screen frames on={screen_on} off={screen_off} ({:.1}% on); \
+                 palette blocks luma {} chroma {}; intrabc blocks {} (searched {} / valid {} / \
+                 won {})",
+                100.0 * screen_on as f64 / (screen_on + screen_off).max(1) as f64,
+                palette[0],
+                palette_uv[0],
+                ibc[0],
+                search[0],
+                search[1],
+                search[2],
+            );
+            let (aom, aom_wall) = external_ladder(&source, cw, ch, "libaom-av1", &aom_points);
+            let (rav1e, rav1e_wall) = external_ladder(&source, cw, ch, "librav1e", &rav1e_points);
+            assert_monotone(&format!("{name}: ours"), &ours);
+            assert_monotone(&format!("{name}: libaom"), &aom);
+            assert_monotone(&format!("{name}: rav1e"), &rav1e);
+            let points = ours
+                .iter()
+                .map(|(p, b)| format!("{p:.2} dB/{:.0} B", 10f64.powf(*b)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "| {name} | {cw}x{ch} | {points} | {:+.1}% | {:+.1}% | {ours_wall:.1}s:{aom_wall:.1}s:{rav1e_wall:.1}s |",
+                bd_rate(&aom, &ours) * 100.0,
+                bd_rate(&rav1e, &ours) * 100.0,
             );
         }
     }
