@@ -4859,6 +4859,7 @@ fn mode_bits(above_mode: u8, left_mode: u8) -> [f64; 13] {
 }
 
 /// What the luma mode search picks between, and under what terms.
+#[derive(Clone, Copy)]
 struct Search<'a> {
     /// This frame's `allow_screen_content_tools` ([`screen_content`]): the
     /// luma search then offers a palette candidate beside the intra modes.
@@ -7293,6 +7294,161 @@ fn search_inter_block(
     )
 }
 
+/// lane-av1tpl: the strength `k` of the temporal lambda weighting
+/// ([`tpl_sb_factors`]). 0 keeps every block at the frame's own lambda, which
+/// is what every measurement before this lane was taken on. Swept by
+/// `EC_AV1_TPL=<k>`.
+///
+/// SWEPT on lane-av1tpl at the native gate (1920x1024, 12 frames, BD-rate vs
+/// libaom `cpu-used 6` / rav1e `speed 6`); `k=0` reproduces the pre-lane
+/// baseline exactly, which is the control the rest of the table is read
+/// against:
+///
+/// | k | film 1080p | film 2160p | screen |
+/// |---|---|---|---|
+/// | 0 | +16.2/-1.1 | +46.6/+18.8 | +51.3/-14.4 |
+/// | 0.25 | +16.4/-0.7 | +46.6/+18.8 | +51.2/-14.4 |
+/// | **0.5** | **+15.9/-1.3** | **+46.5/+18.7** | **+51.2/-14.4** |
+/// | 1 | +16.2/-0.9 | +46.6/+18.8 | +51.2/-14.4 |
+/// | 2 | +16.5/-0.7 | +46.7/+19.0 | +51.1/-14.4 |
+///
+/// 0.5 is the only arm that is at least flat on every row and down on five of
+/// the six columns, so it ships as the default. The lookahead pass that feeds
+/// it costs 1.5 ms per 1920x1024 frame against a ~0.8 s encode (0.2%).
+const TPL_STRENGTH: f64 = 0.5;
+
+fn tpl_strength() -> f64 {
+    std::env::var("EC_AV1_TPL")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|k| k.is_finite() && *k >= 0.0)
+        .unwrap_or(TPL_STRENGTH)
+}
+
+/// Nanoseconds the lookahead pass ([`tpl_reference_map`]) has spent this
+/// process, so the gate can price it against the encode it rides on.
+static TPL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How much of THIS frame the next one will predict from, per 16x16 cell: one
+/// coarse full-pel motion pass of the next SOURCE frame against this one
+/// (libaom's `tpl` lookahead in its cheapest possible shape -- no transform,
+/// no propagation chain, just referenced area). A cell's value is the area of
+/// it that the next frame's blocks land on, in units of its own area, so 1.0
+/// is "referenced exactly once".
+///
+/// Deterministic: integer SADs, a fixed 3-step pattern seeded at zero and at
+/// the left/above winners, first-best tie-break. The map is built once on the
+/// frame's own thread and read-only afterwards, so it cannot make a tile's
+/// bytes depend on the thread count.
+fn tpl_reference_map(cur: &[u8], next: &[u8], width: usize, height: usize) -> Vec<f64> {
+    let start = std::time::Instant::now();
+    let (cells_x, cells_y) = (width / 16, height / 16);
+    let mut area = vec![0.0f64; cells_x * cells_y];
+    // SAD of the next frame's 16x16 block at (bx, by) against this frame at
+    // that block displaced by (mx, my); a displacement that leaves the frame
+    // is not a candidate at all.
+    let sad = |bx: usize, by: usize, (mx, my): (i32, i32)| -> u32 {
+        let (sx, sy) = (bx as i32 + mx, by as i32 + my);
+        if sx < 0 || sy < 0 || sx as usize + 16 > width || sy as usize + 16 > height {
+            return u32::MAX;
+        }
+        let (sx, sy) = (sx as usize, sy as usize);
+        let mut sum = 0u32;
+        for r in 0..16 {
+            let a = &next[(by + r) * width + bx..][..16];
+            let b = &cur[(sy + r) * width + sx..][..16];
+            sum += a.iter().zip(b).map(|(&p, &q)| u32::from(p.abs_diff(q))).sum::<u32>();
+        }
+        sum
+    };
+    let mut above = vec![(0i32, 0i32); cells_x];
+    for cy in 0..cells_y {
+        let mut left = (0i32, 0i32);
+        for cx in 0..cells_x {
+            let (bx, by) = (cx * 16, cy * 16);
+            let mut best = (sad(bx, by, (0, 0)), (0i32, 0i32));
+            for cand in [left, above[cx]] {
+                if cand != (0, 0) {
+                    let s = sad(bx, by, cand);
+                    if s < best.0 {
+                        best = (s, cand);
+                    }
+                }
+            }
+            for step in [8i32, 4, 2, 1] {
+                let centre = best.1;
+                for (dx, dy) in [(step, 0), (-step, 0), (0, step), (0, -step)] {
+                    let mv = (centre.0 + dx, centre.1 + dy);
+                    if mv.0.abs() > 32 || mv.1.abs() > 32 {
+                        continue;
+                    }
+                    let s = sad(bx, by, mv);
+                    if s < best.0 {
+                        best = (s, mv);
+                    }
+                }
+            }
+            let (mv, _) = (best.1, best.0);
+            left = mv;
+            above[cx] = mv;
+            // The 16x16 window of THIS frame that block referenced, spread
+            // over the (at most four) cells it overlaps.
+            let (x0, y0) = ((bx as i32 + mv.0) as usize, (by as i32 + mv.1) as usize);
+            for ci in x0 / 16..=((x0 + 15) / 16).min(cells_x - 1) {
+                let ox = (x0 + 16).min(ci * 16 + 16) - x0.max(ci * 16);
+                for ri in y0 / 16..=((y0 + 15) / 16).min(cells_y - 1) {
+                    let oy = (y0 + 16).min(ri * 16 + 16) - y0.max(ri * 16);
+                    area[ri * cells_x + ci] += (ox * oy) as f64 / 256.0;
+                }
+            }
+        }
+    }
+    TPL_NANOS.fetch_add(
+        start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    area
+}
+
+/// [`tpl_reference_map`]'s per-cell referenced-ness turned into one lambda
+/// factor per 64x64 superblock: `f = (1 + k) / (1 + k * w_rel)`, where
+/// `w_rel` is the superblock's mean referenced-ness over the FRAME's mean.
+/// Decreasing in referenced-ness (a block the next frame leans on is coded
+/// more distortion-averse) and 1.0 at the frame's own mean, so the frame's
+/// total lambda scale is only redistributed, never moved -- a global move is
+/// the thing lane-av1lambda already measured inert.
+fn tpl_sb_factors(map: &[f64], cells_x: usize, cells_y: usize, k: f64) -> Vec<f64> {
+    let (sb_cols, sb_rows) = (cells_x / 4, cells_y / 4);
+    let mean = (map.iter().sum::<f64>() / map.len().max(1) as f64).max(1e-6);
+    let mut out = Vec::with_capacity(sb_cols * sb_rows);
+    for sr in 0..sb_rows {
+        for sc in 0..sb_cols {
+            let mut sum = 0.0;
+            for r in 0..4 {
+                for c in 0..4 {
+                    sum += map[(sr * 4 + r) * cells_x + sc * 4 + c];
+                }
+            }
+            let w_rel = sum / 16.0 / mean;
+            out.push(((1.0 + k) / (1.0 + k * w_rel)).clamp(0.25, 4.0));
+        }
+    }
+    if std::env::var("EC_AV1_TPL_HIST").ok().as_deref() == Some("1") {
+        let mut hist = [0usize; 8];
+        for w in map {
+            hist[((w / mean * 2.0) as usize).min(7)] += 1;
+        }
+        let (lo, hi) = out.iter().fold((f64::MAX, 0.0f64), |(l, h), &f| (l.min(f), h.max(f)));
+        eprintln!(
+            "tpl k={k}: {} cells mean w={mean:.3}, w/mean hist (0-.5,.5-1,..,>3.5) {hist:?}, \
+             sb factor {lo:.3}..{hi:.3}, lookahead wall {:.1} ms cumulative",
+            map.len(),
+            TPL_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        );
+    }
+    out
+}
+
 /// Where one inter frame sits in a coding-order pyramid: which DPB slots its
 /// references name, which slot it refreshes, whether it is shown when it is
 /// coded, and the `ref_frame_sign_bias` that follows from all of it. `None`
@@ -7352,6 +7508,11 @@ pub(crate) fn encode_inter_frame(
     // Where this frame sits in the coding-order pyramid; `None` is the flat
     // one-shown-frame-per-picture stream this encoder wrote before.
     pyramid: Option<PyramidFrame>,
+    // lane-av1tpl: the NEXT picture's source, padded like this one. Present,
+    // it buys the one-frame lookahead the per-superblock lambda weighting
+    // reads ([`tpl_reference_map`]); `None` (every streaming caller, which
+    // has no lookahead buffer) codes the frame at one lambda, as before.
+    lookahead: Option<&Picture>,
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -7510,6 +7671,19 @@ pub(crate) fn encode_inter_frame(
         screen,
     };
     let mode_bits_table = inter_mode_bits();
+    // lane-av1tpl: one lambda factor per 64x64 superblock, from how much of
+    // this frame the NEXT one predicts from. Off (`None`) without a
+    // lookahead picture or at strength 0.
+    let tpl_k = tpl_strength();
+    let tpl_factors: Option<Vec<f64>> = lookahead
+        .filter(|_| tpl_k > 0.0)
+        .filter(|n| n.width == picture.width && n.height == picture.height)
+        .map(|n| {
+            let next_y8: Vec<u8> = n.y.iter().map(|&v| v as u8).collect();
+            let map = tpl_reference_map(&picture_y8, &next_y8, picture.width, picture.height);
+            tpl_sb_factors(&map, picture.width / 16, picture.height / 16, tpl_k)
+        });
+    let tpl_sb_cols = picture.width / SUPERBLOCK;
 
     // The true grid ([`crate::tile::block_grid`]'s ceiling), not the padded
     // coding surface's: `blocks` carries one entry per 32x32 block the tile
@@ -7578,6 +7752,16 @@ pub(crate) fn encode_inter_frame(
         let mut blocks: Vec<(usize, Quadrant)> = Vec::new();
     for sb_r in rect.sb_row0 as usize..rect.sb_row1 as usize {
         for sb_c in rect.sb_col0 as usize..rect.sb_col1 as usize {
+            // lane-av1tpl: this superblock's own lambda -- every RD decision
+            // under it (partition, mode, tx, motion) reads `search.lambda`,
+            // so scaling the one field here scales all of them.
+            let search = match &tpl_factors {
+                Some(f) => Search {
+                    lambda: search.lambda * f[sb_r * tpl_sb_cols + sb_c],
+                    ..search
+                },
+                None => search,
+            };
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
                 // Same filter as the tile writer's: a quadrant whose own mi
@@ -8289,6 +8473,10 @@ pub(crate) fn encode_sequence_with_ctx(
     let mut frames = vec![crop_encoded(&key, render.0, render.1)];
     for (i, picture) in rest.iter().enumerate() {
         picture.check_even()?;
+        // lane-av1tpl: the one-frame lookahead the per-superblock lambda
+        // weighting reads -- the NEXT picture's source at this frame's coded
+        // (padded) size. The last frame of the sequence has none.
+        let lookahead = rest.get(i + 1).map(|n| n.padded_to(SUPERBLOCK));
         if (picture.width, picture.height) != render {
             return Err(Error::unsupported(
                 "AV1 encode",
@@ -8308,6 +8496,7 @@ pub(crate) fn encode_sequence_with_ctx(
             Some(&golden),
             prev2.as_ref(), fctx,
             None,
+            lookahead.as_ref(),
         )?;
         stream.extend_from_slice(&inter.stream);
         carried = inter.next_cdfs.clone();
@@ -8322,6 +8511,41 @@ pub(crate) fn encode_sequence_with_ctx(
 
 #[cfg(test)]
 mod tests {
+
+    /// lane-av1tpl's map and its lambda factors, on the two properties every
+    /// decision under them rests on: a frame the next one repeats exactly is
+    /// referenced once per cell (w = 1 everywhere, so every factor is 1 and
+    /// the weighting is a no-op), and the factor DECREASES in
+    /// referenced-ness -- a block the next frame leans on twice as hard as
+    /// the frame's mean is coded at a smaller lambda (more distortion-averse)
+    /// than one nothing points at.
+    #[test]
+    fn tpl_map_is_flat_on_a_repeated_frame_and_its_factor_falls_with_referencedness() {
+        let (w, h) = (64usize, 64usize);
+        let frame: Vec<u8> = (0..w * h).map(|i| ((i * 37) % 251) as u8).collect();
+        let map = super::tpl_reference_map(&frame, &frame, w, h);
+        assert_eq!(map.len(), 16, "4x4 cells of 16x16");
+        for (i, &v) in map.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-9, "cell {i} referenced {v} times, want exactly 1");
+        }
+        let factors = super::tpl_sb_factors(&map, 4, 4, 1.0);
+        assert_eq!(factors.len(), 1);
+        assert!((factors[0] - 1.0).abs() < 1e-9, "a flat map must not move any lambda");
+
+        // Two superblocks of cells side by side, 8 cells wide and 4 tall:
+        // superblock 0 covers columns 0..4 and is referenced four times as
+        // much as superblock 1 in columns 4..8, so its factor must be the
+        // smaller of the two and the frame mean must sit between them.
+        let by_col: Vec<f64> = (0..32)
+            .map(|i| if (i % 8) < 4 { 2.0 } else { 0.5 })
+            .collect();
+        for k in [0.25f64, 0.5, 1.0, 2.0] {
+            let f = super::tpl_sb_factors(&by_col, 8, 4, k);
+            assert_eq!(f.len(), 2);
+            assert!(f[0] < 1.0 && f[1] > 1.0, "k={k}: factors {f:?} must straddle 1");
+            assert!(f[0] < f[1], "k={k}: the referenced half must get the smaller lambda");
+        }
+    }
 
     /// lane-rectx r5: libaom lays `has_tr_*`/`has_bl_*` out row-major for a
     /// 128x128 superblock -- `MAX_MIB_SIZE_LOG2 = 5` mi columns per row, so a
@@ -10787,7 +11011,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None, None).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -10885,7 +11109,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None, None).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -11063,7 +11287,7 @@ mod tests {
                     0.5,
                     1,
                     flat_order_hints(1, 0, false),
-                    (width, height), None, None, None, fctx, None,
+                    (width, height), None, None, None, fctx, None, None,
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -11081,7 +11305,7 @@ mod tests {
                         0.5,
                         1,
                         flat_order_hints(1, 0, false),
-                        (width, height), None, None, None, fctx, None,
+                        (width, height), None, None, None, fctx, None, None,
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
@@ -11628,7 +11852,9 @@ mod tests {
     /// search moved with it. Re-pinned on lane-av1rejudge: local warp is on
     /// by default ([`warp_on`], a sequence/frame header bit and a new
     /// motion_mode symbol on eligible blocks) and
-    /// [`LEAF_SECOND_NEW_MARGIN`] moved 0.8 -> 1.2.
+    /// [`LEAF_SECOND_NEW_MARGIN`] moved 0.8 -> 1.2. Re-pinned on lane-av1tpl:
+    /// every inter frame's superblocks now code at their own lambda
+    /// ([`TPL_STRENGTH`]), so every RD decision in an inter frame moved.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -11650,7 +11876,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7139, 0x4d35_5d6d_8a54_1c6d), (60, 26461, 0xa52e_1445_7f69_b4c1)];
+            [(150, 7128, 0x8ee1_5c87_bdb4_a8c5), (60, 26353, 0x50fc_c10f_9eab_b638)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
