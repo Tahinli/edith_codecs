@@ -20763,15 +20763,58 @@ pub(crate) fn decode_key_frame_tile_lr(
     lr: &LoopRestorationParams,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
-    let delta = DeltaParams::default();
     let single_tile = TileInfo {
         mi_col_starts: vec![0, mi_cols],
         mi_row_starts: vec![0, mi_rows],
         ..TileInfo::default()
     };
-    decode_key_frame_tile_with_cdfs(
+    decode_key_frame_tiles_lr(
         &[data],
         &single_tile,
+        mi_cols,
+        mi_rows,
+        base_q_idx,
+        frame_width,
+        frame_height,
+        enable_filter_intra,
+        cdef,
+        loop_filter,
+        tx_select,
+        reduced_tx_set,
+        allow_screen_content_tools,
+        allow_intrabc,
+        lr,
+        fctx,
+    )
+}
+
+/// [`decode_key_frame_tile_lr`] for a frame coded as SEVERAL tiles: the
+/// encoder's own filter search hands back one payload per tile plus the
+/// `tile_info` its header carries, and the per-tile CDF/LR/neighbour resets
+/// are the decoder's own (`decode_key_frame_tile_with_cdfs`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_key_frame_tiles_lr(
+    tiles: &[&[u8]],
+    tile_info: &TileInfo,
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    enable_filter_intra: bool,
+    cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
+    tx_select: bool,
+    reduced_tx_set: bool,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
+    lr: &LoopRestorationParams,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<Picture> {
+    let delta = DeltaParams::default();
+    decode_key_frame_tile_with_cdfs(
+        tiles,
+        tile_info,
         mi_cols,
         mi_rows,
         base_q_idx,
@@ -25395,6 +25438,7 @@ fn decode_inter_block(
     // combinations that don't implement scaled MC yet.
     frame_width: usize, fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
+
     // lane-inter4 r1: `at` is in MI units (4 px) so a 32-level 1:4 strip can
     // name an 8-px offset; `(r, c)` stays the enclosing 16-px cell for the
     // few 16-px-granular uses below.
@@ -32946,9 +32990,62 @@ pub(crate) fn decode_inter_frame_tile_lr(
         mi_row_starts: vec![0, mi_rows],
         ..TileInfo::default()
     };
-    decode_inter_frame_tile_with_cdfs(
+    decode_inter_frame_tiles_lr(
         &[data],
         &single_tile,
+        mi_cols,
+        mi_rows,
+        base_q_idx,
+        frame_width,
+        frame_height,
+        refpix,
+        cdef,
+        loop_filter,
+        allow_high_precision_mv,
+        force_integer_mv,
+        interp_fixed,
+        enable_dual_filter,
+        reference_select,
+        tx_select,
+        lr,
+        initial_cdfs,
+        sign_bias,
+        allow_screen_content_tools,
+        fctx,
+    )
+}
+
+/// [`decode_inter_frame_tile_lr`] for a frame coded as SEVERAL tiles; see
+/// [`decode_key_frame_tiles_lr`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_inter_frame_tiles_lr(
+    tiles: &[&[u8]],
+    tile_info: &TileInfo,
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    refpix: &RefPix<'_>,
+    cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
+    allow_high_precision_mv: bool,
+    force_integer_mv: bool,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    enable_dual_filter: bool,
+    reference_select: bool,
+    tx_select: bool,
+    lr: &LoopRestorationParams,
+    initial_cdfs: Option<Cdfs>,
+    sign_bias: crate::mvstack::SignBiasTable,
+    // This frame header's own `allow_screen_content_tools` (see the
+    // single-tile wrapper): the palette syntax its intra blocks carry.
+    allow_screen_content_tools: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> Result<Picture> {
+    decode_inter_frame_tile_with_cdfs(
+        tiles,
+        tile_info,
         mi_cols,
         mi_rows,
         base_q_idx,

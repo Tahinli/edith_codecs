@@ -55,6 +55,35 @@ pub(crate) fn set_filter_threads(n: usize) {
     FILTER_THREADS.store(n.clamp(1, 64), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `EC_AV1_TILE_THREADS`, how many workers the ENCODER spreads a frame's
+/// tiles across (default 1 = the shipped single-threaded write). Tiles are
+/// entropy-independent by construction (each starts from the frame's own
+/// tables and resets its own contexts), so the bytes a frame comes out as do
+/// not depend on this -- `encoder::tests::tile_bytes_do_not_depend_on_the_
+/// thread_count` is the pin.
+static TILE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn tile_threads() -> usize {
+    match TILE_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let n = crate::envflags::var("EC_AV1_TILE_THREADS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 64);
+            TILE_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+            n
+        }
+        n => n,
+    }
+}
+
+/// Test-only override of [`tile_threads`]; see [`set_filter_threads`].
+#[cfg(test)]
+pub(crate) fn set_tile_threads(n: usize) {
+    TILE_THREADS.store(n.clamp(1, 64), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Splits `units` work units into at most `threads` contiguous, non-empty
 /// bands. The caller picks the unit so that a band boundary is always a legal
 /// cut of its stage (16-pixel rows for the deblocker, 2 mi for CDEF, one
