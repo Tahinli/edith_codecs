@@ -2592,9 +2592,12 @@ fn intrabc_worth_it(y: &[u8], width: usize, true_width: usize, true_height: usiz
 /// changes again), plus the last DV chosen, which the RD price uses as its
 /// predictor estimate.
 struct Ibc {
+    /// Keyed on the SOURCE, exactly as libaom's `av1_intrabc_hash` is: the
+    /// source repeats exactly where a lossily coded reconstruction only
+    /// nearly does, so an exact-match table over the reconstruction finds
+    /// almost nothing. The candidate is then SCORED against the
+    /// reconstruction ([`ibc_sse`]), which is what a decoder will copy.
     table: std::collections::HashMap<u64, Vec<(u32, u32)>>,
-    /// The reconstruction row this table has been filled up to.
-    filled_to: usize,
     /// The tile's own luma rect, in samples.
     tile: (usize, usize, usize, usize),
     /// The DV the previous intrabc block of this tile took -- the *estimate*
@@ -2611,36 +2614,17 @@ struct Ibc {
 }
 
 impl Ibc {
-    fn new(tile: (usize, usize, usize, usize)) -> Self {
+    fn new(tile: (usize, usize, usize, usize), source: &[u8], width: usize) -> Self {
+        let mut table = std::collections::HashMap::new();
+        ibc_index(&mut table, source, width, (tile.0, tile.1), (tile.2, tile.3));
         Self {
-            table: std::collections::HashMap::new(),
-            filled_to: tile.1,
+            table,
             tile,
             last_dv: None,
             hits: 0,
             lookups: 0,
             found: 0,
         }
-    }
-
-    /// Indexes every reconstruction row above `y_limit` that is not indexed
-    /// yet. Called once per superblock row, with the row's own top edge.
-    fn fill_to(&mut self, recon: &[u8], width: usize, y_limit: usize) {
-        if y_limit <= self.filled_to {
-            return;
-        }
-        // A square straddling the boundary would be half-indexed, so start
-        // `IBC_HASH - 1` rows back: `ibc_index` re-adds a few positions, and a
-        // duplicate entry only costs one extra verified candidate.
-        let from = self.filled_to.saturating_sub(IBC_HASH - 1).max(self.tile.1);
-        ibc_index(
-            &mut self.table,
-            recon,
-            width,
-            (self.tile.0, from),
-            (self.tile.2, y_limit),
-        );
-        self.filled_to = y_limit;
     }
 
     /// libaom `av1_is_dv_valid` for a `w`x`h` block at `(x, y)` under `dv`
@@ -2683,6 +2667,27 @@ impl Ibc {
         let wf = (1 + INTRABC_DELAY_SB64) * (active_sb_row - src_sb_row);
         src_sb_col < active_sb_col - INTRABC_DELAY_SB64 + wf
     }
+}
+
+/// How many block searches ran, how many found at least one VALID candidate,
+/// and how many won on rate-distortion -- the hash hit rate a gate prints
+/// (class `gate-blind-to-feature`: "the search ran" and "the search found
+/// something" and "the block took it" are three different claims).
+static IBC_SEARCH: [std::sync::atomic::AtomicUsize; 3] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+
+impl Drop for Ibc {
+    fn drop(&mut self) {
+        for (slot, n) in [self.lookups, self.found, self.hits].into_iter().enumerate() {
+            IBC_SEARCH[slot].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Reads [`IBC_SEARCH`] and zeroes it, so a gate can attribute the counts to
+/// its own encode.
+pub(crate) fn take_intrabc_search() -> [usize; 3] {
+    std::array::from_fn(|i| IBC_SEARCH[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// [`crate::tile::write_dv_component`]'s static price -- the same shape as
@@ -2819,12 +2824,19 @@ fn ibc_search(
     };
     ibc.lookups += 1;
     let key = ibc_hash(luma.source, luma.width, x, y);
-    // Newest first: a nearby copy costs the fewest DV bits, and the table is
-    // filled in raster order.
+    // The table is filled in raster order, so the entries BEFORE this block's
+    // own position are exactly the already-coded ones -- and the nearest of
+    // them costs the fewest DV bits. Walking backwards from the block's own
+    // slot is what makes the search look up-and-left; taking the newest
+    // entries outright only ever finds candidates below and to the right,
+    // every one of which `dv_valid` rejects.
     let hits: Vec<(u32, u32)> = ibc
         .table
         .get(&key)
-        .map(|h| h.iter().rev().take(16).copied().collect())
+        .map(|h| {
+            let end = h.partition_point(|&(hx, hy)| (hy, hx) < (y as u32, x as u32));
+            h[..end].iter().rev().take(32).copied().collect()
+        })
         .unwrap_or_default();
     for (hx, hy) in hits {
         consider(&*ibc, hx as usize, hy as usize, &mut best);
@@ -4296,21 +4308,19 @@ pub(crate) fn encode_key_frame_inner(
         let mut above_mode = vec![DC_PRED; cols * 2];
         let mut left_mode = vec![DC_PRED; rows * 2];
         let mut ibc = allow_intrabc.then(|| {
-            Ibc::new((
-                rect.mi_col0 as usize * 4,
-                rect.mi_row0 as usize * 4,
-                (rect.mi_col1 as usize * 4).min(true_width),
-                (rect.mi_row1 as usize * 4).min(true_height),
-            ))
+            Ibc::new(
+                (
+                    rect.mi_col0 as usize * 4,
+                    rect.mi_row0 as usize * 4,
+                    (rect.mi_col1 as usize * 4).min(true_width),
+                    (rect.mi_row1 as usize * 4).min(true_height),
+                ),
+                &picture_y8,
+                frame_width,
+            )
         });
         let mut coded: Vec<(usize, Superblock, Vec<u8>)> = Vec::new();
     for sb_row in rect.sb_row0 as usize..rect.sb_row1 as usize {
-        // Every superblock row above this one is final (the in-loop filters
-        // are off on an `allow_intrabc` frame), so it is indexed for the
-        // block-hash search exactly once, here.
-        if let Some(ibc) = ibc.as_mut() {
-            ibc.fill_to(&luma.reconstruction, luma.width, sb_row * 64);
-        }
         for sb_col in rect.sb_col0 as usize..rect.sb_col1 as usize {
             let mut modes = Vec::with_capacity(4);
             // The quadrants of a superblock are coded in the order the decoder
@@ -7379,6 +7389,57 @@ mod tests {
         // detector (and so the whole sequence header) alone.
         let film = encode_key_frame_with_ctx(&test_card(width, height), 100, 0.5, fctx).unwrap();
         assert!(!film.screen, "the detector fired on the film-shaped test card");
+    }
+
+    /// lane-av1ibc's own end-to-end check: a repeated-pattern screen card
+    /// sets `allow_intrabc` (so every in-loop filter is off), blocks really
+    /// take a block vector (fire count + DV histogram, class
+    /// `gate-blind-to-feature`), and both our own decoder and ffmpeg --
+    /// libaom's reader of the `use_intrabc`/`assign_dv` syntax -- reconstruct
+    /// exactly what the encoder did.
+    #[test]
+    fn a_repeated_pattern_key_frame_codes_intrabc_blocks_ffmpeg_decodes_exactly() {
+        let fctx = &crate::decode::FrameCtx::new();
+        // Wide enough for the wavefront rule (`INTRABC_DELAY_SB64` = 4
+        // superblocks of 64) and tall enough for a source superblock row
+        // above the blocks that copy from it.
+        let (width, height) = (512usize, 256usize);
+        let picture = screen_card(width, height);
+        let _ = crate::tile::take_intrabc_hits();
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
+        assert!(
+            encoded.allow_intrabc,
+            "allow_intrabc was not set on a fully periodic screen card              (source repeat share {:.1}%)",
+            intrabc_source_share() * 100.0
+        );
+        let hits = crate::tile::take_intrabc_hits();
+        eprintln!(
+            "intrabc blocks {} DV magnitude histogram (1,2,4,8,16,32+ px) {:?},              source repeat share {:.1}%",
+            hits[0],
+            &hits[1..],
+            intrabc_source_share() * 100.0
+        );
+        let search = take_intrabc_search();
+        eprintln!(
+            "intrabc searches {} found-valid {} won-RD {}",
+            search[0], search[1], search[2]
+        );
+        assert!(
+            hits[0] > 0,
+            "no block took a block vector -- the `use_intrabc` syntax is unproven: {hits:?}"
+        );
+        let via_us = crate::stream::decode_stream(&encoded.stream).unwrap();
+        assert_eq!(via_us[0].y, encoded.reconstruction.y, "our decoder: luma");
+        assert_eq!(via_us[0].u, encoded.reconstruction.u, "our decoder: U");
+        assert_eq!(via_us[0].v, encoded.reconstruction.v, "our decoder: V");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let decoded = ffmpeg_decode(&encoded.stream, width, height);
+        assert_eq!(decoded.y, encoded.reconstruction.y, "ffmpeg: luma");
+        assert_eq!(decoded.u, encoded.reconstruction.u, "ffmpeg: U");
+        assert_eq!(decoded.v, encoded.reconstruction.v, "ffmpeg: V");
     }
 
     /// The minimal repro that isolated the inter-residual desync: a key frame
