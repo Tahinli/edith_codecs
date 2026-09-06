@@ -3042,6 +3042,7 @@ pub(crate) fn encode_key_frame_inner(
         &mut chroma,
         [&picture_y8, &picture_u8, &picture_v8],
         true,
+        fctx,
         |lf, cdef, h| {
             crate::decode::decode_key_frame_tile(
                 &tile,
@@ -3107,6 +3108,7 @@ fn pick_and_apply_filters(
     chroma: &mut [Plane<'_>; 2],
     source: [&[u8]; 3],
     search: bool,
+    fctx: &crate::decode::FrameCtx,
     decode: impl Fn(&LoopFilterParams, &CdefParams, &FrameHeader) -> Result<Picture>,
 ) -> Result<()> {
     if !search {
@@ -3117,13 +3119,25 @@ fn pick_and_apply_filters(
     // libaom `av1_pick_filter_level`'s sibling `av1_cdef_search`:
     // `cdef_damping = 3 + (base_qindex >> 6)`, never searched.
     let damping = 3 + (header.quantization.base_q_idx >> 6);
-    let (lf, cdef, filtered) = crate::filter_search::pick_filters(
-        |lf, cdef| decode(lf, cdef, &hdr),
+    // Every candidate scores the same coded tile: decode it once and re-run
+    // the filters alone for the rest (`crate::decode::FilterReplay`, 24% of
+    // the encoder's profile before this).
+    crate::decode::clear_filter_replay();
+    let search_result = crate::filter_search::pick_filters(
+        |lf, cdef| {
+            if let Some(picture) = crate::decode::replay_filters(lf, cdef, fctx) {
+                return Ok(picture);
+            }
+            crate::decode::arm_filter_replay();
+            decode(lf, cdef, &hdr)
+        },
         source,
         luma.width,
         (fw, fh),
         damping,
-    )?;
+    );
+    crate::decode::clear_filter_replay();
+    let (lf, cdef, filtered) = search_result?;
     header.loop_filter = lf;
     header.cdef = cdef;
     let dec_cw = filtered.width.div_ceil(2);
@@ -4234,6 +4248,7 @@ pub(crate) fn encode_inter_frame(
         // `TxMode::Select` too (it used to skip and leave every inter frame
         // unfiltered once Select became the default).
         true,
+        fctx,
         |lf, cdef, h| {
             crate::decode::decode_inter_frame_tile(
                 &tile,

@@ -6588,6 +6588,7 @@ struct BlkCell {
 /// contexts read (spec `av1_set_entropy_contexts`) — which is what lets a
 /// chroma transform straddling the true, odd-sized frame edge see its
 /// neighbour's state clamped at its own subsampled edge rather than luma's.
+#[derive(Clone)]
 struct Neighbours {
     above: Vec<[Neighbour; 3]>,
     left: Vec<[Neighbour; 3]>,
@@ -19674,6 +19675,119 @@ fn plane_snapshot(p: &PlaneBuf<'_>, ss_y: u32) -> PlaneBuf<'static> {
     PlaneBuf { data: std::borrow::Cow::Owned(data), ..*p }
 }
 
+/// The pre-filter reconstruction of one coded frame, plus the per-block state
+/// the loop filters read.
+///
+/// The encoder's filter search ([`crate::filter_search::pick_filters`])
+/// decodes the same coded tile under ~25 candidate deblock/CDEF parameter
+/// sets to score each one, and the entropy decode and reconstruction it
+/// repeats are identical every time -- both filters run after it, on the
+/// finished planes. That re-parse was 24% of the encoder's profile. A caller
+/// arms [`arm_filter_replay`] around ONE decode and then re-runs the filters
+/// alone through [`replay_filters`]; the result is the same picture the full
+/// decode would have returned, because it is the same two calls on a copy of
+/// the same planes.
+pub(crate) struct FilterReplay {
+    y: PlaneBuf<'static>,
+    u: PlaneBuf<'static>,
+    v: PlaneBuf<'static>,
+    neighbours: Neighbours,
+    frame_width: usize,
+    frame_height: usize,
+    width: usize,
+    height: usize,
+}
+
+thread_local! {
+    /// Set by [`arm_filter_replay`] for the span of one decode.
+    static REPLAY_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What that decode captured, until [`clear_filter_replay`].
+    static REPLAY: std::cell::RefCell<Option<FilterReplay>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Capture this thread's next decode's pre-filter frame (see [`FilterReplay`]).
+pub(crate) fn arm_filter_replay() {
+    REPLAY_ARMED.set(true);
+}
+
+/// Drop the armed flag and anything captured: the tile it belongs to is done.
+pub(crate) fn clear_filter_replay() {
+    REPLAY_ARMED.set(false);
+    REPLAY.with_borrow_mut(|r| *r = None);
+}
+
+/// The capture itself, called from the decoder's own pre-filter point. Owns
+/// copies of the planes, since the caller filters them in place.
+fn capture_filter_replay(
+    y: &PlaneBuf<'_>,
+    u: &PlaneBuf<'_>,
+    v: &PlaneBuf<'_>,
+    neighbours: &Neighbours,
+    frame_width: usize,
+    frame_height: usize,
+    width: usize,
+    height: usize,
+) {
+    if !REPLAY_ARMED.replace(false) {
+        return;
+    }
+    let own = |p: &PlaneBuf<'_>| PlaneBuf { data: std::borrow::Cow::Owned(p.data.to_vec()), ..*p };
+    REPLAY.with_borrow_mut(|slot| {
+        *slot = Some(FilterReplay {
+            y: own(y),
+            u: own(u),
+            v: own(v),
+            neighbours: neighbours.clone(),
+            frame_width,
+            frame_height,
+            width,
+            height,
+        });
+    });
+}
+
+/// The filter half of a captured decode, under new parameters: exactly the
+/// [`apply_deblock`] / [`apply_cdef`] pair the decoder's own tail runs, on a
+/// copy of the captured planes. `None` when nothing is captured (the caller
+/// then decodes for real).
+pub(crate) fn replay_filters(
+    loop_filter: &LoopFilterParams,
+    cdef: &CdefParams,
+    fctx: &FrameCtx,
+) -> Option<Picture> {
+    REPLAY.with_borrow(|slot| {
+        let r = slot.as_ref()?;
+        let copy = |p: &PlaneBuf<'_>| PlaneBuf {
+            data: std::borrow::Cow::Owned(p.data.to_vec()),
+            ..*p
+        };
+        let (mut y, mut u, mut v) = (copy(&r.y), copy(&r.u), copy(&r.v));
+        apply_deblock(
+            &mut y,
+            &mut u,
+            &mut v,
+            loop_filter,
+            &r.neighbours,
+            r.frame_width,
+            r.frame_height,
+            fctx,
+        );
+        apply_cdef(&mut y, &mut u, &mut v, cdef, &r.neighbours, (r.frame_width, r.frame_height), fctx);
+        // The capture only happens on the shape the decoder's own tail
+        // returns whole (no superres, no loop restoration, no crop), so this
+        // is that tail.
+        fctx.last_frame_wide_margin.with(|m| *m.borrow_mut() = None);
+        Some(Picture {
+            width: r.width,
+            height: r.height,
+            y: y.data.into_owned(),
+            u: u.data.into_owned(),
+            v: v.data.into_owned(),
+        })
+    })
+}
+
 /// The output crop, taking the plane by value: a frame whose width is
 /// already superblock-aligned (only its height is padded) has a padded
 /// buffer whose stride equals the visible width, so the crop is a pure
@@ -22847,6 +22961,28 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             let _ = f.write_all(&crop_wide(&u));
             let _ = f.write_all(&crop_wide(&v));
         }
+    }
+    // lane-av1fwd: the encoder's filter search re-decodes this same key
+    // frame tile per candidate -- capture it once (see [`FilterReplay`]),
+    // on the shape whose tail is the two filter calls and nothing else.
+    if superres(fctx).is_none()
+        && frame_width as usize == width
+        && frame_height as usize == height
+        && !(0..3).any(|p| {
+            lr.frame_restoration_type[p] != ec_av1_syntax::RestorationType::None
+                && lr.loop_restoration_size[p] != 0
+        })
+    {
+        capture_filter_replay(
+            &y,
+            &u,
+            &v,
+            &neighbours,
+            frame_width as usize,
+            frame_height as usize,
+            width,
+            height,
+        );
     }
     apply_deblock(
         &mut y,
@@ -35447,6 +35583,27 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         p.finish();
     }
     drop(pipe);
+    // lane-av1fwd: the encoder scores ~25 filter candidates against this
+    // same coded tile ([`FilterReplay`]). Capture the reconstruction here,
+    // before either filter has touched it -- but only on the shape whose
+    // tail is exactly `apply_deblock` + `apply_cdef` and nothing else.
+    if !pipelined
+        && !lr_active
+        && superres(fctx).is_none()
+        && frame_width as usize == width
+        && frame_height as usize == height
+    {
+        capture_filter_replay(
+            &y,
+            &u,
+            &v,
+            &neighbours,
+            frame_width as usize,
+            frame_height as usize,
+            width,
+            height,
+        );
+    }
     if pipelined {
         cdef_scan_counters(&neighbours);
     } else {
