@@ -3430,6 +3430,103 @@ where
     Ok((out, stored))
 }
 
+/// Runs `job(tile_index, ctx)` once per tile, on `EC_AV1_TILE_THREADS`
+/// workers, and returns the results in tile order. The counterpart of
+/// [`write_tiles`] for the RD/motion SEARCH: a tile's job owns every piece of
+/// state the search mutates (its own reconstruction planes, its own `MiGrid`,
+/// its own neighbour-mode bands and its own [`crate::decode::FrameCtx`]), and
+/// availability is already tile-relative (`clip_planes_to_tile`,
+/// `MiGrid::set_tile_bounds`), so what a tile decides cannot depend on which
+/// other tiles have run -- gated by
+/// `encoder::tests::tile_bytes_do_not_depend_on_the_thread_count`, which now
+/// covers the search as well as the write.
+///
+/// The `FrameCtx` copy is made on the calling thread (`&FrameCtx` is `!Sync`
+/// by design) and moved into the worker, exactly as [`crate::par::run_bands`]
+/// does it for the decoder's filter bands.
+fn search_tiles<T, F>(tiles: usize, fctx: &crate::decode::FrameCtx, job: F) -> Result<Vec<T>>
+where
+    T: Send,
+    F: Fn(usize, &crate::decode::FrameCtx) -> Result<T> + Sync,
+{
+    let threads = crate::par::tile_threads().min(tiles);
+    if threads <= 1 {
+        return (0..tiles).map(|index| job(index, fctx)).collect();
+    }
+    type Slot<T> = Option<Result<T>>;
+    let done: std::sync::Mutex<Vec<Slot<T>>> =
+        std::sync::Mutex::new((0..tiles).map(|_| None).collect());
+    {
+        let batch = crate::par::Batch::new("ec-av1-tile-search");
+        for (from, to) in crate::par::bands(tiles, threads) {
+            let done = &done;
+            let job = &job;
+            let ctx = crate::decode::filter_ctx_copy(fctx);
+            batch.submit(move || {
+                for index in from..to {
+                    let searched = job(index, &ctx);
+                    done.lock().expect("tile slots")[index] = Some(searched);
+                }
+            });
+        }
+    }
+    done.into_inner()
+        .expect("tile slots")
+        .into_iter()
+        .map(|slot| slot.expect("every tile was searched"))
+        .collect()
+}
+
+/// One tile job's own copy of a plane: the frame's source, a blank
+/// reconstruction of the frame's size, and the frame's own bounds -- narrowed
+/// to the tile by `clip_planes_to_tile` right after. Blank rather than a copy
+/// of the frame's reconstruction because a tile's prediction never reads a
+/// sample outside its own rectangle, and every sample inside it is written
+/// before it is read.
+fn fresh_plane(source: &[u8], width: usize, height: usize, true_width: usize, true_height: usize) -> Plane<'_> {
+    Plane {
+        source,
+        reconstruction: vec![128; source.len()],
+        width,
+        height,
+        true_width,
+        true_height,
+        tile_x0: 0,
+        tile_y0: 0,
+        tile_x1: width,
+        tile_y1: height,
+    }
+}
+
+/// Copies the rectangle `[x0, x1) x [y0, y1)` of a tile job's own plane into
+/// the frame's plane, through the [`crate::par::Shared`] every job holds.
+///
+/// corner-cut: the disjointness that makes the aliasing sound is the caller's
+/// -- `x0..x1`/`y0..y1` are the job's own `TileRect`, and a frame's tile
+/// rectangles partition it -- checked end-to-end by
+/// `tile_bytes_do_not_depend_on_the_thread_count` rather than by the borrow
+/// checker, exactly the contract `Shared`'s own doc names. Upgrade path is
+/// row-range `split_at_mut` plumbing through `Plane`, which would have to
+/// thread an origin offset through every prediction and transform call site
+/// for the same bytes.
+#[allow(unsafe_code)]
+fn copy_rect(
+    dst: crate::par::Shared<'_, Vec<u8>>,
+    src: &[u8],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+) {
+    // SAFETY: this job touches only its own tile rectangle (see above).
+    let dst = unsafe { dst.get() };
+    for y in y0..y1 {
+        let (a, b) = (y * stride + x0, y * stride + x1);
+        dst[a..b].copy_from_slice(&src[a..b]);
+    }
+}
+
 /// The frame header's `tile_info` (spec 5.9.15) for `layout`:
 /// `context_update_tile_id` names the largest tile, whose end-of-tile CDF
 /// tables the frame stores (spec 7.20), which is what
@@ -3697,8 +3794,6 @@ pub(crate) fn encode_key_frame_inner(
     // symbol the writer will actually write.
     // The bookkeeping is kept on the 16x16 grid the tile writer keeps it on,
     // because a 32x32 block may be split into four 16x16 ones.
-    let mut above_mode = vec![DC_PRED; cols * 2];
-    let mut left_mode = vec![DC_PRED; rows * 2];
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     // This frame's tile grid (one tile unless the facade armed more).
     let layout =
@@ -3709,15 +3804,36 @@ pub(crate) fn encode_key_frame_inner(
     // `mi_row_starts`), which is what makes the writer's rects and the
     // reader's the same rects.
     let header_tile_info = header.tile_info.clone();
-    let mut superblocks = Vec::with_capacity(sb_cols * sb_rows);
-    let mut modes = Vec::with_capacity(cols * rows);
-    for sb_row in 0..sb_rows {
-        for sb_col in 0..sb_cols {
-            clip_planes_to_tile(
-                &mut luma,
-                &mut chroma,
-                layout.rect(layout.index_of_sb(sb_row as u32, sb_col as u32)),
-            );
+    // lane-av1tsearch: the search runs once per TILE (`search_tiles`), not
+    // once over the whole frame. Each tile job builds its own reconstruction
+    // planes and its own `above_mode`/`left_mode` bands, which is also what
+    // the tile writer reads -- a tile resets its neighbour contexts (spec
+    // 5.11.1), so a block at a tile's left edge must cost its mode against
+    // the default context, not against whatever the tile to its west left in
+    // that row. At one tile the bands are the frame's, exactly as before.
+    let (frame_width, frame_height) = (picture.width, picture.height);
+    let luma_out = crate::par::Shared::new(&mut luma.reconstruction);
+    let [cb, cr] = &mut chroma;
+    let chroma_out = [
+        crate::par::Shared::new(&mut cb.reconstruction),
+        crate::par::Shared::new(&mut cr.reconstruction),
+    ];
+    let search_tile = |index: usize,
+                       fctx: &crate::decode::FrameCtx|
+     -> Result<Vec<(usize, Superblock, Vec<u8>)>> {
+        let rect = layout.rect(index);
+        let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
+        let mut chroma = [
+            fresh_plane(&picture_u8, frame_width / 2, frame_height / 2, true_width / 2, true_height / 2),
+            fresh_plane(&picture_v8, frame_width / 2, frame_height / 2, true_width / 2, true_height / 2),
+        ];
+        clip_planes_to_tile(&mut luma, &mut chroma, rect);
+        let mut above_mode = vec![DC_PRED; cols * 2];
+        let mut left_mode = vec![DC_PRED; rows * 2];
+        let mut coded: Vec<(usize, Superblock, Vec<u8>)> = Vec::new();
+    for sb_row in rect.sb_row0 as usize..rect.sb_row1 as usize {
+        for sb_col in rect.sb_col0 as usize..rect.sb_col1 as usize {
+            let mut modes = Vec::with_capacity(4);
             // The quadrants of a superblock are coded in the order the decoder
             // walks them, which for a 64x64 split into 32x32 blocks is raster
             // order among the quadrants that are inside the frame.
@@ -3901,8 +4017,39 @@ pub(crate) fn encode_key_frame_inner(
                     blocks.push(Quadrant::Whole(whole));
                 }
             }
-            superblocks.push(Superblock::Split(blocks));
+            coded.push((sb_row * sb_cols + sb_col, Superblock::Split(blocks), modes));
         }
+    }
+        let (x0, y0) = (rect.mi_col0 as usize * 4, rect.mi_row0 as usize * 4);
+        let (x1, y1) = (rect.mi_col1 as usize * 4, rect.mi_row1 as usize * 4);
+        copy_rect(luma_out, &luma.reconstruction, frame_width, x0, y0, x1, y1);
+        for (&out, tile) in chroma_out.iter().zip(&chroma) {
+            copy_rect(
+                out,
+                &tile.reconstruction,
+                frame_width / 2,
+                x0 / 2,
+                y0 / 2,
+                x1.div_ceil(2),
+                y1.div_ceil(2),
+            );
+        }
+        Ok(coded)
+    };
+    let searched = search_tiles(layout.count(), fctx, search_tile)?;
+    // Back into frame raster order: the tile writer indexes `superblocks` by
+    // the frame's own superblock index, and `modes` is the coding order the
+    // ablation drivers read.
+    let mut in_order: Vec<Option<(Superblock, Vec<u8>)>> = (0..sb_cols * sb_rows).map(|_| None).collect();
+    for (at, superblock, block_modes) in searched.into_iter().flatten() {
+        in_order[at] = Some((superblock, block_modes));
+    }
+    let mut superblocks = Vec::with_capacity(sb_cols * sb_rows);
+    let mut modes = Vec::with_capacity(cols * rows);
+    for slot in in_order {
+        let (superblock, block_modes) = slot.expect("every superblock belongs to a tile");
+        superblocks.push(superblock);
+        modes.extend_from_slice(&block_modes);
     }
 
     #[cfg(test)]
@@ -5348,7 +5495,7 @@ pub(crate) fn encode_inter_frame(
     // whenever the true size is not a 64x64 multiple.
     let (cols, rows) = crate::tile::block_grid(header.mi_cols, header.mi_rows);
     let (cols, rows) = (cols as usize, rows as usize);
-    let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
+    let (sb_cols, _sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
     // This frame's tile grid, as in `encode_key_frame_inner`.
     let (tile_cols_log2, tile_rows_log2) = armed_tiles();
@@ -5360,24 +5507,42 @@ pub(crate) fn encode_inter_frame(
     // integer-`u8`-scale), so the DPB reference plane is narrowed for it --
     // once per frame (lane-av1rd2), not once per block, which is a whole
     // plane's map per 32x32 block and now per leaf too.
-    let mut grid = MiGrid::new(mi_cols, mi_rows);
-    grid.set_sign_bias(sign_bias);
     let mut blocks = vec![Quadrant::Whole(BlockCoeffs::default()); cols * rows];
-
-    for sb_r in 0..sb_rows {
-        for sb_c in 0..sb_cols {
-            // Neighbour availability -- intra edges and the MV stack's
-            // scans alike -- stops at this superblock's own tile, exactly
-            // where the decoder stops it (`PlaneBuf::set_tile_origin`,
-            // `MiGrid::set_tile_bounds`).
-            let rect = layout.rect(layout.index_of_sb(sb_r as u32, sb_c as u32));
-            clip_planes_to_tile(&mut luma, &mut chroma, rect);
-            grid.set_tile_bounds(
-                rect.mi_row0 as usize,
-                rect.mi_col0 as usize,
-                rect.mi_row1 as usize,
-                rect.mi_col1 as usize,
-            );
+    // lane-av1tsearch: one search job per TILE (`search_tiles`). Neighbour
+    // availability -- intra edges and the MV stack's scans alike -- already
+    // stopped at the superblock's own tile (`PlaneBuf::set_tile_origin`,
+    // `MiGrid::set_tile_bounds`), so a tile reads nothing another tile wrote;
+    // giving each job its own planes and its own `MiGrid` therefore leaves
+    // every decision, and so every coded bit, exactly where the whole-frame
+    // loop left it, at any tile count and any thread count.
+    let (frame_width, frame_height) = (picture.width, picture.height);
+    let luma_out = crate::par::Shared::new(&mut luma.reconstruction);
+    let [cb, cr] = &mut chroma;
+    let chroma_out = [
+        crate::par::Shared::new(&mut cb.reconstruction),
+        crate::par::Shared::new(&mut cr.reconstruction),
+    ];
+    let search_tile = |index: usize,
+                       fctx: &crate::decode::FrameCtx|
+     -> Result<Vec<(usize, Quadrant)>> {
+        let rect = layout.rect(index);
+        let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
+        let mut chroma = [
+            fresh_plane(&picture_u8, frame_width / 2, frame_height / 2, true_width / 2, true_height / 2),
+            fresh_plane(&picture_v8, frame_width / 2, frame_height / 2, true_width / 2, true_height / 2),
+        ];
+        clip_planes_to_tile(&mut luma, &mut chroma, rect);
+        let mut grid = MiGrid::new(mi_cols, mi_rows);
+        grid.set_sign_bias(sign_bias);
+        grid.set_tile_bounds(
+            rect.mi_row0 as usize,
+            rect.mi_col0 as usize,
+            rect.mi_row1 as usize,
+            rect.mi_col1 as usize,
+        );
+        let mut blocks: Vec<(usize, Quadrant)> = Vec::new();
+    for sb_r in rect.sb_row0 as usize..rect.sb_row1 as usize {
+        for sb_c in rect.sb_col0 as usize..rect.sb_col1 as usize {
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
                 // Same filter as the tile writer's: a quadrant whose own mi
@@ -5602,14 +5767,14 @@ pub(crate) fn encode_inter_frame(
                             // grid, and their reconstruction is what the
                             // planes hold.
                             partition_hit(1);
-                            blocks[r32 * cols + c32] = Quadrant::Split(leaves);
+                            blocks.push((r32 * cols + c32, Quadrant::Split(leaves)));
                             continue;
                         }
                         restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
                     }
                     partition_hit(0);
                     record_mi(&mut grid, mi_row, mi_col, 8, block.inter);
-                    blocks[r32 * cols + c32] = Quadrant::Whole(block);
+                    blocks.push((r32 * cols + c32, Quadrant::Whole(block)));
                 } else {
                     // The sub-positions actually inside the true frame, same
                     // filter as `sb_coeff_inter_frame_tile`'s `sub_positions`.
@@ -5774,10 +5939,32 @@ pub(crate) fn encode_inter_frame(
                             });
                         }
                     }
-                    blocks[r32 * cols + c32] = Quadrant::Split(leaves);
+                    blocks.push((r32 * cols + c32, Quadrant::Split(leaves)));
                 }
             }
         }
+    }
+        let (x0, y0) = (rect.mi_col0 as usize * 4, rect.mi_row0 as usize * 4);
+        let (x1, y1) = (rect.mi_col1 as usize * 4, rect.mi_row1 as usize * 4);
+        copy_rect(luma_out, &luma.reconstruction, frame_width, x0, y0, x1, y1);
+        for (&out, tile) in chroma_out.iter().zip(&chroma) {
+            copy_rect(
+                out,
+                &tile.reconstruction,
+                frame_width / 2,
+                x0 / 2,
+                y0 / 2,
+                x1.div_ceil(2),
+                y1.div_ceil(2),
+            );
+        }
+        Ok(blocks)
+    };
+    for (at, quadrant) in search_tiles(layout.count(), fctx, search_tile)?
+        .into_iter()
+        .flatten()
+    {
+        blocks[at] = quadrant;
     }
 
     let modes = blocks
