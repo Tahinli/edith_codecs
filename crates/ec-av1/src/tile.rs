@@ -2395,8 +2395,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
             TX16 => &SCANS[2],
             _ => &SCANS[3],
         };
-        let mut enc = SymbolEncoder::new();
-        enc.reset_bits();
+        let mut enc = SymbolEncoder::pricer();
         write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
         enc.bits()
     })
@@ -2449,10 +2448,19 @@ fn write_coeffs(
         ec_rng_trace(|| format!("EC_PLANE plane={plane} tell_before={}", enc.tell()));
     }
     let side = coding.side;
-    let eob = scan
-        .iter()
-        .rposition(|&pos| grid[pos as usize] != 0)
-        .map_or(0, |i| i + 1);
+    // The scan-order search reads the grid in scan order, one dependent load
+    // per position, and an all-zero block makes it walk every one of them --
+    // which the pricer does for candidate after candidate. A straight-line
+    // pass settles that case first: it vectorises, and a block that codes
+    // anything at all almost always codes its DC, so it stops at the first
+    // element.
+    let eob = if grid.iter().all(|&level| level == 0) {
+        0
+    } else {
+        scan.iter()
+            .rposition(|&pos| grid[pos as usize] != 0)
+            .map_or(0, |i| i + 1)
+    };
     enc.symbol(usize::from(eob == 0), &mut coding.txb_skip[skip_ctx]);
     if plane.is_some() {
         ec_rng_trace(|| {
@@ -2656,10 +2664,22 @@ fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
     if row == 0 && col == 0 {
         return 0;
     }
-    let mag: i32 = [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
-        .iter()
-        .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs().min(3))
-        .sum();
+    // A coefficient two rows and two columns clear of the far edges reaches
+    // all five neighbours, so the gather is five loads off one index with no
+    // per-neighbour edge test -- which is where this writer spends a third of
+    // its coefficient loop.
+    let p = row * side + col;
+    let mag: i32 = if row + 2 < side && col + 2 < side {
+        [p + side, p + 1, p + side + 1, p + 2 * side, p + 2]
+            .iter()
+            .map(|&i| grid[i].abs().min(3))
+            .sum()
+    } else {
+        [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
+            .iter()
+            .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs().min(3))
+            .sum()
+    };
     let offset = cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize;
     (((mag + 1) >> 1).min(4) as usize) + offset
 }
@@ -2668,10 +2688,15 @@ fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
 /// of its three closest neighbours below and to the right, uncapped, and a
 /// term separating the DC, the corner of the transform, and the rest.
 fn br_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
-    let mag: i32 = [(1, 0), (0, 1), (1, 1)]
-        .iter()
-        .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs())
-        .sum();
+    let p = row * side + col;
+    let mag: i32 = if row + 1 < side && col + 1 < side {
+        grid[p + side].abs() + grid[p + 1].abs() + grid[p + side + 1].abs()
+    } else {
+        [(1, 0), (0, 1), (1, 1)]
+            .iter()
+            .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs())
+            .sum()
+    };
     let mag = (((mag + 1) >> 1).min(6)) as usize;
     if row == 0 && col == 0 {
         mag

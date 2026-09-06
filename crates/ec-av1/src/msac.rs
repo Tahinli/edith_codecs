@@ -47,11 +47,22 @@ pub struct SymbolEncoder {
     /// Flushed bytes before carry propagation: each entry can exceed `0xff` by
     /// the carry it owes the byte before it, which [`Self::finish`] adds in.
     precarry: Vec<u16>,
-    /// What every symbol written so far cost against the CDF it was written
-    /// with, in bits. The arithmetic coder spends `-log2(p)` on a symbol of
-    /// probability `p` to within the rounding of its interval, so this is what
-    /// a search may price a decision with without coding it twice.
-    bits: f64,
+    /// `log2` of the interval width the bit account started from — the coder's
+    /// width at [`Self::new`] or at the last [`Self::reset_bits`].
+    bits_base: f64,
+    /// How many bits the renormalisation has shifted `rng` up by since the
+    /// account started. A symbol costs `log2(r) - log2(rng)` for the widths it
+    /// narrows between, and the next symbol's `r` is this symbol's `rng`
+    /// shifted left by the renormalisation, so the whole string's cost
+    /// telescopes to `bits_base + shifts - log2(rng)` — one `log2` per price
+    /// asked for, instead of one per symbol (libaom's `od_ec_enc_tell_frac`
+    /// reads its account the same way).
+    shifts: u32,
+    /// Whether this coder only prices: the bit account depends on nothing but
+    /// how far each symbol narrows `rng`, so a pricer keeps the interval width
+    /// and drops the value bookkeeping (`low`, `cnt`, `precarry`) whose only
+    /// consumer is [`Self::finish`].
+    pricing: bool,
 }
 
 impl Default for SymbolEncoder {
@@ -69,13 +80,25 @@ impl SymbolEncoder {
             rng: 0x8000,
             cnt: -9,
             precarry: Vec::new(),
-            bits: 0.0,
+            bits_base: 15.0,
+            shifts: 0,
+            pricing: false,
+        }
+    }
+
+    /// A coder that only prices, for a search that wants [`Self::bits`] and
+    /// will never ask for the bytes. Every symbol narrows `rng` exactly as it
+    /// would in a writing coder, so the account is the same to the bit.
+    pub fn pricer() -> SymbolEncoder {
+        SymbolEncoder {
+            pricing: true,
+            ..SymbolEncoder::new()
         }
     }
 
     /// What the symbols written so far cost, in bits.
     pub fn bits(&self) -> f64 {
-        self.bits
+        self.bits_base + f64::from(self.shifts) - f64::from(self.rng).log2()
     }
 
     /// The coder's current interval width — libaom's `od_ec_enc_rng` /
@@ -91,13 +114,15 @@ impl SymbolEncoder {
     /// holds one `u16` per byte already flushed. Pairs with the decoder's
     /// `aom_reader_tell`, which counts the same bits consumed.
     pub fn tell(&self) -> i32 {
+        debug_assert!(!self.pricing, "a pricer keeps no byte position");
         self.cnt + 10 + self.precarry.len() as i32 * 8
     }
 
     /// Forgets the cost accumulated so far, so that the next stretch of
     /// symbols can be priced on its own.
     pub fn reset_bits(&mut self) {
-        self.bits = 0.0;
+        self.bits_base = f64::from(self.rng).log2();
+        self.shifts = 0;
     }
 
     /// Writes `symbol` against `cdf` and adapts `cdf` exactly as the decoder
@@ -145,9 +170,15 @@ impl SymbolEncoder {
         // which is not quite its nominal probability: the coder works the
         // range through an eight-bit multiply and hands every symbol above
         // this one a floor of `EC_MIN_PROB`. Pricing the narrowing rather than
-        // the table entry is what makes the account match the bytes.
-        self.bits -= (f64::from(rng) / f64::from(r)).log2();
-        self.normalize(low, rng);
+        // the table entry is what makes the account match the bytes; the
+        // narrowing itself is read off `rng` and `shifts` by [`Self::bits`].
+        if self.pricing {
+            let d = 16 - (32 - rng.leading_zeros());
+            self.rng = rng << d;
+            self.shifts += d;
+        } else {
+            self.normalize(low, rng);
+        }
     }
 
     /// Writes `bits` raw bits of `value`, most significant first — the `L(n)`
@@ -169,6 +200,7 @@ impl SymbolEncoder {
     /// inside it however the decoder pads the string, which is what lets a tile
     /// payload end on a byte boundary with no terminator.
     pub fn finish(mut self) -> Vec<u8> {
+        assert!(!self.pricing, "a pricer holds no bytes to flush");
         // Round the interval's low end up to a value with 14 low zero bits,
         // then set bit 14: the result is inside the interval (the interval is
         // at least 2^15 wide before normalisation) and its tail bits are all
@@ -223,6 +255,7 @@ impl SymbolEncoder {
         self.low = low << d;
         self.rng = rng << d;
         self.cnt = s;
+        self.shifts += d as u32;
     }
 }
 
