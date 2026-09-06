@@ -1,0 +1,13 @@
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 })
+bars 1080p: pricer armings default=16 real=177
+bars 1080p: motion_mode 32x32 SIMPLE=76115 OBMC=0 WARP=138 | 16x16 SIMPLE=2927 OBMC=0 WARP=163 | 8x8 SIMPLE=17155 OBMC=0 WARP=1236 (0.0% OBMC / 1.6% WARP of 97734 eligible)
+bars 1080p: inter var-tx depths of 12372 blocks -- leaf single 0=1211 1=649 (34.9% split) | leaf compound 0=1472 1=1210 (45.1% split) | 32x32 single 0=940 1=2057 (68.6% split) | 32x32 compound 0=2446 1=2387 (49.4% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| bars 1080p 1920x1024 | 43.96 dB/264019 B, 47.65 dB/387214 B, 51.09 dB/518844 B, 53.97 dB/647879 B | +21.5% | +3.7% | 37.8s:8.4s:16.4s |
