@@ -6316,17 +6316,24 @@ mod tests {
     /// ours: `base_q_idx {60,90,120,150}`. Every PSNR is all-plane, on
     /// ffmpeg-decoded frames of each encoder's own stream.
     ///
-    /// Measured baseline 2026-09-06, 12 frames, this box (wall = the four
-    /// encodes of that ladder together):
+    /// Measured 2026-09-06 after the inter partition search (lane-av1rd2),
+    /// 12 frames, this box (wall = the four encodes of that ladder
+    /// together):
     ///
     /// | clip | ours (q 150/120/90/60) | BD-rate vs libaom | vs rav1e | wall ours:aom:rav1e |
     /// |---|---|---|---|---|
-    /// | 1080p fixture | 40.36 dB/26824 B .. 48.24 dB/120942 B | +501.4% | +364.4% | 5.1s:1.9s:3.8s |
-    /// | 2160p fixture | 41.36 dB/17608 B .. 49.27 dB/76978 B | +504.4% | +401.0% | 4.6s:1.5s:3.3s |
-    /// | screen capture | 37.32 dB/13053 B .. 45.39 dB/59744 B | +440.9% | +206.0% | 5.9s:1.7s:3.0s |
+    /// | 1080p fixture | 41.16 dB/22349 B .. 49.97 dB/83178 B | +234.0% | +171.9% | 9.8s:1.1s:2.6s |
+    /// | 2160p fixture | 42.01 dB/14687 B .. 50.82 dB/52415 B | +260.3% | +203.2% | 9.3s:1.0s:2.2s |
+    /// | screen capture | 37.49 dB/12797 B .. 46.19 dB/50643 B | +318.5% | +155.3% | 9.1s:1.0s:2.1s |
     ///
-    /// So: roughly 5x libaom's rate and 3-4x rav1e's at matched fidelity,
-    /// while spending 2.7x libaom's and 1.4x rav1e's encode time. No
+    /// The baseline it replaced, before an inter frame's blocks chose their
+    /// own partition, was +501.4/+504.4/+440.9 against libaom and
+    /// +364.4/+401.0/+206.0 against rav1e at 5.1/4.6/5.9 s.
+    ///
+    /// So: roughly 2.5-3x libaom's rate and 1.5-2x rav1e's at matched
+    /// fidelity, while spending far more time than either (the partition
+    /// search's own cost, uncut: see the two intra-pruning variants measured
+    /// and rejected in the lane report). No
     /// threshold is asserted yet -- this run sets the baseline; the gate
     /// asserts only four monotone points per ladder and that ffmpeg decodes
     /// our stream sample-exact against our reconstruction.
