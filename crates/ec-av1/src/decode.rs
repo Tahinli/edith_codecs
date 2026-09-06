@@ -2559,7 +2559,18 @@ struct WaveQueue {
     /// Jobs popped but not finished -- what [`wave_barrier`] waits out.
     active: usize,
     closed: bool,
+    /// lane-sballoc: the three per-superblock buffers a finished job hands
+    /// back, so [`wave_submit`] takes a warm allocation (capacity kept, no
+    /// first-touch page faults) instead of the `Vec::with_capacity` it used
+    /// to make per superblock -- 3 allocations and 3 frees per superblock,
+    /// 4680 per 4K frame. Bounded at `recon_threads + 2` sets, and it lives
+    /// inside the queue's own mutex, which both sides already take.
+    free: Vec<JobBufs>,
+    free_cap: usize,
 }
+
+/// One recycled set of [`ReconJob`] buffers (lane-sballoc).
+type JobBufs = (Vec<ReconOp>, Vec<i32>, Vec<u16>);
 
 impl WaveQueue {
     /// The lowest-row queued job whose wavefront dependencies are satisfied,
@@ -2701,15 +2712,22 @@ fn wave_worker(st: &WaveState, idx: usize) {
         // every superblock that could have written or be reading them is
         // complete by the wavefront rule above.
         let mut cur: [Vec<u16>; 3] = Default::default();
+        let ReconJob { mut ops, mut coeffs, mut preds } = job;
         unsafe {
-            for op in job.ops {
-                exec_op(op, &mut *y, &mut *u, &mut *v, &mut cur, &job.coeffs, &job.preds, &fctx);
+            for op in ops.drain(..) {
+                exec_op(op, &mut *y, &mut *u, &mut *v, &mut cur, &coeffs, &preds, &fctx);
             }
         }
         if stats {
             WS_BUSY[slot].fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
         }
+        coeffs.clear();
+        preds.clear();
         let mut q = st.q.lock().unwrap();
+        // lane-sballoc: hand the three buffers back for the next submit.
+        if q.free.len() < q.free_cap {
+            q.free.push((ops, coeffs, preds));
+        }
         q.done[r] = c as isize;
         q.active -= 1;
         st.cv.notify_all();
@@ -2750,6 +2768,8 @@ impl<'a> WaveGuard<'a> {
                 last_push: vec![-1; rows],
                 active: 0,
                 closed: false,
+                free: Vec::new(),
+                free_cap: threads + 2,
             }),
             cv: std::sync::Condvar::new(),
             // SAFETY: the planes are locals of the tile decoder and outlive
@@ -2792,6 +2812,16 @@ impl Drop for WaveGuard<'_> {
     }
 }
 
+/// An empty buffer for the next superblock: the recycled one when it is at
+/// least as big as the superblock just parsed, else a fresh sized one
+/// (lane-sballoc; `v` is always empty).
+fn reuse<T>(mut v: Vec<T>, cap: usize) -> Vec<T> {
+    if v.capacity() < cap {
+        v.reserve_exact(cap - v.len());
+    }
+    v
+}
+
 /// Hands superblock `(r, c)`'s recorded writes to the wavefront. `false`
 /// when there is no wavefront (one reconstruction thread), in which case the
 /// caller replays them itself.
@@ -2802,10 +2832,15 @@ fn wave_submit(fctx: &crate::decode::FrameCtx, r: usize, c: usize) -> bool {
     // exactly as the two arenas below are -- taking it left a zero-capacity
     // `Vec` that regrew (and memmoved every recorded op) from nothing on
     // every superblock.
+    // lane-sballoc: the replacement comes from the finished jobs' free list
+    // when there is one (warm capacity, already faulted in); only the first
+    // superblocks of a tile allocate.
+    let mut q = st.q.lock().unwrap();
+    let (sops, scoeffs, spreds) = q.free.pop().unwrap_or_default();
     let ops = fctx.recon_ops.with(|c| {
         let mut c = c.borrow_mut();
         let cap = c.len();
-        std::mem::replace(&mut *c, Vec::with_capacity(cap))
+        std::mem::replace(&mut *c, reuse(sops, cap))
     });
     // The job owns its coefficients: the arena is replaced by an empty one
     // sized for the next superblock, so parse never regrows from nothing and
@@ -2813,15 +2848,14 @@ fn wave_submit(fctx: &crate::decode::FrameCtx, r: usize, c: usize) -> bool {
     let coeffs = fctx.coeff_arena.with(|c| {
         let mut c = c.borrow_mut();
         let cap = c.len();
-        std::mem::replace(&mut *c, Vec::with_capacity(cap))
+        std::mem::replace(&mut *c, reuse(scoeffs, cap))
     });
     let preds = fctx.pred_arena.with(|c| {
         let mut c = c.borrow_mut();
         let cap = c.len();
-        std::mem::replace(&mut *c, Vec::with_capacity(cap))
+        std::mem::replace(&mut *c, reuse(spreds, cap))
     });
     {
-        let mut q = st.q.lock().unwrap();
         if (c as isize) > q.last_sub[r] {
             q.last_sub[r] = c as isize;
         }
