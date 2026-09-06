@@ -4637,8 +4637,17 @@ fn code_square_inter(
             // 0.05 (both rejections above were measured at 0.1, the weight
             // the lambda lane showed was 2x too heavy): a compound winner is
             // offered the same var-tx split, its units predicted from BOTH
-            // references. Behind `EC_AV1_COMP_VARTX` until the native table
-            // says keep.
+            // references (`mc_trial_compound`). RE-MEASURED native: film
+            // 1080p +16.0/-1.1, film 2160p +46.6/+18.8, screen +51.4/-14.4
+            // against the +16.2/-1.1, +46.6/+18.8, +51.3/-14.4 with it off --
+            // one row 0.2 down, two flat, short of the two-down-one-flat keep
+            // rule, so it stays behind `EC_AV1_COMP_VARTX` (default OFF)
+            // rather than change the default on a single 0.2 row. It fires:
+            // 37.0% / 11.1% / 32.9% of the compound blocks split. 640x384 for
+            // the record: +70.5/+84.0/+48.9 and +28.9/+46.2/-3.7 against
+            // +70.4/+85.3/+48.5 and +28.4/+47.4/-4.0 -- the 4K film row is
+            // 1.3/1.2 down there, which is where the upgrade path is if this
+            // is picked up again.
             let second = info.ref1.filter(|_| motion_won == 0).and_then(|r| {
                 refs[r as usize].map(|g| {
                     (
@@ -7205,15 +7214,28 @@ fn search_inter_block(
             }
         }
     }
-    // lane-av1txbits BUILT the transform-depth search this path lacks -- a
-    // 32x32 single-reference winner offered `commit_inter_luma`'s four 16x16
-    // units against its flat trial, exactly as a 16x16 winner is -- and
-    // MEASURED it flat to slightly worse: +78.7/+95.1/+54.6 vs libaom and
-    // +36.1/+56.2/+1.8 vs rav1e, against the +78.8/+95.1/+54.5 and
-    // +36.1/+56.4/+1.4 this code scores, while the split fired on 40.2% of
-    // the film's inter blocks and 17.6% of the screen's. The same shape as
-    // the compound trial set below: a local RD win that does not convert into
-    // ladder bytes. The flat 32x32 transform stays.
+    // The transform-depth search of a 32x32 winner (`EC_AV1_TX32_DEPTH`,
+    // default OFF): the four 16x16 units of `commit_inter_luma` against the
+    // flat trial, exactly as a 16x16 leaf is offered. lane-av1txbits measured
+    // it flat-to-worse at LAMBDA_SCALE 0.1; lane-av1txdepth REBUILT it and
+    // RE-MEASURED it at 0.05, where the rate weight is half of what rejected
+    // it, and it is worse again on the deciding native table: film 1080p
+    // +16.6/-0.5, film 2160p +46.6/+18.8, screen +50.9/-14.3 against the
+    // +16.2/-1.1, +46.6/+18.8, +51.3/-14.4 of the same build with it off --
+    // 1080p up 0.4/0.6, one row flat, screen 0.4 down against libaom and 0.1
+    // up against rav1e. (640x384 reads it slightly the other way, +70.0/
+    // +85.0/+48.4 and +28.3/+47.2/-3.6 against +70.4/+85.3/+48.5 and
+    // +28.4/+47.4/-4.0 -- the native table decides.)
+    //
+    // NOT blindness: the split wins 62.3% of the 1080p film's 32x32 blocks,
+    // 70.9% of the 4K film's and 53.5% of the screen's. NOT mis-pricing
+    // either, and the census names the row: the split units' own set
+    // `Luma16Inter` is priced within 1.4% of what it is written at in every
+    // bucket from two non-zeros up, and its ZERO bucket (335 units) is priced
+    // +30.1% ABOVE the written bits -- an error that biases AGAINST splitting,
+    // so a perfect pricer would split even more, and more splitting is what
+    // measured worse. The four extra txb_skip/eob symbols simply cost more
+    // ladder bytes than the local RD saves. The flat 32x32 transform stays.
     // lane-av1txdepth REBUILT that search at LAMBDA_SCALE 0.05 (the rejection
     // above was measured at 0.1), behind `EC_AV1_TX32_DEPTH`, and gave the
     // compound winner the same offer behind `EC_AV1_COMP_VARTX`. An OBMC/warp

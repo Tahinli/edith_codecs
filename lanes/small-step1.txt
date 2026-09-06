@@ -1,0 +1,69 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1txdepth/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+12 frames of each clip at 640x384, gop=12, 1 tile, 1 thread
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e |
+|---|---|---|---|---|
+h264-1080p-23.976-8bit.mp4: inter modes NEAREST 9573 (80.6%) NEAR 235 (2.0%) GLOBAL 187 (1.6%) NEW 1875 (15.8%); drl idx 0/1/2/3+ 11492/351/27/0
+h264-1080p-23.976-8bit.mp4: compound 13817 of 25687 inter blocks (53.8%); modes NEAREST_NEAREST 10834 NEAR_NEAR 0 NEAREST_NEW 818 NEW_NEAREST 628 GLOBAL_GLOBAL 843 NEW_NEW 694; pairs LAST+GOLDEN 3894 LAST+ALTREF 9923
+h264-1080p-23.976-8bit.mp4: leaf (16x16 and below) compound modes NEAREST_NEAREST 8075 NEAR_NEAR 0 NEAREST_NEW 726 NEW_NEAREST 526 GLOBAL_GLOBAL 661 NEW_NEW 594
+h264-1080p-23.976-8bit.mp4: compound by size 8x8 6760 16x16 3822 32x32 3235
+h264-1080p-23.976-8bit.mp4: motion search 96827 calls, 5377360 candidate evals (55.5/call, 28.8% of them subpel), 457409 integer rounds (4.72/call); winner within +-1 pel of pred_mv 85.3%, winner = starting seed 65.3%
+h264-1080p-23.976-8bit.mp4: references LAST 7078 GOLDEN 4444 (LAST2 0 LAST3 0 BWD 0 ALT2 0 ALT 348)
+h264-1080p-23.976-8bit.mp4: inter 32x32 split into 16s 1587 of 10560 blocks (15.0%); 16x16 leaves split into 8s 1851 of 8912 (20.8%)
+h264-1080p-23.976-8bit.mp4: over 48 frames -- deblock luma mean 9.4 chroma 9.1; cdef luma pri 5.4/sec 3.1, chroma pri 4.4/sec 2.0
+h264-1080p-23.976-8bit.mp4: cdef_bits frames 6/17/17/8 (0/1/2/3); 950 of 2880 64x64 units on a non-default preset (33.0%)
+h264-1080p-23.976-8bit.mp4: lr units none=2861 wiener=19 (0.7% restored)
+h264-1080p-23.976-8bit.mp4: pricer armings default=16 real=182
+h264-1080p-23.976-8bit.mp4: screen frames on=0 off=4; palette blocks 0 sizes 
+h264-1080p-23.976-8bit.mp4: chroma palette blocks 0 sizes 
+h264-1080p-23.976-8bit.mp4: uv modes DC=15015 (43.0%) V=2566 (7.4%) H=3287 (9.4%) SMOOTH=4343 (12.4%) SMOOTH_V=2043 (5.9%) SMOOTH_H=2740 (7.9%) PAETH=4894 (14.0%)
+h264-1080p-23.976-8bit.mp4: intra tx depths 0=12065 (34.6%) 1=19537 (56.0%) 2=3286 (9.4%)
+h264-1080p-23.976-8bit.mp4: inter var-tx depths of 1883 blocks -- leaf single 0=551 1=361 (39.6% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=411 1=560 (57.7% split) | 32x32 compound 0=0 1=0 (0.0% split)
+h264-1080p-23.976-8bit.mp4: motion_mode 32x32 SIMPLE=6713 OBMC=0 WARP=320 | 16x16 SIMPLE=1039 OBMC=0 WARP=309 | 8x8 SIMPLE=2310 OBMC=0 WARP=495 (0.0% OBMC / 10.0% WARP of 11186 eligible)
+| h264-1080p-23.976-8bit.mp4 | 43.21 dB/13524 B, 46.27 dB/25983 B, 49.08 dB/43986 B, 51.48 dB/66133 B | +70.0% | +28.3% | 5.6s:1.1s:2.6s |
+|   references | libaom 42.76 dB/7179 B, 44.78 dB/10177 B, 48.45 dB/24647 B, 56.50 dB/94272 B | rav1e 37.98 dB/4274 B, 42.57 dB/8004 B, 45.74 dB/17715 B, 49.20 dB/39938 B | | |
+h264-2160p-23.976-8bit.mp4: inter modes NEAREST 8576 (84.7%) NEAR 334 (3.3%) GLOBAL 174 (1.7%) NEW 1036 (10.2%); drl idx 0/1/2/3+ 9705/409/6/0
+h264-2160p-23.976-8bit.mp4: compound 7912 of 18032 inter blocks (43.9%); modes NEAREST_NEAREST 6412 NEAR_NEAR 0 NEAREST_NEW 465 NEW_NEAREST 188 GLOBAL_GLOBAL 548 NEW_NEW 299; pairs LAST+GOLDEN 1594 LAST+ALTREF 6318
+h264-2160p-23.976-8bit.mp4: leaf (16x16 and below) compound modes NEAREST_NEAREST 3758 NEAR_NEAR 0 NEAREST_NEW 377 NEW_NEAREST 167 GLOBAL_GLOBAL 354 NEW_NEW 256
+h264-2160p-23.976-8bit.mp4: compound by size 8x8 2328 16x16 2584 32x32 3000
+h264-2160p-23.976-8bit.mp4: motion search 79008 calls, 4341056 candidate evals (54.9/call, 29.1% of them subpel), 368587 integer rounds (4.67/call); winner within +-1 pel of pred_mv 86.5%, winner = starting seed 79.6%
+h264-2160p-23.976-8bit.mp4: references LAST 5455 GOLDEN 4379 (LAST2 0 LAST3 0 BWD 0 ALT2 0 ALT 286)
+h264-2160p-23.976-8bit.mp4: inter 32x32 split into 16s 1115 of 10560 blocks (10.6%); 16x16 leaves split into 8s 1010 of 7240 (14.0%)
+h264-2160p-23.976-8bit.mp4: over 48 frames -- deblock luma mean 9.2 chroma 6.1; cdef luma pri 1.3/sec 1.5, chroma pri 2.1/sec 1.9
+h264-2160p-23.976-8bit.mp4: cdef_bits frames 8/21/15/4 (0/1/2/3); 827 of 2880 64x64 units on a non-default preset (28.7%)
+h264-2160p-23.976-8bit.mp4: lr units none=2862 wiener=18 (0.6% restored)
+h264-2160p-23.976-8bit.mp4: pricer armings default=18 real=173
+h264-2160p-23.976-8bit.mp4: screen frames on=0 off=4; palette blocks 0 sizes 
+h264-2160p-23.976-8bit.mp4: chroma palette blocks 0 sizes 
+h264-2160p-23.976-8bit.mp4: uv modes DC=17607 (61.8%) V=2599 (9.1%) H=1734 (6.1%) SMOOTH=1104 (3.9%) SMOOTH_V=1335 (4.7%) SMOOTH_H=1127 (4.0%) PAETH=2974 (10.4%)
+h264-2160p-23.976-8bit.mp4: intra tx depths 0=14508 (50.9%) 1=11877 (41.7%) 2=2095 (7.4%)
+h264-2160p-23.976-8bit.mp4: inter var-tx depths of 1913 blocks -- leaf single 0=623 1=365 (36.9% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=468 1=457 (49.4% split) | 32x32 compound 0=0 1=0 (0.0% split)
+h264-2160p-23.976-8bit.mp4: motion_mode 32x32 SIMPLE=6689 OBMC=0 WARP=317 | 16x16 SIMPLE=1037 OBMC=0 WARP=217 | 8x8 SIMPLE=800 OBMC=0 WARP=396 (0.0% OBMC / 9.8% WARP of 9456 eligible)
+| h264-2160p-23.976-8bit.mp4 | 43.79 dB/9586 B, 47.47 dB/14483 B, 50.20 dB/24077 B, 52.38 dB/36583 B | +85.0% | +47.2% | 4.7s:1.0s:2.2s |
+|   references | libaom 44.31 dB/5833 B, 47.75 dB/9035 B, 51.45 dB/13848 B, 56.50 dB/49099 B | rav1e 39.20 dB/2833 B, 43.62 dB/5536 B, 47.90 dB/10763 B, 50.92 dB/21183 B | | |
+screen capture (2026-07-25 02-09-04.mkv): inter modes NEAREST 10925 (99.8%) NEAR 6 (0.1%) GLOBAL 0 (0.0%) NEW 19 (0.2%); drl idx 0/1/2/3+ 10944/6/0/0
+screen capture (2026-07-25 02-09-04.mkv): compound 5404 of 16354 inter blocks (33.0%); modes NEAREST_NEAREST 5389 NEAR_NEAR 0 NEAREST_NEW 0 NEW_NEAREST 8 GLOBAL_GLOBAL 7 NEW_NEW 0; pairs LAST+GOLDEN 335 LAST+ALTREF 5069
+screen capture (2026-07-25 02-09-04.mkv): leaf (16x16 and below) compound modes NEAREST_NEAREST 933 NEAR_NEAR 0 NEAREST_NEW 0 NEW_NEAREST 6 GLOBAL_GLOBAL 2 NEW_NEW 0
+screen capture (2026-07-25 02-09-04.mkv): compound by size 8x8 276 16x16 665 32x32 4463
+screen capture (2026-07-25 02-09-04.mkv): motion search 106783 calls, 5536309 candidate evals (51.8/call, 30.9% of them subpel), 465113 integer rounds (4.36/call); winner within +-1 pel of pred_mv 98.7%, winner = starting seed 98.1%
+screen capture (2026-07-25 02-09-04.mkv): references LAST 4022 GOLDEN 6178 (LAST2 0 LAST3 0 BWD 0 ALT2 0 ALT 750)
+screen capture (2026-07-25 02-09-04.mkv): inter 32x32 split into 16s 351 of 10560 blocks (3.3%); 16x16 leaves split into 8s 261 of 12116 (2.2%)
+screen capture (2026-07-25 02-09-04.mkv): over 48 frames -- deblock luma mean 4.3 chroma 0.9; cdef luma pri 1.1/sec 0.5, chroma pri 2.5/sec 0.2
+screen capture (2026-07-25 02-09-04.mkv): cdef_bits frames 27/7/11/3 (0/1/2/3); 612 of 2880 64x64 units on a non-default preset (21.2%)
+screen capture (2026-07-25 02-09-04.mkv): lr units none=2878 wiener=2 (0.1% restored)
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=167 real=0
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0; palette blocks 1573 sizes 3=6 4=523 5=2 8=1042
+screen capture (2026-07-25 02-09-04.mkv): chroma palette blocks 202 sizes 4=180 8=22
+screen capture (2026-07-25 02-09-04.mkv): uv modes DC=9840 (24.7%) V=949 (2.4%) H=7932 (19.9%) SMOOTH=1646 (4.1%) SMOOTH_V=734 (1.8%) SMOOTH_H=1305 (3.3%) PAETH=17474 (43.8%)
+screen capture (2026-07-25 02-09-04.mkv): intra tx depths 0=9308 (23.3%) 1=22853 (57.3%) 2=7719 (19.4%)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 4055 blocks -- leaf single 0=1400 1=811 (36.7% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=1059 1=785 (42.6% split) | 32x32 compound 0=0 1=0 (0.0% split)
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=9238 OBMC=0 WARP=490 | 16x16 SIMPLE=787 OBMC=0 WARP=57 | 8x8 SIMPLE=135 OBMC=0 WARP=163 (0.0% OBMC / 6.5% WARP of 10870 eligible)
+| screen capture (2026-07-25 02-09-04.mkv) | 41.30 dB/9726 B, 44.53 dB/14028 B, 47.24 dB/19241 B, 49.44 dB/24944 B | +48.4% | -3.6% | 5.7s:1.0s:2.1s |
+|   references | libaom 45.12 dB/10679 B, 49.35 dB/15779 B, 55.26 dB/25633 B, 71.29 dB/52986 B | rav1e 34.51 dB/3233 B, 39.45 dB/7772 B, 44.72 dB/15210 B, 49.31 dB/24915 B | | |
+test encode::tests::bd_rate_vs_libaom_and_rav1e ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 573 filtered out; finished in 28.94s
+
