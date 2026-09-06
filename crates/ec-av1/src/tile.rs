@@ -1166,6 +1166,11 @@ pub struct BlockCoeffs {
     /// `tx_depth` to zero (the whole block is one transform over the
     /// palette's own prediction).
     pub palette: Option<PaletteY>,
+    /// The chroma palette this block's two chroma planes are predicted with
+    /// (spec 5.11.46 `palette_mode_info`'s plane-1 half), or `None`. Only a
+    /// `UV_DC_PRED` block of an `allow_screen_content_tools` frame may carry
+    /// one; it is independent of [`Self::palette`] (either, both or neither).
+    pub palette_uv: Option<PaletteUv>,
     /// How many times this block's luma transform is halved under
     /// `TxMode::Select` (spec `tx_depth`, 0 = one transform over the whole
     /// block). Read only by the writers a `tx_select` frame calls; a
@@ -1186,6 +1191,27 @@ pub struct PaletteY {
     /// The base colours, ascending.
     pub colors: [u16; 8],
     /// Which colour each pixel takes, row-major over the block's own side.
+    pub map: Vec<u8>,
+}
+
+/// As [`PaletteY`], for a block's chroma palette -- one colour-index map
+/// SHARED by U and V (spec `av1_visit_palette`'s plane-1 pass; the two planes
+/// are co-located after 4:2:0 subsampling) plus each plane's own base
+/// colours, exactly what [`crate::decode`]'s own `PaletteUv` carries out of
+/// the stream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaletteUv {
+    /// How many base colours, 2..=8 (spec `PaletteSizeUV`).
+    pub size: u8,
+    /// U's base colours, ASCENDING and distinct -- `read_palette_colors_uv`
+    /// merges the cached and transmitted lists as two ascending runs, and its
+    /// delta form only ever steps upwards.
+    pub u_colors: [u16; 8],
+    /// V's base colours, in the same cluster order as [`Self::u_colors`] --
+    /// the shared map indexes both, and V's own coding needs no ordering.
+    pub v_colors: [u16; 8],
+    /// Which colour each chroma pixel takes, row-major over the subsampled
+    /// block's own `(side / 2).max(4)` side.
     pub map: Vec<u8>,
 }
 
@@ -1455,6 +1481,15 @@ struct Neighbours {
     pending_palette: Option<(u8, [u16; 8])>,
     /// The colours beside [`Self::above_palette_size`].
     above_palette_colors: Vec<[u16; 8]>,
+    /// The chroma (U-channel) halves of the three bands above --
+    /// `av1_get_palette_cache(xd, 1, cache)`'s source, mirrored from the
+    /// decoder's own `above_palette_uv_*`/`left_palette_uv_*`.
+    above_palette_uv_size: Vec<u8>,
+    left_palette_uv_size: Vec<u8>,
+    above_palette_uv_colors: Vec<[u16; 8]>,
+    left_palette_uv_colors: Vec<[u16; 8]>,
+    /// [`Self::pending_palette`] for the chroma palette.
+    pending_palette_uv: Option<(u8, [u16; 8])>,
     /// The same, down the left edge.
     left_palette_colors: Vec<[u16; 8]>,
     /// Whether the neighbour was coded inter, for the `is_inter` context.
@@ -1546,6 +1581,11 @@ impl Neighbours {
             left_palette_size: vec![0; rows * (SUB / MI)],
             pending_palette: None,
             above_palette_colors: vec![[0; 8]; cols * (SUB / MI)],
+            above_palette_uv_size: vec![0; cols * (SUB / MI)],
+            left_palette_uv_size: vec![0; rows * (SUB / MI)],
+            above_palette_uv_colors: vec![[0; 8]; cols * (SUB / MI)],
+            left_palette_uv_colors: vec![[0; 8]; rows * (SUB / MI)],
+            pending_palette_uv: None,
             left_palette_colors: vec![[0; 8]; rows * (SUB / MI)],
             mi_cols,
             mi_rows,
@@ -1584,6 +1624,8 @@ impl Neighbours {
         self.left_tx.iter_mut().for_each(|t| *t = 0);
         self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
         self.left_palette_size.iter_mut().for_each(|s| *s = 0);
+        self.left_palette_uv_size.iter_mut().for_each(|s| *s = 0);
+        self.left_palette_uv_colors.iter_mut().for_each(|c| *c = [0u16; 8]);
     }
 
     /// `av1_get_palette_mode_ctx` + `av1_get_palette_cache`, mirrored from
@@ -1639,6 +1681,80 @@ impl Neighbours {
             li += 1;
         }
         (ctx, cache)
+    }
+
+    /// [`Self::palette_ctx_and_cache`]'s cache half for the U channel
+    /// (`av1_get_palette_cache(xd, 1, cache)`), mirrored from the decoder's
+    /// `palette_uv_cache_mi`: the `palette_uv_mode` context needs no
+    /// neighbour lookup at all (it is this block's own just-decided Y palette
+    /// use), so only the cache is wanted here.
+    fn palette_uv_cache(&self, (r, c): (usize, usize)) -> Vec<u16> {
+        let above_ok = r % 16 != 0;
+        let (above_n, above_colors) = if above_ok && self.above_palette_uv_size[c] > 0 {
+            (
+                usize::from(self.above_palette_uv_size[c]),
+                self.above_palette_uv_colors[c],
+            )
+        } else {
+            (0, [0u16; 8])
+        };
+        let (left_n, left_colors) = if c > 0 && self.left_palette_uv_size[r] > 0 {
+            (
+                usize::from(self.left_palette_uv_size[r]),
+                self.left_palette_uv_colors[r],
+            )
+        } else {
+            (0, [0u16; 8])
+        };
+        let mut cache = Vec::with_capacity(16);
+        let push_dedup = |cache: &mut Vec<u16>, v: u16| {
+            if cache.last() != Some(&v) {
+                cache.push(v);
+            }
+        };
+        let (mut ai, mut li) = (0usize, 0usize);
+        while ai < above_n && li < left_n {
+            let (va, vl) = (above_colors[ai], left_colors[li]);
+            if vl < va {
+                push_dedup(&mut cache, vl);
+                li += 1;
+            } else {
+                push_dedup(&mut cache, va);
+                ai += 1;
+                if vl == va {
+                    li += 1;
+                }
+            }
+        }
+        while ai < above_n {
+            push_dedup(&mut cache, above_colors[ai]);
+            ai += 1;
+        }
+        while li < left_n {
+            push_dedup(&mut cache, left_colors[li]);
+            li += 1;
+        }
+        cache
+    }
+
+    /// [`Self::record_palette_y`] for the chroma bands (decode.rs
+    /// `record_palette_uv_rect`) -- `size == 0` clears stale state the same
+    /// way, and the span is in LUMA pixels for both planes' bands alike.
+    fn record_palette_uv(&mut self, (r, c): (usize, usize), side: usize, size: u8, colors: [u16; 8]) {
+        for cell in 0..(side / MI).max(1) {
+            if let Some(e) = self.above_palette_uv_size.get_mut(c + cell) {
+                *e = size;
+                if size > 0 {
+                    self.above_palette_uv_colors[c + cell] = colors;
+                }
+            }
+            if let Some(e) = self.left_palette_uv_size.get_mut(r + cell) {
+                *e = size;
+                if size > 0 {
+                    self.left_palette_uv_colors[r + cell] = colors;
+                }
+            }
+        }
     }
 
     /// What a just-written block leaves in the palette bands (decode.rs
@@ -1809,6 +1925,8 @@ impl Neighbours {
         if screen_armed() {
             let (size, colors) = self.pending_palette.take().unwrap_or((0, [0u16; 8]));
             self.record_palette_y(at_mi, side, size, colors);
+            let (uv_size, uv_colors) = self.pending_palette_uv.take().unwrap_or((0, [0u16; 8]));
+            self.record_palette_uv(at_mi, side, uv_size, uv_colors);
         }
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         let side_mi = side / MI;
@@ -2581,6 +2699,72 @@ fn write_palette_colors_y(enc: &mut SymbolEncoder, colors: &[u16], cache: &[u16]
     }
 }
 
+/// `write_palette_colors_uv` (bitstream.c:1236), the write side of
+/// [`crate::decode`]'s `read_palette_colors_uv` at 8 bits. U is
+/// [`write_palette_colors_y`]'s cache/delta scheme with the reader's two
+/// documented differences -- the shrinking range starts at `256 - first`
+/// (not `255 - first`) and each delta is written unbiased (no `-1`).
+///
+/// corner-cut: V takes the reader's RAW form (the leading bit 0, then `n`
+/// 8-bit literals) rather than its first-value-plus-signed-deltas form.
+/// Ceiling: about `n` bits per chroma-palette block more than the delta form
+/// would spend (8n against roughly 10 + (n-1)*(5..8)), which the RD pricer
+/// below sees, so it only ever makes the encoder take FEWER chroma palettes
+/// than it should -- never a wrong stream. Upgrade path: price both forms
+/// here and write the cheaper one under its own leading bit.
+fn write_palette_colors_uv(enc: &mut SymbolEncoder, u_colors: &[u16], v_colors: &[u16], cache: &[u16]) {
+    let n = u_colors.len();
+    let mut cached: Vec<u16> = Vec::with_capacity(n);
+    for &c in cache {
+        if cached.len() >= n {
+            break;
+        }
+        let take = u_colors.contains(&c);
+        enc.literal(u32::from(take), 1);
+        if take {
+            PALETTE_UV_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cached.push(c);
+        }
+    }
+    let transmitted: Vec<u16> = u_colors
+        .iter()
+        .copied()
+        .filter(|c| !cached.contains(c))
+        .collect();
+    if !transmitted.is_empty() {
+        enc.literal(u32::from(transmitted[0]), 8);
+        if transmitted.len() > 1 {
+            let fits = |extra: u32| -> bool {
+                let mut bits = 5 + extra;
+                let mut range = 256i32 - i32::from(transmitted[0]);
+                for w in transmitted.windows(2) {
+                    let delta = i32::from(w[1]) - i32::from(w[0]);
+                    if delta >= (1i32 << bits) {
+                        return false;
+                    }
+                    range -= delta;
+                    bits = bits.min(crate::decode::ceil_log2(range.max(0) as u32));
+                }
+                true
+            };
+            let extra = (0..=3).find(|&e| fits(e)).unwrap_or(3);
+            enc.literal(extra, 2);
+            let mut bits = 5 + extra;
+            let mut range = 256i32 - i32::from(transmitted[0]);
+            for w in transmitted.windows(2) {
+                let delta = i32::from(w[1]) - i32::from(w[0]);
+                enc.literal(delta as u32, bits);
+                range -= delta;
+                bits = bits.min(crate::decode::ceil_log2(range.max(0) as u32));
+            }
+        }
+    }
+    enc.literal(0, 1);
+    for &v in v_colors {
+        enc.literal(u32::from(v), 8);
+    }
+}
+
 /// `write_palette_color_map` (bitstream.c), the write side of
 /// [`crate::decode`]'s `decode_color_index_map`: the same wavefront diagonal,
 /// each symbol written as the position its colour takes in the neighbour
@@ -2627,6 +2811,25 @@ pub(crate) fn palette_bits(pal: &PaletteY, side: usize) -> f64 {
     write_palette_colors_y(&mut enc, &pal.colors[..n], &[]);
     let mut idx_cdfs = cdf::PALETTE_Y_COLOR_INDEX[n - 2];
     write_color_index_map(&mut enc, &mut idx_cdfs, &pal.map, side, n);
+    enc.bits()
+}
+
+/// [`palette_bits`] for the chroma palette: the `palette_uv_mode` flag, the
+/// size symbol, both colour lists and the shared colour-index map, priced
+/// through the very writers above (empty cache, which only over-prices).
+pub(crate) fn palette_uv_bits(pal: &PaletteUv, side: usize) -> f64 {
+    let Some(bsize_ctx) = crate::decode::palette_bsize_ctx(side) else {
+        return f64::INFINITY;
+    };
+    let n = usize::from(pal.size);
+    let mut enc = SymbolEncoder::pricer();
+    let mut mode_cdf = cdf::PALETTE_UV_MODE[0];
+    enc.symbol(1, &mut mode_cdf);
+    let mut size_cdf = cdf::PALETTE_UV_SIZE[bsize_ctx];
+    enc.symbol(n - 2, &mut size_cdf);
+    write_palette_colors_uv(&mut enc, &pal.u_colors[..n], &pal.v_colors[..n], &[]);
+    let mut idx_cdfs = cdf::PALETTE_UV_COLOR_INDEX[n - 2];
+    write_color_index_map(&mut enc, &mut idx_cdfs, &pal.map, palette_uv_side(side), n);
     enc.bits()
 }
 
@@ -2680,7 +2883,17 @@ fn write_intra_mode(
     // `av1_get_palette_mode_ctx` counts palette NEIGHBOURS, and this writer
     // codes none -- exactly the ctx-0 read the decoder does under the same
     // condition.
-    write_palette_syntax(enc, cdfs, neighbours, block.palette.as_ref(), mode, uv_mode, mi, side);
+    write_palette_syntax(
+        enc,
+        cdfs,
+        neighbours,
+        block.palette.as_ref(),
+        block.palette_uv.as_ref(),
+        mode,
+        uv_mode,
+        mi,
+        side,
+    );
     mode
 }
 
@@ -2703,6 +2916,7 @@ fn write_palette_syntax(
     cdfs: &mut Cdfs,
     neighbours: &mut Neighbours,
     palette: Option<&PaletteY>,
+    palette_uv: Option<&PaletteUv>,
     mode: usize,
     uv_mode: usize,
     mi: (usize, usize),
@@ -2712,8 +2926,10 @@ fn write_palette_syntax(
         return;
     }
     let palette = palette.filter(|_| mode == DC_PRED);
+    let palette_uv = palette_uv.filter(|_| uv_mode == DC_PRED);
     if let Some(bsize_ctx) = crate::decode::palette_bsize_ctx(side) {
         let (mode_ctx, cache) = neighbours.palette_ctx_and_cache(mi);
+        let uv_cache = neighbours.palette_uv_cache(mi);
         if mode == DC_PRED {
             enc.symbol(
                 usize::from(palette.is_some()),
@@ -2726,15 +2942,45 @@ fn write_palette_syntax(
             write_palette_colors_y(enc, &pal.colors[..n], &cache);
         }
         if uv_mode == DC_PRED {
-            enc.symbol(0, &mut cdfs.palette_uv_mode[usize::from(palette.is_some())]);
+            enc.symbol(
+                usize::from(palette_uv.is_some()),
+                &mut cdfs.palette_uv_mode[usize::from(palette.is_some())],
+            );
         }
+        if let Some(pal) = palette_uv {
+            let n = usize::from(pal.size);
+            enc.symbol(n - 2, &mut cdfs.palette_uv_size[bsize_ctx]);
+            write_palette_colors_uv(enc, &pal.u_colors[..n], &pal.v_colors[..n], &uv_cache);
+        }
+        // Both colour-index maps come after BOTH colour lists, in plane order
+        // (`av1_visit_palette` runs from the caller, past `filter_intra`).
         if let Some(pal) = palette {
             let n = usize::from(pal.size);
             write_color_index_map(enc, &mut cdfs.palette_y_color_index[n - 2], &pal.map, side, n);
             note_palette(n);
         }
+        if let Some(pal) = palette_uv {
+            let n = usize::from(pal.size);
+            write_color_index_map(
+                enc,
+                &mut cdfs.palette_uv_color_index[n - 2],
+                &pal.map,
+                palette_uv_side(side),
+                n,
+            );
+            note_palette_uv(n);
+        }
     }
     neighbours.pending_palette = palette.map(|p| (p.size, p.colors));
+    neighbours.pending_palette_uv = palette_uv.map(|p| (p.size, p.u_colors));
+}
+
+/// The side of a chroma palette's shared colour-index map for a square luma
+/// block of `side` samples: `av1_get_plane_block_size(bsize, 1, 1)` floored at
+/// the 4-px transform, NOT a plain halving (decode.rs reads the map at
+/// exactly this size).
+pub(crate) fn palette_uv_side(side: usize) -> usize {
+    (side / 2).max(4)
 }
 
 /// How many blocks took a palette, and of what size -- the fire count a gate
@@ -2747,6 +2993,35 @@ static PALETTE_HITS: [std::sync::atomic::AtomicUsize; 9] =
 fn note_palette(n: usize) {
     PALETTE_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     PALETTE_HITS[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`PALETTE_HITS`] for the chroma palette -- the same shape, so a gate can
+/// print the share of each plane's palette separately.
+static PALETTE_UV_HITS: [std::sync::atomic::AtomicUsize; 9] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 9];
+
+fn note_palette_uv(n: usize) {
+    PALETTE_UV_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PALETTE_UV_HITS[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many chroma base colours came out of the NEIGHBOUR CACHE rather than
+/// the stream -- the half of `write_palette_colors_uv` a test cannot see from
+/// the block counts alone, and the one that desyncs the tile if this writer's
+/// cache ever disagrees with the decoder's (`gate-blind-to-feature`).
+static PALETTE_UV_CACHE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Reads [`PALETTE_UV_CACHE_HITS`] and zeroes it.
+#[cfg(test)]
+pub(crate) fn take_palette_uv_cache_hits() -> usize {
+    PALETTE_UV_CACHE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`take_palette_hits`] for the chroma palette.
+#[cfg(test)]
+pub(crate) fn take_palette_uv_hits() -> [usize; 9] {
+    std::array::from_fn(|i| PALETTE_UV_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Reads [`PALETTE_HITS`] and zeroes it, so a gate can attribute the counts to
@@ -4672,6 +4947,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         &mut cdfs,
                         &mut neighbours,
                         block.palette.as_ref(),
+                        block.palette_uv.as_ref(),
                         mode,
                         uv_mode,
                         (mi_row, mi_col),
@@ -4895,6 +5171,7 @@ fn write_inter_frame_leaf(
             cdfs,
             neighbours,
             block.palette.as_ref(),
+            block.palette_uv.as_ref(),
             mode,
             uv_mode,
             (mi_row, mi_col),
@@ -5124,6 +5401,7 @@ fn write_inter_frame_leaf8(
             cdfs,
             neighbours,
             block.palette.as_ref(),
+            block.palette_uv.as_ref(),
             mode,
             uv_mode,
             leaf_mi,
