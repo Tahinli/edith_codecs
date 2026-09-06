@@ -759,16 +759,25 @@ impl Neighbours {
     /// `get_tx_size_context` as libaom writes it for a block inside an INTER
     /// frame (decode.rs `tx_size_context_txfm_rect`): the `TXFM_CONTEXT`
     /// bands, except that an *inter* neighbour contributes its own BLOCK size.
+    ///
+    /// lane-av1tx2 r1: a neighbour OUTSIDE the tile contributes nothing at all
+    /// -- the decoder's `tx_size_context_txfm` drops the whole term when
+    /// `has_above`/`has_left` is false, where this counted the band's
+    /// [`TXFM_CTX_INIT`] (64, the widest transform) as a real neighbour. Every
+    /// intra block on a tile's top row or left column then took its `tx_depth`
+    /// off a CDF row one higher than the decoder's, which is the first
+    /// divergence of the inter `TxMode::Select` stream.
     fn tx_size_ctx_txfm(&self, (mi_r, mi_c): (usize, usize), own_side: usize) -> usize {
+        let (has_above, has_left) = (mi_r > 0, mi_c > 0);
         let mut above = usize::from(self.above_txfm[mi_c]) >= own_side;
         let mut left = usize::from(self.left_txfm[mi_r]) >= own_side;
-        if mi_r > 0 && self.above_inter[mi_c] {
+        if has_above && self.above_inter[mi_c] {
             above = self.above_side_mi[mi_c] >= own_side;
         }
-        if mi_c > 0 && self.left_inter[mi_r] {
+        if has_left && self.left_inter[mi_r] {
             left = self.left_side_mi[mi_r] >= own_side;
         }
-        usize::from(above) + usize::from(left)
+        usize::from(has_above && above) + usize::from(has_left && left)
     }
 
     /// `get_tx_size_context` (decode.rs [`crate::decode::tx_size_context`]):
