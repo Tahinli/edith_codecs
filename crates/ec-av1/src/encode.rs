@@ -5537,6 +5537,11 @@ pub(crate) fn encode_inter_frame(
     let search_tile = |index: usize,
                        fctx: &crate::decode::FrameCtx|
      -> Result<Vec<(usize, Quadrant)>> {
+        // Thread-local, and this job may be running on a `search_tiles`
+        // worker: `ref_distance`'s order-hint distance (the scaled motion
+        // search step) is read by the SEARCH, so every worker arms it or the
+        // tile's bits depend on the thread count.
+        crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
         let rect = layout.rect(index);
         let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
         let mut chroma = [
