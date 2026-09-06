@@ -689,7 +689,12 @@ fn intra_predict_u8(
     // a block is at most `BLOCK * BLOCK`. Same samples either way.
     let mut above_buf = [0u16; 2 * BLOCK];
     let mut left_buf = [0u16; 2 * BLOCK];
-    let mut dst_buf = [0u16; BLOCK * BLOCK];
+    // lane-av1speed2: a `BLOCK * BLOCK` scratch is 2 KB zeroed on every mode
+    // trial of every block, and a 4x4 block writes 32 bytes of it. The
+    // predictor fills every sample it is handed, so the zeros are dead
+    // either way -- size the scratch to the block instead of to the largest
+    // block there is.
+
     let widen = |src: &[u8], buf: &mut [u16; 2 * BLOCK]| {
         for (d, &v) in buf[..src.len()].iter_mut().zip(src) {
             *d = u16::from(v);
@@ -703,21 +708,30 @@ fn intra_predict_u8(
     }
     let above16 = above.map(|s| &above_buf[..s.len()]);
     let left16 = left.map(|s| &left_buf[..s.len()]);
-    let dst16 = &mut dst_buf[..dst.len()];
-    crate::intra::predict(
-        mode,
-        angle_delta,
-        above16,
-        left16,
-        corner.map(u16::from),
-        bw,
-        bh,
-        enable_edge_filter,
-        smooth_neighbor,
-        dst16, fctx,
-    );
-    for (d, &s) in dst.iter_mut().zip(dst16.iter()) {
-        *d = s as u8;
+    let mut run = |dst16: &mut [u16]| {
+        crate::intra::predict(
+            mode,
+            angle_delta,
+            above16,
+            left16,
+            corner.map(u16::from),
+            bw,
+            bh,
+            enable_edge_filter,
+            smooth_neighbor,
+            dst16, fctx,
+        );
+        for (d, &s) in dst.iter_mut().zip(dst16.iter()) {
+            *d = s as u8;
+        }
+    };
+    let n = bw * bh;
+    if n <= 64 {
+        run(&mut [0u16; 64][..n]);
+    } else if n <= 256 {
+        run(&mut [0u16; 256][..n]);
+    } else {
+        run(&mut [0u16; BLOCK * BLOCK][..n]);
     }
 }
 
@@ -1392,13 +1406,19 @@ impl Plane<'_> {
     /// they are not, or where the frame ends first, the edge is shorter and
     /// the predictor repeats its last sample, exactly as the decoder's clamp
     /// to `aboveLimit` and `leftLimit` does (spec 7.11.2.2).
-    fn edges(
+    /// lane-av1speed2: the two edges used to be a `Vec` each -- a malloc and
+    /// a free per mode per block, on the search's hottest path -- while an
+    /// edge is at most `2 * side` samples, which is `2 * BLOCK`. Same
+    /// samples, on the caller's stack.
+    fn edges_into<'a>(
         &self,
         x: usize,
         y: usize,
         side: usize,
         reach: Reach,
-    ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
+        above_buf: &'a mut [u8; 2 * BLOCK],
+        left_buf: &'a mut [u8; 2 * BLOCK],
+    ) -> (Option<&'a [u8]>, Option<&'a [u8]>, Option<u8>) {
         // Even a block's *own* edge is clamped to the true frame bound, not
         // just a `reach` extension: libaom's `av1_predict_intra_block`
         // (`av1/common/reconintra.c`) derives `xr`/`yd` -- the distance from
@@ -1436,16 +1456,24 @@ impl Plane<'_> {
         // samples above or left of it at all, same as `y == 0`/`x == 0`.
         let across = across.min(self.tile_x1);
         let down = down.min(self.tile_y1);
-        let above = (y > self.tile_y0 && across > x)
-            .then(|| self.reconstruction[(y - 1) * self.width + x..][..across - x].to_vec());
-        let left = (x > self.tile_x0 && down > y).then(|| {
-            (y..down)
-                .map(|row| self.reconstruction[row * self.width + x - 1])
-                .collect::<Vec<_>>()
-        });
+        let above_n = (y > self.tile_y0 && across > x).then(|| across - x);
+        if let Some(n) = above_n {
+            above_buf[..n]
+                .copy_from_slice(&self.reconstruction[(y - 1) * self.width + x..][..n]);
+        }
+        let left_n = (x > self.tile_x0 && down > y).then(|| down - y);
+        if let Some(n) = left_n {
+            for (d, row) in left_buf[..n].iter_mut().zip(y..down) {
+                *d = self.reconstruction[row * self.width + x - 1];
+            }
+        }
         let corner = (x > self.tile_x0 && y > self.tile_y0)
             .then(|| self.reconstruction[(y - 1) * self.width + x - 1]);
-        (above, left, corner)
+        (
+            above_n.map(|n| &above_buf[..n]),
+            left_n.map(|n| &left_buf[..n]),
+            corner,
+        )
     }
 
     /// Codes one block under one mode without committing it: hands back the
@@ -1507,7 +1535,9 @@ impl Plane<'_> {
         let At {
             x, y, side, reach, ..
         } = at;
-        let (above, left, corner) = self.edges(x, y, side, reach);
+        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+        let (above, left, corner) =
+            self.edges_into(x, y, side, reach, &mut above_buf, &mut left_buf);
         // Per-candidate scratch on the search's hottest path, so both buffers
         // live on the stack -- `side` is at most `BLOCK` -- rather than
         // costing a malloc/free pair per trial (`mc_trial` already does this).
@@ -1516,8 +1546,8 @@ impl Plane<'_> {
         intra_predict_u8(
             mode,
             0,
-            above.as_deref(),
-            left.as_deref(),
+            above,
+            left,
             corner,
             side,
             side,
@@ -1920,7 +1950,9 @@ impl Plane<'_> {
         let At {
             x, y, side, reach, ..
         } = at;
-        let (above, left, corner) = self.edges(x, y, side, reach);
+        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+        let (above, left, corner) =
+            self.edges_into(x, y, side, reach, &mut above_buf, &mut left_buf);
         modes
             .iter()
             .map(|&mode| {
@@ -1928,8 +1960,8 @@ impl Plane<'_> {
                 intra_predict_u8(
                     mode,
                     0,
-                    above.as_deref(),
-                    left.as_deref(),
+                    above,
+                    left,
                     corner,
                     side,
                     side,
@@ -1962,7 +1994,9 @@ impl Plane<'_> {
         let At {
             x, y, side, reach, ..
         } = at;
-        let (above, left, corner) = self.edges(x, y, side, reach);
+        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+        let (above, left, corner) =
+            self.edges_into(x, y, side, reach, &mut above_buf, &mut left_buf);
         // Nothing ranks by the SAD pre-pass unless `top_k` prunes by it (or
         // the census reports it), so summing it under the default unpruned
         // search is `side * side` absolute differences per mode spent on a
@@ -1976,8 +2010,8 @@ impl Plane<'_> {
                 intra_predict_u8(
                     mode,
                     0,
-                    above.as_deref(),
-                    left.as_deref(),
+                    above,
+                    left,
                     corner,
                     side,
                     side,
