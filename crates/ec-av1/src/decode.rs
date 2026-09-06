@@ -19766,6 +19766,27 @@ pub(crate) fn set_filter_replay_disabled(off: bool) {
     REPLAY_DISABLED.store(off, std::sync::atomic::Ordering::Relaxed);
 }
 
+// Test-only: run the capture decode `replay_final` replaced as well, and
+// hold its picture and its `FilterStages` against the replay's
+// (`encoder::tests::filter_replay_final_matches_the_capture_decode`).
+// Thread-local, not a global: the filter stage runs on the frame thread the
+// test itself drives, and a process-wide flag would put every test encoding
+// in parallel with this one through the extra decode too.
+#[cfg(test)]
+thread_local! {
+    static VERIFY_FINAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_verify_final_replay(on: bool) {
+    VERIFY_FINAL.set(on);
+}
+
+#[cfg(test)]
+pub(crate) fn verify_final_replay() -> bool {
+    VERIFY_FINAL.get()
+}
+
 /// Drop the armed flag and anything captured: the tile it belongs to is done.
 pub(crate) fn clear_filter_replay() {
     REPLAY_ARMED.set(false);
@@ -19845,6 +19866,45 @@ pub(crate) fn replay_filters(
     if REPLAY_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
+    replay_inner(loop_filter, cdef, None, fctx).map(|(picture, _)| picture)
+}
+
+/// lane-av1cap: the filter stage's LAST replay -- the WINNING parameters,
+/// under the per-64x64 `cdef_idx` grid the re-coded tile carries. The stage
+/// used to reach this picture by decoding that re-coded tile a second time
+/// (10% of a 4K frame's encode), only because the loop-restoration search
+/// needs the decoder's own post-CDEF plane
+/// ([`FrameCtx::capture_stages`]). It is the same two kernel calls
+/// ([`apply_deblock`], [`apply_cdef`]) on the same captured pre-filter
+/// planes in the same order, so it is the same bytes -- pinned by
+/// `encoder::tests::filter_replay_final_matches_the_capture_decode`, which
+/// runs the decode as well and holds picture and stages against it.
+///
+/// `want_stages` mirrors `capture_stages`' own `deblocked = None` arm: that
+/// decode's header says `RESTORE_NONE`, so the decoder took no pre-CDEF
+/// snapshot and handed the post-CDEF plane over for both stages.
+pub(crate) fn replay_final(
+    loop_filter: &LoopFilterParams,
+    cdef: &CdefParams,
+    idx_grid: &[u8],
+    want_stages: bool,
+    fctx: &FrameCtx,
+) -> Option<(Picture, Option<FilterStages>)> {
+    #[cfg(test)]
+    if REPLAY_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    replay_inner(loop_filter, cdef, Some((idx_grid, want_stages)), fctx)
+}
+
+fn replay_inner(
+    loop_filter: &LoopFilterParams,
+    cdef: &CdefParams,
+    // `Some((cdef_idx grid, capture the filter stages))` for the final
+    // replay; `None` for a scoring candidate, which always codes `bits == 0`.
+    final_pass: Option<(&[u8], bool)>,
+    fctx: &FrameCtx,
+) -> Option<(Picture, Option<FilterStages>)> {
     REPLAY.with_borrow_mut(|slot| {
         let r = slot.as_mut()?;
         let hit = matches!(&r.deblocked, Some((lf, ..)) if lf == loop_filter);
@@ -19881,9 +19941,29 @@ pub(crate) fn replay_filters(
             (y, u, v)
         };
         drop(cpt);
+        // The winner's `cdef_idx` literals live in the re-coded tile, which
+        // nothing parses on this path -- hand the grid the encoder already
+        // chose straight to the filter (`bits == 0` leaves the grid the last
+        // parse sized, which is what every scoring candidate reads).
+        if let Some((grid, _)) = final_pass.filter(|(g, _)| !g.is_empty()) {
+            fctx.cdef_idx_grid.with(|g| *g.borrow_mut() = grid.to_vec());
+        }
         let ct = crate::par::timer(crate::par::S_CDEF);
-        apply_cdef(&mut y, &mut u, &mut v, cdef, &r.neighbours, (r.frame_width, r.frame_height), fctx);
+        let pre = r.deblocked.as_ref().map(|(_, dy, du, dv)| {
+            (dy.data.as_ref(), du.data.as_ref(), dv.data.as_ref())
+        });
+        apply_cdef(
+            &mut y, &mut u, &mut v, cdef, &r.neighbours, (r.frame_width, r.frame_height), fctx,
+            pre,
+        );
         drop(ct);
+        let stages = final_pass.and_then(|(_, want)| {
+            want.then(|| FilterStages {
+                deblocked: [y.data.to_vec(), u.data.to_vec(), v.data.to_vec()],
+                cdefed: [y.data.to_vec(), u.data.to_vec(), v.data.to_vec()],
+                stride: [y.width, u.width, v.width],
+            })
+        });
         // The capture only happens on the shape whose tail is the two
         // filter calls and the crop (no superres, no loop restoration), so
         // what is left is that crop -- byte for byte the cropped return path
@@ -19897,13 +19977,16 @@ pub(crate) fn replay_filters(
         let (fw, fh) = (r.frame_width, r.frame_height);
         if fw == r.width && fh == r.height {
             fctx.last_frame_wide_margin.with(|m| *m.borrow_mut() = None);
-            return Some(Picture {
-                width: r.width,
-                height: r.height,
-                y: y.data.into_owned(),
-                u: u.data.into_owned(),
-                v: v.data.into_owned(),
-            });
+            return Some((
+                Picture {
+                    width: r.width,
+                    height: r.height,
+                    y: y.data.into_owned(),
+                    u: u.data.into_owned(),
+                    v: v.data.into_owned(),
+                },
+                stages,
+            ));
         }
         let crop = |plane: &PlaneBuf<'_>, w: usize, h: usize| -> Vec<u16> {
             let mut out = Vec::with_capacity(w * h);
@@ -19935,7 +20018,7 @@ pub(crate) fn replay_filters(
                 r.scratch.push(plane.data.into_owned());
             }
         }
-        Some(out)
+        Some((out, stages))
     })
 }
 
@@ -20655,6 +20738,13 @@ fn apply_cdef(
     // This frame header's own CROPPED luma size, for the straddling-unit
     // counter only -- CDEF itself walks the mi-rounded plane.
     (frame_w, frame_h): (usize, usize), fctx: &crate::decode::FrameCtx,
+    // lane-av1cap: every CDEF unit reads the PRE-CDEF planes, so the filter
+    // starts by copying all three (~19 MB at 4K). The encoder's filter
+    // replay already holds an untouched copy of exactly those planes -- its
+    // post-deblock cache, which is where the working planes were copied FROM
+    // -- so it hands them straight in and the copy does not happen. `None`
+    // (every decode) copies as before.
+    src: Option<(&[u16], &[u16], &[u16])>,
 ) {
     // lane-part32 r2 debug rung, env-gated: see `apply_deblock`'s sibling.
     if crate::envflags::env_flag!("EC_AV1_DEBUG_SKIP_CDEF") {
@@ -20674,9 +20764,15 @@ fn apply_cdef(
     // One entry per superblock (a few hundred at 4K), so this clone is not
     // one of the per-frame copies lane-perf6 pooled below.
     let idx_grid = fctx.cdef_idx_grid.with(|g| g.borrow().clone());
-    let src_y = scratch_from(&y.data);
-    let src_u = scratch_from(&u.data);
-    let src_v = scratch_from(&v.data);
+    let owned = src.is_none();
+    let (src_y, src_u, src_v) = match src {
+        Some((a, b, c)) => (std::borrow::Cow::Borrowed(a), std::borrow::Cow::Borrowed(b), std::borrow::Cow::Borrowed(c)),
+        None => (
+            std::borrow::Cow::Owned(scratch_from(&y.data)),
+            std::borrow::Cow::Owned(scratch_from(&u.data)),
+            std::borrow::Cow::Owned(scratch_from(&v.data)),
+        ),
+    };
     // libaom `av1_cdef_filter_fb`: `pri_strength = level << coeff_shift`,
     // `sec_strength <<= coeff_shift`, `damping += coeff_shift - (pli != 0)`.
     let coeff_shift = i32::from(bit_depth(fctx)) - 8;
@@ -20691,9 +20787,11 @@ fn apply_cdef(
         y, u, v, &src_y, &src_u, &src_v, cdef, skip_grid, &idx_grid, sb_cols, coeff_shift,
         damping, damping_uv, (frame_w, frame_h), 0, skip_grid.mi_rows, fctx,
     );
-    scratch_return(src_y);
-    scratch_return(src_u);
-    scratch_return(src_v);
+    if owned {
+        scratch_return(src_y.into_owned());
+        scratch_return(src_u.into_owned());
+        scratch_return(src_v.into_owned());
+    }
 }
 
 /// [`FrameCtx::capture_stages`]'s write side, called between CDEF and loop
@@ -23270,6 +23368,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         cdef,
         &neighbours,
         (frame_width as usize, frame_height as usize), fctx,
+        None,
     );
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     dump_stage16("EC_AV1_POSTCDEF_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
@@ -36085,6 +36184,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             cdef,
             &neighbours,
             (frame_width as usize, frame_height as usize), fctx,
+            None,
         );
     }
     dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);

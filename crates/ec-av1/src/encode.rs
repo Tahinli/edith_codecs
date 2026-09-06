@@ -1566,7 +1566,7 @@ impl Plane<'_> {
             }
         }
         #[cfg(test)]
-        let t = std::time::Instant::now();
+        let t = stage_start();
         let levels =
             forward_and_quantize_typed(residual, side, 8, i32::from(base_q_idx), deadzone, tx_type);
         // lane-av1speed2: 60% of the transform units of an inter stream carry
@@ -1580,7 +1580,7 @@ impl Plane<'_> {
             &levels, side, side, 8, i32::from(base_q_idx), 0, 0, tx_type,
         );
         #[cfg(test)]
-        stage_add(2, t.elapsed());
+        stage_since(2, t);
 
         let reconstruction: Vec<u8> = if coded.is_empty() {
             prediction.to_vec()
@@ -1596,7 +1596,7 @@ impl Plane<'_> {
         // will code them with, so the search ranks modes -- and the partition
         // trial ranks trees -- by the bits they actually spend.
         #[cfg(test)]
-        let t = std::time::Instant::now();
+        let t = stage_start();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
             // What the search used before it could price a block exactly: a
             // level costs its magnitude's width plus a sign and a run. Kept
@@ -1620,7 +1620,7 @@ impl Plane<'_> {
             }
         };
         #[cfg(test)]
-        stage_add(3, t.elapsed());
+        stage_since(3, t);
         Trial {
             levels,
             reconstruction,
@@ -1666,7 +1666,7 @@ impl Plane<'_> {
             }
         }
         #[cfg(test)]
-        let t = std::time::Instant::now();
+        let t = stage_start();
         let levels = forward_and_quantize(residual, side, 8, i32::from(base_q_idx), deadzone);
         // The same all-zero shortcut [`Self::trial_typed`] takes.
         let coded = dequant_and_inverse_typed_wh(
@@ -1680,7 +1680,7 @@ impl Plane<'_> {
             TxType::DctDct,
         );
         #[cfg(test)]
-        stage_add(2, t.elapsed());
+        stage_since(2, t);
         let reconstruction: Vec<u8> = if coded.is_empty() {
             prediction.to_vec()
         } else {
@@ -1692,7 +1692,7 @@ impl Plane<'_> {
         };
         let sse = self.block_sse(x, y, side, &reconstruction);
         #[cfg(test)]
-        let t = std::time::Instant::now();
+        let t = stage_start();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
             levels
                 .iter()
@@ -1712,7 +1712,7 @@ impl Plane<'_> {
             }
         };
         #[cfg(test)]
-        stage_add(3, t.elapsed());
+        stage_since(3, t);
         Trial {
             levels,
             reconstruction,
@@ -5035,6 +5035,24 @@ thread_local! {
     ];
 }
 
+/// lane-av1cap: the trial timers are `#[cfg(test)]`, and the BD gate and
+/// every encoder test are `cfg(test)` builds -- so two `Instant::now()` ran
+/// per transform trial and per `mc::predict` call whether or not anyone was
+/// reading the breakdown (the vdso clock was 1.7% of the encoder's profile).
+/// The clock is now read only when [`crate::par::stage_times`] is on, which
+/// is what prints the breakdown in the first place.
+#[cfg(test)]
+pub(crate) fn stage_start() -> Option<std::time::Instant> {
+    crate::par::stage_times().then(std::time::Instant::now)
+}
+
+#[cfg(test)]
+pub(crate) fn stage_since(bucket: usize, t: Option<std::time::Instant>) {
+    if let Some(t) = t {
+        stage_add(bucket, t.elapsed());
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn stage_add(bucket: usize, dur: std::time::Duration) {
     STAGE_NS.with(|c| c[bucket].set(c[bucket].get() + dur.as_nanos() as u64));
@@ -5042,11 +5060,13 @@ pub(crate) fn stage_add(bucket: usize, dur: std::time::Duration) {
 
 #[cfg(test)]
 fn stage_reset() {
+    crate::par::set_stage_times(true);
     STAGE_NS.with(|c| c.iter().for_each(|cell| cell.set(0)));
 }
 
 #[cfg(test)]
 fn stage_read() -> [std::time::Duration; 4] {
+    crate::par::set_stage_times(false);
     STAGE_NS.with(|c| {
         c.each_ref()
             .map(|cell| std::time::Duration::from_nanos(cell.get()))
@@ -6018,7 +6038,6 @@ fn pick_and_apply_filters(
         lambda,
     );
     drop(ft);
-    crate::decode::clear_filter_replay();
     let (lf, cdef, idx_grid, picture) = search_result?;
     header.loop_filter = lf;
     header.cdef = cdef;
@@ -6037,22 +6056,86 @@ fn pick_and_apply_filters(
     // an approximation inside the SEARCH only; the reconstruction this
     // function ends up splicing is always a real decode of the real tile.
     let lr_on = restoration_enabled();
-    fctx.capture_stages.set(lr_on);
-    let mut filtered = if idx_grid.is_empty() {
-        if lr_on {
-            let _t = crate::par::timer(crate::par::S_CAPTURE);
-            decode(&lf, &cdef, &hdr, tiles, &none_lr)?
-        } else {
-            picture
+    // The `cdef_idx` literals live in the tile payload, so a frame that
+    // chose a per-64x64 preset list codes its tiles a second time.
+    if !idx_grid.is_empty() {
+        *tiles = recode(cdef.bits, sb_cols, &idx_grid, &[])?;
+    }
+    // lane-av1cap: that re-coded tile used to be DECODED here as well --
+    // 10% of a 4K frame -- purely to reach the post-CDEF plane the loop
+    // restoration search reads (`crate::decode::FrameCtx::capture_stages`)
+    // and the picture this function splices. Both come out of ONE more
+    // replay of the winning parameters on the same captured pre-filter
+    // planes every candidate was scored on: the same two filter kernels, on
+    // the same input, in the same order, so the same bytes. Re-coding the
+    // tile does not move the reconstruction the replay holds -- `cdef_idx`
+    // is an equiprobable literal, so it adapts no CDF and changes no
+    // residual.
+    let replayed = crate::decode::replay_final(&lf, &cdef, &idx_grid, lr_on, fctx);
+    #[cfg(test)]
+    let replay_was_used = replayed.is_some();
+    let (mut filtered, mut stages) = match replayed {
+        Some((picture, stages)) => (picture, stages),
+        // Nothing captured (the shapes [`crate::decode::FilterReplay`]
+        // refuses): every candidate was a full decode, so the winner's own
+        // picture stands, and the stages still need a capturing decode.
+        None => {
+            fctx.capture_stages.set(lr_on);
+            let picture = if idx_grid.is_empty() && !lr_on {
+                picture
+            } else {
+                let _t = crate::par::timer(crate::par::S_CAPTURE);
+                decode(&lf, &cdef, &hdr, tiles, &none_lr)?
+            };
+            fctx.capture_stages.set(false);
+            (picture, crate::decode::take_filter_stages(fctx))
         }
-    } else {
-        let coded = recode(cdef.bits, sb_cols, &idx_grid, &[])?;
-        let _t = crate::par::timer(crate::par::S_CAPTURE);
-        let picture = decode(&lf, &cdef, &hdr, &coded, &none_lr)?;
-        *tiles = coded;
-        picture
     };
-    fctx.capture_stages.set(false);
+    #[cfg(test)]
+    if crate::decode::verify_final_replay() && replay_was_used {
+        fctx.capture_stages.set(lr_on);
+        let want = decode(&lf, &cdef, &hdr, tiles, &none_lr)?;
+        fctx.capture_stages.set(false);
+        let want_stages = crate::decode::take_filter_stages(fctx);
+        assert!(
+            (want.width, want.height) == (filtered.width, filtered.height)
+                && want.y == filtered.y
+                && want.u == filtered.u
+                && want.v == filtered.v,
+            "the final filter replay is not the capture decode it stands in for",
+        );
+        // Only the frame's own cropped region: the plane is padded to the
+        // superblock grid and the columns past the mi extent are written by
+        // nothing (the decoder's plane pool leaves whatever the last frame
+        // put there), while the restoration search reads strictly inside
+        // `fw x fh` -- `restoration::lr_sample` clamps its column to
+        // `plane_w - 1` and its row to the frame's, and
+        // `filter_search::pick_restoration`'s own SSE walk never leaves the
+        // crop either.
+        let region = |a: &[u16], b: &[u16], stride: usize, w: usize, h: usize, what: &str| {
+            for row in 0..h {
+                let (x, y) = (&a[row * stride..][..w], &b[row * stride..][..w]);
+                assert!(
+                    x == y,
+                    "{what}: the replayed filter stages are not the ones the capture \
+                     decode returns (row {row} of {h}, width {w}, stride {stride})",
+                );
+            }
+        };
+        match (&want_stages, &stages) {
+            (Some(a), Some(b)) => {
+                assert_eq!(a.stride, b.stride, "the captured plane strides moved");
+                let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
+                for (i, (w, h)) in [(fw, fh), (cw, ch), (cw, ch)].into_iter().enumerate() {
+                    region(&a.deblocked[i], &b.deblocked[i], a.stride[i], w, h, "deblocked");
+                    region(&a.cdefed[i], &b.cdefed[i], a.stride[i], w, h, "cdefed");
+                }
+            }
+            (None, None) => {}
+            _ => panic!("one path captured filter stages and the other did not"),
+        }
+    }
+    crate::decode::clear_filter_replay();
     let mut lr = LoopRestorationParams::default();
     if lr_on {
         let mut want = LoopRestorationParams {
@@ -6062,7 +6145,7 @@ fn pick_and_apply_filters(
         };
         want.frame_restoration_type[0] = ec_av1_syntax::RestorationType::Wiener;
         let lrt = crate::par::timer(crate::par::S_LR);
-        let units = match crate::decode::take_filter_stages(fctx) {
+        let units = match stages.take() {
             Some(stages) => crate::filter_search::pick_restoration(
                 &stages,
                 source[0],
@@ -6714,7 +6797,7 @@ fn search_inter_block(
     let source_block = luma.source_block(x, y, BLOCK);
     let (seeds, seed_n) = mv_seeds(stack);
     #[cfg(test)]
-    let t = std::time::Instant::now();
+    let t = stage_start();
     let found = motion::search(
         ref_luma.0,
         ref_luma.1,
@@ -6731,7 +6814,7 @@ fn search_inter_block(
         1,
     );
     #[cfg(test)]
-    stage_add(0, t.elapsed());
+    stage_since(0, t);
     let mv = round_to_valid_mv(found.mv, stack.pred_mv);
     // Each DRL entry is a different `PredMv` (spec 7.10.2.10 `assign_mv`), so
     // the same vector costs a different residual from each: take the index
@@ -6814,7 +6897,7 @@ fn search_inter_block(
         if extra_ref_new_mv() && !skip_search {
             let (gseeds, gn) = mv_seeds(gstack);
             #[cfg(test)]
-            let t = std::time::Instant::now();
+            let t = stage_start();
             let gfound = motion::search(
                 &g.y,
                 g.width,
@@ -6831,7 +6914,7 @@ fn search_inter_block(
                 ref_distance(ref_frame),
             );
             #[cfg(test)]
-            stage_add(0, t.elapsed());
+            stage_since(0, t);
             let gmv = round_to_valid_mv(gfound.mv, gstack.pred_mv);
             extra_new_mvs.push((ref_frame, gmv));
             if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(gstack, gmv) {
@@ -9347,6 +9430,26 @@ mod tests {
         let width: u32 = fields.next().expect("ffprobe width").parse().unwrap();
         let height: u32 = fields.next().expect("ffprobe height").parse().unwrap();
         (width, height)
+    }
+
+    /// lane-av1cap: the final filter replay against the capture decode it
+    /// replaced, at the block-padded and straddling sizes the whole-frame
+    /// tests cover -- `set_verify_final_replay` makes
+    /// [`pick_and_apply_filters`] run both on every frame and assert, per
+    /// frame, that the spliced picture and the two filter stages the
+    /// restoration search reads are bit-identical over the frame's own crop.
+    #[test]
+    fn the_final_filter_replay_matches_the_capture_decode_at_odd_sizes() {
+        let fctx = &crate::decode::FrameCtx::new();
+        crate::decode::set_verify_final_replay(true);
+        for &(width, height) in
+            &[(64usize, 56usize), (216, 96), (192, 120), (640, 352), (1280, 720)]
+        {
+            eprintln!("--- {width}x{height}");
+            let picture = test_card(width, height);
+            let _ = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
+        }
+        crate::decode::set_verify_final_replay(false);
     }
 
     /// A key frame at an arbitrary even size round-trips through ffmpeg over

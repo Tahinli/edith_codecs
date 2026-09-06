@@ -2092,6 +2092,48 @@ mod tests {
         }
     }
 
+    /// lane-av1cap: the filter stage's FINAL replay -- the one that replaced
+    /// the capture decode -- against that decode. `set_verify_final_replay`
+    /// makes `encode::pick_and_apply_filters` run both on every frame and
+    /// assert, per frame, that the spliced picture and the two filter stages
+    /// the loop-restoration search reads are bit-identical.
+    #[test]
+    fn filter_replay_final_matches_the_capture_decode() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let run = |sources: &[Picture], width: usize, height: usize, tiles: (u32, u32)| {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 2,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: tiles.0,
+                tile_rows_log2: tiles.1,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            for packet in encode_all(&mut enc, sources) {
+                assert!(!packet.data.is_empty());
+            }
+        };
+        crate::decode::set_verify_final_replay(true);
+        // 320x160 crops (its coding surface is one superblock row taller);
+        // 320x192 is a whole number of superblocks.
+        for (width, height) in [(320usize, 160usize), (320, 192)] {
+            let sources: Vec<Picture> =
+                (0..4).map(|t| test_card(width, height, t * 3)).collect();
+            run(&sources, width, height, (0, 0));
+        }
+        // Real gate content, where the CDEF preset search actually chooses
+        // `bits > 0` and the tile is re-coded, one tile and four.
+        if let Some(sources) = h264_clip_frames(640, 384, 3) {
+            run(&sources, 640, 384, (0, 0));
+            run(&sources, 640, 384, (1, 1));
+        } else {
+            eprintln!("SKIP the gate-clip arm: no fixture or no ffmpeg");
+        }
+        crate::decode::set_verify_final_replay(false);
+    }
+
     /// lane-av1fpar: where a frame's wall actually goes, stage by stage --
     /// the per-tile search, the tile write, the frame-level filter search
     /// (with its deblock/CDEF replay and per-64 SSE inside it), the capture
