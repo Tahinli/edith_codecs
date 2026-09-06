@@ -531,7 +531,7 @@ static STAGE_NS: [std::sync::atomic::AtomicU64; STAGES.len()] =
 /// [`set_stage_times`] from a gate (the env snapshot is process-constant).
 static STAGE_ON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn stage_times() -> bool {
+pub(crate) fn stage_times() -> bool {
     match STAGE_ON.load(std::sync::atomic::Ordering::Relaxed) {
         0 => {
             let on = 1 + usize::from(crate::envflags::is_set("EC_AV1_STAGE_TIMES"));
