@@ -552,20 +552,37 @@ fn intra_predict_u8(
     smooth_neighbor: bool,
     dst: &mut [u8], fctx: &crate::decode::FrameCtx,
 ) {
-    let above16: Option<Vec<u16>> = above.map(|s| s.iter().map(|&v| u16::from(v)).collect());
-    let left16: Option<Vec<u16>> = left.map(|s| s.iter().map(|&v| u16::from(v)).collect());
-    let mut dst16 = vec![0u16; dst.len()];
+    // Three heap allocations per call became three stack buffers: this runs
+    // once per mode per trial, and an edge is at most `bw + bh` samples while
+    // a block is at most `BLOCK * BLOCK`. Same samples either way.
+    let mut above_buf = [0u16; 2 * BLOCK];
+    let mut left_buf = [0u16; 2 * BLOCK];
+    let mut dst_buf = [0u16; BLOCK * BLOCK];
+    let widen = |src: &[u8], buf: &mut [u16; 2 * BLOCK]| {
+        for (d, &v) in buf[..src.len()].iter_mut().zip(src) {
+            *d = u16::from(v);
+        }
+    };
+    if let Some(s) = above {
+        widen(s, &mut above_buf);
+    }
+    if let Some(s) = left {
+        widen(s, &mut left_buf);
+    }
+    let above16 = above.map(|s| &above_buf[..s.len()]);
+    let left16 = left.map(|s| &left_buf[..s.len()]);
+    let dst16 = &mut dst_buf[..dst.len()];
     crate::intra::predict(
         mode,
         angle_delta,
-        above16.as_deref(),
-        left16.as_deref(),
+        above16,
+        left16,
         corner.map(u16::from),
         bw,
         bh,
         enable_edge_filter,
         smooth_neighbor,
-        &mut dst16, fctx,
+        dst16, fctx,
     );
     for (d, &s) in dst.iter_mut().zip(dst16.iter()) {
         *d = s as u8;
@@ -1244,6 +1261,40 @@ impl Plane<'_> {
     /// spec 9.3, [`crate::decode::default_intra_tx_type`]). Luma keeps
     /// `DCT_DCT`, which is the one type this writer's `tx_type` symbol names.
     #[allow(clippy::too_many_arguments)]
+    /// Sum of absolute differences between the source block at `(x, y)` and a
+    /// `side x side` prediction, as the whole number it is.
+    ///
+    /// Bit-identical to the `f64` accumulation it replaces: every partial sum
+    /// is an integer below `255 * 64 * 64` (under 2^21), which `f64` holds
+    /// exactly, so no add here rounds and the order of the adds cannot change
+    /// the result. Dropping the per-pixel `i / side` and `i % side` -- an
+    /// integer division per sample -- is what lets the row walk vectorize.
+    fn block_sad(&self, x: usize, y: usize, side: usize, prediction: &[u8]) -> f64 {
+        let mut sad = 0u32;
+        for row in 0..side {
+            let source = &self.source[(y + row) * self.width + x..][..side];
+            for (&s, &p) in source.iter().zip(&prediction[row * side..][..side]) {
+                sad += u32::from(s.abs_diff(p));
+            }
+        }
+        f64::from(sad)
+    }
+
+    /// Squared error between the source block at `(x, y)` and a reconstruction
+    /// of it. Exact for the same reason [`Self::block_sad`] is: the largest
+    /// total is `255^2 * 64 * 64`, under 2^28.
+    fn block_sse(&self, x: usize, y: usize, side: usize, reconstruction: &[u8]) -> f64 {
+        let mut sse = 0u64;
+        for row in 0..side {
+            let source = &self.source[(y + row) * self.width + x..][..side];
+            for (&s, &r) in source.iter().zip(&reconstruction[row * side..][..side]) {
+                let d = u32::from(s.abs_diff(r));
+                sse += u64::from(d * d);
+            }
+        }
+        sse as f64
+    }
+
     fn trial_typed(
         &self,
         at: At,
@@ -1293,19 +1344,12 @@ impl Plane<'_> {
         #[cfg(test)]
         stage_add(2, t.elapsed());
 
-        let mut reconstruction = vec![0u8; side * side];
-        let mut sse = 0.0;
-        for row in 0..side {
-            for col in 0..side {
-                let i = row * side + col;
-                let sample = (i32::from(prediction[i]) + coded[i]).clamp(0, 255) as u8;
-                reconstruction[i] = sample;
-                let error = f64::from(
-                    i32::from(self.source[(y + row) * self.width + x + col]) - i32::from(sample),
-                );
-                sse += error * error;
-            }
-        }
+        let reconstruction: Vec<u8> = prediction
+            .iter()
+            .zip(&coded)
+            .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
+            .collect();
+        let sse = self.block_sse(x, y, side, &reconstruction);
         // What the levels cost is priced through the same CDFs the tile writer
         // will code them with, so the search ranks modes -- and the partition
         // trial ranks trees -- by the bits they actually spend.
@@ -1353,16 +1397,7 @@ impl Plane<'_> {
         set: TxbSet,
     ) -> Trial {
         if skip {
-            let mut sse = 0.0;
-            for row in 0..side {
-                for col in 0..side {
-                    let error = f64::from(
-                        i32::from(self.source[(y + row) * self.width + x + col])
-                            - i32::from(prediction[row * side + col]),
-                    );
-                    sse += error * error;
-                }
-            }
+            let sse = self.block_sse(x, y, side, prediction);
             return Trial {
                 levels: vec![0i32; side * side],
                 reconstruction: prediction.to_vec(),
@@ -1385,19 +1420,12 @@ impl Plane<'_> {
         let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
         #[cfg(test)]
         stage_add(2, t.elapsed());
-        let mut reconstruction = vec![0u8; side * side];
-        let mut sse = 0.0;
-        for row in 0..side {
-            for col in 0..side {
-                let i = row * side + col;
-                let sample = (i32::from(prediction[i]) + coded[i]).clamp(0, 255) as u8;
-                reconstruction[i] = sample;
-                let error = f64::from(
-                    i32::from(self.source[(y + row) * self.width + x + col]) - i32::from(sample),
-                );
-                sse += error * error;
-            }
-        }
+        let reconstruction: Vec<u8> = prediction
+            .iter()
+            .zip(&coded)
+            .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
+            .collect();
+        let sse = self.block_sse(x, y, side, &reconstruction);
         #[cfg(test)]
         let t = std::time::Instant::now();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
@@ -1482,17 +1510,13 @@ impl Plane<'_> {
     /// `source`), since [`Self::source`] itself is the whole plane, strided
     /// by [`Self::width`].
     fn source_block(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
-        (y..y + side)
-            .flat_map(|row| self.source[row * self.width + x..][..side].to_vec())
-            .collect()
+        rows_of(self.source, self.width, x, y, side)
     }
 
     /// The reconstructed samples of one square, so that a partition trial can
     /// be undone.
     fn snapshot(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
-        (y..y + side)
-            .flat_map(|row| self.reconstruction[row * self.width + x..][..side].to_vec())
-            .collect()
+        rows_of(&self.reconstruction, self.width, x, y, side)
     }
 
     /// Puts a snapshot back.
@@ -1534,16 +1558,7 @@ impl Plane<'_> {
                     false,
                     &mut prediction, fctx,
                 );
-                let sad: f64 = (0..side * side)
-                    .map(|i| {
-                        let (row, col) = (i / side, i % side);
-                        f64::from(
-                            (i32::from(self.source[(y + row) * self.width + x + col])
-                                - i32::from(prediction[i]))
-                            .abs(),
-                        )
-                    })
-                    .sum();
+                let sad = self.block_sad(x, y, side, &prediction);
                 (sad + lambda * mode_bits[usize::from(mode)], mode)
             })
             .collect()
@@ -1591,17 +1606,8 @@ impl Plane<'_> {
                     false,
                     &mut prediction, fctx,
                 );
-                let sad: f64 = if want_sad {
-                    (0..side * side)
-                        .map(|i| {
-                            let (row, col) = (i / side, i % side);
-                            f64::from(
-                                (i32::from(self.source[(y + row) * self.width + x + col])
-                                    - i32::from(prediction[i]))
-                                .abs(),
-                            )
-                        })
-                        .sum()
+                let sad = if want_sad {
+                    self.block_sad(x, y, side, &prediction)
                 } else {
                     0.0
                 };
@@ -3783,6 +3789,19 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
 
 /// The reconstructed samples one 32x32 square covers in all three planes, so
 /// that a partition trial can be undone.
+/// One square of a plane, row-major, the inverse of [`Plane::restore`].
+///
+/// Same bytes as the `flat_map(|row| ..to_vec()).collect()` this replaces,
+/// which allocated and freed a `Vec` per row of every block it copied --
+/// `Plane::snapshot` runs once per partition trial.
+fn rows_of(plane: &[u8], width: usize, x: usize, y: usize, side: usize) -> Vec<u8> {
+    let mut out = vec![0u8; side * side];
+    for row in 0..side {
+        out[row * side..][..side].copy_from_slice(&plane[(y + row) * width + x..][..side]);
+    }
+    out
+}
+
 fn snapshot(
     luma: &Plane,
     chroma: &[Plane; 2],
