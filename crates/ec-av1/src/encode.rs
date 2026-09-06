@@ -110,6 +110,18 @@ pub(crate) fn take_predicted_bits() -> Vec<f64> {
     PREDICTED_BITS.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
+/// Whether a 16x16 (or 8x8) leaf runs a motion search of its own beside the
+/// NEARESTMV candidate it always had.
+const LEAF_NEW_MV: bool = true;
+
+/// [`LEAF_NEW_MV`], or what `EC_AV1_LEAF_NEWMV` names in a test build.
+fn leaf_new_mv() -> bool {
+    match std::env::var("EC_AV1_LEAF_NEWMV").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => LEAF_NEW_MV,
+    }
+}
+
 /// Whether an INTER frame's 32x32 block may be split into four 16x16 ones
 /// when the trial says four cost less. Before lane-av1rd2 only a quadrant
 /// the true frame edge cut through was ever split there; inside the frame
@@ -1683,6 +1695,7 @@ fn code_square_inter(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
+    ref_y8: &[u8],
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), side, search, mode_bits, fctx);
@@ -1804,6 +1817,93 @@ fn code_square_inter(
     // `MiGrid` now records intra cells (`tile.rs`/`encode.rs`'s `else`
     // branches), which is what made 8-mi geometry a true no-op instead of
     // one that only held when every neighbour happened to be inter.
+    // A motion search of this leaf's own (lane-av1rd2): before it, a leaf
+    // only ever took the stack's NEARESTMV candidate or went intra, so a
+    // 32x32 block splitting because its four quarters MOVE differently could
+    // not code the movement it split for. Same candidate `search_inter_block`
+    // prices for a whole block -- `motion::search` from `pred_mv`, rounded to
+    // a vector the residual syntax can name -- at this leaf's own side.
+    let mut best = (inter_cost, None);
+    if leaf_new_mv() {
+        let source_block = luma.source_block(x, y, side);
+        let found = motion::search(
+            ref_y8,
+            ref_luma.1,
+            ref_luma.2,
+            ref_luma.3,
+            &source_block,
+            x,
+            y,
+            side,
+            side,
+            stack.pred_mv,
+            search.lambda, fctx,
+        );
+        let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
+        if let Some(mv_bits) = mv_residual_bits(new_mv, stack.pred_mv) {
+            let luma_new = mc_trial(
+                luma, x, y, side, new_mv, true, ref_luma.0, ref_luma.1, ref_luma.2, ref_luma.3,
+                false, search.base_q_idx, search.deadzone, luma_set, fctx,
+            );
+            let u_new = mc_trial(
+                &chroma[0], x / 2, y / 2, side / 2, new_mv, false, ref_u.0, ref_u.1, ref_u.2,
+                ref_u.3, false, search.base_q_idx, search.deadzone, chroma_set, fctx,
+            );
+            let v_new = mc_trial(
+                &chroma[1], x / 2, y / 2, side / 2, new_mv, false, ref_v.0, ref_v.1, ref_v.2,
+                ref_v.3, false, search.base_q_idx, search.deadzone, chroma_set, fctx,
+            );
+            let skip_new = luma_new.levels.iter().all(|&l| l == 0)
+                && u_new.levels.iter().all(|&l| l == 0)
+                && v_new.levels.iter().all(|&l| l == 0);
+            let drl_bits = if stack.entries.len() > 1 {
+                symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[0]], 0)
+            } else {
+                0.0
+            };
+            let cost_new = luma_new.sse
+                + u_new.sse
+                + v_new.sse
+                + search.lambda
+                    * (skip_bits(skip_new)
+                        + intra_inter_bits(true)
+                        + single_ref_bits
+                        + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
+                        + drl_bits
+                        + mv_bits
+                        + if skip_new {
+                            0.0
+                        } else {
+                            luma_new.bits + u_new.bits + v_new.bits
+                        });
+            if cost_new < best.0 {
+                best = (cost_new, Some((luma_new, u_new, v_new, skip_new, new_mv)));
+            }
+        }
+    }
+    if let (cost, Some((luma_new, u_new, v_new, skip_new, new_mv))) = best {
+        if cost < intra_cost {
+            luma.commit(x, y, side, &luma_new);
+            chroma[0].commit(x / 2, y / 2, side / 2, &u_new);
+            chroma[1].commit(x / 2, y / 2, side / 2, &v_new);
+            return (
+                BlockCoeffs {
+                    luma: coeffs(&luma_new.levels, side),
+                    u: coeffs(&u_new.levels, side / 2),
+                    v: coeffs(&v_new.levels, side / 2),
+                    mode: DC_PRED as u8,
+                    skip: skip_new,
+                    eight: None,
+                    inter: Some(InterInfo {
+                        mode: InterMode::NewMv,
+                        mv: new_mv,
+                    }),
+                },
+                cost,
+            );
+        }
+    }
+
     if inter_cost < intra_cost {
         luma.commit(x, y, side, &luma_trial);
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
@@ -2687,6 +2787,7 @@ fn search_inter_block(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
+    ref_y8: &[u8],
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
@@ -2923,13 +3024,10 @@ fn search_inter_block(
     }
 
     let source_block = luma.source_block(x, y, BLOCK);
-    // lane-hbd r4: `motion::search` is 8-bit only (its SAD/cost math is
-    // integer-`u8`-scale); narrow the DPB reference plane locally.
-    let ref_luma_8: Vec<u8> = ref_luma.0.iter().map(|&v| v as u8).collect();
     #[cfg(test)]
     let t = std::time::Instant::now();
     let found = motion::search(
-        &ref_luma_8,
+        ref_y8,
         ref_luma.1,
         ref_luma.2,
         ref_luma.3,
@@ -3143,6 +3241,11 @@ pub(crate) fn encode_inter_frame(
     let (cols, rows) = (cols as usize, rows as usize);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
+    // lane-hbd r4: `motion::search` is 8-bit only (its SAD/cost math is
+    // integer-`u8`-scale), so the DPB reference plane is narrowed for it --
+    // once per frame (lane-av1rd2), not once per block, which is a whole
+    // plane's map per 32x32 block and now per leaf too.
+    let ref_y8: Vec<u8> = reference.y.iter().map(|&v| v as u8).collect();
     let mut grid = MiGrid::new(mi_cols, mi_rows);
     let mut blocks = vec![Quadrant::Whole(BlockCoeffs::default()); cols * rows];
 
@@ -3189,6 +3292,7 @@ pub(crate) fn encode_inter_frame(
                         &search,
                         &mode_bits_table,
                         reference,
+                        &ref_y8,
                         &stack, fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
@@ -3240,6 +3344,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
+                                    &ref_y8,
                                     &stack, fctx,
                                 );
                                 cost += leaf_cost;
@@ -3319,6 +3424,7 @@ pub(crate) fn encode_inter_frame(
                                 &search,
                                 &mode_bits_table,
                                 reference,
+                                &ref_y8,
                                 &stack, fctx,
                             );
                             for dr in 0..4 {
@@ -3379,6 +3485,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
+                                    &ref_y8,
                                     &stack, fctx,
                                 );
                                 for dr in 0..2 {
