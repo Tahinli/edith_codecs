@@ -1,3 +1,4 @@
+# lane-opusmode r1: EC_OPUS_BW_DETECT=1 (detected-bandwidth clamp) -- byte-identical to shipped
 # ec-opus encoder vs ffmpeg libopus — encoders-only gate (r1)
 # both bitstreams decoded by ec-opus; 120s cap; VBR; 48kHz stereo
 # source	kbps	ours_kbps	ref_kbps	rate%	corr_ours	corr_ref	gap	Q_ours	Q_ref	err_ratio	minsec_ours	minsec_ref	drop_ours	drop_ref

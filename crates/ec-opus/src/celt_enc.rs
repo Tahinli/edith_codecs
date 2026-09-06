@@ -83,6 +83,9 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// | 1.3 trim + tonality term (`-r1`) | nik@64 .708→.647, reelo@64 1.510→1.071, reelo@96 .940→.898, reell@96 4.499→2.458, dl8a .552/.374→.512/.336 | nik@96 .985→1.006, her@64 1.103→1.109, her@96 1.051→1.085, reell@64 2.697→2.872 |
 /// | vbr tonality + activity (`-r2`) | hein@64 .853→.327, hein@96 .528→.426, nik@64 →.672, dl8a@64 →.541 | nik@96 →1.061, reelo@96 →1.165, her@64 →1.104, her@96 →1.060, dl8a@96 →.414 |
 /// | vbr activity alone (`-r3`) | hein@64 →.430, hein@96 →.408, nik@64 →.657, dl8a@64 →.511 | nik@96 →.990, her@64 →1.104, her@96 →1.071, dl8a@96 →.382 |
+/// | `EC_OPUS_BW_DETECT` (`opusmode -r1`) | -- | -- (byte-identical: `analysis.bandwidth` is 20 on every valid frame of every gate source, so the clamp never fires) |
+/// | `EC_OPUS_LEAK` (`opusmode -r2`) | -- | nik@64 .708→.709, nik@96 .985→.986, her@96 1.051→1.052 (the rest identical) |
+/// | `EC_OPUS_BW_DETECT` + `EC_OPUS_VBR_ACT` + `EC_OPUS_TF_K=1.25` (`opusmode -r3`) | reell@96 4.499→2.516, reell@64 2.697→1.440, hein@64 .853→.470, hein@96 .528→.404, dl8a@96 .374→.315, dl8a@64 →.535, nik@64 →.651, **nik@96 .985→.957**, reelo@96 →.928, reelo@64 →1.509 | her@96 1.051→1.071, her@64 1.103→1.104 |
 /// | all four + `EC_OPUS_ALIGN=1` (`-r4`) | reell@64 →1.865, reell@96 →3.986, reelo@64 →1.123, reelo@96 →.891, her@64 →.952 | nik@64 →1.014, nik@96 →1.842, her@96 →1.217, dl8a →1.162/.988, hein →.971/1.514 |
 ///
 /// `corr_ours` is never worse by more than .0005 on any unaligned arm (it is
@@ -93,7 +96,13 @@ fn tf_boost_params() -> (f32, f32, bool, f32) {
 /// discrete-ladder arm was run. The activity cut is the nearest miss ever
 /// measured on this gate for a speech source (hein halves) and is blocked by
 /// her@96 +.020 and nik@96 +.005 -- the same two rows that have blocked the
-/// tf boost. Aligned, the analysis moves reell/reelo/her@64 a long way but leaves
+/// The combined arm (`opusmode -r3`) is the first arm ever measured on this
+/// gate that moves a blocking row the right way: nik@96 .985→.957. It is
+/// **rejected by the per-row KEEP rule** (her@96 +.020, her@64 +.001) and
+/// **passes the aggregate rule** (geometric-mean err_ratio 1.0218→0.8378,
+/// -18.0%; worst row her@96 +1.9%, under the 5% bound; `corr_ours` within
+/// .0001 on every row). Which rule ships is the user's call; the default is
+/// off either way. Aligned, the analysis moves reell/reelo/her@64 a long way but leaves
 /// the aligned blocking set (nik, her@96, dl8a, hein) exactly where the
 /// analysis-free aligned arms left it, so the alignment default stays off.
 pub(crate) fn analysis_params() -> (bool, bool, bool, bool, bool, bool) {
