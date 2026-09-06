@@ -17,8 +17,8 @@ use ec_av1_syntax::sequence::{ChromaSamplePosition, ColorConfig};
 use ec_core::{Error, Result};
 
 use crate::encode::{
-    Encoded, Picture, SUPERBLOCK, crop_encoded, encode_inter_frame, encode_key_frame_inner,
-    split_blocks,
+    Encoded, GOLDEN_SLOT, Picture, SUPERBLOCK, crop_encoded, encode_inter_frame,
+    encode_key_frame_inner, split_blocks,
 };
 use crate::intra::KEY_FRAME_MODES;
 
@@ -100,6 +100,46 @@ pub enum RateTarget {
     /// coded frame near this many bytes, via [`RateLoop`] — see there for
     /// the controller and its windup bound.
     BytesPerFrame(u32),
+    /// A target BITRATE: the same closed loop, with the per-frame byte
+    /// target derived from `bits_per_second` and `frames_per_second`
+    /// (`bits_per_second / 8 / frames_per_second`), and — in pyramid mode —
+    /// split across the levels by their reference weight, since a hidden
+    /// `ALTREF` and a leaf differ by several times in size and one shared
+    /// predictor would swing the quantizer every frame.
+    Bitrate {
+        /// The stream's target bitrate.
+        bits_per_second: u32,
+        /// The frame rate the bitrate is spent at.
+        frames_per_second: f64,
+    },
+}
+
+impl RateTarget {
+    /// Applies this target to `config` and returns the closed loop it needs
+    /// (`None` for the two open-loop variants). `mini_gop` is `Some` in
+    /// pyramid mode, which is what makes the loop keep a quantizer per level.
+    fn into_loop(self, config: &mut EncoderConfig, mini_gop: Option<usize>) -> Option<RateLoop> {
+        let target_bytes = match self {
+            RateTarget::QIndex(q) => {
+                config.base_q_idx = q;
+                return None;
+            }
+            RateTarget::Quality(quality) => {
+                config.base_q_idx = quality_to_q_idx(quality);
+                return None;
+            }
+            RateTarget::BytesPerFrame(target_bytes) => f64::from(target_bytes),
+            RateTarget::Bitrate {
+                bits_per_second,
+                frames_per_second,
+            } => f64::from(bits_per_second) / 8.0 / frames_per_second.max(1.0),
+        };
+        Some(RateLoop::new(
+            target_bytes,
+            f64::from(config.base_q_idx),
+            mini_gop,
+        ))
+    }
 }
 
 /// `quality`'s mapping to `base_q_idx`, linear across the calibration sweep's
@@ -112,19 +152,39 @@ fn quality_to_q_idx(quality: u8) -> u8 {
     (240.0 - quality * 2.0).round() as u8
 }
 
-/// The closed-loop controller behind [`RateTarget::BytesPerFrame`]: a
-/// proportional step on `base_q_idx`, sized from the calibration sweep's own
-/// log-linear slope (bytes roughly halve every ~45 `q_idx` steps there, i.e.
-/// `d(ln bytes)/d(q_idx) ≈ -0.0154`), clamped per frame. Pure proportional —
-/// no accumulated error term — is the windup bound itself
-/// ([[vorbis-rate-loop-windup]]'s class): the only state carried between
-/// frames is `q`, already clamped to `0..=255`, so a quiet lead-in cannot
-/// build a debt a later transient has to repay; each frame's step is bounded
-/// by `STEP_CLAMP` regardless of history.
+/// How much of a mini-GOP's byte budget the hidden `ALTREF` frame is worth
+/// relative to one leaf: every leaf of the group predicts off it, so it is
+/// bought at roughly twice a leaf's size (libaom's `gf_group` spends its
+/// `ARF` the same way, through a lower quantizer rather than a byte target).
+const ARF_WEIGHT: f64 = 2.0;
+
+/// How much a key frame is worth relative to one leaf, same units.
+const KEY_WEIGHT: f64 = 3.0;
+
+/// The closed-loop controller behind [`RateTarget::BytesPerFrame`] and
+/// [`RateTarget::Bitrate`]: a proportional step on `base_q_idx`, sized from
+/// the calibration sweep's own log-linear slope (bytes roughly halve every
+/// ~45 `q_idx` steps there, i.e. `d(ln bytes)/d(q_idx) ≈ -0.0154`), clamped
+/// per frame. Pure proportional — no accumulated error term — is the windup
+/// bound itself ([[vorbis-rate-loop-windup]]'s class): the only state carried
+/// between frames is `q`, already clamped to `0..=255`, so a quiet lead-in
+/// cannot build a debt a later transient has to repay; each frame's step is
+/// bounded by `STEP_CLAMP` regardless of history.
+///
+/// In pyramid mode the state is kept PER LEVEL: each frame's size is
+/// predicted from the previous frame of its own level, against that level's
+/// own share of the budget, which is the whole "two-pass-free model" this
+/// encoder carries.
 #[derive(Debug, Clone, Copy)]
 struct RateLoop {
-    target_bytes: u32,
-    q: f64,
+    /// Byte target per level, indexed by [`RateLoop::slot`].
+    target: [f64; 3],
+    /// Quantizer per level, same index.
+    q: [f64; 3],
+    /// Whether the three slots are actually distinct (pyramid mode) or all
+    /// one shared controller (the flat path, unchanged from before levels
+    /// existed).
+    per_level: bool,
 }
 
 impl RateLoop {
@@ -137,25 +197,54 @@ impl RateLoop {
     /// convert a bytes ratio into a `q_idx` step.
     const GAIN: f64 = 1.0 / 0.0154;
 
-    fn new(target_bytes: u32, start_q: f64) -> Self {
+    fn new(target_bytes: f64, start_q: f64, mini_gop: Option<usize>) -> Self {
+        let Some(m) = mini_gop.map(|m| m as f64) else {
+            return Self {
+                target: [target_bytes; 3],
+                q: [start_q; 3],
+                per_level: false,
+            };
+        };
+        // A group of `m` pictures gets `m * target_bytes`, split one
+        // `ARF_WEIGHT` share to the hidden frame and one each to the `m - 1`
+        // leaves, so the group's own average is the target exactly.
+        let share = target_bytes * m / (m - 1.0 + ARF_WEIGHT);
         Self {
-            target_bytes,
-            q: start_q,
+            target: [target_bytes * KEY_WEIGHT, share * ARF_WEIGHT, share],
+            q: [start_q; 3],
+            per_level: true,
         }
     }
 
-    fn q_idx(&self) -> u8 {
-        self.q.round().clamp(0.0, 255.0) as u8
+    /// Which controller a level uses: one shared slot on the flat path, three
+    /// separate ones under a pyramid.
+    fn slot(&self, level: Level) -> usize {
+        if !self.per_level {
+            return 0;
+        }
+        match level {
+            Level::Key => 0,
+            Level::Arf => 1,
+            // A `show_existing_frame` packet codes no pixels and never
+            // reaches `update`; it shares the leaf slot so `q_idx` is total.
+            Level::Leaf | Level::ShowExisting => 2,
+        }
     }
 
-    /// Steers `q` toward `target_bytes` from this frame's actual coded size.
-    fn update(&mut self, actual_bytes: usize) {
-        if self.target_bytes == 0 || actual_bytes == 0 {
+    fn q_idx(&self, level: Level) -> u8 {
+        self.q[self.slot(level)].round().clamp(0.0, 255.0) as u8
+    }
+
+    /// Steers this level's `q` toward its own target from the frame's actual
+    /// coded size.
+    fn update(&mut self, level: Level, actual_bytes: usize) {
+        let slot = self.slot(level);
+        if self.target[slot] <= 0.0 || actual_bytes == 0 {
             return;
         }
-        let ratio = actual_bytes as f64 / f64::from(self.target_bytes);
+        let ratio = actual_bytes as f64 / self.target[slot];
         let step = (ratio.ln() * Self::GAIN).clamp(-Self::STEP_CLAMP, Self::STEP_CLAMP);
-        self.q = (self.q + step).clamp(0.0, 255.0);
+        self.q[slot] = (self.q[slot] + step).clamp(0.0, 255.0);
     }
 }
 
@@ -199,13 +288,85 @@ pub struct Packet {
     pub data: Vec<u8>,
     /// Whether this picture was coded as a key frame.
     pub key: bool,
-    /// This picture's position in the stream, in coding (== presentation,
-    /// since this encoder has no B frames) order, starting at 0.
+    /// This picture's position in DISPLAY (presentation) order, starting at
+    /// 0 — a muxer's `pts` in picture units. Without a [`Pyramid`] this is
+    /// also the coding order and equals `dts`.
     pub order: u64,
+    /// This packet's position in CODING (decode) order, starting at 0 — a
+    /// muxer's `dts` in packet units. With a [`Pyramid`] the hidden frame of
+    /// each mini-GOP is coded before the leaves it precedes in display order,
+    /// so `dts` and `order` diverge, and the `show_existing_frame` packet
+    /// that re-outputs the hidden frame carries the hidden frame's own
+    /// `order` with its own later `dts`.
+    pub dts: u64,
+    /// Which pyramid level this packet is.
+    pub level: Level,
 }
 
+/// One mini-GOP of a two-level coding pyramid, and the quantizer offsets its
+/// two levels are coded at. libaom's `gf_group` shape, cut down to the two
+/// levels this encoder's reference set can carry: the last picture of each
+/// mini-GOP is coded FIRST, hidden (`show_frame == 0`), as the group's
+/// `ALTREF_FRAME`, then the pictures before it are coded as shown leaves that
+/// may predict backward off it, and finally a `show_existing_frame` header
+/// re-outputs the hidden frame in its own display position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pyramid {
+    /// Pictures per mini-GOP: the hidden frame is `mini_gop` pictures ahead
+    /// of the group's anchor, and `mini_gop - 1` leaves sit between them.
+    /// `1` would leave no leaf at all and is refused.
+    pub mini_gop: usize,
+    /// Added to `base_q_idx` for the hidden `ALTREF_FRAME` — negative, since
+    /// every leaf of the group predicts off it.
+    pub arf_q_offset: i16,
+    /// Added to `base_q_idx` for each shown leaf — positive, since nothing
+    /// predicts off a leaf but the next leaf.
+    pub leaf_q_offset: i16,
+}
+
+impl Default for Pyramid {
+    /// The offsets `encode::tests::pyramid_q_offset_sweep` measured (see the
+    /// sweep's own report) at the mini-GOP size that won it.
+    fn default() -> Self {
+        Self {
+            mini_gop: 4,
+            arf_q_offset: -16,
+            leaf_q_offset: 8,
+        }
+    }
+}
+
+/// Which level of the pyramid a coded frame sits at, reported on every
+/// [`Packet`] so a caller (and the BD gate's histogram) can tell them apart
+/// without parsing the frame headers back out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// A key frame.
+    Key,
+    /// A hidden `ALTREF_FRAME`, coded ahead of its display position.
+    Arf,
+    /// A shown leaf.
+    Leaf,
+    /// A `show_existing_frame` header re-outputting a hidden frame: no coded
+    /// pixels at all, four bits of header.
+    ShowExisting,
+}
+
+/// The DPB slot the group anchors alternate between (see
+/// [`Av1Encoder::encode_frames`]): the hidden frame of group `g` refreshes
+/// `ANCHOR_SLOTS[(g + 1) % 2]`, which is the slot the leaves of group `g`
+/// name as `ALTREF_FRAME` and which group `g + 1` reads as its own anchor.
+/// Two slots alternate because a group's leaves must still be able to read
+/// the previous anchor while the new one is already written.
+const ANCHOR_SLOTS: [u8; 2] = [3, 4];
+
+/// The slot the leaf chain refreshes and reads as `LAST_FRAME`.
+const LEAF_SLOT: u8 = 0;
+
 /// The AV1 software encoder: [`EncoderConfig`] in, one [`Packet`] out per
-/// [`Av1Encoder::encode`] call.
+/// [`Av1Encoder::encode`] call — or, with a [`Pyramid`] configured, a
+/// coding-order burst of them per [`Av1Encoder::encode_frames`] call plus a
+/// [`Av1Encoder::flush`] at the end of the stream.
 #[derive(Debug)]
 pub struct Av1Encoder {
     config: EncoderConfig,
@@ -237,6 +398,31 @@ pub struct Av1Encoder {
     /// The frame two back: `ALTREF_FRAME`, in the slot the next frame is
     /// about to refresh (`encode_inter_frame`'s 0/2 alternation).
     prev2: Option<Picture>,
+    /// `Some` puts the encoder in pyramid mode: [`Av1Encoder::encode`] then
+    /// refuses (a picture no longer maps to one packet) and the state below
+    /// drives coding order.
+    pyramid: Option<Pyramid>,
+    /// The eight DPB slots, modelled exactly as the decoder does (spec 7.20):
+    /// what picture each holds, the order hint it was coded at, and the CDF
+    /// tables it stored. Only pyramid mode reads these; the flat path keeps
+    /// `reference`/`golden`/`prev2` so its bytes are unchanged.
+    dpb: [Option<DpbSlot>; 8],
+    /// Pictures held back waiting for their mini-GOP's hidden frame.
+    pending: Vec<(u64, Picture)>,
+    /// Which of [`ANCHOR_SLOTS`] the group about to be coded reads as its
+    /// anchor.
+    anchor: usize,
+    /// Coding-order position of the next packet — a packet's `dts`.
+    next_dts: u64,
+}
+
+/// One decoded-picture-buffer slot: what a `refresh_frame_flags` bit stores
+/// and what a `ref_frame_idx` entry reads back.
+#[derive(Debug, Clone)]
+struct DpbSlot {
+    picture: Picture,
+    order_hint: u32,
+    cdfs: crate::encode::CdfSnapshot,
 }
 
 /// The encoder stays `Send` now that it owns a `FrameCtx` (whose cells are
@@ -271,7 +457,35 @@ impl Av1Encoder {
             next_index: 0,
             rate_loop: None,
             fctx: crate::decode::FrameCtx::new(),
+            pyramid: None,
+            dpb: [const { None }; 8],
+            pending: Vec::new(),
+            anchor: 0,
+            next_dts: 0,
         })
+    }
+
+    /// [`Av1Encoder::new`] in pyramid mode: pictures are coded out of display
+    /// order, so a call to [`Av1Encoder::encode_frames`] returns zero, one or
+    /// several packets and [`Av1Encoder::flush`] drains whatever is still
+    /// held at the end of the stream. [`Av1Encoder::encode`]'s one-in-one-out
+    /// contract cannot hold here and it returns an error instead; a caller
+    /// that wants the old shape simply does not call this constructor.
+    ///
+    /// # Errors
+    /// As [`Av1Encoder::new`], plus a `mini_gop` below 2 (no leaf would be
+    /// left between the anchor and the hidden frame) or above `config.gop`
+    /// (the group would straddle a key frame).
+    pub fn with_pyramid(config: EncoderConfig, pyramid: Pyramid) -> Result<Self> {
+        if pyramid.mini_gop < 2 {
+            return Err(Error::unsupported(
+                "AV1 encode",
+                "a pyramid mini-GOP is at least 2 pictures",
+            ));
+        }
+        let mut encoder = Self::new(config)?;
+        encoder.pyramid = Some(pyramid);
+        Ok(encoder)
     }
 
     /// [`Av1Encoder::new`], but `rate` picks `base_q_idx` (or steers it,
@@ -281,20 +495,27 @@ impl Av1Encoder {
     /// # Errors
     /// Same as [`Av1Encoder::new`].
     pub fn with_rate_target(mut config: EncoderConfig, rate: RateTarget) -> Result<Self> {
-        let rate_loop = match rate {
-            RateTarget::QIndex(q) => {
-                config.base_q_idx = q;
-                None
-            }
-            RateTarget::Quality(quality) => {
-                config.base_q_idx = quality_to_q_idx(quality);
-                None
-            }
-            RateTarget::BytesPerFrame(target_bytes) => {
-                Some(RateLoop::new(target_bytes, f64::from(config.base_q_idx)))
-            }
-        };
+        let rate_loop = rate.into_loop(&mut config, None);
         let mut encoder = Self::new(config)?;
+        encoder.rate_loop = rate_loop;
+        Ok(encoder)
+    }
+
+    /// [`Av1Encoder::with_pyramid`] and [`Av1Encoder::with_rate_target`] at
+    /// once: the rate loop then keeps a separate quantizer per pyramid level,
+    /// predicting each frame's size from the previous frame of its OWN level
+    /// (a leaf and a hidden `ALTREF` differ by several times in size, so one
+    /// shared predictor would swing the quantizer every frame).
+    ///
+    /// # Errors
+    /// As both.
+    pub fn with_pyramid_and_rate_target(
+        mut config: EncoderConfig,
+        pyramid: Pyramid,
+        rate: RateTarget,
+    ) -> Result<Self> {
+        let rate_loop = rate.into_loop(&mut config, Some(pyramid.mini_gop));
+        let mut encoder = Self::with_pyramid(config, pyramid)?;
         encoder.rate_loop = rate_loop;
         Ok(encoder)
     }
@@ -322,10 +543,32 @@ impl Av1Encoder {
     ///
     /// # Errors
     /// Returns an error when `picture`'s size does not match
-    /// [`EncoderConfig::width`]/[`EncoderConfig::height`], or under the same
-    /// conditions [`crate::encode::encode_key_frame`]/
-    /// [`crate::encode::encode_sequence`] do.
+    /// [`EncoderConfig::width`]/[`EncoderConfig::height`], when the encoder
+    /// was built by [`Av1Encoder::with_pyramid`] (which reorders pictures, so
+    /// one call cannot return one packet), or under the same conditions
+    /// [`crate::encode::encode_key_frame`]/[`crate::encode::encode_sequence`]
+    /// do.
     pub fn encode(&mut self, picture: &Picture) -> Result<Packet> {
+        if self.pyramid.is_some() {
+            return Err(Error::unsupported(
+                "AV1 encode",
+                "a pyramid stream reorders pictures -- use encode_frames()/flush()",
+            ));
+        }
+        let mut packets = self.encode_frames(picture)?;
+        Ok(packets.pop().expect("the flat path emits exactly one packet"))
+    }
+
+    /// Encodes one picture and returns every packet it completed, in coding
+    /// order. Without a [`Pyramid`] that is always exactly one packet and
+    /// this is [`Av1Encoder::encode`] with a `Vec` around it; with one it is
+    /// empty for most pictures and a whole mini-GOP's worth (the hidden
+    /// frame, its leaves and the `show_existing_frame` that re-outputs it)
+    /// for the picture that closes a group.
+    ///
+    /// # Errors
+    /// As [`Av1Encoder::encode`], minus the pyramid refusal.
+    pub fn encode_frames(&mut self, picture: &Picture) -> Result<Vec<Packet>> {
         if (picture.width, picture.height) != (self.config.width, self.config.height) {
             return Err(Error::unsupported(
                 "AV1 encode",
@@ -335,14 +578,48 @@ impl Av1Encoder {
                 ),
             ));
         }
+        let Some(pyramid) = self.pyramid else {
+            return Ok(vec![self.encode_flat(picture)?]);
+        };
+        let order = self.next_index;
+        self.next_index += 1;
+        if order.is_multiple_of(self.config.gop as u64) {
+            // A key frame closes whatever group is open (there is nothing for
+            // its leaves to point forward at across the boundary) and then
+            // restarts the pyramid from the key itself.
+            let mut packets = self.drain_pending()?;
+            packets.push(self.encode_key(order, picture)?);
+            return Ok(packets);
+        }
+        self.pending.push((order, picture.clone()));
+        // The group closes on its own size, or early when the next picture
+        // would be a key frame.
+        let next_is_key = (order + 1).is_multiple_of(self.config.gop as u64);
+        if self.pending.len() >= pyramid.mini_gop || next_is_key {
+            return self.drain_pending();
+        }
+        Ok(Vec::new())
+    }
+
+    /// Codes and returns every picture still held back — the tail of a stream
+    /// whose last mini-GOP never filled up. Empty (and cheap) for a stream
+    /// with no [`Pyramid`], which never holds a picture at all.
+    ///
+    /// # Errors
+    /// As [`Av1Encoder::encode_frames`].
+    pub fn flush(&mut self) -> Result<Vec<Packet>> {
+        self.drain_pending()
+    }
+
+    /// The pre-pyramid path, byte for byte: one picture in, one packet out.
+    fn encode_flat(&mut self, picture: &Picture) -> Result<Packet> {
         let render = (self.config.width, self.config.height);
         let padded = picture.padded_to(SUPERBLOCK);
-        let is_key = self.next_index % self.config.gop as u64 == 0;
+        let is_key = self.next_index.is_multiple_of(self.config.gop as u64);
         let order = self.next_index;
-        let base_q_idx = self
-            .rate_loop
-            .as_ref()
-            .map_or(self.config.base_q_idx, RateLoop::q_idx);
+        let base_q_idx = self.rate_loop.as_ref().map_or(self.config.base_q_idx, |r| {
+            r.q_idx(if is_key { Level::Key } else { Level::Leaf })
+        });
 
         let encoded: Encoded = if is_key {
             encode_key_frame_inner(
@@ -373,6 +650,7 @@ impl Av1Encoder {
                 self.golden.as_ref(),
                 self.prev2.as_ref(),
                 &self.fctx,
+                None,
             )?
         };
 
@@ -386,14 +664,213 @@ impl Av1Encoder {
         self.reference = Some(encoded.reconstruction.clone());
         self.next_index += 1;
         let cropped = crop_encoded(&encoded, render.0, render.1);
+        let level = if is_key { Level::Key } else { Level::Leaf };
         if let Some(rate_loop) = self.rate_loop.as_mut() {
-            rate_loop.update(cropped.stream.len());
+            rate_loop.update(level, cropped.stream.len());
         }
-        Ok(Packet {
-            data: cropped.stream,
-            key: is_key,
+        Ok(self.packet(cropped.stream, is_key, order, level))
+    }
+
+    /// Stamps a packet with its display and coding positions and advances the
+    /// coding-order clock.
+    fn packet(&mut self, data: Vec<u8>, key: bool, order: u64, level: Level) -> Packet {
+        let dts = self.next_dts;
+        self.next_dts += 1;
+        Packet {
+            data,
+            key,
             order,
-        })
+            dts,
+            level,
+        }
+    }
+
+    /// Stores a coded frame into every DPB slot its `refresh_frame_flags`
+    /// names (spec 7.20).
+    fn refresh(&mut self, slots: &[u8], encoded: &Encoded, order_hint: u32) {
+        let slot = DpbSlot {
+            picture: encoded.reconstruction.clone(),
+            order_hint,
+            cdfs: encoded.next_cdfs.clone(),
+        };
+        for &s in slots {
+            self.dpb[s as usize] = Some(slot.clone());
+        }
+    }
+
+    /// Codes a key frame in pyramid mode: it refreshes all eight slots, so it
+    /// becomes the anchor, the `GOLDEN_FRAME` and the CDF source for the
+    /// whole GOP at once.
+    fn encode_key(&mut self, order: u64, picture: &Picture) -> Result<Packet> {
+        let render = (self.config.width, self.config.height);
+        let base_q_idx = self
+            .rate_loop
+            .as_ref()
+            .map_or(self.config.base_q_idx, |r| r.q_idx(Level::Key));
+        let encoded = encode_key_frame_inner(
+            &picture.padded_to(SUPERBLOCK),
+            base_q_idx,
+            DEADZONE,
+            &KEY_FRAME_MODES,
+            split_blocks(),
+            render,
+            self.color_config,
+            &self.fctx,
+        )?;
+        self.refresh(&[0, 1, 2, 3, 4, 5, 6, 7], &encoded, 0);
+        self.anchor = 0;
+        let cropped = crop_encoded(&encoded, render.0, render.1);
+        if let Some(rate_loop) = self.rate_loop.as_mut() {
+            rate_loop.update(Level::Key, cropped.stream.len());
+        }
+        Ok(self.packet(cropped.stream, true, order, Level::Key))
+    }
+
+    /// Codes one inter frame at `order` from the DPB, in coding order.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_pyramid_inter(
+        &mut self,
+        order: u64,
+        picture: &Picture,
+        last_slot: u8,
+        self_slot: u8,
+        altref_slot: u8,
+        show_frame: bool,
+        level: Level,
+    ) -> Result<Packet> {
+        let render = (self.config.width, self.config.height);
+        let order_hint = (order & 0x7f) as u32;
+        let pyramid = self.pyramid.expect("pyramid mode");
+        let offset = match level {
+            Level::Arf => pyramid.arf_q_offset,
+            _ => pyramid.leaf_q_offset,
+        };
+        let base = self
+            .rate_loop
+            .as_ref()
+            .map_or(i16::from(self.config.base_q_idx), |r| {
+                i16::from(r.q_idx(level))
+            });
+        let base_q_idx = (base + offset).clamp(1, 255) as u8;
+        // spec 5.9.2's `ref_frame_sign_bias`, derived from what the slots
+        // this frame names actually hold: a reference whose order hint is
+        // AHEAD of this frame's is backward-biased, and the MV stack scans
+        // (writer and decoder alike) flip borrowed candidates across the
+        // boundary. Only `ALTREF_FRAME` can be ahead here — the leaves of a
+        // mini-GOP name the group's hidden frame there.
+        let mut sign_bias = crate::mvstack::NO_SIGN_BIAS;
+        let ahead = |slot: u8, dpb: &[Option<DpbSlot>; 8]| {
+            dpb[slot as usize]
+                .as_ref()
+                .is_some_and(|s| s.order_hint > order_hint)
+        };
+        for (i, slot) in [
+            last_slot, last_slot, last_slot, GOLDEN_SLOT, last_slot, last_slot, altref_slot,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sign_bias[i] = ahead(slot, &self.dpb);
+        }
+        let reference = self.dpb[last_slot as usize]
+            .as_ref()
+            .map(|s| s.picture.clone())
+            .ok_or_else(|| {
+                Error::unsupported("AV1 encode", "an inter frame needs a previous reconstruction")
+            })?;
+        let golden = self.dpb[GOLDEN_SLOT as usize].as_ref().map(|s| s.picture.clone());
+        let altref = (altref_slot != GOLDEN_SLOT)
+            .then(|| self.dpb[altref_slot as usize].as_ref().map(|s| s.picture.clone()))
+            .flatten();
+        let start_cdfs = self.dpb[last_slot as usize].as_ref().map(|s| s.cdfs.0.clone());
+        let encoded = encode_inter_frame(
+            &picture.padded_to(SUPERBLOCK),
+            &reference,
+            base_q_idx,
+            DEADZONE,
+            order_hint,
+            render,
+            start_cdfs.as_ref(),
+            golden.as_ref(),
+            altref.as_ref(),
+            &self.fctx,
+            Some(crate::encode::PyramidFrame {
+                last_slot,
+                self_slot,
+                altref_slot,
+                show_frame,
+                sign_bias,
+            }),
+        )?;
+        self.refresh(&[self_slot], &encoded, order_hint);
+        let cropped = crop_encoded(&encoded, render.0, render.1);
+        if let Some(rate_loop) = self.rate_loop.as_mut() {
+            rate_loop.update(level, cropped.stream.len());
+        }
+        Ok(self.packet(cropped.stream, false, order, level))
+    }
+
+    /// Codes the open mini-GOP: its hidden frame first, then its leaves, then
+    /// the `show_existing_frame` header that puts the hidden frame back in
+    /// display order.
+    fn drain_pending(&mut self) -> Result<Vec<Packet>> {
+        if self.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let group: Vec<(u64, Picture)> = std::mem::take(&mut self.pending);
+        let mut packets = Vec::with_capacity(group.len() + 1);
+        let anchor_slot = ANCHOR_SLOTS[self.anchor];
+        let next_anchor_slot = ANCHOR_SLOTS[1 - self.anchor];
+        let (arf_order, arf_picture) = group.last().cloned().expect("non-empty");
+        if group.len() == 1 {
+            // Nothing to predict backward, so no hidden frame: one shown leaf
+            // that also becomes the next group's anchor.
+            packets.push(self.encode_pyramid_inter(
+                arf_order,
+                &arf_picture,
+                anchor_slot,
+                next_anchor_slot,
+                GOLDEN_SLOT,
+                true,
+                Level::Leaf,
+            )?);
+            self.anchor = 1 - self.anchor;
+            return Ok(packets);
+        }
+        packets.push(self.encode_pyramid_inter(
+            arf_order,
+            &arf_picture,
+            anchor_slot,
+            next_anchor_slot,
+            GOLDEN_SLOT,
+            false,
+            Level::Arf,
+        )?);
+        for (i, (order, picture)) in group[..group.len() - 1].iter().enumerate() {
+            let last_slot = if i == 0 { anchor_slot } else { LEAF_SLOT };
+            packets.push(self.encode_pyramid_inter(
+                *order,
+                picture,
+                last_slot,
+                LEAF_SLOT,
+                next_anchor_slot,
+                true,
+                Level::Leaf,
+            )?);
+        }
+        let (seq, _) = crate::encode::key_frame_headers(
+            self.config.width,
+            self.config.height,
+            self.config.base_q_idx,
+        )?;
+        let mut data = crate::obu::temporal_delimiter();
+        data.extend_from_slice(&crate::frame::show_existing_frame_obu(
+            &seq,
+            next_anchor_slot,
+        )?);
+        packets.push(self.packet(data, false, arf_order, Level::ShowExisting));
+        self.anchor = 1 - self.anchor;
+        Ok(packets)
     }
 }
 
@@ -799,10 +1276,10 @@ mod tests {
         };
         let mut enc =
             Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(4_000)).unwrap();
-        let mut prev_q = enc.rate_loop.as_ref().unwrap().q_idx();
+        let mut prev_q = enc.rate_loop.as_ref().unwrap().q_idx(Level::Leaf);
         for picture in &pictures {
             enc.encode(picture).unwrap();
-            let q = enc.rate_loop.as_ref().unwrap().q_idx();
+            let q = enc.rate_loop.as_ref().unwrap().q_idx(Level::Leaf);
             let step = (i32::from(q) - i32::from(prev_q)).abs();
             assert!(
                 f64::from(step) <= RateLoop::STEP_CLAMP + 1.0, // +1 for u8 rounding

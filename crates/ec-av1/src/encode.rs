@@ -3988,6 +3988,33 @@ fn search_inter_block(
     )
 }
 
+/// Where one inter frame sits in a coding-order pyramid: which DPB slots its
+/// references name, which slot it refreshes, whether it is shown when it is
+/// coded, and the `ref_frame_sign_bias` that follows from all of it. `None`
+/// keeps `encode_inter_frame`'s pre-pyramid flat behaviour verbatim (slot
+/// 0/2 alternation, every frame shown, every reference in the past).
+///
+/// The sign bias is carried rather than derived here because only the caller
+/// knows what order hint each slot holds; it is armed onto the tile writer
+/// ([`crate::tile::arm_sign_bias`]) and set on the encoder's own MV grid, so
+/// the writer scans the same stacks the decoder will.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PyramidFrame {
+    /// The slot `LAST_FRAME` (and every reference this encoder does not name
+    /// apart) reads.
+    pub last_slot: u8,
+    /// The single slot `refresh_frame_flags` sets.
+    pub self_slot: u8,
+    /// The slot `ALTREF_FRAME` reads -- a FUTURE frame for a leaf of a
+    /// pyramid, which is what makes `sign_bias`'s last entry true.
+    pub altref_slot: u8,
+    /// `show_frame`: false for a hidden frame, output later by a
+    /// `show_existing_frame` header.
+    pub show_frame: bool,
+    /// This frame's `ref_frame_sign_bias` (spec 5.9.2).
+    pub sign_bias: crate::mvstack::SignBiasTable,
+}
+
 /// Encodes one picture as an inter frame predicting from `reference`'s
 /// reconstruction, which the caller decoded (or, for the frame right after
 /// the key frame, is the key frame's own reconstruction).
@@ -4011,6 +4038,9 @@ pub(crate) fn encode_inter_frame(
     // (the encoder alternates 0/2): `ALTREF_FRAME`. `None` for the first two
     // inter frames of a GOP, where the frame two back IS the key frame.
     altref: Option<&Picture>, fctx: &crate::decode::FrameCtx,
+    // Where this frame sits in the coding-order pyramid; `None` is the flat
+    // one-shown-frame-per-picture stream this encoder wrote before.
+    pyramid: Option<PyramidFrame>,
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -4037,14 +4067,17 @@ pub(crate) fn encode_inter_frame(
     // frame: frame n writes A(n) = 0 for odd n, 2 for even, so A(n) = A(n-2)
     // and the picture this frame names as `ALTREF_FRAME` is the one sitting
     // in the very slot it will overwrite.
-    let self_slot = if order_hint % 2 == 1 { 0 } else { 2 };
-    let last_slot = if order_hint <= 1 {
-        LAST_SLOT
-    } else if (order_hint - 1) % 2 == 1 {
-        0
-    } else {
-        2
-    };
+    let self_slot = pyramid.map_or(if order_hint % 2 == 1 { 0 } else { 2 }, |p| p.self_slot);
+    let last_slot = pyramid.map_or(
+        if order_hint <= 1 {
+            LAST_SLOT
+        } else if (order_hint - 1) % 2 == 1 {
+            0
+        } else {
+            2
+        },
+        |p| p.last_slot,
+    );
     // `render`, not `picture.width`/`picture.height`: `picture` here is
     // already padded to a whole number of superblocks (`encode_sequence`'s
     // `padded_to(SUPERBLOCK)`), and the header's `mi_cols`/`mi_rows` (and so
@@ -4058,10 +4091,20 @@ pub(crate) fn encode_inter_frame(
         order_hint,
         last_slot,
         self_slot,
-        if altref.is_some() { self_slot } else { GOLDEN_SLOT },
+        match pyramid {
+            Some(p) => p.altref_slot,
+            None if altref.is_some() => self_slot,
+            None => GOLDEN_SLOT,
+        },
     )?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
+    let sign_bias = pyramid.map_or(crate::mvstack::NO_SIGN_BIAS, |p| p.sign_bias);
+    if let Some(p) = pyramid {
+        header.show_frame = p.show_frame;
+        header.showable_frame = !p.show_frame;
+        header.ref_frame_sign_bias = p.sign_bias;
+    }
     // `TxMode::Select` here too: an inter block then codes one `txfm_split`
     // flag (kept at zero -- its var-tx tree is not searched yet) and an INTRA
     // block inside this frame codes and searches its own `tx_depth`, the same
@@ -4128,6 +4171,7 @@ pub(crate) fn encode_inter_frame(
     // once per frame (lane-av1rd2), not once per block, which is a whole
     // plane's map per 32x32 block and now per leaf too.
     let mut grid = MiGrid::new(mi_cols, mi_rows);
+    grid.set_sign_bias(sign_bias);
     let mut blocks = vec![Quadrant::Whole(BlockCoeffs::default()); cols * rows];
 
     for sb_r in 0..sb_rows {
@@ -4522,6 +4566,7 @@ pub(crate) fn encode_inter_frame(
         .cloned()
         .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
     let start_cdfs = CdfSnapshot(cdfs.clone());
+    crate::tile::arm_sign_bias(sign_bias);
     let mut tile = crate::tile::sb_coeff_inter_frame_tile_cdfs(
         mi_cols,
         mi_rows,
@@ -4611,6 +4656,7 @@ pub(crate) fn encode_inter_frame(
         |bits, sb_cols, grid, units| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
+            crate::tile::arm_sign_bias(sign_bias);
             let mut cdfs = start_cdfs.0.clone();
             let coded = crate::tile::sb_coeff_inter_frame_tile_cdfs(
                 mi_cols,
@@ -4766,6 +4812,7 @@ pub(crate) fn encode_sequence_with_ctx(
             Some(&carried.0),
             Some(&golden),
             prev2.as_ref(), fctx,
+            None,
         )?;
         stream.extend_from_slice(&inter.stream);
         carried = inter.next_cdfs.clone();
@@ -6805,7 +6852,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx, None).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -6903,7 +6950,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx, None).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -7080,7 +7127,7 @@ mod tests {
                     q,
                     0.5,
                     1,
-                    (width, height), None, None, None, fctx,
+                    (width, height), None, None, None, fctx, None,
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -7097,7 +7144,7 @@ mod tests {
                         q,
                         0.5,
                         1,
-                        (width, height), None, None, None, fctx,
+                        (width, height), None, None, None, fctx, None,
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);

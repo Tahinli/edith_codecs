@@ -256,6 +256,16 @@ pub struct MiGrid {
     tile_col0: usize,
     tile_row1: usize,
     tile_col1: usize,
+    /// This frame's `ref_frame_sign_bias` (spec 5.9.2), the table
+    /// [`find_mv_stack`] scans under. It lives on the grid rather than in
+    /// every caller's argument list because it is frame-scoped exactly as the
+    /// grid is, and because the tile WRITER reaches `find_mv_stack` through
+    /// four nested helpers that would otherwise each grow a parameter. All
+    /// `false` (every reference in the past) unless
+    /// [`Self::set_sign_bias`] says otherwise -- which is what a frame with a
+    /// backward `ALTREF_FRAME` (a pyramid's hidden future frame) must do, or
+    /// its writer builds a different stack than the decoder does.
+    sign_bias: SignBiasTable,
 }
 
 impl MiGrid {
@@ -269,7 +279,13 @@ impl MiGrid {
             tile_col0: 0,
             tile_row1: rows,
             tile_col1: cols,
+            sign_bias: NO_SIGN_BIAS,
         }
+    }
+
+    /// Sets this frame's `ref_frame_sign_bias` (see the field).
+    pub fn set_sign_bias(&mut self, sign_bias: SignBiasTable) {
+        self.sign_bias = sign_bias;
     }
 
     /// Narrows [`Self::get`]'s own read window to one tile's mi-unit span
@@ -1146,7 +1162,7 @@ pub fn find_mv_stack(
         ref_frame,
         mi_cols,
         mi_rows,
-        &NO_SIGN_BIAS,
+        &grid.sign_bias,
         &NO_GM_MV,
         None,
     )
