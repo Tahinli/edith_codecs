@@ -4983,12 +4983,6 @@ pub(crate) fn encode_inter_frame(
         |bits, sb_cols, grid, units| code_tiles(bits, sb_cols, grid, units),
         |lf, cdef, h, tiles: &[Vec<u8>], lr| {
             let payloads: Vec<&[u8]> = tiles.iter().map(Vec::as_slice).collect();
-            eprintln!(
-                "TILEDBG inter decode tiles={:?} cdef_bits={} lr={}",
-                tiles.iter().map(Vec::len).collect::<Vec<_>>(),
-                cdef.bits,
-                lr.uses_lr
-            );
             crate::decode::decode_inter_frame_tiles_lr(
                 &payloads,
                 &header_tile_info,

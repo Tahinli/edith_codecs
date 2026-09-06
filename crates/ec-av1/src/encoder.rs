@@ -1650,10 +1650,10 @@ mod tests {
     /// spec does not, and the parser half catches the reverse.
     #[test]
     fn every_tile_layout_decodes_sample_exact_through_both_decoders() {
-        let (width, height) = (128usize, 128usize);
-        let sources: Vec<Picture> = (0..2).map(|t| test_card(width, height, t * 3)).collect();
+        let (width, height) = (640usize, 384usize);
+        let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
         let mut sizes = Vec::new();
-        for (cols_log2, rows_log2) in [(0u32, 1u32)] {
+        for (cols_log2, rows_log2) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1), (2, 1)] {
             let config = EncoderConfig {
                 width,
                 height,
@@ -1728,6 +1728,59 @@ mod tests {
                 "{layout}: {bytes} bytes ({:+.2}% vs one tile)",
                 (*bytes as f64 / base - 1.0) * 100.0
             );
+        }
+    }
+
+    /// The same round trip at a real 1920x1080 crop of the gate's own clip
+    /// -- the size the editor's export actually runs at, where a tile grid
+    /// is worth having. Ignored by default only for its wall (a 1080p
+    /// encode of three pictures), not for any weakness in the check.
+    #[test]
+    #[ignore = "1080p encode: minutes, run it with --ignored"]
+    fn a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders() {
+        let (width, height) = (1920usize, 1080usize);
+        let Some(sources) = h264_clip_frames(width, height, 3) else {
+            eprintln!("SKIP the 1080p tile round trip: no fixture");
+            return;
+        };
+        for (cols_log2, rows_log2) in [(1u32, 0u32), (1, 1), (2, 1)] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 3,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: cols_log2,
+                tile_rows_log2: rows_log2,
+            };
+            let layout = format!("{}x{} tiles", 1 << cols_log2, 1 << rows_log2);
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for (i, picture) in sources.iter().enumerate() {
+                let packet = enc
+                    .encode(picture)
+                    .unwrap_or_else(|e| panic!("{layout} frame {i}: {e}"));
+                stream.extend_from_slice(&packet.data);
+            }
+            let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+            assert_eq!(ours.len(), sources.len(), "{layout}: our decoder's frames");
+            if !have_ffmpeg() {
+                eprintln!("SKIP the ffmpeg half of 1080p {layout}: no ffmpeg");
+                continue;
+            }
+            let theirs = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "{layout}: ffmpeg's frames");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                    panic!(
+                        "1080p {layout} frame {i}: luma differs first at ({}, {})",
+                        at % width,
+                        at / width
+                    );
+                }
+            }
+            eprintln!("1080p {layout}: {} bytes, sample-exact", stream.len());
         }
     }
 
