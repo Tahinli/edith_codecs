@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use ec_av1::encode::Picture as Av1Picture;
-use ec_av1::encoder::{Av1Encoder, Colour, EncoderConfig as Av1Config};
+use ec_av1::encoder::{Av1Encoder, Colour, EncoderConfig as Av1Config, Level, Pyramid};
 use ec_core::frame::{
     AudioFrame, ChannelLayout, Frame, PixelFormat, Plane, SampleFormat, VideoFrame,
 };
@@ -352,9 +352,26 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
         gop: 10,
         colour: Colour::default(),
     };
-    let mut enc = Av1Encoder::new(cfg).expect("av1 encoder");
+    // `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]` benches the
+    // encoder's coding pyramid (hidden ALTREF + show_existing_frame) instead
+    // of the flat one-picture-one-packet stream, the same knob shape as
+    // `EC_H265_RDOQ_ESTIMATE`. Unset keeps the flat default.
+    let pyramid = std::env::var("EC_AV1_PYRAMID").ok().and_then(|spec| {
+        let mut f = spec.split(':');
+        let d = Pyramid::default();
+        Some(Pyramid {
+            mini_gop: f.next()?.parse().ok()?,
+            arf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.arf_q_offset),
+            leaf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.leaf_q_offset),
+        })
+    });
+    let mut enc = match pyramid {
+        None => Av1Encoder::new(cfg).expect("av1 encoder"),
+        Some(p) => Av1Encoder::with_pyramid(cfg, p).expect("av1 encoder"),
+    };
     let frame_len = (w * h + 2 * (w.div_ceil(2) * h.div_ceil(2))) as usize;
     let mut stream = Vec::new();
+    let mut hidden = 0usize;
     let start = Instant::now();
     for frame in planes.chunks_exact(frame_len) {
         let (y, rest) = frame.split_at((w * h) as usize);
@@ -368,7 +385,13 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
             u: u.iter().map(|&s| u16::from(s)).collect(),
             v: v.iter().map(|&s| u16::from(s)).collect(),
         };
-        let packet = enc.encode(&pic).expect("av1 encode");
+        for packet in enc.encode_frames(&pic).expect("av1 encode") {
+            hidden += usize::from(packet.level == Level::Arf);
+            stream.extend_from_slice(&packet.data);
+        }
+    }
+    for packet in enc.flush().expect("av1 flush") {
+        hidden += usize::from(packet.level == Level::Arf);
         stream.extend_from_slice(&packet.data);
     }
     let wall = start.elapsed().as_secs_f64();
@@ -379,7 +402,7 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
         component: "ec-av1",
         direction: "encode",
         content: format!(
-            "{w}x{h}, {n} frames, gop=10, {fps:.1} fps, {bytes_per_frame:.0} B/frame"
+            "{w}x{h}, {n} frames, gop=10, {hidden} hidden, {fps:.1} fps, {bytes_per_frame:.0} B/frame"
         ),
         media: format!("{media_s:.1}s"),
         wall_ms: wall * 1000.0,

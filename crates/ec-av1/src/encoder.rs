@@ -1255,6 +1255,65 @@ mod tests {
         );
     }
 
+    /// [`RateTarget::Bitrate`] lands the achieved bitrate within ±10% of the
+    /// target over 48 frames of a real clip, flat and under a pyramid alike.
+    /// This is the accuracy claim of the target-bitrate mode: no two-pass, no
+    /// lookahead, just each frame's size predicted from the previous frame of
+    /// its own level and one clamped proportional step.
+    #[test]
+    fn bitrate_target_lands_within_10_percent_over_48_frames() {
+        let (width, height, frames) = (640usize, 384usize, 48usize);
+        let Some(pictures) = h264_clip_frames(width, height, frames) else {
+            eprintln!("SKIP bitrate_target_lands_within_10_percent_over_48_frames: no ffmpeg/fixture");
+            return;
+        };
+        let fps = 24.0;
+        for bits_per_second in [768_000u32, 1_536_000] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 100,
+                gop: frames,
+                colour: Colour::Bt709Limited,
+            };
+            let rate = RateTarget::Bitrate {
+                bits_per_second,
+                frames_per_second: fps,
+            };
+            for pyramid in [None, Some(Pyramid::default())] {
+                let mut enc = match pyramid {
+                    None => Av1Encoder::with_rate_target(config, rate).unwrap(),
+                    Some(p) => Av1Encoder::with_pyramid_and_rate_target(config, p, rate).unwrap(),
+                };
+                let mut coded = 0usize;
+                for picture in &pictures {
+                    for packet in enc.encode_frames(picture).unwrap() {
+                        coded += packet.data.len();
+                    }
+                }
+                for packet in enc.flush().unwrap() {
+                    coded += packet.data.len();
+                }
+                let seconds = frames as f64 / fps;
+                let achieved = coded as f64 * 8.0 / seconds;
+                let error = achieved / f64::from(bits_per_second) - 1.0;
+                eprintln!(
+                    "bitrate {bits_per_second} bps, pyramid {}: {coded} bytes over {seconds:.2}s \
+                     = {achieved:.0} bps ({:+.1}%)",
+                    pyramid.is_some(),
+                    100.0 * error,
+                );
+                assert!(
+                    error.abs() <= 0.10,
+                    "achieved {achieved:.0} bps is {:+.1}% off the {bits_per_second} bps target \
+                     (pyramid {})",
+                    100.0 * error,
+                    pyramid.is_some(),
+                );
+            }
+        }
+    }
+
     /// The `BytesPerFrame` controller's own windup bound: no frame's coded
     /// `base_q_idx` step exceeds [`RateLoop::STEP_CLAMP`], across a real
     /// clip's full range of content (so a scene cut can't be the one frame
