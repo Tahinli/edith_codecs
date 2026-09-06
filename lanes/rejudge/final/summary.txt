@@ -1,0 +1,13 @@
+=== scoped 19:56:44
+RC=101
+=== threadcount 19:57:06
+RC=0
+=== ownsdecoder 19:57:08
+RC=0
+=== native_tiles22 19:57:08
+RC=0
+=== native_final 20:00:03
+RC=0
+=== small_final 20:03:04
+RC=0
+ALLDONE

@@ -1,0 +1,25 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running unittests src/lib.rs (/home/tahinli/.cache/cargo-target-av1rejudge/release/deps/ec_av1-8fef0196ab10338d)
+
+running 1 test
+
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+film 1080p: pricer armings default=14 real=164
+film 1080p: motion_mode 32x32 SIMPLE=26406 OBMC=0 WARP=283 | 16x16 SIMPLE=3827 OBMC=0 WARP=270 | 8x8 SIMPLE=15185 OBMC=0 WARP=1865 (0.0% OBMC / 5.1% WARP of 47836 eligible)
+film 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+test encode::tests::bd_rate_screen_native has been running for over 60 seconds
+| film 1080p 1920x1024 | 43.83 dB/249214 B, 47.65 dB/372234 B, 51.04 dB/494322 B, 53.76 dB/619372 B | +16.9% | -0.4% | 36.1s:6.5s:16.5s |
+film 2160p: pricer armings default=15 real=150
+film 2160p: motion_mode 32x32 SIMPLE=15525 OBMC=0 WARP=3 | 16x16 SIMPLE=352 OBMC=0 WARP=33 | 8x8 SIMPLE=3942 OBMC=0 WARP=702 (0.0% OBMC / 3.6% WARP of 20557 eligible)
+film 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film 2160p 1920x1024 | 43.45 dB/303236 B, 47.69 dB/458310 B, 51.36 dB/586988 B, 54.25 dB/704413 B | +47.0% | +19.1% | 31.8s:5.6s:15.9s |
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=159 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=77982 OBMC=0 WARP=1901 | 16x16 SIMPLE=3599 OBMC=0 WARP=409 | 8x8 SIMPLE=523 OBMC=0 WARP=520 (0.0% OBMC / 3.3% WARP of 84934 eligible)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 6808 chroma 644; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 44.81 dB/41708 B, 48.14 dB/54131 B, 50.67 dB/70884 B, 52.99 dB/92939 B | +51.2% | -14.4% | 27.2s:8.2s:11.3s |
+test encode::tests::bd_rate_screen_native ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 573 filtered out; finished in 166.67s
+

@@ -37807,7 +37807,7 @@ mod tests {
                 // These GOP round trips decode a tile the encoder wrote, so
                 // the warp bit must be the one it wrote too (lane-av1obmc2);
                 // the encoder only sets it under `EC_AV1_WARP`.
-                crate::envflags::env_flag!("EC_AV1_WARP"),
+                crate::encode::warp_on(),
                 fctx,
             )
             .unwrap();
@@ -38145,7 +38145,7 @@ mod tests {
                 // These GOP round trips decode a tile the encoder wrote, so
                 // the warp bit must be the one it wrote too (lane-av1obmc2);
                 // the encoder only sets it under `EC_AV1_WARP`.
-                crate::envflags::env_flag!("EC_AV1_WARP"),
+                crate::encode::warp_on(),
                 fctx,
             )
             .unwrap();
