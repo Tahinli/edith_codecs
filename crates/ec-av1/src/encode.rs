@@ -1711,7 +1711,6 @@ fn code_square_inter(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    ref_y8: &[u8],
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), side, search, mode_bits, fctx);
@@ -1843,7 +1842,7 @@ fn code_square_inter(
     if leaf_new_mv() {
         let source_block = luma.source_block(x, y, side);
         let found = motion::search(
-            ref_y8,
+            ref_luma.0,
             ref_luma.1,
             ref_luma.2,
             ref_luma.3,
@@ -2809,7 +2808,6 @@ fn search_inter_block(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    ref_y8: &[u8],
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
@@ -3049,7 +3047,7 @@ fn search_inter_block(
     #[cfg(test)]
     let t = std::time::Instant::now();
     let found = motion::search(
-        ref_y8,
+        ref_luma.0,
         ref_luma.1,
         ref_luma.2,
         ref_luma.3,
@@ -3267,7 +3265,6 @@ pub(crate) fn encode_inter_frame(
     // integer-`u8`-scale), so the DPB reference plane is narrowed for it --
     // once per frame (lane-av1rd2), not once per block, which is a whole
     // plane's map per 32x32 block and now per leaf too.
-    let ref_y8: Vec<u8> = reference.y.iter().map(|&v| v as u8).collect();
     let mut grid = MiGrid::new(mi_cols, mi_rows);
     let mut blocks = vec![Quadrant::Whole(BlockCoeffs::default()); cols * rows];
 
@@ -3314,7 +3311,6 @@ pub(crate) fn encode_inter_frame(
                         &search,
                         &mode_bits_table,
                         reference,
-                        &ref_y8,
                         &stack, fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
@@ -3366,8 +3362,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                    &ref_y8,
-                                    &stack, fctx,
+                                                &stack, fctx,
                                 );
                                 let leaf_cost = leaf_cost
                                     + search.lambda * partition_bits(SUB, false);
@@ -3401,8 +3396,7 @@ pub(crate) fn encode_inter_frame(
                                                 &search,
                                                 &mode_bits_table,
                                                 reference,
-                                                &ref_y8,
-                                                &stack8, fctx,
+                                                                        &stack8, fctx,
                                             );
                                             cost8 += cost;
                                             record_mi(&mut grid, mr, mc, 2, leaf8.inter);
@@ -3503,8 +3497,7 @@ pub(crate) fn encode_inter_frame(
                                 &search,
                                 &mode_bits_table,
                                 reference,
-                                &ref_y8,
-                                &stack, fctx,
+                                        &stack, fctx,
                             );
                             for dr in 0..4 {
                                 for dc in 0..4 {
@@ -3564,8 +3557,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
-                                    &ref_y8,
-                                    &stack, fctx,
+                                                &stack, fctx,
                                 );
                                 for dr in 0..2 {
                                     for dc in 0..2 {

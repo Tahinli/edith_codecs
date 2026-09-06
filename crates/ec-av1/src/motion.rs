@@ -190,7 +190,7 @@ pub struct MotionSearch {
 /// empty (the same contracts [`predict`] has).
 #[allow(clippy::too_many_arguments)] // one reference plane, one block, one predictor
 pub(crate) fn search(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     ref_width: usize,
     ref_height: usize,
@@ -214,7 +214,7 @@ pub(crate) fn search(
 /// checks.
 #[allow(clippy::too_many_arguments)] // one reference plane, one block, one predictor
 fn search_traced(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     ref_width: usize,
     ref_height: usize,
@@ -247,7 +247,7 @@ fn search_traced(
 /// [`SEARCH_INITIAL_STEP_PEL`].
 #[allow(clippy::too_many_arguments)]
 fn search_traced_from_step(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     ref_width: usize,
     ref_height: usize,
@@ -263,17 +263,17 @@ fn search_traced_from_step(
     assert_eq!(source.len(), block_w * block_h, "source is one block");
     assert!(!reference.is_empty(), "a reference plane has samples");
 
-    // lane-hbd r2: this encoder-side search stays `u8` (see
-    // `encode::intra_predict_u8`'s doc comment) -- `reference` is converted
-    // once here, outside the per-candidate closure, since `mc::predict` now
-    // takes `u16`.
-    let reference16: Vec<u16> = reference.iter().map(|&v| u16::from(v)).collect();
+    // lane-av1speed: `reference` arrives as the DPB picture's own `u16`
+    // plane. It used to be handed the encoder's `u8` shadow copy and
+    // converted here, whole-plane, on EVERY call -- one 245k-element
+    // allocate-and-convert per searched block, which profiled as the single
+    // largest symbol in the encoder (30% of `sequence_bench_sanity`).
     let mut dst16 = vec![0u16; block_w * block_h];
     let mut cost_of = |mv: (i32, i32)| -> f64 {
         let x_q4 = (block_x as i32) * 16 + mv.1 * Q4_PER_Q3;
         let y_q4 = (block_y as i32) * 16 + mv.0 * Q4_PER_Q3;
         predict(
-            &reference16, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h,
+            reference, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h,
             &mut dst16, fctx,
         );
         let sad: f64 = source
@@ -405,6 +405,7 @@ mod tests {
         let width = 64;
         let height = 64;
         let (plane, _unused) = plane_and_block(width, height, 0, 0, 1, 1);
+        let plane16: Vec<u16> = plane.iter().map(|&v| u16::from(v)).collect();
         let block_w = 8;
         let block_h = 8;
         // Anchor the source block away from the plane's edges so every sign
@@ -433,7 +434,7 @@ mod tests {
                 }
             }
             let result = search(
-                &plane,
+                &plane16,
                 width,
                 width,
                 height,
@@ -463,6 +464,7 @@ mod tests {
         let plane: Vec<u8> = (0..width * height)
             .map(|i| (2 * (i % width)) as u8)
             .collect();
+        let plane16: Vec<u16> = plane.iter().map(|&v| u16::from(v)).collect();
         let block_w = 8;
         let block_h = 6;
         let anchor_x = 10;
@@ -481,7 +483,7 @@ mod tests {
             }
         }
         let result = search(
-            &plane,
+            &plane16,
             width,
             width,
             height,
@@ -506,6 +508,7 @@ mod tests {
         let width = 48;
         let height = 48;
         let (plane, _unused) = plane_and_block(width, height, 0, 0, 1, 1);
+        let plane16: Vec<u16> = plane.iter().map(|&v| u16::from(v)).collect();
         let block_w = 8;
         let block_h = 8;
         let anchor_x = 20;
@@ -518,7 +521,7 @@ mod tests {
             }
         }
         let (_result, trace) = search_traced(
-            &plane,
+            &plane16,
             width,
             width,
             height,
@@ -566,6 +569,7 @@ mod tests {
         let width = 96;
         let height = 96;
         let (plane, _unused) = plane_and_block(width, height, 0, 0, 1, 1);
+        let plane16: Vec<u16> = plane.iter().map(|&v| u16::from(v)).collect();
         let block_w = 8;
         let block_h = 8;
         let anchor_x = 48;
@@ -586,7 +590,7 @@ mod tests {
                     }
                 }
                 let (result, trace) = search_traced_from_step(
-                    &plane,
+                    &plane16,
                     width,
                     width,
                     height,
