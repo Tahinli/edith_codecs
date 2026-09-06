@@ -5717,3 +5717,73 @@ fn frame_decisions_vs_libopus() {
 }
 
 const NB_BANDS_DIAG: usize = ec_opus::celt::NB_BANDS;
+
+/// The ported tonality analysis (`crates/ec-opus/src/analysis.rs`) must
+/// actually tell speech from music, since `music_prob` is what libopus's mode
+/// and bandwidth decisions read. Drives the real entry surface
+/// (`Encoder::encode_float`) over 30 s of each gate source and reads the
+/// per-frame value back through [`CeltFrameDiag`]. Speech (hein) must land
+/// clearly below the two music sources (naz, zaur).
+#[test]
+#[ignore = "needs the local library sources; run with --ignored"]
+fn analysis_music_prob_separates_speech_from_music() {
+    const SECS: f64 = 30.0;
+    const FRAME: usize = 960;
+    const CHANNELS: usize = 2;
+    let sources: &[(&str, &str, bool)] = &[
+        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3", false),
+        ("naz", "~/Music/naz_aglama_ben_aglarim.mp4", true),
+        ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3", true),
+    ];
+    let mut means: Vec<(String, bool, f64)> = Vec::new();
+    for (tag, path, is_music) in sources {
+        let src = shellexpand(path);
+        if !src.exists() {
+            eprintln!("SKIP {tag}: missing {}", src.display());
+            continue;
+        }
+        let pcm = ffmpeg_decode_pcm(&src, SECS);
+        let mut enc = Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
+        enc.set_bitrate(96_000);
+        enc.set_vbr_constrained(true);
+        let mut out = vec![0u8; 4000];
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        let mut valid = 0usize;
+        for chunk in pcm.chunks_exact(FRAME * CHANNELS) {
+            enc.encode_float(chunk, FRAME, &mut out).expect("encode");
+            let d = enc.last_celt_diag();
+            n += 1;
+            if d.analysis_valid {
+                valid += 1;
+                sum += f64::from(d.music_prob);
+            }
+        }
+        assert!(valid * 10 > n * 9, "{tag}: analysis valid on only {valid}/{n} frames");
+        let mean = sum / valid as f64;
+        println!("music_prob {tag}: mean {mean:.3} over {valid}/{n} frames (music={is_music})");
+        means.push(((*tag).to_string(), *is_music, mean));
+    }
+    if means.len() < 2 {
+        eprintln!("SKIP: fewer than two sources present");
+        return;
+    }
+    let speech: Vec<_> = means.iter().filter(|m| !m.1).collect();
+    let music: Vec<_> = means.iter().filter(|m| m.1).collect();
+    for s in &speech {
+        assert!(s.2 < 0.5, "{}: speech music_prob {:.3} should be < 0.5", s.0, s.2);
+        for m in &music {
+            assert!(
+                m.2 - s.2 > 0.2,
+                "{} ({:.3}) does not separate from {} ({:.3}) by 0.2",
+                m.0,
+                m.2,
+                s.0,
+                s.2
+            );
+        }
+    }
+    for m in &music {
+        assert!(m.2 > 0.5, "{}: music music_prob {:.3} should be > 0.5", m.0, m.2);
+    }
+}
