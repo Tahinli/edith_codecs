@@ -9399,11 +9399,32 @@ mod tests {
         (ladder, wall)
     }
 
+    /// First differing sample between two pictures, as
+    /// `(plane, index, left, right)` -- so a gate failure names the plane and
+    /// the sample instead of just "differs". A length difference counts as a
+    /// mismatch of that plane at the first index past the shorter one.
+    fn first_plane_mismatch(a: &Picture, b: &Picture) -> Option<(&'static str, usize, i64, i64)> {
+        for (plane, l, r) in [("Y", &a.y, &b.y), ("U", &a.u, &b.u), ("V", &a.v, &b.v)] {
+            if let Some(i) = l.iter().zip(r.iter()).position(|(x, y)| x != y) {
+                return Some((plane, i, i64::from(l[i]), i64::from(r[i])));
+            }
+            if l.len() != r.len() {
+                return Some((plane, l.len().min(r.len()), l.len() as i64, r.len() as i64));
+            }
+        }
+        None
+    }
+
     /// The same ladder for this encoder, at four `base_q_idx` points. The PSNR
-    /// comes from ffmpeg's decode of our own stream, and every frame of that
-    /// decode is asserted sample-exact against our reconstruction -- which is
-    /// itself a gate: it proves the bitstream says what the encoder thinks.
+    /// comes from ffmpeg's decode of our own stream, and at EVERY point the
+    /// stream is decoded twice -- by ffmpeg and by our own
+    /// [`crate::stream::decode_stream`] -- and all three pictures (encoder
+    /// reconstruction, ffmpeg's decode, our decode) are asserted sample-exact
+    /// in Y, U and V over every shown frame in display order. That is itself
+    /// a gate: it proves the bitstream says what the encoder thinks, in the
+    /// only two decoders that read it.
     fn our_ladder(
+        name: &str,
         source: &[Picture],
         width: usize,
         height: usize,
@@ -9416,13 +9437,27 @@ mod tests {
             let encoded = encode_sequence_with_ctx(source, q, 0.5, fctx).unwrap();
             wall += start.elapsed().as_secs_f64();
             let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, source.len());
+            let ours = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+            assert_eq!(
+                ours.len(),
+                source.len(),
+                "{name} q={q}: our decoder's display-order frame count"
+            );
             for (i, (d, e)) in decoded.iter().zip(&encoded.frames).enumerate() {
-                assert!(
-                    d.y == e.reconstruction.y
-                        && d.u == e.reconstruction.u
-                        && d.v == e.reconstruction.v,
-                    "q={q} frame {i}: ffmpeg's decode differs from our reconstruction"
-                );
+                if let Some((plane, s, got, want)) = first_plane_mismatch(d, &e.reconstruction) {
+                    panic!(
+                        "{name} q={q} frame {i} plane {plane} sample {s}: ffmpeg decoded \
+                         {got}, the encoder reconstructed {want}"
+                    );
+                }
+            }
+            for (i, (o, e)) in ours.iter().zip(&encoded.frames).enumerate() {
+                if let Some((plane, s, got, want)) = first_plane_mismatch(o, &e.reconstruction) {
+                    panic!(
+                        "{name} q={q} frame {i} plane {plane} sample {s}: our decoder decoded \
+                         {got}, the encoder reconstructed {want}"
+                    );
+                }
             }
             let mean: f64 = decoded
                 .iter()
@@ -9459,6 +9494,7 @@ mod tests {
     /// the ladder, the wall, and — per pyramid level over the whole ladder —
     /// how many frames and how many bytes it spent.
     fn our_ladder_pyramid(
+        name: &str,
         source: &[Picture],
         width: usize,
         height: usize,
@@ -9503,10 +9539,15 @@ mod tests {
             // source picture, in the right order -- checked against our own
             // decoder as well as ffmpeg's, both below.
             let ours = crate::stream::decode_stream(&stream).expect("our decoder");
-            assert_eq!(ours.len(), source.len(), "q={q}: our display-order count");
+            assert_eq!(ours.len(), source.len(), "{name} q={q}: our display-order count");
             let decoded = ffmpeg_decode_sequence(&stream, width, height, source.len());
             for (i, (d, o)) in decoded.iter().zip(&ours).enumerate() {
-                assert!(d.y == o.y, "q={q} display frame {i}: ffmpeg differs from our decoder");
+                if let Some((plane, s, got, want)) = first_plane_mismatch(d, o) {
+                    panic!(
+                        "{name} q={q} display frame {i} plane {plane} sample {s}: ffmpeg \
+                         decoded {got}, our decoder decoded {want}"
+                    );
+                }
             }
             let mean: f64 = decoded
                 .iter()
@@ -9705,8 +9746,15 @@ mod tests {
     /// search's own cost, uncut: see the two intra-pruning variants measured
     /// and rejected in the lane report). No
     /// threshold is asserted yet -- this run sets the baseline; the gate
-    /// asserts only four monotone points per ladder and that ffmpeg decodes
-    /// our stream sample-exact against our reconstruction.
+    /// asserts four monotone points per ladder, and at EVERY ladder point of
+    /// EVERY clip it decodes our stream twice -- with ffmpeg and with our own
+    /// `crate::stream::decode_stream` -- and asserts the encoder's
+    /// reconstruction, ffmpeg's decode and our decode sample-exact in Y, U
+    /// and V over every shown frame in display order. A failure names the
+    /// clip, the q, the frame, the plane and the first differing sample.
+    /// (Under `EC_AV1_PYRAMID` the frames come out of the streaming facade,
+    /// which exposes no per-packet reconstruction, so that path asserts the
+    /// two decoders against each other on all three planes.)
     ///
     /// Run:
     ///     cargo test -p ec-av1 --release --lib -- --ignored \
@@ -9789,10 +9837,10 @@ mod tests {
             let _ = crate::tile::take_compound_size_hits();
             let _ = crate::motion::take_census();
             let (ours, ours_wall) = match pyramid_from_env() {
-                None => our_ladder(&source, width, height, fctx),
+                None => our_ladder(name, &source, width, height, fctx),
                 Some(pyramid) => {
                     let (ladder, wall, counts, bytes) =
-                        our_ladder_pyramid(&source, width, height, pyramid);
+                        our_ladder_pyramid(name, &source, width, height, pyramid);
                     eprintln!(
                         "{name}: pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
                          show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
