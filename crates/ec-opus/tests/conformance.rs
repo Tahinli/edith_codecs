@@ -4530,6 +4530,8 @@ fn spectral_divergence_vs_libopus() {
 
     let all: &[(&str, &str)] = &[
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
+        ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3"),
+        ("nik", "~/Music/Yok - Nikbinler.mp4"),
         ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
         ("her", "~/Music/Her Nerdeysen.mp3"),
         ("sadie", "~/Music/sadie.wav"),
@@ -4550,8 +4552,9 @@ fn spectral_divergence_vs_libopus() {
 
     let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
     fs::create_dir_all(&lanes_dir).unwrap();
-    let out_path = lanes_dir.join("opus-naz-r2.bands.txt");
-    let frames_path = lanes_dir.join("opus-naz-r2.frames.txt");
+    let stem = std::env::var("SWEEP_TAG").unwrap_or_else(|_| "opus-naz-r2".to_owned());
+    let out_path = lanes_dir.join(format!("{stem}.bands.txt"));
+    let frames_path = lanes_dir.join(format!("{stem}.frames.txt"));
     let scratch = lanes_dir.join("opus-naz-r1.scratch.ogg");
     let mut frames_all = String::new();
     let mut report = String::new();
@@ -4655,6 +4658,22 @@ fn spectral_divergence_vs_libopus() {
              corr o={corr_o:.4} r={corr_r:.4}; err o={err_o:.3} r={err_r:.3} ratio={:.2}\n",
             err_o / err_r
         ));
+        // opus_compare's err is (mean ef²)^(1/16), so one window can carry a
+        // whole file. Recompute both sides with the worst k windows dropped
+        // (same denominator) to separate a broadband gap from an outlier one.
+        let drop_err = |v: &[f64], k: usize| -> f64 {
+            let mut w = v.to_vec();
+            w.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            (w[k..].iter().sum::<f64>() / v.len() as f64).powf(1.0 / 16.0)
+        };
+        for k in [0usize, 1, 8, ef2_o.len() / 100] {
+            let (eo, er) = (drop_err(&ef2_o, k), drop_err(&ef2_r, k));
+            report.push_str(&format!(
+                "# drop-{k} worst windows ({} total): err o={eo:.3} r={er:.3} ratio={:.3}\n",
+                ef2_o.len(),
+                eo / er
+            ));
+        }
         report.push_str(
             "# dln = mean ln(E_test/E_src) per channel (neg = energy missing); \
              err = mean |dln|; eb2 = band's mean share of the pre-squared frame error\n",
@@ -4960,11 +4979,12 @@ fn naz_startup_hop_energies() {
     let secs = (centre_ms / 1000.0 + 1.0).max(2.0);
     let pcm = ffmpeg_decode_pcm(&src, secs);
     let scratch = std::env::temp_dir().join("ec-opus-naz-startup.opus");
-    ffmpeg_encode_libopus(&src, 96, &scratch, secs);
+    let kbps: u32 = std::env::var("HOP_KBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+    ffmpeg_encode_libopus(&src, kbps, &scratch, secs);
     let (ref_dec, _) = decode_ogg(&scratch);
     let (lag_r, ref_al) = align_to_source(&pcm, &ref_dec, CH, 2000);
     let mut enc = Encoder::new(48000, CH, Application::Audio).unwrap();
-    enc.set_bitrate(96_000);
+    enc.set_bitrate(kbps * 1000);
     enc.set_vbr_constrained(true);
     let mut frames_diag = Vec::new();
     let mut dec = Decoder::new(48000, CH).unwrap();

@@ -18,8 +18,9 @@
 //!   per-band `importance[]` and feeds it to the search, matching the
 //!   reference's analysis path.
 //! - **Fixed spreading.** `SPREAD_NORMAL` every frame, coded explicitly.
-//! - **Single-pass coarse energy** with the reference's own delayed-intra
-//!   heuristic, not the two-pass encode-both-and-compare.
+//! - **Coarse energy**: the reference's two-pass encode-both-and-compare is
+//!   ported (`TWO_PASS_COARSE_ENERGY`) but ships off — it measured mixed on
+//!   the library gate's err_ratio; the delayed-intra heuristic decides.
 //!
 //! What stays: transient detection, the closed-form allocation-trim and
 //! dynalloc spike heuristics, the stereo-mode analysis, intensity thresholds
@@ -395,6 +396,13 @@ pub struct CeltEncoder {
     band_log_e: Vec<f32>,
     /// Long-window log energies used by dynalloc (`bandLogE2`).
     band_log_e2: Vec<f32>,
+    /// Coarse-energy two-pass scratch: state before the first pass, and the
+    /// intra pass's results while the inter pass overwrites the live arrays.
+    old_e_save: Vec<f32>,
+    old_e_intra: Vec<f32>,
+    error_intra: Vec<f32>,
+    /// Bytes the intra pass wrote, kept while the inter pass is tried.
+    coarse_bytes: Vec<u8>,
     /// Previous intensity decision (hysteresis state, libopus `st->intensity`).
     intensity: usize,
     error: Vec<f32>,
@@ -448,6 +456,10 @@ impl CeltEncoder {
             band_e: vec![0.0; 2 * NB_BANDS],
             band_log_e: vec![0.0; 2 * NB_BANDS],
             band_log_e2: vec![0.0; 2 * NB_BANDS],
+            old_e_save: vec![0.0; 2 * NB_BANDS],
+            old_e_intra: vec![0.0; 2 * NB_BANDS],
+            error_intra: vec![0.0; 2 * NB_BANDS],
+            coarse_bytes: Vec::with_capacity(1275),
             intensity: 0,
             error: vec![0.0; 2 * NB_BANDS],
             transient_tmp: vec![0.0; max_n + OVERLAP],
@@ -712,7 +724,15 @@ impl CeltEncoder {
         };
 
         // --- Coarse energy --------------------------------------------------
-        let two_pass = false;
+        // libopus runs the two-pass coarse-energy search at complexity >= 4.
+        // MEASURED OFF (lane opus64, 12-row library gate vs libopus): it moves
+        // err_ratio 6 rows better / 4 worse (nik@96 .982->.990, zaur@64
+        // 1.510->1.581, her@64 1.102->1.135, her@96 1.052->1.059; nik@64
+        // .708->.703, zaur@96 .940->.872, dl8a .551/.374->.503/.346, hein
+        // .855/.528->.771/.419), corr within +.0001 everywhere. The KEEP rule
+        // is "err_ratio not worse on every row", so the search ships off.
+        const TWO_PASS_COARSE_ENERGY: bool = false;
+        let mut two_pass = TWO_PASS_COARSE_ENERGY;
         let mut intra = self.force_intra
             || (!two_pass
                 && self.delayed_intra > (2 * c * (end - start)) as f32
@@ -730,9 +750,14 @@ impl CeltEncoder {
         let tell = enc.tell();
         if tell + 3 > total_bits as u32 {
             intra = false;
+            two_pass = false;
         }
         let max_decay = 16.0f32.min(0.125 * nb_available as f32);
-        self.quant_coarse_energy(enc, start, end, intra, c, lm, total_bits, max_decay);
+        if two_pass || intra {
+            intra = self.quant_coarse_energy(enc, start, end, intra, c, lm, total_bits, max_decay);
+        } else {
+            self.quant_coarse_energy_impl(enc, start, end, intra, c, lm, total_bits, max_decay);
+        }
         self.delayed_intra = if intra {
             new_distortion
         } else {
@@ -1537,7 +1562,12 @@ impl CeltEncoder {
     // -- Energy --------------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
-    fn quant_coarse_energy(
+    /// libopus `quant_coarse_energy_impl()`: codes one pass of coarse energy
+    /// with the given intra setting and returns its *badness* — the total
+    /// clamping the bit budget forced on the quantised deltas, which the
+    /// two-pass search in [`CeltEncoder::quant_coarse_energy`] minimises.
+    #[allow(clippy::too_many_arguments)]
+    fn quant_coarse_energy_impl(
         &mut self,
         enc: &mut RangeEncoder,
         start: usize,
@@ -1547,7 +1577,8 @@ impl CeltEncoder {
         lm: usize,
         budget: i32,
         max_decay: f32,
-    ) {
+    ) -> i32 {
+        let mut badness = 0i32;
         let tell = enc.tell() as i32;
         if tell + 3 <= budget {
             enc.enc_bit_logp(intra, 3);
@@ -1575,6 +1606,7 @@ impl CeltEncoder {
                         qi = 0;
                     }
                 }
+                let qi0 = qi;
                 let tell = enc.tell() as i32;
                 let bits_left = budget - tell - 3 * (c as i32) * (end - i) as i32;
                 if i != start && bits_left < 30 {
@@ -1607,11 +1639,61 @@ impl CeltEncoder {
                     qi = -1;
                 }
                 self.error[i + ch * NB_BANDS] = f - qi as f32;
+                badness += (qi0 - qi).abs();
                 let q = qi as f32;
                 self.old_band_e[i + ch * NB_BANDS] = coef * old + *prev + q;
                 *prev += q - beta * q;
             }
         }
+        badness
+    }
+
+    /// libopus `quant_coarse_energy()`: codes the coarse band energies twice —
+    /// once intra, once inter-predicted — and keeps the pass with the lower
+    /// badness, breaking ties on bits used. `intra_bias` is zero here because
+    /// this encoder has no packet-loss rate to trade against.
+    #[allow(clippy::too_many_arguments)]
+    fn quant_coarse_energy(
+        &mut self,
+        enc: &mut RangeEncoder,
+        start: usize,
+        end: usize,
+        intra: bool,
+        c: usize,
+        lm: usize,
+        budget: i32,
+        max_decay: f32,
+    ) -> bool {
+        let start_state = enc.snapshot();
+        let start_offs = enc.front_offs();
+        self.old_e_save.copy_from_slice(&self.old_band_e);
+        // Pass 1 is always the intra one, as in the reference.
+        let badness1 = self.quant_coarse_energy_impl(enc, start, end, true, c, lm, budget, max_decay);
+        if intra {
+            return true;
+        }
+        let tell_intra = enc.tell_frac();
+        let intra_state = enc.snapshot();
+        let intra_offs = enc.front_offs();
+        self.coarse_bytes.clear();
+        self.coarse_bytes
+            .extend_from_slice(&enc.front()[start_offs..intra_offs]);
+        self.old_e_intra.copy_from_slice(&self.old_band_e);
+        self.error_intra.copy_from_slice(&self.error);
+
+        // Pass 2: inter-predicted, from the state the first pass started in.
+        enc.restore(&start_state);
+        self.old_band_e.copy_from_slice(&self.old_e_save);
+        let badness2 =
+            self.quant_coarse_energy_impl(enc, start, end, false, c, lm, budget, max_decay);
+        if badness1 < badness2 || (badness1 == badness2 && enc.tell_frac() > tell_intra) {
+            enc.restore(&intra_state);
+            enc.front_write(start_offs, &self.coarse_bytes);
+            self.old_band_e.copy_from_slice(&self.old_e_intra);
+            self.error.copy_from_slice(&self.error_intra);
+            return true;
+        }
+        false
     }
 
     #[allow(clippy::too_many_arguments)]
