@@ -1446,6 +1446,12 @@ pub struct BlockCoeffs {
     /// `luma` then carries the whole block's levels in BLOCK coordinates,
     /// which the writer slices per transform unit.
     pub tx_depth: u8,
+    /// This block's `UV_CFL_PRED` alphas (`alpha_q3` for U and V, spec
+    /// 5.11.45's `cfl_alpha_signs`/`cfl_alpha_u`/`cfl_alpha_v`), or `None` for
+    /// any other chroma mode. `Some` iff [`Self::uv_mode`] is
+    /// [`UV_CFL_PRED`]; at least one of the pair is nonzero, since the joint
+    /// sign symbol has no (ZERO, ZERO) value.
+    pub cfl_alphas: Option<(i32, i32)>,
     /// This block's intra block-copy vector (spec 5.11.13 `use_intrabc` ->
     /// `assign_dv`), in the spec's 1/8-pel `(row, col)` units, or `None` for
     /// an ordinary intra block. Only a key frame whose header set
@@ -3292,6 +3298,77 @@ fn write_intrabc_block(
     Ok(())
 }
 
+/// `UV_CFL_PRED` (spec 6.10.19's chroma mode enum), the fourteenth entry of
+/// [`crate::cdf::UV_MODE_CFL`] -- the writer's twin of the decoder's own
+/// constant.
+pub(crate) const UV_CFL_PRED: usize = 13;
+
+/// The `cfl_alpha_signs` joint value (0..8) that codes this signed alpha pair,
+/// inverting the decoder's own `read_cfl_alphas` split (`sign_u =
+/// ((joint+1)*11)>>5`, `sign_v = (joint+1) - 3*sign_u`, with 0 ZERO, 1 NEG,
+/// 2 POS). There is no (ZERO, ZERO) joint value, so at least one alpha of a
+/// CfL block is nonzero by construction.
+pub(crate) fn cfl_joint_sign(alpha_u: i32, alpha_v: i32) -> usize {
+    let sign = |a: i32| match a.signum() {
+        0 => 0,
+        -1 => 1,
+        _ => 2,
+    };
+    let (want_u, want_v) = (sign(alpha_u), sign(alpha_v));
+    (0..8)
+        .find(|&j| {
+            let su = ((j + 1) * 11) >> 5;
+            (su, (j + 1) - 3 * su) == (want_u, want_v)
+        })
+        .expect("cfl_alpha_signs covers every pair but (ZERO, ZERO)") as usize
+}
+
+/// The `cfl_alpha_u`/`cfl_alpha_v` magnitude CDF row for one plane, by the
+/// same `CFL_CONTEXT_U`/`CFL_CONTEXT_V` derivation the decoder reads with
+/// (libaom cfl.h). `joint` is [`cfl_joint_sign`]'s value.
+fn cfl_alpha_ctx(joint: usize, plane: usize) -> usize {
+    let joint = joint as i32;
+    let su = ((joint + 1) * 11) >> 5;
+    let sv = (joint + 1) - 3 * su;
+    if plane == 0 {
+        (joint + 1 - 3) as usize
+    } else {
+        (sv * 3 + su - 3) as usize
+    }
+}
+
+/// What [`write_cfl_alphas`] will spend on this alpha pair, through the same
+/// tables -- the encoder's RD price for the CfL arm.
+pub(crate) fn cfl_alpha_bits(alpha_u: i32, alpha_v: i32) -> f64 {
+    use crate::encode::symbol_bits;
+    let joint = cfl_joint_sign(alpha_u, alpha_v);
+    let mut bits = symbol_bits(&crate::cdf::CFL_SIGN, joint);
+    for (plane, alpha) in [alpha_u, alpha_v].into_iter().enumerate() {
+        if alpha != 0 {
+            bits += symbol_bits(
+                &crate::cdf::CFL_ALPHA[cfl_alpha_ctx(joint, plane)],
+                (alpha.unsigned_abs() - 1) as usize,
+            );
+        }
+    }
+    bits
+}
+
+/// `read_cfl_alphas` (spec 5.11.45) written: the joint sign, then each
+/// plane's magnitude where its sign is nonzero.
+fn write_cfl_alphas(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, (alpha_u, alpha_v): (i32, i32)) {
+    let joint = cfl_joint_sign(alpha_u, alpha_v);
+    enc.symbol(joint, &mut cdfs.cfl_sign);
+    for (plane, alpha) in [alpha_u, alpha_v].into_iter().enumerate() {
+        if alpha != 0 {
+            enc.symbol(
+                (alpha.unsigned_abs() - 1) as usize,
+                &mut cdfs.cfl_alpha[cfl_alpha_ctx(joint, plane)],
+            );
+        }
+    }
+}
+
 fn write_intra_mode(
     enc: &mut SymbolEncoder,
     cdfs: &mut Cdfs,
@@ -3334,7 +3411,15 @@ fn write_intra_mode(
     if cfl {
         enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
     } else {
+        debug_assert_ne!(uv_mode, UV_CFL_PRED, "is_cfl_allowed excludes this block");
         enc.symbol(uv_mode, &mut cdfs.uv_mode_no_cfl[mode]);
+    }
+    if uv_mode == UV_CFL_PRED {
+        write_cfl_alphas(
+            enc,
+            cdfs,
+            block.cfl_alphas.expect("a UV_CFL_PRED block carries its alphas"),
+        );
     }
     // `angle_delta_uv` (spec `read_intra_angle_info`) off the same CDF array
     // the luma delta reads, indexed by the chroma mode.
@@ -5710,6 +5795,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     }
                     let uv_mode = usize::from(block.uv_mode);
                     enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
+                    if uv_mode == UV_CFL_PRED {
+                        write_cfl_alphas(&mut enc, &mut cdfs, block.cfl_alphas.expect("cfl"));
+                    }
                     if (V_PRED..=D67_PRED).contains(&uv_mode) {
                         enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
                     }
@@ -5945,6 +6033,9 @@ fn write_inter_frame_leaf(
         }
         let uv_mode = usize::from(block.uv_mode);
         enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
+        if uv_mode == UV_CFL_PRED {
+            write_cfl_alphas(enc, cdfs, block.cfl_alphas.expect("cfl"));
+        }
         if (V_PRED..=D67_PRED).contains(&uv_mode) {
             enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
         }
@@ -6186,6 +6277,9 @@ fn write_inter_frame_leaf8(
         }
         let uv_mode = usize::from(block.uv_mode);
         enc.symbol(uv_mode, &mut cdfs.uv_mode_cfl[mode]);
+        if uv_mode == UV_CFL_PRED {
+            write_cfl_alphas(enc, cdfs, block.cfl_alphas.expect("cfl"));
+        }
         if (V_PRED..=D67_PRED).contains(&uv_mode) {
             enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
         }
