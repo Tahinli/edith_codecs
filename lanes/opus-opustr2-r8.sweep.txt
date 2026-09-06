@@ -1,3 +1,4 @@
+# lane-opustr2 r8: k=1.25 off=.044
 # ec-opus encoder vs ffmpeg libopus — encoders-only gate (r1)
 # both bitstreams decoded by ec-opus; 120s cap; VBR; 48kHz stereo
 # source	kbps	ours_kbps	ref_kbps	rate%	corr_ours	corr_ref	gap	Q_ours	Q_ref	err_ratio	minsec_ours	minsec_ref	drop_ours	drop_ref
