@@ -19,8 +19,8 @@
 use crate::decode::WithRef;
 use ec_av1_syntax::sequence::{ColorConfig, OperatingPoint, SequenceHeader};
 use ec_av1_syntax::{
-    CdefParams, ChromaSamplePosition, FrameHeader, FrameType, LoopFilterParams, PRIMARY_REF_NONE,
-    QuantizationParams, TileInfo, TxMode,
+    CdefParams, ChromaSamplePosition, FrameHeader, FrameType, LoopFilterParams,
+    LoopRestorationParams, PRIMARY_REF_NONE, QuantizationParams, TileInfo, TxMode,
 };
 use ec_core::{Error, Result};
 
@@ -187,6 +187,20 @@ fn split_inter_blocks() -> bool {
     match std::env::var("EC_AV1_SPLIT_INTER").ok() {
         Some(v) if cfg!(test) => v != "0",
         _ => SPLIT_INTER_BLOCKS,
+    }
+}
+
+/// Whether the encoder searches loop restoration at all (spec 7.17): one
+/// Wiener filter per 64x64 luma restoration unit, picked from
+/// [`crate::filter_search::WIENER_CANDIDATES`]. Swept by `EC_AV1_LR` in a
+/// test build, like [`lambda_scale`].
+const RESTORATION: bool = true;
+
+/// [`RESTORATION`], or what `EC_AV1_LR` names in a test build.
+fn restoration_enabled() -> bool {
+    match std::env::var("EC_AV1_LR").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => RESTORATION,
     }
 }
 
@@ -478,6 +492,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
         loop_filter: encoded.loop_filter,
+        loop_restoration: encoded.loop_restoration,
         cdef: encoded.cdef,
     }
 }
@@ -524,6 +539,11 @@ pub struct Encoded {
     /// This frame header's chosen CDEF parameters, threaded for the same
     /// reason as `loop_filter`.
     pub(crate) cdef: CdefParams,
+    /// This frame header's chosen loop restoration parameters, threaded for
+    /// the same reason as `loop_filter` -- and doubly so: the per-unit
+    /// filters themselves are coded in `tile`, so a decode of it under a
+    /// stale `RESTORE_NONE` header desyncs at the first superblock.
+    pub(crate) loop_restoration: LoopRestorationParams,
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -608,7 +628,7 @@ pub(crate) fn key_frame_headers_colour(
         // `cdef_idx` literal is coded in the tile and a frame that wants no
         // CDEF simply carries zero strengths.
         enable_cdef: true,
-        enable_restoration: false,
+        enable_restoration: true,
         seq_force_screen_content_tools: 0,
         seq_force_integer_mv: 0,
         color_config,
@@ -3037,6 +3057,12 @@ pub(crate) fn encode_key_frame_inner(
     // `crate::filter_search`), and keep the filtered picture that wins as
     // the reconstruction -- what a decoder outputs, and what the next
     // frame predicts from.
+    // The luma restoration-unit grid this frame's `lr_params` implies
+    // (`av1_lr_count_units` rounds to nearest, so a short last unit is
+    // swallowed by the one before it), for the tile writer's own per-unit
+    // walk.
+    let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
+    let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
     pick_and_apply_filters(
         &mut header,
         &mut luma,
@@ -3045,8 +3071,10 @@ pub(crate) fn encode_key_frame_inner(
         true,
         &mut tile,
         search.lambda,
-        |bits, sb_cols, grid| {
+        fctx,
+        |bits, sb_cols, grid, units| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
+            crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             crate::tile::sb_coeff_key_frame_tile_tx(
                 mi_cols,
                 mi_rows,
@@ -3055,8 +3083,8 @@ pub(crate) fn encode_key_frame_inner(
                 tx_select,
             )
         },
-        |lf, cdef, h, tile| {
-            crate::decode::decode_key_frame_tile(
+        |lf, cdef, h, tile, lr| {
+            crate::decode::decode_key_frame_tile_lr(
                 tile,
                 h.mi_cols,
                 h.mi_rows,
@@ -3070,6 +3098,7 @@ pub(crate) fn encode_key_frame_inner(
                 h.reduced_tx_set,
                 h.allow_screen_content_tools,
                 h.allow_intrabc,
+                lr,
                 fctx,
             )
         },
@@ -3097,6 +3126,7 @@ pub(crate) fn encode_key_frame_inner(
         tx_select,
         loop_filter: header.loop_filter,
         cdef: header.cdef,
+        loop_restoration: header.loop_restoration,
     })
 }
 
@@ -3126,8 +3156,15 @@ fn pick_and_apply_filters(
     // winner re-decoded from it.
     tile: &mut Vec<u8>,
     lambda: f64,
-    recode: impl Fn(u8, usize, &[u8]) -> Result<Vec<u8>>,
-    decode: impl Fn(&LoopFilterParams, &CdefParams, &FrameHeader, &[u8]) -> Result<Picture>,
+    fctx: &crate::decode::FrameCtx,
+    recode: impl Fn(u8, usize, &[u8], &[Option<crate::restoration::WienerInfo>]) -> Result<Vec<u8>>,
+    decode: impl Fn(
+        &LoopFilterParams,
+        &CdefParams,
+        &FrameHeader,
+        &[u8],
+        &LoopRestorationParams,
+    ) -> Result<Picture>,
 ) -> Result<()> {
     if !search {
         return Ok(());
@@ -3139,8 +3176,9 @@ fn pick_and_apply_filters(
     let damping = 3 + (header.quantization.base_q_idx >> 6);
     let (cols32, rows32) = crate::tile::block_grid(header.mi_cols, header.mi_rows);
     let (sb_cols, sb_rows) = (cols32.div_ceil(2) as usize, rows32.div_ceil(2) as usize);
+    let none_lr = LoopRestorationParams::default();
     let (lf, cdef, idx_grid, picture) = crate::filter_search::pick_filters(
-        |lf, cdef| decode(lf, cdef, &hdr, tile),
+        |lf, cdef| decode(lf, cdef, &hdr, tile, &none_lr),
         source,
         luma.width,
         (fw, fh),
@@ -3150,14 +3188,61 @@ fn pick_and_apply_filters(
     )?;
     header.loop_filter = lf;
     header.cdef = cdef;
-    let filtered = if idx_grid.is_empty() {
+    // spec 7.17: loop restoration. Its per-unit filters live in the TILE, so
+    // this stage codes the tile a second time no matter what -- first with
+    // every unit at `RESTORE_NONE`, which is the shape whose decode hands
+    // back the post-deblock and post-CDEF pictures the search needs (and
+    // whose output IS the post-CDEF picture), then again with the filters it
+    // picked.
+    let mut lr = LoopRestorationParams::default();
+    if restoration_enabled() {
+        lr.frame_restoration_type[0] = ec_av1_syntax::RestorationType::Wiener;
+        lr.loop_restoration_size = [64, 64, 64];
+        lr.uses_lr = true;
+    }
+    let grid_dims = crate::restoration::RestorationGrid::new(&lr, fw as u32, fh as u32);
+    let n_units = if lr.uses_lr {
+        grid_dims.horz_units[0] * grid_dims.vert_units[0]
+    } else {
+        0
+    };
+    let filtered = if idx_grid.is_empty() && n_units == 0 {
         picture
     } else {
-        let coded = recode(cdef.bits, sb_cols, &idx_grid)?;
-        let picture = decode(&lf, &cdef, &hdr, &coded)?;
-        *tile = coded;
-        picture
+        let probe = recode(cdef.bits, sb_cols, &idx_grid, &vec![None; n_units])?;
+        fctx.capture_stages.set(n_units > 0);
+        let probe_picture = decode(&lf, &cdef, &hdr, &probe, &lr)?;
+        fctx.capture_stages.set(false);
+        let units = match crate::decode::take_filter_stages(fctx) {
+            Some(stages) => crate::filter_search::pick_restoration(
+                &stages,
+                source[0],
+                luma.width,
+                (fw, fh),
+                &lr,
+                lambda,
+                fctx,
+            ),
+            None => Vec::new(),
+        };
+        if units.iter().any(Option::is_some) {
+            let coded = recode(cdef.bits, sb_cols, &idx_grid, &units)?;
+            let picture = decode(&lf, &cdef, &hdr, &coded, &lr)?;
+            *tile = coded;
+            picture
+        } else {
+            // Nothing to restore: code the frame with `RESTORE_NONE` on every
+            // plane instead of a tile full of `restore_wiener = 0` symbols
+            // (worth ~1 bit per 64x64, which the BD gate saw on a clip whose
+            // units never take a filter). The probe's picture already IS the
+            // unrestored one -- a grid of `RESTORE_NONE` units restores
+            // nothing -- so this costs one tile write and no decode.
+            lr = LoopRestorationParams::default();
+            *tile = recode(cdef.bits, sb_cols, &idx_grid, &[])?;
+            probe_picture
+        }
     };
+    header.loop_restoration = lr;
     let dec_cw = filtered.width.div_ceil(2);
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
     crate::filter_search::splice(&mut luma.reconstruction, luma.width, &filtered.y, filtered.width, fw, fh);
@@ -4257,6 +4342,12 @@ pub(crate) fn encode_inter_frame(
     let mut refs: [Option<&Picture>; 8] = [None; 8];
     refs[1] = Some(&trial_ref);
     let refpix = crate::decode::RefPix::ready(refs);
+    // The luma restoration-unit grid this frame's `lr_params` implies
+    // (`av1_lr_count_units` rounds to nearest, so a short last unit is
+    // swallowed by the one before it), for the tile writer's own per-unit
+    // walk.
+    let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
+    let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
     pick_and_apply_filters(
         &mut header,
         &mut luma,
@@ -4269,8 +4360,10 @@ pub(crate) fn encode_inter_frame(
         true,
         &mut tile,
         search.lambda,
-        |bits, sb_cols, grid| {
+        fctx,
+        |bits, sb_cols, grid, units| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
+            crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             crate::tile::sb_coeff_inter_frame_tile_tx(
                 mi_cols,
                 mi_rows,
@@ -4279,8 +4372,8 @@ pub(crate) fn encode_inter_frame(
                 tx_select,
             )
         },
-        |lf, cdef, h, tile| {
-            crate::decode::decode_inter_frame_tile(
+        |lf, cdef, h, tile, lr| {
+            crate::decode::decode_inter_frame_tile_lr(
                 tile,
                 h.mi_cols,
                 h.mi_rows,
@@ -4296,6 +4389,7 @@ pub(crate) fn encode_inter_frame(
                 seq.enable_dual_filter,
                 h.reference_select,
                 tx_select,
+                lr,
                 fctx,
             )
         },
@@ -4322,6 +4416,7 @@ pub(crate) fn encode_inter_frame(
         tx_select,
         loop_filter: header.loop_filter,
         cdef: header.cdef,
+        loop_restoration: header.loop_restoration,
     })
 }
 
@@ -7286,6 +7381,13 @@ mod tests {
                 on_extra,
                 units,
                 100.0 * on_extra as f64 / units.max(1) as f64
+            );
+            // How the 64x64 luma restoration units split between
+            // RESTORE_NONE and Wiener (lane-av1lr).
+            let (lr_none, lr_wiener) = crate::filter_search::take_lr_histogram();
+            eprintln!(
+                "{name}: lr units none={lr_none} wiener={lr_wiener} ({:.1}% restored)",
+                100.0 * lr_wiener as f64 / (lr_none + lr_wiener).max(1) as f64
             );
             // Which chroma modes the search actually wins with, against the
             // unconditional DC_PRED that was the only outcome before
