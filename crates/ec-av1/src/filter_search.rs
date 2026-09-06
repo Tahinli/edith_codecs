@@ -521,3 +521,38 @@ thread_local! {
 pub(crate) fn take_lr_histogram() -> (usize, usize) {
     LR_CHOSEN.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::unit_sse;
+
+    /// [`unit_sse`]'s chunked, `u32`-accumulating shape against the naive
+    /// per-sample reference it replaced -- per unit AND in total, on a plane
+    /// whose width is not a whole number of units (the case where the last
+    /// chunk is short) and with strides wider than the region scored.
+    #[test]
+    fn unit_sse_matches_the_naive_sum() {
+        let (w, h, unit, sb_cols) = (100usize, 70usize, 32usize, 4usize);
+        let (dec_w, src_w) = (w + 7, w + 13);
+        let mut state = 0x1234_5678u32;
+        let mut rnd = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        };
+        let dec: Vec<u16> = (0..dec_w * h).map(|_| u16::from(rnd())).collect();
+        let src: Vec<u8> = (0..src_w * h).map(|_| rnd()).collect();
+        let mut want = vec![7u64; sb_cols * 4]; // a non-zero start: this accumulates
+        let mut total = 0u64;
+        for row in 0..h {
+            let base = (row / unit) * sb_cols;
+            for col in 0..w {
+                let diff = i64::from(dec[row * dec_w + col]) - i64::from(src[row * src_w + col]);
+                want[base + col / unit] += (diff * diff) as u64;
+                total += (diff * diff) as u64;
+            }
+        }
+        let mut got = vec![7u64; sb_cols * 4];
+        assert_eq!(unit_sse(&dec, dec_w, &src, src_w, w, h, unit, sb_cols, &mut got), total);
+        assert_eq!(got, want);
+    }
+}
