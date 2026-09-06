@@ -491,9 +491,22 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         mi_rows: encoded.mi_rows,
         base_q_idx: encoded.base_q_idx,
         tx_select: encoded.tx_select,
+        start_cdfs: encoded.start_cdfs.clone(),
+        next_cdfs: encoded.next_cdfs.clone(),
         loop_filter: encoded.loop_filter,
         loop_restoration: encoded.loop_restoration,
         cdef: encoded.cdef,
+    }
+}
+
+/// A `Cdfs` inside a `Debug` type: the tables are tens of kilobytes of
+/// numbers nobody wants printed, and [`Encoded`] derives `Debug`.
+#[derive(Clone)]
+pub(crate) struct CdfSnapshot(pub(crate) crate::cdf_state::Cdfs);
+
+impl std::fmt::Debug for CdfSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CdfSnapshot")
     }
 }
 
@@ -530,6 +543,18 @@ pub struct Encoded {
     /// a `tx_depth` frame as a `TxMode::Largest` one and desyncs at the first
     /// block.
     pub(crate) tx_select: bool,
+    /// The CDF state this frame's tile writer started from -- the defaults
+    /// for a key frame and for the first inter frame, and the previous
+    /// frame's stored tables after that. A test that decodes `tile` directly
+    /// must feed the decoder this, exactly as `decode_stream` feeds it what
+    /// the frame's `primary_ref_frame` slot holds (same class as
+    /// `tx_select`: a header bit a raw tile decode cannot guess).
+    pub(crate) start_cdfs: CdfSnapshot,
+    /// What this frame stores into the slots it refreshes (spec 7.20,
+    /// `crate::stream::stored_cdfs_for`): its end-of-tile tables with the
+    /// counts reset when `disable_frame_end_update_cdf` is off, and what it
+    /// started from when it is on.
+    pub(crate) next_cdfs: CdfSnapshot,
     /// This frame header's chosen deblocking parameters
     /// ([`crate::filter_search::pick_deblock`]) — `reconstruction` is the
     /// picture the decoder produces UNDER them, so a test that decodes
@@ -708,6 +733,11 @@ pub(crate) fn key_frame_headers_colour(
     Ok((seq, header))
 }
 
+/// The DPB slot `GOLDEN_FRAME` names in every frame this encoder writes: the
+/// key frame refreshes all eight slots, each inter frame only slot 0, so slot
+/// 1 still holds the key frame however long the GOP runs.
+pub const GOLDEN_SLOT: u8 = 1;
+
 /// The frame header for a shown inter frame that predicts from the single
 /// slot `last_slot` (every `ref_frame_idx` entry names it) and refreshes that
 /// same slot with itself once coded. The sequence header is [`key_frame_headers`]'s,
@@ -722,6 +752,26 @@ pub fn inter_frame_headers(
     order_hint: u32,
     last_slot: u8,
 ) -> Result<(SequenceHeader, FrameHeader)> {
+    inter_frame_headers_slots(width, height, base_q_idx, order_hint, last_slot, last_slot, last_slot)
+}
+
+/// [`inter_frame_headers`] with the three slots named apart: the one read as
+/// `LAST_FRAME`, the one this frame refreshes, and the one read as
+/// `ALTREF_FRAME`. The encoder alternates the refreshed slot between 0 and 2
+/// so that the frame two back is still intact in the slot this one is about
+/// to overwrite -- read before write, spec 7.20's decode order.
+///
+/// # Errors
+/// As [`inter_frame_headers`].
+pub fn inter_frame_headers_slots(
+    width: usize,
+    height: usize,
+    base_q_idx: u8,
+    order_hint: u32,
+    last_slot: u8,
+    self_slot: u8,
+    altref_slot: u8,
+) -> Result<(SequenceHeader, FrameHeader)> {
     let (seq, key) = key_frame_headers(width, height, base_q_idx)?;
     let header = FrameHeader {
         frame_type: FrameType::Inter,
@@ -729,12 +779,25 @@ pub fn inter_frame_headers(
         show_frame: true,
         error_resilient_mode: false,
         disable_cdf_update: false,
-        disable_frame_end_update_cdf: true,
+        // The tile writer hands its end-of-tile tables to the next frame
+        // (`encode_sequence_with_ctx`), so the frame stores them the way the
+        // decoder will load them (spec 7.20).
+        disable_frame_end_update_cdf: false,
         force_integer_mv: false,
         order_hint,
         primary_ref_frame: 0,
-        refresh_frame_flags: 1 << last_slot,
-        ref_frame_idx: [last_slot; ec_av1_syntax::REFS_PER_FRAME],
+        refresh_frame_flags: 1 << self_slot,
+        // Every reference but `GOLDEN_FRAME` (index 3 of `ref_frame_idx`)
+        // names the slot this frame both predicts from and refreshes;
+        // GOLDEN names slot 1, which the key frame wrote when it refreshed
+        // all eight and which no inter frame ever overwrites, so it holds
+        // the key frame's own picture for the whole GOP.
+        ref_frame_idx: {
+            let mut idx = [last_slot; ec_av1_syntax::REFS_PER_FRAME];
+            idx[3] = GOLDEN_SLOT;
+            idx[6] = altref_slot;
+            idx
+        },
         allow_high_precision_mv: false,
         interpolation_filter: ec_av1_syntax::InterpolationFilter::Eighttap,
         is_motion_mode_switchable: false,
@@ -2357,8 +2420,10 @@ fn code_square_inter(
                     eight: None,
                     tx_depth,
                     inter: Some(InterInfo {
+                        ref_frame: crate::mvstack::LAST_FRAME,
                         mode: InterMode::NewMv,
                         mv: new_mv,
+                        ref_mv_idx: 0,
                     }),
                 },
                 cost + dcost,
@@ -2382,8 +2447,10 @@ fn code_square_inter(
             eight: None,
             tx_depth,
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv,
+                ref_mv_idx: 0,
             }),
         }, inter_cost + dcost)
     } else {
@@ -2399,7 +2466,7 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
     let info = match inter {
         Some(info) => MiInfo {
             is_inter: true,
-            ref_frame: LAST_FRAME,
+            ref_frame: info.ref_frame,
             ref_frame1: NO_REF1,
             mv1: (0, 0),
             mv: mv16(info.mv),
@@ -3044,13 +3111,21 @@ pub(crate) fn encode_key_frame_inner(
 
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits_sb(&superblocks, base_q_idx));
+    // A key frame always starts from the defaults (`primary_ref_frame` is
+    // `PRIMARY_REF_NONE`), and its header keeps `disable_frame_end_update_cdf`
+    // set, so what it stores into the slots it refreshes is exactly those
+    // defaults again (spec 7.20's `started_from` arm) -- the first inter
+    // frame after it therefore starts from the defaults too.
     let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
-    let mut tile = crate::tile::sb_coeff_key_frame_tile_tx(
+    let mut cdfs = crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx));
+    let start_cdfs = CdfSnapshot(cdfs.clone());
+    let mut tile = crate::tile::sb_coeff_key_frame_tile_cdfs(
         mi_cols,
         mi_rows,
         base_q_idx,
         &superblocks,
         tx_select,
+        &mut cdfs,
     )?;
     // spec 7.14 deblocking: pick this frame's `loop_filter_level` by handing
     // the tile just coded back to the decoder under each candidate (see
@@ -3072,15 +3147,21 @@ pub(crate) fn encode_key_frame_inner(
         &mut tile,
         search.lambda,
         fctx,
+        // Every re-code starts from this frame's OWN starting tables, never
+        // from where the first write left them: the second tile is the same
+        // symbol sequence plus new ones, so it must adapt from the same
+        // point the decoder will.
         |bits, sb_cols, grid, units| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
-            crate::tile::sb_coeff_key_frame_tile_tx(
+            let mut cdfs = start_cdfs.0.clone();
+            crate::tile::sb_coeff_key_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
                 base_q_idx,
                 &superblocks,
                 tx_select,
+                &mut cdfs,
             )
         },
         |lf, cdef, h, tile, lr| {
@@ -3124,6 +3205,8 @@ pub(crate) fn encode_key_frame_inner(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        next_cdfs: start_cdfs.clone(),
+        start_cdfs,
         loop_filter: header.loop_filter,
         cdef: header.cdef,
         loop_restoration: header.loop_restoration,
@@ -3483,7 +3566,13 @@ fn search_inter_block(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
-    stack: &MvStack, fctx: &crate::decode::FrameCtx,
+    stack: &MvStack,
+    // `GOLDEN_FRAME`: the key frame's own reconstruction, held in DPB slot 1
+    // for the whole GOP, with the stack this block derives against it. Only
+    // its two search-free modes are priced (`NEARESTMV`, `GLOBALMV`) -- a
+    // second motion search would double the wall of the stage that already
+    // owns most of it.
+    extra: &[(i8, &Picture, &MvStack)], fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
     // below price their coefficients through `TxbSet::Luma32Inter`, which is
@@ -3496,9 +3585,17 @@ fn search_inter_block(
     // function's doc comment.
     let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
     let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
-    let single_ref_bits = symbol_bits(&cdf::SINGLE_REF[0][0], 0)
-        + symbol_bits(&cdf::SINGLE_REF[0][2], 0)
-        + symbol_bits(&cdf::SINGLE_REF[0][3], 0);
+    // `write_single_ref`'s own tree, at the fixed context this pricer uses
+    // for every neighbour-derived symbol: LAST is p1=0,p3=0,p4=0 and GOLDEN
+    // p1=0,p3=1,p5=1.
+    let single_ref_bits = |ref_frame: i8| {
+        symbol_bits(&cdf::SINGLE_REF[0][0], 0)
+            + if ref_frame == crate::mvstack::GOLDEN_FRAME {
+                symbol_bits(&cdf::SINGLE_REF[0][2], 1) + symbol_bits(&cdf::SINGLE_REF[0][4], 1)
+            } else {
+                symbol_bits(&cdf::SINGLE_REF[0][2], 0) + symbol_bits(&cdf::SINGLE_REF[0][3], 0)
+            }
+    };
 
     struct Candidate {
         cost: f64,
@@ -3631,100 +3728,72 @@ fn search_inter_block(
         chroma[1].true_width,
         chroma[1].true_height,
     );
-    let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
-            + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
-            + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0); // NEARESTMV
-
-    // The NEARESTMV candidate: `skip` is decided below from whether its
-    // trial actually found a nonzero level, once its residual is priced
-    // against the same CDFs the tile writer codes it with.
-    //
-    // lane-av1speed: its three trials are kept (rather than moved straight
-    // into the candidate) so that a NEWMV landing on the very same vector --
-    // common on static content, where the stack's nearest vector is also
-    // what the search finds -- reuses them instead of running the same
-    // motion compensation, transform, quantize and reconstruct again. The
-    // reused trials are the same values, so the choice is bit-identical.
-    let nearest_trials;
-    {
-        let mv = stack.nearest_mv;
-        let luma_trial = mc_trial(
-            luma,
-            x,
-            y,
-            BLOCK,
-            mv,
-            true,
-            ref_luma.0,
-            ref_luma.1,
-            ref_luma.2,
-            ref_luma.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            TxbSet::Luma32Inter, fctx,
-        );
-        let u = mc_trial(
-            &chroma[0],
-            x / 2,
-            y / 2,
-            BLOCK / 2,
-            mv,
-            false,
-            ref_u.0,
-            ref_u.1,
-            ref_u.2,
-            ref_u.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            chroma_set, fctx,
-        );
-        let v = mc_trial(
-            &chroma[1],
-            x / 2,
-            y / 2,
-            BLOCK / 2,
-            mv,
-            false,
-            ref_v.0,
-            ref_v.1,
-            ref_v.2,
-            ref_v.3,
-            false,
-            search.base_q_idx,
-            search.deadzone,
-            chroma_set, fctx,
-        );
-        let skip = luma_trial.levels.iter().all(|&l| l == 0)
-            && u.levels.iter().all(|&l| l == 0)
-            && v.levels.iter().all(|&l| l == 0);
-        let cost = luma_trial.sse
-            + u.sse
-            + v.sse
-            + search.lambda
-                * (skip_bits(skip)
-                    + intra_inter_bits(true)
-                    + single_ref_bits
-                    + mode_bits_inter
-                    + if skip {
-                        0.0
-                    } else {
-                        luma_trial.bits + u.bits + v.bits
-                    });
-        nearest_trials = (luma_trial.clone(), u.clone(), v.clone());
-        consider(Candidate {
-            cost,
-            luma: luma_trial,
-            u,
-            v,
-            mode: DC_PRED,
-            skip,
-            inter: Some(InterInfo {
+    // Every single-reference mode the writer can code (spec 5.11.24's symbol
+    // chain, mirrored by `tile::write_inter_mode`), priced with the static
+    // CDFs at this block's own stack contexts. A candidate is a motion
+    // vector plus the cheapest syntax that reaches it, so two modes landing
+    // on the same vector share one set of trials: the added modes cost
+    // mode-bit arithmetic, not another motion compensation.
+    let not_new = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1);
+    let not_zero = symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1);
+    // `tile::write_drl_idx`'s cost: one `drl_mode` symbol per stack entry
+    // past `start`, `1` to advance and `0` to stop, at most two. A `target`
+    // the loop cannot reach is never offered below -- every candidate's
+    // index is one this same loop walks to.
+    let drl_bits = |start: usize, target: usize| {
+        let mut bits = 0.0;
+        let mut idx = start;
+        while idx < start + 2 && stack.entries.len() > idx + 1 {
+            let advance = idx < target;
+            bits += symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[idx]], usize::from(advance));
+            if !advance {
+                break;
+            }
+            idx += 1;
+        }
+        bits
+    };
+    let last_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME);
+    let mut cands: Vec<((i32, i32), f64, InterInfo)> = vec![
+        (
+            stack.nearest_mv,
+            last_ref_bits + not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0),
+            InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
-                mv,
-            }),
-        });
+                mv: stack.nearest_mv,
+                ref_mv_idx: 0,
+            },
+        ),
+        // GLOBALMV is the identity model's zero vector -- this encoder writes
+        // no `gm_params` -- and the cheapest syntax of the four on the static
+        // content where that vector is also the right one.
+        (
+            (0, 0),
+            last_ref_bits + not_new + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 0),
+            InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
+                mode: InterMode::GlobalMv,
+                mv: (0, 0),
+                ref_mv_idx: 0,
+            },
+        ),
+    ];
+    let near_bits =
+        last_ref_bits + not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 1);
+    for idx in 1..=2usize {
+        if let Some(e) = stack.entries.get(idx) {
+            cands.push((
+                e.mv,
+                near_bits + drl_bits(1, idx),
+                InterInfo {
+                    ref_frame: crate::mvstack::LAST_FRAME,
+                    mode: InterMode::NearMv,
+                    mv: e.mv,
+                    ref_mv_idx: idx as u8,
+                },
+            ));
+        }
     }
 
     let source_block = luma.source_block(x, y, BLOCK);
@@ -3746,96 +3815,157 @@ fn search_inter_block(
     #[cfg(test)]
     stage_add(0, t.elapsed());
     let mv = round_to_valid_mv(found.mv, stack.pred_mv);
-    if let Some(mv_bits) = mv_residual_bits(mv, stack.pred_mv) {
-        let (luma_trial, u, v) = if mv == stack.nearest_mv {
-            nearest_trials
-        } else {
-            (
-                mc_trial(
-                    luma,
-                    x,
-                    y,
-                    BLOCK,
-                    mv,
-                    true,
-                    ref_luma.0,
-                    ref_luma.1,
-                    ref_luma.2,
-                    ref_luma.3,
-                    false,
-                    search.base_q_idx,
-                    search.deadzone,
-                    TxbSet::Luma32Inter, fctx,
-                ),
-                mc_trial(
-                    &chroma[0],
-                    x / 2,
-                    y / 2,
-                    BLOCK / 2,
-                    mv,
-                    false,
-                    ref_u.0,
-                    ref_u.1,
-                    ref_u.2,
-                    ref_u.3,
-                    false,
-                    search.base_q_idx,
-                    search.deadzone,
-                    chroma_set, fctx,
-                ),
-                mc_trial(
-                    &chroma[1],
-                    x / 2,
-                    y / 2,
-                    BLOCK / 2,
-                    mv,
-                    false,
-                    ref_v.0,
-                    ref_v.1,
-                    ref_v.2,
-                    ref_v.3,
-                    false,
-                    search.base_q_idx,
-                    search.deadzone,
-                    chroma_set, fctx,
-                ),
-            )
-        };
-        let drl_bits = if stack.entries.len() > 1 {
-            symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[0]], 0)
-        } else {
-            0.0
-        };
-        let skip = luma_trial.levels.iter().all(|&l| l == 0)
-            && u.levels.iter().all(|&l| l == 0)
-            && v.levels.iter().all(|&l| l == 0);
-        let cost = luma_trial.sse
-            + u.sse
-            + v.sse
-            + search.lambda
-                * (skip_bits(skip)
-                    + intra_inter_bits(true)
-                    + single_ref_bits
-                    + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
-                    + drl_bits
-                    + mv_bits
-                    + if skip {
-                        0.0
-                    } else {
-                        luma_trial.bits + u.bits + v.bits
-                    });
-        consider(Candidate {
-            cost,
-            luma: luma_trial,
-            u,
-            v,
-            mode: DC_PRED,
-            skip,
-            inter: Some(InterInfo {
+    // Each DRL entry is a different `PredMv` (spec 7.10.2.10 `assign_mv`), so
+    // the same vector costs a different residual from each: take the index
+    // whose residual plus DRL bits is cheapest, not entry 0 by default.
+    let mut best_new: Option<(f64, u8)> = None;
+    for idx in 0..3usize {
+        if idx > 0 && stack.entries.len() <= idx {
+            break;
+        }
+        let base = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+        if let Some(b) = mv_residual_bits(mv, base) {
+            let total = b + drl_bits(0, idx);
+            if best_new.is_none_or(|(t, _)| total < t) {
+                best_new = Some((total, idx as u8));
+            }
+        }
+    }
+    if let Some((bits, ref_mv_idx)) = best_new {
+        cands.push((
+            mv,
+            last_ref_bits + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
+            InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NewMv,
                 mv,
-            }),
-        });
+                ref_mv_idx,
+            },
+        ));
+    }
+
+    for &(ref_frame, _, gstack) in extra {
+        let g_ref_bits = single_ref_bits(ref_frame);
+        let g_not_new = symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 1);
+        cands.push((
+            gstack.nearest_mv,
+            g_ref_bits
+                + g_not_new
+                + symbol_bits(&cdf::ZERO_MV[gstack.zero_mv_ctx], 1)
+                + symbol_bits(&cdf::REF_MV[gstack.ref_mv_ctx], 0),
+            InterInfo {
+                ref_frame,
+                mode: InterMode::NearestMv,
+                mv: gstack.nearest_mv,
+                ref_mv_idx: 0,
+            },
+        ));
+        cands.push((
+            (0, 0),
+            g_ref_bits + g_not_new + symbol_bits(&cdf::ZERO_MV[gstack.zero_mv_ctx], 0),
+            InterInfo {
+                ref_frame,
+                mode: InterMode::GlobalMv,
+                mv: (0, 0),
+                ref_mv_idx: 0,
+            },
+        ));
+    }
+
+    // One trial set per distinct (reference, vector) pair: sort, cheapest
+    // syntax first, and drop the rest of each pair's run.
+    cands.sort_by(|a, b| {
+        (a.2.ref_frame, a.0)
+            .cmp(&(b.2.ref_frame, b.0))
+            .then(a.1.total_cmp(&b.1))
+    });
+    cands.dedup_by_key(|c| (c.2.ref_frame, c.0));
+    {
+        for (mv, mode_bits_inter, info) in cands {
+            let (ref_luma, ref_u, ref_v) = match extra
+                .iter()
+                .find(|(r, _, _)| *r == info.ref_frame)
+            {
+                Some(&(_, g, _)) => (
+                    (&g.y, g.width, luma.true_width, luma.true_height),
+                    (&g.u, g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                    (&g.v, g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                ),
+                None => (ref_luma, ref_u, ref_v),
+            };
+            let luma_trial = mc_trial(
+                luma,
+                x,
+                y,
+                BLOCK,
+                mv,
+                true,
+                ref_luma.0,
+                ref_luma.1,
+                ref_luma.2,
+                ref_luma.3,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                TxbSet::Luma32Inter, fctx,
+            );
+            let u = mc_trial(
+                &chroma[0],
+                x / 2,
+                y / 2,
+                BLOCK / 2,
+                mv,
+                false,
+                ref_u.0,
+                ref_u.1,
+                ref_u.2,
+                ref_u.3,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                chroma_set, fctx,
+            );
+            let v = mc_trial(
+                &chroma[1],
+                x / 2,
+                y / 2,
+                BLOCK / 2,
+                mv,
+                false,
+                ref_v.0,
+                ref_v.1,
+                ref_v.2,
+                ref_v.3,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                chroma_set, fctx,
+            );
+            let skip = luma_trial.levels.iter().all(|&l| l == 0)
+                && u.levels.iter().all(|&l| l == 0)
+                && v.levels.iter().all(|&l| l == 0);
+            let cost = luma_trial.sse
+                + u.sse
+                + v.sse
+                + search.lambda
+                    * (skip_bits(skip)
+                        + intra_inter_bits(true)
+                        + mode_bits_inter
+                        + if skip {
+                            0.0
+                        } else {
+                            luma_trial.bits + u.bits + v.bits
+                        });
+            consider(Candidate {
+                cost,
+                luma: luma_trial,
+                u,
+                v,
+                mode: DC_PRED,
+                skip,
+                inter: Some(info),
+            });
+        }
     }
 
     let best = best.expect("the search offers at least the intra modes");
@@ -3867,7 +3997,20 @@ pub(crate) fn encode_inter_frame(
     base_q_idx: u8,
     deadzone: f64,
     order_hint: u32,
-    render: (usize, usize), fctx: &crate::decode::FrameCtx,
+    render: (usize, usize),
+    // The tables this frame's writer starts from: what the previous frame
+    // stored into the slot this one's `primary_ref_frame` names. `None`
+    // starts from the defaults, which is right only for the frame straight
+    // after a key frame.
+    start_cdfs: Option<&crate::cdf_state::Cdfs>,
+    // The key frame's own (padded) reconstruction, which every frame of the
+    // GOP still holds in DPB slot 1 -- `GOLDEN_FRAME`. `None` codes the frame
+    // with `LAST_FRAME` alone, exactly as before.
+    golden: Option<&Picture>,
+    // The frame two back, held in the slot this frame is about to refresh
+    // (the encoder alternates 0/2): `ALTREF_FRAME`. `None` for the first two
+    // inter frames of a GOP, where the frame two back IS the key frame.
+    altref: Option<&Picture>, fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
     picture.check()?;
     if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
@@ -3890,14 +4033,33 @@ pub(crate) fn encode_inter_frame(
     // overwrites slot 0, so the frame just coded is always what the next one
     // predicts against.
     const LAST_SLOT: u8 = 0;
+    // Slot 0 and slot 2 alternate so the frame two back survives one more
+    // frame: frame n writes A(n) = 0 for odd n, 2 for even, so A(n) = A(n-2)
+    // and the picture this frame names as `ALTREF_FRAME` is the one sitting
+    // in the very slot it will overwrite.
+    let self_slot = if order_hint % 2 == 1 { 0 } else { 2 };
+    let last_slot = if order_hint <= 1 {
+        LAST_SLOT
+    } else if (order_hint - 1) % 2 == 1 {
+        0
+    } else {
+        2
+    };
     // `render`, not `picture.width`/`picture.height`: `picture` here is
     // already padded to a whole number of superblocks (`encode_sequence`'s
     // `padded_to(SUPERBLOCK)`), and the header's `mi_cols`/`mi_rows` (and so
     // every true-edge clamp downstream) must come from the frame's real,
     // unpadded size, same as `key_frame_headers_colour` takes `render` and
     // not the padded picture in `encode_key_frame_inner`.
-    let (seq, mut header) =
-        inter_frame_headers(render.0, render.1, base_q_idx, order_hint, LAST_SLOT)?;
+    let (seq, mut header) = inter_frame_headers_slots(
+        render.0,
+        render.1,
+        base_q_idx,
+        order_hint,
+        last_slot,
+        self_slot,
+        if altref.is_some() { self_slot } else { GOLDEN_SLOT },
+    )?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
     // `TxMode::Select` here too: an inter block then codes one `txfm_split`
@@ -4002,6 +4164,25 @@ pub(crate) fn encode_inter_frame(
                     let (mi_row, mi_col) = (r32 * 8, c32 * 8);
                     let stack =
                         find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
+                    let extra_stacks: Vec<(i8, &Picture, MvStack)> = [
+                        (crate::mvstack::GOLDEN_FRAME, golden),
+                        (crate::mvstack::ALTREF_FRAME, altref),
+                    ]
+                    .into_iter()
+                    .filter_map(|(r, pic)| {
+                        pic.map(|p| {
+                            (
+                                r,
+                                p,
+                                find_mv_stack(&grid, mi_row, mi_col, 8, 8, r, mi_cols, mi_rows),
+                            )
+                        })
+                    })
+                    .collect();
+                    let extra: Vec<(i8, &Picture, &MvStack)> = extra_stacks
+                        .iter()
+                        .map(|(r, p, st)| (*r, *p, st))
+                        .collect();
 
                     let base = snapshot(&luma, &chroma, (x, y), BLOCK);
                     let (block, mut cost_whole) = search_inter_block(
@@ -4011,7 +4192,8 @@ pub(crate) fn encode_inter_frame(
                         &search,
                         &mode_bits_table,
                         reference,
-                        &stack, fctx,
+                        &stack,
+                        &extra, fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
                     let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
@@ -4331,13 +4513,22 @@ pub(crate) fn encode_inter_frame(
         / modes.len() as f64;
     #[cfg(test)]
     record_predicted_bits(crate::tile::predicted_coeff_bits(&blocks, base_q_idx));
+    // This frame's header leaves `disable_frame_end_update_cdf` off, so it
+    // stores its end-of-tile tables with the counts reset (spec 7.20) and the
+    // next frame's writer starts from them -- exactly what
+    // `crate::stream::stored_cdfs_for` hands the decoder.
     let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
-    let mut tile = crate::tile::sb_coeff_inter_frame_tile_tx(
+    let mut cdfs = start_cdfs
+        .cloned()
+        .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
+    let start_cdfs = CdfSnapshot(cdfs.clone());
+    let mut tile = crate::tile::sb_coeff_inter_frame_tile_cdfs(
         mi_cols,
         mi_rows,
         base_q_idx,
         &blocks,
         tx_select,
+        &mut cdfs,
     )?;
     // Deblocking, as in `encode_key_frame_inner`: the decoder reconstructs
     // this tile against the same single-slot reference this encoder predicted
@@ -4347,6 +4538,7 @@ pub(crate) fn encode_inter_frame(
     // reference whose height is not the header's own `frame_height` (spec
     // 7.9's compatible-size rule), and the chained-decode round trips prove
     // the two predict identically.
+    let end_cdfs = std::cell::RefCell::new(cdfs);
     let (fw, fh) = (header.frame_width as usize, header.frame_height as usize);
     let trial_ref = if (reference.width, reference.height) == (fw, fh) {
         reference.clone()
@@ -4359,8 +4551,39 @@ pub(crate) fn encode_inter_frame(
             v: crop_plane(&reference.v, reference.width / 2, fw / 2, fh / 2),
         }
     };
+    // `RefPix` is indexed by the reference NAME (`LAST_FRAME` = 1,
+    // `GOLDEN_FRAME` = 4), not by DPB slot: the trial decode of a frame whose
+    // blocks may name GOLDEN needs that plane too, cropped the same way.
+    let trial_golden = golden.map(|g| {
+        if (g.width, g.height) == (fw, fh) {
+            g.clone()
+        } else {
+            Picture {
+                width: fw,
+                height: fh,
+                y: crop_plane(&g.y, g.width, fw, fh),
+                u: crop_plane(&g.u, g.width / 2, fw / 2, fh / 2),
+                v: crop_plane(&g.v, g.width / 2, fw / 2, fh / 2),
+            }
+        }
+    });
+    let trial_altref = altref.map(|a| {
+        if (a.width, a.height) == (fw, fh) {
+            a.clone()
+        } else {
+            Picture {
+                width: fw,
+                height: fh,
+                y: crop_plane(&a.y, a.width, fw, fh),
+                u: crop_plane(&a.u, a.width / 2, fw / 2, fh / 2),
+                v: crop_plane(&a.v, a.width / 2, fw / 2, fh / 2),
+            }
+        }
+    });
     let mut refs: [Option<&Picture>; 8] = [None; 8];
     refs[1] = Some(&trial_ref);
+    refs[4] = trial_golden.as_ref();
+    refs[7] = trial_altref.as_ref();
     let refpix = crate::decode::RefPix::ready(refs);
     // The luma restoration-unit grid this frame's `lr_params` implies
     // (`av1_lr_count_units` rounds to nearest, so a short last unit is
@@ -4381,16 +4604,26 @@ pub(crate) fn encode_inter_frame(
         &mut tile,
         search.lambda,
         fctx,
+        // As in `encode_key_frame_inner`, but this frame's end-of-tile tables
+        // are what the NEXT frame writes from, so the winning re-code
+        // publishes its own into `end_cdfs` -- the first write's are stale
+        // the moment a second tile is coded.
         |bits, sb_cols, grid, units| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
-            crate::tile::sb_coeff_inter_frame_tile_tx(
+            let mut cdfs = start_cdfs.0.clone();
+            let coded = crate::tile::sb_coeff_inter_frame_tile_cdfs(
                 mi_cols,
                 mi_rows,
                 base_q_idx,
                 &blocks,
                 tx_select,
-            )
+                &mut cdfs,
+            );
+            if coded.is_ok() {
+                *end_cdfs.borrow_mut() = cdfs;
+            }
+            coded
         },
         |lf, cdef, h, tile, lr| {
             crate::decode::decode_inter_frame_tile_lr(
@@ -4410,10 +4643,17 @@ pub(crate) fn encode_inter_frame(
                 h.reference_select,
                 tx_select,
                 lr,
+                // The trial decode re-reads the tile the writer just wrote,
+                // so it starts from the same tables the writer did (this
+                // frame's `start_cdfs`), not from the defaults.
+                Some(start_cdfs.0.clone()),
                 fctx,
             )
         },
     )?;
+    let mut cdfs = end_cdfs.into_inner();
+    cdfs.reset_counts();
+    let next_cdfs = CdfSnapshot(cdfs);
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
 
@@ -4434,6 +4674,8 @@ pub(crate) fn encode_inter_frame(
         mi_rows: header.mi_rows,
         base_q_idx,
         tx_select,
+        start_cdfs,
+        next_cdfs,
         loop_filter: header.loop_filter,
         cdef: header.cdef,
         loop_restoration: header.loop_restoration,
@@ -4495,6 +4737,14 @@ pub(crate) fn encode_sequence_with_ctx(
         unspecified_color_config(), fctx,
     )?;
     let mut stream = key.stream.clone();
+    // Slot 1 keeps the key frame's own reconstruction for the whole GOP (the
+    // key frame refreshes every slot, each inter frame only slot 0), which is
+    // what `GOLDEN_FRAME` names.
+    let golden = key.reconstruction.clone();
+    // The frame two back, once there is one that is not the key frame
+    // itself (which `GOLDEN_FRAME` already names).
+    let mut prev2: Option<Picture> = None;
+    let mut carried = key.next_cdfs.clone();
     let mut reference = key.reconstruction.clone();
     let mut frames = vec![crop_encoded(&key, render.0, render.1)];
     for (i, picture) in rest.iter().enumerate() {
@@ -4512,10 +4762,17 @@ pub(crate) fn encode_sequence_with_ctx(
             base_q_idx,
             deadzone,
             order_hint,
-            render, fctx,
+            render,
+            Some(&carried.0),
+            Some(&golden),
+            prev2.as_ref(), fctx,
         )?;
         stream.extend_from_slice(&inter.stream);
-        reference = inter.reconstruction.clone();
+        carried = inter.next_cdfs.clone();
+        prev2 = Some(std::mem::replace(
+            &mut reference,
+            inter.reconstruction.clone(),
+        ));
         frames.push(crop_encoded(&inter, render.0, render.1));
     }
     Ok(EncodedSequence { stream, frames })
@@ -4925,15 +5182,19 @@ mod tests {
             eight: None,
             tx_depth: 0,
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
+                ref_mv_idx: 0,
             }),
         };
         let skipped_block = BlockCoeffs {
             skip: true,
             inter: Some(InterInfo {
+                ref_frame: crate::mvstack::LAST_FRAME,
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
+                ref_mv_idx: 0,
             }),
             ..BlockCoeffs::default()
         };
@@ -6544,7 +6805,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), fctx).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -6642,7 +6903,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), fctx).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height), None, None, None, fctx).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -6819,7 +7080,7 @@ mod tests {
                     q,
                     0.5,
                     1,
-                    (width, height), fctx,
+                    (width, height), None, None, None, fctx,
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -6836,7 +7097,7 @@ mod tests {
                         q,
                         0.5,
                         1,
-                        (width, height), fctx,
+                        (width, height), None, None, None, fctx,
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
@@ -7221,6 +7482,12 @@ mod tests {
     ///
     /// The BD gate above measures quality, which a speed lane can move by a
     /// hair without failing anything; this pins the streams themselves.
+    /// Re-measured on the lane-av1lr merge with main d5fc99e0: the per-64x64
+    /// `cdef_idx` literals and the per-unit loop restoration syntax are new
+    /// bits in the tile, so the streams move (q=150 7416 -> 7458 bytes,
+    /// q=60 27927 -> 27807 -- the low-rate frame pays for the syntax, the
+    /// high-rate one more than earns it back).
+    ///
     /// Every number below was measured 2026-09-06: first on lane-av1fwd
     /// (whose three speed steps left them identical to `a6649c4e`'s), then
     /// re-measured on the lane-av1lr merge, which legitimately moves them --
@@ -7248,7 +7515,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7796, 0x70db_e81d_606b_034c), (60, 28182, 0xb23d_005b_1f2e_e008)];
+            [(150, 7458, 0x7eb2_33c6_bd96_3baf), (60, 27807, 0xeee0_f1e5_e099_46bd)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -7409,11 +7676,34 @@ mod tests {
             let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
             let _ = take_partition_hits();
             let _ = take_uv_mode_hits();
+            let _ = crate::tile::take_inter_mode_hits();
+            let _ = crate::tile::take_drl_hits();
+            let _ = crate::tile::take_ref_hits();
             let (ours, ours_wall) = our_ladder(&source, width, height, fctx);
             // How often the inter split actually fired over this clip's four
             // encodes, against the whole 32x32 that was the only outcome
             // before (gate-blind-to-feature).
             let [whole32, split32, whole16, split16] = take_partition_hits();
+            // Which inter modes actually fired over this clip's four encodes,
+            // and at which DRL index -- a mode nobody picks is a mode the BD
+            // number cannot be crediting (gate-blind-to-feature).
+            let [nearest, near, global, new] = crate::tile::take_inter_mode_hits();
+            let [drl0, drl1, drl2, drl3] = crate::tile::take_drl_hits();
+            let refs = crate::tile::take_ref_hits();
+            let modes_total = (nearest + near + global + new).max(1);
+            eprintln!(
+                "{name}: inter modes NEAREST {nearest} ({:.1}%) NEAR {near} ({:.1}%) \
+                 GLOBAL {global} ({:.1}%) NEW {new} ({:.1}%); drl idx 0/1/2/3+ \
+                 {drl0}/{drl1}/{drl2}/{drl3}",
+                100.0 * nearest as f64 / modes_total as f64,
+                100.0 * near as f64 / modes_total as f64,
+                100.0 * global as f64 / modes_total as f64,
+                100.0 * new as f64 / modes_total as f64,
+            );
+            eprintln!(
+                "{name}: references LAST {} GOLDEN {} (LAST2 {} LAST3 {} BWD {} ALT2 {} ALT {})",
+                refs[0], refs[3], refs[1], refs[2], refs[4], refs[5], refs[6]
+            );
             eprintln!(
                 "{name}: inter 32x32 split into 16s {split32} of {} blocks ({:.1}%); \
                  16x16 leaves split into 8s {split16} of {} ({:.1}%)",

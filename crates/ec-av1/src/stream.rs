@@ -3396,7 +3396,13 @@ mod tests {
 
             // Frame 1: hand-coded, intra-only, refreshes slot 0 with a flat
             // 128 block (no neighbours to predict `DC_PRED` from).
-            let (_, header1) = inter_frame_headers(width, height, base_q_idx, 1, 0).unwrap();
+            let (_, mut header1) = inter_frame_headers(width, height, base_q_idx, 1, 0).unwrap();
+            // These two tiles are hand-coded from a FRESH `Cdfs`, so the
+            // frames must not carry CDF state the way the encoder's own inter
+            // frames now do (spec 7.20): with the bit set, what each frame
+            // stores is what it started from -- the defaults -- which is
+            // exactly what the next hand-coded tile assumes.
+            header1.disable_frame_end_update_cdf = true;
             let tile1 = {
                 let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
                 let mut enc = SymbolEncoder::new();
@@ -3414,6 +3420,7 @@ mod tests {
             // Frame 2: hand-coded, single_ref all the way to GOLDEN_FRAME,
             // skip zero-MV NEARESTMV -- a direct copy of slot 3 (frame 0).
             let (_, mut header2) = inter_frame_headers(width, height, base_q_idx, 2, 0).unwrap();
+            header2.disable_frame_end_update_cdf = true;
             header2.ref_frame_idx[3] = 3; // GOLDEN_FRAME's own slot: frame 0's, untouched by frame 1
             let tile2 = {
                 let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
