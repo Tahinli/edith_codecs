@@ -124,19 +124,22 @@ const SPLIT_INTER_8: bool = true;
 /// Whether a key frame codes `tx_mode == TxMode::Select` and searches each
 /// block's transform depth (lane-av1tx). On by default; `EC_AV1_TX_SELECT=0`
 /// turns it off for an A/B on one build.
-/// Whether an INTER frame also carries `TxMode::Select` (lane-av1tx step 2:
-/// one `txfm_split` flag per inter block, a searched `tx_depth` on every
-/// intra block inside the inter frame). OFF by default and opt-in through
-/// `EC_AV1_TX_SELECT_INTER=1`: the syntax is written but a stream carrying it
-/// is refused by dav1d and by this crate's own decoder, and the first
-/// diverging symbol was not located inside the lane's budget. Key frames are
-/// unaffected -- they are byte-exact with [`tx_select`] on.
+/// Whether an INTER frame also carries `TxMode::Select`: an inter block's
+/// residual as one transform over the whole block or as the four transforms
+/// of half the side ([`commit_inter_luma`]), a searched `tx_depth` on every
+/// intra block inside the inter frame. ON since lane-av1tx2, which found why
+/// the streams desynced -- the writer counted the [`crate::decode::
+/// TXFM_CTX_INIT`] band value of a neighbour outside the tile, where the
+/// reader drops the term -- and measured the split search: BD-rate vs libaom
+/// 233.5 -> 226.1 and 170.9 -> 167.4 on two clips, 212.8 -> 213.2 on the
+/// third, for 13% encode wall. `EC_AV1_TX_SELECT_INTER=0` turns it off for an
+/// A/B on one build.
 fn tx_select_inter() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("EC_AV1_TX_SELECT_INTER").as_deref(),
-            Ok("1") | Ok("on")
+            Ok("0") | Ok("off")
         )
     })
 }
@@ -1798,6 +1801,111 @@ pub(crate) fn take_tx_depth_hits() -> [usize; 3] {
     std::array::from_fn(|d| TX_DEPTH_HITS[d].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// How many inter blocks resolved to each var-tx depth (0 = one transform
+/// over the whole block, 1 = its four halves), the fire count a gate prints
+/// to see the split search reach its candidates at all.
+static INTER_TX_SPLIT_HITS: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+/// Reads [`INTER_TX_SPLIT_HITS`] and zeroes it.
+#[cfg(test)]
+pub(crate) fn take_inter_tx_split_hits() -> [usize; 2] {
+    std::array::from_fn(|d| INTER_TX_SPLIT_HITS[d].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// What the `txfm_split` symbols of one inter block cost at `depth`, priced
+/// off the neighbour-free context row the way [`tx_depth_bits`] is: depth 0
+/// is one flag, depth 1 is a split root plus one unsplit flag per child
+/// (decode.rs `read_var_tx_size` stops symbol-free only at `MAX_VARTX_DEPTH`
+/// or a 4x4 sub-size).
+fn txfm_split_bits(side: usize, depth: usize) -> f64 {
+    let max_tx = side.min(64);
+    let ctx = |tx: usize| {
+        crate::decode::txfm_partition_ctx_rect(
+            crate::decode::TXFM_CTX_INIT,
+            crate::decode::TXFM_CTX_INIT,
+            side,
+            tx,
+            tx,
+        )
+    };
+    if depth == 0 {
+        return symbol_bits(&cdf::TXFM_PARTITION[ctx(max_tx)], 0);
+    }
+    symbol_bits(&cdf::TXFM_PARTITION[ctx(max_tx)], 1)
+        + 4.0 * symbol_bits(&cdf::TXFM_PARTITION[ctx(max_tx / 2)], 0)
+}
+
+/// The inter block's own var-tx decision, once its motion vector is settled:
+/// its residual as ONE transform over the whole block, or as the four
+/// transforms of half the side the tree's first halving names. The prediction
+/// is the same motion compensation either way, so the split trial
+/// re-transforms the identical residual in four pieces -- it wins where four
+/// small transforms carry a locally varying residual cheaper than one big
+/// one. Commits the winner into `luma` and hands back its block-coordinate
+/// levels, the depth the writer codes and the cost the winner adds to (or
+/// takes off) the caller's already-computed flat cost.
+///
+/// Only for a block wholly inside the frame: past the true edge the reader's
+/// var-tx recursion skips the units that fall outside
+/// (decode.rs `read_var_tx_size`'s `max_w_mi`/`max_h_mi` guard), which would
+/// leave the residual units this writes unpaired.
+#[allow(clippy::too_many_arguments)]
+fn commit_inter_luma(
+    luma: &mut Plane,
+    (x, y): (usize, usize),
+    side: usize,
+    mv: (i32, i32),
+    reference: (&[u16], usize, usize, usize),
+    search: &Search,
+    flat: &Trial,
+    skip: bool, fctx: &crate::decode::FrameCtx,
+) -> (Vec<i32>, u8, f64) {
+    let eligible = tx_select()
+        && tx_select_inter()
+        && !skip
+        && side >= 16
+        && x + side <= luma.true_width
+        && y + side <= luma.true_height;
+    if !eligible {
+        luma.commit(x, y, side, flat);
+        return (flat.levels.clone(), 0, 0.0);
+    }
+    let tx = side / 2;
+    let set = if tx >= 16 { TxbSet::Luma16Inter } else { TxbSet::Luma8Inter };
+    let mut levels = vec![0i32; side * side];
+    let (mut sse, mut bits) = (0.0, 0.0);
+    let mut units = Vec::with_capacity(4);
+    for tu_row in 0..2 {
+        for tu_col in 0..2 {
+            let (tu_x, tu_y) = (x + tu_col * tx, y + tu_row * tx);
+            let trial = mc_trial(
+                luma, tu_x, tu_y, tx, mv, true, reference.0, reference.1, reference.2,
+                reference.3, false, search.base_q_idx, search.deadzone, set, fctx,
+            );
+            sse += trial.sse;
+            bits += trial.bits;
+            for row in 0..tx {
+                levels[(tu_row * tx + row) * side + tu_col * tx..][..tx]
+                    .copy_from_slice(&trial.levels[row * tx..][..tx]);
+            }
+            units.push((tu_x, tu_y, trial));
+        }
+    }
+    let split_cost = sse + search.lambda * (bits + txfm_split_bits(side, 1));
+    let flat_cost = flat.sse + search.lambda * (flat.bits + txfm_split_bits(side, 0));
+    if split_cost < flat_cost {
+        for (tu_x, tu_y, trial) in &units {
+            luma.commit(*tu_x, *tu_y, tx, trial);
+        }
+        INTER_TX_SPLIT_HITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return (levels, 1, split_cost - flat_cost);
+    }
+    INTER_TX_SPLIT_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    luma.commit(x, y, side, flat);
+    (flat.levels.clone(), 0, 0.0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn code_square(
     luma: &mut Plane,
@@ -2195,47 +2303,51 @@ fn code_square_inter(
     }
     if let (cost, Some((luma_new, u_new, v_new, skip_new, new_mv))) = best {
         if cost < intra_cost {
-            luma.commit(x, y, side, &luma_new);
+            let (levels, tx_depth, dcost) = commit_inter_luma(
+                luma, (x, y), side, new_mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_new, skip_new, fctx,
+            );
             chroma[0].commit(x / 2, y / 2, side / 2, &u_new);
             chroma[1].commit(x / 2, y / 2, side / 2, &v_new);
             return (
                 BlockCoeffs {
-                    luma: coeffs(&luma_new.levels, side),
+                    luma: coeffs(&levels, side),
                     u: coeffs(&u_new.levels, side / 2),
                     v: coeffs(&v_new.levels, side / 2),
                     mode: DC_PRED as u8,
                     uv_mode: DC_PRED,
                     skip: skip_new,
                     eight: None,
-                    tx_depth: 0,
+                    tx_depth,
                     inter: Some(InterInfo {
                         mode: InterMode::NewMv,
                         mv: new_mv,
                     }),
                 },
-                cost,
+                cost + dcost,
             );
         }
     }
 
     if inter_cost < intra_cost {
-        luma.commit(x, y, side, &luma_trial);
+        let (levels, tx_depth, dcost) = commit_inter_luma(
+            luma, (x, y), side, mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_trial, skip, fctx,
+        );
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
         chroma[1].commit(x / 2, y / 2, side / 2, &v);
         (BlockCoeffs {
-            luma: coeffs(&luma_trial.levels, side),
+            luma: coeffs(&levels, side),
             u: coeffs(&u.levels, side / 2),
             v: coeffs(&v.levels, side / 2),
             mode: DC_PRED as u8,
             uv_mode: DC_PRED,
             skip,
             eight: None,
-            tx_depth: 0,
+            tx_depth,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv,
             }),
-        }, inter_cost)
+        }, inter_cost + dcost)
     } else {
         (intra_block, intra_cost)
     }
@@ -5902,6 +6014,55 @@ mod tests {
         }
     }
 
+    /// The same sequence through OUR OWN decoder, sample-exact against the
+    /// encoder's reconstruction. ffmpeg stays the bitstream oracle
+    /// ([[shared-oracle-blindness]]) -- but a stream ffmpeg REFUSES yields no
+    /// divergence point at all, while our decoder can be traced symbol by
+    /// symbol (`EC_TRACE_MODE_STEP`) on the very stream that broke. This is
+    /// the instrument the inter `TxMode::Select` hunt lacked; on failure it
+    /// names the first differing frame, plane and position.
+    #[test]
+    fn every_frame_of_a_sequence_decodes_through_our_own_decoder() {
+        let fctx = &crate::decode::FrameCtx::new();
+        let (width, height) = (128usize, 64usize);
+        let pictures: Vec<Picture> =
+            (0..5).map(|i| panned_test_card(width, height, i * 3)).collect();
+        let _ = take_inter_tx_split_hits();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
+        let split = take_inter_tx_split_hits();
+        eprintln!("inter var-tx: {} blocks flat, {} split", split[0], split[1]);
+        // [[gate-blind-to-feature]]: with inter `TxMode::Select` on, this
+        // content splits -- a green round trip in which the split never fires
+        // would prove only the flat path.
+        if tx_select() && tx_select_inter() {
+            assert!(split[1] > 0, "the inter var-tx split never fired");
+        }
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            let recon = &frame.reconstruction;
+            for (plane, got, want, stride) in [
+                ("luma", &dec.y, &recon.y, width),
+                ("U", &dec.u, &recon.u, width / 2),
+                ("V", &dec.v, &recon.v, width / 2),
+            ] {
+                assert_eq!(got.len(), want.len(), "frame {i}: {plane} size");
+                if let Some(at) = got.iter().zip(want).position(|(a, b)| a != b) {
+                    panic!(
+                        "frame {i}: {plane} differs first at ({}, {}): decoded {} vs \
+                         reconstruction {} ({} of {} samples differ)",
+                        at % stride,
+                        at / stride,
+                        got[at],
+                        want[at],
+                        got.iter().zip(want).filter(|(a, b)| a != b).count(),
+                        got.len(),
+                    );
+                }
+            }
+        }
+    }
+
     /// The rate term the mode search ranks every decision by has to be the
     /// rate the writer then spends. The search prices a block's coefficients
     /// through `tile::coeff_bits` -- the writer's own symbol chain, but
@@ -6862,6 +7023,23 @@ mod tests {
                     .map(|(d, &n)| format!(
                         "{d}={n} ({:.1}%)",
                         100.0 * n as f64 / depth_total.max(1) as f64
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            // And which var-tx depth this clip's INTER blocks resolved to
+            // (lane-av1tx2): 0 is one transform over the whole block, 1 its
+            // four halves.
+            let splits = take_inter_tx_split_hits();
+            let split_total: usize = splits.iter().sum();
+            eprintln!(
+                "{name}: inter var-tx depths {}",
+                splits
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &n)| format!(
+                        "{d}={n} ({:.1}%)",
+                        100.0 * n as f64 / split_total.max(1) as f64
                     ))
                     .collect::<Vec<_>>()
                     .join(" ")
