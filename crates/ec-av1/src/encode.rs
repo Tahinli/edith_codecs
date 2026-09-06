@@ -124,19 +124,22 @@ const SPLIT_INTER_8: bool = true;
 /// Whether a key frame codes `tx_mode == TxMode::Select` and searches each
 /// block's transform depth (lane-av1tx). On by default; `EC_AV1_TX_SELECT=0`
 /// turns it off for an A/B on one build.
-/// Whether an INTER frame also carries `TxMode::Select` (lane-av1tx step 2:
-/// one `txfm_split` flag per inter block, a searched `tx_depth` on every
-/// intra block inside the inter frame). OFF by default and opt-in through
-/// `EC_AV1_TX_SELECT_INTER=1`: the syntax is written but a stream carrying it
-/// is refused by dav1d and by this crate's own decoder, and the first
-/// diverging symbol was not located inside the lane's budget. Key frames are
-/// unaffected -- they are byte-exact with [`tx_select`] on.
+/// Whether an INTER frame also carries `TxMode::Select`: an inter block's
+/// residual as one transform over the whole block or as the four transforms
+/// of half the side ([`commit_inter_luma`]), a searched `tx_depth` on every
+/// intra block inside the inter frame. ON since lane-av1tx2, which found why
+/// the streams desynced -- the writer counted the [`crate::decode::
+/// TXFM_CTX_INIT`] band value of a neighbour outside the tile, where the
+/// reader drops the term -- and measured the split search: BD-rate vs libaom
+/// 233.5 -> 226.1 and 170.9 -> 167.4 on two clips, 212.8 -> 213.2 on the
+/// third, for 13% encode wall. `EC_AV1_TX_SELECT_INTER=0` turns it off for an
+/// A/B on one build.
 fn tx_select_inter() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("EC_AV1_TX_SELECT_INTER").as_deref(),
-            Ok("1") | Ok("on")
+            Ok("0") | Ok("off")
         )
     })
 }
@@ -7010,6 +7013,23 @@ mod tests {
                     .map(|(d, &n)| format!(
                         "{d}={n} ({:.1}%)",
                         100.0 * n as f64 / depth_total.max(1) as f64
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            // And which var-tx depth this clip's INTER blocks resolved to
+            // (lane-av1tx2): 0 is one transform over the whole block, 1 its
+            // four halves.
+            let splits = take_inter_tx_split_hits();
+            let split_total: usize = splits.iter().sum();
+            eprintln!(
+                "{name}: inter var-tx depths {}",
+                splits
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &n)| format!(
+                        "{d}={n} ({:.1}%)",
+                        100.0 * n as f64 / split_total.max(1) as f64
                     ))
                     .collect::<Vec<_>>()
                     .join(" ")
