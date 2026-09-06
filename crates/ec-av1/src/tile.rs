@@ -629,6 +629,9 @@ struct Neighbours {
     left_side_mi: Vec<usize>,
     /// Whether the neighbour carried no residual, for [`sb_coeff_inter_frame_tile`]'s
     /// skip context. Unused (and left at its default) by the key frame writers.
+    /// Kept per 4x4 mode-info unit, like [`Self::above_side_mi`] and for the
+    /// same reason: under a real PARTITION_SPLIT to 8x8 the four leaves of a
+    /// 16x16 read (and leave) different contexts inside one [`SUB`] slot.
     above_skip: Vec<bool>,
     /// The same, down the left edge.
     left_skip: Vec<bool>,
@@ -676,10 +679,10 @@ impl Neighbours {
             left_side: vec![SB; rows],
             above_side_mi: vec![SB; cols * (SUB / MI)],
             left_side_mi: vec![SB; rows * (SUB / MI)],
-            above_skip: vec![false; cols],
-            left_skip: vec![false; rows],
-            above_inter: vec![false; cols],
-            left_inter: vec![false; rows],
+            above_skip: vec![false; cols * (SUB / MI)],
+            left_skip: vec![false; rows * (SUB / MI)],
+            above_inter: vec![false; cols * (SUB / MI)],
+            left_inter: vec![false; rows * (SUB / MI)],
             mi_cols,
             mi_rows,
         }
@@ -768,11 +771,17 @@ impl Neighbours {
     /// fills for the coefficient and mode state.
     fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool) {
         let (r, c) = at;
-        for cell in 0..side / SUB {
-            self.above_skip[c + cell] = skip;
-            self.left_skip[r + cell] = skip;
-            self.above_inter[c + cell] = is_inter;
-            self.left_inter[r + cell] = is_inter;
+        self.record_inter_mi((r * (SUB / MI), c * (SUB / MI)), side, skip, is_inter);
+    }
+
+    /// [`Self::record_inter`] taking the block's position directly in 4x4
+    /// mode-info units, for a block finer than one [`SUB`] slot.
+    fn record_inter_mi(&mut self, (mi_r, mi_c): (usize, usize), side: usize, skip: bool, is_inter: bool) {
+        for cell in 0..side / MI {
+            self.above_skip[mi_c + cell] = skip;
+            self.left_skip[mi_r + cell] = skip;
+            self.above_inter[mi_c + cell] = is_inter;
+            self.left_inter[mi_r + cell] = is_inter;
         }
     }
 
@@ -1682,6 +1691,7 @@ pub(crate) fn partition_bits(side: usize, split: bool) -> f64 {
     let cdf: &[u16] = match side {
         SB => &cdfs.partition_w64[0],
         BLOCK => &cdfs.partition_w32[0],
+        TX8 => &cdfs.partition_w8[0],
         _ => &cdfs.partition_w16[0],
     };
     let symbol = if split {
@@ -2368,6 +2378,50 @@ pub fn sb_coeff_inter_frame_tile(
                             let at16 = (sr, sc);
                             if has_cols16 && has_rows16 {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                // A 16x16 leaf wholly inside the frame that
+                                // carries `eight` split itself further, on
+                                // cost rather than on geometry (lane-av1rd2):
+                                // spec PARTITION_SPLIT at BLOCK_16X16, then
+                                // the same four 8x8 leaves the straddling
+                                // branch below writes -- all four inside, so
+                                // the partition symbol is a real one rather
+                                // than the edge's gathered flag.
+                                if let Some(leaves) = &leaf.eight {
+                                    if leaves.len() != 4 {
+                                        return Err(Error::unsupported(
+                                            "AV1 tile",
+                                            "a 16x16 inter-frame block inside the frame that                                              splits needs all four 8x8 leaves",
+                                        ));
+                                    }
+                                    enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w16[ctx16]);
+                                    let (mi_row0, mi_col0) =
+                                        (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                    for (i, leaf8) in leaves.iter().enumerate() {
+                                        let leaf_mi = (
+                                            (mi_row0 + (i as u32 / 2) * 2) as usize,
+                                            (mi_col0 + (i as u32 % 2) * 2) as usize,
+                                        );
+                                        let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                        enc.symbol(
+                                            PARTITION_NONE,
+                                            &mut cdfs.partition_w8[leaf_ctx],
+                                        );
+                                        let (skip, is_inter) = write_inter_frame_leaf8(
+                                            &mut enc,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            &mut grid,
+                                            mi_cols,
+                                            mi_rows,
+                                            leaf8,
+                                            leaf_mi,
+                                            &scan8,
+                                            &scan4,
+                                        )?;
+                                        let _ = (skip, is_inter);
+                                    }
+                                    continue;
+                                }
                                 enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx16]);
                                 write_inter_frame_leaf(
                                     &mut enc,
@@ -2413,7 +2467,6 @@ pub fn sb_coeff_inter_frame_tile(
                                          `eight` entry per 8x8 leaf inside the true frame",
                                     ));
                                 }
-                                let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
                                 for (leaf8, (mr, mc)) in leaves.iter().zip(leaf_positions) {
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
@@ -2426,22 +2479,18 @@ pub fn sb_coeff_inter_frame_tile(
                                         mi_cols,
                                         mi_rows,
                                         leaf8,
-                                        at16,
                                         leaf_mi,
                                         &scan8,
                                         &scan4,
-                                        prev_leaf,
                                     )?;
-                                    prev_leaf = Some((leaf_mi, skip, is_inter));
+                                    let _ = (skip, is_inter);
                                 }
                                 // Same write-back-once-from-the-last-leaf rule
                                 // as the key frame search's `write_leaf8`
                                 // caller (r15): the SUB-grid skip/inter arrays
                                 // are otherwise left stale for the next
                                 // 16x16 slot.
-                                if let Some((_, skip, is_inter)) = prev_leaf {
-                                    neighbours.record_inter(at16, SUB, skip, is_inter);
-                                }
+
                             }
                         }
                         continue;
@@ -2451,13 +2500,14 @@ pub fn sb_coeff_inter_frame_tile(
                 let (r, c) = at;
                 let has_above = r32 > 0;
                 let has_left = c32 > 0;
-                let skip_ctx =
-                    usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
+                let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+                let skip_ctx = usize::from(neighbours.above_skip[mi_c])
+                    + usize::from(neighbours.left_skip[mi_r]);
                 enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
 
                 let is_inter = block.inter.is_some();
                 let (above_inter, left_inter) =
-                    (neighbours.above_inter[c], neighbours.left_inter[r]);
+                    (neighbours.above_inter[mi_c], neighbours.left_inter[mi_r]);
                 let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
                 enc.symbol(usize::from(is_inter), &mut cdfs.intra_inter[ii_ctx]);
 
@@ -2649,11 +2699,12 @@ fn write_inter_frame_leaf(
     const LAST_FRAME: i8 = 1;
 
     let (r, c) = at;
-    let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
+    let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+    let skip_ctx = usize::from(neighbours.above_skip[mi_c]) + usize::from(neighbours.left_skip[mi_r]);
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
 
     let (has_above, has_left) = (r > 0, c > 0);
-    let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
+    let (above_inter, left_inter) = (neighbours.above_inter[mi_c], neighbours.left_inter[mi_r]);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
     let is_inter = block.inter.is_some();
     enc.symbol(usize::from(is_inter), &mut cdfs.intra_inter[ii_ctx]);
@@ -2812,11 +2863,9 @@ fn write_inter_frame_leaf8(
     mi_cols: u32,
     mi_rows: u32,
     block: &BlockCoeffs,
-    outer_at: (usize, usize),
     leaf_mi: (usize, usize),
     scan8: &Vec<u16>,
     scan4: &Vec<u16>,
-    prev_leaf: Option<((usize, usize), bool, bool)>,
 ) -> Result<(bool, bool)> {
     if block.inter.is_none() && usize::from(block.mode) >= INTRA_MODES {
         return Err(Error::unsupported(
@@ -2834,20 +2883,16 @@ fn write_inter_frame_leaf8(
     /// branches.
     const LAST_FRAME: i8 = 1;
 
-    let (r, c) = outer_at;
-    let mut above_skip = neighbours.above_skip[c];
-    let mut left_skip = neighbours.left_skip[r];
-    let mut above_inter = neighbours.above_inter[c];
-    let mut left_inter = neighbours.left_inter[r];
-    if let Some(((pr, pc), pskip, pinter)) = prev_leaf {
-        if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
-            above_skip = pskip;
-            above_inter = pinter;
-        } else if pr == leaf_mi.0 && leaf_mi.1 == pc + 2 {
-            left_skip = pskip;
-            left_inter = pinter;
-        }
-    }
+    // This leaf's own 4x4 mode-info cells, not the enclosing 16x16 slot's:
+    // under a real PARTITION_SPLIT all four leaves are coded, so the
+    // bottom-left leaf's true above neighbour is the FIRST leaf and the
+    // bottom-right's above and left are two DIFFERENT ones (lane-av1rd2 --
+    // reading the coarse slot desynced the stream, and so did an override
+    // that remembered only the previous leaf).
+    let above_skip = neighbours.above_skip[leaf_mi.1];
+    let left_skip = neighbours.left_skip[leaf_mi.0];
+    let above_inter = neighbours.above_inter[leaf_mi.1];
+    let left_inter = neighbours.left_inter[leaf_mi.0];
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
 
@@ -2964,6 +3009,7 @@ fn write_inter_frame_leaf8(
             vec![0i32; TX4 * TX4],
         ];
         neighbours.record_mi(leaf_mi, 8, &zero_grids);
+        neighbours.record_inter_mi(leaf_mi, 8, block.skip, block.inter.is_some());
     } else {
         let grids = [
             level_grid(&block.luma, TX8)?,
@@ -2980,6 +3026,7 @@ fn write_inter_frame_leaf8(
             mode_for_tx,
         );
         neighbours.record_mi(leaf_mi, 8, &grids);
+        neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter);
     }
     Ok((block.skip, is_inter))
 }
