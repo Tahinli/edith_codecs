@@ -1,0 +1,13 @@
+=== ARM base env=[] 19:04:21
+RC=0
+=== ARM warp env=[EC_AV1_WARP=1] 19:07:07
+RC=0
+=== ARM obmc8 env=[EC_AV1_OBMC=1] 19:09:57
+RC=0
+=== ARM obmc16 env=[EC_AV1_OBMC=1 EC_AV1_OBMC_MIN=16] 19:12:45
+RC=0
+=== ARM warp_obmc8 env=[EC_AV1_WARP=1 EC_AV1_OBMC=1] 19:15:33
+RC=0
+=== ARM warp_obmc16 env=[EC_AV1_WARP=1 EC_AV1_OBMC=1 EC_AV1_OBMC_MIN=16] 19:18:25
+RC=0
+ALLDONE

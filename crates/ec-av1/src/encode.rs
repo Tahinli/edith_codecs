@@ -247,6 +247,12 @@ const EXTRA_REF_NEW_MV: bool = true;
 /// extra searches drop from +27% to +4% of the base count -- and on screen
 /// capture, where an extra reference's NEWMV wins nothing, it skips 99.7% of
 /// them. Below 0.35 the gain starts eroding (0.15: +125.3/+151.7).
+/// RE-SWEPT on lane-av1rejudge at [`LAMBDA_SCALE`] 0.05 with warp on: 0.25
+/// reads +16.6/-0.6, +47.0/+19.1, +51.3/-14.3 and 0.5 reads +16.6/-0.7,
+/// +47.0/+19.1, +51.3/-14.3 against the base's +16.7/-0.5, +47.0/+19.1,
+/// +51.3/-14.3 -- one row 0.1-0.2 down, two flat, inside the measurement's
+/// own noise. 0.35 stays; the lever that did move at the new rate weight is
+/// [`LEAF_SECOND_NEW_MARGIN`], not this one.
 const EXTRA_NEW_SKIP_MARGIN: f64 = 0.35;
 
 /// [`EXTRA_NEW_SKIP_MARGIN`], swept by `EC_AV1_MV_SKIP_MARGIN`.
@@ -274,7 +280,25 @@ fn extra_new_skip_margin() -> f64 {
 /// Screen capture is BYTE-IDENTICAL at every margin -- its leaf compound is
 /// all `NEAREST_NEARESTMV` and no searched second vector ever wins there --
 /// so the margin is pure wall on that content (+10% searches at 0.8).
-const LEAF_SECOND_NEW_MARGIN: f64 = 0.8;
+///
+/// RE-SWEPT on lane-av1rejudge after [`LAMBDA_SCALE`] moved 0.1 -> 0.05, on
+/// the native gate with local warp on, BD vs libaom / vs rav1e:
+///
+/// | margin | film 1080p | film 2160p | screen |
+/// |---|---|---|---|
+/// | 0.6 | +16.9 / -0.4 | +47.0 / +19.1 | +51.2 / -14.4 |
+/// | 0.8 (was) | +16.7 / -0.5 | +47.0 / +19.1 | +51.3 / -14.3 |
+/// | 1.2 | +16.2 / -1.1 | +46.6 / +18.8 | +51.3 / -14.4 |
+/// | 1.6 | +16.4 / -0.8 | +46.6 / +18.8 | +51.3 / -14.4 |
+/// | 0.0 (never skip) | +16.4 / -0.8 | +46.6 / +18.8 | +51.3 / -14.4 |
+///
+/// 1.2 is the floor of that bowl -- two rows 0.3-0.6 down on BOTH columns
+/// with screen flat -- and it beats never-skipping, i.e. the early-out is
+/// still worth having, just at a looser margin than the old rate weight
+/// wanted. It costs about 10% encoder wall on the two film clips (36.6s vs
+/// 32.6s at 2160p), which is the price of the extra second-reference
+/// searches.
+const LEAF_SECOND_NEW_MARGIN: f64 = 1.2;
 
 /// [`LEAF_SECOND_NEW_MARGIN`], swept by `EC_AV1_LEAF_SECOND_MARGIN`; the
 /// search itself is switched off by `EC_AV1_LEAF_SECOND_NEWMV=0`.
@@ -381,6 +405,11 @@ const SPLIT_BREAKOUT_COEFFS: usize = 0;
 /// +3.5/+4.7/+1.8 for -15% wall, and 1.0 costs +19/+27/+6. So 0.125 ships --
 /// the largest threshold whose BD stays inside the +0.3 keep rule on every
 /// clip.
+/// RE-SWEPT on lane-av1rejudge at [`LAMBDA_SCALE`] 0.05 with warp on (base
+/// +16.7/-0.5, +47.0/+19.1, +51.3/-14.3): 0.0625 is +16.9/-0.4, +47.0/+19.1,
+/// +51.3/-14.2 (the 1080p film 0.2 worse for a finer search) and 0.25 is
+/// +16.6/-0.6, +46.9/+19.1, +51.6/-14.5 (screen 0.3 worse vs libaom, 3s off
+/// the screen wall). Neither clears the keep rule; 0.125 stays.
 const SPLIT_RD_THRESHOLD: f64 = 0.125;
 
 /// [`SPLIT_RD_THRESHOLD`], swept by `EC_AV1_SPLIT_RD` in any build.
@@ -1098,7 +1127,7 @@ pub(crate) fn key_frame_headers_colour(
         // lane-av1obmc2: the sequence bit `allow_warped_motion` is gated on
         // (spec 5.5.2). Set only under the warp knob, so the DEFAULT sequence
         // header is byte-identical to the streams before this lane.
-        enable_warped_motion: crate::envflags::env_flag!("EC_AV1_WARP"),
+        enable_warped_motion: warp_on(),
         enable_dual_filter: false,
         enable_jnt_comp: false,
         enable_ref_frame_mvs: false,
@@ -1242,8 +1271,8 @@ pub fn inter_frame_headers_slots(
         // block read the 3-symbol `motion_mode_cdf` alphabet instead of the
         // 2-symbol `obmc_cdf` one (libaom `motion_mode_allowed`).
         is_motion_mode_switchable: crate::envflags::env_flag!("EC_AV1_OBMC")
-            || crate::envflags::env_flag!("EC_AV1_WARP"),
-        allow_warped_motion: crate::envflags::env_flag!("EC_AV1_WARP"),
+            || warp_on(),
+        allow_warped_motion: warp_on(),
         use_ref_frame_mvs: false,
         // Forces `get_tx_set` (spec 5.11.48) to the two-symbol
         // `TX_SET_INTER_3` for every inter transform below 32x32 -- the only
@@ -2514,6 +2543,19 @@ impl Reach {
 }
 
 /// What one symbol costs against a CDF, in bits.
+/// Whether local warped motion is on: the `WARPED_CAUSAL` candidate in the
+/// search, the frame header's `allow_warped_motion` and the sequence's
+/// `enable_warped_motion`, all three together. ON by default since
+/// lane-av1rejudge re-measured it at [`LAMBDA_SCALE`] 0.05 (the table at
+/// [`warp_prediction`]); `EC_AV1_WARP=0` turns the tool -- and the two header
+/// bits -- back off for an A/B on one build.
+pub(crate) fn warp_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(crate::envflags::var("EC_AV1_WARP").as_deref(), Ok("0") | Ok("off"))
+    });
+    *ON
+}
+
 /// The smallest LEAF an OBMC candidate is offered for, so the census can
 /// attribute the tool's effect by footprint (`EC_AV1_OBMC_MIN`, default 8 --
 /// every leaf; 16 or 32 turn the smaller leaves off). Only read when
@@ -2547,6 +2589,15 @@ impl Reach {
 /// (the 640x384 arm reads +78.9/+36.4, +94.9/+56.3, +54.2/+0.8 at min side 8
 /// against +78.8/+36.1, +95.1/+56.4, +54.5/+1.1 off -- two rows down, the
 /// 1080p film up, i.e. the same disagreement between the two gates).
+///
+/// RE-JUDGED again on lane-av1rejudge against the defaults this lane kept
+/// (local warp on, [`LEAF_SECOND_NEW_MARGIN`] 1.2 -- native +16.2/-1.1,
+/// +46.6/+18.8, +51.3/-14.4): OBMC at min side 8 on top of that base reads
+/// +16.2/-1.0, +46.6/+18.8, +51.3/-14.4, i.e. three rows flat and the 1080p
+/// rav1e column 0.1 WORSE, so the tool buys nothing once the second-reference
+/// margin is loosened. On warp alone it looked like a keep (+16.3/-0.9 at
+/// min 8, +16.6/-0.7 at min 16 against warp's +16.7/-0.5) -- that gain and
+/// the margin's gain are the same bytes. It stays OFF.
 fn obmc_min_side() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -2610,11 +2661,18 @@ fn motion_mode_bits(write_w: usize, write_h: usize, motion: u8, warp_alphabet: b
 ///
 /// two rows down against libaom (0.3 each) with the third flat, and the rav1e
 /// column inside 0.1 everywhere -- which reads as a keep rather than the
-/// 0.7/0.9 loss it was. The knob still ships OFF here: the margin is 0.3 BD
-/// points on a table whose other levers move whole points, and turning warp
-/// on by default is a stream-feature change (`enable_warped_motion` in the
-/// sequence header) that wants its own conformance pass, not a lambda lane's
-/// side effect.
+/// 0.7/0.9 loss it was.
+///
+/// KEPT ON BY DEFAULT on lane-av1rejudge, which reproduced that table
+/// exactly (base +17.0/-0.3, +47.0/+19.2, +51.6/-14.2; warp +16.7/-0.5,
+/// +47.0/+19.1, +51.3/-14.3 -- two rows down on both columns, one flat) and
+/// ran the conformance shape the lambda lane deferred: every warp stream
+/// decodes three-way exact (our decoder and ffmpeg, `EC_COMP_MISMATCH=1`
+/// clean), the native gate runs clean under `EC_AV1_TILES=2:2` (warp inside
+/// a 16-tile frame, sample walk and all), and tile bytes still do not depend
+/// on the thread count. The tool fires on 5.4% / 3.3% / 3.3% of the blocks
+/// that code a motion_mode symbol. `EC_AV1_WARP=0` ([`warp_on`]) turns it,
+/// `allow_warped_motion` and `enable_warped_motion` back off together.
 ///
 /// The WARPED_CAUSAL prediction of one square single-reference block: the
 /// decoder's own warp-sample walk (`decode::find_samples` +
@@ -3654,6 +3712,9 @@ fn chroma_top_k() -> Option<usize> {
 /// BD swings by about a point in either direction as near-tie chroma modes
 /// flip, which is the measurement's own sensitivity, not a trend: nothing
 /// here buys >=5% wall at <=+0.3 BD, so the default stays unpruned.
+/// RE-MEASURED on lane-av1rejudge at [`LAMBDA_SCALE`] 0.05 with warp on:
+/// K=4 is +17.1/-0.1, +47.1/+19.2, +51.6/-13.8 against the base's
+/// +16.7/-0.5, +47.0/+19.1, +51.3/-14.3 -- every row worse. Still `None`.
 const CHROMA_TOP_K: Option<usize> = None;
 
 fn search_chroma(
@@ -4424,7 +4485,7 @@ fn code_square_inter(
         Some(_) => None,
     };
     if let Some(info) = single.filter(|i| {
-        (crate::envflags::env_flag!("EC_AV1_OBMC") || crate::envflags::env_flag!("EC_AV1_WARP"))
+        (crate::envflags::env_flag!("EC_AV1_OBMC") || warp_on())
             && i.ref_frame == crate::mvstack::LAST_FRAME
     }) {
         let planes = [
@@ -4437,7 +4498,7 @@ fn code_square_inter(
         // 3-symbol one only under `allow_warped_motion` and at least one warp
         // sample. Mirrored here so the candidates are priced against the
         // table the tile really narrows.
-        let warp_alphabet = crate::envflags::env_flag!("EC_AV1_WARP")
+        let warp_alphabet = warp_on()
             && crate::decode::num_proj_ref(
                 grid,
                 mi_row,
@@ -6681,6 +6742,10 @@ fn search_inter_block(
     // it could default on. `NEAREST_NEWMV`/`NEW_NEARESTMV` keep (-1.0/-0.8
     // vs libaom, screen byte-identical) and ship on; `NEAR_NEARMV` does not
     // (+0.5/-0.2/flat) and stays behind `EC_AV1_COMP_NEARNEAR`.
+    // RE-MEASURED on lane-av1rejudge at LAMBDA_SCALE 0.05 with warp on:
+    // +16.6/-0.7, +47.0/+19.1, +51.3/-14.3 against the base's +16.7/-0.5,
+    // +47.0/+19.1, +51.3/-14.3 -- one row 0.1/0.2 down, two flat, short of
+    // the keep rule. Still behind the knob.
     let near_near = crate::envflags::env_flag!("EC_AV1_COMP_NEARNEAR");
     let half_new = true;
     for (ref1, g, cstack) in compound {
@@ -6981,7 +7046,7 @@ fn search_inter_block(
     if let Some(info) = best.inter.filter(|i| {
         i.ref1.is_none()
             && (crate::envflags::env_flag!("EC_AV1_OBMC")
-                || crate::envflags::env_flag!("EC_AV1_WARP"))
+                || warp_on())
     }) {
         let mut refs: [Option<&Picture>; 8] = [None; 8];
         refs[LAST_FRAME as usize] = Some(reference);
@@ -7006,7 +7071,7 @@ fn search_inter_block(
         // The alphabet `tile::write_motion_mode` will code this block's
         // symbol against, mirrored term for term (libaom
         // `motion_mode_allowed`).
-        let warp_alphabet = crate::envflags::env_flag!("EC_AV1_WARP")
+        let warp_alphabet = warp_on()
             && crate::decode::num_proj_ref(
                 grid,
                 mi_row,
@@ -10399,8 +10464,13 @@ mod tests {
         // decisions, so this bound and the byte pins above FAIL BY DESIGN
         // under it; the default path (no motion_mode syntax at all) is the
         // one they are measured on.
+        // lane-av1rejudge: local warp is ON by default now, so every eligible
+        // single-reference block carries that same `motion_mode` symbol (a
+        // 3-value alphabet where a warp sample exists) on the DEFAULT path --
+        // +34.9% here, one point past the OBMC reading above. The bound moves
+        // with it; `EC_AV1_WARP=0` restores the +32.6% no-motion_mode number.
         assert!(
-            worst_under <= 0.34,
+            worst_under <= 0.36,
             "the writer spent {:.2}% more than the search priced -- more than \
              the mode/mv syntax outside the coefficient sum explains",
             worst_under * 100.0
@@ -11334,6 +11404,13 @@ mod tests {
     /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]`. Unset
     /// keeps the flat one-key-then-all-inter ladder the baseline was measured
     /// on, so the gate's default recipe is unchanged.
+    ///
+    /// RE-MEASURED on lane-av1rejudge at [`LAMBDA_SCALE`] 0.05 with warp on,
+    /// native, against the flat ladder's +16.7/-0.5, +47.0/+19.1,
+    /// +51.3/-14.3: `2:-16:8` is +23.8/+5.8, +46.0/+18.9, +58.6/-10.2 and
+    /// `4:-16:8` is +21.1/+3.4, +47.2/+19.2, +55.2/-11.7 -- whole points
+    /// worse on the 1080p film and on screen, so the flat ladder stays the
+    /// default. Only the 2160p film likes a pyramid.
     fn pyramid_from_env() -> Option<crate::encoder::Pyramid> {
         let spec = std::env::var("EC_AV1_PYRAMID").ok()?;
         let mut f = spec.split(':');
@@ -11437,7 +11514,10 @@ mod tests {
     /// real neighbour contexts ([`Plane::coef_ctx`]) instead of zero, which
     /// is the same kind of decision change. Re-pinned on lane-av1lambda:
     /// [`LAMBDA_SCALE`] moved 0.1 -> 0.05, so every RD decision in the
-    /// search moved with it.
+    /// search moved with it. Re-pinned on lane-av1rejudge: local warp is on
+    /// by default ([`warp_on`], a sequence/frame header bit and a new
+    /// motion_mode symbol on eligible blocks) and
+    /// [`LEAF_SECOND_NEW_MARGIN`] moved 0.8 -> 1.2.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -11459,7 +11539,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7130, 0x0415_8aec_b26b_195a), (60, 26185, 0x9e7b_b2c7_672b_c381)];
+            [(150, 7139, 0x4d35_5d6d_8a54_1c6d), (60, 26461, 0xa52e_1445_7f69_b4c1)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
