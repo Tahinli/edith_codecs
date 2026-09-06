@@ -1303,9 +1303,8 @@ use ec_ogg::OggMuxer;
 
 /// The RFC 7845 identification header for this encoder — built by the crate's
 /// own [`ec_opus::ogg`] helper, so a muxer and the encoder cannot disagree.
-/// `pre_skip` is the encoder's [`Encoder::look_ahead`]: 312, the CELT overlap
-/// plus its input delay compensation, for every CELT call site; SILK's own
-/// delay for SILK.
+/// `pre_skip` is the encoder's [`Encoder::look_ahead`]: 120, the CELT overlap
+/// delay, for every CELT call site; SILK's own (larger) delay for SILK.
 fn opus_head(channels: usize, pre_skip: u16, layout: Option<(usize, usize, &[u8])>) -> Vec<u8> {
     let mapping =
         layout.map(|(streams, coupled, table)| (1u8, streams as u8, coupled as u8, table));
@@ -2511,15 +2510,14 @@ fn hybrid_layers_align() {
             e.look_ahead(960)
         }
     );
-    // A fullband CELT click lands at exactly +312 (`celt_click_peak_offset`:
-    // the MDCT overlap plus the 192-sample input delay compensation);
+    // A fullband CELT click lands at exactly +120 (`celt_click_peak_offset`);
     // the band-limited HB layer's main lobe sits up to 2 samples early once
     // transient frames keep their short blocks, and SILK lands at +121.
     assert!(
         (plb - phb).abs() <= 3,
         "layers misaligned: LB +{plb} vs HB +{phb}"
     );
-    assert!((phb - 312).abs() <= 2, "HB peak +{phb}, look_ahead 312");
+    assert!((phb - 120).abs() <= 2, "HB peak +{phb}, look_ahead 120");
 }
 
 /// 20 ms FB hybrid at 32 kbps: decodes in our decoder range-exactly, tracks

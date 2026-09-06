@@ -40,16 +40,11 @@ const MAX_SILK_PACKET_BYTES: usize = 1 + 1 + 2 * 2 + 3 * MAX_FRAME_BYTES;
 const SILK_LOOK_AHEAD_48K_NB: usize = 58;
 const SILK_LOOK_AHEAD_48K_MB: usize = 54;
 const SILK_LOOK_AHEAD_48K_WB: usize = 50;
-/// The CELT layer's own delay: one MDCT overlap (120) plus libopus's
-/// `delay_compensation = Fs/250` (`CELT_DELAY_48K`, 192 at 48 kHz), which the
-/// CELT encoder applies to its input so its analysis window sits where
-/// libopus's does.
-const CELT_LOOK_AHEAD_48K: usize = 120 + 192;
 /// How far the hybrid path delays the SILK layer's input so its output lines
 /// up with the CELT layer's at the decoder (which sums them as-is): CELT's
-/// delay minus SILK's WB round trip, click-measured through the
+/// overlap (120) minus SILK's WB round trip, click-measured through the
 /// decoder with one layer muted (`hybrid_layers_align` in conformance.rs).
-const HYBRID_SILK_DELAY_48K: usize = CELT_LOOK_AHEAD_48K - SILK_LOOK_AHEAD_48K_WB;
+const HYBRID_SILK_DELAY_48K: usize = 120 - SILK_LOOK_AHEAD_48K_WB;
 /// Bytes the CELT layer of a hybrid packet always keeps, whatever SILK spent.
 /// Was 8: at 16 kbps SILK takes 37 of the 40-byte budget, so 8 expanded
 /// 5133/6001 packets (+12.9% rate on the speech gate); libopus leaves CELT
@@ -199,8 +194,7 @@ impl Encoder {
     /// Encoder delay in *input* samples for a `frame_size`-sample (per
     /// channel, native rate) frame: the decoded stream lags the input by
     /// this much, and an Ogg-Opus pre-skip of `look_ahead * 48000/rate`
-    /// cancels it exactly. CELT: one MDCT overlap plus the 192-sample input
-    /// delay compensation, 312 samples at 48 kHz.
+    /// cancels it exactly. CELT: one MDCT overlap, 120 samples at 48 kHz.
     /// SILK (10, 20, 40 or 60 ms frames, when the application/bitrate or an
     /// explicit [`Encoder::set_mode`] select it — the same
     /// [`Encoder::silk_choice`] predicate `encode_toc_and_payload` dispatches
@@ -219,7 +213,7 @@ impl Encoder {
             };
             return delay / self.upsample;
         }
-        CELT_LOOK_AHEAD_48K / self.upsample
+        120 / self.upsample
     }
 
     /// Forces the coded bandwidth; [`None`] (the default) picks it from the
@@ -902,33 +896,33 @@ mod tests {
         let mut e = Encoder::new(24000, 2, Application::Audio).unwrap();
         e.set_bitrate(256_000);
         assert_eq!(e.auto_bandwidth(), Bandwidth::SuperWide);
-        assert_eq!(e.look_ahead(960), CELT_LOOK_AHEAD_48K / 2);
+        assert_eq!(e.look_ahead(960), 60);
     }
 
     /// `look_ahead` must use the same 10-or-20 ms-frame predicate dispatch
     /// does (`silk_choice`/`hybrid_choice`), not just `wants_silk`: 2.5/5 ms
     /// frames still code as CELT, while 10/20 ms speech follows SILK and
-    /// hybrid follows CELT's delay.
+    /// hybrid follows CELT's overlap.
     #[test]
     fn look_ahead_matches_the_frame_size_dispatch_actually_uses() {
         let mut e = Encoder::new(48000, 1, Application::Voip).unwrap();
         e.set_bitrate(8000);
         assert_eq!(e.look_ahead(480), 58, "10ms NB SILK");
-        assert_eq!(e.look_ahead(240), CELT_LOOK_AHEAD_48K, "5ms frame falls back to CELT");
+        assert_eq!(e.look_ahead(240), 120, "5ms frame falls back to CELT");
         assert_eq!(e.look_ahead(960), 58, "20ms NB SILK");
 
         // 16k VoIP is hybrid-FB since the libopus threshold port (CELT overlap).
         e.set_bitrate(16000);
-        assert_eq!(e.look_ahead(960), CELT_LOOK_AHEAD_48K, "20ms hybrid FB");
+        assert_eq!(e.look_ahead(960), 120, "20ms hybrid FB");
 
         e.set_bitrate(32000);
-        assert_eq!(e.look_ahead(960), CELT_LOOK_AHEAD_48K, "20ms hybrid, CELT's delay");
+        assert_eq!(e.look_ahead(960), 120, "20ms hybrid, CELT's overlap");
 
         let mut e = Encoder::new(48000, 2, Application::Voip).unwrap();
         e.set_bitrate(8000);
         assert_eq!(e.look_ahead(960), 58, "stereo 20ms NB SILK");
         e.set_bitrate(64_000);
-        assert_eq!(e.look_ahead(960), CELT_LOOK_AHEAD_48K, "stereo 20ms hybrid");
+        assert_eq!(e.look_ahead(960), 120, "stereo 20ms hybrid");
     }
 
     #[test]
