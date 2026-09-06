@@ -2835,9 +2835,28 @@ pub(crate) fn take_tx_depth_hits() -> [usize; 3] {
 
 /// How many inter blocks resolved to each var-tx depth (0 = one transform
 /// over the whole block, 1 = its four halves), the fire count a gate prints
-/// to see the split search reach its candidates at all.
-static INTER_TX_SPLIT_HITS: [std::sync::atomic::AtomicUsize; 2] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+/// to see the split search reach its candidates at all. Indexed
+/// `(block is 32x32) * 4 + (block is compound) * 2 + depth`, so one census
+/// says which of the four block classes the split reaches -- the 32x32 root
+/// and the compound blocks are this lane's two new ones.
+static INTER_TX_SPLIT_HITS: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+
+/// Whether a 32x32 inter winner searches its own var-tx depth (the four
+/// 16x16 units against the flat transform) instead of coding depth 0 blind.
+/// `EC_AV1_TX32_DEPTH`.
+fn tx32_depth_search() -> bool {
+    crate::envflags::env_flag!("EC_AV1_TX32_DEPTH")
+}
+
+/// Whether a COMPOUND inter winner is offered the var-tx split at all: its
+/// trial units have to be predicted from BOTH references
+/// ([`mc_trial_compound`]) or the split would re-predict them by single-
+/// reference translation, which is not what the decoder reconstructs.
+/// `EC_AV1_COMP_VARTX`.
+fn compound_var_tx() -> bool {
+    crate::envflags::env_flag!("EC_AV1_COMP_VARTX")
+}
 
 /// How many 32x32-and-below inter blocks each reference frame won, indexed by
 /// `ref_frame` (`crate::mvstack::LAST_FRAME` = 1 .. `ALTREF_FRAME` = 7), the
@@ -2855,7 +2874,7 @@ pub(crate) fn take_ref_frame_hits() -> [usize; 8] {
 
 /// Reads [`INTER_TX_SPLIT_HITS`] and zeroes it.
 #[cfg(test)]
-pub(crate) fn take_inter_tx_split_hits() -> [usize; 2] {
+pub(crate) fn take_inter_tx_split_hits() -> [usize; 8] {
     std::array::from_fn(|d| INTER_TX_SPLIT_HITS[d].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -2905,12 +2924,19 @@ fn commit_inter_luma(
     reference: (&[u16], usize, usize, usize),
     search: &Search,
     flat: &Trial,
-    skip: bool, fctx: &crate::decode::FrameCtx,
+    skip: bool,
+    // A COMPOUND winner's second half: the vector and reference planes the
+    // trial units are blended from ([`mc_trial_compound`], the decoder's own
+    // `comp_group_idx == 0` average). `None` is the single-reference block.
+    second: Option<((i32, i32), (&[u16], usize, usize, usize))>,
+    fctx: &crate::decode::FrameCtx,
 ) -> (Vec<i32>, u8, f64) {
     let eligible = tx_select()
         && tx_select_inter()
         && !skip
         && side >= 16
+        && (second.is_none() || compound_var_tx())
+        && (side < BLOCK || tx32_depth_search())
         && x + side <= luma.true_width
         && y + side <= luma.true_height;
     if !eligible {
@@ -2929,10 +2955,16 @@ fn commit_inter_luma(
     for tu_row in 0..2 {
         for tu_col in 0..2 {
             let (tu_x, tu_y) = (x + tu_col * tx, y + tu_row * tx);
-            let trial = mc_trial(
-                luma, tu_x, tu_y, tx, mv, true, reference.0, reference.1, reference.2,
-                reference.3, false, search.base_q_idx, search.deadzone, set, fctx,
-            );
+            let trial = match second {
+                Some((mv1, ref1)) => mc_trial_compound(
+                    luma, tu_x, tu_y, tx, (mv, mv1), true, reference, ref1,
+                    search.base_q_idx, search.deadzone, set, fctx,
+                ),
+                None => mc_trial(
+                    luma, tu_x, tu_y, tx, mv, true, reference.0, reference.1, reference.2,
+                    reference.3, false, search.base_q_idx, search.deadzone, set, fctx,
+                ),
+            };
             sse += trial.sse;
             bits += trial.bits;
             for row in 0..tx {
@@ -2945,14 +2977,15 @@ fn commit_inter_luma(
     luma.ctx.tu_split = false;
     let split_cost = sse + search.lambda * (bits + txfm_split_bits(side, 1));
     let flat_cost = flat.sse + search.lambda * (flat.bits + txfm_split_bits(side, 0));
+    let class = usize::from(side == BLOCK) * 4 + usize::from(second.is_some()) * 2;
     if split_cost < flat_cost {
         for (tu_x, tu_y, trial) in &units {
             luma.commit(*tu_x, *tu_y, tx, trial);
         }
-        INTER_TX_SPLIT_HITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        INTER_TX_SPLIT_HITS[class + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return (levels, 1, split_cost - flat_cost);
     }
-    INTER_TX_SPLIT_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    INTER_TX_SPLIT_HITS[class].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     luma.commit(x, y, side, flat);
     (flat.levels.clone(), 0, 0.0)
 }
@@ -4600,14 +4633,30 @@ fn code_square_inter(
             // An OBMC winner commits the flat trial too: `commit_inter_luma`
             // re-predicts each var-tx unit by plain translation, which is not
             // the prediction this candidate was priced from.
-            let (levels, tx_depth, dcost) = if info.ref1.is_some() || motion_won != 0 {
+            // lane-av1txdepth REBUILT the compound trial set at LAMBDA_SCALE
+            // 0.05 (both rejections above were measured at 0.1, the weight
+            // the lambda lane showed was 2x too heavy): a compound winner is
+            // offered the same var-tx split, its units predicted from BOTH
+            // references. Behind `EC_AV1_COMP_VARTX` until the native table
+            // says keep.
+            let second = info.ref1.filter(|_| motion_won == 0).and_then(|r| {
+                refs[r as usize].map(|g| {
+                    (
+                        info.mv1,
+                        (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                    )
+                })
+            });
+            let (levels, tx_depth, dcost) = if motion_won != 0
+                || (info.ref1.is_some() && second.is_none())
+            {
                 luma.commit(x, y, side, &luma_new);
                 (luma_new.levels.clone(), 0, 0.0)
             } else {
                 commit_inter_luma(
                     luma, (x, y), side, info.mv,
                     (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
-                    search, &luma_new, skip_new, fctx,
+                    search, &luma_new, skip_new, second, fctx,
                 )
             };
             chroma[0].commit(x / 2, y / 2, side / 2, &u_new);
@@ -4642,7 +4691,7 @@ fn code_square_inter(
     }
     if inter_cost < intra_cost {
         let (levels, tx_depth, dcost) = commit_inter_luma(
-            luma, (x, y), side, mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_trial, skip, fctx,
+            luma, (x, y), side, mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_trial, skip, None, fctx,
         );
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
         chroma[1].commit(x / 2, y / 2, side / 2, &v);
@@ -7165,12 +7214,46 @@ fn search_inter_block(
     // the film's inter blocks and 17.6% of the screen's. The same shape as
     // the compound trial set below: a local RD win that does not convert into
     // ladder bytes. The flat 32x32 transform stays.
-    luma.commit(x, y, BLOCK, &best.luma);
+    // lane-av1txdepth REBUILT that search at LAMBDA_SCALE 0.05 (the rejection
+    // above was measured at 0.1), behind `EC_AV1_TX32_DEPTH`, and gave the
+    // compound winner the same offer behind `EC_AV1_COMP_VARTX`. An OBMC/warp
+    // winner still commits flat: `commit_inter_luma` re-predicts each unit by
+    // plain translation, which is not the prediction it was priced from.
+    let (levels, tx_depth, dcost) = match best.inter.filter(|_| motion_won == 0) {
+        Some(info) => {
+            let own = match extra.iter().find(|(r, _, _)| *r == info.ref_frame) {
+                Some(&(_, g, _)) => (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                None => (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3),
+            };
+            let second = info.ref1.and_then(|r| {
+                compound.iter().find(|(c, _, _)| *c == r).map(|&(_, g, _)| {
+                    (
+                        info.mv1,
+                        (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                    )
+                })
+            });
+            match info.ref1.is_some() && second.is_none() {
+                true => {
+                    luma.commit(x, y, BLOCK, &best.luma);
+                    (best.luma.levels.clone(), 0, 0.0)
+                }
+                false => commit_inter_luma(
+                    luma, (x, y), BLOCK, info.mv, own, search, &best.luma, best.skip, second,
+                    fctx,
+                ),
+            }
+        }
+        None => {
+            luma.commit(x, y, BLOCK, &best.luma);
+            (best.luma.levels.clone(), 0, 0.0)
+        }
+    };
     chroma[0].commit(x / 2, y / 2, BLOCK / 2, &best.u);
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
     (
         BlockCoeffs {
-            luma: coeffs(&best.luma.levels, BLOCK),
+            luma: coeffs(&levels, BLOCK),
             u: coeffs(&best.u.levels, BLOCK / 2),
             v: coeffs(&best.v.levels, BLOCK / 2),
             mode: best.mode,
@@ -7182,9 +7265,9 @@ fn search_inter_block(
             dv: None,
             palette: None,
             palette_uv: None,
-            tx_depth: 0,
+            tx_depth,
         },
-        best.cost,
+        best.cost + dcost,
     )
 }
 
@@ -10359,7 +10442,13 @@ mod tests {
             (0..5).map(|i| panned_test_card(width, height, i * 3)).collect();
         let _ = take_inter_tx_split_hits();
         let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
-        let split = take_inter_tx_split_hits();
+        let raw = take_inter_tx_split_hits();
+        // Summed over the four block classes the census keys on (leaf/32x32 x
+        // single/compound): this assert is about the split firing at all.
+        let split = [
+            raw.iter().step_by(2).sum::<usize>(),
+            raw.iter().skip(1).step_by(2).sum::<usize>(),
+        ];
         eprintln!("inter var-tx: {} blocks flat, {} split", split[0], split[1]);
         // [[gate-blind-to-feature]]: with inter `TxMode::Select` on, this
         // content splits -- a green round trip in which the split never fires
@@ -11991,23 +12080,7 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            // And which var-tx depth this clip's INTER blocks resolved to
-            // (lane-av1tx2): 0 is one transform over the whole block, 1 its
-            // four halves.
-            let splits = take_inter_tx_split_hits();
-            let split_total: usize = splits.iter().sum();
-            eprintln!(
-                "{name}: inter var-tx depths {}",
-                splits
-                    .iter()
-                    .enumerate()
-                    .map(|(d, &n)| format!(
-                        "{d}={n} ({:.1}%)",
-                        100.0 * n as f64 / split_total.max(1) as f64
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
+            print_inter_tx_census(name);
             // lane-av1obmc: how many blocks actually CODED a motion_mode
             // symbol and which value they took, by footprint -- "OBMC is on"
             // as a measurement rather than a claim (class
@@ -12053,6 +12126,31 @@ mod tests {
             );
         }
     }
+    /// Which var-tx depth this clip's INTER blocks resolved to (lane-av1tx2,
+    /// split by block class in lane-av1txdepth): depth 0 is one transform over
+    /// the whole block, 1 its four halves; the classes are the 16x16/8x8
+    /// leaves and the 32x32 root, each single-reference or compound. A class
+    /// with no counts at all never reached `commit_inter_luma` -- which is
+    /// what its knob being off looks like (class `gate-blind-to-feature`).
+    fn print_inter_tx_census(name: &str) {
+        let splits = take_inter_tx_split_hits();
+        let total: usize = splits.iter().sum();
+        let row = |label: &str, base: usize| {
+            let (n0, n1) = (splits[base], splits[base + 1]);
+            format!(
+                "{label} 0={n0} 1={n1} ({:.1}% split)",
+                100.0 * n1 as f64 / (n0 + n1).max(1) as f64
+            )
+        };
+        eprintln!(
+            "{name}: inter var-tx depths of {total} blocks -- {} | {} | {} | {}",
+            row("leaf single", 0),
+            row("leaf compound", 2),
+            row("32x32 single", 4),
+            row("32x32 compound", 6),
+        );
+    }
+
     /// The video stream's coded size, from ffprobe.
     fn probe_dims(clip: &str) -> Option<(usize, usize)> {
         let out = Command::new("ffprobe")
@@ -12244,6 +12342,7 @@ mod tests {
                 100.0 * (mm[2] + mm[5] + mm[8]) as f64 / mm.iter().sum::<usize>().max(1) as f64,
                 mm.iter().sum::<usize>(),
             );
+            print_inter_tx_census(name);
             let palette = crate::tile::take_palette_hits();
             let palette_uv = crate::tile::take_palette_uv_hits();
             let ibc = crate::tile::take_intrabc_hits();
