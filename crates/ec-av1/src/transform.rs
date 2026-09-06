@@ -1442,6 +1442,34 @@ fn axis_basis(n: usize, kind: TxType1d) -> &'static [f64] {
     cache[k][idx].get_or_init(|| build_axis_basis(n, kind))
 }
 
+/// [`axis_basis`] transposed: `[i * n + u]` is basis function `u`'s sample
+/// `i`. Both of [`forward_transform_2d_typed`]'s passes sum over the sample
+/// index and are independent across the basis index, so this layout makes the
+/// basis index the contiguous one and the two matmuls vectorize -- without
+/// touching either sum's order, which is what keeps the levels bit-identical
+/// to the strided `.map().sum()` this replaced.
+fn axis_basis_t(n: usize, kind: TxType1d) -> &'static [f64] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<[[OnceLock<Vec<f64>>; 5]; 3]> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
+    let k = match kind {
+        TxType1d::Dct => 0,
+        TxType1d::Adst => 1,
+        TxType1d::Identity => 2,
+    };
+    let idx = (n.trailing_zeros() as usize).saturating_sub(2);
+    cache[k][idx].get_or_init(|| {
+        let basis = axis_basis(n, kind);
+        let mut t = vec![0.0f64; n * n];
+        for u in 0..n {
+            for i in 0..n {
+                t[i * n + u] = basis[u * n + i];
+            }
+        }
+        t
+    })
+}
+
 /// [`forward_transform_2d`] for a block whose transform type is not
 /// `DCT_DCT` -- what an intra chroma block coded in a non-`DC_PRED` mode
 /// gets, since chroma never codes a `tx_type` symbol and the decoder derives
@@ -1461,8 +1489,14 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
         "a flipped ADST needs its residual mirrored before this basis applies"
     );
     let (row_kind, col_kind) = tx_type.axes();
-    let (hb, vb) = (axis_basis(side, row_kind), axis_basis(side, col_kind));
+    let (hb, vb) = (axis_basis_t(side, row_kind), axis_basis_t(side, col_kind));
     let mut rows = vec![0.0f64; side * side];
+    // Which rows of `rows` the pass below actually fills; the column pass
+    // walks only those. A row of `+0.0` contributes `0.0 * b` terms, which
+    // are `+-0.0`, and adding either to a running sum that is never `-0.0`
+    // (it starts at `+0.0` and `x + -x` is `+0.0`) leaves it unchanged.
+    let mut filled: [usize; 64] = [0; 64];
+    let mut nfilled = 0usize;
     // Zero in, zero out, and `rows` is already zero here -- the skip
     // [`forward_rows`] takes for the same reason, which this path was
     // missing: a census of the BD gate's own ladder (lane-av1fwd) found 68%
@@ -1476,12 +1510,16 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
             continue;
         }
         any = true;
-        for v in 0..side {
-            rows[i * side + v] = source
-                .iter()
-                .zip(&hb[v * side..][..side])
-                .map(|(&r, &b)| f64::from(r) * b)
-                .sum();
+        filled[nfilled] = i;
+        nfilled += 1;
+        let out = &mut rows[i * side..][..side];
+        // `k` ascending is the term order the strided `.map().sum()` had, so
+        // every lane's partial sums are the same values in the same order.
+        for (k, &r) in source.iter().enumerate() {
+            let r = f64::from(r);
+            for (o, &b) in out.iter_mut().zip(&hb[k * side..][..side]) {
+                *o += r * b;
+            }
         }
     }
     if !any {
@@ -1489,10 +1527,15 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
     }
     let mut out = vec![0.0f64; side * side];
     for u in 0..side {
-        let column = &vb[u * side..][..side];
-        for v in 0..side {
-            let sum: f64 = (0..side).map(|i| rows[i * side + v] * column[i]).sum();
-            out[u * side + v] = INVERSE_GAIN_RECIPROCAL * sum;
+        let acc = &mut out[u * side..][..side];
+        for &i in &filled[..nfilled] {
+            let c = vb[i * side + u];
+            for (a, &r) in acc.iter_mut().zip(&rows[i * side..][..side]) {
+                *a += r * c;
+            }
+        }
+        for a in acc.iter_mut() {
+            *a *= INVERSE_GAIN_RECIPROCAL;
         }
     }
     out
@@ -2613,6 +2656,90 @@ mod tests {
     /// full-range noise. A single differing lane at any size would be a
     /// silent pixel drift on whatever stream first reaches it.
     #[cfg(target_arch = "x86_64")]
+    /// [`forward_transform_2d_typed`]'s contiguous-basis passes are the
+    /// strided `.map().sum()` they replaced, bit for bit.
+    ///
+    /// The reordering is safe only because each output's terms stay in the
+    /// same order -- only the loop that iterates the *outputs* moved -- so
+    /// this compares raw bit patterns, not an epsilon: any reassociation
+    /// would show up here as a last-place difference at some size.
+    #[test]
+    fn the_typed_forward_transform_is_bit_identical_to_the_strided_form() {
+        fn strided(residual: &[i32], side: usize, tx_type: TxType) -> Vec<f64> {
+            let (row_kind, col_kind) = tx_type.axes();
+            let (hb, vb) = (axis_basis(side, row_kind), axis_basis(side, col_kind));
+            let mut rows = vec![0.0f64; side * side];
+            for i in 0..side {
+                let source = &residual[i * side..][..side];
+                if source.iter().all(|&r| r == 0) {
+                    continue;
+                }
+                for v in 0..side {
+                    rows[i * side + v] = source
+                        .iter()
+                        .zip(&hb[v * side..][..side])
+                        .map(|(&r, &b)| f64::from(r) * b)
+                        .sum();
+                }
+            }
+            let mut out = vec![0.0f64; side * side];
+            for u in 0..side {
+                let column = &vb[u * side..][..side];
+                for v in 0..side {
+                    let sum: f64 = (0..side).map(|i| rows[i * side + v] * column[i]).sum();
+                    out[u * side + v] = INVERSE_GAIN_RECIPROCAL * sum;
+                }
+            }
+            out
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let types = [
+            TxType::Idtx,
+            TxType::AdstAdst,
+            TxType::AdstDct,
+            TxType::DctAdst,
+            TxType::VDct,
+            TxType::HDct,
+        ];
+        for side in [4usize, 8, 16, 32] {
+            for tx_type in types {
+                // ADST is undefined above 16 (the spec's 32+ sets are
+                // DCT/identity only), so those pairs never reach this path.
+                let adst = matches!(tx_type.axes(), (TxType1d::Adst, _) | (_, TxType1d::Adst));
+                if side > 16 && adst {
+                    continue;
+                }
+                for round in 0..8 {
+                    // Round 0 is an all-zero residual and round 1 has whole
+                    // zero rows, so both skips are exercised at every size.
+                    let residual: Vec<i32> = (0..side * side)
+                        .map(|i| match round {
+                            0 => 0,
+                            1 if (i / side) % 2 == 0 => 0,
+                            _ => (next() % 511) as i32 - 255,
+                        })
+                        .collect();
+                    let ours = forward_transform_2d_typed(&residual, side, tx_type);
+                    let theirs = strided(&residual, side, tx_type);
+                    for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{tx_type:?} {side}x{side} round {round} coefficient {i}: \
+                             {a} vs {b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_avx2_dct_matches_the_scalar_one_over_the_full_range() {
         if !std::arch::is_x86_feature_detected!("avx2") {

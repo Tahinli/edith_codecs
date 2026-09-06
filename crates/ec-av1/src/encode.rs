@@ -588,20 +588,37 @@ fn intra_predict_u8(
     smooth_neighbor: bool,
     dst: &mut [u8], fctx: &crate::decode::FrameCtx,
 ) {
-    let above16: Option<Vec<u16>> = above.map(|s| s.iter().map(|&v| u16::from(v)).collect());
-    let left16: Option<Vec<u16>> = left.map(|s| s.iter().map(|&v| u16::from(v)).collect());
-    let mut dst16 = vec![0u16; dst.len()];
+    // Three heap allocations per call became three stack buffers: this runs
+    // once per mode per trial, and an edge is at most `bw + bh` samples while
+    // a block is at most `BLOCK * BLOCK`. Same samples either way.
+    let mut above_buf = [0u16; 2 * BLOCK];
+    let mut left_buf = [0u16; 2 * BLOCK];
+    let mut dst_buf = [0u16; BLOCK * BLOCK];
+    let widen = |src: &[u8], buf: &mut [u16; 2 * BLOCK]| {
+        for (d, &v) in buf[..src.len()].iter_mut().zip(src) {
+            *d = u16::from(v);
+        }
+    };
+    if let Some(s) = above {
+        widen(s, &mut above_buf);
+    }
+    if let Some(s) = left {
+        widen(s, &mut left_buf);
+    }
+    let above16 = above.map(|s| &above_buf[..s.len()]);
+    let left16 = left.map(|s| &left_buf[..s.len()]);
+    let dst16 = &mut dst_buf[..dst.len()];
     crate::intra::predict(
         mode,
         angle_delta,
-        above16.as_deref(),
-        left16.as_deref(),
+        above16,
+        left16,
         corner.map(u16::from),
         bw,
         bh,
         enable_edge_filter,
         smooth_neighbor,
-        &mut dst16, fctx,
+        dst16, fctx,
     );
     for (d, &s) in dst.iter_mut().zip(dst16.iter()) {
         *d = s as u8;
@@ -1280,6 +1297,40 @@ impl Plane<'_> {
     /// spec 9.3, [`crate::decode::default_intra_tx_type`]). Luma keeps
     /// `DCT_DCT`, which is the one type this writer's `tx_type` symbol names.
     #[allow(clippy::too_many_arguments)]
+    /// Sum of absolute differences between the source block at `(x, y)` and a
+    /// `side x side` prediction, as the whole number it is.
+    ///
+    /// Bit-identical to the `f64` accumulation it replaces: every partial sum
+    /// is an integer below `255 * 64 * 64` (under 2^21), which `f64` holds
+    /// exactly, so no add here rounds and the order of the adds cannot change
+    /// the result. Dropping the per-pixel `i / side` and `i % side` -- an
+    /// integer division per sample -- is what lets the row walk vectorize.
+    fn block_sad(&self, x: usize, y: usize, side: usize, prediction: &[u8]) -> f64 {
+        let mut sad = 0u32;
+        for row in 0..side {
+            let source = &self.source[(y + row) * self.width + x..][..side];
+            for (&s, &p) in source.iter().zip(&prediction[row * side..][..side]) {
+                sad += u32::from(s.abs_diff(p));
+            }
+        }
+        f64::from(sad)
+    }
+
+    /// Squared error between the source block at `(x, y)` and a reconstruction
+    /// of it. Exact for the same reason [`Self::block_sad`] is: the largest
+    /// total is `255^2 * 64 * 64`, under 2^28.
+    fn block_sse(&self, x: usize, y: usize, side: usize, reconstruction: &[u8]) -> f64 {
+        let mut sse = 0u64;
+        for row in 0..side {
+            let source = &self.source[(y + row) * self.width + x..][..side];
+            for (&s, &r) in source.iter().zip(&reconstruction[row * side..][..side]) {
+                let d = u32::from(s.abs_diff(r));
+                sse += u64::from(d * d);
+            }
+        }
+        sse as f64
+    }
+
     fn trial_typed(
         &self,
         at: At,
@@ -1329,19 +1380,12 @@ impl Plane<'_> {
         #[cfg(test)]
         stage_add(2, t.elapsed());
 
-        let mut reconstruction = vec![0u8; side * side];
-        let mut sse = 0.0;
-        for row in 0..side {
-            for col in 0..side {
-                let i = row * side + col;
-                let sample = (i32::from(prediction[i]) + coded[i]).clamp(0, 255) as u8;
-                reconstruction[i] = sample;
-                let error = f64::from(
-                    i32::from(self.source[(y + row) * self.width + x + col]) - i32::from(sample),
-                );
-                sse += error * error;
-            }
-        }
+        let reconstruction: Vec<u8> = prediction
+            .iter()
+            .zip(&coded)
+            .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
+            .collect();
+        let sse = self.block_sse(x, y, side, &reconstruction);
         // What the levels cost is priced through the same CDFs the tile writer
         // will code them with, so the search ranks modes -- and the partition
         // trial ranks trees -- by the bits they actually spend.
@@ -1389,16 +1433,7 @@ impl Plane<'_> {
         set: TxbSet,
     ) -> Trial {
         if skip {
-            let mut sse = 0.0;
-            for row in 0..side {
-                for col in 0..side {
-                    let error = f64::from(
-                        i32::from(self.source[(y + row) * self.width + x + col])
-                            - i32::from(prediction[row * side + col]),
-                    );
-                    sse += error * error;
-                }
-            }
+            let sse = self.block_sse(x, y, side, prediction);
             return Trial {
                 levels: vec![0i32; side * side],
                 reconstruction: prediction.to_vec(),
@@ -1421,19 +1456,12 @@ impl Plane<'_> {
         let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
         #[cfg(test)]
         stage_add(2, t.elapsed());
-        let mut reconstruction = vec![0u8; side * side];
-        let mut sse = 0.0;
-        for row in 0..side {
-            for col in 0..side {
-                let i = row * side + col;
-                let sample = (i32::from(prediction[i]) + coded[i]).clamp(0, 255) as u8;
-                reconstruction[i] = sample;
-                let error = f64::from(
-                    i32::from(self.source[(y + row) * self.width + x + col]) - i32::from(sample),
-                );
-                sse += error * error;
-            }
-        }
+        let reconstruction: Vec<u8> = prediction
+            .iter()
+            .zip(&coded)
+            .map(|(&p, &c)| (i32::from(p) + c).clamp(0, 255) as u8)
+            .collect();
+        let sse = self.block_sse(x, y, side, &reconstruction);
         #[cfg(test)]
         let t = std::time::Instant::now();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
@@ -1518,17 +1546,13 @@ impl Plane<'_> {
     /// `source`), since [`Self::source`] itself is the whole plane, strided
     /// by [`Self::width`].
     fn source_block(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
-        (y..y + side)
-            .flat_map(|row| self.source[row * self.width + x..][..side].to_vec())
-            .collect()
+        rows_of(self.source, self.width, x, y, side)
     }
 
     /// The reconstructed samples of one square, so that a partition trial can
     /// be undone.
     fn snapshot(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
-        (y..y + side)
-            .flat_map(|row| self.reconstruction[row * self.width + x..][..side].to_vec())
-            .collect()
+        rows_of(&self.reconstruction, self.width, x, y, side)
     }
 
     /// Puts a snapshot back.
@@ -1570,16 +1594,7 @@ impl Plane<'_> {
                     false,
                     &mut prediction, fctx,
                 );
-                let sad: f64 = (0..side * side)
-                    .map(|i| {
-                        let (row, col) = (i / side, i % side);
-                        f64::from(
-                            (i32::from(self.source[(y + row) * self.width + x + col])
-                                - i32::from(prediction[i]))
-                            .abs(),
-                        )
-                    })
-                    .sum();
+                let sad = self.block_sad(x, y, side, &prediction);
                 (sad + lambda * mode_bits[usize::from(mode)], mode)
             })
             .collect()
@@ -1627,17 +1642,8 @@ impl Plane<'_> {
                     false,
                     &mut prediction, fctx,
                 );
-                let sad: f64 = if want_sad {
-                    (0..side * side)
-                        .map(|i| {
-                            let (row, col) = (i / side, i % side);
-                            f64::from(
-                                (i32::from(self.source[(y + row) * self.width + x + col])
-                                    - i32::from(prediction[i]))
-                                .abs(),
-                            )
-                        })
-                        .sum()
+                let sad = if want_sad {
+                    self.block_sad(x, y, side, &prediction)
                 } else {
                     0.0
                 };
@@ -3941,6 +3947,19 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
 
 /// The reconstructed samples one 32x32 square covers in all three planes, so
 /// that a partition trial can be undone.
+/// One square of a plane, row-major, the inverse of [`Plane::restore`].
+///
+/// Same bytes as the `flat_map(|row| ..to_vec()).collect()` this replaces,
+/// which allocated and freed a `Vec` per row of every block it copied --
+/// `Plane::snapshot` runs once per partition trial.
+fn rows_of(plane: &[u8], width: usize, x: usize, y: usize, side: usize) -> Vec<u8> {
+    let mut out = vec![0u8; side * side];
+    for row in 0..side {
+        out[row * side..][..side].copy_from_slice(&plane[(y + row) * width + x..][..side]);
+    }
+    out
+}
+
 fn snapshot(
     luma: &Plane,
     chroma: &[Plane; 2],
@@ -9851,10 +9870,25 @@ mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Picture> {
+        clip_frames_vf(clip, skip, &format!("scale={width}:{height}"), width, height, frames)
+    }
+
+    /// [`clip_frames`] with the filter chain spelled out, so a caller can ask
+    /// for a native-resolution CROP instead of a downscale (the downscale is
+    /// what destroys a screen capture's exact repeats -- class
+    /// `gate-recipe-confound`). `width`/`height` must be what `vf` produces.
+    fn clip_frames_vf(
+        clip: &str,
+        skip: &str,
+        vf: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Picture> {
         let out = Command::new("ffmpeg")
             .args(["-v", "error", "-ss", skip, "-i", clip])
             .args(["-frames:v", &frames.to_string()])
-            .args(["-vf", &format!("scale={width}:{height}")])
+            .args(["-vf", vf])
             .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
             .output()
             .expect("ffmpeg failed to run");
@@ -10851,6 +10885,173 @@ mod tests {
                     .map(|(p, b)| format!("{p:.2} dB/{:.0} B", 10f64.powf(*b)))
                     .collect::<Vec<_>>()
                     .join(", "),
+            );
+        }
+    }
+    /// The video stream's coded size, from ffprobe.
+    fn probe_dims(clip: &str) -> Option<(usize, usize)> {
+        let out = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=width,height", "-of", "csv=p=0"])
+            .arg(clip)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut f = text.trim().split(',');
+        Some((f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?))
+    }
+
+    /// The NATIVE-resolution screen arm of the BD gate. The default gate
+    /// downscales the OBS capture to 640x384, which destroys exactly the
+    /// pixel-identical 16x16 repeats intrabc and (part of) the palette exist
+    /// for (class `gate-recipe-confound`), so every screen-tool decision taken
+    /// on that recipe is taken on content the tool cannot serve. This arm
+    /// crops -- never scales -- a superblock-aligned window out of the middle
+    /// of the capture at its own resolution (at most 1920x1024, so the wall
+    /// stays in the minutes) and runs the same 12-frame, four-quantizer
+    /// ladder against libaom `cpu-used 6` and rav1e `speed=6`, one tile, one
+    /// thread, with the same three-way (encoder / ffmpeg / our decoder)
+    /// sample-exactness assertion `our_ladder` makes.
+    ///
+    /// It is its own `--ignored` test so the default gate's wall does not
+    /// grow. Every variant is an environment knob, and each of those is a
+    /// `OnceLock` read once per process, so a variant is a separate run:
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         bd_rate_screen_native --nocapture           # baseline
+    ///     EC_AV1_INTRABC=1 ... same command                # intra block copy
+    ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
+    ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
+    ///     EC_AV1_NATIVE_FILM=1 ... same command            # + a film crop row
+    #[test]
+    #[ignore = "the native-resolution screen BD arm: minutes per row, needs ffmpeg"]
+    fn bd_rate_screen_native() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP bd_rate_screen_native: no ffmpeg");
+            return;
+        }
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let mut clips: Vec<(String, String)> = Vec::new();
+        match std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) {
+            Ok(manifest) => match manifest
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split('\t').next())
+                .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+            {
+                Some(p) => clips.push((
+                    format!("screen capture ({})", p.rsplit('/').next().unwrap_or(p)),
+                    p.to_string(),
+                )),
+                None => eprintln!("SKIP screen capture: no OBS recording in the manifest exists"),
+            },
+            Err(e) => eprintln!("SKIP bd_rate_screen_native: no real-library manifest ({e})"),
+        }
+        // The film crop is an extra row, not a default-moving measurement.
+        if std::env::var("EC_AV1_NATIVE_FILM").ok().as_deref() == Some("1") {
+            let path = fixtures.join("video").join("h264-1080p-23.976-8bit.mp4");
+            if path.exists() {
+                clips.push((
+                    "film 1080p (native crop)".to_string(),
+                    path.to_str().unwrap().to_string(),
+                ));
+            }
+        }
+        if clips.is_empty() {
+            eprintln!("SKIP bd_rate_screen_native: no clip");
+            return;
+        }
+
+        let frames = 12usize;
+        let aom_points: Vec<Vec<String>> = [5, 20, 35, 45]
+            .iter()
+            .map(|q| {
+                ["-cpu-used", "6", "-b:v", "0", "-crf", &q.to_string()]
+                    .map(String::from)
+                    .to_vec()
+            })
+            .collect();
+        let rav1e_points: Vec<Vec<String>> = [50, 100, 150, 200]
+            .iter()
+            .map(|q| {
+                vec![
+                    "-rav1e-params".to_string(),
+                    format!("speed=6:quantizer={q}:tile_cols=1:tile_rows=1:threads=1"),
+                ]
+            })
+            .collect();
+        println!(
+            "\nnative crop, {frames} frames, gop={frames}; tiles {:?}, tile threads {}, \
+             intrabc {}, palette maxcolors {}",
+            armed_tiles(),
+            crate::par::tile_threads(),
+            intrabc_enabled(),
+            palette_max_colors(),
+        );
+        println!("| clip | size | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e |");
+        println!("|---|---|---|---|---|---|");
+        for (name, path) in &clips {
+            let fctx = &crate::decode::FrameCtx::new();
+            let Some((nw, nh)) = probe_dims(path) else {
+                eprintln!("SKIP {name}: ffprobe gave no size");
+                continue;
+            };
+            // A whole number of 128-wide superblocks, at most 1920x1024, out
+            // of the middle of the frame; the offsets stay even for 4:2:0.
+            let cw = nw.min(1920) / 128 * 128;
+            let ch = nh.min(1024) / 128 * 128;
+            assert!(cw >= 128 && ch >= 128, "{name}: {nw}x{nh} is smaller than a superblock");
+            let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
+            let source = clip_frames_vf(
+                path,
+                "0",
+                &format!("crop={cw}:{ch}:{x}:{y}"),
+                cw,
+                ch,
+                frames,
+            );
+            SCREEN_FRAMES.iter().for_each(|c| {
+                c.store(0, std::sync::atomic::Ordering::Relaxed);
+            });
+            let _ = crate::tile::take_palette_hits();
+            let _ = crate::tile::take_palette_uv_hits();
+            let _ = crate::tile::take_intrabc_hits();
+            let _ = take_intrabc_search();
+            let (ours, ours_wall) = our_ladder(name, &source, cw, ch, fctx);
+            // gate-blind-to-feature: what the screen tools actually did at
+            // native resolution, over this clip's four encodes.
+            let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
+            let screen_off = SCREEN_FRAMES[0].load(std::sync::atomic::Ordering::Relaxed);
+            let palette = crate::tile::take_palette_hits();
+            let palette_uv = crate::tile::take_palette_uv_hits();
+            let ibc = crate::tile::take_intrabc_hits();
+            let search = take_intrabc_search();
+            eprintln!(
+                "{name}: screen frames on={screen_on} off={screen_off} ({:.1}% on); \
+                 palette blocks luma {} chroma {}; intrabc blocks {} (searched {} / valid {} / \
+                 won {})",
+                100.0 * screen_on as f64 / (screen_on + screen_off).max(1) as f64,
+                palette[0],
+                palette_uv[0],
+                ibc[0],
+                search[0],
+                search[1],
+                search[2],
+            );
+            let (aom, aom_wall) = external_ladder(&source, cw, ch, "libaom-av1", &aom_points);
+            let (rav1e, rav1e_wall) = external_ladder(&source, cw, ch, "librav1e", &rav1e_points);
+            assert_monotone(&format!("{name}: ours"), &ours);
+            assert_monotone(&format!("{name}: libaom"), &aom);
+            assert_monotone(&format!("{name}: rav1e"), &rav1e);
+            let points = ours
+                .iter()
+                .map(|(p, b)| format!("{p:.2} dB/{:.0} B", 10f64.powf(*b)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "| {name} | {cw}x{ch} | {points} | {:+.1}% | {:+.1}% | {ours_wall:.1}s:{aom_wall:.1}s:{rav1e_wall:.1}s |",
+                bd_rate(&aom, &ours) * 100.0,
+                bd_rate(&rav1e, &ours) * 100.0,
             );
         }
     }
