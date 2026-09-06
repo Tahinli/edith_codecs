@@ -2990,7 +2990,23 @@ pub(crate) fn arm_tiles(cols_log2: u32, rows_log2: u32) {
 }
 
 fn armed_tiles() -> (u32, u32) {
-    TILE_LOG2.with(std::cell::Cell::get)
+    let armed = TILE_LOG2.with(std::cell::Cell::get);
+    if armed != (0, 0) {
+        return armed;
+    }
+    // `EC_AV1_TILES=<cols_log2>[:<rows_log2>]` in a TEST build, so the BD gate
+    // (which codes through `encode_sequence`, not the facade) can measure what
+    // a tile grid costs without a knob of its own -- same shape as
+    // `EC_AV1_LR`/`EC_AV1_PYRAMID`.
+    match std::env::var("EC_AV1_TILES").ok() {
+        Some(v) if cfg!(test) => {
+            let mut f = v.split(':');
+            let cols = f.next().and_then(|c| c.parse().ok()).unwrap_or(0);
+            let rows = f.next().and_then(|r| r.parse().ok()).unwrap_or(0);
+            (cols, rows)
+        }
+        _ => armed,
+    }
 }
 
 /// Codes a frame's `tiles` tiles, each entirely on its own (see

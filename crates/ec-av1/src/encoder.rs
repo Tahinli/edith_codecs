@@ -1731,6 +1731,57 @@ mod tests {
         }
     }
 
+    /// What tiles and tile threads are worth at the size the editor exports
+    /// at: 1920x1080, eight real pictures, two passes per cell (ABAB), wall
+    /// per cell. Ignored by default (minutes).
+    #[test]
+    #[ignore = "1080p wall table: minutes, run it with --ignored"]
+    fn tile_wall_table_at_1080p() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (1920usize, 1080usize);
+        let Some(sources) = h264_clip_frames(width, height, 8) else {
+            eprintln!("SKIP tile_wall_table_at_1080p: no fixture");
+            return;
+        };
+        let layouts = [(0u32, 0u32), (1, 0), (1, 1), (2, 1)];
+        let threadings = [1usize, 2, 4, 8];
+        let mut table: Vec<(String, usize, f64, usize)> = Vec::new();
+        for pass in 0..2 {
+            for &(cols_log2, rows_log2) in &layouts {
+                for &threads in &threadings {
+                    crate::par::set_tile_threads(threads);
+                    let config = EncoderConfig {
+                        width,
+                        height,
+                        base_q_idx: 120,
+                        gop: 8,
+                        colour: Colour::Bt709Limited,
+                        tile_cols_log2: cols_log2,
+                        tile_rows_log2: rows_log2,
+                    };
+                    let mut enc = Av1Encoder::new(config).unwrap();
+                    let start = std::time::Instant::now();
+                    let mut bytes = 0usize;
+                    for picture in &sources {
+                        bytes += enc.encode(picture).unwrap().data.len();
+                    }
+                    let wall = start.elapsed().as_secs_f64();
+                    let name = format!("{}x{}", 1 << cols_log2, 1 << rows_log2);
+                    match table.iter_mut().find(|r| r.0 == name && r.1 == threads) {
+                        Some(row) => row.2 = row.2.min(wall),
+                        None => table.push((name, threads, wall, bytes)),
+                    }
+                    let _ = pass;
+                }
+            }
+        }
+        crate::par::set_tile_threads(1);
+        eprintln!("| tiles | threads | wall (s, best of 2) | bytes |");
+        for (name, threads, wall, bytes) in &table {
+            eprintln!("| {name} | {threads} | {wall:.2} | {bytes} |");
+        }
+    }
+
     /// The tiles of a frame are entropy-independent, so the bytes must not
     /// depend on how many workers wrote them: the same stream at one tile
     /// thread and at four, per layout.
