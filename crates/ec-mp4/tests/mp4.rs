@@ -137,11 +137,19 @@ fn mp4_fixtures() -> Vec<PathBuf> {
 fn derived_fixtures() -> Vec<PathBuf> {
     let h264 = fixtures().join("video/h264-1080p-23.976-8bit.mp4");
     let src = h264.to_string_lossy().into_owned();
+    let aac = fixtures().join("audio/aac-mp4-stereo-48000.mp4");
+    let aac_src = aac.to_string_lossy().into_owned();
     let out = work();
     let mov = out.join("h264.mov");
+    let qt = out.join("aac-quicktime.mov");
     let frag = out.join("h264-fragmented.mp4");
-    let jobs: [(&PathBuf, Vec<&str>); 2] = [
+    let jobs: [(&PathBuf, Vec<&str>); 3] = [
         (&mov, vec!["-i", &src, "-c", "copy", "-f", "mov"]),
+        // The same AAC in a QuickTime-brand file, which states it as a version-1
+        // SoundDescription with its `esds` inside a `wave`: what Resolve, Final
+        // Cut and `ffmpeg -f mov` write, and what an ISO-only reader hears
+        // nothing from.
+        (&qt, vec!["-i", &aac_src, "-c", "copy", "-f", "mov"]),
         (
             &frag,
             vec![
@@ -870,4 +878,139 @@ fn the_real_library_demuxes_to_eof() {
 fn name_of(path: &Path) -> String {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     name.chars().take(56).collect()
+}
+
+/// The extradata ffprobe reads out of a stream, as bytes: its `-show_data`
+/// hexdump, which is the only place it prints the octets themselves.
+fn probe_extradata(path: &Path, stream: &str) -> Vec<u8> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_data",
+            "-select_streams",
+        ])
+        .arg(stream)
+        .arg(path)
+        .output()
+        .expect("ffprobe runs");
+    assert!(out.status.success(), "ffprobe refused {}", path.display());
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut bytes = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line.starts_with("extradata=") {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        // "00000000: 1190 56e5 00    ..V.." — offset, hex groups, then ASCII.
+        let Some((_, rest)) = line.split_once(": ") else {
+            break;
+        };
+        for group in rest.split_whitespace().take(8) {
+            let Ok(pair) = u32::from_str_radix(group, 16) else {
+                break;
+            };
+            match group.len() {
+                4 => bytes.extend_from_slice(&(pair as u16).to_be_bytes()),
+                2 => bytes.push(pair as u8),
+                _ => break,
+            }
+        }
+    }
+    bytes
+}
+
+/// A QuickTime-brand `.mov` keeps its `mp4a` configuration in a `wave` box and
+/// prefixes the entry with a version-1 SoundDescription tail; an ISO-only
+/// reader takes that tail for the first child box, never finds the `esds`, and
+/// hands the decoder no extradata at all — a silent sound track.
+#[test]
+fn quicktime_sound_description_states_its_esds_inside_wave() {
+    let iso = fixtures().join("audio/aac-mp4-stereo-48000.mp4");
+    let qt = work().join("aac-quicktime.mov");
+    derived_fixtures();
+
+    let want = probe_extradata(&qt, "a:0");
+    assert!(!want.is_empty(), "ffprobe reads no extradata from the .mov");
+
+    let demuxer = open(&qt);
+    let audio = demuxer
+        .streams()
+        .iter()
+        .find(|s| matches!(s.params.media, MediaParameters::Audio(_)))
+        .expect("the .mov has a sound track");
+    let MediaParameters::Audio(params) = &audio.params.media else {
+        unreachable!()
+    };
+    assert_eq!(audio.params.codec, CodecId::Aac);
+    assert_eq!(params.sample_rate, 48_000);
+    assert_eq!(params.layout.channel_count(), 2);
+    let got = audio
+        .params
+        .extradata
+        .as_ref()
+        .map(|b| b.as_ref().to_vec())
+        .unwrap_or_default();
+    assert_eq!(got, want, "AudioSpecificConfig differs from ffprobe's");
+
+    // ...and it is the same configuration the ISO-branded copy of the same
+    // stream states, which is the claim "QuickTime is only a different shape".
+    let iso_demuxer = open(&iso);
+    let iso_extra = iso_demuxer.streams()[0]
+        .params
+        .extradata
+        .as_ref()
+        .map(|b| b.as_ref().to_vec())
+        .unwrap_or_default();
+    assert_eq!(got, iso_extra, "QuickTime and ISO read different extradata");
+}
+
+/// The real exports this shape was found in: set `EC_MP4_QT_MOV` to a
+/// colon-separated list of `.mov` files to check this crate against ffprobe on
+/// files that are not in the corpus.
+#[test]
+fn real_quicktime_exports_demux_like_ffprobe_says() {
+    let Ok(list) = std::env::var("EC_MP4_QT_MOV") else {
+        return;
+    };
+    for path in list.split(':').filter(|p| !p.is_empty()).map(Path::new) {
+        assert!(path.exists(), "{}: not there", path.display());
+        let want = probe_extradata(path, "a:0");
+        let demuxer = open(path);
+        let audio = demuxer
+            .streams()
+            .iter()
+            .find(|s| matches!(s.params.media, MediaParameters::Audio(_)))
+            .unwrap_or_else(|| panic!("{}: no sound track", path.display()));
+        let MediaParameters::Audio(params) = &audio.params.media else {
+            unreachable!()
+        };
+        let rate = probe_field(path, "stream=sample_rate")
+            .into_iter()
+            .find(|f| !f.is_empty() && f != "N/A")
+            .and_then(|f| f.trim().parse::<u32>().ok())
+            .expect("ffprobe states a sample rate");
+        assert_eq!(audio.params.codec, CodecId::Aac, "{}", path.display());
+        assert_eq!(params.sample_rate, rate, "{}", path.display());
+        let got = audio
+            .params
+            .extradata
+            .as_ref()
+            .map(|b| b.as_ref().to_vec())
+            .unwrap_or_default();
+        assert_eq!(got, want, "{}: extradata", path.display());
+        println!(
+            "{}: {:?} {} Hz {} ch, extradata {}",
+            path.display(),
+            audio.params.codec,
+            params.sample_rate,
+            params.layout.channel_count(),
+            got.len()
+        );
+    }
 }
