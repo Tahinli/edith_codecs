@@ -35638,16 +35638,10 @@ mod tests {
         RefPix::ready(refs)
     }
 
-    /// [`last_only`] plus `GOLDEN_FRAME` (index 4 of the name-keyed array):
-    /// what a frame this encoder writes needs, since every inter frame's
-    /// `ref_frame_idx[3]` names the slot the key frame left behind and its
-    /// blocks may code `single_ref` out to it.
-    fn last_and_golden<'a>(last: &'a Picture, golden: &'a Picture) -> RefPix<'a> {
-        last_golden_altref(last, golden, None)
-    }
-
-    /// [`last_and_golden`] plus `ALTREF_FRAME` (index 7): the frame two back,
-    /// which the encoder keeps in the slot the current frame refreshes.
+    /// [`last_only`] plus `GOLDEN_FRAME` (index 4 of the name-keyed array)
+    /// and `ALTREF_FRAME` (index 7, the frame two back, which the encoder
+    /// keeps in the slot the current frame refreshes): what a frame this
+    /// encoder writes needs, since its blocks may name any of the three.
     fn last_golden_altref<'a>(
         last: &'a Picture,
         golden: &'a Picture,
