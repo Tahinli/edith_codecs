@@ -2305,6 +2305,27 @@ fn motion_mode_bits(write_w: usize, write_h: usize, motion: u8, warp_alphabet: b
     }
 }
 
+/// MEASURED 2026-09-06 and NOT KEPT ON BY DEFAULT (`EC_AV1_WARP=1` turns the
+/// candidate, the header's `allow_warped_motion` and the sequence's
+/// `enable_warped_motion` on together). BD vs libaom / vs rav1e, the standing
+/// native keep table, against the same build with the knob off:
+///
+/// | clip | warp on | off |
+/// |---|---|---|
+/// | film 1080p | +18.7 / +1.6 | +18.0 / +0.7 |
+/// | film 2160p | +47.3 / +19.2 | +47.3 / +19.2 |
+/// | screen | +59.2 / -9.9 | +59.4 / -10.0 |
+///
+/// One row flat, one 0.2 down against libaom and 0.1 up against rav1e, and
+/// the 1080p film 0.7/0.9 UP -- the keep rule wants two down and one flat, so
+/// it stays off. The 640x384 arm reads +78.7/+36.5, +95.1/+56.4, +54.7/+1.2
+/// against +78.8/+36.1, +95.1/+56.4, +54.5/+1.1. The census says the tool
+/// fires: 7.0% / 2.7% / 2.4% of the blocks that code a motion_mode symbol
+/// take WARPED_CAUSAL at native (197+91+2441 blocks on the 1080p film), so
+/// this is a measured loss, not an inert knob. Same shape as the OBMC
+/// candidate above it (`obmc_min_side`): a local RD win that does not convert
+/// into ladder bytes.
+///
 /// The WARPED_CAUSAL prediction of one square single-reference block: the
 /// decoder's own warp-sample walk (`decode::find_samples` +
 /// `warp::select_samples`), least-squares model (`warp::find_projection`) and
