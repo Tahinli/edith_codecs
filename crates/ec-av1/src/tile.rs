@@ -525,6 +525,19 @@ pub(crate) fn take_compound_pair_hits() -> [usize; 7] {
     std::array::from_fn(|i| COMPOUND_PAIR_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Per-SIZE fire counts of [`write_compound_block`], indexed by
+/// `log2(bw4)` (1 = 8x8, 2 = 16x16, 3 = 32x32 and up): compound started as a
+/// 32x32-only tool, so the share by size is what says whether the leaf
+/// candidates fire at all (gate-blind-to-feature).
+static COMPOUND_SIZE_HITS: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+
+/// Takes and clears the compound size histogram.
+#[cfg(test)]
+pub(crate) fn take_compound_size_hits() -> [usize; 4] {
+    std::array::from_fn(|i| COMPOUND_SIZE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Writes one COMPOUND_REFERENCE block's whole mode chain -- the writer side
 /// of decode.rs' `read_compound_ref_frames` / `read_inter_compound_mode` /
 /// `assign_compound_mv` / `comp_group_idx` / `compound_idx` sequence, in that
@@ -661,6 +674,8 @@ fn write_compound_block(
     let _ = ORDER_HINTS.with(std::cell::Cell::get);
     COMPOUND_MODE_HITS[mode].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     COMPOUND_PAIR_HITS[(ref1.max(1) - 1) as usize % 7]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    COMPOUND_SIZE_HITS[(bw4.max(1).trailing_zeros() as usize).min(3)]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if crate::envflags::env_flag!("EC_COMP_MISMATCH") && (mvs.0 != info.mv || mvs.1 != info.mv1) {
         eprintln!(
