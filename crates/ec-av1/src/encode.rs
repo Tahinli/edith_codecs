@@ -4146,6 +4146,11 @@ fn pick_and_apply_filters(
     // preset search reads comes off the REPLAYED picture, which is the same
     // picture a decode produces -- that is what the replay is pinned on.
     crate::decode::clear_filter_replay();
+    // lane-av1fpar: the per-tile search is over, so every core is idle from
+    // here to the end of the frame -- band each candidate's deblock/CDEF
+    // replay, the capture decode's own filter chain and the loop-restoration
+    // passes across the same workers the search used.
+    let _bands = crate::par::override_filter_threads(crate::par::tile_threads());
     let ft = crate::par::timer(crate::par::S_FILTER);
     let search_result = crate::filter_search::pick_filters(
         |lf, cdef| {
@@ -4153,6 +4158,7 @@ fn pick_and_apply_filters(
                 return Ok(picture);
             }
             crate::decode::arm_filter_replay();
+            let _t = crate::par::timer(crate::par::S_FIRST);
             decode(lf, cdef, &hdr, tiles, &none_lr)
         },
         source,

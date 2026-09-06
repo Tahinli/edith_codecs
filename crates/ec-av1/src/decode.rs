@@ -19729,6 +19729,12 @@ pub(crate) struct FilterReplay {
     /// stash the cropped return path leaves behind.
     true_width: usize,
     true_height: usize,
+    /// lane-av1fpar: plane buffers this replay is done with. Every candidate
+    /// works on its own copy of three ~6 MB planes, and a fresh `Vec` per
+    /// copy is a fresh mmap the kernel faults in page by page -- 12.6% of a
+    /// 1080p frame's wall in allocation, not in filtering. Recycled here
+    /// instead; the pool holds at most the six planes one candidate has live.
+    scratch: Vec<Vec<u16>>,
     /// The last deblocked planes and the levels that produced them.
     /// Deblocking depends on nothing else the search moves, and the search
     /// fixes the levels before it walks the CDEF strengths, so every
@@ -19796,9 +19802,34 @@ fn capture_filter_replay(
             height,
             true_width,
             true_height,
+            scratch: Vec::new(),
             deblocked: None,
         });
     });
+}
+
+/// One candidate's working copy of a captured plane, off [`FilterReplay`]'s
+/// own buffer pool: a cleared `Vec` that already has the capacity keeps the
+/// allocator and the page fault handler out of the filter search.
+fn pooled(p: &PlaneBuf<'_>, scratch: &mut Vec<Vec<u16>>) -> PlaneBuf<'static> {
+    let mut buf = scratch.pop().unwrap_or_default();
+    let src: &[u16] = &p.data;
+    let threads = crate::par::filter_threads();
+    if buf.len() != src.len() || threads <= 1 {
+        buf.clear();
+        buf.extend_from_slice(src);
+    } else {
+        // A recycled buffer is already the right length, so the copy is a
+        // plain `copy_from_slice` -- and one worth banding: ~6 MB per
+        // candidate is memory bandwidth, not arithmetic, and the halves are
+        // disjoint `&mut` slices (no `par::Shared` needed).
+        let per = src.len().div_ceil(threads);
+        let batch = crate::par::Batch::new("ec-av1-filter");
+        for (dst, src) in buf.chunks_mut(per).zip(src.chunks(per)) {
+            batch.submit(move || dst.copy_from_slice(src));
+        }
+    }
+    PlaneBuf { data: std::borrow::Cow::Owned(buf), ..*p }
 }
 
 /// The filter half of a captured decode, under new parameters: exactly the
@@ -19816,16 +19847,23 @@ pub(crate) fn replay_filters(
     }
     REPLAY.with_borrow_mut(|slot| {
         let r = slot.as_mut()?;
-        let copy = |p: &PlaneBuf<'_>| PlaneBuf {
-            data: std::borrow::Cow::Owned(p.data.to_vec()),
-            ..*p
-        };
         let hit = matches!(&r.deblocked, Some((lf, ..)) if lf == loop_filter);
+        let cpt = crate::par::timer(crate::par::S_COPY);
         let (mut y, mut u, mut v) = if hit {
-            let (_, dy, du, dv) = r.deblocked.as_ref().expect("just matched");
-            (copy(dy), copy(du), copy(dv))
+            let (deblocked, scratch) = (&r.deblocked, &mut r.scratch);
+            let (_, dy, du, dv) = deblocked.as_ref().expect("just matched");
+            (pooled(dy, scratch), pooled(du, scratch), pooled(dv, scratch))
         } else {
-            let (mut y, mut u, mut v) = (copy(&r.y), copy(&r.u), copy(&r.v));
+            // The levels moved, so the cached deblocked planes are dead:
+            // their buffers are this candidate's working copies.
+            if let Some((_, dy, du, dv)) = r.deblocked.take() {
+                r.scratch.push(dy.data.into_owned());
+                r.scratch.push(du.data.into_owned());
+                r.scratch.push(dv.data.into_owned());
+            }
+            let (cap_y, cap_u, cap_v, scratch) = (&r.y, &r.u, &r.v, &mut r.scratch);
+            let (mut y, mut u, mut v) =
+                (pooled(cap_y, scratch), pooled(cap_u, scratch), pooled(cap_v, scratch));
             let _t = crate::par::timer(crate::par::S_DEBLOCK);
             apply_deblock(
                 &mut y,
@@ -19837,9 +19875,12 @@ pub(crate) fn replay_filters(
                 r.frame_height,
                 fctx,
             );
-            r.deblocked = Some((*loop_filter, copy(&y), copy(&u), copy(&v)));
+            let scratch = &mut r.scratch;
+            r.deblocked =
+                Some((*loop_filter, pooled(&y, scratch), pooled(&u, scratch), pooled(&v, scratch)));
             (y, u, v)
         };
+        drop(cpt);
         let ct = crate::par::timer(crate::par::S_CDEF);
         apply_cdef(&mut y, &mut u, &mut v, cdef, &r.neighbours, (r.frame_width, r.frame_height), fctx);
         drop(ct);
@@ -19881,13 +19922,20 @@ pub(crate) fn replay_filters(
                 v: crop(&v, tw.div_ceil(2), th.div_ceil(2)),
             });
         });
-        Some(Picture {
+        let out = Picture {
             width: fw,
             height: fh,
-            y: crop_owned(y, fw, fh),
-            u: crop_owned(u, fw.div_ceil(2), fh.div_ceil(2)),
-            v: crop_owned(v, fw.div_ceil(2), fh.div_ceil(2)),
-        })
+            y: crop(&y, fw, fh),
+            u: crop(&u, fw.div_ceil(2), fh.div_ceil(2)),
+            v: crop(&v, fw.div_ceil(2), fh.div_ceil(2)),
+        };
+        // The working planes outlive the crop, so they go back to the pool.
+        for plane in [y, u, v] {
+            if r.scratch.len() < 6 {
+                r.scratch.push(plane.data.into_owned());
+            }
+        }
+        Some(out)
     })
 }
 
