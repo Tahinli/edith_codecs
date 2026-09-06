@@ -165,15 +165,22 @@ fn split_inter_8() -> bool {
 /// NEARESTMV candidate it always had.
 const LEAF_NEW_MV: bool = true;
 
-/// Whether GOLDEN/ALTREF get a `NEWMV` search of their own. Set from the
-/// lane report's measurement.
-const EXTRA_REF_NEW_MV: bool = false;
+/// Whether GOLDEN/ALTREF get a `NEWMV` search of their own. Measured on the
+/// BD gate: with the early-out below at its swept margin, -1.7/-2.5/-0.0
+/// points vs libaom and -1.6/-2.3/-0.0 vs rav1e for 4%/4%/0.3% more motion
+/// searches (the census `bd_rate_vs_libaom_and_rav1e` prints).
+const EXTRA_REF_NEW_MV: bool = true;
 
 /// How much cheaper an extra reference's `NEARESTMV` has to be than LAST's
 /// own best vector before that reference's `NEWMV` search is skipped: a
 /// factor on the search cost scale, `1.0` meaning "as good or better".
-/// Swept on the BD gate (see the lane report) -- `0.0` never skips.
-const EXTRA_NEW_SKIP_MARGIN: f64 = 0.0;
+/// Swept on the BD gate over 0.15/0.25/0.35/0.5/0.8/1.0/1.5 and off (`0.0`,
+/// never skip): the whole BD gain survives down to 0.35 (+124.8/+150.4/+80.9
+/// vs libaom, against +124.9/+150.3/+81.0 with no early-out at all) while the
+/// extra searches drop from +27% to +4% of the base count -- and on screen
+/// capture, where an extra reference's NEWMV wins nothing, it skips 99.7% of
+/// them. Below 0.35 the gain starts eroding (0.15: +125.3/+151.7).
+const EXTRA_NEW_SKIP_MARGIN: f64 = 0.35;
 
 /// [`EXTRA_NEW_SKIP_MARGIN`], swept by `EC_AV1_MV_SKIP_MARGIN`.
 fn extra_new_skip_margin() -> f64 {
@@ -7441,7 +7448,9 @@ mod tests {
     /// hair without failing anything; this pins the streams themselves.
     /// Every number below was measured 2026-09-06 (lane-av1fwd) and is
     /// identical at `a6649c4e`, the merge before that lane's three exact
-    /// speed steps.
+    /// speed steps; the q=150 pin moved with lane-av1mv's extra-reference
+    /// `NEWMV` (a coded-bits change, not a speed step -- the BD gate is what
+    /// judged it).
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -7463,7 +7472,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7416, 0x75632db72a63d5f1), (60, 27927, 0xb63a984f521b7341)];
+            [(150, 7397, 0xca56a6962842df67), (60, 27780, 0x584a5034ed4c3b27)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
