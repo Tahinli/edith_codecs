@@ -524,7 +524,9 @@ pub struct Encoded {
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
-/// tile, one transform size per block, no in-loop filtering, no CDF adaptation
+/// tile, one transform size per block, no in-loop filter parameters yet
+/// (`crate::encode::pick_and_apply_filters` fills the deblocking levels and
+/// CDEF strengths in once the tile is coded), no CDF adaptation
 /// and no tool the tile writer does not code.
 ///
 /// # Errors
@@ -4479,6 +4481,46 @@ mod tests {
     /// A picture with something of everything in it: a gradient, an edge, a
     /// ripple and a block of flat colour, none of them aligned to the block
     /// grid.
+    /// The in-loop filters actually FIRE and the stream still decodes to
+    /// exactly what the encoder kept as its reconstruction
+    /// (gate-blind-to-feature: a filter search that always answered "off"
+    /// would leave every other test just as green, and the BD gate that
+    /// would notice is `#[ignore]`d).
+    ///
+    /// Run:
+    ///     cargo test -p ec-av1 --release --lib -- \
+    ///         encode::tests::the_filter_search_picks_real_filters
+    #[test]
+    fn the_filter_search_picks_real_filters() {
+        let fctx = &crate::decode::FrameCtx::new();
+        let pictures: Vec<_> = (0..3).map(|i| panned_test_card(128, 128, i * 3)).collect();
+        let encoded = encode_sequence_with_ctx(&pictures, 120, 0.5, fctx).unwrap();
+        let fired = encoded
+            .frames
+            .iter()
+            .filter(|f| f.loop_filter.level[0] > 0 || f.cdef.y_pri_strength[0] > 0)
+            .count();
+        assert!(
+            fired > 0,
+            "no frame of this sequence chose any in-loop filtering: {:?}",
+            encoded
+                .frames
+                .iter()
+                .map(|f| (f.loop_filter.level, f.cdef.y_pri_strength[0]))
+                .collect::<Vec<_>>()
+        );
+        // The reconstruction the encoder predicts from is the FILTERED one,
+        // and it is what a decoder of the stream produces -- byte for byte,
+        // frame for frame.
+        let decoded = crate::stream::decode_stream(&encoded.stream).unwrap();
+        assert_eq!(decoded.len(), encoded.frames.len());
+        for (i, (dec, enc)) in decoded.iter().zip(&encoded.frames).enumerate() {
+            assert_eq!(dec.y, enc.reconstruction.y, "frame {i} luma");
+            assert_eq!(dec.u, enc.reconstruction.u, "frame {i} U");
+            assert_eq!(dec.v, enc.reconstruction.v, "frame {i} V");
+        }
+    }
+
     fn test_card(width: usize, height: usize) -> Picture {
         let mut picture = Picture::grey(width, height);
         for y in 0..height {
@@ -6876,15 +6918,30 @@ mod tests {
     /// ours: `base_q_idx {60,90,120,150}`. Every PSNR is all-plane, on
     /// ffmpeg-decoded frames of each encoder's own stream.
     ///
-    /// Measured 2026-09-06 after the inter partition search (lane-av1rd2),
-    /// 12 frames, this box (wall = the four encodes of that ladder
-    /// together):
+    /// Measured 2026-09-06 after the in-loop filters (lane-av1filt: per-frame
+    /// deblocking levels and CDEF strengths, both chosen by re-decoding the
+    /// coded tile -- `crate::filter_search`), 12 frames, this box (wall = the
+    /// four encodes of that ladder together):
     ///
     /// | clip | ours (q 150/120/90/60) | BD-rate vs libaom | vs rav1e | wall ours:aom:rav1e |
     /// |---|---|---|---|---|
-    /// | 1080p fixture | 41.16 dB/22349 B .. 49.97 dB/83178 B | +234.0% | +171.9% | 9.8s:1.1s:2.6s |
-    /// | 2160p fixture | 42.01 dB/14687 B .. 50.82 dB/52415 B | +260.3% | +203.2% | 9.3s:1.0s:2.2s |
-    /// | screen capture | 37.49 dB/12797 B .. 46.19 dB/50643 B | +318.5% | +155.3% | 9.1s:1.0s:2.1s |
+    /// | 1080p fixture | 42.11 dB/17774 B .. 50.99 dB/76838 B | +143.6% | +94.0% | 9.2s:1.1s:2.6s |
+    /// | 2160p fixture | 42.84 dB/12480 B .. 51.43 dB/46557 B | +179.5% | +128.8% | 8.6s:1.0s:2.2s |
+    /// | screen capture | 39.76 dB/9536 B .. 48.87 dB/29189 B | +88.0% | +21.5% | 7.2s:1.0s:2.1s |
+    ///
+    /// The three steps of that lane, same recipe (vs libaom, then vs rav1e):
+    ///
+    /// | step | 1080p | 2160p | screen |
+    /// |---|---|---|---|
+    /// | no in-loop filter | +234.0 / +171.9 | +260.3 / +203.2 | +318.5 / +155.3 |
+    /// | + deblocking | +198.2 / +143.1 | +218.1 / +162.4 | +136.9 / +52.7 |
+    /// | + CDEF | +143.6 / +94.0 | +179.5 / +128.8 | +88.0 / +21.5 |
+    ///
+    /// Loop restoration is NOT in yet: it is the one filter whose parameters
+    /// are per restoration UNIT inside the tile payload, so it needs both
+    /// tile writers to code `lr` syntax and an encoder-visible post-CDEF
+    /// buffer to solve against -- neither of which this frame-header-level
+    /// search reaches.
     ///
     /// The baseline it replaced, before an inter frame's blocks chose their
     /// own partition, was +501.4/+504.4/+440.9 against libaom and
