@@ -33092,7 +33092,7 @@ pub(crate) fn decode_inter_frame_tile(
         loop_filter, allow_high_precision_mv, force_integer_mv, interp_fixed,
         enable_dual_filter, reference_select, tx_select,
         &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, false,
-        switchable_motion_mode, fctx,
+        switchable_motion_mode, false, fctx,
     )
 }
 
@@ -33138,6 +33138,12 @@ pub(crate) fn decode_inter_frame_tile_lr(
     // crate's own encoder writes once inter blocks started carrying a
     // `motion_mode` symbol (class: test asserts against a stale header).
     switchable_motion_mode: bool,
+    // lane-av1obmc2: this frame header's own `allow_warped_motion` (spec
+    // 5.9.2) -- what picks the 3-symbol `motion_mode_cdf` alphabet over the
+    // 2-symbol `obmc_cdf` one at a block with a warp sample. Hard-coding
+    // `false` here desynced every stream this crate's encoder writes with the
+    // warp knob on: the same stale-header class as the parameter above.
+    allow_warped_motion: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -33167,6 +33173,7 @@ pub(crate) fn decode_inter_frame_tile_lr(
         sign_bias,
         allow_screen_content_tools,
         switchable_motion_mode,
+        allow_warped_motion,
         fctx,
     )
 }
@@ -33202,6 +33209,12 @@ pub(crate) fn decode_inter_frame_tiles_lr(
     // crate's own encoder writes once inter blocks started carrying a
     // `motion_mode` symbol (class: test asserts against a stale header).
     switchable_motion_mode: bool,
+    // lane-av1obmc2: this frame header's own `allow_warped_motion` (spec
+    // 5.9.2) -- what picks the 3-symbol `motion_mode_cdf` alphabet over the
+    // 2-symbol `obmc_cdf` one at a block with a warp sample. Hard-coding
+    // `false` here desynced every stream this crate's encoder writes with the
+    // warp knob on: the same stale-header class as the parameter above.
+    allow_warped_motion: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     decode_inter_frame_tile_with_cdfs(
@@ -33237,7 +33250,7 @@ pub(crate) fn decode_inter_frame_tiles_lr(
         true,
         tx_select,
         switchable_motion_mode,
-        false,
+        allow_warped_motion,
         allow_screen_content_tools,
         DeltaParams::default(),
         // `enable_filter_intra`: this crate's own encoder never writes the
@@ -37790,6 +37803,10 @@ mod tests {
                 // Same stale-header class: the bit that makes this frame's
                 // inter blocks carry a `motion_mode` symbol.
                 frame.switchable_motion_mode,
+                // These GOP round trips decode a tile the encoder wrote, so
+                // the warp bit must be the one it wrote too (lane-av1obmc2);
+                // the encoder only sets it under `EC_AV1_WARP`.
+                crate::envflags::env_flag!("EC_AV1_WARP"),
                 fctx,
             )
             .unwrap();
@@ -38124,6 +38141,10 @@ mod tests {
                 // Same stale-header class: the bit that makes this frame's
                 // inter blocks carry a `motion_mode` symbol.
                 frame.switchable_motion_mode,
+                // These GOP round trips decode a tile the encoder wrote, so
+                // the warp bit must be the one it wrote too (lane-av1obmc2);
+                // the encoder only sets it under `EC_AV1_WARP`.
+                crate::envflags::env_flag!("EC_AV1_WARP"),
                 fctx,
             )
             .unwrap();
