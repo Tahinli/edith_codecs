@@ -960,6 +960,23 @@ thread_local! {
     static SCREEN_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+thread_local! {
+    /// What the last [`encode_sequence_with_ctx`] call on this thread coded
+    /// under, AFTER the content gate: the pyramid, or `None` for a stream
+    /// that stayed flat. Read by the BD gates, which print the requested and
+    /// the effective pyramid side by side -- a screen clip requests one and
+    /// codes flat, and that difference is the gate (class
+    /// `gate-blind-to-feature`).
+    static LAST_SEQ_PYRAMID: std::cell::Cell<Option<crate::encoder::Pyramid>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The pyramid the last sequence coded on this thread was EFFECTIVELY under.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn last_sequence_pyramid() -> Option<crate::encoder::Pyramid> {
+    LAST_SEQ_PYRAMID.with(std::cell::Cell::get)
+}
+
 #[cfg(test)]
 pub(crate) fn force_screen(value: Option<bool>) {
     SCREEN_FORCE.with(|c| c.set(value));
@@ -5456,6 +5473,14 @@ pub fn encode_key_frame_with_modes(
 
 /// Codes `pictures` as one key frame followed by inter frames.
 ///
+/// Camera material is coded under [`crate::encoder::Pyramid::default`] since
+/// lane-av1pyrdef -- mini-GOPs of 4 with a hidden `ALTREF` and a
+/// `show_existing_frame` header, so `stream` is in CODING order while
+/// `frames` stays in display order (`EncodedSequence::coding_order` is the
+/// map). Screen content codes flat, decided once per sequence by the same
+/// detector the streaming facade's content gate uses, and `EC_AV1_PYRAMID=0`
+/// puts every stream back on the flat path for an A/B.
+///
 /// # Errors
 /// Returns an error under the same conditions [`encode_key_frame`] and the
 /// inter frame path do.
@@ -8983,8 +9008,15 @@ pub struct EncodedSequence {
     /// `stream` (a temporal delimiter and that frame's OBU alone; it reuses
     /// the sequence header the key frame carried).
     pub stream: Vec<u8>,
-    /// One entry per picture, in coding order.
+    /// One entry per picture, in DISPLAY order — the order a decoder outputs
+    /// them and the order `pictures` came in. Without a pyramid that is also
+    /// the coding order; with one the two differ, and `coding_order` is the
+    /// map between them.
     pub frames: Vec<Encoded>,
+    /// The index into `frames` of each coded frame, in CODING order — what a
+    /// per-coded-frame census (`take_predicted_bits`) must be zipped against.
+    /// `0..frames.len()` on the flat path.
+    pub coding_order: Vec<usize>,
 }
 
 /// Encodes a sequence of pictures as a key frame followed by one inter frame
@@ -9012,6 +9044,42 @@ pub(crate) fn encode_sequence_with_ctx(
     };
     first.check_even()?;
     let render = (first.width, first.height);
+    // THE CODING PYRAMID (lane-av1pyrdef): a sequence of camera material is
+    // coded as mini-GOPs -- a hidden ALTREF ahead of its display position,
+    // the leaves that predict backward off it, and a `show_existing_frame`
+    // header that re-outputs it -- unless `EC_AV1_PYRAMID` turns it off for
+    // an A/B. Screen content stays flat (the content gate in
+    // `Av1Encoder::encode_frames`, whose detector this asks first so the
+    // whole sequence path is decided in one place), and so does a run that
+    // asks for a quantizer rounding offset the facade does not carry: the
+    // facade codes at `encoder::DEADZONE` (0.5), so any other deadzone --
+    // the ablations' -- must keep the flat path rather than be silently
+    // ignored.
+    //
+    // The reordering itself is NOT reimplemented here: it is the facade's
+    // own driver ([`crate::encoder::Av1Encoder::encode_sequence_pyramid`]),
+    // called with this sequence's shape, so the two paths cannot drift.
+    let pyramid = crate::encoder::Pyramid::from_env()
+        .filter(|_| !rest.is_empty() && (deadzone - 0.5).abs() < f64::EPSILON)
+        .filter(|_| !picture_is_screen(first));
+    LAST_SEQ_PYRAMID.with(|c| c.set(pyramid));
+    if let Some(pyramid) = pyramid {
+        for picture in rest {
+            picture.check_even()?;
+            if (picture.width, picture.height) != render {
+                return Err(Error::unsupported(
+                    "AV1 encode",
+                    "every picture in a sequence must be the same size as the first",
+                ));
+            }
+        }
+        return crate::encoder::Av1Encoder::encode_sequence_pyramid(
+            pictures,
+            base_q_idx,
+            pyramid,
+            armed_tiles(),
+        );
+    }
     // The key frame and every inter frame after it are coded at the same
     // padded size, so the reference each inter frame predicts from -- the
     // previous frame's own uncropped reconstruction, at the size a decoder's
@@ -9077,7 +9145,11 @@ pub(crate) fn encode_sequence_with_ctx(
         ));
         frames.push(crop_encoded(&inter, render.0, render.1));
     }
-    Ok(EncodedSequence { stream, frames })
+    Ok(EncodedSequence {
+        stream,
+        coding_order: (0..frames.len()).collect(),
+        frames,
+    })
 }
 
 #[cfg(test)]
@@ -11354,11 +11426,24 @@ mod tests {
         // on that side, so the two directions no longer share a bound.
         let mut worst_over: f64 = 0.0;
         let mut worst_under: f64 = 0.0;
-        for (i, (frame, &bits)) in encoded.frames.iter().zip(&predicted).enumerate() {
+        // The census is per CODED frame, so it is zipped in coding order --
+        // which is not display order under a pyramid.
+        let coded: Vec<&Encoded> =
+            encoded.coding_order.iter().map(|&i| &encoded.frames[i]).collect();
+        for (i, (frame, &bits)) in coded.into_iter().zip(&predicted).enumerate() {
             let written = frame.tile.len() as f64 * 8.0;
             let drift = (written - bits) / written;
             worst_over = worst_over.max(-drift);
-            worst_under = worst_under.max(drift);
+            // lane-av1pyrdef: a pyramid LEAF codes almost no coefficients at
+            // all (150-250 bits of tile, nearly all of it partition/mode/mv
+            // syntax the coefficient sum never counts), so its ratio measures
+            // that floor rather than any drift. Frames under 512 written bits
+            // are left out of the under-price bound for that reason; the
+            // over-price bound -- the defect direction, where the search pays
+            // MORE than the writer -- still covers every frame.
+            if written >= 512.0 {
+                worst_under = worst_under.max(drift);
+            }
             eprintln!("{i:5}  {bits:14.0}  {written:12.0}  {:+6.2}%", drift * 100.0);
         }
         // Measured 2026-09-06 on this sequence: -13.5% at the key frame,
@@ -11394,6 +11479,11 @@ mod tests {
         // decisions, so this bound and the byte pins above FAIL BY DESIGN
         // under it; the default path (no motion_mode syntax at all) is the
         // one they are measured on.
+        // lane-av1pyrdef: `encode_sequence` codes this fixture under the
+        // coding pyramid now, so the five frames are a key frame, a hidden
+        // ALTREF at q-16 and three leaves at q+8: +2.6% / +6.9% (the two
+        // frames over the 512-bit floor) and +44.7 / +74.4 / +74.4 on the
+        // near-empty leaves below it. Both bounds stand where they were.
         // lane-av1rejudge: local warp is ON by default now, so every eligible
         // single-reference block carries that same `motion_mode` symbol (a
         // 3-value alphabet where a warp sample exists) on the DEFAULT path --
@@ -12326,31 +12416,17 @@ mod tests {
                 / source.len() as f64;
             ladder.push((mean, (encoded.stream.len() as f64).log10()));
         }
+        // What this clip asked for and what the content gate left it coding
+        // under: a screen clip requests a pyramid and codes flat, and that
+        // difference is what keeps its row identical to the flat baseline
+        // (class `gate-blind-to-feature`).
+        eprintln!(
+            "{name}: sequence, pyramid requested {:?} effective {:?}",
+            crate::encoder::Pyramid::from_env(),
+            last_sequence_pyramid(),
+        );
         ladder.sort_by(|a, b| a.0.total_cmp(&b.0));
         (ladder, wall)
-    }
-
-    /// The [`crate::encoder::Pyramid`] this run's ladder is coded under, from
-    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]`. Unset
-    /// keeps the flat one-key-then-all-inter ladder the baseline was measured
-    /// on, so the gate's default recipe is unchanged.
-    ///
-    /// RE-SWEPT on lane-av1pyrgate under the content gate (see
-    /// [`crate::encoder::Pyramid`]'s own table): with the screen capture
-    /// coding flat by construction, `4:-16:8` takes film A +62.8/+32.5 ->
-    /// +54.1/+24.2 and film B +86.3/+50.5 -> +82.6/+47.4, and the screen row
-    /// is unchanged to the byte. The gate ladder still defaults to flat --
-    /// the sequence path this arm is pinned against codes no pyramid.
-    fn pyramid_from_env() -> Option<crate::encoder::Pyramid> {
-        let spec = std::env::var("EC_AV1_PYRAMID").ok()?;
-        let mut f = spec.split(':');
-        let mini_gop = f.next()?.parse().ok()?;
-        let d = crate::encoder::Pyramid::default();
-        Some(crate::encoder::Pyramid {
-            mini_gop,
-            arf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.arf_q_offset),
-            leaf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.leaf_q_offset),
-        })
     }
 
     /// [`our_ladder`] through the streaming facade — the surface the editor's
@@ -12485,8 +12561,15 @@ mod tests {
                 (h ^ u64::from(v)).wrapping_mul(0x0000_0100_0000_01b3)
             })
         };
+        // Re-taken on lane-av1pyrdef: `encode_sequence` codes this (non-screen)
+        // clip under the coding pyramid now -- one hidden ALTREF per mini-GOP
+        // of 4, its leaves at q+8 and a `show_existing_frame` header per
+        // group. 7299 -> 8194 bytes at q=150 and 26804 -> 28285 at q=60 over
+        // four frames; four pictures is one short mini-GOP, which is the
+        // shape that pays least (the ARF's own quality has no later group to
+        // carry it), so this is not the BD gate's number.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7299, 0xaa98_12b4_860a_28cc), (60, 26804, 0xedea_182d_e11b_3c3f)];
+            [(150, 8194, 0x08ba_a7a8_26f6_f414), (60, 28285, 0x64af_fc52_eef6_2967)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -12660,12 +12743,24 @@ mod tests {
     /// | bars 2160p | +81.6% | +41.5% | 4.8s:1.0s:2.2s |
     /// | screen capture | +49.1% | -4.3% | 5.5s:1.0s:2.1s |
     ///
-    /// The same run under `EC_AV1_PYRAMID=4:-16:8 EC_AV1_GATE_FACADE=1`
-    /// (lane-av1pyrgate), which is what the content gate does at this scale:
-    /// the bars are non-screen so they take the pyramid (+84.7 / +39.9 and
-    /// +124.4 / +75.2 -- this downscaled recipe hates it, as it hates every
-    /// knob the real film rows keep), and the capture's row comes back
-    /// +49.1 / -4.3, the flat row to the byte. That equality IS the gate.
+    /// RE-RECORDED 2026-09-07 (lane-av1pyrdef), with the coding pyramid the
+    /// DEFAULT of the sequence path this gate codes through -- the bars are
+    /// non-screen so they take it, the capture is gated flat:
+    ///
+    /// | clip | effective pyramid | BD vs libaom | BD vs rav1e | wall |
+    /// |---|---|---|---|---|
+    /// | bars 1080p | 4:-16:8 | +84.7% | +39.9% | 5.1s:1.1s:2.6s |
+    /// | bars 2160p | 4:-16:8 | +124.4% | +75.2% | 4.4s:1.0s:2.8s |
+    /// | screen capture | none (gated) | +49.1% | -4.3% | 6.5s:1.2s:2.3s |
+    ///
+    /// Those are, to the byte, the numbers lane-av1pyrgate recorded for the
+    /// same clips under `EC_AV1_PYRAMID=4:-16:8 EC_AV1_GATE_FACADE=1` -- the
+    /// facade arm -- which is what "one mini-GOP driver, two entry points"
+    /// means here. This downscaled recipe HATES the pyramid (as it hates
+    /// every knob the real film rows of `bd_rate_screen_native` keep, which
+    /// is why it decides nothing); `EC_AV1_PYRAMID=0` restores the flat rows
+    /// above. The capture's row is the flat row to the byte in both runs --
+    /// that equality IS the content gate.
     ///
     /// Loop restoration is NOT in yet: it is the one filter whose parameters
     /// are per restoration UNIT inside the tile payload, so it needs both
@@ -12778,14 +12873,16 @@ mod tests {
             let _ = crate::tile::take_compound_size_hits();
             let _ = crate::tile::take_compound_leaf_mode_hits();
             let _ = crate::motion::take_census();
-            let pyramid_env = pyramid_from_env();
             // The entry-surface arm: run the SAME ladder through the
             // streaming facade the editor's export calls, which must print
-            // the same BD numbers as the sequence path.
+            // the same BD numbers as the sequence path -- byte for byte the
+            // same stream now that both drive one mini-GOP driver
+            // (lane-av1pyrdef).
             let facade = std::env::var_os("EC_AV1_GATE_FACADE").is_some();
-            let (ours, ours_wall) = match (facade, pyramid_env) {
-                (false, None) => our_ladder(name, &source, width, height, fctx),
-                (_, pyramid) => {
+            let (ours, ours_wall) = match facade {
+                false => our_ladder(name, &source, width, height, fctx),
+                true => {
+                    let pyramid = crate::encoder::Pyramid::from_env();
                     let (ladder, wall, counts, bytes, effective) =
                         our_ladder_facade(name, &source, width, height, pyramid);
                     eprintln!(
@@ -13184,13 +13281,17 @@ mod tests {
     ///     EC_AV1_INTRABC=1 ... same command                # intra block copy
     ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
     ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
-    ///     EC_AV1_PYRAMID=4:-16:8 ... same command          # coding pyramid
+    ///     EC_AV1_PYRAMID=0 ... same command                # no coding pyramid
+    ///     EC_AV1_GATE_FACADE=1 ... same command            # the facade arm
     ///
-    /// Under `EC_AV1_PYRAMID` this arm codes its ladder through the streaming
-    /// facade ([`our_ladder_pyramid`]), which exposes no per-packet
-    /// reconstruction: that path asserts ffmpeg's decode against our own
-    /// decoder on all three planes in display order, and prints the per-level
-    /// frame and byte census.
+    /// The coding pyramid is the DEFAULT of the sequence path this arm codes
+    /// through (lane-av1pyrdef); the run prints the requested and the
+    /// effective pyramid per clip, and a screen clip's effective one is
+    /// `None`. `EC_AV1_GATE_FACADE=1` runs the same ladder through the
+    /// streaming facade instead, which prints the per-level frame and byte
+    /// census and asserts ffmpeg's decode against our own decoder on all
+    /// three planes in display order; both arms code the same bytes
+    /// (`encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence`).
     ///
     /// WHICH ROWS ARE REAL CONTENT: the `bars 1080p` / `bars 2160p` rows are
     /// the repo fixtures `scripts/gen-fixtures.sh` builds with ffmpeg
@@ -13219,6 +13320,23 @@ mod tests {
     /// Both bars rows and the capture are byte-identical across that change
     /// (their classification never moved); the palette search over film was
     /// costing roughly a tenth of the film rows' wall.
+    ///
+    /// CONFIRM RUN 2026-09-07 (lane-av1pyrdef), with the pyramid now the
+    /// sequence path's default -- the four non-screen rows take `4:-16:8`,
+    /// the capture is gated flat and does not move a byte:
+    ///
+    /// | clip | effective | flat -> default | vs rav1e | wall ours:libaom:rav1e |
+    /// |---|---|---|---|---|
+    /// | bars 1080p | 4:-16:8 | +16.4% -> +21.5% | -1.1% -> +3.7% | 37.8s:8.4s:16.4s |
+    /// | bars 2160p | 4:-16:8 | +48.2% -> +48.3% | +20.4% -> +20.4% | 32.2s:5.6s:16.2s |
+    /// | film A | 4:-16:8 | +62.8% -> +54.1% | +32.5% -> +24.2% | 58.9s:9.5s:13.6s |
+    /// | film B | 4:-16:8 | +86.3% -> +82.6% | +50.5% -> +47.4% | 63.2s:18.7s:16.4s |
+    /// | screen capture | none (gated) | +50.1% -> +50.1% | -15.4% -> -15.4% | 31.1s:8.4s:11.3s |
+    ///
+    /// Every row lands on lane-av1pyrgate's facade-arm number to the digit,
+    /// which is the point of the shared driver: the two entry points code one
+    /// stream. The bars rows are fixtures (recorded, never a decision); the
+    /// two real films are what the pyramid ships for.
     ///
     /// All five gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
     /// `EC_AV1_NATIVE_FILM4K=1` and `EC_AV1_NATIVE_SCREEN=1` select a subset:
@@ -13293,21 +13411,10 @@ mod tests {
             let _ = crate::tile::take_palette_uv_hits();
             let _ = crate::tile::take_intrabc_hits();
             let _ = take_intrabc_search();
-            let (ours, ours_wall) = match pyramid_from_env() {
-                None => our_ladder(name, &source, cw, ch, fctx),
-                Some(pyramid) => {
-                    let (ladder, wall, counts, bytes, effective) =
-                        our_ladder_facade(name, &source, cw, ch, Some(pyramid));
-                    eprintln!(
-                        "{name}: pyramid requested {pyramid:?} effective {effective:?} \
-                         -- frames key {} arf {} leaf {} \
-                         show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
-                        counts[0], counts[1], counts[2], counts[3],
-                        bytes[0], bytes[1], bytes[2], bytes[3],
-                    );
-                    (ladder, wall)
-                }
-            };
+            // The sequence path itself codes the pyramid now
+            // (lane-av1pyrdef), and prints what it requested and what the
+            // content gate left effective.
+            let (ours, ours_wall) = our_ladder(name, &source, cw, ch, fctx);
             // gate-blind-to-feature: what the screen tools actually did at
             // native resolution, over this clip's four encodes.
             let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
