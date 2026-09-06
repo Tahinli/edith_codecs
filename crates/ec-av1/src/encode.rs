@@ -13109,6 +13109,25 @@ mod tests {
     /// names, at a pinned seek; added 2026-09-07) and the screen capture. A
     /// decision only the bars rows support is not supported.
     ///
+    /// Measured 2026-09-07, the five rows before and after the screen
+    /// detector grew libaom's variance term ([`screen_var`]) -- before it,
+    /// BOTH real films were classified as screen content on 48/48 frames, so
+    /// their coefficients were priced against the DEFAULT CDFs and the
+    /// palette search ran over film; after, both are non-screen (0/48) and
+    /// the capture is unchanged at 48/48:
+    ///
+    /// | clip | vs libaom before -> after | vs rav1e before -> after | wall ours |
+    /// |---|---|---|---|
+    /// | bars 1080p | +15.6% -> +15.6% | -1.7% -> -1.7% | 37.9s |
+    /// | bars 2160p | +46.5% -> +46.5% | +18.8% -> +18.8% | 33.9s |
+    /// | film A | +69.5% -> +69.0% | +37.7% -> +37.5% | 72s -> 64.4s |
+    /// | film B | +102.4% -> +100.0% | +63.4% -> +61.5% | 72s -> 67.9s |
+    /// | screen capture | +51.0% -> +51.0% | -14.5% -> -14.5% | 27.5s |
+    ///
+    /// Both bars rows and the capture are byte-identical across that change
+    /// (their classification never moved); the palette search over film was
+    /// costing roughly a tenth of the film rows' wall.
+    ///
     /// All five gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
     /// `EC_AV1_NATIVE_FILM4K=1` and `EC_AV1_NATIVE_SCREEN=1` select a subset:
     /// setting any one of them keeps only the selected rows (the two 1080p
