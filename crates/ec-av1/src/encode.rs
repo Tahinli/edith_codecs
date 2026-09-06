@@ -2486,11 +2486,33 @@ fn palette_candidates(block: &[u8]) -> Vec<crate::tile::PaletteY> {
 // gives up. `EC_AV1_INTRABC=0` turns the whole arm off.
 // ---------------------------------------------------------------------------
 
-/// Whether intra block copy is offered at all. On by default; off on a frame
-/// that detected no screen content, and off entirely under `EC_AV1_INTRABC=0`.
+/// Whether intra block copy is offered at all. **Off by default** --
+/// `EC_AV1_INTRABC=1` turns it on. The syntax is complete and proven against
+/// ffmpeg (`a_repeated_pattern_key_frame_codes_intrabc_blocks_ffmpeg_decodes_exactly`),
+/// but on the gate's real screen capture it MEASURED WORSE: setting
+/// `allow_intrabc` costs the key frame its deblocking, CDEF and loop
+/// restoration (spec 5.9.11/5.9.19/5.9.20) and the copied blocks do not pay
+/// that back -- screen BD +59.1/+5.1 against the +54.5/+1.1 base (lane-av1ibc,
+/// `probe_intrabc_key_frame` has the per-key-frame table). Also off on a frame
+/// that detected no screen content.
 fn intrabc_enabled() -> bool {
+    if let Some(forced) = INTRABC_FORCE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EC_AV1_INTRABC").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| std::env::var("EC_AV1_INTRABC").ok().as_deref() == Some("1"))
+}
+
+thread_local! {
+    /// Overrides [`intrabc_enabled`] for the calling thread -- the ablation
+    /// probe runs both arms in one process, and the suite is one process, so
+    /// an environment variable cannot separate them (same reason
+    /// [`SCREEN_FORCE`] exists).
+    static INTRABC_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn force_intrabc(value: Option<bool>) {
+    INTRABC_FORCE.with(|c| c.set(value));
 }
 
 /// How many of a screen frame's 16x16 blocks must have an exact repeat
@@ -7552,6 +7574,55 @@ mod tests {
         assert!(!film.screen, "the detector fired on the film-shaped test card");
     }
 
+    /// The lane's keep-rule measurement: the gate's own screen capture, one
+    /// KEY FRAME, coded with and without `allow_intrabc` at four quantizers.
+    /// Setting the bit forces deblocking, CDEF and loop restoration off for
+    /// that frame, so the table is exactly the filter loss against the bytes
+    /// the copied blocks save.
+    #[test]
+    #[ignore = "needs the real-library manifest and ffmpeg"]
+    fn probe_intrabc_key_frame() {
+        let fctx = &crate::decode::FrameCtx::new();
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures");
+        let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) else {
+            eprintln!("SKIP probe_intrabc_key_frame: no real-library manifest");
+            return;
+        };
+        let Some(clip) = manifest
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split('\t').next())
+            .find(|p| p.contains("/OBS/") && p.ends_with(".mkv") && std::path::Path::new(p).exists())
+        else {
+            eprintln!("SKIP probe_intrabc_key_frame: no OBS recording");
+            return;
+        };
+        let (width, height) = (640usize, 384usize);
+        let picture = clip_frame(clip, "0", width, height);
+        eprintln!("| base_q_idx | intrabc | bytes | PSNR | blocks | searches/found/won |");
+        for q in [5u8, 20, 35, 45] {
+            for on in [false, true] {
+                force_intrabc(Some(on));
+                let _ = crate::tile::take_intrabc_hits();
+                let _ = take_intrabc_search();
+                let encoded = encode_key_frame_with_ctx(&picture, q, 0.5, fctx).unwrap();
+                let hits = crate::tile::take_intrabc_hits();
+                let search = take_intrabc_search();
+                eprintln!(
+                    "| {q} | {} | {} | {:.2} dB | {} (dv hist {:?}) | {}/{}/{} |",
+                    if encoded.allow_intrabc { "on" } else { "off" },
+                    encoded.stream.len(),
+                    psnr_all(&encoded.reconstruction, &picture),
+                    hits[0],
+                    &hits[1..],
+                    search[0], search[1], search[2],
+                );
+            }
+        }
+        force_intrabc(None);
+    }
+
     /// lane-av1ibc's own end-to-end check: a repeated-pattern screen card
     /// sets `allow_intrabc` (so every in-loop filter is off), blocks really
     /// take a block vector (fire count + DV histogram, class
@@ -7567,7 +7638,12 @@ mod tests {
         let (width, height) = (512usize, 256usize);
         let picture = screen_card(width, height);
         let _ = crate::tile::take_intrabc_hits();
+        // The default is OFF (it measured worse on the real screen capture --
+        // see [`intrabc_enabled`]); this gate proves the SYNTAX, so it turns
+        // the arm on for its own encode and puts it back straight after.
+        force_intrabc(Some(true));
         let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
+        force_intrabc(None);
         assert!(
             encoded.allow_intrabc,
             "allow_intrabc was not set on a fully periodic screen card              (source repeat share {:.1}%)",
