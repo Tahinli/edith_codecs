@@ -5735,6 +5735,18 @@ fn analysis_music_prob_separates_speech_from_music() {
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4", true),
         ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3", true),
     ];
+    // Oracle: libopus v1.6 built from source with one fprintf of `analysis_info`
+    // after `run_analysis()` in `opus_encode_native`, fed the same 30 s of
+    // ffmpeg-decoded f32 at the same settings, 1498-1499 valid windows each.
+    // Means of (music_prob, tonality, tonality_slope, activity).
+    let oracle = |tag: &str| -> Option<[f64; 4]> {
+        match tag {
+            "hein" => Some([0.160, 0.155, -0.0876, 0.567]),
+            "naz" => Some([0.991, 0.362, -0.1680, 0.701]),
+            "zaur" => Some([0.977, 0.313, -0.1333, 0.735]),
+            _ => None,
+        }
+    };
     let mut means: Vec<(String, bool, f64)> = Vec::new();
     for (tag, path, is_music) in sources {
         let src = shellexpand(path);
@@ -5747,7 +5759,7 @@ fn analysis_music_prob_separates_speech_from_music() {
         enc.set_bitrate(96_000);
         enc.set_vbr_constrained(true);
         let mut out = vec![0u8; 4000];
-        let mut sum = 0.0f64;
+        let mut sum = [0.0f64; 4];
         let mut n = 0usize;
         let mut valid = 0usize;
         for chunk in pcm.chunks_exact(FRAME * CHANNELS) {
@@ -5756,13 +5768,32 @@ fn analysis_music_prob_separates_speech_from_music() {
             n += 1;
             if d.analysis_valid {
                 valid += 1;
-                sum += f64::from(d.music_prob);
+                sum[0] += f64::from(d.music_prob);
+                sum[1] += f64::from(d.tonality);
+                sum[2] += f64::from(d.tonality_slope);
+                sum[3] += f64::from(d.activity);
             }
         }
         assert!(valid * 10 > n * 9, "{tag}: analysis valid on only {valid}/{n} frames");
-        let mean = sum / valid as f64;
-        println!("music_prob {tag}: mean {mean:.3} over {valid}/{n} frames (music={is_music})");
-        means.push(((*tag).to_string(), *is_music, mean));
+        let m = sum.map(|v| v / valid as f64);
+        println!(
+            "analysis {tag}: music {:.3} tonality {:.3} slope {:.4} activity {:.3} over {valid}/{n} frames (music={is_music})",
+            m[0], m[1], m[2], m[3]
+        );
+        if let Some(o) = oracle(tag) {
+            for (i, name) in ["music_prob", "tonality", "tonality_slope", "activity"]
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    (m[i] - o[i]).abs() < 0.02,
+                    "{tag} {name}: ours {:.4} vs libopus {:.4}",
+                    m[i],
+                    o[i]
+                );
+            }
+        }
+        means.push(((*tag).to_string(), *is_music, m[0]));
     }
     if means.len() < 2 {
         eprintln!("SKIP: fewer than two sources present");
