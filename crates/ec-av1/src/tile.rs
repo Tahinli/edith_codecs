@@ -357,6 +357,7 @@ fn note_intrabc(dv: (i32, i32)) {
 
 /// Reads [`INTRABC_HITS`] and zeroes it, so a gate can attribute the counts
 /// to its own encode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn take_intrabc_hits() -> [usize; 7] {
     std::array::from_fn(|i| INTRABC_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }

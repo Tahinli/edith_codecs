@@ -740,6 +740,7 @@ thread_local! {
 }
 
 /// [`IBC_SHARE`] for the last key frame encoded on this thread.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn intrabc_source_share() -> f64 {
     IBC_SHARE.with(std::cell::Cell::get)
 }
@@ -2511,6 +2512,7 @@ thread_local! {
     static INTRABC_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn force_intrabc(value: Option<bool>) {
     INTRABC_FORCE.with(|c| c.set(value));
 }
@@ -2723,6 +2725,7 @@ impl Drop for Ibc {
 
 /// Reads [`IBC_SEARCH`] and zeroes it, so a gate can attribute the counts to
 /// its own encode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn take_intrabc_search() -> [usize; 3] {
     std::array::from_fn(|i| IBC_SEARCH[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
