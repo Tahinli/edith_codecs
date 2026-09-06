@@ -12521,10 +12521,15 @@ mod tests {
         }
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         let mut clips: Vec<(String, std::path::PathBuf)> = Vec::new();
-        for name in ["h264-1080p-23.976-8bit.mp4", "h264-2160p-23.976-8bit.mp4"] {
+        // testsrc2 COLOUR BARS, not film -- labelled so no reader takes these
+        // rows for real content (the real rows live in the native gate).
+        for (label, name) in [
+            ("bars 1080p", "h264-1080p-23.976-8bit.mp4"),
+            ("bars 2160p", "h264-2160p-23.976-8bit.mp4"),
+        ] {
             let path = fixtures.join("video").join(name);
             if path.exists() {
-                clips.push((name.to_string(), path));
+                clips.push((label.to_string(), path));
             } else {
                 eprintln!("SKIP clip {name}: missing");
             }
@@ -12915,9 +12920,20 @@ mod tests {
     /// decoder on all three planes in display order, and prints the per-level
     /// frame and byte census.
     ///
-    /// All three gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
+    /// WHICH ROWS ARE REAL CONTENT: the `bars 1080p` / `bars 2160p` rows are
+    /// the repo fixtures `scripts/gen-fixtures.sh` builds with ffmpeg
+    /// `testsrc2` -- COLOUR BARS, ~90% of whose 16x16 cells have no intra
+    /// cost -- so every "film" column in the historical tables of this file
+    /// is that generator, not film. The real content is `film A`, `film B`
+    /// (native crops out of the two AV1 films the real-library manifest
+    /// names, at a pinned seek; added 2026-09-07) and the screen capture. A
+    /// decision only the bars rows support is not supported.
+    ///
+    /// All five gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
     /// `EC_AV1_NATIVE_FILM4K=1` and `EC_AV1_NATIVE_SCREEN=1` select a subset:
-    /// setting any one of them keeps only the selected rows.
+    /// setting any one of them keeps only the selected rows (the two 1080p
+    /// rows, the two 2160p rows, the capture row respectively). A missing
+    /// real film SKIPs its row; it never fails the gate.
     #[test]
     #[ignore = "the native-resolution BD arm: minutes per row, needs ffmpeg"]
     fn bd_rate_screen_native() {
@@ -12934,22 +12950,61 @@ mod tests {
         );
         // No selector at all means every clip; any selector means that subset.
         let all = !(film || film4k || screen);
-        let mut clips: Vec<(String, String)> = Vec::new();
+        // (label, path, seek). The two `testsrc2` fixtures are COLOUR BARS,
+        // not film -- they print as "bars" so no reader takes them for real
+        // content -- and the two rows below them are the real AV1 films.
+        let mut clips: Vec<(String, String, String)> = Vec::new();
         for (want, label, file) in [
-            (all || film, "film 1080p", "h264-1080p-23.976-8bit.mp4"),
-            (all || film4k, "film 2160p", "h264-2160p-23.976-8bit.mp4"),
+            (all || film, "bars 1080p", "h264-1080p-23.976-8bit.mp4"),
+            (all || film4k, "bars 2160p", "h264-2160p-23.976-8bit.mp4"),
         ] {
             if !want {
                 continue;
             }
             let path = fixtures.join("video").join(file);
             match path.exists() {
-                true => clips.push((label.to_string(), path.to_str().unwrap().to_string())),
+                true => {
+                    clips.push((label.to_string(), path.to_str().unwrap().to_string(), "0".into()))
+                }
                 false => eprintln!("SKIP {label}: {file} missing"),
             }
         }
+        let manifest = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv"));
+        // The real films, taken out of the real-library manifest by codec and
+        // coded width so no title and no home path lives in this file. Each
+        // seek is PINNED (class `seeded fixture not reproducible`) at a
+        // moving, non-black window -- a black leader would make every arm
+        // read +0.000 (class `flat sample window`). Both sources are 10-bit
+        // (one HDR10/PQ); the loader's plain `-pix_fmt yuv420p` conversion is
+        // what all three encoders see, so the comparison stays
+        // encoder-vs-encoder.
+        let pick = |width: &str| -> Option<String> {
+            let m = manifest.as_ref().ok()?;
+            m.lines()
+                .skip(1)
+                .map(|l| l.split('\t').collect::<Vec<_>>())
+                .find(|f| {
+                    f.len() > 4
+                        && f[2] == "av1"
+                        && f[3] == width
+                        && std::path::Path::new(f[0]).exists()
+                })
+                .map(|f| f[0].to_string())
+        };
+        for (want, label, width, seek) in [
+            (all || film, "film A (1080p source)", "1920", "00:35:00"),
+            (all || film4k, "film B (2160p HDR source)", "3840", "00:40:00"),
+        ] {
+            if !want {
+                continue;
+            }
+            match pick(width) {
+                Some(path) => clips.push((label.to_string(), path, seek.to_string())),
+                None => eprintln!("SKIP {label}: no {width}-wide AV1 source in the manifest"),
+            }
+        }
         if all || screen {
-            match std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) {
+            match &manifest {
                 Ok(manifest) => match manifest
                     .lines()
                     .skip(1)
@@ -12959,6 +13014,7 @@ mod tests {
                     Some(p) => clips.push((
                         format!("screen capture ({})", p.rsplit('/').next().unwrap_or(p)),
                         p.to_string(),
+                        "0".into(),
                     )),
                     None => eprintln!("SKIP screen capture: no OBS recording in the manifest exists"),
                 },
@@ -12998,7 +13054,7 @@ mod tests {
         );
         println!("| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |");
         println!("|---|---|---|---|---|");
-        for (name, path) in &clips {
+        for (name, path, seek) in &clips {
             let fctx = &crate::decode::FrameCtx::new();
             let Some((nw, nh)) = probe_dims(path) else {
                 eprintln!("SKIP {name}: ffprobe gave no size");
@@ -13012,7 +13068,7 @@ mod tests {
             let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
             let source = clip_frames_vf(
                 path,
-                "0",
+                seek,
                 &format!("crop={cw}:{ch}:{x}:{y}"),
                 cw,
                 ch,
@@ -13115,8 +13171,8 @@ mod tests {
         }
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
         for (label, file) in [
-            ("film 1080p", "h264-1080p-23.976-8bit.mp4"),
-            ("film 2160p", "h264-2160p-23.976-8bit.mp4"),
+            ("bars 1080p", "h264-1080p-23.976-8bit.mp4"),
+            ("bars 2160p", "h264-2160p-23.976-8bit.mp4"),
         ] {
             let path = fixtures.join("video").join(file);
             if !path.exists() {
