@@ -2513,6 +2513,15 @@ fn hybrid_roundtrip(
 /// The two layers of a hybrid packet reach the decoder's output at the same
 /// delay: a click's low-band-only and high-band-only peaks coincide at the
 /// encoder's documented look-ahead.
+/// The delay [`hybrid_roundtrip`]'s encoder advertises for a 20 ms frame —
+/// [`Encoder::look_ahead`] of that same configuration, so the lag assertions
+/// track the layer's real delay instead of a constant.
+fn hybrid_delay(bps: u32) -> usize {
+    let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+    enc.set_bitrate(bps);
+    enc.look_ahead(960)
+}
+
 #[test]
 fn hybrid_layers_align() {
     let mut click = vec![0f32; 48000];
@@ -2528,25 +2537,18 @@ fn hybrid_layers_align() {
     };
     let (lb, _) = hybrid_roundtrip(&click, 32_000, None, (true, false));
     let (hb, _) = hybrid_roundtrip(&click, 32_000, None, (false, true));
-    let enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+    let delay = hybrid_delay(32_000) as i64;
     let (plb, phb) = (peak(&lb) as i64 - at as i64, peak(&hb) as i64 - at as i64);
-    eprintln!(
-        "hybrid click: LB peak +{plb}, HB peak +{phb}, look_ahead {}",
-        {
-            let mut e = enc.clone();
-            e.set_bitrate(32_000);
-            e.look_ahead(960)
-        }
-    );
-    // A fullband CELT click lands at exactly +312 (`celt_click_peak_offset`:
-    // the MDCT overlap plus the 192-sample input delay compensation);
-    // the band-limited HB layer's main lobe sits up to 2 samples early once
-    // transient frames keep their short blocks, and SILK lands at +121.
+    eprintln!("hybrid click: LB peak +{plb}, HB peak +{phb}, look_ahead {delay}");
+    // A fullband CELT click lands at exactly the encoder's advertised delay
+    // (`celt_click_peak_offset`); the band-limited HB layer's main lobe sits
+    // up to 2 samples early once transient frames keep their short blocks,
+    // and SILK lands one sample late.
     assert!(
         (plb - phb).abs() <= 3,
         "layers misaligned: LB +{plb} vs HB +{phb}"
     );
-    assert!((phb - 312).abs() <= 2, "HB peak +{phb}, look_ahead 312");
+    assert!((phb - delay).abs() <= 2, "HB peak +{phb}, look_ahead {delay}");
 }
 
 /// 20 ms FB hybrid at 32 kbps: decodes in our decoder range-exactly, tracks
@@ -2572,11 +2574,7 @@ fn hybrid_fb_roundtrip() {
         );
         assert!(corr >= 0.95, "{name}: full-band corr {corr:.4}");
         // +-3: the wav16 fixture is a pure tone, whose phase moves the peak.
-        let delay = {
-            let mut e = Encoder::new(48000, 1, Application::Voip).unwrap();
-            e.set_bitrate(32_000);
-            e.look_ahead(960)
-        };
+        let delay = hybrid_delay(32_000);
         assert!(
             (delay - 3..=delay + 3).contains(&lag),
             "{name}: aligned at lag {lag}, not the advertised {delay}"
