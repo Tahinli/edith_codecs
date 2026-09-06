@@ -3530,7 +3530,14 @@ fn write_block_planes(
             Some(plane),
         );
         #[cfg(test)]
-        census_record(planes[plane], q_ctx, grid, f64::from(enc.tell() - before));
+        census_record(
+            planes[plane],
+            q_ctx,
+            grid,
+            f64::from(enc.tell() - before),
+            skip_ctx,
+            dc_sign_ctx(around[plane].dc_vote),
+        );
         ec_rng_trace(|| {
             format!(
                 "EC_PLANE plane={plane} nz={} skip_ctx={skip_ctx} tell={}",
@@ -3625,7 +3632,14 @@ fn write_luma_tus(
                 Some(0),
             );
             #[cfg(test)]
-            census_record(set, q_ctx, &unit, f64::from(enc.tell() - before));
+            census_record(
+                set,
+                q_ctx,
+                &unit,
+                f64::from(enc.tell() - before),
+                skip_ctx,
+                dc_sign_ctx(around.dc_vote),
+            );
             if n > 1 {
                 neighbours.record_mi_luma(tu_mi, tx, &unit);
             }
@@ -3906,9 +3920,9 @@ pub(crate) fn predicted_coeff_bits_sb(superblocks: &[Superblock], base_q_idx: u8
             // top-left 32x32 carries coefficients) and each chroma plane at
             // 32x32; `predicted_coeff_bits` has no 64 arm, so price it here.
             Superblock::Whole(block) if !block.skip => {
-                coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx)
-                    + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx)
-                    + coeff_bits(&dense(&block.v, 32), TxbSet::Chroma32, q_ctx)
+                coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx, 0, 0)
+                    + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx, 0, 0)
+                    + coeff_bits(&dense(&block.v, 32), TxbSet::Chroma32, q_ctx, 0, 0)
             }
             Superblock::Whole(_) => 0.0,
             Superblock::Split(quadrants) => predicted_coeff_bits(quadrants, base_q_idx),
@@ -3935,9 +3949,9 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
             (_, false) => (TxbSet::Luma8, TxbSet::Chroma4),
             (_, true) => (TxbSet::Luma8Inter, TxbSet::Chroma4),
         };
-        coeff_bits(&dense(&block.luma, side), luma, q_ctx)
-            + coeff_bits(&dense(&block.u, side / 2), chroma, q_ctx)
-            + coeff_bits(&dense(&block.v, side / 2), chroma, q_ctx)
+        coeff_bits(&dense(&block.luma, side), luma, q_ctx, 0, 0)
+            + coeff_bits(&dense(&block.u, side / 2), chroma, q_ctx, 0, 0)
+            + coeff_bits(&dense(&block.v, side / 2), chroma, q_ctx, 0, 0)
     }
     blocks
         .iter()
@@ -3953,7 +3967,7 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
 
 #[cfg(test)]
 pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
-    coeff_bits(grid, TxbSet::Luma32, 2)
+    coeff_bits(grid, TxbSet::Luma32, 2, 0, 0)
 }
 
 /// What one transform block's levels cost through the CDFs of `set`, in bits.
@@ -3981,7 +3995,19 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
 /// are not yet decided; the map would have to be built per trial, not per
 /// block. Deferred with the numbers above rather than approximated by a
 /// fitted constant.
-pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
+pub(crate) fn coeff_bits(
+    grid: &[i32],
+    set: TxbSet,
+    q_ctx: usize,
+    // lane-av1skipctx: the two neighbour-derived contexts, mirrored from the
+    // writer's own (`write_block_planes`/`write_luma_tus`) off the search's
+    // coding-order-committed map ([`crate::encode::CoefCtxMap`]). `(0, 0)` is
+    // what every caller passed before the map existed -- exact for a luma
+    // transform covering its whole block, and the census row that was the
+    // largest remaining pricer error for every other block.
+    skip_ctx: usize,
+    sign_ctx: usize,
+) -> f64 {
     /// Built once per size: the search prices thirteen modes for every block,
     /// and the scan is the same table every time.
     static SCANS: LazyLock<[Vec<u16>; 4]> = LazyLock::new(|| {
@@ -4031,7 +4057,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet, q_ctx: usize) -> f64 {
             _ => &SCANS[3],
         };
         let mut enc = SymbolEncoder::pricer();
-        write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
+        write_coeffs(&mut enc, &mut coding, grid, scan, skip_ctx, sign_ctx, None);
         enc.bits()
     };
     PRICING_BASE.with_borrow_mut(|base| {
@@ -4182,7 +4208,18 @@ pub(crate) fn census_bucket_label(bucket: usize) -> &'static str {
 }
 
 #[cfg(test)]
-fn census_record(set: TxbSet, q_ctx: usize, grid: &[i32], written: f64) {
+fn census_record(
+    set: TxbSet,
+    q_ctx: usize,
+    grid: &[i32],
+    written: f64,
+    // The writer's own neighbour contexts for this very transform block: the
+    // census prices the search's estimate the way the search now takes it
+    // (lane-av1skipctx), so a row's error is the table/adaptation drift that
+    // is left once the context is right.
+    skip_ctx: usize,
+    sign_ctx: usize,
+) {
     if CENSUS.with_borrow(|c| c.is_none()) {
         return;
     }
@@ -4196,7 +4233,7 @@ fn census_record(set: TxbSet, q_ctx: usize, grid: &[i32], written: f64) {
         9..=16 => 5,
         _ => 6,
     };
-    let priced = coeff_bits(grid, set, q_ctx);
+    let priced = coeff_bits(grid, set, q_ctx, skip_ctx, sign_ctx);
     CENSUS.with_borrow_mut(|rows| {
         let rows = rows.as_mut().expect("the census is on");
         let row = rows.entry((format!("{set:?}"), bucket)).or_default();
