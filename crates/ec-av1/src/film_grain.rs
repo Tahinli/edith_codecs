@@ -1098,6 +1098,42 @@ fn uninit_plane(n: usize) -> Vec<u16> {
 /// apply film grain to `picture`, returning a new grained picture. `picture`
 /// itself is unchanged -- it stays the clean reference-frame-bank copy.
 /// Returns `picture.clone()` untouched when `apply_grain` is unset.
+/// lane-grainrow: one block's noise, gathered from the three sources spec
+/// 7.18.3.5 reads for it -- the row above's blended line buffer (its `top`
+/// rows), the column to the left's blended column buffer (`c_wide` columns)
+/// and the grain template for the rest. `rows`/`cols` are the block's own
+/// extent, already clipped at the picture edge by the caller.
+#[allow(clippy::too_many_arguments)]
+fn assemble_block_noise(
+    dst: &mut [i32],
+    d_stride: usize,
+    rows: usize,
+    cols: usize,
+    line: &[i32],
+    l_stride: usize,
+    l_col0: usize,
+    top: usize,
+    col: &[i32],
+    c_wide: usize,
+    tmpl: &[i32],
+    t_stride: usize,
+    t_row0: usize,
+    t_col0: usize,
+) {
+    for r in 0..rows {
+        let d = &mut dst[r * d_stride..r * d_stride + cols];
+        if r < top {
+            let o = r * l_stride + l_col0;
+            d.copy_from_slice(&line[o..o + cols]);
+        } else {
+            let o = (t_row0 + r) * t_stride + t_col0;
+            d.copy_from_slice(&tmpl[o..o + cols]);
+            let w = c_wide.min(cols);
+            d[..w].copy_from_slice(&col[r * c_wide..r * c_wide + w]);
+        }
+    }
+}
+
 pub(crate) fn apply_grain(
     picture: &Picture,
     fg: &FilmGrainParams,
@@ -1151,6 +1187,9 @@ pub(crate) fn apply_grain(
     let scaling_cr = expand_scaling_lut(&scaling_cr, expand_bd);
 
     let overlap = fg.overlap_flag;
+    let apply_y = fg.num_y_points > 0;
+    let apply_cb = fg.num_cb_points > 0 || fg.chroma_scaling_from_luma;
+    let apply_cr = fg.num_cr_points > 0 || fg.chroma_scaling_from_luma;
 
     // lane-filt1: 32-pixel block ROWS are the parallel axis. A row's noise
     // offsets come from `Rng::line(y * 2, grain_seed)` -- a function of the
@@ -1215,6 +1254,9 @@ pub(crate) fn apply_grain(
         let mut y_col_buf = vec![0i32; ((LUMA_SUBBLOCK + 2) * 2) as usize];
         let mut cb_col_buf = vec![0i32; (CHROMA_SUBBLOCK + 1) as usize];
         let mut cr_col_buf = vec![0i32; (CHROMA_SUBBLOCK + 1) as usize];
+        let mut y_blk = vec![0i32; (LUMA_SUBBLOCK * LUMA_SUBBLOCK) as usize];
+        let mut cb_blk = vec![0i32; (CHROMA_SUBBLOCK * CHROMA_SUBBLOCK) as usize];
+        let mut cr_blk = vec![0i32; (CHROMA_SUBBLOCK * CHROMA_SUBBLOCK) as usize];
 
         let mut y = y_first;
         while y < y_hi {
@@ -1281,30 +1323,6 @@ pub(crate) fn apply_grain(
                         hc_count, fctx,
                     );
 
-                    let i = if y != 0 { 1 } else { 0 };
-                    if !prelude {
-                        add_noise_to_block(
-                            fg,
-                            mc_identity,
-                            &scaling_y,
-                            &scaling_cb,
-                            &scaling_cr,
-                            &mut *out,
-                            (y + i) << 1,
-                            x << 1,
-                            &y_col_buf,
-                            2,
-                            i * 2,
-                            0,
-                            &cb_col_buf,
-                            &cr_col_buf,
-                            1,
-                            i,
-                            0,
-                            (LUMA_SUBBLOCK >> 1).min(height / 2 - y) - i,
-                            1, fctx,
-                        );
-                    }
                 }
 
                 if overlap && y != 0 {
@@ -1387,7 +1405,14 @@ pub(crate) fn apply_grain(
                         1, fctx,
                     );
 
-                    if !prelude {
+                }
+
+                let i = if overlap && y != 0 { 1 } else { 0 };
+                let j = if overlap && x != 0 { 1 } else { 0 };
+                if !prelude {
+                    let bh = (LUMA_SUBBLOCK >> 1).min(height / 2 - y);
+                    let bw = (LUMA_SUBBLOCK >> 1).min(width / 2 - x);
+                    if i == 0 && j == 0 {
                         add_noise_to_block(
                             fg,
                             mc_identity,
@@ -1397,45 +1422,107 @@ pub(crate) fn apply_grain(
                             &mut *out,
                             y << 1,
                             x << 1,
-                            &y_line_buf,
-                            y_stride,
-                            0,
+                            &luma_template,
+                            LUMA_BLOCK_W,
+                            luma_off_y,
+                            luma_off_x,
+                            &cb_template,
+                            &cr_template,
+                            CHROMA_BLOCK_W,
+                            chroma_off_y,
+                            chroma_off_x,
+                            bh,
+                            bw, fctx,
+                        );
+                    } else {
+                        // lane-grainrow: the overlap line and the overlap
+                        // column used to add their noise in calls of their own
+                        // -- the column 1 chroma sample wide (one scalar call
+                        // per row), and the block that was left 15 wide, whose
+                        // AVX2 kernel handed the 3-sample tail of every row
+                        // back to the scalar loop. A 4K cut spent 2.19e9 calls
+                        // on 4.4e9 such samples. Assembling the three noise
+                        // sources into one 32x32 block (16x16 chroma) first
+                        // makes it one kernel call per block over a width that
+                        // is a multiple of 8, with no scalar remainder. Every
+                        // sample keeps the value its own source gave it, so the
+                        // picture is bit-identical.
+                        if apply_y {
+                            assemble_block_noise(
+                                &mut y_blk,
+                                LUMA_SUBBLOCK as usize,
+                                (bh * 2) as usize,
+                                (bw * 2) as usize,
+                                &y_line_buf,
+                                y_stride as usize,
+                                (x << 1) as usize,
+                                (i * 2) as usize,
+                                &y_col_buf,
+                                (j * 2) as usize,
+                                &luma_template,
+                                LUMA_BLOCK_W as usize,
+                                luma_off_y as usize,
+                                luma_off_x as usize,
+                            );
+                        }
+                        if apply_cb {
+                            assemble_block_noise(
+                                &mut cb_blk,
+                                CHROMA_SUBBLOCK as usize,
+                                bh as usize,
+                                bw as usize,
+                                &cb_line_buf,
+                                c_stride as usize,
+                                x as usize,
+                                i as usize,
+                                &cb_col_buf,
+                                j as usize,
+                                &cb_template,
+                                CHROMA_BLOCK_W as usize,
+                                chroma_off_y as usize,
+                                chroma_off_x as usize,
+                            );
+                        }
+                        if apply_cr {
+                            assemble_block_noise(
+                                &mut cr_blk,
+                                CHROMA_SUBBLOCK as usize,
+                                bh as usize,
+                                bw as usize,
+                                &cr_line_buf,
+                                c_stride as usize,
+                                x as usize,
+                                i as usize,
+                                &cr_col_buf,
+                                j as usize,
+                                &cr_template,
+                                CHROMA_BLOCK_W as usize,
+                                chroma_off_y as usize,
+                                chroma_off_x as usize,
+                            );
+                        }
+                        add_noise_to_block(
+                            fg,
+                            mc_identity,
+                            &scaling_y,
+                            &scaling_cb,
+                            &scaling_cr,
+                            &mut *out,
+                            y << 1,
                             x << 1,
-                            &cb_line_buf,
-                            &cr_line_buf,
-                            c_stride,
+                            &y_blk,
+                            LUMA_SUBBLOCK,
                             0,
-                            x,
-                            1,
-                            (LUMA_SUBBLOCK >> 1).min(width / 2 - x), fctx,
+                            0,
+                            &cb_blk,
+                            &cr_blk,
+                            CHROMA_SUBBLOCK,
+                            0,
+                            0,
+                            bh,
+                            bw, fctx,
                         );
                     }
-                }
-
-                let i = if overlap && y != 0 { 1 } else { 0 };
-                let j = if overlap && x != 0 { 1 } else { 0 };
-                if !prelude {
-                    add_noise_to_block(
-                        fg,
-                        mc_identity,
-                        &scaling_y,
-                        &scaling_cb,
-                        &scaling_cr,
-                        &mut *out,
-                        (y + i) << 1,
-                        (x + j) << 1,
-                        &luma_template,
-                        LUMA_BLOCK_W,
-                        luma_off_y + (i << 1),
-                        luma_off_x + (j << 1),
-                        &cb_template,
-                        &cr_template,
-                        CHROMA_BLOCK_W,
-                        chroma_off_y + i,
-                        chroma_off_x + j,
-                        (LUMA_SUBBLOCK >> 1).min(height / 2 - y) - i,
-                        (LUMA_SUBBLOCK >> 1).min(width / 2 - x) - j, fctx,
-                    );
                 }
 
                 if overlap {
