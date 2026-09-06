@@ -2288,6 +2288,105 @@ fn commit_inter_luma(
     (flat.levels.clone(), 0, 0.0)
 }
 
+/// The largest distinct-colour count a block may hold and still be offered a
+/// palette candidate at all: past it the k-means quantisation costs more
+/// error than the map saves rate, and every trial is wasted wall.
+/// `EC_AV1_PAL_MAXCOLORS`.
+fn palette_max_colors() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("EC_AV1_PAL_MAXCOLORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// The palettes worth trying for one block's luma, in the shape libaom's
+/// `av1_k_means` picks them: a block holding at most `PALETTE_MAX_SIZE`
+/// distinct colours takes them ALL (the prediction is then exact and the
+/// residual empty), and a busier one is quantised to 8 and to 4 colours by a
+/// one-dimensional Lloyd iteration seeded evenly across its range -- both
+/// offered, because which wins is an RD question the caller answers.
+/// `block` is `side*side` source samples, row-major.
+fn palette_candidates(block: &[u8]) -> Vec<crate::tile::PaletteY> {
+    let mut histogram = [0u32; 256];
+    for &v in block {
+        histogram[usize::from(v)] += 1;
+    }
+    let present: Vec<u16> = (0..256u16).filter(|&v| histogram[usize::from(v)] > 0).collect();
+    if present.len() < 2 {
+        return Vec::new();
+    }
+    let exact = |colors: &[u16]| -> crate::tile::PaletteY {
+        let mut base = [0u16; 8];
+        base[..colors.len()].copy_from_slice(colors);
+        let map = block
+            .iter()
+            .map(|&v| {
+                colors
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &c)| (i32::from(c) - i32::from(v)).abs())
+                    .map(|(i, _)| i as u8)
+                    .expect("a palette holds at least two colours")
+            })
+            .collect();
+        crate::tile::PaletteY { size: colors.len() as u8, colors: base, map }
+    };
+    if present.len() <= 8 {
+        return vec![exact(&present)];
+    }
+    if present.len() > palette_max_colors() {
+        return Vec::new();
+    }
+    let (lo, hi) = (
+        i32::from(present[0]),
+        i32::from(present[present.len() - 1]),
+    );
+    let mut out = Vec::with_capacity(2);
+    for n in [8usize, 4] {
+        // Even seeding across the block's own range, then four Lloyd passes
+        // over the histogram (256 bins, not `side*side` pixels).
+        let mut centres: Vec<f64> = (0..n)
+            .map(|i| f64::from(lo) + f64::from(hi - lo) * (i as f64 + 0.5) / n as f64)
+            .collect();
+        for _ in 0..4 {
+            let mut sums = vec![0f64; n];
+            let mut counts = vec![0u32; n];
+            for (v, &count) in histogram.iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                let k = (0..n)
+                    .min_by(|&a, &b| {
+                        (centres[a] - v as f64)
+                            .abs()
+                            .total_cmp(&(centres[b] - v as f64).abs())
+                    })
+                    .expect("n >= 2");
+                sums[k] += (v as u32 * count) as f64;
+                counts[k] += count;
+            }
+            for k in 0..n {
+                if counts[k] > 0 {
+                    centres[k] = sums[k] / f64::from(counts[k]);
+                }
+            }
+        }
+        let mut colors: Vec<u16> = centres
+            .iter()
+            .map(|&c| c.round().clamp(0.0, 255.0) as u16)
+            .collect();
+        colors.sort_unstable();
+        colors.dedup();
+        if colors.len() >= 2 {
+            out.push(exact(&colors));
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn code_square(
     luma: &mut Plane,
@@ -2349,6 +2448,55 @@ fn code_square(
         luma_coeffs = best.3;
         TX_DEPTH_HITS[best.1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    // The palette candidate is priced against the mode the luma search (and
+    // its transform-depth search) already settled on, so a block only takes
+    // one when it beats the best ordinary intra coding of the same pixels.
+    // A palette block is `DC_PRED` with `tx_depth` 0 by construction: its
+    // prediction is the colour map, not the DC of its neighbours.
+    let mut mode = mode;
+    let mut palette = None;
+    if search.screen && crate::decode::palette_bsize_ctx(side).is_some() {
+        let source: Vec<u8> = (y..y + side)
+            .flat_map(|row| luma.source[row * luma.width + x..][..side].to_vec())
+            .collect();
+        let kept = luma.snapshot(x, y, side);
+        for pal in palette_candidates(&source) {
+            let n = usize::from(pal.size);
+            let prediction: Vec<u8> = pal
+                .map
+                .iter()
+                .map(|&i| pal.colors[usize::from(i).min(n - 1)] as u8)
+                .collect();
+            let trial = luma.code_from_prediction(
+                x,
+                y,
+                side,
+                &prediction,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                luma_set,
+            );
+            let cost_p = trial.sse
+                + search.lambda
+                    * (trial.bits
+                        + mode_bits[DC_PRED as usize]
+                        + crate::tile::palette_bits(&pal, side)
+                        + if tx_select { tx_depth_bits(side, 0) } else { 0.0 });
+            if cost_p < cost {
+                cost = cost_p;
+                mode = DC_PRED as u8;
+                tx_depth = 0;
+                luma_coeffs = coeffs(&trial.levels, side);
+                luma.commit(x, y, side, &trial);
+                palette = Some(pal);
+            }
+        }
+        if palette.is_none() {
+            luma.restore(x, y, side, &kept);
+        }
+    }
+
     // Chroma searches its own mode over [`CHROMA_MODES`], one symbol for both
     // planes; what it costs still counts towards the partition decision.
     let ([u, v], uv_mode, chroma_cost) =
@@ -2362,6 +2510,7 @@ fn code_square(
             mode,
             uv_mode,
             tx_depth,
+            palette,
             ..BlockCoeffs::default()
         },
         cost,
@@ -2757,6 +2906,7 @@ fn code_square_inter(
                     uv_mode: DC_PRED,
                     skip: skip_new,
                     eight: None,
+                    palette: None,
                     tx_depth,
                     inter: Some(InterInfo {
                         ref_frame: crate::mvstack::LAST_FRAME,
@@ -2791,6 +2941,7 @@ fn code_square_inter(
             uv_mode: DC_PRED,
             skip,
             eight: None,
+            palette: None,
             tx_depth,
             inter: Some(InterInfo {
                 ref_frame: crate::mvstack::LAST_FRAME,
@@ -2906,6 +3057,9 @@ fn mode_bits(above_mode: u8, left_mode: u8) -> [f64; 13] {
 
 /// What the luma mode search picks between, and under what terms.
 struct Search<'a> {
+    /// This frame's `allow_screen_content_tools` ([`screen_content`]): the
+    /// luma search then offers a palette candidate beside the intra modes.
+    screen: bool,
     base_q_idx: u8,
     deadzone: f64,
     lambda: f64,
@@ -3257,6 +3411,7 @@ pub(crate) fn encode_key_frame_inner(
         lambda: lambda_scale() * step * step,
         modes,
         top_k: prune_top_k(),
+        screen,
     };
 
     // The block grid this frame is coded over: [`crate::tile::block_grid`]'s
@@ -4446,6 +4601,7 @@ fn search_inter_block(
             skip: best.skip,
             inter: best.inter,
             eight: None,
+            palette: None,
             tx_depth: 0,
         },
         best.cost,
@@ -4618,6 +4774,9 @@ pub(crate) fn encode_inter_frame(
         lambda: lambda_scale() * step * step,
         modes: &KEY_FRAME_MODES,
         top_k: prune_top_k_inter(),
+        // An inter frame never sets `allow_screen_content_tools` yet, so its
+        // intra blocks code no palette syntax (deferred, see the lane report).
+        screen: false,
     };
     let mode_bits_table = inter_mode_bits();
 
@@ -5667,6 +5826,68 @@ mod tests {
         );
     }
 
+    /// A synthetic screen-content picture -- a few flat colours in a grid of
+    /// boxes with hard edges and text-like bars, the shape a desktop capture
+    /// has -- so the palette path is exercised on content it is for.
+    #[cfg(test)]
+    fn screen_card(width: usize, height: usize) -> Picture {
+        const INK: [u16; 4] = [16, 90, 180, 235];
+        let mut picture = Picture::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let cell = (x / 24 + y / 24) % 2;
+                let bar = usize::from(y % 24 < 6 && x % 24 >= 3 && x % 24 < 20);
+                picture.y[y * width + x] = INK[cell * 2 + bar];
+            }
+        }
+        for y in 0..height / 2 {
+            for x in 0..width / 2 {
+                let cell = (x / 12 + y / 12) % 2;
+                picture.u[y * (width / 2) + x] = if cell == 0 { 110 } else { 145 };
+                picture.v[y * (width / 2) + x] = if cell == 0 { 140 } else { 108 };
+            }
+        }
+        picture
+    }
+
+    /// The lane's own end-to-end check: on screen content the detector fires,
+    /// blocks really take a palette (fire count, class
+    /// `gate-blind-to-feature`), and ffmpeg -- libaom's own reader of every
+    /// symbol this lane writes -- reconstructs exactly what the encoder did.
+    /// The film-shaped `test_card` must NOT trip the detector, which is what
+    /// keeps every non-screen stream byte-identical.
+    #[test]
+    fn a_screen_content_picture_codes_palette_blocks_ffmpeg_decodes_exactly() {
+        let fctx = &crate::decode::FrameCtx::new();
+        let (width, height) = (192usize, 96usize);
+        let _ = crate::tile::take_palette_hits();
+        let picture = screen_card(width, height);
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
+        assert!(
+            encoded.screen,
+            "the detector did not fire on screen content -- no palette syntax was coded at all"
+        );
+        let hits = crate::tile::take_palette_hits();
+        assert!(hits[0] > 0, "no block took a palette: {hits:?}");
+        eprintln!("palette blocks {} sizes {:?}", hits[0], &hits[2..]);
+        let via_us = crate::stream::decode_stream(&encoded.stream).unwrap();
+        assert_eq!(via_us[0].y, encoded.reconstruction.y, "our decoder: luma");
+        assert_eq!(via_us[0].u, encoded.reconstruction.u, "our decoder: U");
+        assert_eq!(via_us[0].v, encoded.reconstruction.v, "our decoder: V");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let decoded = ffmpeg_decode(&encoded.stream, width, height);
+        assert_eq!(decoded.y, encoded.reconstruction.y, "ffmpeg: luma");
+        assert_eq!(decoded.u, encoded.reconstruction.u, "ffmpeg: U");
+        assert_eq!(decoded.v, encoded.reconstruction.v, "ffmpeg: V");
+        // The other half of the keep rule: film-shaped content leaves the
+        // detector (and so the whole sequence header) alone.
+        let film = encode_key_frame_with_ctx(&test_card(width, height), 100, 0.5, fctx).unwrap();
+        assert!(!film.screen, "the detector fired on the film-shaped test card");
+    }
+
     /// The minimal repro that isolated the inter-residual desync: a key frame
     /// followed by one inter frame whose single superblock carries one
     /// `NEARESTMV` block (`mv == (0, 0)`) with exactly one nonzero luma
@@ -5703,6 +5924,7 @@ mod tests {
             uv_mode: 0,
             skip: false,
             eight: None,
+            palette: None,
             tx_depth: 0,
             inter: Some(InterInfo {
                 ref_frame: crate::mvstack::LAST_FRAME,
@@ -8289,6 +8511,10 @@ mod tests {
             let fctx = &crate::decode::FrameCtx::new();
             let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
             let _ = take_partition_hits();
+            let _ = crate::tile::take_palette_hits();
+            SCREEN_FRAMES.iter().for_each(|c| {
+                c.store(0, std::sync::atomic::Ordering::Relaxed);
+            });
             let _ = take_uv_mode_hits();
             let _ = crate::tile::take_inter_mode_hits();
             let _ = crate::tile::take_drl_hits();
@@ -8408,6 +8634,22 @@ mod tests {
             // Which chroma modes the search actually wins with, against the
             // unconditional DC_PRED that was the only outcome before
             // (gate-blind-to-feature).
+            // Screen-content detection and the palette it turns on
+            // (gate-blind-to-feature): how many frames set
+            // `allow_screen_content_tools`, how many blocks took a palette,
+            // and of what size. A film clip must print `screen frames on=0`.
+            let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
+            let screen_off = SCREEN_FRAMES[0].load(std::sync::atomic::Ordering::Relaxed);
+            let palette = crate::tile::take_palette_hits();
+            eprintln!(
+                "{name}: screen frames on={screen_on} off={screen_off}; palette blocks {} sizes {}",
+                palette[0],
+                (2..=8)
+                    .filter(|&n| palette[n] > 0)
+                    .map(|n| format!("{n}={}", palette[n]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
             let uv = take_uv_mode_hits();
             let uv_total: usize = uv.iter().sum();
             eprintln!(
