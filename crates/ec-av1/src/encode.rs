@@ -5947,7 +5947,20 @@ mod tests {
     /// ours: `base_q_idx {60,90,120,150}`. Every PSNR is all-plane, on
     /// ffmpeg-decoded frames of each encoder's own stream.
     ///
-    /// Measured baseline 2026-09-06 (see the lane report for the full table).
+    /// Measured baseline 2026-09-06, 12 frames, this box (wall = the four
+    /// encodes of that ladder together):
+    ///
+    /// | clip | ours (q 150/120/90/60) | BD-rate vs libaom | vs rav1e | wall ours:aom:rav1e |
+    /// |---|---|---|---|---|
+    /// | 1080p fixture | 40.36 dB/26824 B .. 48.24 dB/120942 B | +501.4% | +364.4% | 5.1s:1.9s:3.8s |
+    /// | 2160p fixture | 41.36 dB/17608 B .. 49.27 dB/76978 B | +504.4% | +401.0% | 4.6s:1.5s:3.3s |
+    /// | screen capture | 37.32 dB/13053 B .. 45.39 dB/59744 B | +440.9% | +206.0% | 5.9s:1.7s:3.0s |
+    ///
+    /// So: roughly 5x libaom's rate and 3-4x rav1e's at matched fidelity,
+    /// while spending 2.7x libaom's and 1.4x rav1e's encode time. No
+    /// threshold is asserted yet -- this run sets the baseline; the gate
+    /// asserts only four monotone points per ladder and that ffmpeg decodes
+    /// our stream sample-exact against our reconstruction.
     ///
     /// Run:
     ///     cargo test -p ec-av1 --release --lib -- --ignored \
