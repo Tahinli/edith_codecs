@@ -260,14 +260,6 @@ impl<'a> RangeDecoder<'a> {
     }
 }
 
-/// The Opus range *encoder* (RFC 6716, Section 5.1) — the exact mirror of
-/// [`RangeDecoder`], over a fixed-size buffer.
-///
-/// Range-coded bytes grow from the front of the buffer, raw bits from the
-/// back, exactly as the decoder reads them; the two meeting is a bust, which
-/// [`RangeEncoder::error`] reports rather than corrupting either stream. The
-/// buffer is owned and reused across frames — [`RangeEncoder::reset`] costs a
-/// `fill(0)` of the frame, so a steady-state encoder never allocates here.
 /// Scalar state of a [`RangeEncoder`], saved and restored around a trial
 /// encode (the coarse-energy two-pass search).
 #[derive(Clone, Copy)]
@@ -284,6 +276,14 @@ pub struct EncSnapshot {
     error: bool,
 }
 
+/// The Opus range *encoder* (RFC 6716, Section 5.1) — the exact mirror of
+/// [`RangeDecoder`], over a fixed-size buffer.
+///
+/// Range-coded bytes grow from the front of the buffer, raw bits from the
+/// back, exactly as the decoder reads them; the two meeting is a bust, which
+/// [`RangeEncoder::error`] reports rather than corrupting either stream. The
+/// buffer is owned and reused across frames — [`RangeEncoder::reset`] costs a
+/// `fill(0)` of the frame, so a steady-state encoder never allocates here.
 #[derive(Clone, Debug)]
 pub struct RangeEncoder {
     buf: Vec<u8>,
