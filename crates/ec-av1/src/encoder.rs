@@ -356,6 +356,33 @@ pub struct Pyramid {
     pub leaf_q_offset: i16,
 }
 
+impl Pyramid {
+    /// The pyramid a run asks for through the environment:
+    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]`, with
+    /// `0` (or anything that is not a mini-GOP of at least 2, e.g. `flat`)
+    /// meaning the flat one-picture-one-frame path. UNSET is
+    /// [`Pyramid::default`]: the pyramid is what
+    /// [`crate::encode::encode_sequence`], the BD gate and `ec-bench` code
+    /// under unless a run turns it off for an A/B.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let d = Self::default();
+        let Some(spec) = std::env::var("EC_AV1_PYRAMID").ok() else {
+            return Some(d);
+        };
+        let mut f = spec.split(':');
+        let mini_gop: usize = f.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if mini_gop < 2 {
+            return None;
+        }
+        Some(Self {
+            mini_gop,
+            arf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.arf_q_offset),
+            leaf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.leaf_q_offset),
+        })
+    }
+}
+
 impl Default for Pyramid {
     /// The best point of the offset sweep run through the BD gate's own
     /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]` knob
@@ -580,6 +607,11 @@ pub struct Av1Encoder {
     anchor: usize,
     /// Coding-order position of the next packet — a packet's `dts`.
     next_dts: u64,
+    /// Set by [`Av1Encoder::encode_sequence_pyramid`]: every coded frame's
+    /// own cropped [`Encoded`] (its display position and its reconstruction),
+    /// which is what [`crate::encode::EncodedSequence`] carries and a packet
+    /// does not. `None` for every other caller, which pays nothing for it.
+    collected: Option<Vec<(u64, Encoded)>>,
 }
 
 /// One decoded-picture-buffer slot: what a `refresh_frame_flags` bit stores
@@ -645,6 +677,7 @@ impl Av1Encoder {
             held: std::collections::VecDeque::new(),
             anchor: 0,
             next_dts: 0,
+            collected: None,
         })
     }
 
@@ -931,6 +964,65 @@ impl Av1Encoder {
         Ok(self.packet(cropped.stream, is_key, order, level))
     }
 
+    /// THE SHARED MINI-GOP DRIVER: codes a whole sequence — one key frame
+    /// then all inter, which is [`crate::encode::encode_sequence`]'s only
+    /// shape — through this very facade, under `pyramid`, and hands back what
+    /// that path returns. The two are byte-identical BY CONSTRUCTION rather
+    /// than by a mirrored second implementation: there is one reordering,
+    /// one DPB/slot policy and one set of per-level quantizer offsets, here
+    /// (`encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence`
+    /// still pins it, now over a pyramid sequence too).
+    ///
+    /// The content gate lives in [`Av1Encoder::encode_frames`] and applies
+    /// unchanged, so a screen-content clip handed in here codes flat.
+    ///
+    /// `EncodedSequence::frames` comes back in DISPLAY order, one entry per
+    /// source picture — the order the flat path's coding order happens to be,
+    /// and the order every reader of it (the BD gate's sample-exactness
+    /// assertions against a decoder's output) needs. `stream` stays in coding
+    /// order, which is the order a decoder reads.
+    ///
+    /// # Errors
+    /// As [`Av1Encoder::encode_frames`].
+    pub(crate) fn encode_sequence_pyramid(
+        pictures: &[Picture],
+        base_q_idx: u8,
+        pyramid: Pyramid,
+        tiles: (u32, u32),
+    ) -> Result<crate::encode::EncodedSequence> {
+        let first = pictures.first().ok_or_else(|| {
+            Error::unsupported("AV1 encode", "a sequence needs at least one picture")
+        })?;
+        let config = EncoderConfig {
+            width: first.width,
+            height: first.height,
+            base_q_idx,
+            // One key frame, at picture 0, and inter for the rest.
+            gop: pictures.len().max(1),
+            // `encode_sequence` writes an unspecified colour config.
+            colour: Colour::Unspecified,
+            tile_cols_log2: tiles.0,
+            tile_rows_log2: tiles.1,
+        };
+        let mut encoder = Self::with_pyramid(config, pyramid)?;
+        encoder.collected = Some(Vec::with_capacity(pictures.len()));
+        let mut stream = Vec::new();
+        for picture in pictures {
+            for packet in encoder.encode_frames(picture)? {
+                stream.extend_from_slice(&packet.data);
+            }
+        }
+        for packet in encoder.flush()? {
+            stream.extend_from_slice(&packet.data);
+        }
+        let mut collected = encoder.collected.take().expect("collecting");
+        collected.sort_by_key(|(order, _)| *order);
+        Ok(crate::encode::EncodedSequence {
+            stream,
+            frames: collected.into_iter().map(|(_, encoded)| encoded).collect(),
+        })
+    }
+
     /// Stamps a packet with its display and coding positions and advances the
     /// coding-order clock.
     fn packet(&mut self, data: Vec<u8>, key: bool, order: u64, level: Level) -> Packet {
@@ -982,6 +1074,9 @@ impl Av1Encoder {
         let cropped = crop_encoded(&encoded, render.0, render.1);
         if let Some(rate_loop) = self.rate_loop.as_mut() {
             rate_loop.update(Level::Key, cropped.stream.len());
+        }
+        if let Some(collected) = self.collected.as_mut() {
+            collected.push((order, cropped.clone()));
         }
         Ok(self.packet(cropped.stream, true, order, Level::Key))
     }
@@ -1090,6 +1185,9 @@ impl Av1Encoder {
         let cropped = crop_encoded(&encoded, render.0, render.1);
         if let Some(rate_loop) = self.rate_loop.as_mut() {
             rate_loop.update(level, cropped.stream.len());
+        }
+        if let Some(collected) = self.collected.as_mut() {
+            collected.push((order, cropped.clone()));
         }
         Ok(self.packet(cropped.stream, false, order, level))
     }
@@ -1263,54 +1361,106 @@ mod tests {
         assert!(enc.flush().unwrap().is_empty(), "nothing is held twice");
     }
 
-    /// THE ENTRY-SURFACE GATE (lane-av1facade): the streaming facade — what
-    /// the editor's export drives — codes byte for byte what
-    /// [`crate::encode::encode_sequence`] codes, which is the path the BD
-    /// gate measures. It did not before: the facade passed no lookahead, so
-    /// every inter frame missed the per-superblock temporal lambda map
-    /// (lane-av1tpl) the gate's numbers were measured with.
+    /// A screen-like card: hard-edged 4-pixel bands of two flat luma values
+    /// with a moving block over the lower half — few colours per 16x16 block
+    /// at high variance, which is exactly what
+    /// [`crate::encode::picture_is_screen`] separates. Used unforced, so the
+    /// gate below runs the real detector rather than an override.
+    fn screen_card(width: usize, height: usize, shift: usize) -> Picture {
+        let mut picture = Picture::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let band = if (x / 4).is_multiple_of(2) { 40 } else { 200 };
+                let over = y >= height / 2 && (x + shift) % width < width / 3;
+                picture.y[y * width + x] = if over { 128 } else { band };
+            }
+        }
+        picture
+    }
+
+    /// THE ENTRY-SURFACE GATE (lane-av1facade, extended to the pyramid on
+    /// lane-av1pyrdef): the streaming facade — what the editor's export
+    /// drives — codes byte for byte what [`crate::encode::encode_sequence`]
+    /// codes, which is the path the BD gate measures. Both now drive ONE
+    /// mini-GOP driver ([`Av1Encoder::encode_sequence_pyramid`]), so the
+    /// identity is by construction; this pins it anyway, over both content
+    /// classes the content gate splits:
     ///
-    /// Runs on the gate's own clip at the gate's own size when the fixture is
-    /// there, and on a synthetic card otherwise — never skipped, since a
-    /// skipped identity gate is the defect it is meant to catch.
+    ///   * film-like (the gate's own clip when the fixture is there, a
+    ///     multi-tone moving card otherwise): the pyramid is EFFECTIVE, the
+    ///     stream is reordered (a hidden `ALTREF` per mini-GOP), and the two
+    ///     paths' whole streams are identical;
+    ///   * screen-like: the content gate drops BOTH paths back to flat, one
+    ///     packet per picture, identical frame by frame as well as whole.
+    ///
+    /// Never skipped, since a skipped identity gate is the defect it is meant
+    /// to catch.
     #[test]
     fn the_facade_codes_the_same_bytes_as_encode_sequence() {
         let frames = 12usize;
-        let pictures = h264_clip_frames(640, 384, frames).unwrap_or_else(|| {
+        let film = h264_clip_frames(640, 384, frames).unwrap_or_else(|| {
             eprintln!("no h264 clip: the facade identity gate runs on a synthetic card");
             (0..frames).map(|t| test_card(64, 64, t)).collect()
         });
-        let (width, height) = (pictures[0].width, pictures[0].height);
-        for q in [150u8, 60] {
-            let config = EncoderConfig {
-                width,
-                height,
-                base_q_idx: q,
-                // One key frame then all inter, which is `encode_sequence`'s
-                // only shape, and the gate's recipe.
-                gop: frames,
-                // `encode_sequence` writes an unspecified colour config.
-                colour: Colour::Unspecified,
-                tile_cols_log2: 0,
-                tile_rows_log2: 0,
-            };
-            let mut enc = Av1Encoder::new(config).unwrap();
-            let packets = encode_all(&mut enc, &pictures);
-            let sequence = crate::encode::encode_sequence(&pictures, q, DEADZONE).unwrap();
-            assert_eq!(packets.len(), frames, "q={q}: one packet per picture");
-            for (i, (packet, coded)) in packets.iter().zip(&sequence.frames).enumerate() {
-                let cropped = crate::encode::crop_encoded(coded, width, height);
+        let screen: Vec<Picture> = (0..frames).map(|t| screen_card(64, 64, t)).collect();
+        let pyramid = Pyramid::from_env().expect("the pyramid is this build's default");
+        for (content, pictures, is_screen) in
+            [("film", &film, false), ("screen", &screen, true)]
+        {
+            let (width, height) = (pictures[0].width, pictures[0].height);
+            for q in [150u8, 60] {
+                let config = EncoderConfig {
+                    width,
+                    height,
+                    base_q_idx: q,
+                    // One key frame then all inter, which is
+                    // `encode_sequence`'s only shape, and the gate's recipe.
+                    gop: frames,
+                    // `encode_sequence` writes an unspecified colour config.
+                    colour: Colour::Unspecified,
+                    tile_cols_log2: 0,
+                    tile_rows_log2: 0,
+                };
+                let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
+                let mut packets = Vec::new();
+                for picture in pictures {
+                    packets.extend(enc.encode_frames(picture).unwrap());
+                }
+                packets.extend(enc.flush().unwrap());
                 assert_eq!(
-                    (packet.data.len(), packet.data.clone()),
-                    (cropped.stream.len(), cropped.stream.clone()),
-                    "q={q} frame {i}: the facade's bytes are not the sequence path's"
+                    enc.pyramid().is_none(),
+                    is_screen,
+                    "{content} q={q}: the content gate read this clip the other way round"
                 );
+                let sequence = crate::encode::encode_sequence(pictures, q, DEADZONE).unwrap();
+                assert_eq!(
+                    (packets.iter().map(|p| p.data.len()).sum::<usize>(), concat(&packets)),
+                    (sequence.stream.len(), sequence.stream.clone()),
+                    "{content} q={q}: the facade's stream is not the sequence path's"
+                );
+                assert_eq!(
+                    sequence.frames.len(),
+                    frames,
+                    "{content} q={q}: one entry per picture, in display order"
+                );
+                if is_screen {
+                    assert_eq!(packets.len(), frames, "{content} q={q}: one packet per picture");
+                    for (i, (packet, coded)) in packets.iter().zip(&sequence.frames).enumerate() {
+                        let cropped = crate::encode::crop_encoded(coded, width, height);
+                        assert_eq!(
+                            (packet.data.len(), packet.data.clone()),
+                            (cropped.stream.len(), cropped.stream.clone()),
+                            "{content} q={q} frame {i}: the facade's bytes are not the \
+                             sequence path's"
+                        );
+                    }
+                } else {
+                    assert!(
+                        packets.iter().any(|p| p.level == Level::Arf),
+                        "{content} q={q}: a non-screen stream coded no hidden frame"
+                    );
+                }
             }
-            assert_eq!(
-                concat(&packets),
-                sequence.stream,
-                "q={q}: whole stream"
-            );
         }
     }
 
