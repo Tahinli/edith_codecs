@@ -595,6 +595,47 @@ pub fn show_existing_frame_obu(seq: &SequenceHeader, frame_to_show_map_idx: u8) 
     ))
 }
 
+/// How wide a tile group's per-tile size field has to be for these tiles
+/// (`TileSizeBytes`, spec 5.11.1: every non-last tile carries `size - 1` in
+/// that many bytes, so the widest of them decides).
+pub(crate) fn tile_size_bytes_for(tiles: &[Vec<u8>]) -> u32 {
+    let widest = tiles
+        .iter()
+        .rev()
+        .skip(1)
+        .map(|t| t.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
+    match widest {
+        0..=0xFF => 1,
+        0x100..=0xFFFF => 2,
+        0x1_0000..=0xFF_FFFF => 3,
+        _ => 4,
+    }
+}
+
+/// `tile_group_obu()` (spec 5.11.1) for a group holding every tile of the
+/// frame: `tile_start_and_end_present_flag = 0` (only coded when the frame
+/// has more than one tile), byte alignment, then each tile's size (all but
+/// the last, little endian, `tile_size_bytes` wide) ahead of its payload.
+/// One tile leaves the payload exactly as it was, which is what every
+/// single-tile stream this crate wrote before tiles existed carries.
+pub(crate) fn tile_group_payload(tiles: &[Vec<u8>], tile_size_bytes: u32) -> Vec<u8> {
+    if tiles.len() == 1 {
+        return tiles[0].clone();
+    }
+    // The flag bit plus `byte_alignment()`: one zero byte.
+    let mut out = vec![0u8];
+    for (i, tile) in tiles.iter().enumerate() {
+        if i + 1 < tiles.len() {
+            let size = (tile.len() - 1) as u32;
+            out.extend((0..tile_size_bytes).map(|b| (size >> (8 * b)) as u8));
+        }
+        out.extend_from_slice(tile);
+    }
+    out
+}
+
 /// A `OBU_FRAME`: the header above, byte-aligned, followed by the tile group
 /// payload the caller supplies.
 pub fn frame_obu(seq: &SequenceHeader, h: &FrameHeader, tile_data: &[u8]) -> Result<Vec<u8>> {
