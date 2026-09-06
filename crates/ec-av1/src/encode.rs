@@ -2766,7 +2766,12 @@ fn mc_trial(
     // lane-hbd r4: `reference` (a DPB `Picture`'s plane) is `u16` now that
     // `Picture` is widened; `prediction`/the encoder stay `u8` (encoder is
     // 8-bit only this round, see `intra_predict_u8`'s doc comment).
-    let mut prediction16 = vec![0u16; side * side];
+    // lane-av1speed: both buffers are per-candidate scratch on the hottest
+    // path in the encoder, so they live on the stack -- `side` is at most
+    // `BLOCK` (32) for luma and half that for chroma. Two heap allocations
+    // per motion-compensated trial otherwise.
+    let mut prediction16 = [0u16; BLOCK * BLOCK];
+    let prediction16 = &mut prediction16[..side * side];
     mc::predict(
         reference,
         stride,
@@ -2776,10 +2781,14 @@ fn mc_trial(
         y_q4,
         side,
         side,
-        &mut prediction16, fctx,
+        prediction16, fctx,
     );
-    let prediction: Vec<u8> = prediction16.iter().map(|&v| v as u8).collect();
-    plane.code_from_prediction(x, y, side, &prediction, skip, base_q_idx, deadzone, set)
+    let mut prediction = [0u8; BLOCK * BLOCK];
+    let prediction = &mut prediction[..side * side];
+    for (dst, &src) in prediction.iter_mut().zip(prediction16.iter()) {
+        *dst = src as u8;
+    }
+    plane.code_from_prediction(x, y, side, prediction, skip, base_q_idx, deadzone, set)
 }
 
 /// Codes one 32x32 block of an inter frame as whichever costs least of: each
