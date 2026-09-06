@@ -373,10 +373,14 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
     }
     let wall = start.elapsed().as_secs_f64();
     let media_s = n as f64 / 30.0;
+    let fps = if wall > 0.0 { f64::from(n) / wall } else { 0.0 };
+    let bytes_per_frame = stream.len() as f64 / f64::from(n);
     rows.push(Row {
         component: "ec-av1",
         direction: "encode",
-        content: format!("{w}x{h}, {n} frames, gop=10"),
+        content: format!(
+            "{w}x{h}, {n} frames, gop=10, {fps:.1} fps, {bytes_per_frame:.0} B/frame"
+        ),
         media: format!("{media_s:.1}s"),
         wall_ms: wall * 1000.0,
         rtf: (wall > 0.0).then_some(media_s / wall),
