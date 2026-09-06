@@ -9987,6 +9987,7 @@ mod tests {
             let _ = crate::tile::take_compound_mode_hits();
             let _ = crate::tile::take_compound_pair_hits();
             let _ = crate::tile::take_compound_size_hits();
+            let _ = crate::tile::take_compound_leaf_mode_hits();
             let _ = crate::motion::take_census();
             let (ours, ours_wall) = match pyramid_from_env() {
                 None => our_ladder(name, &source, width, height, fctx),
@@ -10029,6 +10030,7 @@ mod tests {
             let comp_modes = crate::tile::take_compound_mode_hits();
             let comp_pairs = crate::tile::take_compound_pair_hits();
             let comp_sizes = crate::tile::take_compound_size_hits();
+            let comp_leaf = crate::tile::take_compound_leaf_mode_hits();
             let comp_total: usize = comp_modes.iter().sum();
             eprintln!(
                 "{name}: compound {comp_total} of {} inter blocks ({:.1}%); modes \
@@ -10039,6 +10041,12 @@ mod tests {
                 comp_modes[0], comp_modes[1], comp_modes[2], comp_modes[3],
                 comp_modes[6], comp_modes[7],
                 comp_pairs[3], comp_pairs[6],
+            );
+            eprintln!(
+                "{name}: leaf (16x16 and below) compound modes NEAREST_NEAREST {} \
+                 NEAR_NEAR {} NEAREST_NEW {} NEW_NEAREST {} GLOBAL_GLOBAL {} NEW_NEW {}",
+                comp_leaf[0], comp_leaf[1], comp_leaf[2], comp_leaf[3], comp_leaf[6],
+                comp_leaf[7],
             );
             eprintln!(
                 "{name}: compound by size 8x8 {} 16x16 {} 32x32 {}",
