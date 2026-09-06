@@ -13,13 +13,32 @@
 //! tile payload, so no candidate re-runs the search or the entropy coder).
 
 use crate::encode::Picture;
-use ec_av1_syntax::LoopFilterParams;
+use ec_av1_syntax::{CdefParams, LoopFilterParams};
 use ec_core::Result;
 
 /// Luma deblocking levels tried at the coarse stage, refined by +-1/+-2
 /// around the winner (libaom's `av1_pick_filter_level` runs a golden-section
 /// search over the same 0..63 range; this ladder is the charter's).
 const COARSE: [u8; 7] = [0, 4, 8, 16, 24, 32, 48];
+
+thread_local! {
+    /// Every frame's chosen filter parameters, in coding
+    /// order -- the BD gate prints the distribution once per clip
+    /// (gate-blind-to-feature: a filter nobody counts is a filter that may
+    /// never fire).
+    static CHOSEN: std::cell::RefCell<Vec<Cand>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes and clears [`CHOSEN`].
+#[allow(dead_code)] // read from the `#[cfg(test)]` BD gate
+pub(crate) fn take_chosen_levels() -> Vec<((u8, u8), (u8, u8), (u8, u8))> {
+    CHOSEN.with(|c| {
+        std::mem::take(&mut *c.borrow_mut())
+            .into_iter()
+            .map(|c| (c.lf, c.y, c.uv))
+            .collect()
+    })
+}
 
 /// Squared error between a decoded plane and the source it was coded from,
 /// over the frame's own cropped `w x h` (the two planes have different
@@ -36,105 +55,143 @@ fn plane_sse(dec: &[u16], dec_w: usize, src: &[u8], src_w: usize, w: usize, h: u
     sse
 }
 
+/// CDEF primary strengths tried (libaom's own range is 0..15 for 8-bit
+/// content) and the secondary ladder, whose only legal values are 0, 1, 2
+/// and 4 -- 3 is not codeable (spec 5.9.19 codes a secondary strength of 4
+/// as 3).
+const CDEF_PRI: [u8; 5] = [0, 1, 2, 4, 8];
+const CDEF_SEC: [u8; 4] = [0, 1, 2, 4];
+
+/// One point of the filter search: the deblocking levels and the single
+/// CDEF strength pair per plane type this encoder writes (`cdef_bits == 0`,
+/// so no `cdef_idx` literal is coded in the tile at all and the choice is
+/// purely a frame-header one).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Cand {
+    /// `(luma, chroma)` deblocking level.
+    lf: (u8, u8),
+    /// Luma `(primary, secondary)` CDEF strength.
+    y: (u8, u8),
+    /// Chroma `(primary, secondary)` CDEF strength.
+    uv: (u8, u8),
+}
+
 /// One evaluated candidate: the decoded picture and its luma / chroma error.
 struct Trial {
-    level: (u8, u8),
+    cand: Cand,
     picture: Picture,
     sse_y: u64,
     sse_uv: u64,
 }
 
-/// Picks `loop_filter_level[0..4]` for one frame and hands back the filtered
-/// reconstruction that goes with the winner.
+/// Picks this frame's deblocking levels and CDEF strengths and hands back
+/// the filtered reconstruction that goes with the winner.
 ///
 /// `decode` reconstructs this frame's already-coded tile under the candidate
 /// parameters; `source` is the encoder's padded (luma, U, V) coding surface
-/// with luma stride `src_w`, and `(fw, fh)` the frame header's own true
-/// size, which is what `decode` crops to.
+/// with luma stride `src_w`, `(fw, fh)` the frame header's own true size,
+/// which is what `decode` crops to, and `damping` the CDEF damping the
+/// caller's header carries.
 ///
-/// Luma (`level[0..2]`, kept equal -- this encoder has no reason to filter
-/// vertical and horizontal edges differently) is chosen on luma SSE with the
-/// chroma levels riding along, then chroma (`level[2..4]`) is chosen on
-/// chroma SSE with luma fixed. `sharpness` stays 0 and the ref/mode deltas
-/// stay off, as [`LoopFilterParams::default`] has them.
+/// A coordinate search, in the decoder's own filter order and each stage on
+/// the plane it moves: deblocking luma (`level[0..2]`, kept equal -- nothing
+/// here filters vertical and horizontal edges differently), deblocking
+/// chroma (`level[2..4]`, a real choice of its own: flat chroma has no edges
+/// to soften), then CDEF's luma and chroma primary/secondary strengths.
+/// `sharpness` stays 0, the loop-filter deltas stay off, and `cdef_bits`
+/// stays 0 -- one strength pair for the whole frame, which is the only CDEF
+/// shape that costs no `cdef_idx` literal in the tile payload.
 ///
 /// # Errors
 /// Whatever `decode` returns: a stream this crate's own decoder refuses is
 /// a caller's cue to keep its unfiltered reconstruction.
-pub(crate) fn pick_deblock(
-    decode: impl Fn(&LoopFilterParams) -> Result<Picture>,
+pub(crate) fn pick_filters(
+    decode: impl Fn(&LoopFilterParams, &CdefParams) -> Result<Picture>,
     source: [&[u8]; 3],
     src_w: usize,
     (fw, fh): (usize, usize),
-) -> Result<(LoopFilterParams, Picture)> {
+    damping: u8,
+) -> Result<(LoopFilterParams, CdefParams, Picture)> {
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
     let mut trials: Vec<Trial> = Vec::new();
-    let eval = |level: (u8, u8), trials: &mut Vec<Trial>| -> Result<usize> {
-        if let Some(i) = trials.iter().position(|t| t.level == level) {
+    let eval = |cand: Cand, trials: &mut Vec<Trial>| -> Result<usize> {
+        if let Some(i) = trials.iter().position(|t| t.cand == cand) {
             return Ok(i);
         }
-        let lf = LoopFilterParams {
-            level: [level.0, level.0, level.1, level.1],
-            ..LoopFilterParams::default()
-        };
-        let picture = decode(&lf)?;
+        let picture = decode(&loop_filter(cand), &cdef(cand, damping))?;
         let dec_cw = picture.width.div_ceil(2);
         let sse_y = plane_sse(&picture.y, picture.width, source[0], src_w, fw, fh);
         let sse_uv = plane_sse(&picture.u, dec_cw, source[1], src_w / 2, cw, ch)
             + plane_sse(&picture.v, dec_cw, source[2], src_w / 2, cw, ch);
-        trials.push(Trial { level, picture, sse_y, sse_uv });
+        trials.push(Trial { cand, picture, sse_y, sse_uv });
         Ok(trials.len() - 1)
     };
+    // One stage of the coordinate search: try `values` in the slot `set`
+    // moves and keep the one with the lowest error `sse` reads.
+    let stage = |best: &mut Cand,
+                     values: &[u8],
+                     set: fn(&mut Cand, u8),
+                     sse: fn(&Trial) -> u64,
+                     trials: &mut Vec<Trial>|
+     -> Result<()> {
+        let mut winner = *best;
+        let mut lowest = u64::MAX;
+        for &v in values {
+            let mut cand = *best;
+            set(&mut cand, v);
+            let i = eval(cand, trials)?;
+            if sse(&trials[i]) < lowest {
+                lowest = sse(&trials[i]);
+                winner = cand;
+            }
+        }
+        *best = winner;
+        Ok(())
+    };
 
-    // Luma: the coarse ladder, then +-1/+-2 around its winner.
-    let mut best_y = 0u8;
-    let mut best_sse = u64::MAX;
-    for l in COARSE {
-        let i = eval((l, l), &mut trials)?;
-        if trials[i].sse_y < best_sse {
-            best_sse = trials[i].sse_y;
-            best_y = l;
-        }
-    }
-    for delta in [-2i32, -1, 1, 2] {
-        let Ok(l) = u8::try_from(i32::from(best_y) + delta) else {
-            continue;
-        };
-        if l > 63 {
-            continue;
-        }
-        let i = eval((l, l), &mut trials)?;
-        if trials[i].sse_y < best_sse {
-            best_sse = trials[i].sse_y;
-            best_y = l;
-        }
-    }
+    let mut best = Cand { lf: (0, 0), y: (0, 0), uv: (0, 0) };
+    // Deblocking luma: the coarse ladder, then +-1/+-2 around its winner.
+    stage(&mut best, &COARSE, |c, v| c.lf = (v, v), |t| t.sse_y, &mut trials)?;
+    let refine: Vec<u8> = [-2i32, -1, 1, 2]
+        .iter()
+        .filter_map(|d| u8::try_from(i32::from(best.lf.0) + d).ok())
+        .filter(|&l| l <= 63)
+        .collect();
+    stage(&mut best, &refine, |c, v| c.lf = (v, v), |t| t.sse_y, &mut trials)?;
+    // Deblocking chroma, three points around the luma winner.
+    let chroma_levels = [0, best.lf.0 / 2, best.lf.0];
+    stage(&mut best, &chroma_levels, |c, v| c.lf.1 = v, |t| t.sse_uv, &mut trials)?;
+    // CDEF, primary then secondary, luma on luma error and chroma on chroma.
+    stage(&mut best, &CDEF_PRI, |c, v| c.y.0 = v, |t| t.sse_y, &mut trials)?;
+    stage(&mut best, &CDEF_SEC, |c, v| c.y.1 = v, |t| t.sse_y, &mut trials)?;
+    stage(&mut best, &CDEF_PRI, |c, v| c.uv.0 = v, |t| t.sse_uv, &mut trials)?;
+    stage(&mut best, &CDEF_SEC, |c, v| c.uv.1 = v, |t| t.sse_uv, &mut trials)?;
 
-    // Chroma: three points around the luma winner. A chroma level of 0 with
-    // luma non-zero is a real outcome (flat chroma has no edges to soften),
-    // which is why `level[2..4]` is searched at all rather than tied to
-    // `level[0]`.
-    let mut best_uv = best_y;
-    let mut best_sse_uv = u64::MAX;
-    for c in [0, best_y / 2, best_y] {
-        let i = eval((best_y, c), &mut trials)?;
-        if trials[i].sse_uv < best_sse_uv {
-            best_sse_uv = trials[i].sse_uv;
-            best_uv = c;
-        }
-    }
-
+    CHOSEN.with(|c| c.borrow_mut().push(best));
     let win = trials
         .into_iter()
-        .find(|t| t.level == (best_y, best_uv))
-        .expect("the winning pair was evaluated");
-    Ok((
-        LoopFilterParams {
-            level: [best_y, best_y, best_uv, best_uv],
-            ..LoopFilterParams::default()
-        },
-        win.picture,
-    ))
+        .find(|t| t.cand == best)
+        .expect("the winning candidate was evaluated");
+    Ok((loop_filter(best), cdef(best, damping), win.picture))
+}
+
+/// The header's `loop_filter_params` for one candidate.
+fn loop_filter(cand: Cand) -> LoopFilterParams {
+    LoopFilterParams {
+        level: [cand.lf.0, cand.lf.0, cand.lf.1, cand.lf.1],
+        ..LoopFilterParams::default()
+    }
+}
+
+/// The header's `cdef_params` for one candidate: a single strength pair per
+/// plane type (`bits == 0`).
+fn cdef(cand: Cand, damping: u8) -> CdefParams {
+    let mut cdef = CdefParams { damping, bits: 0, ..CdefParams::default() };
+    cdef.y_pri_strength[0] = cand.y.0;
+    cdef.y_sec_strength[0] = cand.y.1;
+    cdef.uv_pri_strength[0] = cand.uv.0;
+    cdef.uv_sec_strength[0] = cand.uv.1;
+    cdef
 }
 
 /// Writes the frame's own (cropped) region of `filtered` back over the
