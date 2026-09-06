@@ -14,7 +14,7 @@
 use crate::cdf;
 
 /// Which of the four coefficient table sets a transform block is coded with.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum TxbSet {
     /// The 32x32 luma transform of an intra 32x32 block. `get_tx_set` is
     /// DCT-only at this size for an intra block, so no `tx_type` symbol is
@@ -303,6 +303,10 @@ pub(crate) struct TxbTables<'a> {
 /// Every table a key frame's tile writer adapts.
 #[derive(Clone)]
 pub(crate) struct Cdfs {
+    /// The coefficient q-context these tables were built for (spec 8.3.2's
+    /// `Get_Qctx`), so a writer can price a block against the same tables the
+    /// search did (`tile::coeff_bits`).
+    pub q_ctx: usize,
     /// The partition symbol of a 64x64 superblock.
     /// `partition_cdf`'s `BLOCK_128X128` rows (8 symbols).
     pub partition_w128: [[u16; 9]; 4],
@@ -968,6 +972,7 @@ impl Cdfs {
     /// quantizer, so they are the same for every `q_ctx`.
     pub fn new(q_ctx: usize) -> Cdfs {
         Cdfs {
+            q_ctx,
             partition_w128: cdf::PARTITION_W128,
             partition_w64: cdf::PARTITION_W64,
             partition_w32: cdf::PARTITION_W32,
