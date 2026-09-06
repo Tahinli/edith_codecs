@@ -1131,22 +1131,24 @@ fn quantise_granule(
     // Short blocks carry twelve bands, long ones twenty-one.
     let bands = if block_type == 2 { 12 } else { SFB_LONG };
     let threshold = band_thresholds(threshold, block_type, sample_rate);
-    for _round in 0..20 {
+    let mut exit = ("cap", 19usize);
+    for round in 0..20 {
         let (granule, noise) = code_with(xr, block_type, target_bits, &scalefac, sample_rate);
         let ratios: Vec<f64> = (0..bands)
             .map(|b| f64::from(noise[b]) / f64::from(threshold[b]).max(1e-30))
             .collect();
         let score: f64 = ratios.iter().sum();
-        let spent = granule.part2_3_length;
         let mut order: Vec<usize> = (0..bands)
             .filter(|&b| scalefac[b] < max_scalefac(b, block_type))
             .collect();
         order.sort_by(|a, b| ratios[*b].total_cmp(&ratios[*a]));
         let over: Vec<usize> = order.iter().copied().filter(|&b| ratios[b] > 1.0).collect();
+        let spent = granule.part2_3_length;
         if best.as_ref().is_none_or(|(_, s, _)| score < *s) {
             best = Some((granule, score, bands));
         }
         if score <= 0.0 {
+            exit = ("mask", round);
             break; // every band is already exactly at the mask; nothing left to buy
         }
         // Where to stop amplifying, as a fraction of the frame's budget. Swept
@@ -1156,7 +1158,20 @@ fn quantise_granule(
         // budget is gone only makes the rate loop coarsen every other band to
         // pay for it. Below 70% the test stops binding, since the first round
         // already spends more than that.
+        //
+        // LAME's own shape -- drop the budget break, let the distortion test
+        // drive, since `code_with` fits `target_bits` at every round anyway --
+        // was built and measured here (2026-09-06). It makes the loop live
+        // (10440 granules of 36758 reach the 20-round cap against 3 before) and
+        // loses on both gate metrics: zaur at 128 kbit/s goes 0.99917 ->
+        // 0.99787 correlation, from +0.00062 ahead of libmp3lame to -0.00068
+        // behind it, and its worst 20 ms window from -15.3 to -12.4 dB, at
+        // roughly five times the encode time. The gate measures waveform error,
+        // and a budget-filling rate loop over flat scalefactors is already near
+        // the MSE optimum, so perceptual redistribution can only trade away
+        // what this gate scores. Don't re-run it: change the metric first.
         if spent * 100 > target_bits * 85 {
+            exit = ("budget", round);
             break; // the budget is spent; amplifying now only coarsens
         }
         // Bands over their mask get the bits first, worst three per round so
@@ -1173,14 +1188,27 @@ fn quantise_granule(
             .take(3)
             .collect();
         if chosen.is_empty() {
+            exit = ("saturated", round);
             break;
         }
         for band in chosen {
             scalefac[band] += 1;
         }
     }
+    census(exit);
     let (granule, score, bands) = best.expect("at least one round runs");
     (granule, score / bands as f64)
+}
+
+/// Exit-reason census for the distortion loop: with `EC_MP3_LOOP_TRACE` set,
+/// one `mp3loop <reason> <round>` line per granule on stderr, so a sweep can be
+/// counted with `sort | uniq -c`. The loop's shape is the encoder's open
+/// question; without this the only evidence it ever iterates is indirect.
+fn census(exit: (&str, usize)) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("EC_MP3_LOOP_TRACE").is_some()) {
+        eprintln!("mp3loop {} {}", exit.0, exit.1);
+    }
 }
 
 /// Bitstream order for a short block's spectrum.
