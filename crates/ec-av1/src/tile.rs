@@ -374,6 +374,12 @@ fn write_compound_block(
         None,
     );
     let ctx = crate::cdf::COMPOUND_MODE_CTX_MAP[stack.ref_mv_ctx >> 1][stack.new_mv_ctx.min(4)];
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
+        eprintln!(
+            "EC_WCOMP mi_row={mi_row} mi_col={mi_col} mode={mode} ref0={} ref1={ref1} ctx={ctx} new_mv_ctx={} ref_mv_ctx={} stack={}",
+            info.ref_frame, stack.new_mv_ctx, stack.ref_mv_ctx, stack.entries.len()
+        );
+    }
     enc.symbol(mode, &mut cdfs.inter_compound_mode[ctx]);
     // `assign_compound_mv`'s own DRL half: `NEW_NEWMV` walks from index 0,
     // the two derived modes code no index at all.
@@ -437,6 +443,14 @@ fn write_comp_mode(
     let above = has_above.then(|| neighbours.above_nbr(mi_c));
     let left = has_left.then(|| neighbours.left_nbr(mi_r));
     let ctx = crate::mvstack::reference_mode_ctx(above, left);
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
+        eprintln!(
+            "EC_WCM mi=({mi_r},{mi_c}) ctx={ctx} val={} a={:?} l={:?}",
+            usize::from(compound),
+            above.map(|n| (n.is_inter, n.ref0, n.ref1)),
+            left.map(|n| (n.is_inter, n.ref0, n.ref1))
+        );
+    }
     enc.symbol(usize::from(compound), &mut cdfs.comp_mode[ctx]);
 }
 
@@ -3334,7 +3348,9 @@ fn write_single_ref(
     cdfs: &mut Cdfs,
     ref_frame: i8,
     above_ref: i8,
+    above_ref1: Option<i8>,
     left_ref: i8,
+    left_ref1: Option<i8>,
 ) {
     REF_HITS[(ref_frame.max(1) - 1) as usize % 7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     use crate::mvstack::{
@@ -3344,21 +3360,26 @@ fn write_single_ref(
     };
     let above = (above_ref > 0).then_some(above_ref);
     let left = (left_ref > 0).then_some(left_ref);
+    // libaom `av1_collect_neighbors_ref_counts` counts BOTH of a compound
+    // neighbour's references (decode.rs `read_single_ref`'s own
+    // `above_ref1`/`left_ref1`): dropping the second one reads a different
+    // context row for every block sitting under a compound neighbour, and so
+    // decodes a different reference NAME.
     let backward = ref_frame >= BWDREF_FRAME;
     enc.symbol(
         usize::from(backward),
-        &mut cdfs.single_ref[single_ref_p1_ctx(above, None, left, None)][0],
+        &mut cdfs.single_ref[single_ref_p1_ctx(above, above_ref1, left, left_ref1)][0],
     );
     if backward {
         let is_altref = ref_frame == ALTREF_FRAME;
         enc.symbol(
             usize::from(is_altref),
-            &mut cdfs.single_ref[single_ref_p2_ctx(above, None, left, None)][1],
+            &mut cdfs.single_ref[single_ref_p2_ctx(above, above_ref1, left, left_ref1)][1],
         );
         if !is_altref {
             enc.symbol(
                 usize::from(ref_frame == ALTREF2_FRAME),
-                &mut cdfs.single_ref[single_ref_p6_ctx(above, None, left, None)][5],
+                &mut cdfs.single_ref[single_ref_p6_ctx(above, above_ref1, left, left_ref1)][5],
             );
         }
         return;
@@ -3366,17 +3387,17 @@ fn write_single_ref(
     let far = ref_frame == LAST3_FRAME || ref_frame == GOLDEN_FRAME;
     enc.symbol(
         usize::from(far),
-        &mut cdfs.single_ref[single_ref_p3_ctx(above, None, left, None)][2],
+        &mut cdfs.single_ref[single_ref_p3_ctx(above, above_ref1, left, left_ref1)][2],
     );
     if far {
         enc.symbol(
             usize::from(ref_frame == GOLDEN_FRAME),
-            &mut cdfs.single_ref[single_ref_p5_ctx(above, None, left, None)][4],
+            &mut cdfs.single_ref[single_ref_p5_ctx(above, above_ref1, left, left_ref1)][4],
         );
     } else {
         enc.symbol(
             usize::from(ref_frame == LAST2_FRAME),
-            &mut cdfs.single_ref[single_ref_p4_ctx(above, None, left, None)][3],
+            &mut cdfs.single_ref[single_ref_p4_ctx(above, above_ref1, left, left_ref1)][3],
         );
     }
 }
@@ -3946,7 +3967,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         }
                         mode_for_tx = 0;
                     } else {
-                    write_single_ref(&mut enc, &mut cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
+                    write_single_ref(&mut enc, &mut cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.above_ref1[mi_c], neighbours.left_ref[mi_r], neighbours.left_ref1[mi_r]);
 
                     let stack = find_mv_stack(
                         &grid,
@@ -4178,7 +4199,7 @@ fn write_inter_frame_leaf(
             }
             mode_for_tx = 0;
         } else {
-        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.left_ref[mi_r]);
+        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[mi_c], neighbours.above_ref1[mi_c], neighbours.left_ref[mi_r], neighbours.left_ref1[mi_r]);
 
         let stack = find_mv_stack(
             grid,
@@ -4397,7 +4418,7 @@ fn write_inter_frame_leaf8(
             }
             mode_for_tx = 0;
         } else {
-        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[leaf_mi.1], neighbours.left_ref[leaf_mi.0]);
+        write_single_ref(enc, cdfs, info.ref_frame, neighbours.above_ref[leaf_mi.1], neighbours.above_ref1[leaf_mi.1], neighbours.left_ref[leaf_mi.0], neighbours.left_ref1[leaf_mi.0]);
 
         let stack = find_mv_stack(
             grid,

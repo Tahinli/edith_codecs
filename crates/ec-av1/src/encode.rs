@@ -4352,7 +4352,6 @@ fn search_inter_block(
         let mode_bits_of =
             |mode: usize| pair_bits + symbol_bits(&cdf::INTER_COMPOUND_MODE[mode_ctx], mode);
         let mut ccands: Vec<(((i32, i32), (i32, i32)), f64, InterInfo)> = vec![
-            #[cfg(any())]
             (
                 cstack.nearest_mv,
                 mode_bits_of(0),
@@ -4380,7 +4379,7 @@ fn search_inter_block(
         ];
         // `NEW_NEWMV` seeded from the two single-reference searches this
         // block already ran -- no joint search of its own.
-        if false && let Some(&(_, mv1)) = extra_new_mvs.iter().find(|(r, _)| *r == ref1) {
+        if let Some(&(_, mv1)) = extra_new_mvs.iter().find(|(r, _)| *r == ref1) {
             let base = cstack
                 .entries
                 .first()
