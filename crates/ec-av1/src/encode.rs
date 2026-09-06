@@ -10922,6 +10922,13 @@ mod tests {
     ///     EC_AV1_INTRABC=1 ... same command                # intra block copy
     ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
     ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
+    ///     EC_AV1_PYRAMID=4:-16:8 ... same command          # coding pyramid
+    ///
+    /// Under `EC_AV1_PYRAMID` this arm codes its ladder through the streaming
+    /// facade ([`our_ladder_pyramid`]), which exposes no per-packet
+    /// reconstruction: that path asserts ffmpeg's decode against our own
+    /// decoder on all three planes in display order, and prints the per-level
+    /// frame and byte census.
     ///
     /// All three gate clips are rows by default. `EC_AV1_NATIVE_FILM=1`,
     /// `EC_AV1_NATIVE_FILM4K=1` and `EC_AV1_NATIVE_SCREEN=1` select a subset:
@@ -11033,7 +11040,20 @@ mod tests {
             let _ = crate::tile::take_palette_uv_hits();
             let _ = crate::tile::take_intrabc_hits();
             let _ = take_intrabc_search();
-            let (ours, ours_wall) = our_ladder(name, &source, cw, ch, fctx);
+            let (ours, ours_wall) = match pyramid_from_env() {
+                None => our_ladder(name, &source, cw, ch, fctx),
+                Some(pyramid) => {
+                    let (ladder, wall, counts, bytes) =
+                        our_ladder_pyramid(name, &source, cw, ch, pyramid);
+                    eprintln!(
+                        "{name}: pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
+                         show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
+                        counts[0], counts[1], counts[2], counts[3],
+                        bytes[0], bytes[1], bytes[2], bytes[3],
+                    );
+                    (ladder, wall)
+                }
+            };
             // gate-blind-to-feature: what the screen tools actually did at
             // native resolution, over this clip's four encodes.
             let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
