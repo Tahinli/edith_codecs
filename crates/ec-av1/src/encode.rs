@@ -89,6 +89,27 @@ fn lambda_scale() -> f64 {
     }
 }
 
+// Every frame's predicted coefficient bits since the last
+// `take_predicted_bits`, in coding order -- the encoder half of
+// `predicted_coeff_bits_track_the_tile_the_writer_wrote`'s drift measurement.
+#[cfg(test)]
+thread_local! {
+    static PREDICTED_BITS: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records one frame's predicted coefficient bits.
+#[cfg(test)]
+fn record_predicted_bits(bits: f64) {
+    PREDICTED_BITS.with(|p| p.borrow_mut().push(bits));
+}
+
+/// Takes (and clears) what the frames encoded on this thread were predicted to
+/// spend on coefficients.
+#[cfg(test)]
+pub(crate) fn take_predicted_bits() -> Vec<f64> {
+    PREDICTED_BITS.with(|p| std::mem::take(&mut *p.borrow_mut()))
+}
+
 /// Whether a 32x32 block may be split into four 16x16 ones when the trial says
 /// four cost less. Set from the measurement in the lane report.
 const SPLIT_BLOCKS: bool = true;
@@ -719,7 +740,7 @@ impl Plane<'_> {
                 .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
                 .sum()
         } else {
-            crate::tile::coeff_bits(&levels, at.set)
+            crate::tile::coeff_bits(&levels, at.set, crate::decode::q_ctx_of(base_q_idx))
         };
         #[cfg(test)]
         stage_add(3, t.elapsed());
@@ -803,7 +824,7 @@ impl Plane<'_> {
                 .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
                 .sum()
         } else {
-            crate::tile::coeff_bits(&levels, set)
+            crate::tile::coeff_bits(&levels, set, crate::decode::q_ctx_of(base_q_idx))
         };
         #[cfg(test)]
         stage_add(3, t.elapsed());
@@ -2364,6 +2385,8 @@ pub(crate) fn encode_key_frame_inner(
         }
     }
 
+    #[cfg(test)]
+    record_predicted_bits(crate::tile::predicted_coeff_bits_sb(&superblocks, base_q_idx));
     let tile = sb_coeff_key_frame_tile(header.mi_cols, header.mi_rows, base_q_idx, &superblocks)?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&sequence_header_obu(&seq)?);
@@ -2593,6 +2616,10 @@ fn search_inter_block(
     reference: &Picture,
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
 ) -> BlockCoeffs {
+    // `luma_set` is the INTRA candidates' table; the two inter candidates
+    // below price their coefficients through `TxbSet::Luma32Inter`, which is
+    // what `sb_coeff_inter_frame_tile` codes an inter block with (it carries
+    // the inter `tx_type` symbol `Luma32` has no table for -- lane-av1rd1).
     let (luma_set, chroma_set) = (TxbSet::Luma32, TxbSet::Chroma16);
     let reach = Reach::of(BLOCK, x, y, luma.true_width, luma.true_height, fctx);
 
@@ -2758,7 +2785,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            luma_set, fctx,
+            TxbSet::Luma32Inter, fctx,
         );
         let u = mc_trial(
             &chroma[0],
@@ -2859,7 +2886,7 @@ fn search_inter_block(
             false,
             search.base_q_idx,
             search.deadzone,
-            luma_set, fctx,
+            TxbSet::Luma32Inter, fctx,
         );
         let u = mc_trial(
             &chroma[0],
@@ -3308,6 +3335,8 @@ pub(crate) fn encode_inter_frame(
         .filter(|b| b.inter.is_some())
         .count() as f64
         / modes.len() as f64;
+    #[cfg(test)]
+    record_predicted_bits(crate::tile::predicted_coeff_bits(&blocks, base_q_idx));
     let tile = sb_coeff_inter_frame_tile(header.mi_cols, header.mi_rows, base_q_idx, &blocks)?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
@@ -5168,6 +5197,52 @@ mod tests {
         }
     }
 
+    /// The rate term the mode search ranks every decision by has to be the
+    /// rate the writer then spends. The search prices a block's coefficients
+    /// through `tile::coeff_bits` -- the writer's own symbol chain, but
+    /// against the default CDFs a tile starts from and the contexts of a
+    /// block whose neighbours coded nothing -- while the tile writer codes
+    /// them against a state that has been adapting all frame (the
+    /// price-the-narrowing class). This measures that drift: the sum of what
+    /// the search paid for the coefficients it kept, against the bytes the
+    /// writer actually emitted for the whole tile (which also carries the
+    /// partition/mode/skip/mv syntax the sum leaves out, so the writer is
+    /// expected to be the larger of the two).
+    #[test]
+    fn predicted_coeff_bits_track_the_tile_the_writer_wrote() {
+        let fctx = &crate::decode::FrameCtx::new();
+        let (width, height) = (256usize, 128usize);
+        let pictures: Vec<Picture> = (0..5)
+            .map(|i| panned_test_card(width, height, i * 2))
+            .collect();
+        let _ = take_predicted_bits();
+        let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap();
+        let predicted = take_predicted_bits();
+        assert_eq!(predicted.len(), encoded.frames.len());
+
+        eprintln!("frame  predicted bits  written bits  drift");
+        let mut worst: f64 = 0.0;
+        for (i, (frame, &bits)) in encoded.frames.iter().zip(&predicted).enumerate() {
+            let written = frame.tile.len() as f64 * 8.0;
+            let drift = (written - bits) / written;
+            worst = worst.max(drift.abs());
+            eprintln!("{i:5}  {bits:14.0}  {written:12.0}  {:+6.2}%", drift * 100.0);
+        }
+        // Measured 2026-09-06 on this sequence: -13.5% at the key frame,
+        // -8.1%, -3.8%, -2.1%, +1.8% down the inter frames. The search
+        // over-prices every frame but the last (its sum EXCLUDES the
+        // partition/mode/skip/mv syntax the written side carries, so the true
+        // coefficient over-price is larger still): the writer's CDFs adapt to
+        // the content while the search's stay at the defaults. The bound is
+        // set just above the worst measured point -- a widening drift is the
+        // thing this gate exists to catch.
+        assert!(
+            worst <= 0.16,
+            "the search's rate term drifted {:.2}% from the bits the writer spent",
+            worst * 100.0
+        );
+    }
+
     /// Low motion has to actually buy something: at least one inter frame of
     /// a panning sequence has to cost fewer bytes than the key frame that
     /// starts it, and the inter-block share it prints has to be non-zero --
@@ -5289,7 +5364,7 @@ mod tests {
             };
             let t = Instant::now();
             for _ in 0..N {
-                std::hint::black_box(crate::tile::coeff_bits(&levels, set));
+                std::hint::black_box(crate::tile::coeff_bits(&levels, set, 2));
             }
             let entropy_t = t.elapsed() / N;
 
