@@ -109,12 +109,33 @@ fn reach_sb_px(fctx: &crate::decode::FrameCtx) -> usize {
 /// | 0.05   | +17.0 / -0.3 | +47.0 / +19.2 | +51.6 / -14.2 |
 /// | 0.1    | +18.1 / +0.9 | +47.1 / +19.0 | +58.3 / -9.8 |
 ///
-/// 0.0375 is the best point on two clips of three and costs the 2160p film
-/// +0.4/+0.7, outside the +-0.3 band every other lever here is kept inside,
-/// so 0.05 ships: two clips down on both columns, the 2160p film flat
-/// (-0.1 / +0.2). It also spends ~8% more encode wall, the bits it stopped
-/// refusing.
-const LAMBDA_SCALE: f64 = 0.05;
+/// 0.0375 was the best point on two clips of three there and cost the "2160p
+/// film" row +0.4/+0.7, outside the +-0.3 band every other lever here is kept
+/// inside, so 0.05 shipped. BOTH of those tables' "film" rows are the
+/// `testsrc2` COLOUR BARS fixtures (see [`bd_rate_screen_native`]), ~90% of
+/// whose cells have no intra cost -- no real film supported the point.
+///
+/// FIFTH SWEEP (lane-av1resweep, 2026-09-07), on the native gate's two REAL
+/// film crops (film A 1080p, film B 2160p HDR) plus the capture, BD-rate vs
+/// libaom / vs rav1e, everything else at the shipped defaults:
+///
+/// | lambda | bars 1080p | bars 2160p | film A | film B | screen |
+/// |--------|------------|------------|--------|--------|--------|
+/// | 0.02   | +17.5 / -0.2 | +49.7 / +21.7 | +65.8 / +35.0 | +91.2 / +55.4 | +53.4 / -14.1 |
+/// | 0.0275 | +16.6 / -0.9 | +48.3 / +20.5 | +65.5 / +34.7 | +91.6 / +55.1 | +51.3 / -15.0 |
+/// | 0.035  | +16.1 / -1.3 | +47.5 / +19.7 | +66.4 / +35.2 | +94.2 / +56.9 | +50.8 / -15.1 |
+/// | 0.05   | +15.6 / -1.7 | +46.5 / +18.8 | +69.0 / +37.5 | +100.0 / +61.5 | +51.0 / -14.5 |
+/// | 0.07   | +16.6 / -0.5 | +46.8 / +18.8 | +72.3 / +40.4 | +108.5 / +68.8 | +54.4 / -12.4 |
+/// | 0.1    | +16.5 / -0.7 | +46.6 / +18.7 | +76.9 / +44.4 | +118.2 / +77.1 | +57.3 / -10.1 |
+///
+/// Real film wants roughly HALF the rate weight the bars asked for: the bowl
+/// on both film rows bottoms between 0.02 and 0.0275 and is 5-11 points deep
+/// against the shipped 0.05, while the bars rows walk the other way (they are
+/// recorded, not decided on). 0.02 breaks the capture (+2.4 vs libaom), so
+/// 0.0275 ships -- both films 3.5/8.4 points down vs libaom, the capture
+/// +0.3/-0.5 (at the +-0.3 band, and better than baseline once the var-tx
+/// defaults below are on: +50.1 / -15.4). It spends ~5% more encode wall.
+const LAMBDA_SCALE: f64 = 0.0275;
 
 /// [`LAMBDA_SCALE`], or whatever `EC_AV1_LAMBDA` names when the sweep that
 /// picks it is the thing running. A release build has no such knob.
@@ -2933,18 +2954,44 @@ static INTER_TX_SPLIT_HITS: [std::sync::atomic::AtomicUsize; 8] =
 
 /// Whether a 32x32 inter winner searches its own var-tx depth (the four
 /// 16x16 units against the flat transform) instead of coding depth 0 blind.
-/// `EC_AV1_TX32_DEPTH`.
+/// ON by default; `EC_AV1_TX32_DEPTH=0` turns it off.
+///
+/// Rejected three times on the bars rows of the native gate (flat to +0.3).
+/// lane-av1resweep re-judged it on the two REAL film crops at
+/// [`LAMBDA_SCALE`] 0.05, where it is the largest single lever in this file
+/// (BD vs libaom / vs rav1e, shipped -> `EC_AV1_TX32_DEPTH=1`):
+///
+/// | clip | shipped | tx32 depth | + [`compound_var_tx`] |
+/// |---|---|---|---|
+/// | bars 1080p | +15.6 / -1.7 | +15.7 / -1.5 | +15.6 / -1.6 |
+/// | bars 2160p | +46.5 / +18.8 | +46.5 / +18.8 | +46.6 / +18.8 |
+/// | film A | +69.0 / +37.5 | +67.9 / +36.3 | +65.5 / +34.7 |
+/// | film B | +100.0 / +61.5 | +96.6 / +58.4 | +94.5 / +56.9 |
+/// | screen | +51.0 / -14.5 | +50.7 / -14.4 | +50.2 / -14.6 |
+///
+/// The bars rows are ~90% zero-intra-cost cells, so the split never had
+/// residual to reach there -- the tool was being judged on content that
+/// cannot pay for it (class `gate-blind-to-feature`). `EC_AV1_TX32_DEPTH`.
 fn tx32_depth_search() -> bool {
-    crate::envflags::env_flag!("EC_AV1_TX32_DEPTH")
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(crate::envflags::var("EC_AV1_TX32_DEPTH").as_deref(), Ok("0") | Ok("off"))
+    });
+    *ON
 }
 
 /// Whether a COMPOUND inter winner is offered the var-tx split at all: its
 /// trial units have to be predicted from BOTH references
 /// ([`mc_trial_compound`]) or the split would re-predict them by single-
 /// reference translation, which is not what the decoder reconstructs.
+/// ON by default (the table on [`tx32_depth_search`]: on real film it is
+/// worth a further -2.4/-1.6 on film A and -2.1/-1.5 on film B on top of the
+/// 32x32 depth search); `EC_AV1_COMP_VARTX=0` turns it off.
 /// `EC_AV1_COMP_VARTX`.
 fn compound_var_tx() -> bool {
-    crate::envflags::env_flag!("EC_AV1_COMP_VARTX")
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !matches!(crate::envflags::var("EC_AV1_COMP_VARTX").as_deref(), Ok("0") | Ok("off"))
+    });
+    *ON
 }
 
 /// How many 32x32-and-below inter blocks each reference frame won, indexed by
@@ -12394,6 +12441,10 @@ mod tests {
     /// [`LEAF_SECOND_NEW_MARGIN`] moved 0.8 -> 1.2. Re-pinned on lane-av1tpl:
     /// every inter frame's superblocks now code at their own lambda
     /// ([`TPL_STRENGTH`]), so every RD decision in an inter frame moved.
+    /// Re-pinned on lane-av1resweep: [`LAMBDA_SCALE`] moved 0.05 -> 0.0275
+    /// and the two var-tx depth searches ([`tx32_depth_search`],
+    /// [`compound_var_tx`]) are on by default, all three re-judged on the
+    /// native gate's real film rows.
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -12415,7 +12466,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7173, 0x3d5a_1440_7773_1816), (60, 26362, 0x2619_8199_39ad_828c)];
+            [(150, 7299, 0xaa98_12b4_860a_28cc), (60, 26804, 0xedea_182d_e11b_3c3f)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
