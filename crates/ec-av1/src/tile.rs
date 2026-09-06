@@ -455,6 +455,12 @@ fn write_compound_block(
     COMPOUND_MODE_HITS[mode].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     COMPOUND_PAIR_HITS[(ref1.max(1) - 1) as usize % 7]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if crate::envflags::env_flag!("EC_COMP_MISMATCH") && (mvs.0 != info.mv || mvs.1 != info.mv1) {
+        eprintln!(
+            "EC_COMP_MISMATCH mode={mode} enc=({:?},{:?}) wrote=({:?},{:?})",
+            info.mv, info.mv1, mvs.0, mvs.1
+        );
+    }
     // decode.rs' own `is_new_mv` for a compound block: modes 2, 3, 4, 5, 7.
     Ok((
         mvs.0,
