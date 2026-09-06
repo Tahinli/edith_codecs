@@ -110,6 +110,17 @@ pub(crate) fn take_predicted_bits() -> Vec<f64> {
     PREDICTED_BITS.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
+/// Whether a 16x16 inter leaf may split into four 8x8 ones of its own.
+const SPLIT_INTER_8: bool = true;
+
+/// [`SPLIT_INTER_8`], or what `EC_AV1_SPLIT_INTER8` names in a test build.
+fn split_inter_8() -> bool {
+    match std::env::var("EC_AV1_SPLIT_INTER8").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => SPLIT_INTER_8,
+    }
+}
+
 /// Whether a 16x16 (or 8x8) leaf runs a motion search of its own beside the
 /// NEARESTMV candidate it always had.
 const LEAF_NEW_MV: bool = true;
@@ -142,9 +153,14 @@ fn split_inter_blocks() -> bool {
 /// How often each partition decision was taken since the last
 /// [`take_partition_hits`], so a gate can report how often a new partition
 /// fires rather than assume it does (gate-blind-to-feature). Index 0 is an
-/// inter 32x32 block left whole, 1 one split into four 16x16 leaves.
-static PARTITION_HITS: [std::sync::atomic::AtomicUsize; 2] =
-    [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+/// inter 32x32 block left whole, 1 one split into four 16x16 leaves; 2 is
+/// such a leaf left whole, 3 one split into four 8x8 leaves of its own.
+static PARTITION_HITS: [std::sync::atomic::AtomicUsize; 4] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
 
 /// Records one such decision.
 fn partition_hit(which: usize) {
@@ -153,8 +169,8 @@ fn partition_hit(which: usize) {
 
 /// Takes (and clears) the counts.
 #[cfg(test)]
-pub(crate) fn take_partition_hits() -> [usize; 2] {
-    [0, 1].map(|i| PARTITION_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+pub(crate) fn take_partition_hits() -> [usize; 4] {
+    [0, 1, 2, 3].map(|i| PARTITION_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Whether a 32x32 block may be split into four 16x16 ones when the trial says
@@ -1965,11 +1981,16 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
 
 /// The reconstructed samples one 32x32 square covers in all three planes, so
 /// that a partition trial can be undone.
-fn snapshot(luma: &Plane, chroma: &[Plane; 2], (x, y): (usize, usize)) -> [Vec<u8>; 3] {
+fn snapshot(
+    luma: &Plane,
+    chroma: &[Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+) -> [Vec<u8>; 3] {
     [
-        luma.snapshot(x, y, BLOCK),
-        chroma[0].snapshot(x / 2, y / 2, BLOCK / 2),
-        chroma[1].snapshot(x / 2, y / 2, BLOCK / 2),
+        luma.snapshot(x, y, side),
+        chroma[0].snapshot(x / 2, y / 2, side / 2),
+        chroma[1].snapshot(x / 2, y / 2, side / 2),
     ]
 }
 
@@ -1978,11 +1999,12 @@ fn restore(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
+    side: usize,
     saved: &[Vec<u8>; 3],
 ) {
-    luma.restore(x, y, BLOCK, &saved[0]);
-    chroma[0].restore(x / 2, y / 2, BLOCK / 2, &saved[1]);
-    chroma[1].restore(x / 2, y / 2, BLOCK / 2, &saved[2]);
+    luma.restore(x, y, side, &saved[0]);
+    chroma[0].restore(x / 2, y / 2, side / 2, &saved[1]);
+    chroma[1].restore(x / 2, y / 2, side / 2, &saved[2]);
 }
 
 /// Keeps the DC candidate plus the cheapest `top_k` (or fewer, once DC is set
@@ -2385,7 +2407,7 @@ pub(crate) fn encode_key_frame_inner(
                 }
                 let (x, y) = (col * BLOCK, row * BLOCK);
                 let (c0, r0) = (col * 2, row * 2);
-                let base = snapshot(&luma, &chroma, (x, y));
+                let base = snapshot(&luma, &chroma, (x, y), BLOCK);
 
                 // spec `decode_partition`'s hasRows/hasCols recomputed at this
                 // 32x32 block's own half (see `crate::tile::has_half`): the
@@ -2459,11 +2481,11 @@ pub(crate) fn encode_key_frame_inner(
                     &mode_bits(above_mode[c0], left_mode[r0]), fctx,
                 );
                 cost_whole += search.lambda * partition_bits(BLOCK, false);
-                let after_whole = snapshot(&luma, &chroma, (x, y));
+                let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
 
                 // What four 16x16 blocks cost instead, each searched against
                 // the reconstruction the ones before it left.
-                restore(&mut luma, &mut chroma, (x, y), &base);
+                restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
                 let mut split = Vec::with_capacity(4);
                 let mut cost_split = search.lambda
                     * (partition_bits(BLOCK, true) + 4.0 * partition_bits(SUB, false));
@@ -2545,7 +2567,7 @@ pub(crate) fn encode_key_frame_inner(
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
-                    restore(&mut luma, &mut chroma, (x, y), &after_whole);
+                    restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
                     for cell in 0..2 {
                         above_mode[c0 + cell] = whole.mode;
                         left_mode[r0 + cell] = whole.mode;
@@ -3284,7 +3306,7 @@ pub(crate) fn encode_inter_frame(
                     let stack =
                         find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
 
-                    let base = snapshot(&luma, &chroma, (x, y));
+                    let base = snapshot(&luma, &chroma, (x, y), BLOCK);
                     let (block, mut cost_whole) = search_inter_block(
                         &mut luma,
                         &mut chroma,
@@ -3296,7 +3318,7 @@ pub(crate) fn encode_inter_frame(
                         &stack, fctx,
                     );
                     cost_whole += search.lambda * partition_bits(BLOCK, false);
-                    let after_whole = snapshot(&luma, &chroma, (x, y));
+                    let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
 
                     // What four 16x16 leaves cost instead (spec
                     // PARTITION_SPLIT at BLOCK_32X32, which
@@ -3326,20 +3348,20 @@ pub(crate) fn encode_inter_frame(
                     });
                     let split = (!block.skip && leaves_legal && split_inter_blocks())
                         .then(|| {
-                            restore(&mut luma, &mut chroma, (x, y), &base);
-                            let mut cost = search.lambda
-                                * (partition_bits(BLOCK, true)
-                                    + 4.0 * partition_bits(SUB, false));
+                            restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
+                            let mut cost = search.lambda * partition_bits(BLOCK, true);
                             let mut leaves = Vec::with_capacity(4);
                             for &(sr, sc) in &leaf_positions {
                                 let (mi_row, mi_col) = (sr * 4, sc * 4);
+                                let (lx, ly) = (sc * SUB, sr * SUB);
+                                let leaf_base = snapshot(&luma, &chroma, (lx, ly), SUB);
                                 let stack = find_mv_stack(
                                     &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
                                 );
                                 let (leaf, leaf_cost) = code_square_inter(
                                     &mut luma,
                                     &mut chroma,
-                                    (sc * SUB, sr * SUB),
+                                    (lx, ly),
                                     SUB,
                                     &search,
                                     &mode_bits_table,
@@ -3347,6 +3369,63 @@ pub(crate) fn encode_inter_frame(
                                     &ref_y8,
                                     &stack, fctx,
                                 );
+                                let leaf_cost = leaf_cost
+                                    + search.lambda * partition_bits(SUB, false);
+                                let after_leaf = snapshot(&luma, &chroma, (lx, ly), SUB);
+
+                                // And what four 8x8 leaves cost instead --
+                                // the same tree one step further down, which
+                                // the writer codes as a real PARTITION_SPLIT
+                                // at BLOCK_16X16 (lane-av1rd2). Same
+                                // skipped-block prune as the level above.
+                                let eight = (!leaf.skip && split_inter_8())
+                                    .then(|| {
+                                        restore(
+                                            &mut luma, &mut chroma, (lx, ly), SUB, &leaf_base,
+                                        );
+                                        let mut cost8 = search.lambda
+                                            * (partition_bits(SUB, true)
+                                                + 4.0 * partition_bits(8, false));
+                                        let mut eight = Vec::with_capacity(4);
+                                        for i in 0..4 {
+                                            let (mr, mc) =
+                                                (mi_row + (i / 2) * 2, mi_col + (i % 2) * 2);
+                                            let stack8 = find_mv_stack(
+                                                &grid, mr, mc, 2, 2, LAST_FRAME, mi_cols, mi_rows,
+                                            );
+                                            let (leaf8, cost) = code_square_inter(
+                                                &mut luma,
+                                                &mut chroma,
+                                                (lx + (i % 2) * 8, ly + (i / 2) * 8),
+                                                8,
+                                                &search,
+                                                &mode_bits_table,
+                                                reference,
+                                                &ref_y8,
+                                                &stack8, fctx,
+                                            );
+                                            cost8 += cost;
+                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter);
+                                            eight.push(leaf8);
+                                        }
+                                        (eight, cost8)
+                                    });
+                                match eight {
+                                    Some((eight, cost8)) if cost8 < leaf_cost => {
+                                        partition_hit(3);
+                                        cost += cost8;
+                                        leaves.push(BlockCoeffs {
+                                            eight: Some(eight),
+                                            ..BlockCoeffs::default()
+                                        });
+                                        continue;
+                                    }
+                                    Some(_) => restore(
+                                        &mut luma, &mut chroma, (lx, ly), SUB, &after_leaf,
+                                    ),
+                                    None => {}
+                                }
+                                partition_hit(2);
                                 cost += leaf_cost;
                                 record_mi(&mut grid, mi_row, mi_col, 4, leaf.inter);
                                 leaves.push(leaf);
@@ -3362,7 +3441,7 @@ pub(crate) fn encode_inter_frame(
                             blocks[r32 * cols + c32] = Quadrant::Split(leaves);
                             continue;
                         }
-                        restore(&mut luma, &mut chroma, (x, y), &after_whole);
+                        restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
                     }
                     partition_hit(0);
                     record_mi(&mut grid, mi_row, mi_col, 8, block.inter);
@@ -6324,11 +6403,14 @@ mod tests {
             // How often the inter split actually fired over this clip's four
             // encodes, against the whole 32x32 that was the only outcome
             // before (gate-blind-to-feature).
-            let [whole32, split32] = take_partition_hits();
+            let [whole32, split32, whole16, split16] = take_partition_hits();
             eprintln!(
-                "{name}: inter 32x32 split into 16s {split32} of {} blocks ({:.1}%)",
+                "{name}: inter 32x32 split into 16s {split32} of {} blocks ({:.1}%); \
+                 16x16 leaves split into 8s {split16} of {} ({:.1}%)",
                 whole32 + split32,
-                100.0 * split32 as f64 / (whole32 + split32).max(1) as f64
+                100.0 * split32 as f64 / (whole32 + split32).max(1) as f64,
+                whole16 + split16,
+                100.0 * split16 as f64 / (whole16 + split16).max(1) as f64
             );
             let (aom, aom_wall) =
                 external_ladder(&source, width, height, "libaom-av1", &aom_points);
