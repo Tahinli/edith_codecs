@@ -359,6 +359,45 @@ pub fn write_show_existing_frame_header(
     Ok(())
 }
 
+/// Spec 5.9.22's `skipModeAllowed`, the gate on whether a
+/// `skip_mode_present` bit is coded at all -- the write side of
+/// `ec_av1_syntax::frame`'s `read_skip_mode_params`, reading the per-reference
+/// order hints out of `h.order_hints` (what that reader takes from its own
+/// reference state). Returns `false` for every frame that codes no
+/// `reference_select`, which is every frame this crate wrote before compound
+/// references existed.
+fn skip_mode_allowed(seq: &SequenceHeader, h: &FrameHeader) -> bool {
+    if h.frame_is_intra || !h.reference_select || !seq.enable_order_hint {
+        return false;
+    }
+    let bits = seq.order_hint_bits;
+    let dist = |a: u32, b: u32| crate::motion_field::get_relative_dist(bits, a, b);
+    let (mut forward_idx, mut backward_idx) = (-1i32, -1i32);
+    let (mut forward_hint, mut backward_hint) = (0u32, 0u32);
+    for (i, &hint) in h.order_hints.iter().enumerate() {
+        if dist(hint, h.order_hint) < 0 {
+            if forward_idx < 0 || dist(hint, forward_hint) > 0 {
+                forward_idx = i as i32;
+                forward_hint = hint;
+            }
+        } else if dist(hint, h.order_hint) > 0
+            && (backward_idx < 0 || dist(hint, backward_hint) < 0)
+        {
+            backward_idx = i as i32;
+            backward_hint = hint;
+        }
+    }
+    if forward_idx < 0 {
+        return false;
+    }
+    if backward_idx >= 0 {
+        return true;
+    }
+    h.order_hints
+        .iter()
+        .any(|&hint| dist(hint, forward_hint) < 0)
+}
+
 /// `uncompressed_header()` (spec 5.9.2) for a shown key or inter frame: no
 /// decoder model, no frame ids, no still-picture shortcut, and (for an inter
 /// frame) short reference signalling, non-identity global motion, compound
@@ -530,15 +569,25 @@ pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHead
     }
     if h.frame_is_intra {
         // reference_select is forced false and not coded.
-    } else if h.reference_select {
-        return Err(Error::unsupported(
-            "AV1 frame header",
-            "reference_select (and the skip mode it gates) is not written",
-        ));
     } else {
-        w.write_bit(false);
-        // skip_mode_present is forced false when reference_select is false
-        // (spec 5.9.22), and not coded.
+        w.write_bit(h.reference_select);
+        // spec 5.9.22 `skip_mode_params`: `skip_mode_present` is coded only
+        // when `skipModeAllowed`, which needs `reference_select` and either a
+        // forward and a backward reference or two distinct forward ones.
+        // Mirrors `ec_av1_syntax::frame`'s own `read_skip_mode_params` off
+        // `h.order_hints` (the per-reference order hints the ENCODER fills
+        // from its DPB, which is what a decoder reads out of its own
+        // `state.refs`); a `false` bit here would desync every stream whose
+        // references make skip mode allowed.
+        if skip_mode_allowed(seq, h) {
+            if h.skip_mode_present {
+                return Err(Error::unsupported(
+                    "AV1 frame header",
+                    "skip_mode_present is not written -- no writer codes a skip-mode block",
+                ));
+            }
+            w.write_bit(false);
+        }
     }
     if h.frame_is_intra || h.error_resilient_mode || !seq.enable_warped_motion {
         // allow_warped_motion is forced false and not coded.
