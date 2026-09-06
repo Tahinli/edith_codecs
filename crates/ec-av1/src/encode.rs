@@ -3448,7 +3448,7 @@ fn search_inter_block(
         ),
     ];
     let near_bits = not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 1);
-    for idx in 1..=3usize {
+    for idx in 1..=2usize {
         if let Some(e) = stack.entries.get(idx) {
             cands.push((
                 e.mv,
