@@ -56,6 +56,12 @@ pub enum TransformSkip {
     Off,
     /// Skip the transform on every 4x4 TU that has non-zero residual.
     AlwaysFor4x4,
+    /// Decide per 4x4 luma transform block by rate-distortion: quantise and
+    /// reconstruct the block both ways and keep the cheaper one. Unconditional
+    /// skip is a big win on screen capture and a loss on camera content
+    /// (measured, see `transform_skip`), which is exactly what a per-block
+    /// decision resolves.
+    Rd,
 }
 
 /// Encoder settings.
@@ -177,6 +183,26 @@ pub struct EncoderConfig {
     /// loss. `false` restores exact per-trial CABAC replay for A/B.
     pub rdoq_estimate: bool,
     /// Whether 4x4 TUs may skip the integer transform.
+    ///
+    /// `Rd` by default: the tool is the screen-content lever, and it wants a
+    /// per-block decision, not a switch. BD-PSNR luma / all-plane against x265
+    /// at matched features over the four-QP ladder (`EC_H265_TSKIP=0|always|rd`
+    /// in `bd_psnr_vs_x265`, real clips, 24 pictures each):
+    ///
+    /// | clip | `Off` | `AlwaysFor4x4` | `Rd` |
+    /// |------|-------|----------------|------|
+    /// | 1440p screen capture A | -0.381 / -0.438 | +1.485 / +1.373 | +1.034 / +0.918 |
+    /// | 1440p screen capture B | +0.716 / +0.561 | +0.783 / +0.222 | +1.133 / +0.781 |
+    /// | 1440p screen capture C | +0.213 / +0.099 | | +0.124 / +0.008 |
+    /// | 1080p film | +0.584 / +0.468 | | +0.580 / +0.460 |
+    ///
+    /// Unconditional skip is worth +1.8 dB all-plane on A and -0.34 dB on B, so
+    /// neither setting of a switch is right; the per-block trial takes A's win
+    /// without B's loss and leaves film where it was (-0.008 dB, the estimate
+    /// proxy's noise). The cost is the second quantise-and-reconstruct pass on
+    /// every committed 4x4 luma block: the whole four-QP ladder went 111s ->
+    /// 290s on screen capture A and 427s -> 494s on film. Set `Off` to buy that
+    /// time back.
     pub transform_skip: TransformSkip,
     /// Whether the transform tree may split once (rate-quantisation transform):
     /// the luma TU of a 2Nx2N coding unit may be coded as four half-size
@@ -237,7 +263,7 @@ impl EncoderConfig {
             sign_hiding: false,
             rdoq: true,
             rdoq_estimate: true,
-            transform_skip: TransformSkip::Off,
+            transform_skip: TransformSkip::Rd,
             rqt: true,
             cu64: true,
             video_signal_type: None,
@@ -624,7 +650,7 @@ impl Encoder {
                             self.cfg.sign_hiding,
                             self.cfg.rdoq,
                             self.cfg.rdoq_estimate,
-                            self.cfg.transform_skip != TransformSkip::Off,
+                            self.cfg.transform_skip,
                             self.cfg.rqt,
                             self.cfg.cu64,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
