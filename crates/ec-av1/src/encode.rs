@@ -12335,12 +12335,12 @@ mod tests {
     /// keeps the flat one-key-then-all-inter ladder the baseline was measured
     /// on, so the gate's default recipe is unchanged.
     ///
-    /// RE-MEASURED on lane-av1rejudge at [`LAMBDA_SCALE`] 0.05 with warp on,
-    /// native, against the flat ladder's +16.7/-0.5, +47.0/+19.1,
-    /// +51.3/-14.3: `2:-16:8` is +23.8/+5.8, +46.0/+18.9, +58.6/-10.2 and
-    /// `4:-16:8` is +21.1/+3.4, +47.2/+19.2, +55.2/-11.7 -- whole points
-    /// worse on the 1080p film and on screen, so the flat ladder stays the
-    /// default. Only the 2160p film likes a pyramid.
+    /// RE-SWEPT on lane-av1pyrgate under the content gate (see
+    /// [`crate::encoder::Pyramid`]'s own table): with the screen capture
+    /// coding flat by construction, `4:-16:8` takes film A +62.8/+32.5 ->
+    /// +54.1/+24.2 and film B +86.3/+50.5 -> +82.6/+47.4, and the screen row
+    /// is unchanged to the byte. The gate ladder still defaults to flat --
+    /// the sequence path this arm is pinned against codes no pyramid.
     fn pyramid_from_env() -> Option<crate::encoder::Pyramid> {
         let spec = std::env::var("EC_AV1_PYRAMID").ok()?;
         let mut f = spec.split(':');
