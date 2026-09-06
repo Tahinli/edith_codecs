@@ -27,6 +27,13 @@ pub struct MultistreamEncoder {
 }
 
 impl MultistreamEncoder {
+    /// The encoder delay each stream carries for a `frame_size` frame — the
+    /// per-stream [`Encoder::look_ahead`], which every stream shares, and so
+    /// the Ogg-Opus pre-skip a multistream file must carry.
+    pub fn look_ahead(&self, frame_size: usize) -> usize {
+        self.streams[0].look_ahead(frame_size)
+    }
+
     /// An encoder for `streams` elementary streams of which the first
     /// `coupled` are stereo, with `mapping` naming the coded channel each
     /// input channel feeds. Layout rules are the decoder's, checked the same

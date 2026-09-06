@@ -40,11 +40,12 @@ const MAX_SILK_PACKET_BYTES: usize = 1 + 1 + 2 * 2 + 3 * MAX_FRAME_BYTES;
 const SILK_LOOK_AHEAD_48K_NB: usize = 58;
 const SILK_LOOK_AHEAD_48K_MB: usize = 54;
 const SILK_LOOK_AHEAD_48K_WB: usize = 50;
-/// How far the hybrid path delays the SILK layer's input so its output lines
-/// up with the CELT layer's at the decoder (which sums them as-is): CELT's
-/// overlap (120) minus SILK's WB round trip, click-measured through the
-/// decoder with one layer muted (`hybrid_layers_align` in conformance.rs).
-const HYBRID_SILK_DELAY_48K: usize = 120 - SILK_LOOK_AHEAD_48K_WB;
+/// One MDCT overlap: the CELT layer's delay without libopus's input
+/// alignment ([`Encoder::set_libopus_input_alignment`]), which adds
+/// `delay_compensation = Fs/250` (192 at 48 kHz) on top.
+const CELT_OVERLAP_48K: usize = 120;
+/// libopus `opus_encoder.c`'s `delay_compensation = Fs/250`.
+const CELT_DELAY_COMP_48K: usize = 192;
 /// Bytes the CELT layer of a hybrid packet always keeps, whatever SILK spent.
 /// Was 8: at 16 kbps SILK takes 37 of the 40-byte budget, so 8 expanded
 /// 5133/6001 packets (+12.9% rate on the speech gate); libopus leaves CELT
@@ -106,11 +107,19 @@ pub struct Encoder {
     /// Scratch space for the SILK packet payload, sized once so the steady-state
     /// loop (`steady_state_encode_loop_zero_alloc`) doesn't allocate.
     silk_buf: [u8; MAX_SILK_PACKET_BYTES],
-    /// Hybrid: the last [`HYBRID_SILK_DELAY_48K`] samples of SILK-layer input.
+    /// Hybrid: the last [`Encoder::hybrid_silk_delay_48k`] samples of SILK-layer input.
     silk_delay: Vec<f32>,
     /// Scratch space for the zero-stuffed SILK/hybrid input, sized once so
     /// the steady-state loop doesn't allocate a `Vec` per frame.
     silk_stuff: Vec<f32>,
+    /// [`Encoder::set_libopus_input_alignment`]: off by default.
+    align_input: bool,
+    /// libopus `opus_encoder.c`'s `hp_mem`: the one-pole state of the
+    /// [`Encoder::dc_reject`] filter every frame of API input goes through,
+    /// one per channel.
+    hp_mem: [f32; 2],
+    /// Scratch space for that filter's output, sized once.
+    hp_buf: Vec<f32>,
 }
 
 /// SILK's internal sample rate (kHz) for a target bandwidth: Narrow → 8,
@@ -149,7 +158,7 @@ impl Encoder {
                 "one stream carries at most two channels; use MultistreamEncoder",
             ));
         }
-        Ok(Encoder {
+        let mut enc = Encoder {
             celt: CeltEncoder::new(channels, upsample),
             range: RangeEncoder::new(),
             sample_rate,
@@ -170,7 +179,16 @@ impl Encoder {
             silk_buf: [0u8; MAX_SILK_PACKET_BYTES],
             silk_delay: Vec::new(),
             silk_stuff: Vec::new(),
-        })
+            align_input: false,
+            hp_mem: [0.0; 2],
+            hp_buf: Vec::new(),
+        };
+        // `EC_OPUS_ALIGN=1` turns the alignment on for a whole process — how
+        // the gate rows at `set_libopus_input_alignment` were produced.
+        if std::env::var_os("EC_OPUS_ALIGN").is_some() {
+            enc.set_libopus_input_alignment(true);
+        }
+        Ok(enc)
     }
 
     /// Overrides the automatic SILK/Hybrid/CELT choice `wants_silk` and
@@ -194,14 +212,15 @@ impl Encoder {
     /// Encoder delay in *input* samples for a `frame_size`-sample (per
     /// channel, native rate) frame: the decoded stream lags the input by
     /// this much, and an Ogg-Opus pre-skip of `look_ahead * 48000/rate`
-    /// cancels it exactly. CELT: one MDCT overlap, 120 samples at 48 kHz.
+    /// cancels it exactly. CELT: one MDCT overlap plus the 192-sample input
+    /// delay compensation, 312 samples at 48 kHz.
     /// SILK (10, 20, 40 or 60 ms frames, when the application/bitrate or an
     /// explicit [`Encoder::set_mode`] select it — the same
     /// [`Encoder::silk_choice`] predicate `encode_toc_and_payload` dispatches
     /// on, so this always matches which layer actually codes the frame):
     /// [`SILK_LOOK_AHEAD_48K_NB`], [`SILK_LOOK_AHEAD_48K_MB`] or
     /// [`SILK_LOOK_AHEAD_48K_WB`]. Hybrid: CELT's 120, the SILK layer being
-    /// delayed to meet it ([`HYBRID_SILK_DELAY_48K`]). Any other frame size
+    /// delayed to meet it ([`Encoder::hybrid_silk_delay_48k`]). Any other frame size
     /// falls back to CELT here exactly as `encode_toc_and_payload` does.
     pub fn look_ahead(&self, frame_size: usize) -> usize {
         let frame_48k = frame_size * self.upsample;
@@ -213,7 +232,61 @@ impl Encoder {
             };
             return delay / self.upsample;
         }
-        120 / self.upsample
+        self.celt_look_ahead_48k() / self.upsample
+    }
+
+    /// The CELT layer's delay in 48 kHz samples: one MDCT overlap, plus
+    /// libopus's `delay_compensation` when the alignment is on.
+    fn celt_look_ahead_48k(&self) -> usize {
+        CELT_OVERLAP_48K + if self.align_input { CELT_DELAY_COMP_48K } else { 0 }
+    }
+
+    /// How far the hybrid path delays the SILK layer's input so its output
+    /// lines up with the CELT layer's at the decoder (which sums them as-is):
+    /// CELT's delay minus SILK's WB round trip, click-measured through the
+    /// decoder with one layer muted (`hybrid_layers_align` in conformance.rs).
+    fn hybrid_silk_delay_48k(&self) -> usize {
+        self.celt_look_ahead_48k() - SILK_LOOK_AHEAD_48K_WB
+    }
+
+    /// Puts our CELT analysis window exactly where libopus's is: the layer is
+    /// fed the input delayed by `delay_compensation = Fs/250` (192 samples at
+    /// 48 kHz, `opus_encoder.c` ~:1955) and every frame first goes through
+    /// libopus's 3 Hz `dc_reject`. The alignment is *exact* — on the naz
+    /// attack frame (frame 2, 20 ms, LM=3, transient) our first eight band
+    /// log-energies become
+    /// 3.4386 4.0055 3.2603 4.5954 1.1790 4.2774 4.7584 3.7169 against
+    /// libopus's 3.439 4.005 3.260 4.595 1.179 4.277 4.758 3.717, all eight
+    /// within .0006 (the unaligned encoder is .06-.21 apart).
+    ///
+    /// It ships OFF because the 12-row library gate rejects it, and because
+    /// re-tuning the constants that were fitted on the misaligned spectrum
+    /// does not rescue it. Against the shipped rows
+    /// (`lanes/opus-opustr2-r1.sweep.txt`), err_ratio:
+    ///
+    /// | arm | better | worse (blocking) |
+    /// |---|---|---|
+    /// | delay only (`opus-opusx-r1`) | 7 | nik@64 .708→.800, nik@96 .985→1.763, her@96 1.051→1.292, hein@64 .853→.980, hein@96 .528→1.602 |
+    /// | delay + `dc_reject` (`opus-opusx2-r1`) | 5 | those, plus dl8a@64 .552→1.074, dl8a@96 .374→1.011 |
+    /// | + two-pass coarse energy (`-r2`) | 5 | same 7 rows (nik@96 1.809, dl8a@64 1.200) |
+    /// | + continuous 1.3 `alloc_trim` (`-r3`) | 5 | same 7, and corr worse by >.0005 on 9 rows |
+    /// | + tf boost k=1.25 (`-r4`) | 5 | same 7 |
+    /// | + tf boost k=1.5 (`-r5`) | 5 | same 7 |
+    /// | + two-pass *and* k=1.25, the combined best (`-r7`) | 5 | same 7: nik@64 .773, nik@96 1.801, her@96 1.114, dl8a@64 1.181, dl8a@96 1.014, hein@64 .977, hein@96 1.398 |
+    ///
+    /// The best aligned arm on the KEEP rule is the delay alone without
+    /// `dc_reject` (5 rows worse); every arm that adds `dc_reject` puts dl8a
+    /// in the blocking set too.
+    ///
+    /// The blocking set (nik, her@96, dl8a, hein) is the same in every arm and
+    /// no arm moves any of those rows back towards its shipped value, so the
+    /// misfit is not one of the swept constants. Turning this on also costs
+    /// 4 ms of algorithmic delay: [`Encoder::look_ahead`] for a CELT frame
+    /// becomes 312, not 120, and the Ogg pre-skip must follow it.
+    pub fn set_libopus_input_alignment(&mut self, on: bool) {
+        self.align_input = on;
+        self.celt.set_align_input(on);
+        self.hp_mem = [0.0; 2];
     }
 
     /// Forces the coded bandwidth; [`None`] (the default) picks it from the
@@ -277,6 +350,7 @@ impl Encoder {
         self.silk_stereo_mb = None;
         self.silk_stereo_wb = None;
         self.silk_delay.clear();
+        self.hp_mem = [0.0; 2];
         self.final_range = 0;
     }
 
@@ -686,6 +760,38 @@ impl Encoder {
         BWS[idx].min(ceiling)
     }
 
+    /// libopus `opus_encoder.c`'s `dc_reject(pcm, 3, ...)`: a 3 Hz one-pole
+    /// high-pass on the API input, applied once before *both* layers (libopus
+    /// filters into `pcm_buf`, which is what `silk_Encode` and
+    /// `celt_encode_with_ec` both read). `coef = 6.3 * cutoff / Fs` at the
+    /// API rate; the output is the input minus a leaky integrator of it, and
+    /// the integrator state carries across frames.
+    ///
+    /// libopus takes the `hp_cutoff` branch instead for
+    /// `OPUS_APPLICATION_VOIP` (a bandwidth-dependent second-order section);
+    /// not ported — every VoIP frame still gets this DC reject.
+    /// Ships off with the alignment knob: `dc_reject` alone (without the
+    /// input delay) has never been measured on the library gate.
+    fn dc_reject<'a>(&mut self, pcm: &'a [f32], frame_size: usize, out: &'a mut Vec<f32>) -> &'a [f32] {
+        if !self.align_input {
+            return pcm;
+        }
+        let c = self.channels;
+        let coef = 6.3 * 3.0 / self.sample_rate as f32;
+        out.clear();
+        out.resize(frame_size * c, 0.0);
+        for ch in 0..c {
+            let mut m = self.hp_mem[ch];
+            for i in 0..frame_size {
+                let x = pcm[i * c + ch];
+                out[i * c + ch] = x - m;
+                m += coef * (x - m);
+            }
+            self.hp_mem[ch] = m;
+        }
+        out
+    }
+
     /// Encodes one frame — `frame_size` samples per channel of interleaved
     /// `f32` at the input rate, 2.5, 5, 10 or 20 ms of it — as a code-0 Opus
     /// packet in `out`, returning the packet length.
@@ -695,19 +801,27 @@ impl Encoder {
         frame_size: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        let (toc, payload) =
-            self.encode_toc_and_payload(pcm, frame_size, out.len().saturating_sub(1))?;
-        let n = payload.len();
-        if out.len() < 1 + n {
-            return Err(Error::corrupt(format!(
-                "opus encode: packet needs {} bytes, buffer holds {}",
-                1 + n,
-                out.len()
-            )));
-        }
-        out[0] = toc;
-        out[1..1 + n].copy_from_slice(payload);
-        Ok(1 + n)
+        let mut hp = std::mem::take(&mut self.hp_buf);
+        let input = self.dc_reject(pcm, frame_size, &mut hp);
+        let r = match self.encode_toc_and_payload(input, frame_size, out.len().saturating_sub(1)) {
+            Err(e) => Err(e),
+            Ok((toc, payload)) => {
+                let n = payload.len();
+                if out.len() < 1 + n {
+                    Err(Error::corrupt(format!(
+                        "opus encode: packet needs {} bytes, buffer holds {}",
+                        1 + n,
+                        out.len()
+                    )))
+                } else {
+                    out[0] = toc;
+                    out[1..1 + n].copy_from_slice(payload);
+                    Ok(1 + n)
+                }
+            }
+        };
+        self.hp_buf = hp;
+        r
     }
 
     /// [`Encoder::encode_float`] from 16-bit samples.
@@ -725,33 +839,41 @@ impl Encoder {
         frame_size: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        let (toc, payload) =
-            self.encode_toc_and_payload(pcm, frame_size, out.len().saturating_sub(3))?;
-        let n = payload.len();
-        let len_bytes = if n < 252 { 1 } else { 2 };
-        if out.len() < 1 + len_bytes + n {
-            return Err(Error::corrupt(format!(
-                "opus encode: self-delimited packet needs {} bytes, buffer holds {}",
-                1 + len_bytes + n,
-                out.len()
-            )));
-        }
-        out[0] = toc;
-        if n < 252 {
-            out[1] = n as u8;
-        } else {
-            let b0 = 252 + ((n - 252) & 3);
-            out[1] = b0 as u8;
-            out[2] = ((n - b0) / 4) as u8;
-        }
-        out[1 + len_bytes..1 + len_bytes + n].copy_from_slice(payload);
-        Ok(1 + len_bytes + n)
+        let mut hp = std::mem::take(&mut self.hp_buf);
+        let input = self.dc_reject(pcm, frame_size, &mut hp);
+        let r = match self.encode_toc_and_payload(input, frame_size, out.len().saturating_sub(3)) {
+            Err(e) => Err(e),
+            Ok((toc, payload)) => {
+                let n = payload.len();
+                let len_bytes = if n < 252 { 1 } else { 2 };
+                if out.len() < 1 + len_bytes + n {
+                    Err(Error::corrupt(format!(
+                        "opus encode: self-delimited packet needs {} bytes, buffer holds {}",
+                        1 + len_bytes + n,
+                        out.len()
+                    )))
+                } else {
+                    out[0] = toc;
+                    if n < 252 {
+                        out[1] = n as u8;
+                    } else {
+                        let b0 = 252 + ((n - 252) & 3);
+                        out[1] = b0 as u8;
+                        out[2] = ((n - b0) / 4) as u8;
+                    }
+                    out[1 + len_bytes..1 + len_bytes + n].copy_from_slice(payload);
+                    Ok(1 + len_bytes + n)
+                }
+            }
+        };
+        self.hp_buf = hp;
+        r
     }
 
     /// One hybrid frame (10 or 20 ms, mono or stereo, `bandwidth` SWB or FB)
     /// into the internal range coder, returning its byte length: the SILK
     /// layer's symbols (WB, 16 kHz internal, fed the input delayed by
-    /// [`HYBRID_SILK_DELAY_48K`]), the no-redundancy flag under the decoder's
+    /// [`Encoder::hybrid_silk_delay_48k`]), the no-redundancy flag under the decoder's
     /// exact presence rule, then the CELT layer from band 17 in the same
     /// coder. CBR: the packet is the bitrate's size unless SILK alone needs
     /// more, in which case CELT keeps [`HYBRID_CELT_MIN_BYTES`] on top.
@@ -777,7 +899,7 @@ impl Encoder {
         } else {
             Self::zero_stuff_mono(pcm, frame_size, self.upsample, &mut self.silk_stuff);
         }
-        let d = HYBRID_SILK_DELAY_48K * self.channels;
+        let d = self.hybrid_silk_delay_48k() * self.channels;
         if self.silk_delay.len() != d {
             self.silk_delay.clear();
             self.silk_delay.resize(d, 0.0);
@@ -896,33 +1018,39 @@ mod tests {
         let mut e = Encoder::new(24000, 2, Application::Audio).unwrap();
         e.set_bitrate(256_000);
         assert_eq!(e.auto_bandwidth(), Bandwidth::SuperWide);
-        assert_eq!(e.look_ahead(960), 60);
+        assert_eq!(e.look_ahead(960), CELT_OVERLAP_48K / 2);
     }
 
     /// `look_ahead` must use the same 10-or-20 ms-frame predicate dispatch
     /// does (`silk_choice`/`hybrid_choice`), not just `wants_silk`: 2.5/5 ms
     /// frames still code as CELT, while 10/20 ms speech follows SILK and
-    /// hybrid follows CELT's overlap.
+    /// hybrid follows CELT's delay.
     #[test]
     fn look_ahead_matches_the_frame_size_dispatch_actually_uses() {
         let mut e = Encoder::new(48000, 1, Application::Voip).unwrap();
         e.set_bitrate(8000);
         assert_eq!(e.look_ahead(480), 58, "10ms NB SILK");
-        assert_eq!(e.look_ahead(240), 120, "5ms frame falls back to CELT");
+        assert_eq!(e.look_ahead(240), CELT_OVERLAP_48K, "5ms frame falls back to CELT");
         assert_eq!(e.look_ahead(960), 58, "20ms NB SILK");
 
         // 16k VoIP is hybrid-FB since the libopus threshold port (CELT overlap).
         e.set_bitrate(16000);
-        assert_eq!(e.look_ahead(960), 120, "20ms hybrid FB");
+        assert_eq!(e.look_ahead(960), CELT_OVERLAP_48K, "20ms hybrid FB");
 
         e.set_bitrate(32000);
-        assert_eq!(e.look_ahead(960), 120, "20ms hybrid, CELT's overlap");
+        assert_eq!(e.look_ahead(960), CELT_OVERLAP_48K, "20ms hybrid, CELT's delay");
 
         let mut e = Encoder::new(48000, 2, Application::Voip).unwrap();
         e.set_bitrate(8000);
         assert_eq!(e.look_ahead(960), 58, "stereo 20ms NB SILK");
         e.set_bitrate(64_000);
-        assert_eq!(e.look_ahead(960), 120, "stereo 20ms hybrid");
+        assert_eq!(e.look_ahead(960), CELT_OVERLAP_48K, "stereo 20ms hybrid");
+        e.set_libopus_input_alignment(true);
+        assert_eq!(
+            e.look_ahead(960),
+            CELT_OVERLAP_48K + CELT_DELAY_COMP_48K,
+            "the alignment adds libopus's delay_compensation to the advertised delay"
+        );
     }
 
     #[test]
