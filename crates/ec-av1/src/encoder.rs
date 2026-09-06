@@ -803,6 +803,9 @@ impl Av1Encoder {
                 self.prev2.as_ref(),
                 &self.fctx,
                 None,
+                // The streaming facade holds no lookahead buffer
+                // (lane-av1tpl).
+                None,
             )?
         };
 
@@ -959,6 +962,9 @@ impl Av1Encoder {
                 show_frame,
                 sign_bias,
             }),
+            // The streaming facade holds no lookahead buffer, so the
+            // temporal lambda weighting is off on this path (lane-av1tpl).
+            None,
         ) }();
         // Name the pyramid position in any failure: an error out of the tile
         // writer or the filter search is otherwise indistinguishable between
