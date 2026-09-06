@@ -1369,7 +1369,6 @@ pub fn dequant_and_inverse(levels: &[i32], side: usize, bit_depth: u8, q_idx: i3
 /// undo, and nothing else: measuring the network's response to a unit
 /// coefficient at every size gives the same `1 / (8 * sqrt(2))` per unit of
 /// `dqDenom`, which is what [`forward_transform_2d`] divides out.
-#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 fn build_dct_basis(n: usize) -> Vec<f64> {
     let mut basis = vec![0.0f64; n * n];
     let scale = (2.0 / n as f64).sqrt();
@@ -1399,6 +1398,103 @@ fn dct_basis(n: usize) -> &'static [f64] {
     let cache = CACHE.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     let idx = (n.trailing_zeros() as usize).saturating_sub(2);
     cache[idx].get_or_init(|| build_dct_basis(n))
+}
+
+/// The orthonormal basis of one 1D axis, measured from the decoder's own
+/// inverse network rather than written out: a unit coefficient through
+/// [`inverse_1d`] IS the basis function that kernel synthesises, and
+/// normalising each to unit length gives the analysis basis a forward
+/// transform pairs with. AV1 normalises every 1D kernel to the same gain --
+/// that is what lets one shift chain serve mixed types -- so the
+/// [`INVERSE_GAIN_RECIPROCAL`] correction a DCT axis takes is the one an ADST
+/// axis takes too.
+fn build_axis_basis(n: usize, kind: TxType1d) -> Vec<f64> {
+    if kind == TxType1d::Dct {
+        return build_dct_basis(n);
+    }
+    let log2 = n.trailing_zeros();
+    let mut basis = vec![0.0f64; n * n];
+    for u in 0..n {
+        let mut t = [0i32; 64];
+        // Large enough that the network's own rounding is negligible, small
+        // enough that nothing clamps at the 24-bit range passed below.
+        t[u] = 1 << 12;
+        inverse_1d(&mut t, log2, 24, kind);
+        let norm = (0..n).map(|i| f64::from(t[i]) * f64::from(t[i])).sum::<f64>().sqrt();
+        for i in 0..n {
+            basis[u * n + i] = f64::from(t[i]) / norm;
+        }
+    }
+    basis
+}
+
+/// [`build_axis_basis`], computed once per (size, kind).
+fn axis_basis(n: usize, kind: TxType1d) -> &'static [f64] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<[[OnceLock<Vec<f64>>; 5]; 3]> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())));
+    let k = match kind {
+        TxType1d::Dct => 0,
+        TxType1d::Adst => 1,
+        TxType1d::Identity => 2,
+    };
+    let idx = (n.trailing_zeros() as usize).saturating_sub(2);
+    cache[k][idx].get_or_init(|| build_axis_basis(n, kind))
+}
+
+/// [`forward_transform_2d`] for a block whose transform type is not
+/// `DCT_DCT` -- what an intra chroma block coded in a non-`DC_PRED` mode
+/// gets, since chroma never codes a `tx_type` symbol and the decoder derives
+/// it from the mode (`Intra_Mode_To_Tx_Type`, spec 9.3).
+///
+/// The forward transform is the encoder's own business: only the levels and
+/// the type reach the decoder, so an approximate analysis basis costs rate,
+/// never correctness -- the reconstruction the search scores comes back
+/// through the decoder's exact inverse either way.
+pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType) -> Vec<f64> {
+    if tx_type == TxType::DctDct {
+        return forward_transform_2d(residual, side);
+    }
+    debug_assert_eq!(
+        tx_type.flip(),
+        (false, false),
+        "a flipped ADST needs its residual mirrored before this basis applies"
+    );
+    let (row_kind, col_kind) = tx_type.axes();
+    let (hb, vb) = (axis_basis(side, row_kind), axis_basis(side, col_kind));
+    let mut rows = vec![0.0f64; side * side];
+    for i in 0..side {
+        let source = &residual[i * side..][..side];
+        for v in 0..side {
+            rows[i * side + v] = source
+                .iter()
+                .zip(&hb[v * side..][..side])
+                .map(|(&r, &b)| f64::from(r) * b)
+                .sum();
+        }
+    }
+    let mut out = vec![0.0f64; side * side];
+    for u in 0..side {
+        let column = &vb[u * side..][..side];
+        for v in 0..side {
+            let sum: f64 = (0..side).map(|i| rows[i * side + v] * column[i]).sum();
+            out[u * side + v] = INVERSE_GAIN_RECIPROCAL * sum;
+        }
+    }
+    out
+}
+
+/// [`forward_and_quantize`] at a named transform type.
+pub fn forward_and_quantize_typed(
+    residual: &[i32],
+    side: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    deadzone: f64,
+    tx_type: TxType,
+) -> Vec<i32> {
+    let coeffs = forward_transform_2d_typed(residual, side, tx_type);
+    quantize(&coeffs, side, bit_depth, q_idx, deadzone)
 }
 
 /// How much the decoder's inverse transform shrinks an orthonormal DCT.
@@ -1692,6 +1788,40 @@ mod tests {
                 }
                 let out = inverse_transform_2d_typed_wh(&vec![0i32; w * h], w, h, 10, tx);
                 assert!(out.iter().all(|&v| v == 0), "2D {w}x{h} {tx:?} left a non-zero");
+            }
+        }
+    }
+
+    /// The typed forward transform is the decoder's exact inverse undone:
+    /// quantized and taken back, an ADST-typed residual returns with the same
+    /// error a `DCT_DCT` one does. This is what pins the *gain* of the ADST
+    /// basis measured off the inverse network -- an approximate shape only
+    /// costs rate, but a wrong gain would put every level in the wrong decade
+    /// and the mode search would read as a loss.
+    #[test]
+    fn a_typed_forward_round_trips_like_the_dct_one() {
+        for side in [4usize, 8, 16] {
+            let residual: Vec<i32> = noise(side * side, 7 + side as u64)
+                .iter()
+                .map(|&v| v / 4)
+                .collect();
+            let rmse = |tx: TxType| {
+                let levels = forward_and_quantize_typed(&residual, side, 8, 60, 0.5, tx);
+                let back = dequant_and_inverse_typed(&levels, side, 8, 60, 0, 0, tx);
+                let sum: f64 = residual
+                    .iter()
+                    .zip(&back)
+                    .map(|(&a, &b)| f64::from(a - b) * f64::from(a - b))
+                    .sum();
+                (sum / (side * side) as f64).sqrt()
+            };
+            let dct = rmse(TxType::DctDct);
+            for tx in [TxType::AdstDct, TxType::DctAdst, TxType::AdstAdst] {
+                let e = rmse(tx);
+                assert!(
+                    e < 2.0 * dct,
+                    "{side}x{side} {tx:?} round trip rmse {e:.2} against DCT_DCT's {dct:.2}"
+                );
             }
         }
     }
