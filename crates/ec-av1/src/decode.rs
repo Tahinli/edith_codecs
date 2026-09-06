@@ -36619,6 +36619,7 @@ mod tests {
             mi_cols,
             mi_rows,
             base_q_idx,
+            tx_select,
             ..
         }: Encoded = crate::encode::encode_key_frame_with_modes_with_ctx(&picture, 40, 0.0, modes, fctx).unwrap();
         let decoded = decode_key_frame_tile(
@@ -36631,7 +36632,7 @@ mod tests {
             false,
             &CdefParams::default(),
             &LoopFilterParams::default(),
-            false,
+            tx_select,
             true,
             false,
             false, fctx,
@@ -36996,7 +36997,7 @@ mod tests {
                 false,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
-                false,
+                encoded.tx_select,
                 true,
                 false,
                 false, fctx,
@@ -37005,6 +37006,59 @@ mod tests {
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
             assert_eq!(ours.u, ffmpeg_decoded.u, "{width}x{height}: U vs ffmpeg");
             assert_eq!(ours.v, ffmpeg_decoded.v, "{width}x{height}: V vs ffmpeg");
+        }
+    }
+
+    /// The key frame the encoder writes carries `tx_mode == TxMode::Select`,
+    /// and that header bit is load-bearing for a decode of its tile: read as a
+    /// `TxMode::Largest` frame the very first block misses its `tx_depth`
+    /// symbol and the whole tile desyncs. Pins the shape that broke nine gates
+    /// when `Encoded` had no `tx_select` for them to pass along — a test that
+    /// hardcoded the bit was decoding a different frame header than the one
+    /// the encoder wrote (and than the one `decode_stream`/ffmpeg read off the
+    /// wire).
+    #[test]
+    fn a_key_frames_tile_needs_the_headers_own_tx_select_bit() {
+        let fctx = &crate::decode::FrameCtx::new();
+        use crate::encode::encode_key_frame_with_ctx;
+        let (width, height) = (64usize, 64usize);
+        let picture = round_trip_test_card(width, height);
+        let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
+        assert!(
+            encoded.tx_select,
+            "the encoder's key frame no longer codes TxMode::Select -- this \
+             gate's premise moved, not the decoder"
+        );
+        let decode = |tx_select: bool| {
+            decode_key_frame_tile(
+                &encoded.tile,
+                encoded.mi_cols,
+                encoded.mi_rows,
+                encoded.base_q_idx,
+                width as u32,
+                height as u32,
+                false,
+                &CdefParams::default(),
+                &LoopFilterParams::default(),
+                tx_select,
+                true,
+                false,
+                false,
+                fctx,
+            )
+        };
+        let right = decode(true).expect("the header's own tx_mode decodes");
+        assert_eq!(right.y, encoded.reconstruction.y, "luma under tx_select");
+        assert_eq!(right.u, encoded.reconstruction.u, "U under tx_select");
+        assert_eq!(right.v, encoded.reconstruction.v, "V under tx_select");
+        // The wrong bit either refuses or reconstructs something else; what it
+        // must never do is agree, which would mean the bit codes nothing.
+        if let Ok(wrong) = decode(false) {
+            assert_ne!(
+                wrong.y, encoded.reconstruction.y,
+                "reading a TxMode::Select tile as Largest agreed -- the \
+                 tx_depth symbols are not being coded"
+            );
         }
     }
 
@@ -37070,7 +37124,7 @@ mod tests {
             false,
             &CdefParams::default(),
             &LoopFilterParams::default(),
-            false,
+            key.tx_select,
             true,
             false,
             false, fctx,
@@ -37390,7 +37444,7 @@ mod tests {
             false,
             &CdefParams::default(),
             &LoopFilterParams::default(),
-            false,
+            key.tx_select,
             true,
             false,
             false, fctx,
