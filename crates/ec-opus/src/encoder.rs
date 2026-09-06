@@ -40,11 +40,16 @@ const MAX_SILK_PACKET_BYTES: usize = 1 + 1 + 2 * 2 + 3 * MAX_FRAME_BYTES;
 const SILK_LOOK_AHEAD_48K_NB: usize = 58;
 const SILK_LOOK_AHEAD_48K_MB: usize = 54;
 const SILK_LOOK_AHEAD_48K_WB: usize = 50;
+/// The CELT layer's own delay: one MDCT overlap (120) plus libopus's
+/// `delay_compensation = Fs/250` (`CELT_DELAY_48K`, 192 at 48 kHz), which the
+/// CELT encoder applies to its input so its analysis window sits where
+/// libopus's does.
+const CELT_LOOK_AHEAD_48K: usize = 120 + 192;
 /// How far the hybrid path delays the SILK layer's input so its output lines
 /// up with the CELT layer's at the decoder (which sums them as-is): CELT's
-/// overlap (120) minus SILK's WB round trip, click-measured through the
+/// delay minus SILK's WB round trip, click-measured through the
 /// decoder with one layer muted (`hybrid_layers_align` in conformance.rs).
-const HYBRID_SILK_DELAY_48K: usize = 120 - SILK_LOOK_AHEAD_48K_WB;
+const HYBRID_SILK_DELAY_48K: usize = CELT_LOOK_AHEAD_48K - SILK_LOOK_AHEAD_48K_WB;
 /// Bytes the CELT layer of a hybrid packet always keeps, whatever SILK spent.
 /// Was 8: at 16 kbps SILK takes 37 of the 40-byte budget, so 8 expanded
 /// 5133/6001 packets (+12.9% rate on the speech gate); libopus leaves CELT
@@ -194,7 +199,8 @@ impl Encoder {
     /// Encoder delay in *input* samples for a `frame_size`-sample (per
     /// channel, native rate) frame: the decoded stream lags the input by
     /// this much, and an Ogg-Opus pre-skip of `look_ahead * 48000/rate`
-    /// cancels it exactly. CELT: one MDCT overlap, 120 samples at 48 kHz.
+    /// cancels it exactly. CELT: one MDCT overlap plus the 192-sample input
+    /// delay compensation, 312 samples at 48 kHz.
     /// SILK (10, 20, 40 or 60 ms frames, when the application/bitrate or an
     /// explicit [`Encoder::set_mode`] select it — the same
     /// [`Encoder::silk_choice`] predicate `encode_toc_and_payload` dispatches
@@ -213,7 +219,7 @@ impl Encoder {
             };
             return delay / self.upsample;
         }
-        120 / self.upsample
+        CELT_LOOK_AHEAD_48K / self.upsample
     }
 
     /// Forces the coded bandwidth; [`None`] (the default) picks it from the
