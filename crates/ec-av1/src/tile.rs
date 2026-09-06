@@ -381,6 +381,99 @@ pub(crate) fn arm_reference_select(on: bool) {
     REFERENCE_SELECT.with(|c| c.set(on));
 }
 
+thread_local! {
+    /// This frame header's own `is_motion_mode_switchable` bit (spec 5.9.2),
+    /// armed exactly like [`REFERENCE_SELECT`]. `true` makes every
+    /// single-reference inter block that libaom's `motion_mode_allowed`
+    /// accepts carry a `motion_mode`/`obmc` symbol right after its MV syntax,
+    /// exactly where decode.rs' `read_motion_mode` reads one.
+    static MOTION_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms the frame's `is_motion_mode_switchable` bit for the next tile written
+/// on this thread; cleared by [`CdefIdxGuard`] when that writer returns.
+pub(crate) fn arm_motion_mode(on: bool) {
+    MOTION_MODE.with(|c| c.set(on));
+}
+
+/// How many single-reference inter blocks this writer coded a `motion_mode`
+/// symbol for, split by the value it coded and by the block's own footprint
+/// -- the histogram a gate prints so that "OBMC is on" is a measurement, not
+/// a claim (class `gate-blind-to-feature`). Index: `0 + 2 * bucket` for
+/// SIMPLE, `1 + 2 * bucket` for OBMC, bucket 0/1/2 = 32x32/16x16/8x8.
+static MOTION_MODE_HITS: [std::sync::atomic::AtomicUsize; 6] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+
+/// Reads [`MOTION_MODE_HITS`] and zeroes it, so a gate can attribute the
+/// counts to its own encode.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn take_motion_mode_hits() -> [usize; 6] {
+    std::array::from_fn(|i| MOTION_MODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `read_motion_mode`'s write side (spec 5.11.24), called on a
+/// single-reference inter block right after its MV syntax and before the
+/// (never switchable here) interpolation filter -- libaom's own sequential
+/// order in `read_inter_block_mode_info`.
+///
+/// Eligibility is decode.rs' own `motion_mode_eligible`, term for term, with
+/// the terms this writer settles statically dropped: no block it codes is
+/// `skip_mode`, interintra or a non-IDENTITY-global `GLOBALMV` one, so what
+/// is left is the footprint floor and the overlappable-neighbour walk
+/// ([`crate::decode::has_overlappable_neighbour`], shared with the decoder so
+/// the two cannot drift). The frame header keeps `allow_warped_motion == 0`,
+/// so the alphabet is always the 2-symbol `obmc_cdf`, never the 3-symbol
+/// `motion_mode_cdf`.
+fn write_motion_mode(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    grid: &MiGrid,
+    (mi_row, mi_col): (usize, usize),
+    (bw4, bh4): (usize, usize),
+    (write_w, write_h): (usize, usize),
+    (mi_cols, mi_rows): (usize, usize),
+    obmc: bool,
+) -> Result<()> {
+    let eligible = MOTION_MODE.with(std::cell::Cell::get)
+        && write_w.min(write_h) >= 8
+        && crate::decode::has_overlappable_neighbour(
+            grid, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows,
+        );
+    if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
+        eprintln!(
+            "EC_MMW mi_row={mi_row} mi_col={mi_col} w={write_w} h={write_h} elig={}",
+            eligible as u8
+        );
+    }
+    if !eligible {
+        // The encoder trialled an OBMC prediction for a block this writer
+        // codes as SIMPLE_TRANSLATION: its reconstruction is not the
+        // decoder's (class encoder-grid-drift), which is exactly what the
+        // `EC_COMP_MISMATCH` rung exists to catch.
+        if obmc && crate::envflags::env_flag!("EC_COMP_MISMATCH") {
+            eprintln!(
+                "EC_COMP_MISMATCH motion_mode enc=OBMC wrote=SIMPLE                  mi=({mi_row},{mi_col}) wh=({write_w}x{write_h})"
+            );
+        }
+        return Ok(());
+    }
+    let row = crate::decode::motion_mode_cdf_row(write_w, write_h).ok_or_else(|| {
+        Error::unsupported(
+            "AV1 tile",
+            format!("a {write_w}x{write_h} block has no motion_mode CDF row"),
+        )
+    })?;
+    enc.symbol(usize::from(obmc), &mut cdfs.obmc[row]);
+    let bucket = match write_w.min(write_h) {
+        32.. => 0,
+        16 => 1,
+        _ => 2,
+    };
+    MOTION_MODE_HITS[usize::from(obmc) + 2 * bucket]
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 /// The compound half of a block's end-of-block neighbour record: nothing for
 /// a single-reference or intra block, and `record_compound_mi`'s overwrite of
 /// the ALTREF default for a compound one (this writer only codes
@@ -759,6 +852,7 @@ impl Drop for CdefIdxGuard {
         SIGN_BIAS.with(|c| c.set(crate::mvstack::NO_SIGN_BIAS));
         SCREEN.with(|c| c.set(false));
         REFERENCE_SELECT.with(|c| c.set(false));
+        MOTION_MODE.with(|c| c.set(false));
         INTRABC.with(|c| c.set(false));
         INTRABC_GRID.with(|c| *c.borrow_mut() = None);
         ORDER_HINTS.with(|c| c.set((7, 0, [0; 7])));
@@ -1240,6 +1334,12 @@ pub struct BlockCoeffs {
     /// block. Only [`sb_coeff_inter_frame_tile`] codes `is_inter`; the key
     /// frame writers never read this field.
     pub inter: Option<InterInfo>,
+    /// Whether this (single-reference inter) block's prediction was built
+    /// with OBMC -- spec `motion_mode == OBMC_CAUSAL`, written by
+    /// [`write_motion_mode`]. `false` (the [`Default`]) is
+    /// `SIMPLE_TRANSLATION`, the only motion mode this writer coded before
+    /// lane-av1obmc.
+    pub obmc: bool,
     /// The 8x8 leaves a straddling 16x16 block is split into (lane-av1-rect),
     /// each with its own 8x8 luma transform and 4x4 chroma transforms, in
     /// raster order among the leaves that are inside the true frame. `Some`
@@ -5439,6 +5539,16 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                             );
                         }
                     }
+                    write_motion_mode(
+                        &mut enc,
+                        &mut cdfs,
+                        &grid,
+                        (mi_row, mi_col),
+                        (8, 8),
+                        (BLOCK, BLOCK),
+                        (mi_cols as usize, mi_rows as usize),
+                        block.obmc,
+                    )?;
                     mode_for_tx = 0;
                     }
                 } else {
@@ -5663,6 +5773,16 @@ fn write_inter_frame_leaf(
                 );
             }
         }
+        write_motion_mode(
+            enc,
+            cdfs,
+            grid,
+            (mi_row, mi_col),
+            (SUB_MI as usize, SUB_MI as usize),
+            (SUB, SUB),
+            (mi_cols as usize, mi_rows as usize),
+            block.obmc,
+        )?;
         mode_for_tx = 0;
         }
     } else {
@@ -5893,6 +6013,16 @@ fn write_inter_frame_leaf8(
                 );
             }
         }
+        write_motion_mode(
+            enc,
+            cdfs,
+            grid,
+            (mi_row, mi_col),
+            (2, 2),
+            (8, 8),
+            (mi_cols as usize, mi_rows as usize),
+            block.obmc,
+        )?;
         mode_for_tx = 0;
         }
     } else {
