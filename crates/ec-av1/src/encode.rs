@@ -2582,6 +2582,7 @@ fn code_square_inter(
             stack.pred_mv,
             &seeds[..seed_n],
             search.lambda, fctx,
+            1,
         );
         let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
         if let Some(mv_bits) = mv_residual_bits(new_mv, stack.pred_mv) {
@@ -3803,6 +3804,22 @@ fn mv_seeds(stack: &MvStack) -> ([(i32, i32); 4], usize) {
 /// coding `mv` as a residual against `pred`: the joint symbol naming which
 /// components differ, then each differing component. `None` under the same
 /// condition [`mv_component_bits`] returns `None`.
+/// How many frames back `ref_frame` sits from the frame being coded, off the
+/// order hints [`crate::tile::arm_order_hints`] armed for it. `LAST_FRAME` is
+/// 1 in this encoder's GOP; `GOLDEN`/`ALTREF` can be much further, which is
+/// what [`crate::motion::search`] scales its starting step by.
+fn ref_distance(ref_frame: i8) -> u32 {
+    let (bits, order_hint, hints) = crate::tile::order_hints();
+    let i = (ref_frame - crate::mvstack::LAST_FRAME).clamp(0, 6) as usize;
+    let d = crate::motion_field::get_relative_dist(bits, order_hint, hints[i])
+        .unsigned_abs()
+        .max(1);
+    if crate::envflags::env_flag!("EC_TRACE_DIST") {
+        eprintln!("EC_DIST ref={ref_frame} bits={bits} oh={order_hint} hint={} d={d}", hints[i]);
+    }
+    d
+}
+
 fn mv_residual_bits(mv: (i32, i32), pred: (i32, i32)) -> Option<f64> {
     let diff = (mv.0 - pred.0, mv.1 - pred.1);
     let joint = match (diff.0 != 0, diff.1 != 0) {
@@ -4215,6 +4232,7 @@ fn search_inter_block(
         stack.pred_mv,
         &seeds[..seed_n],
         search.lambda, fctx,
+        1,
     );
     #[cfg(test)]
     stage_add(0, t.elapsed());
@@ -4314,6 +4332,7 @@ fn search_inter_block(
                 gstack.pred_mv,
                 &gseeds[..gn],
                 search.lambda, fctx,
+                ref_distance(ref_frame),
             );
             #[cfg(test)]
             stage_add(0, t.elapsed());
@@ -4762,6 +4781,12 @@ pub(crate) fn encode_inter_frame(
     // `frame::write_frame_header`'s `skipModeAllowed` reads this.
     header.order_hints = order_hints;
     header.reference_select = reference_select();
+    // Armed HERE, not only beside the tile write below: `ref_distance`'s own
+    // per-reference order-hint distance is read by the block SEARCH, which
+    // runs long before the writer arms these (the distance-scaled search step
+    // read `(0, 0, [0; 7])` and came out 1 for every reference -- the knob
+    // never reached the tool).
+    crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
     if let Some(p) = pyramid {
         header.show_frame = p.show_frame;
         header.showable_frame = !p.show_frame;
@@ -8371,7 +8396,7 @@ mod tests {
             })
         };
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7166, 0xc608_4e2a_071e_1d72), (60, 26950, 0x019f_a19c_251b_f61d)];
+            [(150, 7103, 0xb9b7_763b_6f18_a887), (60, 26778, 0x4071_f16e_1e5d_87c3)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
