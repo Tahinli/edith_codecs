@@ -82,9 +82,51 @@ fn unit_sse(
     sb_cols: usize,
     out: &mut [u64],
 ) -> u64 {
+    // lane-av1fpar: the whole-frame pass, split across the filter workers by
+    // UNIT ROW -- each band owns its own rows of `out` (`chunks_mut`, so the
+    // disjointness is the borrow checker's) and its partial totals are `u64`
+    // integers, which add up to the same value in any order.
+    let threads = crate::par::filter_threads().min(h.div_ceil(unit));
+    if threads <= 1 {
+        return unit_sse_rows(dec, dec_w, src, src_w, w, 0, h, unit, sb_cols, out);
+    }
+    let per = h.div_ceil(unit).div_ceil(threads);
+    let total = std::sync::atomic::AtomicU64::new(0);
+    {
+        let batch = crate::par::Batch::new("ec-av1-filter");
+        for (band, rows) in out.chunks_mut(per * sb_cols).enumerate() {
+            let (r0, r1) = ((band * per * unit).min(h), ((band + 1) * per * unit).min(h));
+            if r0 == r1 {
+                continue;
+            }
+            let total = &total;
+            batch.submit(move || {
+                let sse = unit_sse_rows(dec, dec_w, src, src_w, w, r0, r1, unit, sb_cols, rows);
+                total.fetch_add(sse, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+    }
+    total.into_inner()
+}
+
+/// [`unit_sse`] over rows `r0..r1` alone, accumulating into `out` as if it
+/// started at unit row `r0 / unit`.
+#[allow(clippy::too_many_arguments)]
+fn unit_sse_rows(
+    dec: &[u16],
+    dec_w: usize,
+    src: &[u8],
+    src_w: usize,
+    w: usize,
+    r0: usize,
+    r1: usize,
+    unit: usize,
+    sb_cols: usize,
+    out: &mut [u64],
+) -> u64 {
     let mut total = 0u64;
-    for row in 0..h {
-        let base = (row / unit) * sb_cols;
+    for row in r0..r1 {
+        let base = ((row - r0) / unit) * sb_cols;
         let (d, s) = (&dec[row * dec_w..][..w], &src[row * src_w..][..w]);
         for (i, (dc, sc)) in d.chunks(unit).zip(s.chunks(unit)).enumerate() {
             let mut acc = 0u32;
@@ -196,6 +238,7 @@ pub(crate) fn pick_filters(
             (cand.lf.0, cand.y),
             (if cand.uv == (0, 0) { 0 } else { cand.lf.0 }, cand.lf.1, cand.uv),
         );
+        let sst = crate::par::timer(crate::par::S_SSE);
         if !st.luma.iter().any(|(k, _)| *k == lkey) {
             let mut units = vec![0u64; nsb];
             let sse =
@@ -208,6 +251,7 @@ pub(crate) fn pick_filters(
                 + unit_sse(&picture.v, dec_cw, source[2], src_w / 2, cw, ch, 32, sb_cols, &mut units);
             st.chroma.push((ckey, (sse, units)));
         }
+        drop(sst);
         let (sse_y, sse_uv, sse64) = {
             let l = &st.luma.iter().find(|(k, _)| *k == lkey).expect("just inserted").1;
             let c = &st.chroma.iter().find(|(k, _)| *k == ckey).expect("just inserted").1;
@@ -456,13 +500,33 @@ pub(crate) fn pick_restoration(
         sse
     };
     // Cost of leaving every unit alone, then one whole-plane pass per
-    // candidate to price taking it.
-    let mut best: Vec<(f64, Option<crate::restoration::WienerInfo>)> = (0..horz * vert)
-        .map(|i| {
-            let sse = unit_sse(&stages.cdefed[0], i / horz, i % horz) as f64;
-            (sse + lambda * LR_NONE_BITS, None)
-        })
-        .collect();
+    // candidate to price taking it. Both walks are banded by unit ROW
+    // (lane-av1fpar): a unit's cost is read off its own samples alone and
+    // written to its own slot, so the bands are `chunks_mut` of the same
+    // `best` and the choice cannot depend on how many of them there are.
+    let rows_of = |plane: &[u16], r0: usize, slice: &mut [(f64, Option<crate::restoration::WienerInfo>)], score: &dyn Fn(u64, &mut (f64, Option<crate::restoration::WienerInfo>))| {
+        for (i, slot) in slice.iter_mut().enumerate() {
+            score(unit_sse(plane, r0 + i / horz, i % horz), slot);
+        }
+    };
+    let banded = |plane: &[u16], best: &mut [(f64, Option<crate::restoration::WienerInfo>)], score: &(dyn Fn(u64, &mut (f64, Option<crate::restoration::WienerInfo>)) + Sync)| {
+        let threads = crate::par::filter_threads().min(vert);
+        if threads <= 1 {
+            rows_of(plane, 0, best, score);
+            return;
+        }
+        let per = vert.div_ceil(threads);
+        let batch = crate::par::Batch::new("ec-av1-filter");
+        for (band, slice) in best.chunks_mut(per * horz).enumerate() {
+            let rows_of = &rows_of;
+            batch.submit(move || rows_of(plane, band * per, slice, score));
+        }
+    };
+    let mut best: Vec<(f64, Option<crate::restoration::WienerInfo>)> =
+        vec![(0.0, None); horz * vert];
+    banded(&stages.cdefed[0], &mut best, &|sse, slot| {
+        *slot = (sse as f64 + lambda * LR_NONE_BITS, None);
+    });
     let mut out = Vec::new();
     for taps in WIENER_CANDIDATES {
         let info = crate::restoration::wiener_from_taps(taps, taps);
@@ -487,15 +551,12 @@ pub(crate) fn pick_restoration(
             None,
             fctx,
         );
-        for rrow in 0..vert {
-            for rcol in 0..horz {
-                let cost = unit_sse(&out, rrow, rcol) as f64 + lambda * LR_WIENER_BITS;
-                let slot = &mut best[rcol + rrow * horz];
-                if cost < slot.0 {
-                    *slot = (cost, Some(info));
-                }
+        banded(&out, &mut best, &|sse, slot| {
+            let cost = sse as f64 + lambda * LR_WIENER_BITS;
+            if cost < slot.0 {
+                *slot = (cost, Some(info));
             }
-        }
+        });
     }
     let chosen: Vec<Option<crate::restoration::WienerInfo>> =
         best.into_iter().map(|(_, f)| f).collect();
@@ -554,5 +615,17 @@ mod tests {
         let mut got = vec![7u64; sb_cols * 4];
         assert_eq!(unit_sse(&dec, dec_w, &src, src_w, w, h, unit, sb_cols, &mut got), total);
         assert_eq!(got, want);
+        // lane-av1fpar: and banded across workers -- same per-unit slots,
+        // same frame total (the partial sums are integers).
+        for threads in [2usize, 4, 8] {
+            let _bands = crate::par::override_filter_threads(threads);
+            let mut banded = vec![7u64; sb_cols * 4];
+            assert_eq!(
+                unit_sse(&dec, dec_w, &src, src_w, w, h, unit, sb_cols, &mut banded),
+                total,
+                "{threads} bands: the frame total moved"
+            );
+            assert_eq!(banded, want, "{threads} bands: a unit's error moved");
+        }
     }
 }
