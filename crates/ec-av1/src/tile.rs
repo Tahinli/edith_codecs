@@ -4543,9 +4543,14 @@ fn write_coeffs(
 
     write_eob(enc, coding, eob, plane);
 
+    // lane-av1speed3: `side` is 4, 8, 16 or 32, but it is a runtime value --
+    // `pos / side` compiles to a real integer division, once per coefficient,
+    // in the encoder's largest self-time symbol. Same row and column.
+    debug_assert!(side.is_power_of_two(), "the scan splits a position by shifting");
+    let (shift, mask) = (side.trailing_zeros(), side - 1);
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
-        let (row, col) = (pos / side, pos % side);
+        let (row, col) = (pos >> shift, pos & mask);
         let level = grid[pos].abs();
         if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, side * side);

@@ -1496,8 +1496,16 @@ mod tests {
         if !have_ffmpeg() {
             return None;
         }
-        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
+        // lane-av1speed3: the wall tables below are read on REAL film as
+        // well as on the colour-bar fixture (`bars` vs `film` in the BD
+        // gate's own vocabulary), and the film crop lives outside the repo --
+        // `EC_AV1_WALL_CLIP` names it. Unset everywhere else, so every other
+        // caller still gets the fixture.
+        let clip = match std::env::var("EC_AV1_WALL_CLIP") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4"),
+        };
         if !clip.exists() {
             return None;
         }
@@ -2166,6 +2174,16 @@ mod tests {
     #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
     fn filter_stage_wall_4k() {
         filter_stage_wall(3840, 1608, 4, (2, 1), &[8, 12]);
+    }
+
+    /// The same breakdown at the real films' own crop size. With
+    /// `EC_AV1_WALL_CLIP` pointing at a film window this is the film row; with
+    /// it unset it is the colour-bar fixture at the same size, which is what
+    /// makes the pair a comparison rather than a number.
+    #[test]
+    #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
+    fn filter_stage_wall_film() {
+        filter_stage_wall(1920, 768, 4, (2, 1), &[8]);
     }
 
     fn filter_stage_wall(
