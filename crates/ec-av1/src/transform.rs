@@ -1463,8 +1463,19 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
     let (row_kind, col_kind) = tx_type.axes();
     let (hb, vb) = (axis_basis(side, row_kind), axis_basis(side, col_kind));
     let mut rows = vec![0.0f64; side * side];
+    // Zero in, zero out, and `rows` is already zero here -- the skip
+    // [`forward_rows`] takes for the same reason, which this path was
+    // missing: a census of the BD gate's own ladder (lane-av1fwd) found 68%
+    // of the 1.9M calls here carry an all-zero residual, and another 6.5M
+    // individual rows of the rest are zero. A row of zeros contributes only
+    // `0.0 * b` terms, and a sum of zeros is `+0.0`, so this is exact.
+    let mut any = false;
     for i in 0..side {
         let source = &residual[i * side..][..side];
+        if source.iter().all(|&r| r == 0) {
+            continue;
+        }
+        any = true;
         for v in 0..side {
             rows[i * side + v] = source
                 .iter()
@@ -1472,6 +1483,9 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
                 .map(|(&r, &b)| f64::from(r) * b)
                 .sum();
         }
+    }
+    if !any {
+        return rows;
     }
     let mut out = vec![0.0f64; side * side];
     for u in 0..side {
@@ -1914,20 +1928,20 @@ pub fn quantize(coeffs: &[f64], side: usize, bit_depth: u8, q_idx: i32, deadzone
     let dc = f64::from(crate::quant::dc_q(bit_depth, q_idx));
     let ac = f64::from(crate::quant::ac_q(bit_depth, q_idx));
     let mut levels = vec![0i32; side * side];
-    for (i, &c) in coeffs.iter().enumerate() {
-        let (row, col) = (i / side, i % side);
-        if row >= 32 || col >= 32 {
-            continue;
+    let coded = side.min(32);
+    for row in 0..coded {
+        for col in 0..coded {
+            let i = row * side + col;
+            let q = if i == 0 { dc } else { ac };
+            let scaled = coeffs[i] / q;
+            let magnitude = scaled.abs() + deadzone;
+            let level = if magnitude < 1.0 {
+                0
+            } else {
+                magnitude.floor().min(f64::from(i32::MAX)) as i32
+            };
+            levels[i] = if scaled < 0.0 { -level } else { level };
         }
-        let q = if i == 0 { dc } else { ac };
-        let scaled = c / q;
-        let magnitude = scaled.abs() + deadzone;
-        let level = if magnitude < 1.0 {
-            0
-        } else {
-            magnitude.floor().min(f64::from(i32::MAX)) as i32
-        };
-        levels[i] = if scaled < 0.0 { -level } else { level };
     }
     levels
 }
@@ -1941,6 +1955,13 @@ pub fn forward_and_quantize(
     q_idx: i32,
     deadzone: f64,
 ) -> Vec<i32> {
+    // 72% of this encoder's forward DCTs are of an all-zero residual
+    // (measured over the BD gate's own ladder, lane-av1fwd): every row and
+    // every column of the network is skipped for them anyway, so the levels
+    // are zero without allocating the row pass's buffer at all.
+    if residual.iter().all(|&r| r == 0) {
+        return vec![0i32; side * side];
+    }
     // Fused: the levels are formed straight off the fixed-point coefficients,
     // so neither the `Vec<f64>` of coefficients nor the pass that reads it
     // exists.
