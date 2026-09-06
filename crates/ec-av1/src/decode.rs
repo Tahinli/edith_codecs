@@ -25017,6 +25017,15 @@ fn read_comp_mode(
 ) -> bool {
     let ctx = reference_mode_ctx(above, left);
     let compound = dec.symbol(&mut cdfs.comp_mode[ctx]) == 1;
+    if crate::envflags::env_flag!("EC_TRACE_MODE") {
+        eprintln!(
+            "EC_RCM ctx={ctx} val={} a={:?} l={:?} rng={}",
+            usize::from(compound),
+            above.map(|n| (n.is_inter, n.ref0, n.ref1)),
+            left.map(|n| (n.is_inter, n.ref0, n.ref1)),
+            dec.debug_state().0
+        );
+    }
     if compound {
         hit!(COMP_MODE_HITS);
     }
@@ -37499,7 +37508,12 @@ mod tests {
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
-                false,
+                // The encoder's own `reference_select` (spec 5.9.22): these
+                // GOP round trips decode a tile the ENCODER wrote, so the
+                // header bit must be the one it wrote, not a hard-coded
+                // `false` (stale-header class -- a `reference_select` stream
+                // reads a `comp_mode` symbol this decode would skip).
+                crate::encode::reference_select(),
                 frame.tx_select,
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
@@ -37818,7 +37832,12 @@ mod tests {
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
-                false,
+                // The encoder's own `reference_select` (spec 5.9.22): these
+                // GOP round trips decode a tile the ENCODER wrote, so the
+                // header bit must be the one it wrote, not a hard-coded
+                // `false` (stale-header class -- a `reference_select` stream
+                // reads a `comp_mode` symbol this decode would skip).
+                crate::encode::reference_select(),
                 frame.tx_select,
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
