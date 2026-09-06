@@ -110,6 +110,69 @@ pub(crate) fn take_predicted_bits() -> Vec<f64> {
     PREDICTED_BITS.with(|p| std::mem::take(&mut *p.borrow_mut()))
 }
 
+/// Whether a 16x16 inter leaf may split into four 8x8 ones of its own.
+const SPLIT_INTER_8: bool = true;
+
+/// [`SPLIT_INTER_8`], or what `EC_AV1_SPLIT_INTER8` names in a test build.
+fn split_inter_8() -> bool {
+    match std::env::var("EC_AV1_SPLIT_INTER8").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => SPLIT_INTER_8,
+    }
+}
+
+/// Whether a 16x16 (or 8x8) leaf runs a motion search of its own beside the
+/// NEARESTMV candidate it always had.
+const LEAF_NEW_MV: bool = true;
+
+/// [`LEAF_NEW_MV`], or what `EC_AV1_LEAF_NEWMV` names in a test build.
+fn leaf_new_mv() -> bool {
+    match std::env::var("EC_AV1_LEAF_NEWMV").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => LEAF_NEW_MV,
+    }
+}
+
+/// Whether an INTER frame's 32x32 block may be split into four 16x16 ones
+/// when the trial says four cost less. Before lane-av1rd2 only a quadrant
+/// the true frame edge cut through was ever split there; inside the frame
+/// every block was coded whole, which left the partition decision the key
+/// frame already makes unmade for eleven frames out of twelve.
+const SPLIT_INTER_BLOCKS: bool = true;
+
+/// [`SPLIT_INTER_BLOCKS`], or what `EC_AV1_SPLIT_INTER` names when the
+/// measurement that keeps it is running (test builds only, like
+/// [`lambda_scale`]).
+fn split_inter_blocks() -> bool {
+    match std::env::var("EC_AV1_SPLIT_INTER").ok() {
+        Some(v) if cfg!(test) => v != "0",
+        _ => SPLIT_INTER_BLOCKS,
+    }
+}
+
+/// How often each partition decision was taken since the last
+/// [`take_partition_hits`], so a gate can report how often a new partition
+/// fires rather than assume it does (gate-blind-to-feature). Index 0 is an
+/// inter 32x32 block left whole, 1 one split into four 16x16 leaves; 2 is
+/// such a leaf left whole, 3 one split into four 8x8 leaves of its own.
+static PARTITION_HITS: [std::sync::atomic::AtomicUsize; 4] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Records one such decision.
+fn partition_hit(which: usize) {
+    PARTITION_HITS[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes (and clears) the counts.
+#[cfg(test)]
+pub(crate) fn take_partition_hits() -> [usize; 4] {
+    [0, 1, 2, 3].map(|i| PARTITION_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Whether a 32x32 block may be split into four 16x16 ones when the trial says
 /// four cost less. Set from the measurement in the lane report.
 const SPLIT_BLOCKS: bool = true;
@@ -1648,8 +1711,9 @@ fn code_square_inter(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
+    ref_y8: &[u8],
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
-) -> BlockCoeffs {
+) -> (BlockCoeffs, f64) {
     let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), side, search, mode_bits, fctx);
     let luma_set = if side == 8 {
         TxbSet::Luma8Inter
@@ -1769,11 +1833,98 @@ fn code_square_inter(
     // `MiGrid` now records intra cells (`tile.rs`/`encode.rs`'s `else`
     // branches), which is what made 8-mi geometry a true no-op instead of
     // one that only held when every neighbour happened to be inter.
+    // A motion search of this leaf's own (lane-av1rd2): before it, a leaf
+    // only ever took the stack's NEARESTMV candidate or went intra, so a
+    // 32x32 block splitting because its four quarters MOVE differently could
+    // not code the movement it split for. Same candidate `search_inter_block`
+    // prices for a whole block -- `motion::search` from `pred_mv`, rounded to
+    // a vector the residual syntax can name -- at this leaf's own side.
+    let mut best = (inter_cost, None);
+    if leaf_new_mv() {
+        let source_block = luma.source_block(x, y, side);
+        let found = motion::search(
+            ref_y8,
+            ref_luma.1,
+            ref_luma.2,
+            ref_luma.3,
+            &source_block,
+            x,
+            y,
+            side,
+            side,
+            stack.pred_mv,
+            search.lambda, fctx,
+        );
+        let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
+        if let Some(mv_bits) = mv_residual_bits(new_mv, stack.pred_mv) {
+            let luma_new = mc_trial(
+                luma, x, y, side, new_mv, true, ref_luma.0, ref_luma.1, ref_luma.2, ref_luma.3,
+                false, search.base_q_idx, search.deadzone, luma_set, fctx,
+            );
+            let u_new = mc_trial(
+                &chroma[0], x / 2, y / 2, side / 2, new_mv, false, ref_u.0, ref_u.1, ref_u.2,
+                ref_u.3, false, search.base_q_idx, search.deadzone, chroma_set, fctx,
+            );
+            let v_new = mc_trial(
+                &chroma[1], x / 2, y / 2, side / 2, new_mv, false, ref_v.0, ref_v.1, ref_v.2,
+                ref_v.3, false, search.base_q_idx, search.deadzone, chroma_set, fctx,
+            );
+            let skip_new = luma_new.levels.iter().all(|&l| l == 0)
+                && u_new.levels.iter().all(|&l| l == 0)
+                && v_new.levels.iter().all(|&l| l == 0);
+            let drl_bits = if stack.entries.len() > 1 {
+                symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[0]], 0)
+            } else {
+                0.0
+            };
+            let cost_new = luma_new.sse
+                + u_new.sse
+                + v_new.sse
+                + search.lambda
+                    * (skip_bits(skip_new)
+                        + intra_inter_bits(true)
+                        + single_ref_bits
+                        + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
+                        + drl_bits
+                        + mv_bits
+                        + if skip_new {
+                            0.0
+                        } else {
+                            luma_new.bits + u_new.bits + v_new.bits
+                        });
+            if cost_new < best.0 {
+                best = (cost_new, Some((luma_new, u_new, v_new, skip_new, new_mv)));
+            }
+        }
+    }
+    if let (cost, Some((luma_new, u_new, v_new, skip_new, new_mv))) = best {
+        if cost < intra_cost {
+            luma.commit(x, y, side, &luma_new);
+            chroma[0].commit(x / 2, y / 2, side / 2, &u_new);
+            chroma[1].commit(x / 2, y / 2, side / 2, &v_new);
+            return (
+                BlockCoeffs {
+                    luma: coeffs(&luma_new.levels, side),
+                    u: coeffs(&u_new.levels, side / 2),
+                    v: coeffs(&v_new.levels, side / 2),
+                    mode: DC_PRED as u8,
+                    skip: skip_new,
+                    eight: None,
+                    inter: Some(InterInfo {
+                        mode: InterMode::NewMv,
+                        mv: new_mv,
+                    }),
+                },
+                cost,
+            );
+        }
+    }
+
     if inter_cost < intra_cost {
         luma.commit(x, y, side, &luma_trial);
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
         chroma[1].commit(x / 2, y / 2, side / 2, &v);
-        BlockCoeffs {
+        (BlockCoeffs {
             luma: coeffs(&luma_trial.levels, side),
             u: coeffs(&u.levels, side / 2),
             v: coeffs(&v.levels, side / 2),
@@ -1784,19 +1935,62 @@ fn code_square_inter(
                 mode: InterMode::NearestMv,
                 mv,
             }),
-        }
+        }, inter_cost)
     } else {
-        intra_block
+        (intra_block, intra_cost)
+    }
+}
+
+/// Publishes one coded inter-frame block into the `mi` grid the next block's
+/// MV stack reads, over the `size` x `size` 4x4 units it covers. An intra
+/// block casts no vote but is still a coded cell (see `code_square_inter`'s
+/// note on `processed_rows`/`processed_cols`).
+fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: Option<InterInfo>) {
+    let info = match inter {
+        Some(info) => MiInfo {
+            is_inter: true,
+            ref_frame: LAST_FRAME,
+            ref_frame1: NO_REF1,
+            mv1: (0, 0),
+            mv: mv16(info.mv),
+            is_new_mv: matches!(info.mode, InterMode::NewMv),
+            size,
+            size_h: size,
+            is_global_mv0: false,
+            is_global_mv1: false,
+        },
+        None => MiInfo {
+            is_inter: false,
+            ref_frame: -1,
+            ref_frame1: NO_REF1,
+            mv1: (0, 0),
+            mv: (0, 0),
+            is_new_mv: false,
+            size,
+            size_h: size,
+            is_global_mv0: false,
+            is_global_mv1: false,
+        },
+    };
+    for dr in 0..usize::from(size) {
+        for dc in 0..usize::from(size) {
+            grid.set(mi_row + dr, mi_col + dc, info);
+        }
     }
 }
 
 /// The reconstructed samples one 32x32 square covers in all three planes, so
 /// that a partition trial can be undone.
-fn snapshot(luma: &Plane, chroma: &[Plane; 2], (x, y): (usize, usize)) -> [Vec<u8>; 3] {
+fn snapshot(
+    luma: &Plane,
+    chroma: &[Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+) -> [Vec<u8>; 3] {
     [
-        luma.snapshot(x, y, BLOCK),
-        chroma[0].snapshot(x / 2, y / 2, BLOCK / 2),
-        chroma[1].snapshot(x / 2, y / 2, BLOCK / 2),
+        luma.snapshot(x, y, side),
+        chroma[0].snapshot(x / 2, y / 2, side / 2),
+        chroma[1].snapshot(x / 2, y / 2, side / 2),
     ]
 }
 
@@ -1805,11 +1999,12 @@ fn restore(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
+    side: usize,
     saved: &[Vec<u8>; 3],
 ) {
-    luma.restore(x, y, BLOCK, &saved[0]);
-    chroma[0].restore(x / 2, y / 2, BLOCK / 2, &saved[1]);
-    chroma[1].restore(x / 2, y / 2, BLOCK / 2, &saved[2]);
+    luma.restore(x, y, side, &saved[0]);
+    chroma[0].restore(x / 2, y / 2, side / 2, &saved[1]);
+    chroma[1].restore(x / 2, y / 2, side / 2, &saved[2]);
 }
 
 /// Keeps the DC candidate plus the cheapest `top_k` (or fewer, once DC is set
@@ -2212,7 +2407,7 @@ pub(crate) fn encode_key_frame_inner(
                 }
                 let (x, y) = (col * BLOCK, row * BLOCK);
                 let (c0, r0) = (col * 2, row * 2);
-                let base = snapshot(&luma, &chroma, (x, y));
+                let base = snapshot(&luma, &chroma, (x, y), BLOCK);
 
                 // spec `decode_partition`'s hasRows/hasCols recomputed at this
                 // 32x32 block's own half (see `crate::tile::has_half`): the
@@ -2286,11 +2481,11 @@ pub(crate) fn encode_key_frame_inner(
                     &mode_bits(above_mode[c0], left_mode[r0]), fctx,
                 );
                 cost_whole += search.lambda * partition_bits(BLOCK, false);
-                let after_whole = snapshot(&luma, &chroma, (x, y));
+                let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
 
                 // What four 16x16 blocks cost instead, each searched against
                 // the reconstruction the ones before it left.
-                restore(&mut luma, &mut chroma, (x, y), &base);
+                restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
                 let mut split = Vec::with_capacity(4);
                 let mut cost_split = search.lambda
                     * (partition_bits(BLOCK, true) + 4.0 * partition_bits(SUB, false));
@@ -2372,7 +2567,7 @@ pub(crate) fn encode_key_frame_inner(
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
-                    restore(&mut luma, &mut chroma, (x, y), &after_whole);
+                    restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
                     for cell in 0..2 {
                         above_mode[c0 + cell] = whole.mode;
                         left_mode[r0 + cell] = whole.mode;
@@ -2614,8 +2809,9 @@ fn search_inter_block(
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
+    ref_y8: &[u8],
     stack: &MvStack, fctx: &crate::decode::FrameCtx,
-) -> BlockCoeffs {
+) -> (BlockCoeffs, f64) {
     // `luma_set` is the INTRA candidates' table; the two inter candidates
     // below price their coefficients through `TxbSet::Luma32Inter`, which is
     // what `sb_coeff_inter_frame_tile` codes an inter block with (it carries
@@ -2850,13 +3046,10 @@ fn search_inter_block(
     }
 
     let source_block = luma.source_block(x, y, BLOCK);
-    // lane-hbd r4: `motion::search` is 8-bit only (its SAD/cost math is
-    // integer-`u8`-scale); narrow the DPB reference plane locally.
-    let ref_luma_8: Vec<u8> = ref_luma.0.iter().map(|&v| v as u8).collect();
     #[cfg(test)]
     let t = std::time::Instant::now();
     let found = motion::search(
-        &ref_luma_8,
+        ref_y8,
         ref_luma.1,
         ref_luma.2,
         ref_luma.3,
@@ -2961,15 +3154,18 @@ fn search_inter_block(
     luma.commit(x, y, BLOCK, &best.luma);
     chroma[0].commit(x / 2, y / 2, BLOCK / 2, &best.u);
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
-    BlockCoeffs {
-        luma: coeffs(&best.luma.levels, BLOCK),
-        u: coeffs(&best.u.levels, BLOCK / 2),
-        v: coeffs(&best.v.levels, BLOCK / 2),
-        mode: best.mode,
-        skip: best.skip,
-        inter: best.inter,
-        eight: None,
-    }
+    (
+        BlockCoeffs {
+            luma: coeffs(&best.luma.levels, BLOCK),
+            u: coeffs(&best.u.levels, BLOCK / 2),
+            v: coeffs(&best.v.levels, BLOCK / 2),
+            mode: best.mode,
+            skip: best.skip,
+            inter: best.inter,
+            eight: None,
+        },
+        best.cost,
+    )
 }
 
 /// Encodes one picture as an inter frame predicting from `reference`'s
@@ -3067,6 +3263,11 @@ pub(crate) fn encode_inter_frame(
     let (cols, rows) = (cols as usize, rows as usize);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
+    // lane-hbd r4: `motion::search` is 8-bit only (its SAD/cost math is
+    // integer-`u8`-scale), so the DPB reference plane is narrowed for it --
+    // once per frame (lane-av1rd2), not once per block, which is a whole
+    // plane's map per 32x32 block and now per leaf too.
+    let ref_y8: Vec<u8> = reference.y.iter().map(|&v| v as u8).collect();
     let mut grid = MiGrid::new(mi_cols, mi_rows);
     let mut blocks = vec![Quadrant::Whole(BlockCoeffs::default()); cols * rows];
 
@@ -3105,54 +3306,145 @@ pub(crate) fn encode_inter_frame(
                     let stack =
                         find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
 
-                    let block = search_inter_block(
+                    let base = snapshot(&luma, &chroma, (x, y), BLOCK);
+                    let (block, mut cost_whole) = search_inter_block(
                         &mut luma,
                         &mut chroma,
                         (x, y),
                         &search,
                         &mode_bits_table,
                         reference,
+                        &ref_y8,
                         &stack, fctx,
                     );
+                    cost_whole += search.lambda * partition_bits(BLOCK, false);
+                    let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
 
-                    for dr in 0..8 {
-                        for dc in 0..8 {
-                            grid.set(
-                                mi_row + dr,
-                                mi_col + dc,
-                                match block.inter {
-                                    Some(info) => MiInfo {
-                                        is_inter: true,
-                                        ref_frame: LAST_FRAME,
-                                        ref_frame1: NO_REF1,
-                                        mv1: (0, 0),
-                                        mv: mv16(info.mv),
-                                        is_new_mv: matches!(info.mode, InterMode::NewMv),
-                                        size: 8,
-                                        size_h: 8,
-                                        is_global_mv0: false,
-                                        is_global_mv1: false,
-                                    },
-                                    // Intra: no vote, but still a coded cell
-                                    // -- mvstack's extended-scan coverage
-                                    // (`processed_rows`/`processed_cols`)
-                                    // must see it (module doc).
-                                    None => MiInfo {
-                                        is_inter: false,
-                                        ref_frame: -1,
-                                        ref_frame1: NO_REF1,
-                                        mv1: (0, 0),
-                                        mv: (0, 0),
-                                        is_new_mv: false,
-                                        size: 8,
-                                        size_h: 8,
-                                        is_global_mv0: false,
-                                        is_global_mv1: false,
-                                    },
-                                },
-                            );
+                    // What four 16x16 leaves cost instead (spec
+                    // PARTITION_SPLIT at BLOCK_32X32, which
+                    // `sb_coeff_inter_frame_tile`'s `Quadrant::Split` arm
+                    // already writes for a straddling quadrant). Each leaf is
+                    // searched against the reconstruction -- and the `mi`
+                    // grid -- the ones before it left, exactly as the writer
+                    // and the decoder will read them.
+                    //
+                    // A block the whole-32 search left skipped (no residual
+                    // at all) is not offered the split: libaom prunes the
+                    // same way at cpu-used 6, and it is where the wall would
+                    // otherwise go on static content.
+                    let leaf_positions: Vec<(usize, usize)> = (0..4)
+                        .map(|i| (r32 * 2 + i / 2, c32 * 2 + i % 2))
+                        .collect();
+                    let leaves_legal = leaf_positions.iter().all(|&(sr, sc)| {
+                        crate::tile::has_half(
+                            sc as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_cols,
+                        ) && crate::tile::has_half(
+                            sr as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_rows,
+                        )
+                    });
+                    let split = (!block.skip && leaves_legal && split_inter_blocks())
+                        .then(|| {
+                            restore(&mut luma, &mut chroma, (x, y), BLOCK, &base);
+                            let mut cost = search.lambda * partition_bits(BLOCK, true);
+                            let mut leaves = Vec::with_capacity(4);
+                            for &(sr, sc) in &leaf_positions {
+                                let (mi_row, mi_col) = (sr * 4, sc * 4);
+                                let (lx, ly) = (sc * SUB, sr * SUB);
+                                let leaf_base = snapshot(&luma, &chroma, (lx, ly), SUB);
+                                let stack = find_mv_stack(
+                                    &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
+                                );
+                                let (leaf, leaf_cost) = code_square_inter(
+                                    &mut luma,
+                                    &mut chroma,
+                                    (lx, ly),
+                                    SUB,
+                                    &search,
+                                    &mode_bits_table,
+                                    reference,
+                                    &ref_y8,
+                                    &stack, fctx,
+                                );
+                                let leaf_cost = leaf_cost
+                                    + search.lambda * partition_bits(SUB, false);
+                                let after_leaf = snapshot(&luma, &chroma, (lx, ly), SUB);
+
+                                // And what four 8x8 leaves cost instead --
+                                // the same tree one step further down, which
+                                // the writer codes as a real PARTITION_SPLIT
+                                // at BLOCK_16X16 (lane-av1rd2). Same
+                                // skipped-block prune as the level above.
+                                let eight = (!leaf.skip && split_inter_8())
+                                    .then(|| {
+                                        restore(
+                                            &mut luma, &mut chroma, (lx, ly), SUB, &leaf_base,
+                                        );
+                                        let mut cost8 = search.lambda
+                                            * (partition_bits(SUB, true)
+                                                + 4.0 * partition_bits(8, false));
+                                        let mut eight = Vec::with_capacity(4);
+                                        for i in 0..4 {
+                                            let (mr, mc) =
+                                                (mi_row + (i / 2) * 2, mi_col + (i % 2) * 2);
+                                            let stack8 = find_mv_stack(
+                                                &grid, mr, mc, 2, 2, LAST_FRAME, mi_cols, mi_rows,
+                                            );
+                                            let (leaf8, cost) = code_square_inter(
+                                                &mut luma,
+                                                &mut chroma,
+                                                (lx + (i % 2) * 8, ly + (i / 2) * 8),
+                                                8,
+                                                &search,
+                                                &mode_bits_table,
+                                                reference,
+                                                &ref_y8,
+                                                &stack8, fctx,
+                                            );
+                                            cost8 += cost;
+                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter);
+                                            eight.push(leaf8);
+                                        }
+                                        (eight, cost8)
+                                    });
+                                match eight {
+                                    Some((eight, cost8)) if cost8 < leaf_cost => {
+                                        partition_hit(3);
+                                        cost += cost8;
+                                        leaves.push(BlockCoeffs {
+                                            eight: Some(eight),
+                                            ..BlockCoeffs::default()
+                                        });
+                                        continue;
+                                    }
+                                    Some(_) => restore(
+                                        &mut luma, &mut chroma, (lx, ly), SUB, &after_leaf,
+                                    ),
+                                    None => {}
+                                }
+                                partition_hit(2);
+                                cost += leaf_cost;
+                                record_mi(&mut grid, mi_row, mi_col, 4, leaf.inter);
+                                leaves.push(leaf);
+                            }
+                            (leaves, cost)
+                        });
+                    if let Some((leaves, cost)) = split {
+                        if cost < cost_whole {
+                            // The leaves' own `mi` cells are already in the
+                            // grid, and their reconstruction is what the
+                            // planes hold.
+                            partition_hit(1);
+                            blocks[r32 * cols + c32] = Quadrant::Split(leaves);
+                            continue;
                         }
+                        restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
                     }
+                    partition_hit(0);
+                    record_mi(&mut grid, mi_row, mi_col, 8, block.inter);
                     blocks[r32 * cols + c32] = Quadrant::Whole(block);
                 } else {
                     // The sub-positions actually inside the true frame, same
@@ -3203,7 +3495,7 @@ pub(crate) fn encode_inter_frame(
                             let stack = find_mv_stack(
                                 &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
                             );
-                            let block = code_square_inter(
+                            let (block, _) = code_square_inter(
                                 &mut luma,
                                 &mut chroma,
                                 (x, y),
@@ -3211,6 +3503,7 @@ pub(crate) fn encode_inter_frame(
                                 &search,
                                 &mode_bits_table,
                                 reference,
+                                &ref_y8,
                                 &stack, fctx,
                             );
                             for dr in 0..4 {
@@ -3263,7 +3556,7 @@ pub(crate) fn encode_inter_frame(
                                 let stack = find_mv_stack(
                                     &grid, mi_row, mi_col, 2, 2, LAST_FRAME, mi_cols, mi_rows,
                                 );
-                                let leaf = code_square_inter(
+                                let (leaf, _) = code_square_inter(
                                     &mut luma,
                                     &mut chroma,
                                     (leaf_x, leaf_y),
@@ -3271,6 +3564,7 @@ pub(crate) fn encode_inter_frame(
                                     &search,
                                     &mode_bits_table,
                                     reference,
+                                    &ref_y8,
                                     &stack, fctx,
                                 );
                                 for dr in 0..2 {
@@ -6022,17 +6316,24 @@ mod tests {
     /// ours: `base_q_idx {60,90,120,150}`. Every PSNR is all-plane, on
     /// ffmpeg-decoded frames of each encoder's own stream.
     ///
-    /// Measured baseline 2026-09-06, 12 frames, this box (wall = the four
-    /// encodes of that ladder together):
+    /// Measured 2026-09-06 after the inter partition search (lane-av1rd2),
+    /// 12 frames, this box (wall = the four encodes of that ladder
+    /// together):
     ///
     /// | clip | ours (q 150/120/90/60) | BD-rate vs libaom | vs rav1e | wall ours:aom:rav1e |
     /// |---|---|---|---|---|
-    /// | 1080p fixture | 40.36 dB/26824 B .. 48.24 dB/120942 B | +501.4% | +364.4% | 5.1s:1.9s:3.8s |
-    /// | 2160p fixture | 41.36 dB/17608 B .. 49.27 dB/76978 B | +504.4% | +401.0% | 4.6s:1.5s:3.3s |
-    /// | screen capture | 37.32 dB/13053 B .. 45.39 dB/59744 B | +440.9% | +206.0% | 5.9s:1.7s:3.0s |
+    /// | 1080p fixture | 41.16 dB/22349 B .. 49.97 dB/83178 B | +234.0% | +171.9% | 9.8s:1.1s:2.6s |
+    /// | 2160p fixture | 42.01 dB/14687 B .. 50.82 dB/52415 B | +260.3% | +203.2% | 9.3s:1.0s:2.2s |
+    /// | screen capture | 37.49 dB/12797 B .. 46.19 dB/50643 B | +318.5% | +155.3% | 9.1s:1.0s:2.1s |
     ///
-    /// So: roughly 5x libaom's rate and 3-4x rav1e's at matched fidelity,
-    /// while spending 2.7x libaom's and 1.4x rav1e's encode time. No
+    /// The baseline it replaced, before an inter frame's blocks chose their
+    /// own partition, was +501.4/+504.4/+440.9 against libaom and
+    /// +364.4/+401.0/+206.0 against rav1e at 5.1/4.6/5.9 s.
+    ///
+    /// So: roughly 2.5-3x libaom's rate and 1.5-2x rav1e's at matched
+    /// fidelity, while spending far more time than either (the partition
+    /// search's own cost, uncut: see the two intra-pruning variants measured
+    /// and rejected in the lane report). No
     /// threshold is asserted yet -- this run sets the baseline; the gate
     /// asserts only four monotone points per ladder and that ffmpeg decodes
     /// our stream sample-exact against our reconstruction.
@@ -6104,7 +6405,20 @@ mod tests {
         for (name, path) in &clips {
             let fctx = &crate::decode::FrameCtx::new();
             let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
+            let _ = take_partition_hits();
             let (ours, ours_wall) = our_ladder(&source, width, height, fctx);
+            // How often the inter split actually fired over this clip's four
+            // encodes, against the whole 32x32 that was the only outcome
+            // before (gate-blind-to-feature).
+            let [whole32, split32, whole16, split16] = take_partition_hits();
+            eprintln!(
+                "{name}: inter 32x32 split into 16s {split32} of {} blocks ({:.1}%); \
+                 16x16 leaves split into 8s {split16} of {} ({:.1}%)",
+                whole32 + split32,
+                100.0 * split32 as f64 / (whole32 + split32).max(1) as f64,
+                whole16 + split16,
+                100.0 * split16 as f64 / (whole16 + split16).max(1) as f64
+            );
             let (aom, aom_wall) =
                 external_ladder(&source, width, height, "libaom-av1", &aom_points);
             let (rav1e, rav1e_wall) =
