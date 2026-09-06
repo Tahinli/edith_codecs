@@ -1731,6 +1731,48 @@ mod tests {
         }
     }
 
+    /// The tiles of a frame are entropy-independent, so the bytes must not
+    /// depend on how many workers wrote them: the same stream at one tile
+    /// thread and at four, per layout.
+    #[test]
+    fn tile_bytes_do_not_depend_on_the_thread_count() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (320usize, 192usize);
+        let sources: Vec<Picture> = (0..3).map(|t| test_card(width, height, t * 3)).collect();
+        let coded = |threads: usize, cols_log2: u32, rows_log2: u32| {
+            crate::par::set_tile_threads(threads);
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 3,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: cols_log2,
+                tile_rows_log2: rows_log2,
+            };
+            let mut enc = Av1Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for picture in &sources {
+                stream.extend_from_slice(&enc.encode(picture).unwrap().data);
+            }
+            stream
+        };
+        for (cols_log2, rows_log2) in [(1u32, 0u32), (0, 1), (1, 1), (2, 1)] {
+            let one = coded(1, cols_log2, rows_log2);
+            let four = coded(4, cols_log2, rows_log2);
+            assert_eq!(
+                one,
+                four,
+                "{}x{} tiles: {} bytes at one thread, {} at four",
+                1 << cols_log2,
+                1 << rows_log2,
+                one.len(),
+                four.len()
+            );
+        }
+        crate::par::set_tile_threads(1);
+    }
+
     /// The same round trip at a real 1920x1080 crop of the gate's own clip
     /// -- the size the editor's export actually runs at, where a tile grid
     /// is worth having. Ignored by default only for its wall (a 1080p

@@ -348,7 +348,9 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
     // `EC_AV1_TILES=<cols_log2>[:<rows_log2>]` benches the encoder's tile
     // grid (spec 5.9.15's uniform spacing): `1:0` is two tile columns, `1:1`
     // a 2x2 grid. Unset keeps the one-tile default, whose bytes are the ones
-    // the byte pins carry.
+    // the byte pins carry. `EC_AV1_TILE_THREADS=<n>` (read by `ec_av1::par`)
+    // spreads those tiles across `n` pool workers; the bytes are the same
+    // either way, only the wall changes.
     let (tile_cols_log2, tile_rows_log2) = std::env::var("EC_AV1_TILES")
         .ok()
         .and_then(|spec| {
