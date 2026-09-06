@@ -1080,6 +1080,21 @@ fn screen_content(y: &[u8], width: usize, true_width: usize, true_height: usize)
     on
 }
 
+/// Whether this SOURCE picture reads as screen content, for a caller that has
+/// to decide something BEFORE the frame is coded: [`crate::encoder::Av1Encoder`]
+/// gates its coding pyramid on this (a desktop capture keeps the flat
+/// one-in-one-out structure the BD gate measured it on, camera material takes
+/// the mini-GOP). The key frame runs the same detector again when it builds
+/// its header -- that is the run the [`SCREEN_FRAMES`] histogram is meant to
+/// count, so this probe undoes its own tick and leaves the gate prints
+/// reading one detection per coded frame.
+pub(crate) fn picture_is_screen(picture: &Picture) -> bool {
+    let y: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
+    let on = screen_content(&y, picture.width, picture.width, picture.height);
+    SCREEN_FRAMES[usize::from(on)].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
 /// The sequence and frame headers a picture of this size is coded under: one
 /// tile, one transform size per block, no in-loop filter parameters yet
 /// (`crate::encode::pick_and_apply_filters` fills the deblocking levels and
@@ -12320,12 +12335,12 @@ mod tests {
     /// keeps the flat one-key-then-all-inter ladder the baseline was measured
     /// on, so the gate's default recipe is unchanged.
     ///
-    /// RE-MEASURED on lane-av1rejudge at [`LAMBDA_SCALE`] 0.05 with warp on,
-    /// native, against the flat ladder's +16.7/-0.5, +47.0/+19.1,
-    /// +51.3/-14.3: `2:-16:8` is +23.8/+5.8, +46.0/+18.9, +58.6/-10.2 and
-    /// `4:-16:8` is +21.1/+3.4, +47.2/+19.2, +55.2/-11.7 -- whole points
-    /// worse on the 1080p film and on screen, so the flat ladder stays the
-    /// default. Only the 2160p film likes a pyramid.
+    /// RE-SWEPT on lane-av1pyrgate under the content gate (see
+    /// [`crate::encoder::Pyramid`]'s own table): with the screen capture
+    /// coding flat by construction, `4:-16:8` takes film A +62.8/+32.5 ->
+    /// +54.1/+24.2 and film B +86.3/+50.5 -> +82.6/+47.4, and the screen row
+    /// is unchanged to the byte. The gate ladder still defaults to flat --
+    /// the sequence path this arm is pinned against codes no pyramid.
     fn pyramid_from_env() -> Option<crate::encoder::Pyramid> {
         let spec = std::env::var("EC_AV1_PYRAMID").ok()?;
         let mut f = spec.split(':');
@@ -12345,15 +12360,18 @@ mod tests {
     /// own quantizer offset; without one it is the flat ladder, which
     /// `encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence`
     /// pins byte-identical to [`our_ladder`]'s, so this arm must print the
-    /// same BD numbers. Returns the ladder, the wall, and — per pyramid level
-    /// over the whole ladder — how many frames and how many bytes it spent.
+    /// same BD numbers. Returns the ladder, the wall, per pyramid level over
+    /// the whole ladder how many frames and how many bytes it spent, and the
+    /// pyramid the streams were EFFECTIVELY coded under — the content gate in
+    /// `Av1Encoder::encode_frames` drops a screen-content clip back to the
+    /// flat path, so a requested pyramid can come back `None` here.
     fn our_ladder_facade(
         name: &str,
         source: &[Picture],
         width: usize,
         height: usize,
         pyramid: Option<crate::encoder::Pyramid>,
-    ) -> (Vec<(f64, f64)>, f64, [usize; 4], [usize; 4]) {
+    ) -> (Vec<(f64, f64)>, f64, [usize; 4], [usize; 4], Option<crate::encoder::Pyramid>) {
         use crate::encoder::{Av1Encoder, Colour, EncoderConfig, Level};
         let slot = |l: Level| match l {
             Level::Key => 0,
@@ -12363,6 +12381,7 @@ mod tests {
         };
         let mut ladder = Vec::new();
         let mut wall = 0.0;
+        let mut effective = None;
         let (mut counts, mut bytes) = ([0usize; 4], [0usize; 4]);
         for &q in &[150u8, 120, 90, 60] {
             let config = EncoderConfig {
@@ -12385,6 +12404,7 @@ mod tests {
             }
             packets.extend(enc.flush().unwrap());
             wall += start.elapsed().as_secs_f64();
+            effective = enc.pyramid();
             let mut stream = Vec::new();
             for p in &packets {
                 counts[slot(p.level)] += 1;
@@ -12415,7 +12435,7 @@ mod tests {
             ladder.push((mean, (stream.len() as f64).log10()));
         }
         ladder.sort_by(|a, b| a.0.total_cmp(&b.0));
-        (ladder, wall, counts, bytes)
+        (ladder, wall, counts, bytes, effective)
     }
 
     /// Byte-exactness gate for encoder work that is meant to change only
@@ -12640,6 +12660,13 @@ mod tests {
     /// | bars 2160p | +81.6% | +41.5% | 4.8s:1.0s:2.2s |
     /// | screen capture | +49.1% | -4.3% | 5.5s:1.0s:2.1s |
     ///
+    /// The same run under `EC_AV1_PYRAMID=4:-16:8 EC_AV1_GATE_FACADE=1`
+    /// (lane-av1pyrgate), which is what the content gate does at this scale:
+    /// the bars are non-screen so they take the pyramid (+84.7 / +39.9 and
+    /// +124.4 / +75.2 -- this downscaled recipe hates it, as it hates every
+    /// knob the real film rows keep), and the capture's row comes back
+    /// +49.1 / -4.3, the flat row to the byte. That equality IS the gate.
+    ///
     /// Loop restoration is NOT in yet: it is the one filter whose parameters
     /// are per restoration UNIT inside the tile payload, so it needs both
     /// tile writers to code `lr` syntax and an encoder-visible post-CDEF
@@ -12759,10 +12786,11 @@ mod tests {
             let (ours, ours_wall) = match (facade, pyramid_env) {
                 (false, None) => our_ladder(name, &source, width, height, fctx),
                 (_, pyramid) => {
-                    let (ladder, wall, counts, bytes) =
+                    let (ladder, wall, counts, bytes, effective) =
                         our_ladder_facade(name, &source, width, height, pyramid);
                     eprintln!(
-                        "{name}: facade, pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
+                        "{name}: facade, pyramid requested {pyramid:?} effective \
+                         {effective:?} -- frames key {} arf {} leaf {} \
                          show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
                         counts[0], counts[1], counts[2], counts[3],
                         bytes[0], bytes[1], bytes[2], bytes[3],
@@ -13268,10 +13296,11 @@ mod tests {
             let (ours, ours_wall) = match pyramid_from_env() {
                 None => our_ladder(name, &source, cw, ch, fctx),
                 Some(pyramid) => {
-                    let (ladder, wall, counts, bytes) =
+                    let (ladder, wall, counts, bytes, effective) =
                         our_ladder_facade(name, &source, cw, ch, Some(pyramid));
                     eprintln!(
-                        "{name}: pyramid {pyramid:?} -- frames key {} arf {} leaf {} \
+                        "{name}: pyramid requested {pyramid:?} effective {effective:?} \
+                         -- frames key {} arf {} leaf {} \
                          show_existing {}; bytes key {} arf {} leaf {} show_existing {}",
                         counts[0], counts[1], counts[2], counts[3],
                         bytes[0], bytes[1], bytes[2], bytes[3],
