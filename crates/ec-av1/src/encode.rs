@@ -3194,9 +3194,16 @@ fn code_square_inter(
             // A compound winner commits the flat trial it was priced from:
             // `commit_inter_luma`'s var-tx trial set is single-reference
             // (`mc_trial`), so a compound leaf codes `tx_depth = 0`.
-            // corner-cut: no var-tx split for a compound leaf -- ceiling is
-            // the split gain on 16x16 compound blocks; upgrade path is a
-            // compound `commit_inter_luma` taking both references.
+            // lane-av1comp4 BUILT that upgrade (a `commit_inter_luma`
+            // predicting each half-side trial from BOTH references, verified
+            // byte-identical to this when its split is disabled) and MEASURED
+            // it a loss: vs libaom +83.5/+99.7/+54.9 at no margin against the
+            // +83.0/+99.9/+54.5 here, and +83.3/+100.2/+54.9, +83.8/+99.5/
+            // +54.9, +83.3/+100.0/+54.9 at split margins 0.02/0.05/0.15. A
+            // compound block's residual is small enough that the four extra
+            // per-unit txb_skip/eob symbols cost more ladder bytes than this
+            // encoder's static-CDF estimate prices them at, so the local RD
+            // win does not convert. The flat trial stays.
             let (levels, tx_depth, dcost) = if info.ref1.is_some() {
                 luma.commit(x, y, side, &luma_new);
                 (luma_new.levels.clone(), 0, 0.0)
