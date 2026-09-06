@@ -7326,13 +7326,51 @@ fn tpl_strength() -> f64 {
 }
 
 /// lane-av1tpl2: how many SOURCE pictures the lambda map looks at, counting
-/// the frame being coded: 1 turns the weighting off (nothing to propagate
-/// from), 2 is lane-av1tpl's one-frame map. Swept by `EC_AV1_TPL_D=<d>`.
+/// the frame being coded. 1 turns the weighting off; 2 is the shipped
+/// one-frame area map ([`tpl_area_map`]); 3 and up only mean anything under
+/// [`tpl_propagating`], which is the map that can actually use them. Swept
+/// by `EC_AV1_TPL_D=<d>`.
 ///
 /// The streaming facade holds `depth - 1` pictures back so it feeds
 /// `encode_inter_frame` the same window `encode_sequence` does; both read
 /// THIS function, so the two paths cannot disagree about the window.
-const TPL_DEPTH: usize = 4;
+const TPL_DEPTH: usize = 2;
+
+/// The exponent the dependence ratio is read through ([`tpl_lambda_factors`]).
+const TPL_POWER: f64 = 1.0;
+
+/// lane-av1tpl2: the propagating map ([`tpl_lambda_factors`]) instead of the
+/// one-frame area map ([`tpl_area_map`]), behind `EC_AV1_TPL_PROP=1`.
+///
+/// MEASURED at the native gate (1920x1024, 12 frames, BD-rate vs libaom
+/// `cpu-used 6` / rav1e `speed 6`), against the shipped one-frame map
+/// (+15.9/-1.3, +46.5/+18.7, +51.2/-14.4). `p` is [`TPL_POWER`]:
+///
+/// | k | D | p | film 1080p | film 2160p | screen |
+/// |---|---|---|---|---|---|
+/// | 0.0625 | 8 | 1 | +15.7/-1.6 | +46.6/+18.8 | +51.1/-14.5 |
+/// | 0.125 | 4 | 1 | +15.7/-1.6 | +46.7/+18.9 | +51.2/-14.5 |
+/// | 0.125 | 8 | 1 | +15.9/-1.3 | +46.8/+19.0 | +50.7/-14.7 |
+/// | 0.25 | 4 | 1 | +15.5/-1.8 | +46.8/+19.1 | +51.2/-14.5 |
+/// | 0.25 | 8 | 1 | +15.7/-1.6 | +46.9/+19.1 | +50.7/-14.6 |
+/// | 0.5 | 4 | 1 | +16.1/-1.2 | +47.0/+19.2 | +51.1/-14.6 |
+/// | 0.5 | 8 | 1 | +16.0/-1.4 | +47.1/+19.3 | +51.8/-13.9 |
+/// | 1 | 4 | 1 | +16.2/-1.3 | +47.2/+19.4 | +51.9/-13.9 |
+/// | 2 | 4 | 1 | +17.2/-0.5 | +47.2/+19.5 | +57.0/-10.7 |
+/// | **0.5** | **8** | **0.5** | **+15.5/-1.7** | **+46.7/+19.0** | **+50.8/-14.6** |
+/// | 0.5 | 4 | 0.5 | +15.6/-1.6 | +46.8/+19.0 | +51.0/-14.6 |
+/// | 1 | 8 | 0.5 | +15.9/-1.5 | +47.0/+19.2 | +51.0/-14.5 |
+///
+/// The map is genuinely non-flat now (0.25..1.12 across 7680 cells, only 58
+/// of them within 0.9..1.1, where the one-frame map had 7127 of 7680 inside
+/// 1..1.5x its own mean), and its best arm is 0.4 down on both film 1080p
+/// columns and 0.4/0.2 down on screen -- but EVERY arm is 0.1..0.4 UP on
+/// film 2160p, including the vanishingly weak ones, so no arm is at least
+/// flat on every row. It therefore ships OFF: the default stays the
+/// one-frame map the gate's numbers were measured on.
+fn tpl_propagating() -> bool {
+    std::env::var("EC_AV1_TPL_PROP").ok().as_deref() == Some("1")
+}
 
 pub(crate) fn tpl_depth() -> usize {
     std::env::var("EC_AV1_TPL_D")
@@ -7439,6 +7477,75 @@ fn tpl_intra_costs(frame: &[u8], width: usize, height: usize) -> Vec<u32> {
     out
 }
 
+/// lane-av1tpl's one-frame map, in terms of the pass above: how much of THIS
+/// frame the next one predicts from, per 16x16 cell -- each cell of `next`
+/// splats its own area, at its winning displacement, onto the (at most four)
+/// cells of `cur` it lands on. 1.0 is "referenced exactly once".
+fn tpl_area_map(cur: &[u8], next: &[u8], width: usize, height: usize) -> Vec<f64> {
+    let start = std::time::Instant::now();
+    let (cells_x, cells_y) = (width / 16, height / 16);
+    let pass = tpl_coarse_pass(cur, next, width, height);
+    let mut area = vec![0.0f64; cells_x * cells_y];
+    for cy in 0..cells_y {
+        for cx in 0..cells_x {
+            let (mv, _) = pass[cy * cells_x + cx];
+            let (x0, y0) = ((cx * 16) as i32 + mv.0, (cy * 16) as i32 + mv.1);
+            let (x0, y0) = (x0.max(0) as usize, y0.max(0) as usize);
+            for ci in x0 / 16..=((x0 + 15) / 16).min(cells_x - 1) {
+                let ox = (x0 + 16).min(ci * 16 + 16) - x0.max(ci * 16);
+                for ri in y0 / 16..=((y0 + 15) / 16).min(cells_y - 1) {
+                    let oy = (y0 + 16).min(ri * 16 + 16) - y0.max(ri * 16);
+                    area[ri * cells_x + ci] += (ox * oy) as f64 / 256.0;
+                }
+            }
+        }
+    }
+    TPL_NANOS.fetch_add(
+        start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    area
+}
+
+/// [`tpl_area_map`]'s per-cell referenced-ness turned into one lambda
+/// factor per 64x64 superblock: `f = (1 + k) / (1 + k * w_rel)`, where
+/// `w_rel` is the superblock's mean referenced-ness over the FRAME's mean.
+/// Decreasing in referenced-ness (a block the next frame leans on is coded
+/// more distortion-averse) and 1.0 at the frame's own mean, so the frame's
+/// total lambda scale is only redistributed, never moved -- a global move is
+/// the thing lane-av1lambda already measured inert.
+fn tpl_sb_factors(map: &[f64], cells_x: usize, cells_y: usize, k: f64) -> Vec<f64> {
+    let (sb_cols, sb_rows) = (cells_x / 4, cells_y / 4);
+    let mean = (map.iter().sum::<f64>() / map.len().max(1) as f64).max(1e-6);
+    let mut out = Vec::with_capacity(sb_cols * sb_rows);
+    for sr in 0..sb_rows {
+        for sc in 0..sb_cols {
+            let mut sum = 0.0;
+            for r in 0..4 {
+                for c in 0..4 {
+                    sum += map[(sr * 4 + r) * cells_x + sc * 4 + c];
+                }
+            }
+            let w_rel = sum / 16.0 / mean;
+            out.push(((1.0 + k) / (1.0 + k * w_rel)).clamp(0.25, 4.0));
+        }
+    }
+    if std::env::var("EC_AV1_TPL_HIST").ok().as_deref() == Some("1") {
+        let mut hist = [0usize; 8];
+        for w in map {
+            hist[((w / mean * 2.0) as usize).min(7)] += 1;
+        }
+        let (lo, hi) = out.iter().fold((f64::MAX, 0.0f64), |(l, h), &f| (l.min(f), h.max(f)));
+        eprintln!(
+            "tpl k={k}: {} cells mean w={mean:.3}, w/mean hist (0-.5,.5-1,..,>3.5) {hist:?}, \
+             sb factor {lo:.3}..{hi:.3}, lookahead wall {:.1} ms cumulative",
+            map.len(),
+            TPL_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+        );
+    }
+    out
+}
+
 /// libaom's `tpl_model_update` in this crate's cheapest shape: one lambda
 /// factor per 16x16 cell of `frames[0]` (the frame being coded), from how
 /// much of the WHOLE lookahead window leans on that cell.
@@ -7491,10 +7598,20 @@ fn tpl_lambda_factors(frames: &[&[u8]], width: usize, height: usize, k: f64) -> 
             }
         }
     }
+    // The tail compression `p`: `mc_dep/intra` is a ratio with a very long
+    // tail (a nearly flat cell the window leans on has a tiny denominator),
+    // and at p = 1 that tail slams into the clamp. libaom reads its own
+    // dependence ratio through a sqrt (`dr_from_beta`); `EC_AV1_TPL_P`
+    // sweeps the exponent, 1 being the raw ratio.
+    let power = std::env::var("EC_AV1_TPL_P")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0)
+        .unwrap_or(TPL_POWER);
     let mut out: Vec<f64> = (0..cells)
         .map(|c| {
             let r = mc_dep[0][c] / f64::from(intra[0][c].max(1));
-            1.0 / (1.0 + k * r)
+            (1.0 + k * r).powf(-power)
         })
         .collect();
     let mean = (out.iter().sum::<f64>() / cells.max(1) as f64).max(1e-9);
@@ -7753,12 +7870,26 @@ pub(crate) fn encode_inter_frame(
         .collect();
     let tpl_sources: Vec<Vec<u8>> =
         window.iter().map(|n| n.y.iter().map(|&v| v as u8).collect()).collect();
-    let tpl_factors: Option<Vec<f64>> = (tpl_k > 0.0 && !tpl_sources.is_empty()).then(|| {
-        let mut frames: Vec<&[u8]> = vec![&picture_y8];
-        frames.extend(tpl_sources.iter().map(Vec::as_slice));
-        tpl_lambda_factors(&frames, picture.width, picture.height, tpl_k)
-    });
     let tpl_cells_x = picture.width / 16;
+    let tpl_factors: Option<Vec<f64>> = (tpl_k > 0.0 && !tpl_sources.is_empty()).then(|| {
+        if tpl_propagating() {
+            let mut frames: Vec<&[u8]> = vec![&picture_y8];
+            frames.extend(tpl_sources.iter().map(Vec::as_slice));
+            tpl_lambda_factors(&frames, picture.width, picture.height, tpl_k)
+        } else {
+            // The shipped map is one factor per 64x64; it is spread over that
+            // superblock's own 16 cells so the application site below (which
+            // averages the four cells of a 32x32 block) reads exactly the
+            // superblock factor, whichever map fed it.
+            let map =
+                tpl_area_map(&picture_y8, &tpl_sources[0], picture.width, picture.height);
+            let cells_y = picture.height / 16;
+            let sb = tpl_sb_factors(&map, tpl_cells_x, cells_y, tpl_k);
+            (0..tpl_cells_x * cells_y)
+                .map(|c| sb[(c / tpl_cells_x / 4) * (tpl_cells_x / 4) + (c % tpl_cells_x) / 4])
+                .collect()
+        }
+    });
 
     // The true grid ([`crate::tile::block_grid`]'s ceiling), not the padded
     // coding surface's: `blocks` carries one entry per 32x32 block the tile
