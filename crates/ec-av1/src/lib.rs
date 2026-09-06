@@ -32,6 +32,7 @@ pub mod encode;
 pub mod encoder;
 mod envflags;
 mod film_grain;
+mod filter_search;
 pub mod frame;
 mod gate_coverage;
 mod hits;
