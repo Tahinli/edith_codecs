@@ -1617,6 +1617,19 @@ fn decode_frame(
             "a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)",
         ));
     }
+    // lane-lossless r1 ships the KEY/intra-only half: an inter block's chroma
+    // plane is still read as ONE transform per block here, where a lossless
+    // frame codes it as 4x4 units like everything else (libaom
+    // `read_block_tx_size` returns TX_4X4 for every plane). The luma side of
+    // the inter path is already converted (`read_block_tx_size`'s synthesized
+    // leaves); the chroma walk and its mu-chunk order are the remaining work,
+    // so refuse by name rather than return silently wrong pixels.
+    if coded_lossless && header.frame_type == FrameType::Inter {
+        return Err(Error::unsupported(
+            "AV1 decode_stream",
+            "a lossless INTER frame (its chroma plane is still coded as one transform per block here)",
+        ));
+    }
     crate::decode::set_lossless(coded_lossless, fctx);
     crate::decode::set_bit_depth(bit_depth, fctx);
     // spec 7.16: this frame's superres state, for the filter chain --
@@ -3994,18 +4007,20 @@ pub(crate) mod tests {
         }
     }
 
-    /// lane-dpm1: the lossless refusal is a CLAIM, so it gets a stream that
-    /// reaches it. libaom at `-crf 0` codes `base_q_idx == 0` -- the same
-    /// lossless frame his screen-capture row gets at `-crf 5` -- where the tile
-    /// syntax is TX_4X4 + Walsh-Hadamard and `is_cfl_allowed` narrows to
-    /// `plane_bsize == BLOCK_4X4`. Before the refusal our decoder returned a
-    /// picture that was wrong from luma sample 0 (measured on that row: 126
-    /// against ffmpeg's 33, the first block's `uv_mode` read off the CfL
-    /// alphabet). The gate asserts the stream really is lossless and that we
-    /// refuse it BY NAME rather than decode it wrong.
+    /// lane-lossless: the refusal became an implementation, so its gate became
+    /// a DECODE-EXACT one (class `refusal-lifted-without-a-gate`). libaom at
+    /// `-crf 0` codes `base_q_idx == 0` -- the same lossless frame his
+    /// screen-capture row gets at `-crf 5` -- where every plane is TX_4X4 with
+    /// the Walsh-Hadamard transform, no `tx_type` symbol is coded
+    /// (`read_tx_type`, `decodetxb.c`: "No need to read transform type for
+    /// lossless mode(qindex==0)") and `is_cfl_allowed` (`blockd.h`) narrows to
+    /// a BLOCK_4X4 chroma plane block. The gate asserts the stream really is
+    /// lossless (class `gate-blind-to-feature`), that every KEY frame decodes
+    /// sample-exact against ffmpeg, and that the still-unimplemented lossless
+    /// INTER frame is refused BY NAME rather than decoded wrong.
     #[test]
-    fn a_lossless_libaom_stream_is_refused_by_name() {
-        const NAME: &str = "a_lossless_libaom_stream_is_refused_by_name";
+    fn a_lossless_libaom_key_frame_decodes_sample_exact() {
+        const NAME: &str = "a_lossless_libaom_key_frame_decodes_sample_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -4023,17 +4038,21 @@ pub(crate) mod tests {
         // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
         let src = std::env::temp_dir().join(format!("ec-av1-lossless-{}.yuv", std::process::id()));
         std::fs::write(&src, &raw).expect("raw source");
-        let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
-            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
-            .arg(&src)
-            .args(["-an", "-threads", "1", "-g", "2", "-c:v", "libaom-av1"])
-            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "0", "-f", "obu", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("ffmpeg failed to run");
+        let encode = |gop: &str| {
+            let out = Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+                .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+                .arg(&src)
+                .args(["-an", "-threads", "1", "-g", gop, "-c:v", "libaom-av1"])
+                .args(["-cpu-used", "6", "-b:v", "0", "-crf", "0", "-f", "obu", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            out
+        };
+        let out = encode("1");
         let _ = std::fs::remove_file(&src);
         if !out.status.success() {
             eprintln!(
@@ -4054,15 +4073,68 @@ pub(crate) mod tests {
                 ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) => h,
                 _ => continue,
             };
-            if header.lossless.iter().any(|&l| l) {
+            if header.lossless.iter().all(|&l| l) {
                 lossless += 1;
             }
         }
-        assert!(lossless > 0, "{NAME} went blind: libaom coded no lossless frame at -crf 0");
-        match decode_stream(&stream) {
-            Ok(_) => panic!("{NAME}: a lossless stream decoded instead of being refused"),
+        assert_eq!(lossless, frames, "{NAME} went blind: libaom coded no lossless key frame at -crf 0");
+        let ours = decode_stream(&stream).expect("a lossless key-frame stream decodes");
+        let refs = ffmpeg_decode_sequence(&stream, w, h, frames);
+        assert_eq!(ours.len(), frames, "{NAME}: frame count");
+        for (i, (got, want)) in ours.iter().zip(refs.iter()).enumerate() {
+            for (plane, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                .iter()
+                .enumerate()
+            {
+                let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(bad, 0, "{NAME}: frame {i} plane {plane}: {bad} samples differ");
+            }
+        }
+    }
+
+    /// The other half of lane-lossless r1: a lossless INTER frame is refused BY
+    /// NAME (its chroma plane is still one transform per block here), never
+    /// decoded into silently wrong pixels -- the refusal this gate pins is the
+    /// one `refusal_inventory` carries.
+    #[test]
+    fn a_lossless_inter_frame_is_refused_by_name() {
+        const NAME: &str = "a_lossless_inter_frame_is_refused_by_name";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let (w, h, frames) = (128usize, 64usize, 4usize);
+        let mut raw = Vec::with_capacity(frames * w * h * 3 / 2);
+        for f in 0..frames {
+            for row in 0..h {
+                for col in 0..w {
+                    raw.push(((col * 7 + row * 13 + f * 31) % 251) as u8);
+                }
+            }
+            raw.extend(std::iter::repeat_n(128u8, w * h / 2));
+        }
+        let src = std::env::temp_dir().join(format!("ec-av1-lossless-i-{}.yuv", std::process::id()));
+        std::fs::write(&src, &raw).expect("raw source");
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+            .arg(&src)
+            .args(["-an", "-threads", "1", "-g", "4", "-c:v", "libaom-av1"])
+            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "0", "-f", "obu", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        let _ = std::fs::remove_file(&src);
+        if !out.status.success() {
+            eprintln!("SKIP {NAME}: ffmpeg has no libaom-av1 encoder");
+            return;
+        }
+        match decode_stream(&out.stdout) {
+            Ok(_) => panic!("{NAME}: a lossless inter stream decoded instead of being refused"),
             Err(e) => assert!(
-                format!("{e}").contains("a lossless frame (qindex 0)"),
+                format!("{e}").contains("a lossless INTER frame"),
                 "{NAME}: refused for the wrong reason: {e}"
             ),
         }

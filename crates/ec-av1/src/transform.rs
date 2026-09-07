@@ -2934,19 +2934,20 @@ mod lossless_tx_tests {
         fn fwht(residual: &[i32]) -> Vec<i32> {
             let mut t = [0i32; 16];
             for i in 0..4 {
-                let (a, b, c, d) = undo(residual[i], residual[4 + i], residual[8 + i], residual[12 + i]);
-                t[i * 4] = a;
-                t[i * 4 + 1] = c;
-                t[i * 4 + 2] = d;
-                t[i * 4 + 3] = b;
+                let (a, b, c, d) =
+                    undo(residual[i], residual[4 + i], residual[8 + i], residual[12 + i]);
+                t[i] = a;
+                t[4 + i] = c;
+                t[8 + i] = d;
+                t[12 + i] = b;
             }
             let mut dq = vec![0i32; 16];
             for i in 0..4 {
-                let (a, b, c, d) = undo(t[i], t[4 + i], t[8 + i], t[12 + i]);
-                dq[i] = a * 4;
-                dq[4 + i] = c * 4;
-                dq[8 + i] = d * 4;
-                dq[12 + i] = b * 4;
+                let (a, b, c, d) = undo(t[i * 4], t[i * 4 + 1], t[i * 4 + 2], t[i * 4 + 3]);
+                dq[i * 4] = a * 4;
+                dq[i * 4 + 1] = c * 4;
+                dq[i * 4 + 2] = d * 4;
+                dq[i * 4 + 3] = b * 4;
             }
             dq
         }
