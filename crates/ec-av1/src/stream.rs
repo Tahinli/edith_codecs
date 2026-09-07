@@ -1617,19 +1617,10 @@ fn decode_frame(
             "a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)",
         ));
     }
-    // lane-lossless r1 ships the KEY/intra-only half: an inter block's chroma
-    // plane is still read as ONE transform per block here, where a lossless
-    // frame codes it as 4x4 units like everything else (libaom
-    // `read_block_tx_size` returns TX_4X4 for every plane). The luma side of
-    // the inter path is already converted (`read_block_tx_size`'s synthesized
-    // leaves); the chroma walk and its mu-chunk order are the remaining work,
-    // so refuse by name rather than return silently wrong pixels.
-    if coded_lossless && header.frame_type == FrameType::Inter {
-        return Err(Error::unsupported(
-            "AV1 decode_stream",
-            "a lossless INTER frame (its chroma plane is still coded as one transform per block here)",
-        ));
-    }
+    // lane-lossless2: an INTER frame's chroma plane is now walked as 4x4
+    // transform units too (`decode::read_inter_chroma_lossless`), so the
+    // named refusal that stood here is gone -- the gate that replaced it is
+    // `a_lossless_libaom_inter_frame_decodes_sample_exact`.
     crate::decode::set_lossless(coded_lossless, fctx);
     crate::decode::set_bit_depth(bit_depth, fctx);
     // spec 7.16: this frame's superres state, for the filter chain --
@@ -4033,7 +4024,20 @@ pub(crate) mod tests {
                     raw.push(((col * 7 + row * 13 + f * 31) % 251) as u8);
                 }
             }
-            raw.extend(std::iter::repeat_n(128u8, w * h / 2));
+            // lane-lossless2: TEXTURED chroma. A flat chroma plane codes one
+            // `txb_skip` symbol per 4x4 unit with every context at 0, which
+            // is blind to both the unit ORDER and the per-unit contexts
+            // (class `gate-blind-to-feature`).
+            for row in 0..h / 2 {
+                for col in 0..w / 2 {
+                    raw.push((((col + f) * 11 + row * 5) % 251) as u8);
+                }
+            }
+            for row in 0..h / 2 {
+                for col in 0..w / 2 {
+                    raw.push(((col * 3 + (row + f) * 17) % 251) as u8);
+                }
+            }
         }
         // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
         let src = std::env::temp_dir().join(format!("ec-av1-lossless-{}.yuv", std::process::id()));
@@ -4092,51 +4096,157 @@ pub(crate) mod tests {
         }
     }
 
-    /// The other half of lane-lossless r1: a lossless INTER frame is refused BY
-    /// NAME (its chroma plane is still one transform per block here), never
-    /// decoded into silently wrong pixels -- the refusal this gate pins is the
-    /// one `refusal_inventory` carries.
+    /// lane-lossless2: the refusal `a_lossless_inter_frame_is_refused_by_name`
+    /// pinned became an implementation, so its gate became a DECODE-EXACT one
+    /// (class `refusal-lifted-without-a-gate`). A lossless INTER frame codes
+    /// its chroma plane as 4x4 transform units, plane-major inside each 64x64
+    /// mu chunk (libaom `read_tx_size` returns TX_4X4 for every plane under
+    /// `xd->lossless[..]`, and `decode_token_recon_block` walks
+    /// `for (plane..) for (blk_row..) for (blk_col..)`), which is what
+    /// `decode::read_inter_chroma_lossless` reads. The source carries TEXTURED
+    /// CHROMA and real motion on purpose: a flat-chroma source codes one
+    /// `txb_skip` symbol per unit and is blind to both the unit order and the
+    /// per-unit contexts (class `gate-blind-to-feature`).
     #[test]
-    fn a_lossless_inter_frame_is_refused_by_name() {
-        const NAME: &str = "a_lossless_inter_frame_is_refused_by_name";
+    fn a_lossless_libaom_inter_frame_decodes_sample_exact() {
+        const NAME: &str = "a_lossless_libaom_inter_frame_decodes_sample_exact";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let (w, h, frames) = (128usize, 64usize, 4usize);
-        let mut raw = Vec::with_capacity(frames * w * h * 3 / 2);
-        for f in 0..frames {
-            for row in 0..h {
-                for col in 0..w {
-                    raw.push(((col * 7 + row * 13 + f * 31) % 251) as u8);
+        // (w, h, frames, gop, bit depth, 128-superblock, screen content)
+        // lane-lossless2: the SCREEN rows carry palette blocks, which is what
+        // caught the whole-block palette prediction being handed to a 4x4
+        // chroma unit; they are KEY-only, see the lane report's deferred
+        // screen-inter desync.
+        let cases: [(usize, usize, usize, &str, u32, bool, bool); 6] = [
+            (256, 128, 8, "4", 8, false, false),
+            (192, 96, 6, "3", 10, false, false),
+            (320, 192, 6, "3", 8, false, false),
+            (256, 256, 4, "2", 8, true, false),
+            (320, 192, 2, "1", 8, false, true),
+            (640, 384, 2, "1", 8, false, true),
+        ];
+        for &(w, h, frames, gop, depth, sb128, screen) in &cases {
+            let tag = format!(
+                "{w}x{h} {depth}-bit gop {gop}{}{}",
+                if sb128 { " sb128" } else { "" },
+                if screen { " screen" } else { "" }
+            );
+            let mut raw: Vec<u8> = Vec::new();
+            let put = |v: u32, raw: &mut Vec<u8>| {
+                if depth == 10 {
+                    raw.extend_from_slice(&((v * 4) as u16).to_le_bytes());
+                } else {
+                    raw.push(v as u8);
+                }
+            };
+            // A screen source is a few flat colours in 16x16 tiles plus
+            // 1-px text-like rows -- what makes libaom code palette blocks.
+            const PAL: [u32; 8] = [16, 60, 110, 145, 180, 210, 235, 128];
+            for f in 0..frames {
+                for row in 0..h {
+                    for col in 0..w {
+                        let v = if screen {
+                            if row % 7 == 0 && col % 3 == 0 {
+                                if (col / 3 + row + f) % 2 == 1 { 16 } else { 235 }
+                            } else {
+                                PAL[((col + 4 * f) / 16 + row / 16) % PAL.len()]
+                            }
+                        } else {
+                            (((col + 2 * f) * 7 + row * 13) % 251) as u32
+                        };
+                        put(v, &mut raw);
+                    }
+                }
+                for plane in 0..2usize {
+                    for row in 0..h / 2 {
+                        for col in 0..w / 2 {
+                            let v = if screen {
+                                PAL[((col + 2 * f) / 8 + row / 8 + plane) % PAL.len()]
+                            } else if plane == 0 {
+                                (((col + f) * 11 + row * 5) % 251) as u32
+                            } else {
+                                ((col * 3 + (row + f) * 17) % 251) as u32
+                            };
+                            put(v, &mut raw);
+                        }
+                    }
                 }
             }
-            raw.extend(std::iter::repeat_n(128u8, w * h / 2));
-        }
-        let src = std::env::temp_dir().join(format!("ec-av1-lossless-i-{}.yuv", std::process::id()));
-        std::fs::write(&src, &raw).expect("raw source");
-        let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
-            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
-            .arg(&src)
-            .args(["-an", "-threads", "1", "-g", "4", "-c:v", "libaom-av1"])
-            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "0", "-f", "obu", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("ffmpeg failed to run");
-        let _ = std::fs::remove_file(&src);
-        if !out.status.success() {
-            eprintln!("SKIP {NAME}: ffmpeg has no libaom-av1 encoder");
-            return;
-        }
-        match decode_stream(&out.stdout) {
-            Ok(_) => panic!("{NAME}: a lossless inter stream decoded instead of being refused"),
-            Err(e) => assert!(
-                format!("{e}").contains("a lossless INTER frame"),
-                "{NAME}: refused for the wrong reason: {e}"
-            ),
+            let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
+            let src = std::env::temp_dir()
+                .join(format!("ec-av1-lossless2-{}-{w}x{h}-{depth}.yuv", std::process::id()));
+            std::fs::write(&src, &raw).expect("raw source");
+            let mut cmd = Command::new("ffmpeg");
+            cmd.args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", pix])
+                .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+                .arg(&src)
+                .args(["-an", "-threads", "1", "-g", gop, "-c:v", "libaom-av1"])
+                .args(["-pix_fmt", pix, "-cpu-used", "6", "-b:v", "0", "-crf", "0"]);
+            if sb128 {
+                cmd.args(["-aom-params", "sb-size=128"]);
+            }
+            if screen {
+                cmd.args(["-aom-params", "tune-content=screen"]);
+            }
+            let out = cmd
+                .args(["-f", "obu", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            let _ = std::fs::remove_file(&src);
+            if !out.status.success() {
+                eprintln!(
+                    "SKIP {NAME}: ffmpeg has no libaom-av1 encoder ({})",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                return;
+            }
+            let stream = out.stdout;
+            // The stream must really be lossless AND really carry inter frames
+            // (class `gate-blind-to-feature`).
+            let mut parser = Av1Parser::new();
+            let (mut pos, mut lossless, mut inters) = (0usize, 0usize, 0usize);
+            while pos < stream.len() {
+                let obu = parser.parse_obu(&stream[pos..]).expect("libaom OBU parses");
+                pos += obu.total_size.max(1);
+                let header = match &obu.kind {
+                    ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) => h,
+                    _ => continue,
+                };
+                if header.lossless.iter().all(|&l| l) {
+                    lossless += 1;
+                }
+                if header.frame_type == FrameType::Inter {
+                    inters += 1;
+                }
+            }
+            assert!(lossless >= frames, "{NAME} [{tag}] went blind: {lossless} lossless frames");
+            assert!(
+                screen || inters > 0,
+                "{NAME} [{tag}] went blind: no inter frame at gop {gop}"
+            );
+            let ours = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME} [{tag}]: a lossless inter stream decodes: {e}"));
+            let refs = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, w, h, frames)
+            } else {
+                ffmpeg_decode_sequence(&stream, w, h, frames)
+            };
+            assert_eq!(ours.len(), frames, "{NAME} [{tag}]: frame count");
+            for (i, (got, want)) in ours.iter().zip(refs.iter()).enumerate() {
+                for (plane, (g, r)) in [(&got.y, &want.y), (&got.u, &want.u), (&got.v, &want.v)]
+                    .iter()
+                    .enumerate()
+                {
+                    let bad = g.iter().zip(r.iter()).filter(|(a, b)| a != b).count();
+                    assert_eq!(bad, 0, "{NAME} [{tag}]: frame {i} plane {plane}: {bad} samples differ");
+                }
+            }
         }
     }
 
