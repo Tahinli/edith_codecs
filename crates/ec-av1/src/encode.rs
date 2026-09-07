@@ -517,6 +517,32 @@ pub fn take_b64_var_tx_hits() -> usize {
     B64_VAR_TX_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a superblock the true frame edge CUTS THROUGH may be left whole
+/// (lane-b64b). AV1 asks only that the block's own half is inside
+/// (`has_cols`/`has_rows`, spec `decode_partition`), and the writer already
+/// codes that case; what was missing was a trial whose SSE is scored over the
+/// INSIDE part alone ([`inside_sse`]) instead of over the padding the encoder
+/// invented past the edge. Both gate films are superblock-aligned, so this
+/// only reaches the user's own arbitrary export sizes.
+///
+/// Off by `EC_AV1_B64EDGE=0`.
+fn b64_edge() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64EDGE").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b64_root()
+}
+
+/// How many 64x64 roots the frame edge cut through since the last
+/// [`take_b64_edge_hits`] (class `gate-blind-to-feature`: both gate films are
+/// superblock-aligned, so nothing but a synthetic size fires this).
+static B64_EDGE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The edge 64x64-root count since the last call, and zero it.
+pub fn take_b64_edge_hits() -> usize {
+    B64_EDGE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the encoder searches loop restoration at all (spec 7.17): one
 /// Wiener filter per 64x64 luma restoration unit, picked from
 /// [`crate::filter_search::WIENER_CANDIDATES`]. Swept by `EC_AV1_LR` in a
@@ -5982,6 +6008,46 @@ where
 /// of the frame's reconstruction because a tile's prediction never reads a
 /// sample outside its own rectangle, and every sample inside it is written
 /// before it is read.
+/// [`Plane::block_sse`] over the part of a block that is INSIDE the true
+/// frame. A block the edge cuts through is still coded whole -- the decoder
+/// reconstructs its outside samples too and the display crop throws them away
+/// -- so scoring them would rank a 64x64 root by how well it predicts padding
+/// the source does not have (lane-b64b).
+fn inside_sse(plane: &Plane, x: usize, y: usize, side: usize, reconstruction: &[u8]) -> f64 {
+    let rows = side.min(plane.true_height.saturating_sub(y));
+    let cols = side.min(plane.true_width.saturating_sub(x));
+    let mut sse = 0u64;
+    for row in 0..rows {
+        let source = &plane.source[(y + row) * plane.width + x..][..cols];
+        for (col, &s) in source.iter().enumerate() {
+            let d = u32::from(s.abs_diff(reconstruction[row * side + col]));
+            sse += u64::from(d * d);
+        }
+    }
+    sse as f64
+}
+
+/// Rescores one 64x64 root trial set (luma and the two chroma planes) over
+/// the inside part of a superblock the frame edge cuts through.
+fn clip_sb64_sse(
+    trials: &mut [Trial; 3],
+    luma: &Plane,
+    chroma: &[Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+) {
+    trials[0].sse = inside_sse(luma, x, y, side, &trials[0].reconstruction);
+    for plane in 0..2 {
+        trials[plane + 1].sse = inside_sse(
+            &chroma[plane],
+            x / 2,
+            y / 2,
+            side / 2,
+            &trials[plane + 1].reconstruction,
+        );
+    }
+}
+
 fn fresh_plane(source: &[u8], width: usize, height: usize, true_width: usize, true_height: usize) -> Plane<'_> {
     Plane {
         source,
@@ -7503,9 +7569,12 @@ fn search_skip_64(
         }
     }
 
+    // A superblock the true frame edge cuts through: every trial below is
+    // ranked over its inside part only ([`clip_sb64_sse`]).
+    let edge = x + side > luma.true_width || y + side > luma.true_height;
     let mut best: Option<(f64, f64, InterInfo, [Trial; 3])> = None;
     for (bits, info) in cands {
-        let trials = [
+        let mut trials = [
             (0usize, x, y, side, true),
             (1, x / 2, y / 2, side / 2, false),
             (2, x / 2, y / 2, side / 2, false),
@@ -7542,6 +7611,9 @@ fn search_skip_64(
                 TxbSet::Luma32Inter,
             )
         });
+        if edge {
+            clip_sb64_sse(&mut trials, luma, chroma, (x, y), side);
+        }
         let cost = trials[0].sse
             + trials[1].sse
             + trials[2].sse
@@ -7614,7 +7686,7 @@ fn search_skip_64(
         ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         ccands.dedup_by_key(|c| c.0);
         for (mvs, bits, info) in ccands {
-            let trials = [
+            let mut trials = [
                 (0usize, x, y, side, true),
                 (1, x / 2, y / 2, side / 2, false),
                 (2, x / 2, y / 2, side / 2, false),
@@ -7658,6 +7730,9 @@ fn search_skip_64(
                     TxbSet::Luma32Inter,
                 )
             });
+            if edge {
+                clip_sb64_sse(&mut trials, luma, chroma, (x, y), side);
+            }
             let syntax = fixed - ref_bits + bits;
             let cost =
                 trials[0].sse + trials[1].sse + trials[2].sse + search.lambda * syntax;
@@ -7690,7 +7765,7 @@ fn search_skip_64(
     let mut luma_levels: Option<(Vec<i32>, u8)> = None;
     if residual {
         let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
-        let residual_trials = [0usize, 1, 2].map(|plane| {
+        let mut residual_trials = [0usize, 1, 2].map(|plane| {
             let (target, px, py, s) = if plane == 0 {
                 (&*luma, x, y, side)
             } else {
@@ -7707,6 +7782,9 @@ fn search_skip_64(
                 sets[plane],
             )
         });
+        if edge {
+            clip_sb64_sse(&mut residual_trials, luma, chroma, (x, y), side);
+        }
         let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
         let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
         // lane-b64b: the root's own var-tx decision -- one TX_64X64 or the
@@ -9425,19 +9503,30 @@ pub(crate) fn encode_inter_frame(
             // lane-b64: the whole superblock as ONE 64x64 block, tried before
             // its quadrants are (`search_skip_64`) and compared against the
             // four of them below. Only a superblock wholly inside the true
-            // frame is offered it: a 64x64 root whose right or bottom part
-            // hangs over the edge is legal AV1 (`has_cols`/`has_rows` only
-            // ask for half), but its trial would score prediction the frame
-            // does not have -- corner-cut, ceiling = the edge superblocks of
-            // a frame whose size is not a multiple of 64, which stay split.
+            // frame is offered it, and (lane-b64b, `EC_AV1_B64EDGE`) one the
+            // edge CUTS THROUGH: the spec's own `has_cols`/`has_rows` ask
+            // only that the block's half is inside, and the trial is ranked
+            // over the inside part alone ([`clip_sb64_sse`]).
             let (x64, y64) = (sb_c * SUPERBLOCK, sb_r * SUPERBLOCK);
-            let sb64_legal = b64_root()
-                && sb_r * 2 + 1 < rows
-                && sb_c * 2 + 1 < cols
-                && (sb_c as u32 + 1) * crate::tile::SB_MI <= header.mi_cols
+            let whole_inside = (sb_c as u32 + 1) * crate::tile::SB_MI <= header.mi_cols
                 && (sb_r as u32 + 1) * crate::tile::SB_MI <= header.mi_rows
                 && x64 + SUPERBLOCK <= luma.true_width
                 && y64 + SUPERBLOCK <= luma.true_height;
+            let edge_inside = b64_edge()
+                && crate::tile::has_half(
+                    sb_c as u32 * crate::tile::SB_MI,
+                    crate::tile::SB_MI,
+                    header.mi_cols,
+                )
+                && crate::tile::has_half(
+                    sb_r as u32 * crate::tile::SB_MI,
+                    crate::tile::SB_MI,
+                    header.mi_rows,
+                );
+            let sb64_legal = b64_root()
+                && sb_r * 2 + 1 < rows
+                && sb_c * 2 + 1 < cols
+                && (whole_inside || edge_inside);
             // One lambda for the whole superblock, the same mean the 32x32
             // level takes over its own four tpl cells: the 64-vs-four-32
             // comparison below weighs one cost against four, so both sides
@@ -9952,6 +10041,9 @@ pub(crate) fn encode_inter_frame(
                 B64_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if block.inter.is_some_and(|i| i.ref1.is_some()) {
                     B64_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if !whole_inside {
+                    B64_EDGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 blocks.truncate(mark);
                 restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
