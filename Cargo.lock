@@ -285,12 +285,14 @@ dependencies = [
  "ec-h264",
  "ec-h264-syntax",
  "ec-h265",
+ "ec-hw",
  "ec-image",
  "ec-inflate",
  "ec-mp3",
  "ec-opus",
  "ec-probe",
  "ec-truehd",
+ "ec-va",
  "ec-vorbis",
 ]
 
@@ -351,6 +353,7 @@ dependencies = [
 name = "ec-hw"
 version = "0.1.0"
 dependencies = [
+ "ec-av1",
  "ec-av1-syntax",
  "ec-core",
  "ec-h264-syntax",

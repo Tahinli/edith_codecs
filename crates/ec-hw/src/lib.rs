@@ -30,7 +30,7 @@
 //! * [`params`] — the `#[repr(C)]` codec parameter buffers, each checked
 //!   against the system headers by a `const` assertion.
 //! * [`dec`] — one stateless decoder per codec behind [`Decoder`].
-//! * [`enc`] — H.264 and HEVC encoders, and an opt-in AV1 one.
+//! * [`enc`] — H.264, HEVC and AV1 encoders.
 //! * [`SurfacePool`] / [`Frame`] — surface recycling and pixel access.
 //!
 //! # Unsafe

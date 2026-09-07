@@ -365,3 +365,262 @@ pub(super) mod hevc {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// AV1
+// ---------------------------------------------------------------------------
+
+/// The two OBUs the AV1 encode path hands the driver: a sequence header and,
+/// per picture, an uncompressed frame header.
+///
+/// radeonsi *parses* these (`picture_av1_enc.c:vlVaHandleVAEncPackedHeaderData
+/// BufferTypeAV1`) rather than copying them through — the sequence header in
+/// full, the frame header as far as `uniform_tile_spacing_flag` — and then
+/// writes the header that goes into the stream itself, from those values plus
+/// the picture parameter buffer. So these are the *parameters*, in AV1's own
+/// syntax: a field written here that disagrees with the parameter buffer is a
+/// picture described two ways, and the driver believes this one.
+pub(super) mod av1 {
+    use ec_core::BitWriter;
+
+    use super::{Colour, Packed};
+    use crate::params::enc::{PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE};
+
+    /// `OrderHintBits`, and the width of `order_hint` in a frame header.
+    pub(in crate::enc) const ORDER_HINT_BITS: u32 = 8;
+
+    /// Bytes of the `obu_size` field. radeonsi reports
+    /// `VAConfigAttribEncAV1Ext2.obu_size_bytes_minus1 = 1` (measured on this
+    /// box), i.e. it wants that field a fixed two bytes so it can rewrite it
+    /// without moving the payload; leb128 permits the padded encoding.
+    const OBU_SIZE_BYTES: usize = 2;
+
+    /// Wrap a payload as one OBU: header byte, fixed-width `obu_size`, payload.
+    fn obu(kind: u32, obu_type: u8, payload: Vec<u8>) -> Packed {
+        let mut bytes = Vec::with_capacity(payload.len() + 1 + OBU_SIZE_BYTES);
+        // forbidden(0) type(4) extension(0) has_size(1) reserved(0)
+        bytes.push(obu_type << 3 | 0b010);
+        let mut size = payload.len();
+        for i in 0..OBU_SIZE_BYTES {
+            let last = i + 1 == OBU_SIZE_BYTES;
+            bytes.push((size as u8 & 0x7f) | if last { 0 } else { 0x80 });
+            size >>= 7;
+        }
+        bytes.extend_from_slice(&payload);
+        let bits = bytes.len() as u32 * 8;
+        Packed { kind, bytes, bits }
+    }
+
+    /// `trailing_bits()` (5.3.4).
+    fn trailing(w: &mut BitWriter) {
+        w.write_bit(true);
+        w.align_to_byte();
+    }
+
+    /// What the sequence header says about the stream.
+    pub(in crate::enc) struct SeqParams {
+        pub(in crate::enc) width: u32,
+        pub(in crate::enc) height: u32,
+        pub(in crate::enc) seq_level_idx: u8,
+        pub(in crate::enc) seq_tier: u8,
+        /// 10-bit (`high_bitdepth`); profile 0 has no `twelve_bit`.
+        pub(in crate::enc) high_bitdepth: bool,
+        pub(in crate::enc) colour: Option<Colour>,
+    }
+
+    /// `sequence_header_obu()` (5.5.1), profile 0, one operating point.
+    ///
+    /// Every coding tool this driver does not advertise
+    /// (`VAConfigAttribEncAV1`: no filter intra, no warped motion, no dual
+    /// filter, no superres, no restoration) is signalled off, which is also
+    /// what ffmpeg's `av1_vaapi` writes.
+    pub(in crate::enc) fn sequence_header(p: &SeqParams) -> Packed {
+        let mut w = BitWriter::new();
+        w.write_bits(0, 3); // seq_profile
+        w.write_bit(false); // still_picture
+        w.write_bit(false); // reduced_still_picture_header
+        w.write_bit(false); // timing_info_present_flag
+        w.write_bit(false); // initial_display_delay_present_flag
+        w.write_bits(0, 5); // operating_points_cnt_minus_1
+        w.write_bits(0, 12); // operating_point_idc[0]
+        w.write_bits(u32::from(p.seq_level_idx), 5);
+        if p.seq_level_idx > 7 {
+            w.write_bits(u32::from(p.seq_tier), 1);
+        }
+        let width_bits = 32 - p.width.max(1).leading_zeros(); // floor(log2(w)) + 1
+        let height_bits = 32 - p.height.max(1).leading_zeros();
+        w.write_bits(width_bits - 1, 4); // frame_width_bits_minus_1
+        w.write_bits(height_bits - 1, 4); // frame_height_bits_minus_1
+        w.write_bits(p.width - 1, width_bits); // max_frame_width_minus_1
+        w.write_bits(p.height - 1, height_bits); // max_frame_height_minus_1
+        w.write_bit(false); // frame_id_numbers_present_flag
+        w.write_bit(false); // use_128x128_superblock
+        w.write_bit(false); // enable_filter_intra
+        w.write_bit(false); // enable_intra_edge_filter
+        w.write_bit(false); // enable_interintra_compound
+        w.write_bit(false); // enable_masked_compound
+        w.write_bit(false); // enable_warped_motion
+        w.write_bit(false); // enable_dual_filter
+        w.write_bit(true); // enable_order_hint
+        w.write_bit(false); // enable_jnt_comp
+        w.write_bit(false); // enable_ref_frame_mvs
+        w.write_bit(false); // seq_choose_screen_content_tools
+        w.write_bit(false); // seq_force_screen_content_tools
+        w.write_bits(ORDER_HINT_BITS - 1, 3); // order_hint_bits_minus_1
+        w.write_bit(false); // enable_superres
+        w.write_bit(false); // enable_cdef
+        w.write_bit(false); // enable_restoration
+        // color_config(): profile 0 is 4:2:0, and never 12-bit.
+        w.write_bit(p.high_bitdepth);
+        w.write_bit(false); // mono_chrome
+        match p.colour {
+            Some(c) => {
+                w.write_bit(true); // color_description_present_flag
+                w.write_bits(u32::from(c.primaries), 8);
+                w.write_bits(u32::from(c.transfer), 8);
+                w.write_bits(u32::from(c.matrix), 8);
+                w.write_bit(c.full_range); // color_range
+            }
+            None => {
+                w.write_bit(false);
+                w.write_bit(false); // color_range
+            }
+        }
+        w.write_bits(0, 2); // chroma_sample_position = CSP_UNKNOWN
+        w.write_bit(false); // separate_uv_delta_q
+        w.write_bit(false); // film_grain_params_present
+        trailing(&mut w);
+        obu(PACKED_HEADER_SEQUENCE, 1, w.into_bytes())
+    }
+
+    /// What one picture's uncompressed header says.
+    pub(in crate::enc) struct FrameParams {
+        pub(in crate::enc) keyframe: bool,
+        pub(in crate::enc) order_hint: u8,
+        pub(in crate::enc) primary_ref_frame: u8,
+        pub(in crate::enc) refresh_frame_flags: u8,
+        pub(in crate::enc) ref_frame_idx: [u8; 7],
+        pub(in crate::enc) base_q_idx: u8,
+        pub(in crate::enc) loop_filter_level: [u8; 4],
+        /// `TX_MODE_SELECT`; this driver advertises no other
+        /// (`VAConfigAttribEncAV1Ext2.tx_mode_support = 0x4`).
+        pub(in crate::enc) tx_mode_select: bool,
+        /// The bit offsets the driver needs to back-annotate its own choices
+        /// into this header are only read outside CQP, so they are computed
+        /// unconditionally and used by the caller when it is not in CQP.
+        pub(in crate::enc) max_tile_cols_log2: u32,
+        pub(in crate::enc) max_tile_rows_log2: u32,
+    }
+
+    /// Where the driver may rewrite fields of the header we just wrote, in
+    /// bits from the first bit of the OBU (`VAEncPictureParameterBufferAV1`).
+    pub(in crate::enc) struct FrameHeaderOffsets {
+        pub(in crate::enc) qindex: u32,
+        pub(in crate::enc) segmentation: u32,
+        pub(in crate::enc) loop_filter: u32,
+        pub(in crate::enc) cdef: u32,
+        pub(in crate::enc) cdef_size: u32,
+        pub(in crate::enc) obu_size_byte: u32,
+        pub(in crate::enc) total_bits: u32,
+    }
+
+    /// `frame_header_obu()` (5.9.1) for a shown key or inter frame with one
+    /// tile, no segmentation, no CDEF, no restoration and no global motion.
+    pub(in crate::enc) fn frame_header(p: &FrameParams) -> (Packed, FrameHeaderOffsets) {
+        // The OBU header and its size field precede every offset below.
+        let prefix_bits = 8 * (1 + OBU_SIZE_BYTES) as u32;
+        let mut w = BitWriter::new();
+        w.write_bit(false); // show_existing_frame
+        w.write_bits(u32::from(!p.keyframe), 2); // frame_type: KEY / INTER
+        w.write_bit(true); // show_frame
+        if !p.keyframe {
+            // A shown key frame infers error_resilient_mode = 1.
+            w.write_bit(false); // error_resilient_mode
+        }
+        w.write_bit(false); // disable_cdf_update
+        w.write_bit(false); // frame_size_override_flag
+        w.write_bits(u32::from(p.order_hint), ORDER_HINT_BITS);
+        if !p.keyframe {
+            w.write_bits(u32::from(p.primary_ref_frame), 3);
+            // A shown key frame refreshes every slot, unsignalled.
+            w.write_bits(u32::from(p.refresh_frame_flags), 8);
+            w.write_bit(false); // frame_refs_short_signaling
+            for idx in p.ref_frame_idx {
+                w.write_bits(u32::from(idx), 3);
+            }
+        }
+        // frame_size(): frame_size_override_flag = 0 takes the sequence
+        // header's size, and enable_superres = 0 codes no superres bit.
+        w.write_bit(false); // render_and_frame_size_different
+        if !p.keyframe {
+            w.write_bit(false); // allow_high_precision_mv
+            w.write_bit(true); // is_filter_switchable
+            w.write_bit(false); // is_motion_mode_switchable
+            // use_ref_frame_mvs is inferred 0 from enable_ref_frame_mvs = 0.
+        }
+        w.write_bit(false); // disable_frame_end_update_cdf
+        // tile_info(): one tile, uniformly spaced. The increment loop stops
+        // with a zero bit for as long as the maximum allows another doubling.
+        w.write_bit(true); // uniform_tile_spacing_flag
+        if p.max_tile_cols_log2 > 0 {
+            w.write_bit(false); // increment_tile_cols_log2
+        }
+        if p.max_tile_rows_log2 > 0 {
+            w.write_bit(false); // increment_tile_rows_log2
+        }
+        let qindex = prefix_bits + w.bit_len() as u32;
+        w.write_bits(u32::from(p.base_q_idx), 8);
+        w.write_bit(false); // DeltaQYDc.delta_coded
+        w.write_bit(false); // DeltaQUDc.delta_coded
+        w.write_bit(false); // DeltaQUAc.delta_coded
+        w.write_bit(false); // using_qmatrix
+        let segmentation = prefix_bits + w.bit_len() as u32;
+        w.write_bit(false); // segmentation_enabled
+        w.write_bit(false); // delta_q_present (base_q_idx > 0)
+        let loop_filter = prefix_bits + w.bit_len() as u32;
+        w.write_bits(u32::from(p.loop_filter_level[0]), 6);
+        w.write_bits(u32::from(p.loop_filter_level[1]), 6);
+        if p.loop_filter_level[0] != 0 || p.loop_filter_level[1] != 0 {
+            w.write_bits(u32::from(p.loop_filter_level[2]), 6);
+            w.write_bits(u32::from(p.loop_filter_level[3]), 6);
+        }
+        w.write_bits(0, 3); // loop_filter_sharpness
+        w.write_bit(false); // loop_filter_delta_enabled
+        // cdef_params() and lr_params() are empty: enable_cdef =
+        // enable_restoration = 0 in the sequence header above.
+        let cdef = prefix_bits + w.bit_len() as u32;
+        w.write_bit(p.tx_mode_select); // tx_mode_select
+        if !p.keyframe {
+            w.write_bit(false); // reference_select — single reference, which
+            // also makes skipModeAllowed 0, so no skip_mode_present bit
+        }
+        w.write_bit(false); // reduced_tx_set
+        if !p.keyframe {
+            for _ in 0..7 {
+                w.write_bit(false); // is_global[ref]
+            }
+        }
+        trailing(&mut w);
+        let packed = obu(PACKED_HEADER_PICTURE, 3, w.into_bytes());
+        let offsets = FrameHeaderOffsets {
+            qindex,
+            segmentation,
+            loop_filter,
+            cdef,
+            cdef_size: 0,
+            obu_size_byte: 1,
+            total_bits: packed.bits,
+        };
+        (packed, offsets)
+    }
+
+    /// `tile_log2(1, n)`: the number of doublings of 1 needed to reach `n`,
+    /// which is the ceiling of log2 (5.9.15).
+    pub(in crate::enc) fn tile_log2(target: u32) -> u32 {
+        let mut k = 0;
+        while (1u32 << k) < target {
+            k += 1;
+        }
+        k
+    }
+}
