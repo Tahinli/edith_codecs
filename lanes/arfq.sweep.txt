@@ -1,0 +1,11 @@
+# lane-arfq -- pyramid ladder shape after the key/ARF anchors moved (key -48).
+# gate: encode::tests::bd_rate_film_long_gop (48 pictures, gop 48), release lib binary,
+#       --test-threads 1, <= 2 arms in parallel, each arm keyed by the log's own
+#       "pyramid requested/effective" print. spec = <mini_gop>:<arf>:<leaf>:<mid>:<key>.
+# logs: lanes/arfq/*.log
+
+## long-GOP (48 pictures, gop 48) -- BD-rate vs libaom cpu-used 6 / vs rav1e speed 6
+| arm | spec | film A | film B |
+|---|---|---|---|
+| control | 8:-32:16:-8:-48 (default) | +43.5 / +4.6 | +131.3 / +35.0 |
+| leaf 8 | 8:-32:8:-8:-48 | +43.4 / +5.1 | +127.6 / +34.1 |
