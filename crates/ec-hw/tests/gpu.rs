@@ -1154,6 +1154,22 @@ fn av1_10bit_encode_agrees_between_two_decoders() {
         "the coded stream's sequence header does not say 10-bit"
     );
 
+    // The two refusals this depth added, exercised rather than asserted in
+    // prose: 10-bit H.265 (High and Main are 8-bit profiles, so this crate
+    // never asks the driver), and 8-bit pixels handed to a 10-bit encoder.
+    let ten_bit_hevc = EncoderConfig::new(EncCodec::H265, width, height).ten_bit();
+    assert!(
+        Encoder::new(&display, ten_bit_hevc).is_err(),
+        "a 10-bit HEVC encoder was built out of an 8-bit profile"
+    );
+    let mut config = EncoderConfig::new(EncCodec::Av1, width, height).ten_bit();
+    config.rate_control = RateControlMode::ConstantQp { qp: 90 };
+    let mut ten = Encoder::new(&display, config).expect("a 10-bit AV1 encoder");
+    assert!(
+        ten.encode(&source_frame(width, height, 0), FrameMetadata::default()).is_err(),
+        "8-bit pixels went into a 10-bit encoder"
+    );
+
     let ours = ec_av1::stream::decode_stream(&data)
         .unwrap_or_else(|e| panic!("ec-av1 decodes the 10-bit hardware stream: {e}"));
     assert_eq!(ours.len(), planes.len(), "ec-av1 decoded {} of {frames} frames", ours.len());
