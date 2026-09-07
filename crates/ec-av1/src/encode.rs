@@ -453,13 +453,39 @@ fn rdoq_on() -> bool {
 /// frame average has its coefficients optimised at the frame's weight. The
 /// upgrade is one `lambda` field on the trial call sites, which is the whole
 /// mode-search argument list.
-/// `EC_AV1_RDOQ_LAMBDA` multiplies it (the rate-term calibration sweep).
+///
+/// SWEPT (lane-rdoq, 12-frame `bd_rate_screen_native`, BD vs libaom
+/// `cpu-used 6` on the three real rows). The bowl is a factor of TWO above
+/// the mode search's own weight, and it is the same multiplier on all three
+/// rows:
+///
+/// | `EC_AV1_RDOQ_LAMBDA` | film A | film B | screen |
+/// |---|---|---|---|
+/// | 0.7 | +27.6 | +39.5 | +29.6 |
+/// | 1.0 | +26.3 | +37.5 | +29.1 |
+/// | 1.3 | +25.6 | +37.0 | +28.8 |
+/// | 1.6 | +24.6 | +35.9 | +28.7 |
+/// | 2.2 (shipped) | +24.4 | +35.5 | +28.1 |
+/// | 3.2 | +24.7 | +36.1 | +29.4 |
+///
+/// A coefficient's rate is worth twice here what the mode search prices it
+/// at, and the likeliest reason is that the price is taken against tables
+/// that have not adapted yet ([`crate::tile::coeff_bits`]): a block coded
+/// late in a frame whose `txb_skip`/`base` tables have narrowed really costs
+/// less than the pricer says, and this pass is the one decision taken per
+/// COEFFICIENT, so it feels that error most. The honest fix is an adapted
+/// price, not a fitted multiplier; this is the fitted multiplier, and its
+/// bowl is measured rather than assumed.
+const RDOQ_LAMBDA_MULT: f64 = 2.2;
+
+/// [`RDOQ_LAMBDA_MULT`], or what `EC_AV1_RDOQ_LAMBDA` names (the rate-term
+/// calibration sweep).
 fn rdoq_lambda() -> f64 {
     static MULT: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_RDOQ_LAMBDA")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0)
+            .unwrap_or(RDOQ_LAMBDA_MULT)
     });
     lambda_scale() * *MULT
 }
