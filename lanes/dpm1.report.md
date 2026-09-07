@@ -79,3 +79,41 @@ with this same screen row at crf 5.`
 ## OPEN
 * The native gate's screen row now reports the refusal instead of a silent
   wrong decode; it is RED until the lossless lane lands.
+
+## Gate results (this head, fea6a377)
+
+`cargo test -p ec-av1 --release --lib -- --ignored --exact bd_rate_screen_native`
+(12 frames, all five rows, every reference point of every row decoded through
+our decoder and compared to ffmpeg):
+
+| row | verdict |
+|---|---|
+| bars 1080p | all 8 reference points exact |
+| bars 2160p | all 8 exact (was: libaom crf 45 frame 1 Y sample 66) |
+| film A (1080p source) | all 8 exact |
+| film B (2160p HDR source) | all 8 exact |
+| screen capture | 7 of 8 exact; libaom crf 5 REFUSED (lossless, deferred) |
+
+The gate ends RED on exactly that one point, and the collecting assertion is
+why the four film/bars rows and their BD table are measured at all in the same
+run:
+
+    1 reference ladder point(s) did not decode exactly through our decoder:
+    libaom-av1 ["-cpu-used","6","-b:v","0","-crf","5"]: our decoder refused the
+    stream (a lossless frame (qindex 0) ...)
+
+BD table unchanged by this lane (bars 1080p +2.0/-14.0, bars 2160p +13.1/-9.6,
+film A +38.5/+8.2, film B +58.2/+26.5, screen +33.4/-23.8 vs libaom/rav1e).
+
+`cargo check --workspace --all-targets -j4`: 0 errors, 0 ec-av1 warnings (the
+25 warnings are pre-existing ec-opus/ec-vorbis ones).
+
+## Deferred
+* `deferred: the lossless decode path (WHT TX_4X4, forced tx size, the lossless
+  CfL rule) — a feature lane, refused by name meanwhile — unblocks: implement
+  the inverse Walsh-Hadamard + `is_cfl_allowed`'s lossless branch, gate on the
+  screen row at crf 5.`
+* `deferred: the inter-side palette-band publication (lane-dkey's open half) —
+  not what any defect in this lane needed, and the previous naive stamp
+  regressed 13 tests — unblocks: derive each inter reader's real band footprint
+  from how `record_palette_*` indexes the bands.`
