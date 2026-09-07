@@ -291,15 +291,29 @@ pub(crate) fn pick_filters(
         .filter_map(|d| u8::try_from(i32::from(best.lf.0) + d).ok())
         .filter(|&l| l <= 63)
         .collect();
-    stage(&mut best, &refine, |c, v| c.lf = (v, v), |t| t.sse_y, &mut st)?;
+    // Which of these stages run is the SPEED PRESET's filter-search lever
+    // (`crate::speed`): each stage costs one whole-frame decode per candidate
+    // it has not seen, and the filter search is 19-28% of the encoder's wall.
+    // At speed 0 every table below reads its shipped value, so the sequence is
+    // the one this function always ran.
+    if crate::speed::at(&crate::speed::DEBLOCK_REFINE) {
+        stage(&mut best, &refine, |c, v| c.lf = (v, v), |t| t.sse_y, &mut st)?;
+    }
     // Deblocking chroma, three points around the luma winner.
-    let chroma_levels = [0, best.lf.0 / 2, best.lf.0];
-    stage(&mut best, &chroma_levels, |c, v| c.lf.1 = v, |t| t.sse_uv, &mut st)?;
+    if crate::speed::at(&crate::speed::DEBLOCK_CHROMA) {
+        let chroma_levels = [0, best.lf.0 / 2, best.lf.0];
+        stage(&mut best, &chroma_levels, |c, v| c.lf.1 = v, |t| t.sse_uv, &mut st)?;
+    }
     // CDEF, primary then secondary, luma on luma error and chroma on chroma.
-    stage(&mut best, &CDEF_PRI, |c, v| c.y.0 = v, |t| t.sse_y, &mut st)?;
-    stage(&mut best, &CDEF_SEC, |c, v| c.y.1 = v, |t| t.sse_y, &mut st)?;
-    stage(&mut best, &CDEF_PRI, |c, v| c.uv.0 = v, |t| t.sse_uv, &mut st)?;
-    stage(&mut best, &CDEF_SEC, |c, v| c.uv.1 = v, |t| t.sse_uv, &mut st)?;
+    // `n == 0` leaves every strength at 0, i.e. deblocking only.
+    let n = crate::speed::at(&crate::speed::CDEF_STRENGTHS);
+    if n > 0 {
+        let (pri, sec) = (&CDEF_PRI[..n.min(CDEF_PRI.len())], &CDEF_SEC[..n.min(CDEF_SEC.len())]);
+        stage(&mut best, pri, |c, v| c.y.0 = v, |t| t.sse_y, &mut st)?;
+        stage(&mut best, sec, |c, v| c.y.1 = v, |t| t.sse_y, &mut st)?;
+        stage(&mut best, pri, |c, v| c.uv.0 = v, |t| t.sse_uv, &mut st)?;
+        stage(&mut best, sec, |c, v| c.uv.1 = v, |t| t.sse_uv, &mut st)?;
+    }
 
     CHOSEN.with(|c| c.borrow_mut().push(best));
     let trials = st.trials;
@@ -342,7 +356,12 @@ pub(crate) fn pick_filters(
     }
     let mut order: Vec<usize> = (0..pool.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(counts[i]));
-    presets.extend(order.iter().take(7).map(|&i| pool[i]));
+    presets.extend(
+        order
+            .iter()
+            .take(crate::speed::at(&crate::speed::CDEF_PRESETS))
+            .map(|&i| pool[i]),
+    );
     // The cheapest list length: `bits` costs one literal per superblock plus
     // twelve header bits per extra pair, and buys whatever per-unit error the
     // wider choice removes.

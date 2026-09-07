@@ -659,6 +659,24 @@ const _: fn() = || {
 };
 
 impl Av1Encoder {
+    /// [`Av1Encoder::new`] at a SPEED PRESET (`speed` 0..=10, rav1e's scale:
+    /// 0 is the full search this encoder has always run and is byte for byte
+    /// identical to [`Av1Encoder::new`]; higher presets switch search levers
+    /// off, [`crate::speed::levers`] naming which).
+    ///
+    /// The preset is process-global (the tile search reads it from worker
+    /// threads -- see [`crate::speed`]), so it is set here for every encode
+    /// that follows on this process, and two encoders at different speeds
+    /// must not run concurrently. `EC_AV1_SPEED=<n>` is the same knob for a
+    /// caller that does not construct the encoder itself.
+    ///
+    /// # Errors
+    /// [`Av1Encoder::new`]'s.
+    pub fn with_speed(config: EncoderConfig, speed: u8) -> Result<Self> {
+        crate::speed::set_speed(speed);
+        Self::new(config)
+    }
+
     /// # Errors
     /// Returns an error when `config.width`/`config.height` are zero, odd,
     /// or larger than the 16-bit frame size an AV1 sequence header carries,
