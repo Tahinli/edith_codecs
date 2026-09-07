@@ -103,6 +103,18 @@ pub(crate) fn arm_sb128(on: bool) {
     SB128.with(|c| c.set(on));
 }
 
+/// How many 128x128 superblock roots the writers have coded since the last
+/// [`take_sb128_root_hits`] -- a gate reports how often the root fires rather
+/// than assuming it does (class `gate-blind-to-feature`). Process-global
+/// rather than thread-local because the tiles of one frame are written on
+/// worker threads.
+static SB128_ROOT_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The 128x128-root count since the last call, and zero it.
+pub fn take_sb128_root_hits() -> usize {
+    SB128_ROOT_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the next tile write codes 128x128 superblocks ([`arm_sb128`]).
 fn sb128_armed() -> bool {
     SB128.with(std::cell::Cell::get)
@@ -163,6 +175,7 @@ fn write_sb128_root(
     mi_cols: u32,
     mi_rows: u32,
 ) {
+    SB128_ROOT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (mi_r128, mi_c128) = ((sb_r & !1) * SB_MI, (sb_c & !1) * SB_MI);
     write_lr(enc, cdfs, mi_r128, mi_c128, SB_MI * 2);
     let at128 = ((mi_r128 / 4) as usize, (mi_c128 / 4) as usize);
