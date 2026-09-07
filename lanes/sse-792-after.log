@@ -1,0 +1,60 @@
+
+running 1 test
+test encode::tests::bd_rate_screen_native ... 
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+bars 1080p: edge 8x8 scores=960 inside_sse=0 padding_sse=3584 (100.0% of raw)
+bars 1080p: edge 16x16 scores=51780 inside_sse=184517941 padding_sse=59682853 (24.4% of raw)
+bars 1080p: edge 32x32 scores=33197 inside_sse=211907113 padding_sse=55299738 (20.7% of raw)
+bars 1080p: pricer armings default=18 real=181
+bars 1080p: 64x64 roots 12879 (with a residual 9586, split luma 2622, compound 4902)
+bars 1080p: motion_mode 32x32 SIMPLE=28351 OBMC=0 WARP=206 | 16x16 SIMPLE=3508 OBMC=0 WARP=417 | 8x8 SIMPLE=8284 OBMC=0 WARP=1909 (0.0% OBMC / 5.9% WARP of 42675 eligible)
+bars 1080p: inter var-tx depths of 11113 blocks -- leaf single 0=1442 1=1124 (43.8% split) | leaf compound 0=1651 1=523 (24.1% split) | 32x32 single 0=599 1=1537 (72.0% split) | 32x32 compound 0=803 1=3434 (81.0% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+bars 1080p: filter intra on=true blocks 16456 (modes DC=3638 V=2376 H=2911 D157=5027 PAETH=2504)
+LADDER DECODE FAILURE: libaom-av1 ["-cpu-used", "6", "-b:v", "0", "-crf", "5"]: our decoder refused the stream (unsupported: AV1 tile (a Golomb tail longer than this decoder reads))
+LADDER DECODE FAILURE: librav1e ["-rav1e-params", "speed=6:quantizer=50:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1500774: our decoder decoded 42, ffmpeg 41
+LADDER DECODE FAILURE: librav1e ["-rav1e-params", "speed=6:quantizer=100:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1500931: our decoder decoded 105, ffmpeg 106
+LADDER DECODE FAILURE: librav1e ["-rav1e-params", "speed=6:quantizer=150:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1501049: our decoder decoded 123, ffmpeg 122
+LADDER DECODE FAILURE: librav1e ["-rav1e-params", "speed=6:quantizer=200:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1500785: our decoder decoded 107, ffmpeg 106
+| bars 1080p 1920x792 | 42.60 dB/220495 B, 46.34 dB/337918 B, 49.79 dB/467682 B, 53.10 dB/613770 B | +14.0% | +1.4% | 37.3s:6.4s:17.8s |
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+film A (1080p source): edge 8x8 scores=960 inside_sse=0 padding_sse=52870 (100.0% of raw)
+film A (1080p source): edge 16x16 scores=75698 inside_sse=29785412 padding_sse=9999651 (25.1% of raw)
+film A (1080p source): edge 32x32 scores=44740 inside_sse=161811991 padding_sse=44523877 (21.6% of raw)
+film A (1080p source): pricer armings default=20 real=214
+film A (1080p source): 64x64 roots 9300 (with a residual 6033, split luma 3003, compound 3636)
+film A (1080p source): motion_mode 32x32 SIMPLE=35555 OBMC=0 WARP=1204 | 16x16 SIMPLE=18196 OBMC=0 WARP=1332 | 8x8 SIMPLE=4419 OBMC=0 WARP=871 (0.0% OBMC / 5.5% WARP of 61577 eligible)
+film A (1080p source): inter var-tx depths of 84624 blocks -- leaf single 0=13801 1=2731 (16.5% split) | leaf compound 0=32683 1=6521 (16.6% split) | 32x32 single 0=7280 1=5899 (44.8% split) | 32x32 compound 0=9695 1=6014 (38.3% split)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film A (1080p source): filter intra on=true blocks 22070 (modes DC=5417 V=3501 H=3992 D157=6271 PAETH=2889)
+LADDER DECODE FAILURE: librav1e ["-rav1e-params", "speed=6:quantizer=50:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1494211: our decoder decoded 64, ffmpeg 63
+LADDER DECODE FAILURE: librav1e ["-rav1e-params", "speed=6:quantizer=100:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1479397: our decoder decoded 48, ffmpeg 49
+LADDER DECODE FAILURE: librav1e ["-rav1e-params", "speed=6:quantizer=150:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1460032: our decoder decoded 47, ffmpeg 46
+LADDER DECODE FAILURE: librav1e ["-rav1e-params", "speed=6:quantizer=200:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1460334: our decoder decoded 49, ffmpeg 50
+| film A (1080p source) 1920x792 | 44.35 dB/79716 B, 45.88 dB/131827 B, 47.08 dB/223892 B, 48.33 dB/525372 B | +36.1% | +7.4% | 84.9s:11.5s:17.6s |
+
+thread 'encode::tests::bd_rate_screen_native' (2413136) panicked at crates/ec-av1/src/encode.rs:13856:9:
+9 reference ladder point(s) did not decode exactly through our decoder:
+libaom-av1 ["-cpu-used", "6", "-b:v", "0", "-crf", "5"]: our decoder refused the stream (unsupported: AV1 tile (a Golomb tail longer than this decoder reads))
+librav1e ["-rav1e-params", "speed=6:quantizer=50:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1500774: our decoder decoded 42, ffmpeg 41
+librav1e ["-rav1e-params", "speed=6:quantizer=100:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1500931: our decoder decoded 105, ffmpeg 106
+librav1e ["-rav1e-params", "speed=6:quantizer=150:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1501049: our decoder decoded 123, ffmpeg 122
+librav1e ["-rav1e-params", "speed=6:quantizer=200:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1500785: our decoder decoded 107, ffmpeg 106
+librav1e ["-rav1e-params", "speed=6:quantizer=50:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1494211: our decoder decoded 64, ffmpeg 63
+librav1e ["-rav1e-params", "speed=6:quantizer=100:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1479397: our decoder decoded 48, ffmpeg 49
+librav1e ["-rav1e-params", "speed=6:quantizer=150:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1460032: our decoder decoded 47, ffmpeg 46
+librav1e ["-rav1e-params", "speed=6:quantizer=200:tile_cols=1:tile_rows=1:threads=1"] frame 0 plane Y sample 1460334: our decoder decoded 49, ffmpeg 50
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    encode::tests::bd_rate_screen_native
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 607 filtered out; finished in 184.43s
+
+RC=101
