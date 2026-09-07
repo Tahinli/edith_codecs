@@ -886,6 +886,23 @@ const MID_DEFAULT: Option<i16> = Some(-8);
 /// is gated off).
 const KEY_DEFAULT: i16 = -48;
 
+/// Whether the pyramid path hands each frame a lookahead window, i.e.
+/// whether the temporal lambda map (`encode::tpl_lambda_factors`) runs on
+/// the DEFAULT stream at all. It did not until lane-arfcen: the pyramid
+/// reorders pictures, so this path passed `&[]` and the map -- measured and
+/// shipped on the flat path -- was inert on every frame of every pyramid
+/// stream, including the ARFs that carry 54% of a long-GOP stream's bytes
+/// (class `tool disabled in every gate recipe`).
+fn tpl_pyramid() -> bool {
+    match std::env::var("EC_AV1_TPL_PYRAMID").ok() {
+        Some(v) => v != "0",
+        None => TPL_PYRAMID,
+    }
+}
+
+/// [`tpl_pyramid`]'s default.
+const TPL_PYRAMID: bool = true;
+
 /// The AV1 software encoder: [`EncoderConfig`] in, one [`Packet`] out per
 /// [`Av1Encoder::encode`] call — or, with a [`Pyramid`] configured, a
 /// coding-order burst of them per [`Av1Encoder::encode_frames`] call plus a
@@ -1464,6 +1481,10 @@ impl Av1Encoder {
         // ARF and the mid one) at different offsets, and they share the
         // rate-control slot but not the offset.
         offset: i16,
+        // The lookahead window this frame's temporal lambda map is built
+        // from, already padded (lane-arfcen). Empty codes the frame at one
+        // lambda, which is what the whole pyramid path used to do.
+        lookahead: &[Picture],
     ) -> Result<Packet> {
         let render = (self.config.width, self.config.height);
         let order_hint = (order & 0x7f) as u32;
@@ -1529,10 +1550,10 @@ impl Av1Encoder {
                 show_frame,
                 sign_bias,
             }),
-            // The pyramid path reorders pictures, so its own buffer is not
-            // a lookahead window: the temporal lambda weighting is off on
-            // this path (lane-av1tpl).
-            &[],
+            // lane-arfcen: the group's own sources ARE this frame's window
+            // (`tpl_window`); it was `&[]` here, which switched the temporal
+            // lambda map off on every frame the default stream codes.
+            lookahead,
         ) }();
         // Name the pyramid position in any failure: an error out of the tile
         // writer or the filter search is otherwise indistinguishable between
@@ -1568,6 +1589,23 @@ impl Av1Encoder {
         }
         let group: Vec<(u64, Picture)> = std::mem::take(&mut self.pending);
         let mut packets = Vec::with_capacity(group.len() + 1);
+        // The lookahead window of the group's picture at index `pos`: the
+        // display-order successors inside this group, or -- for the group's
+        // top ARF, the last picture, whose successors are not buffered yet --
+        // the leaves BEHIND it in reverse display order, which are exactly
+        // the pictures that predict backward from it. Padded like the frame
+        // itself, as `encode_inter_frame` wants it.
+        let tpl_window = |pos: usize, back: bool| -> Vec<Picture> {
+            let depth = crate::encode::tpl_depth();
+            if !tpl_pyramid() || depth < 2 {
+                return Vec::new();
+            }
+            let window: Vec<&Picture> = match back {
+                false => group[pos + 1..].iter().map(|(_, p)| p).collect(),
+                true => group[..pos].iter().rev().map(|(_, p)| p).collect(),
+            };
+            window.into_iter().take(depth - 1).map(|p| p.padded_to(SUPERBLOCK)).collect()
+        };
         let anchor_slot = ANCHOR_SLOTS[self.anchor];
         let next_anchor_slot = ANCHOR_SLOTS[1 - self.anchor];
         let (arf_order, arf_picture) = group.last().cloned().expect("non-empty");
@@ -1584,6 +1622,7 @@ impl Av1Encoder {
                 true,
                 Level::Leaf,
                 pyramid.leaf_q_offset,
+                &tpl_window(0, false),
             )?);
             self.anchor = 1 - self.anchor;
             return Ok(packets);
@@ -1598,6 +1637,7 @@ impl Av1Encoder {
             false,
             Level::Arf,
             pyramid.arf_q_offset,
+            &tpl_window(group.len() - 1, true),
         )?);
         let leaves = group.len() - 1;
         // THE THIRD LEVEL: a second hidden frame at the middle of the leaf
@@ -1630,6 +1670,7 @@ impl Av1Encoder {
                 false,
                 Level::Arf,
                 offset,
+                &tpl_window(at, false),
             )?);
         }
         // THE FOURTH LEVEL: one hidden frame at the middle of each half of
@@ -1665,6 +1706,7 @@ impl Av1Encoder {
                     false,
                     Level::Arf,
                     offset,
+                    &tpl_window(pos, false),
                 )?);
             }
         }
@@ -1721,6 +1763,7 @@ impl Av1Encoder {
                 true,
                 Level::Leaf,
                 pyramid.leaf_q_offset,
+                &tpl_window(i, false),
             )?);
         }
         let packet = show_existing(self, next_anchor_slot, arf_order)?;

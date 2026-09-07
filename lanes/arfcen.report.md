@@ -61,3 +61,63 @@ the same six positions in rav1e's stream, and everything else:
 So the WHOLE +15.4 kB gap (and 6 kB more) sits in the six pictures we code at
 prediction distance 8; our non-anchor pictures are already 23% CHEAPER than
 rav1e's -- though 0.3-0.4 dB worse (leaves 45.26 vs 45.69 dB).
+
+## 4. Ranked mechanisms, and what each one measured
+
+Every arm below is `enc_probe`'s q=150 and q=90 points on film B (48 frames,
+the gate's window), read against the control's own rate/quality slope
+(3.46 dB per decade of bytes between its two points), so "better" means
+fewer bytes AT the arm's own PSNR.
+
+| # | mechanism | bytes at stake | verdict |
+|---|---|---|---|
+| 1 | anchor density (rav1e anchors every 2 pictures, ours every 4) | 22.1 kB of leaf+mid | **REFUTED** |
+| 2 | hidden-frame rate weight (ARF codes residual on 50% of area, rav1e 26-30%) | 48.1 kB of ARF | **REFUTED** |
+| 3 | motion search widening at distance 8 (`MV_DIST_SCALE`, its 4x cap) | 48.1 kB of ARF | **INERT** |
+| 4 | the temporal lambda map never ran on the pyramid path | the whole stream | **KEPT, small** |
+| 5 | ARF q offset / key allocation | — | already swept (lane-arfq, lane-keyq) |
+
+1. `EC_AV1_PYRAMID` density arms: `4:-32:12:-8:-48` 108567 B/45.809 dB and
+   613170 B/48.283 (3.8% better at q150, 3.8% WORSE at q90), `4:-24:12:-8:-48`
+   92200/45.504 and 535188/48.102 (0.4% better, 2.7% worse), `2:-32:12:-8:-48`
+   127348/45.982 and 778014/48.492 (tie, 15% worse). Denser anchors pay only
+   at the low-rate end and lose at the rates the gate is scored on -- the same
+   verdict lane-pyr6 got for a fourth level, now with the mini-GOP-4 shape
+   (rav1e's exact structure) measured too.
+2. `EC_AV1_LAMBDA_HIDDEN` (a rate weight for hidden frames only, on top of
+   the q-derived lambda -- the one knob the q offsets cannot express):
+   1.5 -> 84513/45.297 (4.8% WORSE), 2.0 -> 81454/45.160, 3.0 -> 75372/44.910,
+   0.5 -> 106859/45.733 (0.9% better at q150, 5.5% worse at q90). 1.0 is the
+   optimum; our ARF's operating point is not mispriced.
+3. `EC_AV1_MV_DIST_SCALE` x `EC_AV1_MV_DIST_CAP`: (0.5,8) 90534/45.471,
+   (1.0,8) 90531/45.481, (2.0,8) 90526/45.473, (1.0,16) 90650/45.474 against
+   the control's 90674/45.473 -- +-0.2% bytes, +-0.01 dB. The distance-8 ARF
+   is NOT search-range-bound (and its coded mv histogram, 0.0% over 64 px, is
+   the content, not a clamp).
+
+## 5. The lever: the temporal lambda map was inert on every default stream
+
+`Av1Encoder::encode_pyramid_inter` passed `&[]` as the lookahead window with
+the comment "the pyramid path reorders pictures, so its own buffer is not a
+lookahead window: the temporal lambda weighting is off on this path". The
+pyramid has been the DEFAULT since lane-av1pyrdef, so the propagating tpl map
+lane-av1tpl2/3 measured and shipped (`TPL_DEPTH` 8, `TPL_STRENGTH` 0.5) has
+been running on nothing but the flat A/B arm ever since -- class
+`tool disabled in every gate recipe`.
+
+The fix is the window the group already holds: for a frame inside the leaf
+run, its display-order successors in `pending`; for the group's top ARF (the
+last picture of the group, whose successors are not buffered yet) the group's
+own leaves in REVERSE display order, which are exactly the pictures that
+predict backward from it. `EC_AV1_TPL_PYRAMID=0` restores the old behaviour.
+
+Probe arms on film B (control = the old `&[]`):
+
+| arm | q150 | q90 | vs control at equal PSNR |
+|---|---|---|---|
+| off (control) | 90674 B / 45.473 dB | 479686 B / 47.978 dB | — |
+| on, depth 8 | 91206 / 45.511 | 482161 / 47.989 | -1.9% / -0.2% |
+| on, depth 4 | 91453 / 45.506 | 481555 / 47.991 | -1.4% / -0.3% |
+| on, depth 2 | 91328 / 45.489 | 481497 / 47.990 | -0.6% / -0.3% |
+
+Wall is unchanged (101.5 s vs 101.2 s for the two-point ladder).
