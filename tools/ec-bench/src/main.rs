@@ -465,17 +465,19 @@ fn bench_hw_av1_encode_10bit(rows: &mut Vec<Row>) {
     rows.push(Row {
         component: "ec-hw av1 10-bit",
         direction: "encode",
-        content: format!("{w}x{h} yuv420p10le, {n} frames, CQP 120, {} kB", coded / 1000),
+        content: format!("{w}x{h} yuv420p10le, {n} frames from 00:01:00, CQP 120, {} kB", coded / 1000),
         media: format!("{media_s:.1}s"),
         wall_ms: wall * 1000.0,
         rtf: (wall > 0.0).then_some(media_s / wall),
     });
 }
 
-/// `extract_yuv420p` at ten bits: P010-ordered planar 16-bit little endian.
+/// `extract_yuv420p` at ten bits, planar 16-bit little endian, seeked a
+/// minute in: frame 0 of a film is its black leader, and a black leader codes
+/// to nothing and benchmarks nothing.
 fn extract_yuv420p10(src: &Path, w: u32, h: u32, n: u32) -> Vec<u8> {
     let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
+        .args(["-v", "error", "-ss", "60", "-i"])
         .arg(src)
         .args([
             "-vf", &format!("scale={w}:{h}"),
