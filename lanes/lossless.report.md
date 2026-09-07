@@ -1,6 +1,6 @@
 # lane-lossless — AV1 lossless (qindex 0) decode
 
-Branch `lane-lossless`, base `7ba28bcd`. Status: KEY-frame half SHIPPED, inter half refused by name.
+Branch `lane-lossless`, base `7ba28bcd`. Suite: 556 passed / 0 failed / 43 ignored (`cargo test -p ec-av1 --lib -- --test-threads=1`, 3611 s). `cargo check --workspace --all-targets -j4`: 0 errors, 0 ec-av1 warnings. Native `bd_rate_screen_native` NOT run: its crf-5 point has inter frames and now hits the named lossless-inter refusal (still red on that point).
 
 ## Rules implemented (each with its libaom reference)
 | rule | libaom | where |
