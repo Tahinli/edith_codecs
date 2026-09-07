@@ -4,3 +4,22 @@ test encode::tests::bd_rate_film_long_gop ...
 native crop, 48 frames, gop=48; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
 | clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
 |---|---|---|---|---|
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+film A (1080p source): pricer armings default=20 real=911
+film A (1080p source): motion_mode 32x32 SIMPLE=156428 OBMC=0 WARP=4746 | 16x16 SIMPLE=76930 OBMC=0 WARP=6135 | 8x8 SIMPLE=26207 OBMC=0 WARP=3318 (0.0% OBMC / 5.2% WARP of 273764 eligible)
+film A (1080p source): inter var-tx depths of 376293 blocks -- leaf single 0=48909 1=9093 (15.7% split) | leaf compound 0=153981 1=37482 (19.6% split) | 32x32 single 0=25331 1=18956 (42.8% split) | 32x32 compound 0=47837 1=34704 (42.0% split)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film A (1080p source): filter intra on=true blocks 109815 (modes DC=26363 V=15850 H=21066 D157=31128 PAETH=15408)
+| film A (1080p source) 1920x768 | 44.37 dB/220740 B, 46.00 dB/394517 B, 47.17 dB/704850 B, 48.28 dB/1630711 B | +40.9% | +3.1% | 371.4s:45.7s:63.2s |
+film B (2160p HDR source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+film B (2160p HDR source): pricer armings default=20 real=817
+film B (2160p HDR source): motion_mode 32x32 SIMPLE=208678 OBMC=0 WARP=3954 | 16x16 SIMPLE=63976 OBMC=0 WARP=3701 | 8x8 SIMPLE=16525 OBMC=0 WARP=1563 (0.0% OBMC / 3.1% WARP of 298397 eligible)
+film B (2160p HDR source): inter var-tx depths of 332425 blocks -- leaf single 0=47510 1=10992 (18.8% split) | leaf compound 0=121448 1=28084 (18.8% split) | 32x32 single 0=30300 1=27628 (47.7% split) | 32x32 compound 0=36307 1=30156 (45.4% split)
+film B (2160p HDR source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film B (2160p HDR source): filter intra on=true blocks 70881 (modes DC=18838 V=9625 H=10185 D157=24808 PAETH=7425)
+| film B (2160p HDR source) 1920x1024 | 46.80 dB/91262 B, 48.02 dB/204825 B, 49.03 dB/479578 B, 50.07 dB/1257860 B | +125.6% | +32.0% | 322.2s:85.4s:68.1s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 603 filtered out; finished in 991.68s
+
+RC=0
