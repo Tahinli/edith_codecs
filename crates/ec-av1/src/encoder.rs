@@ -734,11 +734,41 @@ impl Default for Pyramid {
     /// The 12-frame gate keeps its numbers exactly (+43.9 / +15.6 and +68.4 /
     /// +38.2, byte-identical streams): a GOP that is one single mini-GOP does
     /// not code the third level at all (see `drain_pending`).
+    /// THE LEAF OFFSET, RE-SWEPT ONCE THE ANCHORS MOVED (lane-arfq,
+    /// `lanes/arfq.sweep.txt`). The table above chose `16` when the key frame
+    /// still sat at the base quantizer; with [`Pyramid::key_q_offset`] at
+    /// `-48` the whole run predicts off a much finer anchor and the leaves
+    /// want to be finer with it. Long-GOP gate, control arm on the same head:
+    ///
+    /// | mini_gop:arf:leaf:mid:key | film A vs libaom / rav1e | film B vs libaom / rav1e |
+    /// |---|---|---|
+    /// | 8:-32:8:-8:-48 | +43.4 / +5.1 | +127.6 / +34.1 |
+    /// | **8:-32:12:-8:-48** | **+43.1 / +4.6** | **+129.0 / +34.3** |
+    /// | 8:-32:16:-8:-48 (control) | +43.5 / +4.6 | +131.3 / +35.0 |
+    /// | 8:-32:24:-8:-48 | +45.6 / +5.6 | +138.8 / +38.4 |
+    /// | 8:-32:12:-12:-48 | +43.4 / +5.0 | +128.1 / +33.8 |
+    /// | 8:-32:12:-16:-48 | +44.0 / +5.6 | +127.7 / +34.1 |
+    /// | 8:-24:12:-8:-48 | +44.5 / +5.2 | +128.6 / +33.3 |
+    /// | 16:-32:12:-8:-48 | +47.2 / +6.3 | +134.7 / +35.6 |
+    ///
+    /// `12` ships: film B 2.3 / 0.7 down, film A 0.4 down against libaom and
+    /// flat against rav1e. `8` is past the optimum (it buys film B and gives
+    /// film A back), `24` is worse on all four. The other two axes were
+    /// re-swept at `12` and did not move: a deeper mid (`-12`, `-16`) and a
+    /// shallower ARF (`-24`) both trade film A away for film B, so the top
+    /// ARF keeps its `-32` and the mid its `-8`. A 16-picture mini-GOP is
+    /// worse on all four -- the pyramid has exactly three levels, so one mid
+    /// frame cannot carry fifteen leaves.
+    ///
+    /// Unlike the third level this is NOT gated on GOP length: the 12-frame
+    /// gate improves on every row too (film A +38.5 / +8.2 -> +37.5 / +7.6,
+    /// film B +58.2 / +26.5 -> +54.1 / +23.9, both bars rows down, the screen
+    /// capture byte-identical).
     fn default() -> Self {
         Self {
             mini_gop: 8,
             arf_q_offset: -32,
-            leaf_q_offset: 16,
+            leaf_q_offset: 12,
             mid_q_offset: MID_DEFAULT,
             key_q_offset: KEY_DEFAULT,
         }
