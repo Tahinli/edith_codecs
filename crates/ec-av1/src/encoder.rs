@@ -234,13 +234,21 @@ impl RateLoop {
             false => target_bytes,
         };
         // A group of `m` pictures gets `m * rest`, split one `ARF_WEIGHT`
-        // share to EACH of its `h` hidden frames and one each to the `m - h`
-        // leaves, so the group's own average is `rest` exactly. `h` is the
-        // pyramid's depth, not 1: a four-level group of eight codes four
-        // hidden frames, and pricing that group as one ARF plus seven leaves
-        // gave the ARF slot a target its four frames could not share.
-        let h = p.hidden_per_group(gop);
-        let share = rest * m / (m - h + h * ARF_WEIGHT);
+        // share to the hidden frame and one each to the `m - 1` leaves, so
+        // the group's own average is `rest` exactly.
+        //
+        // ONE hidden frame, deliberately, even though the group has coded two
+        // since the mid level landed (and four with
+        // [`Pyramid::quarter_q_offset`] on). Pricing the real count
+        // (`m / (m - h + h * ARF_WEIGHT)`, h = 2) is the truthful model and
+        // it lands the 48-frame bitrate gate -9.4% / -14.9% under target
+        // against this line's -1.8% / -6.3%: the h = 1 split over-allocates
+        // the group by exactly the amount `ARF_WEIGHT` under-prices a hidden
+        // frame, and the two errors cancel. Fixing the split alone therefore
+        // makes the loop WORSE; `ARF_WEIGHT` has to be recalibrated in the
+        // same diff, which is a rate-control lane, not a pyramid-shape one
+        // (lane-pyr6, `lanes/pyr6.sweep.txt`).
+        let share = rest * m / (m - 1.0 + ARF_WEIGHT);
         Self {
             target: [target_bytes * key, share * ARF_WEIGHT, share],
             q: [start_q; 3],
@@ -502,18 +510,6 @@ impl Pyramid {
                 Some(v) => v.parse().ok().or(d.quarter_q_offset),
             },
         })
-    }
-
-    /// How many hidden frames a FULL mini-GOP of this shape codes, in a run
-    /// of `gop` pictures: the top ARF, plus the mid one and the two
-    /// quarter-point ones when they are switched on. Mirrors the gating in
-    /// [`Av1Encoder::drain_pending`] -- the rate loop prices the group from
-    /// it ([`RateLoop::new`]), so the two must move together.
-    fn hidden_per_group(&self, gop: usize) -> f64 {
-        let long_run = gop > self.mini_gop + self.mini_gop / 2;
-        let mid = long_run && self.mid_q_offset.is_some() && self.mini_gop >= 4;
-        let quarters = mid && self.quarter_q_offset.is_some() && self.mini_gop >= 8;
-        1.0 + f64::from(mid) + 2.0 * f64::from(quarters)
     }
 }
 
