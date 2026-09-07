@@ -460,11 +460,15 @@ pub(crate) const I64_ROOT: bool = true;
 /// How many key-frame superblocks were coded as one 64x64 intra block since
 /// the last [`take_i64_root_hits`], so a gate reports the fire rate rather
 /// than assuming it (class `gate-blind-to-feature`).
-static I64_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Index 1 is how many were OFFERED the trial at all, so a gate reads a
+/// SHARE and not a bare count.
+static I64_HITS: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
 
-/// The key-frame 64x64-intra-root count since the last call, and zero it.
-pub fn take_i64_root_hits() -> usize {
-    I64_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+/// The key-frame `(whole, offered)` 64x64-intra-root counts since the last
+/// call, and zero them.
+pub fn take_i64_root_hits() -> [usize; 2] {
+    std::array::from_fn(|i| I64_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// [`I64_ROOT`], or what `EC_AV1_I64` names.
@@ -6624,6 +6628,7 @@ pub(crate) fn encode_key_frame_inner(
                 && y64 + SUPERBLOCK <= luma.true_height;
             let mut sb64: Option<(f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> = None;
             if sb64_legal {
+                I64_HITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let base = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
                 let (c64, r64) = (sb_col * 4, sb_row * 4);
                 let (block, cost) = code_square(
@@ -6830,7 +6835,7 @@ pub(crate) fn encode_key_frame_inner(
                         above_mode[sb_col * 4 + cell] = block.mode;
                         left_mode[sb_row * 4 + cell] = block.mode;
                     }
-                    I64_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    I64_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let mode = block.mode;
                     coded.push((index, Superblock::Whole(block), vec![mode]));
                 }
@@ -11086,7 +11091,8 @@ mod tests {
         }
         let _ = take_i64_root_hits();
         let encoded = encode_key_frame_with_ctx(&picture, 120, 0.5, fctx).unwrap();
-        let roots = take_i64_root_hits();
+        let [roots, offered] = take_i64_root_hits();
+        assert_eq!(offered, 12, "every superblock is inside the frame");
         assert!(
             roots >= 8,
             "a smooth-gradient key frame coded only {roots} whole 64x64 intra roots of 12"
@@ -15538,6 +15544,13 @@ mod tests {
             // superblocks stayed whole, and how many of those coded a
             // residual, split that residual's luma, or took a compound
             // reference (class `gate-blind-to-feature`).
+            // lane-i64: the KEY frame's own 64x64 intra root -- how many of
+            // the superblocks offered the trial were coded whole.
+            let [i64_whole, i64_offered] = take_i64_root_hits();
+            eprintln!(
+                "{name}: key 64x64 intra roots {i64_whole} of {i64_offered} offered ({:.1}%)",
+                100.0 * i64_whole as f64 / i64_offered.max(1) as f64,
+            );
             eprintln!(
                 "{name}: 64x64 roots {} (with a residual {}, split luma {}, compound {})",
                 take_b64_root_hits(),
