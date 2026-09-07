@@ -73,3 +73,19 @@ same figure it reaches at 1.5 Mbit/s) and the leaves sit at 1 + 12
 is split. The top arm is 2 Mbit/s, inside the reach, and its -4.4% is that
 ceiling showing through. Lifting it is a pyramid-shape change (the offsets
 would have to collapse as `q` approaches the floor), out of this lane's scope.
+
+## Gates
+
+- `cargo test --release -p ec-av1 --lib encoder::` — 26 passed / 0 failed / 8
+  ignored, including `the_facade_codes_the_same_bytes_as_encode_sequence`
+  (the rate-loop-off path is untouched) and the new
+  `the_rate_loop_prices_the_frames_the_pyramid_codes`.
+- Same, with `EC_COMP_MISMATCH=1` — 26 passed / 0 failed, no mismatch.
+- Full crate suite (detached): `test result: ok. 559 passed; 0 failed;
+  44 ignored` in 850 s — 558 + this lane's one new test. That run contains
+  `encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins`,
+  so the constant-q pins 9835 (q150) / 35798 (q60) are unchanged.
+- `cargo check --workspace --all-targets -j4` — 0 errors, 0 ec-av1 warnings
+  (the 22 warnings are pre-existing ec-opus/ec-vorbis ones).
+- `rustfmt --edition 2024 --check crates/ec-av1/src/encoder.rs` — clean.
+- /tmp at 68%.
