@@ -75,3 +75,21 @@ extension was REVERTED and the coupling documented at the line -- recalibrating
 `ARF_WEIGHT` belongs to a rate-control lane, not to a pyramid-shape one. deferred:
 truthful group split + ARF_WEIGHT recalibration -- needs the bitrate gate as its own
 keep rule -- unblocked by a rate lane.
+
+## 12-frame gate at the winner: NOT RUN -- there is no winner
+`quarter_q_offset` defaults to `None`, so the 12-frame gate codes the same bytes it
+coded on main 7b05ecee; its control run on this head is the table above (film A
++37.5 / +7.6, film B +54.1 / +23.9, bars +1.7 / -14.5 and +12.2 / -10.2, screen
++33.4 / -23.8), which reproduces the charter's numbers exactly.
+
+## invariants at 73244a41
+* encoder::tests::a_four_level_pyramid_stream_decodes_in_display_order: ok (key 1,
+  arf 4, leaf 4, show_existing 4 -- four hidden frames per group of eight, each put
+  back in its own display position, display-order-exact through our decoder AND ffmpeg)
+* the_facade_codes_the_same_bytes_as_encode_sequence: ok
+* tile_bytes_do_not_depend_on_the_thread_count (--include-ignored): ok
+* the_encoders_own_streams_are_byte_identical_to_their_pins: ok (9835 / 35798 unmoved)
+* bitrate_target_lands_within_10_percent_over_48_frames: ok, pyramid -0.4% / -6.3%
+  (lane-arfq's numbers exactly)
+* EC_COMP_MISMATCH=1 full lib suite: 555 passed, 0 failed, 43 ignored
+* cargo check --workspace --all-targets: 0 errors, 0 ec-av1 warnings
