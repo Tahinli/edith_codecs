@@ -23,3 +23,19 @@ a shorter group, is what pays here.
 
 Encoder wall is unchanged within noise (231-280 s per 4-point ladder across
 every arm, ctl 272 s / 255 s).
+
+## The 12-frame gate (encode::tests::bd_rate_screen_native), keyed by each log's
+## own mid_q_offset print
+
+| mid | film A vs libaom / rav1e | film B vs libaom / rav1e |
+|---|---|---|
+| None (control) | +43.9 / +15.6 | +68.4 / +38.2 |
+| -4 | +43.8 / +15.8 | +71.1 / +38.1 |
+| -8 | +43.7 / +15.7 | +71.2 / +37.8 |
+| -8, run-length gated (SHIPPED) | +43.9 / +15.6 | +68.4 / +38.2 (byte-identical to the control) |
+
+A 12-picture GOP under mini_gop 8 is ONE group of 11 (group_target absorbs the
+tail), and a second hidden frame inside it costs 2.7-2.8 points against libaom
+on film B at every offset measured. So the third level is gated on the RUN's
+length -- `gop > mini_gop + mini_gop / 2`, i.e. a GOP that holds more than one
+mini-GOP -- and the 12-frame gate codes byte for byte what it coded before.
