@@ -491,6 +491,12 @@ pub(crate) const TX_TYPE_SEARCH: [bool; 11] = [
     true, true, true, true, true, true, true, false, false, false, false,
 ];
 
+/// `tx_type_candidates`: whether an INTER luma transform unit searches the
+/// two-type `TX_SET_INTER_3` (`IDTX` vs `DCT_DCT`) the writer already codes a
+/// symbol for, instead of always coding `DCT_DCT` (lane-txset2). Off at every
+/// preset until the gate says otherwise; `EC_AV1_TXSET_INTER` overrides.
+pub(crate) const TX_TYPE_SEARCH_INTER: [bool; 11] = [false; 11];
+
 /// `filter_search`: whether the deblock ladder's +-1/+-2 refinement stage runs.
 pub(crate) const DEBLOCK_REFINE: [bool; 11] = [
     true, true, true, true, true, true, true, false, false, false, false,
