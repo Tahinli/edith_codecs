@@ -14316,8 +14316,11 @@ mod tests {
         // references and depth-1 var-tx, on top of the tpl window and the
         // ARF's second reference from lane-arfcen. `EC_AV1_B64COMP=0
         // EC_AV1_B64VARTX=0` restores 9853 / 35866.
+        // Re-taken on lane-i64: the KEY frame -- one of these four pictures --
+        // offers every superblock a 64x64 intra root now, and 31-45% of them
+        // are coded whole. `EC_AV1_I64=0` restores 9808 / 35791.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9808, 0xb71a_2a4c_0aff_713c), (60, 35791, 0x57a3_93fa_5324_255b)];
+            [(150, 9843, 0xa47d_588d_8b92_624c), (60, 35834, 0xbef4_a521_3553_81f3)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
