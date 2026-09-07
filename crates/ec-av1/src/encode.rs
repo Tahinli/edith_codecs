@@ -13747,8 +13747,13 @@ mod tests {
         // (`crate::encoder::arf_altref`) instead of the key frame it already
         // reads as `GOLDEN` -- 9859 -> 9853 at q=150 and 35904 -> 35866 at
         // q=60. `EC_AV1_ARF_ALTREF=0` restores these.
+        // Re-taken on lane-rdoq: the coefficient quantiser runs the
+        // rate-distortion pass ([`crate::tile::rdoq`]) now, so every block of
+        // these four pictures codes the levels that pass settled on -- 9853
+        // -> 8618 at q=150 and 35866 -> 33339 at q=60. `EC_AV1_RDOQ=0`
+        // restores 9853 / 35866.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9853, 0x0f6d_bbc8_b72c_ceb3), (60, 35866, 0xbd00_f4ed_e283_3ce4)];
+            [(150, 8618, 0xc238_83cc_3cfc_bb3e), (60, 33339, 0xfff4_a39f_0cd8_285f)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(

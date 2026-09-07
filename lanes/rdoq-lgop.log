@@ -4,3 +4,10 @@ test encode::tests::bd_rate_film_long_gop ...
 native crop, 48 frames, gop=48; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
 | clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
 |---|---|---|---|---|
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+film A (1080p source): pricer armings default=20 real=895
+film A (1080p source): motion_mode 32x32 SIMPLE=192900 OBMC=0 WARP=7450 | 16x16 SIMPLE=57575 OBMC=0 WARP=6884 | 8x8 SIMPLE=24687 OBMC=0 WARP=3239 (0.0% OBMC / 6.0% WARP of 292735 eligible)
+film A (1080p source): inter var-tx depths of 259566 blocks -- leaf single 0=42208 1=6041 (12.5% split) | leaf compound 0=105604 1=17598 (14.3% split) | 32x32 single 0=23152 1=14905 (39.2% split) | 32x32 compound 0=30637 1=19421 (38.8% split)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film A (1080p source): filter intra on=true blocks 92991 (modes DC=21700 V=14106 H=18102 D157=25835 PAETH=13248)
+| film A (1080p source) 1920x768 | 43.99 dB/188841 B, 45.66 dB/321714 B, 46.92 dB/542939 B, 48.11 dB/1196594 B | +29.4% | -3.9% | 575.7s:41.6s:60.6s |
