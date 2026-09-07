@@ -1,0 +1,95 @@
+# lane-pyr6 -- A FOURTH pyramid level: hidden quarter-point ARFs.
+# gate: encode::tests::bd_rate_film_long_gop (48 pictures, gop 48), release lib binary,
+#       --test-threads 1, <= 2 arms in parallel, each arm keyed by the log's own
+#       "pyramid requested/effective" print.
+#       spec = <mini_gop>:<arf>:<leaf>:<mid>:<key>:<quarter>  (`off` = level absent).
+# logs: lanes/pyr6/*.log
+
+## controls on this head (0326d9fc), reproducing main 7b05ecee exactly
+| gate | film A | film B |
+|---|---|---|
+| long-GOP (48 pictures, gop 48) | +43.1 / +4.6 | +129.0 / +34.3 |
+| 12-frame (bd_rate_screen_native) | +37.5 / +7.6 | +54.1 / +23.9 |
+12-frame control also: bars 1080p +1.7 / -14.5, bars 2160p +12.2 / -10.2, screen
+capture +33.4 / -23.8 (pyramid gated off).  Both charter control rows match to the
+decimal.  NOTE: bd_rate_screen_native exits 101 on this head for a reason that predates
+this lane -- assert_ladder_decodes fails on the libaom crf 5 REFERENCE point ("a
+lossless frame (qindex 0): the TX_4X4 Walsh-Hadamard tile syntax ... unimplemented"),
+a decoder gap outside this lane's scope.  The BD table is printed in full before the
+assert, so every arm's numbers are read from the table, not the exit code.
+
+## long-GOP sweep -- BD-rate vs libaom cpu-used 6 / vs rav1e speed 6
+| arm | spec | film A | film B |
+|---|---|---|---|
+| control (3 levels) | 8:-32:12:-8:-48 | +43.1 / +4.6 | +129.0 / +34.3 |
+| 8, quarter 0 | 8:-32:12:-8:-48:0 | +43.6 / +5.4 | +129.5 / +35.6 |
+| 8, quarter +4 | 8:-32:12:-8:-48:4 | +43.4 / +5.1 | +129.7 / +35.4 |
+| 8, quarter +8 | 8:-32:12:-8:-48:8 | +43.3 / +5.0 | +129.9 / +35.3 |
+| 16, quarter 0 | 16:-32:12:-8:-48:0 | +44.2 / +4.9 | +132.4 / +35.4 |
+| 16, quarter +4 | 16:-32:12:-8:-48:4 | +44.3 / +4.9 | +133.7 / +36.0 |
+| 8, quarter +8, leaf 16 | 8:-32:16:-8:-48:8 | +43.2 / +4.7 | +131.2 / +35.5 |
+
+DECISION: the fourth level LOSES on every arm; `quarter_q_offset` stays `None`
+(QUARTER_DEFAULT), so the default stream is byte-identical to main 7b05ecee and the
+12-frame gate was not re-run at a "winner" -- there is none.  The keep rule ("both film
+rows improve on both columns") is missed by all six arms; the best of them
+(8:-32:12:-8:-48:8) is +0.2 / +0.4 on film A and +0.9 / +1.0 on film B WORSE than the
+three-level control.
+
+What the numbers say:
+  * At mini_gop 8 the quarter arms improve MONOTONICALLY as the quarter offset walks
+    toward the leaf offset (0: +43.6, +4: +43.4, +8: +43.3 on film A vs libaom), i.e.
+    the sweep's own optimum is quarter == leaf == "no fourth level".  Half the group
+    (4 of 8 pictures) is hidden at ARF-ish quality, and the extra hidden frames cost
+    more than the halved reference distance buys.  Film B degrades on the same axis in
+    the opposite direction (+129.5 -> +129.9 vs libaom while rav1e improves +35.6 ->
+    +35.3), so no offset makes both films agree either.
+  * At mini_gop 16 the fourth level is a REAL gain over the same group at three levels
+    (lane-arfq's 16:-32:12:-8:-48 measured +47.2 / +6.3 and +134.7 / +35.6): quarters
+    take it to +44.3 / +4.9 and +133.7 / +36.0, film A -2.9 / -1.4.  The depth is what
+    a 16-picture group was missing -- it just does not catch the 8-picture group, which
+    already has one hidden frame per four pictures.
+  * Leaf 16 under the best quarter arm recovers film A (+43.2 / +4.7, within noise of
+    the control) but pays film B (+131.2 / +35.5); same trade lane-arfq measured for
+    leaf 16 without quarters.
+
+So the depth lever is spent at THIS group size: our per-hidden-frame overhead, not the
+level count, is what separates us from rav1e's 23-hidden-per-48 shape.  The code stays
+in (six-field EC_AV1_PYRAMID, slot map documented, round trip gated) so the next lane
+can re-measure it the moment a hidden frame gets cheaper.
+
+## the rate loop: the truthful group split makes it WORSE (kept at h = 1)
+`RateLoop::new` splits a group's byte budget as one `ARF_WEIGHT` share plus `m - 1`
+leaf shares -- a model from when the pyramid had ONE hidden frame per group. Extending
+it to the real count (`m / (m - h + h * ARF_WEIGHT)`, h = 2 with the mid level, 4 with
+quarters) is the truthful model and it FAILS the 48-frame bitrate gate:
+
+| model | 768 kbps, pyramid | 1536 kbps, pyramid |
+|---|---|---|
+| h = 1 (main, kept) | -1.8% | -6.3% |
+| h = real hidden count | -9.4% | -14.9% (gate limit 10%) |
+
+The h = 1 split over-allocates a group by exactly what `ARF_WEIGHT` = 2.0 under-prices a
+hidden frame at, and the two errors cancel; fixing one alone un-cancels them. So the
+extension was REVERTED and the coupling documented at the line -- recalibrating
+`ARF_WEIGHT` belongs to a rate-control lane, not to a pyramid-shape one. deferred:
+truthful group split + ARF_WEIGHT recalibration -- needs the bitrate gate as its own
+keep rule -- unblocked by a rate lane.
+
+## 12-frame gate at the winner: NOT RUN -- there is no winner
+`quarter_q_offset` defaults to `None`, so the 12-frame gate codes the same bytes it
+coded on main 7b05ecee; its control run on this head is the table above (film A
++37.5 / +7.6, film B +54.1 / +23.9, bars +1.7 / -14.5 and +12.2 / -10.2, screen
++33.4 / -23.8), which reproduces the charter's numbers exactly.
+
+## invariants at 73244a41
+* encoder::tests::a_four_level_pyramid_stream_decodes_in_display_order: ok (key 1,
+  arf 4, leaf 4, show_existing 4 -- four hidden frames per group of eight, each put
+  back in its own display position, display-order-exact through our decoder AND ffmpeg)
+* the_facade_codes_the_same_bytes_as_encode_sequence: ok
+* tile_bytes_do_not_depend_on_the_thread_count (--include-ignored): ok
+* the_encoders_own_streams_are_byte_identical_to_their_pins: ok (9835 / 35798 unmoved)
+* bitrate_target_lands_within_10_percent_over_48_frames: ok, pyramid -0.4% / -6.3%
+  (lane-arfq's numbers exactly)
+* EC_COMP_MISMATCH=1 full lib suite: 555 passed, 0 failed, 43 ignored
+* cargo check --workspace --all-targets: 0 errors, 0 ec-av1 warnings
