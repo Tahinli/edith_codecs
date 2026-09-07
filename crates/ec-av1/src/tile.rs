@@ -4525,6 +4525,32 @@ pub(crate) fn coeff_bits(
     })
 }
 
+/// The largest level [`rdoq`] offers a candidate for, and the most prices it
+/// may spend on one block. `EC_AV1_RDOQ_MAXLEVEL` / `EC_AV1_RDOQ_BUDGET`
+/// sweep them; see [`rdoq`] for why both exist.
+const RDOQ_MAX_LEVEL: u32 = 2;
+const RDOQ_BUDGET: u32 = 24;
+
+fn rdoq_max_level() -> u32 {
+    static ENV: LazyLock<u32> = LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_RDOQ_MAXLEVEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(RDOQ_MAX_LEVEL)
+    });
+    *ENV
+}
+
+fn rdoq_budget() -> u32 {
+    static ENV: LazyLock<u32> = LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_RDOQ_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(RDOQ_BUDGET)
+    });
+    *ENV
+}
+
 /// Rate-distortion optimised quantisation (lane-rdoq): the pass every
 /// reference encoder runs after the quantiser and this one did not have.
 ///
@@ -4602,18 +4628,35 @@ pub(crate) fn rdoq(
     if census {
         census_block(levels, scaled, side, coded, bits);
     }
+    // Where the pass may spend its prices. Every candidate here costs a whole
+    // `write_coeffs`, where rav1e's incremental model costs a table lookup,
+    // so both bounds exist to keep that affordable -- and both cut where the
+    // decisions do not pay anyway:
+    //  * a level above [`RDOQ_MAX_LEVEL`] is never a candidate: one step off
+    //    a big level gives back a fraction of a bit for a whole quantiser
+    //    step of squared error. What pays is `1 -> 0` and `2 -> 1`.
+    //  * at most [`RDOQ_BUDGET`] prices per block, spent from the TAIL
+    //    backwards -- the eob end, where dropping a level also shortens the
+    //    eob -- so a fine-quantizer block carrying two hundred coefficients
+    //    cannot cost two hundred re-codings.
+    let mut budget = rdoq_budget();
+    let max_level = rdoq_max_level();
     for &position in scan_of(coded).iter().rev() {
+        if budget == 0 {
+            break;
+        }
         let (row, col) = (usize::from(position) / coded, usize::from(position) % coded);
         let i = row * side + col;
-        if levels[i] == 0 {
+        if levels[i] == 0 || levels[i].unsigned_abs() > max_level {
             continue;
         }
         let s = f64::from(scaled[i]);
         let weight = if i == 0 { dc_weight } else { 1.0 };
-        loop {
+        while budget > 0 {
             let level = levels[i];
             let candidate = level - level.signum();
             levels[i] = candidate;
+            budget -= 1;
             let after = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx);
             let distortion = weight
                 * ((s - f64::from(candidate)).powi(2) - (s - f64::from(level)).powi(2));
