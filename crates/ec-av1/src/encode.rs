@@ -252,6 +252,48 @@ fn tx_select_inter() -> bool {
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX_SELECT_INTER))
 }
 
+/// SCREEN CONTENT ONLY, measured (12-frame `bd_rate_screen_native`, control
+/// vs arm): the capture row goes +27.8/-26.0 -> +20.8/-30.1 -- seven points
+/// against libaom -- while BOTH film rows LOSE (film A +21.7/-4.4 ->
+/// +22.1/-4.0, film B +26.9/-0.6 -> +28.1/+0.7) and 2160p bars lose 0.8/1.1.
+/// The keep rule wants both films down, so this takes the same content gate
+/// palette, intrabc and the angle-delta refinement already stand behind: a
+/// non-screen frame is byte-identical to the encoder before the lane.
+///
+/// The transform types an intra luma transform unit of `set` may be coded
+/// with -- exactly the alphabet the writer's `tx_type` symbol names for that
+/// set, so a searched type is always one the tile can express (lane-txset).
+/// `DCT_DCT` first: it is the incumbent every other candidate has to beat.
+///
+/// Under this encoder's `reduced_tx_set` header bit every intra set at 16x16
+/// and below is `TX_SET_INTRA_2` (spec `get_tx_set`), the five types
+/// [`TxType::from_symbol`] names; 32x32 and 64x64 luma code no symbol at all,
+/// and inter luma reads the two-type `TX_SET_INTER_3`, left at `DCT_DCT`
+/// here.
+pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType] {
+    const DCT: [TxType; 1] = [TxType::DctDct];
+    const INTRA2: [TxType; 5] = [
+        TxType::DctDct,
+        TxType::AdstAdst,
+        TxType::AdstDct,
+        TxType::DctAdst,
+        TxType::Idtx,
+    ];
+    match set {
+        TxbSet::Luma16 | TxbSet::Luma8 | TxbSet::Luma4 if screen && tx_type_search() => &INTRA2,
+        _ => &DCT,
+    }
+}
+
+fn tx_type_search() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_TXSET")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "off"))
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX_TYPE_SEARCH))
+}
+
 fn tx_select() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_TX_SELECT")
@@ -2128,6 +2170,7 @@ impl Plane<'_> {
             let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, at.set);
             let bits = crate::tile::rdoq(
                 &mut levels, &scaled, side, base_q_idx, at.set, skip_ctx, sign_ctx, rdoq_lambda(),
+                tx_type,
             );
             (levels, Some(bits))
         } else {
@@ -2182,12 +2225,13 @@ impl Plane<'_> {
         } else {
             {
                 let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, at.set);
-                crate::tile::coeff_bits(
+                crate::tile::coeff_bits_typed(
                     &levels,
                     at.set,
                     crate::decode::q_ctx_of(base_q_idx),
                     skip_ctx,
                     sign_ctx,
+                    tx_type,
                 )
             }
         };
@@ -2258,6 +2302,7 @@ impl Plane<'_> {
             let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, set);
             let bits = crate::tile::rdoq(
                 &mut levels, &scaled, side, base_q_idx, set, skip_ctx, sign_ctx, rdoq_lambda(),
+                TxType::DctDct,
             );
             (levels, Some(bits))
         } else {
@@ -2353,7 +2398,7 @@ impl Plane<'_> {
         // `filter_intra`), not once over the whole block.
         filter_intra: Option<u8>,
         search: &Search, fctx: &crate::decode::FrameCtx,
-    ) -> (Vec<i32>, f64, f64) {
+    ) -> (Vec<i32>, f64, f64, Vec<TxType>) {
         let At { x, y, side, reach, .. } = at;
         let tx = side >> depth;
         let n = 1usize << depth;
@@ -2369,6 +2414,11 @@ impl Plane<'_> {
         // for its `txb_skip` context, not context 0 ([`Plane::coef_ctx`]).
         self.ctx.tu_split = n > 1;
         let (mut sse, mut bits) = (0.0, 0.0);
+        // One entry per unit at its own `tu_row * n + tu_col`, which is how
+        // the writer indexes them (tile.rs `write_luma_tus`) -- a unit the
+        // frame edge cuts away is never coded there, so a compacted list
+        // would slide every later unit's type onto the wrong transform.
+        let mut tx_types = vec![TxType::DctDct; n * n];
         for tu_row in 0..n {
             for tu_col in 0..n {
                 let (col_off, row_off) = (tu_col * tx, tu_row * tx);
@@ -2406,7 +2456,27 @@ impl Plane<'_> {
                         )
                     }
                     None => {
-                        self.trial(tu, mode, angle_delta, search.base_q_idx, search.deadzone, fctx)
+                        // lane-txset: the unit picks its own transform type
+                        // out of the set the writer can name it in, priced
+                        // through the same RDOQ'd trial path (its `bits`
+                        // already carry the `tx_type` symbol itself).
+                        let mut best: Option<(f64, TxType, Trial)> = None;
+                        for &tx_type in tx_type_candidates(set, search.screen) {
+                            let candidate = self.trial_typed(
+                                tu, mode, angle_delta, search.base_q_idx, search.deadzone,
+                                tx_type, fctx,
+                            );
+                            let cost = candidate.sse + search.lambda * candidate.bits;
+                            if best.as_ref().is_none_or(|(best, _, _)| cost < *best) {
+                                best = Some((cost, tx_type, candidate));
+                            }
+                        }
+                        let (_, tx_type, trial) =
+                            best.expect("the candidate list is never empty");
+                        tx_types[tu_row * n + tu_col] = tx_type;
+                        TX_TYPE_HITS[tx_type as usize]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        trial
                     }
                 };
                 sse += trial.sse;
@@ -2419,7 +2489,7 @@ impl Plane<'_> {
             }
         }
         self.ctx.tu_split = false;
-        (levels, sse, bits)
+        (levels, sse, bits, tx_types)
     }
 
     /// Writes a trial's reconstruction back into the plane, and the
@@ -2637,7 +2707,7 @@ impl Plane<'_> {
         at: At,
         search: &Search,
         mode_bits: &[f64; 13], fctx: &crate::decode::FrameCtx,
-    ) -> (Vec<Coeff>, u8, i32, f64) {
+    ) -> (Vec<Coeff>, u8, i32, f64, TxType) {
         let At {
             x, y, side, reach, ..
         } = at;
@@ -2777,6 +2847,23 @@ impl Plane<'_> {
             ANGLE_DELTA_HITS[(crate::tile::ANGLE_DELTA_ZERO as i32 + angle_delta) as usize]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // lane-txset: the block's own transform type, searched on the mode
+        // and angle the trials above settled -- the same ordering the angle
+        // refinement uses, and the same RD terms.
+        let mut tx_type = TxType::DctDct;
+        for &candidate_type in tx_type_candidates(at.set, search.screen).iter().skip(1) {
+            let candidate = self.trial_typed(
+                at, mode, angle_delta, search.base_q_idx, search.deadzone, candidate_type, fctx,
+            );
+            let cost_t =
+                candidate.sse + search.lambda * (candidate.bits + mode_bits[usize::from(mode)]);
+            if cost_t < cost {
+                cost = cost_t;
+                tx_type = candidate_type;
+                trial = candidate;
+            }
+        }
+        TX_TYPE_HITS[tx_type as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if census_on() {
             LUMA_RANK[sad_rank(&ranking, mode).min(12)]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2784,7 +2871,7 @@ impl Plane<'_> {
         self.commit(x, y, side, &trial);
         // A 64-point transform codes only its top-left 32x32 corner, which is
         // the grid `code_from_prediction` hands back (lane-i64).
-        (coeffs(&trial.levels, side.min(BLOCK)), mode, angle_delta, cost)
+        (coeffs(&trial.levels, side.min(BLOCK)), mode, angle_delta, cost, tx_type)
     }
 }
 
@@ -3586,6 +3673,19 @@ fn tx_depth_bits(side: usize, depth: usize) -> f64 {
     }
 }
 
+/// How many luma transform units resolved to each [`TxType`], indexed by the
+/// enum's own discriminant (lane-txset): the fire count a witness asserts on,
+/// and the instrument that says which types the search actually reaches.
+pub(crate) static TX_TYPE_HITS: [std::sync::atomic::AtomicUsize; 16] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
+
+/// Reads [`TX_TYPE_HITS`] and zeroes it, so a gate or a test attributes the
+/// counts to its own encode.
+#[cfg(test)]
+pub(crate) fn take_tx_type_hits() -> [usize; 16] {
+    std::array::from_fn(|t| TX_TYPE_HITS[t].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// How many blocks resolved to each `tx_depth`, the fire count that says
 /// whether the depth search below reaches its candidates at all.
 static TX_DEPTH_HITS: [std::sync::atomic::AtomicUsize; 3] =
@@ -4377,8 +4477,9 @@ fn code_square(
         reach: Reach::of(side, x, y, luma.true_width, luma.true_height, fctx),
         set: luma_set,
     };
-    let (mut luma_coeffs, mode, angle_delta, mut cost) =
+    let (mut luma_coeffs, mode, angle_delta, mut cost, tx_type) =
         luma.search_block(at, search, mode_bits, fctx);
+    let mut luma_tx_types = vec![tx_type];
     // The depth search runs on the mode the whole-block transform picked --
     // libaom's own ordering, and the reason it costs one extra pass per depth
     // rather than one per (mode, depth) pair.
@@ -4398,15 +4499,19 @@ fn code_square(
             luma.snapshot(x, y, side),
             luma_coeffs,
         );
+        let mut best_types = std::mem::take(&mut luma_tx_types);
         for depth in 1..=max_tx_depth(side) {
-            let (levels, sse, bits) = luma.code_tx_depth(at, mode, angle_delta, depth, None, search, fctx);
+            let (levels, sse, bits, types) =
+                luma.code_tx_depth(at, mode, angle_delta, depth, None, search, fctx);
             let cost_d = sse
                 + search.lambda
                     * (bits + mode_bits[usize::from(mode)] + tx_depth_bits(side, depth));
             if cost_d < best.0 {
                 best = (cost_d, depth, luma.snapshot(x, y, side), coeffs(&levels, side));
+                best_types = types;
             }
         }
+        luma_tx_types = best_types;
         luma.restore(x, y, side, &best.2);
         cost = best.0;
         tx_depth = best.1 as u8;
@@ -4503,7 +4608,10 @@ fn code_square(
         let mut best: Option<(f64, u8, usize, (Vec<u8>, Vec<CoefCtx>), Vec<Coeff>)> = None;
         for fi in 0..5u8 {
             for depth in 0..=max_depth {
-                let (levels, sse, bits) =
+                // A filter-intra block's units are coded through
+                // `code_from_prediction`, which is `DCT_DCT` throughout, so
+                // this arm keeps the empty (all-`DCT_DCT`) type list.
+                let (levels, sse, bits, _) =
                     luma.code_tx_depth(at, DC_PRED, 0, depth, Some(fi), search, fctx);
                 let cost_f = sse
                     + search.lambda
@@ -4564,6 +4672,12 @@ fn code_square(
             }
         }
     }
+    // A palette or filter-intra block's luma was recoded through `DCT_DCT`
+    // (its levels came from `code_from_prediction`), so the searched types
+    // belong to a block this one no longer is.
+    if palette.is_some() || filter_intra.is_some() {
+        luma_tx_types = Vec::new();
+    }
     (
         BlockCoeffs {
             u,
@@ -4577,6 +4691,7 @@ fn code_square(
             filter_intra,
             cfl_alphas,
             angle_delta_y: angle_delta as i8,
+            luma_tx_types,
             ..BlockCoeffs::default()
         },
         cost,
@@ -5847,6 +5962,7 @@ fn code_square_inter(
                     palette: None,
             palette_uv: None,
                     tx_depth,
+                    luma_tx_types: Vec::new(),
                     inter: Some(info),
                     motion_mode: motion_won,
                 },
@@ -5869,6 +5985,7 @@ fn code_square_inter(
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
         chroma[1].commit(x / 2, y / 2, side / 2, &v);
         (BlockCoeffs {
+            luma_tx_types: Vec::new(),
             angle_delta_y: 0,
             cfl_alphas: None,
             filter_intra: None,
@@ -9117,6 +9234,7 @@ fn search_inter_block(
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
     (
         BlockCoeffs {
+            luma_tx_types: Vec::new(),
             angle_delta_y: 0,
             cfl_alphas: None,
             filter_intra: None,
@@ -11802,6 +11920,7 @@ mod tests {
         let (_, inter_header) = inter_frame_headers(width, height, 100, 1, 0).unwrap();
 
         let residual_block = BlockCoeffs {
+            luma_tx_types: Vec::new(),
             angle_delta_y: 0,
             cfl_alphas: None,
             filter_intra: None,

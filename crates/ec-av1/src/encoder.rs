@@ -3615,6 +3615,118 @@ mod tests {
         eprintln!("delta_q witness: {levels} quantizer levels, {} bytes", stream.len());
     }
 
+    /// lane-txset's witness: a clip of hard directional edges makes the intra
+    /// luma search take EVERY type of the five-type reduced set
+    /// (`TX_SET_INTRA_2`: `DCT_DCT`, `ADST_ADST`, `ADST_DCT`, `DCT_ADST`,
+    /// `IDTX`) at least once -- the fire count, class `gate-blind-to-feature`
+    /// -- and both decoders reconstruct every frame sample-exact from the
+    /// `tx_type` symbols that name them. Before the lane the writer coded
+    /// `DCT_DCT` for every luma transform unit ever written, so this is also
+    /// the statement that the other four are REACHABLE at all.
+    #[test]
+    fn an_edge_clip_codes_every_reduced_set_tx_type_both_decoders_read_exactly() {
+        // `knob_write`: the screen override below is process-global, and the
+        // type search is SCREEN-ONLY (`encode::tx_type_candidates`).
+        let _knobs = crate::speed::knob_write();
+        crate::encode::force_screen(Some(true));
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (320usize, 192usize);
+        // Sharp horizontal and vertical steps: a vertical edge is what an
+        // `ADST` column pass beats a `DCT` one on, a horizontal edge the
+        // mirror, and the flat/ramp areas between them are where `IDTX` wins.
+        let sources: Vec<Picture> = (0..2)
+            .map(|t| {
+                let mut p = test_card(width, height, t * 3);
+                for y in 0..height {
+                    for x in 0..width {
+                        let v = match ((x + t * 4) / 16 % 2, y / 16 % 2) {
+                            (0, 0) => 16u16,
+                            (1, 0) => 235,
+                            (0, 1) => (x % 64 * 3) as u16,
+                            _ => (y % 64 * 3) as u16,
+                        };
+                        p.y[y * width + x] = v;
+                    }
+                }
+                p
+            })
+            .collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 90,
+            gop: 2,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let _ = crate::encode::take_tx_type_hits();
+        let mut stream = Vec::new();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let hits = crate::encode::take_tx_type_hits();
+        // The type search is a speed lever (`speed::TX_TYPE_SEARCH`); above
+        // the presets that carry it only `DCT_DCT` is offered, and the
+        // exactness half below is what still runs there. The FULL five-type
+        // fire count is preset 0's to make: a faster preset prunes modes and
+        // partitions before a type is ever priced on them, so `ADST_ADST` and
+        // `IDTX` stop winning on this clip at preset 6 (measured: hits
+        // `[0, 6192, 0, 79, 284, ..]`). Every preset that carries the lever
+        // still has to reach SOME non-`DCT_DCT` type -- that is the
+        // "reachable at all" statement, class `gate-blind-to-feature`.
+        if crate::speed::at(&crate::speed::TX_TYPE_SEARCH) {
+            let non_dct: usize = hits.iter().sum::<usize>()
+                - hits[crate::transform::TxType::DctDct as usize];
+            assert!(
+                non_dct > 0,
+                "every luma transform unit took DCT_DCT: {hits:?}"
+            );
+        }
+        if crate::speed::at(&crate::speed::TX_TYPE_SEARCH) && crate::speed::speed() == 0 {
+            for (name, ty) in [
+                ("DCT_DCT", crate::transform::TxType::DctDct),
+                ("ADST_ADST", crate::transform::TxType::AdstAdst),
+                ("ADST_DCT", crate::transform::TxType::AdstDct),
+                ("DCT_ADST", crate::transform::TxType::DctAdst),
+                ("IDTX", crate::transform::TxType::Idtx),
+            ] {
+                assert!(
+                    hits[ty as usize] > 0,
+                    "no luma transform unit took {name}: {hits:?}"
+                );
+            }
+        } else {
+            eprintln!(
+                "SKIP the five-type fire count at preset {}: {hits:?}",
+                crate::speed::speed()
+            );
+        }
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if have_ffmpeg() {
+            let theirs = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                    panic!(
+                        "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                        at % width,
+                        at / width,
+                        got[at],
+                        b[at],
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+        }
+        crate::encode::force_screen(None);
+        eprintln!("tx_type witness: hits {hits:?}, {} bytes", stream.len());
+    }
+
     /// Every SHIPPED SPEED PRESET codes a stream both decoders reconstruct
     /// sample-exact -- ours and ffmpeg's -- and codes a DIFFERENT stream from
     /// its neighbour (a preset that changes no byte is a preset that buys no

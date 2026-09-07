@@ -1483,11 +1483,25 @@ pub fn forward_transform_2d_typed(residual: &[i32], side: usize, tx_type: TxType
     if tx_type == TxType::DctDct {
         return forward_transform_2d(residual, side);
     }
-    debug_assert_eq!(
-        tx_type.flip(),
-        (false, false),
-        "a flipped ADST needs its residual mirrored before this basis applies"
-    );
+    // A FLIPADST axis is the plain ADST kernel with the DECODER's output
+    // mirrored (`dequant_and_inverse_typed_wh`'s `ud_flip`/`lr_flip`: row
+    // `h - 1 - i`, column `w - 1 - j`). A mirror is its own inverse, so the
+    // analysis half is the same plain basis over the mirrored residual --
+    // lane-txset, which is what lets every FLIPADST-bearing type share the
+    // kernels below instead of needing its own.
+    let (ud_flip, lr_flip) = tx_type.flip();
+    let mirrored: Vec<i32> = if ud_flip || lr_flip {
+        (0..side)
+            .flat_map(|row| {
+                let src = if ud_flip { side - 1 - row } else { row };
+                (0..side).map(move |col| (src, if lr_flip { side - 1 - col } else { col }))
+            })
+            .map(|(r, c)| residual[r * side + c])
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let residual: &[i32] = if mirrored.is_empty() { residual } else { &mirrored };
     let (row_kind, col_kind) = tx_type.axes();
     let (hb, vb) = (axis_basis_t(side, row_kind), axis_basis_t(side, col_kind));
     let mut rows = vec![0.0f64; side * side];
@@ -2162,7 +2176,27 @@ mod tests {
                 (sum / (side * side) as f64).sqrt()
             };
             let dct = rmse(TxType::DctDct);
-            for tx in [TxType::AdstDct, TxType::DctAdst, TxType::AdstAdst] {
+            // lane-txset: every one of the sixteen types, not just the four
+            // the reduced set names -- the FLIPADST and 1D-ADST/DCT families
+            // reach the forward side through the mirrored residual, and a
+            // mirror on the wrong axis reads exactly as a blown-up rmse here.
+            for tx in [
+                TxType::AdstDct,
+                TxType::DctAdst,
+                TxType::AdstAdst,
+                TxType::Idtx,
+                TxType::VDct,
+                TxType::HDct,
+                TxType::VAdst,
+                TxType::HAdst,
+                TxType::VFlipAdst,
+                TxType::HFlipAdst,
+                TxType::FlipAdstDct,
+                TxType::DctFlipAdst,
+                TxType::FlipAdstFlipAdst,
+                TxType::AdstFlipAdst,
+                TxType::FlipAdstAdst,
+            ] {
                 let e = rmse(tx);
                 assert!(
                     e < 2.0 * dct,
