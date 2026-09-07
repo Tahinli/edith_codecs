@@ -542,11 +542,62 @@ impl Default for Pyramid {
     /// entry point still codes flat, since a picture no longer maps to a
     /// packet under a pyramid — [`Av1Encoder::with_pyramid`] plus
     /// [`Av1Encoder::encode_frames`] is the streaming surface that reorders.
+    /// RE-SWEPT on lane-pyr3, on main 503d7aa9 -- `4:-16:8` was chosen when
+    /// the gate's "film" rows were still colour bars, and CfL, the luma
+    /// angle deltas, filter intra, the propagating tpl map and the rate-loop
+    /// step have all landed since (class `unswept decision constants`). The
+    /// axes were swept in the order mini-GOP first at the shipped offsets,
+    /// then both offset axes at the best mini-GOP, then the joint corners
+    /// (`encode::tests::bd_rate_screen_native`, BD-rate vs libaom / vs
+    /// rav1e; the bars rows move by at most 4 points across the WHOLE sweep
+    /// and decide nothing, the screen row is byte-identical in every arm
+    /// because the content gate codes it flat):
+    ///
+    /// | arm | film A | film B |
+    /// |---|---|---|
+    /// | flat (no pyramid) | +61.4 / +31.3 | +85.3 / +49.7 |
+    /// | 2:-16:8 | +59.2 / +28.1 | +82.3 / +49.1 |
+    /// | 4:-16:8 (was shipped) | +52.8 / +23.3 | +81.0 / +46.1 |
+    /// | 8:-16:8 | +54.3 / +24.4 | +81.8 / +45.8 |
+    /// | 16:-16:8 | +50.8 / +21.4 | +73.8 / +38.7 |
+    /// | 8:-8:8 | +58.0 / +27.5 | +83.3 / +46.5 |
+    /// | 8:-24:8 | +52.7 / +23.4 | +83.7 / +48.4 |
+    /// | 8:-32:8 | +52.3 / +23.1 | +86.8 / +51.9 |
+    /// | 8:-16:0 | +60.7 / +30.7 | +85.3 / +51.2 |
+    /// | 8:-16:4 | +57.6 / +27.4 | +84.1 / +48.6 |
+    /// | 8:-16:12 | +51.8 / +22.2 | +80.4 / +43.9 |
+    /// | 8:-16:16 | +50.1 / +20.5 | +80.6 / +43.4 |
+    /// | 16:-24:8 | +47.8 / +19.0 | +71.5 / +37.4 |
+    /// | 16:-16:12 | +48.0 / +18.9 | +71.1 / +35.7 |
+    /// | 16:-16:16 | +45.9 / +17.0 | +69.3 / +34.0 |
+    /// | 16:-24:12 | +45.6 / +17.0 | +70.2 / +35.6 |
+    /// | **16:-24:16** | **+44.2 / +15.7** | **+70.5 / +35.2** |
+    /// | 16:-32:16 | +43.6 / +15.2 | +71.2 / +36.2 |
+    /// | 16:-24:20 (past the swept range) | +42.9 / +14.5 | +70.8 / +34.9 |
+    /// | 16:-24:24 (past the swept range) | +42.6 / +14.1 | +71.3 / +35.7 |
+    ///
+    /// `16:-24:16` ships: it takes 8.6 / 7.6 points off film A and 10.5 /
+    /// 10.9 off film B against the old defaults, and every axis through it
+    /// is at or next to its own minimum. The two arms past the swept leaf
+    /// range were run because leaf `+16` was the range's edge and still
+    /// improving (class `instrument at bound`): film A keeps falling to
+    /// `+24` but film B turns back up at `+20`, so `+16` is where BOTH films
+    /// are minimal and the bound is not the answer. Deeper ARF is the same
+    /// shape -- `-32` buys 0.6 on film A and gives 0.7 back on film B.
+    ///
+    /// TWO THINGS THIS SWEEP DOES NOT SAY. The mini-GOP axis is measured
+    /// against a gate that codes 12 frames with `gop = 12`, and a group is
+    /// cut at every key frame (`encode_frames`), so `16` here is really
+    /// "one hidden ARF per GOP" and any mini-GOP over 12 codes the same
+    /// stream; on a stream with a longer GOP `16` is a genuine 16-picture
+    /// group, which this gate cannot measure. And the offsets were swept at
+    /// mini-GOP 8 before 16 won the first axis; the two joint corners at 16
+    /// confirm the same gradient, but the full grid at 16 is not measured.
     fn default() -> Self {
         Self {
-            mini_gop: 4,
-            arf_q_offset: -16,
-            leaf_q_offset: 8,
+            mini_gop: 16,
+            arf_q_offset: -24,
+            leaf_q_offset: 16,
         }
     }
 }
