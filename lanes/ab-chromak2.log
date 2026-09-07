@@ -1,0 +1,23 @@
+
+running 1 test
+test encode::tests::bd_rate_screen_native ... 
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 })
+bars 1080p: pricer armings default=16 real=176
+bars 1080p: motion_mode 32x32 SIMPLE=77120 OBMC=0 WARP=136 | 16x16 SIMPLE=2993 OBMC=0 WARP=177 | 8x8 SIMPLE=12685 OBMC=0 WARP=1370 (0.0% OBMC / 1.8% WARP of 94481 eligible)
+bars 1080p: inter var-tx depths of 11738 blocks -- leaf single 0=1361 1=717 (34.5% split) | leaf compound 0=1172 1=655 (35.9% split) | 32x32 single 0=1016 1=2085 (67.2% split) | 32x32 compound 0=2398 1=2334 (49.3% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| bars 1080p 1920x1024 | 44.31 dB/229378 B, 47.85 dB/333572 B, 51.13 dB/451496 B, 53.93 dB/580424 B | +4.0% | -12.4% | 48.1s:9.4s:18.6s |
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 })
+film A (1080p source): pricer armings default=20 real=218
+film A (1080p source): motion_mode 32x32 SIMPLE=64454 OBMC=0 WARP=2096 | 16x16 SIMPLE=31160 OBMC=0 WARP=2510 | 8x8 SIMPLE=10880 OBMC=0 WARP=2102 (0.0% OBMC / 5.9% WARP of 113202 eligible)
+film A (1080p source): inter var-tx depths of 115297 blocks -- leaf single 0=19862 1=5078 (20.4% split) | leaf compound 0=41135 1=11887 (22.4% split) | 32x32 single 0=9394 1=6474 (40.8% split) | 32x32 compound 0=13019 1=8448 (39.4% split)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film A (1080p source) 1920x768 | 43.49 dB/72785 B, 45.38 dB/121712 B, 46.82 dB/218821 B, 47.98 dB/398518 B | +53.3% | +23.4% | 69.0s:11.0s:16.3s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 583 filtered out; finished in 179.24s
+
+RC=0
