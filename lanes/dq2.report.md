@@ -43,4 +43,22 @@ The fix there was a `!screen` content gate on the tool. That gate lives in `enco
 
 ## 2. long-GOP tpl depth, preset 0
 
+`bd_rate_film_long_gop` (48 pictures, gop 48, the two film rows only), `EC_AV1_SPEED=0`.
+The depth override EXISTS: `encode.rs:9371 tpl_depth()` reads `EC_AV1_TPL_D` (`>= 1`), which wins
+over `speed::TPL_DEPTH`.
+
+| arm | film A | film B |
+|---|---|---|
+| control (depth 8, shipped) | +26.4 / -6.6 | +89.8 / +9.1 |
+| `EC_AV1_TPL_D=4` | +26.4 / -6.6 | +89.8 / +9.1 |
+
+Both rows land on the same tenth on both columns, and the wall is inside noise (film A 577.0s vs
+575.0s, film B 514.8s vs 510.0s ours). The byte points differ slightly (film B q=5 71161 vs
+70641 B), so the arms really did code different streams -- the depth is simply not worth a tenth
+of a BD point over a 48-picture GOP.
+
+That does NOT reopen preset 0's shipped 8: the 12-frame gate measured depth 4 costing film B
+0.7 on BOTH columns there, and this arm measures no long-GOP win to trade for it. `TPL_DEPTH`
+ships unchanged.
+
 ## 3. Shipped constants
