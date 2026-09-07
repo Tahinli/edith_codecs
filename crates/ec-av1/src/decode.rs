@@ -29249,6 +29249,12 @@ fn decode_inter_block(
                             cu_mi, luma_span, luma_span, plane_idx, &cu_grid,
                         );
                         hit!(CHROMA_SPLIT_TX_HITS);
+                        // lane-dpm1: the two INTER mu-chunk sites set this and this
+                        // INTRA-in-inter one did not, so the whole-block chroma
+                        // record below re-stamped all four 32x32 units with the
+                        // TOP-LEFT unit's level and the next block read a txb_skip
+                        // row libaom never selects (class `override-slot-on-one-arm`).
+                        mu_chroma = true;
                         let dst = mu_units(
                             if plane_idx == 1 { &mut u_units } else { &mut v_units },
                             chroma_side * chroma_side,

@@ -13310,25 +13310,31 @@ mod tests {
             // 25 dB garbage while this gate stayed green) and the crf-5 key
             // frame desync. A failure names the encoder, the point's flags and
             // the first differing frame/plane/sample.
+            // lane-dpm1: a failing reference point is COLLECTED, not panicked
+            // on, so one run still prints the whole BD table and names every
+            // bad point instead of stopping at the first. The collection is
+            // asserted empty by [`assert_ladder_decodes`] at the end of each
+            // gate.
             match crate::stream::decode_stream(&stream) {
+                Ok(ours) if ours.len() != decoded.len() => note_ladder_failure(format!(
+                    "{encoder} {params:?}: our decoder returned {} shown frames, ffmpeg {}",
+                    ours.len(),
+                    decoded.len(),
+                )),
                 Ok(ours) => {
-                    assert_eq!(
-                        ours.len(),
-                        decoded.len(),
-                        "{encoder} {params:?}: our decoder returned {} shown frames, ffmpeg {}",
-                        ours.len(),
-                        decoded.len(),
-                    );
                     for (f, (o, d)) in ours.iter().zip(&decoded).enumerate() {
                         if let Some((plane, s, got, want)) = first_plane_mismatch(o, d) {
-                            panic!(
+                            note_ladder_failure(format!(
                                 "{encoder} {params:?} frame {f} plane {plane} sample {s}: our \
                                  decoder decoded {got}, ffmpeg {want}"
-                            );
+                            ));
+                            break;
                         }
                     }
                 }
-                Err(e) => panic!("{encoder} {params:?}: our decoder refused the stream ({e})"),
+                Err(e) => note_ladder_failure(format!(
+                    "{encoder} {params:?}: our decoder refused the stream ({e})"
+                )),
             }
             let mean: f64 = decoded
                 .iter()
@@ -13342,6 +13348,28 @@ mod tests {
         let _ = std::fs::remove_file(&raw_path);
         ladder.sort_by(|a, b| a.0.total_cmp(&b.0));
         (ladder, wall)
+    }
+
+    /// Every reference ladder point that did not decode sample-exactly
+    /// through our own decoder, collected across a whole gate run so the BD
+    /// table still prints and EVERY bad point is named
+    /// (`encoder params frame plane sample`) instead of only the first.
+    static LADDER_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn note_ladder_failure(msg: String) {
+        eprintln!("LADDER DECODE FAILURE: {msg}");
+        LADDER_FAILURES.lock().expect("ladder failures").push(msg);
+    }
+
+    /// Fail the gate at its END on everything [`external_ladder`] collected.
+    fn assert_ladder_decodes() {
+        let failures = std::mem::take(&mut *LADDER_FAILURES.lock().expect("ladder failures"));
+        assert!(
+            failures.is_empty(),
+            "{} reference ladder point(s) did not decode exactly through our decoder:\n{}",
+            failures.len(),
+            failures.join("\n"),
+        );
     }
 
     /// First differing sample between two pictures, as
@@ -14446,6 +14474,7 @@ mod tests {
                     .join(", "),
             );
         }
+        assert_ladder_decodes();
     }
     /// Which var-tx depth this clip's INTER blocks resolved to (lane-av1tx2,
     /// split by block class in lane-av1txdepth): depth 0 is one transform over
@@ -14846,6 +14875,7 @@ mod tests {
                 bd_rate(&rav1e, &ours) * 100.0,
             );
         }
+        assert_ladder_decodes();
     }
 
     /// lane-av1tpl3 step 1: the SHAPE of the propagating map's denominator
