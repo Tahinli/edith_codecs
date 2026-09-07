@@ -415,6 +415,16 @@ fn b64_root() -> bool {
 /// chroma ones. Off by `EC_AV1_B64RES=0`, which restores the skip-only root
 /// lane-b64 shipped, so the two can be measured against each other on the
 /// same build.
+///
+/// MEASURED on the native gate (two arms of one build, baseline reproduced to
+/// the tenth): both film rows improve on both columns -- film A
+/// +43.0/+15.0 -> +42.9/+14.8, film B +64.7/+34.0 -> +63.3/+31.5 -- and
+/// SCREEN CAPTURE loses +33.4/-23.8 -> +34.3/-23.4, outside the keep rule's
+/// +-0.3 screen clause. So the caller gates this off on a screen frame
+/// (`allow_screen_content_tools`), the same content gate the coding pyramid
+/// takes: a desktop capture's 64x64 superblocks are flat runs whose skip arm
+/// already codes them for nothing, and a residual there only spends bits the
+/// intra/palette tools would have spent better.
 fn b64_residual() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_B64RES").ok().map(|v| v != "0")
@@ -498,8 +508,27 @@ fn split_rd_threshold() -> f64 {
 /// Whether `cost` over a `side` x `side` block is cheap enough per pixel that
 /// [`split_rd_threshold`] withholds the split trial.
 fn split_rd_breakout(cost: f64, side: usize, lambda: f64) -> bool {
-    let t = split_rd_threshold();
+    split_rd_breakout_at(split_rd_threshold(), cost, side, lambda)
+}
+
+/// [`split_rd_breakout`] at an explicit threshold -- what the 64x64 root's own
+/// early-out reads.
+fn split_rd_breakout_at(t: f64, cost: f64, side: usize, lambda: f64) -> bool {
     t > 0.0 && cost < t * lambda * (side * side) as f64
+}
+
+/// The threshold the 64x64 root's early-out uses: [`split_rd_threshold`]
+/// CLAMPED at the shipped [`SPLIT_RD_THRESHOLD`] (lane-tx64).
+///
+/// The 32x32 level is allowed to loosen its breakout with the speed preset
+/// (`crate::speed::SPLIT_RD` steps to 0.5 at preset 6), but lane-b64 measured
+/// what that does one size up: at 0.5 a whole superblock is taken at 64x64
+/// without its four quadrants ever being searched, and film B goes
+/// +91.5/+53.4 -> +114.6/+71.5. A 64x64 block is four times the area, so the
+/// same per-pixel threshold withholds four times as much search -- the
+/// preset's step is priced for the 32 level and does not carry up here.
+fn b64_breakout_threshold() -> f64 {
+    split_rd_threshold().min(SPLIT_RD_THRESHOLD)
 }
 
 /// [`SPLIT_BREAKOUT_COEFFS`], swept by `EC_AV1_SPLIT_BREAKOUT` in a test
@@ -7269,6 +7298,9 @@ fn search_skip_64(
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
     search: &Search,
+    // Whether the non-skip arm is priced at all ([`b64_residual`], and off on
+    // screen content -- see that function's doc).
+    residual: bool,
     reference: &Picture,
     stack: &MvStack,
     fctx: &crate::decode::FrameCtx,
@@ -7398,7 +7430,7 @@ fn search_skip_64(
     // two numbers are comparable: `fixed` charged `skip` coded 1, and this
     // arm charges 0 instead and adds its three planes' coefficient bits.
     let mut chosen = (skip_cost, true, skip_trials);
-    if b64_residual() {
+    if residual {
         let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
         let residual_trials = [0usize, 1, 2].map(|plane| {
             let (target, px, py, s) = if plane == 0 {
@@ -9130,6 +9162,7 @@ pub(crate) fn encode_inter_frame(
                     &mut chroma,
                     (x64, y64),
                     &sb_search,
+                    b64_residual() && !screen,
                     reference,
                     &stack,
                     fctx,
@@ -9145,9 +9178,14 @@ pub(crate) fn encode_inter_frame(
             // pixel is taken outright and its quadrants are never searched --
             // the same `split_rd_breakout` shape the 32x32 level uses one
             // size up, and where this lever BUYS wall instead of spending it.
-            let early64 = sb64
-                .as_ref()
-                .is_some_and(|(c, _, _)| split_rd_breakout(*c, SUPERBLOCK, sb_search.lambda));
+            let early64 = sb64.as_ref().is_some_and(|(c, _, _)| {
+                split_rd_breakout_at(
+                    b64_breakout_threshold(),
+                    *c,
+                    SUPERBLOCK,
+                    sb_search.lambda,
+                )
+            });
             for quadrant in 0..if early64 { 0 } else { 4 } {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
                 // lane-av1tpl2: this 32x32 block's own lambda -- every RD
