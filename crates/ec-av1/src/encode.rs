@@ -376,6 +376,40 @@ fn split_inter_blocks() -> bool {
     }
 }
 
+/// Whether the inter search offers the whole superblock as ONE 64x64 block
+/// (`PARTITION_NONE` at `BLOCK_64X64`), coded SKIP, against the four 32x32
+/// quadrants it would otherwise always split into.
+///
+/// The census (`lanes/census-filmB.md`) is what points here: rav1e speed 6
+/// codes 45.2% of its blocks at 64x64 -- 73.8% of its LEAF blocks, 99.2% of
+/// them skip at 328 bytes a frame -- while every block this encoder wrote was
+/// 32x32 or smaller, which put our mode+mv+partition+tx_size spend at 162,669
+/// bits against rav1e's 61,988, about 46% of the film B gap.
+///
+/// SKIP-only: a 64x64 residual needs a forward TX_64X64 the encoder does not
+/// have (`transform.rs` tops out at 32x32), and the writer refuses any other
+/// shape (`crate::tile::Quadrant::Whole64`). Switched off by `EC_AV1_B64=0`
+/// in any build.
+pub(crate) const B64_ROOT: bool = true;
+
+/// How many superblocks took the 64x64 root since the last
+/// [`take_b64_root_hits`], so a gate reports how often it fires rather than
+/// assuming it does (class `gate-blind-to-feature`).
+static B64_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The 64x64-root count since the last call, and zero it.
+pub fn take_b64_root_hits() -> usize {
+    B64_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`B64_ROOT`], or what `EC_AV1_B64` names.
+fn b64_root() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::B64_ROOT))
+}
+
 /// Whether the encoder searches loop restoration at all (spec 7.17): one
 /// Wiener filter per 64x64 luma restoration unit, picked from
 /// [`crate::filter_search::WIENER_CANDIDATES`]. Swept by `EC_AV1_LR` in a
@@ -7135,6 +7169,180 @@ fn mc_trial_compound(
 /// [`find_mv_stack`] is public and this function is handed the same `MvStack`
 /// the tile writer derives from the same grid state.
 #[allow(clippy::too_many_arguments)]
+/// One prediction of `side` x `side` samples from `reference`, as `u8` --
+/// [`mc_trial`]'s prediction half, on the heap because a 64x64 luma block is
+/// four times the stack scratch that function sizes for [`BLOCK`].
+fn predict_u8(
+    reference: &[u16],
+    stride: usize,
+    ref_width: usize,
+    ref_height: usize,
+    (x, y): (usize, usize),
+    side: usize,
+    mv: (i32, i32),
+    luma: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> Vec<u8> {
+    let mut prediction = vec![0u16; side * side];
+    mc::predict(
+        reference,
+        stride,
+        ref_width,
+        ref_height,
+        mv_to_q4(x, mv.1, luma),
+        mv_to_q4(y, mv.0, luma),
+        side,
+        side,
+        &mut prediction,
+        fctx,
+    );
+    prediction.iter().map(|&v| v as u8).collect()
+}
+
+/// The 64x64 `PARTITION_NONE` candidate for a whole superblock ([`B64_ROOT`]):
+/// single-reference LAST at `NEARESTMV`/`GLOBALMV`/`NEARMV`/`NEWMV`, coded
+/// SKIP, priced through the same `symbol_bits` path every other candidate
+/// uses. The winner's prediction is committed to the planes (it IS the
+/// reconstruction -- a skip block has no residual); the caller restores them
+/// if the four quadrants come out cheaper.
+///
+/// `None` when no candidate could be coded at all (a `NEWMV` residual the
+/// writer cannot name is simply not offered, and the other modes always are,
+/// so this only happens if every candidate is refused).
+fn search_skip_64(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    (x, y): (usize, usize),
+    search: &Search,
+    reference: &Picture,
+    stack: &MvStack,
+    fctx: &crate::decode::FrameCtx,
+) -> Option<(f64, BlockCoeffs)> {
+    let side = SUPERBLOCK;
+    let not_new = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1);
+    let not_zero = symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1);
+    let ref_bits = symbol_bits(&cdf::SINGLE_REF[0][0], 0)
+        + symbol_bits(&cdf::SINGLE_REF[0][2], 0)
+        + symbol_bits(&cdf::SINGLE_REF[0][3], 0);
+    // What every candidate pays whatever its vector: `skip` coded 1, then
+    // `is_inter` coded 1, then the LAST chain above.
+    let fixed = symbol_bits(&cdf::SKIP[0], 1) + symbol_bits(&cdf::INTRA_INTER[0], 1) + ref_bits;
+    let info_of = |mode: InterMode, mv: (i32, i32), ref_mv_idx: u8| InterInfo {
+        ref1: None,
+        mv1: (0, 0),
+        ref_frame: crate::mvstack::LAST_FRAME,
+        mode,
+        mv,
+        ref_mv_idx,
+    };
+    let mut cands: Vec<(f64, InterInfo)> = vec![
+        (
+            not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0),
+            info_of(InterMode::NearestMv, stack.nearest_mv, 0),
+        ),
+        (
+            not_new + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 0),
+            info_of(InterMode::GlobalMv, (0, 0), 0),
+        ),
+    ];
+    let near_bits = not_new + not_zero + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 1);
+    for idx in 1..=2usize {
+        if let Some(e) = stack.entries.get(idx) {
+            cands.push((
+                near_bits + drl_bits_for(stack, 1, idx),
+                info_of(InterMode::NearMv, e.mv, idx as u8),
+            ));
+        }
+    }
+    if leaf_new_mv() {
+        let source_block = luma.source_block(x, y, side);
+        let (seeds, seed_n) = mv_seeds(stack);
+        let found = motion::search(
+            &reference.y,
+            reference.width,
+            luma.true_width,
+            luma.true_height,
+            &source_block,
+            x,
+            y,
+            side,
+            side,
+            stack.pred_mv,
+            &seeds[..seed_n],
+            search.lambda,
+            fctx,
+            1,
+        );
+        let mv = round_to_valid_mv(found.mv, stack.pred_mv);
+        if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(stack, mv) {
+            cands.push((
+                symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
+                info_of(InterMode::NewMv, mv, ref_mv_idx),
+            ));
+        }
+    }
+
+    let mut best: Option<(f64, InterInfo, [Trial; 3])> = None;
+    for (bits, info) in cands {
+        let trials = [
+            (0usize, x, y, side, true),
+            (1, x / 2, y / 2, side / 2, false),
+            (2, x / 2, y / 2, side / 2, false),
+        ]
+        .map(|(plane, px, py, s, is_luma)| {
+            let (samples, stride, w, h) = match plane {
+                0 => (&reference.y, reference.width, luma.true_width, luma.true_height),
+                1 => (
+                    &reference.u,
+                    reference.width / 2,
+                    chroma[0].true_width,
+                    chroma[0].true_height,
+                ),
+                _ => (
+                    &reference.v,
+                    reference.width / 2,
+                    chroma[1].true_width,
+                    chroma[1].true_height,
+                ),
+            };
+            let prediction = predict_u8(samples, stride, w, h, (px, py), s, info.mv, is_luma, fctx);
+            let target: &Plane = if plane == 0 { luma } else { &chroma[plane - 1] };
+            // `skip` true: the trial is the prediction itself plus its SSE,
+            // so no transform of any size is involved (the reason a 64x64
+            // root can be coded at all before a forward TX_64X64 exists).
+            target.code_from_prediction(
+                px,
+                py,
+                s,
+                &prediction,
+                true,
+                search.base_q_idx,
+                search.deadzone,
+                TxbSet::Luma32Inter,
+            )
+        });
+        let cost = trials[0].sse
+            + trials[1].sse
+            + trials[2].sse
+            + search.lambda * (fixed + bits);
+        if best.as_ref().is_none_or(|b| cost < b.0) {
+            best = Some((cost, info, trials));
+        }
+    }
+    let (cost, info, trials) = best?;
+    luma.commit(x, y, side, &trials[0]);
+    chroma[0].commit(x / 2, y / 2, side / 2, &trials[1]);
+    chroma[1].commit(x / 2, y / 2, side / 2, &trials[2]);
+    Some((
+        cost,
+        BlockCoeffs {
+            skip: true,
+            inter: Some(info),
+            ..BlockCoeffs::default()
+        },
+    ))
+}
+
 fn search_inter_block(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
@@ -8776,7 +8984,68 @@ pub(crate) fn encode_inter_frame(
         let mut blocks: Vec<(usize, Quadrant)> = Vec::new();
     for sb_r in rect.sb_row0 as usize..rect.sb_row1 as usize {
         for sb_c in rect.sb_col0 as usize..rect.sb_col1 as usize {
-            for quadrant in 0..4 {
+            // lane-b64: the whole superblock as ONE 64x64 block, tried before
+            // its quadrants are (`search_skip_64`) and compared against the
+            // four of them below. Only a superblock wholly inside the true
+            // frame is offered it: a 64x64 root whose right or bottom part
+            // hangs over the edge is legal AV1 (`has_cols`/`has_rows` only
+            // ask for half), but its trial would score prediction the frame
+            // does not have -- corner-cut, ceiling = the edge superblocks of
+            // a frame whose size is not a multiple of 64, which stay split.
+            let (x64, y64) = (sb_c * SUPERBLOCK, sb_r * SUPERBLOCK);
+            let sb64_legal = b64_root()
+                && sb_r * 2 + 1 < rows
+                && sb_c * 2 + 1 < cols
+                && (sb_c as u32 + 1) * crate::tile::SB_MI <= header.mi_cols
+                && (sb_r as u32 + 1) * crate::tile::SB_MI <= header.mi_rows
+                && x64 + SUPERBLOCK <= luma.true_width
+                && y64 + SUPERBLOCK <= luma.true_height;
+            // One lambda for the whole superblock, the same mean the 32x32
+            // level takes over its own four tpl cells: the 64-vs-four-32
+            // comparison below weighs one cost against four, so both sides
+            // have to be priced at the same lambda.
+            let sb_search = match &tpl_factors {
+                Some(f) if sb64_legal => {
+                    let mean = (0..16)
+                        .map(|i| f[(sb_r * 4 + i / 4) * tpl_cells_x + sb_c * 4 + i % 4])
+                        .sum::<f64>()
+                        / 16.0;
+                    Search { lambda: search.lambda * mean, ..search }
+                }
+                _ => search,
+            };
+            let mark = blocks.len();
+            let mut sb64: Option<(f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> = None;
+            let mut sb_cost = 0.0f64;
+            if sb64_legal {
+                let base = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
+                let (mi_row, mi_col) = (sb_r * 16, sb_c * 16);
+                let stack =
+                    find_mv_stack(&grid, mi_row, mi_col, 16, 16, LAST_FRAME, mi_cols, mi_rows);
+                if let Some((cost, block)) = search_skip_64(
+                    &mut luma,
+                    &mut chroma,
+                    (x64, y64),
+                    &sb_search,
+                    reference,
+                    &stack,
+                    fctx,
+                ) {
+                    let after = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
+                    restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &base);
+                    let cost = cost
+                        + sb_search.lambda * crate::tile::partition_bits(SUPERBLOCK, false);
+                    sb64 = Some((cost, block, after));
+                }
+            }
+            // A superblock whose 64x64 trial already codes almost nothing per
+            // pixel is taken outright and its quadrants are never searched --
+            // the same `split_rd_breakout` shape the 32x32 level uses one
+            // size up, and where this lever BUYS wall instead of spending it.
+            let early64 = sb64
+                .as_ref()
+                .is_some_and(|(c, _, _)| split_rd_breakout(*c, SUPERBLOCK, sb_search.lambda));
+            for quadrant in 0..if early64 { 0 } else { 4 } {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
                 // lane-av1tpl2: this 32x32 block's own lambda -- every RD
                 // decision under it (partition, mode, tx, motion) reads
@@ -9061,12 +9330,14 @@ pub(crate) fn encode_inter_frame(
                             // grid, and their reconstruction is what the
                             // planes hold.
                             partition_hit(1);
+                            sb_cost += cost;
                             blocks.push((r32 * cols + c32, Quadrant::Split(leaves)));
                             continue;
                         }
                         restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
                     }
                     partition_hit(0);
+                    sb_cost += cost_whole;
                     record_mi(&mut grid, mi_row, mi_col, 8, block.inter);
                     blocks.push((r32 * cols + c32, Quadrant::Whole(block)));
                 } else {
@@ -9183,6 +9454,26 @@ pub(crate) fn encode_inter_frame(
                         }
                     }
                     blocks.push((r32 * cols + c32, Quadrant::Split(leaves)));
+                }
+            }
+            // The 64x64 root against what its four quadrants really cost.
+            if let Some((cost64, block, after)) = sb64
+                && (early64
+                    || cost64
+                        < sb_cost
+                            + sb_search.lambda * crate::tile::partition_bits(SUPERBLOCK, true))
+            {
+                B64_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                blocks.truncate(mark);
+                restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
+                // Overwrites every 16x16 mi cell the quadrant searches
+                // published under this superblock, so the next block's stack
+                // is built off the block that was really coded.
+                record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter);
+                blocks.push(((sb_r * 2) * cols + sb_c * 2, Quadrant::Whole64(block)));
+                for q in 1..4 {
+                    let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
+                    blocks.push((r32 * cols + c32, Quadrant::Covered));
                 }
             }
         }

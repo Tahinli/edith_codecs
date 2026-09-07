@@ -143,6 +143,12 @@ pub(crate) fn at<T: Copy>(table: &[T; 11]) -> T {
 // table for what each step measured).
 // ---------------------------------------------------------------------------
 
+/// `encode::B64_ROOT`: the 64x64 `PARTITION_NONE` skip trial at the
+/// superblock root. On at every preset -- it is a wall SAVER as well as a bit
+/// saver, since a superblock the trial takes is never searched at 32x32 (see
+/// the lane report for the measured wall at preset 0 and 6).
+pub(crate) const B64_ROOT: [bool; 11] = [crate::encode::B64_ROOT; 11];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [
