@@ -50,12 +50,44 @@
 //! bars-fixture sweeps rated cheap -- is the most expensive thing to lose, so
 //! it only goes at speed 9. MEASURED end to end on the same row:
 //!
-//! | preset | BD vs libaom / rav1e | rel. wall | 640x384 ec-bench fps |
-//! |---|---|---|---|
-//! | 0 | +53.2 / +23.4 | 1.00 | 6.8 |
-//! | 3 | +55.1 / +24.7 | 0.47 | 9.3 |
-//! | 6 | +60.9 / +29.1 | 0.32 | 14.2 |
-//! | 10 | +158.8 / +104.9 | 0.14 | 16.2 |
+//! # The presets, measured (native gate, one arm at a time, box under other
+//! lanes at load 9-48 -- read the wall column against the rav1e anchor in the
+//! SAME arm, not across arms)
+//!
+//! | preset | film A BD vs libaom / rav1e | screen BD vs libaom / rav1e | film ladder wall ours:libaom:rav1e | 1080p 4x2/8 fps | 3840x1608 4x2/8 fps |
+//! |---|---|---|---|---|---|
+//! | 0 | +53.2 / +23.4 | +49.3 / -16.0 | 102.9 : 19.6 : 25.0 | 1.32 | 0.50 |
+//! | 3 | +55.1 / +24.7 | +54.3 / -13.2 | 63.3 : 16.3 : 23.5 | 1.60 | 0.72 |
+//! | 6 | +60.9 / +29.1 | +57.7 / -11.7 | 41.3 : 16.0 : 23.4 | 1.83 | 1.50 |
+//! | 10 | +158.8 / +104.9 | +174.5 / +41.8 | 16.9 : 18.3 : 24.2 | 6.29 | 3.32 |
+//!
+//! # Against the reference encoders at THEIR fast presets
+//!
+//! Same film A crop, 4-point ladders, single thread, one tile, BD-rate vs
+//! rav1e `speed 6` (own harness, `lanes/pareto.md`); fps = 48 coded frames
+//! over the whole ladder:
+//!
+//! | encoder | BD vs rav1e speed 6 | fps |
+//! |---|---|---|
+//! | rav1e speed 6 | 0.0 | 1.79 |
+//! | rav1e speed 8 | +2.1 | 2.48 |
+//! | rav1e speed 10 | +16.9 | 4.73 |
+//! | libaom cpu-used 6 | -20.7 | 2.55 |
+//! | SVT-AV1 preset 8 | -3.9 | 13.80 |
+//! | SVT-AV1 preset 10/12 | +10.9 | 20.78 |
+//! | ours speed 0 | +23.4 | 0.47 |
+//! | ours speed 3 | +24.7 | 0.76 |
+//! | ours speed 6 | +29.1 | 1.16 |
+//! | ours speed 10 | +104.9 | 2.84 |
+//!
+//! The keep rule for a preset -- at its own wall, no worse in BD than the
+//! reference at that wall -- FAILS at every preset on film: rav1e reaches our
+//! speed-10 wall at +16.9 where we are at +104.9, and SVT-AV1 is five times
+//! faster than any of ours. What the axis does buy is real: 4.8x (1080p) to
+//! 6.6x (4K) the frames per second of the full search for +7.7 BD points up
+//! to speed 6, and on SCREEN content speeds 0-6 still beat rav1e speed 6
+//! (-16.0 / -13.2 / -11.7).
+
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
