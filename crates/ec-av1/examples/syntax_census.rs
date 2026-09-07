@@ -189,6 +189,39 @@ fn report(label: &str, f: &Frame, frames: usize) {
             .collect::<Vec<_>>()
             .join("  "),
     );
+    // lane-libcen: the coding TOOLS, by name, so a level row says which of
+    // them the stream codes at all -- a table absent here is a tool this
+    // encoder never wrote (class `gate-blind-to-feature`).
+    const TOOLS: [&str; 16] = [
+        "motion_mode",
+        "obmc",
+        "interintra",
+        "wedge_interintra",
+        "wedge_idx",
+        "compound_type",
+        "comp_group_idx",
+        "compound_idx",
+        "switchable_interp",
+        "palette_y_mode",
+        "palette_uv_mode",
+        "intrabc",
+        "filter_intra",
+        "cfl_alpha",
+        "delta_q",
+        "segment_id",
+    ];
+    println!(
+        "  tools (symbols/bits): {}",
+        TOOLS
+            .iter()
+            .map(|t| {
+                let (n, bits) = f.families.get(t).copied().unwrap_or((0, 0.0));
+                format!("{t} {n}/{bits:.0}")
+            })
+            .collect::<Vec<_>>()
+            .join("  "),
+    );
+
     // Bits by family group, then the ten biggest tables inside them.
     let mut groups: BTreeMap<&str, (u64, f64)> = BTreeMap::new();
     for (name, (n, bits)) in &f.families {
