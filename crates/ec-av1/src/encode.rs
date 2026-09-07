@@ -386,10 +386,16 @@ fn split_inter_blocks() -> bool {
 /// 32x32 or smaller, which put our mode+mv+partition+tx_size spend at 162,669
 /// bits against rav1e's 61,988, about 46% of the film B gap.
 ///
-/// SKIP-only: a 64x64 residual needs a forward TX_64X64 the encoder does not
-/// have (`transform.rs` tops out at 32x32), and the writer refuses any other
-/// shape (`crate::tile::Quadrant::Whole64`). Switched off by `EC_AV1_B64=0`
-/// in any build.
+/// lane-tx64: no longer skip-only. The root also prices a REAL residual --
+/// one TX_64X64 luma transform (`transform.rs`'s forward network has always
+/// reached 64 points; what was missing was the block coder and the writer
+/// around it) and one TX_32X32 per chroma plane -- see [`b64_residual`],
+/// which carries that arm's own gate table. Still refused at the 64 root:
+/// compound references, a depth-1 4x32x32 var-tx tree, intra, and a
+/// superblock the true frame edge cuts through.
+///
+/// Switched off by `EC_AV1_B64=0` in any build; `EC_AV1_B64RES=0` keeps the
+/// root and restores the skip-only shape lane-b64 shipped.
 pub(crate) const B64_ROOT: bool = true;
 
 /// How many superblocks took the 64x64 root since the last
@@ -13495,8 +13501,14 @@ mod tests {
         // one mode/mv chain and no residual where four quadrants used to --
         // 8076 -> 7291 at q=150 and 27585 -> 27466 at q=60. `EC_AV1_B64=0`
         // restores these.
+        // Re-taken on lane-tx64: that 64x64 root can code a REAL residual now
+        // (one TX_64X64 luma transform and two TX_32X32 chroma ones), so a
+        // superblock whose skip arm was too coarse codes coefficients where
+        // it used to fall back to four quadrants -- 7291 -> 7355 at q=150 and
+        // 27466 -> 27573 at q=60. `EC_AV1_B64RES=0` restores these;
+        // `EC_AV1_B64=0` still gives lane-b64's own pre-root 8076 / 27585.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7291, 0xa411_97e8_8a80_2a1b), (60, 27466, 0xdc87_26a3_c625_46ce)];
+            [(150, 7355, 0xd074_3dc7_a231_8a20), (60, 27573, 0xd9fb_3c84_57cc_b86f)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
