@@ -169,6 +169,11 @@ pub(crate) fn at<T: Copy>(table: &[T; 11]) -> T {
 /// (screen). So it is on at every preset.
 pub(crate) const B64_ROOT: [bool; 11] = [crate::encode::B64_ROOT; 11];
 
+/// `encode::deltaq_res_log2`: the per-superblock quantizer's `delta_q_res`
+/// LOG2 (2 = a step of 4 qindex), or `4` for "no delta_q syntax at all".
+/// It rides the tpl map, which every preset that keeps the map keeps.
+pub(crate) const DELTAQ_RES: [u8; 11] = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [

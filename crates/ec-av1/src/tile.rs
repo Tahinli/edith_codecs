@@ -282,6 +282,39 @@ pub(crate) fn arm_cdef_idx(bits: u8, sb_cols: usize, grid: Vec<u8>) {
     });
 }
 
+/// One frame's per-superblock quantizer plan (lane-deltaq, see
+/// [`arm_delta_q`]): the writer side of decode.rs `maybe_read_delta_q`.
+struct DeltaQPlan {
+    /// `1 << delta_q_res`, the multiplier the coded symbol is scaled by --
+    /// every `grid` entry is congruent to `base` modulo it, so the delta the
+    /// writer codes is always a whole number of steps.
+    res: i32,
+    /// Superblocks per row, the stride of `grid`.
+    sb_cols: usize,
+    /// The absolute `qindex` each 64x64 superblock is coded at, raster order.
+    grid: Vec<u8>,
+    /// The spec's `CurrentQIndex`, carried across the superblocks of THIS
+    /// tile -- armed at the frame's `base_q_idx` because a tile writer is
+    /// armed once per tile (`encode_inter_frame`'s `code_tiles`), which is
+    /// exactly the spec's own per-tile reset.
+    cur: i32,
+}
+
+thread_local! {
+    static DELTA_Q: std::cell::RefCell<Option<DeltaQPlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the next tile write with one absolute `qindex` per 64x64 superblock.
+/// Disarmed (a plain no-op writer, byte for byte what this crate wrote before
+/// lane-deltaq) when `res == 0`.
+pub(crate) fn arm_delta_q(res: i32, sb_cols: usize, grid: Vec<u8>, base: u8) {
+    DELTA_Q.with(|c| {
+        *c.borrow_mut() =
+            (res > 0).then(|| DeltaQPlan { res, sb_cols, grid, cur: i32::from(base) });
+    });
+}
+
 thread_local! {
     static SIGN_BIAS: std::cell::Cell<crate::mvstack::SignBiasTable> =
         const { std::cell::Cell::new(crate::mvstack::NO_SIGN_BIAS) };
@@ -1004,6 +1037,7 @@ struct CdefIdxGuard;
 impl Drop for CdefIdxGuard {
     fn drop(&mut self) {
         CDEF_IDX.with(|c| *c.borrow_mut() = None);
+        DELTA_Q.with(|c| *c.borrow_mut() = None);
         LR_PLAN.with(|c| *c.borrow_mut() = None);
         SIGN_BIAS.with(|c| c.set(crate::mvstack::NO_SIGN_BIAS));
         SCREEN.with(|c| c.set(false));
@@ -1036,6 +1070,55 @@ fn write_cdef_idx(enc: &mut SymbolEncoder, mi: (usize, usize), skip: bool) {
             u32::from(plan.grid.get(sb).copied().unwrap_or(0)),
             u32::from(plan.bits),
         );
+    });
+}
+
+/// `read_delta_qindex`'s write side (spec 5.11.10), called right after every
+/// block's [`write_cdef_idx`] -- the spec's own `skip -> cdef -> delta_q`
+/// order, and decode.rs `maybe_read_delta_q` is the reader this mirrors
+/// symbol for symbol. A no-op unless this block sits at its superblock's own
+/// top-left mode-info position, and (the one case the reader skips too) when
+/// that block IS the whole superblock and is skipped, in which case
+/// `CurrentQIndex` carries over unchanged on both sides.
+fn write_delta_q(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    mi: (usize, usize),
+    is_whole_sb: bool,
+    skip: bool,
+) {
+    DELTA_Q.with(|c| {
+        let mut plan = c.borrow_mut();
+        let Some(plan) = plan.as_mut() else { return };
+        if mi.0 % SB_MI as usize != 0 || mi.1 % SB_MI as usize != 0 {
+            return;
+        }
+        if is_whole_sb && skip {
+            return;
+        }
+        let sb = (mi.0 / SB_MI as usize) * plan.sb_cols + (mi.1 / SB_MI as usize);
+        let target = i32::from(plan.grid.get(sb).copied().unwrap_or(0));
+        // `reduced` is the spec's `delta_q_abs`/`delta_q_sign_bit` pair: the
+        // step count, not the qindex difference.
+        let reduced = (target - plan.cur) / plan.res;
+        let abs = reduced.unsigned_abs() as usize;
+        /// spec `DELTA_Q_SMALL`: the largest `delta_q_abs` symbol that is not
+        /// an escape into the literal pair below.
+        const DELTA_Q_SMALL: usize = 3;
+        enc.symbol(abs.min(DELTA_Q_SMALL), &mut cdfs.delta_q);
+        if abs >= DELTA_Q_SMALL {
+            // libaom `write_delta_qindex`: `rem_bits = get_msb(abs - 1)`,
+            // written one less in three bits, and the value offset by the
+            // threshold `(1 << rem_bits) + 1` the reader adds back.
+            let rem_bits = 31 - ((abs as u32) - 1).leading_zeros();
+            let thr = (1u32 << rem_bits) + 1;
+            enc.literal(rem_bits - 1, 3);
+            enc.literal(abs as u32 - thr, rem_bits);
+        }
+        if abs != 0 {
+            enc.literal(u32::from(reduced < 0), 1);
+        }
+        plan.cur = (plan.cur + reduced * plan.res).clamp(1, 255);
     });
 }
 
@@ -5659,6 +5742,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     + usize::from(neighbours.left_skip[mi_r]);
                 enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
                 write_cdef_idx(&mut enc, (mi_r, mi_c), block.skip);
+                write_delta_q(&mut enc, &mut cdfs, (mi_r, mi_c), true, block.skip);
                 let ii_ctx = intra_inter_ctx(
                     has_above,
                     has_left,
@@ -6054,6 +6138,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     + usize::from(neighbours.left_skip[mi_r]);
                 enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
                 write_cdef_idx(&mut enc, (mi_r, mi_c), block.skip);
+                write_delta_q(&mut enc, &mut cdfs, (mi_r, mi_c), false, block.skip);
 
                 let is_inter = block.inter.is_some();
                 let (above_inter, left_inter) =
@@ -6314,6 +6399,7 @@ fn write_inter_frame_leaf(
     let skip_ctx = usize::from(neighbours.above_skip[mi_c]) + usize::from(neighbours.left_skip[mi_r]);
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
     write_cdef_idx(enc, (mi_r, mi_c), block.skip);
+    write_delta_q(enc, cdfs, (mi_r, mi_c), false, block.skip);
 
     let (has_above, has_left) = (neighbours.has_above(mi_r), neighbours.has_left(mi_c));
     let (above_inter, left_inter) = (neighbours.above_inter[mi_c], neighbours.left_inter[mi_r]);
@@ -6564,6 +6650,7 @@ fn write_inter_frame_leaf8(
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
     write_cdef_idx(enc, leaf_mi, block.skip);
+    write_delta_q(enc, cdfs, leaf_mi, false, block.skip);
 
     let (has_above, has_left) = (neighbours.has_above(leaf_mi.0), neighbours.has_left(leaf_mi.1));
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
