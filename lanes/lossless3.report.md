@@ -66,10 +66,25 @@ published its per-transform-unit levels and `record_mi` would flatten them.
 ## Results
 | gate | result |
 |---|---|
-| `a_lossless_libaom_inter_frame_decodes_sample_exact` (7 rows) | see below |
-| `bd_rate_screen_native` (deciding) | see below |
-| crate suite `-p ec-av1 --release --lib` | see below |
-| `cargo check --workspace --all-targets -j4` | see below |
+| `a_lossless_libaom_inter_frame_decodes_sample_exact` (7 rows, new screen-inter row) | PASS |
+| `a_lossless_libaom_key_frame_decodes_sample_exact` | PASS |
+| DECIDING `bd_rate_screen_native` | **GREEN**, 424.9 s, every reference point decodes (no `LADDER DECODE FAILURE`) |
+| crate suite `-p ec-av1 --release --lib --test-threads=1` | 558 passed / 0 failed / 44 ignored, 1000.6 s |
+| `the_encoders_own_streams_are_byte_identical_to_their_pins` | PASS, pins 9835 / 35798 untouched (no encoder change this lane) |
+| `cargo check --workspace --all-targets -j4` | RC=0, 0 errors, 0 ec-av1 warnings (22 pre-existing: 21 ec-opus, 1 ec-vorbis test) |
+
+### `bd_rate_screen_native` table (baseline knobs, 12 frames, gop 12, 1 tile)
+| clip | ours PSNR/bytes per point | BD vs libaom | BD vs rav1e | wall ours:libaom:rav1e |
+|---|---|---|---|---|
+| bars 1080p 1920x1024 | 44.10 dB/218144 B, 47.66/318010, 51.05/439435, 54.25/587007 | +1.7% | -14.5% | 47.6s:8.2s:18.6s |
+| bars 2160p 1920x1024 | 43.70 dB/228646 B, 47.60/341309, 51.18/452951, 54.52/582847 | +12.2% | -10.2% | 33.5s:6.6s:18.8s |
+| film A (1080p source) 1920x768 | 44.23 dB/75096 B, 45.82/125659, 47.05/217532, 48.31/518999 | +37.5% | +7.6% | 68.3s:10.6s:15.4s |
+| film B (2160p HDR source) 1920x1024 | 46.69 dB/34137 B, 48.03/69950, 49.15/149378, 50.29/399139 | +54.1% | +23.9% | 67.4s:22.1s:17.4s |
+| screen capture 1920x1024 | 45.87 dB/40155 B, 48.55/51325, 50.86/63998, 53.07/80203 | +33.4% | -23.8% | 43.7s:9.6s:12.9s |
+
+The BD numbers are unchanged from lane-lossless2's run (this lane touches the
+DECODER only); what changed is that the crf-5 screen reference point now
+decodes, so the gate exits 0 instead of failing `assert_ladder_decodes`.
 
 ## Deferred
 - `deferred: a frame mixing lossless and lossy segments — still refused by name; unchanged from lane-lossless2 (no libaom recipe found that emits one).`
