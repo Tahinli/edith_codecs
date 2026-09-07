@@ -11910,6 +11910,7 @@ mod tests {
         let (_, inter_header) = inter_frame_headers(width, height, 100, 1, 0).unwrap();
 
         let residual_block = BlockCoeffs {
+            luma_tx_types: Vec::new(),
             angle_delta_y: 0,
             cfl_alphas: None,
             filter_intra: None,
