@@ -26220,6 +26220,7 @@ fn decode_inter_block(
                     t.ref_order_hints[(ref1 - LAST_FRAME) as usize],
                 ),
                 allow_high_precision_mv,
+                force_integer_mv,
             });
             let gm_table = build_gm_mv_table(
                 global_motion,
@@ -27444,6 +27445,7 @@ fn decode_inter_block(
                     t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
                 ),
                 allow_high_precision_mv,
+                force_integer_mv,
             });
             let gm_table = build_gm_mv_table(
                 global_motion,
@@ -29829,6 +29831,7 @@ fn decode_inter_sub8_split4(
                 t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
             ),
             allow_high_precision_mv,
+            force_integer_mv,
         });
         let stack = crate::mvstack::find_mv_stack_with_sign_bias(
             grid,
@@ -30857,6 +30860,7 @@ fn decode_inter_sub8_rect2(
                 t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
             ),
             allow_high_precision_mv,
+            force_integer_mv,
         });
         let stack = crate::mvstack::find_mv_stack_with_sign_bias(
             grid,
@@ -31603,6 +31607,7 @@ fn decode_inter_block8(
                         t.ref_order_hints[(ref1 - LAST_FRAME) as usize],
                     ),
                     allow_high_precision_mv,
+                    force_integer_mv,
                 });
                 // lane-av1comp: this leaf path has neither a real sign-bias
                 // table nor `tpl_frame` (see this function's own doc on the
@@ -32293,6 +32298,7 @@ fn decode_inter_block8(
                 t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
             ),
             allow_high_precision_mv,
+            force_integer_mv,
         });
         let stack = crate::mvstack::find_mv_stack_with_sign_bias(
             grid,
