@@ -36,3 +36,18 @@ ran bitrate_target_lands_within_10_percent_over_48_frames +10.8% over target. Th
 loop now prices the key's share through the calibration slope
 (KEY_WEIGHT * exp(-key_q_offset / GAIN)) and takes it out of the other gop-1
 pictures: 768 kbps pyramid arm -0.3%, 1536 kbps -6.2%.
+
+## per-level census after (film B, q150, EC_AV1_BITCENSUS=1 + examples/syntax_census)
+stream 89,239 B (the gate's own first point, byte-identical), 88,079 B censused,
+PSNR-Y mean 45.432 dB over 48 displayed pictures, display-0 47.67 dB.
+
+| level | before (3-level, key at base q) | after (key -48) |
+|---|---|---|
+| key | 1 @ 150: 8,399 B (10.2%) | 1 @ 102: 19,321 B (21.9%) |
+| arf top+mid | 12: 64,980 B | 12: 58,457 B (66.4%) |
+| leaf | 35: 9,117 B | 35: 10,301 B (11.7%) |
+| stream / mean PSNR-Y | 82,496 B / 45.096 dB | 89,239 B / 45.432 dB |
+
+Key share 10.2% -> 21.9%, inside the references' 22-37% band (rav1e 31.6%, libaom
+36.9% on film A); display-0 PSNR 45.0 -> 47.67 dB against rav1e's 47.1 at its own
+matched point.
