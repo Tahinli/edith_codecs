@@ -386,10 +386,16 @@ fn split_inter_blocks() -> bool {
 /// 32x32 or smaller, which put our mode+mv+partition+tx_size spend at 162,669
 /// bits against rav1e's 61,988, about 46% of the film B gap.
 ///
-/// SKIP-only: a 64x64 residual needs a forward TX_64X64 the encoder does not
-/// have (`transform.rs` tops out at 32x32), and the writer refuses any other
-/// shape (`crate::tile::Quadrant::Whole64`). Switched off by `EC_AV1_B64=0`
-/// in any build.
+/// lane-tx64: no longer skip-only. The root also prices a REAL residual --
+/// one TX_64X64 luma transform (`transform.rs`'s forward network has always
+/// reached 64 points; what was missing was the block coder and the writer
+/// around it) and one TX_32X32 per chroma plane -- see [`b64_residual`],
+/// which carries that arm's own gate table. Still refused at the 64 root:
+/// compound references, a depth-1 4x32x32 var-tx tree, intra, and a
+/// superblock the true frame edge cuts through.
+///
+/// Switched off by `EC_AV1_B64=0` in any build; `EC_AV1_B64RES=0` keeps the
+/// root and restores the skip-only shape lane-b64 shipped.
 pub(crate) const B64_ROOT: bool = true;
 
 /// How many superblocks took the 64x64 root since the last
@@ -408,6 +414,57 @@ fn b64_root() -> bool {
         crate::envflags::var("EC_AV1_B64").ok().map(|v| v != "0")
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::B64_ROOT))
+}
+
+/// Whether the 64x64 root also prices a NON-skip candidate (lane-tx64): the
+/// winner's prediction through one TX_64X64 luma transform and two TX_32X32
+/// chroma ones. Off by `EC_AV1_B64RES=0`, which restores the skip-only root
+/// lane-b64 shipped, so the two can be measured against each other on the
+/// same build.
+///
+/// MEASURED on the native gate (two arms of one build, baseline reproduced to
+/// the tenth): both film rows improve on both columns -- film A
+/// +43.0/+15.0 -> +42.9/+14.8, film B +64.7/+34.0 -> +63.3/+31.5 -- and
+/// SCREEN CAPTURE loses +33.4/-23.8 -> +34.3/-23.4, outside the keep rule's
+/// +-0.3 screen clause. So the caller gates this off on a screen frame
+/// (`allow_screen_content_tools`), the same content gate the coding pyramid
+/// takes: a desktop capture's 64x64 superblocks are flat runs whose skip arm
+/// already codes them for nothing, and a residual there only spends bits the
+/// intra/palette tools would have spent better.
+///
+/// CENSUS on film B (12 frames, q120, `EC_AV1_BITCENSUS=1` +
+/// `examples/syntax_census.rs`, both streams read by OUR decoder), off vs on:
+///
+/// | | skip-only | + residual |
+/// |---|---|---|
+/// | 64x64 share, all frames | 36.4% | 38.3% |
+/// | 64x64 share, leaf frames | 53.3% | 56.0% |
+/// | skip area, all frames | 80.4% | 78.8% |
+/// | skip area, leaf frames | 90.2% | 88.5% |
+/// | stream bytes | 34,366 | 34,295 |
+/// | encoder wall | 13.4s | 9.6s |
+///
+/// `base_luma_64` enters the leaf frames' top tables at 5.7%, i.e. the
+/// TX_64X64 coefficients are really being coded. The root wins MORE often
+/// with a residual to offer (rav1e speed 6's own 64x64 share on this clip is
+/// 45.2%), which is also why the arm is 28% FASTER despite costing three more
+/// transforms per superblock: a root that wins is four quadrant searches that
+/// never run.
+fn b64_residual() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64RES").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b64_root()
+}
+
+/// How many 64x64 roots came out cheaper with a residual than skipped, since
+/// the last [`take_b64_residual_hits`] -- so a gate reports the fire rate
+/// rather than assuming one (class `gate-blind-to-feature`).
+static B64_RESIDUAL_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The non-skip 64x64-root count since the last call, and zero it.
+pub fn take_b64_residual_hits() -> usize {
+    B64_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether the encoder searches loop restoration at all (spec 7.17): one
@@ -476,8 +533,27 @@ fn split_rd_threshold() -> f64 {
 /// Whether `cost` over a `side` x `side` block is cheap enough per pixel that
 /// [`split_rd_threshold`] withholds the split trial.
 fn split_rd_breakout(cost: f64, side: usize, lambda: f64) -> bool {
-    let t = split_rd_threshold();
+    split_rd_breakout_at(split_rd_threshold(), cost, side, lambda)
+}
+
+/// [`split_rd_breakout`] at an explicit threshold -- what the 64x64 root's own
+/// early-out reads.
+fn split_rd_breakout_at(t: f64, cost: f64, side: usize, lambda: f64) -> bool {
     t > 0.0 && cost < t * lambda * (side * side) as f64
+}
+
+/// The threshold the 64x64 root's early-out uses: [`split_rd_threshold`]
+/// CLAMPED at the shipped [`SPLIT_RD_THRESHOLD`] (lane-tx64).
+///
+/// The 32x32 level is allowed to loosen its breakout with the speed preset
+/// (`crate::speed::SPLIT_RD` steps to 0.5 at preset 6), but lane-b64 measured
+/// what that does one size up: at 0.5 a whole superblock is taken at 64x64
+/// without its four quadrants ever being searched, and film B goes
+/// +91.5/+53.4 -> +114.6/+71.5. A 64x64 block is four times the area, so the
+/// same per-pixel threshold withholds four times as much search -- the
+/// preset's step is priced for the 32 level and does not carry up here.
+fn b64_breakout_threshold() -> f64 {
+    split_rd_threshold().min(SPLIT_RD_THRESHOLD)
 }
 
 /// [`SPLIT_BREAKOUT_COEFFS`], swept by `EC_AV1_SPLIT_BREAKOUT` in a test
@@ -1829,8 +1905,20 @@ impl Plane<'_> {
                 bits: 0.0,
             };
         }
-        let mut residual = [0i32; BLOCK * BLOCK];
-        let residual = &mut residual[..side * side];
+        // A 64x64 root's residual is four times the scratch every other
+        // block coder here sizes for [`BLOCK`]; only that one case pays for
+        // a heap buffer, so the 4x4..32x32 path keeps its stack array.
+        let mut small = [0i32; BLOCK * BLOCK];
+        let mut big = if side > BLOCK {
+            vec![0i32; side * side]
+        } else {
+            Vec::new()
+        };
+        let residual: &mut [i32] = if side > BLOCK {
+            &mut big
+        } else {
+            &mut small[..side * side]
+        };
         for row in 0..side {
             for col in 0..side {
                 residual[row * side + col] =
@@ -1864,6 +1952,16 @@ impl Plane<'_> {
                 .collect()
         };
         let sse = self.block_sse(x, y, side, &reconstruction);
+        // A 64-point transform codes only its top-left 32x32 corner (spec
+        // 5.11.39's zero-out; `TxbSet::Luma64`'s tables are 32-sided and the
+        // key frame writer takes a 32x32 level grid for one). The inverse
+        // above reads the whole 64x64 array, but the price below and the
+        // levels the writer takes are that corner.
+        let levels = if side > BLOCK {
+            coded_corner(&levels, side, BLOCK)
+        } else {
+            levels
+        };
         #[cfg(test)]
         let t = stage_start();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
@@ -5657,6 +5755,17 @@ struct Trial {
     bits: f64,
 }
 
+/// The top-left `to` x `to` corner of a `from`-sided level grid -- the part
+/// of a 64-point transform that is actually coded (everything outside it is
+/// zeroed by [`crate::transform::quantize`] already, so this only reshapes).
+fn coded_corner(levels: &[i32], from: usize, to: usize) -> Vec<i32> {
+    let mut out = vec![0i32; to * to];
+    for row in 0..to {
+        out[row * to..][..to].copy_from_slice(&levels[row * from..][..to]);
+    }
+    out
+}
+
 /// The non-zero levels of a block, as the tile writer takes them.
 fn coeffs(levels: &[i32], side: usize) -> Vec<Coeff> {
     levels
@@ -7214,6 +7323,9 @@ fn search_skip_64(
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
     search: &Search,
+    // Whether the non-skip arm is priced at all ([`b64_residual`], and off on
+    // screen content -- see that function's doc).
+    residual: bool,
     reference: &Picture,
     stack: &MvStack,
     fctx: &crate::decode::FrameCtx,
@@ -7282,7 +7394,7 @@ fn search_skip_64(
         }
     }
 
-    let mut best: Option<(f64, InterInfo, [Trial; 3])> = None;
+    let mut best: Option<(f64, f64, InterInfo, [Trial; 3])> = None;
     for (bits, info) in cands {
         let trials = [
             (0usize, x, y, side, true),
@@ -7326,18 +7438,66 @@ fn search_skip_64(
             + trials[2].sse
             + search.lambda * (fixed + bits);
         if best.as_ref().is_none_or(|b| cost < b.0) {
-            best = Some((cost, info, trials));
+            best = Some((cost, bits, info, trials));
         }
     }
-    let (cost, info, trials) = best?;
+    let (skip_cost, bits, info, skip_trials) = best?;
+
+    // The winner's prediction coded with a REAL residual (lane-tx64): one
+    // TX_64X64 luma transform -- `TxbSet::Luma64`, whose coded quarter is the
+    // 32x32 corner `code_from_prediction` hands back -- and one TX_32X32 per
+    // chroma plane, since a 64x64 root's chroma block IS 32x32. Only the mv
+    // the skip arm already chose is re-coded: the prediction with the lowest
+    // SSE is also the cheapest residual to code, and a second 64x64 motion
+    // search per superblock is the wall this root was taken to SAVE.
+    //
+    // Priced against the skip arm through the same `symbol_bits` path, so the
+    // two numbers are comparable: `fixed` charged `skip` coded 1, and this
+    // arm charges 0 instead and adds its three planes' coefficient bits.
+    let mut chosen = (skip_cost, true, skip_trials);
+    if residual {
+        let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
+        let residual_trials = [0usize, 1, 2].map(|plane| {
+            let (target, px, py, s) = if plane == 0 {
+                (&*luma, x, y, side)
+            } else {
+                (&chroma[plane - 1], x / 2, y / 2, side / 2)
+            };
+            target.code_from_prediction(
+                px,
+                py,
+                s,
+                &chosen.2[plane].reconstruction,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                sets[plane],
+            )
+        });
+        let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
+        let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
+        let cost = residual_trials.iter().map(|t| t.sse).sum::<f64>()
+            + search.lambda * (fixed + bits + unskip + coeff_bits);
+        if cost < skip_cost {
+            B64_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            chosen = (cost, false, residual_trials);
+        }
+    }
+
+    let (cost, skip, trials) = chosen;
     luma.commit(x, y, side, &trials[0]);
     chroma[0].commit(x / 2, y / 2, side / 2, &trials[1]);
     chroma[1].commit(x / 2, y / 2, side / 2, &trials[2]);
     Some((
         cost,
         BlockCoeffs {
-            skip: true,
+            skip,
             inter: Some(info),
+            // Both grids are 32-sided: the luma one is the 64-point
+            // transform's coded corner, the chroma ones are whole TX_32X32.
+            luma: if skip { Vec::new() } else { coeffs(&trials[0].levels, BLOCK) },
+            u: if skip { Vec::new() } else { coeffs(&trials[1].levels, side / 2) },
+            v: if skip { Vec::new() } else { coeffs(&trials[2].levels, side / 2) },
             ..BlockCoeffs::default()
         },
     ))
@@ -9027,6 +9187,7 @@ pub(crate) fn encode_inter_frame(
                     &mut chroma,
                     (x64, y64),
                     &sb_search,
+                    b64_residual() && !screen,
                     reference,
                     &stack,
                     fctx,
@@ -9042,9 +9203,14 @@ pub(crate) fn encode_inter_frame(
             // pixel is taken outright and its quadrants are never searched --
             // the same `split_rd_breakout` shape the 32x32 level uses one
             // size up, and where this lever BUYS wall instead of spending it.
-            let early64 = sb64
-                .as_ref()
-                .is_some_and(|(c, _, _)| split_rd_breakout(*c, SUPERBLOCK, sb_search.lambda));
+            let early64 = sb64.as_ref().is_some_and(|(c, _, _)| {
+                split_rd_breakout_at(
+                    b64_breakout_threshold(),
+                    *c,
+                    SUPERBLOCK,
+                    sb_search.lambda,
+                )
+            });
             for quadrant in 0..if early64 { 0 } else { 4 } {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
                 // lane-av1tpl2: this 32x32 block's own lambda -- every RD
@@ -13348,14 +13514,14 @@ mod tests {
         // the blocks that take one code a filter-intra mode, a different
         // prediction and different coefficients -- 7321 -> 7373 at q=150 and
         // 27285 -> 27074 at q=60. `EC_AV1_FILTER_INTRA=0` restores these.
-        // Re-taken on lane-b64 (64x64 skip root, `EC_AV1_B64=0` restores
-        // 8076 / 27585 under the 16:-24:16 pyramid) and again at the lane-pyr4
-        // merge: the default pyramid is `8:-32:16` now, the long-GOP sweep's
-        // shape (`lanes/pyr4.sweep.txt`), so these four pictures code as one
-        // truncated group of 8 with its hidden ALTREF at `q-32`.
-        // `EC_AV1_PYRAMID=16:-24:16` restores 7291 / 27466.
+        // Re-taken on lane-b64 (64x64 skip root), at the lane-pyr4 merge
+        // (default pyramid `8:-32:16`, one truncated group of 8 with its
+        // hidden ALTREF at `q-32`), and at the lane-tx64 merge: the 64x64
+        // root can code a REAL residual now (one TX_64X64 luma transform and
+        // two TX_32X32 chroma ones). `EC_AV1_B64RES=0` restores 8446 / 28548;
+        // `EC_AV1_B64=0` gives the pre-root bytes under this pyramid.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8446, 0xaf24_d4bc_c9a3_9819), (60, 28548, 0x1459_61a1_f2b6_0f05)];
+            [(150, 8590, 0x407d_4c27_d24f_d830), (60, 28535, 0xf033_c999_93a3_5b27)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(

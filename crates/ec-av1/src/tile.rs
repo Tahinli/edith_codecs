@@ -1770,9 +1770,10 @@ pub enum Quadrant {
     /// and the other three carry [`Covered`](Quadrant::Covered), so the
     /// per-32x32-entry shape the inter writer takes is unchanged.
     ///
-    /// The block is coded SKIP and single-reference: a 64x64 residual needs
-    /// the forward TX_64X64 the encoder does not have (`transform.rs` tops
-    /// out at 32x32), and the writer refuses anything else.
+    /// The block is single-reference; the writer refuses a compound one. It
+    /// may be skipped or carry a real residual -- one TX_64X64 luma transform
+    /// whose coded quarter is a 32x32 level grid, and one TX_32X32 per chroma
+    /// plane (lane-tx64, `crate::encode::b64_residual`).
     Whole64(BlockCoeffs),
     /// A quadrant a [`Whole64`](Quadrant::Whole64) at its superblock's
     /// top-left already coded; it carries no block of its own.
@@ -4365,9 +4366,24 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
             let side = match q {
                 Quadrant::Whole(_) => 32,
                 Quadrant::Split(_) => 16,
-                // A 64x64 root is skip-only, so it carries no coefficient
-                // bits to predict at all (`Quadrant::Whole64`).
-                Quadrant::Whole64(_) | Quadrant::Covered => return 0.0,
+                // lane-tx64: a 64x64 root that codes a residual pays for one
+                // TX_64X64 luma transform (only the top-left 32x32 carries
+                // coefficients) and one TX_32X32 per chroma plane -- the same
+                // three prices `predicted_coeff_bits_sb` takes for a key
+                // frame's whole superblock, and the same sets the writer's
+                // `Whole64` arm codes. `block_bits`'s table has no 64 row, so
+                // it is spelled out here.
+                Quadrant::Whole64(block) => {
+                    return match block.skip {
+                        true => 0.0,
+                        false => {
+                            coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx, 0, 0)
+                                + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx, 0, 0)
+                                + coeff_bits(&dense(&block.v, 32), TxbSet::Chroma32, q_ctx, 0, 0)
+                        }
+                    };
+                }
+                Quadrant::Covered => return 0.0,
             };
             q.blocks().iter().map(|b| block_bits(b, side, q_ctx)).sum::<f64>()
         })
@@ -5558,6 +5574,12 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     // derived from luma's, not coded, so it never differs between the two.
     let intra_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
     let inter_planes = [TxbSet::Luma32Inter, TxbSet::Chroma16, TxbSet::Chroma16];
+    // A 64x64 root's planes (lane-tx64): TX_64X64 luma -- DCT-only at this
+    // size for an inter block too (spec `av1_get_ext_tx_set_type` returns
+    // `TX_SET_DCTONLY` for `tx_size_sqr_up == TX_64X64`), so `Luma64` carries
+    // no `tx_type` symbol and there is no `Luma64Inter` to write -- and one
+    // TX_32X32 per chroma plane.
+    let sb64_planes = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
     let scan32 = default_scan(TX32);
     let scan16 = default_scan(TX16);
     let scan8 = default_scan(TX8);
@@ -5593,8 +5615,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
             );
             // lane-b64: a superblock the search left WHOLE — one 64x64 block
             // at `PARTITION_NONE`, carried by its top-left quadrant's entry
-            // ([`Quadrant::Whole64`]). Coded skip and single-reference: no
-            // residual, so no TX_64X64 coefficients and no `cdef_idx`.
+            // ([`Quadrant::Whole64`]). Single-reference; skipped, or with a
+            // real residual through `TxbSet::Luma64` + two `Chroma32`
+            // (lane-tx64).
             let sb64 = ((sb_r * 2) < rows && (sb_c * 2) < cols)
                 .then(|| &blocks[((sb_r * 2) * cols + sb_c * 2) as usize])
                 .and_then(|q| match q {
@@ -5611,11 +5634,10 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 let info = block.inter.ok_or_else(|| {
                     Error::unsupported("AV1 tile", "a 64x64 root block is coded inter")
                 })?;
-                if !block.skip || info.ref1.is_some() {
+                if info.ref1.is_some() {
                     return Err(Error::unsupported(
                         "AV1 tile",
-                        "a 64x64 root block is coded skip and single-reference \
-                         (a 64x64 residual needs a forward TX_64X64)",
+                        "a 64x64 root block is coded single-reference",
                     ));
                 }
                 enc.symbol(PARTITION_NONE, &mut cdfs.partition_w64[sb_ctx]);
@@ -5624,8 +5646,8 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 let has_left = neighbours.has_left(mi_c);
                 let skip_ctx = usize::from(neighbours.above_skip[mi_c])
                     + usize::from(neighbours.left_skip[mi_r]);
-                enc.symbol(1, &mut cdfs.skip[skip_ctx]);
-                write_cdef_idx(&mut enc, (mi_r, mi_c), true);
+                enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+                write_cdef_idx(&mut enc, (mi_r, mi_c), block.skip);
                 let ii_ctx = intra_inter_ctx(
                     has_above,
                     has_left,
@@ -5694,8 +5716,11 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 )?;
                 if tx_select {
                     // A skipped inter block writes no `txfm_split` at all --
-                    // this only publishes the max transform size the reader
-                    // infers for it (`write_tx_syntax_inter`).
+                    // that call only publishes the max transform size the
+                    // reader infers for it; an unskipped one writes the
+                    // `txfm_split` flag, 0 here because a 64x64 root's luma
+                    // is one whole TX_64X64 (depth 1 is lane-tx64's deferred
+                    // var-tx arm).
                     write_tx_syntax_inter(
                         &mut enc,
                         &mut cdfs,
@@ -5703,12 +5728,37 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         (mi_r, mi_c),
                         SB,
                         true,
-                        true,
+                        block.skip,
                         0,
                     );
                 }
-                neighbours.record(sb_at, SB, 0, &zero_grids);
-                neighbours.record_inter(sb_at, SB, true, true, block_ref(block));
+                if block.skip {
+                    neighbours.record(sb_at, SB, 0, &zero_grids);
+                } else {
+                    // lane-tx64: the 64x64 root's real residual. Luma is one
+                    // TX_64X64 whose coded quarter is a 32x32 level grid
+                    // (`TxbSet::Luma64`, `TX32`'s own scan -- the same pair
+                    // `sb_coeff_key_frame_tile`'s `Superblock::Whole` writes),
+                    // chroma one whole TX_32X32 per plane, and `split` is
+                    // false because the luma transform covers the block.
+                    let grids = [
+                        level_grid(&block.luma, TX32)?,
+                        level_grid(&block.u, TX32)?,
+                        level_grid(&block.v, TX32)?,
+                    ];
+                    write_block_planes(
+                        &mut enc,
+                        &mut cdfs,
+                        &sb64_planes,
+                        &grids,
+                        &[&scan32, &scan32, &scan32],
+                        &neighbours.around(sb_at, SB),
+                        0,
+                        false,
+                    );
+                    neighbours.record_planes(sb_at, SB, 0, &grids, true);
+                }
+                neighbours.record_inter(sb_at, SB, block.skip, true, block_ref(block));
                 continue;
             }
             match (has_cols, has_rows) {
