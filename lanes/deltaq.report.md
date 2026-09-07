@@ -157,3 +157,5 @@ films paid, this row would have needed the same `!screen` content gate
   header's `delta_q` bit but counts no `delta_qindex` symbols; the fire counter
   `encode::take_deltaq_levels` (distinct qindex levels per frame) is what this
   lane used instead.
+
+* full lib suite detached (`lanes/dq-suite.log`): **565 passed, 0 failed, 44 ignored**, 781.6s -- the base' 564 plus this lane' witness.
