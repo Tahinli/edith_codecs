@@ -27,4 +27,39 @@ group at 8 anyway; the screen row is content-gated flat and takes
 
 ## Results
 
-(pending)
+Every cell is BD-rate vs libaom `cpu-used 6` / vs rav1e `speed 6` (lower is
+better). `wall` is ours:rav1e inside the arm. `bars` rows are `testsrc2`
+colour-bar fixtures, recorded, never a decision.
+
+### Preset 3 (batch: the two arms ran side by side, load ~14)
+
+| row | depth 1 (control) | depth 8 | delta |
+|---|---|---|---|
+| bars 1080p | +43.9 / +21.2 | +44.2 / +21.4 | +0.3 / +0.2 |
+| bars 2160p | +49.1 / +18.9 | +48.9 / +18.9 | -0.2 / 0.0 |
+| **film A** | **+22.5 / -3.9** | **+22.5 / -3.9** | **0.0 / 0.0** |
+| **film B** | **+27.6 / +0.1** | **+27.7 / +0.1** | **+0.1 / 0.0** |
+| **screen** | **+33.5 / -23.1** | **+32.9 / -23.4** | **-0.6 / -0.3** |
+| wall film A | 165.4s:23.8s = 6.95 | 165.9s:24.8s = 6.69 | -3.7% |
+| wall film B | 142.5s:26.2s = 5.44 | 139.1s:26.1s = 5.33 | -2.0% |
+| wall screen | 76.9s:13.4s = 5.74 | 77.1s:13.7s = 5.63 | -1.9% |
+
+At preset 3 the lookahead pass does not show up in the wall at all -- the
+ratio moves 2-4% the WRONG way, i.e. the pass is smaller than this box's
+noise -- and no film row moves. Logs `lanes/tw-p3d{1,8}.log`.
+
+### Preset 6 (batch: the two arms ran side by side, load ~14)
+
+| row | depth 1 (control) | depth 8 | delta |
+|---|---|---|---|
+| bars 1080p | +67.6 / +39.5 | +69.2 / +40.7 | +1.6 / +1.2 |
+| bars 2160p | +63.8 / +29.0 | +64.1 / +29.4 | +0.3 / +0.4 |
+| **film A** | **+27.0 / -0.3** | **+27.0 / -0.4** | **0.0 / -0.1** |
+| **film B** | **+35.9 / +7.2** | **+35.6 / +6.9** | **-0.3 / -0.3** |
+| **screen** | **+34.7 / -22.4** | **+34.9 / -22.3** | **+0.2 / +0.1** |
+| wall film A | 75.3s:20.7s = 3.64 | 77.1s:19.5s = 3.95 | +8.5% |
+| wall film B | 62.6s:17.9s = 3.50 | 63.0s:17.5s = 3.60 | +2.9% |
+| wall screen | 37.6s:12.4s = 3.03 | 39.0s:12.1s = 3.22 | +6.3% |
+
+Preset 6's search is 2x cheaper than preset 3's, so the SAME lookahead pass is
++3..8% of the wall here. Logs `lanes/tw-p6d{1,8}.log`.
