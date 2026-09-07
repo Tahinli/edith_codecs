@@ -3,48 +3,45 @@
 //! our encoder. Also the byte-exactness gate for encoder-internal rewrites:
 //! it prints each point's stream length and a hash of its bytes.
 //!
-//! Usage: `enc_probe <clip> <width> <height> <frames> [q,q,..]`
-
-use std::process::Command;
+//! Usage: `enc_probe <clip> <width|gate> <height> <frames> [q,q,..]`
+//!
+//! `gate` as the width takes the native BD gate's own window on the clip
+//! (`probe::gate_crop`, superblock-aligned centre crop) and ignores the height
+//! argument; `EC_ENC_SS` is the gate's seek and `EC_ENC_VF` overrides the
+//! filter chain. Without both of those the probe measures different pixels
+//! than the gate it reports on.
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
-    let (clip, width, height, frames) = (
-        a[0].clone(),
-        a[1].parse::<usize>().unwrap(),
-        a[2].parse::<usize>().unwrap(),
-        a[3].parse::<usize>().unwrap(),
-    );
+    let clip = a[0].clone();
+    let frames: usize = a[3].parse().unwrap();
+    let gate = a[1] == "gate";
+    let (width, height) = match gate {
+        true => (0, 0),
+        false => (a[1].parse().unwrap(), a[2].parse().unwrap()),
+    };
     let qs: Vec<u8> = a
         .get(4)
         .map_or_else(|| vec![150, 120, 90, 60], |s| s.split(',').map(|q| q.parse().unwrap()).collect());
 
-    let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-i", &clip, "-frames:v", &frames.to_string()])
-        // lane-census: the BD gate's native rows CROP, they do not scale, so
-        // the census can ask for the gate's own recipe (`EC_ENC_VF`).
-        .args([
-            "-vf",
-            &std::env::var("EC_ENC_VF").unwrap_or_else(|_| format!("scale={width}:{height}")),
-        ])
-        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
-        .output()
-        .expect("ffmpeg failed to run");
-    assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
-    let (luma, chroma) = (width * height, width * height / 4);
-    let frame_len = luma + 2 * chroma;
-    let source: Vec<ec_av1::encode::Picture> = (0..frames)
-        .map(|i| {
-            let b = &out.stdout[i * frame_len..][..frame_len];
-            ec_av1::encode::Picture {
-                width,
-                height,
-                y: b[..luma].iter().map(|&v| u16::from(v)).collect(),
-                u: b[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                v: b[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
-            }
-        })
-        .collect();
+    // lane-census/lane-probe: the BD gate's native rows CROP (`EC_ENC_VF`) and
+    // SEEK (`EC_ENC_SS`) -- without the seek this probe read film B's black
+    // leader and every census off it was probe-relative.
+    let (vf, width, height) = match gate {
+        true => ec_av1::probe::gate_crop(&clip),
+        false => (
+            std::env::var("EC_ENC_VF").unwrap_or_else(|_| format!("scale={width}:{height}")),
+            width,
+            height,
+        ),
+    };
+    let vf = match gate {
+        true => std::env::var("EC_ENC_VF").unwrap_or(vf),
+        false => vf,
+    };
+    eprintln!("probe: {width}x{height} vf={vf}");
+    let skip = std::env::var("EC_ENC_SS").unwrap_or_else(|_| "0".into());
+    let source = ec_av1::probe::source(&clip, &skip, &vf, width, height, frames);
 
     let start = std::time::Instant::now();
     for q in qs {
