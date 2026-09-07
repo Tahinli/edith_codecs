@@ -3985,6 +3985,80 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-dpm1: the lossless refusal is a CLAIM, so it gets a stream that
+    /// reaches it. libaom at `-crf 0` codes `base_q_idx == 0` -- the same
+    /// lossless frame his screen-capture row gets at `-crf 5` -- where the tile
+    /// syntax is TX_4X4 + Walsh-Hadamard and `is_cfl_allowed` narrows to
+    /// `plane_bsize == BLOCK_4X4`. Before the refusal our decoder returned a
+    /// picture that was wrong from luma sample 0 (measured on that row: 126
+    /// against ffmpeg's 33, the first block's `uv_mode` read off the CfL
+    /// alphabet). The gate asserts the stream really is lossless and that we
+    /// refuse it BY NAME rather than decode it wrong.
+    #[test]
+    fn a_lossless_libaom_stream_is_refused_by_name() {
+        const NAME: &str = "a_lossless_libaom_stream_is_refused_by_name";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let (w, h, frames) = (256usize, 128usize, 2usize);
+        let mut raw = Vec::with_capacity(frames * w * h * 3 / 2);
+        for f in 0..frames {
+            for row in 0..h {
+                for col in 0..w {
+                    raw.push(((col * 7 + row * 13 + f * 31) % 251) as u8);
+                }
+            }
+            raw.extend(std::iter::repeat_n(128u8, w * h / 2));
+        }
+        // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
+        let src = std::env::temp_dir().join(format!("ec-av1-lossless-{}.yuv", std::process::id()));
+        std::fs::write(&src, &raw).expect("raw source");
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+            .arg(&src)
+            .args(["-an", "-threads", "1", "-g", "2", "-c:v", "libaom-av1"])
+            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "0", "-f", "obu", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        let _ = std::fs::remove_file(&src);
+        if !out.status.success() {
+            eprintln!(
+                "SKIP {NAME}: ffmpeg has no libaom-av1 encoder ({})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let stream = out.stdout;
+        // Half of the gate: the stream must really carry a lossless frame
+        // (class `gate-blind-to-feature`).
+        let mut parser = Av1Parser::new();
+        let (mut pos, mut lossless) = (0usize, 0usize);
+        while pos < stream.len() {
+            let obu = parser.parse_obu(&stream[pos..]).expect("libaom OBU parses");
+            pos += obu.total_size.max(1);
+            let header = match &obu.kind {
+                ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) => h,
+                _ => continue,
+            };
+            if header.lossless.iter().any(|&l| l) {
+                lossless += 1;
+            }
+        }
+        assert!(lossless > 0, "{NAME} went blind: libaom coded no lossless frame at -crf 0");
+        match decode_stream(&stream) {
+            Ok(_) => panic!("{NAME}: a lossless stream decoded instead of being refused"),
+            Err(e) => assert!(
+                format!("{e}").contains("a lossless frame (qindex 0)"),
+                "{NAME}: refused for the wrong reason: {e}"
+            ),
+        }
+    }
+
     /// lane-dkey: the palette-neighbour-band gate. A palette-Y block's size and
     /// colours used to stay standing in the mi-granular above/left bands after a
     /// sub-8x8 group was decoded next to it -- the sub-8x8 readers published
