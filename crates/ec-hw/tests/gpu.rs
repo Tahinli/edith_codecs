@@ -1324,6 +1324,114 @@ fn ffmpeg_psnr_at(coded: &Path, source: &Path, fps: u32) -> Option<f64> {
     field.split_whitespace().next()?.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
+/// What the GPU's 10-bit AV1 costs against 10-bit software, on his own film.
+///
+/// The same shape as the 8-bit row, at film B's native 1920x1024 crop and
+/// entirely in the 10-bit domain: no arm ever sees an 8-bit sample, so the
+/// comparison is encoder against encoder rather than depth against depth.
+/// Skips when the manifest has no 10-bit film -- a synthetic gradient would
+/// be a BD-rate number about a gradient.
+#[test]
+fn av1_10bit_bd_row_vs_software() {
+    let Some(display) = display() else { return };
+    let dir = std::env::temp_dir().join("ec-hw-av1-10bit-bd");
+    let _ = std::fs::create_dir_all(&dir);
+    let frames = 12u32;
+    let Some((label, y4m, planes)) = ten_bit_source(&dir, frames) else {
+        eprintln!("skipped: no 10-bit source could be built");
+        return;
+    };
+    if !label.starts_with("film") {
+        eprintln!("skipped: no 10-bit film in the real-library manifest ({label})");
+        return;
+    }
+    let (width, height) = (planes[0].width, planes[0].height);
+    let coded = planes.len() as u32;
+
+    let mut ours = Vec::new();
+    for qp in [180u32, 140, 100, 60] {
+        let data = match encode_stream_16(
+            &display,
+            &planes,
+            qp,
+            RateControlMode::ConstantQp { qp },
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("skipped: 10-bit AV1 encode unavailable ({e})");
+                return;
+            }
+        };
+        let path = dir.join(format!("hw10-{qp}.obu"));
+        std::fs::write(&path, &data).expect("write");
+        if let Some(db) = ffmpeg_psnr(&path, &y4m, true) {
+            ours.push((data.len() as f64 * 8.0 / f64::from(coded), db));
+        }
+    }
+    let rav1e: Vec<(f64, f64)> = [180u32, 140, 100, 60]
+        .iter()
+        .filter_map(|q| {
+            software_point(
+                &dir,
+                &y4m,
+                "film-B-10bit",
+                "librav1e",
+                &[
+                    "-pix_fmt", "yuv420p10le",
+                    "-rav1e-params", &format!("speed=6:quantizer={q}"),
+                    "-g", "60",
+                ],
+                *q,
+                coded,
+            )
+        })
+        .collect();
+    let libaom: Vec<(f64, f64)> = [56u32, 44, 32, 20]
+        .iter()
+        .filter_map(|crf| {
+            software_point(
+                &dir,
+                &y4m,
+                "film-B-10bit",
+                "libaom-av1",
+                &[
+                    "-pix_fmt", "yuv420p10le",
+                    "-cpu-used", "6", "-crf", &crf.to_string(), "-b:v", "0", "-g", "60",
+                ],
+                *crf,
+                coded,
+            )
+        })
+        .collect();
+
+    println!("10-bit BD row: {label}, {width}x{height} yuv420p10le, {coded} frames");
+    for (name, ladder) in [
+        ("hw AV1 10-bit", &ours),
+        ("librav1e 10-bit", &rav1e),
+        ("libaom 10-bit", &libaom),
+    ] {
+        println!("  {name}: {ladder:?}");
+        for pair in ladder.windows(2) {
+            assert!(
+                pair[1].0 > pair[0].0 && pair[1].1 > pair[0].1,
+                "{name}: ladder is not monotone at {pair:?}"
+            );
+        }
+    }
+    if ours.len() >= 3 && rav1e.len() >= 3 {
+        println!(
+            "  BD-rate: hw AV1 10-bit vs librav1e speed 6 10-bit: {:+.1}%",
+            bd_rate(&rav1e, &ours) * 100.0
+        );
+    }
+    if ours.len() >= 3 && libaom.len() >= 3 {
+        println!(
+            "  BD-rate: hw AV1 10-bit vs libaom cpu-used 6 10-bit: {:+.1}%",
+            bd_rate(&libaom, &ours) * 100.0
+        );
+    }
+}
+
 /// What the GPU's AV1 costs against software, on his own content.
 ///
 /// Four quantisers per encoder on a 1920x1080 crop of a film and of a screen
@@ -1652,6 +1760,22 @@ fn av1_encode_speed() {
                 return;
             }
         }
+    }
+    // 10-bit at the size his own films are in: the depth his library is
+    // actually stored at, so the fps that matters for a real export.
+    let planes: Vec<I420_16> = (0..30).map(|t| source_frame_16(3840, 1608, t)).collect();
+    let start = Instant::now();
+    match encode_stream_16(&display, &planes, 90, RateControlMode::ConstantQp { qp: 90 }) {
+        Ok(data) => {
+            let secs = start.elapsed().as_secs_f64();
+            println!(
+                "AV1 encode 3840x1608 10-bit: {:.1} fps ({} frames in {secs:.2} s), {} kbit/frame",
+                planes.len() as f64 / secs,
+                planes.len(),
+                data.len() * 8 / planes.len() / 1000
+            );
+        }
+        Err(e) => eprintln!("skipped: 10-bit AV1 encode unavailable ({e})"),
     }
 }
 

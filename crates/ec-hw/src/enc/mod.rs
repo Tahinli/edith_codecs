@@ -16,6 +16,20 @@
 //! driver composes no headers of its own from thin air: it parses the
 //! sequence and frame header OBUs this crate packs (see `enc::headers::av1`)
 //! and writes the stream's headers from them.
+//!
+//! AV1 encodes at 8 or 10 bits ([`EncoderConfig::bit_depth`]); 10-bit is the
+//! depth his own library is stored at, and `gpu.rs`'s
+//! `av1_10bit_encode_agrees_between_two_decoders` proves a 10-bit stream out
+//! of this path decodes identically through `ec-av1` and libdav1d with
+//! ffprobe reading `yuv420p10le` out of the sequence header.
+//!
+//! # Rate control
+//!
+//! [`RateControlMode`] is not advisory: it is set as
+//! `VAConfigAttribRateControl` when the VA config is created, so an encoder
+//! built for CQP ignores a bitrate handed to it later. CQP, CBR, VBR and QVBR
+//! are all measured by `gpu.rs`'s `av1_encode_rate_control_lands`, which
+//! prints what each mode delivered against what it was asked for.
 
 use std::sync::Arc;
 
