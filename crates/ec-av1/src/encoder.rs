@@ -3512,10 +3512,19 @@ mod tests {
             stream.extend_from_slice(&packet.data);
         }
         let levels = crate::encode::take_deltaq_levels();
-        assert!(
-            levels >= 2,
-            "the quantizer grid was flat ({levels} level(s)): no delta_qindex was coded"
-        );
+        // The quantizer grid rides the tpl map, and `speed::TPL_DEPTH` cuts
+        // the lookahead window to one picture at every preset above 0, so
+        // there IS no map -- and no delta_q syntax -- outside preset 0. The
+        // exactness half below still runs there; only the fire count is
+        // preset-0's to make.
+        if crate::speed::speed() == 0 {
+            assert!(
+                levels >= 2,
+                "the quantizer grid was flat ({levels} level(s)): no delta_qindex was coded"
+            );
+        } else {
+            eprintln!("SKIP the fire count at preset {}: no tpl map", crate::speed::speed());
+        }
         let ours = crate::stream::decode_stream(&stream).expect("our decoder");
         assert_eq!(ours.len(), sources.len(), "our decoder's frames");
         if have_ffmpeg() {

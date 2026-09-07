@@ -35,3 +35,17 @@ film B (2160p HDR source): motion_mode 32x32 SIMPLE=33757 OBMC=0 WARP=1046 | 16x
 film B (2160p HDR source): inter var-tx depths of 77362 blocks -- leaf single 0=13093 1=2331 (15.1% split) | leaf compound 0=29653 1=5369 (15.3% split) | 32x32 single 0=7921 1=5758 (42.1% split) | 32x32 compound 0=8206 1=5031 (38.0% split)
 film B (2160p HDR source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
 film B (2160p HDR source): filter intra on=true blocks 16945 (modes DC=4638 V=2305 H=2417 D157=5827 PAETH=1758)
+| film B (2160p HDR source) 1920x1024 | 46.98 dB/34709 B, 48.12 dB/70826 B, 49.17 dB/150093 B, 50.28 dB/395791 B | +46.7% | +16.6% | 69.1s:23.1s:15.4s |
+screen capture (2026-07-25 02-09-04.mkv): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective None
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): 64x64 roots 20563 (with a residual 0, split luma 0, compound 0)
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=23558 OBMC=0 WARP=139 | 16x16 SIMPLE=1353 OBMC=0 WARP=331 | 8x8 SIMPLE=594 OBMC=0 WARP=684 (0.0% OBMC / 4.3% WARP of 26659 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 40890 blocks -- leaf single 0=7529 1=8410 (52.8% split) | leaf compound 0=3738 1=3351 (47.3% split) | 32x32 single 0=7745 1=8430 (52.1% split) | 32x32 compound 0=994 1=693 (41.1% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 9829 chroma 1102; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+screen capture (2026-07-25 02-09-04.mkv): filter intra on=true blocks 8262 (modes DC=95 V=2448 H=5409 D157=221 PAETH=89)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.88 dB/40365 B, 48.59 dB/51376 B, 50.95 dB/65061 B, 53.14 dB/81143 B | +34.1% | -23.6% | 55.2s:10.3s:14.4s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 608 filtered out; finished in 449.67s
+
+RC=0
