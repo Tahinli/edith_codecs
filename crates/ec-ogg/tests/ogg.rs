@@ -679,7 +679,7 @@ fn flac_headers(rate: u32) -> [Vec<u8>; 2] {
     si[10] = (rate >> 12) as u8;
     si[11] = (rate >> 4) as u8;
     si[12] = ((rate & 0x0f) as u8) << 4 | (1 << 1);
-    ([head, vec![0x84, 0, 0, 0]])
+    [head, vec![0x84, 0, 0, 0]]
 }
 
 fn mux_seek_case(
