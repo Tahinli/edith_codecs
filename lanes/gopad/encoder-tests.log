@@ -1,0 +1,42 @@
+
+running 29 tests
+test encoder::tests::a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders ... ok
+test encoder::tests::a_pyramid_stream_decodes_in_display_order_through_both_decoders ... ok
+test encoder::tests::a_static_clip_codes_64x64_roots_and_decodes_sample_exact ... ok
+test encoder::tests::bitrate_target_lands_within_10_percent_over_48_frames ... ok
+test encoder::tests::bt601_limited_colour_is_reported_by_ffprobe ... ok
+test encoder::tests::bt709_limited_colour_is_reported_by_ffprobe ... ok
+test encoder::tests::bytes_per_frame_controller_never_oscillates_past_its_clamp ... ok
+test encoder::tests::bytes_per_frame_target_settles_within_20_percent ... ok
+test encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders ... ok
+test encoder::tests::every_tile_layout_decodes_sample_exact_through_both_decoders ... ok
+test encoder::tests::filter_replay_codes_the_same_stream_as_a_full_decode ... ok
+test encoder::tests::filter_replay_final_matches_the_capture_decode ... ok
+test encoder::tests::filter_stage_bytes_do_not_depend_on_the_thread_count ... ok
+test encoder::tests::filter_stage_wall_1080p ... ok
+test encoder::tests::filter_stage_wall_4k ... ok
+test encoder::tests::filter_stage_wall_film ... ok
+test encoder::tests::geometry_mismatch_is_refused ... ok
+test encoder::tests::gop_cadence_is_honored ... ok
+test encoder::tests::one_in_one_out_delayed_by_the_lookahead_depth ... ok
+test encoder::tests::quality_target_is_monotone_in_bytes_and_psnr ... ok
+test encoder::tests::the_content_gate_keeps_screen_streams_flat ... ok
+test encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence ... ok
+test encoder::tests::the_mini_gop_layout_leaves_no_short_tail ... ok
+test encoder::tests::thirty_pictures_at_gop_fifteen_decode_to_two_key_frames ... ok
+test encoder::tests::tile_bytes_do_not_depend_on_the_thread_count ... ok
+test encoder::tests::tile_search_wall_1080p ... ok
+test encoder::tests::tile_search_wall_4k ... ok
+test encoder::tests::tile_wall_table_at_1080p ... ok
+test encoder::tests::zero_gop_is_refused ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 560 filtered out; finished in 672.16s
+
+
+running 2 tests
+test encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins ... ok
+test encoder::tests::tile_bytes_do_not_depend_on_the_thread_count ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 587 filtered out; finished in 3.15s
+
+RC=0
