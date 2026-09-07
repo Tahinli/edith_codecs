@@ -147,3 +147,52 @@ three arms. What it needs, from this lane's reading:`
   lose 2 dB of PSNR, which is a pricer that under-charges the cheap type, not
   a decoder or kernel defect -- the typed round trip at 32 is inside its
   bound).
+
+## Invariants, the long-GOP gate and the suite (at the shipped state)
+
+| invariant | preset 0 | preset 6 |
+|---|---|---|
+| `an_inter_clip_codes_both_inter_set_tx_types_both_decoders_read_exactly` (new) | PASS | PASS |
+| `an_edge_clip_codes_every_reduced_set_tx_type_both_decoders_read_exactly` | PASS | PASS |
+| `tile_bytes_do_not_depend_on_the_thread_count --include-ignored` | PASS | PASS |
+| `the_facade_codes_the_same_bytes_as_encode_sequence` | PASS | PASS |
+| `predicted_coeff_bits_track_the_tile_the_writer_wrote` | PASS | PASS |
+| all five above with `EC_COMP_MISMATCH=1` | 0 mismatches | 0 mismatches |
+
+`transform::tests::a_typed_forward_round_trips_like_the_dct_one` now covers
+`side = 32` for `IDTX` (the size the inter search newly offers): PASS.
+`every_speed_preset_decodes_sample_exact_through_both_decoders --ignored`
+with `EC_COMP_MISMATCH=1`: PASS.
+`the_encoders_own_streams_are_byte_identical_to_their_pins`: PASS at the
+UNCHANGED 8562 / 33357 -- no re-pin, the pin clip is not screen content
+(`EC_AV1_TXSET=0` therefore also restores them unchanged).
+
+`encode::tests::bd_rate_film_long_gop` at the shipped state (both rows are
+non-screen, so byte-identical to the encoder before the lane, which the
+12-frame confirm run proves clip by clip):
+
+| clip | shipped | wall ours:libaom:rav1e |
+|---|---|---|
+| film A | +26.4% / -6.6% | 726.9s:52.9s:73.5s |
+| film B | +89.8% / +9.1% | 489.9s:78.8s:52.2s |
+
+Full `ec-av1` suite, detached: **569 passed / 0 failed / 45 ignored**
+(1327.8s). `timeout 890 cargo check --workspace --all-targets -j4`: 0 errors,
+0 `ec-av1` warnings (the 22 warnings the workspace prints are `ec-opus` /
+`ec-vorbis`, untouched by this lane).
+
+## Deferred
+
+* `deferred: reduced_tx_set = 0 and the 13/17 alphabets -- see the scoped
+  section above; unblocked by a lane of its own with two gate slots. Arm it
+  screen-gated from the start.`
+* `deferred: the FILM question behind both halves of this search -- at equal
+  bytes the bars rows lose 2 dB, i.e. the pricer under-charges the cheap type
+  rather than any kernel or decoder being wrong (round trip at 32 is inside
+  its bound, the witness decodes sample-exact through ffmpeg). The upgrade
+  path is the rate term / lambda the type search compares with (class
+  rd-rate-term-calibration), not a wider set -- unblocked by a sweep of that
+  term against the bars and film rows.`
+* `deferred: offering the inter search on a warp/OBMC winner -- commit_inter_luma
+  is skipped entirely for those blocks (motion_won != 0), so they still code
+  DCT_DCT; unblocked by pricing the type on the motion-mode prediction.`
