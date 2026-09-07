@@ -55,16 +55,66 @@ and a block spends at most 24 prices, taken from the tail backwards
 
 ## 12-frame `bd_rate_screen_native` (1920-wide crops, 4 quantizers, vs libaom cpu-used 6 / rav1e speed 6)
 
-| row | control (`EC_AV1_RDOQ=0`) | RDOQ, lambda x1.0 | lambda x0.7 |
-|---|---|---|---|
-| bars 1080p | +2.2 / -14.0 | -0.4 / -16.3 | +0.1 / -15.9 |
-| bars 2160p | +12.7 / -9.8 | +10.5 / -11.7 | +10.9 / -11.4 |
-| film A | +37.1 / +7.3 | **+26.3 / -0.5** | +27.6 / +0.3 |
-| film B | +52.5 / +22.3 | **+37.5 / +9.7** | +39.5 / +11.6 |
-| screen | +33.4 / -23.8 | **+29.1 / -25.7** | +29.6 / -25.5 |
+| row | control (`EC_AV1_RDOQ=0`) | SHIPPED (lambda x2.2) |
+|---|---|---|
+| bars 1080p | +2.2 / -14.0 | -0.9 / -16.7 |
+| bars 2160p | +12.7 / -9.8 | +9.3 / -12.8 |
+| film A | +37.1 / +7.3 | **+24.4 / -1.8** |
+| film B | +52.5 / +22.3 | **+35.5 / +7.6** |
+| screen | +33.4 / -23.8 | **+28.1 / -25.7** |
 
 The control row-for-row reproduces the charter's numbers on this head, so the
 baseline is not stale. The keep rule (both film rows down on both columns,
-screen not worse by 0.3) passes with room: film A -10.8 / -7.8, film B
--15.0 / -12.6, and the screen capture comes DOWN on both columns too.
-lambda x0.7 is worse than x1.0 on every row.
+screen not worse by 0.3) passes with room: film A -12.7 / -9.1, film B
+-17.0 / -14.7, and the screen capture comes DOWN on both columns too.
+
+### The rate-term sweep (`EC_AV1_RDOQ_LAMBDA`, BD vs libaom / vs rav1e)
+
+| x | film A | film B | screen |
+|---|---|---|---|
+| 0.7 | +27.6 / +0.3 | +39.5 / +11.6 | +29.6 / -25.5 |
+| 1.0 | +26.3 / -0.5 | +37.5 / +9.7 | +29.1 / -25.7 |
+| 1.3 | +25.6 / -0.9 | +37.0 / +9.3 | +28.8 / -25.8 |
+| 1.6 | +24.6 / -1.6 | +35.9 / +8.2 | +28.7 / -25.7 |
+| **2.2** | **+24.4 / -1.8** | **+35.5 / +7.6** | **+28.1 / -25.7** |
+| 3.2 | +24.7 / -1.5 | +36.1 / +7.6 | +29.4 / -25.0 |
+
+One bowl, at the same multiplier on all three rows, and it is a factor of TWO
+above the weight the mode search prices the same bits at. The likeliest cause
+is named in `rdoq_lambda`'s doc comment: the price is taken against tables
+that have not adapted yet, which over-states what a coefficient really costs,
+and this is the one decision taken per coefficient.
+
+### The deadzone, re-swept WITH the pass (`EC_AV1_DEADZONE`, at lambda x1.0)
+
+| deadzone | film A | film B | screen |
+|---|---|---|---|
+| 0.42 | +48.1 / +20.7 | +55.7 / +23.8 | +29.0 / -25.6 |
+| **0.5 (shipped)** | **+26.3 / -0.5** | **+37.5 / +9.7** | **+29.1 / -25.7** |
+| 0.6 | +49.3 / +21.5 | +58.4 / +26.6 | +31.4 / -24.8 |
+
+It was fitted without the pass and it survives it: both neighbours are 20+
+points worse on both films. Rounding to nearest and letting the RD pass do
+every zeroing is strictly better than a quantiser that guesses at it, in
+either direction. 0.35 was NOT run: 0.42 is already 22 points the wrong way
+and the arm below it can only be further out (deferred, one gate arm).
+
+## Preset gate (`crate::speed::RDOQ`)
+
+| row | preset 0 off | preset 0 on | preset 6 off | preset 6 on |
+|---|---|---|---|---|
+| film A | +37.1 / +7.3 (77s) | +24.4 / -1.8 (138s) | +46.0 / +14.5 (32s) | +30.4 / +2.9 (60s) |
+| film B | +52.5 / +22.3 (78s) | +35.5 / +7.6 (130s) | +67.8 / +35.0 (30s) | +43.5 / +14.2 (51s) |
+| screen | +33.4 / -23.8 (45s) | +28.1 / -25.7 (79s) | +40.3 / -20.0 (15s) | +34.9 / -22.0 (34s) |
+
+About 2x wall, and it pays at both ends of the measured range. It also
+DOMINATES the ladder: preset 6 with the pass beats preset 0 without it on
+every row and both columns, at less wall. So the lever is on from preset 0 to
+6; 7..=10 are the real-time rungs, are unmeasured here, and keep the cheaper
+choice (`EC_AV1_RDOQ=1` turns it on there).
+
+Wall caveat: every number above is one gate row with a second gate arm running
+beside it on the same box (the lane runs two arms in parallel), which is what
+the gate's own "noisy" label means. Best-of the five preset-0 RDOQ arms
+(lambda 1.0/1.3/1.6/2.2/3.2, all the same work) is film A 131.7s, film B
+118.6s, screen 78.5s against the control's 77.1 / 78.1 / 45.1s -- 1.7-1.8x.
