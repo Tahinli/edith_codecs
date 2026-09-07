@@ -121,3 +121,53 @@ libaom's on both films** (film A -24% bytes, +0.60 dB; film B -12% bytes,
 | 4 | extended transform sets: our streams code set3/set6 symbols only (DCT/ADST), libaom codes set13/set17 on 41% of its `tx_type` symbols | (b)+(c) | txtype bits 0.3% vs 1.4%, but it moves the 53% coefficient bucket | same | `tx_type symbols` row |
 | 5 | residual efficiency at matched q (RDOQ) | (c) | our anchors already spend FEWER coefficient bits per frame and per non-skip mi than libaom's; the excess is non-skip AREA (51.4% at distance 8 vs libaom's 37.2% at distance 30), i.e. prediction, not quantisation | same | area/skip rows |
 | 6 | wedge / interintra / intrabc / global motion | (b) | ZERO symbols in EITHER stream on both films | same | `tools` rows -- these are not the gap on film content; OBMC fires in both |
+
+## 4. The structure lever the census pointed at, measured and REFUTED
+
+Mechanism 1 (anchor count) is the biggest single number, so it was probed
+first, in the shape libaom actually uses: a longer mini-GOP with an extra
+pyramid level under it (so the anchors get sparser without the leaves getting
+farther from one), and libaom's much deeper anchor quantiser spread (its key
+sits 106 qindex below its leaves; ours sits 60 below). Arms are
+`EC_AV1_PYRAMID` on `enc_probe`'s q150 and q90 points, film B, the gate's own
+window; each arm is judged at the CONTROL's two PSNRs through its own
+rate/quality slope, so "worse" means more bytes at the same quality.
+
+| arm | q150 point | q90 point | vs control at 45.663 dB | at 47.910 dB |
+|---|---|---|---|---|
+| control `8:-32:12:-8:-48` | 88290 B / 45.663 dB | 441309 B / 47.910 dB | — | — |
+| `16:-32:12:-8:-48:0` (mini-GOP 16, 4 levels) | 77769 / 45.388 | 390342 / 47.765 | **+7.2%** | -1.9% |
+| `16:-32:12:-8:-48:4` | 76929 / 45.354 | 385650 / 47.749 | **+7.3%** | -2.4% |
+| `16:-50:12:-8:-60:0` (deep anchors too) | 100622 / 45.752 | 479176 / 47.968 | **+7.0%** | +4.2% |
+| `8:-50:12:-8:-60` (deep anchors only) | 124809 / 46.141 | 607880 / 48.221 | -2.0% | **+8.9%** |
+
+Every arm is worse at one end and no arm is better at both, which is nowhere
+near the keep rule. Fewer anchors DO cost fewer bytes -- and lose exactly as
+much quality. That makes this the sixth independent refutation of the
+structure/allocation axis (lane-pyr3/4/5/6, lane-arfcen, here), and it is why
+mechanism 1 is NOT a lever in `encoder.rs` at this parameterisation: our
+anchors are already priced right for what our anchors can do. What libaom has
+that lets ONE anchor per 16 pictures hold the group is not the offsets -- it
+is per-SB `delta_q` (mechanism 3) and the 128-root partition (mechanism 2)
+placing quality where it propagates.
+
+**No encoder lever ships from this lane.** The ranking's top two are
+capability gaps, not allocation knobs.
+
+## 5. What should follow, in order
+
+1. **A 128x128 superblock encoder lane.** `use_128x128_superblock = 0` in our
+   sequence header, so `partition_w128` and every 128-rooted block are dead
+   syntax on the encode side while the DECODER already reads them. libaom puts
+   41% of its blocks and 88% of its shown-leaf blocks there; our leaves spend
+   more bits on MODE signalling (5.2 kB) than on coefficients (1.6 kB). Bytes
+   at stake ~5-8 kB of a 42 kB gap on film B, ~10 kB of 60 kB on film A.
+2. **A per-SB `delta_q` lane** (libaom's `deltaq-mode`, fed by the tpl map the
+   pyramid path already builds since lane-arfcen). We code `delta_q` in no
+   frame; libaom codes it in all of them.
+3. The RDOQ lane already running owns mechanism 5, but note what this census
+   says about it: at the anchors our coefficient bits per frame (37.3 kbit)
+   and per non-skip mi (0.59 bits) are already BELOW libaom's (49.2 kbit,
+   1.08 bits). The anchor excess is non-skip AREA -- prediction quality at
+   distance 8 -- not quantisation.
+4. Extended transform sets (set13/set17) are unused by us entirely.
