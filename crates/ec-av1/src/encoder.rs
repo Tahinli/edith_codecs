@@ -704,6 +704,10 @@ impl Default for Pyramid {
     /// so the third level is worth more than a shorter group, and the census
     /// (`lanes/census-longgop.md`) says why: at 8 pictures our leaves are
     /// already cheap and the bytes sit in the ARFs.
+    ///
+    /// The 12-frame gate keeps its numbers exactly (+43.9 / +15.6 and +68.4 /
+    /// +38.2, byte-identical streams): a GOP that is one single mini-GOP does
+    /// not code the third level at all (see `drain_pending`).
     fn default() -> Self {
         Self {
             mini_gop: 8,
@@ -1468,7 +1472,18 @@ impl Av1Encoder {
         // run, coded off the anchor with the top ARF as its own backward
         // reference. It needs a leaf on both sides of it, so a group of
         // three or fewer stays two-level.
-        let mid = pyramid.mid_q_offset.filter(|_| leaves >= 3).map(|offset| {
+        //
+        // AND IT NEEDS A RUN LONG ENOUGH TO AMORTISE IT: a GOP that is one
+        // single mini-GOP (`group_target` absorbs a tail, so a 12-picture GOP
+        // under `mini_gop` 8 is ONE group of 11) pays for the second hidden
+        // frame out of eleven pictures and reads +2.8 BD points worse against
+        // libaom on film B at every mid offset measured (-4: +71.1, -8:
+        // +71.2, against the two-level +68.4), while the 48-picture GOP -- six
+        // groups sharing the same machinery -- is 6.0 points BETTER. So the
+        // third level is switched on by the RUN's length, not by the group's:
+        // the same GOP-length dependence `group_target` itself was built for.
+        let long_run = self.config.gop > pyramid.mini_gop + pyramid.mini_gop / 2;
+        let mid = pyramid.mid_q_offset.filter(|_| leaves >= 3 && long_run).map(|offset| {
             let at = (leaves - 1) / 2;
             (at, offset)
         });
