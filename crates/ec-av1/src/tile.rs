@@ -1770,9 +1770,10 @@ pub enum Quadrant {
     /// and the other three carry [`Covered`](Quadrant::Covered), so the
     /// per-32x32-entry shape the inter writer takes is unchanged.
     ///
-    /// The block is coded SKIP and single-reference: a 64x64 residual needs
-    /// the forward TX_64X64 the encoder does not have (`transform.rs` tops
-    /// out at 32x32), and the writer refuses anything else.
+    /// The block is single-reference; the writer refuses a compound one. It
+    /// may be skipped or carry a real residual -- one TX_64X64 luma transform
+    /// whose coded quarter is a 32x32 level grid, and one TX_32X32 per chroma
+    /// plane (lane-tx64, `crate::encode::b64_residual`).
     Whole64(BlockCoeffs),
     /// A quadrant a [`Whole64`](Quadrant::Whole64) at its superblock's
     /// top-left already coded; it carries no block of its own.
@@ -4365,9 +4366,24 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
             let side = match q {
                 Quadrant::Whole(_) => 32,
                 Quadrant::Split(_) => 16,
-                // A 64x64 root is skip-only, so it carries no coefficient
-                // bits to predict at all (`Quadrant::Whole64`).
-                Quadrant::Whole64(_) | Quadrant::Covered => return 0.0,
+                // lane-tx64: a 64x64 root that codes a residual pays for one
+                // TX_64X64 luma transform (only the top-left 32x32 carries
+                // coefficients) and one TX_32X32 per chroma plane -- the same
+                // three prices `predicted_coeff_bits_sb` takes for a key
+                // frame's whole superblock, and the same sets the writer's
+                // `Whole64` arm codes. `block_bits`'s table has no 64 row, so
+                // it is spelled out here.
+                Quadrant::Whole64(block) => {
+                    return match block.skip {
+                        true => 0.0,
+                        false => {
+                            coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx, 0, 0)
+                                + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx, 0, 0)
+                                + coeff_bits(&dense(&block.v, 32), TxbSet::Chroma32, q_ctx, 0, 0)
+                        }
+                    };
+                }
+                Quadrant::Covered => return 0.0,
             };
             q.blocks().iter().map(|b| block_bits(b, side, q_ctx)).sum::<f64>()
         })
@@ -5599,8 +5615,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
             );
             // lane-b64: a superblock the search left WHOLE — one 64x64 block
             // at `PARTITION_NONE`, carried by its top-left quadrant's entry
-            // ([`Quadrant::Whole64`]). Coded skip and single-reference: no
-            // residual, so no TX_64X64 coefficients and no `cdef_idx`.
+            // ([`Quadrant::Whole64`]). Single-reference; skipped, or with a
+            // real residual through `TxbSet::Luma64` + two `Chroma32`
+            // (lane-tx64).
             let sb64 = ((sb_r * 2) < rows && (sb_c * 2) < cols)
                 .then(|| &blocks[((sb_r * 2) * cols + sb_c * 2) as usize])
                 .and_then(|q| match q {
