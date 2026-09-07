@@ -2836,3 +2836,126 @@ mod tests {
     }
 
 }
+
+/// The lossless inverse transform: libaom `av1_iwht4x4_16_add_c`
+/// (`aom_dsp/inv_txfm.c:22`), the 4x4 Walsh-Hadamard a frame with
+/// `Lossless == 1` uses for every plane instead of the DCT/ADST network
+/// (`inv_txfm_add`, `av1/common/idct.c:69`: `if (txfm_param->lossless) {
+/// assert(tx_type == DCT_DCT); av1_iwht4x4_add(...); return; }`).
+///
+/// `dq` is the DEQUANTIZED grid; each input is shifted down by
+/// `UNIT_QUANT_SHIFT` (2, `aom_dsp/inv_txfm.h`) before the row pass, which at
+/// `qindex == 0` (`dc_q(0) == ac_q(0) == 4` at every bit depth) undoes the
+/// dequantization exactly -- that is what makes the round trip lossless.
+pub fn inverse_wht4x4(dq: &[i32]) -> Vec<i32> {
+    debug_assert_eq!(dq.len(), 16);
+    let mut out = [0i32; 16];
+    for i in 0..4 {
+        let ip = &dq[i * 4..];
+        let (mut a1, mut c1, mut d1, mut b1) = (ip[0] >> 2, ip[1] >> 2, ip[2] >> 2, ip[3] >> 2);
+        a1 += c1;
+        d1 -= b1;
+        let e1 = (a1 - d1) >> 1;
+        b1 = e1 - b1;
+        c1 = e1 - c1;
+        a1 -= b1;
+        d1 += c1;
+        out[i * 4] = a1;
+        out[i * 4 + 1] = b1;
+        out[i * 4 + 2] = c1;
+        out[i * 4 + 3] = d1;
+    }
+    let mut res = vec![0i32; 16];
+    for i in 0..4 {
+        let (mut a1, mut c1, mut d1, mut b1) = (out[i], out[4 + i], out[8 + i], out[12 + i]);
+        a1 += c1;
+        d1 -= b1;
+        let e1 = (a1 - d1) >> 1;
+        b1 = e1 - b1;
+        c1 = e1 - c1;
+        a1 -= b1;
+        d1 += c1;
+        res[i] = a1;
+        res[4 + i] = b1;
+        res[8 + i] = c1;
+        res[12 + i] = d1;
+    }
+    res
+}
+
+/// [`inverse_wht4x4`] with the spec 7.12.3 dequantization in front of it, the
+/// lossless twin of [`dequant_and_inverse_typed_wh`] (same empty-grid
+/// marker contract).
+pub fn dequant_and_inverse_wht4x4(
+    levels: &[i32],
+    bit_depth: u8,
+    q_idx: i32,
+    dc_delta: i32,
+    ac_delta: i32,
+) -> Vec<i32> {
+    if crate::decode::is_zero_grid(levels) {
+        return Vec::new();
+    }
+    DQ_SCRATCH.with(|cell| {
+        let mut dq = cell.borrow_mut();
+        crate::quant::dequant_wh_into(levels, &mut dq, 4, 4, bit_depth, q_idx, dc_delta, ac_delta);
+        inverse_wht4x4(&dq[..16])
+    })
+}
+
+#[cfg(test)]
+mod lossless_tx_tests {
+    /// The WHT is its own inverse up to the `UNIT_QUANT_SHIFT` scaling: a
+    /// forward pass (libaom `av1_fwht4x4_c`, which scales UP by 4 through
+    /// `output[i] * UNIT_QUANT_SHIFT`) followed by [`super::inverse_wht4x4`]
+    /// on the dequantized levels (`q == 4` at qindex 0) returns the residual
+    /// EXACTLY -- that identity is the whole lossless claim.
+    #[test]
+    fn the_walsh_hadamard_round_trip_is_exact() {
+        // The exact integer inverse of [`super::inverse_wht4x4`]'s two
+        // butterflies, run in the opposite order (columns then rows) and
+        // scaled back up by `UNIT_QUANT_SHIFT` -- the encoder side of the
+        // lossless pair (libaom `av1_fwht4x4_c`).
+        fn undo(a2: i32, b2: i32, c2: i32, d2: i32) -> (i32, i32, i32, i32) {
+            let a1 = a2 + b2;
+            let d1 = d2 - c2;
+            let e1 = (a1 - d1) >> 1;
+            let b = e1 - b2;
+            let c = e1 - c2;
+            (a1 - c, b, c, d1 + b)
+        }
+        fn fwht(residual: &[i32]) -> Vec<i32> {
+            let mut t = residual.to_vec();
+            for i in 0..4 {
+                let (a, b, c, d) = undo(t[i], t[4 + i], t[8 + i], t[12 + i]);
+                t[i] = a;
+                t[4 + i] = c;
+                t[8 + i] = d;
+                t[12 + i] = b;
+            }
+            let mut out = vec![0i32; 16];
+            for i in 0..4 {
+                let (a, b, c, d) = undo(t[i * 4], t[i * 4 + 1], t[i * 4 + 2], t[i * 4 + 3]);
+                out[i * 4] = a * 4;
+                out[i * 4 + 1] = c * 4;
+                out[i * 4 + 2] = d * 4;
+                out[i * 4 + 3] = b * 4;
+            }
+            out
+        }
+        let mut state = 0x1234_5678u32;
+        for _ in 0..200 {
+            let residual: Vec<i32> = (0..16)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((state >> 20) as i32 % 511) - 255
+                })
+                .collect();
+            let levels = fwht(&residual);
+            // The forward pass already carries libaom's `UNIT_QUANT_SHIFT`
+            // scale-up, so the coded level is `levels / 4` and qindex 0's
+            // dequantization (times 4) hands `levels` straight back.
+            assert_eq!(super::inverse_wht4x4(&levels), residual, "levels={levels:?}");
+        }
+    }
+}
