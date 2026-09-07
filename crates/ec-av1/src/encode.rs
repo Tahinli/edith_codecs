@@ -14092,6 +14092,7 @@ mod tests {
             let _ = crate::tile::take_palette_uv_hits();
             let _ = crate::tile::take_intrabc_hits();
             let _ = take_intrabc_search();
+            let _ = crate::tile::take_filter_intra_hits();
             // The sequence path itself codes the pyramid now
             // (lane-av1pyrdef), and prints what it requested and what the
             // content gate left effective.
@@ -14137,6 +14138,20 @@ mod tests {
                 search[0],
                 search[1],
                 search[2],
+            );
+            // gate-blind-to-feature: how often the five recursive filter-intra
+            // modes actually won a block over this clip's four encodes -- a
+            // tool that never fires is not measured by the row above it.
+            let fi = crate::tile::take_filter_intra_hits();
+            eprintln!(
+                "{name}: filter intra on={} blocks {} (modes DC={} V={} H={} D157={} PAETH={})",
+                filter_intra_on(),
+                fi[0],
+                fi[1],
+                fi[2],
+                fi[3],
+                fi[4],
+                fi[5],
             );
             let (aom, aom_wall) = external_ladder(&source, cw, ch, "libaom-av1", &aom_points);
             let (rav1e, rav1e_wall) = external_ladder(&source, cw, ch, "librav1e", &rav1e_points);

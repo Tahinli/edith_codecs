@@ -38019,6 +38019,68 @@ mod tests {
         }
     }
 
+    /// lane-fintra: the encoder's own filter-intra blocks, read back by BOTH
+    /// decoders. Two claims in one gate: the stream really exercises the tool
+    /// (the decoder's own `use_filter_intra == 1` counter moves, class
+    /// `gate-blind-to-feature` -- a feature that never fires is not measured),
+    /// and every sample of the frame that carries them matches ffmpeg's
+    /// (class `fixture-proves-symbol-not-signal`: the symbol alone would not
+    /// prove the recursive predictor, the tx_type row or the syntax position
+    /// between the palette colours and the colour-index maps).
+    #[test]
+    fn a_filter_intra_key_frame_decodes_pixel_exact_through_ffmpeg() {
+        let fctx = &crate::decode::FrameCtx::new();
+        if !crate::encode::filter_intra_on() {
+            eprintln!("SKIP a_filter_intra_key_frame...: EC_AV1_FILTER_INTRA=0");
+            return;
+        }
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_filter_intra_key_frame...: no ffmpeg");
+            return;
+        }
+        let (width, height) = (128usize, 128usize);
+        // Smooth, slowly curving content: what the recursive filter modes are
+        // for, and what a plain directional prediction leaves residual on.
+        let mut picture = crate::encode::Picture::grey(width, height);
+        for row in 0..height {
+            for col in 0..width {
+                let v = 128.0
+                    + 60.0 * ((row as f64) / 9.0).sin() * ((col as f64) / 11.0).cos()
+                    + 8.0 * ((row + col) as f64 / 3.0).sin();
+                picture.y[row * width + col] = v.clamp(0.0, 255.0) as u16;
+            }
+        }
+        let encoded = crate::encode::encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
+        let (coded_w, coded_h) = ffprobe_size(&encoded.stream);
+        let before = filter_intra_hits();
+        let ours = decode_key_frame_tile_lr(
+            &encoded.tile,
+            encoded.mi_cols,
+            encoded.mi_rows,
+            encoded.base_q_idx,
+            coded_w,
+            coded_h,
+            crate::encode::filter_intra_on(),
+            &encoded.cdef,
+            &encoded.loop_filter,
+            encoded.tx_select,
+            true,
+            encoded.screen,
+            encoded.allow_intrabc,
+            &encoded.loop_restoration,
+            fctx,
+        )
+        .unwrap();
+        let fired = filter_intra_hits() - before;
+        assert!(fired > 0, "no block took filter intra -- the gate is blind to the feature");
+        eprintln!("a_filter_intra_key_frame: {fired} filter-intra blocks");
+        let ffmpeg_decoded = ffmpeg_decode(&encoded.stream, coded_w as usize, coded_h as usize);
+        assert_eq!(ours.y, ffmpeg_decoded.y, "luma vs ffmpeg");
+        assert_eq!(ours.u, ffmpeg_decoded.u, "U vs ffmpeg");
+        assert_eq!(ours.v, ffmpeg_decoded.v, "V vs ffmpeg");
+        assert_eq!(ours.y, encoded.reconstruction.y, "luma vs the encoder's own reconstruction");
+    }
+
     /// The key frame the encoder writes carries `tx_mode == TxMode::Select`,
     /// and that header bit is load-bearing for a decode of its tile: read as a
     /// `TxMode::Largest` frame the very first block misses its `tx_depth`
