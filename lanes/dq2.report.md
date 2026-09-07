@@ -23,6 +23,24 @@ VERDICT preset 3: **reject**. Film A moves -0.3 / 0.0 (below the 0.5 the keep ru
 single row), film B moves +0.6 / +0.7 WORSE on both columns, and screen is +0.4 worse vs libaom
 (over the 0.3 bound). The two bars rows are fixtures, never a decision.
 
+### preset 6 (`EC_AV1_SPEED=6`, tpl depth 4)
+
+| arm | bars 1080p | bars 2160p | film A | film B | screen |
+|---|---|---|---|---|---|
+| control | +68.4 / +40.0 | +62.7 / +28.0 | +27.2 / -0.2 | +35.2 / +6.6 | +34.8 / -22.3 |
+| `EC_AV1_DELTAQ=2` | +67.0 / +40.2 | +64.1 / +29.5 | +26.6 / -0.4 | +34.7 / +6.4 | +35.3 / -22.2 |
+
+Control reproduces the charter's preset-6 row to the digit.
+VERDICT preset 6: **both film rows pass, the screen row fails the rule.** Film A -0.6 / -0.2 and
+film B -0.5 / -0.2, i.e. both real films improve on both columns -- the first arm in which
+delta_q is a win on film at all, and the tpl window is what made it one. Screen capture is +0.5
+worse vs libaom (bound is 0.3), so under the keep rule as written `DELTAQ_RES` does NOT ship on
+at preset 6 either.
+
+The shape is the one lane-b64b already met: a lever that pays on film and loses on the capture.
+The fix there was a `!screen` content gate on the tool. That gate lives in `encode.rs`
+(`deltaq_res_log2`), outside this lane's scope -- see the deferred list.
+
 ## 2. long-GOP tpl depth, preset 0
 
 ## 3. Shipped constants
