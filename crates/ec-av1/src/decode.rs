@@ -2099,6 +2099,18 @@ pub(crate) fn intra_in_inter_split_tx_hits() -> [usize; 4] {
 /// (`set`) / consumes it (`take`). Set and take MUST pair: a buffer armed at a
 /// site whose reconstruct never runs would be picked up by the NEXT block's
 /// reconstruct (class [[refusal-hides-a-defect]] / stale thread-local), so
+/// lane-lossless2: one transform unit's window on a block-sized palette
+/// prediction buffer. A unit reads its prediction at ITS OWN stride, so
+/// handing it the whole-block buffer makes every unit reconstruct the block's
+/// top-left corner (the luma split-transform paths already window; the chroma
+/// ones did not, which is invisible until a lossless frame codes a palette
+/// block as 4x4 chroma units).
+fn palette_window(buf: &[u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize) -> Vec<u16> {
+    (0..h)
+        .flat_map(|r| buf[(oy + r) * stride + ox..][..w].iter().copied())
+        .collect()
+}
+
 /// `EC_DEBUG_PAL=1` traces every arm and every consumption with its call site.
 #[track_caller]
 fn set_palette_pred(buf: Vec<u16>, fctx: &crate::decode::FrameCtx) {
@@ -9601,8 +9613,9 @@ fn decode_rect_split(
                     );
                     let (cu_x, cu_y) = (cpx + cu_col * 4, cpy + cu_row * 4);
                     if let Some((ub, vb)) = &m.palette_uv {
+                        let pbuf = if plane_idx == 1 { ub } else { vb };
                         set_palette_pred(
-                            if plane_idx == 1 { ub.clone() } else { vb.clone() },
+                            palette_window(pbuf, chroma_w, cu_col * 4, cu_row * 4, 4, 4),
                             fctx,
                         );
                     }
@@ -14498,8 +14511,12 @@ fn decode_block(
                 };
                 let (cu_x, cu_y) = (cpx + cu_col * chroma_tx, cpy + cu_row * chroma_tx);
                 if let Some((ub, vb)) = &palette_uv_bufs {
+                    let pbuf = if plane_pass == 1 { ub } else { vb };
                     set_palette_pred(
-                        if plane_pass == 1 { ub.clone() } else { vb.clone() },
+                        palette_window(
+                            pbuf, chroma_side, cu_col * chroma_tx, cu_row * chroma_tx,
+                            chroma_tx, chroma_tx,
+                        ),
                         fctx,
                     );
                 }
@@ -24494,16 +24511,28 @@ fn read_intra_chroma_lossless(
         for rr in 0..reg_h / 4 {
             for cc in 0..reg_w / 4 {
                 let (ox, oy) = (org_x + cc * 4, org_y + rr * 4);
+                // libaom's `max_blocks_wide/high` clip: a unit whose origin is
+                // past the frame edge is not coded at all
+                // (`decode_token_recon_block`), same test `decode_block`'s
+                // luma loop already runs.
+                if cpx + ox >= u.true_width || cpy + oy >= u.true_height {
+                    continue;
+                }
                 let cu_mi = (at_mi.0 + oy / 2, at_mi.1 + ox / 2);
-                let cu_around = neighbours.around_mi(cu_mi, 8);
+                // libaom's chroma entropy-context arrays are SUBSAMPLED:
+                // `get_txb_ctx` reads exactly one entry per plane for a
+                // TX_4X4 chroma unit (`a[0]`/`l[0]`). Our bands are luma-mi
+                // indexed and carry that one entry replicated over the unit's
+                // two cells, so one cell is the same answer -- and the second
+                // cell is past the band on a unit whose block hangs off the
+                // frame edge, which libaom still codes.
+                let cu_around = neighbours.around_mi(cu_mi, MI);
                 let cu_reach = tu_reach(
                     side, side, ox * 2, oy * 2, 8, reach, px, py, frame_w, frame_h, fctx,
                 );
                 if let Some((ub, vb)) = palette_uv_bufs {
-                    set_palette_pred(
-                        if plane_idx == 1 { ub.to_vec() } else { vb.to_vec() },
-                        fctx,
-                    );
+                    let buf = if plane_idx == 1 { ub } else { vb };
+                    set_palette_pred(palette_window(buf, stride, ox, oy, 4, 4), fctx);
                 }
                 let buf: &mut PlaneBuf<'static> =
                     if plane_idx == 1 { &mut *u } else { &mut *v };
@@ -24590,10 +24619,24 @@ fn read_inter_chroma_lossless(
         for rr in 0..reg_h / 4 {
             for cc in 0..reg_w / 4 {
                 let (ox, oy) = (org_x + cc * 4, org_y + rr * 4);
+                // libaom's `max_blocks_wide/high` clip: a unit whose origin is
+                // past the frame edge is not coded at all
+                // (`decode_token_recon_block`), same test `decode_block`'s
+                // luma loop already runs.
+                if cpx + ox >= u.true_width || cpy + oy >= u.true_height {
+                    continue;
+                }
                 // The chroma neighbour bands are indexed in LUMA mi: 4 chroma
                 // pixels span 8 luma ones, i.e. 2 mi.
                 let cu_mi = (at_mi.0 + oy / 2, at_mi.1 + ox / 2);
-                let cu_around = neighbours.around_mi(cu_mi, 8);
+                // libaom's chroma entropy-context arrays are SUBSAMPLED:
+                // `get_txb_ctx` reads exactly one entry per plane for a
+                // TX_4X4 chroma unit (`a[0]`/`l[0]`). Our bands are luma-mi
+                // indexed and carry that one entry replicated over the unit's
+                // two cells, so one cell is the same answer -- and the second
+                // cell is past the band on a unit whose block hangs off the
+                // frame edge, which libaom still codes.
+                let cu_around = neighbours.around_mi(cu_mi, MI);
                 let (src, buf) = if plane_idx == 1 {
                     (su, &mut *u)
                 } else {
