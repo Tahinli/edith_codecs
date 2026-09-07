@@ -3579,11 +3579,11 @@ mod tests {
         }
         let levels = crate::encode::take_deltaq_levels();
         // The quantizer grid rides the tpl map, and `speed::TPL_DEPTH` cuts
-        // the lookahead window to one picture at every preset above 0, so
-        // there IS no map -- and no delta_q syntax -- outside preset 0. The
-        // exactness half below still runs there; only the fire count is
-        // preset-0's to make.
-        if crate::speed::speed() == 0 {
+        // the lookahead window to one picture at the top presets, so there IS
+        // no map -- and no delta_q syntax -- there. The exactness half below
+        // still runs; only the fire count needs a window (lane-tplwin: the
+        // predicate is the window, not preset 0, since presets 1..6 have one).
+        if crate::speed::at(&crate::speed::TPL_DEPTH) > 1 {
             assert!(
                 levels >= 2,
                 "the quantizer grid was flat ({levels} level(s)): no delta_qindex was coded"

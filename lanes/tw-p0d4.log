@@ -1,0 +1,56 @@
+
+running 1 test
+test encode::tests::bd_rate_screen_native ... 
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+bars 1080p: pricer armings default=17 real=185
+bars 1080p: key 64x64 intra roots 1520 of 1920 offered (79.2%)
+bars 1080p: 64x64 roots 17516 (with a residual 12850, split luma 3222, compound 6569)
+bars 1080p: motion_mode 32x32 SIMPLE=35380 OBMC=0 WARP=188 | 16x16 SIMPLE=4784 OBMC=0 WARP=456 | 8x8 SIMPLE=17551 OBMC=0 WARP=3505 (0.0% OBMC / 6.7% WARP of 61864 eligible)
+bars 1080p: inter var-tx depths of 10513 blocks -- leaf single 0=1456 1=1047 (41.8% split) | leaf compound 0=613 1=607 (49.8% split) | 32x32 single 0=674 1=1846 (73.3% split) | 32x32 compound 0=2084 1=2186 (51.2% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+bars 1080p: filter intra on=true blocks 29269 (modes DC=6768 V=3604 H=5240 D157=8889 PAETH=4768)
+| bars 1080p 1920x1024 | 43.55 dB/193477 B, 47.33 dB/297920 B, 50.85 dB/419421 B, 54.04 dB/566617 B | -1.4% | -17.1% | 179.6s:7.5s:17.6s |
+bars 2160p: sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+bars 2160p: pricer armings default=14 real=173
+bars 2160p: key 64x64 intra roots 1704 of 1920 offered (88.8%)
+bars 2160p: 64x64 roots 18430 (with a residual 12524, split luma 2544, compound 6922)
+bars 2160p: motion_mode 32x32 SIMPLE=28046 OBMC=0 WARP=184 | 16x16 SIMPLE=2889 OBMC=0 WARP=405 | 8x8 SIMPLE=7458 OBMC=0 WARP=301 (0.0% OBMC / 2.3% WARP of 39283 eligible)
+bars 2160p: inter var-tx depths of 8598 blocks -- leaf single 0=1042 1=441 (29.7% split) | leaf compound 0=808 1=270 (25.0% split) | 32x32 single 0=301 1=1364 (81.9% split) | 32x32 compound 0=129 1=4243 (97.0% split)
+bars 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+bars 2160p: filter intra on=true blocks 12802 (modes DC=3379 V=890 H=2559 D157=4088 PAETH=1886)
+| bars 2160p 1920x1024 | 43.15 dB/207786 B, 47.28 dB/323855 B, 50.97 dB/437071 B, 54.36 dB/565802 B | +9.9% | -12.2% | 143.5s:6.1s:17.0s |
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+film A (1080p source): pricer armings default=20 real=212
+film A (1080p source): key 64x64 intra roots 385 of 1440 offered (26.7%)
+film A (1080p source): 64x64 roots 8905 (with a residual 8282, split luma 4377, compound 3552)
+film A (1080p source): motion_mode 32x32 SIMPLE=38408 OBMC=0 WARP=2043 | 16x16 SIMPLE=14636 OBMC=0 WARP=1613 | 8x8 SIMPLE=4645 OBMC=0 WARP=849 (0.0% OBMC / 7.2% WARP of 62194 eligible)
+film A (1080p source): inter var-tx depths of 60515 blocks -- leaf single 0=11344 1=1734 (13.3% split) | leaf compound 0=23249 1=3460 (13.0% split) | 32x32 single 0=5977 1=4489 (42.9% split) | 32x32 compound 0=6333 1=3929 (38.3% split)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film A (1080p source): filter intra on=true blocks 20125 (modes DC=4846 V=3129 H=3915 D157=5776 PAETH=2459)
+| film A (1080p source) 1920x768 | 44.02 dB/64317 B, 45.56 dB/102209 B, 46.87 dB/170292 B, 48.15 dB/413104 B | +21.5% | -4.5% | 226.3s:13.8s:20.5s |
+film B (2160p HDR source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+film B (2160p HDR source): pricer armings default=19 real=186
+film B (2160p HDR source): key 64x64 intra roots 753 of 1920 offered (39.2%)
+film B (2160p HDR source): 64x64 roots 15054 (with a residual 10191, split luma 3735, compound 6762)
+film B (2160p HDR source): motion_mode 32x32 SIMPLE=41308 OBMC=0 WARP=1524 | 16x16 SIMPLE=9257 OBMC=0 WARP=895 | 8x8 SIMPLE=1893 OBMC=0 WARP=408 (0.0% OBMC / 5.1% WARP of 55285 eligible)
+film B (2160p HDR source): inter var-tx depths of 52830 blocks -- leaf single 0=11225 1=1329 (10.6% split) | leaf compound 0=20295 1=2600 (11.4% split) | 32x32 single 0=6035 1=3563 (37.1% split) | 32x32 compound 0=5280 1=2503 (32.2% split)
+film B (2160p HDR source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film B (2160p HDR source): filter intra on=true blocks 11579 (modes DC=3183 V=1594 H=1868 D157=3790 PAETH=1144)
+| film B (2160p HDR source) 1920x1024 | 46.71 dB/27495 B, 47.87 dB/50441 B, 48.94 dB/105426 B, 50.08 dB/296170 B | +27.6% | +0.1% | 149.6s:20.8s:19.3s |
+screen capture (2026-07-25 02-09-04.mkv): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective None
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=155 real=0
+screen capture (2026-07-25 02-09-04.mkv): key 64x64 intra roots 878 of 1920 offered (45.7%)
+screen capture (2026-07-25 02-09-04.mkv): 64x64 roots 20386 (with a residual 0, split luma 0, compound 0)
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=24932 OBMC=0 WARP=479 | 16x16 SIMPLE=1344 OBMC=0 WARP=310 | 8x8 SIMPLE=552 OBMC=0 WARP=634 (0.0% OBMC / 5.0% WARP of 28251 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 7849 blocks -- leaf single 0=1277 1=1036 (44.8% split) | leaf compound 0=417 1=427 (50.6% split) | 32x32 single 0=1432 1=2846 (66.5% split) | 32x32 compound 0=168 1=246 (59.4% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 8687 chroma 993; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+screen capture (2026-07-25 02-09-04.mkv): filter intra on=true blocks 6637 (modes DC=64 V=1883 H=4425 D157=199 PAETH=66)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.66 dB/39127 B, 48.14 dB/48233 B, 50.39 dB/59136 B, 52.63 dB/72191 B | +27.7% | -26.1% | 77.4s:9.3s:12.7s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 610 filtered out; finished in 948.85s
+
+RC=0
