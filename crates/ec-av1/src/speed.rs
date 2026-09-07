@@ -169,6 +169,13 @@ pub(crate) fn at<T: Copy>(table: &[T; 11]) -> T {
 /// (screen). So it is on at every preset.
 pub(crate) const B64_ROOT: [bool; 11] = [crate::encode::B64_ROOT; 11];
 
+/// `encode::rdoq_on`: rate-distortion optimised quantisation
+/// ([`crate::tile::rdoq`], lane-rdoq). Provisional table -- the wall/BD
+/// measurement per preset is in `lanes/rdoq.report.md`.
+pub(crate) const RDOQ: [bool; 11] = [
+    true, true, true, false, false, false, false, false, false, false, false,
+];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [
