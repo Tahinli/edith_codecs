@@ -81,3 +81,61 @@ Film B decides it: shortening the window to 4 costs 0.7 points on BOTH columns
 of the 2160p film, past the keep rule's bound, for 7.7% of that row's wall,
 while film A moves 0.2 the other way and screen 0.1. **8 stays the preset-0
 default, so the byte pins do not move.** Logs `lanes/tw-p0d{8,4}.log`.
+
+### Depth 4 (the arm that ships at presets 3..6)
+
+| row | preset 3 d1 | preset 3 **d4** | preset 3 d8 | preset 6 d1 | preset 6 **d4** | preset 6 d8 |
+|---|---|---|---|---|---|---|
+| bars 1080p | +43.9 / +21.2 | +43.1 / +20.4 | +44.2 / +21.4 | +67.6 / +39.5 | +68.4 / +40.0 | +69.2 / +40.7 |
+| bars 2160p | +49.1 / +18.9 | +49.2 / +19.0 | +48.9 / +18.9 | +63.8 / +29.0 | +62.7 / +28.0 | +64.1 / +29.4 |
+| film A | +22.5 / -3.9 | +22.3 / -4.1 | +22.5 / -3.9 | +27.0 / -0.3 | +27.2 / -0.2 | +27.0 / -0.4 |
+| film B | +27.6 / +0.1 | +27.3 / -0.3 | +27.7 / +0.1 | +35.9 / +7.2 | +35.2 / +6.6 | +35.6 / +6.9 |
+| screen | +33.5 / -23.1 | +33.4 / -23.2 | +32.9 / -23.4 | +34.7 / -22.4 | +34.8 / -22.3 | +34.9 / -22.3 |
+
+Logs `lanes/tw-p{3,6}d4.log`. The preset-6 depth-1 and depth-4 arms were then
+re-run SIDE BY SIDE (`lanes/tw-p6d{1,4}b.log`) both to price depth 4's wall
+in-batch and to check the box: every ladder point came back byte-identical to
+the first run, so nothing in the BD columns above is run noise.
+
+| preset 6, in-batch | depth 1 | depth 4 | ratio delta |
+|---|---|---|---|
+| film A wall | 64.6s:15.4s = 4.19 | 66.0s:16.0s = 4.13 | -1.6% |
+| film B wall | 54.2s:16.4s = 3.30 | 53.6s:17.6s = 3.05 | -7.8% |
+| screen wall | 39.2s:12.1s = 3.24 | 39.4s:11.9s = 3.31 | +2.2% |
+
+Depth 4's cost straddles zero on a box at load 13-15; depth 8's, measured the
+same way, was +3/+2.9/+6.3% -- all three positive, which is the one wall
+statement this batch supports.
+
+## Shipped
+
+    speed::TPL_DEPTH = [8, 8, 8, 4, 4, 4, 4, 1, 1, 1, 1]   // was [8, 1, ...]
+
+The rule, greedy by BD per 1% wall against what each preset already dropped
+(CfL + angle 0.031, coefficient breakout 0.041 -- the frontier `speed.rs`
+documents):
+
+* preset 0 keeps 8 -- depth 4 costs film B 0.7 on BOTH columns. Pins unmoved.
+* presets 3..6 take 4 -- best real-content arm at 3 (every row down), film B
+  -0.7/-0.6 at 6, for no wall this box can see: >= 0.1 BD points per 1% wall
+  against a frontier of 0.04, and the cheaper of the two windows that pay.
+* presets 1..2 take 8 (unmeasured): nearest measured neighbour is preset 0,
+  whose optimum is 8, and the monotone rule forbids anything below preset 3's.
+* presets 7..10 stay at 1 (unmeasured, per charter).
+
+Side effect: lane-deltaq's `EC_AV1_DELTAQ` is no longer inert at presets 1..6
+-- there is a map to read again. It still ships OFF, and its witness' fire
+count is now gated on the window (`speed::at(&TPL_DEPTH) > 1`) rather than on
+`speed() == 0`.
+
+## Invariants
+
+* `EC_COMP_MISMATCH=1` at presets 0, 3, 6 over
+  `tile_bytes_do_not_depend_on_the_thread_count --include-ignored` and
+  `the_facade_codes_the_same_bytes_as_encode_sequence`: all six pass, 0
+  mismatch lines (`lanes/tw-inv2.log`). The FIRST attempt used `--exact` with
+  a bare test name and matched 0 tests -- a green "ok. 0 passed" that proved
+  nothing (`lanes/tw-inv.log`, kept as the record of that miss).
+* `every_speed_preset_decodes_sample_exact_through_both_decoders --ignored`
+  under `EC_COMP_MISMATCH=1`: pass, 0 lines.
+* `cargo check --workspace --all-targets`: 0 errors, 0 ec-av1 warnings.
