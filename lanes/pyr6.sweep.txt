@@ -1,0 +1,24 @@
+# lane-pyr6 -- A FOURTH pyramid level: hidden quarter-point ARFs.
+# gate: encode::tests::bd_rate_film_long_gop (48 pictures, gop 48), release lib binary,
+#       --test-threads 1, <= 2 arms in parallel, each arm keyed by the log's own
+#       "pyramid requested/effective" print.
+#       spec = <mini_gop>:<arf>:<leaf>:<mid>:<key>:<quarter>  (`off` = level absent).
+# logs: lanes/pyr6/*.log
+
+## controls on this head (0326d9fc), reproducing main 7b05ecee exactly
+| gate | film A | film B |
+|---|---|---|
+| long-GOP (48 pictures, gop 48) | +43.1 / +4.6 | +129.0 / +34.3 |
+| 12-frame (bd_rate_screen_native) | +37.5 / +7.6 | +54.1 / +23.9 |
+12-frame control also: bars 1080p +1.7 / -14.5, bars 2160p +12.2 / -10.2, screen
+capture +33.4 / -23.8 (pyramid gated off).  Both charter control rows match to the
+decimal.  NOTE: bd_rate_screen_native exits 101 on this head for a reason that predates
+this lane -- assert_ladder_decodes fails on the libaom crf 5 REFERENCE point ("a
+lossless frame (qindex 0): the TX_4X4 Walsh-Hadamard tile syntax ... unimplemented"),
+a decoder gap outside this lane's scope.  The BD table is printed in full before the
+assert, so every arm's numbers are read from the table, not the exit code.
+
+## long-GOP sweep -- BD-rate vs libaom cpu-used 6 / vs rav1e speed 6
+| arm | spec | film A | film B |
+|---|---|---|---|
+| control (3 levels) | 8:-32:12:-8:-48 | +43.1 / +4.6 | +129.0 / +34.3 |
