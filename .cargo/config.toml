@@ -5,3 +5,9 @@
 # (cargo does not resolve runner paths relative to this file, and an absolute
 # path would break other worktree checkouts of this repo).
 runner = ["bash", "-c", "root=$(git rev-parse --show-toplevel) && exec \"$root/scripts/memguard-runner.sh\" \"$@\"", "--"]
+
+[env]
+# The AV1 rate-target tests keep several frames' worth of encoder state on the
+# test thread's stack; the 2 MB default overflows in debug builds (release
+# passes). Cap lives in the repo so every checkout and worktree gets it.
+RUST_MIN_STACK = "67108864"
