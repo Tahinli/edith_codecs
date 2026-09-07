@@ -29,3 +29,44 @@ Rejected, all four mixed or worse:
     film A +1.4 -- with key -48 in place the top ARF still wants its -32.
   * mini_gop 16 is worse on all four: one mid frame cannot carry 15 leaves (the pyramid
     has exactly three levels), so the longer group does not amortise the top ARF.
+
+## 12-frame gate (encode::tests::bd_rate_screen_native) at the winner
+| clip | control (leaf 16) | leaf 12 |
+|---|---|---|
+| bars 1080p | +2.0 / -14.0 | +1.7 / -14.5 |
+| bars 2160p | +13.1 / -9.6 | +12.2 / -10.2 |
+| film A | +38.5 / +8.2 | +37.5 / +7.6 |
+| film B | +58.2 / +26.5 | +54.1 / +23.9 |
+| screen capture | +33.4 / -23.8 | +33.4 / -23.8 (pyramid gated off, byte-identical) |
+
+Every row improves, so leaf_q_offset is NOT gated on GOP length (unlike mid_q_offset).
+Both control arms reproduce the charter's numbers exactly on this head.
+
+## rate loop (encoder::tests::bitrate_target_lands_within_10_percent_over_48_frames)
+768 kbps pyramid -0.4% (flat -1.8%), 1536 kbps pyramid -6.3% (flat -3.0%): the same
+numbers lane-keyq left (-0.3% / -6.2%), so the finer leaves need no change to the
+loop's model -- the leaf share is what the loop already steers on.
+
+## per-level census, film B q150, 48 frames (examples/enc_probe + syntax_census)
+Both arms through the SAME probe on the gate's own pixels (the crop's raw yuv420p
+md5 matches the gate's ffmpeg recipe byte for byte).
+
+| level | leaf 16 (control) | leaf 12 |
+|---|---|---|
+| key | 1 @ 15,160 B (26.0%) | 1 @ 15,160 B (25.6%) -- byte-identical |
+| arf (top+mid) | 12 @ 35,513 B (61.0%) | 12 @ 35,513 B (59.9%) -- byte-identical |
+| leaf | 35 @ 7,543 B (13.0%) | 35 @ 8,647 B (14.6%) |
+| censused / stream | 58,216 / 59,358 B | 59,320 / 60,466 B |
+| PSNR-Y mean / display-0 | 46.491 / 48.42 dB | 46.525 / 48.42 dB |
+
+1,104 bytes (+1.9% of the stream) move into the leaves and nothing else changes; the
+anchors are untouched, which is why the win is uniform across both gates.
+
+OPEN, carried out of this lane: the enc_probe/syntax_census route codes 59-60 kB for
+the very pixels the long-GOP gate codes as 89-91 kB at q=150 (the raw crop md5 is
+identical and the pyramid census is 1 key / 12 arf / 35 leaf either way), so the
+"byte-identical to the gate's own first point" note in lanes/keyq.sweep.txt does NOT
+reproduce here. The census above is therefore probe-relative -- valid as a before/after
+through one tool, not as the gate's own byte breakdown. Unblocker: find what the test
+binary's encode path arms that the example's does not (class `stale output faked a
+measurement` / `gate-recipe confound`).

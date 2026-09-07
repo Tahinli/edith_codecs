@@ -1,0 +1,128 @@
+# syntax census of /home/tahinli/.cache/arfq/ours-leaf16.obu (59358 bytes)
+
+| frame | kind | q | bytes | lf | cdef bits/y/uv | lr | dq | seg |
+|---|---|---|---|---|---|---|---|---|
+| 0 | key | 102 | 15160 | 22/22 | 3/8/8 | [1, 0, 0] | 0 | 0 |
+| 1 | arf | 118 | 5389 | 25/25 | 1/8/2 | [0, 0, 0] | 0 | 0 |
+| 2 | arf | 142 | 2108 | 25/25 | 0/8/2 | [0, 0, 0] | 0 | 0 |
+| 3 | leaf | 166 | 19 | 2/2 | 0/0/0 | [0, 0, 0] | 0 | 0 |
+| 4 | leaf | 166 | 440 | 17/17 | 0/8/8 | [1, 0, 0] | 0 | 0 |
+| 5 | leaf | 166 | 417 | 33/33 | 0/8/4 | [0, 0, 0] | 0 | 0 |
+| 6 | leaf | 166 | 330 | 33/33 | 0/8/4 | [0, 0, 0] | 0 | 0 |
+| 7 | leaf | 166 | 650 | 33/33 | 0/8/4 | [1, 0, 0] | 0 | 0 |
+| 8 | leaf | 166 | 490 | 33/33 | 0/8/8 | [0, 0, 0] | 0 | 0 |
+| 9 | arf | 118 | 5260 | 26/26 | 0/8/8 | [1, 0, 0] | 0 | 0 |
+| 10 | arf | 142 | 829 | 26/26 | 0/4/2 | [0, 0, 0] | 0 | 0 |
+| 11 | leaf | 166 | 219 | 25/25 | 0/8/4 | [1, 0, 0] | 0 | 0 |
+| 12 | leaf | 166 | 186 | 26/26 | 0/4/1 | [0, 0, 0] | 0 | 0 |
+| 13 | leaf | 166 | 240 | 26/26 | 0/8/2 | [1, 0, 0] | 0 | 0 |
+| 14 | leaf | 166 | 181 | 17/17 | 0/8/1 | [0, 0, 0] | 0 | 0 |
+| 15 | leaf | 166 | 175 | 17/17 | 0/2/4 | [0, 0, 0] | 0 | 0 |
+| 16 | leaf | 166 | 204 | 7/7 | 0/8/4 | [0, 0, 0] | 0 | 0 |
+| 17 | arf | 118 | 6003 | 26/26 | 2/8/2 | [1, 0, 0] | 0 | 0 |
+| 18 | arf | 142 | 1344 | 25/25 | 0/4/1 | [1, 0, 0] | 0 | 0 |
+| 19 | leaf | 166 | 103 | 10/10 | 0/8/2 | [0, 0, 0] | 0 | 0 |
+| 20 | leaf | 166 | 203 | 33/33 | 0/8/1 | [1, 0, 0] | 0 | 0 |
+| 21 | leaf | 166 | 315 | 33/33 | 0/8/2 | [1, 0, 0] | 0 | 0 |
+| 22 | leaf | 166 | 201 | 25/25 | 0/8/2 | [0, 0, 0] | 0 | 0 |
+| 23 | leaf | 166 | 337 | 26/26 | 0/8/2 | [0, 0, 0] | 0 | 0 |
+| 24 | leaf | 166 | 276 | 23/23 | 0/8/4 | [0, 0, 0] | 0 | 0 |
+| 25 | arf | 118 | 3029 | 18/18 | 1/4/2 | [1, 0, 0] | 0 | 0 |
+| 26 | arf | 142 | 700 | 26/26 | 0/2/2 | [0, 0, 0] | 0 | 0 |
+| 27 | leaf | 166 | 159 | 25/25 | 0/8/4 | [1, 0, 0] | 0 | 0 |
+| 28 | leaf | 166 | 175 | 22/22 | 0/8/1 | [0, 0, 0] | 0 | 0 |
+| 29 | leaf | 166 | 147 | 25/25 | 0/8/2 | [0, 0, 0] | 0 | 0 |
+| 30 | leaf | 166 | 111 | 22/22 | 0/4/1 | [0, 0, 0] | 0 | 0 |
+| 31 | leaf | 166 | 162 | 7/7 | 0/4/2 | [0, 0, 0] | 0 | 0 |
+| 32 | leaf | 166 | 186 | 22/22 | 0/8/4 | [0, 0, 0] | 0 | 0 |
+| 33 | arf | 118 | 4488 | 23/23 | 1/4/2 | [1, 0, 0] | 0 | 0 |
+| 34 | arf | 142 | 673 | 10/10 | 0/0/2 | [1, 0, 0] | 0 | 0 |
+| 35 | leaf | 166 | 136 | 10/10 | 0/8/8 | [0, 0, 0] | 0 | 0 |
+| 36 | leaf | 166 | 103 | 9/9 | 0/8/2 | [0, 0, 0] | 0 | 0 |
+| 37 | leaf | 166 | 154 | 22/22 | 0/4/2 | [0, 0, 0] | 0 | 0 |
+| 38 | leaf | 166 | 103 | 9/9 | 0/2/2 | [0, 0, 0] | 0 | 0 |
+| 39 | leaf | 166 | 127 | 7/7 | 0/8/1 | [0, 0, 0] | 0 | 0 |
+| 40 | leaf | 166 | 175 | 6/6 | 0/2/4 | [0, 0, 0] | 0 | 0 |
+| 41 | arf | 118 | 5062 | 26/26 | 1/4/2 | [1, 0, 0] | 0 | 0 |
+| 42 | arf | 142 | 628 | 15/15 | 0/2/2 | [1, 0, 0] | 0 | 0 |
+| 43 | leaf | 166 | 99 | 9/9 | 0/1/2 | [0, 0, 0] | 0 | 0 |
+| 44 | leaf | 166 | 199 | 17/17 | 0/4/1 | [0, 0, 0] | 0 | 0 |
+| 45 | leaf | 166 | 121 | 10/10 | 0/4/1 | [1, 0, 0] | 0 | 0 |
+| 46 | leaf | 166 | 175 | 6/6 | 0/2/2 | [0, 0, 0] | 0 | 0 |
+| 47 | leaf | 166 | 225 | 22/22 | 0/4/2 | [0, 0, 0] | 0 | 0 |
+
+PSNR-Y display order (48 pictures): 0:48.42 1:48.42 2:46.00 3:45.85 4:46.55 5:46.47 6:45.94 7:46.13 8:46.95 9:46.84 10:46.25 11:46.76 12:47.45 13:46.63 14:45.79 15:46.45 16:46.91 17:46.75 18:46.18 19:46.62 20:46.88 21:46.40 22:45.54 23:45.68 24:46.42 25:46.65 26:45.56 27:46.46 28:47.21 29:46.81 30:47.00 31:46.77 32:47.54 33:46.72 34:46.51 35:45.70 36:46.71 37:46.01 38:46.20 39:45.76 40:47.05 41:45.93 42:46.23 43:46.04 44:46.12 45:45.76 46:46.15 47:46.38
+PSNR-Y mean 46.491 dB over 48 pictures
+
+== key (1 frames, 15160 bytes) ==
+  area: intra 100.0% single-ref 0.0% compound 0.0% | skip 0.0%
+  refs (area): INTRA 100.0%
+  single-ref modes: NEW 0.0% GLOBAL 0.0% NEAREST 0.0% NEAR 0.0% (of 0)
+  coded mv |max| (1/8 pel): 0 0.0% <=8 0.0% <=32 0.0% <=128 0.0% <=512 0.0% >512 0.0% (of 0)
+  blocks (2436 total): 32x32 71.8%  16x16 28.2%
+  published luma tx (2436): 32x32 67.4%  16x16 26.5%  8x8 5.7%  4x4 0.4%
+  tx_type symbols (792): set6/1 100.0%
+  bits by family (census total 121271 bits vs 121280 payload bits):
+    coeff             78625 bits   64.8%  (82563 symbols)
+    literal           24703 bits   20.4%  (24703 symbols)
+    mode              15050 bits   12.4%  (10675 symbols)
+    partition          1065 bits    0.9%  (3088 symbols)
+    txsize             1155 bits    1.0%  (2436 symbols)
+    txtype              673 bits    0.6%  (792 symbols)
+    top tables: base_luma_32 32.4%  literal 20.4%  base_luma_16 8.2%  br_luma_32 6.1%  uv_mode_cfl 4.8%  kf_y_mode 4.6%  eob_pt_1024_luma 3.5%  txb_skip_chroma_16 2.2%
+
+== arf (12 frames, 35513 bytes) ==
+  area: intra 2.7% single-ref 91.6% compound 5.7% | skip 74.6%
+  refs (area): INTRA 2.7%  LAST 94.6%  GOLDEN 2.4%  ALTREF 0.3%
+  single-ref modes: NEW 28.0% GLOBAL 2.5% NEAREST 52.3% NEAR 17.2% (of 8093)
+  coded mv |max| (1/8 pel): 0 0.0% <=8 9.7% <=32 16.1% <=128 59.1% <=512 15.1% >512 0.0% (of 3055)
+  blocks (11772 total): 64x64 39.1%  32x32 33.7%  16x16 20.8%  8x8 6.4%
+  published luma tx (11772): 64x64 39.1%  32x32 33.7%  16x16 20.8%  8x8 5.9%  4x4 0.5%
+  tx_type symbols (6210): set3/1 77.6%  set6/1 22.4%
+  bits by family (census total 283926 bits vs 284104 payload bits):
+    coeff            150701 bits   53.1%  (239499 symbols)
+    literal           45729 bits   16.1%  (45729 symbols)
+    mode              49775 bits   17.5%  (107354 symbols)
+    mv                25449 bits    9.0%  (20764 symbols)
+    partition         10059 bits    3.5%  (22610 symbols)
+    txsize             1188 bits    0.4%  (1883 symbols)
+    txtype             1024 bits    0.4%  (6210 symbols)
+    top tables: base_luma_32 20.4%  literal 16.1%  base_luma_16 11.1%  mv_comp 7.3%  base_luma_64 4.4%  eob_pt_256_luma 3.2%  skip 2.6%  eob_pt_1024_luma 2.5%
+
+== leaf (35 frames, 7543 bytes) ==
+  area: intra 0.1% single-ref 99.2% compound 0.8% | skip 96.8%
+  refs (area): INTRA 0.1%  LAST 99.8%  GOLDEN 0.0%  ALTREF 0.1%
+  single-ref modes: NEW 8.9% GLOBAL 1.5% NEAREST 75.7% NEAR 13.9% (of 17032)
+  coded mv |max| (1/8 pel): 0 0.0% <=8 21.1% <=32 59.2% <=128 19.2% <=512 0.5% >512 0.0% (of 1759)
+  blocks (17826 total): 64x64 92.9%  32x32 5.0%  16x16 2.0%  8x8 0.1%
+  published luma tx (17826): 64x64 92.9%  32x32 5.0%  16x16 2.0%  8x8 0.1%  4x4 0.0%
+  tx_type symbols (448): set3/1 86.6%  set6/1 13.4%
+  bits by family (census total 59808 bits vs 60344 payload bits):
+    coeff             12477 bits   20.9%  (21492 symbols)
+    literal            3845 bits    6.4%  (3845 symbols)
+    mode              29818 bits   49.9%  (179515 symbols)
+    mv                10982 bits   18.4%  (10315 symbols)
+    partition          2540 bits    4.2%  (19433 symbols)
+    txsize               51 bits    0.1%  (94 symbols)
+    txtype               96 bits    0.2%  (448 symbols)
+    top tables: ref_mv 15.1%  mv_comp 13.8%  new_mv 10.9%  base_luma_64 7.7%  skip 6.9%  literal 6.4%  mv_joint 4.6%  drl_mode 4.0%
+
+== ALL (48 frames, 58216 bytes) ==
+  area: intra 2.8% single-ref 95.2% compound 2.0% | skip 89.2%
+  refs (area): INTRA 2.8%  LAST 96.4%  GOLDEN 0.6%  ALTREF 0.1%
+  single-ref modes: NEW 15.1% GLOBAL 1.8% NEAREST 68.1% NEAR 15.0% (of 25125)
+  coded mv |max| (1/8 pel): 0 0.0% <=8 13.9% <=32 31.9% <=128 44.5% <=512 9.7% >512 0.0% (of 4814)
+  blocks (32034 total): 64x64 66.0%  32x32 20.7%  16x16 10.9%  8x8 2.4%
+  published luma tx (32034): 64x64 66.0%  32x32 20.3%  16x16 10.7%  8x8 2.7%  4x4 0.2%
+  tx_type symbols (7450): set3/1 69.9%  set6/1 30.1%
+  bits by family (census total 465005 bits vs 465728 payload bits):
+    coeff            241804 bits   52.0%  (343554 symbols)
+    literal           74277 bits   16.0%  (74277 symbols)
+    mode              94643 bits   20.4%  (297544 symbols)
+    mv                36431 bits    7.8%  (31079 symbols)
+    partition         13664 bits    2.9%  (45131 symbols)
+    txsize             2393 bits    0.5%  (4413 symbols)
+    txtype             1793 bits    0.4%  (7450 symbols)
+    top tables: base_luma_32 21.2%  literal 16.0%  base_luma_16 9.1%  mv_comp 6.2%  base_luma_64 3.7%  eob_pt_1024_luma 2.9%  ref_mv 2.8%  new_mv 2.8%
+
+coverage: censused block area 5898240 of 5898240 mi (100.00%)
