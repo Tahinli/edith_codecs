@@ -14115,17 +14115,59 @@ mod tests {
     #[test]
     #[ignore = "the native-resolution BD arm: minutes per row, needs ffmpeg"]
     fn bd_rate_screen_native() {
+        native_bd_arm("bd_rate_screen_native", 12, false);
+    }
+
+    /// The LONG-GOP arm of the native BD gate: the same recipe as
+    /// [`bd_rate_screen_native`] over the two real film rows only, but 48
+    /// pictures with `gop = 48` (`encode_sequence` sets `gop =
+    /// pictures.len()`, and `external_ladder` passes ffmpeg `-g 48`, which
+    /// reaches libaom as `--kf-max-dist=48` and rav1e as
+    /// `key_frame_interval=48`), so every encoder sees one key frame and 47
+    /// inter pictures.
+    ///
+    /// WHY IT EXISTS: `bd_rate_screen_native` codes 12 frames with `gop =
+    /// 12`, and `Av1Encoder::encode_frames` cuts a mini-GOP at every key
+    /// frame (`encoder.rs`), so ANY [`crate::encoder::Pyramid::mini_gop`]
+    /// above 12 codes the same stream there -- the shipped `16` was measured
+    /// as "one hidden ARF per 12-picture GOP", never as a real 16-picture
+    /// group (class `instrument at bound` / `gate blind to feature`). The
+    /// user's exports are long GOPs, so the pyramid shape is decided here.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         bd_rate_film_long_gop --nocapture
+    ///
+    /// `EC_AV1_NATIVE_FILM=1` keeps only film A, `EC_AV1_NATIVE_FILM4K=1`
+    /// only film B; `EC_AV1_PYRAMID=<mini_gop>:<arf>:<leaf>` picks the shape.
+    /// Read every row off the log's own "pyramid requested/effective" print,
+    /// never off the argument order of the runs (lane-pyr3 misattributed
+    /// three rows that way).
+    ///
+    /// Table: `lanes/pyr4.sweep.txt`.
+    #[test]
+    #[ignore = "the long-GOP native BD arm: ~7 minutes per film row, needs ffmpeg"]
+    fn bd_rate_film_long_gop() {
+        native_bd_arm("bd_rate_film_long_gop", 48, true);
+    }
+
+    /// The shared driver of the two native BD arms above: `frames` pictures
+    /// per row (the sequence's `gop` is the same number, so one key frame),
+    /// four quantizers, `films_only` dropping every row but the two real
+    /// films.
+    fn native_bd_arm(label: &str, frames: usize, films_only: bool) {
         if !have_ffmpeg() {
-            eprintln!("SKIP bd_rate_screen_native: no ffmpeg");
+            eprintln!("SKIP {label}: no ffmpeg");
             return;
         }
-        let clips = native_gate_clips();
+        let mut clips = native_gate_clips();
+        if films_only {
+            clips.retain(|(name, _, _)| name.starts_with("film "));
+        }
         if clips.is_empty() {
-            eprintln!("SKIP bd_rate_screen_native: no clip");
+            eprintln!("SKIP {label}: no clip");
             return;
         }
 
-        let frames = 12usize;
         let aom_points: Vec<Vec<String>> = [5, 20, 35, 45]
             .iter()
             .map(|q| {
