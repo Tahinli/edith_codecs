@@ -761,9 +761,13 @@ impl Encoder {
             &misc_bytes(MISC_FRAME_RATE, &fr.words()),
         )?);
         if bits > 0 {
+            // One rate window of buffer, three quarters full to start, which
+            // is what ffmpeg's vaapi encoder asks for: a two-window buffer
+            // let radeonsi's AV1 CBR undershoot the ask by 20% where ffmpeg's
+            // own av1_vaapi undershot by 8% on the same clip (measured).
             let hrd = crate::params::enc::Hrd {
-                initial_buffer_fullness: bits,
-                buffer_size: bits * 2,
+                initial_buffer_fullness: bits / 4 * 3,
+                buffer_size: bits,
             };
             out.push(Buffer::from_bytes(
                 &self.context,

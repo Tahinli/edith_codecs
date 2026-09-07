@@ -1188,6 +1188,142 @@ fn av1_10bit_encode_agrees_between_two_decoders() {
     );
 }
 
+/// Rate control: does an asked-for bitrate come back?
+///
+/// CQP was the only mode the AV1 path had ever measured, because the config
+/// was created without a `VAConfigAttribRateControl` at all — a driver
+/// configured for CQP ignores a bitrate handed to it later. With the attribute
+/// set, three targets are encoded in each of CBR and VBR on his own 1080p
+/// content and the delivered rate is compared with the ask; the table is
+/// printed either way, including the pixel format and the mode, so the row
+/// says what it exercised.
+#[test]
+fn av1_encode_rate_control_lands() {
+    let Some(display) = display() else { return };
+    let clips = real_clips();
+    let Some((label, source)) = clips.into_iter().next() else {
+        eprintln!("skipped: no real-library manifest");
+        return;
+    };
+    let dir = std::env::temp_dir().join("ec-hw-av1-rc");
+    let _ = std::fs::create_dir_all(&dir);
+    let (width, height, frames, fps) = (1920u32, 1080u32, 60u32, 30u32);
+    let y4m = dir.join("rc-source.y4m");
+    if !extract_y4m(&source, &y4m, width, height, frames) {
+        eprintln!("skipped {label}: extraction failed");
+        return;
+    }
+    let Some(planes) = raw_frames(&y4m, width, height, frames) else {
+        eprintln!("skipped {label}: no frames extracted");
+        return;
+    };
+
+    println!("AV1 rate control on {label}, {width}x{height} yuv420p, {} frames at {fps} fps:", planes.len());
+    // QVBR is quality-defined: `bitrate` is a ceiling it may not exceed, not
+    // a target it must reach, so asking it to land on the number would be
+    // asking for the wrong thing.
+    enum Ask {
+        Within(f64),
+        Ceiling,
+    }
+    for (mode_name, mode, ask) in [
+        ("CBR", RateControlMode::ConstantBitrate, Ask::Within(0.15)),
+        ("VBR", RateControlMode::VariableBitrate, Ask::Within(0.25)),
+        ("QVBR", RateControlMode::Qvbr { quality: 100 }, Ask::Ceiling),
+    ] {
+        let mut table: Vec<(u32, f64, f64)> = Vec::new();
+        for target in [2_000_000u32, 6_000_000, 12_000_000] {
+            let mut config = EncoderConfig::new(EncCodec::Av1, width, height);
+            config.framerate = (fps, 1);
+            config.gop_size = 60;
+            config.bitrate = target;
+            config.rate_control = mode;
+            let mut encoder = match Encoder::new(&display, config) {
+                Ok(encoder) => encoder,
+                Err(e) => {
+                    // A mode the driver does not advertise refuses at config
+                    // creation; that is the driver's answer, printed as one.
+                    eprintln!("  {mode_name}: refused by the driver ({e})");
+                    break;
+                }
+            };
+            let mut bytes = Vec::new();
+            for (i, frame) in planes.iter().enumerate() {
+                match encoder.encode(
+                    frame,
+                    FrameMetadata { timestamp: i as i64, force_keyframe: false },
+                ) {
+                    Ok(coded) => bytes.extend_from_slice(&coded.data),
+                    Err(e) => panic!("{mode_name} at {target} bps: encode failed ({e})"),
+                }
+            }
+            let path = dir.join(format!("{mode_name}-{target}.obu"));
+            std::fs::write(&path, &bytes).expect("write");
+            let delivered =
+                bytes.len() as f64 * 8.0 * f64::from(fps) / f64::from(planes.len() as u32);
+            let db = ffmpeg_psnr_at(&path, &y4m, fps).unwrap_or(f64::NAN);
+            println!(
+                "  {mode_name} target {:>5} kbps -> delivered {:>6.0} kbps ({:+.1}%), {db:.2} dB",
+                target / 1000,
+                delivered / 1000.0,
+                (delivered / f64::from(target) - 1.0) * 100.0
+            );
+            table.push((target, delivered, db));
+        }
+        if table.len() < 3 {
+            continue;
+        }
+        match ask {
+            Ask::Within(tolerance) => {
+                for &(target, delivered, _) in &table {
+                    let error = delivered / f64::from(target) - 1.0;
+                    assert!(
+                        error.abs() <= tolerance,
+                        "{mode_name} at {target} bps delivered {delivered:.0} bps ({:+.1}%), \
+                         outside +/-{:.0}%",
+                        error * 100.0,
+                        tolerance * 100.0
+                    );
+                }
+                for pair in table.windows(2) {
+                    assert!(
+                        pair[1].2 > pair[0].2,
+                        "{mode_name}: PSNR is not monotone in the target ({:?} then {:?})",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+            }
+            Ask::Ceiling => {
+                for &(target, delivered, _) in &table {
+                    assert!(
+                        delivered <= f64::from(target) * 1.1,
+                        "{mode_name} at a {target} bps ceiling delivered {delivered:.0} bps"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// [`ffmpeg_psnr`] with the rate pinned to `fps` on both inputs.
+fn ffmpeg_psnr_at(coded: &Path, source: &Path, fps: u32) -> Option<f64> {
+    let rate = fps.to_string();
+    let out = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "info", "-f", "obu", "-r", &rate])
+        .arg("-i")
+        .arg(coded)
+        .args(["-r", &rate])
+        .arg("-i")
+        .arg(source)
+        .args(["-lavfi", "psnr", "-f", "null", "-"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    let field = text.split("average:").nth(1)?;
+    field.split_whitespace().next()?.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
 /// What the GPU's AV1 costs against software, on his own content.
 ///
 /// Four quantisers per encoder on a 1920x1080 crop of a film and of a screen
