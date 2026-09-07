@@ -4114,15 +4114,25 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        // (w, h, frames, gop, bit depth, 128-superblock)
-        let cases: [(usize, usize, usize, &str, u32, bool); 4] = [
-            (256, 128, 8, "4", 8, false),
-            (192, 96, 6, "3", 10, false),
-            (320, 192, 6, "3", 8, false),
-            (256, 256, 4, "2", 8, true),
+        // (w, h, frames, gop, bit depth, 128-superblock, screen content)
+        // lane-lossless2: the SCREEN rows carry palette blocks, which is what
+        // caught the whole-block palette prediction being handed to a 4x4
+        // chroma unit; they are KEY-only, see the lane report's deferred
+        // screen-inter desync.
+        let cases: [(usize, usize, usize, &str, u32, bool, bool); 6] = [
+            (256, 128, 8, "4", 8, false, false),
+            (192, 96, 6, "3", 10, false, false),
+            (320, 192, 6, "3", 8, false, false),
+            (256, 256, 4, "2", 8, true, false),
+            (320, 192, 2, "1", 8, false, true),
+            (640, 384, 2, "1", 8, false, true),
         ];
-        for &(w, h, frames, gop, depth, sb128) in &cases {
-            let tag = format!("{w}x{h} {depth}-bit gop {gop}{}", if sb128 { " sb128" } else { "" });
+        for &(w, h, frames, gop, depth, sb128, screen) in &cases {
+            let tag = format!(
+                "{w}x{h} {depth}-bit gop {gop}{}{}",
+                if sb128 { " sb128" } else { "" },
+                if screen { " screen" } else { "" }
+            );
             let mut raw: Vec<u8> = Vec::new();
             let put = |v: u32, raw: &mut Vec<u8>| {
                 if depth == 10 {
@@ -4131,20 +4141,36 @@ pub(crate) mod tests {
                     raw.push(v as u8);
                 }
             };
+            // A screen source is a few flat colours in 16x16 tiles plus
+            // 1-px text-like rows -- what makes libaom code palette blocks.
+            const PAL: [u32; 8] = [16, 60, 110, 145, 180, 210, 235, 128];
             for f in 0..frames {
                 for row in 0..h {
                     for col in 0..w {
-                        put((((col + 2 * f) * 7 + row * 13) % 251) as u32, &mut raw);
+                        let v = if screen {
+                            if row % 7 == 0 && col % 3 == 0 {
+                                if (col / 3 + row + f) % 2 == 1 { 16 } else { 235 }
+                            } else {
+                                PAL[((col + 4 * f) / 16 + row / 16) % PAL.len()]
+                            }
+                        } else {
+                            (((col + 2 * f) * 7 + row * 13) % 251) as u32
+                        };
+                        put(v, &mut raw);
                     }
                 }
-                for row in 0..h / 2 {
-                    for col in 0..w / 2 {
-                        put((((col + f) * 11 + row * 5) % 251) as u32, &mut raw);
-                    }
-                }
-                for row in 0..h / 2 {
-                    for col in 0..w / 2 {
-                        put(((col * 3 + (row + f) * 17) % 251) as u32, &mut raw);
+                for plane in 0..2usize {
+                    for row in 0..h / 2 {
+                        for col in 0..w / 2 {
+                            let v = if screen {
+                                PAL[((col + 2 * f) / 8 + row / 8 + plane) % PAL.len()]
+                            } else if plane == 0 {
+                                (((col + f) * 11 + row * 5) % 251) as u32
+                            } else {
+                                ((col * 3 + (row + f) * 17) % 251) as u32
+                            };
+                            put(v, &mut raw);
+                        }
                     }
                 }
             }
@@ -4161,6 +4187,9 @@ pub(crate) mod tests {
                 .args(["-pix_fmt", pix, "-cpu-used", "6", "-b:v", "0", "-crf", "0"]);
             if sb128 {
                 cmd.args(["-aom-params", "sb-size=128"]);
+            }
+            if screen {
+                cmd.args(["-aom-params", "tune-content=screen"]);
             }
             let out = cmd
                 .args(["-f", "obu", "-"])
@@ -4197,7 +4226,10 @@ pub(crate) mod tests {
                 }
             }
             assert!(lossless >= frames, "{NAME} [{tag}] went blind: {lossless} lossless frames");
-            assert!(inters > 0, "{NAME} [{tag}] went blind: no inter frame at gop {gop}");
+            assert!(
+                screen || inters > 0,
+                "{NAME} [{tag}] went blind: no inter frame at gop {gop}"
+            );
             let ours = decode_stream(&stream)
                 .unwrap_or_else(|e| panic!("{NAME} [{tag}]: a lossless inter stream decodes: {e}"));
             let refs = if depth == 10 {
