@@ -61,4 +61,45 @@ That does NOT reopen preset 0's shipped 8: the 12-frame gate measured depth 4 co
 0.7 on BOTH columns there, and this arm measures no long-GOP win to trade for it. `TPL_DEPTH`
 ships unchanged.
 
-## 3. Shipped constants
+## 3. delta_q over a long GOP at preset 6
+
+`bd_rate_film_long_gop` (48 pictures, gop 48), `EC_AV1_SPEED=6`. Run because preset 6 is where
+delta_q pays on film, and the long GOP is the shape his exports actually have (the screen row is
+not in this gate).
+
+| arm | film A | film B |
+|---|---|---|
+| control | +32.8 / -2.7 | +104.5 / +18.3 |
+| `EC_AV1_DELTAQ=2` | +32.0 / -2.9 | +104.3 / +17.8 |
+
+Both films improve on both columns again (film A -0.8 / -0.2, film B -0.2 / -0.5), i.e. the
+12-frame film result is not a 12-picture artefact -- it holds, slightly larger on film A, over 48
+pictures. delta_q is a real film lever at preset 6 once the tpl map exists; the only thing
+standing between it and the default is the capture row.
+
+## 4. Shipped constants
+
+**Nothing changes.** `speed::DELTAQ_RES` stays `[4; 11]` (off at every preset) and
+`speed::TPL_DEPTH` stays `[8, 8, 8, 4, 4, 4, 4, 1, 1, 1, 1]`. No source file outside
+`lanes/dq2.report.md` is touched by this lane.
+
+* preset 3 delta_q: rejected on its own numbers (film B worse on both columns).
+* preset 6 delta_q: passes the film half of the keep rule twice (12-frame and long-GOP), fails
+  the screen bound by 0.2 over it. Shipping it on would trade 0.5 BD points of his capture
+  content for 0.5 of his film content -- the rule's answer is no, and the honest fix is a
+  content gate, not a looser rule.
+* `TPL_DEPTH` at preset 0: depth 4 and depth 8 are indistinguishable over 48 pictures, so the
+  12-frame measurement (which prefers 8 by 0.7 on film B) remains the only signal and 8 stays.
+
+## Deferred
+
+* `deferred: delta_q behind a !screen content gate at preset 6 --` the measurement says it wins
+  on both films on both gates and loses only on the capture, exactly lane-b64b's shape; the gate
+  itself lives in `encode.rs deltaq_res_log2` (plus a `DELTAQ_RES` flip at preset 6), which is
+  outside this lane's `speed.rs`-only scope -- `unblocked by a charter that may edit encode.rs`.
+* `deferred: presets 1, 2, 4, 5 for delta_q --` unmeasured; preset 3 rejects and preset 6 is
+  screen-blocked, so the neighbours only matter once the content gate exists --
+  `unblocked by that same lane`.
+* `deferred: long-GOP tpl depth above preset 0 --` only preset 0 was run; presets 3..6 already
+  ship 4 and the preset-0 arm shows the axis is flat over a long GOP -- `unblocked by a lane that
+  finds a reason to care`.
