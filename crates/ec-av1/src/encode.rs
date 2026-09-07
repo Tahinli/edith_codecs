@@ -13929,9 +13929,11 @@ mod tests {
         // `EC_AV1_PYRAMID=8:-32:16:-8:-48` restores these.
         // Re-taken on lane-b64b: the 64x64 root prices COMPOUND references
         // now ([`b64_compound`]) -- 9835 -> 9793 at q=150 and 35798 -> 35911
-        // at q=60. `EC_AV1_B64COMP=0` restores these.
+        // at q=60 -- and may SPLIT its luma into four TX_32X32 units
+        // ([`b64_var_tx`]) -- 9793 -> 9798 and 35911 -> 35614.
+        // `EC_AV1_B64COMP=0` / `EC_AV1_B64VARTX=0` restore each half.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9793, 0x31ac_a6a7_6a00_5ab7), (60, 35911, 0xcd51_00e3_7008_f372)];
+            [(150, 9798, 0x4e14_c67c_ba5e_5849), (60, 35614, 0x557b_47a5_b5ee_4848)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
