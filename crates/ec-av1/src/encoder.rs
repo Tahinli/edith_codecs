@@ -3625,7 +3625,10 @@ mod tests {
     /// the statement that the other four are REACHABLE at all.
     #[test]
     fn an_edge_clip_codes_every_reduced_set_tx_type_both_decoders_read_exactly() {
-        let _knobs = crate::speed::knob_read();
+        // `knob_write`: the screen override below is process-global, and the
+        // type search is SCREEN-ONLY (`encode::tx_type_candidates`).
+        let _knobs = crate::speed::knob_write();
+        crate::encode::force_screen(Some(true));
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (320usize, 192usize);
         // Sharp horizontal and vertical steps: a vertical edge is what an
@@ -3703,6 +3706,7 @@ mod tests {
         } else {
             eprintln!("SKIP the ffmpeg half: no ffmpeg");
         }
+        crate::encode::force_screen(None);
         eprintln!("tx_type witness: hits {hits:?}, {} bytes", stream.len());
     }
 
