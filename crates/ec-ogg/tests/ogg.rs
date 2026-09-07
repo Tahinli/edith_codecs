@@ -19,6 +19,15 @@ use ec_core::{
 };
 use ec_ogg::{Mapping, OggDemuxer, OggMuxer, granule_of, granule_side_data};
 
+/// The fixture's own name — never the whole path, which carries the checkout
+/// directory and has matched fixture keywords by accident.
+fn name_of(p: &std::path::Path) -> String {
+    p.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/audio")
 }
@@ -327,7 +336,7 @@ fn page_size_does_not_change_the_audio() {
     let files = ogg_fixtures();
     let Some(path) = files
         .iter()
-        .find(|p| p.to_string_lossy().contains("vorbis-ogg-stereo-48000"))
+        .find(|p| name_of(p).contains("vorbis-ogg-stereo-48000"))
     else {
         eprintln!("fixtures absent — skipping");
         return;
@@ -341,7 +350,7 @@ fn damage_costs_one_page_and_no_more() {
     let files = ogg_fixtures();
     let Some(path) = files
         .iter()
-        .find(|p| p.to_string_lossy().contains("vorbis-ogg-stereo-44100"))
+        .find(|p| name_of(p).contains("vorbis-ogg-stereo-44100"))
     else {
         eprintln!("fixtures absent — skipping");
         return;
@@ -458,7 +467,7 @@ fn reads_flac_in_ogg() {
     let files = ogg_fixtures();
     let Some(source) = files
         .iter()
-        .find(|p| p.to_string_lossy().contains("vorbis-ogg-stereo-44100"))
+        .find(|p| name_of(p).contains("vorbis-ogg-stereo-44100"))
     else {
         eprintln!("fixtures absent — skipping");
         return;
