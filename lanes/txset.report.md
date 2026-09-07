@@ -153,7 +153,24 @@ PASS (with `EC_COMP_MISMATCH=1`).
 `the_encoders_own_streams_are_byte_identical_to_their_pins`: PASS at the
 UNCHANGED 8562 / 33357 -- no re-pin, the pin clip is not screen content.
 
-## 7. Deferred
+## 7. The long-GOP gate at what ships, and the suite
+
+`encode::tests::bd_rate_film_long_gop` (48 pictures, gop 48) on the shipped
+state -- both rows are non-screen and therefore byte-identical to the encoder
+before the lane, which the 12-frame confirm run proves clip by clip:
+
+| clip | shipped | wall ours:libaom:rav1e |
+|---|---|---|
+| film A | +26.4% / -6.6% | 713.0s:38.4s:60.4s |
+| film B | +89.8% / +9.1% | 459.0s:71.9s:59.0s |
+
+Full `ec-av1` suite, detached: **567 passed / 1 failed / 45 ignored**
+(943s). The one failure is `stream::tests::no_per_frame_state_is_thread_local_any_more`
+-- `["encode.rs: SB128"]`, main's own red from the sb128 merge that a fix lane
+owns, not this lane's. `timeout 900 cargo check --workspace --all-targets -j4`:
+0 errors, 0 `ec-av1` warnings.
+
+## 8. Deferred
 
 * `deferred: inter luma IDTX vs DCT_DCT (the two-type TX_SET_INTER_3 the
   writer already codes) -- the plumbing is done (an inter block's
