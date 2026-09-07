@@ -4,3 +4,17 @@ test encode::tests::bd_rate_screen_native ...
 native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
 | clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
 |---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+bars 1080p: pricer armings default=17 real=182
+bars 1080p: motion_mode 32x32 SIMPLE=48527 OBMC=0 WARP=211 | 16x16 SIMPLE=4508 OBMC=0 WARP=438 | 8x8 SIMPLE=16138 OBMC=0 WARP=1529 (0.0% OBMC / 3.1% WARP of 71351 eligible)
+bars 1080p: inter var-tx depths of 11187 blocks -- leaf single 0=1531 1=1124 (42.3% split) | leaf compound 0=869 1=639 (42.4% split) | 32x32 single 0=769 1=1874 (70.9% split) | 32x32 compound 0=2146 1=2235 (51.0% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+bars 1080p: filter intra on=true blocks 28842 (modes DC=6848 V=3145 H=5568 D157=8774 PAETH=4507)
+| bars 1080p 1920x1024 | 44.16 dB/219474 B, 47.71 dB/322777 B, 51.09 dB/442730 B, 54.30 dB/593065 B | +2.2% | -14.0% | 43.9s:8.0s:18.9s |
+bars 2160p: sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+bars 2160p: pricer armings default=14 real=175
+bars 2160p: motion_mode 32x32 SIMPLE=42061 OBMC=0 WARP=284 | 16x16 SIMPLE=3119 OBMC=0 WARP=671 | 8x8 SIMPLE=7819 OBMC=0 WARP=252 (0.0% OBMC / 2.2% WARP of 54206 eligible)
+bars 2160p: inter var-tx depths of 9166 blocks -- leaf single 0=1267 1=519 (29.1% split) | leaf compound 0=1061 1=257 (19.5% split) | 32x32 single 0=400 1=1261 (75.9% split) | 32x32 compound 0=161 1=4240 (96.3% split)
+bars 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+bars 2160p: filter intra on=true blocks 13065 (modes DC=3422 V=776 H=2756 D157=4292 PAETH=1819)
+| bars 2160p 1920x1024 | 43.68 dB/232087 B, 47.61 dB/341622 B, 51.20 dB/455971 B, 54.53 dB/583936 B | +12.7% | -9.8% | 43.1s:6.3s:20.9s |
