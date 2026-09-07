@@ -22,3 +22,38 @@ assert, so every arm's numbers are read from the table, not the exit code.
 | arm | spec | film A | film B |
 |---|---|---|---|
 | control (3 levels) | 8:-32:12:-8:-48 | +43.1 / +4.6 | +129.0 / +34.3 |
+| 8, quarter 0 | 8:-32:12:-8:-48:0 | +43.6 / +5.4 | +129.5 / +35.6 |
+| 8, quarter +4 | 8:-32:12:-8:-48:4 | +43.4 / +5.1 | +129.7 / +35.4 |
+| 8, quarter +8 | 8:-32:12:-8:-48:8 | +43.3 / +5.0 | +129.9 / +35.3 |
+| 16, quarter 0 | 16:-32:12:-8:-48:0 | +44.2 / +4.9 | +132.4 / +35.4 |
+| 16, quarter +4 | 16:-32:12:-8:-48:4 | +44.3 / +4.9 | +133.7 / +36.0 |
+| 8, quarter +8, leaf 16 | 8:-32:16:-8:-48:8 | +43.2 / +4.7 | +131.2 / +35.5 |
+
+DECISION: the fourth level LOSES on every arm; `quarter_q_offset` stays `None`
+(QUARTER_DEFAULT), so the default stream is byte-identical to main 7b05ecee and the
+12-frame gate was not re-run at a "winner" -- there is none.  The keep rule ("both film
+rows improve on both columns") is missed by all six arms; the best of them
+(8:-32:12:-8:-48:8) is +0.2 / +0.4 on film A and +0.9 / +1.0 on film B WORSE than the
+three-level control.
+
+What the numbers say:
+  * At mini_gop 8 the quarter arms improve MONOTONICALLY as the quarter offset walks
+    toward the leaf offset (0: +43.6, +4: +43.4, +8: +43.3 on film A vs libaom), i.e.
+    the sweep's own optimum is quarter == leaf == "no fourth level".  Half the group
+    (4 of 8 pictures) is hidden at ARF-ish quality, and the extra hidden frames cost
+    more than the halved reference distance buys.  Film B degrades on the same axis in
+    the opposite direction (+129.5 -> +129.9 vs libaom while rav1e improves +35.6 ->
+    +35.3), so no offset makes both films agree either.
+  * At mini_gop 16 the fourth level is a REAL gain over the same group at three levels
+    (lane-arfq's 16:-32:12:-8:-48 measured +47.2 / +6.3 and +134.7 / +35.6): quarters
+    take it to +44.3 / +4.9 and +133.7 / +36.0, film A -2.9 / -1.4.  The depth is what
+    a 16-picture group was missing -- it just does not catch the 8-picture group, which
+    already has one hidden frame per four pictures.
+  * Leaf 16 under the best quarter arm recovers film A (+43.2 / +4.7, within noise of
+    the control) but pays film B (+131.2 / +35.5); same trade lane-arfq measured for
+    leaf 16 without quarters.
+
+So the depth lever is spent at THIS group size: our per-hidden-frame overhead, not the
+level count, is what separates us from rav1e's 23-hidden-per-48 shape.  The code stays
+in (six-field EC_AV1_PYRAMID, slot map documented, round trip gated) so the next lane
+can re-measure it the moment a hidden frame gets cheaper.
