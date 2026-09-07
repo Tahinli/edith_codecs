@@ -57,3 +57,21 @@ So the depth lever is spent at THIS group size: our per-hidden-frame overhead, n
 level count, is what separates us from rav1e's 23-hidden-per-48 shape.  The code stays
 in (six-field EC_AV1_PYRAMID, slot map documented, round trip gated) so the next lane
 can re-measure it the moment a hidden frame gets cheaper.
+
+## the rate loop: the truthful group split makes it WORSE (kept at h = 1)
+`RateLoop::new` splits a group's byte budget as one `ARF_WEIGHT` share plus `m - 1`
+leaf shares -- a model from when the pyramid had ONE hidden frame per group. Extending
+it to the real count (`m / (m - h + h * ARF_WEIGHT)`, h = 2 with the mid level, 4 with
+quarters) is the truthful model and it FAILS the 48-frame bitrate gate:
+
+| model | 768 kbps, pyramid | 1536 kbps, pyramid |
+|---|---|---|
+| h = 1 (main, kept) | -1.8% | -6.3% |
+| h = real hidden count | -9.4% | -14.9% (gate limit 10%) |
+
+The h = 1 split over-allocates a group by exactly what `ARF_WEIGHT` = 2.0 under-prices a
+hidden frame at, and the two errors cancel; fixing one alone un-cancels them. So the
+extension was REVERTED and the coupling documented at the line -- recalibrating
+`ARF_WEIGHT` belongs to a rate-control lane, not to a pyramid-shape one. deferred:
+truthful group split + ARF_WEIGHT recalibration -- needs the bitrate gate as its own
+keep rule -- unblocked by a rate lane.
