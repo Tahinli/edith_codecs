@@ -63,4 +63,25 @@ unclamped the two are the same number.
 
 ## Results
 
-(filled in below as each gate lands)
+### The 12-frame gate, `bd_rate_screen_native` (BD vs libaom / vs rav1e)
+
+CONTROL FIRST (`EC_AV1_DELTAQ=0`, `lanes/dq-ctrl.log`). The charter's control
+numbers are STALE for this head on the two film rows: the screen row lands on
++33.4/-23.8 to the digit, but film A reads +34.8/+5.0 (charter +37.1/+7.3) and
+film B +47.0/+16.5 (charter +52.5/+22.3). Every delta below is against THIS
+control, same binary, same box.
+
+| row | control | res 4, K 1 |
+|---|---|---|
+| bars 1080p | +1.8 / -14.4 | +1.5 / -14.9 |
+| bars 2160p | +12.6 / -9.9 | +12.5 / -9.8 |
+| film A 1920x768 | +34.8 / +5.0 | +34.7 / +5.2 |
+| film B 1920x1024 | +47.0 / +16.5 | +46.7 / +16.6 |
+| screen capture | +33.4 / -23.8 | +34.1 / -23.6 |
+
+Logs `lanes/dq-ctrl.log`, `lanes/dq-r2k1.log`.
+
+Screen is NOT byte-identical, which the charter expected: screen frames still
+get a tpl map (the screen detector gates palette/intrabc, not the map), so
+they carry the syntax too -- and they LOSE 0.7 points against libaom, past the
+keep rule's 0.3 bound.
