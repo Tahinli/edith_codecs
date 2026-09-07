@@ -418,6 +418,7 @@ pub fn levers(n: u8) -> Vec<String> {
             out.push(format!("no {name}"));
         }
     };
+    flag("64x64 root", &B64_ROOT);
     flag("8x8 split", &SPLIT_8);
     flag("32x32 split (32x32-only partitions)", &SPLIT_INTER);
     flag("leaf second-reference search", &LEAF_SECOND);
