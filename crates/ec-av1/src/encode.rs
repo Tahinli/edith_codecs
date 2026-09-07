@@ -12996,37 +12996,11 @@ mod tests {
         height: usize,
         frames: usize,
     ) -> Vec<Picture> {
-        let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-ss", skip, "-i", clip])
-            .args(["-frames:v", &frames.to_string()])
-            .args(["-vf", vf])
-            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
-            .output()
-            .expect("ffmpeg failed to run");
-        assert!(
-            out.status.success(),
-            "ffmpeg: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let (luma, chroma) = (width * height, width * height / 4);
-        let frame_len = luma + 2 * chroma;
-        assert_eq!(
-            out.stdout.len(),
-            frame_len * frames,
-            "expected {frames} 4:2:0 frames"
-        );
-        (0..frames)
-            .map(|i| {
-                let bytes = &out.stdout[i * frame_len..][..frame_len];
-                Picture {
-                    width,
-                    height,
-                    y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
-                    u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                    v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
-                }
-            })
-            .collect()
+        // ONE definition of the gate's loader recipe, shared with
+        // `examples/enc_probe` so the instrument cannot arm a different source
+        // than the gate it reports on (class `instrument disagrees with the
+        // gate`; lane-probe).
+        crate::probe::source(clip, skip, vf, width, height, frames)
     }
 
     /// The standing regression gate on real content: 12 frames of a real
@@ -14507,15 +14481,7 @@ mod tests {
 
     /// The video stream's coded size, from ffprobe.
     fn probe_dims(clip: &str) -> Option<(usize, usize)> {
-        let out = Command::new("ffprobe")
-            .args(["-v", "error", "-select_streams", "v:0"])
-            .args(["-show_entries", "stream=width,height", "-of", "csv=p=0"])
-            .arg(clip)
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut f = text.trim().split(',');
-        Some((f.next()?.trim().parse().ok()?, f.next()?.trim().parse().ok()?))
+        crate::probe::dims(clip)
     }
 
     /// The rows of [`bd_rate_screen_native`] -- (label, path, seek) -- shared
@@ -14777,24 +14743,16 @@ mod tests {
         println!("|---|---|---|---|---|");
         for (name, path, seek) in &clips {
             let fctx = &crate::decode::FrameCtx::new();
-            let Some((nw, nh)) = probe_dims(path) else {
+            if probe_dims(path).is_none() {
                 eprintln!("SKIP {name}: ffprobe gave no size");
                 continue;
-            };
+            }
             // A whole number of 128-wide superblocks, at most 1920x1024, out
             // of the middle of the frame; the offsets stay even for 4:2:0.
-            let cw = nw.min(1920) / 128 * 128;
-            let ch = nh.min(1024) / 128 * 128;
-            assert!(cw >= 128 && ch >= 128, "{name}: {nw}x{nh} is smaller than a superblock");
-            let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
-            let source = clip_frames_vf(
-                path,
-                seek,
-                &format!("crop={cw}:{ch}:{x}:{y}"),
-                cw,
-                ch,
-                frames,
-            );
+            // ONE definition, shared with `examples/enc_probe` so the probe
+            // cannot measure a different window than this gate (lane-probe).
+            let (vf, cw, ch) = crate::probe::gate_crop(path);
+            let source = clip_frames_vf(path, seek, &vf, cw, ch, frames);
             SCREEN_FRAMES.iter().for_each(|c| {
                 c.store(0, std::sync::atomic::Ordering::Relaxed);
             });
@@ -14950,5 +14908,93 @@ mod tests {
                 100.0 * below(1.0) as f64 / costs.len() as f64,
             );
         }
+    }
+
+    /// The probe arms the gate's source (lane-probe, class `instrument
+    /// disagrees with the gate`). `examples/enc_probe` built its own ffmpeg
+    /// command line and had no `-ss`, so it read film B from frame 0 -- a
+    /// black leader -- and coded 59 kB where the gate's own ladder point
+    /// coded 89 kB of the same title; every census taken through it was
+    /// probe-relative. Both now call [`crate::probe::source`]; this pins that
+    /// the shared loader honours the seek (arming the probe's way and the
+    /// gate's way gives byte-identical streams, and dropping the seek does
+    /// not), on a synthetic clip whose content moves over time.
+    #[test]
+    fn the_probe_arms_the_gates_source() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP the_probe_arms_the_gates_source: no ffmpeg");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ec-av1-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("testsrc2.y4m");
+        // 384x202: neither side is a multiple of 128, so the gate's centre
+        // window is a real derivation and not the frame itself -- exactly the
+        // shape film B has (3840x1608, never 3840x2160).
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=384x202:rate=10"])
+            .args(["-frames:v", "20", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let path = clip.to_str().unwrap();
+
+        // The window: superblock-aligned, centred, even offsets.
+        let (vf, w, h) = crate::probe::gate_crop(path);
+        assert_eq!((vf.as_str(), w, h), ("crop=384:128:0:36", 384, 128));
+
+        let (seek, q) = ("00:00:01", 150u8);
+        let gate = clip_frames_vf(path, seek, &vf, w, h, 6);
+        let probe = crate::probe::source(path, seek, &vf, w, h, 6);
+        assert!(
+            gate.iter().zip(&probe).all(|(a, b)| a.y == b.y && a.u == b.u && a.v == b.v),
+            "the probe's source differs from the gate's at the same window"
+        );
+        let bytes = |src: &[Picture]| {
+            encode_sequence_with_ctx(src, q, 0.5, &crate::decode::FrameCtx::new())
+                .unwrap()
+                .stream
+        };
+        assert_eq!(bytes(&gate), bytes(&probe), "probe and gate code different bytes");
+        // The two witnesses that both halves of the arming reach ffmpeg: the
+        // seek, and the crop's own offset (the film-B defect in miniature --
+        // the probe was reading `crop=..:568` of a 1608-high frame).
+        let unseeked = crate::probe::source(path, "0", &vf, w, h, 6);
+        assert_ne!(
+            bytes(&gate),
+            bytes(&unseeked),
+            "seeked and unseeked arming coded the same bytes -- the seek is inert"
+        );
+        let offset = crate::probe::source(path, seek, "crop=384:128:0:0", w, h, 6);
+        assert_ne!(
+            bytes(&gate),
+            bytes(&offset),
+            "centred and top-aligned windows coded the same bytes -- the crop is inert"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// lane-probe diagnostic: the gate's own loader + ladder call for ONE
+    /// point inside the test binary, to compare against `examples/enc_probe`.
+    #[test]
+    #[ignore = "diagnostic: needs ffmpeg and a clip"]
+    fn probe_parity_point() {
+        let _knobs = crate::speed::knob_write();
+        let g = |k: &str| std::env::var(k).unwrap();
+        let (w, h) = g("EC_PARITY_DIMS").split_once(':').map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap())).unwrap();
+        let frames: usize = g("EC_PARITY_FRAMES").parse().unwrap();
+        let q: u8 = g("EC_PARITY_Q").parse().unwrap();
+        let source = clip_frames_vf(&g("EC_PARITY_CLIP"), &g("EC_PARITY_SS"), &g("EC_PARITY_VF"), w, h, frames);
+        let fctx = &crate::decode::FrameCtx::new();
+        let e = encode_sequence_with_ctx(&source, q, 0.5, fctx).unwrap();
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in &e.stream {
+            hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        eprintln!("PARITY q={q} bytes={} fnv1a={hash:016x} speed={} pyramid {:?} effective {:?}",
+            e.stream.len(), crate::speed::speed(), crate::encoder::Pyramid::from_env(), last_sequence_pyramid());
     }
 }
