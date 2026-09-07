@@ -246,7 +246,7 @@ fn every_fixture_demuxes_into_the_streams_ffprobe_reports() {
                     rates[i],
                     avg_rates[i]
                 );
-                if path.to_string_lossy().contains("23.976") {
+                if name_of(&path).contains("23.976") {
                     assert_eq!(
                         video.frame_rate,
                         Some(TimeBase::new(24_000, 1001)),
