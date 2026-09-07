@@ -57,6 +57,15 @@ const REFUSALS: &[&str] = &[
     "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
+    // lane-dpm1: libaom codes his screen-capture row at `-crf 5` with
+    // `base_q_idx == 0`, i.e. LOSSLESS -- TX_4X4 with the Walsh-Hadamard
+    // transform over every block (no `tx_depth` symbol at all) and
+    // `is_cfl_allowed` narrowed to `plane_bsize == BLOCK_4X4`, which changes
+    // the `uv_mode` alphabet. Nothing here consumes the header's `lossless`,
+    // so the first block of such a frame read `uv_mode` = UV_CFL_PRED where
+    // aomdec reads V_PRED. Refused by name (gate
+    // `a_lossless_libaom_stream_is_refused_by_name`) until the path exists.
+    "a lossless frame (qindex 0): the TX_4X4 Walsh-Hadamard tile syntax and the lossless CfL rule are unimplemented",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with no mode-info grid",
@@ -274,6 +283,10 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "an inter frame with no key frame before it",
         "an_inter_frame_opening_a_stream_is_refused_by_name",
+    ),
+    (
+        "a lossless frame (qindex 0): the TX_4X4 Walsh-Hadamard tile syntax and the lossless CfL rule are unimplemented",
+        "a_lossless_libaom_stream_is_refused_by_name",
     ),
     // lane-t900 r25, enumeration: a motion_mode/obmc symbol is read only under
     // `is_motion_variation_allowed_bsize` (min side >= 8), and each of the 17
