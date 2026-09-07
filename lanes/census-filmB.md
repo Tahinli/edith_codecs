@@ -70,12 +70,12 @@ Film B is a near-static, dark clip; rav1e's leaves cost 328 bytes each and are
 | refs (area) | LAST 48.8 GOLDEN 28.8 ALTREF 7.3 | LAST 75.1 LAST2 3.0 ALTREF 12.9 | LAST 66.3 GOLDEN 9.0 ALTREF 7.7 | LAST 70.5 LAST2 3.5 ALTREF 13.8 |
 | single-ref modes | NEW 11.7 GLOBAL 1.8 NEAREST 79.6 NEAR 7.0 | NEW 22.8 GLOBAL 1.1 NEAREST 58.2 NEAR 17.9 | NEW 16.7 GLOBAL 1.6 NEAREST 72.3 NEAR 9.4 | NEW 20.1 GLOBAL 1.1 NEAREST 57.0 NEAR 21.9 |
 | coded mv \|max\| (1/8 pel) | <=8 8.8, <=32 36.0, <=128 44.6, <=512 10.4% | <=8 4.2, <=32 25.8, <=128 55.9, <=512 14.0% | <=8 35.7, <=32 42.7, <=128 20.0% | <=8 27.3, <=32 45.1, <=128 26.9% |
-| tx_type symbols | 12,660 (set3/1 78%, set6/1 22%) | 2,108 | 9,600+ | 2,108 |
+| tx_type symbols | 12,660 (set3/1 78%, set6/1 22%) | 2,108 | 15,511 | 3,762 |
 | coeff bits | 329,971 (55.3%) | 230,617 (61.0%) | 610,650 (62.6%) | 471,565 (66.0%) |
 | mode bits | 114,631 (19.2%) | 33,154 (8.8%) | 118,197 (12.1%) | 56,582 (7.9%) |
 | mv bits | 28,291 (4.7%) | 22,760 (6.0%) | 30,445 (3.1%) | 22,229 (3.1%) |
 | partition bits | 16,507 (2.8%) | 6,074 (1.6%) | 19,331 (2.0%) | 9,923 (1.4%) |
-| tx_size bits | 3,240 | 0 (TxMode not Select) | 6,960 | 0 |
+| tx_size bits | 3,240 (5,908 symbols) | 0 (no `tx_size` symbol coded) | 3,083 (6,097 symbols) | 0 |
 | literal (raw) bits | 101,867 (17.1%) | 84,706 (22.4%) | 190,425 (19.5%) | 153,593 (21.5%) |
 | biggest tables | base_luma_32 25.9%, base_luma_16 10.0% | **base_luma_64 28.1%**, base_luma_32 13.0% | base_luma_32 25.2%, base_luma_16 14.1% | base_luma_64 20.1%, base_luma_32 13.1% |
 | segmentation / LR | off / off-or-luma-Wiener | on / switchable on all 3 planes | off / luma only | on / all 3 planes |
@@ -116,7 +116,7 @@ so the byte figures must not be added.
 3. **Skip share 52.5% vs 84.8% -> coefficient bits +99,354 bits (+12.4 kB).**
    We code residual over ~32 points more of the frame area than rav1e does
    (leaves: 70.0% vs 99.2%). Partly a consequence of (1) -- a worse reference
-   leaves a real residual -- and partly the decision itself: our leaves code
+   leaves a real residual -- and partly the decision itself: our streams code
    12,660 tx_type symbols against rav1e's 2,108, i.e. we are choosing coded
    transforms where rav1e chooses none at all.
 
