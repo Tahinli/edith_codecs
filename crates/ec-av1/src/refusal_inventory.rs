@@ -57,15 +57,14 @@ const REFUSALS: &[&str] = &[
     "intra block copy on a HORZ/VERT/1:4 rect intra strip (reconstruction is not ported at this shape)",
     "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
-    // lane-lossless: the KEY/intra-only half of a lossless frame (base_q_idx
-    // 0) now decodes sample-exact -- TX_4X4 with the Walsh-Hadamard transform
+    // lane-lossless/lane-lossless2: a lossless frame (base_q_idx 0) decodes
+    // sample-exact, KEY and INTER -- TX_4X4 with the Walsh-Hadamard transform
     // on every plane, no `tx_type` symbol, `is_cfl_allowed` narrowed to a
-    // BLOCK_4X4 chroma plane block. What is left is the INTER chroma walk: an
-    // inter block's chroma plane is still read as ONE transform per block
-    // here, so a lossless inter frame is refused by name (gate
-    // `a_lossless_inter_frame_is_refused_by_name`). A frame whose segments
-    // disagree is refused separately: every lossless rule is per segment.
-    "a lossless INTER frame (its chroma plane is still coded as one transform per block here)",
+    // BLOCK_4X4 chroma plane block, and the chroma plane walked as 4x4 units
+    // plane-major inside each mu chunk (gates
+    // `a_lossless_libaom_key_frame_decodes_sample_exact` /
+    // `a_lossless_libaom_inter_frame_decodes_sample_exact`). A frame whose
+    // segments disagree is still refused: every lossless rule is per segment.
     "a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
@@ -284,10 +283,6 @@ const PROVEN: &[(&str, &str)] = &[
     (
         "an inter frame with no key frame before it",
         "an_inter_frame_opening_a_stream_is_refused_by_name",
-    ),
-    (
-        "a lossless INTER frame (its chroma plane is still coded as one transform per block here)",
-        "a_lossless_inter_frame_is_refused_by_name",
     ),
     // lane-t900 r25, enumeration: a motion_mode/obmc symbol is read only under
     // `is_motion_variation_allowed_bsize` (min side >= 8), and each of the 17
