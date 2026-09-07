@@ -25,6 +25,12 @@
 //! call [`Frame::to_i420_16`] instead — that is the lossless path that keeps
 //! all ten bits.
 //!
+//! Encoding is 10-bit too, for AV1: `EncoderConfig::ten_bit()` allocates P010
+//! surfaces and takes its pixels through [`Encoder::encode_16`] (or straight
+//! from a 10-bit [`Frame`], with no conversion at all). H.264 and H.265 stay
+//! 8-bit here, because High and Main — the profiles this crate configures —
+//! are 8-bit profiles.
+//!
 //! # Shape
 //!
 //! * [`params`] — the `#[repr(C)]` codec parameter buffers, each checked

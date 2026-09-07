@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ec_hw::{
-    Codec, Decoder, EncCodec, Encoder, EncoderConfig, Frame, FrameMetadata, I420, RateControlMode,
+    Codec, Decoder, EncCodec, Encoder, EncoderConfig, Frame, FrameMetadata, I420, I420_16,
+    RateControlMode,
 };
 use ec_va::Display;
 
@@ -918,6 +919,535 @@ fn av1_encode_agrees_between_two_decoders() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 10-bit hardware AV1: his whole AV1 library is yuv420p10le, so an 8-bit-only
+// encoder does not serve his files.
+// ---------------------------------------------------------------------------
+
+/// Film B's native 10-bit crop from the real-library manifest: `(path, seek,
+/// width, height, x, y)`, the same 1920x1024 window and 00:40:00 seek the
+/// software gates use (`ec-av1`'s `native_gate_clips`).
+fn ten_bit_film_clip() -> Option<(PathBuf, String, u32, u32, u32, u32)> {
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/real-library-manifest.tsv");
+    let text = std::fs::read_to_string(manifest).ok()?;
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 7 || f[2] != "av1" || f[5] != "yuv420p10le" || f[3] != "3840" {
+            continue;
+        }
+        let path = PathBuf::from(f[0]);
+        if !path.exists() {
+            continue;
+        }
+        let (nw, nh): (u32, u32) = (f[3].parse().ok()?, f[4].parse().ok()?);
+        let (cw, ch) = (nw.min(1920) / 128 * 128, nh.min(1024) / 128 * 128);
+        return Some((path, "00:40:00".into(), cw, ch, (nw - cw) / 2 & !1, (nh - ch) / 2 & !1));
+    }
+    None
+}
+
+/// A 10-bit gradient with real dynamic range, used when the manifest has no
+/// 10-bit film: 64..940 across the frame with a moving highlight, so the
+/// stream is neither flat nor 8-bit content dressed up as 10.
+fn source_frame_16(width: u32, height: u32, t: u32) -> I420_16 {
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut f = I420_16 {
+        y: vec![0; w * h],
+        u: vec![512; cw * ch],
+        v: vec![512; cw * ch],
+        width,
+        height,
+        bit_depth: 10,
+    };
+    for y in 0..h {
+        for x in 0..w {
+            f.y[y * w + x] = (64 + x * 700 / w + y * 176 / h) as u16;
+        }
+    }
+    let (bx, by) = ((t as usize * 7) % (w - 64), (t as usize * 5) % (h - 64));
+    for y in by..by + 64 {
+        for x in bx..bx + 64 {
+            f.y[y * w + x] = 940;
+        }
+    }
+    for y in by / 2..(by + 64) / 2 {
+        for x in bx / 2..(bx + 64) / 2 {
+            f.u[y * cw + x] = 360;
+            f.v[y * cw + x] = 960;
+        }
+    }
+    f
+}
+
+/// Write 10-bit planes as a y4m so ffmpeg sees the same source the encoder did.
+fn write_y4m_16(path: &Path, frames: &[I420_16], fps: (u32, u32)) -> bool {
+    use std::io::Write;
+    let Ok(file) = std::fs::File::create(path) else {
+        return false;
+    };
+    let mut out = std::io::BufWriter::new(file);
+    let (w, h) = (frames[0].width, frames[0].height);
+    if write!(out, "YUV4MPEG2 W{w} H{h} F{}:{} Ip A1:1 C420p10\n", fps.0, fps.1).is_err() {
+        return false;
+    }
+    for f in frames {
+        if out.write_all(b"FRAME\n").is_err() {
+            return false;
+        }
+        for plane in [&f.y, &f.u, &f.v] {
+            let bytes: Vec<u8> = plane.iter().flat_map(|s| s.to_le_bytes()).collect();
+            if out.write_all(&bytes).is_err() {
+                return false;
+            }
+        }
+    }
+    out.flush().is_ok()
+}
+
+/// The 10-bit source the 10-bit gates encode, plus the y4m every reference
+/// encoder and every PSNR reads: his own film when the manifest has it,
+/// a synthetic 10-bit gradient otherwise. The label says which — a gate that
+/// does not say what it exercised proves nothing about his library.
+fn ten_bit_source(dir: &Path, frames: u32) -> Option<(String, PathBuf, Vec<I420_16>)> {
+    let y4m = dir.join("source-10bit.y4m");
+    let _ = std::fs::remove_file(&y4m);
+    if let Some((path, seek, cw, ch, x, y)) = ten_bit_film_clip() {
+        let ok = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-ss", &seek, "-i"])
+            .arg(&path)
+            .args([
+                "-frames:v",
+                &frames.to_string(),
+                "-vf",
+                &format!("crop={cw}:{ch}:{x}:{y}"),
+                "-pix_fmt",
+                "yuv420p10le",
+                // y4m's 10-bit chroma formats are outside its official set.
+                "-strict",
+                "-1",
+            ])
+            .arg(&y4m)
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok && let Some(planes) = raw_frames_16(&y4m, cw, ch, frames) {
+            return Some(("film B 10-bit native crop".into(), y4m, planes));
+        }
+        eprintln!("film B 10-bit extraction failed; falling back to the synthetic gradient");
+    }
+    let (w, h) = (1920u32, 1024u32);
+    let planes: Vec<I420_16> = (0..frames).map(|t| source_frame_16(w, h, t)).collect();
+    write_y4m_16(&y4m, &planes, (24, 1)).then_some(("synthetic 10-bit gradient".into(), y4m, planes))
+}
+
+/// The same pictures as 10-bit planes, for the hardware encoder's own input.
+fn raw_frames_16(y4m: &Path, width: u32, height: u32, frames: u32) -> Option<Vec<I420_16>> {
+    let out = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(y4m)
+        .args(["-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let frame_len = (w * h + 2 * cw * ch) * 2;
+    let read = |s: &[u8]| -> Vec<u16> {
+        s.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect()
+    };
+    let mut pictures = Vec::new();
+    for chunk in out.stdout.chunks_exact(frame_len).take(frames as usize) {
+        let (y, rest) = chunk.split_at(w * h * 2);
+        let (u, v) = rest.split_at(cw * ch * 2);
+        pictures.push(I420_16 {
+            y: read(y),
+            u: read(u),
+            v: read(v),
+            width,
+            height,
+            bit_depth: 10,
+        });
+    }
+    (!pictures.is_empty()).then_some(pictures)
+}
+
+/// What ffprobe calls the stream's pixel format — for an AV1 stream that is
+/// libdav1d reporting the sequence header's `high_bitdepth`, read by a decoder
+/// that shares no code with the writer above.
+fn ffprobe_pix_fmt(path: &Path) -> Option<String> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=pix_fmt", "-of", "default=nw=1:nk=1", "-f", "obu",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Encode 10-bit planes and return the bitstream.
+fn encode_stream_16(
+    display: &Arc<Display>,
+    planes: &[I420_16],
+    qp: u32,
+    rate_control: RateControlMode,
+) -> Result<Vec<u8>, ec_hw::Error> {
+    let (width, height) = (planes[0].width, planes[0].height);
+    let mut config = EncoderConfig::new(EncCodec::Av1, width, height).ten_bit();
+    config.gop_size = 60;
+    config.framerate = (24, 1);
+    config.rate_control = match rate_control {
+        RateControlMode::ConstantQp { .. } => RateControlMode::ConstantQp { qp },
+        other => other,
+    };
+    let mut encoder = Encoder::new(display, config)?;
+    let mut out = Vec::new();
+    for (t, frame) in planes.iter().enumerate() {
+        let coded = encoder.encode_16(
+            frame,
+            FrameMetadata { timestamp: t as i64, force_keyframe: false },
+        )?;
+        out.extend_from_slice(&coded.data);
+    }
+    Ok(out)
+}
+
+/// 10-bit AV1 hardware encode, proved by two decoders and by two readings of
+/// the stream's bit depth.
+///
+/// The bit depth is not taken on trust: ffprobe (libdav1d) must call the
+/// stream `yuv420p10le`, which is it reading the `high_bitdepth` bit this
+/// crate packs into the sequence header, and `ec-av1`'s own decode must
+/// produce samples above 255 — an 8-bit stream dressed as 10 fails both.
+#[test]
+fn av1_10bit_encode_agrees_between_two_decoders() {
+    let Some(display) = display() else { return };
+    let dir = std::env::temp_dir().join("ec-hw-av1-10bit");
+    let _ = std::fs::create_dir_all(&dir);
+    let frames = 10u32;
+    let Some((label, y4m, planes)) = ten_bit_source(&dir, frames) else {
+        eprintln!("skipped: no 10-bit source could be built");
+        return;
+    };
+    let _ = y4m;
+    let (width, height) = (planes[0].width, planes[0].height);
+    let data = match encode_stream_16(
+        &display,
+        &planes,
+        90,
+        RateControlMode::ConstantQp { qp: 90 },
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("skipped: 10-bit AV1 encode unavailable ({e})");
+            return;
+        }
+    };
+    let path = dir.join("hw-10bit.obu");
+    std::fs::write(&path, &data).expect("write the coded stream");
+
+    assert_eq!(
+        ffprobe_pix_fmt(&path).as_deref(),
+        Some("yuv420p10le"),
+        "the coded stream's sequence header does not say 10-bit"
+    );
+
+    // The two refusals this depth added, exercised rather than asserted in
+    // prose: 10-bit H.265 (High and Main are 8-bit profiles, so this crate
+    // never asks the driver), and 8-bit pixels handed to a 10-bit encoder.
+    let ten_bit_hevc = EncoderConfig::new(EncCodec::H265, width, height).ten_bit();
+    assert!(
+        Encoder::new(&display, ten_bit_hevc).is_err(),
+        "a 10-bit HEVC encoder was built out of an 8-bit profile"
+    );
+    let mut config = EncoderConfig::new(EncCodec::Av1, width, height).ten_bit();
+    config.rate_control = RateControlMode::ConstantQp { qp: 90 };
+    let mut ten = Encoder::new(&display, config).expect("a 10-bit AV1 encoder");
+    assert!(
+        ten.encode(&source_frame(width, height, 0), FrameMetadata::default()).is_err(),
+        "8-bit pixels went into a 10-bit encoder"
+    );
+
+    let ours = ec_av1::stream::decode_stream(&data)
+        .unwrap_or_else(|e| panic!("ec-av1 decodes the 10-bit hardware stream: {e}"));
+    assert_eq!(ours.len(), planes.len(), "ec-av1 decoded {} of {frames} frames", ours.len());
+    let peak = ours.iter().flat_map(|p| p.y.iter()).copied().max().unwrap_or(0);
+    assert!(peak > 255, "every decoded luma sample fits in 8 bits (peak {peak})");
+
+    let mut reference =
+        Reference::open(&path, width, height, true).expect("ffmpeg opens the stream");
+    let mut worst = f64::INFINITY;
+    for (i, picture) in ours.iter().enumerate() {
+        let theirs = reference
+            .next(width, height)
+            .unwrap_or_else(|| panic!("ffmpeg has no frame {i}"));
+        let mine = Planes {
+            y: picture.y.clone(),
+            u: picture.u.clone(),
+            v: picture.v.clone(),
+            peak: 1023.0,
+        };
+        let db = psnr(&mine, &theirs);
+        assert!(db.is_infinite(), "frame {i}: the two decoders disagree ({db:.2} dB)");
+        let source = Planes::from_16bit(&planes[i]);
+        let fidelity = psnr(&mine, &source);
+        assert!(fidelity > 30.0, "frame {i}: coded {fidelity:.2} dB from the 10-bit source");
+        worst = worst.min(fidelity);
+    }
+    println!(
+        "AV1 10-bit encode {width}x{height} ({label}): {frames} frames, {} bytes, pix_fmt \
+         yuv420p10le, CQP 90, decoded peak luma {peak}, ec-av1 and libdav1d agree sample for \
+         sample, worst frame {worst:.2} dB from the source (10-bit domain)",
+        data.len()
+    );
+}
+
+/// Rate control: does an asked-for bitrate come back?
+///
+/// CQP was the only mode the AV1 path had ever measured, because the config
+/// was created without a `VAConfigAttribRateControl` at all — a driver
+/// configured for CQP ignores a bitrate handed to it later. With the attribute
+/// set, three targets are encoded in each of CBR and VBR on his own 1080p
+/// content and the delivered rate is compared with the ask; the table is
+/// printed either way, including the pixel format and the mode, so the row
+/// says what it exercised.
+#[test]
+fn av1_encode_rate_control_lands() {
+    let Some(display) = display() else { return };
+    let clips = real_clips();
+    let Some((label, source)) = clips.into_iter().next() else {
+        eprintln!("skipped: no real-library manifest");
+        return;
+    };
+    let dir = std::env::temp_dir().join("ec-hw-av1-rc");
+    let _ = std::fs::create_dir_all(&dir);
+    let (width, height, frames, fps) = (1920u32, 1080u32, 60u32, 30u32);
+    let y4m = dir.join("rc-source.y4m");
+    if !extract_y4m(&source, &y4m, width, height, frames) {
+        eprintln!("skipped {label}: extraction failed");
+        return;
+    }
+    let Some(planes) = raw_frames(&y4m, width, height, frames) else {
+        eprintln!("skipped {label}: no frames extracted");
+        return;
+    };
+
+    println!("AV1 rate control on {label}, {width}x{height} yuv420p, {} frames at {fps} fps:", planes.len());
+    // QVBR is quality-defined: `bitrate` is a ceiling it may not exceed, not
+    // a target it must reach, so asking it to land on the number would be
+    // asking for the wrong thing.
+    enum Ask {
+        Within(f64),
+        Ceiling,
+    }
+    for (mode_name, mode, ask) in [
+        ("CBR", RateControlMode::ConstantBitrate, Ask::Within(0.15)),
+        ("VBR", RateControlMode::VariableBitrate, Ask::Within(0.25)),
+        ("QVBR", RateControlMode::Qvbr { quality: 100 }, Ask::Ceiling),
+    ] {
+        let mut table: Vec<(u32, f64, f64)> = Vec::new();
+        for target in [2_000_000u32, 6_000_000, 12_000_000] {
+            let mut config = EncoderConfig::new(EncCodec::Av1, width, height);
+            config.framerate = (fps, 1);
+            config.gop_size = 60;
+            config.bitrate = target;
+            config.rate_control = mode;
+            let mut encoder = match Encoder::new(&display, config) {
+                Ok(encoder) => encoder,
+                Err(e) => {
+                    // A mode the driver does not advertise refuses at config
+                    // creation; that is the driver's answer, printed as one.
+                    eprintln!("  {mode_name}: refused by the driver ({e})");
+                    break;
+                }
+            };
+            let mut bytes = Vec::new();
+            for (i, frame) in planes.iter().enumerate() {
+                match encoder.encode(
+                    frame,
+                    FrameMetadata { timestamp: i as i64, force_keyframe: false },
+                ) {
+                    Ok(coded) => bytes.extend_from_slice(&coded.data),
+                    Err(e) => panic!("{mode_name} at {target} bps: encode failed ({e})"),
+                }
+            }
+            let path = dir.join(format!("{mode_name}-{target}.obu"));
+            std::fs::write(&path, &bytes).expect("write");
+            let delivered =
+                bytes.len() as f64 * 8.0 * f64::from(fps) / f64::from(planes.len() as u32);
+            let db = ffmpeg_psnr_at(&path, &y4m, fps).unwrap_or(f64::NAN);
+            println!(
+                "  {mode_name} target {:>5} kbps -> delivered {:>6.0} kbps ({:+.1}%), {db:.2} dB",
+                target / 1000,
+                delivered / 1000.0,
+                (delivered / f64::from(target) - 1.0) * 100.0
+            );
+            table.push((target, delivered, db));
+        }
+        if table.len() < 3 {
+            continue;
+        }
+        match ask {
+            Ask::Within(tolerance) => {
+                for &(target, delivered, _) in &table {
+                    let error = delivered / f64::from(target) - 1.0;
+                    assert!(
+                        error.abs() <= tolerance,
+                        "{mode_name} at {target} bps delivered {delivered:.0} bps ({:+.1}%), \
+                         outside +/-{:.0}%",
+                        error * 100.0,
+                        tolerance * 100.0
+                    );
+                }
+                for pair in table.windows(2) {
+                    assert!(
+                        pair[1].2 > pair[0].2,
+                        "{mode_name}: PSNR is not monotone in the target ({:?} then {:?})",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+            }
+            Ask::Ceiling => {
+                for &(target, delivered, _) in &table {
+                    assert!(
+                        delivered <= f64::from(target) * 1.1,
+                        "{mode_name} at a {target} bps ceiling delivered {delivered:.0} bps"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// [`ffmpeg_psnr`] with the rate pinned to `fps` on both inputs.
+fn ffmpeg_psnr_at(coded: &Path, source: &Path, fps: u32) -> Option<f64> {
+    let rate = fps.to_string();
+    let out = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "info", "-f", "obu", "-r", &rate])
+        .arg("-i")
+        .arg(coded)
+        .args(["-r", &rate])
+        .arg("-i")
+        .arg(source)
+        .args(["-lavfi", "psnr", "-f", "null", "-"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    let field = text.split("average:").nth(1)?;
+    field.split_whitespace().next()?.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// What the GPU's 10-bit AV1 costs against 10-bit software, on his own film.
+///
+/// The same shape as the 8-bit row, at film B's native 1920x1024 crop and
+/// entirely in the 10-bit domain: no arm ever sees an 8-bit sample, so the
+/// comparison is encoder against encoder rather than depth against depth.
+/// Skips when the manifest has no 10-bit film -- a synthetic gradient would
+/// be a BD-rate number about a gradient.
+#[test]
+fn av1_10bit_bd_row_vs_software() {
+    let Some(display) = display() else { return };
+    let dir = std::env::temp_dir().join("ec-hw-av1-10bit-bd");
+    let _ = std::fs::create_dir_all(&dir);
+    let frames = 12u32;
+    let Some((label, y4m, planes)) = ten_bit_source(&dir, frames) else {
+        eprintln!("skipped: no 10-bit source could be built");
+        return;
+    };
+    if !label.starts_with("film") {
+        eprintln!("skipped: no 10-bit film in the real-library manifest ({label})");
+        return;
+    }
+    let (width, height) = (planes[0].width, planes[0].height);
+    let coded = planes.len() as u32;
+
+    let mut ours = Vec::new();
+    for qp in [180u32, 140, 100, 60] {
+        let data = match encode_stream_16(
+            &display,
+            &planes,
+            qp,
+            RateControlMode::ConstantQp { qp },
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("skipped: 10-bit AV1 encode unavailable ({e})");
+                return;
+            }
+        };
+        let path = dir.join(format!("hw10-{qp}.obu"));
+        std::fs::write(&path, &data).expect("write");
+        if let Some(db) = ffmpeg_psnr(&path, &y4m, true) {
+            ours.push((data.len() as f64 * 8.0 / f64::from(coded), db));
+        }
+    }
+    let rav1e: Vec<(f64, f64)> = [180u32, 140, 100, 60]
+        .iter()
+        .filter_map(|q| {
+            software_point(
+                &dir,
+                &y4m,
+                "film-B-10bit",
+                "librav1e",
+                &[
+                    "-pix_fmt", "yuv420p10le",
+                    "-rav1e-params", &format!("speed=6:quantizer={q}"),
+                    "-g", "60",
+                ],
+                *q,
+                coded,
+            )
+        })
+        .collect();
+    let libaom: Vec<(f64, f64)> = [56u32, 44, 32, 20]
+        .iter()
+        .filter_map(|crf| {
+            software_point(
+                &dir,
+                &y4m,
+                "film-B-10bit",
+                "libaom-av1",
+                &[
+                    "-pix_fmt", "yuv420p10le",
+                    "-cpu-used", "6", "-crf", &crf.to_string(), "-b:v", "0", "-g", "60",
+                ],
+                *crf,
+                coded,
+            )
+        })
+        .collect();
+
+    println!("10-bit BD row: {label}, {width}x{height} yuv420p10le, {coded} frames");
+    for (name, ladder) in [
+        ("hw AV1 10-bit", &ours),
+        ("librav1e 10-bit", &rav1e),
+        ("libaom 10-bit", &libaom),
+    ] {
+        println!("  {name}: {ladder:?}");
+        for pair in ladder.windows(2) {
+            assert!(
+                pair[1].0 > pair[0].0 && pair[1].1 > pair[0].1,
+                "{name}: ladder is not monotone at {pair:?}"
+            );
+        }
+    }
+    if ours.len() >= 3 && rav1e.len() >= 3 {
+        println!(
+            "  BD-rate: hw AV1 10-bit vs librav1e speed 6 10-bit: {:+.1}%",
+            bd_rate(&rav1e, &ours) * 100.0
+        );
+    }
+    if ours.len() >= 3 && libaom.len() >= 3 {
+        println!(
+            "  BD-rate: hw AV1 10-bit vs libaom cpu-used 6 10-bit: {:+.1}%",
+            bd_rate(&libaom, &ours) * 100.0
+        );
+    }
+}
+
 /// What the GPU's AV1 costs against software, on his own content.
 ///
 /// Four quantisers per encoder on a 1920x1080 crop of a film and of a screen
@@ -1246,6 +1776,22 @@ fn av1_encode_speed() {
                 return;
             }
         }
+    }
+    // 10-bit at the size his own films are in: the depth his library is
+    // actually stored at, so the fps that matters for a real export.
+    let planes: Vec<I420_16> = (0..30).map(|t| source_frame_16(3840, 1608, t)).collect();
+    let start = Instant::now();
+    match encode_stream_16(&display, &planes, 90, RateControlMode::ConstantQp { qp: 90 }) {
+        Ok(data) => {
+            let secs = start.elapsed().as_secs_f64();
+            println!(
+                "AV1 encode 3840x1608 10-bit: {:.1} fps ({} frames in {secs:.2} s), {} kbit/frame",
+                planes.len() as f64 / secs,
+                planes.len(),
+                data.len() * 8 / planes.len() / 1000
+            );
+        }
+        Err(e) => eprintln!("skipped: 10-bit AV1 encode unavailable ({e})"),
     }
 }
 

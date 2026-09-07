@@ -43,6 +43,7 @@ fn main() {
     bench_h265_encode(&mut rows);
     bench_av1_encode(&mut rows);
     bench_hw_av1_encode(&mut rows);
+    bench_hw_av1_encode_10bit(&mut rows);
     bench_audio_decode(&mut rows);
     bench_audio_encode(&mut rows);
     bench_truehd(&mut rows);
@@ -398,6 +399,98 @@ fn bench_hw_av1_encode(rows: &mut Vec<Row>) {
         wall_ms: wall * 1000.0,
         rtf: (wall > 0.0).then_some(media_s / wall),
     });
+}
+
+/// The same row at 10 bits, which is the depth his own AV1 library is stored
+/// at (`yuv420p10le`, both films). Skips as a row when there is no VA device,
+/// no AV1 encode entrypoint, or no source to read.
+fn bench_hw_av1_encode_10bit(rows: &mut Vec<Row>) {
+    let Some(src) = real_video("av1").or_else(|| real_video("hevc")).or_else(|| real_video("h264"))
+    else {
+        rows.push(missing("ec-hw av1 10-bit", "encode"));
+        return;
+    };
+    let display = match ec_va::Display::open() {
+        Ok(display) => display,
+        Err(e) => {
+            rows.push(missing_direction("ec-hw av1 10-bit", "encode", &format!("no VA display ({e})")));
+            return;
+        }
+    };
+    let (w, h) = (1920u32, 1080u32);
+    let raw = extract_yuv420p10(&src, w, h, 30);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let frame_len = ((w * h + 2 * cw * ch) * 2) as usize;
+    let n = (raw.len() / frame_len) as u32;
+    if n == 0 {
+        rows.push(missing("ec-hw av1 10-bit", "encode"));
+        return;
+    }
+    let mut cfg = ec_hw::EncoderConfig::new(ec_hw::EncCodec::Av1, w, h).ten_bit();
+    cfg.rate_control = ec_hw::RateControlMode::ConstantQp { qp: 120 };
+    let mut enc = match ec_hw::Encoder::new(&display, cfg) {
+        Ok(enc) => enc,
+        Err(e) => {
+            rows.push(missing_direction("ec-hw av1 10-bit", "encode", &format!("driver refused ({e})")));
+            return;
+        }
+    };
+    let read = |s: &[u8]| -> Vec<u16> {
+        s.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect()
+    };
+    let start = Instant::now();
+    let mut coded = 0usize;
+    for (i, frame) in raw.chunks_exact(frame_len).enumerate() {
+        let (y, rest) = frame.split_at((w * h * 2) as usize);
+        let (u, v) = rest.split_at(rest.len() / 2);
+        let picture = ec_hw::I420_16 {
+            y: read(y),
+            u: read(u),
+            v: read(v),
+            width: w,
+            height: h,
+            bit_depth: 10,
+        };
+        let meta = ec_hw::FrameMetadata { timestamp: i as i64, force_keyframe: false };
+        match enc.encode_16(&picture, meta) {
+            Ok(out) => coded += out.data.len(),
+            Err(e) => {
+                rows.push(missing_direction("ec-hw av1 10-bit", "encode", &format!("encode failed ({e})")));
+                return;
+            }
+        }
+    }
+    let wall = start.elapsed().as_secs_f64();
+    let media_s = f64::from(n) / 30.0;
+    rows.push(Row {
+        component: "ec-hw av1 10-bit",
+        direction: "encode",
+        content: format!("{w}x{h} yuv420p10le, {n} frames from 00:01:00, CQP 120, {} kB", coded / 1000),
+        media: format!("{media_s:.1}s"),
+        wall_ms: wall * 1000.0,
+        rtf: (wall > 0.0).then_some(media_s / wall),
+    });
+}
+
+/// `extract_yuv420p` at ten bits, planar 16-bit little endian, seeked a
+/// minute in: frame 0 of a film is its black leader, and a black leader codes
+/// to nothing and benchmarks nothing.
+fn extract_yuv420p10(src: &Path, w: u32, h: u32, n: u32) -> Vec<u8> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", "60", "-i"])
+        .arg(src)
+        .args([
+            "-vf", &format!("scale={w}:{h}"),
+            "-frames:v", &n.to_string(),
+            "-pix_fmt", "yuv420p10le",
+            "-f", "rawvideo", "-",
+        ])
+        .output()
+        .expect("ffmpeg extract yuv420p10le");
+    if !out.status.success() {
+        return Vec::new();
+    }
+    out.stdout
 }
 
 // ---------------------------------------------------------------------------
