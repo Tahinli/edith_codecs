@@ -410,6 +410,28 @@ fn b64_root() -> bool {
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::B64_ROOT))
 }
 
+/// Whether the 64x64 root also prices a NON-skip candidate (lane-tx64): the
+/// winner's prediction through one TX_64X64 luma transform and two TX_32X32
+/// chroma ones. Off by `EC_AV1_B64RES=0`, which restores the skip-only root
+/// lane-b64 shipped, so the two can be measured against each other on the
+/// same build.
+fn b64_residual() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64RES").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b64_root()
+}
+
+/// How many 64x64 roots came out cheaper with a residual than skipped, since
+/// the last [`take_b64_residual_hits`] -- so a gate reports the fire rate
+/// rather than assuming one (class `gate-blind-to-feature`).
+static B64_RESIDUAL_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The non-skip 64x64-root count since the last call, and zero it.
+pub fn take_b64_residual_hits() -> usize {
+    B64_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the encoder searches loop restoration at all (spec 7.17): one
 /// Wiener filter per 64x64 luma restoration unit, picked from
 /// [`crate::filter_search::WIENER_CANDIDATES`]. Swept by `EC_AV1_LR` in a
@@ -1829,8 +1851,20 @@ impl Plane<'_> {
                 bits: 0.0,
             };
         }
-        let mut residual = [0i32; BLOCK * BLOCK];
-        let residual = &mut residual[..side * side];
+        // A 64x64 root's residual is four times the scratch every other
+        // block coder here sizes for [`BLOCK`]; only that one case pays for
+        // a heap buffer, so the 4x4..32x32 path keeps its stack array.
+        let mut small = [0i32; BLOCK * BLOCK];
+        let mut big = if side > BLOCK {
+            vec![0i32; side * side]
+        } else {
+            Vec::new()
+        };
+        let residual: &mut [i32] = if side > BLOCK {
+            &mut big
+        } else {
+            &mut small[..side * side]
+        };
         for row in 0..side {
             for col in 0..side {
                 residual[row * side + col] =
@@ -1864,6 +1898,16 @@ impl Plane<'_> {
                 .collect()
         };
         let sse = self.block_sse(x, y, side, &reconstruction);
+        // A 64-point transform codes only its top-left 32x32 corner (spec
+        // 5.11.39's zero-out; `TxbSet::Luma64`'s tables are 32-sided and the
+        // key frame writer takes a 32x32 level grid for one). The inverse
+        // above reads the whole 64x64 array, but the price below and the
+        // levels the writer takes are that corner.
+        let levels = if side > BLOCK {
+            coded_corner(&levels, side, BLOCK)
+        } else {
+            levels
+        };
         #[cfg(test)]
         let t = stage_start();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
@@ -5657,6 +5701,17 @@ struct Trial {
     bits: f64,
 }
 
+/// The top-left `to` x `to` corner of a `from`-sided level grid -- the part
+/// of a 64-point transform that is actually coded (everything outside it is
+/// zeroed by [`crate::transform::quantize`] already, so this only reshapes).
+fn coded_corner(levels: &[i32], from: usize, to: usize) -> Vec<i32> {
+    let mut out = vec![0i32; to * to];
+    for row in 0..to {
+        out[row * to..][..to].copy_from_slice(&levels[row * from..][..to]);
+    }
+    out
+}
+
 /// The non-zero levels of a block, as the tile writer takes them.
 fn coeffs(levels: &[i32], side: usize) -> Vec<Coeff> {
     levels
@@ -7282,7 +7337,7 @@ fn search_skip_64(
         }
     }
 
-    let mut best: Option<(f64, InterInfo, [Trial; 3])> = None;
+    let mut best: Option<(f64, f64, InterInfo, [Trial; 3])> = None;
     for (bits, info) in cands {
         let trials = [
             (0usize, x, y, side, true),
@@ -7326,18 +7381,66 @@ fn search_skip_64(
             + trials[2].sse
             + search.lambda * (fixed + bits);
         if best.as_ref().is_none_or(|b| cost < b.0) {
-            best = Some((cost, info, trials));
+            best = Some((cost, bits, info, trials));
         }
     }
-    let (cost, info, trials) = best?;
+    let (skip_cost, bits, info, skip_trials) = best?;
+
+    // The winner's prediction coded with a REAL residual (lane-tx64): one
+    // TX_64X64 luma transform -- `TxbSet::Luma64`, whose coded quarter is the
+    // 32x32 corner `code_from_prediction` hands back -- and one TX_32X32 per
+    // chroma plane, since a 64x64 root's chroma block IS 32x32. Only the mv
+    // the skip arm already chose is re-coded: the prediction with the lowest
+    // SSE is also the cheapest residual to code, and a second 64x64 motion
+    // search per superblock is the wall this root was taken to SAVE.
+    //
+    // Priced against the skip arm through the same `symbol_bits` path, so the
+    // two numbers are comparable: `fixed` charged `skip` coded 1, and this
+    // arm charges 0 instead and adds its three planes' coefficient bits.
+    let mut chosen = (skip_cost, true, skip_trials);
+    if b64_residual() {
+        let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
+        let residual_trials = [0usize, 1, 2].map(|plane| {
+            let (target, px, py, s) = if plane == 0 {
+                (&*luma, x, y, side)
+            } else {
+                (&chroma[plane - 1], x / 2, y / 2, side / 2)
+            };
+            target.code_from_prediction(
+                px,
+                py,
+                s,
+                &chosen.2[plane].reconstruction,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                sets[plane],
+            )
+        });
+        let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
+        let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
+        let cost = residual_trials.iter().map(|t| t.sse).sum::<f64>()
+            + search.lambda * (fixed + bits + unskip + coeff_bits);
+        if cost < skip_cost {
+            B64_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            chosen = (cost, false, residual_trials);
+        }
+    }
+
+    let (cost, skip, trials) = chosen;
     luma.commit(x, y, side, &trials[0]);
     chroma[0].commit(x / 2, y / 2, side / 2, &trials[1]);
     chroma[1].commit(x / 2, y / 2, side / 2, &trials[2]);
     Some((
         cost,
         BlockCoeffs {
-            skip: true,
+            skip,
             inter: Some(info),
+            // Both grids are 32-sided: the luma one is the 64-point
+            // transform's coded corner, the chroma ones are whole TX_32X32.
+            luma: if skip { Vec::new() } else { coeffs(&trials[0].levels, BLOCK) },
+            u: if skip { Vec::new() } else { coeffs(&trials[1].levels, side / 2) },
+            v: if skip { Vec::new() } else { coeffs(&trials[2].levels, side / 2) },
             ..BlockCoeffs::default()
         },
     ))
