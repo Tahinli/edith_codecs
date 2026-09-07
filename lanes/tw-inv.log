@@ -1,0 +1,16 @@
+=== preset 0 tile_bytes_do_not_depend_on_the_thread_count
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 0.00s
+=== preset 0 the_facade_codes_the_same_bytes_as_encode_sequence
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 0.00s
+=== preset 3 tile_bytes_do_not_depend_on_the_thread_count
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 0.00s
+=== preset 3 the_facade_codes_the_same_bytes_as_encode_sequence
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 0.00s
+=== preset 6 tile_bytes_do_not_depend_on_the_thread_count
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 0.00s
+=== preset 6 the_facade_codes_the_same_bytes_as_encode_sequence
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 0.00s
+=== all presets decode sample-exact
+test encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 610 filtered out; finished in 17.53s
+RC=0

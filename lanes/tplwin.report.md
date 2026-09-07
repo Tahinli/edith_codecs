@@ -63,3 +63,21 @@ noise -- and no film row moves. Logs `lanes/tw-p3d{1,8}.log`.
 
 Preset 6's search is 2x cheaper than preset 3's, so the SAME lookahead pass is
 +3..8% of the wall here. Logs `lanes/tw-p6d{1,8}.log`.
+
+### Preset 0 -- is 8 still the optimum under the pyramid window? (batch: two arms side by side)
+
+| row | depth 8 (shipped) | depth 4 | delta of 4 |
+|---|---|---|---|
+| bars 1080p | -1.0 / -16.8 | -1.4 / -17.1 | -0.4 / -0.3 |
+| bars 2160p | +9.4 / -12.7 | +9.9 / -12.2 | +0.5 / +0.5 |
+| **film A** | **+21.7 / -4.4** | **+21.5 / -4.5** | **-0.2 / -0.1** |
+| **film B** | **+26.9 / -0.6** | **+27.6 / +0.1** | **+0.7 / +0.7** |
+| **screen** | **+27.8 / -26.0** | **+27.7 / -26.1** | **-0.1 / -0.1** |
+| wall film A | 224.0s:21.1s = 10.62 | 226.3s:20.5s = 11.04 | +4.0% |
+| wall film B | 157.9s:18.8s = 8.40 | 149.6s:19.3s = 7.75 | -7.7% |
+| wall screen | 76.6s:12.4s = 6.18 | 77.4s:12.7s = 6.09 | -1.4% |
+
+Film B decides it: shortening the window to 4 costs 0.7 points on BOTH columns
+of the 2160p film, past the keep rule's bound, for 7.7% of that row's wall,
+while film A moves 0.2 the other way and screen 0.1. **8 stays the preset-0
+default, so the byte pins do not move.** Logs `lanes/tw-p0d{8,4}.log`.
