@@ -467,6 +467,32 @@ pub fn take_b64_residual_hits() -> usize {
     B64_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the 64x64 root also prices COMPOUND candidates (lane-b64b): the
+/// `LAST` + extra-reference pairs the 32x32 level already offers, at the
+/// three modes a root can form without a second 64x64 motion search --
+/// `NEAREST_NEARESTMV`, `GLOBAL_GLOBALMV` and `NEW_NEARESTMV` (whose NEW half
+/// is the vector `search_skip_64`'s own single-reference search already
+/// found). `NEAREST_NEWMV`/`NEW_NEWMV` need the SECOND reference's own
+/// `NEWMV` vector, which only a second search per superblock produces -- the
+/// wall this root exists to save -- so they are not offered here.
+///
+/// Off by `EC_AV1_B64COMP=0`, so both arms measure on one build.
+fn b64_compound() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64COMP").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b64_root()
+}
+
+/// How many 64x64 roots took a COMPOUND candidate since the last
+/// [`take_b64_compound_hits`] (class `gate-blind-to-feature`).
+static B64_COMPOUND_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The compound 64x64-root count since the last call, and zero it.
+pub fn take_b64_compound_hits() -> usize {
+    B64_COMPOUND_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the encoder searches loop restoration at all (spec 7.17): one
 /// Wiener filter per 64x64 luma restoration unit, picked from
 /// [`crate::filter_search::WIENER_CANDIDATES`]. Swept by `EC_AV1_LR` in a
@@ -7308,6 +7334,42 @@ fn predict_u8(
     prediction.iter().map(|&v| v as u8).collect()
 }
 
+/// [`predict_u8`]'s compound counterpart, on the heap because a 64x64 root's
+/// side is twice what [`mc_trial_compound`]'s fixed trial buffers hold: both
+/// references predict into the `CONV_BUF` intermediate domain and are blended
+/// at the simple-average split `(8, 8)`, the same path (and so the same
+/// samples) a `comp_group_idx == 0`, `compound_idx == 1` decoder computes.
+fn predict_compound_u8(
+    ref0: (&[u16], usize, usize, usize),
+    ref1: (&[u16], usize, usize, usize),
+    (x, y): (usize, usize),
+    side: usize,
+    (mv0, mv1): ((i32, i32), (i32, i32)),
+    luma: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> Vec<u8> {
+    let mut inter = [vec![0i32; side * side], vec![0i32; side * side]];
+    for ((mv, r), dst) in [(mv0, ref0), (mv1, ref1)].into_iter().zip(inter.iter_mut()) {
+        mc::predict_compound_intermediate(
+            r.0,
+            r.1,
+            r.2,
+            r.3,
+            mv_to_q4(x, mv.1, luma),
+            mv_to_q4(y, mv.0, luma),
+            mc::REF_NO_SCALE,
+            side,
+            side,
+            mc::InterpFilterKind::Regular,
+            mc::InterpFilterKind::Regular,
+            dst,
+        );
+    }
+    let mut blended = vec![0u16; side * side];
+    mc::combine_compound(&inter[0], &inter[1], 8, 8, &mut blended, fctx);
+    blended.iter().map(|&v| v as u8).collect()
+}
+
 /// The 64x64 `PARTITION_NONE` candidate for a whole superblock ([`B64_ROOT`]):
 /// single-reference LAST at `NEARESTMV`/`GLOBALMV`/`NEARMV`/`NEWMV`, coded
 /// SKIP, priced through the same `symbol_bits` path every other candidate
@@ -7328,6 +7390,10 @@ fn search_skip_64(
     residual: bool,
     reference: &Picture,
     stack: &MvStack,
+    // The COMPOUND stack of each `LAST` + extra-reference pair at THIS
+    // superblock's 16x16-mi window, built off the same grid the tile writer
+    // rebuilds it from (empty unless the frame carries `reference_select`).
+    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
     fctx: &crate::decode::FrameCtx,
 ) -> Option<(f64, BlockCoeffs)> {
     let side = SUPERBLOCK;
@@ -7366,6 +7432,9 @@ fn search_skip_64(
             ));
         }
     }
+    // `LAST`'s own `NEWMV` vector, kept for the compound `NEW_NEARESTMV`
+    // candidate below to pair with the second reference's NEAREST half.
+    let mut last_new_mv: Option<(i32, i32)> = None;
     if leaf_new_mv() {
         let source_block = luma.source_block(x, y, side);
         let (seeds, seed_n) = mv_seeds(stack);
@@ -7387,6 +7456,7 @@ fn search_skip_64(
         );
         let mv = round_to_valid_mv(found.mv, stack.pred_mv);
         if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(stack, mv) {
+            last_new_mv = Some(mv);
             cands.push((
                 symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
                 info_of(InterMode::NewMv, mv, ref_mv_idx),
@@ -7438,10 +7508,127 @@ fn search_skip_64(
             + trials[2].sse
             + search.lambda * (fixed + bits);
         if best.as_ref().is_none_or(|b| cost < b.0) {
-            best = Some((cost, bits, info, trials));
+            best = Some((cost, fixed + bits, info, trials));
         }
     }
-    let (skip_cost, bits, info, skip_trials) = best?;
+
+    // lane-b64b: the COMPOUND candidates at the 64 root, the same three a
+    // superblock can form without a second motion search ([`b64_compound`]),
+    // priced through the same `symbol_bits` path -- `fixed` minus the single
+    // reference's tree, plus the pair tree and the compound mode.
+    for (ref1, g, cstack) in compound.iter().filter(|_| b64_compound()) {
+        let (ref1, g) = (*ref1, *g);
+        let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&ref1);
+        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
+            + if uni {
+                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
+                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
+                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
+                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
+            } else {
+                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
+            };
+        let mode_ctx =
+            cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
+        let mode_bits_of =
+            |mode: usize| pair_bits + symbol_bits(&cdf::INTER_COMPOUND_MODE[mode_ctx], mode);
+        let compound_info = |mode: InterMode, mvs: ((i32, i32), (i32, i32))| InterInfo {
+            ref1: Some(ref1),
+            mv1: mvs.1,
+            ref_frame: crate::mvstack::LAST_FRAME,
+            mode,
+            mv: mvs.0,
+            ref_mv_idx: 0,
+        };
+        let mut ccands: Vec<(((i32, i32), (i32, i32)), f64, InterInfo)> = vec![
+            (
+                cstack.nearest_mv,
+                mode_bits_of(0),
+                compound_info(InterMode::NearestNearestMv, cstack.nearest_mv),
+            ),
+            (
+                ((0, 0), (0, 0)),
+                mode_bits_of(6),
+                compound_info(InterMode::GlobalGlobalMv, ((0, 0), (0, 0))),
+            ),
+        ];
+        // `NEW_NEARESTMV`: the NEW half is `LAST`'s vector from the search
+        // above, its residual priced against compound stack entry 0 -- what
+        // `assign_compound_mv` predicts from at `ref_mv_idx = 0`.
+        let cbase = cstack
+            .entries
+            .first()
+            .map_or(cstack.nearest_mv, |e| (e.mv0, e.mv1));
+        if let Some(new_mv) = last_new_mv
+            && let Some(b0) = mv_residual_bits(new_mv, cbase.0)
+        {
+            let mvs = (new_mv, cstack.nearest_mv.1);
+            ccands.push((
+                mvs,
+                mode_bits_of(3) + b0,
+                compound_info(InterMode::NewNearestMv, mvs),
+            ));
+        }
+        ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        ccands.dedup_by_key(|c| c.0);
+        for (mvs, bits, info) in ccands {
+            let trials = [
+                (0usize, x, y, side, true),
+                (1, x / 2, y / 2, side / 2, false),
+                (2, x / 2, y / 2, side / 2, false),
+            ]
+            .map(|(plane, px, py, s, is_luma)| {
+                let (r0, r1) = match plane {
+                    0 => (
+                        (reference.y.as_slice(), reference.width, luma.true_width, luma.true_height),
+                        (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                    ),
+                    1 => (
+                        (
+                            reference.u.as_slice(),
+                            reference.width / 2,
+                            chroma[0].true_width,
+                            chroma[0].true_height,
+                        ),
+                        (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                    ),
+                    _ => (
+                        (
+                            reference.v.as_slice(),
+                            reference.width / 2,
+                            chroma[1].true_width,
+                            chroma[1].true_height,
+                        ),
+                        (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                    ),
+                };
+                let prediction =
+                    predict_compound_u8(r0, r1, (px, py), s, mvs, is_luma, fctx);
+                let target: &Plane = if plane == 0 { luma } else { &chroma[plane - 1] };
+                target.code_from_prediction(
+                    px,
+                    py,
+                    s,
+                    &prediction,
+                    true,
+                    search.base_q_idx,
+                    search.deadzone,
+                    TxbSet::Luma32Inter,
+                )
+            });
+            let syntax = fixed - ref_bits + bits;
+            let cost =
+                trials[0].sse + trials[1].sse + trials[2].sse + search.lambda * syntax;
+            if best.as_ref().is_none_or(|b| cost < b.0) {
+                best = Some((cost, syntax, info, trials));
+            }
+        }
+    }
+
+    let (skip_cost, syntax, info, skip_trials) = best?;
 
     // The winner's prediction coded with a REAL residual (lane-tx64): one
     // TX_64X64 luma transform -- `TxbSet::Luma64`, whose coded quarter is the
@@ -7477,7 +7664,7 @@ fn search_skip_64(
         let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
         let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
         let cost = residual_trials.iter().map(|t| t.sse).sum::<f64>()
-            + search.lambda * (fixed + bits + unskip + coeff_bits);
+            + search.lambda * (syntax + unskip + coeff_bits);
         if cost < skip_cost {
             B64_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             chosen = (cost, false, residual_trials);
@@ -9182,6 +9369,42 @@ pub(crate) fn encode_inter_frame(
                 let (mi_row, mi_col) = (sb_r * 16, sb_c * 16);
                 let stack =
                     find_mv_stack(&grid, mi_row, mi_col, 16, 16, LAST_FRAME, mi_cols, mi_rows);
+                // lane-b64b: the `LAST` + extra-reference pairs at this
+                // superblock's own 16x16-mi window, the same stacks the tile
+                // writer's `Whole64` arm rebuilds. Empty unless the frame
+                // codes `reference_select`, which is what gates the syntax.
+                let sb_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+                    if header.reference_select && b64_compound() {
+                        [
+                            (crate::mvstack::GOLDEN_FRAME, golden),
+                            (crate::mvstack::ALTREF_FRAME, altref),
+                        ]
+                        .into_iter()
+                        .filter_map(|(r, pic)| {
+                            pic.map(|p| {
+                                (
+                                    r,
+                                    p,
+                                    crate::mvstack::find_mv_stack_compound(
+                                        &grid,
+                                        mi_row,
+                                        mi_col,
+                                        16,
+                                        16,
+                                        (crate::mvstack::LAST_FRAME, r),
+                                        mi_cols,
+                                        mi_rows,
+                                        grid.sign_bias_table(),
+                                        &[(0, 0); 7],
+                                        None,
+                                    ),
+                                )
+                            })
+                        })
+                        .collect()
+                    } else {
+                        Vec::new()
+                    };
                 if let Some((cost, block)) = search_skip_64(
                     &mut luma,
                     &mut chroma,
@@ -9190,6 +9413,7 @@ pub(crate) fn encode_inter_frame(
                     b64_residual() && !screen,
                     reference,
                     &stack,
+                    &sb_compound,
                     fctx,
                 ) {
                     let after = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
@@ -9630,6 +9854,9 @@ pub(crate) fn encode_inter_frame(
                             + sb_search.lambda * crate::tile::partition_bits(SUPERBLOCK, true))
             {
                 B64_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if block.inter.is_some_and(|i| i.ref1.is_some()) {
+                    B64_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 blocks.truncate(mark);
                 restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
                 // Overwrites every 16x16 mi cell the quadrant searches
