@@ -285,12 +285,14 @@ dependencies = [
  "ec-h264",
  "ec-h264-syntax",
  "ec-h265",
+ "ec-hw",
  "ec-image",
  "ec-inflate",
  "ec-mp3",
  "ec-opus",
  "ec-probe",
  "ec-truehd",
+ "ec-va",
  "ec-vorbis",
 ]
 

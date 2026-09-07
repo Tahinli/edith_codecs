@@ -1,4 +1,4 @@
-//! Hardware encoding: H.264, HEVC, and AV1 behind an explicit opt-in.
+//! Hardware encoding: H.264, HEVC and AV1.
 //!
 //! One frame in, one coded frame out. The GOP is IDR-then-P with a single
 //! reference, which is what this GPU advertises (`VAConfigAttribEncMaxRefFrames`
@@ -7,11 +7,15 @@
 //!
 //! # AV1
 //!
-//! AV1 encoding is off unless [`EncoderConfig::allow_av1`] is set, and never
-//! reachable from an "auto" codec choice. The reason is on the record rather
-//! than theoretical: an AV1 encode submission on this driver generation took
-//! the GPU down hard enough to need a reset. The path is built, typed and
-//! probed; turning it on is a caller's explicit decision.
+//! AV1 encode was opt-in until 2026-09-07, after a submission on an older
+//! driver took the GPU down. It is on by default now because the refusal was
+//! retired by measurement, not by opinion: on mesa 26.1.8 (gfx1200) ffmpeg's
+//! own `av1_vaapi` encodes, this path encodes, and `gpu.rs`'s
+//! `av1_encode_agrees_between_two_decoders` proves every coded frame decodes
+//! identically through `ec-av1` and libdav1d. Unlike H.264 and HEVC, the
+//! driver composes no headers of its own from thin air: it parses the
+//! sequence and frame header OBUs this crate packs (see `enc::headers::av1`)
+//! and writes the stream's headers from them.
 
 use std::sync::Arc;
 
@@ -42,7 +46,7 @@ pub enum EncCodec {
     H264,
     /// H.265 / HEVC, Main profile.
     H265,
-    /// AV1 Profile 0 — opt-in only, see the module docs.
+    /// AV1 Profile 0.
     Av1,
 }
 
@@ -95,8 +99,6 @@ pub struct EncoderConfig {
     pub rate_control: RateControlMode,
     /// Driver quality/speed level, 1 (best quality) upwards; 0 = driver default.
     pub quality: u32,
-    /// Permit AV1 encoding. Without it, [`EncCodec::Av1`] is refused.
-    pub allow_av1: bool,
     /// The colour description to write into the VUI, or `None` to leave it
     /// unsignalled (`video_signal_type_present_flag = 0`) as before.
     pub colour: Option<Colour>,
@@ -132,7 +134,6 @@ impl EncoderConfig {
             gop_size: 60,
             rate_control: RateControlMode::ConstantBitrate,
             quality: 0,
-            allow_av1: false,
             colour: None,
         }
     }
@@ -199,12 +200,6 @@ pub struct Encoder {
 impl Encoder {
     /// Build an encoder for `config` on `display`.
     pub fn new(display: &Arc<Display>, config: EncoderConfig) -> Result<Encoder> {
-        if config.codec == EncCodec::Av1 && !config.allow_av1 {
-            return Err(Error::unsupported(
-                "AV1 hardware encoding",
-                "it is opt-in (EncoderConfig::allow_av1) after a GPU recovery incident",
-            ));
-        }
         let profile = match config.codec {
             // High is the profile every H.264 encoder on this driver reports and
             // the one a High-profile decoder expects; Main is a strict subset.
