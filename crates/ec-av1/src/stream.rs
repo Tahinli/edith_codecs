@@ -1591,6 +1591,24 @@ fn decode_frame(
             "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         ));
     }
+    // lane-dpm1: a LOSSLESS frame (`qindex == 0` with zero deltas, spec 5.9.12)
+    // is a different tile syntax, and this decoder has none of it: libaom
+    // forces TX_4X4 with the WALSH-HADAMARD transform over every block (so no
+    // `tx_depth` symbol is coded at all), and `is_cfl_allowed` narrows to
+    // `plane_bsize == BLOCK_4X4` instead of the 32x32 rule, which changes the
+    // `uv_mode` ALPHABET. Measured on his own screen-capture row at libaom
+    // `-crf 5` (base_q_idx 0): the very first block, mi(0,0) BLOCK_32X32,
+    // reads `uv_mode` off the CfL alphabet where libaom reads the plain one
+    // (ours 12 = UV_CFL_PRED, aomdec 1 = V_PRED) and the tile desyncs at
+    // symbol four of the frame. Refuse by name rather than return a picture
+    // that is silently wrong from luma sample 0 (class `refusal-hides-a-defect`
+    // read the other way: a silent wrong decode is worse than a named gap).
+    if header.lossless.iter().any(|&l| l) {
+        return Err(Error::unsupported(
+            "AV1 decode_stream",
+            "a lossless frame (qindex 0): the TX_4X4 Walsh-Hadamard tile syntax and the lossless CfL rule are unimplemented",
+        ));
+    }
     crate::decode::set_bit_depth(bit_depth, fctx);
     // spec 7.16: this frame's superres state, for the filter chain --
     // `decode.rs` upscales between CDEF and loop restoration and sizes
@@ -3771,14 +3789,22 @@ pub(crate) mod tests {
     /// the desync surfaced blocks later as "a Golomb tail longer than this
     /// decoder reads".
     ///
-    /// The source is SYNTHETIC (no film sample lives in `fixtures`): a
-    /// near-flat dark background at the film-B crop size, 1920x1024, with one
-    /// textured patch stepping 9 px every SECOND frame, so half the frames are
-    /// exact duplicates of their predecessor (the `C == T` trigger) while the
-    /// motion field still holds non-zero MVs whose projections are not
-    /// multiples of 8. The gate asserts both halves: at least one INTER frame
-    /// really carries `force_integer_mv` (class `gate-blind-to-feature`), and
-    /// every shown frame decodes sample-exact against ffmpeg's own decode.
+    /// The source is SYNTHETIC (no film sample lives in `fixtures`): the
+    /// near-flat dark pattern libaom's own screen-content detector counts as
+    /// screen content, at the film-B crop size 1920x1024, SCROLLING globally
+    /// 5 px per frame and frozen on frame 8 -- an exact duplicate of frame 7
+    /// (the `C == T` trigger) whose twin is not among its own references, so
+    /// its blocks still code real motion under `force_integer_mv`.
+    ///
+    /// lane-dpm1 made this gate SENSITIVE: with the `force_integer_mv` branch
+    /// of [`crate::motion_field::lower_mv_precision`] stubbed out (`if false
+    /// &&`) the stream decodes WRONG -- frame 8, luma sample 25695, 20 against
+    /// ffmpeg's 19 -- where the previous patch-in-a-static-background recipe
+    /// (and two others tried) still decoded byte-exact: there the used mv-stack
+    /// slots came from agreeing spatial neighbours and the rounded temporal
+    /// entries never won one. The gate asserts both halves: at least one INTER
+    /// frame really carries `force_integer_mv` (class `gate-blind-to-feature`),
+    /// and every shown frame decodes sample-exact against ffmpeg's own decode.
     #[test]
     fn a_libaom_force_integer_mv_stream_decodes_exact() {
         const NAME: &str = "a_libaom_force_integer_mv_stream_decodes_exact";
@@ -3786,23 +3812,30 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let (w, h, frames) = (1920usize, 1024usize, 12usize);
+        let (w, h, frames) = (1920usize, 1024usize, 16usize);
         let mut raw = Vec::with_capacity(frames * w * h * 3 / 2);
+        let mut off = 0usize;
         for f in 0..frames {
+            // lane-dpm1: the WHOLE picture scrolls 5 px per frame and freezes
+            // on frame 8, so (a) every block of the frozen frame -- including
+            // mi(0,0), which has no spatial neighbour at all -- still codes
+            // real motion against the references that are not its twin, and
+            // (b) 40 eighth-pels projected over the pyramid's distances lands
+            // on non-multiples of 8 (40/2 = 20 -> 16). A patch moving inside a
+            // static background was NOT sensitive: there the used stack slots
+            // came from spatial neighbours that agreed, and the rounded
+            // temporal entries never won one.
+            if f > 0 && f != 8 {
+                off = (off + 5) % h;
+            }
             let mut y = vec![0u8; w * h];
             for row in 0..h {
+                let src = (row + off) % h;
                 for col in 0..w {
                     // 2..=4 distinct values per 16x16 block, all dark: the
                     // screen-content detector's own counting rule.
                     y[row * w + col] =
-                        16 + ((col / 32 + row / 32) % 5) as u8 + ((col / 4 + row / 4) % 3) as u8;
-                }
-            }
-            let x0 = 200 + 9 * (f / 2);
-            for row in 300..428 {
-                for col in x0..x0 + 192 {
-                    y[row * w + col] =
-                        ((((col - x0) / 3) * 7 + ((row - 300) / 5) * 13) % 200 + 30) as u8;
+                        16 + ((col / 32 + src / 32) % 5) as u8 + ((col / 4 + src / 4) % 3) as u8;
                 }
             }
             raw.extend_from_slice(&y);
@@ -3815,7 +3848,7 @@ pub(crate) mod tests {
             .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
             .arg(&src)
-            .args(["-an", "-threads", "1", "-g", "12", "-c:v", "libaom-av1"])
+            .args(["-an", "-threads", "1", "-g", "16", "-c:v", "libaom-av1"])
             .args(["-cpu-used", "6", "-b:v", "0", "-crf", "35", "-f", "obu", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -3864,6 +3897,165 @@ pub(crate) mod tests {
                     first.unwrap()
                 );
             }
+        }
+    }
+
+    /// lane-dpm1: the 128x128-INTRA-inside-an-INTER-frame chroma context gate.
+    /// A 128x128 block codes its chroma as four TX_32X32 units, one per 64x64
+    /// mu chunk, and libaom stamps the coefficient context PER UNIT. The two
+    /// INTER mu-chunk sites set `mu_chroma` so the block tail re-stamps the
+    /// four units in mu order; the INTRA-in-inter site did not, so the
+    /// whole-block record left every unit carrying the TOP-LEFT unit's level.
+    /// The next block then read its `txb_skip` off ctx 11 where libaom reads
+    /// ctx 10 (class `override-slot-on-one-arm`) -- one symbol on the wrong
+    /// CDF row, tile desynced, and because the loop-restoration coefficients
+    /// live in the same tile data the damage showed up as a +-1 luma sample at
+    /// the TOP of the frame (measured: frame 1, luma sample 66, ours 146 /
+    /// ffmpeg 145, with 1.7M samples wrong behind it).
+    ///
+    /// Source: the repository's own 2160p colour-bar fixture at the native
+    /// gate's crop (1920x1024 out of the middle), 12 frames, libaom
+    /// `-cpu-used 6 -crf 45 -g 12` -- the first reference point of
+    /// `bd_rate_screen_native`'s "bars 2160p" row, which is where the assertion
+    /// caught it. The gate asserts the tool fired (class
+    /// `gate-blind-to-feature`) and that every shown frame decodes sample-exact
+    /// against ffmpeg's own decode.
+    #[test]
+    fn a_libaom_stream_with_128_intra_blocks_in_inter_frames_decodes_exact() {
+        const NAME: &str = "a_libaom_stream_with_128_intra_blocks_in_inter_frames_decodes_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/video/h264-2160p-23.976-8bit.mp4");
+        if !clip.exists() {
+            eprintln!("SKIP {NAME}: the 2160p bars fixture is missing");
+            return;
+        }
+        let (w, h, frames) = (1920usize, 1024usize, 12usize);
+        // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
+        let src = std::env::temp_dir().join(format!("ec-av1-i128-{}.yuv", std::process::id()));
+        let load = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&clip)
+            .args(["-frames:v", &frames.to_string(), "-vf", "crop=1920:1024:960:568"])
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&src)
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(load.status.success(), "{NAME}: {}", String::from_utf8_lossy(&load.stderr));
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+            .arg(&src)
+            .args(["-an", "-threads", "1", "-g", "12", "-c:v", "libaom-av1"])
+            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "45", "-f", "obu", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        let _ = std::fs::remove_file(&src);
+        if !out.status.success() {
+            eprintln!(
+                "SKIP {NAME}: ffmpeg has no libaom-av1 encoder ({})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let stream = out.stdout;
+        let before = crate::decode::intra_128_in_inter_hits();
+        let ours = decode_stream(&stream).expect("libaom bars stream decodes");
+        assert!(
+            crate::decode::intra_128_in_inter_hits() > before,
+            "{NAME} went blind: no 128-rooted intra block inside an inter frame"
+        );
+        let theirs = ffmpeg_decode_sequence(&stream, w, h, frames);
+        assert_eq!(ours.len(), frames, "shown frame count");
+        for (i, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
+            for (plane, l, r) in [("Y", &a.y, &b.y), ("U", &a.u, &b.u), ("V", &a.v, &b.v)] {
+                let first = l.iter().zip(r.iter()).position(|(x, y)| x != y);
+                assert!(
+                    first.is_none(),
+                    "frame {i} plane {plane} differs from ffmpeg at sample {}",
+                    first.unwrap()
+                );
+            }
+        }
+    }
+
+    /// lane-dpm1: the lossless refusal is a CLAIM, so it gets a stream that
+    /// reaches it. libaom at `-crf 0` codes `base_q_idx == 0` -- the same
+    /// lossless frame his screen-capture row gets at `-crf 5` -- where the tile
+    /// syntax is TX_4X4 + Walsh-Hadamard and `is_cfl_allowed` narrows to
+    /// `plane_bsize == BLOCK_4X4`. Before the refusal our decoder returned a
+    /// picture that was wrong from luma sample 0 (measured on that row: 126
+    /// against ffmpeg's 33, the first block's `uv_mode` read off the CfL
+    /// alphabet). The gate asserts the stream really is lossless and that we
+    /// refuse it BY NAME rather than decode it wrong.
+    #[test]
+    fn a_lossless_libaom_stream_is_refused_by_name() {
+        const NAME: &str = "a_lossless_libaom_stream_is_refused_by_name";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let (w, h, frames) = (256usize, 128usize, 2usize);
+        let mut raw = Vec::with_capacity(frames * w * h * 3 / 2);
+        for f in 0..frames {
+            for row in 0..h {
+                for col in 0..w {
+                    raw.push(((col * 7 + row * 13 + f * 31) % 251) as u8);
+                }
+            }
+            raw.extend(std::iter::repeat_n(128u8, w * h / 2));
+        }
+        // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
+        let src = std::env::temp_dir().join(format!("ec-av1-lossless-{}.yuv", std::process::id()));
+        std::fs::write(&src, &raw).expect("raw source");
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+            .arg(&src)
+            .args(["-an", "-threads", "1", "-g", "2", "-c:v", "libaom-av1"])
+            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "0", "-f", "obu", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        let _ = std::fs::remove_file(&src);
+        if !out.status.success() {
+            eprintln!(
+                "SKIP {NAME}: ffmpeg has no libaom-av1 encoder ({})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let stream = out.stdout;
+        // Half of the gate: the stream must really carry a lossless frame
+        // (class `gate-blind-to-feature`).
+        let mut parser = Av1Parser::new();
+        let (mut pos, mut lossless) = (0usize, 0usize);
+        while pos < stream.len() {
+            let obu = parser.parse_obu(&stream[pos..]).expect("libaom OBU parses");
+            pos += obu.total_size.max(1);
+            let header = match &obu.kind {
+                ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) => h,
+                _ => continue,
+            };
+            if header.lossless.iter().any(|&l| l) {
+                lossless += 1;
+            }
+        }
+        assert!(lossless > 0, "{NAME} went blind: libaom coded no lossless frame at -crf 0");
+        match decode_stream(&stream) {
+            Ok(_) => panic!("{NAME}: a lossless stream decoded instead of being refused"),
+            Err(e) => assert!(
+                format!("{e}").contains("a lossless frame (qindex 0)"),
+                "{NAME}: refused for the wrong reason: {e}"
+            ),
         }
     }
 
