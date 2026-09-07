@@ -3771,14 +3771,22 @@ pub(crate) mod tests {
     /// the desync surfaced blocks later as "a Golomb tail longer than this
     /// decoder reads".
     ///
-    /// The source is SYNTHETIC (no film sample lives in `fixtures`): a
-    /// near-flat dark background at the film-B crop size, 1920x1024, with one
-    /// textured patch stepping 9 px every SECOND frame, so half the frames are
-    /// exact duplicates of their predecessor (the `C == T` trigger) while the
-    /// motion field still holds non-zero MVs whose projections are not
-    /// multiples of 8. The gate asserts both halves: at least one INTER frame
-    /// really carries `force_integer_mv` (class `gate-blind-to-feature`), and
-    /// every shown frame decodes sample-exact against ffmpeg's own decode.
+    /// The source is SYNTHETIC (no film sample lives in `fixtures`): the
+    /// near-flat dark pattern libaom's own screen-content detector counts as
+    /// screen content, at the film-B crop size 1920x1024, SCROLLING globally
+    /// 5 px per frame and frozen on frame 8 -- an exact duplicate of frame 7
+    /// (the `C == T` trigger) whose twin is not among its own references, so
+    /// its blocks still code real motion under `force_integer_mv`.
+    ///
+    /// lane-dpm1 made this gate SENSITIVE: with the `force_integer_mv` branch
+    /// of [`crate::motion_field::lower_mv_precision`] stubbed out (`if false
+    /// &&`) the stream decodes WRONG -- frame 8, luma sample 25695, 20 against
+    /// ffmpeg's 19 -- where the previous patch-in-a-static-background recipe
+    /// (and two others tried) still decoded byte-exact: there the used mv-stack
+    /// slots came from agreeing spatial neighbours and the rounded temporal
+    /// entries never won one. The gate asserts both halves: at least one INTER
+    /// frame really carries `force_integer_mv` (class `gate-blind-to-feature`),
+    /// and every shown frame decodes sample-exact against ffmpeg's own decode.
     #[test]
     fn a_libaom_force_integer_mv_stream_decodes_exact() {
         const NAME: &str = "a_libaom_force_integer_mv_stream_decodes_exact";
@@ -3786,23 +3794,30 @@ pub(crate) mod tests {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let (w, h, frames) = (1920usize, 1024usize, 12usize);
+        let (w, h, frames) = (1920usize, 1024usize, 16usize);
         let mut raw = Vec::with_capacity(frames * w * h * 3 / 2);
+        let mut off = 0usize;
         for f in 0..frames {
+            // lane-dpm1: the WHOLE picture scrolls 5 px per frame and freezes
+            // on frame 8, so (a) every block of the frozen frame -- including
+            // mi(0,0), which has no spatial neighbour at all -- still codes
+            // real motion against the references that are not its twin, and
+            // (b) 40 eighth-pels projected over the pyramid's distances lands
+            // on non-multiples of 8 (40/2 = 20 -> 16). A patch moving inside a
+            // static background was NOT sensitive: there the used stack slots
+            // came from spatial neighbours that agreed, and the rounded
+            // temporal entries never won one.
+            if f > 0 && f != 8 {
+                off = (off + 5) % h;
+            }
             let mut y = vec![0u8; w * h];
             for row in 0..h {
+                let src = (row + off) % h;
                 for col in 0..w {
                     // 2..=4 distinct values per 16x16 block, all dark: the
                     // screen-content detector's own counting rule.
                     y[row * w + col] =
-                        16 + ((col / 32 + row / 32) % 5) as u8 + ((col / 4 + row / 4) % 3) as u8;
-                }
-            }
-            let x0 = 200 + 9 * (f / 2);
-            for row in 300..428 {
-                for col in x0..x0 + 192 {
-                    y[row * w + col] =
-                        ((((col - x0) / 3) * 7 + ((row - 300) / 5) * 13) % 200 + 30) as u8;
+                        16 + ((col / 32 + src / 32) % 5) as u8 + ((col / 4 + src / 4) % 3) as u8;
                 }
             }
             raw.extend_from_slice(&y);
@@ -3815,7 +3830,7 @@ pub(crate) mod tests {
             .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
             .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
             .arg(&src)
-            .args(["-an", "-threads", "1", "-g", "12", "-c:v", "libaom-av1"])
+            .args(["-an", "-threads", "1", "-g", "16", "-c:v", "libaom-av1"])
             .args(["-cpu-used", "6", "-b:v", "0", "-crf", "35", "-f", "obu", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
