@@ -197,6 +197,29 @@ pub(crate) const RDOQ: [bool; 11] = [
 /// searches here either.
 pub(crate) const I64_ROOT: [bool; 11] = [crate::encode::I64_ROOT; 11];
 
+/// `encode::deltaq_res_log2`: the per-superblock quantizer's `delta_q_res`
+/// LOG2 (2 = a step of 4 qindex), or `4` for "no delta_q syntax at all".
+///
+/// SHIPPED OFF at every preset. lane-deltaq measured the whole mapping sweep
+/// on the 12-frame native gate against its own control (film A +34.8/+5.0,
+/// film B +47.0/+16.5, screen +33.4/-23.8):
+///
+/// | arm | film A | film B | screen |
+/// |---|---|---|---|
+/// | res 4, K 1.0 | +34.7 / +5.2 | +46.7 / +16.6 | +34.1 / -23.6 |
+/// | res 4, K 1.3 | +34.7 / +5.1 | +46.8 / +16.6 | +34.3 / -23.5 |
+/// | res 8, K 1.0 | +35.2 / +5.3 | +47.8 / +17.1 | +35.0 / -23.4 |
+///
+/// The best arm moves neither film row by as much as the keep rule's 0.5 on
+/// either column (film A -0.1/+0.2, film B -0.3/+0.1) and costs screen 0.7
+/// against libaom. Coarser steps (res 8) are worse everywhere. The syntax is
+/// all there and proven three ways
+/// (`a_moving_detail_clip_codes_two_delta_q_levels_both_decoders_read_exactly`);
+/// `EC_AV1_DELTAQ=2` switches it on. Above preset 0 it is inert anyway --
+/// [`TPL_DEPTH`] cuts the lookahead to one picture, so there is no map to
+/// vary the quantizer by.
+pub(crate) const DELTAQ_RES: [u8; 11] = [4; 11];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [

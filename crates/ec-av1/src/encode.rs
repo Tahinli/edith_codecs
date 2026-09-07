@@ -1182,6 +1182,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         loop_filter: encoded.loop_filter,
         loop_restoration: encoded.loop_restoration,
         allow_intrabc: encoded.allow_intrabc,
+        delta: encoded.delta.clone(),
         cdef: encoded.cdef,
     }
 }
@@ -1272,6 +1273,12 @@ pub struct Encoded {
     /// guessed `false` would desync at the first block (same class as
     /// `screen`/`tx_select`).
     pub(crate) allow_intrabc: bool,
+    /// This frame header's `delta_q_params`/`delta_lf_params` (spec
+    /// 5.9.17/5.9.18) -- with `delta_q_present` every superblock's first
+    /// coded block carries a `delta_qindex` symbol group, so a raw tile
+    /// decode that guessed the defaults desyncs at the first superblock
+    /// (same class as `screen`/`tx_select`).
+    pub(crate) delta: ec_av1_syntax::DeltaParams,
 }
 
 thread_local! {
@@ -7115,6 +7122,7 @@ pub(crate) fn encode_key_frame_inner(
         cdef: header.cdef,
         loop_restoration: header.loop_restoration,
         allow_intrabc,
+        delta: header.delta.clone(),
     })
 }
 
@@ -9107,6 +9115,127 @@ fn search_inter_block(
 /// it costs 1.5 ms per 1920x1024 frame against a ~0.8 s encode (0.2%).
 const TPL_STRENGTH: f64 = 0.5;
 
+/// lane-deltaq: the per-superblock quantizer, `delta_q_present` (spec
+/// 5.9.17/5.11.10). `EC_AV1_DELTAQ=0` switches it off (the stream is then
+/// byte-identical to the pre-lane one); anything else is the `delta_q_res`
+/// LOG2, so `2` is a step of 4 and `3` a step of 8. `None` = off.
+///
+/// A frame with no tpl map (no lookahead picture, or `EC_AV1_TPL=0`) has
+/// nothing to vary the quantizer BY and codes no delta syntax at all.
+fn deltaq_res_log2() -> Option<u8> {
+    match DELTAQ_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        u8::MAX => {}
+        4 => return None,
+        r => return Some(r),
+    }
+    match crate::envflags::var("EC_AV1_DELTAQ").ok().as_deref().map(str::trim) {
+        Some("0") => None,
+        Some(v) => v.parse::<u8>().ok().filter(|r| *r <= 3),
+        None => Some(crate::speed::at(&crate::speed::DELTAQ_RES)).filter(|r| *r < 4),
+    }
+}
+
+/// A PROCESS-GLOBAL [`deltaq_res_log2`] override that wins over both the
+/// environment and the preset -- `u8::MAX` = unset, `4` = off. The gate that
+/// sets it holds [`crate::speed::knob_write`], the same exclusive lock the
+/// speed presets take, because the streams every other test pins move under
+/// it (the shipped default is OFF, see [`crate::speed::DELTAQ_RES`]).
+static DELTAQ_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Sets [`DELTAQ_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` gates
+pub(crate) fn set_deltaq_res(res_log2: Option<u8>) {
+    DELTAQ_OVERRIDE.store(
+        res_log2.unwrap_or(u8::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// How much of the derived qindex step is actually taken
+/// (`EC_AV1_DELTAQ_K`, default 1.0 = the full derivation).
+fn deltaq_k() -> f64 {
+    crate::envflags::var("EC_AV1_DELTAQ_K")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|k| k.is_finite() && *k >= 0.0)
+        .unwrap_or(1.0)
+}
+
+/// The largest qindex the map may move a superblock by, either way
+/// (`EC_AV1_DELTAQ_CLAMP`, default 16 -- libaom clamps its own objective
+/// deltaq around a quarter of the base qindex).
+fn deltaq_clamp() -> i32 {
+    crate::envflags::var("EC_AV1_DELTAQ_CLAMP")
+        .ok()
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|c| (0..=63).contains(c))
+        .unwrap_or(16)
+}
+
+/// The qindex a lambda factor `f` asks for, derived rather than fitted.
+///
+/// The tpl map hands out a factor on LAMBDA, and RD lambda goes as the
+/// square of the quantizer step (`encode_inter_frame`'s own
+/// `lambda = .. * step * step`), so the step this superblock wants is
+/// `sqrt(f)` times the frame's. `ac_q` is not linear in the index, so the
+/// step ratio is inverted through the table itself -- the index whose `ac_q`
+/// is closest to `ac_q(base) * sqrt(f)` -- rather than through a fitted
+/// constant. `k` scales the resulting step (1.0 takes all of it), `clamp`
+/// bounds it, and the answer is snapped onto the `res` grid so that every
+/// superblock's qindex is congruent to `base` and the coded delta is a whole
+/// number of steps.
+fn deltaq_for_factor(base: u8, f: f64, k: f64, clamp: i32, res: i32) -> u8 {
+    let base_ac = f64::from(ac_q(8, i32::from(base)));
+    let target = base_ac * f.max(1e-6).sqrt();
+    let exact = (1..=255)
+        .min_by(|&a, &b| {
+            let d = |q: i32| (f64::from(ac_q(8, q)) - target).abs();
+            d(a).partial_cmp(&d(b)).expect("ac_q is finite")
+        })
+        .expect("the qindex range is not empty")
+        - i32::from(base);
+    let want = (exact as f64 * k).round() as i32;
+    // Snapped to the `res` grid BEFORE the clamp: `clamp` is a qindex bound
+    // and need not be a whole number of steps, and clamping afterwards would
+    // hand back a qindex that is not congruent to `base`.
+    let max_steps = clamp / res;
+    let steps = (want as f64 / f64::from(res)).round() as i32;
+    let delta = steps.clamp(-max_steps, max_steps) * res;
+    (i32::from(base) + delta).clamp(1, 255) as u8
+}
+
+/// How many DISTINCT per-superblock quantizer levels the last inter frame's
+/// [`sb_q`](encode_inter_frame) grid carried -- lane-deltaq's fire counter
+/// (class `gate-blind-to-feature`: every exactness assert below passes on a
+/// grid that is one flat value, i.e. on no delta_q at all). Process-global
+/// like [`TX_DEPTH_HITS`], and read through [`take_deltaq_levels`], which
+/// keeps the LARGEST count seen since the last read.
+static DELTAQ_LEVELS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// [`DELTAQ_LEVELS`], reset to 0.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn take_deltaq_levels() -> usize {
+    DELTAQ_LEVELS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// This superblock's search state: the quantizer it is coded at, and the
+/// lambda that quantizer implies. RD lambda goes as the square of the step,
+/// which is exactly the relation [`deltaq_for_factor`] inverted, so with no
+/// `sb_q` grid the caller keeps the tpl LAMBDA factor alone (the behaviour
+/// before lane-deltaq).
+fn sb_q_search<'m>(
+    sb_q: &[u8],
+    sb_cols: usize,
+    base_q_idx: u8,
+    (sb_r, sb_c): (usize, usize),
+    base: Search<'m>,
+) -> Search<'m> {
+    let q = sb_q[sb_r * sb_cols + sb_c];
+    let ratio = f64::from(ac_q(8, i32::from(q))) / f64::from(ac_q(8, i32::from(base_q_idx)));
+    Search { base_q_idx: q, lambda: base.lambda * ratio * ratio, ..base }
+}
+
 fn tpl_strength() -> f64 {
     std::env::var("EC_AV1_TPL")
         .ok()
@@ -9773,6 +9902,47 @@ pub(crate) fn encode_inter_frame(
     let (cols, rows) = crate::tile::block_grid(header.mi_cols, header.mi_rows);
     let (cols, rows) = (cols as usize, rows as usize);
     let (sb_cols, _sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
+    // lane-deltaq: one absolute qindex per 64x64 superblock, from the same
+    // tpl map the lambda factor comes from ([`deltaq_for_factor`]). Present
+    // only when the map is, and `delta_q_res` follows straight into the frame
+    // header (`write_delta_q_params`) and into the tile writer's own plan.
+    let deltaq_res: Option<i32> = tpl_factors
+        .as_ref()
+        .and(deltaq_res_log2().map(|r| 1i32 << r));
+    let sb_q: Option<Vec<u8>> = match (&tpl_factors, deltaq_res) {
+        (Some(f), Some(res)) => {
+            let (k, clamp) = (deltaq_k(), deltaq_clamp());
+            Some(
+                (0..sb_cols * _sb_rows)
+                    .map(|sb| {
+                        let (sb_r, sb_c) = (sb / sb_cols, sb % sb_cols);
+                        // The same 16-cell mean the superblock's own lambda
+                        // takes, clamped to the map the frame actually has.
+                        let mean = (0..16)
+                            .map(|i| {
+                                let (cy, cx) = (sb_r * 4 + i / 4, sb_c * 4 + i % 4);
+                                f[(cy.min(f.len() / tpl_cells_x - 1)) * tpl_cells_x
+                                    + cx.min(tpl_cells_x - 1)]
+                            })
+                            .sum::<f64>()
+                            / 16.0;
+                        deltaq_for_factor(base_q_idx, mean, k, clamp, res)
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
+    if let Some(res) = deltaq_res.filter(|_| sb_q.is_some()) {
+        header.delta.q_present = true;
+        header.delta.q_res = res.trailing_zeros() as u8;
+    }
+    if let Some(g) = &sb_q {
+        let mut levels: Vec<u8> = g.clone();
+        levels.sort_unstable();
+        levels.dedup();
+        DELTAQ_LEVELS.fetch_max(levels.len(), std::sync::atomic::Ordering::Relaxed);
+    }
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
     // This frame's tile grid, as in `encode_key_frame_inner`.
     let (tile_cols_log2, tile_rows_log2) = armed_tiles();
@@ -9864,6 +10034,10 @@ pub(crate) fn encode_inter_frame(
             // comparison below weighs one cost against four, so both sides
             // have to be priced at the same lambda.
             let sb_search = match &tpl_factors {
+                // lane-deltaq: with a per-superblock quantizer the lambda
+                // comes from that quantizer, not from the raw map factor --
+                // the two agree exactly at `EC_AV1_DELTAQ_K=1` unclamped.
+                Some(_) if sb_q.is_some() => sb_q_search(sb_q.as_ref().expect("armed"), sb_cols, base_q_idx, (sb_r, sb_c), search),
                 Some(f) if sb64_legal => {
                     let mean = (0..16)
                         .map(|i| f[(sb_r * 4 + i / 4) * tpl_cells_x + sb_c * 4 + i % 4])
@@ -9962,6 +10136,12 @@ pub(crate) fn encode_inter_frame(
                 // one 32x32 cost against four 16x16 ones: a per-leaf lambda
                 // would make those two numbers incomparable.
                 let search = match &tpl_factors {
+                    // lane-deltaq: the quantizer is a SUPERBLOCK-level
+                    // symbol, so all four quadrants take their superblock's
+                    // own qindex and the lambda it implies. No granularity is
+                    // lost: the shipped map (`EC_AV1_TPL_SB`) is already one
+                    // factor per superblock, shared by its sixteen cells.
+                    Some(_) if sb_q.is_some() => sb_q_search(sb_q.as_ref().expect("armed"), sb_cols, base_q_idx, (sb_r, sb_c), search),
                     Some(f) => {
                         let mean = (0..4)
                             .map(|i| f[(r32 * 2 + i / 2) * tpl_cells_x + c32 * 2 + i % 2])
@@ -10462,6 +10642,12 @@ pub(crate) fn encode_inter_frame(
      -> Result<Vec<Vec<u8>>> {
         let (out, stored) = write_tiles(layout.count(), store_tile, |index| {
             crate::tile::arm_cdef_idx(bits, sb_cols, cdef_grid.to_vec());
+            crate::tile::arm_delta_q(
+                deltaq_res.filter(|_| sb_q.is_some()).unwrap_or(0),
+                sb_cols,
+                sb_q.clone().unwrap_or_default(),
+                base_q_idx,
+            );
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             crate::tile::arm_sign_bias(sign_bias);
             // Thread-locals: every tile job arms its own worker.
@@ -10598,6 +10784,10 @@ pub(crate) fn encode_inter_frame(
                 switchable_motion_mode,
                 h.allow_warped_motion,
                 seq.enable_filter_intra,
+                // lane-deltaq: this frame's own delta_q/delta_lf params, so
+                // the trial decode reads the per-superblock `delta_qindex`
+                // syntax the writer just wrote.
+                h.delta.clone(),
                 fctx,
             )
         },
@@ -10640,6 +10830,7 @@ pub(crate) fn encode_inter_frame(
         // An inter frame never allows intrabc (spec 5.9.2 codes the bit on
         // intra frames only).
         allow_intrabc: false,
+        delta: header.delta.clone(),
     })
 }
 
