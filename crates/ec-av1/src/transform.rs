@@ -2160,7 +2160,10 @@ mod tests {
     /// and the mode search would read as a loss.
     #[test]
     fn a_typed_forward_round_trips_like_the_dct_one() {
-        for side in [4usize, 8, 16] {
+        // lane-txset2: 32 too -- the INTER search offers `IDTX` at 32x32
+        // (`TxbSet::Luma32Inter`'s `EXT_TX_SET_DCT_IDTX`), a size the intra
+        // sets never name and this round trip never covered.
+        for side in [4usize, 8, 16, 32] {
             let residual: Vec<i32> = noise(side * side, 7 + side as u64)
                 .iter()
                 .map(|&v| v / 4)
@@ -2180,7 +2183,10 @@ mod tests {
             // the reduced set names -- the FLIPADST and 1D-ADST/DCT families
             // reach the forward side through the mirrored residual, and a
             // mirror on the wrong axis reads exactly as a blown-up rmse here.
-            for tx in [
+            // At 32x32 the only types any set names are `DCT_DCT` and
+            // `IDTX` (`EXT_TX_SET_DCT_IDTX`; ADST is undefined above 16), and
+            // the inter search offers exactly those.
+            let all = [
                 TxType::AdstDct,
                 TxType::DctAdst,
                 TxType::AdstAdst,
@@ -2196,7 +2202,9 @@ mod tests {
                 TxType::FlipAdstFlipAdst,
                 TxType::AdstFlipAdst,
                 TxType::FlipAdstAdst,
-            ] {
+            ];
+            let types: &[TxType] = if side > 16 { &[TxType::Idtx] } else { &all };
+            for &tx in types {
                 let e = rmse(tx);
                 assert!(
                     e < 2.0 * dct,

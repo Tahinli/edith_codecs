@@ -292,22 +292,22 @@ pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType]
 /// (`IDTX`, `DCT_DCT`) and 32x32 is `EXT_TX_SET_DCT_IDTX` -- the same two
 /// types, a symbol the writer already codes and never varied. 64x64 codes no
 /// `tx_type` symbol at all, so it is not offered one.
-/// `EC_AV1_TXSET_INTER`: `0`/`off`, `screen` (screen frames only), anything
-/// else on for every frame.
+/// `EC_AV1_TXSET_INTER`: `0`/`off`, `screen` (screen frames only), `le16`
+/// (16x16 and below, the sizes libaom's own census picks a non-`DCT_DCT`
+/// inter type on -- it never takes `IDTX` at 32x32 on film B), anything else
+/// on for every frame at every size.
 pub(crate) fn inter_tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType] {
     const DCT: [TxType; 1] = [TxType::DctDct];
     const INTER3: [TxType; 2] = [TxType::DctDct, TxType::Idtx];
-    let on = match inter_tx_type_search() {
+    let mode = inter_tx_type_search();
+    let on = match mode {
         InterTxSearch::Off => false,
         InterTxSearch::Screen => screen,
-        InterTxSearch::All => true,
+        InterTxSearch::All | InterTxSearch::Le16 => true,
     };
     match set {
-        TxbSet::Luma32Inter | TxbSet::Luma16Inter | TxbSet::Luma8Inter | TxbSet::Luma4Inter
-            if on =>
-        {
-            &INTER3
-        }
+        TxbSet::Luma32Inter if on && mode != InterTxSearch::Le16 => &INTER3,
+        TxbSet::Luma16Inter | TxbSet::Luma8Inter | TxbSet::Luma4Inter if on => &INTER3,
         _ => &DCT,
     }
 }
@@ -316,6 +316,8 @@ pub(crate) fn inter_tx_type_candidates(set: TxbSet, screen: bool) -> &'static [T
 pub(crate) enum InterTxSearch {
     Off,
     Screen,
+    /// 16x16 and below only.
+    Le16,
     All,
 }
 
@@ -346,6 +348,7 @@ fn inter_tx_type_search() -> InterTxSearch {
         crate::envflags::var("EC_AV1_TXSET_INTER").ok().map(|v| match v.as_str() {
             "0" | "off" => InterTxSearch::Off,
             "screen" => InterTxSearch::Screen,
+            "le16" => InterTxSearch::Le16,
             _ => InterTxSearch::All,
         })
     });
