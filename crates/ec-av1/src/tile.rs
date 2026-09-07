@@ -8005,6 +8005,7 @@ mod tests {
                 0,
                 0,
                 None,
+                TxType::DctDct,
             );
             priced += luma_32_coeff_bits(grid);
         }
@@ -8953,7 +8954,7 @@ mod tests {
                 .sum();
             d + lambda * coeff_bits(grid, set, crate::decode::q_ctx_of(q), 0, 0)
         };
-        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda);
+        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda, TxType::DctDct);
         assert_eq!(bits, coeff_bits(&levels, set, crate::decode::q_ctx_of(q), 0, 0));
         assert!(cost(&levels) <= cost(&before), "{:?} vs {:?}", cost(&levels), cost(&before));
         // The tail is what it is for: the last coded position moves earlier.
@@ -8974,7 +8975,7 @@ mod tests {
                 if v < 0.0 { -l } else { l }
             })
             .collect();
-        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda);
+        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda, TxType::DctDct);
         let corner: Vec<i32> = (0..32)
             .flat_map(|row| levels[row * side..][..32].to_vec())
             .collect();
