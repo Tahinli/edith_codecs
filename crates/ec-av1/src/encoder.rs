@@ -1467,6 +1467,7 @@ mod tests {
     /// exactly one non-empty packet per picture, `depth - 1` calls later.
     #[test]
     fn one_in_one_out_delayed_by_the_lookahead_depth() {
+        let _knobs = crate::speed::knob_read();
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -1533,6 +1534,7 @@ mod tests {
     /// to catch.
     #[test]
     fn the_facade_codes_the_same_bytes_as_encode_sequence() {
+        let _knobs = crate::speed::knob_read();
         let frames = 12usize;
         let film = h264_clip_frames(640, 384, frames).unwrap_or_else(|| {
             eprintln!("no h264 clip: the facade identity gate runs on a synthetic card");
@@ -1609,6 +1611,7 @@ mod tests {
     /// that only checked the screen half would pass with the pyramid deleted).
     #[test]
     fn the_content_gate_keeps_screen_streams_flat() {
+        let _knobs = crate::speed::knob_read();
         let frames = 8usize;
         let pictures: Vec<Picture> = (0..frames).map(|t| test_card(64, 64, t)).collect();
         let config = EncoderConfig {
@@ -1647,6 +1650,7 @@ mod tests {
     /// reads back out of the coded bytes.
     #[test]
     fn gop_cadence_is_honored() {
+        let _knobs = crate::speed::knob_read();
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -1744,6 +1748,7 @@ mod tests {
     /// coded size confirm what the facade already reported.
     #[test]
     fn thirty_pictures_at_gop_fifteen_decode_to_two_key_frames() {
+        let _knobs = crate::speed::knob_read();
         if !have_ffmpeg() {
             eprintln!("SKIP thirty_pictures_at_gop_fifteen_decode_to_two_key_frames: no ffmpeg");
             return;
@@ -1799,6 +1804,7 @@ mod tests {
     /// which is a visibly different string).
     #[test]
     fn bt709_limited_colour_is_reported_by_ffprobe() {
+        let _knobs = crate::speed::knob_read();
         if !have_ffmpeg() {
             eprintln!("SKIP bt709_limited_colour_is_reported_by_ffprobe: no ffmpeg");
             return;
@@ -1823,6 +1829,7 @@ mod tests {
     /// as BT.709 for every input.
     #[test]
     fn bt601_limited_colour_is_reported_by_ffprobe() {
+        let _knobs = crate::speed::knob_read();
         if !have_ffmpeg() {
             eprintln!("SKIP bt601_limited_colour_is_reported_by_ffprobe: no ffmpeg");
             return;
@@ -1849,6 +1856,7 @@ mod tests {
     /// is refused by name.
     #[test]
     fn geometry_mismatch_is_refused() {
+        let _knobs = crate::speed::knob_read();
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -1866,6 +1874,7 @@ mod tests {
     /// `gop == 0` is refused at construction, not the first `encode()` call.
     #[test]
     fn zero_gop_is_refused() {
+        let _knobs = crate::speed::knob_read();
         let config = EncoderConfig {
             width: 64,
             height: 64,
@@ -1942,6 +1951,7 @@ mod tests {
     /// state and the controller's first couple of steps).
     #[test]
     fn bytes_per_frame_target_settles_within_20_percent() {
+        let _knobs = crate::speed::knob_read();
         let Some(pictures) = h264_clip_frames(640, 384, 24) else {
             eprintln!("SKIP bytes_per_frame_target_settles_within_20_percent: no ffmpeg/fixture");
             return;
@@ -1981,6 +1991,7 @@ mod tests {
     /// its own level and one clamped proportional step.
     #[test]
     fn bitrate_target_lands_within_10_percent_over_48_frames() {
+        let _knobs = crate::speed::knob_read();
         let (width, height, frames) = (640usize, 384usize, 48usize);
         let Some(pictures) = h264_clip_frames(width, height, frames) else {
             eprintln!("SKIP bitrate_target_lands_within_10_percent_over_48_frames: no ffmpeg/fixture");
@@ -2048,6 +2059,7 @@ mod tests {
     /// break it.
     #[test]
     fn bytes_per_frame_controller_never_oscillates_past_its_clamp() {
+        let _knobs = crate::speed::knob_read();
         let Some(pictures) = h264_clip_frames(640, 384, 24) else {
             eprintln!(
                 "SKIP bytes_per_frame_controller_never_oscillates_past_its_clamp: no ffmpeg/fixture"
@@ -2151,6 +2163,7 @@ mod tests {
     /// display-order list and fails here.
     #[test]
     fn a_pyramid_stream_decodes_in_display_order_through_both_decoders() {
+        let _knobs = crate::speed::knob_read();
         let (width, height) = (128usize, 128usize);
         let config = EncoderConfig {
             width,
@@ -2266,6 +2279,7 @@ mod tests {
     /// nothing about whether a single 64x64 block was ever written.
     #[test]
     fn a_static_clip_codes_64x64_roots_and_decodes_sample_exact() {
+        let _knobs = crate::speed::knob_read();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (256usize, 128usize);
         let still = test_card(width, height, 0);
@@ -2317,6 +2331,7 @@ mod tests {
 
     #[test]
     fn every_tile_layout_decodes_sample_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_read();
         let (width, height) = (640usize, 384usize);
         let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
         let mut sizes = Vec::new();
@@ -2409,6 +2424,7 @@ mod tests {
     #[test]
     #[ignore = "sets the process-global speed preset: run it alone"]
     fn every_speed_preset_decodes_sample_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (640usize, 384usize);
         let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
@@ -2472,6 +2488,7 @@ mod tests {
     #[test]
     #[ignore = "1080p wall table: minutes, run it with --ignored"]
     fn tile_wall_table_at_1080p() {
+        let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (1920usize, 1080usize);
         let Some(sources) = h264_clip_frames(width, height, 8) else {
@@ -2522,6 +2539,7 @@ mod tests {
     /// thread and at four, per layout.
     #[test]
     fn tile_bytes_do_not_depend_on_the_thread_count() {
+        let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (320usize, 192usize);
         let sources: Vec<Picture> = (0..3).map(|t| test_card(width, height, t * 3)).collect();
@@ -2571,6 +2589,7 @@ mod tests {
     #[test]
     #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
     fn tile_search_wall_1080p() {
+        let _knobs = crate::speed::knob_write();
         tile_search_wall(1920, 1080, 12, &[(0, 0), (1, 0), (1, 1), (2, 1)], &[1, 2, 4, 8]);
     }
 
@@ -2579,6 +2598,7 @@ mod tests {
     #[test]
     #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
     fn tile_search_wall_4k() {
+        let _knobs = crate::speed::knob_write();
         tile_search_wall(3840, 1608, 6, &[(2, 1), (3, 2)], &[1, 8, 12]);
     }
 
@@ -2590,6 +2610,7 @@ mod tests {
     /// rows tall, which is what makes the bands non-trivial.
     #[test]
     fn filter_stage_bytes_do_not_depend_on_the_thread_count() {
+        let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (384usize, 288usize);
         let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
@@ -2627,6 +2648,7 @@ mod tests {
     /// which is the arm this lane opened.
     #[test]
     fn filter_replay_codes_the_same_stream_as_a_full_decode() {
+        let _knobs = crate::speed::knob_read();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let run = |width: usize, height: usize, off: bool| {
             let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
@@ -2672,6 +2694,7 @@ mod tests {
     /// the loop-restoration search reads are bit-identical.
     #[test]
     fn filter_replay_final_matches_the_capture_decode() {
+        let _knobs = crate::speed::knob_read();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let run = |sources: &[Picture], width: usize, height: usize, tiles: (u32, u32)| {
             let config = EncoderConfig {
@@ -2715,12 +2738,14 @@ mod tests {
     #[test]
     #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
     fn filter_stage_wall_1080p() {
+        let _knobs = crate::speed::knob_write();
         filter_stage_wall(1920, 1080, 8, (2, 1), &[8]);
     }
 
     #[test]
     #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
     fn filter_stage_wall_4k() {
+        let _knobs = crate::speed::knob_write();
         filter_stage_wall(3840, 1608, 4, (2, 1), &[8, 12]);
     }
 
@@ -2731,6 +2756,7 @@ mod tests {
     #[test]
     #[ignore = "wall measurement: minutes, run it with --ignored --nocapture"]
     fn filter_stage_wall_film() {
+        let _knobs = crate::speed::knob_write();
         filter_stage_wall(1920, 768, 4, (2, 1), &[8]);
     }
 
@@ -2955,6 +2981,7 @@ mod tests {
     #[test]
     #[ignore = "1080p encode: minutes, run it with --ignored"]
     fn a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_read();
         let (width, height) = (1920usize, 1080usize);
         let Some(sources) = h264_clip_frames(width, height, 3) else {
             eprintln!("SKIP the 1080p tile round trip: no fixture");
@@ -3003,6 +3030,7 @@ mod tests {
     /// the same real clip.
     #[test]
     fn quality_target_is_monotone_in_bytes_and_psnr() {
+        let _knobs = crate::speed::knob_read();
         if !have_ffmpeg() {
             eprintln!("SKIP quality_target_is_monotone_in_bytes_and_psnr: no ffmpeg");
             return;
