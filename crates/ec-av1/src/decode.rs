@@ -9043,25 +9043,7 @@ fn tx_size_context_rect(
 
 /// [`cfl_ac_q3`] for a true `bw`x`bh` rect strip (lane-intradisp r1).
 fn cfl_ac_q3_rect(y: &PlaneBuf<'_>, px: usize, py: usize, bw: usize, bh: usize) -> Vec<i32> {
-    let (cw, ch) = (bw / 2, bh / 2);
-    let mut ac = vec![0i32; cw * ch];
-    let mut sum = 0i32;
-    for cy in 0..ch {
-        for cx in 0..cw {
-            let (lx, ly) = (px + cx * 2, py + cy * 2);
-            let q3 = (i32::from(y.data[ly * y.width + lx])
-                + i32::from(y.data[ly * y.width + lx + 1])
-                + i32::from(y.data[(ly + 1) * y.width + lx])
-                + i32::from(y.data[(ly + 1) * y.width + lx + 1]))
-                << 1;
-            ac[cy * cw + cx] = q3;
-            sum += q3;
-        }
-    }
-    let num_pel = (cw * ch) as i32;
-    let avg = (sum + num_pel / 2) >> num_pel.trailing_zeros();
-    ac.iter_mut().for_each(|v| *v -= avg);
-    ac
+    cfl_ac_q3_at(px, py, bw, bh, |lx, ly| i32::from(y.data[ly * y.width + lx]))
 }
 
 /// Everything a rect strip already read out of the stream before its luma
@@ -13104,22 +13086,37 @@ fn read_cfl_alphas(dec: &mut SymbolDecoder, cdfs: &mut Cdfs) -> (i32, i32) {
 /// subtracted (`round_offset = num_pel/2`, right-shifted by `log2(num_pel)`)
 /// to give the AC values [`cfl_scaled`] scales by alpha.
 fn cfl_ac_q3(y: &PlaneBuf<'_>, px: usize, py: usize, side: usize) -> Vec<i32> {
-    let cside = side / 2;
-    let mut ac = vec![0i32; cside * cside];
+    cfl_ac_q3_at(px, py, side, side, |lx, ly| i32::from(y.data[ly * y.width + lx]))
+}
+
+/// The one body [`cfl_ac_q3`] and [`cfl_ac_q3_rect`] share, reading its luma
+/// samples through `sample(x, y)` instead of a [`PlaneBuf`] -- so the encoder
+/// (lane-av1cfl) builds a CfL candidate's AC signal from its own `u8`
+/// reconstruction through THIS function rather than a second transcription of
+/// `cfl_luma_subsampling_420_lbd_c` + `subtract_average_c`.
+pub(crate) fn cfl_ac_q3_at(
+    px: usize,
+    py: usize,
+    bw: usize,
+    bh: usize,
+    sample: impl Fn(usize, usize) -> i32,
+) -> Vec<i32> {
+    let (cw, ch) = (bw / 2, bh / 2);
+    let mut ac = vec![0i32; cw * ch];
     let mut sum = 0i32;
-    for cy in 0..cside {
-        for cx in 0..cside {
+    for cy in 0..ch {
+        for cx in 0..cw {
             let (lx, ly) = (px + cx * 2, py + cy * 2);
-            let q3 = (i32::from(y.data[ly * y.width + lx])
-                + i32::from(y.data[ly * y.width + lx + 1])
-                + i32::from(y.data[(ly + 1) * y.width + lx])
-                + i32::from(y.data[(ly + 1) * y.width + lx + 1]))
+            let q3 = (sample(lx, ly)
+                + sample(lx + 1, ly)
+                + sample(lx, ly + 1)
+                + sample(lx + 1, ly + 1))
                 << 1;
-            ac[cy * cside + cx] = q3;
+            ac[cy * cw + cx] = q3;
             sum += q3;
         }
     }
-    let num_pel = (cside * cside) as i32;
+    let num_pel = (cw * ch) as i32;
     let avg = (sum + num_pel / 2) >> num_pel.trailing_zeros();
     ac.iter_mut().for_each(|v| *v -= avg);
     ac
@@ -13128,7 +13125,7 @@ fn cfl_ac_q3(y: &PlaneBuf<'_>, px: usize, py: usize, side: usize) -> Vec<i32> {
 /// `get_scaled_luma_q0` (libaom cfl.h): `alpha_q3 * ac_q3`, rounded from Q6
 /// back to whole samples with `ROUND_POWER_OF_TWO_SIGNED` (round-to-nearest,
 /// ties away from zero on the shifted-out sign).
-fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
+pub(crate) fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
     let v = alpha_q3 * ac_q3;
     if v >= 0 {
         (v + 32) >> 6

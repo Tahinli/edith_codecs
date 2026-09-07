@@ -1561,8 +1561,8 @@ impl Plane<'_> {
     /// Codes one block under one mode without committing it: hands back the
     /// levels, the block the decoder would reconstruct, the squared error
     /// against the source and an estimate of what the levels cost in bits.
-    fn trial(&self, at: At, mode: u8, base_q_idx: u8, deadzone: f64, fctx: &crate::decode::FrameCtx) -> Trial {
-        self.trial_typed(at, mode, base_q_idx, deadzone, TxType::DctDct, fctx)
+    fn trial(&self, at: At, mode: u8, angle_delta: i32, base_q_idx: u8, deadzone: f64, fctx: &crate::decode::FrameCtx) -> Trial {
+        self.trial_typed(at, mode, angle_delta, base_q_idx, deadzone, TxType::DctDct, fctx)
     }
 
     /// [`Self::trial`] under a named transform type -- what an intra chroma
@@ -1609,6 +1609,10 @@ impl Plane<'_> {
         &self,
         at: At,
         mode: u8,
+        // This block's `angle_delta_y`/`angle_delta_uv` (spec
+        // `read_intra_angle_info`, -3..=3), zero for every non-directional
+        // mode -- the predictor's own `angle_delta` argument.
+        angle_delta: i32,
         base_q_idx: u8,
         deadzone: f64,
         tx_type: TxType,
@@ -1627,7 +1631,7 @@ impl Plane<'_> {
         let prediction = &mut prediction[..side * side];
         intra_predict_u8(
             mode,
-            0,
+            angle_delta,
             above,
             left,
             corner,
@@ -1815,6 +1819,7 @@ impl Plane<'_> {
         &mut self,
         at: At,
         mode: u8,
+        angle_delta: i32,
         depth: usize,
         search: &Search, fctx: &crate::decode::FrameCtx,
     ) -> (Vec<i32>, f64, f64) {
@@ -1843,7 +1848,7 @@ impl Plane<'_> {
                     reach: Reach::of_tu(side, side, col_off, row_off, tx, tx, reach),
                     set,
                 };
-                let trial = self.trial(tu, mode, search.base_q_idx, search.deadzone, fctx);
+                let trial = self.trial(tu, mode, angle_delta, search.base_q_idx, search.deadzone, fctx);
                 sse += trial.sse;
                 bits += trial.bits;
                 self.commit(tu.x, tu.y, tx, &trial);
@@ -2072,7 +2077,7 @@ impl Plane<'_> {
         at: At,
         search: &Search,
         mode_bits: &[f64; 13], fctx: &crate::decode::FrameCtx,
-    ) -> (Vec<Coeff>, u8, f64) {
+    ) -> (Vec<Coeff>, u8, i32, f64) {
         let At {
             x, y, side, reach, ..
         } = at;
@@ -2155,13 +2160,69 @@ impl Plane<'_> {
                 best = Some((cost, mode, trial));
             }
         }
-        let (cost, mode, trial) = best.expect("the search offers at least one mode");
+        let (mut cost, mode, mut trial) = best.expect("the search offers at least one mode");
+        // `angle_delta_y` (spec `read_intra_angle_info`): the eight
+        // directional modes each carry a -3..=3 delta, three degrees a step,
+        // which the writer has always coded as ZERO because nothing searched
+        // it. Refined on the winning mode only -- libaom's own ordering, and
+        // six extra trials on the directional blocks instead of on every
+        // block times every mode. The edges are the ones the base angle
+        // already read (`enable_intra_edge_filter` is off in this encoder's
+        // sequence header, so no delta changes which samples exist), and the
+        // predictor is the decoder's, `angle_delta` argument and all.
+        let mut angle_delta = 0i32;
+        // Not on a screen frame: measured on the 5-row native gate, the
+        // refinement is worth -0.6/-0.6 on the 2160p film row and flat on the
+        // 1080p one, but +0.7/+0.3 the WRONG way on the screen capture --
+        // synthetic edges land on the base angles, so every delta there buys
+        // a symbol and no prediction. Same `search.screen` gate palette and
+        // intrabc already stand behind.
+        if angle_delta_on() && !search.screen && (V_PRED..=D67_PRED).contains(&mode) {
+            let row = &cdf::ANGLE_DELTA[usize::from(mode - V_PRED)];
+            let zero_bits = symbol_bits(row, crate::tile::ANGLE_DELTA_ZERO);
+            let mut prediction = vec![0u8; side * side];
+            for delta in [-3i32, -2, -1, 1, 2, 3] {
+                intra_predict_u8(
+                    mode,
+                    delta,
+                    above,
+                    left,
+                    corner,
+                    side,
+                    side,
+                    false,
+                    false,
+                    &mut prediction, fctx,
+                );
+                let candidate = self.code_from_prediction(
+                    x,
+                    y,
+                    side,
+                    &prediction,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    at.set,
+                );
+                let bits = symbol_bits(row, (crate::tile::ANGLE_DELTA_ZERO as i32 + delta) as usize)
+                    - zero_bits;
+                let cost_d = candidate.sse
+                    + search.lambda * (candidate.bits + mode_bits[usize::from(mode)] + bits);
+                if cost_d < cost {
+                    cost = cost_d;
+                    angle_delta = delta;
+                    trial = candidate;
+                }
+            }
+            ANGLE_DELTA_HITS[(crate::tile::ANGLE_DELTA_ZERO as i32 + angle_delta) as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if census_on() {
             LUMA_RANK[sad_rank(&ranking, mode).min(12)]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.commit(x, y, side, &trial);
-        (coeffs(&trial.levels, side), mode, cost)
+        (coeffs(&trial.levels, side), mode, angle_delta, cost)
     }
 }
 
@@ -3720,7 +3781,8 @@ fn code_square(
         reach: Reach::of(side, x, y, luma.true_width, luma.true_height, fctx),
         set: luma_set,
     };
-    let (mut luma_coeffs, mode, mut cost) = luma.search_block(at, search, mode_bits, fctx);
+    let (mut luma_coeffs, mode, angle_delta, mut cost) =
+        luma.search_block(at, search, mode_bits, fctx);
     // The depth search runs on the mode the whole-block transform picked --
     // libaom's own ordering, and the reason it costs one extra pass per depth
     // rather than one per (mode, depth) pair.
@@ -3733,7 +3795,7 @@ fn code_square(
             luma_coeffs,
         );
         for depth in 1..=max_tx_depth(side) {
-            let (levels, sse, bits) = luma.code_tx_depth(at, mode, depth, search, fctx);
+            let (levels, sse, bits) = luma.code_tx_depth(at, mode, angle_delta, depth, search, fctx);
             let cost_d = sse
                 + search.lambda
                     * (bits + mode_bits[usize::from(mode)] + tx_depth_bits(side, depth));
@@ -3753,6 +3815,7 @@ fn code_square(
     // A palette block is `DC_PRED` with `tx_depth` 0 by construction: its
     // prediction is the colour map, not the DC of its neighbours.
     let mut mode = mode;
+    let mut angle_delta = angle_delta;
     let mut palette = None;
     if search.screen && crate::decode::palette_bsize_ctx(side).is_some() {
         let source: Vec<u8> = (y..y + side)
@@ -3785,6 +3848,7 @@ fn code_square(
             if cost_p < cost {
                 cost = cost_p;
                 mode = DC_PRED as u8;
+                angle_delta = 0;
                 tx_depth = 0;
                 luma_coeffs = coeffs(&trial.levels, side);
                 luma.commit(x, y, side, &trial);
@@ -3798,8 +3862,8 @@ fn code_square(
 
     // Chroma searches its own mode over [`CHROMA_MODES`], one symbol for both
     // planes; what it costs still counts towards the partition decision.
-    let ([u, v], uv_mode, chroma_cost, palette_uv) =
-        search_chroma(chroma, (x, y), side, chroma_set, search, mode, fctx);
+    let ([u, v], uv_mode, chroma_cost, palette_uv, cfl_alphas) =
+        search_chroma(chroma, luma, (x, y), side, chroma_set, search, mode, fctx);
     cost += chroma_cost;
 
     // The intrabc arm is priced against the WHOLE block -- luma and both
@@ -3834,6 +3898,8 @@ fn code_square(
             tx_depth,
             palette,
             palette_uv,
+            cfl_alphas,
+            angle_delta_y: angle_delta as i8,
             ..BlockCoeffs::default()
         },
         cost,
@@ -3858,21 +3924,61 @@ const CHROMA_MODES: [u8; 7] = [
 
 /// The thirteen intra mode names, for the chroma fire count's print.
 #[cfg(test)]
-const UV_MODE_NAMES: [&str; 13] = [
+const UV_MODE_NAMES: [&str; 14] = [
     "DC", "V", "H", "D45", "D135", "D113", "D157", "D203", "D67", "SMOOTH", "SMOOTH_V",
-    "SMOOTH_H", "PAETH",
+    "SMOOTH_H", "PAETH", "CFL",
 ];
 
 /// How many blocks each chroma mode has won, indexed by the mode itself --
 /// the fire count that says whether the search below reaches its candidates
 /// at all (the `gate-blind-to-feature` class), printed once per gate run.
-static UV_MODE_HITS: [std::sync::atomic::AtomicUsize; 13] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 13];
+static UV_MODE_HITS: [std::sync::atomic::AtomicUsize; 14] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 14];
+
+/// How many blocks each CfL alpha magnitude (`1..=16`, indexed `mag - 1`) has
+/// won, summed over both chroma planes -- the alpha histogram the gate prints
+/// beside the CfL share (`gate-blind-to-feature`: a tool that fires at one
+/// magnitude only is a search that never left its first candidate).
+static CFL_ALPHA_HITS: [std::sync::atomic::AtomicUsize; 17] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 17];
+
+/// Reads [`CFL_ALPHA_HITS`] and zeroes it. Index 0 is "this plane took alpha
+/// zero on a CfL block", `1..=16` the magnitudes.
+#[cfg(test)]
+pub(crate) fn take_cfl_alpha_hits() -> [usize; 17] {
+    std::array::from_fn(|m| CFL_ALPHA_HITS[m].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// How many directional luma blocks won at each `angle_delta_y`, indexed
+/// `delta + 3` -- the histogram that says whether the refinement below ever
+/// leaves zero (`gate-blind-to-feature`).
+static ANGLE_DELTA_HITS: [std::sync::atomic::AtomicUsize; 7] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 7];
+
+/// Reads [`ANGLE_DELTA_HITS`] and zeroes it.
+#[cfg(test)]
+pub(crate) fn take_angle_delta_hits() -> [usize; 7] {
+    std::array::from_fn(|d| ANGLE_DELTA_HITS[d].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Whether the luma search refines a directional winner's `angle_delta_y`
+/// (`EC_AV1_ANGLE=0` switches it off, the lane's own on/off pair).
+fn angle_delta_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EC_AV1_ANGLE").as_deref() != Ok("0"))
+}
+
+/// Whether the chroma search offers `UV_CFL_PRED` at all (`EC_AV1_CFL=0`
+/// switches it off, which is how the lane measured its own on/off pair).
+fn cfl_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EC_AV1_CFL").as_deref() != Ok("0"))
+}
 
 /// Reads [`UV_MODE_HITS`] and zeroes it, so a gate can attribute the counts
 /// to its own encode.
 #[cfg(test)]
-pub(crate) fn take_uv_mode_hits() -> [usize; 13] {
+pub(crate) fn take_uv_mode_hits() -> [usize; 14] {
     std::array::from_fn(|m| UV_MODE_HITS[m].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -3920,13 +4026,22 @@ const CHROMA_TOP_K: Option<usize> = None;
 
 fn search_chroma(
     chroma: &mut [Plane; 2],
+    // The luma plane's RECONSTRUCTION under this block, already committed by
+    // [`Plane::search_block`] -- the signal a `UV_CFL_PRED` candidate scales.
+    luma: &Plane,
     (x, y): (usize, usize),
     side: usize,
     set: TxbSet,
     search: &Search,
     luma_mode: u8,
     fctx: &crate::decode::FrameCtx,
-) -> ([Vec<Coeff>; 2], u8, f64, Option<crate::tile::PaletteUv>) {
+) -> (
+    [Vec<Coeff>; 2],
+    u8,
+    f64,
+    Option<crate::tile::PaletteUv>,
+    Option<(i32, i32)>,
+) {
     let at = At {
         x: x / 2,
         y: y / 2,
@@ -3967,8 +4082,8 @@ fn search_chroma(
             bits += symbol_bits(&cdf::ANGLE_DELTA[usize::from(mode - V_PRED)], 3);
         }
         let tx_type = crate::decode::default_intra_tx_type(mode);
-        let u = chroma[0].trial_typed(at, mode, search.base_q_idx, search.deadzone, tx_type, fctx);
-        let v = chroma[1].trial_typed(at, mode, search.base_q_idx, search.deadzone, tx_type, fctx);
+        let u = chroma[0].trial_typed(at, mode, 0, search.base_q_idx, search.deadzone, tx_type, fctx);
+        let v = chroma[1].trial_typed(at, mode, 0, search.base_q_idx, search.deadzone, tx_type, fctx);
         let cost = u.sse + v.sse + search.lambda * (bits + u.bits + v.bits);
         if best.as_ref().is_none_or(|(b, ..)| cost < *b) {
             best = Some((cost, mode, u, v));
@@ -4047,6 +4162,134 @@ fn search_chroma(
             }
         }
     }
+    // The chroma-from-luma arm (spec 5.11.45, libaom `cfl_rd_pick_alpha`):
+    // `UV_CFL_PRED` predicts as `DC_PRED` (`get_uv_mode`, spec 9.3) and then
+    // nudges every sample by `alpha_q3` times the block's subsampled,
+    // average-subtracted luma reconstruction. Offered only where
+    // `is_cfl_allowed` (spec 5.11.5) does -- a luma block at most 32x32 --
+    // and priced against the best ordinary chroma mode above, palette
+    // included, so a block only takes it when it beats both.
+    let mut cfl_alphas = None;
+    if side <= 32 && cfl_on() {
+        // The AC signal, through the decoder's own
+        // `cfl_luma_subsampling_420_lbd_c` + `subtract_average_c` body.
+        let ac = crate::decode::cfl_ac_q3_at(x, y, side, side, |lx, ly| {
+            i32::from(luma.reconstruction[ly * luma.width + lx])
+        });
+        let dc_prediction = |plane: &Plane| -> Vec<u8> {
+            let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+            let (above, left, corner) =
+                plane.edges_into(at.x, at.y, at.side, at.reach, &mut above_buf, &mut left_buf);
+            let mut prediction = vec![0u8; at.side * at.side];
+            intra_predict_u8(
+                DC_PRED, 0, above, left, corner, at.side, at.side, false, false, &mut prediction,
+                fctx,
+            );
+            prediction
+        };
+        let bases = [dc_prediction(&chroma[0]), dc_prediction(&chroma[1])];
+        // `av1_cfl_predict_block` (cfl.c): clip the nudged prediction, then
+        // add the residual -- which is what [`Plane::code_from_prediction`]
+        // does with what this returns.
+        let apply = |base: &[u8], alpha: i32| -> Vec<u8> {
+            base.iter()
+                .zip(ac.iter())
+                .map(|(&b, &a)| {
+                    (i32::from(b) + crate::decode::cfl_scaled(alpha, a)).clamp(0, 255) as u8
+                })
+                .collect()
+        };
+        // The least-squares alpha, then its two neighbours: minimising
+        // `sum (source - base - alpha*ac/64)^2` over a continuous alpha is one
+        // dot-product ratio, and the quantised optimum is one of the two
+        // integers around it (the clamp and the Q6 rounding are what the SSE
+        // check below re-decides). libaom sweeps all sixteen magnitudes under
+        // full RD; three predictions per plane buy nearly the same alpha for a
+        // thirtieth of the search.
+        let pick_alpha = |plane: &Plane, base: &[u8]| -> i32 {
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for row in 0..at.side {
+                for col in 0..at.side {
+                    let i = row * at.side + col;
+                    let d = f64::from(plane.source[(at.y + row) * plane.width + at.x + col])
+                        - f64::from(base[i]);
+                    num += d * f64::from(ac[i]);
+                    den += f64::from(ac[i]) * f64::from(ac[i]);
+                }
+            }
+            if den == 0.0 {
+                return 0;
+            }
+            let ideal = 64.0 * num / den;
+            let mut best = (plane.block_sse(at.x, at.y, at.side, base), 0i32);
+            for alpha in [ideal.floor() as i64, ideal.ceil() as i64] {
+                let alpha = alpha.clamp(-16, 16) as i32;
+                if alpha == 0 {
+                    continue;
+                }
+                let sse = plane.block_sse(at.x, at.y, at.side, &apply(base, alpha));
+                if sse < best.0 {
+                    best = (sse, alpha);
+                }
+            }
+            best.1
+        };
+        let picked = [
+            pick_alpha(&chroma[0], &bases[0]),
+            pick_alpha(&chroma[1], &bases[1]),
+        ];
+        if picked != [0, 0] {
+            let cfl_bits = symbol_bits(uv_cdf, crate::tile::UV_CFL_PRED) - dc_bits;
+            let trial = |plane_idx: usize, alpha: i32| -> Trial {
+                let prediction = if alpha == 0 {
+                    bases[plane_idx].clone()
+                } else {
+                    apply(&bases[plane_idx], alpha)
+                };
+                chroma[plane_idx].code_from_prediction(
+                    at.x,
+                    at.y,
+                    at.side,
+                    &prediction,
+                    false,
+                    search.base_q_idx,
+                    search.deadzone,
+                    set,
+                )
+            };
+            // At least one alpha must be nonzero: `cfl_alpha_signs` has no
+            // (ZERO, ZERO) joint value ([`crate::tile::cfl_joint_sign`]).
+            let combos: [(i32, i32); 3] = [
+                (picked[0], picked[1]),
+                (picked[0], 0),
+                (0, picked[1]),
+            ];
+            for &(alpha_u, alpha_v) in &combos {
+                if (alpha_u, alpha_v) == (0, 0) {
+                    continue;
+                }
+                let cu = trial(0, alpha_u);
+                let cv = trial(1, alpha_v);
+                let bits =
+                    cfl_bits + crate::tile::cfl_alpha_bits(alpha_u, alpha_v) + cu.bits + cv.bits;
+                let cost_cfl = cu.sse + cv.sse + search.lambda * bits;
+                if cost_cfl < cost {
+                    cost = cost_cfl;
+                    mode = crate::tile::UV_CFL_PRED as u8;
+                    u = cu;
+                    v = cv;
+                    palette_uv = None;
+                    cfl_alphas = Some((alpha_u, alpha_v));
+                }
+            }
+        }
+    }
+    if let Some((alpha_u, alpha_v)) = cfl_alphas {
+        for alpha in [alpha_u, alpha_v] {
+            CFL_ALPHA_HITS[alpha.unsigned_abs() as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     if census_on() {
         CHROMA_RANK[sad_rank(&ranking, mode).min(6)]
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4059,6 +4302,7 @@ fn search_chroma(
         mode,
         cost,
         palette_uv,
+        cfl_alphas,
     )
 }
 
@@ -4840,6 +5084,8 @@ fn code_square_inter(
             chroma[1].commit(x / 2, y / 2, side / 2, &v_new);
             return (
                 BlockCoeffs {
+                    angle_delta_y: 0,
+                    cfl_alphas: None,
                     luma: coeffs(&levels, side),
                     u: coeffs(&u_new.levels, side / 2),
                     v: coeffs(&v_new.levels, side / 2),
@@ -4873,6 +5119,8 @@ fn code_square_inter(
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
         chroma[1].commit(x / 2, y / 2, side / 2, &v);
         (BlockCoeffs {
+            angle_delta_y: 0,
+            cfl_alphas: None,
             luma: coeffs(&levels, side),
             u: coeffs(&u.levels, side / 2),
             v: coeffs(&v.levels, side / 2),
@@ -6788,6 +7036,7 @@ fn search_inter_block(
             set: chroma_set,
         },
         DC_PRED,
+        0,
         search.base_q_idx,
         search.deadzone, fctx,
     );
@@ -6800,6 +7049,7 @@ fn search_inter_block(
             set: chroma_set,
         },
         DC_PRED,
+        0,
         search.base_q_idx,
         search.deadzone, fctx,
     );
@@ -6834,6 +7084,7 @@ fn search_inter_block(
                 set: luma_set,
             },
             mode,
+            0,
             search.base_q_idx,
             search.deadzone, fctx,
         );
@@ -7576,6 +7827,8 @@ fn search_inter_block(
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
     (
         BlockCoeffs {
+            angle_delta_y: 0,
+            cfl_alphas: None,
             luma: coeffs(&levels, BLOCK),
             u: coeffs(&best.u.levels, BLOCK / 2),
             v: coeffs(&best.v.levels, BLOCK / 2),
@@ -9828,6 +10081,8 @@ mod tests {
         let (_, inter_header) = inter_frame_headers(width, height, 100, 1, 0).unwrap();
 
         let residual_block = BlockCoeffs {
+            angle_delta_y: 0,
+            cfl_alphas: None,
             luma: vec![Coeff {
                 row: 0,
                 col: 0,
@@ -11489,8 +11744,14 @@ mod tests {
         // 3-value alphabet where a warp sample exists) on the DEFAULT path --
         // +34.9% here, one point past the OBMC reading above. The bound moves
         // with it; `EC_AV1_WARP=0` restores the +32.6% no-motion_mode number.
+        // lane-av1cfl: a `UV_CFL_PRED` block carries a `cfl_alpha_signs`
+        // symbol and one or two magnitude symbols, none of which the
+        // coefficient sum counts either -- +36.9% here against the same
+        // fixture's +34.9% with `EC_AV1_CFL=0`.
+        // ... and a directional block whose `angle_delta_y` is no longer
+        // always ZERO codes a costlier symbol off the same CDF -- +39.1%.
         assert!(
-            worst_under <= 0.36,
+            worst_under <= 0.40,
             "the writer spent {:.2}% more than the search priced -- more than \
              the mode/mv syntax outside the coefficient sum explains",
             worst_under * 100.0
@@ -12541,6 +12802,12 @@ mod tests {
     /// and the two var-tx depth searches ([`tx32_depth_search`],
     /// [`compound_var_tx`]) are on by default, all three re-judged on the
     /// native gate's real film rows.
+    /// Re-pinned on lane-av1cfl: the chroma search offers `UV_CFL_PRED`, so
+    /// every block whose chroma takes it codes a different mode symbol, two
+    /// alpha symbols and different chroma coefficients. `EC_AV1_CFL=0`
+    /// restores the previous streams. Re-pinned again in the same lane once
+    /// directional luma winners searched their `angle_delta_y`
+    /// (`EC_AV1_ANGLE=0` restores that half).
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
         if !have_ffmpeg() {
@@ -12568,8 +12835,13 @@ mod tests {
         // four frames; four pictures is one short mini-GOP, which is the
         // shape that pays least (the ARF's own quality has no later group to
         // carry it), so this is not the BD gate's number.
+        // Re-taken again on lane-av1cfl: the chroma search offers
+        // `UV_CFL_PRED` and directional luma winners search `angle_delta_y`,
+        // so every block taking either codes different syntax and different
+        // coefficients -- 8194 -> 7321 at q=150 and 28285 -> 27285 at q=60.
+        // `EC_AV1_CFL=0` / `EC_AV1_ANGLE=0` restore each half.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8194, 0x08ba_a7a8_26f6_f414), (60, 28285, 0x64af_fc52_eef6_2967)];
+            [(150, 7321, 0x34e2_e4e0_d7c5_09f3), (60, 27285, 0xbfd2_41af_dcac_a0c6)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -13046,6 +13318,38 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
+            // The CfL alpha histogram (lane-av1cfl): one entry per chroma
+            // plane of every `UV_CFL_PRED` block, by |alpha_q3|. A tool that
+            // only ever fires at one magnitude is a search that never left
+            // its first candidate (gate-blind-to-feature).
+            // The luma angle-delta histogram (lane-av1cfl): how many
+            // directional blocks won at each delta. All-zero would mean the
+            // refinement never beat the base angle.
+            let deltas = take_angle_delta_hits();
+            if deltas.iter().sum::<usize>() > 0 {
+                eprintln!(
+                    "{name}: angle_delta_y {}",
+                    deltas
+                        .iter()
+                        .enumerate()
+                        .map(|(d, &n)| format!("{:+}={n}", d as i32 - 3))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+            let alphas = take_cfl_alpha_hits();
+            if alphas.iter().sum::<usize>() > 0 {
+                eprintln!(
+                    "{name}: cfl |alpha| {}",
+                    alphas
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &n)| n > 0)
+                        .map(|(a, &n)| format!("{a}={n}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
             let palette_uv = crate::tile::take_palette_uv_hits();
             eprintln!(
                 "{name}: chroma palette blocks {} sizes {}",
