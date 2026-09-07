@@ -2152,6 +2152,42 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn txrd_gain_probe() {
+        for side in [4usize, 8, 16, 32] {
+            let residual: Vec<i32> =
+                noise(side * side, 7 + side as u64).iter().map(|&v| v / 4).collect();
+            let all = [
+                TxType::DctDct,
+                TxType::AdstDct,
+                TxType::DctAdst,
+                TxType::AdstAdst,
+                TxType::Idtx,
+                TxType::VDct,
+                TxType::HDct,
+                TxType::VAdst,
+                TxType::HAdst,
+            ];
+            for &tx in &all {
+                if side > 16 && !matches!(tx, TxType::DctDct | TxType::Idtx) {
+                    continue;
+                }
+                let levels = forward_and_quantize_typed(&residual, side, 8, 20, 0.5, tx);
+                let back = dequant_and_inverse_typed(&levels, side, 8, 20, 0, 0, tx);
+                let num: f64 =
+                    residual.iter().zip(&back).map(|(&a, &b)| f64::from(a) * f64::from(b)).sum();
+                let den: f64 = residual.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
+                let nz = levels.iter().filter(|&&l| l != 0).count();
+                let energy: f64 = levels.iter().map(|&l| f64::from(l.abs())).sum();
+                println!(
+                    "{side}x{side} {tx:?} alpha={:.4} nz={nz} sum|l|={energy}",
+                    num / den
+                );
+            }
+        }
+    }
+
     /// The typed forward transform is the decoder's exact inverse undone:
     /// quantized and taken back, an ADST-typed residual returns with the same
     /// error a `DCT_DCT` one does. This is what pins the *gain* of the ADST
