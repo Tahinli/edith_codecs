@@ -32,7 +32,50 @@ Instrumented finding: a +64 perturbation of rounded candidates DID change the
 output on those streams, so the rounded candidates were consumed but only in
 slots whose ±4 eighth-pel difference never reached a coded block's mv.
 
+## (B) bars 2160p libaom crf 45 — FIXED (root cause, class, sweep, fixture)
+First divergence (two instrumented decoders, `EC_TRACE_MODE_STEP` +
+`EC_TRACE_COEFF`): INTER frame 1, block **mi(0,288)**, a 128x128 INTRA block
+inside an inter frame, its FIRST chroma (U) transform unit -- aomdec reads
+`txb_skip` on ctx 10, ours on ctx 11 (`get_txb_ctx`'s offset-10 rows, base 1 vs
+0). The luma ladder and every symbol before it matched exactly.
+
+Root cause, `crates/ec-av1/src/decode.rs`: a 128x128 block codes its chroma as
+four TX_32X32 units, one per 64x64 mu chunk, and libaom stamps the coefficient
+context PER UNIT. The block tail re-stamps those four units only when
+`mu_chroma` is set -- the two INTER mu-chunk sites (27255, 28552) set it, the
+INTRA-in-inter site did not, so the whole-block record left all four units
+carrying the TOP-LEFT unit's level. Class **`override-slot-on-one-arm`** (a fix
+installed on one arm of a set of twins). Sweep: all `CHROMA_SPLIT_TX_HITS`
+sites -- the two key-frame ones (14364, 14703) have their own local re-stamp,
+the three inter-frame ones now all set `mu_chroma`. No other site.
+
+Why it read as a `+-1` at sample 66: the U-plane symbol desynced the tile, and
+the loop-restoration coefficients live in the same tile data, so the whole
+frame shifted by one level while 1.7M samples behind it went wrong.
+
+Fixture: `stream.rs a_libaom_stream_with_128_intra_blocks_in_inter_frames_decodes_exact` -- the repo's own 2160p bars fixture at the native crop, libaom
+`-cpu-used 6 -crf 45 -g 12`, asserts the tool fired and every frame is exact.
+With `mu_chroma = false` on that arm it FAILS with "frame 1 plane Y differs
+from ffmpeg at sample 66" (verified).
+
+## (A) screen capture libaom crf 5 — root cause found, feature DEFERRED
+That stream's key frame is coded **LOSSLESS** (`base_q_idx 0`, `lossless[seg]`
+true; aomdec's own `EC_IMODE_VAL ... tx=0` shows TX_4X4 on a BLOCK_32X32).
+libaom then (a) forces TX_4X4 + the Walsh-Hadamard transform everywhere and
+codes NO `tx_depth` symbol, and (b) narrows `is_cfl_allowed` to
+`plane_bsize == BLOCK_4X4`, which changes the `uv_mode` alphabet. Our tile
+reader ignores `header.lossless` entirely: the FIRST block, mi(0,0), reads
+`uv_mode` = 12 (UV_CFL_PRED) where aomdec reads 1 (V_PRED) -- symbol four of
+the frame. Class `branch-dropped-as-unreachable` (the header computes
+`lossless`/`coded_lossless` and nothing consumes it).
+
+Shipped now: a NAMED REFUSAL in `stream.rs` (`a lossless frame (qindex 0) ...`)
+so the decoder stops returning a picture that is wrong from luma sample 0.
+`deferred: the lossless decode path (WHT 4x4, forced tx size, lossless CfL
+rule, filter bypass) — a feature lane, not a fix — unblocks: implement
+`inverse WHT + the TX_4X4 forcing + `is_cfl_allowed`'s lossless branch, gate
+with this same screen row at crf 5.`
+
 ## OPEN
-* bars 2160p libaom crf 45 frame 1 Y sample 66 (+-1 reconstruction).
-* screen capture (OBS .mkv row) libaom crf 5 frame 0 (KEY) Y sample 0: 126 vs
-  33 — a key-frame desync at the first sample.
+* The native gate's screen row now reports the refusal instead of a silent
+  wrong decode; it is RED until the lossless lane lands.

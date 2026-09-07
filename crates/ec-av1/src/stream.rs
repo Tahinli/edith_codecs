@@ -1591,6 +1591,24 @@ fn decode_frame(
             "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
         ));
     }
+    // lane-dpm1: a LOSSLESS frame (`qindex == 0` with zero deltas, spec 5.9.12)
+    // is a different tile syntax, and this decoder has none of it: libaom
+    // forces TX_4X4 with the WALSH-HADAMARD transform over every block (so no
+    // `tx_depth` symbol is coded at all), and `is_cfl_allowed` narrows to
+    // `plane_bsize == BLOCK_4X4` instead of the 32x32 rule, which changes the
+    // `uv_mode` ALPHABET. Measured on his own screen-capture row at libaom
+    // `-crf 5` (base_q_idx 0): the very first block, mi(0,0) BLOCK_32X32,
+    // reads `uv_mode` off the CfL alphabet where libaom reads the plain one
+    // (ours 12 = UV_CFL_PRED, aomdec 1 = V_PRED) and the tile desyncs at
+    // symbol four of the frame. Refuse by name rather than return a picture
+    // that is silently wrong from luma sample 0 (class `refusal-hides-a-defect`
+    // read the other way: a silent wrong decode is worse than a named gap).
+    if header.lossless.iter().any(|&l| l) {
+        return Err(Error::unsupported(
+            "AV1 decode_stream",
+            "a lossless frame (qindex 0): the TX_4X4 Walsh-Hadamard tile syntax and the lossless CfL rule are unimplemented",
+        ));
+    }
     crate::decode::set_bit_depth(bit_depth, fctx);
     // spec 7.16: this frame's superres state, for the filter chain --
     // `decode.rs` upscales between CDEF and loop restoration and sizes
@@ -3876,6 +3894,91 @@ pub(crate) mod tests {
                     first.is_none(),
                     "frame {i} plane {plane} differs from ffmpeg at sample {} \
                      ({int_mv_inter} force_integer_mv inter frames in this stream)",
+                    first.unwrap()
+                );
+            }
+        }
+    }
+
+    /// lane-dpm1: the 128x128-INTRA-inside-an-INTER-frame chroma context gate.
+    /// A 128x128 block codes its chroma as four TX_32X32 units, one per 64x64
+    /// mu chunk, and libaom stamps the coefficient context PER UNIT. The two
+    /// INTER mu-chunk sites set `mu_chroma` so the block tail re-stamps the
+    /// four units in mu order; the INTRA-in-inter site did not, so the
+    /// whole-block record left every unit carrying the TOP-LEFT unit's level.
+    /// The next block then read its `txb_skip` off ctx 11 where libaom reads
+    /// ctx 10 (class `override-slot-on-one-arm`) -- one symbol on the wrong
+    /// CDF row, tile desynced, and because the loop-restoration coefficients
+    /// live in the same tile data the damage showed up as a +-1 luma sample at
+    /// the TOP of the frame (measured: frame 1, luma sample 66, ours 146 /
+    /// ffmpeg 145, with 1.7M samples wrong behind it).
+    ///
+    /// Source: the repository's own 2160p colour-bar fixture at the native
+    /// gate's crop (1920x1024 out of the middle), 12 frames, libaom
+    /// `-cpu-used 6 -crf 45 -g 12` -- the first reference point of
+    /// `bd_rate_screen_native`'s "bars 2160p" row, which is where the assertion
+    /// caught it. The gate asserts the tool fired (class
+    /// `gate-blind-to-feature`) and that every shown frame decodes sample-exact
+    /// against ffmpeg's own decode.
+    #[test]
+    fn a_libaom_stream_with_128_intra_blocks_in_inter_frames_decodes_exact() {
+        const NAME: &str = "a_libaom_stream_with_128_intra_blocks_in_inter_frames_decodes_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/video/h264-2160p-23.976-8bit.mp4");
+        if !clip.exists() {
+            eprintln!("SKIP {NAME}: the 2160p bars fixture is missing");
+            return;
+        }
+        let (w, h, frames) = (1920usize, 1024usize, 12usize);
+        // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
+        let src = std::env::temp_dir().join(format!("ec-av1-i128-{}.yuv", std::process::id()));
+        let load = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&clip)
+            .args(["-frames:v", &frames.to_string(), "-vf", "crop=1920:1024:960:568"])
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .arg(&src)
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(load.status.success(), "{NAME}: {}", String::from_utf8_lossy(&load.stderr));
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+            .arg(&src)
+            .args(["-an", "-threads", "1", "-g", "12", "-c:v", "libaom-av1"])
+            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "45", "-f", "obu", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        let _ = std::fs::remove_file(&src);
+        if !out.status.success() {
+            eprintln!(
+                "SKIP {NAME}: ffmpeg has no libaom-av1 encoder ({})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let stream = out.stdout;
+        let before = crate::decode::intra_128_in_inter_hits();
+        let ours = decode_stream(&stream).expect("libaom bars stream decodes");
+        assert!(
+            crate::decode::intra_128_in_inter_hits() > before,
+            "{NAME} went blind: no 128-rooted intra block inside an inter frame"
+        );
+        let theirs = ffmpeg_decode_sequence(&stream, w, h, frames);
+        assert_eq!(ours.len(), frames, "shown frame count");
+        for (i, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
+            for (plane, l, r) in [("Y", &a.y, &b.y), ("U", &a.u, &b.u), ("V", &a.v, &b.v)] {
+                let first = l.iter().zip(r.iter()).position(|(x, y)| x != y);
+                assert!(
+                    first.is_none(),
+                    "frame {i} plane {plane} differs from ffmpeg at sample {}",
                     first.unwrap()
                 );
             }
