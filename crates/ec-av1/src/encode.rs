@@ -487,6 +487,82 @@ pub fn take_b64_residual_hits() -> usize {
     B64_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the 64x64 root also prices COMPOUND candidates (lane-b64b): the
+/// `LAST` + extra-reference pairs the 32x32 level already offers, at the
+/// three modes a root can form without a second 64x64 motion search --
+/// `NEAREST_NEARESTMV`, `GLOBAL_GLOBALMV` and `NEW_NEARESTMV` (whose NEW half
+/// is the vector `search_skip_64`'s own single-reference search already
+/// found). `NEAREST_NEWMV`/`NEW_NEWMV` need the SECOND reference's own
+/// `NEWMV` vector, which only a second search per superblock produces -- the
+/// wall this root exists to save -- so they are not offered here.
+///
+/// Off by `EC_AV1_B64COMP=0`, so both arms measure on one build.
+fn b64_compound() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64COMP").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b64_root()
+}
+
+/// How many 64x64 roots took a COMPOUND candidate since the last
+/// [`take_b64_compound_hits`] (class `gate-blind-to-feature`).
+static B64_COMPOUND_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The compound 64x64-root count since the last call, and zero it.
+pub fn take_b64_compound_hits() -> usize {
+    B64_COMPOUND_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a 64x64 root that codes a residual may SPLIT its luma transform
+/// (lane-b64b): four TX_32X32 units instead of the one TX_64X64, decided by
+/// [`commit_inter_luma`] like every other inter block's var-tx, and coded by
+/// the writer's `Whole64` arm as `txfm_split = 1`. It exists because
+/// TX_64X64 zeroes everything outside its 32x32 corner, so a root whose
+/// residual has detail in the other three quadrants cannot code it at all.
+///
+/// Off by `EC_AV1_B64VARTX=0`.
+fn b64_var_tx() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64VARTX").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b64_root()
+}
+
+/// How many 64x64 roots split their luma transform since the last
+/// [`take_b64_var_tx_hits`].
+static B64_VAR_TX_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The split-luma 64x64-root count since the last call, and zero it.
+pub fn take_b64_var_tx_hits() -> usize {
+    B64_VAR_TX_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a superblock the true frame edge CUTS THROUGH may be left whole
+/// (lane-b64b). AV1 asks only that the block's own half is inside
+/// (`has_cols`/`has_rows`, spec `decode_partition`), and the writer already
+/// codes that case; what was missing was a trial whose SSE is scored over the
+/// INSIDE part alone ([`inside_sse`]) instead of over the padding the encoder
+/// invented past the edge. Both gate films are superblock-aligned, so this
+/// only reaches the user's own arbitrary export sizes.
+///
+/// Off by `EC_AV1_B64EDGE=0`.
+fn b64_edge() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64EDGE").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b64_root()
+}
+
+/// How many 64x64 roots the frame edge cut through since the last
+/// [`take_b64_edge_hits`] (class `gate-blind-to-feature`: both gate films are
+/// superblock-aligned, so nothing but a synthetic size fires this).
+static B64_EDGE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The edge 64x64-root count since the last call, and zero it.
+pub fn take_b64_edge_hits() -> usize {
+    B64_EDGE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the encoder searches loop restoration at all (spec 7.17): one
 /// Wiener filter per 64x64 luma restoration unit, picked from
 /// [`crate::filter_search::WIENER_CANDIDATES`]. Swept by `EC_AV1_LR` in a
@@ -3406,7 +3482,7 @@ fn commit_inter_luma(
         && !skip
         && side >= 16
         && (second.is_none() || compound_var_tx())
-        && (side < BLOCK || tx32_depth_search())
+        && (side != BLOCK || tx32_depth_search())
         && x + side <= luma.true_width
         && y + side <= luma.true_height;
     if !eligible {
@@ -3414,7 +3490,14 @@ fn commit_inter_luma(
         return (flat.levels.clone(), 0, 0.0);
     }
     let tx = side / 2;
-    let set = if tx >= 16 { TxbSet::Luma16Inter } else { TxbSet::Luma8Inter };
+    let set = if tx >= 32 {
+        // lane-b64b: the 64x64 root's halved transform is TX_32X32.
+        TxbSet::Luma32Inter
+    } else if tx >= 16 {
+        TxbSet::Luma16Inter
+    } else {
+        TxbSet::Luma8Inter
+    };
     let mut levels = vec![0i32; side * side];
     let (mut sse, mut bits) = (0.0, 0.0);
     let mut units = Vec::with_capacity(4);
@@ -3448,14 +3531,22 @@ fn commit_inter_luma(
     let split_cost = sse + search.lambda * (bits + txfm_split_bits(side, 1));
     let flat_cost = flat.sse + search.lambda * (flat.bits + txfm_split_bits(side, 0));
     let class = usize::from(side == BLOCK) * 4 + usize::from(second.is_some()) * 2;
+    // The depth census has a leaf row and a 32x32 row and no 64 one, so the
+    // 64x64 root counts itself ([`take_b64_var_tx_hits`]) instead of landing
+    // in the leaf row (class `gate-blind-to-feature`).
+    let counted = side <= BLOCK;
     if split_cost < flat_cost {
         for (tu_x, tu_y, trial) in &units {
             luma.commit(*tu_x, *tu_y, tx, trial);
         }
-        INTER_TX_SPLIT_HITS[class + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if counted {
+            INTER_TX_SPLIT_HITS[class + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return (levels, 1, split_cost - flat_cost);
     }
-    INTER_TX_SPLIT_HITS[class].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if counted {
+        INTER_TX_SPLIT_HITS[class].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     luma.commit(x, y, side, flat);
     (flat.levels.clone(), 0, 0.0)
 }
@@ -5937,6 +6028,46 @@ where
 /// of the frame's reconstruction because a tile's prediction never reads a
 /// sample outside its own rectangle, and every sample inside it is written
 /// before it is read.
+/// [`Plane::block_sse`] over the part of a block that is INSIDE the true
+/// frame. A block the edge cuts through is still coded whole -- the decoder
+/// reconstructs its outside samples too and the display crop throws them away
+/// -- so scoring them would rank a 64x64 root by how well it predicts padding
+/// the source does not have (lane-b64b).
+fn inside_sse(plane: &Plane, x: usize, y: usize, side: usize, reconstruction: &[u8]) -> f64 {
+    let rows = side.min(plane.true_height.saturating_sub(y));
+    let cols = side.min(plane.true_width.saturating_sub(x));
+    let mut sse = 0u64;
+    for row in 0..rows {
+        let source = &plane.source[(y + row) * plane.width + x..][..cols];
+        for (col, &s) in source.iter().enumerate() {
+            let d = u32::from(s.abs_diff(reconstruction[row * side + col]));
+            sse += u64::from(d * d);
+        }
+    }
+    sse as f64
+}
+
+/// Rescores one 64x64 root trial set (luma and the two chroma planes) over
+/// the inside part of a superblock the frame edge cuts through.
+fn clip_sb64_sse(
+    trials: &mut [Trial; 3],
+    luma: &Plane,
+    chroma: &[Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+) {
+    trials[0].sse = inside_sse(luma, x, y, side, &trials[0].reconstruction);
+    for plane in 0..2 {
+        trials[plane + 1].sse = inside_sse(
+            &chroma[plane],
+            x / 2,
+            y / 2,
+            side / 2,
+            &trials[plane + 1].reconstruction,
+        );
+    }
+}
+
 fn fresh_plane(source: &[u8], width: usize, height: usize, true_width: usize, true_height: usize) -> Plane<'_> {
     Plane {
         source,
@@ -7328,6 +7459,42 @@ fn predict_u8(
     prediction.iter().map(|&v| v as u8).collect()
 }
 
+/// [`predict_u8`]'s compound counterpart, on the heap because a 64x64 root's
+/// side is twice what [`mc_trial_compound`]'s fixed trial buffers hold: both
+/// references predict into the `CONV_BUF` intermediate domain and are blended
+/// at the simple-average split `(8, 8)`, the same path (and so the same
+/// samples) a `comp_group_idx == 0`, `compound_idx == 1` decoder computes.
+fn predict_compound_u8(
+    ref0: (&[u16], usize, usize, usize),
+    ref1: (&[u16], usize, usize, usize),
+    (x, y): (usize, usize),
+    side: usize,
+    (mv0, mv1): ((i32, i32), (i32, i32)),
+    luma: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> Vec<u8> {
+    let mut inter = [vec![0i32; side * side], vec![0i32; side * side]];
+    for ((mv, r), dst) in [(mv0, ref0), (mv1, ref1)].into_iter().zip(inter.iter_mut()) {
+        mc::predict_compound_intermediate(
+            r.0,
+            r.1,
+            r.2,
+            r.3,
+            mv_to_q4(x, mv.1, luma),
+            mv_to_q4(y, mv.0, luma),
+            mc::REF_NO_SCALE,
+            side,
+            side,
+            mc::InterpFilterKind::Regular,
+            mc::InterpFilterKind::Regular,
+            dst,
+        );
+    }
+    let mut blended = vec![0u16; side * side];
+    mc::combine_compound(&inter[0], &inter[1], 8, 8, &mut blended, fctx);
+    blended.iter().map(|&v| v as u8).collect()
+}
+
 /// The 64x64 `PARTITION_NONE` candidate for a whole superblock ([`B64_ROOT`]):
 /// single-reference LAST at `NEARESTMV`/`GLOBALMV`/`NEARMV`/`NEWMV`, coded
 /// SKIP, priced through the same `symbol_bits` path every other candidate
@@ -7348,6 +7515,10 @@ fn search_skip_64(
     residual: bool,
     reference: &Picture,
     stack: &MvStack,
+    // The COMPOUND stack of each `LAST` + extra-reference pair at THIS
+    // superblock's 16x16-mi window, built off the same grid the tile writer
+    // rebuilds it from (empty unless the frame carries `reference_select`).
+    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
     fctx: &crate::decode::FrameCtx,
 ) -> Option<(f64, BlockCoeffs)> {
     let side = SUPERBLOCK;
@@ -7386,6 +7557,9 @@ fn search_skip_64(
             ));
         }
     }
+    // `LAST`'s own `NEWMV` vector, kept for the compound `NEW_NEARESTMV`
+    // candidate below to pair with the second reference's NEAREST half.
+    let mut last_new_mv: Option<(i32, i32)> = None;
     if leaf_new_mv() {
         let source_block = luma.source_block(x, y, side);
         let (seeds, seed_n) = mv_seeds(stack);
@@ -7407,6 +7581,7 @@ fn search_skip_64(
         );
         let mv = round_to_valid_mv(found.mv, stack.pred_mv);
         if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(stack, mv) {
+            last_new_mv = Some(mv);
             cands.push((
                 symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
                 info_of(InterMode::NewMv, mv, ref_mv_idx),
@@ -7414,9 +7589,12 @@ fn search_skip_64(
         }
     }
 
+    // A superblock the true frame edge cuts through: every trial below is
+    // ranked over its inside part only ([`clip_sb64_sse`]).
+    let edge = x + side > luma.true_width || y + side > luma.true_height;
     let mut best: Option<(f64, f64, InterInfo, [Trial; 3])> = None;
     for (bits, info) in cands {
-        let trials = [
+        let mut trials = [
             (0usize, x, y, side, true),
             (1, x / 2, y / 2, side / 2, false),
             (2, x / 2, y / 2, side / 2, false),
@@ -7453,15 +7631,138 @@ fn search_skip_64(
                 TxbSet::Luma32Inter,
             )
         });
+        if edge {
+            clip_sb64_sse(&mut trials, luma, chroma, (x, y), side);
+        }
         let cost = trials[0].sse
             + trials[1].sse
             + trials[2].sse
             + search.lambda * (fixed + bits);
         if best.as_ref().is_none_or(|b| cost < b.0) {
-            best = Some((cost, bits, info, trials));
+            best = Some((cost, fixed + bits, info, trials));
         }
     }
-    let (skip_cost, bits, info, skip_trials) = best?;
+
+    // lane-b64b: the COMPOUND candidates at the 64 root, the same three a
+    // superblock can form without a second motion search ([`b64_compound`]),
+    // priced through the same `symbol_bits` path -- `fixed` minus the single
+    // reference's tree, plus the pair tree and the compound mode.
+    for (ref1, g, cstack) in compound.iter().filter(|_| b64_compound()) {
+        let (ref1, g) = (*ref1, *g);
+        let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&ref1);
+        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
+            + if uni {
+                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
+                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
+                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
+                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
+            } else {
+                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
+                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
+            };
+        let mode_ctx =
+            cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
+        let mode_bits_of =
+            |mode: usize| pair_bits + symbol_bits(&cdf::INTER_COMPOUND_MODE[mode_ctx], mode);
+        let compound_info = |mode: InterMode, mvs: ((i32, i32), (i32, i32))| InterInfo {
+            ref1: Some(ref1),
+            mv1: mvs.1,
+            ref_frame: crate::mvstack::LAST_FRAME,
+            mode,
+            mv: mvs.0,
+            ref_mv_idx: 0,
+        };
+        let mut ccands: Vec<(((i32, i32), (i32, i32)), f64, InterInfo)> = vec![
+            (
+                cstack.nearest_mv,
+                mode_bits_of(0),
+                compound_info(InterMode::NearestNearestMv, cstack.nearest_mv),
+            ),
+            (
+                ((0, 0), (0, 0)),
+                mode_bits_of(6),
+                compound_info(InterMode::GlobalGlobalMv, ((0, 0), (0, 0))),
+            ),
+        ];
+        // `NEW_NEARESTMV`: the NEW half is `LAST`'s vector from the search
+        // above, its residual priced against compound stack entry 0 -- what
+        // `assign_compound_mv` predicts from at `ref_mv_idx = 0`.
+        let cbase = cstack
+            .entries
+            .first()
+            .map_or(cstack.nearest_mv, |e| (e.mv0, e.mv1));
+        if let Some(new_mv) = last_new_mv
+            && let Some(b0) = mv_residual_bits(new_mv, cbase.0)
+        {
+            let mvs = (new_mv, cstack.nearest_mv.1);
+            ccands.push((
+                mvs,
+                mode_bits_of(3) + b0,
+                compound_info(InterMode::NewNearestMv, mvs),
+            ));
+        }
+        ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        ccands.dedup_by_key(|c| c.0);
+        for (mvs, bits, info) in ccands {
+            let mut trials = [
+                (0usize, x, y, side, true),
+                (1, x / 2, y / 2, side / 2, false),
+                (2, x / 2, y / 2, side / 2, false),
+            ]
+            .map(|(plane, px, py, s, is_luma)| {
+                let (r0, r1) = match plane {
+                    0 => (
+                        (reference.y.as_slice(), reference.width, luma.true_width, luma.true_height),
+                        (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                    ),
+                    1 => (
+                        (
+                            reference.u.as_slice(),
+                            reference.width / 2,
+                            chroma[0].true_width,
+                            chroma[0].true_height,
+                        ),
+                        (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                    ),
+                    _ => (
+                        (
+                            reference.v.as_slice(),
+                            reference.width / 2,
+                            chroma[1].true_width,
+                            chroma[1].true_height,
+                        ),
+                        (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                    ),
+                };
+                let prediction =
+                    predict_compound_u8(r0, r1, (px, py), s, mvs, is_luma, fctx);
+                let target: &Plane = if plane == 0 { luma } else { &chroma[plane - 1] };
+                target.code_from_prediction(
+                    px,
+                    py,
+                    s,
+                    &prediction,
+                    true,
+                    search.base_q_idx,
+                    search.deadzone,
+                    TxbSet::Luma32Inter,
+                )
+            });
+            if edge {
+                clip_sb64_sse(&mut trials, luma, chroma, (x, y), side);
+            }
+            let syntax = fixed - ref_bits + bits;
+            let cost =
+                trials[0].sse + trials[1].sse + trials[2].sse + search.lambda * syntax;
+            if best.as_ref().is_none_or(|b| cost < b.0) {
+                best = Some((cost, syntax, info, trials));
+            }
+        }
+    }
+
+    let (skip_cost, syntax, info, skip_trials) = best?;
 
     // The winner's prediction coded with a REAL residual (lane-tx64): one
     // TX_64X64 luma transform -- `TxbSet::Luma64`, whose coded quarter is the
@@ -7475,9 +7776,16 @@ fn search_skip_64(
     // two numbers are comparable: `fixed` charged `skip` coded 1, and this
     // arm charges 0 instead and adds its three planes' coefficient bits.
     let mut chosen = (skip_cost, true, skip_trials);
+    // Set when [`commit_inter_luma`] already wrote the residual arm's luma
+    // into the plane, so the tail below does not commit over its units.
+    let mut luma_committed = false;
+    // The residual arm's luma levels and the `txfm_split` depth the writer
+    // codes: depth 0 is the TX_64X64 corner in 32x32 coordinates, depth 1 is
+    // four TX_32X32 units in 64x64 ones.
+    let mut luma_levels: Option<(Vec<i32>, u8)> = None;
     if residual {
         let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
-        let residual_trials = [0usize, 1, 2].map(|plane| {
+        let mut residual_trials = [0usize, 1, 2].map(|plane| {
             let (target, px, py, s) = if plane == 0 {
                 (&*luma, x, y, side)
             } else {
@@ -7494,18 +7802,59 @@ fn search_skip_64(
                 sets[plane],
             )
         });
+        if edge {
+            clip_sb64_sse(&mut residual_trials, luma, chroma, (x, y), side);
+        }
         let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
         let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
+        // lane-b64b: the root's own var-tx decision -- one TX_64X64 or the
+        // four TX_32X32 units of `txfm_split = 1`, taken by the same
+        // `commit_inter_luma` every other inter block's is (it commits the
+        // winner and hands back the cost it took off the flat arm).
+        let (levels, depth, gain) = if b64_var_tx() {
+            let second = info.ref1.and_then(|r1| {
+                compound.iter().find(|(r, _, _)| *r == r1).map(|&(_, g, _)| {
+                    (
+                        info.mv1,
+                        (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                    )
+                })
+            });
+            luma_committed = true;
+            commit_inter_luma(
+                luma,
+                (x, y),
+                side,
+                info.mv,
+                (&reference.y, reference.width, luma.true_width, luma.true_height),
+                search,
+                &residual_trials[0],
+                false,
+                second,
+                fctx,
+            )
+        } else {
+            (residual_trials[0].levels.clone(), 0, 0.0)
+        };
         let cost = residual_trials.iter().map(|t| t.sse).sum::<f64>()
-            + search.lambda * (fixed + bits + unskip + coeff_bits);
+            + search.lambda * (syntax + unskip + coeff_bits)
+            + gain;
         if cost < skip_cost {
             B64_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if depth == 1 {
+                B64_VAR_TX_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            luma_levels = Some((levels, depth));
             chosen = (cost, false, residual_trials);
         }
     }
 
     let (cost, skip, trials) = chosen;
-    luma.commit(x, y, side, &trials[0]);
+    // `commit_inter_luma` already wrote the residual arm's luma (its four
+    // split units are not one 64-sided trial); a skip winner overwrites it.
+    if skip || !luma_committed {
+        luma.commit(x, y, side, &trials[0]);
+    }
     chroma[0].commit(x / 2, y / 2, side / 2, &trials[1]);
     chroma[1].commit(x / 2, y / 2, side / 2, &trials[2]);
     Some((
@@ -7513,9 +7862,16 @@ fn search_skip_64(
         BlockCoeffs {
             skip,
             inter: Some(info),
-            // Both grids are 32-sided: the luma one is the 64-point
-            // transform's coded corner, the chroma ones are whole TX_32X32.
-            luma: if skip { Vec::new() } else { coeffs(&trials[0].levels, BLOCK) },
+            // The chroma grids are whole TX_32X32; the luma one is the
+            // 64-point transform's coded 32x32 corner at depth 0 and the
+            // whole 64-sided block at depth 1 (lane-b64b).
+            tx_depth: luma_levels.as_ref().map_or(0, |&(_, d)| d),
+            luma: match (skip, &luma_levels) {
+                (true, _) => Vec::new(),
+                (false, Some((levels, 1))) => coeffs(levels, SUPERBLOCK),
+                (false, Some((levels, _))) => coeffs(levels, BLOCK),
+                (false, None) => coeffs(&trials[0].levels, BLOCK),
+            },
             u: if skip { Vec::new() } else { coeffs(&trials[1].levels, side / 2) },
             v: if skip { Vec::new() } else { coeffs(&trials[2].levels, side / 2) },
             ..BlockCoeffs::default()
@@ -9173,19 +9529,30 @@ pub(crate) fn encode_inter_frame(
             // lane-b64: the whole superblock as ONE 64x64 block, tried before
             // its quadrants are (`search_skip_64`) and compared against the
             // four of them below. Only a superblock wholly inside the true
-            // frame is offered it: a 64x64 root whose right or bottom part
-            // hangs over the edge is legal AV1 (`has_cols`/`has_rows` only
-            // ask for half), but its trial would score prediction the frame
-            // does not have -- corner-cut, ceiling = the edge superblocks of
-            // a frame whose size is not a multiple of 64, which stay split.
+            // frame is offered it, and (lane-b64b, `EC_AV1_B64EDGE`) one the
+            // edge CUTS THROUGH: the spec's own `has_cols`/`has_rows` ask
+            // only that the block's half is inside, and the trial is ranked
+            // over the inside part alone ([`clip_sb64_sse`]).
             let (x64, y64) = (sb_c * SUPERBLOCK, sb_r * SUPERBLOCK);
-            let sb64_legal = b64_root()
-                && sb_r * 2 + 1 < rows
-                && sb_c * 2 + 1 < cols
-                && (sb_c as u32 + 1) * crate::tile::SB_MI <= header.mi_cols
+            let whole_inside = (sb_c as u32 + 1) * crate::tile::SB_MI <= header.mi_cols
                 && (sb_r as u32 + 1) * crate::tile::SB_MI <= header.mi_rows
                 && x64 + SUPERBLOCK <= luma.true_width
                 && y64 + SUPERBLOCK <= luma.true_height;
+            let edge_inside = b64_edge()
+                && crate::tile::has_half(
+                    sb_c as u32 * crate::tile::SB_MI,
+                    crate::tile::SB_MI,
+                    header.mi_cols,
+                )
+                && crate::tile::has_half(
+                    sb_r as u32 * crate::tile::SB_MI,
+                    crate::tile::SB_MI,
+                    header.mi_rows,
+                );
+            let sb64_legal = b64_root()
+                && sb_r * 2 + 1 < rows
+                && sb_c * 2 + 1 < cols
+                && (whole_inside || edge_inside);
             // One lambda for the whole superblock, the same mean the 32x32
             // level takes over its own four tpl cells: the 64-vs-four-32
             // comparison below weighs one cost against four, so both sides
@@ -9208,6 +9575,47 @@ pub(crate) fn encode_inter_frame(
                 let (mi_row, mi_col) = (sb_r * 16, sb_c * 16);
                 let stack =
                     find_mv_stack(&grid, mi_row, mi_col, 16, 16, LAST_FRAME, mi_cols, mi_rows);
+                // lane-b64b: the `LAST` + extra-reference pairs at this
+                // superblock's own 16x16-mi window, the same stacks the tile
+                // writer's `Whole64` arm rebuilds. Empty unless the frame
+                // codes `reference_select`, which is what gates the syntax.
+                // `!screen` for the same reason the residual arm is gated
+                // there ([`b64_residual`]): a desktop capture's superblocks
+                // are flat runs the skip arm already codes for nothing, and
+                // MEASURED, compound at the root cost it +33.4/-23.8 ->
+                // +33.7/-23.6 while both film rows gained (step 1's table).
+                let sb_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+                    if header.reference_select && b64_compound() && !screen {
+                        [
+                            (crate::mvstack::GOLDEN_FRAME, golden),
+                            (crate::mvstack::ALTREF_FRAME, altref),
+                        ]
+                        .into_iter()
+                        .filter_map(|(r, pic)| {
+                            pic.map(|p| {
+                                (
+                                    r,
+                                    p,
+                                    crate::mvstack::find_mv_stack_compound(
+                                        &grid,
+                                        mi_row,
+                                        mi_col,
+                                        16,
+                                        16,
+                                        (crate::mvstack::LAST_FRAME, r),
+                                        mi_cols,
+                                        mi_rows,
+                                        grid.sign_bias_table(),
+                                        &[(0, 0); 7],
+                                        None,
+                                    ),
+                                )
+                            })
+                        })
+                        .collect()
+                    } else {
+                        Vec::new()
+                    };
                 if let Some((cost, block)) = search_skip_64(
                     &mut luma,
                     &mut chroma,
@@ -9216,6 +9624,7 @@ pub(crate) fn encode_inter_frame(
                     b64_residual() && !screen,
                     reference,
                     &stack,
+                    &sb_compound,
                     fctx,
                 ) {
                     let after = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
@@ -9656,6 +10065,12 @@ pub(crate) fn encode_inter_frame(
                             + sb_search.lambda * crate::tile::partition_bits(SUPERBLOCK, true))
             {
                 B64_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if block.inter.is_some_and(|i| i.ref1.is_some()) {
+                    B64_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if !whole_inside {
+                    B64_EDGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 blocks.truncate(mark);
                 restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
                 // Overwrites every 16x16 mi cell the quadrant searches
@@ -13630,19 +14045,12 @@ mod tests {
         // base now, not 16 ([`crate::encoder::Pyramid::leaf_q_offset`]) -- 9778
         // -> 9835 at q=150 and 35450 -> 35798 at q=60.
         // `EC_AV1_PYRAMID=8:-32:16:-8:-48` restores these.
-        // Re-taken on lane-arfcen: the pyramid path hands every frame the
-        // lookahead window its temporal lambda map needs
-        // (`crate::encoder::tpl_pyramid`), which it never had, so every
-        // superblock of these four pictures is priced at its own lambda --
-        // 9835 -> 9859 at q=150 and 35798 -> 35904 at q=60.
-        // `EC_AV1_TPL_PYRAMID=0` restores these.
-        // Re-taken again on lane-arfcen: a group's top ARF names the ARF from
-        // two groups back as its own `ALTREF_FRAME`
-        // (`crate::encoder::arf_altref`) instead of the key frame it already
-        // reads as `GOLDEN` -- 9859 -> 9853 at q=150 and 35904 -> 35866 at
-        // q=60. `EC_AV1_ARF_ALTREF=0` restores these.
+        // Re-taken at the lane-b64b merge: the 64x64 root prices compound
+        // references and depth-1 var-tx, on top of the tpl window and the
+        // ARF's second reference from lane-arfcen. `EC_AV1_B64COMP=0
+        // EC_AV1_B64VARTX=0` restores 9853 / 35866.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9853, 0x0f6d_bbc8_b72c_ceb3), (60, 35866, 0xbd00_f4ed_e283_3ce4)];
+            [(150, 9808, 0xb71a_2a4c_0aff_713c), (60, 35791, 0x57a3_93fa_5324_255b)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -14196,6 +14604,9 @@ mod tests {
             let _ = crate::tile::take_compound_pair_hits();
             let _ = crate::tile::take_compound_size_hits();
             let _ = crate::tile::take_compound_leaf_mode_hits();
+            let _ = take_b64_root_hits();
+            let _ = take_b64_residual_hits();
+            let _ = take_b64_compound_hits();
             let _ = crate::motion::take_census();
             // The entry-surface arm: run the SAME ladder through the
             // streaming facade the editor's export calls, which must print
@@ -14243,6 +14654,17 @@ mod tests {
             // a compound reference at all, which compound mode they took, and
             // which pair (gate-blind-to-feature -- a compound mode nobody
             // picks cannot be what a BD number credits).
+            // The 64x64 root's own fire shares (lane-b64/tx64/b64b): how many
+            // superblocks were left whole at all, and how many of those coded
+            // a residual or took a compound reference.
+            let (roots, root_res, root_comp) = (
+                take_b64_root_hits(),
+                take_b64_residual_hits(),
+                take_b64_compound_hits(),
+            );
+            eprintln!(
+                "{name}: 64x64 roots {roots} (with a residual {root_res}, compound {root_comp})"
+            );
             let comp_modes = crate::tile::take_compound_mode_hits();
             let comp_pairs = crate::tile::take_compound_pair_hits();
             let comp_sizes = crate::tile::take_compound_size_hits();
@@ -14812,6 +15234,17 @@ mod tests {
             // the real side, a screen clip none of them.
             let (price_default, price_real) = crate::tile::take_pricing_hits();
             eprintln!("{name}: pricer armings default={price_default} real={price_real}");
+            // The 64x64 root's own fire shares (lane-b64/tx64/b64b): how many
+            // superblocks stayed whole, and how many of those coded a
+            // residual, split that residual's luma, or took a compound
+            // reference (class `gate-blind-to-feature`).
+            eprintln!(
+                "{name}: 64x64 roots {} (with a residual {}, split luma {}, compound {})",
+                take_b64_root_hits(),
+                take_b64_residual_hits(),
+                take_b64_var_tx_hits(),
+                take_b64_compound_hits(),
+            );
             // lane-av1obmc2: the same motion_mode census the 640x384 gate
             // prints (class `gate-blind-to-feature`) -- how many blocks coded
             // the symbol at each footprint and how many took OBMC. Without it
