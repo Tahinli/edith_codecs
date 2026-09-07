@@ -5634,12 +5634,6 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 let info = block.inter.ok_or_else(|| {
                     Error::unsupported("AV1 tile", "a 64x64 root block is coded inter")
                 })?;
-                if info.ref1.is_some() {
-                    return Err(Error::unsupported(
-                        "AV1 tile",
-                        "a 64x64 root block is coded single-reference",
-                    ));
-                }
                 enc.symbol(PARTITION_NONE, &mut cdfs.partition_w64[sb_ctx]);
                 let (mi_r, mi_c) = (sb_at.0 * (SUB / MI), sb_at.1 * (SUB / MI));
                 let has_above = neighbours.has_above(mi_r);
@@ -5661,28 +5655,46 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     &neighbours,
                     (mi_r, mi_c),
                     (has_above, has_left),
-                    false,
+                    info.ref1.is_some(),
                 );
-                write_single_ref(
-                    &mut enc,
-                    &mut cdfs,
-                    info.ref_frame,
-                    neighbours.above_ref[mi_c],
-                    neighbours.above_ref1[mi_c],
-                    neighbours.left_ref[mi_r],
-                    neighbours.left_ref1[mi_r],
-                );
-                let stack = find_mv_stack(
-                    &grid,
-                    mi_r,
-                    mi_c,
-                    SB_MI as usize,
-                    SB_MI as usize,
-                    info.ref_frame,
-                    mi_cols as usize,
-                    mi_rows as usize,
-                );
-                let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
+                // lane-b64b: a COMPOUND 64x64 root takes the same mode chain
+                // every other compound block does, at this superblock's own
+                // 16x16-mi window.
+                let (mv, mv1, is_new_mv) = if info.ref1.is_some() {
+                    write_compound_block(
+                        &mut enc,
+                        &mut cdfs,
+                        &neighbours,
+                        &grid,
+                        (mi_r, mi_c),
+                        (SB_MI as usize, SB_MI as usize),
+                        (has_above, has_left),
+                        info,
+                        (mi_cols as usize, mi_rows as usize),
+                    )?
+                } else {
+                    write_single_ref(
+                        &mut enc,
+                        &mut cdfs,
+                        info.ref_frame,
+                        neighbours.above_ref[mi_c],
+                        neighbours.above_ref1[mi_c],
+                        neighbours.left_ref[mi_r],
+                        neighbours.left_ref1[mi_r],
+                    );
+                    let stack = find_mv_stack(
+                        &grid,
+                        mi_r,
+                        mi_c,
+                        SB_MI as usize,
+                        SB_MI as usize,
+                        info.ref_frame,
+                        mi_cols as usize,
+                        mi_rows as usize,
+                    );
+                    let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
+                    (mv, (0, 0), is_new_mv)
+                };
                 for dr in 0..SB_MI as usize {
                     for dc in 0..SB_MI as usize {
                         grid.set(
@@ -5691,8 +5703,8 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                             MiInfo {
                                 is_inter: true,
                                 ref_frame: info.ref_frame,
-                                ref_frame1: NO_REF1,
-                                mv1: (0, 0),
+                                ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                                mv1: mv16(mv1),
                                 mv: mv16(mv),
                                 is_new_mv,
                                 size: SB_MI as u8,
@@ -5703,17 +5715,21 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         );
                     }
                 }
-                write_motion_mode(
-                    &mut enc,
-                    &mut cdfs,
-                    &grid,
-                    (mi_r, mi_c),
-                    (SB_MI as usize, SB_MI as usize),
-                    (SB, SB),
-                    (mi_cols as usize, mi_rows as usize),
-                    info.ref_frame,
-                    block.motion_mode,
-                )?;
+                if info.ref1.is_none() {
+                    // libaom's `motion_mode_allowed` fails on a compound
+                    // block, so the decoder reads no symbol for one.
+                    write_motion_mode(
+                        &mut enc,
+                        &mut cdfs,
+                        &grid,
+                        (mi_r, mi_c),
+                        (SB_MI as usize, SB_MI as usize),
+                        (SB, SB),
+                        (mi_cols as usize, mi_rows as usize),
+                        info.ref_frame,
+                        block.motion_mode,
+                    )?;
+                }
                 if tx_select {
                     // A skipped inter block writes no `txfm_split` at all --
                     // that call only publishes the max transform size the
@@ -5759,6 +5775,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     neighbours.record_planes(sb_at, SB, 0, &grids, true);
                 }
                 neighbours.record_inter(sb_at, SB, block.skip, true, block_ref(block));
+                record_block_compound(&mut neighbours, (mi_r, mi_c), SB, block);
                 continue;
             }
             match (has_cols, has_rows) {
