@@ -6158,6 +6158,7 @@ fn read_coeffs(
             eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
         }
         let t = dec.symbol(tx_type_cdf);
+        crate::census::tx_type(len, t);
         if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=tx_type len={len} rng={rng}");
@@ -6389,6 +6390,7 @@ fn read_coeffs_rect(
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
         let len = tx_type_cdf.len();
         let t = dec.symbol(tx_type_cdf);
+        crate::census::tx_type(len, t);
         tx_type = tx_type_from_symbol(len, t)
             .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
         if rect_trace {
@@ -7273,6 +7275,7 @@ impl Neighbours {
         if crate::envflags::env_flag!("EC_TXGRID_TRACE") {
             eprintln!("EC_LFGRID mi_row={mi_r} mi_col={mi_c} w_mi={w_mi} h_mi={h_mi} tx_px={tx_px} tx_h_px={tx_h_px}");
         }
+        crate::census::tx(tx_px, tx_h_px);
         let cur = fctx.current_delta_lf.with(|c| c.get());
         let snapshot: [i8; 4] = if fctx.delta_lf_multi.with(|c| c.get()) {
             std::array::from_fn(|i| cur[i].clamp(-63, 63) as i8)
@@ -7331,6 +7334,9 @@ impl Neighbours {
         if skip && w_mi != h_mi {
             hit!(RECT_SKIP_BAND_HITS);
         }
+        // lane-census: an INTRA frame's blocks never reach the inter
+        // publisher, and this one is what every coded block writes.
+        crate::census::block_intra_frame(w_mi, h_mi, skip);
         for rr in 0..h_mi {
             let start = (mi_r + rr) * self.skip_grid_cols_mi + mi_c;
             fill_span(
@@ -7485,6 +7491,7 @@ impl Neighbours {
         skip_mode: bool,
     ) {
         let (r, c) = at_mi;
+        crate::census::block(w_mi, h_mi, is_inter, ref_frame, skip);
         // lane-t900 r8 (class new-map-ignores-tile-edge's twin: a map NOBODY
         // writes for a whole block class): an INTER block left the luma mode
         // map untouched, so a later intra block's `get_intra_edge_filter_type`
@@ -7587,6 +7594,7 @@ impl Neighbours {
         compound_idx: u8,
     ) {
         let (r, c) = at_mi;
+        crate::census::compound();
         for cell in 0..w_mi {
             self.above_ref1[c + cell] = Some(ref1);
             self.above_comp_group_idx[c + cell] = comp_group_idx;
@@ -21741,6 +21749,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             );
         }
         let mut dec = SymbolDecoder::new(tile_bytes);
+        crate::census::register_cdfs(&cdfs);
         neighbours.start_tile(mi_row0 as usize, mi_col0 as usize, mi_col1 as usize, fctx);
         y.set_tile_origin(
             mi_col0 as usize * 4,
@@ -23990,6 +23999,7 @@ fn read_mv(
     if joint == 1 || joint == 3 {
         diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv, force_integer_mv);
     }
+    crate::census::mv(pred.0 + diff.0, pred.1 + diff.1);
     (pred.0 + diff.0, pred.1 + diff.1)
 }
 
@@ -27459,6 +27469,7 @@ fn decode_inter_block(
                 tpl,
             );
             let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        if !not_new { crate::census::mode(0); }
             let mut is_globalmv = false;
             // lane-interbis r1: which single-ref mode this block resolved to,
             // in the oracle's own numbering (NEARESTMV=13 .. NEWMV=16), for
@@ -27492,6 +27503,7 @@ fn decode_inter_block(
                 )
             } else {
                 let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            if !not_zero { crate::census::mode(1); }
                 is_globalmv = !not_zero;
                 let mv = if !not_zero {
                     // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1), already
@@ -27500,6 +27512,7 @@ fn decode_inter_block(
                     gm_table[(ref_frame - LAST_FRAME) as usize]
                 } else {
                     let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                crate::census::mode(if nearest { 2 } else { 3 });
                     dbg_mode = if nearest { 13 } else { 14 };
                     if nearest {
                         stack.nearest_mv
@@ -29832,6 +29845,7 @@ fn decode_inter_sub8_split4(
             tpl,
         );
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        if !not_new { crate::census::mode(0); }
         let mut is_globalmv = false;
         let (mv, is_new_mv) = if !not_new {
             let mut idx = 0usize;
@@ -29855,11 +29869,13 @@ fn decode_inter_sub8_split4(
             )
         } else {
             let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            if !not_zero { crate::census::mode(1); }
             is_globalmv = !not_zero;
             let mv = if !not_zero {
                 gm_table[(ref_frame - LAST_FRAME) as usize]
             } else {
                 let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                crate::census::mode(if nearest { 2 } else { 3 });
                 if nearest {
                     stack.nearest_mv
                 } else {
@@ -30857,6 +30873,7 @@ fn decode_inter_sub8_rect2(
             tpl,
         );
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        if !not_new { crate::census::mode(0); }
         let mut is_globalmv = false;
         let (mv, is_new_mv) = if !not_new {
             let mut idx = 0usize;
@@ -30880,11 +30897,13 @@ fn decode_inter_sub8_rect2(
             )
         } else {
             let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            if !not_zero { crate::census::mode(1); }
             is_globalmv = !not_zero;
             let mv = if !not_zero {
                 gm_table[(ref_frame - LAST_FRAME) as usize]
             } else {
                 let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                crate::census::mode(if nearest { 2 } else { 3 });
                 if nearest {
                     stack.nearest_mv
                 } else {
@@ -32302,6 +32321,7 @@ fn decode_inter_block8(
         }
 
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        if !not_new { crate::census::mode(0); }
         let mut is_globalmv = false;
         let (mv, is_new_mv) = if !not_new {
             // NEWMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting at 0):
@@ -32331,6 +32351,7 @@ fn decode_inter_block8(
             )
         } else {
             let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            if !not_zero { crate::census::mode(1); }
             is_globalmv = !not_zero;
             let mv = if !not_zero {
                 // lane-gmaffine r1: GLOBALMV (spec 7.10.2.1) -- the same
@@ -32340,6 +32361,7 @@ fn decode_inter_block8(
                 gm_table[(ref_frame - LAST_FRAME) as usize]
             } else {
                 let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                crate::census::mode(if nearest { 2 } else { 3 });
                 if nearest {
                     stack.nearest_mv
                 } else {
@@ -33974,6 +33996,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         fctx.quant_deltas.with(|c| c.set(deltas));
         fctx.current_delta_lf.with(|c| c.set([0; 4]));
         let mut dec = SymbolDecoder::new(data);
+        crate::census::register_cdfs(&cdfs);
         // lane-comppin r9: tile-entry range, the earliest point comparable
         // against aomdec's own `r->ec.rng` right after `aom_reader_init` -- the
         // first ladder rung before any symbol (partition or otherwise) is read.

@@ -1382,6 +1382,7 @@ fn decode_frame(
     // lane-twostage: see `decode_inter_frame_tile_with_cdfs`'s own `stage1`.
     stage1: Option<&dyn Fn(Cdfs, crate::motion_field::MotionField, usize, usize)>,
 ) -> Result<FrameOutput> {
+    crate::census::frame_start(header, tile_bufs.iter().map(|t| t.len()).sum(), decode_idx);
     if header.segmentation.enabled {
         for segment in 0..MAX_SEGMENTS {
             for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {

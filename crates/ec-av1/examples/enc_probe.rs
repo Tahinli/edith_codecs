@@ -21,7 +21,12 @@ fn main() {
 
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-i", &clip, "-frames:v", &frames.to_string()])
-        .args(["-vf", &format!("scale={width}:{height}")])
+        // lane-census: the BD gate's native rows CROP, they do not scale, so
+        // the census can ask for the gate's own recipe (`EC_ENC_VF`).
+        .args([
+            "-vf",
+            &std::env::var("EC_ENC_VF").unwrap_or_else(|_| format!("scale={width}:{height}")),
+        ])
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
         .output()
         .expect("ffmpeg failed to run");
@@ -51,6 +56,11 @@ fn main() {
             h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
         }
         println!("q={q} bytes={} fnv1a={h:016x}", e.stream.len());
+        // lane-census: keep the stream itself when asked, so `syntax_census`
+        // can read the very bytes this point measured.
+        if let Ok(dir) = std::env::var("EC_ENC_OUT") {
+            std::fs::write(format!("{dir}/ours-q{q}.obu"), &e.stream).expect("stream out");
+        }
         if ec_av1::encode::census_on() {
             let (kinds, luma_rank, chroma_rank) = ec_av1::encode::take_census();
             for (name, n) in ec_av1::encode::CENSUS_KINDS.iter().zip(kinds) {
