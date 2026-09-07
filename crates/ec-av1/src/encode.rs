@@ -252,6 +252,14 @@ fn tx_select_inter() -> bool {
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX_SELECT_INTER))
 }
 
+/// SCREEN CONTENT ONLY, measured (12-frame `bd_rate_screen_native`, control
+/// vs arm): the capture row goes +27.8/-26.0 -> +20.8/-30.1 -- seven points
+/// against libaom -- while BOTH film rows LOSE (film A +21.7/-4.4 ->
+/// +22.1/-4.0, film B +26.9/-0.6 -> +28.1/+0.7) and 2160p bars lose 0.8/1.1.
+/// The keep rule wants both films down, so this takes the same content gate
+/// palette, intrabc and the angle-delta refinement already stand behind: a
+/// non-screen frame is byte-identical to the encoder before the lane.
+///
 /// The transform types an intra luma transform unit of `set` may be coded
 /// with -- exactly the alphabet the writer's `tx_type` symbol names for that
 /// set, so a searched type is always one the tile can express (lane-txset).
@@ -262,7 +270,7 @@ fn tx_select_inter() -> bool {
 /// [`TxType::from_symbol`] names; 32x32 and 64x64 luma code no symbol at all,
 /// and inter luma reads the two-type `TX_SET_INTER_3`, left at `DCT_DCT`
 /// here.
-pub(crate) fn tx_type_candidates(set: TxbSet) -> &'static [TxType] {
+pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType] {
     const DCT: [TxType; 1] = [TxType::DctDct];
     const INTRA2: [TxType; 5] = [
         TxType::DctDct,
@@ -272,7 +280,7 @@ pub(crate) fn tx_type_candidates(set: TxbSet) -> &'static [TxType] {
         TxType::Idtx,
     ];
     match set {
-        TxbSet::Luma16 | TxbSet::Luma8 | TxbSet::Luma4 if tx_type_search() => &INTRA2,
+        TxbSet::Luma16 | TxbSet::Luma8 | TxbSet::Luma4 if screen && tx_type_search() => &INTRA2,
         _ => &DCT,
     }
 }
@@ -2453,7 +2461,7 @@ impl Plane<'_> {
                         // through the same RDOQ'd trial path (its `bits`
                         // already carry the `tx_type` symbol itself).
                         let mut best: Option<(f64, TxType, Trial)> = None;
-                        for &tx_type in tx_type_candidates(set) {
+                        for &tx_type in tx_type_candidates(set, search.screen) {
                             let candidate = self.trial_typed(
                                 tu, mode, angle_delta, search.base_q_idx, search.deadzone,
                                 tx_type, fctx,
@@ -2843,7 +2851,7 @@ impl Plane<'_> {
         // and angle the trials above settled -- the same ordering the angle
         // refinement uses, and the same RD terms.
         let mut tx_type = TxType::DctDct;
-        for &candidate_type in tx_type_candidates(at.set).iter().skip(1) {
+        for &candidate_type in tx_type_candidates(at.set, search.screen).iter().skip(1) {
             let candidate = self.trial_typed(
                 at, mode, angle_delta, search.base_q_idx, search.deadzone, candidate_type, fctx,
             );
