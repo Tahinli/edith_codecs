@@ -2281,6 +2281,75 @@ mod tests {
         }
     }
 
+    /// The same clip with a DC step between frames (lane-tx64): the 64x64
+    /// root still predicts the whole superblock from the last frame, but the
+    /// prediction is uniformly off, so the root's NON-skip arm -- one
+    /// TX_64X64 luma transform and two TX_32X32 chroma ones -- prices below
+    /// its skip arm and a 64x64 residual is really written. The counter is
+    /// the gate (class `gate-blind-to-feature`; the static clip above cannot
+    /// reach this arm at all because its prediction is exact), and both
+    /// decoders have to reconstruct those coefficients sample-exact -- a
+    /// writer that names the wrong coefficient set or the wrong `txfm_split`
+    /// desyncs the whole tile here.
+    #[test]
+    fn a_dc_stepped_clip_codes_a_64x64_residual_and_decodes_sample_exact() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (256usize, 128usize);
+        let still = test_card(width, height, 0);
+        let sources: Vec<Picture> = (0..3)
+            .map(|t| {
+                let mut p = still.clone();
+                let step = (t * 6) as u16;
+                for v in &mut p.y {
+                    *v = (*v + step).min(255);
+                }
+                p
+            })
+            .collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 120,
+            gop: 8,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        let _ = crate::encode::take_b64_residual_hits();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let residuals = crate::encode::take_b64_residual_hits();
+        assert!(
+            residuals > 0,
+            "a DC-stepped clip coded no 64x64 root with a residual at all"
+        );
+        eprintln!("64x64 roots with a residual: {residuals} of 16 inter superblocks");
+
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_luma(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+            if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                panic!(
+                    "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                    at % width,
+                    at / width,
+                    got[at],
+                    b[at],
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_tile_layout_decodes_sample_exact_through_both_decoders() {
         let (width, height) = (640usize, 384usize);

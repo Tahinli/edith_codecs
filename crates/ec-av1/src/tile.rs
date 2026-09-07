@@ -5558,6 +5558,12 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     // derived from luma's, not coded, so it never differs between the two.
     let intra_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
     let inter_planes = [TxbSet::Luma32Inter, TxbSet::Chroma16, TxbSet::Chroma16];
+    // A 64x64 root's planes (lane-tx64): TX_64X64 luma -- DCT-only at this
+    // size for an inter block too (spec `av1_get_ext_tx_set_type` returns
+    // `TX_SET_DCTONLY` for `tx_size_sqr_up == TX_64X64`), so `Luma64` carries
+    // no `tx_type` symbol and there is no `Luma64Inter` to write -- and one
+    // TX_32X32 per chroma plane.
+    let sb64_planes = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
     let scan32 = default_scan(TX32);
     let scan16 = default_scan(TX16);
     let scan8 = default_scan(TX8);
@@ -5611,11 +5617,10 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 let info = block.inter.ok_or_else(|| {
                     Error::unsupported("AV1 tile", "a 64x64 root block is coded inter")
                 })?;
-                if !block.skip || info.ref1.is_some() {
+                if info.ref1.is_some() {
                     return Err(Error::unsupported(
                         "AV1 tile",
-                        "a 64x64 root block is coded skip and single-reference \
-                         (a 64x64 residual needs a forward TX_64X64)",
+                        "a 64x64 root block is coded single-reference",
                     ));
                 }
                 enc.symbol(PARTITION_NONE, &mut cdfs.partition_w64[sb_ctx]);
@@ -5624,8 +5629,8 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 let has_left = neighbours.has_left(mi_c);
                 let skip_ctx = usize::from(neighbours.above_skip[mi_c])
                     + usize::from(neighbours.left_skip[mi_r]);
-                enc.symbol(1, &mut cdfs.skip[skip_ctx]);
-                write_cdef_idx(&mut enc, (mi_r, mi_c), true);
+                enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+                write_cdef_idx(&mut enc, (mi_r, mi_c), block.skip);
                 let ii_ctx = intra_inter_ctx(
                     has_above,
                     has_left,
@@ -5694,8 +5699,11 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 )?;
                 if tx_select {
                     // A skipped inter block writes no `txfm_split` at all --
-                    // this only publishes the max transform size the reader
-                    // infers for it (`write_tx_syntax_inter`).
+                    // that call only publishes the max transform size the
+                    // reader infers for it; an unskipped one writes the
+                    // `txfm_split` flag, 0 here because a 64x64 root's luma
+                    // is one whole TX_64X64 (depth 1 is lane-tx64's deferred
+                    // var-tx arm).
                     write_tx_syntax_inter(
                         &mut enc,
                         &mut cdfs,
@@ -5703,12 +5711,37 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         (mi_r, mi_c),
                         SB,
                         true,
-                        true,
+                        block.skip,
                         0,
                     );
                 }
-                neighbours.record(sb_at, SB, 0, &zero_grids);
-                neighbours.record_inter(sb_at, SB, true, true, block_ref(block));
+                if block.skip {
+                    neighbours.record(sb_at, SB, 0, &zero_grids);
+                } else {
+                    // lane-tx64: the 64x64 root's real residual. Luma is one
+                    // TX_64X64 whose coded quarter is a 32x32 level grid
+                    // (`TxbSet::Luma64`, `TX32`'s own scan -- the same pair
+                    // `sb_coeff_key_frame_tile`'s `Superblock::Whole` writes),
+                    // chroma one whole TX_32X32 per plane, and `split` is
+                    // false because the luma transform covers the block.
+                    let grids = [
+                        level_grid(&block.luma, TX32)?,
+                        level_grid(&block.u, TX32)?,
+                        level_grid(&block.v, TX32)?,
+                    ];
+                    write_block_planes(
+                        &mut enc,
+                        &mut cdfs,
+                        &sb64_planes,
+                        &grids,
+                        &[&scan32, &scan32, &scan32],
+                        &neighbours.around(sb_at, SB),
+                        0,
+                        false,
+                    );
+                    neighbours.record_planes(sb_at, SB, 0, &grids, true);
+                }
+                neighbours.record_inter(sb_at, SB, block.skip, true, block_ref(block));
                 continue;
             }
             match (has_cols, has_rows) {
