@@ -2,3 +2,18 @@
 # gate: encode::tests::bd_rate_film_long_gop (48 pictures, gop 48), release lib binary,
 #       --test-threads 1, <= 2 arms in parallel. Rows keyed by the log's own header.
 # spec = EC_AV1_PYRAMID=<mini_gop>:<arf>:<leaf>:<mid>:<key>; control = unset (default 8:-32:16:-8:0).
+
+## long-GOP (48 pictures, gop 48) -- BD-rate vs libaom cpu-used 6 / vs rav1e speed 6
+| key offset | film A | film B |
+|---|---|---|
+| control (0, unset) | +52.0 / +11.7 | +144.5 / +44.3 |
+| -32 | +45.3 / +6.7 | +132.8 / +36.8 |
+| -48 | +43.5 / +4.6 | +131.3 / +35.0 |
+| -64 | +44.9 / +3.8 | +140.7 / +37.5 |
+| -16 | +48.8 / +9.4 | +138.0 / +40.2 |
+| -48, arf -40 | +44.4 / +5.1 | +137.4 / +38.6 |
+
+WINNER key -48 at arf -32: both films improve on both columns against the control
+(film A -8.5 / -7.1, film B -13.2 / -9.3). -64 overshoots on film B (+140.7) and a
+deeper ARF (-40) with the same key gives the bytes back on both films, so the anchor
+is what the ARFs wanted, not more ARF.
