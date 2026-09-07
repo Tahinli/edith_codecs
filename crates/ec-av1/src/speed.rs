@@ -437,6 +437,14 @@ pub(crate) const RESTORATION: [bool; 11] = [
 /// `encode::TPL_DEPTH`: lookahead pictures the lambda map reads (1 = off).
 pub(crate) const TPL_DEPTH: [usize; 11] = [crate::encode::TPL_DEPTH, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 
+/// `encode::tx_type_search`: whether an intra luma transform unit searches
+/// its own `tx_type` instead of coding `DCT_DCT` (lane-txset). The five-type
+/// reduced-set alphabet the writer already codes is what it picks from, so a
+/// preset that turns it off is byte-identical to the encoder before the lane.
+pub(crate) const TX_TYPE_SEARCH: [bool; 11] = [
+    true, true, true, true, true, true, true, false, false, false, false,
+];
+
 /// `filter_search`: whether the deblock ladder's +-1/+-2 refinement stage runs.
 pub(crate) const DEBLOCK_REFINE: [bool; 11] = [
     true, true, true, true, true, true, true, false, false, false, false,
