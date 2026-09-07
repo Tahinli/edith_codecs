@@ -45,6 +45,7 @@ pub mod msac;
 pub mod mvstack;
 pub mod obu;
 mod par;
+pub mod probe;
 pub mod quant;
 mod refusal_inventory;
 pub mod speed;
