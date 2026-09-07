@@ -11206,7 +11206,7 @@ mod tests {
         }
         let _ = take_i64_root_hits();
         let encoded = encode_key_frame_with_ctx(&picture, 120, 0.5, fctx).unwrap();
-        let [roots, offered] = take_i64_root_hits();
+        let [roots, _offered] = take_i64_root_hits();
         // The counters are process-global, so another test encoding in
         // parallel can only ADD to them -- the per-FRAME fact is the mode
         // list, which carries one entry per coded block and so exactly 12
