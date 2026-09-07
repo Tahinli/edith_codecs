@@ -158,12 +158,11 @@ impl FrameCtx {
     /// predecessor was born with.
     pub(crate) fn new() -> Self {
         Self {
-            // lane-sb128: an ENCODER context starts at the sequence size
-            // this process encodes (`crate::encode::sb128_on`) so the mode
-            // search's own `Reach` and the filter search's internal decodes
-            // agree with the tile writer; every real decode overwrites it
-            // from the parsed sequence header (`set_sb128`, stream.rs).
-            sb128_flag: std::cell::Cell::new(crate::encode::sb128_on()),
+            // A DECODER context is seeded from the stream alone: every real
+            // decode overwrites this from the parsed sequence header
+            // (`set_sb128`, stream.rs). The encoder's own contexts start at
+            // the size this process encodes -- see [`FrameCtx::for_encoder`].
+            sb128_flag: std::cell::Cell::new(false),
             lossless_flag: std::cell::Cell::new(false),
             cdef_bits: std::cell::Cell::new(0),
             bit_depth: std::cell::Cell::new(8),
@@ -208,11 +207,7 @@ impl FrameCtx {
             inter_last_mc: std::cell::Cell::new(None),
             enable_edge_filter: std::cell::Cell::new(false),
             last_frame_wide_margin: std::cell::RefCell::new(None),
-            reach_sb_px: std::cell::Cell::new(if crate::encode::sb128_on() {
-                128
-            } else {
-                crate::encode::SUPERBLOCK
-            }),
+            reach_sb_px: std::cell::Cell::new(crate::encode::SUPERBLOCK),
             grain_bit_depth: std::cell::Cell::new(8),
             recon_ops: std::cell::RefCell::new(Vec::new()),
             recon_spare: std::cell::RefCell::new(Vec::new()),
@@ -224,6 +219,20 @@ impl FrameCtx {
             wave: std::cell::RefCell::new(None),
             wave_mark: std::cell::Cell::new(None),
         }
+    }
+
+    /// A context for the ENCODER's own trial decodes: it starts at the
+    /// superblock size this process encodes (`crate::encode::sb128_on`) so
+    /// the mode search's `Reach` and the filter search's internal decodes
+    /// agree with the tile writer. A decoder never reads that knob -- doing
+    /// so coupled every decode to the encoder's process-global and raced the
+    /// 128-superblock decode gates against the encoder witness.
+    pub(crate) fn for_encoder() -> Self {
+        let ctx = Self::new();
+        let on = crate::encode::sb128_on();
+        ctx.sb128_flag.set(on);
+        ctx.reach_sb_px.set(if on { 128 } else { crate::encode::SUPERBLOCK });
+        ctx
     }
 }
 
