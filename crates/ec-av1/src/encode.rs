@@ -756,6 +756,46 @@ fn intra_predict_u8(
     }
 }
 
+/// [`intra_predict_u8`] for recursive filter intra (spec 7.11.2.3): the same
+/// `u8` box around [`crate::intra::predict_filter_intra`], whose `mode` is one
+/// of the five `FILTER_INTRA_MODES` rather than an ordinary intra mode.
+fn filter_intra_predict_u8(
+    mode: usize,
+    above: Option<&[u8]>,
+    left: Option<&[u8]>,
+    corner: Option<u8>,
+    side: usize,
+    dst: &mut [u8], fctx: &crate::decode::FrameCtx,
+) {
+    let mut above_buf = [0u16; 2 * BLOCK];
+    let mut left_buf = [0u16; 2 * BLOCK];
+    let widen = |src: &[u8], buf: &mut [u16; 2 * BLOCK]| {
+        for (d, &v) in buf[..src.len()].iter_mut().zip(src) {
+            *d = u16::from(v);
+        }
+    };
+    if let Some(a) = above {
+        widen(a, &mut above_buf);
+    }
+    if let Some(l) = left {
+        widen(l, &mut left_buf);
+    }
+    let mut dst16 = [0u16; BLOCK * BLOCK];
+    let n = side * side;
+    crate::intra::predict_filter_intra(
+        mode,
+        above.map(|a| &above_buf[..a.len()]),
+        left.map(|l| &left_buf[..l.len()]),
+        corner.map(u16::from),
+        side,
+        side,
+        &mut dst16[..n], fctx,
+    );
+    for (d, &v) in dst.iter_mut().zip(dst16[..n].iter()) {
+        *d = v as u8;
+    }
+}
+
 /// Pads one plane to `(padded_width, padded_height)` by repeating its last
 /// row and column, so the block coder always sees a whole number of blocks.
 /// [`crop_plane`] undoes this on the way back out.
@@ -982,6 +1022,20 @@ pub(crate) fn force_screen(value: Option<bool>) {
     SCREEN_FORCE.with(|c| c.set(value));
 }
 
+// lane-fintra: [`force_screen`] for the filter-intra candidate, so a MODE
+// ablation can measure the mode search alone. Setting it also clears the
+// sequence header's own `enable_filter_intra` bit, so the stream the arm
+// writes is exactly the one this encoder wrote before the lane.
+#[cfg(test)]
+thread_local! {
+    static FILTER_INTRA_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_filter_intra(value: Option<bool>) {
+    FILTER_INTRA_FORCE.with(|c| c.set(value));
+}
+
 pub(crate) fn arm_seq_screen(on: bool) {
     SEQ_SCREEN.with(|c| c.set(on));
 }
@@ -1183,7 +1237,11 @@ pub(crate) fn key_frame_headers_colour(
         max_frame_width: w,
         max_frame_height: h,
         use_128x128_superblock: false,
-        enable_filter_intra: false,
+        // lane-fintra: the encoder's intra search offers the five recursive
+        // filter-intra modes on eligible blocks, so the sequence bit is set
+        // whenever that search is on (`EC_AV1_FILTER_INTRA=0` switches both
+        // off and restores the streams this encoder wrote before the lane).
+        enable_filter_intra: filter_intra_on(),
         enable_intra_edge_filter: false,
         enable_order_hint: true,
         order_hint_bits: 7,
@@ -3860,6 +3918,81 @@ fn code_square(
         }
     }
 
+    // The five recursive filter-intra modes (spec 5.11.14), priced against
+    // whatever the mode, transform-depth and palette searches settled on --
+    // the same "one candidate loop after the incumbent is known" shape the
+    // palette above uses. A block that takes one is `DC_PRED` with no palette
+    // by construction (`av1_filter_intra_allowed`), and its luma transform
+    // types are coded from `fimode_to_intradir`'s row (`crate::tile::tx_row`).
+    //
+    // corner-cut, ceiling named: the candidate is only ever priced at
+    // `tx_depth` 0 (one transform over the whole block), so a block whose
+    // ordinary intra winner wanted a SPLIT transform is compared against a
+    // handicapped filter-intra arm -- and only 19-44% of this encoder's intra
+    // blocks code depth 0. Upgrade path: predict per transform unit inside
+    // [`Plane::code_tx_depth`] (the decoder already reads `filter_intra` per
+    // unit, decode.rs:11835) and run the depth search under the winning
+    // filter mode.
+    let mut filter_intra: Option<u8> = None;
+    if filter_intra_on()
+        && palette.is_none()
+        && let Some(class) = crate::decode::filter_intra_size_class(side)
+    {
+        let row = &cdf::FILTER_INTRA[class];
+        // With the sequence bit on, EVERY `DC_PRED` block without a luma
+        // palette carries the flag, so the incumbent pays its zero before the
+        // comparison -- otherwise the candidate is charged a bit the block
+        // spends either way (class `price-the-narrowing-not-the-table`).
+        if mode == DC_PRED {
+            cost += search.lambda * symbol_bits(row, 0);
+        }
+        let one_bits = symbol_bits(row, 1);
+        let kept = luma.snapshot(x, y, side);
+        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+        let (above, left, corner) =
+            luma.edges_into(x, y, side, at.reach, &mut above_buf, &mut left_buf);
+        let mut prediction = vec![0u8; side * side];
+        for fi in 0..5u8 {
+            filter_intra_predict_u8(
+                usize::from(fi),
+                above,
+                left,
+                corner,
+                side,
+                &mut prediction, fctx,
+            );
+            let trial = luma.code_from_prediction(
+                x,
+                y,
+                side,
+                &prediction,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                luma_set,
+            );
+            let cost_f = trial.sse
+                + search.lambda
+                    * (trial.bits
+                        + mode_bits[DC_PRED as usize]
+                        + one_bits
+                        + symbol_bits(&cdf::FILTER_INTRA_MODE, usize::from(fi))
+                        + if tx_select { tx_depth_bits(side, 0) } else { 0.0 });
+            if cost_f < cost {
+                cost = cost_f;
+                mode = DC_PRED;
+                angle_delta = 0;
+                tx_depth = 0;
+                luma_coeffs = coeffs(&trial.levels, side);
+                luma.commit(x, y, side, &trial);
+                filter_intra = Some(fi);
+            }
+        }
+        if filter_intra.is_none() {
+            luma.restore(x, y, side, &kept);
+        }
+    }
+
     // Chroma searches its own mode over [`CHROMA_MODES`], one symbol for both
     // planes; what it costs still counts towards the partition decision.
     let ([u, v], uv_mode, chroma_cost, palette_uv, cfl_alphas) =
@@ -3898,6 +4031,7 @@ fn code_square(
             tx_depth,
             palette,
             palette_uv,
+            filter_intra,
             cfl_alphas,
             angle_delta_y: angle_delta as i8,
             ..BlockCoeffs::default()
@@ -3973,6 +4107,20 @@ fn angle_delta_on() -> bool {
 fn cfl_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("EC_AV1_CFL").as_deref() != Ok("0"))
+}
+
+/// Whether the intra search offers the five recursive filter-intra modes at
+/// all, and with them whether the sequence header sets `enable_filter_intra`
+/// (`EC_AV1_FILTER_INTRA=0` switches both off, which is how the lane measured
+/// its own on/off pair -- and how every byte pin written before it still
+/// reproduces).
+pub(crate) fn filter_intra_on() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FILTER_INTRA_FORCE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EC_AV1_FILTER_INTRA").as_deref() != Ok("0"))
 }
 
 /// Reads [`UV_MODE_HITS`] and zeroes it, so a gate can attribute the counts
@@ -5086,6 +5234,7 @@ fn code_square_inter(
                 BlockCoeffs {
                     angle_delta_y: 0,
                     cfl_alphas: None,
+                    filter_intra: None,
                     luma: coeffs(&levels, side),
                     u: coeffs(&u_new.levels, side / 2),
                     v: coeffs(&v_new.levels, side / 2),
@@ -5121,6 +5270,7 @@ fn code_square_inter(
         (BlockCoeffs {
             angle_delta_y: 0,
             cfl_alphas: None,
+            filter_intra: None,
             luma: coeffs(&levels, side),
             u: coeffs(&u.levels, side / 2),
             v: coeffs(&v.levels, side / 2),
@@ -6223,6 +6373,7 @@ pub(crate) fn encode_key_frame_inner(
             crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
             let mut cdfs = start_cdfs.0.clone();
             crate::tile::arm_screen(screen);
+            crate::tile::arm_filter_intra(filter_intra_on());
             crate::tile::arm_intrabc(allow_intrabc);
             crate::tile::arm_pricing_cdfs(None, false);
             let bytes = crate::tile::sb_coeff_key_frame_tile_cdfs(
@@ -7829,6 +7980,7 @@ fn search_inter_block(
         BlockCoeffs {
             angle_delta_y: 0,
             cfl_alphas: None,
+            filter_intra: None,
             luma: coeffs(&levels, BLOCK),
             u: coeffs(&best.u.levels, BLOCK / 2),
             v: coeffs(&best.v.levels, BLOCK / 2),
@@ -9079,6 +9231,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_warped_motion(warped_motion);
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
             crate::tile::arm_screen(screen);
+            crate::tile::arm_filter_intra(filter_intra_on());
             let mut cdfs = start_cdfs.0.clone();
             crate::tile::arm_pricing_cdfs(Some(&cdfs), screen);
             // Each tile's own MV grid: a candidate scan never reaches past
@@ -9205,6 +9358,7 @@ pub(crate) fn encode_inter_frame(
                 h.allow_screen_content_tools,
                 switchable_motion_mode,
                 h.allow_warped_motion,
+                seq.enable_filter_intra,
                 fctx,
             )
         },
@@ -10083,6 +10237,7 @@ mod tests {
         let residual_block = BlockCoeffs {
             angle_delta_y: 0,
             cfl_alphas: None,
+            filter_intra: None,
             luma: vec![Coeff {
                 row: 0,
                 col: 0,
@@ -10882,6 +11037,11 @@ mod tests {
             eprintln!("SKIP every_mode_decodes_to_what_the_encoder_predicted: no ffmpeg");
             return;
         }
+        // A mode ablation measures the MODE search: a filter-intra block is
+        // coded `DC_PRED` whatever mode the arm forces, so it would fail the
+        // "the encoder coded something else" check for a reason that is not
+        // about the mode search at all.
+        force_filter_intra(Some(false));
         // 128 wide is a whole number of superblocks and 160 is not: the last
         // superblock of a 160-wide row is half a one, whose blocks have no
         // above-right samples inside the frame at all.
@@ -10992,6 +11152,10 @@ mod tests {
         // these synthetic two-colour pictures losslessly under every arm and
         // leave nothing to compare (see [`force_screen`]).
         force_screen(Some(false));
+        // Same reason, for the filter-intra candidate: it wins blocks under
+        // BOTH arms of a mode ablation and so cancels the difference the
+        // ablation measures (class `gate-recipe-confound`).
+        force_filter_intra(Some(false));
         let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
             .iter()
             .map(|&q| {
@@ -12840,8 +13004,14 @@ mod tests {
         // so every block taking either codes different syntax and different
         // coefficients -- 8194 -> 7321 at q=150 and 28285 -> 27285 at q=60.
         // `EC_AV1_CFL=0` / `EC_AV1_ANGLE=0` restore each half.
+        // Re-taken on lane-fintra: the sequence header sets
+        // `enable_filter_intra`, so every DC_PRED intra block of at most
+        // 32x32 without a luma palette carries a `use_filter_intra` flag and
+        // the blocks that take one code a filter-intra mode, a different
+        // prediction and different coefficients -- 7321 -> 7373 at q=150 and
+        // 27285 -> 27074 at q=60. `EC_AV1_FILTER_INTRA=0` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7321, 0x34e2_e4e0_d7c5_09f3), (60, 27285, 0xbfd2_41af_dcac_a0c6)];
+            [(150, 7373, 0xd0af_b890_28bc_cfbf), (60, 27074, 0x8324_0e9f_5971_e4e7)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -13963,6 +14133,7 @@ mod tests {
             let _ = crate::tile::take_palette_uv_hits();
             let _ = crate::tile::take_intrabc_hits();
             let _ = take_intrabc_search();
+            let _ = crate::tile::take_filter_intra_hits();
             // The sequence path itself codes the pyramid now
             // (lane-av1pyrdef), and prints what it requested and what the
             // content gate left effective.
@@ -14008,6 +14179,20 @@ mod tests {
                 search[0],
                 search[1],
                 search[2],
+            );
+            // gate-blind-to-feature: how often the five recursive filter-intra
+            // modes actually won a block over this clip's four encodes -- a
+            // tool that never fires is not measured by the row above it.
+            let fi = crate::tile::take_filter_intra_hits();
+            eprintln!(
+                "{name}: filter intra on={} blocks {} (modes DC={} V={} H={} D157={} PAETH={})",
+                filter_intra_on(),
+                fi[0],
+                fi[1],
+                fi[2],
+                fi[3],
+                fi[4],
+                fi[5],
             );
             let (aom, aom_wall) = external_ladder(&source, cw, ch, "libaom-av1", &aom_points);
             let (rav1e, rav1e_wall) = external_ladder(&source, cw, ch, "librav1e", &rav1e_points);
