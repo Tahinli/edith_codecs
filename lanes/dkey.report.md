@@ -47,8 +47,15 @@ paths only.
 ## Sweep
 
 `fill_skip_grid*` (every leaf block publishes it) vs `record_palette_*` over
-all 16 block readers: 9 readers had skip but no palette publication. Fixed the
-7 that provably code no palette. **Remaining, deferred:** `decode_rect_split`,
+all 16 block readers: 9 readers had skip but no palette publication. Stamped
+7; the 5 INTER-side stamps (`decode_inter_block`, `decode_inter_block8` x2,
+`decode_inter_sub8_split4`, `decode_inter_sub8_rect2`, `decode_intra_sub8_leaf`)
+REGRESSED 13 tests (our own encoder's screen streams stopped decoding: "a
+reference frame selected with no picture at this frame's own ref_frame_idx
+slot") and were reverted -- the inter readers' `(rmi, cmi)`/`write_w`/`write_h`
+are not the same footprint convention the palette bands index, so those stamps
+zeroed cells belonging to real palette blocks. Only the two KEY-frame sub-8x8
+stamps ship. **Remaining, deferred:** `decode_rect_split`,
 `decode_leaf_rect`, `decode_block_rect4`, `decode_rect4_16_strip` and
 `decode_intra_rect_in_inter` are >=8x8 intra readers that CAN code palette
 (`decode_intra_rect_in_inter` reads `palette_y_mode` at decode.rs:10131) and
@@ -68,8 +75,8 @@ neighbours). Needs each reader's decoded palette threaded to the tail.
 
 ## Files
 
-* `crates/ec-av1/src/decode.rs` — the 7 zero-stamps (2 in the key-frame sub8
-  readers, 5 in the inter/sub8 readers).
+* `crates/ec-av1/src/decode.rs` — 2 zero-stamps, in `decode_leaf_split4` and
+  `decode_leaf_rect8` (the key-frame sub-8x8 groups).
 * `crates/ec-av1/src/encode.rs` — `external_ladder` now decodes EVERY reference
   ladder point through `decode_stream` and asserts sample-exactness against
   ffmpeg, naming encoder/params/frame/plane/sample (the assertion that would
@@ -82,7 +89,12 @@ neighbours). Needs each reader's decoded palette threaded to the tail.
 1. **crf 5 inter-frame Golomb refusal** — key frame is exact now; the failure
    is in an inter frame (`EC_MM` trace, last read mi(124,412)). Unblocks: diff
    aomdec `EC_MODE`/`EC_STACK` against our `EC_MM` from the first inter frame.
-2. **The palette-publishing mirror gap** above (5 readers).
+2. **The inter-side half of the sweep** (5 readers, reverted above) and the
+   palette-publishing mirror gap (`decode_intra_rect_in_inter` reads
+   `palette_y_mode` and publishes nothing). Unblocks: read each inter reader's
+   real band-index/footprint convention before stamping (the failing tests are
+   `encoder::tests::the_content_gate_keeps_screen_streams_flat` and the 12
+   others listed in the suite log).
 3. **The sensitive `force_integer_mv` fixture**: a 1920x1024 source with a
    textured patch moving 2.5 px per duplicate-pair (half-pel motion, exact
    duplicate frames) makes libaom round 72 projected candidates
