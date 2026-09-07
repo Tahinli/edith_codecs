@@ -1191,7 +1191,7 @@ impl Av1Encoder {
             reference: None,
             next_index: 0,
             rate_loop: None,
-            fctx: crate::decode::FrameCtx::new(),
+            fctx: crate::decode::FrameCtx::for_encoder(),
             pyramid: None,
             dpb: [const { None }; 8],
             pending: Vec::new(),
