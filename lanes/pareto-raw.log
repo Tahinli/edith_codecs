@@ -1,0 +1,276 @@
+  rav1e speed 6 q=50: 200390 B, 46.29 dB, 11.6s
+  rav1e speed 6 q=100: 89922 B, 44.10 dB, 6.1s
+  rav1e speed 6 q=150: 37953 B, 40.76 dB, 4.9s
+  rav1e speed 6 q=200: 14006 B, 36.48 dB, 4.2s
+  rav1e speed 8 q=50: 201034 B, 46.16 dB, 8.0s
+  rav1e speed 8 q=100: 89657 B, 43.99 dB, 5.0s
+  rav1e speed 8 q=150: 37937 B, 40.70 dB, 3.6s
+  rav1e speed 8 q=200: 14050 B, 36.45 dB, 2.7s
+  rav1e speed 10 q=50: 218498 B, 46.07 dB, 3.4s
+  rav1e speed 10 q=100: 97345 B, 43.85 dB, 2.3s
+  rav1e speed 10 q=150: 41333 B, 40.53 dB, 2.3s
+  rav1e speed 10 q=200: 16567 B, 36.29 dB, 2.2s
+  libaom cpu-used 6 q=5: 509017 B, 48.21 dB, 8.9s
+  libaom cpu-used 6 q=20: 146653 B, 46.13 dB, 3.7s
+  libaom cpu-used 6 q=35: 70638 B, 44.07 dB, 3.3s
+  libaom cpu-used 6 q=45: 41202 B, 42.05 dB, 2.9s
+  libaom cpu-used 8 q=5: 509017 B, 48.21 dB, 8.0s
+  libaom cpu-used 8 q=20: 146653 B, 46.13 dB, 4.3s
+  libaom cpu-used 8 q=35: 70638 B, 44.07 dB, 4.7s
+  libaom cpu-used 8 q=45: 41202 B, 42.05 dB, 2.9s
+[libaom-av1 @ 0x559d99e953c0] Value 9.000000 for parameter 'cpu-used' out of range [0 - 8]
+[libaom-av1 @ 0x559d99e953c0] Error setting option cpu-used to value 9.
+[vost#0:0/libaom-av1 @ 0x559d99e94d40] Error applying encoder options: Numerical result out of range
+Error opening output file t.ivf.
+Error opening output files: Numerical result out of range
+libaom cpu-used 9: FAILED Command '['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-r', '24', '-i', 'filmA.y4m', '-threads', '1', '-c:v', 'libaom-av1', '-cpu-used', '9', '-b:v', '0', '-crf', '5', '-row-mt', '0', '-tiles', '1x1', '-f', 'ivf', 't.ivf']' returned non-zero exit status 222.
+[libaom-av1 @ 0x55be68d713c0] Value 10.000000 for parameter 'cpu-used' out of range [0 - 8]
+[libaom-av1 @ 0x55be68d713c0] Error setting option cpu-used to value 10.
+[vost#0:0/libaom-av1 @ 0x55be68d70d40] Error applying encoder options: Numerical result out of range
+Error opening output file t.ivf.
+Error opening output files: Numerical result out of range
+libaom cpu-used 10: FAILED Command '['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-r', '24', '-i', 'filmA.y4m', '-threads', '1', '-c:v', 'libaom-av1', '-cpu-used', '10', '-b:v', '0', '-crf', '5', '-row-mt', '0', '-tiles', '1x1', '-f', 'ivf', 't.ivf']' returned non-zero exit status 222.
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 74
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 8 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 32 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 20 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 8 q=20: 159747 B, 45.62 dB, 1.3s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 74
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 8 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 32 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 35 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 8 q=35: 78490 B, 43.79 dB, 0.7s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 74
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 8 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 32 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 45 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 8 q=45: 48265 B, 41.98 dB, 0.8s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 74
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 8 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 32 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 55 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 8 q=55: 27240 B, 39.74 dB, 0.6s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 42
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 10 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 16 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 20 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 10 q=20: 164568 B, 45.21 dB, 0.6s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 42
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 10 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 16 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 35 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 10 q=35: 79122 B, 43.22 dB, 0.5s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 42
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 10 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 16 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 45 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 10 q=45: 47737 B, 41.41 dB, 0.7s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 42
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 10 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 16 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 55 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 10 q=55: 27093 B, 39.35 dB, 0.6s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[warn]: Preset M12 is mapped to M10.
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 42
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 10 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 16 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 20 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 12 q=20: 164568 B, 45.21 dB, 0.8s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[warn]: Preset M12 is mapped to M10.
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 42
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 10 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 16 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 35 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 12 q=35: 79122 B, 43.22 dB, 0.7s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[warn]: Preset M12 is mapped to M10.
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 42
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 10 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 16 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 45 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 12 q=45: 47737 B, 41.41 dB, 0.8s
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [version]:	SVT-AV1 Encoder Lib v3.1.2
+Svt[info]: SVT [build]  :	GCC 16.0.1 20260115 (Red Hat 16.0.1-0)	 64 bit
+Svt[info]: -------------------------------------------
+Svt[warn]: Preset M12 is mapped to M10.
+Svt[info]: Level of Parallelism: 1
+Svt[info]: Number of PPCS 42
+Svt[info]: [asm level on system : up to avx512icl]
+Svt[info]: [asm level selected : up to avx512icl]
+Svt[info]: -------------------------------------------
+Svt[info]: SVT [config]: main profile	tier (auto)	level (auto)
+Svt[info]: SVT [config]: width / height / fps numerator / fps denominator 		: 1920 / 768 / 24 / 1
+Svt[info]: SVT [config]: bit-depth / color format 					: 8 / YUV420
+Svt[info]: SVT [config]: preset / tune / pred struct 					: 10 / PSNR / random access
+Svt[info]: SVT [config]: gop size / mini-gop size / key-frame type 			: 161 / 16 / key frame
+Svt[info]: SVT [config]: BRC mode / rate factor 					: CRF / 55 
+Svt[info]: SVT [config]: AQ mode / Variance Boost 					: 2 / 0
+Svt[info]: SVT [config]: sharpness / luminance-based QP bias 				: 0 / 0
+Svt[info]: -------------------------------------------
+  svt-av1 preset 12 q=55: 27093 B, 39.35 dB, 0.5s
+
+| encoder preset | 4-point ladder (B / dB) | BD-rate vs rav1e speed 6 | wall, 4 points (s) | fps |
+|---|---|---|---|---|
+| rav1e speed 6 | 200390/46.29, 89922/44.10, 37953/40.76, 14006/36.48 | +0.0% | 26.8 | 1.79 |
+| rav1e speed 8 | 201034/46.16, 89657/43.99, 37937/40.70, 14050/36.45 | +2.1% | 19.4 | 2.48 |
+| rav1e speed 10 | 218498/46.07, 97345/43.85, 41333/40.53, 16567/36.29 | +16.9% | 10.2 | 4.73 |
+| libaom cpu-used 6 | 509017/48.21, 146653/46.13, 70638/44.07, 41202/42.05 | -20.7% | 18.8 | 2.55 |
+| libaom cpu-used 8 | 509017/48.21, 146653/46.13, 70638/44.07, 41202/42.05 | -20.7% | 19.9 | 2.42 |
+| svt-av1 preset 8 | 159747/45.62, 78490/43.79, 48265/41.98, 27240/39.74 | -3.9% | 3.5 | 13.80 |
+| svt-av1 preset 10 | 164568/45.21, 79122/43.22, 47737/41.41, 27093/39.35 | +10.9% | 2.3 | 20.78 |
+| svt-av1 preset 12 | 164568/45.21, 79122/43.22, 47737/41.41, 27093/39.35 | +10.9% | 2.7 | 17.70 |
+RC=0

@@ -1,0 +1,34 @@
+
+running 1 test
+test encoder::tests::filter_stage_wall_4k ... 
+3840x1608, 4 frames, 4x2 tiles, 8 tile threads: 5.59s wall, 0.72 fps
+| stage | ms | ms/frame | % of wall |
+| tile search | 2710 | 677.5 | 48.5% |
+| tile write | 94 | 23.6 | 1.7% |
+| filter: deblock replay | 572 | 143.1 | 10.2% |
+| filter: cdef replay | 706 | 176.6 | 12.6% |
+| filter: sse | 178 | 44.5 | 3.2% |
+| filter search (total) | 2422 | 605.5 | 43.4% |
+| capture decode | 0 | 0.0 | 0.0% |
+| lr search | 0 | 0.0 | 0.0% |
+| filter: plane copies | 690 | 172.6 | 12.4% |
+| filter: first decode | 288 | 71.9 | 5.1% |
+accounted 93.6% of wall; outside the tile search 51.5%
+
+3840x1608, 4 frames, 4x2 tiles, 12 tile threads: 4.54s wall, 0.88 fps
+| stage | ms | ms/frame | % of wall |
+| tile search | 2379 | 594.7 | 52.4% |
+| tile write | 84 | 20.9 | 1.8% |
+| filter: deblock replay | 437 | 109.4 | 9.6% |
+| filter: cdef replay | 515 | 128.7 | 11.3% |
+| filter: sse | 145 | 36.2 | 3.2% |
+| filter search (total) | 1818 | 454.4 | 40.0% |
+| capture decode | 0 | 0.0 | 0.0% |
+| lr search | 0 | 0.0 | 0.0% |
+| filter: plane copies | 535 | 133.8 | 11.8% |
+| filter: first decode | 242 | 60.6 | 5.3% |
+accounted 94.3% of wall; outside the tile search 47.6%
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 583 filtered out; finished in 10.56s
+

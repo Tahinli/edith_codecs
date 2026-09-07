@@ -524,6 +524,15 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
             Some((cols, f.next().and_then(|v| v.parse().ok()).unwrap_or(0)))
         })
         .unwrap_or((0, 0));
+    // One row per SPEED PRESET (`ec_av1::speed`): 0 is the full search every
+    // byte pin carries, 10 the fastest. `EC_AV1_SPEED=<n>` benches a single
+    // preset instead of the ladder.
+    let presets: Vec<u8> = match std::env::var("EC_AV1_SPEED").ok().and_then(|v| v.parse().ok()) {
+        Some(n) => vec![n],
+        None => vec![0, 3, 6, 10],
+    };
+    let mut first_stream = Vec::new();
+    for &speed in &presets {
     let cfg = Av1Config {
         width: w as usize,
         height: h as usize,
@@ -540,8 +549,9 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
     // shape of it. The `hidden` column below is how many frames of the row
     // were coded ahead of their display position.
     let pyramid = Pyramid::from_env();
+    ec_av1::speed::set_speed(speed);
     let mut enc = match pyramid {
-        None => Av1Encoder::new(cfg).expect("av1 encoder"),
+        None => Av1Encoder::with_speed(cfg, speed).expect("av1 encoder"),
         Some(p) => Av1Encoder::with_pyramid(cfg, p).expect("av1 encoder"),
     };
     let frame_len = (w * h + 2 * (w.div_ceil(2) * h.div_ceil(2))) as usize;
@@ -579,20 +589,32 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
         (None, None) => "flat".to_string(),
     };
     let media_s = n as f64 / 30.0;
+    let levers = match ec_av1::speed::levers(speed) {
+        v if v.is_empty() => "full search".to_string(),
+        v => v.join(", "),
+    };
     let fps = if wall > 0.0 { f64::from(n) / wall } else { 0.0 };
     let bytes_per_frame = stream.len() as f64 / f64::from(n);
     rows.push(Row {
         component: "ec-av1",
         direction: "encode",
         content: format!(
-            "{w}x{h}, {n} frames, gop=10, {coded_under}, {hidden} hidden, {fps:.1} fps, \
-             {bytes_per_frame:.0} B/frame"
+            "speed {speed} [{levers}], {w}x{h}, {n} frames, gop=10, {coded_under}, \
+             {hidden} hidden, {fps:.1} fps, {bytes_per_frame:.0} B/frame"
         ),
         media: format!("{media_s:.1}s"),
         wall_ms: wall * 1000.0,
         rtf: (wall > 0.0).then_some(media_s / wall),
     });
-
+    if first_stream.is_empty() {
+        first_stream = stream;
+    }
+    }
+    // The decode row reads the FIRST preset's stream, so the number stays
+    // comparable across runs of this bench.
+    ec_av1::speed::set_speed(0);
+    let stream = first_stream;
+    let media_s = n as f64 / 30.0;
     let start = Instant::now();
     let pictures = ec_av1::stream::decode_stream(&stream).expect("av1 decode_stream");
     let wall = start.elapsed().as_secs_f64();

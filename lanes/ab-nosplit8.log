@@ -1,0 +1,23 @@
+
+running 1 test
+test encode::tests::bd_rate_screen_native ... 
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 })
+bars 1080p: pricer armings default=17 real=167
+bars 1080p: motion_mode 32x32 SIMPLE=72101 OBMC=0 WARP=132 | 16x16 SIMPLE=2020 OBMC=0 WARP=178 | 8x8 SIMPLE=0 OBMC=0 WARP=0 (0.0% OBMC / 0.4% WARP of 74431 eligible)
+bars 1080p: inter var-tx depths of 11291 blocks -- leaf single 0=1170 1=521 (30.8% split) | leaf compound 0=1225 1=600 (32.9% split) | 32x32 single 0=883 1=2183 (71.2% split) | 32x32 compound 0=2386 1=2323 (49.3% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| bars 1080p 1920x1024 | 43.81 dB/234996 B, 47.34 dB/343560 B, 50.59 dB/468077 B, 53.49 dB/607372 B | +13.2% | -4.4% | 27.9s:11.3s:25.6s |
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 })
+film A (1080p source): pricer armings default=20 real=215
+film A (1080p source): motion_mode 32x32 SIMPLE=61807 OBMC=0 WARP=2082 | 16x16 SIMPLE=31699 OBMC=0 WARP=2886 | 8x8 SIMPLE=0 OBMC=0 WARP=0 (0.0% OBMC / 5.0% WARP of 98474 eligible)
+film A (1080p source): inter var-tx depths of 113819 blocks -- leaf single 0=19384 1=4722 (19.6% split) | leaf compound 0=40584 1=11836 (22.6% split) | 32x32 single 0=9263 1=6303 (40.5% split) | 32x32 compound 0=13179 1=8548 (39.3% split)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film A (1080p source) 1920x768 | 43.47 dB/72668 B, 45.37 dB/121520 B, 46.81 dB/217909 B, 47.95 dB/395952 B | +53.8% | +23.6% | 52.1s:17.1s:23.6s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 583 filtered out; finished in 165.96s
+
+RC=0

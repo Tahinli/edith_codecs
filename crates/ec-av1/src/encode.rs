@@ -206,7 +206,7 @@ pub(crate) fn take_predicted_bits() -> Vec<f64> {
 }
 
 /// Whether a 16x16 inter leaf may split into four 8x8 ones of its own.
-const SPLIT_INTER_8: bool = true;
+pub(crate) const SPLIT_INTER_8: bool = true;
 
 /// [`SPLIT_INTER_8`], or what `EC_AV1_SPLIT_INTER8` names in a test build.
 /// Whether a key frame codes `tx_mode == TxMode::Select` and searches each
@@ -223,41 +223,39 @@ const SPLIT_INTER_8: bool = true;
 /// third, for 13% encode wall. `EC_AV1_TX_SELECT_INTER=0` turns it off for an
 /// A/B on one build.
 fn tx_select_inter() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("EC_AV1_TX_SELECT_INTER").as_deref(),
-            Ok("0") | Ok("off")
-        )
-    })
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_TX_SELECT_INTER")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "off"))
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX_SELECT_INTER))
 }
 
 fn tx_select() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("EC_AV1_TX_SELECT").as_deref(),
-            Ok("0") | Ok("off")
-        )
-    })
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_TX_SELECT")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "off"))
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX_SELECT_KEY))
 }
 
 fn split_inter_8() -> bool {
     match std::env::var("EC_AV1_SPLIT_INTER8").ok() {
         Some(v) if cfg!(test) => v != "0",
-        _ => SPLIT_INTER_8,
+        _ => crate::speed::at(&crate::speed::SPLIT_8),
     }
 }
 
 /// Whether a 16x16 (or 8x8) leaf runs a motion search of its own beside the
 /// NEARESTMV candidate it always had.
-const LEAF_NEW_MV: bool = true;
+pub(crate) const LEAF_NEW_MV: bool = true;
 
 /// Whether GOLDEN/ALTREF get a `NEWMV` search of their own. Measured on the
 /// BD gate: with the early-out below at its swept margin, -1.7/-2.5/-0.0
 /// points vs libaom and -1.6/-2.3/-0.0 vs rav1e for 4%/4%/0.3% more motion
 /// searches (the census `bd_rate_vs_libaom_and_rav1e` prints).
-const EXTRA_REF_NEW_MV: bool = true;
+pub(crate) const EXTRA_REF_NEW_MV: bool = true;
 
 /// How much cheaper an extra reference's `NEARESTMV` has to be than LAST's
 /// own best vector before that reference's `NEWMV` search is skipped: a
@@ -334,7 +332,7 @@ fn leaf_second_new_margin() -> f64 {
 fn leaf_second_new_mv() -> bool {
     match std::env::var("EC_AV1_LEAF_SECOND_NEWMV").ok() {
         Some(v) => v != "0",
-        None => true,
+        None => crate::speed::at(&crate::speed::LEAF_SECOND),
     }
 }
 
@@ -343,13 +341,13 @@ fn leaf_second_new_mv() -> bool {
 /// block at any leaf size (`tile::write_inter_frame_leaf`/`..._leaf8` both
 /// route through `write_compound_block`, which is sized by `bw4`/`bh4`); what
 /// was missing was the encoder ever forming one below 32x32.
-const LEAF_COMPOUND: bool = true;
+pub(crate) const LEAF_COMPOUND: bool = true;
 
 /// [`LEAF_COMPOUND`], or what `EC_AV1_LEAF_COMPOUND` names in any build.
 fn leaf_compound() -> bool {
     match std::env::var("EC_AV1_LEAF_COMPOUND").ok() {
         Some(v) => v != "0",
-        None => LEAF_COMPOUND,
+        None => crate::speed::at(&crate::speed::LEAF_COMPOUND),
     }
 }
 
@@ -366,7 +364,7 @@ fn leaf_new_mv() -> bool {
 /// the true frame edge cut through was ever split there; inside the frame
 /// every block was coded whole, which left the partition decision the key
 /// frame already makes unmade for eleven frames out of twelve.
-const SPLIT_INTER_BLOCKS: bool = true;
+pub(crate) const SPLIT_INTER_BLOCKS: bool = true;
 
 /// [`SPLIT_INTER_BLOCKS`], or what `EC_AV1_SPLIT_INTER` names when the
 /// measurement that keeps it is running (test builds only, like
@@ -374,7 +372,7 @@ const SPLIT_INTER_BLOCKS: bool = true;
 fn split_inter_blocks() -> bool {
     match std::env::var("EC_AV1_SPLIT_INTER").ok() {
         Some(v) if cfg!(test) => v != "0",
-        _ => SPLIT_INTER_BLOCKS,
+        _ => crate::speed::at(&crate::speed::SPLIT_INTER),
     }
 }
 
@@ -382,13 +380,13 @@ fn split_inter_blocks() -> bool {
 /// Wiener filter per 64x64 luma restoration unit, picked from
 /// [`crate::filter_search::WIENER_CANDIDATES`]. Swept by `EC_AV1_LR` in a
 /// test build, like [`lambda_scale`].
-const RESTORATION: bool = true;
+pub(crate) const RESTORATION: bool = true;
 
 /// [`RESTORATION`], or what `EC_AV1_LR` names in a test build.
 fn restoration_enabled() -> bool {
     match std::env::var("EC_AV1_LR").ok() {
         Some(v) if cfg!(test) => v != "0",
-        _ => RESTORATION,
+        _ => crate::speed::at(&crate::speed::RESTORATION),
     }
 }
 
@@ -405,7 +403,7 @@ fn restoration_enabled() -> bool {
 /// +31.7/+40.6/+27.8, for barely more speed. The split trial is where this
 /// encoder's inter quality lives, so `0` ships and the knob stays for a
 /// future explicit speed preset.
-const SPLIT_BREAKOUT_COEFFS: usize = 0;
+pub(crate) const SPLIT_BREAKOUT_COEFFS: usize = 0;
 
 /// libaom's `partition_search_breakout_rate_thr` shape, in this encoder's own
 /// currency: a 32x32 inter block whose whole-block RD cost per pixel comes
@@ -431,17 +429,14 @@ const SPLIT_BREAKOUT_COEFFS: usize = 0;
 /// +51.3/-14.2 (the 1080p film 0.2 worse for a finer search) and 0.25 is
 /// +16.6/-0.6, +46.9/+19.1, +51.6/-14.5 (screen 0.3 worse vs libaom, 3s off
 /// the screen wall). Neither clears the keep rule; 0.125 stays.
-const SPLIT_RD_THRESHOLD: f64 = 0.125;
+pub(crate) const SPLIT_RD_THRESHOLD: f64 = 0.125;
 
 /// [`SPLIT_RD_THRESHOLD`], swept by `EC_AV1_SPLIT_RD` in any build.
 fn split_rd_threshold() -> f64 {
-    static T: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
-        std::env::var("EC_AV1_SPLIT_RD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(SPLIT_RD_THRESHOLD)
-    })
+    static ENV: std::sync::LazyLock<Option<f64>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_SPLIT_RD").ok().and_then(|v| v.parse().ok())
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::SPLIT_RD))
 }
 
 /// Whether `cost` over a `side` x `side` block is cheap enough per pixel that
@@ -456,7 +451,7 @@ fn split_rd_breakout(cost: f64, side: usize, lambda: f64) -> bool {
 fn split_breakout_coeffs() -> usize {
     match std::env::var("EC_AV1_SPLIT_BREAKOUT").ok() {
         Some(v) if cfg!(test) => v.parse().unwrap_or(SPLIT_BREAKOUT_COEFFS),
-        _ => SPLIT_BREAKOUT_COEFFS,
+        _ => crate::speed::at(&crate::speed::SPLIT_BREAKOUT),
     }
 }
 
@@ -2811,10 +2806,10 @@ impl Reach {
 /// [`warp_prediction`]); `EC_AV1_WARP=0` turns the tool -- and the two header
 /// bits -- back off for an A/B on one build.
 pub(crate) fn warp_on() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        !matches!(crate::envflags::var("EC_AV1_WARP").as_deref(), Ok("0") | Ok("off"))
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_WARP").ok().map(|v| !matches!(v.as_str(), "0" | "off"))
     });
-    *ON
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::WARP))
 }
 
 /// The smallest LEAF an OBMC candidate is offered for, so the census can
@@ -3124,10 +3119,10 @@ static INTER_TX_SPLIT_HITS: [std::sync::atomic::AtomicUsize; 8] =
 /// residual to reach there -- the tool was being judged on content that
 /// cannot pay for it (class `gate-blind-to-feature`). `EC_AV1_TX32_DEPTH`.
 fn tx32_depth_search() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        !matches!(crate::envflags::var("EC_AV1_TX32_DEPTH").as_deref(), Ok("0") | Ok("off"))
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_TX32_DEPTH").ok().map(|v| !matches!(v.as_str(), "0" | "off"))
     });
-    *ON
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX32_DEPTH))
 }
 
 /// Whether a COMPOUND inter winner is offered the var-tx split at all: its
@@ -3139,10 +3134,10 @@ fn tx32_depth_search() -> bool {
 /// 32x32 depth search); `EC_AV1_COMP_VARTX=0` turns it off.
 /// `EC_AV1_COMP_VARTX`.
 fn compound_var_tx() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        !matches!(crate::envflags::var("EC_AV1_COMP_VARTX").as_deref(), Ok("0") | Ok("off"))
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_COMP_VARTX").ok().map(|v| !matches!(v.as_str(), "0" | "off"))
     });
-    *ON
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::COMPOUND_VAR_TX))
 }
 
 /// How many 32x32-and-below inter blocks each reference frame won, indexed by
@@ -4098,29 +4093,35 @@ pub(crate) fn take_angle_delta_hits() -> [usize; 7] {
 /// Whether the luma search refines a directional winner's `angle_delta_y`
 /// (`EC_AV1_ANGLE=0` switches it off, the lane's own on/off pair).
 fn angle_delta_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EC_AV1_ANGLE").as_deref() != Ok("0"))
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_ANGLE").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::ANGLE))
 }
 
 /// Whether the chroma search offers `UV_CFL_PRED` at all (`EC_AV1_CFL=0`
 /// switches it off, which is how the lane measured its own on/off pair).
 fn cfl_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EC_AV1_CFL").as_deref() != Ok("0"))
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_CFL").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::CFL))
 }
 
 /// Whether the intra search offers the five recursive filter-intra modes at
 /// all, and with them whether the sequence header sets `enable_filter_intra`
 /// (`EC_AV1_FILTER_INTRA=0` switches both off, which is how the lane measured
 /// its own on/off pair -- and how every byte pin written before it still
-/// reproduces).
+/// reproduces). It is also a speed lever: on at preset 0, off above it.
 pub(crate) fn filter_intra_on() -> bool {
     #[cfg(test)]
     if let Some(forced) = FILTER_INTRA_FORCE.with(std::cell::Cell::get) {
         return forced;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EC_AV1_FILTER_INTRA").as_deref() != Ok("0"))
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_FILTER_INTRA").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::FILTER_INTRA))
 }
 
 /// Reads [`UV_MODE_HITS`] and zeroes it, so a gate can attribute the counts
@@ -4152,11 +4153,12 @@ pub(crate) fn take_uv_mode_hits() -> [usize; 14] {
 /// winner sat at SAD rank 0 for 67-77% of blocks and inside the top three
 /// for 88%. `EC_AV1_CHROMA_K` sweeps it in any build.
 fn chroma_top_k() -> Option<usize> {
-    static K: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *K.get_or_init(|| match std::env::var("EC_AV1_CHROMA_K").ok() {
-        Some(v) => v.parse::<usize>().ok().filter(|&k| k > 0),
-        None => CHROMA_TOP_K,
-    })
+    static ENV: std::sync::LazyLock<Option<Option<usize>>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_CHROMA_K")
+            .ok()
+            .map(|v| v.parse::<usize>().ok().filter(|&k| k > 0))
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::CHROMA_K))
 }
 
 /// [`chroma_top_k`]'s default. `None`: no `K` cleared the keep rule on the BD
@@ -4170,7 +4172,7 @@ fn chroma_top_k() -> Option<usize> {
 /// RE-MEASURED on lane-av1rejudge at [`LAMBDA_SCALE`] 0.05 with warp on:
 /// K=4 is +17.1/-0.1, +47.1/+19.2, +51.6/-13.8 against the base's
 /// +16.7/-0.5, +47.0/+19.1, +51.3/-14.3 -- every row worse. Still `None`.
-const CHROMA_TOP_K: Option<usize> = None;
+pub(crate) const CHROMA_TOP_K: Option<usize> = None;
 
 fn search_chroma(
     chroma: &mut [Plane; 2],
@@ -5458,7 +5460,7 @@ fn prune_top_k() -> Option<usize> {
         .and_then(|v| v.parse::<usize>().ok());
     match swept {
         Some(k) if cfg!(test) => Some(k),
-        _ => PRUNE_TOP_K,
+        _ => crate::speed::at(&crate::speed::PRUNE_K),
     }
 }
 
@@ -5478,7 +5480,7 @@ fn set_test_top_k_override(value: Option<usize>) {
 
 /// The default: unpruned, thirteen full trials per block, same as before this
 /// lever. Set from the sweep in the lane report if the quality gate clears it.
-const PRUNE_TOP_K: Option<usize> = None;
+pub(crate) const PRUNE_TOP_K: Option<usize> = None;
 
 /// [`Search::top_k`] for [`search_inter_block`]'s intra-candidate loop --
 /// kept apart from [`prune_top_k`]/[`PRUNE_TOP_K`] because the two paths'
@@ -5497,7 +5499,7 @@ fn prune_top_k_inter() -> Option<usize> {
         .and_then(|v| v.parse::<usize>().ok());
     match swept {
         Some(k) if cfg!(test) => Some(k),
-        _ => INTER_PRUNE_TOP_K,
+        _ => crate::speed::at(&crate::speed::PRUNE_K_INTER),
     }
 }
 
@@ -5521,7 +5523,7 @@ fn set_test_top_k_override_inter(value: Option<usize>) {
 /// `K=3`, ships as default. Unlike the key-frame path (still `None`), an
 /// inter block's intra candidates rarely win against NEWMV/NEARESTMV, so
 /// pruning them costs less quality here.
-const INTER_PRUNE_TOP_K: Option<usize> = Some(3);
+pub(crate) const INTER_PRUNE_TOP_K: Option<usize> = Some(3);
 
 // Per-thread nanosecond counters `stage_timing_breakdown_inter` (and
 // [`crate::mc::predict`], through [`stage_add`]) accumulate into, so an
@@ -6835,7 +6837,7 @@ fn mv_component_bits(diff: i32) -> Option<f64> {
 fn extra_ref_new_mv() -> bool {
     match std::env::var("EC_AV1_MV_EXTRA_NEW").ok() {
         Some(v) if cfg!(test) => v != "0",
-        _ => EXTRA_REF_NEW_MV,
+        _ => crate::speed::at(&crate::speed::EXTRA_REF_NEW),
     }
 }
 
@@ -6861,13 +6863,13 @@ pub(crate) fn flat_order_hints(order_hint: u32, key_hint: u32, has_altref: bool)
 /// `EC_AV1_COMPOUND=1` arms it in a test build (which is what the BD gate
 /// runs as), and every block still codes SINGLE, so the only cost is one
 /// `comp_mode` symbol per inter block.
-const REFERENCE_SELECT: bool = true;
+pub(crate) const REFERENCE_SELECT: bool = true;
 
 /// [`REFERENCE_SELECT`], with the test-build environment override.
 pub(crate) fn reference_select() -> bool {
     match std::env::var("EC_AV1_COMPOUND").ok() {
         Some(v) if cfg!(test) => v != "0",
-        _ => REFERENCE_SELECT,
+        _ => crate::speed::at(&crate::speed::COMPOUND),
     }
 }
 
@@ -8040,7 +8042,7 @@ fn tpl_strength() -> f64 {
 /// The streaming facade holds `depth - 1` pictures back so it feeds
 /// `encode_inter_frame` the same window `encode_sequence` does; both read
 /// THIS function, so the two paths cannot disagree about the window.
-const TPL_DEPTH: usize = 8;
+pub(crate) const TPL_DEPTH: usize = 8;
 
 /// The exponent the dependence ratio is read through ([`tpl_lambda_factors`]).
 /// 0.5 is libaom's own square-root compression of its dependence ratio.
@@ -8112,7 +8114,7 @@ pub(crate) fn tpl_depth() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|d| *d >= 1)
-        .unwrap_or(TPL_DEPTH)
+        .unwrap_or_else(|| crate::speed::at(&crate::speed::TPL_DEPTH))
         .max(1)
 }
 

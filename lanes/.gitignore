@@ -4,3 +4,5 @@
 opus_compare
 align_sw.py
 *_al
+suite.log
+check.log
