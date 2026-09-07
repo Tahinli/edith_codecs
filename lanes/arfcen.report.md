@@ -158,13 +158,24 @@ Probe arms on film B: 91262 B/45.518 dB and 479578 B/47.996 dB against arm
 | arm | bars 1080p | bars 2160p | film A | film B |
 |---|---|---|---|---|
 | control | +1.7 / -14.5 | +12.2 / -10.2 | +37.5 / +7.6 | +54.1 / +23.9 |
-| arm 1 | +2.0 / -14.2 | +12.6 / -9.9 | **+37.2 / +7.3** | **+53.2 / +23.1** |
+| arm 1 | +2.0 / -14.2 | +12.6 / -9.9 | +37.2 / +7.3 | +53.2 / +23.1 |
+| arm 1 + arm 2 (ships) | +2.2 / -14.0 | +12.7 / -9.8 | **+37.1 / +7.3** | **+52.5 / +22.3** |
 
 Both REAL film rows improve on both columns here too; the two "bars" rows are
 ffmpeg `testsrc2` colour bars (recorded, never a decision) and read 0.3-0.4
 points up.
 
-Invariants at the shipped arm: `encoder::` scoped 33 passed / 0 failed
+Invariants at the SHIPPED configuration (both arms on): `encoder::` scoped
+33 passed / 0 failed (release binary, 780 s, the bitrate test included),
+`the_facade_codes_the_same_bytes_as_encode_sequence` 1 passed,
+`tile_bytes_do_not_depend_on_the_thread_count --include-ignored` 1 passed,
+`EC_COMP_MISMATCH=1` over the 48-frame film B encode 0 lines, ec-av1 lib
+suite 558 passed / 0 failed / 44 ignored (745 s),
+`cargo check --workspace --all-targets -j4` 0 errors and 0 ec-av1 warnings.
+Pins: 9835 -> 9859 (tpl window) -> **9853** at q=150, 35798 -> 35904 ->
+**35866** at q=60.
+
+Arm 1's own invariant run (tpl window only, before arm 2): `encoder::` scoped 33 passed / 0 failed
 (release binary, 868 s, includes the bitrate test),
 `the_facade_codes_the_same_bytes_as_encode_sequence` +
 `tile_bytes_do_not_depend_on_the_thread_count --include-ignored` 2 passed,
