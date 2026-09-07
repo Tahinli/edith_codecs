@@ -918,6 +918,311 @@ fn av1_encode_agrees_between_two_decoders() {
     }
 }
 
+/// What the GPU's AV1 costs against software, on his own content.
+///
+/// Four quantisers per encoder on a 1920x1080 crop of a film and of a screen
+/// capture, PSNR from ffmpeg, BD-rate over the overlapping quality range
+/// against librav1e speed 6 and libaom cpu-used 6. Nothing is asserted about
+/// the number — a fixed-function encoder is not a search — but it is measured
+/// and printed rather than assumed, and the ladder itself is asserted to be
+/// monotone, which is the part a broken parameter set would break.
+#[test]
+fn av1_encode_bd_row_vs_software() {
+    let Some(display) = display() else { return };
+    let clips = real_clips();
+    if clips.is_empty() {
+        eprintln!("skipped: no real-library manifest");
+        return;
+    }
+    // A ladder compared with itself saves nothing: the check on the metric.
+    let same = [(100.0, 30.0), (200.0, 35.0), (400.0, 40.0)];
+    assert!(bd_rate(&same, &same).abs() < 1e-9, "bd_rate is not self-zero");
+
+    let dir = std::env::temp_dir().join("ec-hw-av1-bd");
+    let _ = std::fs::create_dir_all(&dir);
+    for (label, source) in clips {
+        let y4m = dir.join(format!("{label}.y4m"));
+        let (width, height, frames) = (1920u32, 1080u32, 12u32);
+        if !extract_y4m(&source, &y4m, width, height, frames) {
+            eprintln!("skipped {label}: extraction failed");
+            continue;
+        }
+        let planes = match raw_frames(&y4m, width, height, frames) {
+            Some(planes) => planes,
+            None => {
+                eprintln!("skipped {label}: no frames extracted");
+                continue;
+            }
+        };
+
+        let mut ours = Vec::new();
+        // Descending quantiser: every ladder here is ordered by rising rate.
+        for qp in [180u32, 140, 100, 60] {
+            let mut config = EncoderConfig::new(EncCodec::Av1, width, height);
+            config.framerate = (24, 1);
+            config.gop_size = 60;
+            config.rate_control = RateControlMode::ConstantQp { qp };
+            let mut encoder = match Encoder::new(&display, config) {
+                Ok(encoder) => encoder,
+                Err(e) => {
+                    eprintln!("skipped: AV1 encode unavailable ({e})");
+                    return;
+                }
+            };
+            let mut bytes = Vec::new();
+            for (i, frame) in planes.iter().enumerate() {
+                let coded = encoder
+                    .encode(
+                        frame,
+                        FrameMetadata {
+                            timestamp: i as i64,
+                            force_keyframe: false,
+                        },
+                    )
+                    .expect("hardware AV1 encode");
+                bytes.extend_from_slice(&coded.data);
+            }
+            let path = dir.join(format!("{label}-hw-{qp}.obu"));
+            std::fs::write(&path, &bytes).expect("write");
+            if let Some(db) = ffmpeg_psnr(&path, &y4m, true) {
+                ours.push((bytes.len() as f64 * 8.0 / f64::from(frames), db));
+            }
+        }
+        let rav1e: Vec<(f64, f64)> = [180u32, 140, 100, 60]
+            .iter()
+            .filter_map(|q| {
+                software_point(
+                    &dir,
+                    &y4m,
+                    label,
+                    "librav1e",
+                    &["-rav1e-params", &format!("speed=6:quantizer={q}"), "-g", "60"],
+                    *q,
+                    frames,
+                )
+            })
+            .collect();
+        let libaom: Vec<(f64, f64)> = [56u32, 44, 32, 20]
+            .iter()
+            .filter_map(|crf| {
+                software_point(
+                    &dir,
+                    &y4m,
+                    label,
+                    "libaom-av1",
+                    &[
+                        "-cpu-used", "6", "-crf", &crf.to_string(), "-b:v", "0", "-g", "60",
+                    ],
+                    *crf,
+                    frames,
+                )
+            })
+            .collect();
+
+        for (name, ladder) in [("hw AV1", &ours), ("librav1e", &rav1e), ("libaom", &libaom)] {
+            println!("{label} {name}: {ladder:?}");
+            for pair in ladder.windows(2) {
+                assert!(
+                    pair[1].0 > pair[0].0 && pair[1].1 > pair[0].1,
+                    "{label} {name}: ladder is not monotone at {pair:?}"
+                );
+            }
+        }
+        if ours.len() >= 3 && rav1e.len() >= 3 {
+            println!(
+                "BD-rate row: {label}, hw AV1 vs librav1e speed 6: {:+.1}%",
+                bd_rate(&rav1e, &ours) * 100.0
+            );
+        }
+        if ours.len() >= 3 && libaom.len() >= 3 {
+            println!(
+                "BD-rate row: {label}, hw AV1 vs libaom cpu-used 6: {:+.1}%",
+                bd_rate(&libaom, &ours) * 100.0
+            );
+        }
+    }
+}
+
+/// One software encoder's rate/PSNR point, or `None` when that encoder is not
+/// built into this ffmpeg.
+fn software_point(
+    dir: &Path,
+    y4m: &Path,
+    label: &str,
+    encoder: &str,
+    args: &[&str],
+    point: u32,
+    frames: u32,
+) -> Option<(f64, f64)> {
+    let out = dir.join(format!("{label}-{encoder}-{point}.ivf"));
+    let _ = std::fs::remove_file(&out);
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-i"])
+        .arg(y4m)
+        .args(["-c:v", encoder])
+        .args(args)
+        .arg(&out)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let bytes = std::fs::metadata(&out).ok()?.len() as f64;
+    let db = ffmpeg_psnr(&out, y4m, false)?;
+    Some((bytes * 8.0 / f64::from(frames), db))
+}
+
+/// PSNR of a coded stream against the source, from ffmpeg's own filter.
+fn ffmpeg_psnr(coded: &Path, source: &Path, raw_obu: bool) -> Option<f64> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-nostdin", "-v", "info"]);
+    if raw_obu {
+        cmd.args(["-f", "obu"]);
+    }
+    // Both inputs are pinned to the same rate: a raw OBU stream carries no
+    // timing, so ffmpeg would otherwise call it 25 fps against a 24 fps
+    // source and the filter would compare frame i with frame i+k.
+    let out = cmd
+        .args(["-r", "24"])
+        .arg("-i")
+        .arg(coded)
+        .args(["-r", "24"])
+        .arg("-i")
+        .arg(source)
+        .args(["-lavfi", "psnr", "-f", "null", "-"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    let field = text.split("average:").nth(1)?;
+    field
+        .split_whitespace()
+        .next()?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+}
+
+/// A 1920x1080 crop of `frames` pictures, as a y4m file the encoders share.
+fn extract_y4m(source: &Path, out: &Path, width: u32, height: u32, frames: u32) -> bool {
+    let _ = std::fs::remove_file(out);
+    Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-ss", "60", "-i"])
+        .arg(source)
+        .args([
+            "-frames:v",
+            &frames.to_string(),
+            "-vf",
+            &format!("scale={width}:{height}"),
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(out)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The same pictures as planes, for the hardware encoder's own input.
+fn raw_frames(y4m: &Path, width: u32, height: u32, frames: u32) -> Option<Vec<I420>> {
+    let out = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(y4m)
+        .args(["-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let frame_len = w * h + 2 * cw * ch;
+    let mut pictures = Vec::new();
+    for chunk in out.stdout.chunks_exact(frame_len).take(frames as usize) {
+        let (y, rest) = chunk.split_at(w * h);
+        let (u, v) = rest.split_at(cw * ch);
+        pictures.push(I420 {
+            y: y.to_vec(),
+            u: u.to_vec(),
+            v: v.to_vec(),
+            width,
+            height,
+        });
+    }
+    (!pictures.is_empty()).then_some(pictures)
+}
+
+/// One film and one screen capture from the real-library manifest, labelled
+/// rather than named: the titles are his, not this suite's.
+fn real_clips() -> Vec<(&'static str, PathBuf)> {
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/real-library-manifest.tsv");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return Vec::new();
+    };
+    let mut film = None;
+    let mut screen = None;
+    for line in text.lines().skip(1) {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 7 || f[2] != "h264" {
+            continue;
+        }
+        let width: u32 = f[3].parse().unwrap_or(0);
+        // Long enough that the extraction's 60 s seek lands inside the file.
+        let duration: f64 = f.get(8).and_then(|d| d.parse().ok()).unwrap_or(0.0);
+        if width < 1280 || duration < 90.0 {
+            continue;
+        }
+        let path = PathBuf::from(f[0]);
+        if f[0].contains("/Films/") && film.is_none() {
+            film = Some(("film A", path));
+        } else if f[0].contains("/OBS/") && screen.is_none() {
+            screen = Some(("screen capture", path));
+        }
+    }
+    film.into_iter().chain(screen).collect()
+}
+
+/// BD-rate of `test` against `reference`, as a fraction (negative = fewer
+/// bits for the same quality), integrated piecewise-linearly in
+/// `log10(bits per frame)` over the PSNR range the two ladders share.
+///
+/// The cubic fit of the original method needs four well-spread points and
+/// misbehaves outside them; a trapezoid over the overlap is the honest
+/// version of the same integral for ladders this short.
+fn bd_rate(reference: &[(f64, f64)], test: &[(f64, f64)]) -> f64 {
+    let low = reference[0].1.max(test[0].1);
+    let high = reference[reference.len() - 1].1.min(test[test.len() - 1].1);
+    if !(high > low) {
+        return f64::NAN;
+    }
+    // log-rate at a PSNR, linearly interpolated inside the ladder.
+    let at = |ladder: &[(f64, f64)], db: f64| -> f64 {
+        for pair in ladder.windows(2) {
+            let ((r0, d0), (r1, d1)) = (pair[0], pair[1]);
+            if db >= d0 && db <= d1 {
+                let t = if (d1 - d0).abs() < f64::EPSILON {
+                    0.0
+                } else {
+                    (db - d0) / (d1 - d0)
+                };
+                return r0.log10() + t * (r1.log10() - r0.log10());
+            }
+        }
+        if db < ladder[0].1 {
+            ladder[0].0.log10()
+        } else {
+            ladder[ladder.len() - 1].0.log10()
+        }
+    };
+    let steps = 100;
+    let mut integral = 0.0;
+    for i in 0..steps {
+        let a = low + (high - low) * f64::from(i) / f64::from(steps);
+        let b = low + (high - low) * f64::from(i + 1) / f64::from(steps);
+        let da = at(test, a) - at(reference, a);
+        let db = at(test, b) - at(reference, b);
+        integral += (da + db) / 2.0 * (b - a);
+    }
+    10f64.powf(integral / (high - low)) - 1.0
+}
+
 /// Hardware AV1 encode speed at the two sizes his library is in, in frames per
 /// second. Real time is 24 fps; the number is printed rather than asserted,
 /// since a busy GPU is not a failing encoder.
