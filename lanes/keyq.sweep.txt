@@ -1,0 +1,53 @@
+# lane-keyq -- key-frame quantizer offset (Pyramid::key_q_offset, 5th env field)
+# gate: encode::tests::bd_rate_film_long_gop (48 pictures, gop 48), release lib binary,
+#       --test-threads 1, <= 2 arms in parallel. Rows keyed by the log's own header.
+# spec = EC_AV1_PYRAMID=<mini_gop>:<arf>:<leaf>:<mid>:<key>; control = unset (default 8:-32:16:-8:0).
+
+## long-GOP (48 pictures, gop 48) -- BD-rate vs libaom cpu-used 6 / vs rav1e speed 6
+| key offset | film A | film B |
+|---|---|---|
+| control (0, unset) | +52.0 / +11.7 | +144.5 / +44.3 |
+| -32 | +45.3 / +6.7 | +132.8 / +36.8 |
+| -48 | +43.5 / +4.6 | +131.3 / +35.0 |
+| -64 | +44.9 / +3.8 | +140.7 / +37.5 |
+| -16 | +48.8 / +9.4 | +138.0 / +40.2 |
+| -48, arf -40 | +44.4 / +5.1 | +137.4 / +38.6 |
+
+WINNER key -48 at arf -32: both films improve on both columns against the control
+(film A -8.5 / -7.1, film B -13.2 / -9.3). -64 overshoots on film B (+140.7) and a
+deeper ARF (-40) with the same key gives the bytes back on both films, so the anchor
+is what the ARFs wanted, not more ARF.
+
+## 12-frame gate (encode::tests::bd_rate_screen_native) at the winner
+| clip | control (key 0) | key -48 |
+|---|---|---|
+| bars 1080p | +1.7 / -14.3 | +2.0 / -14.0 |
+| bars 2160p | +13.7 / -9.5 | +13.1 / -9.6 |
+| film A | +43.3 / +15.0 | +38.5 / +8.2 |
+| film B | +66.9 / +35.1 | +58.2 / +26.5 |
+| screen capture | +33.4 / -23.8 | +33.4 / -23.8 (pyramid gated off, byte-identical) |
+
+Both film rows improve on both columns at 12 frames too, so key_q_offset is NOT
+gated on GOP length (unlike mid_q_offset).
+
+## rate loop
+The key slot cannot steer the offset back (one key frame per run), so the finer key
+ran bitrate_target_lands_within_10_percent_over_48_frames +10.8% over target. The
+loop now prices the key's share through the calibration slope
+(KEY_WEIGHT * exp(-key_q_offset / GAIN)) and takes it out of the other gop-1
+pictures: 768 kbps pyramid arm -0.3%, 1536 kbps -6.2%.
+
+## per-level census after (film B, q150, EC_AV1_BITCENSUS=1 + examples/syntax_census)
+stream 89,239 B (the gate's own first point, byte-identical), 88,079 B censused,
+PSNR-Y mean 45.432 dB over 48 displayed pictures, display-0 47.67 dB.
+
+| level | before (3-level, key at base q) | after (key -48) |
+|---|---|---|
+| key | 1 @ 150: 8,399 B (10.2%) | 1 @ 102: 19,321 B (21.9%) |
+| arf top+mid | 12: 64,980 B | 12: 58,457 B (66.4%) |
+| leaf | 35: 9,117 B | 35: 10,301 B (11.7%) |
+| stream / mean PSNR-Y | 82,496 B / 45.096 dB | 89,239 B / 45.432 dB |
+
+Key share 10.2% -> 21.9%, inside the references' 22-37% band (rav1e 31.6%, libaom
+36.9% on film A); display-0 PSNR 45.0 -> 47.67 dB against rav1e's 47.1 at its own
+matched point.

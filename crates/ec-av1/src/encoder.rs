@@ -124,7 +124,7 @@ impl RateTarget {
     /// Applies this target to `config` and returns the closed loop it needs
     /// (`None` for the two open-loop variants). `mini_gop` is `Some` in
     /// pyramid mode, which is what makes the loop keep a quantizer per level.
-    fn into_loop(self, config: &mut EncoderConfig, mini_gop: Option<usize>) -> Option<RateLoop> {
+    fn into_loop(self, config: &mut EncoderConfig, pyramid: Option<Pyramid>) -> Option<RateLoop> {
         let target_bytes = match self {
             RateTarget::QIndex(q) => {
                 config.base_q_idx = q;
@@ -143,7 +143,8 @@ impl RateTarget {
         Some(RateLoop::new(
             target_bytes,
             f64::from(config.base_q_idx),
-            mini_gop,
+            pyramid,
+            config.gop,
         ))
     }
 }
@@ -207,8 +208,8 @@ impl RateLoop {
     /// convert a bytes ratio into a `q_idx` step.
     const GAIN: f64 = 1.0 / 0.0154;
 
-    fn new(target_bytes: f64, start_q: f64, mini_gop: Option<usize>) -> Self {
-        let Some(m) = mini_gop.map(|m| m as f64) else {
+    fn new(target_bytes: f64, start_q: f64, pyramid: Option<Pyramid>, gop: usize) -> Self {
+        let Some(p) = pyramid else {
             return Self {
                 target: [target_bytes; 3],
                 q: [start_q; 3],
@@ -216,12 +217,28 @@ impl RateLoop {
                 seeded: [false; 3],
             };
         };
-        // A group of `m` pictures gets `m * target_bytes`, split one
-        // `ARF_WEIGHT` share to the hidden frame and one each to the `m - 1`
-        // leaves, so the group's own average is the target exactly.
-        let share = target_bytes * m / (m - 1.0 + ARF_WEIGHT);
+        let m = p.mini_gop as f64;
+        // THE KEY FRAME'S SHARE, in frame targets. `KEY_WEIGHT` prices it at
+        // the quantizer the loop steers it to, and
+        // [`Pyramid::key_q_offset`] then codes it that much FINER, which the
+        // key's own slot cannot steer back: a run holds exactly one key
+        // frame, so the slot never gets a second frame to correct on. The
+        // calibration slope (`GAIN`) says what the offset costs in bytes, and
+        // the rest of the run pays for it -- without this the deeper key ran
+        // the 48-frame bitrate gate +10.8% over target.
+        let key = KEY_WEIGHT * (-f64::from(p.key_q_offset) / Self::GAIN).exp();
+        // What is left for the `gop - 1` non-key pictures, per picture: a run
+        // of `gop` pictures is worth `gop` frame targets in total.
+        let rest = match gop > 1 {
+            true => (target_bytes * (gop as f64 - key) / (gop as f64 - 1.0)).max(0.0),
+            false => target_bytes,
+        };
+        // A group of `m` pictures gets `m * rest`, split one `ARF_WEIGHT`
+        // share to the hidden frame and one each to the `m - 1` leaves, so
+        // the group's own average is `rest` exactly.
+        let share = rest * m / (m - 1.0 + ARF_WEIGHT);
         Self {
-            target: [target_bytes * KEY_WEIGHT, share * ARF_WEIGHT, share],
+            target: [target_bytes * key, share * ARF_WEIGHT, share],
             q: [start_q; 3],
             per_level: true,
             seeded: [false; 3],
@@ -388,6 +405,13 @@ pub struct Pyramid {
     /// nearest good reference. Ignored by a group of fewer than four
     /// pictures, where there is no leaf on both sides of a midpoint.
     pub mid_q_offset: Option<i16>,
+    /// Added to `base_q_idx` for the GOP's KEY FRAME — negative, since every
+    /// frame of the run reads it, directly or through an ARF. The 48-frame
+    /// census (`lanes/census-longgop.md`) found ours coded at base q while
+    /// its own ARFs sat 32 steps finer, where rav1e (key 100 / arf 120 /
+    /// leaf 153) and libaom (63 / 95 / 163) both make the key the best frame
+    /// of the run and spend 22--37% of the stream on it against our 10--11%.
+    pub key_q_offset: i16,
 }
 
 /// How many pictures the mini-GOP now being collected takes, given how many
@@ -425,7 +449,7 @@ fn absorb_tail() -> bool {
 
 impl Pyramid {
     /// The pyramid a run asks for through the environment:
-    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>[:<mid>]]`,
+    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>[:<mid>[:<key>]]]`,
     /// where `<mid>` is the third level's offset or `off` for none, with
     /// `0` (or anything that is not a mini-GOP of at least 2, e.g. `flat`)
     /// meaning the flat one-picture-one-frame path. UNSET is
@@ -455,6 +479,8 @@ impl Pyramid {
                 Some("off") => None,
                 Some(v) => v.parse().ok().or(d.mid_q_offset),
             },
+            // A fifth field is the key frame's own offset.
+            key_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.key_q_offset),
         })
     }
 }
@@ -714,6 +740,7 @@ impl Default for Pyramid {
             arf_q_offset: -32,
             leaf_q_offset: 16,
             mid_q_offset: MID_DEFAULT,
+            key_q_offset: KEY_DEFAULT,
         }
     }
 }
@@ -755,6 +782,26 @@ const MID_SLOT: u8 = 2;
 /// long-GOP columns improves against the two-level shape, film B (the wider
 /// gap) by 6.0 / 2.4 BD points.
 const MID_DEFAULT: Option<i16> = Some(-8);
+
+/// [`Pyramid::default`]'s key-frame offset: the long-GOP sweep's winner
+/// (`lanes/keyq.sweep.txt`, 48 pictures, gop 48, BD-rate vs libaom cpu-used 6
+/// / vs rav1e speed 6), which the 12-frame gate agrees with, so it is NOT
+/// gated on GOP length the way the third level is:
+///
+/// | key offset | film A (48) | film B (48) | film A (12) | film B (12) |
+/// |---|---|---|---|---|
+/// | 0 (base q) | +52.0 / +11.7 | +144.5 / +44.3 | +43.3 / +15.0 | +66.9 / +35.1 |
+/// | -16 | +48.8 / +9.4 | +138.0 / +40.2 | | |
+/// | -32 | +45.3 / +6.7 | +132.8 / +36.8 | | |
+/// | -48 | +43.5 / +4.6 | +131.3 / +35.0 | +38.5 / +8.2 | +58.2 / +26.5 |
+/// | -64 | +44.9 / +3.8 | +140.7 / +37.5 | | |
+///
+/// `-64` overshoots on film B, and a deeper ARF (`-40`) under the same key
+/// gives bytes back on both films (+44.4 / +5.1, +137.4 / +38.6), so what the
+/// group was short of is the ANCHOR, not more ARF. The bars rows move by
+/// 0.3 / 0.6 BD points and the screen capture is byte-identical (its pyramid
+/// is gated off).
+const KEY_DEFAULT: i16 = -48;
 
 /// The AV1 software encoder: [`EncoderConfig`] in, one [`Packet`] out per
 /// [`Av1Encoder::encode`] call — or, with a [`Pyramid`] configured, a
@@ -953,7 +1000,7 @@ impl Av1Encoder {
         pyramid: Pyramid,
         rate: RateTarget,
     ) -> Result<Self> {
-        let rate_loop = rate.into_loop(&mut config, Some(pyramid.mini_gop));
+        let rate_loop = rate.into_loop(&mut config, Some(pyramid));
         let mut encoder = Self::with_pyramid(config, pyramid)?;
         encoder.rate_loop = rate_loop;
         Ok(encoder)
@@ -1290,10 +1337,12 @@ impl Av1Encoder {
     /// whole GOP at once.
     fn encode_key(&mut self, order: u64, picture: &Picture) -> Result<Packet> {
         let render = (self.config.width, self.config.height);
-        let base_q_idx = self
+        let base = self
             .rate_loop
             .as_ref()
-            .map_or(self.config.base_q_idx, |r| r.q_idx(Level::Key));
+            .map_or(i16::from(self.config.base_q_idx), |r| i16::from(r.q_idx(Level::Key)));
+        let offset = self.pyramid.map_or(0, |p| p.key_q_offset);
+        let base_q_idx = (base + offset).clamp(1, 255) as u8;
         let encoded = encode_key_frame_inner(
             &picture.padded_to(SUPERBLOCK),
             base_q_idx,
@@ -2376,6 +2425,35 @@ mod tests {
             Pyramid { mini_gop: 8, mid_q_offset: Some(-8), ..Pyramid::default() },
             2,
         );
+    }
+
+    /// [`Pyramid::key_q_offset`] reaches the key frame: the whole run reads
+    /// the key, so an offset that never arrived would be invisible in the BD
+    /// table except as "no change" (class symbol-consumption-gap). A finer
+    /// key must cost strictly more bytes than the same picture at base q.
+    #[test]
+    fn the_key_q_offset_reaches_the_key_frame() {
+        let _knobs = crate::speed::knob_read();
+        crate::encode::force_screen(Some(false));
+        let key_bytes = |offset: i16| {
+            let config = EncoderConfig {
+                width: 128,
+                height: 128,
+                base_q_idx: 120,
+                gop: 32,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let pyramid = Pyramid { key_q_offset: offset, ..Pyramid::default() };
+            let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
+            let packets = enc.encode_frames(&test_card(128, 128, 0)).unwrap();
+            let key = packets.iter().find(|p| p.level == Level::Key).expect("key frame");
+            key.data.len()
+        };
+        let (base, finer) = (key_bytes(0), key_bytes(-48));
+        eprintln!("key at base q {base} bytes, at base q - 48 {finer} bytes");
+        assert!(finer > base, "key_q_offset -48 did not reach the key frame ({finer} <= {base})");
     }
 
     fn pyramid_round_trip(pyramid: Pyramid, hidden: usize) {

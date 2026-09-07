@@ -13566,8 +13566,12 @@ mod tests {
         // root can code a REAL residual now (one TX_64X64 luma transform and
         // two TX_32X32 chroma ones). `EC_AV1_B64RES=0` restores 8446 / 28548;
         // `EC_AV1_B64=0` gives the pre-root bytes under this pyramid.
+        // Re-taken on lane-keyq: the pyramid codes its KEY FRAME at
+        // `base_q - 48` now ([`crate::encoder::Pyramid::key_q_offset`]), and
+        // one of these four pictures is the key -- 8590 -> 9778 at q=150 and
+        // 28535 -> 35450 at q=60. `EC_AV1_PYRAMID=8:-32:16:-8:0` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8590, 0x407d_4c27_d24f_d830), (60, 28535, 0xf033_c999_93a3_5b27)];
+            [(150, 9778, 0x1f95_859a_9851_8fd6), (60, 35450, 0xd404_19e7_e2ba_84ad)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
