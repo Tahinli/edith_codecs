@@ -130,3 +130,48 @@ screen frames of 4 -- so nothing outside screen content moves, pins included.
 Pins: `encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins`
 PASSES UNCHANGED at 8562 / 33357 -- the pin clip is not screen, so nothing to
 re-pin.
+
+## 6. Preset lever and invariants
+
+`speed::TX_TYPE_SEARCH = [true x7, false x4]` (presets 0-6 on) on top of the
+screen content gate. The FIVE-type fire count is preset 0's: at preset 6 the
+mode/partition pruning removes the blocks `ADST_ADST` and `IDTX` were winning
+on (hits `[0, 6192, 0, 79, 284, ..]`), so the witness asserts the full set at
+preset 0 and "some non-`DCT_DCT` type fires" at every preset that carries the
+lever.
+
+| invariant | preset 0 | preset 6 |
+|---|---|---|
+| `an_edge_clip_codes_every_reduced_set_tx_type_both_decoders_read_exactly` | PASS | PASS |
+| `tile_bytes_do_not_depend_on_the_thread_count --include-ignored` | PASS | PASS |
+| `the_facade_codes_the_same_bytes_as_encode_sequence` | PASS | PASS |
+| `predicted_coeff_bits_track_the_tile_the_writer_wrote` | PASS | PASS |
+| all four above with `EC_COMP_MISMATCH=1` | 0 mismatches | 0 mismatches |
+
+`every_speed_preset_decodes_sample_exact_through_both_decoders --ignored`
+PASS (with `EC_COMP_MISMATCH=1`).
+`the_encoders_own_streams_are_byte_identical_to_their_pins`: PASS at the
+UNCHANGED 8562 / 33357 -- no re-pin, the pin clip is not screen content.
+
+## 7. Deferred
+
+* `deferred: inter luma IDTX vs DCT_DCT (the two-type TX_SET_INTER_3 the
+  writer already codes) -- the plumbing is done (an inter block's
+  BlockCoeffs carries luma_tx_types through the same writer path), what is
+  missing is the candidate loop in code_from_prediction/commit_inter_luma and
+  a gate round -- unblocked by ~40 min of gate wall; the screen row is where
+  it would pay, same as the intra half.`
+* `deferred: reduced_tx_set = 0 and the 13/17 alphabets (DTT9_IDTX_1DDCT,
+  ALL16) -- the FORWARD kernels are DONE and round-trip tested (all sixteen
+  types), decode::tx_type_symbol already answers for the 7/12/16-symbol sets,
+  and the decoder reads them; what is missing is the frame-header bit plus
+  the writer's set map (tile.rs:4208 -> the Luma*Set1/Set2 variants) and a
+  rav1e-speed-6-shaped candidate list per class -- unblocked by a lane of its
+  own. Note the shape this lane measured first: the wider a set gets, the
+  more the FILM rows lose (this five-type set already costs film A +0.4 and
+  film B +1.2), so that lane should gate by content from the start rather
+  than measure an unconditional arm.`
+* `deferred: libaom's own tx_type histogram on film B (syntax_census) -- the
+  charter's instrument half. Not run: the two gate slots were the budget, and
+  the decision it would have informed (which types to offer) was settled by
+  the gate itself. Unblocked by one census run.`
