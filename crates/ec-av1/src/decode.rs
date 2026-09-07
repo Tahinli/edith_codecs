@@ -15718,6 +15718,19 @@ fn decode_leaf_split4(
             neighbours.above[leaf_mi.1 + cell][2] = v_state;
         }
     }
+    // lane-dkey: a sub-8x8 leaf can never use palette (`av1_allow_palette`
+    // needs BLOCK_8X8 and up), and libaom's mi grid says so -- its
+    // `palette_size` is 0 in every one of these mi cells, so the NEXT block's
+    // `av1_get_palette_mode_ctx` and colour cache read 0 here. This decoder
+    // only ever WROTE palette state from the >=8x8 readers, so an 8x8 palette
+    // block above a 4x4 group left its size/colours standing in the mi-granular
+    // bands: the block below the group read `palette_y_mode` off CDF row 1
+    // where libaom reads row 0 (class [[cdf-row-held-constant]]), decoded a
+    // palette libaom never coded, and then skipped the `use_filter_intra`
+    // symbol that a palette block has none of -- one symbol short, tile
+    // desynced. Publishing the group's own zeros is the clear.
+    neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
     Ok((leaf_modes[2], leaf_modes[1]))
 }
 
@@ -16078,6 +16091,19 @@ fn decode_leaf_rect8(
             neighbours.above[leaf_mi.1 + cell][2] = v_state;
         }
     }
+    // lane-dkey (same clear as `decode_leaf_split4`): a sub-8x8 leaf can never use palette (`av1_allow_palette`
+    // needs BLOCK_8X8 and up), and libaom's mi grid says so -- its
+    // `palette_size` is 0 in every one of these mi cells, so the NEXT block's
+    // `av1_get_palette_mode_ctx` and colour cache read 0 here. This decoder
+    // only ever WROTE palette state from the >=8x8 readers, so an 8x8 palette
+    // block above a 4x4 group left its size/colours standing in the mi-granular
+    // bands: the block below the group read `palette_y_mode` off CDF row 1
+    // where libaom reads row 0 (class [[cdf-row-held-constant]]), decoded a
+    // palette libaom never coded, and then skipped the `use_filter_intra`
+    // symbol that a palette block has none of -- one symbol short, tile
+    // desynced. Publishing the group's own zeros is the clear.
+    neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
     // `(below_mode, right_mode)`: the sub-block a neighbour below sees is the
     // bottom one (the second under HORZ, the left one under VERT), the one a
     // neighbour to the right sees is the top-right (the second under VERT).

@@ -13302,6 +13302,34 @@ mod tests {
             );
             let stream = std::fs::read(&obu).expect("reference stream");
             let decoded = ffmpeg_decode_sequence(&stream, width, height, source.len());
+            // lane-dkey: every reference point must also decode through OUR
+            // decoder, sample-exact against ffmpeg's decode of the same bytes.
+            // A BD table computed off streams we cannot read is a table about
+            // an encoder we cannot check; this is the assertion that would
+            // have caught the `force_integer_mv` defect (its stream decoded to
+            // 25 dB garbage while this gate stayed green) and the crf-5 key
+            // frame desync. A failure names the encoder, the point's flags and
+            // the first differing frame/plane/sample.
+            match crate::stream::decode_stream(&stream) {
+                Ok(ours) => {
+                    assert_eq!(
+                        ours.len(),
+                        decoded.len(),
+                        "{encoder} {params:?}: our decoder returned {} shown frames, ffmpeg {}",
+                        ours.len(),
+                        decoded.len(),
+                    );
+                    for (f, (o, d)) in ours.iter().zip(&decoded).enumerate() {
+                        if let Some((plane, s, got, want)) = first_plane_mismatch(o, d) {
+                            panic!(
+                                "{encoder} {params:?} frame {f} plane {plane} sample {s}: our \
+                                 decoder decoded {got}, ffmpeg {want}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => panic!("{encoder} {params:?}: our decoder refused the stream ({e})"),
+            }
             let mean: f64 = decoded
                 .iter()
                 .zip(source)
