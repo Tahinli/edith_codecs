@@ -169,6 +169,27 @@ pub(crate) fn at<T: Copy>(table: &[T; 11]) -> T {
 /// (screen). So it is on at every preset.
 pub(crate) const B64_ROOT: [bool; 11] = [crate::encode::B64_ROOT; 11];
 
+/// `encode::rdoq_on`: rate-distortion optimised quantisation
+/// ([`crate::tile::rdoq`], lane-rdoq). MEASURED at both ends of the range on
+/// the 12-frame native gate (BD vs libaom `cpu-used 6` / rav1e `speed 6`,
+/// our wall):
+///
+/// | row | preset 0 off | preset 0 on | preset 6 off | preset 6 on |
+/// |---|---|---|---|---|
+/// | film A | +37.1 / +7.3 (77s) | +24.4 / -1.8 (138s) | +46.0 / +14.5 (32s) | +30.4 / +2.9 (60s) |
+/// | film B | +52.5 / +22.3 (78s) | +35.5 / +7.6 (130s) | +67.8 / +35.0 (30s) | +43.5 / +14.2 (51s) |
+/// | screen | +33.4 / -23.8 (45s) | +28.1 / -25.7 (79s) | +40.3 / -20.0 (15s) | +34.9 / -22.0 (34s) |
+///
+/// It costs about 2x wall and pays at BOTH ends, and it DOMINATES the ladder:
+/// preset 6 with it on is better than preset 0 with it off on every row and
+/// on both columns, at less wall. So it is on up to preset 6. The top rungs
+/// (7..=10) are the real-time ones and are UNMEASURED here, so they keep the
+/// cheaper choice rather than an assumed one; `EC_AV1_RDOQ=1` turns it on
+/// there.
+pub(crate) const RDOQ: [bool; 11] = [
+    true, true, true, true, true, true, true, false, false, false, false,
+];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [

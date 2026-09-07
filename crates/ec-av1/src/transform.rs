@@ -1554,6 +1554,35 @@ pub fn forward_and_quantize_typed(
     quantize(&coeffs, side, bit_depth, q_idx, deadzone)
 }
 
+/// [`forward_and_quantize_typed`] that also hands back each coded position's
+/// pre-rounding scaled coefficient (`coeff / q`, the exact real-valued level
+/// the quantiser rounded). The RDOQ pass ([`crate::tile::rdoq`]) prices
+/// `level - 1` against `level` and needs the distance to both, which the
+/// levels alone no longer carry.
+pub fn forward_and_quantize_typed_scaled(
+    residual: &[i32],
+    side: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    deadzone: f64,
+    tx_type: TxType,
+) -> (Vec<i32>, Vec<f32>) {
+    let coeffs = forward_transform_2d_typed(residual, side, tx_type);
+    let dc = f64::from(crate::quant::dc_q(bit_depth, q_idx));
+    let ac = f64::from(crate::quant::ac_q(bit_depth, q_idx));
+    let mut scaled = vec![0f32; side * side];
+    let coded = side.min(32);
+    for row in 0..coded {
+        for col in 0..coded {
+            let i = row * side + col;
+            scaled[i] = (coeffs[i] / if i == 0 { dc } else { ac }) as f32;
+        }
+    }
+    // Same levels as the plain entry point: this is the same division the
+    // quantiser does, and the levels come from the quantiser itself.
+    (quantize(&coeffs, side, bit_depth, q_idx, deadzone), scaled)
+}
+
 /// How much the decoder's inverse transform shrinks an orthonormal DCT.
 ///
 /// Measured, not asserted: feeding a single dequantized coefficient through
@@ -1998,6 +2027,34 @@ pub fn forward_and_quantize(
     q_idx: i32,
     deadzone: f64,
 ) -> Vec<i32> {
+    forward_and_quantize_into(residual, side, bit_depth, q_idx, deadzone, None)
+}
+
+/// [`forward_and_quantize`] plus the pre-rounding scaled coefficients, for the
+/// same reason [`forward_and_quantize_typed_scaled`] exists. The levels are
+/// bit-identical: it is the one loop below, with the value it rounds also
+/// written out.
+pub fn forward_and_quantize_scaled(
+    residual: &[i32],
+    side: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    deadzone: f64,
+) -> (Vec<i32>, Vec<f32>) {
+    let mut scaled = vec![0f32; side * side];
+    let levels =
+        forward_and_quantize_into(residual, side, bit_depth, q_idx, deadzone, Some(&mut scaled));
+    (levels, scaled)
+}
+
+fn forward_and_quantize_into(
+    residual: &[i32],
+    side: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    deadzone: f64,
+    mut scaled_out: Option<&mut [f32]>,
+) -> Vec<i32> {
     // 72% of this encoder's forward DCTs are of an all-zero residual
     // (measured over the BD gate's own ladder, lane-av1fwd): every row and
     // every column of the network is skipped for them anyway, so the levels
@@ -2023,6 +2080,9 @@ pub fn forward_and_quantize(
         }
         for u in 0..coded {
             let scaled = f64::from(t[u]) * if u == 0 && v == 0 { dc } else { ac };
+            if let Some(out) = scaled_out.as_deref_mut() {
+                out[u * side + v] = scaled as f32;
+            }
             let magnitude = scaled.abs() + deadzone;
             let level = if magnitude < 1.0 {
                 0

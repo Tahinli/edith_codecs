@@ -13,7 +13,7 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ec_core::{Error, Result};
 
@@ -4445,6 +4445,26 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
 /// blocks mostly code nothing narrows `txb_skip` far below where it started.
 /// A whole-block luma transform still reads context 0 -- that is what the
 /// writer codes (`write_luma_tus`, `n == 1`), not an approximation.
+/// The default scan of one transform size, built once per size: the search
+/// prices thirteen modes for every block, and the scan is the same table
+/// every time.
+fn scan_of(side: usize) -> &'static Vec<u16> {
+    static SCANS: LazyLock<[Vec<u16>; 4]> = LazyLock::new(|| {
+        [
+            default_scan(TX4),
+            default_scan(TX8),
+            default_scan(TX16),
+            default_scan(TX32),
+        ]
+    });
+    match side {
+        TX4 => &SCANS[0],
+        TX8 => &SCANS[1],
+        TX16 => &SCANS[2],
+        _ => &SCANS[3],
+    }
+}
+
 pub(crate) fn coeff_bits(
     grid: &[i32],
     set: TxbSet,
@@ -4458,16 +4478,6 @@ pub(crate) fn coeff_bits(
     skip_ctx: usize,
     sign_ctx: usize,
 ) -> f64 {
-    /// Built once per size: the search prices thirteen modes for every block,
-    /// and the scan is the same table every time.
-    static SCANS: LazyLock<[Vec<u16>; 4]> = LazyLock::new(|| {
-        [
-            default_scan(TX4),
-            default_scan(TX8),
-            default_scan(TX16),
-            default_scan(TX32),
-        ]
-    });
     // `Cdfs::new` builds every table a tile writer adapts -- tens of
     // kilobytes -- and this function is called once per priced candidate:
     // together with the copy behind it that was 9% of the encoder's profile
@@ -4500,12 +4510,7 @@ pub(crate) fn coeff_bits(
         if let (Some(dst), Some(src)) = (coding.tx_type.as_mut(), src.tx_type) {
             dst.copy_from_slice(src);
         }
-        let scan = match coding.side {
-            TX4 => &SCANS[0],
-            TX8 => &SCANS[1],
-            TX16 => &SCANS[2],
-            _ => &SCANS[3],
-        };
+        let scan = scan_of(coding.side);
         let mut enc = SymbolEncoder::pricer();
         write_coeffs(&mut enc, &mut coding, grid, scan, skip_ctx, sign_ctx, None);
         enc.bits()
@@ -4535,6 +4540,195 @@ pub(crate) fn coeff_bits(
             if all_zero { zero_price(slot) } else { price(slot) }
         })
     })
+}
+
+/// The largest level [`rdoq`] offers a candidate for, and the most prices it
+/// may spend on one block. `EC_AV1_RDOQ_MAXLEVEL` / `EC_AV1_RDOQ_BUDGET`
+/// sweep them; see [`rdoq`] for why both exist.
+const RDOQ_MAX_LEVEL: u32 = 2;
+const RDOQ_BUDGET: u32 = 24;
+
+fn rdoq_max_level() -> u32 {
+    static ENV: LazyLock<u32> = LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_RDOQ_MAXLEVEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(RDOQ_MAX_LEVEL)
+    });
+    *ENV
+}
+
+fn rdoq_budget() -> u32 {
+    static ENV: LazyLock<u32> = LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_RDOQ_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(RDOQ_BUDGET)
+    });
+    *ENV
+}
+
+/// Rate-distortion optimised quantisation (lane-rdoq): the pass every
+/// reference encoder runs after the quantiser and this one did not have.
+///
+/// The deadzone quantiser rounds each coefficient on its own, blind to what
+/// the coded level costs. Every reference decides that per coefficient
+/// against the entropy coder (libaom `av1_optimize_txb`, rav1e
+/// `optimize_txb`): a level is lowered toward zero when the bits it gives
+/// back are worth more than the squared error it adds, which also shortens
+/// the eob when the tail levels go to zero.
+///
+/// Mirroring rav1e's shape without its incremental cost model: the candidate
+/// set per coefficient is `{level, level - 1, .., 0}` walked one step at a
+/// time in REVERSE scan order (the tail first, so a dropped tail is retried
+/// against the shorter eob it leaves), and each candidate is priced by
+/// re-coding the whole block through [`coeff_bits`] -- the same CDFs, the
+/// same neighbour contexts and the same writer the search already prices
+/// with, so no second cost model can drift from the writer (class
+/// `table-and-reader-move-together`). That costs one `write_coeffs` per
+/// candidate instead of rav1e's table lookup, which is why this is a preset
+/// lever (`crate::speed::RDOQ`) and not unconditional.
+///
+/// `levels` is the side-strided grid the inverse transform and the writer
+/// will read, `scaled` the pre-rounding `coeff / q` of each position
+/// (`crate::transform::forward_and_quantize_scaled`). `lambda` is the rate
+/// weight in units of ONE SQUARED AC QUANTISER STEP: the search's own
+/// `sse + lambda * bits` is `step^2 * (sum (scaled - level)^2 + LAMBDA_SCALE
+/// * bits)` once the pixel-domain error of a level is written through the
+/// orthonormal transform (`(coeff - level * q) / 8`, `INVERSE_GAIN_RECIPROCAL`),
+/// so `step^2` divides out of every comparison here and the DC's different
+/// quantiser is the only per-position weight left.
+///
+/// Returns what the block's levels cost after the pass, so the caller prices
+/// the tile it will actually write and never the pre-RDOQ grid.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rdoq(
+    levels: &mut [i32],
+    scaled: &[f32],
+    side: usize,
+    base_q_idx: u8,
+    set: TxbSet,
+    skip_ctx: usize,
+    sign_ctx: usize,
+    lambda: f64,
+) -> f64 {
+    // A 64-point transform carries its top-left 32x32 alone, and that corner
+    // is what the writer and the pricer take (`coded_corner`).
+    let coded = side.min(TX32);
+    let q_ctx = crate::decode::q_ctx_of(base_q_idx);
+    let mut dense = if coded == side { Vec::new() } else { vec![0i32; coded * coded] };
+    fn price(
+        levels: &[i32],
+        dense: &mut [i32],
+        side: usize,
+        coded: usize,
+        set: TxbSet,
+        q_ctx: usize,
+        skip_ctx: usize,
+        sign_ctx: usize,
+    ) -> f64 {
+        if dense.is_empty() {
+            return coeff_bits(levels, set, q_ctx, skip_ctx, sign_ctx);
+        }
+        for row in 0..coded {
+            dense[row * coded..][..coded].copy_from_slice(&levels[row * side..][..coded]);
+        }
+        coeff_bits(dense, set, q_ctx, skip_ctx, sign_ctx)
+    }
+    let mut bits = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx);
+    // The DC has its own quantiser, so its squared error per unit of level is
+    // `(dc_q / ac_q)^2` of an AC coefficient's.
+    let dc = f64::from(crate::quant::dc_q(8, i32::from(base_q_idx)));
+    let ac = f64::from(crate::quant::ac_q(8, i32::from(base_q_idx)));
+    let dc_weight = (dc / ac) * (dc / ac);
+    let census = crate::envflags::env_flag!("EC_AV1_RDOQ_CENSUS");
+    if census {
+        census_block(levels, scaled, side, coded, bits);
+    }
+    // Where the pass may spend its prices. Every candidate here costs a whole
+    // `write_coeffs`, where rav1e's incremental model costs a table lookup,
+    // so both bounds exist to keep that affordable -- and both cut where the
+    // decisions do not pay anyway:
+    //  * a level above [`RDOQ_MAX_LEVEL`] is never a candidate: one step off
+    //    a big level gives back a fraction of a bit for a whole quantiser
+    //    step of squared error. What pays is `1 -> 0` and `2 -> 1`.
+    //  * at most [`RDOQ_BUDGET`] prices per block, spent from the TAIL
+    //    backwards -- the eob end, where dropping a level also shortens the
+    //    eob -- so a fine-quantizer block carrying two hundred coefficients
+    //    cannot cost two hundred re-codings.
+    let mut budget = rdoq_budget();
+    let max_level = rdoq_max_level();
+    for &position in scan_of(coded).iter().rev() {
+        if budget == 0 {
+            break;
+        }
+        let (row, col) = (usize::from(position) / coded, usize::from(position) % coded);
+        let i = row * side + col;
+        if levels[i] == 0 || levels[i].unsigned_abs() > max_level {
+            continue;
+        }
+        let s = f64::from(scaled[i]);
+        let weight = if i == 0 { dc_weight } else { 1.0 };
+        while budget > 0 {
+            let level = levels[i];
+            let candidate = level - level.signum();
+            levels[i] = candidate;
+            budget -= 1;
+            let after = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx);
+            let distortion = weight
+                * ((s - f64::from(candidate)).powi(2) - (s - f64::from(level)).powi(2));
+            if distortion + lambda * (after - bits) < 0.0 {
+                bits = after;
+                if census {
+                    RDOQ_STATS[if candidate == 0 { 4 } else { 5 }].fetch_add(1, Ordering::Relaxed);
+                }
+                if candidate == 0 {
+                    break;
+                }
+            } else {
+                levels[i] = level;
+                break;
+            }
+        }
+    }
+    if census {
+        RDOQ_STATS[6].fetch_add((bits * 64.0) as u64, Ordering::Relaxed);
+    }
+    bits
+}
+
+/// blocks, coded coefficients, +-1 levels, trailing +-1 levels (a run of them
+/// at the end of the scan), zeroed coefficients, lowered coefficients, bits
+/// after the pass * 64, bits before the pass * 64.
+pub(crate) static RDOQ_STATS: [AtomicU64; 8] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
+
+/// The pre-pass half of [`RDOQ_STATS`] (`EC_AV1_RDOQ_CENSUS`): what the
+/// quantiser handed the pass, which is the instrument for how much is at
+/// stake before any decision is taken.
+fn census_block(levels: &[i32], _scaled: &[f32], side: usize, coded: usize, bits: f64) {
+    let scan = scan_of(coded);
+    let at = |p: u16| levels[usize::from(p) / coded * side + usize::from(p) % coded];
+    let nonzero = scan.iter().filter(|&&p| at(p) != 0).count();
+    let ones = scan.iter().filter(|&&p| at(p).abs() == 1).count();
+    let trailing = scan
+        .iter()
+        .rev()
+        .skip_while(|&&p| at(p) == 0)
+        .take_while(|&&p| at(p).abs() == 1)
+        .count();
+    RDOQ_STATS[0].fetch_add(1, Ordering::Relaxed);
+    RDOQ_STATS[1].fetch_add(nonzero as u64, Ordering::Relaxed);
+    RDOQ_STATS[2].fetch_add(ones as u64, Ordering::Relaxed);
+    RDOQ_STATS[3].fetch_add(trailing as u64, Ordering::Relaxed);
+    RDOQ_STATS[7].fetch_add((bits * 64.0) as u64, Ordering::Relaxed);
+}
+
+/// Reads and clears [`RDOQ_STATS`].
+pub fn take_rdoq_stats() -> [u64; 8] {
+    std::array::from_fn(|i| RDOQ_STATS[i].swap(0, Ordering::Relaxed))
 }
 
 thread_local! {
@@ -8392,6 +8586,82 @@ mod tests {
     /// be: every position exactly once, the origin first, and never a position
     /// before one it sits diagonally behind — which is what lets a decoder read
     /// a coefficient's context off the coefficients it has already decoded.
+    /// lane-rdoq's two contracts, on a block shaped like the ones the pass
+    /// exists for (a strong DC, two mid levels and a tail of barely-rounded
+    /// +-1s): it may only move a block to a LOWER `D + lambda * R`, and the
+    /// bits it hands back must be the price of the grid it leaves behind --
+    /// the search takes that number as the block's rate, so a stale one
+    /// would price a tile nobody writes.
+    #[test]
+    fn rdoq_only_lowers_the_cost_and_reports_its_own_grid() {
+        let (side, set, q, lambda) = (16usize, TxbSet::Luma16, 150u8, 0.0275);
+        let mut scaled = vec![0f32; side * side];
+        for (i, v) in [
+            (0usize, 7.4f32),
+            (1, 2.6),
+            (side, -1.55),
+            // The tail the pass exists for: coefficients the deadzone only
+            // just rounded up to +-1, which give a whole level back for a
+            // fraction of one step of squared error.
+            (2, 0.55),
+            (2 * side + 1, -0.52),
+            (3 * side + 3, 0.51),
+        ] {
+            scaled[i] = v;
+        }
+        // The deadzone quantiser this pass runs after, at the shipped 0.5.
+        let mut levels: Vec<i32> = scaled
+            .iter()
+            .map(|&v| {
+                let m = f64::from(v).abs() + 0.5;
+                let l = if m < 1.0 { 0 } else { m.floor() as i32 };
+                if v < 0.0 { -l } else { l }
+            })
+            .collect();
+        let before = levels.clone();
+        let dc = f64::from(crate::quant::dc_q(8, i32::from(q)));
+        let ac = f64::from(crate::quant::ac_q(8, i32::from(q)));
+        let dc_weight = (dc / ac) * (dc / ac);
+        let cost = |grid: &[i32]| -> f64 {
+            let d: f64 = grid
+                .iter()
+                .zip(&scaled)
+                .enumerate()
+                .map(|(i, (&l, &s))| {
+                    (if i == 0 { dc_weight } else { 1.0 })
+                        * (f64::from(s) - f64::from(l)).powi(2)
+                })
+                .sum();
+            d + lambda * coeff_bits(grid, set, crate::decode::q_ctx_of(q), 0, 0)
+        };
+        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda);
+        assert_eq!(bits, coeff_bits(&levels, set, crate::decode::q_ctx_of(q), 0, 0));
+        assert!(cost(&levels) <= cost(&before), "{:?} vs {:?}", cost(&levels), cost(&before));
+        // The tail is what it is for: the last coded position moves earlier.
+        let last = |g: &[i32]| scan_of(side).iter().rposition(|&p| g[usize::from(p)] != 0);
+        assert!(last(&levels) < last(&before), "eob {:?} -> {:?}", last(&before), last(&levels));
+        // A 64-point transform is priced on its top-left 32x32 corner, and
+        // the pass has to hand back THAT price (the dense path).
+        let (side, set) = (64usize, TxbSet::Luma64);
+        let mut scaled = vec![0f32; side * side];
+        for (i, v) in [(0usize, 6.1f32), (1, 0.55), (side + 1, -0.53)] {
+            scaled[i] = v;
+        }
+        let mut levels: Vec<i32> = scaled
+            .iter()
+            .map(|&v| {
+                let m = f64::from(v).abs() + 0.5;
+                let l = if m < 1.0 { 0 } else { m.floor() as i32 };
+                if v < 0.0 { -l } else { l }
+            })
+            .collect();
+        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda);
+        let corner: Vec<i32> = (0..32)
+            .flat_map(|row| levels[row * side..][..32].to_vec())
+            .collect();
+        assert_eq!(bits, coeff_bits(&corner, set, crate::decode::q_ctx_of(q), 0, 0));
+    }
+
     #[test]
     fn the_default_scan_walks_every_position_outwards() {
         for side in [TX16, TX32] {

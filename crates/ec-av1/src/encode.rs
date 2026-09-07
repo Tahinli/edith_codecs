@@ -42,7 +42,8 @@ use crate::tile::{
 };
 use crate::transform::{
     TxType, dequant_and_inverse_typed_wh, forward_and_quantize,
-    forward_and_quantize_typed,
+    forward_and_quantize_scaled, forward_and_quantize_typed,
+    forward_and_quantize_typed_scaled,
 };
 
 /// The side of the larger of the two luma blocks this encoder codes, in
@@ -426,6 +427,67 @@ static B64_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 /// The 64x64-root count since the last call, and zero it.
 pub fn take_b64_root_hits() -> usize {
     B64_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Rate-distortion optimised quantisation ([`crate::tile::rdoq`], lane-rdoq).
+/// Preset-gated: it re-prices the block once per candidate level, so it buys
+/// bits with wall (see `crate::speed::RDOQ` for the per-preset table).
+///
+/// `EC_AV1_RDOQ=0` in any build restores the plain deadzone quantiser --
+/// which is what the byte pins are taken under when they name it.
+fn rdoq_on() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_RDOQ").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::RDOQ))
+}
+
+/// The rate weight [`crate::tile::rdoq`] trades bits for squared error at, in
+/// units of one squared AC quantiser step -- the search's own
+/// [`LAMBDA_SCALE`], so the quantiser and the mode search speak one currency.
+///
+/// The per-frame factors the search multiplies onto it ([`key_lambda_factor`],
+/// [`hidden_lambda_factor`], both 1.0 as shipped) and the per-superblock
+/// temporal map ([`tpl_lambda_factors`]) are NOT threaded down here:
+/// corner-cut, ceiling = a superblock the temporal map weighs away from the
+/// frame average has its coefficients optimised at the frame's weight. The
+/// upgrade is one `lambda` field on the trial call sites, which is the whole
+/// mode-search argument list.
+///
+/// SWEPT (lane-rdoq, 12-frame `bd_rate_screen_native`, BD vs libaom
+/// `cpu-used 6` on the three real rows). The bowl is a factor of TWO above
+/// the mode search's own weight, and it is the same multiplier on all three
+/// rows:
+///
+/// | `EC_AV1_RDOQ_LAMBDA` | film A | film B | screen |
+/// |---|---|---|---|
+/// | 0.7 | +27.6 | +39.5 | +29.6 |
+/// | 1.0 | +26.3 | +37.5 | +29.1 |
+/// | 1.3 | +25.6 | +37.0 | +28.8 |
+/// | 1.6 | +24.6 | +35.9 | +28.7 |
+/// | 2.2 (shipped) | +24.4 | +35.5 | +28.1 |
+/// | 3.2 | +24.7 | +36.1 | +29.4 |
+///
+/// A coefficient's rate is worth twice here what the mode search prices it
+/// at, and the likeliest reason is that the price is taken against tables
+/// that have not adapted yet ([`crate::tile::coeff_bits`]): a block coded
+/// late in a frame whose `txb_skip`/`base` tables have narrowed really costs
+/// less than the pricer says, and this pass is the one decision taken per
+/// COEFFICIENT, so it feels that error most. The honest fix is an adapted
+/// price, not a fitted multiplier; this is the fitted multiplier, and its
+/// bowl is measured rather than assumed.
+const RDOQ_LAMBDA_MULT: f64 = 2.2;
+
+/// [`RDOQ_LAMBDA_MULT`], or what `EC_AV1_RDOQ_LAMBDA` names (the rate-term
+/// calibration sweep).
+fn rdoq_lambda() -> f64 {
+    static MULT: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_RDOQ_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(RDOQ_LAMBDA_MULT)
+    });
+    lambda_scale() * *MULT
 }
 
 /// [`B64_ROOT`], or what `EC_AV1_B64` names.
@@ -2002,8 +2064,26 @@ impl Plane<'_> {
         }
         #[cfg(test)]
         let t = stage_start();
-        let levels =
-            forward_and_quantize_typed(residual, side, 8, i32::from(base_q_idx), deadzone, tx_type);
+        // lane-rdoq: the levels the writer takes are the RDOQ pass's, so the
+        // reconstruction below and the price further down are both of the
+        // grid this trial would really code.
+        let (levels, rdoq_bits) = if rdoq_on() {
+            let (mut levels, scaled) = forward_and_quantize_typed_scaled(
+                residual, side, 8, i32::from(base_q_idx), deadzone, tx_type,
+            );
+            let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, at.set);
+            let bits = crate::tile::rdoq(
+                &mut levels, &scaled, side, base_q_idx, at.set, skip_ctx, sign_ctx, rdoq_lambda(),
+            );
+            (levels, Some(bits))
+        } else {
+            (
+                forward_and_quantize_typed(
+                    residual, side, 8, i32::from(base_q_idx), deadzone, tx_type,
+                ),
+                None,
+            )
+        };
         // lane-av1speed2: 60% of the transform units of an inter stream carry
         // no coefficient at all, and the square entry point re-inflates that
         // case into `side * side` zeros (one allocate-and-memset per trial)
@@ -2042,6 +2122,9 @@ impl Plane<'_> {
                 .filter(|&&level| level != 0)
                 .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
                 .sum()
+        } else if let Some(bits) = rdoq_bits {
+            // Already priced, against the grid the pass settled on.
+            bits
         } else {
             {
                 let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, at.set);
@@ -2114,7 +2197,21 @@ impl Plane<'_> {
         }
         #[cfg(test)]
         let t = stage_start();
-        let levels = forward_and_quantize(residual, side, 8, i32::from(base_q_idx), deadzone);
+        // lane-rdoq, as in [`Self::trial_typed`].
+        let (levels, rdoq_bits) = if rdoq_on() {
+            let (mut levels, scaled) =
+                forward_and_quantize_scaled(residual, side, 8, i32::from(base_q_idx), deadzone);
+            let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, set);
+            let bits = crate::tile::rdoq(
+                &mut levels, &scaled, side, base_q_idx, set, skip_ctx, sign_ctx, rdoq_lambda(),
+            );
+            (levels, Some(bits))
+        } else {
+            (
+                forward_and_quantize(residual, side, 8, i32::from(base_q_idx), deadzone),
+                None,
+            )
+        };
         // The same all-zero shortcut [`Self::trial_typed`] takes.
         let coded = dequant_and_inverse_typed_wh(
             &levels,
@@ -2156,6 +2253,8 @@ impl Plane<'_> {
                 .filter(|&&level| level != 0)
                 .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
                 .sum()
+        } else if let Some(bits) = rdoq_bits {
+            bits
         } else {
             {
                 let (skip_ctx, sign_ctx) = self.coef_ctx(x, y, side, set);
@@ -13896,7 +13995,14 @@ mod tests {
         let mut wall = 0.0;
         for &q in &[150u8, 120, 90, 60] {
             let start = std::time::Instant::now();
-            let encoded = encode_sequence_with_ctx(source, q, 0.5, fctx).unwrap();
+            // lane-rdoq: the deadzone was fitted WITHOUT the RDOQ pass, so
+            // the gate has to be able to re-sweep it. 0.5 is the shipped one
+            // (`crate::encoder::DEADZONE`).
+            let deadzone = std::env::var("EC_AV1_DEADZONE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5);
+            let encoded = encode_sequence_with_ctx(source, q, deadzone, fctx).unwrap();
             wall += start.elapsed().as_secs_f64();
             let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, source.len());
             let ours = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
@@ -14119,12 +14225,13 @@ mod tests {
         // base now, not 16 ([`crate::encoder::Pyramid::leaf_q_offset`]) -- 9778
         // -> 9835 at q=150 and 35450 -> 35798 at q=60.
         // `EC_AV1_PYRAMID=8:-32:16:-8:-48` restores these.
-        // Re-taken at the lane-b64b merge: the 64x64 root prices compound
-        // references and depth-1 var-tx, on top of the tpl window and the
-        // ARF's second reference from lane-arfcen. `EC_AV1_B64COMP=0
-        // EC_AV1_B64VARTX=0` restores 9853 / 35866.
+        // Re-taken at the lane-b64b merge (compound + depth-1 var-tx at the
+        // 64 root; `EC_AV1_B64COMP=0 EC_AV1_B64VARTX=0` gave 9853 / 35866)
+        // and at the lane-rdoq merge: the coefficient quantiser runs the
+        // rate-distortion pass ([`crate::tile::rdoq`]) now. `EC_AV1_RDOQ=0`
+        // restores 9808 / 35791.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9808, 0xb71a_2a4c_0aff_713c), (60, 35791, 0x57a3_93fa_5324_255b)];
+            [(150, 8557, 0x6c33_e2cd_7ee9_b0ac), (60, 33345, 0x437c_b492_67d1_796c)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -15358,6 +15465,27 @@ mod tests {
                 take_b64_var_tx_hits(),
                 take_b64_compound_hits(),
             );
+            // lane-rdoq, under `EC_AV1_RDOQ_CENSUS=1` only (it costs a scan
+            // of every priced block): what the deadzone quantiser handed the
+            // RDOQ pass and what the pass changed, over every TRIAL block of
+            // this row's four encodes -- not over the coded stream, so it is
+            // the bits AT STAKE in the search, not in the bitstream.
+            let rq = crate::tile::take_rdoq_stats();
+            if rq[0] > 0 {
+                eprintln!(
+                    "{name}: rdoq blocks={} coeffs={} (+-1 {:.1}%, trailing +-1 {:.1}%) \
+                     zeroed={} lowered={} trial bits {:.0} -> {:.0} ({:+.2}%)",
+                    rq[0],
+                    rq[1],
+                    100.0 * rq[2] as f64 / rq[1].max(1) as f64,
+                    100.0 * rq[3] as f64 / rq[1].max(1) as f64,
+                    rq[4],
+                    rq[5],
+                    rq[7] as f64 / 64.0,
+                    rq[6] as f64 / 64.0,
+                    100.0 * (rq[6] as f64 - rq[7] as f64) / rq[7].max(1) as f64,
+                );
+            }
             // lane-av1obmc2: the same motion_mode census the 640x384 gate
             // prints (class `gate-blind-to-feature`) -- how many blocks coded
             // the symbol at each footprint and how many took OBMC. Without it

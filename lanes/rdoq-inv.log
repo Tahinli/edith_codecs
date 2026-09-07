@@ -1,0 +1,23 @@
+
+running 1 test
+test encoder::tests::tile_bytes_do_not_depend_on_the_thread_count ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 603 filtered out; finished in 10.31s
+
+
+running 1 test
+test encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 603 filtered out; finished in 20.42s
+
+
+running 1 test
+speed 0: 32947 bytes []
+speed 3: 30559 bytes [no 8x8 split, no warp, no angle delta, no CfL, no filter intra, no loop restoration, chroma top-3, no tpl]
+speed 6: 35858 bytes [no 8x8 split, no extra-reference NEWMV, no warp, no inter var-tx/tx-depth, no 32x32 tx depth, no compound var-tx, no angle delta, no CfL, no filter intra, no loop restoration, split-RD breakout 0.5, coeff breakout 1, intra top-4, inter-intra top-2, chroma top-2, no tpl]
+speed 10: 106649 bytes [no 8x8 split, no 32x32 split (32x32-only partitions), no leaf second-reference search, no extra-reference NEWMV, no leaf compound, no compound, no warp, no inter var-tx/tx-depth, no 32x32 tx depth, no compound var-tx, no key tx-depth, no angle delta, no CfL, no filter intra, no loop restoration, no deblock refine, no chroma deblock stage, split-RD breakout 4, coeff breakout 4, intra top-1, inter-intra top-1, chroma top-1, no tpl, no CDEF search, CDEF presets 0]
+test encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 603 filtered out; finished in 18.43s
+
+RC=0
