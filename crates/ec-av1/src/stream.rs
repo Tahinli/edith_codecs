@@ -4117,15 +4117,20 @@ pub(crate) mod tests {
         // (w, h, frames, gop, bit depth, 128-superblock, screen content)
         // lane-lossless2: the SCREEN rows carry palette blocks, which is what
         // caught the whole-block palette prediction being handed to a 4x4
-        // chroma unit; they are KEY-only, see the lane report's deferred
-        // screen-inter desync.
-        let cases: [(usize, usize, usize, &str, u32, bool, bool); 6] = [
+        // chroma unit.
+        // lane-lossless3: the last row is a screen source with INTER frames --
+        // the row that caught both of this lane's defects (a skip 8x8 leaf
+        // restoring the previous block's luma level band over the zeros
+        // `av1_reset_entropy_context` writes, and a rect sub-8x8 INTRA leaf
+        // reading one TX_4X8 unit where a lossless frame codes two TX_4X4).
+        let cases: [(usize, usize, usize, &str, u32, bool, bool); 7] = [
             (256, 128, 8, "4", 8, false, false),
             (192, 96, 6, "3", 10, false, false),
             (320, 192, 6, "3", 8, false, false),
             (256, 256, 4, "2", 8, true, false),
             (320, 192, 2, "1", 8, false, true),
             (640, 384, 2, "1", 8, false, true),
+            (640, 384, 6, "3", 8, false, true),
         ];
         for &(w, h, frames, gop, depth, sb128, screen) in &cases {
             let tag = format!(
