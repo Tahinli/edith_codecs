@@ -71,8 +71,9 @@ over all SIXTEEN types at 4x4/8x8/16x16 (was 3), each round trip's rmse under
   keyed by the CDF's alphabet width), so writer and reader cannot drift --
   and it already answers for the 7/12/16-symbol sets a `reduced_tx_set == 0`
   lane would turn on.
-* Lever: `speed::TX_TYPE_SEARCH` (presets 0-6 on, 7-10 off), `EC_AV1_TXSET=0`
-  forces it off and restores the pre-lane bytes.
+* Lever: `speed::TX_TYPE_SEARCH` (presets 0-6 on, 7-10 off) AND a content
+  gate -- SCREEN FRAMES ONLY, see the gate table below. `EC_AV1_TXSET=0`
+  forces it off entirely.
 
 ## 4. Checks
 
@@ -84,3 +85,42 @@ over all SIXTEEN types at 4x4/8x8/16x16 (was 3), each round trip's rmse under
 | `predicted_coeff_bits_track_the_tile_the_writer_wrote`, `tile_bytes_do_not_depend_on_the_thread_count --include-ignored`, `the_facade_codes_the_same_bytes_as_encode_sequence` | PASS |
 | `cargo check -p ec-av1 --all-targets` | 0 errors, 0 warnings |
 
+
+## 5. The 12-frame gate (`encode::tests::bd_rate_screen_native`, 12 frames, gop 12)
+
+Control re-run on this head first (`EC_AV1_TXSET=0`), arm = the search on for
+every frame. BD-rate vs libaom cpu-used 6 / vs rav1e speed 6, lower is better;
+wall is ours per row.
+
+| clip | control | arm (all frames) | delta | wall ctl -> arm |
+|---|---|---|---|---|
+| bars 1080p | -1.0% / -16.8% | -2.3% / -17.8% | -1.3 / -1.0 | 247.2s -> 280.4s |
+| bars 2160p | +9.4% / -12.7% | +10.2% / -11.6% | +0.8 / +1.1 | 168.8s -> 180.7s |
+| film A | +21.7% / -4.4% | +22.1% / -4.0% | +0.4 / +0.4 | 153.9s -> 203.9s |
+| film B | +26.9% / -0.6% | +28.1% / +0.7% | +1.2 / +1.3 | 133.5s -> 164.0s |
+| screen capture | +27.8% / -26.0% | **+20.8% / -30.1%** | **-7.0 / -4.1** | 83.7s -> 120.6s |
+
+KEEP RULE VERDICT on the unconditional arm: FAIL. The rule wants both film
+rows down; both go UP (film A +0.4/+0.4, film B +1.2/+1.3). The capture wins
+seven points against libaom and four against rav1e -- the largest single
+screen move this lane has on record -- so the search ships behind the SAME
+content gate palette, intrabc and the angle-delta refinement already stand
+behind (`search.screen`): a non-screen frame is byte-identical to the encoder
+before the lane.
+
+Class note for the film loss: an ADST/IDTX unit is a locally cheaper
+reconstruction that the next picture then predicts from -- the same
+`local-rd-on-references` shape lane-fitu measured for filter intra, which is
+why the film rows lose while the intra-heavy capture wins.
+
+### Shipped state (screen gate on), confirm run
+
+| clip | control | shipped | note |
+|---|---|---|---|
+| bars 1080p | -1.0% / -16.8% | -1.0% / -16.8% | byte-identical (194497/299067/419042/567789 B) |
+
+(rows continue below once the confirm run finishes)
+
+Pins: `encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins`
+PASSES UNCHANGED at 8562 / 33357 -- the pin clip is not screen, so nothing to
+re-pin.
