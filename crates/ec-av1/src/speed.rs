@@ -50,6 +50,17 @@
 //! bars-fixture sweeps rated cheap -- is the most expensive thing to lose, so
 //! it only goes at speed 9. MEASURED end to end on the same row:
 //!
+//! Filter intra (merged into speed 0 after the table above was measured) was
+//! priced the same way, but at speed 3 rather than 0 -- two sequential arms on
+//! film A native, `lanes/fi-s3-{on,off}.log`: ON +54.6 / +24.3 at 43.1s/13.7s
+//! anchor = 3.15, OFF +55.1 / +24.7 at 39.6s/14.2s = 2.79. It buys 0.5 BD
+//! points for 12.8% wall = 0.039 points per 1% wall, which lands BETWEEN the
+//! levers speed 3 already cuts (CfL + angle, 0.031) and the next one it keeps
+//! (coefficient breakout, 0.041) -- i.e. right at the greedy frontier, inside
+//! this gate's own noise. It ships ON at preset 0 only, where the byte pins
+//! live, and off above it, because a preset whose whole purpose is wall does
+//! not spend 12.8% of it on half a BD point.
+//!
 //! # The presets, measured (native gate, one arm at a time, box under other
 //! lanes at load 9-48 -- read the wall column against the rav1e anchor in the
 //! SAME arm, not across arms)
@@ -325,6 +336,12 @@ pub(crate) const CFL: [bool; 11] = [
     true, true, true, false, false, false, false, false, false, false, false,
 ];
 
+/// `encode::filter_intra_on`: the five recursive filter-intra modes as intra
+/// candidates, and with them the sequence header's `enable_filter_intra`.
+pub(crate) const FILTER_INTRA: [bool; 11] = [
+    true, false, false, false, false, false, false, false, false, false, false,
+];
+
 /// `encode::RESTORATION`: the loop-restoration (Wiener) search.
 pub(crate) const RESTORATION: [bool; 11] = [
     crate::encode::RESTORATION,
@@ -386,6 +403,7 @@ pub fn levers(n: u8) -> Vec<String> {
     flag("key tx-depth", &TX_SELECT_KEY);
     flag("angle delta", &ANGLE);
     flag("CfL", &CFL);
+    flag("filter intra", &FILTER_INTRA);
     flag("loop restoration", &RESTORATION);
     flag("deblock refine", &DEBLOCK_REFINE);
     flag("chroma deblock stage", &DEBLOCK_CHROMA);
