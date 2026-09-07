@@ -3245,6 +3245,20 @@ fn exec_op(
     preds: &[u16],
     fctx: &crate::decode::FrameCtx,
 ) {
+    // lane-nbpub instrument: `EC_AV1_NORECON=1` drops every recorded pixel
+    // write, leaving the entropy parse and the per-mi neighbour bookkeeping
+    // alone. It makes the encoder's own streams garbage, so it is a
+    // MEASUREMENT rung only -- what it measures is how much of the encoder's
+    // first decode of its own tiles (`par::S_FIRST`) is reconstruction and
+    // how much is parse. Answer at 3840x1608 (4 frames, 4x2 tiles, 8 tile
+    // threads): 150 ms -> 141 ms, i.e. the reconstruction is 6% of that
+    // stage and the parse plus the neighbour grids are the other 94%. That
+    // is why handing the decoder the encoder's own reconstruction cannot
+    // shrink the stage: only publishing the per-mi neighbour state the
+    // filters read (and so never parsing at all) can.
+    if crate::envflags::env_flag!("EC_AV1_NORECON") {
+        return;
+    }
     let mut scratch = Vec::new();
     match op {
         ReconOp::Pred(b) => (b.0)(y, u, v, fctx, cur),
