@@ -137,6 +137,26 @@ fn reach_sb_px(fctx: &crate::decode::FrameCtx) -> usize {
 /// defaults below are on: +50.1 / -15.4). It spends ~5% more encode wall.
 const LAMBDA_SCALE: f64 = 0.0275;
 
+/// The rate weight a HIDDEN frame (a pyramid ARF, coded but not shown) codes
+/// under, as a multiple of [`LAMBDA_SCALE`] (lane-arfcen).
+///
+/// The ARF-vs-ARF census says our top ARF codes residual over HALF its area
+/// (rav1e's, at the same display position, over 26-30%) and comes out 1.4-2.5x
+/// its bytes at the same PSNR, while every leaf that predicts from it is
+/// still 0.4 dB behind rav1e's -- i.e. the ARF's extra fidelity is bought at
+/// a rate weight fitted on shown frames and does not propagate. This is the
+/// one knob that prices a hidden frame's rate differently from its q, which
+/// the pyramid's q offsets cannot do (they move lambda and step together).
+const HIDDEN_LAMBDA_FACTOR: f64 = 1.0;
+
+/// [`HIDDEN_LAMBDA_FACTOR`], swept by `EC_AV1_LAMBDA_HIDDEN` in any build.
+fn hidden_lambda_factor() -> f64 {
+    match std::env::var("EC_AV1_LAMBDA_HIDDEN").ok().and_then(|v| v.parse().ok()) {
+        Some(f) => f,
+        None => HIDDEN_LAMBDA_FACTOR,
+    }
+}
+
 /// [`LAMBDA_SCALE`], or whatever `EC_AV1_LAMBDA` names when the sweep that
 /// picks it is the thing running. A release build has no such knob.
 fn lambda_scale() -> f64 {
@@ -9040,7 +9060,13 @@ pub(crate) fn encode_inter_frame(
     let search = Search {
         base_q_idx,
         deadzone,
-        lambda: lambda_scale() * step * step,
+        lambda: lambda_scale()
+            * match pyramid {
+                Some(p) if !p.show_frame => hidden_lambda_factor(),
+                _ => 1.0,
+            }
+            * step
+            * step,
         modes: &KEY_FRAME_MODES,
         top_k: prune_top_k_inter(),
         screen,
