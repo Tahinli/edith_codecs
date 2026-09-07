@@ -4660,12 +4660,30 @@ fn cfl_on() -> bool {
 // the same env-flag shape `EC_AV1_FILTER_INTRA` uses. NOT an `EncoderConfig`
 // field: that struct is built by 90 literal sites in this workspace.
 
+/// Whether this process's sequences code 128x128 superblocks. Read through
+/// a process-global (not a thread-local) because the tile writers run on
+/// worker threads; `2` is "the environment has not been read yet".
+static SB128: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
 /// Whether this process's sequences code 128x128 superblocks.
 pub(crate) fn sb128_on() -> bool {
-    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        crate::envflags::var("EC_AV1_SB128").ok().is_some_and(|v| v != "0")
-    });
-    *ENV
+    use std::sync::atomic::Ordering::Relaxed;
+    match SB128.load(Relaxed) {
+        2 => {
+            let on = crate::envflags::var("EC_AV1_SB128").ok().is_some_and(|v| v != "0");
+            SB128.store(u8::from(on), Relaxed);
+            on
+        }
+        v => v == 1,
+    }
+}
+
+/// Forces [`sb128_on`] for the rest of the process -- the superblock size is
+/// a SEQUENCE field, so a gate that flips it must run alone (`#[ignore]`),
+/// exactly like the speed-preset gates.
+#[cfg(test)]
+pub(crate) fn force_sb128(on: bool) {
+    SB128.store(u8::from(on), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The luma loop-restoration unit size this sequence codes: a 128 superblock
@@ -11234,7 +11252,7 @@ mod tests {
         }
         let _ = take_i64_root_hits();
         let encoded = encode_key_frame_with_ctx(&picture, 120, 0.5, fctx).unwrap();
-        let [roots, offered] = take_i64_root_hits();
+        let [roots, _offered] = take_i64_root_hits();
         // The counters are process-global, so another test encoding in
         // parallel can only ADD to them -- the per-FRAME fact is the mode
         // list, which carries one entry per coded block and so exactly 12
