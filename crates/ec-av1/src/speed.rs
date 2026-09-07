@@ -143,6 +143,34 @@ pub(crate) fn at<T: Copy>(table: &[T; 11]) -> T {
 // table for what each step measured).
 // ---------------------------------------------------------------------------
 
+/// `encode::B64_ROOT`: the 64x64 `PARTITION_NONE` skip trial at the
+/// superblock root. At preset 0 it is a bit saver AND a wall saver -- every
+/// native row improves on both columns (film A +44.2/+15.7 -> +43.0/+15.0,
+/// film B +70.5/+35.2 -> +64.7/+34.0, screen +48.2/-16.4 -> +33.4/-23.8) at
+/// -4% to -20% wall on four of the five rows.
+///
+/// MEASURED OFF from preset 4 up (lane-b64, native gate at `EC_AV1_SPEED=6`,
+/// two arms side by side): ON costs film A +55.1/+24.8 -> +64.5/+37.5 and
+/// film B +91.5/+53.4 -> +114.6/+71.5 for -16%/-36% wall. The cause is the
+/// trial's own early-out, which rides [`SPLIT_RD`]: at 0.5 (preset 6) a
+/// superblock is taken whole without its quadrants ever being searched, and
+/// film B's q150 point loses 1.2 dB. Presets 1..=3 keep it because they keep
+/// `SPLIT_RD` at 0.125, i.e. the early-out they get is the measured one;
+/// 4 and up switch it off with `SPLIT_RD`'s first step.
+pub(crate) const B64_ROOT: [bool; 11] = [
+    crate::encode::B64_ROOT,
+    true,
+    true,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [
@@ -390,6 +418,7 @@ pub fn levers(n: u8) -> Vec<String> {
             out.push(format!("no {name}"));
         }
     };
+    flag("64x64 root", &B64_ROOT);
     flag("8x8 split", &SPLIT_8);
     flag("32x32 split (32x32-only partitions)", &SPLIT_INTER);
     flag("leaf second-reference search", &LEAF_SECOND);

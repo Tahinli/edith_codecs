@@ -1131,7 +1131,7 @@ pub(crate) const INTRA_MODE_CTX: [usize; INTRA_MODES] = [0, 1, 2, 3, 4, 4, 4, 4,
 /// +3, so `MAX_ANGLE_DELTA` is the middle of it.
 pub(crate) const ANGLE_DELTA_ZERO: usize = 3;
 /// Side of a superblock in 4x4 mode-info units when 128x128 superblocks are off.
-const SB_MI: u32 = 16;
+pub(crate) const SB_MI: u32 = 16;
 
 /// `NUM_BASE_LEVELS` (spec 3): levels above this carry a base-range tail.
 const NUM_BASE_LEVELS: i32 = 2;
@@ -1764,14 +1764,28 @@ pub enum Quadrant {
     /// The four 16x16 blocks it is split into, in raster order, each with a
     /// 16x16 luma transform and an 8x8 transform per chroma plane.
     Split(Vec<BlockCoeffs>),
+    /// lane-b64: not a quadrant at all -- the whole 64x64 superblock this
+    /// quadrant is the TOP-LEFT of, coded as one block (`PARTITION_NONE` at
+    /// `BLOCK_64X64`). Only the top-left quadrant of a superblock carries it
+    /// and the other three carry [`Covered`](Quadrant::Covered), so the
+    /// per-32x32-entry shape the inter writer takes is unchanged.
+    ///
+    /// The block is coded SKIP and single-reference: a 64x64 residual needs
+    /// the forward TX_64X64 the encoder does not have (`transform.rs` tops
+    /// out at 32x32), and the writer refuses anything else.
+    Whole64(BlockCoeffs),
+    /// A quadrant a [`Whole64`](Quadrant::Whole64) at its superblock's
+    /// top-left already coded; it carries no block of its own.
+    Covered,
 }
 
 impl Quadrant {
     /// The blocks it carries, in the order they are coded.
     pub(crate) fn blocks(&self) -> &[BlockCoeffs] {
         match self {
-            Quadrant::Whole(block) => std::slice::from_ref(block),
+            Quadrant::Whole(block) | Quadrant::Whole64(block) => std::slice::from_ref(block),
             Quadrant::Split(blocks) => blocks.as_slice(),
+            Quadrant::Covered => &[],
         }
     }
 }
@@ -2746,6 +2760,14 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
                             )
                         });
                         match quadrant {
+                            // A 64x64 root is an INTER-frame partition; a
+                            // key frame codes one as `Superblock::Whole`.
+                            Quadrant::Whole64(_) | Quadrant::Covered => {
+                                return Err(Error::unsupported(
+                                    "AV1 tile",
+                                    "a key frame codes a 64x64 block as `Superblock::Whole`",
+                                ));
+                            }
                             Quadrant::Whole(block) => {
                                 if !has_cols32 || !has_rows32 {
                                     return Err(Error::unsupported(
@@ -4343,6 +4365,9 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
             let side = match q {
                 Quadrant::Whole(_) => 32,
                 Quadrant::Split(_) => 16,
+                // A 64x64 root is skip-only, so it carries no coefficient
+                // bits to predict at all (`Quadrant::Whole64`).
+                Quadrant::Whole64(_) | Quadrant::Covered => return 0.0,
             };
             q.blocks().iter().map(|b| block_bits(b, side, q_ctx)).sum::<f64>()
         })
@@ -5559,15 +5584,133 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             // spec `decode_partition`'s hasRows/hasCols (5.11.4): a superblock
             // whose bottom or right half falls outside the true frame cannot
-            // be left whole, but this writer only ever splits a superblock
-            // into its four 32x32 quadrants (never `PARTITION_NONE` at 64x64),
-            // so the only question is which of the three partition symbols
-            // that split takes — same three-way signaling as
+            // be left whole, so the only question there is which of the three
+            // partition symbols the split takes — same three-way signaling as
             // `sb_coeff_key_frame_tile`'s superblock level.
             let (has_cols, has_rows) = (
                 sb_c * SB_MI + SB_MI / 2 < mi_cols,
                 sb_r * SB_MI + SB_MI / 2 < mi_rows,
             );
+            // lane-b64: a superblock the search left WHOLE — one 64x64 block
+            // at `PARTITION_NONE`, carried by its top-left quadrant's entry
+            // ([`Quadrant::Whole64`]). Coded skip and single-reference: no
+            // residual, so no TX_64X64 coefficients and no `cdef_idx`.
+            let sb64 = ((sb_r * 2) < rows && (sb_c * 2) < cols)
+                .then(|| &blocks[((sb_r * 2) * cols + sb_c * 2) as usize])
+                .and_then(|q| match q {
+                    Quadrant::Whole64(block) => Some(block),
+                    _ => None,
+                });
+            if let Some(block) = sb64 {
+                if !has_cols || !has_rows {
+                    return Err(Error::unsupported(
+                        "AV1 tile",
+                        "a superblock that is half outside the true frame cannot be left whole",
+                    ));
+                }
+                let info = block.inter.ok_or_else(|| {
+                    Error::unsupported("AV1 tile", "a 64x64 root block is coded inter")
+                })?;
+                if !block.skip || info.ref1.is_some() {
+                    return Err(Error::unsupported(
+                        "AV1 tile",
+                        "a 64x64 root block is coded skip and single-reference \
+                         (a 64x64 residual needs a forward TX_64X64)",
+                    ));
+                }
+                enc.symbol(PARTITION_NONE, &mut cdfs.partition_w64[sb_ctx]);
+                let (mi_r, mi_c) = (sb_at.0 * (SUB / MI), sb_at.1 * (SUB / MI));
+                let has_above = neighbours.has_above(mi_r);
+                let has_left = neighbours.has_left(mi_c);
+                let skip_ctx = usize::from(neighbours.above_skip[mi_c])
+                    + usize::from(neighbours.left_skip[mi_r]);
+                enc.symbol(1, &mut cdfs.skip[skip_ctx]);
+                write_cdef_idx(&mut enc, (mi_r, mi_c), true);
+                let ii_ctx = intra_inter_ctx(
+                    has_above,
+                    has_left,
+                    neighbours.above_inter[mi_c],
+                    neighbours.left_inter[mi_r],
+                );
+                enc.symbol(1, &mut cdfs.intra_inter[ii_ctx]);
+                write_comp_mode(
+                    &mut enc,
+                    &mut cdfs,
+                    &neighbours,
+                    (mi_r, mi_c),
+                    (has_above, has_left),
+                    false,
+                );
+                write_single_ref(
+                    &mut enc,
+                    &mut cdfs,
+                    info.ref_frame,
+                    neighbours.above_ref[mi_c],
+                    neighbours.above_ref1[mi_c],
+                    neighbours.left_ref[mi_r],
+                    neighbours.left_ref1[mi_r],
+                );
+                let stack = find_mv_stack(
+                    &grid,
+                    mi_r,
+                    mi_c,
+                    SB_MI as usize,
+                    SB_MI as usize,
+                    info.ref_frame,
+                    mi_cols as usize,
+                    mi_rows as usize,
+                );
+                let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
+                for dr in 0..SB_MI as usize {
+                    for dc in 0..SB_MI as usize {
+                        grid.set(
+                            mi_r + dr,
+                            mi_c + dc,
+                            MiInfo {
+                                is_inter: true,
+                                ref_frame: info.ref_frame,
+                                ref_frame1: NO_REF1,
+                                mv1: (0, 0),
+                                mv: mv16(mv),
+                                is_new_mv,
+                                size: SB_MI as u8,
+                                size_h: SB_MI as u8,
+                                is_global_mv0: false,
+                                is_global_mv1: false,
+                            },
+                        );
+                    }
+                }
+                write_motion_mode(
+                    &mut enc,
+                    &mut cdfs,
+                    &grid,
+                    (mi_r, mi_c),
+                    (SB_MI as usize, SB_MI as usize),
+                    (SB, SB),
+                    (mi_cols as usize, mi_rows as usize),
+                    info.ref_frame,
+                    block.motion_mode,
+                )?;
+                if tx_select {
+                    // A skipped inter block writes no `txfm_split` at all --
+                    // this only publishes the max transform size the reader
+                    // infers for it (`write_tx_syntax_inter`).
+                    write_tx_syntax_inter(
+                        &mut enc,
+                        &mut cdfs,
+                        &mut neighbours,
+                        (mi_r, mi_c),
+                        SB,
+                        true,
+                        true,
+                        0,
+                    );
+                }
+                neighbours.record(sb_at, SB, 0, &zero_grids);
+                neighbours.record_inter(sb_at, SB, true, true, block_ref(block));
+                continue;
+            }
             match (has_cols, has_rows) {
                 (true, true) => enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w64[sb_ctx]),
                 (true, false) => {
@@ -5600,6 +5743,15 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                 );
                 let block = match site {
+                    // Already coded by the `Whole64` above -- but only inside
+                    // a superblock that really carried one.
+                    Quadrant::Whole64(_) | Quadrant::Covered => {
+                        return Err(Error::unsupported(
+                            "AV1 tile",
+                            "a `Whole64`/`Covered` quadrant needs its superblock's \
+                             top-left entry to be the `Whole64`",
+                        ));
+                    }
                     Quadrant::Whole(block) => {
                         if !has_cols32 || !has_rows32 {
                             return Err(Error::unsupported(
