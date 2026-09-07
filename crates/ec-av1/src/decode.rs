@@ -34116,7 +34116,7 @@ pub(crate) fn decode_inter_frame_tile(
         &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, false,
         // `enable_filter_intra`: as the `false`s beside it, this convenience
         // entry names a stream written without the sequence bit (lane-fintra).
-        switchable_motion_mode, false, false, fctx,
+        switchable_motion_mode, false, false, DeltaParams::default(), fctx,
     )
 }
 
@@ -34170,6 +34170,8 @@ pub(crate) fn decode_inter_frame_tile_lr(
     allow_warped_motion: bool,
     // lane-fintra: see [`decode_inter_frame_tiles_lr`]'s own parameter.
     enable_filter_intra: bool,
+    // lane-deltaq: see [`decode_inter_frame_tiles_lr`]'s own parameter.
+    delta: DeltaParams,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -34201,6 +34203,7 @@ pub(crate) fn decode_inter_frame_tile_lr(
         switchable_motion_mode,
         allow_warped_motion,
         enable_filter_intra,
+        delta,
         fctx,
     )
 }
@@ -34248,6 +34251,12 @@ pub(crate) fn decode_inter_frame_tiles_lr(
     // encoder's own trial decode desyncs at the first intra-in-inter DC_PRED
     // block the moment its sequence header sets the bit.
     enable_filter_intra: bool,
+    // lane-deltaq: this frame header's own `delta_q_params`/`delta_lf_params`
+    // (spec 5.9.17/5.9.18) -- the same stale-header class as the three
+    // parameters above. Hard-coded `DeltaParams::default()` here until this
+    // lane, which desyncs the encoder's own trial decode at the first
+    // superblock the moment its header sets `delta_q_present`.
+    delta: DeltaParams,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     decode_inter_frame_tile_with_cdfs(
@@ -34285,7 +34294,7 @@ pub(crate) fn decode_inter_frame_tiles_lr(
         switchable_motion_mode,
         allow_warped_motion,
         allow_screen_content_tools,
-        DeltaParams::default(),
+        delta,
         enable_filter_intra,
         None,
         fctx,
@@ -38925,6 +38934,7 @@ mod tests {
                 // lane-fintra: the sequence bit the encoder wrote this tile
                 // under -- same stale-header class as the warp bit above.
                 crate::encode::filter_intra_on(),
+                frame.delta.clone(),
                 fctx,
             )
             .unwrap();
@@ -39269,6 +39279,7 @@ mod tests {
                 // lane-fintra: the sequence bit the encoder wrote this tile
                 // under -- same stale-header class as the warp bit above.
                 crate::encode::filter_intra_on(),
+                frame.delta.clone(),
                 fctx,
             )
             .unwrap();

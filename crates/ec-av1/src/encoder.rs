@@ -3466,6 +3466,92 @@ mod tests {
         }
     }
 
+    /// lane-deltaq's three-way witness: a clip with a real gradient of tpl
+    /// factors -- a moving detail region over a flat background, so the
+    /// superblocks the NEXT picture predicts from are worth more than the
+    /// ones it does not -- codes at least two distinct per-superblock
+    /// quantizer levels (the fire count, class `gate-blind-to-feature`), and
+    /// both decoders reconstruct every frame sample-exact from the
+    /// `delta_qindex` syntax that carries them.
+    #[test]
+    fn a_moving_detail_clip_codes_two_delta_q_levels_both_decoders_read_exactly() {
+        // `knob_write`, not `knob_read`: the override below is
+        // process-global and every other test's bytes move under it.
+        let _knobs = crate::speed::knob_write();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        crate::encode::set_deltaq_res(Some(2));
+        let (width, height) = (640usize, 384usize);
+        // The gate's own moving test card, with a 128x128 patch of fine
+        // detail travelling right by 32 samples a frame laid over it: the
+        // patch is what the tpl pass finds worth propagating and the card
+        // around it is not, so the map -- and with it the quantizer grid --
+        // is a gradient and not one flat number.
+        let sources: Vec<Picture> = (0..4)
+            .map(|t| {
+                let mut p = test_card(width, height, t * 3);
+                let x0 = 32 + t * 32;
+                for y in 128..256 {
+                    for x in x0..x0 + 128 {
+                        p.y[y * width + x] =
+                            if (x / 2 + y / 3) % 2 == 0 { 40 } else { 210 };
+                    }
+                }
+                p
+            })
+            .collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 120,
+            gop: 4,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let _ = crate::encode::take_deltaq_levels();
+        let mut stream = Vec::new();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let levels = crate::encode::take_deltaq_levels();
+        // The quantizer grid rides the tpl map, and `speed::TPL_DEPTH` cuts
+        // the lookahead window to one picture at every preset above 0, so
+        // there IS no map -- and no delta_q syntax -- outside preset 0. The
+        // exactness half below still runs there; only the fire count is
+        // preset-0's to make.
+        if crate::speed::speed() == 0 {
+            assert!(
+                levels >= 2,
+                "the quantizer grid was flat ({levels} level(s)): no delta_qindex was coded"
+            );
+        } else {
+            eprintln!("SKIP the fire count at preset {}: no tpl map", crate::speed::speed());
+        }
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if have_ffmpeg() {
+            let theirs = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                    panic!(
+                        "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                        at % width,
+                        at / width,
+                        got[at],
+                        b[at],
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+        }
+        crate::encode::set_deltaq_res(None);
+        eprintln!("delta_q witness: {levels} quantizer levels, {} bytes", stream.len());
+    }
+
     /// Every SHIPPED SPEED PRESET codes a stream both decoders reconstruct
     /// sample-exact -- ours and ffmpeg's -- and codes a DIFFERENT stream from
     /// its neighbour (a preset that changes no byte is a preset that buys no
