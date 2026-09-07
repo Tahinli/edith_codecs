@@ -481,7 +481,7 @@ impl Encoder {
             .end()?
             .sync()?;
 
-        let data = {
+        let mut data = {
             let coded = picture
                 .buffers_mut()
                 .iter_mut()
@@ -490,6 +490,15 @@ impl Encoder {
             let mapped = coded.map()?;
             coded_bytes(&mapped)?
         };
+
+        if self.config.codec == EncCodec::Av1 {
+            // Every AV1 temporal unit begins with a temporal delimiter (5.6),
+            // and this driver emits none: its coded buffer starts at the
+            // sequence header. ffmpeg's demuxer refuses such a stream
+            // ("Missing Temporal Delimiter"), so the two bytes are prepended
+            // here rather than left to the caller.
+            data.splice(0..0, [0x12u8, 0x00]);
+        }
 
         self.reference = Some(recon);
         self.coded += 1;
