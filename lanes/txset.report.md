@@ -118,8 +118,14 @@ why the film rows lose while the intra-heavy capture wins.
 | clip | control | shipped | note |
 |---|---|---|---|
 | bars 1080p | -1.0% / -16.8% | -1.0% / -16.8% | byte-identical (194497/299067/419042/567789 B) |
+| bars 2160p | +9.4% / -12.7% | +9.4% / -12.7% | byte-identical (205409/321883/435765/564573 B) |
+| film A | +21.7% / -4.4% | +21.7% / -4.4% | byte-identical (64392/102508/170169/413430 B) |
+| film B | +26.9% / -0.6% | +26.9% / -0.6% | byte-identical (27442/50374/105485/296813 B) |
+| screen capture | +27.8% / -26.0% | **+20.8% / -30.1%** | 36775/45758/57095/71711 B, wall 83.7s -> 96.2s (+15%) |
 
-(rows continue below once the confirm run finishes)
+Every non-screen row lands on the control's own byte counts to the digit --
+the gate is the frame classifier, and the four non-capture clips classify 0
+screen frames of 4 -- so nothing outside screen content moves, pins included.
 
 Pins: `encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins`
 PASSES UNCHANGED at 8562 / 33357 -- the pin clip is not screen, so nothing to
