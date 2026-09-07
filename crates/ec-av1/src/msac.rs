@@ -370,9 +370,26 @@ impl<'a> SymbolDecoder<'a> {
     /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
     #[inline]
     pub fn symbol(&mut self, cdf: &mut [u16]) -> usize {
+        // lane-census: the syntax census charges this symbol's bits to the
+        // TABLE it read, so every coding tool is accounted without a
+        // per-call-site label. Off (`EC_AV1_BITCENSUS` unset) this is one
+        // relaxed load.
+        let t0 = if crate::census::armed() { self.tell_bits() } else { 0.0 };
         let s = self.symbol_fixed(cdf);
         update_cdf(cdf, s);
+        if crate::census::armed() {
+            crate::census::charge(cdf.as_ptr() as usize, self.tell_bits() - t0);
+        }
         s
+    }
+
+    /// Bits consumed so far, fractionally -- the read position less the
+    /// information still held in the range (`log2(range)`, which starts at
+    /// 15). Differences between two of these are one read's cost; the
+    /// absolute value carries a constant offset (class `compare-range-not-tell`).
+    #[must_use]
+    pub fn tell_bits(&self) -> f64 {
+        self.bit as f64 - f64::from(self.range).log2()
     }
 
     /// `decode_symbol`, without the adaptation of 8.3.2 — the form the spec
@@ -468,6 +485,9 @@ impl<'a> SymbolDecoder<'a> {
     /// the coefficient sign pass and the Golomb tail read one bit at a time.
     #[inline]
     pub fn literal(&mut self, bits: u32) -> u32 {
+        if crate::census::armed() {
+            crate::census::charge_literal(bits);
+        }
         let mut v = 0;
         for _ in 0..bits {
             // `EQUIPROBABLE`'s single boundary: `f >> EC_PROB_SHIFT` is 256, so
