@@ -3681,6 +3681,7 @@ pub(crate) static TX_TYPE_HITS: [std::sync::atomic::AtomicUsize; 16] =
 
 /// Reads [`TX_TYPE_HITS`] and zeroes it, so a gate or a test attributes the
 /// counts to its own encode.
+#[cfg(test)]
 pub(crate) fn take_tx_type_hits() -> [usize; 16] {
     std::array::from_fn(|t| TX_TYPE_HITS[t].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
