@@ -1022,6 +1022,20 @@ pub(crate) fn force_screen(value: Option<bool>) {
     SCREEN_FORCE.with(|c| c.set(value));
 }
 
+// lane-fintra: [`force_screen`] for the filter-intra candidate, so a MODE
+// ablation can measure the mode search alone. Setting it also clears the
+// sequence header's own `enable_filter_intra` bit, so the stream the arm
+// writes is exactly the one this encoder wrote before the lane.
+#[cfg(test)]
+thread_local! {
+    static FILTER_INTRA_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_filter_intra(value: Option<bool>) {
+    FILTER_INTRA_FORCE.with(|c| c.set(value));
+}
+
 pub(crate) fn arm_seq_screen(on: bool) {
     SEQ_SCREEN.with(|c| c.set(on));
 }
@@ -4093,6 +4107,10 @@ fn cfl_on() -> bool {
 /// its own on/off pair -- and how every byte pin written before it still
 /// reproduces).
 pub(crate) fn filter_intra_on() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FILTER_INTRA_FORCE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("EC_AV1_FILTER_INTRA").as_deref() != Ok("0"))
 }
@@ -11011,6 +11029,11 @@ mod tests {
             eprintln!("SKIP every_mode_decodes_to_what_the_encoder_predicted: no ffmpeg");
             return;
         }
+        // A mode ablation measures the MODE search: a filter-intra block is
+        // coded `DC_PRED` whatever mode the arm forces, so it would fail the
+        // "the encoder coded something else" check for a reason that is not
+        // about the mode search at all.
+        force_filter_intra(Some(false));
         // 128 wide is a whole number of superblocks and 160 is not: the last
         // superblock of a 160-wide row is half a one, whose blocks have no
         // above-right samples inside the frame at all.
@@ -11121,6 +11144,10 @@ mod tests {
         // these synthetic two-colour pictures losslessly under every arm and
         // leave nothing to compare (see [`force_screen`]).
         force_screen(Some(false));
+        // Same reason, for the filter-intra candidate: it wins blocks under
+        // BOTH arms of a mode ablation and so cancels the difference the
+        // ablation measures (class `gate-recipe-confound`).
+        force_filter_intra(Some(false));
         let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
             .iter()
             .map(|&q| {
@@ -12969,8 +12996,14 @@ mod tests {
         // so every block taking either codes different syntax and different
         // coefficients -- 8194 -> 7321 at q=150 and 28285 -> 27285 at q=60.
         // `EC_AV1_CFL=0` / `EC_AV1_ANGLE=0` restore each half.
+        // Re-taken on lane-fintra: the sequence header sets
+        // `enable_filter_intra`, so every DC_PRED intra block of at most
+        // 32x32 without a luma palette carries a `use_filter_intra` flag and
+        // the blocks that take one code a filter-intra mode, a different
+        // prediction and different coefficients -- 7321 -> 7373 at q=150 and
+        // 27285 -> 27074 at q=60. `EC_AV1_FILTER_INTRA=0` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7321, 0x34e2_e4e0_d7c5_09f3), (60, 27285, 0xbfd2_41af_dcac_a0c6)];
+            [(150, 7373, 0xd0af_b890_28bc_cfbf), (60, 27074, 0x8324_0e9f_5971_e4e7)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
