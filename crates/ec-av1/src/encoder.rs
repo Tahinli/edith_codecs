@@ -2251,6 +2251,77 @@ mod tests {
         }
     }
 
+    /// Every SHIPPED SPEED PRESET codes a stream both decoders reconstruct
+    /// sample-exact -- ours and ffmpeg's -- and codes a DIFFERENT stream from
+    /// its neighbour (a preset that changes no byte is a preset that buys no
+    /// wall: class `gate-blind-to-feature`). Preset 0's bytes are the
+    /// full-search ones, which is the cheap in-suite statement of the byte
+    /// pins' rule.
+    ///
+    /// Ignored by default because the preset is PROCESS-GLOBAL
+    /// ([`crate::speed`]): flipping it while the suite's other tests encode
+    /// in parallel would move their bytes under them. Run it on its own:
+    /// `cargo test -p ec-av1 --release -- --ignored every_speed_preset`.
+    #[test]
+    #[ignore = "sets the process-global speed preset: run it alone"]
+    fn every_speed_preset_decodes_sample_exact_through_both_decoders() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (640usize, 384usize);
+        let sources: Vec<Picture> = (0..4).map(|t| test_card(width, height, t * 3)).collect();
+        let mut sizes: Vec<(u8, usize)> = Vec::new();
+        for speed in [0u8, 3, 6, 10] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 4,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 1,
+                tile_rows_log2: 0,
+            };
+            let mut enc = Av1Encoder::with_speed(config, speed).unwrap();
+            let mut stream = Vec::new();
+            for packet in encode_all(&mut enc, &sources) {
+                stream.extend_from_slice(&packet.data);
+            }
+            let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+            assert_eq!(ours.len(), sources.len(), "speed {speed}: our decoder's frames");
+            if have_ffmpeg() {
+                let theirs = ffmpeg_decode_luma(&stream, width, height);
+                assert_eq!(theirs.len(), sources.len(), "speed {speed}: ffmpeg's frames");
+                for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                    let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                    if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                        panic!(
+                            "speed {speed} frame {i}: luma differs first at ({}, {}): \
+                             ours {} vs ffmpeg {}",
+                            at % width,
+                            at / width,
+                            got[at],
+                            b[at],
+                        );
+                    }
+                }
+            } else {
+                eprintln!("SKIP the ffmpeg half of speed {speed}: no ffmpeg");
+            }
+            eprintln!(
+                "speed {speed}: {} bytes [{}]",
+                stream.len(),
+                crate::speed::levers(speed).join(", ")
+            );
+            sizes.push((speed, stream.len()));
+        }
+        crate::speed::set_speed(0);
+        for w in sizes.windows(2) {
+            assert_ne!(
+                w[0].1, w[1].1,
+                "speed {} and {} coded the same bytes: the preset changed no decision",
+                w[0].0, w[1].0
+            );
+        }
+    }
+
     /// What tiles and tile threads are worth at the size the editor exports
     /// at: 1920x1080, eight real pictures, two passes per cell (ABAB), wall
     /// per cell. Ignored by default (minutes).
