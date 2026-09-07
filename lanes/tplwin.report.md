@@ -139,3 +139,24 @@ count is now gated on the window (`speed::at(&TPL_DEPTH) > 1`) rather than on
 * `every_speed_preset_decodes_sample_exact_through_both_decoders --ignored`
   under `EC_COMP_MISMATCH=1`: pass, 0 lines.
 * `cargo check --workspace --all-targets`: 0 errors, 0 ec-av1 warnings.
+* byte pins **8562 / 33357 HOLD** (preset 0's window is untouched, so every
+  preset-0 stream is byte-identical to the base).
+* full ec-av1 lib suite detached (`lanes/tw-suite.log`): **567 passed, 0
+  failed, 44 ignored**, 923.0s -- the charter's expected totals, no new test
+  added by this lane (it changes a shipped default, and the existing
+  `speed_zero_disables_nothing` / `presets_are_monotone_in_speed` are the
+  runnable check on the new row; both now also pin `TPL_DEPTH[6] == 4` and
+  `TPL_DEPTH[7] == 1`).
+
+## Deferred
+
+* `deferred: presets 1, 2, 4, 5 and 7..10 --` unmeasured; 1..2 take preset 0's
+  measured 8 and 4..5 take preset 3's measured 4 by interpolation, 7..10 stay
+  at 1 per the charter. Four more arm pairs (~40 min) would price them.
+* `deferred: re-running lane-deltaq at preset 3 or 6 --` per-SB delta_q was
+  measured inert BECAUSE the window was 1 above preset 0; with a window back
+  at 3..6 that verdict is stale for those presets. Needs one control + one
+  `EC_AV1_DELTAQ=2` arm per preset.
+* `deferred: the long-GOP arm --` the 12-frame gate bounds propagation to at
+  most 8 pictures; whether a 48-frame run separates depth 4 from 8 further is
+  open.
