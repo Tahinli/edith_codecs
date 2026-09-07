@@ -431,6 +431,25 @@ fn b64_root() -> bool {
 /// takes: a desktop capture's 64x64 superblocks are flat runs whose skip arm
 /// already codes them for nothing, and a residual there only spends bits the
 /// intra/palette tools would have spent better.
+///
+/// CENSUS on film B (12 frames, q120, `EC_AV1_BITCENSUS=1` +
+/// `examples/syntax_census.rs`, both streams read by OUR decoder), off vs on:
+///
+/// | | skip-only | + residual |
+/// |---|---|---|
+/// | 64x64 share, all frames | 36.4% | 38.3% |
+/// | 64x64 share, leaf frames | 53.3% | 56.0% |
+/// | skip area, all frames | 80.4% | 78.8% |
+/// | skip area, leaf frames | 90.2% | 88.5% |
+/// | stream bytes | 34,366 | 34,295 |
+/// | encoder wall | 13.4s | 9.6s |
+///
+/// `base_luma_64` enters the leaf frames' top tables at 5.7%, i.e. the
+/// TX_64X64 coefficients are really being coded. The root wins MORE often
+/// with a residual to offer (rav1e speed 6's own 64x64 share on this clip is
+/// 45.2%), which is also why the arm is 28% FASTER despite costing three more
+/// transforms per superblock: a root that wins is four quadrant searches that
+/// never run.
 fn b64_residual() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_B64RES").ok().map(|v| v != "0")
