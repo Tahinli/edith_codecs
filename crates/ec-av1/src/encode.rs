@@ -10070,8 +10070,14 @@ pub(crate) fn encode_inter_frame(
     // tpl map the lambda factor comes from ([`deltaq_for_factor`]). Present
     // only when the map is, and `delta_q_res` follows straight into the frame
     // header (`write_delta_q_params`) and into the tile writer's own plan.
+    // Not on a screen frame ([`b64_residual`]'s content gate): lane-dq3
+    // measured the per-superblock quantizer as a win on both films and a
+    // 0.5 loss vs libaom on the desktop capture, so a frame that set
+    // `allow_screen_content_tools` codes no delta syntax at all and stays
+    // byte-identical to the pre-lane encoder.
     let deltaq_res: Option<i32> = tpl_factors
         .as_ref()
+        .filter(|_| !screen)
         .and(deltaq_res_log2().map(|r| 1i32 << r));
     let sb_q: Option<Vec<u8>> = match (&tpl_factors, deltaq_res) {
         (Some(f), Some(res)) => {

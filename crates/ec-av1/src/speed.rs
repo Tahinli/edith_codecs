@@ -200,25 +200,34 @@ pub(crate) const I64_ROOT: [bool; 11] = [crate::encode::I64_ROOT; 11];
 /// `encode::deltaq_res_log2`: the per-superblock quantizer's `delta_q_res`
 /// LOG2 (2 = a step of 4 qindex), or `4` for "no delta_q syntax at all".
 ///
-/// SHIPPED OFF at every preset. lane-deltaq measured the whole mapping sweep
-/// on the 12-frame native gate against its own control (film A +34.8/+5.0,
-/// film B +47.0/+16.5, screen +33.4/-23.8):
+/// ON (res 4) AT PRESETS 5 AND 6, off everywhere else, and never on a screen
+/// frame -- `encode_inter_frame` gates the whole map on
+/// `!allow_screen_content_tools`, the same content gate `b64_residual` and
+/// `b64_compound` take, so a desktop capture codes no delta syntax and stays
+/// byte-identical to the pre-lane encoder.
 ///
-/// | arm | film A | film B | screen |
+/// lane-deltaq measured the mapping sweep with the tpl lookahead still cut to
+/// one picture, so the map it read was inert and every arm was flat. With the
+/// window back (lane-tplwin) lane-dq2 re-measured and lane-dq3 shipped it,
+/// 12-frame `bd_rate_screen_native`, BD vs libaom / vs rav1e, off -> on:
+///
+/// | preset | film A | film B | screen capture |
 /// |---|---|---|---|
-/// | res 4, K 1.0 | +34.7 / +5.2 | +46.7 / +16.6 | +34.1 / -23.6 |
-/// | res 4, K 1.3 | +34.7 / +5.1 | +46.8 / +16.6 | +34.3 / -23.5 |
-/// | res 8, K 1.0 | +35.2 / +5.3 | +47.8 / +17.1 | +35.0 / -23.4 |
+/// | 6 | +27.2/-0.2 -> +26.6/-0.4 | +35.2/+6.6 -> +34.7/+6.4 | +26.0/-27.2, byte-identical |
+/// | 5 | +26.6/-0.7 -> +25.8/-1.1 | +33.3/+4.9 -> +32.8/+4.6 | gated off |
+/// | 4 | +23.7/-2.9 -> +23.1/-3.1 | +29.9/+2.0 -> +30.2/+2.6 | gated off |
 ///
-/// The best arm moves neither film row by as much as the keep rule's 0.5 on
-/// either column (film A -0.1/+0.2, film B -0.3/+0.1) and costs screen 0.7
-/// against libaom. Coarser steps (res 8) are worse everywhere. The syntax is
-/// all there and proven three ways
+/// Both films gain on both columns at 5 and 6 (the four q points of the
+/// capture row code the identical byte counts on and off). PRESET 4 REJECTS
+/// -- film B goes the wrong way on both columns there. Preset 3 rejects
+/// (lane-dq2: film B worse on both columns) and preset 0 is neutral, so they
+/// stay off. Coarser steps (res 8) were worse everywhere in lane-deltaq's
+/// sweep. The syntax is proven three ways
 /// (`a_moving_detail_clip_codes_two_delta_q_levels_both_decoders_read_exactly`);
-/// `EC_AV1_DELTAQ=2` switches it on. Above preset 6 it is inert anyway --
-/// [`TPL_DEPTH`] cuts the lookahead to one picture there, so there is no map
-/// to vary the quantizer by (lane-tplwin gave presets 1..6 a window back).
-pub(crate) const DELTAQ_RES: [u8; 11] = [4; 11];
+/// `EC_AV1_DELTAQ=2` forces it on at any preset, `EC_AV1_DELTAQ=0` off.
+/// Above preset 6 it is inert anyway -- [`TPL_DEPTH`] cuts the lookahead to
+/// one picture there, so there is no map to vary the quantizer by.
+pub(crate) const DELTAQ_RES: [u8; 11] = [4, 4, 4, 4, 4, 2, 2, 4, 4, 4, 4];
 
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
