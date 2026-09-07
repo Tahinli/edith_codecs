@@ -4724,6 +4724,9 @@ fn scan_of(side: usize) -> &'static Vec<u16> {
     }
 }
 
+/// [`coeff_bits_typed`] at `DCT_DCT`, the only type the test-only pricers
+/// ([`predicted_coeff_bits`]) model.
+#[cfg(test)]
 pub(crate) fn coeff_bits(
     grid: &[i32],
     set: TxbSet,
@@ -4734,7 +4737,7 @@ pub(crate) fn coeff_bits(
     coeff_bits_typed(grid, set, q_ctx, skip_ctx, sign_ctx, TxType::DctDct)
 }
 
-/// [`coeff_bits`] for levels a named transform type produced: the `tx_type`
+/// What levels a named transform type produced cost: the `tx_type`
 /// symbol is part of what the block spends, so a search comparing types has
 /// to see each one's own symbol priced (lane-txset).
 pub(crate) fn coeff_bits_typed(
