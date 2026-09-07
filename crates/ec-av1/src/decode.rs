@@ -5988,6 +5988,14 @@ pub(crate) fn tx_type_from_symbol(cdf_len: usize, t: usize) -> Option<TxType> {
     }
 }
 
+/// [`tx_type_from_symbol`] inverted: which symbol of a `cdf_len`-wide
+/// `tx_type` CDF names `tx_type`, or `None` when that set does not hold it
+/// (class `table-and-reader-move-together` -- the writer picks its symbol
+/// through the reader's own map, so the two cannot drift).
+pub(crate) fn tx_type_symbol(cdf_len: usize, tx_type: TxType) -> Option<usize> {
+    (0..cdf_len.saturating_sub(1)).find(|&t| tx_type_from_symbol(cdf_len, t) == Some(tx_type))
+}
+
 /// The remainder of a level the base and base-range syntax could not reach
 /// (spec 5.11.40): its bit length in unary, then that many of its own bits,
 /// most significant first — the exact inverse of [`crate::tile::write_golomb`].
