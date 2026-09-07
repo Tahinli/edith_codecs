@@ -121,3 +121,36 @@ Probe arms on film B (control = the old `&[]`):
 | on, depth 2 | 91328 / 45.489 | 481497 / 47.990 | -0.6% / -0.3% |
 
 Wall is unchanged (101.5 s vs 101.2 s for the two-point ladder).
+
+## 6. Gate tables
+
+Long-GOP arm (`bd_rate_film_long_gop`, 48 frames, BD vs libaom cpu-used 6 /
+vs rav1e speed 6). The control arm was RUN, not quoted, and lands on the
+recorded defaults to the digit:
+
+| arm | film A | film B |
+|---|---|---|
+| control (`EC_AV1_TPL_PYRAMID=0`) | +43.1% / +4.6% | +129.0% / +34.3% |
+| **arm 1: tpl on the pyramid path** | **+42.8% / +4.5%** | **+127.3% / +32.9%** |
+
+Both film rows improve on both columns: the keep rule passes, so arm 1 ships
+on by default.
+
+12-frame arm (`bd_rate_screen_native`), control re-run the same way:
+
+| arm | bars 1080p | bars 2160p | film A | film B |
+|---|---|---|---|---|
+| control | +1.7 / -14.5 | +12.2 / -10.2 | +37.5 / +7.6 | +54.1 / +23.9 |
+| arm 1 | +2.0 / -14.2 | +12.6 / -9.9 | **+37.2 / +7.3** | **+53.2 / +23.1** |
+
+Both REAL film rows improve on both columns here too; the two "bars" rows are
+ffmpeg `testsrc2` colour bars (recorded, never a decision) and read 0.3-0.4
+points up.
+
+Invariants at the shipped arm: `encoder::` scoped 33 passed / 0 failed
+(release binary, 868 s, includes the bitrate test),
+`the_facade_codes_the_same_bytes_as_encode_sequence` +
+`tile_bytes_do_not_depend_on_the_thread_count --include-ignored` 2 passed,
+`EC_COMP_MISMATCH=1` over the 48-frame film B encode: 0 lines.
+Pins re-taken (the stream moves by construction): 9835 -> **9859** at q=150
+and 35798 -> **35904** at q=60; `EC_AV1_TPL_PYRAMID=0` restores the old pair.

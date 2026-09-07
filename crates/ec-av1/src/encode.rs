@@ -13630,8 +13630,14 @@ mod tests {
         // base now, not 16 ([`crate::encoder::Pyramid::leaf_q_offset`]) -- 9778
         // -> 9835 at q=150 and 35450 -> 35798 at q=60.
         // `EC_AV1_PYRAMID=8:-32:16:-8:-48` restores these.
+        // Re-taken on lane-arfcen: the pyramid path hands every frame the
+        // lookahead window its temporal lambda map needs
+        // (`crate::encoder::tpl_pyramid`), which it never had, so every
+        // superblock of these four pictures is priced at its own lambda --
+        // 9835 -> 9859 at q=150 and 35798 -> 35904 at q=60.
+        // `EC_AV1_TPL_PYRAMID=0` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9835, 0xfdac_0219_4a6e_111e), (60, 35798, 0xe57e_aa3f_8b48_d206)];
+            [(150, 9859, 0x4409_f8db_e152_9fe7), (60, 35904, 0xc408_f126_2877_0ffb)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
