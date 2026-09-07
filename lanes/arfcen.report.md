@@ -133,8 +133,25 @@ recorded defaults to the digit:
 | control (`EC_AV1_TPL_PYRAMID=0`) | +43.1% / +4.6% | +129.0% / +34.3% |
 | **arm 1: tpl on the pyramid path** | **+42.8% / +4.5%** | **+127.3% / +32.9%** |
 
-Both film rows improve on both columns: the keep rule passes, so arm 1 ships
-on by default.
+| **arm 2: + a second past anchor on the top ARF** | **+40.9% / +3.1%** | **+125.6% / +32.0%** |
+
+Both arms pass the keep rule on their own control (every film row down on
+both columns), so both ship on by default. Together: film A +43.1/+4.6 ->
++40.9/+3.1 and film B +129.0/+34.3 -> +125.6/+32.0, i.e. -2.2/-1.5 and
+-3.4/-2.3 points.
+
+### Arm 2: what it is
+
+The census read `refs [LAST@-8 GOLDEN@-8]` on our first top ARF -- one
+picture named twice -- and `LAST@-8 GOLDEN@-16/-24` after, against rav1e's
+`LAST@-4 LAST2@-8` (two distinct anchors of its own chain). Our top ARF's
+`ALTREF` slot was pinned to `GOLDEN_SLOT`, the key frame it already reads.
+The slot the ARF is ABOUT to refresh still holds the ARF from two groups back
+while the frame is coded, so naming that slot gives the frame a second,
+distinct past anchor for no extra DPB slot and no extra encode:
+`crate::encoder::arf_altref`, `EC_AV1_ARF_ALTREF=0` restores the old wiring.
+Probe arms on film B: 91262 B/45.518 dB and 479578 B/47.996 dB against arm
+1's 91206/45.511 and 482161/47.989 (0.4% and 0.6% better at equal PSNR).
 
 12-frame arm (`bd_rate_screen_native`), control re-run the same way:
 
