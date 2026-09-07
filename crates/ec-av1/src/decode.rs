@@ -38692,9 +38692,17 @@ mod tests {
         let mut picture = crate::encode::Picture::grey(width, height);
         for row in 0..height {
             for col in 0..width {
+                // lane-i64: the smooth field alone is now coded as four whole
+                // 64x64 intra roots, which are too big for filter intra (the
+                // tool stops at 32x32) -- so the fixture carries a hard step
+                // through the middle of every superblock, which no 64x64
+                // prediction fits and which sends the quadrants back to the
+                // sizes the recursive modes are offered at.
+                let step = if (row % 64) > 40 && (col % 64) > 24 { 55.0 } else { 0.0 };
                 let v = 128.0
                     + 60.0 * ((row as f64) / 9.0).sin() * ((col as f64) / 11.0).cos()
-                    + 8.0 * ((row + col) as f64 / 3.0).sin();
+                    + 8.0 * ((row + col) as f64 / 3.0).sin()
+                    + step;
                 picture.y[row * width + col] = v.clamp(0.0, 255.0) as u16;
             }
         }

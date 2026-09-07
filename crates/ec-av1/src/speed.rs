@@ -190,6 +190,13 @@ pub(crate) const RDOQ: [bool; 11] = [
     true, true, true, true, true, true, true, false, false, false, false,
 ];
 
+/// `encode::I64_ROOT`: the KEY frame's 64x64 intra root. On at every preset
+/// (see the lane-i64 report's speed-6 arm); its early-out reads
+/// `encode::b64_breakout_threshold`, the same preset-clamped 0.125 the inter
+/// root uses, so the preset's looser `SPLIT_RD` never withholds four quadrant
+/// searches here either.
+pub(crate) const I64_ROOT: [bool; 11] = [crate::encode::I64_ROOT; 11];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [
