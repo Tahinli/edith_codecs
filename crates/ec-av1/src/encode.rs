@@ -541,7 +541,8 @@ pub fn take_b64_var_tx_hits() -> usize {
 /// (lane-b64b). AV1 asks only that the block's own half is inside
 /// (`has_cols`/`has_rows`, spec `decode_partition`), and the writer already
 /// codes that case; what was missing was a trial whose SSE is scored over the
-/// INSIDE part alone ([`inside_sse`]) instead of over the padding the encoder
+/// INSIDE part alone ([`Plane::block_sse`], which clips since lane-sse)
+/// instead of over the padding the encoder
 /// invented past the edge. Both gate films are superblock-aligned, so this
 /// only reaches the user's own arbitrary export sizes.
 ///
@@ -1694,6 +1695,58 @@ struct CoefCtxMap {
     tu_split: bool,
 }
 
+/// Whether [`Plane::block_sse`] scores a block the true frame edge cuts
+/// through over its INSIDE part alone. On; `EC_AV1_EDGESSE=0` restores the
+/// padding-inclusive score the search used before lane-sse, which is how the
+/// before/after arms of the straddling gate rows are read off ONE binary.
+fn edge_sse() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_EDGESSE").ok().map(|v| v != "0"));
+    ENV.unwrap_or(true)
+}
+
+/// Whether [`Plane::block_sse`] counts the blocks the true frame edge cuts
+/// through and the share of their raw squared error that sat in the padding
+/// (`EC_AV1_EDGE_CENSUS=1`). Off by default: only edge blocks would pay for
+/// it, but the numbers are an instrument, not a decision (class
+/// `gate-blind-to-feature` -- both gate films are superblock-aligned, so
+/// without this census no gate row can say the clip fires at all).
+fn edge_census() -> bool {
+    static ENV: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::envflags::var("EC_AV1_EDGE_CENSUS").ok().as_deref() == Some("1"));
+    *ENV
+}
+
+/// Per block side (indexed by `side.trailing_zeros()`, so 2 is 4x4 and 7 is
+/// 128x128): how many scores clipped, the inside squared error they kept and
+/// the padding squared error they dropped.
+static EDGE_SCORES: [[std::sync::atomic::AtomicU64; 3]; 8] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 8];
+
+/// One clipped score, for [`take_edge_census`].
+fn record_edge_score(side: usize, inside: u64, padding: u64) {
+    let row = &EDGE_SCORES[(side.trailing_zeros() as usize).min(7)];
+    row[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    row[1].fetch_add(inside, std::sync::atomic::Ordering::Relaxed);
+    row[2].fetch_add(padding, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The straddling-block census since the last call, and zero it: one
+/// `(side, scores, inside_sse, padding_sse)` row per block size that fired.
+#[must_use]
+pub fn take_edge_census() -> Vec<(usize, u64, u64, u64)> {
+    EDGE_SCORES
+        .iter()
+        .enumerate()
+        .filter_map(|(log2, row)| {
+            let n = row[0].swap(0, std::sync::atomic::Ordering::Relaxed);
+            let inside = row[1].swap(0, std::sync::atomic::Ordering::Relaxed);
+            let padding = row[2].swap(0, std::sync::atomic::Ordering::Relaxed);
+            (n != 0).then_some((1usize << log2, n, inside, padding))
+        })
+        .collect()
+}
+
 struct Plane<'a> {
     source: &'a [u8],
     reconstruction: Vec<u8>,
@@ -1850,16 +1903,53 @@ impl Plane<'_> {
     }
 
     /// Squared error between the source block at `(x, y)` and a reconstruction
-    /// of it. Exact for the same reason [`Self::block_sad`] is: the largest
-    /// total is `255^2 * 64 * 64`, under 2^28.
+    /// of it, over the part of the block that is INSIDE the true frame.
+    /// Exact for the same reason [`Self::block_sad`] is: the largest total is
+    /// `255^2 * 64 * 64`, under 2^28.
+    ///
+    /// A block the frame edge cuts through is still coded whole -- the
+    /// decoder reconstructs its outside samples too and the display crop
+    /// throws them away -- so scoring the padding would rank a mode, a
+    /// transform or a partition tree by how well it codes samples the source
+    /// does not have (libaom clips the same way: `av1_dist_block` measures
+    /// over `max_blocks_wide`/`max_blocks_high`). The padding is replicated
+    /// edge pixels, so predicting it is nearly free, but coding coefficients
+    /// for it spends real bits. Both gate films are superblock-aligned; this
+    /// only reaches arbitrary export sizes (lane-sse, generalising
+    /// lane-b64b's 64-root-only rescore of the 64 root).
     fn block_sse(&self, x: usize, y: usize, side: usize, reconstruction: &[u8]) -> f64 {
+        let inside_rows = side.min(self.true_height.saturating_sub(y));
+        let inside_cols = side.min(self.true_width.saturating_sub(x));
+        let straddles = inside_rows < side || inside_cols < side;
+        // The knob is read only for a block the edge cuts, so the interior
+        // path -- the hot one -- carries no extra load at all.
+        let (rows, cols) = match straddles && !edge_sse() {
+            true => (side, side),
+            false => (inside_rows, inside_cols),
+        };
         let mut sse = 0u64;
-        for row in 0..side {
-            let source = &self.source[(y + row) * self.width + x..][..side];
-            for (&s, &r) in source.iter().zip(&reconstruction[row * side..][..side]) {
+        for row in 0..rows {
+            let source = &self.source[(y + row) * self.width + x..][..cols];
+            for (&s, &r) in source.iter().zip(&reconstruction[row * side..][..cols]) {
                 let d = u32::from(s.abs_diff(r));
                 sse += u64::from(d * d);
             }
+        }
+        if straddles && edge_census() {
+            let (mut inside, mut whole) = (0u64, 0u64);
+            for row in 0..side {
+                let source = &self.source[(y + row) * self.width + x..][..side];
+                for (col, (&s, &r)) in
+                    source.iter().zip(&reconstruction[row * side..][..side]).enumerate()
+                {
+                    let d = u64::from(u32::from(s.abs_diff(r)).pow(2));
+                    whole += d;
+                    if row < inside_rows && col < inside_cols {
+                        inside += d;
+                    }
+                }
+            }
+            record_edge_score(side, inside, whole - inside);
         }
         sse as f64
     }
@@ -3964,10 +4054,19 @@ fn ibc_sse(
     (sx, sy): (usize, usize),
     side: usize,
 ) -> f64 {
+    // Inside the true frame only, for the reason [`Plane::block_sse`] is
+    // (lane-sse): an intrabc block at the edge would otherwise be ranked by
+    // how well it copies the padding.
     let mut sse = 0.0f64;
-    for row in 0..side {
-        let src = &luma.source[(y + row) * luma.width + x..][..side];
-        let rec = &luma.reconstruction[(sy + row) * luma.width + sx..][..side];
+    let clip = |whole: usize, inside: usize| match edge_sse() {
+        true => whole.min(inside),
+        false => whole,
+    };
+    let rows = clip(side, luma.true_height.saturating_sub(y));
+    let cols = clip(side, luma.true_width.saturating_sub(x));
+    for row in 0..rows {
+        let src = &luma.source[(y + row) * luma.width + x..][..cols];
+        let rec = &luma.reconstruction[(sy + row) * luma.width + sx..][..cols];
         for (&s, &r) in src.iter().zip(rec) {
             let d = f64::from(i32::from(s) - i32::from(r));
             sse += d * d;
@@ -3975,9 +4074,11 @@ fn ibc_sse(
     }
     let half = side / 2;
     for plane in chroma {
-        for row in 0..half {
-            let src = &plane.source[(y / 2 + row) * plane.width + x / 2..][..half];
-            let rec = &plane.reconstruction[(sy / 2 + row) * plane.width + sx / 2..][..half];
+        let rows = clip(half, plane.true_height.saturating_sub(y / 2));
+        let cols = clip(half, plane.true_width.saturating_sub(x / 2));
+        for row in 0..rows {
+            let src = &plane.source[(y / 2 + row) * plane.width + x / 2..][..cols];
+            let rec = &plane.reconstruction[(sy / 2 + row) * plane.width + sx / 2..][..cols];
             for (&s, &r) in src.iter().zip(rec) {
                 let d = f64::from(i32::from(s) - i32::from(r));
                 sse += d * d;
@@ -6028,46 +6129,6 @@ where
 /// of the frame's reconstruction because a tile's prediction never reads a
 /// sample outside its own rectangle, and every sample inside it is written
 /// before it is read.
-/// [`Plane::block_sse`] over the part of a block that is INSIDE the true
-/// frame. A block the edge cuts through is still coded whole -- the decoder
-/// reconstructs its outside samples too and the display crop throws them away
-/// -- so scoring them would rank a 64x64 root by how well it predicts padding
-/// the source does not have (lane-b64b).
-fn inside_sse(plane: &Plane, x: usize, y: usize, side: usize, reconstruction: &[u8]) -> f64 {
-    let rows = side.min(plane.true_height.saturating_sub(y));
-    let cols = side.min(plane.true_width.saturating_sub(x));
-    let mut sse = 0u64;
-    for row in 0..rows {
-        let source = &plane.source[(y + row) * plane.width + x..][..cols];
-        for (col, &s) in source.iter().enumerate() {
-            let d = u32::from(s.abs_diff(reconstruction[row * side + col]));
-            sse += u64::from(d * d);
-        }
-    }
-    sse as f64
-}
-
-/// Rescores one 64x64 root trial set (luma and the two chroma planes) over
-/// the inside part of a superblock the frame edge cuts through.
-fn clip_sb64_sse(
-    trials: &mut [Trial; 3],
-    luma: &Plane,
-    chroma: &[Plane; 2],
-    (x, y): (usize, usize),
-    side: usize,
-) {
-    trials[0].sse = inside_sse(luma, x, y, side, &trials[0].reconstruction);
-    for plane in 0..2 {
-        trials[plane + 1].sse = inside_sse(
-            &chroma[plane],
-            x / 2,
-            y / 2,
-            side / 2,
-            &trials[plane + 1].reconstruction,
-        );
-    }
-}
-
 fn fresh_plane(source: &[u8], width: usize, height: usize, true_width: usize, true_height: usize) -> Plane<'_> {
     Plane {
         source,
@@ -7589,12 +7650,9 @@ fn search_skip_64(
         }
     }
 
-    // A superblock the true frame edge cuts through: every trial below is
-    // ranked over its inside part only ([`clip_sb64_sse`]).
-    let edge = x + side > luma.true_width || y + side > luma.true_height;
     let mut best: Option<(f64, f64, InterInfo, [Trial; 3])> = None;
     for (bits, info) in cands {
-        let mut trials = [
+        let trials = [
             (0usize, x, y, side, true),
             (1, x / 2, y / 2, side / 2, false),
             (2, x / 2, y / 2, side / 2, false),
@@ -7631,9 +7689,6 @@ fn search_skip_64(
                 TxbSet::Luma32Inter,
             )
         });
-        if edge {
-            clip_sb64_sse(&mut trials, luma, chroma, (x, y), side);
-        }
         let cost = trials[0].sse
             + trials[1].sse
             + trials[2].sse
@@ -7706,7 +7761,7 @@ fn search_skip_64(
         ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         ccands.dedup_by_key(|c| c.0);
         for (mvs, bits, info) in ccands {
-            let mut trials = [
+            let trials = [
                 (0usize, x, y, side, true),
                 (1, x / 2, y / 2, side / 2, false),
                 (2, x / 2, y / 2, side / 2, false),
@@ -7750,9 +7805,6 @@ fn search_skip_64(
                     TxbSet::Luma32Inter,
                 )
             });
-            if edge {
-                clip_sb64_sse(&mut trials, luma, chroma, (x, y), side);
-            }
             let syntax = fixed - ref_bits + bits;
             let cost =
                 trials[0].sse + trials[1].sse + trials[2].sse + search.lambda * syntax;
@@ -7785,7 +7837,7 @@ fn search_skip_64(
     let mut luma_levels: Option<(Vec<i32>, u8)> = None;
     if residual {
         let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
-        let mut residual_trials = [0usize, 1, 2].map(|plane| {
+        let residual_trials = [0usize, 1, 2].map(|plane| {
             let (target, px, py, s) = if plane == 0 {
                 (&*luma, x, y, side)
             } else {
@@ -7802,9 +7854,6 @@ fn search_skip_64(
                 sets[plane],
             )
         });
-        if edge {
-            clip_sb64_sse(&mut residual_trials, luma, chroma, (x, y), side);
-        }
         let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
         let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
         // lane-b64b: the root's own var-tx decision -- one TX_64X64 or the
@@ -9532,7 +9581,7 @@ pub(crate) fn encode_inter_frame(
             // frame is offered it, and (lane-b64b, `EC_AV1_B64EDGE`) one the
             // edge CUTS THROUGH: the spec's own `has_cols`/`has_rows` ask
             // only that the block's half is inside, and the trial is ranked
-            // over the inside part alone ([`clip_sb64_sse`]).
+            // over the inside part alone ([`Plane::block_sse`]).
             let (x64, y64) = (sb_c * SUPERBLOCK, sb_r * SUPERBLOCK);
             let whole_inside = (sb_c as u32 + 1) * crate::tile::SB_MI <= header.mi_cols
                 && (sb_r as u32 + 1) * crate::tile::SB_MI <= header.mi_rows
@@ -10502,6 +10551,31 @@ mod tests {
     /// by predicting -- the textured half of a frame whose other half is
     /// flat -- the factor FALLS below 1, i.e. that half is coded more
     /// distortion-averse than the half nothing gains from.
+    /// The distortion metric itself (lane-sse): a block the true frame edge
+    /// cuts through is scored over its INSIDE part only, so a difference that
+    /// lives entirely in the padding costs nothing and a block wholly past
+    /// the edge scores zero. Before this, the search ranked modes,
+    /// transforms and partition trees on samples the display crop throws
+    /// away -- which lane-b64b had fixed for the 64x64 root alone.
+    #[test]
+    fn a_block_the_frame_edge_cuts_is_scored_over_its_inside_only() {
+        // A 40x40 true frame on a 64x64 padded coding surface.
+        let source = vec![10u8; 64 * 64];
+        let plane = fresh_plane(&source, 64, 64, 40, 40);
+        let mut reconstruction = vec![10u8; 64 * 64];
+        // Off by 190 at (50, 50) -- past the true edge in both axes.
+        reconstruction[50 * 64 + 50] = 200;
+        assert_eq!(plane.block_sse(0, 0, 64, &reconstruction), 0.0, "padding was scored");
+        // Off by 10 at (39, 39) -- the last sample the decoder shows.
+        reconstruction[39 * 64 + 39] = 20;
+        assert_eq!(plane.block_sse(0, 0, 64, &reconstruction), 100.0, "inside was not scored");
+        // A 16x16 block whose every sample is padding.
+        let block = vec![200u8; 16 * 16];
+        assert_eq!(plane.block_sse(48, 0, 16, &block), 0.0, "a block past the edge scored");
+        // A 16x16 block the edge cuts: 8 of its columns are inside.
+        assert_eq!(plane.block_sse(32, 32, 16, &block), (190.0 * 190.0) * 64.0);
+    }
+
     #[test]
     fn tpl_factors_are_flat_on_a_uniform_repeat_and_fall_where_the_window_leans() {
         // Four 64x64 superblocks across: the shipped map forms its ratio per
@@ -14943,6 +15017,27 @@ mod tests {
         crate::probe::dims(clip)
     }
 
+    /// `EC_AV1_NATIVE_CROP=<width>x<height>`: the native gate's window at a
+    /// size of the reader's choosing instead of [`crate::probe::gate_crop`]'s
+    /// superblock-aligned one, still centred and still even for 4:2:0.
+    ///
+    /// WHY IT EXISTS (lane-sse): `gate_crop` rounds DOWN to whole 128-wide
+    /// superblocks by design, so no default gate row has a block the frame
+    /// edge cuts through -- while every arbitrary export size does (3840x1608
+    /// is 25.1 superblock rows, 1920x1080 is 8.4). `EC_AV1_NATIVE_CROP=
+    /// 1920x1080` is the straddling arm the edge-clipped distortion score is
+    /// read on.
+    fn native_crop_override(clip: &str) -> Option<(String, usize, usize)> {
+        let spec = std::env::var("EC_AV1_NATIVE_CROP").ok()?;
+        let (w, h) = spec.split_once('x').expect("EC_AV1_NATIVE_CROP is <width>x<height>");
+        let (cw, ch): (usize, usize) =
+            (w.parse().expect("crop width"), h.parse().expect("crop height"));
+        let (nw, nh) = crate::probe::dims(clip)?;
+        assert!(cw <= nw && ch <= nh, "{cw}x{ch} does not fit in {nw}x{nh}");
+        let (x, y) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
+        Some((format!("crop={cw}:{ch}:{x}:{y}"), cw, ch))
+    }
+
     /// The rows of [`bd_rate_screen_native`] -- (label, path, seek) -- shared
     /// with `probe_screen_detect` so the detector sweep measures exactly the
     /// clips the keep table is read off. Selector env vars as documented on
@@ -15210,7 +15305,10 @@ mod tests {
             // of the middle of the frame; the offsets stay even for 4:2:0.
             // ONE definition, shared with `examples/enc_probe` so the probe
             // cannot measure a different window than this gate (lane-probe).
-            let (vf, cw, ch) = crate::probe::gate_crop(path);
+            let (vf, cw, ch) = match native_crop_override(path) {
+                Some(over) => over,
+                None => crate::probe::gate_crop(path),
+            };
             let source = clip_frames_vf(path, seek, &vf, cw, ch, frames);
             SCREEN_FRAMES.iter().for_each(|c| {
                 c.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -15220,10 +15318,25 @@ mod tests {
             let _ = crate::tile::take_intrabc_hits();
             let _ = take_intrabc_search();
             let _ = crate::tile::take_filter_intra_hits();
+            let _ = take_edge_census();
             // The sequence path itself codes the pyramid now
             // (lane-av1pyrdef), and prints what it requested and what the
             // content gate left effective.
             let (ours, ours_wall) = our_ladder(name, &source, cw, ch, fctx);
+            // lane-sse: the blocks the true frame edge cuts through, and how
+            // much of their RAW squared error sat in the padding the encoder
+            // invented past it -- what the inside-only score stopped ranking
+            // on. Empty on a superblock-aligned crop, which is every default
+            // gate row (class `gate-blind-to-feature`).
+            if edge_census() {
+                for (side, n, inside, padding) in take_edge_census() {
+                    eprintln!(
+                        "{name}: edge {side}x{side} scores={n} inside_sse={inside} \
+                         padding_sse={padding} ({:.1}% of raw)",
+                        100.0 * padding as f64 / (inside + padding).max(1) as f64,
+                    );
+                }
+            }
             // gate-blind-to-feature: what the screen tools actually did at
             // native resolution, over this clip's four encodes.
             let screen_on = SCREEN_FRAMES[1].load(std::sync::atomic::Ordering::Relaxed);
