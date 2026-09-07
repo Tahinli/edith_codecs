@@ -532,13 +532,11 @@ fn encode_stream(
     width: u32,
     height: u32,
     frames: u32,
-    allow_av1: bool,
 ) -> Result<Vec<u8>, ec_hw::Error> {
     let mut config = EncoderConfig::new(codec, width, height);
     config.gop_size = 30;
     config.framerate = (30, 1);
     config.rate_control = RateControlMode::ConstantQp { qp: 26 };
-    config.allow_av1 = allow_av1;
     let mut encoder = Encoder::new(display, config)?;
     let mut out = Vec::new();
     for t in 0..frames {
@@ -559,7 +557,7 @@ fn encode_stream(
 fn round_trip(codec: EncCodec, width: u32, height: u32, min_db: f64) {
     let Some(display) = display() else { return };
     let frames = 12u32;
-    let stream = match encode_stream(&display, codec, width, height, frames, false) {
+    let stream = match encode_stream(&display, codec, width, height, frames) {
         Ok(stream) => stream,
         Err(e) => panic!("{codec:?} encode failed: {e}"),
     };
@@ -649,7 +647,7 @@ fn hevc_encode_honours_the_conformance_window() {
 fn our_encoder_and_our_decoder_agree() {
     let Some(display) = display() else { return };
     for (enc, dec) in [(EncCodec::H264, Codec::H264), (EncCodec::H265, Codec::H265)] {
-        let stream = encode_stream(&display, enc, 640, 480, 12, false).expect("encode");
+        let stream = encode_stream(&display, enc, 640, 480, 12).expect("encode");
         let mut decoder = Decoder::new(&display, dec).expect("decoder opens");
         let mut worst = f64::INFINITY;
         let mut count = 0u32;
@@ -863,7 +861,7 @@ fn av1_encode_agrees_between_two_decoders() {
     let dir = std::env::temp_dir().join("ec-hw-av1-encode");
     let _ = std::fs::create_dir_all(&dir);
     for (width, height, frames) in [(640u32, 384u32, 10u32), (1920, 1080, 10)] {
-        let data = match encode_stream(&display, EncCodec::Av1, width, height, frames, true) {
+        let data = match encode_stream(&display, EncCodec::Av1, width, height, frames) {
             Ok(data) => data,
             Err(e) => {
                 eprintln!("skipped: AV1 encode unavailable ({e})");
@@ -929,7 +927,7 @@ fn av1_encode_speed() {
     for (width, height) in [(1920u32, 1080u32), (3840, 1608)] {
         let frames = 30u32;
         let start = Instant::now();
-        match encode_stream(&display, EncCodec::Av1, width, height, frames, true) {
+        match encode_stream(&display, EncCodec::Av1, width, height, frames) {
             Ok(data) => {
                 let secs = start.elapsed().as_secs_f64();
                 println!(
