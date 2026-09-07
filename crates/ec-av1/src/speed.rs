@@ -504,3 +504,35 @@ mod tests {
         assert!(!levers(MAX_SPEED).is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test-only serialisation of the process-global encoder knobs (lane-gaterace)
+// ---------------------------------------------------------------------------
+
+/// [`SPEED`] and [`crate::par::TILE_THREADS`] are PROCESS-global, so a test
+/// that stores one of them changes what every test encoding concurrently on
+/// another test thread codes: with the default `--test-threads`,
+/// `every_speed_preset_decodes_sample_exact_through_both_decoders` (presets
+/// 0..=10) and the `tile_*`/`filter_stage_*` wall tables poisoned five of the
+/// ignored `encoder::` gates, each of which passes standalone. The rule is
+/// reader/writer, not a plain mutex: a test that SETS a knob holds
+/// [`knob_write`] for its whole body, and every test that ENCODES (i.e. reads
+/// the knobs, over more than one call) holds [`knob_read`], so a setter never
+/// overlaps an encode. Poison is ignored deliberately -- one failing gate
+/// must not turn every later one into a lock panic.
+#[cfg(test)]
+static KNOBS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Held by a test that reads the process-global knobs; see [`KNOBS`].
+#[cfg(test)]
+#[must_use]
+pub(crate) fn knob_read() -> std::sync::RwLockReadGuard<'static, ()> {
+    KNOBS.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Held by a test that SETS a process-global knob; see [`KNOBS`].
+#[cfg(test)]
+#[must_use]
+pub(crate) fn knob_write() -> std::sync::RwLockWriteGuard<'static, ()> {
+    KNOBS.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
