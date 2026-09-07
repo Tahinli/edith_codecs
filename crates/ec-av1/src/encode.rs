@@ -13348,14 +13348,14 @@ mod tests {
         // the blocks that take one code a filter-intra mode, a different
         // prediction and different coefficients -- 7321 -> 7373 at q=150 and
         // 27285 -> 27074 at q=60. `EC_AV1_FILTER_INTRA=0` restores these.
-        // Re-taken on lane-b64: the inter search offers the whole superblock
-        // as one 64x64 `PARTITION_NONE` block coded skip ([`B64_ROOT`]), and
-        // every superblock that takes one codes a single partition symbol,
-        // one mode/mv chain and no residual where four quadrants used to --
-        // 8076 -> 7291 at q=150 and 27585 -> 27466 at q=60. `EC_AV1_B64=0`
-        // restores these.
+        // Re-taken on lane-b64 (64x64 skip root, `EC_AV1_B64=0` restores
+        // 8076 / 27585 under the 16:-24:16 pyramid) and again at the lane-pyr4
+        // merge: the default pyramid is `8:-32:16` now, the long-GOP sweep's
+        // shape (`lanes/pyr4.sweep.txt`), so these four pictures code as one
+        // truncated group of 8 with its hidden ALTREF at `q-32`.
+        // `EC_AV1_PYRAMID=16:-24:16` restores 7291 / 27466.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7291, 0xa411_97e8_8a80_2a1b), (60, 27466, 0xdc87_26a3_c625_46ce)];
+            [(150, 8446, 0xaf24_d4bc_c9a3_9819), (60, 28548, 0x1459_61a1_f2b6_0f05)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -14412,17 +14412,59 @@ mod tests {
     #[test]
     #[ignore = "the native-resolution BD arm: minutes per row, needs ffmpeg"]
     fn bd_rate_screen_native() {
+        native_bd_arm("bd_rate_screen_native", 12, false);
+    }
+
+    /// The LONG-GOP arm of the native BD gate: the same recipe as
+    /// [`bd_rate_screen_native`] over the two real film rows only, but 48
+    /// pictures with `gop = 48` (`encode_sequence` sets `gop =
+    /// pictures.len()`, and `external_ladder` passes ffmpeg `-g 48`, which
+    /// reaches libaom as `--kf-max-dist=48` and rav1e as
+    /// `key_frame_interval=48`), so every encoder sees one key frame and 47
+    /// inter pictures.
+    ///
+    /// WHY IT EXISTS: `bd_rate_screen_native` codes 12 frames with `gop =
+    /// 12`, and `Av1Encoder::encode_frames` cuts a mini-GOP at every key
+    /// frame (`encoder.rs`), so ANY [`crate::encoder::Pyramid::mini_gop`]
+    /// above 12 codes the same stream there -- the shipped `16` was measured
+    /// as "one hidden ARF per 12-picture GOP", never as a real 16-picture
+    /// group (class `instrument at bound` / `gate blind to feature`). The
+    /// user's exports are long GOPs, so the pyramid shape is decided here.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         bd_rate_film_long_gop --nocapture
+    ///
+    /// `EC_AV1_NATIVE_FILM=1` keeps only film A, `EC_AV1_NATIVE_FILM4K=1`
+    /// only film B; `EC_AV1_PYRAMID=<mini_gop>:<arf>:<leaf>` picks the shape.
+    /// Read every row off the log's own "pyramid requested/effective" print,
+    /// never off the argument order of the runs (lane-pyr3 misattributed
+    /// three rows that way).
+    ///
+    /// Table: `lanes/pyr4.sweep.txt`.
+    #[test]
+    #[ignore = "the long-GOP native BD arm: ~7 minutes per film row, needs ffmpeg"]
+    fn bd_rate_film_long_gop() {
+        native_bd_arm("bd_rate_film_long_gop", 48, true);
+    }
+
+    /// The shared driver of the two native BD arms above: `frames` pictures
+    /// per row (the sequence's `gop` is the same number, so one key frame),
+    /// four quantizers, `films_only` dropping every row but the two real
+    /// films.
+    fn native_bd_arm(label: &str, frames: usize, films_only: bool) {
         if !have_ffmpeg() {
-            eprintln!("SKIP bd_rate_screen_native: no ffmpeg");
+            eprintln!("SKIP {label}: no ffmpeg");
             return;
         }
-        let clips = native_gate_clips();
+        let mut clips = native_gate_clips();
+        if films_only {
+            clips.retain(|(name, _, _)| name.starts_with("film "));
+        }
         if clips.is_empty() {
-            eprintln!("SKIP bd_rate_screen_native: no clip");
+            eprintln!("SKIP {label}: no clip");
             return;
         }
 
-        let frames = 12usize;
         let aom_points: Vec<Vec<String>> = [5, 20, 35, 45]
             .iter()
             .map(|q| {
