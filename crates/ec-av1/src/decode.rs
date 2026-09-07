@@ -11944,7 +11944,7 @@ fn decode_rect4_16_strip(
         let (px, py) = (lmi.1 * MI, lmi.0 * MI);
         let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height, fctx);
         neighbours.record_mode_mi(lmi.0, lmi.1, mi_w, mi_h, mode);
-        if depth != 0 {
+        if depth != 0 || lossless(fctx) {
             // [`decode_rect_split`]'s per-unit walk, inlined because the
             // CHROMA of this shape belongs to the strip's 4:2:0 pair, not to
             // the strip (that function codes one chroma transform per block).
@@ -16049,7 +16049,7 @@ fn decode_leaf_rect8(
         // context -- `decode_leaf8`'s own depth-1 loop, two units instead of
         // four. The per-TU path writes its own neighbour state, so the
         // block-level write below is skipped for it.
-        let split = depth != 0;
+        let split = depth != 0 || lossless(fctx);
         if split {
             let mut done = 0usize;
             for tu in 0..2usize {
@@ -30935,7 +30935,7 @@ fn decode_intra_sub8_leaf(
         hit!(TX_DEPTH_HITS);
         hit!(RECT8_SPLIT_TX_HITS);
     }
-    let split = depth != 0;
+    let split = depth != 0 || (lossless(fctx) && bw != bh);
     let (px, py) = (lmi.1 * MI, lmi.0 * MI);
     let reach = if bw == bh {
         Reach::of(bw, px, py, y.width, y.height, fctx)
@@ -32788,7 +32788,16 @@ fn decode_inter_block8(
                 // leaf published level 0 to its right/below neighbours: the next
                 // block's first TU read `skip_contexts[4][0] = 3` where aomdec
                 // reads `[4][4] = 6` (class early-return-skips-tail).
-                let saved_luma_ctx = split8.then(|| {
+                // lane-lossless3: `!skip` too. A SKIP block codes no coefficients and so
+                // publishes nothing per transform unit, and on a LOSSLESS frame
+                // `read_block_tx_size` hands back 4x4 leaves for a skip block as well
+                // (libaom's `read_tx_size` returns TX_4X4 before it reads anything), so
+                // `split8` is true over an UNTOUCHED band -- the restore then put the
+                // previous block's levels back over the zeros `record_mi` had just
+                // written, where libaom runs `av1_reset_entropy_context`. Class
+                // [[override-slot-on-one-arm]]: a save/restore is only valid on the arm
+                // that actually wrote the per-TU state.
+                let saved_luma_ctx = (split8 && !skip).then(|| {
                     (
                         [
                             neighbours.left[leaf_mi.0][0],
@@ -33970,7 +33979,16 @@ fn decode_inter_block8(
     // but `record_mi` rewrites all three planes of these cells at once -- so
     // save plane 0 across it, exactly as `record_split_luma` leaves plane 0
     // alone at the bigger block sizes.
-    let saved_luma_ctx = split8.then(|| {
+// lane-lossless3: `!skip` too. A SKIP block codes no coefficients and so
+    // publishes nothing per transform unit, and on a LOSSLESS frame
+    // `read_block_tx_size` hands back 4x4 leaves for a skip block as well
+    // (libaom's `read_tx_size` returns TX_4X4 before it reads anything), so
+    // `split8` is true over an UNTOUCHED band -- the restore then put the
+    // previous block's levels back over the zeros `record_mi` had just
+    // written, where libaom runs `av1_reset_entropy_context`. Class
+    // [[override-slot-on-one-arm]]: a save/restore is only valid on the arm
+    // that actually wrote the per-TU state.
+    let saved_luma_ctx = (split8 && !skip).then(|| {
         (
             [
                 neighbours.left[leaf_mi.0][0],
