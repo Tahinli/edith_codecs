@@ -1868,12 +1868,19 @@ impl Plane<'_> {
     /// reconstructed on its own. Commits the result and hands back the
     /// block-coordinate levels, the block's squared error and what its
     /// coefficients cost.
+    #[allow(clippy::too_many_arguments)]
     fn code_tx_depth(
         &mut self,
         at: At,
         mode: u8,
         angle_delta: i32,
         depth: usize,
+        // This block's `filter_intra_mode` when it is coded with one, in
+        // which case every transform unit predicts recursively off the
+        // reconstruction the units before it left -- what the decoder does
+        // per unit (decode.rs `decode_block`, `push_intra_rect`'s
+        // `filter_intra`), not once over the whole block.
+        filter_intra: Option<u8>,
         search: &Search, fctx: &crate::decode::FrameCtx,
     ) -> (Vec<i32>, f64, f64) {
         let At { x, y, side, reach, .. } = at;
@@ -1901,7 +1908,36 @@ impl Plane<'_> {
                     reach: Reach::of_tu(side, side, col_off, row_off, tx, tx, reach),
                     set,
                 };
-                let trial = self.trial(tu, mode, angle_delta, search.base_q_idx, search.deadzone, fctx);
+                let trial = match filter_intra {
+                    Some(fi) => {
+                        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+                        let (above, left, corner) =
+                            self.edges_into(tu.x, tu.y, tx, tu.reach, &mut above_buf, &mut left_buf);
+                        let mut prediction = vec![0u8; tx * tx];
+                        filter_intra_predict_u8(
+                            usize::from(fi),
+                            above,
+                            left,
+                            corner,
+                            tx,
+                            &mut prediction,
+                            fctx,
+                        );
+                        self.code_from_prediction(
+                            tu.x,
+                            tu.y,
+                            tx,
+                            &prediction,
+                            false,
+                            search.base_q_idx,
+                            search.deadzone,
+                            set,
+                        )
+                    }
+                    None => {
+                        self.trial(tu, mode, angle_delta, search.base_q_idx, search.deadzone, fctx)
+                    }
+                };
                 sse += trial.sse;
                 bits += trial.bits;
                 self.commit(tu.x, tu.y, tx, &trial);
@@ -3848,7 +3884,7 @@ fn code_square(
             luma_coeffs,
         );
         for depth in 1..=max_tx_depth(side) {
-            let (levels, sse, bits) = luma.code_tx_depth(at, mode, angle_delta, depth, search, fctx);
+            let (levels, sse, bits) = luma.code_tx_depth(at, mode, angle_delta, depth, None, search, fctx);
             let cost_d = sse
                 + search.lambda
                     * (bits + mode_bits[usize::from(mode)] + tx_depth_bits(side, depth));
@@ -3920,14 +3956,19 @@ fn code_square(
     // by construction (`av1_filter_intra_allowed`), and its luma transform
     // types are coded from `fimode_to_intradir`'s row (`crate::tile::tx_row`).
     //
-    // corner-cut, ceiling named: the candidate is only ever priced at
-    // `tx_depth` 0 (one transform over the whole block), so a block whose
-    // ordinary intra winner wanted a SPLIT transform is compared against a
-    // handicapped filter-intra arm -- and only 19-44% of this encoder's intra
-    // blocks code depth 0. Upgrade path: predict per transform unit inside
-    // [`Plane::code_tx_depth`] (the decoder already reads `filter_intra` per
-    // unit, decode.rs:11835) and run the depth search under the winning
-    // filter mode.
+    // lane-fitu: on a SCREEN frame the candidate is priced at every transform
+    // depth the ordinary intra search runs, each unit predicting recursively
+    // off the units before it ([`Plane::code_tx_depth`]'s `filter_intra`
+    // arm), so a block whose ordinary winner wanted a split transform is
+    // compared against a filter arm that may split too.
+    //
+    // Measured (native BD table, lane-fitu): searching the depths on EVERY
+    // frame moves screen -1.0/-0.4 and the bars rows -0.4/-0.7 but leaves
+    // film A flat and film B +0.1/+0.5 WORSE -- the extra filter blocks are a
+    // locally cheaper reconstruction that the film rows go on to predict from
+    // (class `local-rd-on-references`) -- at +30..35% encoder wall. Screen
+    // content is where it pays, and a non-screen frame keeps the depth-0-only
+    // arm, byte for byte.
     let mut filter_intra: Option<u8> = None;
     if filter_intra_on()
         && palette.is_none()
@@ -3943,47 +3984,39 @@ fn code_square(
         }
         let one_bits = symbol_bits(row, 1);
         let kept = luma.snapshot(x, y, side);
-        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
-        let (above, left, corner) =
-            luma.edges_into(x, y, side, at.reach, &mut above_buf, &mut left_buf);
-        let mut prediction = vec![0u8; side * side];
+        let max_depth = if tx_select && search.screen { max_tx_depth(side) } else { 0 };
+        let mut best: Option<(f64, u8, usize, (Vec<u8>, Vec<CoefCtx>), Vec<Coeff>)> = None;
         for fi in 0..5u8 {
-            filter_intra_predict_u8(
-                usize::from(fi),
-                above,
-                left,
-                corner,
-                side,
-                &mut prediction, fctx,
-            );
-            let trial = luma.code_from_prediction(
-                x,
-                y,
-                side,
-                &prediction,
-                false,
-                search.base_q_idx,
-                search.deadzone,
-                luma_set,
-            );
-            let cost_f = trial.sse
-                + search.lambda
-                    * (trial.bits
-                        + mode_bits[DC_PRED as usize]
-                        + one_bits
-                        + symbol_bits(&cdf::FILTER_INTRA_MODE, usize::from(fi))
-                        + if tx_select { tx_depth_bits(side, 0) } else { 0.0 });
-            if cost_f < cost {
-                cost = cost_f;
-                mode = DC_PRED;
-                angle_delta = 0;
-                tx_depth = 0;
-                luma_coeffs = coeffs(&trial.levels, side);
-                luma.commit(x, y, side, &trial);
-                filter_intra = Some(fi);
+            for depth in 0..=max_depth {
+                let (levels, sse, bits) =
+                    luma.code_tx_depth(at, DC_PRED, 0, depth, Some(fi), search, fctx);
+                let cost_f = sse
+                    + search.lambda
+                        * (bits
+                            + mode_bits[DC_PRED as usize]
+                            + one_bits
+                            + symbol_bits(&cdf::FILTER_INTRA_MODE, usize::from(fi))
+                            + if tx_select { tx_depth_bits(side, depth) } else { 0.0 });
+                if cost_f < cost && best.as_ref().is_none_or(|b| cost_f < b.0) {
+                    best = Some((
+                        cost_f,
+                        fi,
+                        depth,
+                        luma.snapshot(x, y, side),
+                        coeffs(&levels, side),
+                    ));
+                }
             }
         }
-        if filter_intra.is_none() {
+        if let Some((cost_f, fi, depth, snapshot, levels)) = best {
+            cost = cost_f;
+            mode = DC_PRED;
+            angle_delta = 0;
+            tx_depth = depth as u8;
+            luma_coeffs = levels;
+            luma.restore(x, y, side, &snapshot);
+            filter_intra = Some(fi);
+        } else {
             luma.restore(x, y, side, &kept);
         }
     }
@@ -11078,6 +11111,12 @@ mod tests {
     #[test]
     fn the_search_picks_the_direction_the_picture_runs() {
     let fctx = &crate::decode::FrameCtx::new();
+        // Same confound as [`every_mode_decodes_to_what_the_encoder_predicted`]:
+        // a filter-intra block is coded `DC_PRED` whatever mode the arm
+        // offers, and these stripes are SCREEN content, where the filter arm
+        // now searches its own transform depth (lane-fitu) and wins outright
+        // -- which says nothing about the mode search this gate measures.
+        force_filter_intra(Some(false));
         for (vertical, want) in [(true, V_PRED), (false, H_PRED)] {
             let picture = stripes(128, 96, vertical);
             // Only the pair, because on stripes a third mode predicts exactly
