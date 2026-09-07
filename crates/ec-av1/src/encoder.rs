@@ -3727,6 +3727,90 @@ mod tests {
         eprintln!("tx_type witness: hits {hits:?}, {} bytes", stream.len());
     }
 
+    /// lane-txset2's witness: an INTER frame's luma transform units take BOTH
+    /// types of the two-type inter set the writer already codes a symbol for
+    /// (`TX_SET_INTER_3`: `IDTX` and `DCT_DCT`) at least once -- the fire
+    /// count, class `gate-blind-to-feature` -- and both decoders reconstruct
+    /// every frame sample-exact from the `tx_type` symbols that name them.
+    /// Before this lane every inter luma unit was coded `DCT_DCT`.
+    #[test]
+    fn an_inter_clip_codes_both_inter_set_tx_types_both_decoders_read_exactly() {
+        // The lever is OFF at every preset (`speed::TX_TYPE_SEARCH_INTER`), so
+        // this turns it on process-globally under the same exclusive lock the
+        // presets take.
+        let _knobs = crate::speed::knob_write();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        crate::encode::set_inter_tx_search(Some(true));
+        let (width, height) = (320usize, 192usize);
+        // Sharp steps that MOVE: the motion-compensated residual along a
+        // moving edge is exactly where the identity transform beats a DCT,
+        // and the flat plateaus between them predict to nothing at all.
+        let sources: Vec<Picture> = (0..4)
+            .map(|t| {
+                let mut p = test_card(width, height, t * 3);
+                for y in 0..height {
+                    for x in 0..width {
+                        let v = match ((x + t * 5) / 16 % 2, (y + t * 3) / 16 % 2) {
+                            (0, 0) => 16u16,
+                            (1, 0) => 235,
+                            (0, 1) => ((x + t) % 64 * 3) as u16,
+                            _ => ((y + t) % 64 * 3) as u16,
+                        };
+                        p.y[y * width + x] = v;
+                    }
+                }
+                p
+            })
+            .collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 90,
+            gop: 4,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let _ = crate::encode::take_inter_tx_type_hits();
+        let mut stream = Vec::new();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let hits = crate::encode::take_inter_tx_type_hits();
+        crate::encode::set_inter_tx_search(None);
+        for (name, ty) in [
+            ("DCT_DCT", crate::transform::TxType::DctDct),
+            ("IDTX", crate::transform::TxType::Idtx),
+        ] {
+            assert!(
+                hits[ty as usize] > 0,
+                "no inter luma transform unit was CODED {name}: {hits:?}"
+            );
+        }
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if have_ffmpeg() {
+            let theirs = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                    panic!(
+                        "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                        at % width,
+                        at / width,
+                        got[at],
+                        b[at],
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+        }
+        eprintln!("inter tx_type witness: hits {hits:?}, {} bytes", stream.len());
+    }
+
     /// Every SHIPPED SPEED PRESET codes a stream both decoders reconstruct
     /// sample-exact -- ours and ffmpeg's -- and codes a DIFFERENT stream from
     /// its neighbour (a preset that changes no byte is a preset that buys no
