@@ -3475,8 +3475,11 @@ mod tests {
     /// `delta_qindex` syntax that carries them.
     #[test]
     fn a_moving_detail_clip_codes_two_delta_q_levels_both_decoders_read_exactly() {
-        let _knobs = crate::speed::knob_read();
+        // `knob_write`, not `knob_read`: the override below is
+        // process-global and every other test's bytes move under it.
+        let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
+        crate::encode::set_deltaq_res(Some(2));
         let (width, height) = (640usize, 384usize);
         // The gate's own moving test card, with a 128x128 patch of fine
         // detail travelling right by 32 samples a frame laid over it: the
@@ -3545,6 +3548,7 @@ mod tests {
         } else {
             eprintln!("SKIP the ffmpeg half: no ffmpeg");
         }
+        crate::encode::set_deltaq_res(None);
         eprintln!("delta_q witness: {levels} quantizer levels, {} bytes", stream.len());
     }
 

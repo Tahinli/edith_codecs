@@ -8866,11 +8866,33 @@ const TPL_STRENGTH: f64 = 0.5;
 /// A frame with no tpl map (no lookahead picture, or `EC_AV1_TPL=0`) has
 /// nothing to vary the quantizer BY and codes no delta syntax at all.
 fn deltaq_res_log2() -> Option<u8> {
+    match DELTAQ_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        u8::MAX => {}
+        4 => return None,
+        r => return Some(r),
+    }
     match crate::envflags::var("EC_AV1_DELTAQ").ok().as_deref().map(str::trim) {
         Some("0") => None,
         Some(v) => v.parse::<u8>().ok().filter(|r| *r <= 3),
         None => Some(crate::speed::at(&crate::speed::DELTAQ_RES)).filter(|r| *r < 4),
     }
+}
+
+/// A PROCESS-GLOBAL [`deltaq_res_log2`] override that wins over both the
+/// environment and the preset -- `u8::MAX` = unset, `4` = off. The gate that
+/// sets it holds [`crate::speed::knob_write`], the same exclusive lock the
+/// speed presets take, because the streams every other test pins move under
+/// it (the shipped default is OFF, see [`crate::speed::DELTAQ_RES`]).
+static DELTAQ_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Sets [`DELTAQ_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` gates
+pub(crate) fn set_deltaq_res(res_log2: Option<u8>) {
+    DELTAQ_OVERRIDE.store(
+        res_log2.unwrap_or(u8::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// How much of the derived qindex step is actually taken
