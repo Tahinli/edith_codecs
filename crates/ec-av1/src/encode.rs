@@ -1547,7 +1547,7 @@ pub(crate) fn key_frame_headers_colour(
         frame_height_bits,
         max_frame_width: w,
         max_frame_height: h,
-        use_128x128_superblock: false,
+        use_128x128_superblock: sb128_on(),
         // lane-fintra: the encoder's intra search offers the five recursive
         // filter-intra modes on eligible blocks, so the sequence bit is set
         // whenever that search is on (`EC_AV1_FILTER_INTRA=0` switches both
@@ -4654,6 +4654,28 @@ fn cfl_on() -> bool {
 /// (`EC_AV1_FILTER_INTRA=0` switches both off, which is how the lane measured
 /// its own on/off pair -- and how every byte pin written before it still
 /// reproduces). It is also a speed lever: on at preset 0, off above it.
+// lane-sb128: `use_128x128_superblock` (spec 5.5.1). Off by default until
+// the BD gate says otherwise; `EC_AV1_SB128=1` turns it on for the whole
+// process (a sequence-header field, so it cannot change mid-stream anyway),
+// the same env-flag shape `EC_AV1_FILTER_INTRA` uses. NOT an `EncoderConfig`
+// field: that struct is built by 90 literal sites in this workspace.
+
+/// Whether this process's sequences code 128x128 superblocks.
+pub(crate) fn sb128_on() -> bool {
+    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_SB128").ok().is_some_and(|v| v != "0")
+    });
+    *ENV
+}
+
+/// The luma loop-restoration unit size this sequence codes: a 128 superblock
+/// cannot signal the 64 unit at all (spec `lr_params` reads ONE bit there,
+/// `RESTORATION_TILESIZE_MAX >> (2 - (shift + 1))`, so the smallest unit is
+/// 128), which is the one filter parameter the superblock size moves.
+pub(crate) fn lr_unit() -> u32 {
+    if sb128_on() { 128 } else { 64 }
+}
+
 pub(crate) fn filter_intra_on() -> bool {
     #[cfg(test)]
     if let Some(forced) = FILTER_INTRA_FORCE.with(std::cell::Cell::get) {
@@ -7004,8 +7026,8 @@ pub(crate) fn encode_key_frame_inner(
     // (`av1_lr_count_units` rounds to nearest, so a short last unit is
     // swallowed by the one before it), for the tile writer's own per-unit
     // walk.
-    let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
-    let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
+    let lr_horz = crate::restoration::count_units(header.frame_width, lr_unit()) as u32;
+    let lr_vert = crate::restoration::count_units(header.frame_height, lr_unit()) as u32;
     // Every tile is coded from this frame's OWN starting tables and leaves
     // its own end state behind (spec 5.11.1: each tile resets the CDFs, the
     // loop-restoration reference and its neighbour contexts), so the tiles
@@ -7017,7 +7039,8 @@ pub(crate) fn encode_key_frame_inner(
      -> Result<Vec<Vec<u8>>> {
         let (out, _) = write_tiles(layout.count(), usize::MAX, |index| {
             crate::tile::arm_cdef_idx(bits, sb_cols, grid.to_vec());
-            crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
+            crate::tile::arm_lr(lr_unit(), lr_horz, lr_vert, units.to_vec());
+            crate::tile::arm_sb128(sb128_on());
             let mut cdfs = start_cdfs.0.clone();
             crate::tile::arm_screen(screen);
             crate::tile::arm_filter_intra(filter_intra_on());
@@ -7302,9 +7325,13 @@ fn pick_and_apply_filters(
     // rather than decoding the re-coded tile. Cleared at the end instead.
     let mut lr = LoopRestorationParams::default();
     if lr_on {
+        let unit = lr_unit();
         let mut want = LoopRestorationParams {
-            loop_restoration_size: [64, 64, 64],
+            loop_restoration_size: [unit, unit, unit],
             uses_lr: true,
+            // spec `lr_params`: `RESTORATION_TILESIZE_MAX >> (2 - shift)`, so
+            // 0 is the 64 unit and 1 the 128 one a 128 superblock forces.
+            lr_unit_shift: u8::from(unit == 128),
             ..LoopRestorationParams::default()
         };
         want.frame_restoration_type[0] = ec_av1_syntax::RestorationType::Wiener;
@@ -10446,8 +10473,8 @@ pub(crate) fn encode_inter_frame(
     let switchable_motion_mode = header.is_motion_mode_switchable;
     let warped_motion = header.allow_warped_motion;
     let order_hint_bits = seq.order_hint_bits;
-    let lr_horz = crate::restoration::count_units(header.frame_width, 64) as u32;
-    let lr_vert = crate::restoration::count_units(header.frame_height, 64) as u32;
+    let lr_horz = crate::restoration::count_units(header.frame_width, lr_unit()) as u32;
+    let lr_vert = crate::restoration::count_units(header.frame_height, lr_unit()) as u32;
     // What this frame stores is the LARGEST tile's end-of-tile tables --
     // its own header's `context_update_tile_id` (spec 7.20), which
     // `tile_info_of` set to exactly that tile.
@@ -10462,7 +10489,8 @@ pub(crate) fn encode_inter_frame(
      -> Result<Vec<Vec<u8>>> {
         let (out, stored) = write_tiles(layout.count(), store_tile, |index| {
             crate::tile::arm_cdef_idx(bits, sb_cols, cdef_grid.to_vec());
-            crate::tile::arm_lr(64, lr_horz, lr_vert, units.to_vec());
+            crate::tile::arm_lr(lr_unit(), lr_horz, lr_vert, units.to_vec());
+            crate::tile::arm_sb128(sb128_on());
             crate::tile::arm_sign_bias(sign_bias);
             // Thread-locals: every tile job arms its own worker.
             crate::tile::arm_reference_select(reference_select_bit);
