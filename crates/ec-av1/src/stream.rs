@@ -3867,6 +3867,101 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-dkey: the palette-neighbour-band gate. A palette-Y block's size and
+    /// colours used to stay standing in the mi-granular above/left bands after a
+    /// sub-8x8 group was decoded next to it -- the sub-8x8 readers published
+    /// skip/lf/mode state but no palette state, while libaom's mi grid carries
+    /// `palette_size == 0` in exactly those cells (`av1_allow_palette` needs
+    /// BLOCK_8X8 and up). The next intra block then read `palette_y_mode` off
+    /// CDF row 1 where libaom reads row 0 (class `cdf-row-held-constant`),
+    /// decoded a palette libaom never coded, and skipped the `use_filter_intra`
+    /// symbol a palette block has none of: one symbol short, tile desynced.
+    ///
+    /// Measured on the instrumented aomdec at KEY-frame block mi(76,88) of this
+    /// very stream (`EC_PALSYN_AOM ... ctx=0 y=0` against our `mode_ctx=1`).
+    /// Without the fix every one of the 12 frames differs from ffmpeg's decode
+    /// from luma sample 491904 on.
+    ///
+    /// The source is SYNTHETIC (no film sample lives in `fixtures`): the dark,
+    /// near-flat background libaom's own screen-content detector counts as
+    /// screen content (2..=4 distinct luma values per 16x16 block), which is
+    /// what turns palette on, plus one textured patch at a HALF-PEL position on
+    /// half the frames so the encoder splits that region down to 4x4 groups
+    /// beside its palette blocks.
+    #[test]
+    fn a_libaom_screen_stream_with_sub8_groups_beside_palette_blocks_decodes_exact() {
+        const NAME: &str =
+            "a_libaom_screen_stream_with_sub8_groups_beside_palette_blocks_decodes_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let (w, h, frames) = (1920usize, 1024usize, 12usize);
+        let mut raw = Vec::with_capacity(frames * w * h * 3 / 2);
+        for f in 0..frames {
+            let mut y = vec![0u8; w * h];
+            for row in 0..h {
+                for col in 0..w {
+                    y[row * w + col] =
+                        16 + ((col / 32 + row / 32) % 5) as u8 + ((col / 4 + row / 4) % 3) as u8;
+                }
+            }
+            // 2.5 px per pair of frames: integer on one pair, half a pixel off
+            // on the next (linear interpolation), so the patch's edges land
+            // mid-sample and the encoder splits there.
+            let x0 = 200.0 + 2.5 * (f / 2) as f64;
+            let (fx, ix) = (x0.fract(), x0.floor() as usize);
+            for row in 300..428 {
+                for col in 0..192 {
+                    let tex = |u: f64| -> f64 {
+                        let v = (row - 300) as f64;
+                        30.0 + 100.0 * (0.5 + 0.5 * ((u * 0.35).sin() * (v * 0.21).cos()))
+                    };
+                    let s = tex(col as f64) * (1.0 - fx) + tex(col as f64 - 1.0) * fx;
+                    y[row * w + ix + col] = s.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            raw.extend_from_slice(&y);
+            raw.extend(std::iter::repeat_n(128u8, w * h / 2));
+        }
+        // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
+        let src = std::env::temp_dir().join(format!("ec-av1-palsub8-{}.yuv", std::process::id()));
+        std::fs::write(&src, &raw).expect("raw source");
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+            .arg(&src)
+            .args(["-an", "-threads", "1", "-g", "12", "-c:v", "libaom-av1"])
+            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "35", "-f", "obu", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        let _ = std::fs::remove_file(&src);
+        if !out.status.success() {
+            eprintln!(
+                "SKIP {NAME}: ffmpeg has no libaom-av1 encoder ({})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let stream = out.stdout;
+        let ours = decode_stream(&stream).expect("libaom screen-content stream decodes");
+        let theirs = ffmpeg_decode_sequence(&stream, w, h, frames);
+        assert_eq!(ours.len(), frames, "{NAME}: shown frame count");
+        for (i, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
+            for (plane, l, r) in [("Y", &a.y, &b.y), ("U", &a.u, &b.u), ("V", &a.v, &b.v)] {
+                let first = l.iter().zip(r.iter()).position(|(x, y)| x != y);
+                assert!(
+                    first.is_none(),
+                    "{NAME}: frame {i} plane {plane} differs from ffmpeg at sample {}",
+                    first.unwrap()
+                );
+            }
+        }
+    }
+
     /// Hardened past the report-only test above: a real libaom-av1 gradients
     /// stream, pinned deterministic (`gradients`' own `seed=`, plus
     /// `-threads 1`/`-row-mt 0`/no tiling so libaom's `cpu-used 8` RD search
