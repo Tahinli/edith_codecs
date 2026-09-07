@@ -13006,6 +13006,12 @@ mod tests {
         // so every block taking either codes different syntax and different
         // coefficients -- 8194 -> 7321 at q=150 and 28285 -> 27285 at q=60.
         // `EC_AV1_CFL=0` / `EC_AV1_ANGLE=0` restore each half.
+        // Re-taken on lane-pyr3: the mini-GOP of the default pyramid is 16
+        // pictures at `q-24` / `q+16` now (the sweep in [`Pyramid::default`]),
+        // so these four pictures code as one truncated group -- a hidden
+        // ALTREF at `q-24` and three leaves at `q+16` -- instead of one
+        // mini-GOP of 4 at `q-16` / `q+8`: 7373 -> 8076 at q=150 and
+        // 27074 -> 27585 at q=60. `EC_AV1_PYRAMID=4:-16:8` restores these.
         // Re-taken on lane-fintra: the sequence header sets
         // `enable_filter_intra`, so every DC_PRED intra block of at most
         // 32x32 without a luma palette carries a `use_filter_intra` flag and
@@ -13013,7 +13019,7 @@ mod tests {
         // prediction and different coefficients -- 7321 -> 7373 at q=150 and
         // 27285 -> 27074 at q=60. `EC_AV1_FILTER_INTRA=0` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 7373, 0xd0af_b890_28bc_cfbf), (60, 27074, 0x8324_0e9f_5971_e4e7)];
+            [(150, 8076, 0x8171_4818_e223_ab21), (60, 27585, 0xdbe7_eecd_6d64_c4f5)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
