@@ -84,6 +84,20 @@ neighbours). Needs each reader's decoded palette threaded to the tail.
 * `crates/ec-av1/src/motion_field.rs` — `EC_INTMV` trace print when
   `force_integer_mv` rounding actually changes a projected candidate.
 
+## The new gate assertion's first verdict (12-frame native arm)
+
+`cargo test -p ec-av1 --release -- --ignored --exact encode::tests::bd_rate_screen_native`
+now FAILS on its FIRST reference point, exactly as the assertion is meant to:
+
+    libaom-av1 ["-cpu-used","6","-b:v","0","-crf","45"] frame 1 plane Y sample 66:
+    our decoder decoded 146, ffmpeg 145
+
+Clip "bars 1080p" (`testsrc2` colour bars, 1920x1024 crop, 12 frames, gop 12),
+libaom crf 45, INTER frame 1, a +-1 luma sample — a reconstruction (not entropy)
+gap: a rounding/filter difference, not a desync. The gate stops there, so the
+other reference points of that arm and the later clips are UNMEASURED. This is
+the finding the charter asked for; the fix is a separate lane (defer).
+
 ## OPEN / deferred
 
 1. **crf 5 inter-frame Golomb refusal** — key frame is exact now; the failure
@@ -95,7 +109,9 @@ neighbours). Needs each reader's decoded palette threaded to the tail.
    real band-index/footprint convention before stamping (the failing tests are
    `encoder::tests::the_content_gate_keeps_screen_streams_flat` and the 12
    others listed in the suite log).
-3. **The sensitive `force_integer_mv` fixture**: a 1920x1024 source with a
+3. **The bars-1080p libaom crf-45 +-1** above: first reference point of the
+   12-frame native arm; reproduce with `external_ladder`'s own recipe.
+4. **The sensitive `force_integer_mv` fixture**: a 1920x1024 source with a
    textured patch moving 2.5 px per duplicate-pair (half-pel motion, exact
    duplicate frames) makes libaom round 72 projected candidates
    (`EC_TRACE_TPL` → `EC_INTMV`), and the stream STILL decodes byte-exact with
