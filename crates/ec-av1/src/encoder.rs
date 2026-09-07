@@ -903,6 +903,24 @@ fn tpl_pyramid() -> bool {
 /// [`tpl_pyramid`]'s default.
 const TPL_PYRAMID: bool = true;
 
+/// Whether a group's TOP ARF names the ARF from TWO groups back as its own
+/// `ALTREF_FRAME` (lane-arfcen). It has always named `GOLDEN_SLOT` there,
+/// which for a top ARF is the key frame it already reads as `GOLDEN`, i.e.
+/// its second reference is the same picture as its first for the first group
+/// and adds nothing after: the ARF-vs-ARF census reads
+/// `LAST@-8 GOLDEN@-8` on our first ARF where rav1e's reads two DISTINCT
+/// anchors. The slot the ARF is about to refresh still holds that older
+/// anchor while this frame is coded, so naming it costs no extra DPB slot.
+fn arf_altref() -> bool {
+    match std::env::var("EC_AV1_ARF_ALTREF").ok() {
+        Some(v) => v != "0",
+        None => ARF_ALTREF,
+    }
+}
+
+/// [`arf_altref`]'s default.
+const ARF_ALTREF: bool = false;
+
 /// The AV1 software encoder: [`EncoderConfig`] in, one [`Packet`] out per
 /// [`Av1Encoder::encode`] call — or, with a [`Pyramid`] configured, a
 /// coding-order burst of them per [`Av1Encoder::encode_frames`] call plus a
@@ -1633,7 +1651,14 @@ impl Av1Encoder {
             &arf_picture,
             anchor_slot,
             next_anchor_slot,
-            GOLDEN_SLOT,
+            // lane-arfcen: the slot this ARF refreshes still holds the ARF
+            // from two groups back, so naming it here gives the frame a
+            // SECOND, distinct past anchor instead of the key it already
+            // reads as GOLDEN.
+            match arf_altref() {
+                true => next_anchor_slot,
+                false => GOLDEN_SLOT,
+            },
             false,
             Level::Arf,
             pyramid.arf_q_offset,
