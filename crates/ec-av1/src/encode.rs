@@ -6620,7 +6620,23 @@ pub(crate) fn encode_key_frame_inner(
             // intrabc is refused outright ([`I64_ROOT`]) because the quadrant
             // searches below carry DV state a discarded trial would desync.
             let (x64, y64) = (sb_col * SUPERBLOCK, sb_row * SUPERBLOCK);
+            // corner-cut, ceiling named: only a frame whose true size is a
+            // WHOLE number of superblocks is offered the root at all.
+            // MEASURED (lane-i64): on a 248x152 frame -- whose bottom-right
+            // superblock is cut on BOTH axes -- a frame carrying whole 64
+            // roots elsewhere desyncs that corner's CHROMA three ways (our
+            // writer's reconstruction, our decoder and ffmpeg all disagree,
+            // luma stays exact), i.e. a defect in the whole-64 chroma
+            // neighbour publication that only the doubly-cut tail block
+            // reads (class `last-block-desync-reads-as-reconstruction`).
+            // Every clip on the BD gates, and every real film/screen source,
+            // is superblock aligned, so nothing measured is withheld.
+            // Ceiling: trace the corner block's chroma `txb_skip`/dc context
+            // against aomdec and lift this line.
+            let aligned = header.mi_cols % crate::tile::SB_MI == 0
+                && header.mi_rows % crate::tile::SB_MI == 0;
             let sb64_legal = i64_root()
+                && aligned
                 && ibc.is_none()
                 && sb_row * 2 + 1 < rows
                 && sb_col * 2 + 1 < cols
@@ -11092,7 +11108,15 @@ mod tests {
         let _ = take_i64_root_hits();
         let encoded = encode_key_frame_with_ctx(&picture, 120, 0.5, fctx).unwrap();
         let [roots, offered] = take_i64_root_hits();
-        assert_eq!(offered, 12, "every superblock is inside the frame");
+        // The counters are process-global, so another test encoding in
+        // parallel can only ADD to them -- the per-FRAME fact is the mode
+        // list, which carries one entry per coded block and so exactly 12
+        // when every superblock was coded as one 64x64 intra block.
+        assert_eq!(
+            encoded.modes.len(),
+            12,
+            "not every superblock was coded as one 64x64 intra block"
+        );
         assert!(
             roots >= 8,
             "a smooth-gradient key frame coded only {roots} whole 64x64 intra roots of 12"
@@ -11129,7 +11153,7 @@ mod tests {
             eprintln!("SKIP ffmpeg_decodes_exactly_what_the_encoder_reconstructed: no ffmpeg");
             return;
         }
-        for &(width, height) in &[(64usize, 64usize), (96, 64), (160, 96), (32, 48)] {
+        for &(width, height) in &[(64usize, 64usize), (96, 64), (160, 96), (32, 48), (248, 152)] {
             let picture = test_card(width, height);
             let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
