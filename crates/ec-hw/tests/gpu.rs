@@ -843,40 +843,106 @@ fn colour_description_reaches_the_vui() {
     );
 }
 
-/// AV1 encoding is opt-in, and this test does not turn it on.
+/// AV1 hardware encode, proved by two independent decoders.
 ///
-/// It was probed once, live, at the driver's own minimum encode size
-/// (radeonsi reports 320x128 for AV1 `EncSlice`) on 2026-08-14. The submission
-/// took the GPU down:
+/// The reconstruction inside the GPU is not observable from here, so what is
+/// asserted is that the coded stream means the same thing to two decoders that
+/// share no code: ffmpeg's libdav1d and this family's own `ec-av1`. Every
+/// shown frame is compared sample for sample — a header field that disagrees
+/// with what the hardware coded shows up as a mismatch in one of them long
+/// before it shows up as a quality number.
 ///
-/// ```text
-/// amdgpu: The CS has cancelled because the context is lost.
-///         This context is guilty of a hard recovery.
-/// ```
-///
-/// The process was aborted by the driver, not by this crate — there is no error
-/// to return from a context that no longer exists. So the probe is *recorded*
-/// rather than repeated: what this test asserts is the guard that keeps the
-/// path off unless a caller asks for it by name, which is the only defence a
-/// library has against a driver bug of that class.
+/// The path was refused in-tree until 2026-09-07: a probe on 2026-08-14 took
+/// the GPU down ("the CS has cancelled because the context is lost"). That
+/// refusal is retired by measurement, not by opinion — ffmpeg's own
+/// `av1_vaapi` encodes on this driver (mesa 26.1.8, gfx1200), and the
+/// parameters below are the recipe it uses.
 #[test]
-fn av1_encode_is_opt_in() {
+fn av1_encode_agrees_between_two_decoders() {
     let Some(display) = display() else { return };
-    let refused = Encoder::new(&display, EncoderConfig::new(EncCodec::Av1, 320, 128));
-    assert!(
-        matches!(refused, Err(ec_hw::Error::Unsupported { .. })),
-        "AV1 encoding must be refused without the explicit opt-in"
-    );
-    // With the opt-in the encoder builds — the parameters, the surface pool and
-    // the context are all real; only `encode()` is left untested here.
-    let mut config = EncoderConfig::new(EncCodec::Av1, 320, 128);
-    config.allow_av1 = true;
-    match Encoder::new(&display, config) {
-        Ok(encoder) => println!(
-            "AV1 encode: opt-in encoder built at {:?}, submission deliberately not run",
-            encoder.coded_size()
-        ),
-        Err(e) => println!("AV1 encode: refused by the driver, typed error: {e}"),
+    let dir = std::env::temp_dir().join("ec-hw-av1-encode");
+    let _ = std::fs::create_dir_all(&dir);
+    for (width, height, frames) in [(640u32, 384u32, 10u32), (1920, 1080, 10)] {
+        let data = match encode_stream(&display, EncCodec::Av1, width, height, frames, true) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("skipped: AV1 encode unavailable ({e})");
+                return;
+            }
+        };
+        let path = dir.join(format!("hw-{width}x{height}.obu"));
+        std::fs::write(&path, &data).expect("write the coded stream");
+
+        // Decoder one: this family's software AV1 decoder, on the raw OBUs.
+        let ours = ec_av1::stream::decode_stream(&data)
+            .unwrap_or_else(|e| panic!("ec-av1 decodes the {width}x{height} hardware stream: {e}"));
+        assert_eq!(
+            ours.len(),
+            frames as usize,
+            "{width}x{height}: ec-av1 decoded {} of {frames} shown frames",
+            ours.len()
+        );
+
+        // Decoder two: ffmpeg (libdav1d) on the same bytes.
+        let mut reference =
+            Reference::open(&path, width, height, false).expect("ffmpeg opens the stream");
+        let mut worst = f64::INFINITY;
+        for (i, picture) in ours.iter().enumerate() {
+            let theirs = reference
+                .next(width, height)
+                .unwrap_or_else(|| panic!("{width}x{height}: ffmpeg has no frame {i}"));
+            let mine = Planes {
+                y: picture.y.clone(),
+                u: picture.u.clone(),
+                v: picture.v.clone(),
+                peak: 255.0,
+            };
+            let db = psnr(&mine, &theirs);
+            assert!(
+                db.is_infinite(),
+                "{width}x{height} frame {i}: the two decoders disagree ({db:.2} dB)"
+            );
+            // Agreement alone would also be satisfied by ten grey frames: the
+            // coded picture has to be the picture that was submitted.
+            let source = Planes::from_8bit(&source_frame(width, height, i as u32));
+            let fidelity = psnr(&mine, &source);
+            assert!(
+                fidelity > 30.0,
+                "{width}x{height} frame {i}: coded {fidelity:.2} dB from the source"
+            );
+            worst = worst.min(fidelity);
+        }
+        println!(
+            "AV1 encode {width}x{height}: {frames} frames, {} bytes, ec-av1 and libdav1d agree \
+             sample for sample, worst frame {worst:.2} dB from the source",
+            data.len()
+        );
+    }
+}
+
+/// Hardware AV1 encode speed at the two sizes his library is in, in frames per
+/// second. Real time is 24 fps; the number is printed rather than asserted,
+/// since a busy GPU is not a failing encoder.
+#[test]
+fn av1_encode_speed() {
+    let Some(display) = display() else { return };
+    for (width, height) in [(1920u32, 1080u32), (3840, 1608)] {
+        let frames = 30u32;
+        let start = Instant::now();
+        match encode_stream(&display, EncCodec::Av1, width, height, frames, true) {
+            Ok(data) => {
+                let secs = start.elapsed().as_secs_f64();
+                println!(
+                    "AV1 encode {width}x{height}: {:.1} fps ({frames} frames in {secs:.2} s), {} kbit/frame",
+                    f64::from(frames) / secs,
+                    data.len() * 8 / frames as usize / 1000
+                );
+            }
+            Err(e) => {
+                eprintln!("skipped: AV1 encode unavailable ({e})");
+                return;
+            }
+        }
     }
 }
 

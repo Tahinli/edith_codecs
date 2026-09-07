@@ -351,6 +351,7 @@ dependencies = [
 name = "ec-hw"
 version = "0.1.0"
 dependencies = [
+ "ec-av1",
  "ec-av1-syntax",
  "ec-core",
  "ec-h264-syntax",
