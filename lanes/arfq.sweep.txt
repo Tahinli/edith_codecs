@@ -13,3 +13,19 @@
 | leaf 24 | 8:-32:24:-8:-48 | +45.6 / +5.6 | +138.8 / +38.4 |
 | mid -12 (leaf 12) | 8:-32:12:-12:-48 | +43.4 / +5.0 | +128.1 / +33.8 |
 | mid -16 (leaf 12) | 8:-32:12:-16:-48 | +44.0 / +5.6 | +127.7 / +34.1 |
+| arf -24 (leaf 12) | 8:-24:12:-8:-48 | +44.5 / +5.2 | +128.6 / +33.3 |
+| mini_gop 16 (leaf 12) | 16:-32:12:-8:-48 | +47.2 / +6.3 | +134.7 / +35.6 |
+
+WINNER leaf 12 (8:-32:12:-8:-48): film A +43.5/+4.6 -> +43.1/+4.6 (libaom -0.4, rav1e
+flat), film B +131.3/+35.0 -> +129.0/+34.3 (libaom -2.3, rav1e -0.7). Keep rule met by
+"one film >= 0.5 down on both columns, the other flat".
+
+Rejected, all four mixed or worse:
+  * leaf 8 buys film B (-3.7/-0.9) but costs film A rav1e (+0.5) -- past the optimum.
+  * leaf 24 is worse on all four numbers: the leaves are already too coarse.
+  * a deeper mid (-12, -16) trades film A away for film B on every row and the trend is
+    monotone in film A, so mid -20 was not run; the mid stays -8.
+  * arf -24 (a shallower top ARF under the finer leaves) is the same trade: film B -0.4,
+    film A +1.4 -- with key -48 in place the top ARF still wants its -32.
+  * mini_gop 16 is worse on all four: one mid frame cannot carry 15 leaves (the pyramid
+    has exactly three levels), so the longer group does not amortise the top ARF.
