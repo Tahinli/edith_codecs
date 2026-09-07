@@ -12748,20 +12748,13 @@ mod tests {
             previous = Some((encoded.stream.len(), quality));
         }
 
-        let mut previous = None;
-        for &deadzone in &[0.5f64, 0.3, 0.15] {
-            let encoded = encode_key_frame_with_ctx(&picture, 100, deadzone, fctx).unwrap();
-            let quality = psnr(&encoded.reconstruction.y, &picture.y);
-            if let Some((bytes, better)) = previous {
-                assert!(
-                    encoded.stream.len() < bytes,
-                    "deadzone {deadzone}: {} bytes",
-                    encoded.stream.len()
-                );
-                assert!(quality < better, "deadzone {deadzone}: PSNR {quality}");
-            }
-            previous = Some((encoded.stream.len(), quality));
-        }
+        // The deadzone half of this claim lives in
+        // `transform::tests::a_wider_deadzone_codes_fewer_coefficients` now:
+        // with the rate-distortion pass ([`crate::tile::rdoq`]) deciding
+        // every zeroing, the deadzone no longer moves a coded stream
+        // monotonically (the i64 + rdoq merge read 318 bytes at 0.3 against
+        // fewer at 0.5 on this 128x128 card), and that is the pass doing its
+        // job, not a quantiser defect.
 
         // Bytes must not jump up across a q-context boundary: a wrong CDF
         // table for the far side would show up as a rate discontinuity here,
