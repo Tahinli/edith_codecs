@@ -21,6 +21,7 @@ use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::decode::{TXFM_CTX_INIT, txfm_partition_ctx_rect};
 use crate::msac::SymbolEncoder;
+use crate::transform::TxType;
 use crate::mvstack::{MiGrid, MiInfo, NO_REF1, find_mv_stack, mv16};
 
 // ---------------------------------------------------------------------------
@@ -1674,6 +1675,10 @@ pub struct Coeff {
 pub struct BlockCoeffs {
     /// The luma transform's coefficients.
     pub luma: Vec<Coeff>,
+    /// One transform type per luma transform unit, raster order (lane-txset).
+    /// Empty is `DCT_DCT` throughout -- what every block coded before the
+    /// search offered a type, and what an inter block still carries.
+    pub luma_tx_types: Vec<TxType>,
     /// The U plane's.
     pub u: Vec<Coeff>,
     /// The V plane's.
@@ -3994,6 +3999,7 @@ fn write_block(
             &grids[0],
             tx_mode,
             all_scans,
+            &block.luma_tx_types,
         )?;
         tx < side
     } else {
@@ -4008,6 +4014,7 @@ fn write_block(
         &neighbours.around(at, side),
         tx_mode,
         tx_select,
+        block_tx_type(block),
     );
     neighbours.record_planes(at, side, mode, grids, !split);
     clear_skip_band(neighbours, at_mi, side);
@@ -4092,6 +4099,7 @@ fn write_leaf8(
             &grids[0],
             tx_mode,
             all_scans,
+            &block.luma_tx_types,
         )?;
         tx < 8
     } else {
@@ -4106,6 +4114,7 @@ fn write_leaf8(
         &neighbours.around_mi(leaf_mi, 8),
         tx_mode,
         tx_select,
+        block_tx_type(block),
     );
     neighbours.record_mi_planes(leaf_mi, 8, grids, !split);
     clear_skip_band(neighbours, leaf_mi, 8);
@@ -4127,6 +4136,9 @@ fn write_block_planes(
     // A block whose luma was already written as several transform units
     // ([`write_luma_select`]) has only its chroma planes left here.
     skip_luma: bool,
+    // This block's single luma transform type (lane-txset); chroma's is
+    // derived from its mode by the decoder and codes no symbol.
+    luma_tx_type: TxType,
 ) {
     for (plane, (grid, scan)) in grids.iter().zip(scans.iter()).enumerate() {
         if plane == 0 && skip_luma {
@@ -4153,6 +4165,7 @@ fn write_block_planes(
             skip_ctx,
             dc_sign_ctx(around[plane].dc_vote),
             Some(plane),
+            if plane == 0 { luma_tx_type } else { TxType::DctDct },
         );
         #[cfg(test)]
         census_record(
@@ -4171,6 +4184,12 @@ fn write_block_planes(
             )
         });
     }
+}
+
+/// The single luma transform type a block carries, `DCT_DCT` for one that
+/// never searched one (lane-txset).
+fn block_tx_type(block: &BlockCoeffs) -> TxType {
+    block.luma_tx_types.first().copied().unwrap_or(TxType::DctDct)
 }
 
 /// The `(side / tx)^2` transform units of one block's luma residual, raster
@@ -4192,6 +4211,10 @@ fn write_luma_tus(
     // lane-av1tx2 r2: an INTER block's split units read the inter coefficient
     // tables, not the intra ones (`TxbSet::Luma*Inter`).
     inter: bool,
+    // One transform type per unit in this same raster order (lane-txset).
+    // Empty -- what every caller that never searched a type passes -- is
+    // `DCT_DCT` throughout, the one type this writer used to code.
+    tx_types: &[TxType],
 ) -> Result<()> {
     if tx < side && side > 32 && tx < 32 {
         // A 64x64 block's own levels reach the writer as the 32x32 corner a
@@ -4268,6 +4291,10 @@ fn write_luma_tus(
                 skip_ctx,
                 dc_sign_ctx(around.dc_vote),
                 Some(0),
+                tx_types
+                    .get(tu_row * n + tu_col)
+                    .copied()
+                    .unwrap_or(TxType::DctDct),
             );
             #[cfg(test)]
             census_record(
@@ -4308,6 +4335,7 @@ fn write_luma_select(
     grid: &[i32],
     mode: usize,
     scans: &[Vec<u16>; 4],
+    tx_types: &[TxType],
 ) -> Result<usize> {
     let max_tx = side.min(64);
     let ctx = neighbours.tx_size_ctx(at_mi, max_tx);
@@ -4324,7 +4352,7 @@ fn write_luma_select(
         }
     }
     let tx = max_tx >> depth;
-    write_luma_tus(enc, cdfs, neighbours, at_mi, side, tx, grid, mode, scans, false)?;
+    write_luma_tus(enc, cdfs, neighbours, at_mi, side, tx, grid, mode, scans, false, tx_types)?;
     neighbours.record_tx(at_mi, side, tx);
     Ok(tx)
 }
@@ -4700,6 +4728,19 @@ pub(crate) fn coeff_bits(
     grid: &[i32],
     set: TxbSet,
     q_ctx: usize,
+    skip_ctx: usize,
+    sign_ctx: usize,
+) -> f64 {
+    coeff_bits_typed(grid, set, q_ctx, skip_ctx, sign_ctx, TxType::DctDct)
+}
+
+/// [`coeff_bits`] for levels a named transform type produced: the `tx_type`
+/// symbol is part of what the block spends, so a search comparing types has
+/// to see each one's own symbol priced (lane-txset).
+pub(crate) fn coeff_bits_typed(
+    grid: &[i32],
+    set: TxbSet,
+    q_ctx: usize,
     // lane-av1skipctx: the two neighbour-derived contexts, mirrored from the
     // writer's own (`write_block_planes`/`write_luma_tus`) off the search's
     // coding-order-committed map ([`crate::encode::CoefCtxMap`]). `(0, 0)` is
@@ -4708,6 +4749,7 @@ pub(crate) fn coeff_bits(
     // largest remaining pricer error for every other block.
     skip_ctx: usize,
     sign_ctx: usize,
+    tx_type: TxType,
 ) -> f64 {
     // `Cdfs::new` builds every table a tile writer adapts -- tens of
     // kilobytes -- and this function is called once per priced candidate:
@@ -4743,7 +4785,7 @@ pub(crate) fn coeff_bits(
         }
         let scan = scan_of(coding.side);
         let mut enc = SymbolEncoder::pricer();
-        write_coeffs(&mut enc, &mut coding, grid, scan, skip_ctx, sign_ctx, None);
+        write_coeffs(&mut enc, &mut coding, grid, scan, skip_ctx, sign_ctx, None, tx_type);
         enc.bits()
     };
     // lane-av1speed2: 60% of the transform units of an inter stream hold no
@@ -4842,6 +4884,7 @@ pub(crate) fn rdoq(
     skip_ctx: usize,
     sign_ctx: usize,
     lambda: f64,
+    tx_type: TxType,
 ) -> f64 {
     // A 64-point transform carries its top-left 32x32 alone, and that corner
     // is what the writer and the pricer take (`coded_corner`).
@@ -4857,16 +4900,17 @@ pub(crate) fn rdoq(
         q_ctx: usize,
         skip_ctx: usize,
         sign_ctx: usize,
+        tx_type: TxType,
     ) -> f64 {
         if dense.is_empty() {
-            return coeff_bits(levels, set, q_ctx, skip_ctx, sign_ctx);
+            return coeff_bits_typed(levels, set, q_ctx, skip_ctx, sign_ctx, tx_type);
         }
         for row in 0..coded {
             dense[row * coded..][..coded].copy_from_slice(&levels[row * side..][..coded]);
         }
-        coeff_bits(dense, set, q_ctx, skip_ctx, sign_ctx)
+        coeff_bits_typed(dense, set, q_ctx, skip_ctx, sign_ctx, tx_type)
     }
-    let mut bits = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx);
+    let mut bits = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx, tx_type);
     // The DC has its own quantiser, so its squared error per unit of level is
     // `(dc_q / ac_q)^2` of an AC coefficient's.
     let dc = f64::from(crate::quant::dc_q(8, i32::from(base_q_idx)));
@@ -4905,7 +4949,7 @@ pub(crate) fn rdoq(
             let candidate = level - level.signum();
             levels[i] = candidate;
             budget -= 1;
-            let after = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx);
+            let after = price(levels, &mut dense, side, coded, set, q_ctx, skip_ctx, sign_ctx, tx_type);
             let distortion = weight
                 * ((s - f64::from(candidate)).powi(2) - (s - f64::from(level)).powi(2));
             if distortion + lambda * (after - bits) < 0.0 {
@@ -5177,6 +5221,10 @@ fn write_coeffs(
     skip_ctx: usize,
     sign_ctx: usize,
     plane: Option<usize>,
+    // Which transform type these levels were produced with (lane-txset).
+    // Only a luma set whose alphabet holds more than one type codes it;
+    // chroma never codes a `tx_type` symbol at all.
+    tx_type: TxType,
 ) {
     if let Some(plane) = plane {
         ec_rng_trace(|| format!("EC_PLANE plane={plane} tell_before={}", enc.tell()));
@@ -5212,8 +5260,18 @@ fn write_coeffs(
     // A luma transform whose type set holds more than one type codes which it
     // is, right after the all-zero flag (spec 5.11.39). The writer only ever
     // uses DCT_DCT, which is index one of `Tx_Type_Intra_Inv_Set2`.
-    if let Some(tx_type) = coding.tx_type.as_deref_mut() {
-        enc.symbol(TX_TYPE_DCT_DCT_SET2, tx_type);
+    if let Some(cdf) = coding.tx_type.as_deref_mut() {
+        // The symbol comes from the DECODER's own map, keyed by this set's
+        // alphabet width, so a type this set cannot express is caught here
+        // rather than desyncing the tile. The search only ever offers types
+        // the set holds ([`crate::encode::tx_type_candidates`]).
+        let symbol = crate::decode::tx_type_symbol(cdf.len(), tx_type);
+        debug_assert!(
+            symbol.is_some(),
+            "{tx_type:?} is not in the {}-symbol tx_type set",
+            cdf.len() - 1
+        );
+        enc.symbol(symbol.unwrap_or(TX_TYPE_DCT_DCT_SET2), cdf);
         if plane.is_some() {
             ec_rng_trace(|| format!("EC_TXTYPE tell={} rng={}", enc.tell(), enc.rng()));
         }
@@ -6242,6 +6300,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                             0,
                             &all_scans,
                             true,
+                            &block.luma_tx_types,
                         )?;
                     }
                     write_block_planes(
@@ -6253,6 +6312,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         &neighbours.around(sb_at, SB),
                         0,
                         split,
+                        block_tx_type(block),
                     );
                     neighbours.record_planes(sb_at, SB, 0, &grids, !split);
                 }
@@ -6690,6 +6750,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                             mode_for_tx,
                             &all_scans,
                             is_inter,
+                            &block.luma_tx_types,
                         )?;
                     }
                     write_block_planes(
@@ -6705,6 +6766,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         &neighbours.around(at, BLOCK),
                         mode_for_tx,
                         split,
+                        block_tx_type(block),
                     );
                     neighbours.record_planes(at, BLOCK, mode_for_tx, &grids, !split);
                 }
@@ -6929,6 +6991,7 @@ fn write_inter_frame_leaf(
         if split {
             write_luma_tus(
                 enc, cdfs, neighbours, at_mi, SUB, tx, &grids[0], mode_for_tx, all_scans, is_inter,
+                &block.luma_tx_types,
             )?;
         }
         write_block_planes(
@@ -6944,6 +7007,7 @@ fn write_inter_frame_leaf(
             &neighbours.around(at, SUB),
             mode_for_tx,
             split,
+            block_tx_type(block),
         );
         neighbours.record_planes(at, SUB, mode_for_tx, &grids, !split);
     }
@@ -7184,6 +7248,7 @@ fn write_inter_frame_leaf8(
         if split {
             write_luma_tus(
                 enc, cdfs, neighbours, leaf_mi, 8, tx, &grids[0], mode_for_tx, all_scans, is_inter,
+                &block.luma_tx_types,
             )?;
         }
         write_block_planes(
@@ -7195,6 +7260,7 @@ fn write_inter_frame_leaf8(
             &neighbours.around_mi(leaf_mi, 8),
             mode_for_tx,
             split,
+            block_tx_type(block),
         );
         neighbours.record_mi_planes(leaf_mi, 8, &grids, !split);
         neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter, block_ref(block));
@@ -7939,6 +8005,7 @@ mod tests {
                 0,
                 0,
                 None,
+                TxType::DctDct,
             );
             priced += luma_32_coeff_bits(grid);
         }
@@ -8887,7 +8954,7 @@ mod tests {
                 .sum();
             d + lambda * coeff_bits(grid, set, crate::decode::q_ctx_of(q), 0, 0)
         };
-        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda);
+        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda, TxType::DctDct);
         assert_eq!(bits, coeff_bits(&levels, set, crate::decode::q_ctx_of(q), 0, 0));
         assert!(cost(&levels) <= cost(&before), "{:?} vs {:?}", cost(&levels), cost(&before));
         // The tail is what it is for: the last coded position moves earlier.
@@ -8908,7 +8975,7 @@ mod tests {
                 if v < 0.0 { -l } else { l }
             })
             .collect();
-        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda);
+        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda, TxType::DctDct);
         let corner: Vec<i32> = (0..32)
             .flat_map(|row| levels[row * side..][..32].to_vec())
             .collect();
