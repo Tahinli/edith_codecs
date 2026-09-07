@@ -436,6 +436,45 @@ fn b64_root() -> bool {
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::B64_ROOT))
 }
 
+/// The KEY frame's own 64x64 root (lane-i64): the whole superblock searched
+/// as ONE intra block -- every mode the 32x32 search offers, one TX_64X64
+/// luma transform (`TxbSet::Luma64`, whose coded quarter is the 32x32 corner)
+/// and one TX_32X32 per chroma plane -- and compared against the four 32x32
+/// quadrants at the same lambda, exactly the shape the inter root
+/// ([`B64_ROOT`]) takes on an inter frame. The writer has always been able to
+/// code one (`crate::tile::sb_coeff_key_frame_tile`'s `Superblock::Whole`);
+/// nothing produced one, so the key frame -- 21.6% of a real film stream --
+/// coded every superblock split while libaom and rav1e leave 45-54% of theirs
+/// whole.
+///
+/// No CfL (spec `is_cfl_allowed` stops at 32x32, and `search_chroma` gates on
+/// it), no filter intra (`filter_intra_size_class` has no 64 row) and no
+/// transform-depth split (the writer's `Superblock::Whole` arm takes a 32x32
+/// level grid, so only depth 0 is representable) -- the root is refused
+/// outright on an `allow_intrabc` frame, whose quadrant searches carry DV
+/// state a discarded trial would desync.
+///
+/// Switched off by `EC_AV1_I64=0` in any build.
+pub(crate) const I64_ROOT: bool = true;
+
+/// How many key-frame superblocks were coded as one 64x64 intra block since
+/// the last [`take_i64_root_hits`], so a gate reports the fire rate rather
+/// than assuming it (class `gate-blind-to-feature`).
+static I64_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The key-frame 64x64-intra-root count since the last call, and zero it.
+pub fn take_i64_root_hits() -> usize {
+    I64_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// [`I64_ROOT`], or what `EC_AV1_I64` names.
+fn i64_root() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_I64").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::I64_ROOT))
+}
+
 /// Whether the 64x64 root also prices a NON-skip candidate (lane-tx64): the
 /// winner's prediction through one TX_64X64 luma transform and two TX_32X32
 /// chroma ones. Off by `EC_AV1_B64RES=0`, which restores the skip-only root
@@ -909,16 +948,18 @@ fn intra_predict_u8(
 ) {
     // Three heap allocations per call became three stack buffers: this runs
     // once per mode per trial, and an edge is at most `bw + bh` samples while
-    // a block is at most `BLOCK * BLOCK`. Same samples either way.
-    let mut above_buf = [0u16; 2 * BLOCK];
-    let mut left_buf = [0u16; 2 * BLOCK];
+    // a block is at most `SUPERBLOCK * SUPERBLOCK` (lane-i64: the key frame's
+    // 64x64 intra root predicts through here too, and reads up to `2 * bw`
+    // samples above).
+    let mut above_buf = [0u16; 2 * SUPERBLOCK];
+    let mut left_buf = [0u16; 2 * SUPERBLOCK];
     // lane-av1speed2: a `BLOCK * BLOCK` scratch is 2 KB zeroed on every mode
     // trial of every block, and a 4x4 block writes 32 bytes of it. The
     // predictor fills every sample it is handed, so the zeros are dead
     // either way -- size the scratch to the block instead of to the largest
     // block there is.
 
-    let widen = |src: &[u8], buf: &mut [u16; 2 * BLOCK]| {
+    let widen = |src: &[u8], buf: &mut [u16; 2 * SUPERBLOCK]| {
         for (d, &v) in buf[..src.len()].iter_mut().zip(src) {
             *d = u16::from(v);
         }
@@ -953,8 +994,10 @@ fn intra_predict_u8(
         run(&mut [0u16; 64][..n]);
     } else if n <= 256 {
         run(&mut [0u16; 256][..n]);
-    } else {
+    } else if n <= BLOCK * BLOCK {
         run(&mut [0u16; BLOCK * BLOCK][..n]);
+    } else {
+        run(&mut [0u16; SUPERBLOCK * SUPERBLOCK][..n]);
     }
 }
 
@@ -1810,8 +1853,8 @@ impl Plane<'_> {
         y: usize,
         side: usize,
         reach: Reach,
-        above_buf: &'a mut [u8; 2 * BLOCK],
-        left_buf: &'a mut [u8; 2 * BLOCK],
+        above_buf: &'a mut [u8; 2 * SUPERBLOCK],
+        left_buf: &'a mut [u8; 2 * SUPERBLOCK],
     ) -> (Option<&'a [u8]>, Option<&'a [u8]>, Option<u8>) {
         // Even a block's *own* edge is clamped to the true frame bound, not
         // just a `reach` extension: libaom's `av1_predict_intra_block`
@@ -1970,7 +2013,7 @@ impl Plane<'_> {
         let At {
             x, y, side, reach, ..
         } = at;
-        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+        let (mut above_buf, mut left_buf) = ([0u8; 2 * SUPERBLOCK], [0u8; 2 * SUPERBLOCK]);
         let (above, left, corner) =
             self.edges_into(x, y, side, reach, &mut above_buf, &mut left_buf);
         // Per-candidate scratch on the search's hottest path, so both buffers
@@ -2228,7 +2271,7 @@ impl Plane<'_> {
                 };
                 let trial = match filter_intra {
                     Some(fi) => {
-                        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+                        let (mut above_buf, mut left_buf) = ([0u8; 2 * SUPERBLOCK], [0u8; 2 * SUPERBLOCK]);
                         let (above, left, corner) =
                             self.edges_into(tu.x, tu.y, tx, tu.reach, &mut above_buf, &mut left_buf);
                         let mut prediction = vec![0u8; tx * tx];
@@ -2444,7 +2487,7 @@ impl Plane<'_> {
         let At {
             x, y, side, reach, ..
         } = at;
-        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+        let (mut above_buf, mut left_buf) = ([0u8; 2 * SUPERBLOCK], [0u8; 2 * SUPERBLOCK]);
         let (above, left, corner) =
             self.edges_into(x, y, side, reach, &mut above_buf, &mut left_buf);
         modes
@@ -2488,7 +2531,7 @@ impl Plane<'_> {
         let At {
             x, y, side, reach, ..
         } = at;
-        let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+        let (mut above_buf, mut left_buf) = ([0u8; 2 * SUPERBLOCK], [0u8; 2 * SUPERBLOCK]);
         let (above, left, corner) =
             self.edges_into(x, y, side, reach, &mut above_buf, &mut left_buf);
         // Nothing ranks by the SAD pre-pass unless `top_k` prunes by it (or
@@ -2629,7 +2672,9 @@ impl Plane<'_> {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.commit(x, y, side, &trial);
-        (coeffs(&trial.levels, side), mode, angle_delta, cost)
+        // A 64-point transform codes only its top-left 32x32 corner, which is
+        // the grid `code_from_prediction` hands back (lane-i64).
+        (coeffs(&trial.levels, side.min(BLOCK)), mode, angle_delta, cost)
     }
 }
 
@@ -4193,7 +4238,15 @@ fn code_square(
     // header did not set `allow_intrabc`.
     ibc: Option<&mut Ibc>, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
-    let (luma_set, chroma_set) = if side == BLOCK {
+    let (luma_set, chroma_set) = if side == SUPERBLOCK {
+        // A whole superblock coded as ONE intra block (lane-i64): one
+        // TX_64X64 luma transform, whose coded quarter is the 32x32 corner
+        // `code_from_prediction` hands back, and one TX_32X32 per chroma
+        // plane -- the same three sets the key frame writer's
+        // `Superblock::Whole` arm codes, and the same the inter 64x64 root
+        // uses (`search_skip_64`).
+        (TxbSet::Luma64, TxbSet::Chroma32)
+    } else if side == BLOCK {
         (TxbSet::Luma32, TxbSet::Chroma16)
     } else if side == 8 {
         // An 8x8 leaf under a straddling 16x16 (lane-av1-rect). r5 correction:
@@ -4220,6 +4273,14 @@ fn code_square(
     // libaom's own ordering, and the reason it costs one extra pass per depth
     // rather than one per (mode, depth) pair.
     let mut tx_depth = 0u8;
+    // A 64x64 block has no depth to search (`max_tx_depth`), but the writer
+    // still codes its `tx_depth` symbol off `TX_SIZE_CAT3`, so the incumbent
+    // pays that zero exactly as a 32x32's depth search makes it pay
+    // `tx_depth_bits(32, 0)` -- otherwise the 64-versus-four-32 comparison
+    // below hands the root a symbol for free.
+    if tx_select && side == SUPERBLOCK {
+        cost += search.lambda * tx_depth_bits(side, 0);
+    }
     if tx_select && max_tx_depth(side) > 0 {
         let mut best = (
             cost + search.lambda * tx_depth_bits(side, 0),
@@ -4283,7 +4344,7 @@ fn code_square(
                 mode = DC_PRED as u8;
                 angle_delta = 0;
                 tx_depth = 0;
-                luma_coeffs = coeffs(&trial.levels, side);
+                luma_coeffs = coeffs(&trial.levels, side.min(BLOCK));
                 luma.commit(x, y, side, &trial);
                 palette = Some(pal);
             }
@@ -4608,7 +4669,17 @@ fn search_chroma(
         if (V_PRED..=D67_PRED).contains(&mode) {
             bits += symbol_bits(&cdf::ANGLE_DELTA[usize::from(mode - V_PRED)], 3);
         }
-        let tx_type = crate::decode::default_intra_tx_type(mode);
+        // lane-i64: `av1_get_ext_tx_set_type` resolves a CHROMA plane at
+        // `tx_size_sqr >= TX_32X32` to `EXT_TX_SET_DCTONLY`, so the 32x32
+        // chroma of a 64x64 block is `DCT_DCT` whatever
+        // `Intra_Mode_To_Tx_Type` says -- the decoder's own `side >= 32` arm
+        // (decode.rs `read_chroma_plane`), and ADST is not even defined at 32
+        // points.
+        let tx_type = if at.side >= 32 {
+            TxType::DctDct
+        } else {
+            crate::decode::default_intra_tx_type(mode)
+        };
         let u = chroma[0].trial_typed(at, mode, 0, search.base_q_idx, search.deadzone, tx_type, fctx);
         let v = chroma[1].trial_typed(at, mode, 0, search.base_q_idx, search.deadzone, tx_type, fctx);
         let cost = u.sse + v.sse + search.lambda * (bits + u.bits + v.bits);
@@ -4704,7 +4775,7 @@ fn search_chroma(
             i32::from(luma.reconstruction[ly * luma.width + lx])
         });
         let dc_prediction = |plane: &Plane| -> Vec<u8> {
-            let (mut above_buf, mut left_buf) = ([0u8; 2 * BLOCK], [0u8; 2 * BLOCK]);
+            let (mut above_buf, mut left_buf) = ([0u8; 2 * SUPERBLOCK], [0u8; 2 * SUPERBLOCK]);
             let (above, left, corner) =
                 plane.edges_into(at.x, at.y, at.side, at.reach, &mut above_buf, &mut left_buf);
             let mut prediction = vec![0u8; at.side * at.side];
@@ -6535,7 +6606,58 @@ pub(crate) fn encode_key_frame_inner(
             // walks them, which for a 64x64 split into 32x32 blocks is raster
             // order among the quadrants that are inside the frame.
             let mut blocks = Vec::with_capacity(4);
-            for quadrant in 0..4 {
+            // lane-i64: the whole superblock as ONE 64x64 intra block, tried
+            // BEFORE its quadrants (so both start from the same
+            // reconstruction) and compared against the four of them below --
+            // the shape the inter frame's own 64 root takes
+            // (`search_skip_64`). Only a superblock wholly inside the true
+            // frame is offered it: the writer's `Superblock::Whole` arm
+            // refuses one the edge cuts through, and a frame that allows
+            // intrabc is refused outright ([`I64_ROOT`]) because the quadrant
+            // searches below carry DV state a discarded trial would desync.
+            let (x64, y64) = (sb_col * SUPERBLOCK, sb_row * SUPERBLOCK);
+            let sb64_legal = i64_root()
+                && ibc.is_none()
+                && sb_row * 2 + 1 < rows
+                && sb_col * 2 + 1 < cols
+                && x64 + SUPERBLOCK <= luma.true_width
+                && y64 + SUPERBLOCK <= luma.true_height;
+            let mut sb64: Option<(f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> = None;
+            if sb64_legal {
+                let base = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
+                let (c64, r64) = (sb_col * 4, sb_row * 4);
+                let (block, cost) = code_square(
+                    &mut luma,
+                    &mut chroma,
+                    (x64, y64),
+                    SUPERBLOCK,
+                    &search,
+                    &mode_bits(above_mode[c64], left_mode[r64]),
+                    tx_select,
+                    None,
+                    fctx,
+                );
+                let cost = cost + search.lambda * crate::tile::partition_bits(SUPERBLOCK, false);
+                let after = snapshot(&luma, &chroma, (x64, y64), SUPERBLOCK);
+                restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &base);
+                sb64 = Some((cost, block, after));
+            }
+            // A superblock whose 64x64 trial already codes almost nothing per
+            // pixel is taken outright and its quadrants are never searched --
+            // `split_rd_breakout` one size up, at the threshold the inter
+            // root clamps to ([`b64_breakout_threshold`]), where this lever
+            // BUYS wall instead of spending it.
+            let early64 = sb64.as_ref().is_some_and(|(c, _, _)| {
+                split_rd_breakout_at(b64_breakout_threshold(), *c, SUPERBLOCK, search.lambda)
+            });
+            // What the four quadrants cost together, including the split
+            // partition symbol at the superblock level, so the two arms are
+            // one comparable number.
+            let mut sb_cost = match sb64 {
+                Some(_) => search.lambda * crate::tile::partition_bits(SUPERBLOCK, true),
+                None => 0.0,
+            };
+            for quadrant in 0..if early64 { 0 } else { 4 } {
                 let (col, row) = (sb_col * 2 + quadrant % 2, sb_row * 2 + quadrant / 2);
                 if col >= cols || row >= rows {
                     continue;
@@ -6686,9 +6808,11 @@ pub(crate) fn encode_key_frame_inner(
                 // the read path (`decode_leaf8`), so leaf8 can now win on
                 // cost anywhere, same as any other split.
                 if !whole_legal || (split_blocks && cost_split < cost_whole) {
+                    sb_cost += cost_split;
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
+                    sb_cost += cost_whole;
                     restore(&mut luma, &mut chroma, (x, y), BLOCK, &after_whole);
                     for cell in 0..2 {
                         above_mode[c0 + cell] = whole.mode;
@@ -6698,7 +6822,20 @@ pub(crate) fn encode_key_frame_inner(
                     blocks.push(Quadrant::Whole(whole));
                 }
             }
-            coded.push((sb_row * sb_cols + sb_col, Superblock::Split(blocks), modes));
+            let index = sb_row * sb_cols + sb_col;
+            match sb64 {
+                Some((cost64, block, after)) if early64 || cost64 < sb_cost => {
+                    restore(&mut luma, &mut chroma, (x64, y64), SUPERBLOCK, &after);
+                    for cell in 0..4 {
+                        above_mode[sb_col * 4 + cell] = block.mode;
+                        left_mode[sb_row * 4 + cell] = block.mode;
+                    }
+                    I64_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mode = block.mode;
+                    coded.push((index, Superblock::Whole(block), vec![mode]));
+                }
+                _ => coded.push((index, Superblock::Split(blocks), modes)),
+            }
         }
     }
         let (x0, y0) = (rect.mi_col0 as usize * 4, rect.mi_row0 as usize * 4);
@@ -10920,6 +11057,56 @@ mod tests {
             return f64::INFINITY;
         }
         10.0 * (255.0 * 255.0 * a.len() as f64 / squared).log10()
+    }
+
+    /// lane-i64's witness: a smooth gradient is exactly the picture a whole
+    /// 64x64 intra block predicts as well as four 32x32 ones, so the key
+    /// frame's new root fires on most superblocks -- and what BOTH decoders
+    /// produce is the encoder's own reconstruction, sample for sample.
+    ///
+    /// The fire count is the `gate-blind-to-feature` guard: without it every
+    /// assert below passes on a stream that codes no whole superblock at all.
+    #[test]
+    fn a_smooth_gradient_key_frame_codes_whole_superblocks_and_decodes_exactly() {
+        let _knobs = crate::speed::knob_read();
+        let fctx = &crate::decode::FrameCtx::new();
+        // 4 x 3 superblocks, all of them wholly inside the frame.
+        let (width, height) = (256usize, 192usize);
+        let mut picture = Picture::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                picture.y[y * width + x] = (16 + (x + y) * 200 / (width + height)) as u16;
+            }
+        }
+        for y in 0..height / 2 {
+            for x in 0..width / 2 {
+                picture.u[y * width / 2 + x] = (110 + x * 20 / (width / 2)) as u16;
+                picture.v[y * width / 2 + x] = (130 - y * 20 / (height / 2)) as u16;
+            }
+        }
+        let _ = take_i64_root_hits();
+        let encoded = encode_key_frame_with_ctx(&picture, 120, 0.5, fctx).unwrap();
+        let roots = take_i64_root_hits();
+        assert!(
+            roots >= 8,
+            "a smooth-gradient key frame coded only {roots} whole 64x64 intra roots of 12"
+        );
+        eprintln!("whole 64x64 intra roots on a smooth gradient: {roots} of 12");
+
+        let ours = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(ours.len(), 1, "our decoder's frames");
+        assert_eq!(ours[0].y, encoded.reconstruction.y, "our decoder: luma");
+        assert_eq!(ours[0].u, encoded.reconstruction.u, "our decoder: U");
+        assert_eq!(ours[0].v, encoded.reconstruction.v, "our decoder: V");
+
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let decoded = ffmpeg_decode(&encoded.stream, width, height);
+        assert_eq!(decoded.y, encoded.reconstruction.y, "ffmpeg: luma");
+        assert_eq!(decoded.u, encoded.reconstruction.u, "ffmpeg: U");
+        assert_eq!(decoded.v, encoded.reconstruction.v, "ffmpeg: V");
     }
 
     /// The claim the whole encoder rests on: what a decoder produces is what
