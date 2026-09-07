@@ -684,6 +684,26 @@ impl Default for Pyramid {
     /// columns better than `16:-24:16` ever was, film B vs rav1e 3.0 short),
     /// while 47 inter pictures still take 8 x 5 + 7 -- the long-GOP table
     /// above is coded byte for byte as it was measured.
+    /// THE THIRD LEVEL (lane-pyr5, `lanes/pyr5.sweep.txt`), swept on the
+    /// long-GOP gate against a control arm on this very head:
+    ///
+    /// | mini_gop:arf:leaf:mid | film A vs libaom / rav1e | film B vs libaom / rav1e |
+    /// |---|---|---|
+    /// | 8:-32:16 (control, 2-level) | +55.2 / +12.8 | +151.3 / +47.4 |
+    /// | 8:-32:16:-4 | +51.8 / +11.4 | +146.2 / +45.4 |
+    /// | **8:-32:16:-8** | **+52.1 / +11.7** | **+145.3 / +45.0** |
+    /// | 8:-32:16:-16 | +53.4 / +13.0 | +146.0 / +46.1 |
+    /// | 8:-32:20:-8 | +52.4 / +11.5 | +148.0 / +46.1 |
+    /// | 16:-32:16:-8 | +55.0 / +12.3 | +146.0 / +44.3 |
+    /// | 16:-32:16:-16 | +54.6 / +12.1 | +148.7 / +46.0 |
+    /// | 4:-32:16:-8 | +61.7 / +20.4 | +147.5 / +51.3 |
+    ///
+    /// `-4` and `-8` are within a point of each other and split the two
+    /// films; `-8` ships because film B is the wider gap. A mini-GOP of 4
+    /// with a mid level -- rav1e's own shape at speed 6 -- is far worse here,
+    /// so the third level is worth more than a shorter group, and the census
+    /// (`lanes/census-longgop.md`) says why: at 8 pictures our leaves are
+    /// already cheap and the bytes sit in the ARFs.
     fn default() -> Self {
         Self {
             mini_gop: 8,
@@ -726,8 +746,11 @@ const LEAF_SLOT: u8 = 0;
 /// chain (0) and of `GOLDEN_SLOT` (1), so all four levels are live at once.
 const MID_SLOT: u8 = 2;
 
-/// [`Pyramid::default`]'s third level (`None` = the two-level pyramid).
-const MID_DEFAULT: Option<i16> = None;
+/// [`Pyramid::default`]'s third level (`None` = the two-level pyramid), the
+/// long-GOP sweep's winner (`lanes/pyr5.sweep.txt`): every one of the four
+/// long-GOP columns improves against the two-level shape, film B (the wider
+/// gap) by 6.0 / 2.4 BD points.
+const MID_DEFAULT: Option<i16> = Some(-8);
 
 /// The AV1 software encoder: [`EncoderConfig`] in, one [`Packet`] out per
 /// [`Av1Encoder::encode`] call — or, with a [`Pyramid`] configured, a
