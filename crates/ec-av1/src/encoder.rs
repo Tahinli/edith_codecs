@@ -159,14 +159,27 @@ fn quality_to_q_idx(quality: u8) -> u8 {
     (240.0 - quality * 2.0).round() as u8
 }
 
-/// How much of a mini-GOP's byte budget the hidden `ALTREF` frame is worth
-/// relative to one leaf: every leaf of the group predicts off it, so it is
-/// bought at roughly twice a leaf's size (libaom's `gf_group` spends its
-/// `ARF` the same way, through a lower quantizer rather than a byte target).
-const ARF_WEIGHT: f64 = 2.0;
+/// What one coded frame is worth, relative to a leaf, as a function of how
+/// much FINER than the leaf it is coded (`leaf_q_offset - own offset`, in
+/// `q_idx` steps): `exp(WEIGHT_LEVEL_GAIN * delta)`.
+///
+/// This is the level model the byte budget is split by, and it is MEASURED,
+/// not the old flat "a hidden frame is worth two leaves" guess: the long-GOP
+/// census (`lanes/rc.report.md`, films A and B at three quantizers each,
+/// `lanes/census-longgop-v2.md`'s q150 row among them) reads a level's
+/// bytes/frame as very close to log-linear in its own q offset, at
+/// d(ln bytes)/d(q_idx) = -0.0557 -- three and a half times the SLOPE of the
+/// controller's own `RateLoop::GAIN` (0.0154), because a deeper level is not
+/// just quantized finer, it also carries the group's residual for every
+/// frame that predicts off it.
+const WEIGHT_LEVEL_GAIN: f64 = 0.0557;
 
-/// How much a key frame is worth relative to one leaf, same units.
-const KEY_WEIGHT: f64 = 3.0;
+/// The key frame's own correction on top of `WEIGHT_LEVEL_GAIN`: an intra
+/// frame at the key's offset codes this much of what the level model alone
+/// predicts (the census's key frames are consistently smaller than the pure
+/// exponential, since the exponential is fitted on INTER levels whose size
+/// keeps growing with reference depth).
+const KEY_WEIGHT: f64 = 1.08;
 
 /// The closed-loop controller behind [`RateTarget::BytesPerFrame`] and
 /// [`RateTarget::Bitrate`]: a proportional step on `base_q_idx`, sized from
@@ -196,6 +209,20 @@ struct RateLoop {
     /// FIRST update of a slot is the seeding one and takes the model's whole
     /// step ([`RateLoop::update`]); every later one is clamped.
     seeded: [bool; 3],
+    /// The leaf's own q offset: the zero of the level weight
+    /// ([`WEIGHT_LEVEL_GAIN`]), so slot 1's target can be read in
+    /// LEAF-EQUIVALENT bytes and scaled per frame by that frame's offset.
+    leaf_q_offset: i16,
+    /// The key frame's own leaf-equivalent weight ([`KEY_WEIGHT`]).
+    key_weight: f64,
+    /// The leaf-equivalent weight of a whole run (key included), and the
+    /// run's whole byte budget (`gop` frame targets): what a run RE-PLANS
+    /// from, and what a key frame resets the re-plan to.
+    run_weight: f64,
+    run_bytes: f64,
+    /// What is left of both, ahead of the next frame.
+    left_weight: f64,
+    left_bytes: f64,
 }
 
 impl RateLoop {
@@ -215,46 +242,60 @@ impl RateLoop {
                 q: [start_q; 3],
                 per_level: false,
                 seeded: [false; 3],
+                leaf_q_offset: 0,
+                key_weight: 1.0,
+                run_weight: 0.0,
+                run_bytes: 0.0,
+                left_weight: 0.0,
+                left_bytes: 0.0,
             };
         };
-        let m = p.mini_gop as f64;
-        // THE KEY FRAME'S SHARE, in frame targets. `KEY_WEIGHT` prices it at
-        // the quantizer the loop steers it to, and
-        // [`Pyramid::key_q_offset`] then codes it that much FINER, which the
-        // key's own slot cannot steer back: a run holds exactly one key
-        // frame, so the slot never gets a second frame to correct on. The
-        // calibration slope (`GAIN`) says what the offset costs in bytes, and
-        // the rest of the run pays for it -- without this the deeper key ran
-        // the 48-frame bitrate gate +10.8% over target.
-        let key = KEY_WEIGHT * (-f64::from(p.key_q_offset) / Self::GAIN).exp();
-        // What is left for the `gop - 1` non-key pictures, per picture: a run
-        // of `gop` pictures is worth `gop` frame targets in total.
-        let rest = match gop > 1 {
-            true => (target_bytes * (gop as f64 - key) / (gop as f64 - 1.0)).max(0.0),
-            false => target_bytes,
+        // THE LEVEL MODEL. Every coded frame of the run is priced by its own
+        // q offset through `WEIGHT_LEVEL_GAIN`, in units of one leaf, and the
+        // run's `gop` frame targets are shared out in those units. The old
+        // model priced a group as "one hidden frame worth `ARF_WEIGHT` = 2
+        // leaves plus `m - 1` leaves", which was wrong twice over and the two
+        // errors cancelled (lane-pyr6): the group has coded TWO hidden frames
+        // since the mid level landed (four with
+        // [`Pyramid::quarter_q_offset`]), and a hidden frame is worth far
+        // more than two leaves -- the census reads the top ARF at 24x a leaf
+        // and the mid at 5x. Both are fixed here, in one diff.
+        let w = |offset: i16| {
+            ((f64::from(p.leaf_q_offset) - f64::from(offset)) * WEIGHT_LEVEL_GAIN).exp()
         };
-        // A group of `m` pictures gets `m * rest`, split one `ARF_WEIGHT`
-        // share to the hidden frame and one each to the `m - 1` leaves, so
-        // the group's own average is `rest` exactly.
-        //
-        // ONE hidden frame, deliberately, even though the group has coded two
-        // since the mid level landed (and four with
-        // [`Pyramid::quarter_q_offset`] on). Pricing the real count
-        // (`m / (m - h + h * ARF_WEIGHT)`, h = 2) is the truthful model and
-        // it lands the 48-frame bitrate gate -9.4% / -14.9% under target
-        // against this line's -1.8% / -6.3%: the h = 1 split over-allocates
-        // the group by exactly the amount `ARF_WEIGHT` under-prices a hidden
-        // frame, and the two errors cancel. Fixing the split alone therefore
-        // makes the loop WORSE; `ARF_WEIGHT` has to be recalibrated in the
-        // same diff, which is a rate-control lane, not a pyramid-shape one
-        // (lane-pyr6, `lanes/pyr6.sweep.txt`).
-        let share = rest * m / (m - 1.0 + ARF_WEIGHT);
+        let (hidden, leaves) = gop_shape(p, gop);
+        let key = KEY_WEIGHT * w(p.key_q_offset);
+        let total: f64 = key
+            + leaves as f64
+            + hidden.iter().map(|&(o, n)| n as f64 * w(o)).sum::<f64>();
+        // One leaf's byte target: the run is worth `gop` frame targets and
+        // `total` leaves.
+        let scale = target_bytes * gop.max(1) as f64 / total.max(f64::EPSILON);
+        // THE HIDDEN SLOT holds every hidden level at once (`Level::Arf` is
+        // the top ARF, the mid and the quarters alike -- one controller,
+        // different q offsets), so its target is kept in LEAF-EQUIVALENT
+        // bytes and [`RateLoop::update`] scales it by the coded frame's own
+        // `w(offset)`. Measuring each hidden frame against its OWN predicted
+        // size is what keeps the shared slot from oscillating between the
+        // levels it mixes.
         Self {
-            target: [target_bytes * key, share * ARF_WEIGHT, share],
+            target: [scale * key, scale, scale],
             q: [start_q; 3],
             per_level: true,
             seeded: [false; 3],
+            leaf_q_offset: p.leaf_q_offset,
+            key_weight: key,
+            run_weight: total,
+            run_bytes: target_bytes * gop.max(1) as f64,
+            left_weight: total,
+            left_bytes: target_bytes * gop.max(1) as f64,
         }
+    }
+
+    /// What a frame coded `offset` steps off `base_q_idx` is worth in
+    /// leaf-equivalent bytes ([`WEIGHT_LEVEL_GAIN`]).
+    fn weight(&self, offset: i16) -> f64 {
+        ((f64::from(self.leaf_q_offset) - f64::from(offset)) * WEIGHT_LEVEL_GAIN).exp()
     }
 
     /// Which controller a level uses: one shared slot on the flat path, three
@@ -278,12 +319,23 @@ impl RateLoop {
 
     /// Steers this level's `q` toward its own target from the frame's actual
     /// coded size.
-    fn update(&mut self, level: Level, actual_bytes: usize) {
+    fn update(&mut self, level: Level, offset: i16, actual_bytes: usize) {
         let slot = self.slot(level);
         if self.target[slot] <= 0.0 || actual_bytes == 0 {
             return;
         }
-        let ratio = actual_bytes as f64 / self.target[slot];
+        // A hidden frame is measured against ITS OWN level's predicted size:
+        // slot 1's target is in leaf-equivalent bytes.
+        let frame_weight = match slot {
+            0 => self.key_weight,
+            1 => self.weight(offset),
+            _ => 1.0,
+        };
+        let target = match self.per_level && slot == 1 {
+            true => self.target[slot] * frame_weight,
+            false => self.target[slot],
+        };
+        let ratio = actual_bytes as f64 / target;
         // `STEP_CLAMP` protects an operating point this slot has not found
         // yet: its `q` is still the caller's `base_q_idx` guess, and the
         // clamp makes the loop WALK to the right quantizer at twelve steps a
@@ -302,6 +354,43 @@ impl RateLoop {
             raw
         };
         self.q[slot] = (self.q[slot] + step).clamp(0.0, 255.0);
+        self.replan(level, frame_weight, actual_bytes as f64);
+    }
+
+    /// Re-plans the REST OF THE RUN from what it has actually spent: the
+    /// level model says how the budget SPLITS, and nothing but a measurement
+    /// says what a frame of this content costs at all.
+    ///
+    /// Two frames of a run cannot be steered by the loop and both are pure
+    /// model error without this: the KEY, coded once at the caller's seed `q`
+    /// before anything has been measured (the census's key frames run 0.5x to
+    /// 2.7x the model across the two films), and any level whose `q` has hit
+    /// the floor -- at 3 Mbit/s on the gate's clip the hidden slot codes at
+    /// `q_idx` 1 and physically cannot spend its share, which the leaves must
+    /// then absorb or the stream lands a third under target.
+    ///
+    /// It is NOT an accumulated error term in `q` ([[vorbis-rate-loop-windup]]
+    /// is about exactly that): `q` still moves only by this frame's own
+    /// clamped proportional step, the re-plan only moves the TARGET the next
+    /// frame is measured against, and every key frame resets the whole plan,
+    /// so no debt outlives one run.
+    fn replan(&mut self, level: Level, frame_weight: f64, actual_bytes: f64) {
+        if !self.per_level {
+            return;
+        }
+        if level == Level::Key {
+            self.left_weight = self.run_weight;
+            self.left_bytes = self.run_bytes;
+        }
+        self.left_weight -= frame_weight;
+        self.left_bytes -= actual_bytes;
+        // The tail of a run is not re-planned: under a leaf's worth of weight
+        // left, the division is noise.
+        if self.left_weight <= 1.0 {
+            return;
+        }
+        let scale = (self.left_bytes / self.left_weight).max(0.0);
+        self.target = [scale * self.key_weight, scale, scale];
     }
 }
 
@@ -458,6 +547,47 @@ fn group_target(remaining: usize, mini_gop: usize, absorb_tail: bool) -> usize {
         true => remaining.max(1),
         false => mini_gop,
     }
+}
+
+/// How one GOP of `gop` pictures is actually coded, as [`Av1Encoder::encode_frames`]
+/// and [`Av1Encoder::drain_pending`] lay it out: the HIDDEN frames as
+/// `(q offset, count)` (the group's top `ALTREF`, the mid level and the two
+/// quarter-point ARFs, each at its own offset) and the number of shown
+/// leaves. The key frame is the remaining picture and is not listed.
+///
+/// This is what [`RateLoop::new`] prices the run by, so the two must agree on
+/// the gating rules -- a mid level needs three leaves and a run longer than
+/// 1.5 mini-GOPs, quarters need seven leaves and a mid -- which
+/// `the_rate_loop_prices_the_frames_the_pyramid_codes` pins against the real
+/// packet stream.
+fn gop_shape(p: Pyramid, gop: usize) -> (Vec<(i16, usize)>, usize) {
+    let (mut hidden, mut leaves) = (Vec::<(i16, usize)>::new(), 0usize);
+    let mut add = |offset: i16, n: usize| match hidden.iter_mut().find(|(o, _)| *o == offset) {
+        Some((_, c)) => *c += n,
+        None => hidden.push((offset, n)),
+    };
+    let long_run = gop > p.mini_gop + p.mini_gop / 2;
+    let mut left = gop.saturating_sub(1);
+    while left > 0 {
+        let g = group_target(left, p.mini_gop, absorb_tail()).min(left);
+        left -= g;
+        if g == 1 {
+            leaves += 1;
+            continue;
+        }
+        let inner = g - 1;
+        add(p.arf_q_offset, 1);
+        let mid = p.mid_q_offset.filter(|_| inner >= 3 && long_run);
+        let quarters = mid.and(p.quarter_q_offset).filter(|_| inner >= 7);
+        if let Some(o) = mid {
+            add(o, 1);
+        }
+        if let Some(o) = quarters {
+            add(o, 2);
+        }
+        leaves += inner - usize::from(mid.is_some()) - 2 * usize::from(quarters.is_some());
+    }
+    (hidden, leaves)
 }
 
 /// Whether this run absorbs a short tail group (the default) or cuts every
@@ -1318,7 +1448,8 @@ impl Av1Encoder {
         let cropped = crop_encoded(&encoded, render.0, render.1);
         let level = if is_key { Level::Key } else { Level::Leaf };
         if let Some(rate_loop) = self.rate_loop.as_mut() {
-            rate_loop.update(level, cropped.stream.len());
+            // The flat path codes every frame at the slot's own q, no offset.
+            rate_loop.update(level, 0, cropped.stream.len());
         }
         Ok(self.packet(cropped.stream, is_key, order, level))
     }
@@ -1440,7 +1571,7 @@ impl Av1Encoder {
         self.anchor = 0;
         let cropped = crop_encoded(&encoded, render.0, render.1);
         if let Some(rate_loop) = self.rate_loop.as_mut() {
-            rate_loop.update(Level::Key, cropped.stream.len());
+            rate_loop.update(Level::Key, 0, cropped.stream.len());
         }
         if let Some(collected) = self.collected.as_mut() {
             collected.push((order, cropped.clone()));
@@ -1551,7 +1682,7 @@ impl Av1Encoder {
         self.refresh(&[self_slot], &encoded, order_hint);
         let cropped = crop_encoded(&encoded, render.0, render.1);
         if let Some(rate_loop) = self.rate_loop.as_mut() {
-            rate_loop.update(level, cropped.stream.len());
+            rate_loop.update(level, offset, cropped.stream.len());
         }
         if let Some(collected) = self.collected.as_mut() {
             collected.push((order, cropped.clone()));
@@ -1789,6 +1920,73 @@ mod tests {
         }
         packets.extend(enc.flush().unwrap_or_else(|e| panic!("flush: {e}")));
         packets
+    }
+
+    /// [`gop_shape`] prices the frames the pyramid actually CODES: its hidden
+    /// counts and leaf count match the packets a real run emits, at three
+    /// pyramid shapes, and the plan [`RateLoop::new`] builds from it spends
+    /// the run's budget exactly (`gop` frame targets, no more and no less).
+    ///
+    /// Both halves matter: a shape that misses a level (the old model priced
+    /// ONE hidden frame per group when the mid level had made it two) splits
+    /// the budget by weights that do not add up to the run.
+    #[test]
+    fn the_rate_loop_prices_the_frames_the_pyramid_codes() {
+        let _knobs = crate::speed::knob_read();
+        let pictures: Vec<Picture> = (0..48).map(|i| test_card(64, 64, i)).collect();
+        let quarters = Pyramid {
+            quarter_q_offset: Some(-20),
+            ..Pyramid::default()
+        };
+        let two_level = Pyramid {
+            mid_q_offset: None,
+            ..Pyramid::default()
+        };
+        for (gop, pyramid) in [
+            (48, Pyramid::default()),
+            (12, Pyramid::default()),
+            (48, quarters),
+            (48, two_level),
+        ] {
+            let config = EncoderConfig {
+                width: 64,
+                height: 64,
+                base_q_idx: 100,
+                gop,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let rate = RateTarget::BytesPerFrame(2_000);
+            let mut enc =
+                Av1Encoder::with_pyramid_and_rate_target(config, pyramid, rate).unwrap();
+            let packets = encode_all(&mut enc, &pictures[..gop]);
+            let coded = |level: Level| packets.iter().filter(|p| p.level == level).count();
+            let (hidden, leaves) = gop_shape(pyramid, gop);
+            let hidden_frames: usize = hidden.iter().map(|&(_, n)| n).sum();
+            assert_eq!(
+                (hidden_frames, leaves, 1),
+                (coded(Level::Arf), coded(Level::Leaf), coded(Level::Key)),
+                "gop {gop} {pyramid:?}: shape {hidden:?} + {leaves} leaves"
+            );
+            assert_eq!(
+                hidden_frames + leaves + 1,
+                gop,
+                "gop {gop}: every picture is coded exactly once"
+            );
+            // The plan adds up: one leaf's target times the run's whole
+            // weight is the run's whole budget.
+            let target_bytes = 2_000.0;
+            let loop_ = RateLoop::new(target_bytes, 100.0, Some(pyramid), gop);
+            let planned = loop_.target[0]
+                + loop_.target[2] * (leaves as f64
+                    + hidden.iter().map(|&(o, n)| n as f64 * loop_.weight(o)).sum::<f64>());
+            assert!(
+                (planned - target_bytes * gop as f64).abs() < 1.0,
+                "gop {gop}: plan {planned:.0} bytes against a {:.0} byte run",
+                target_bytes * gop as f64
+            );
+        }
     }
 
     /// The mini-GOP layout leaves no short tail group, and leaves the long
@@ -2361,21 +2559,31 @@ mod tests {
         );
     }
 
-    /// [`RateTarget::Bitrate`] lands the achieved bitrate within ±10% of the
-    /// target over 48 frames of a real clip, flat and under a pyramid alike.
-    /// This is the accuracy claim of the target-bitrate mode: no two-pass, no
-    /// lookahead, just each frame's size predicted from the previous frame of
-    /// its own level and one clamped proportional step.
+    /// [`RateTarget::Bitrate`] lands the achieved bitrate within ±5% of the
+    /// target over 48 frames of a real clip, flat and under a pyramid alike,
+    /// across a 5x span of bitrates. This is the accuracy claim of the
+    /// target-bitrate mode: no two-pass, no lookahead, just each frame's size
+    /// predicted from the previous frame of its own level, one clamped
+    /// proportional step, and the level model
+    /// ([`WEIGHT_LEVEL_GAIN`]) that says how the run's budget splits.
+    ///
+    /// The tolerance was ±10% and every arm was inside ±3.0% when it was cut
+    /// to ±5%; the worst arm is the 2 Mbit/s pyramid at -4.4%, which is the
+    /// ENCODER'S OWN CEILING showing through, not the loop's aim: at that
+    /// rate the hidden slot already codes at `q_idx` 1 (its 22863 bytes a
+    /// frame are the same at 1.5 and 2 Mbit/s) and the leaves sit at 1 + 12
+    /// `leaf_q_offset`, so this clip cannot be made to spend much past
+    /// 2.4 Mbit/s under the default pyramid however the budget is split.
     #[test]
-    fn bitrate_target_lands_within_10_percent_over_48_frames() {
+    fn bitrate_target_lands_within_5_percent_over_48_frames() {
         let _knobs = crate::speed::knob_read();
         let (width, height, frames) = (640usize, 384usize, 48usize);
         let Some(pictures) = h264_clip_frames(width, height, frames) else {
-            eprintln!("SKIP bitrate_target_lands_within_10_percent_over_48_frames: no ffmpeg/fixture");
+            eprintln!("SKIP bitrate_target_lands_within_5_percent_over_48_frames: no ffmpeg/fixture");
             return;
         };
         let fps = 24.0;
-        for bits_per_second in [768_000u32, 1_536_000] {
+        for bits_per_second in [384_000u32, 768_000, 1_536_000, 2_000_000] {
             let config = EncoderConfig {
                 width,
                 height,
@@ -2394,26 +2602,50 @@ mod tests {
                     None => Av1Encoder::with_rate_target(config, rate).unwrap(),
                     Some(p) => Av1Encoder::with_pyramid_and_rate_target(config, p, rate).unwrap(),
                 };
+                let targets = enc.rate_loop.as_ref().unwrap().target;
                 let mut coded = 0usize;
-                for picture in &pictures {
-                    for packet in enc.encode_frames(picture).unwrap() {
+                // Per level, so a miss reads as WHICH level's model is off
+                // rather than as one aggregate percentage.
+                let (mut bytes, mut count) = ([0usize; 4], [0usize; 4]);
+                let mut take = |packets: Vec<Packet>| {
+                    for packet in packets {
                         coded += packet.data.len();
+                        let i = match packet.level {
+                            Level::Key => 0,
+                            Level::Arf => 1,
+                            Level::Leaf => 2,
+                            Level::ShowExisting => 3,
+                        };
+                        bytes[i] += packet.data.len();
+                        count[i] += 1;
                     }
+                };
+                for picture in &pictures {
+                    take(enc.encode_frames(picture).unwrap());
                 }
-                for packet in enc.flush().unwrap() {
-                    coded += packet.data.len();
-                }
+                take(enc.flush().unwrap());
                 let seconds = frames as f64 / fps;
                 let achieved = coded as f64 * 8.0 / seconds;
                 let error = achieved / f64::from(bits_per_second) - 1.0;
+                let per = |i: usize| match count[i] {
+                    0 => "-".to_string(),
+                    n => format!("{n}x{}", bytes[i] / n),
+                };
                 eprintln!(
                     "bitrate {bits_per_second} bps, pyramid {}: {coded} bytes over {seconds:.2}s \
-                     = {achieved:.0} bps ({:+.1}%)",
+                     = {achieved:.0} bps ({:+.1}%) | targets {:.0}/{:.0}/{:.0} \
+                     coded key {} arf {} leaf {}",
                     pyramid.is_some(),
                     100.0 * error,
+                    targets[0],
+                    targets[1],
+                    targets[2],
+                    per(0),
+                    per(1),
+                    per(2),
                 );
                 assert!(
-                    error.abs() <= 0.10,
+                    error.abs() <= 0.05,
                     "achieved {achieved:.0} bps is {:+.1}% off the {bits_per_second} bps target \
                      (pyramid {})",
                     100.0 * error,
