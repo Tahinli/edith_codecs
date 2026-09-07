@@ -53,7 +53,7 @@ are of the censused stream.
 |---|---|---|---|
 | key | 1 @ 150: 20,079 (10.3%) | 1 @ 101: 34,700 (22.2%) | 1 @ **63**: 47,707 (**36.9%**) |
 | arf top | 6 @ 118: 94,076 (48.4%, mean 15,679) | 11 @ 122: 64,282 (41.1%, mean 5,843) | 1 @ 95: 14,513 (11.2%) |
-| arf mid | -- | 12 @ 138: 28,365 (18.1%, mean 2,363) | 21 @ 129..168: 49,319 (38.1%, mean 2,349) |
+| arf mid | -- | 12 @ 138: 28,365 (18.1%, mean 2,363) | 22 @ 129..168: 49,319 (38.1%, mean 2,242) |
 | leaf | 41 @ 166: 80,187 (41.3%, mean 1,955) | 24 @ 154: 28,955 (18.5%, mean 1,206) | 24 @ 163/168: 17,848 (13.8%, mean 743) |
 
 ## Where the gap is
@@ -72,7 +72,7 @@ and the number of levels.**
 2. **One hidden level against two.** rav1e's mini-GOP at speed 6 is FOUR
    pictures with two hidden levels (top ARF at the group's last picture at
    q120, an internal ARF at its midpoint at q137, two leaves at q153) -- 23
-   hidden frames in 48 pictures against our 6. libaom is deeper still: 22
+   hidden frames in 48 pictures against our 6. libaom is deeper still: 23
    hidden frames over qindex 95..168. Our 8-picture group carries one hidden
    frame at q118 and then seven leaves that are 4 to 7 pictures away from
    their nearest good reference.
