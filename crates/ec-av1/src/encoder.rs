@@ -2846,6 +2846,61 @@ mod tests {
         }
     }
 
+    /// A frame whose size is NOT a multiple of a superblock (lane-b64b):
+    /// 232x168 leaves the last superblock column and row cut by the true
+    /// frame edge, with more than half of each inside -- which is exactly
+    /// what AV1's `has_cols`/`has_rows` allow to stay whole. Both gate films
+    /// are superblock-aligned, so nothing but a synthetic size reaches this
+    /// path at all (class `gate-blind-to-feature`), and the user's own
+    /// exports are arbitrary sizes.
+    #[test]
+    fn a_non_superblock_aligned_clip_codes_edge_64x64_roots_and_decodes_sample_exact() {
+        let _knobs = crate::speed::knob_write();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (232usize, 168usize);
+        let still = test_card(width, height, 0);
+        let sources: Vec<Picture> = (0..3).map(|_| still.clone()).collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 120,
+            gop: 8,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        let _ = crate::encode::take_b64_edge_hits();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let edges = crate::encode::take_b64_edge_hits();
+        assert!(edges > 0, "no 64x64 root was taken at a superblock the frame edge cuts");
+        eprintln!("edge 64x64 roots: {edges}");
+
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_luma(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+        for (i, (ours_i, theirs_i)) in ours.iter().zip(&theirs).enumerate() {
+            let got: Vec<u8> = ours_i.y.iter().map(|&v| v as u8).collect();
+            if let Some(at) = got.iter().zip(theirs_i).position(|(x, y)| x != y) {
+                panic!(
+                    "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                    at % width,
+                    at / width,
+                    got[at],
+                    theirs_i[at],
+                );
+            }
+        }
+    }
+
     /// A clip whose inter residual is HIGH-FREQUENCY (lane-b64b): every
     /// frame adds a 4-pixel checkerboard, so the 64x64 root's prediction is
     /// off by exactly the detail a TX_64X64 throws away (it codes only the
