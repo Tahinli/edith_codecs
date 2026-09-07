@@ -17533,6 +17533,18 @@ fn read_block_tx_size(
     is_inter: bool,
     skip: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<(usize, Option<Vec<(usize, usize, usize, usize)>>)> {
+    // lane-lossless: TX_4X4 over the whole block, and NO var-tx tree -- libaom
+    // `read_block_tx_size` (`decodeframe.c`) sends a lossless block down the
+    // `read_tx_size` arm, which returns TX_4X4 before it reads anything.
+    if lossless(fctx) {
+        let mut leaves = Vec::new();
+        for row in 0..side / MI {
+            for col in 0..side / MI {
+                leaves.push((row, col, 4, 4));
+            }
+        }
+        return Ok((4, Some(leaves)));
+    }
     if !fctx.tx_select_inter.with(std::cell::Cell::get) {
         // lane-sb128c r1: `max_txsize_rect_lookup[BLOCK_128X128]` is TX_64X64,
         // so a 128x128 inter block is FOUR luma units even with `tx_mode ==
@@ -17972,6 +17984,15 @@ fn read_block_tx_size_rect(
     (mi_cols, mi_rows): (usize, usize),
     skip: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<Option<Vec<(usize, usize, usize, usize)>>> {
+    if lossless(fctx) {
+        let mut leaves = Vec::new();
+        for row in 0..bh / MI {
+            for col in 0..bw / MI {
+                leaves.push((row, col, 4, 4));
+            }
+        }
+        return Ok(Some(leaves));
+    }
     if skip {
         // `set_txfm_ctxs(.., skip && is_inter)`: a skipped inter block records
         // its own BLOCK size -- width above, height left -- not a transform.
@@ -18261,6 +18282,9 @@ fn read_inter_luma8(
     reduced_tx_set: bool,
     split: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, TxType)> {
+    // lane-lossless: an 8x8 inter block is FOUR 4x4 units (libaom
+    // `read_block_tx_size`'s lossless TX_4X4), tree or no tree.
+    let split = split || lossless(fctx);
     if !split {
         return read_inter_plane(
             dec,
