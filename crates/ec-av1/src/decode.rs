@@ -9153,7 +9153,18 @@ struct RectStripModes {
 /// TX_32X16`) and only the second reaches a square -- the reason
 /// `bw.min(bh) >> (depth - 1)` (correct for a 2:1 strip, where step one is
 /// already square) mis-tiled 1:4 strips.
-fn depth_to_tx_wh(bw: usize, bh: usize, depth: usize) -> (usize, usize) {
+fn depth_to_tx_wh(
+    bw: usize,
+    bh: usize,
+    depth: usize,
+    fctx: &crate::decode::FrameCtx,
+) -> (usize, usize) {
+    // lane-lossless: TX_4X4 whatever the strip's own size and depth (libaom
+    // `read_tx_size`: the lossless early return comes before
+    // `max_txsize_rect_lookup`), and no `tx_depth` symbol was read to get here.
+    if lossless(fctx) {
+        return (4, 4);
+    }
     let (mut w, mut h) = (bw.min(64), bh.min(64));
     for _ in 0..depth {
         match w.cmp(&h) {
@@ -10289,7 +10300,7 @@ fn decode_intra_rect_in_inter(
     if crate::envflags::env_flag!("EC_SPLITSTRIP") {
         eprintln!("EC_SPLITSTRIP mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} depth={depth}");
     }
-    let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+    let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
     // lane-inter16ab r8: libaom runs `set_txfm_ctxs(tx_size, n4_w, n4_h,
     // skip && is_inter, xd)` (decodeframe.c `decode_block`) for EVERY block
     // of an inter frame, intra ones included -- with the skip term 0 it
@@ -10489,7 +10500,7 @@ fn decode_block_rect(
         // per transform unit, each unit taking its edges from the previous
         // unit's reconstruction inside this same strip (spec 5.11.36) --
         // [`decode_rect_split`], the unit named by [`depth_to_tx_wh`].
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         if crate::envflags::env_flag!("EC_SBPART_DUMP64") {
             eprintln!(
                 "DUMP64SPLIT mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} \
@@ -10995,7 +11006,7 @@ fn decode_leaf_rect(
         // depth 2), addressed at this leaf's own mi position.
         hit!(TX_DEPTH_HITS);
         hit!(SUB16_SPLIT_HITS);
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         let modes = RectStripModes {
             skip,
             mode,
@@ -11328,7 +11339,7 @@ fn decode_block_rect4(
     publish_txfm_bands_if_in_inter(
         neighbours,
         (mi_r, mi_c),
-        depth_to_tx_wh(bw, bh, depth),
+        depth_to_tx_wh(bw, bh, depth, fctx),
         (bw, bh), fctx,
     );
     if depth != 0 {
@@ -11338,7 +11349,7 @@ fn decode_block_rect4(
         // (`sub_tx_size_map[TX_32X8] == TX_16X8`), depth 2 the square TX_8X8;
         // both interleave in every real stream.
         hit!(TX_DEPTH_HITS);
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         // lane-rectsplitx r2: both depths ship together, as the r1 handoff
         // predicted -- depth 1 fires FIRST in every attempt that splits at
         // all, so a depth-2-only lift could never be gated. The r1 mismatch
@@ -11853,7 +11864,7 @@ fn decode_rect4_16_strip(
             hit!(TX_DEPTH_HITS);
             hit!(RECT4_16_SPLIT_HITS);
         }
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         let (px, py) = (lmi.1 * MI, lmi.0 * MI);
         let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height, fctx);
         neighbours.record_mode_mi(lmi.0, lmi.1, mi_w, mi_h, mode);
@@ -12344,7 +12355,7 @@ fn decode_block_rect64(
     publish_txfm_bands_if_in_inter(
         neighbours,
         (mi_r, mi_c),
-        depth_to_tx_wh(bw, bh, depth),
+        depth_to_tx_wh(bw, bh, depth, fctx),
         (bw, bh), fctx,
     );
     if depth != 0 {
@@ -12354,7 +12365,7 @@ fn decode_block_rect64(
         // sibling; [`depth_to_tx_wh`] names the unit, which for a 64x16/16x64
         // 1:4 strip is the 2:1 rect TX_32X16 at depth 1 (lane-rectchroma r1
         // measured the old square formula mis-tiling exactly that strip).
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         if bw.max(bh) / bw.min(bh) == 4 {
             let which = if depth == 1 {
                 &RECT4_SPLIT_DEPTH1_HITS
