@@ -388,6 +388,13 @@ pub struct Pyramid {
     /// nearest good reference. Ignored by a group of fewer than four
     /// pictures, where there is no leaf on both sides of a midpoint.
     pub mid_q_offset: Option<i16>,
+    /// Added to `base_q_idx` for the GOP's KEY FRAME — negative, since every
+    /// frame of the run reads it, directly or through an ARF. The 48-frame
+    /// census (`lanes/census-longgop.md`) found ours coded at base q while
+    /// its own ARFs sat 32 steps finer, where rav1e (key 100 / arf 120 /
+    /// leaf 153) and libaom (63 / 95 / 163) both make the key the best frame
+    /// of the run and spend 22--37% of the stream on it against our 10--11%.
+    pub key_q_offset: i16,
 }
 
 /// How many pictures the mini-GOP now being collected takes, given how many
@@ -425,7 +432,7 @@ fn absorb_tail() -> bool {
 
 impl Pyramid {
     /// The pyramid a run asks for through the environment:
-    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>[:<mid>]]`,
+    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>[:<mid>[:<key>]]]`,
     /// where `<mid>` is the third level's offset or `off` for none, with
     /// `0` (or anything that is not a mini-GOP of at least 2, e.g. `flat`)
     /// meaning the flat one-picture-one-frame path. UNSET is
@@ -455,6 +462,8 @@ impl Pyramid {
                 Some("off") => None,
                 Some(v) => v.parse().ok().or(d.mid_q_offset),
             },
+            // A fifth field is the key frame's own offset.
+            key_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.key_q_offset),
         })
     }
 }
@@ -714,6 +723,7 @@ impl Default for Pyramid {
             arf_q_offset: -32,
             leaf_q_offset: 16,
             mid_q_offset: MID_DEFAULT,
+            key_q_offset: KEY_DEFAULT,
         }
     }
 }
@@ -755,6 +765,9 @@ const MID_SLOT: u8 = 2;
 /// long-GOP columns improves against the two-level shape, film B (the wider
 /// gap) by 6.0 / 2.4 BD points.
 const MID_DEFAULT: Option<i16> = Some(-8);
+
+/// [`Pyramid::default`]'s key-frame offset (`lanes/keyq.sweep.txt`).
+const KEY_DEFAULT: i16 = 0;
 
 /// The AV1 software encoder: [`EncoderConfig`] in, one [`Packet`] out per
 /// [`Av1Encoder::encode`] call — or, with a [`Pyramid`] configured, a
@@ -1290,10 +1303,12 @@ impl Av1Encoder {
     /// whole GOP at once.
     fn encode_key(&mut self, order: u64, picture: &Picture) -> Result<Packet> {
         let render = (self.config.width, self.config.height);
-        let base_q_idx = self
+        let base = self
             .rate_loop
             .as_ref()
-            .map_or(self.config.base_q_idx, |r| r.q_idx(Level::Key));
+            .map_or(i16::from(self.config.base_q_idx), |r| i16::from(r.q_idx(Level::Key)));
+        let offset = self.pyramid.map_or(0, |p| p.key_q_offset);
+        let base_q_idx = (base + offset).clamp(1, 255) as u8;
         let encoded = encode_key_frame_inner(
             &picture.padded_to(SUPERBLOCK),
             base_q_idx,
@@ -2376,6 +2391,35 @@ mod tests {
             Pyramid { mini_gop: 8, mid_q_offset: Some(-8), ..Pyramid::default() },
             2,
         );
+    }
+
+    /// [`Pyramid::key_q_offset`] reaches the key frame: the whole run reads
+    /// the key, so an offset that never arrived would be invisible in the BD
+    /// table except as "no change" (class symbol-consumption-gap). A finer
+    /// key must cost strictly more bytes than the same picture at base q.
+    #[test]
+    fn the_key_q_offset_reaches_the_key_frame() {
+        let _knobs = crate::speed::knob_read();
+        crate::encode::force_screen(Some(false));
+        let key_bytes = |offset: i16| {
+            let config = EncoderConfig {
+                width: 128,
+                height: 128,
+                base_q_idx: 120,
+                gop: 32,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let pyramid = Pyramid { key_q_offset: offset, ..Pyramid::default() };
+            let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
+            let packets = enc.encode_frames(&test_card(128, 128, 0)).unwrap();
+            let key = packets.iter().find(|p| p.level == Level::Key).expect("key frame");
+            key.data.len()
+        };
+        let (base, finer) = (key_bytes(0), key_bytes(-48));
+        eprintln!("key at base q {base} bytes, at base q - 48 {finer} bytes");
+        assert!(finer > base, "key_q_offset -48 did not reach the key frame ({finer} <= {base})");
     }
 
     fn pyramid_round_trip(pyramid: Pyramid, hidden: usize) {
