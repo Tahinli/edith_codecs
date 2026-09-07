@@ -46,6 +46,7 @@ pub mod obu;
 mod par;
 pub mod quant;
 mod refusal_inventory;
+pub mod speed;
 mod restoration;
 pub mod sequence;
 mod superres;
