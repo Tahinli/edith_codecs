@@ -16,6 +16,20 @@
 //! driver composes no headers of its own from thin air: it parses the
 //! sequence and frame header OBUs this crate packs (see `enc::headers::av1`)
 //! and writes the stream's headers from them.
+//!
+//! AV1 encodes at 8 or 10 bits ([`EncoderConfig::bit_depth`]); 10-bit is the
+//! depth his own library is stored at, and `gpu.rs`'s
+//! `av1_10bit_encode_agrees_between_two_decoders` proves a 10-bit stream out
+//! of this path decodes identically through `ec-av1` and libdav1d with
+//! ffprobe reading `yuv420p10le` out of the sequence header.
+//!
+//! # Rate control
+//!
+//! [`RateControlMode`] is not advisory: it is set as
+//! `VAConfigAttribRateControl` when the VA config is created, so an encoder
+//! built for CQP ignores a bitrate handed to it later. CQP, CBR, VBR and QVBR
+//! are all measured by `gpu.rs`'s `av1_encode_rate_control_lands`, which
+//! prints what each mode delivered against what it was asked for.
 
 use std::sync::Arc;
 
@@ -26,10 +40,10 @@ use ec_va::{
 };
 
 use crate::error::{Error, Result};
-use crate::frame::I420;
+use crate::frame::{I420, I420_16};
 use crate::params::enc::{
     MISC_FRAME_RATE, MISC_HRD, MISC_RATE_CONTROL, PackedHeaderParameterBuffer, RateControl,
-    misc_bytes,
+    VA_RC_QVBR, misc_bytes,
 };
 use crate::params::param_buffer;
 use crate::pool::{PooledSurface, SurfacePool};
@@ -60,6 +74,38 @@ pub enum RateControlMode {
     },
     /// Constant bitrate, the driver picking quantisers to hold it.
     ConstantBitrate,
+    /// Variable bitrate: `bitrate` is the average asked for, and the driver
+    /// may spend up to 1.5x it inside the rate window.
+    VariableBitrate,
+    /// Quality-defined variable bitrate: the driver holds `quality` (a
+    /// quantiser-like target, lower is better quality) and treats `bitrate`
+    /// as the ceiling it may not exceed.
+    Qvbr {
+        /// The quality factor, in the codec's quantiser scale.
+        quality: u32,
+    },
+}
+
+impl RateControlMode {
+    /// The `VAConfigAttribRateControl` value this mode is configured with.
+    ///
+    /// The attribute is set at config creation, not per picture: a driver
+    /// that was configured for CQP ignores a bitrate handed to it later
+    /// (which is how the AV1 path measured CQP-only until 2026-09-07).
+    fn va_mode(self) -> u32 {
+        match self {
+            RateControlMode::ConstantQp { .. } => sys::VA_RC_CQP,
+            RateControlMode::ConstantBitrate => sys::VA_RC_CBR,
+            RateControlMode::VariableBitrate => sys::VA_RC_VBR,
+            RateControlMode::Qvbr { .. } => VA_RC_QVBR,
+        }
+    }
+
+    /// True when the driver is told exactly which quantiser to use, so it has
+    /// nothing to back-annotate into the header this crate packs.
+    pub(crate) fn is_cqp(self) -> bool {
+        matches!(self, RateControlMode::ConstantQp { .. })
+    }
 }
 
 /// What can be changed between frames without rebuilding the encoder.
@@ -102,6 +148,10 @@ pub struct EncoderConfig {
     /// The colour description to write into the VUI, or `None` to leave it
     /// unsignalled (`video_signal_type_present_flag = 0`) as before.
     pub colour: Option<Colour>,
+    /// Luma bit depth: 8, or 10 for AV1 (his own library is `yuv420p10le`).
+    /// A 10-bit encoder takes its pixels through [`Encoder::encode_16`] or
+    /// straight from a 10-bit [`crate::Frame`].
+    pub bit_depth: u8,
 }
 
 /// H.265 E.2.1 / H.264 E.1.1 colour description code points for the VUI.
@@ -135,7 +185,14 @@ impl EncoderConfig {
             rate_control: RateControlMode::ConstantBitrate,
             quality: 0,
             colour: None,
+            bit_depth: 8,
         }
+    }
+
+    /// Encode at 10 bits (AV1 only); see [`EncoderConfig::bit_depth`].
+    pub fn ten_bit(mut self) -> EncoderConfig {
+        self.bit_depth = 10;
+        self
     }
 
     /// Set the VUI colour description; H.265 E.2.1 / H.264 E.1.1 code points.
@@ -200,6 +257,19 @@ pub struct Encoder {
 impl Encoder {
     /// Build an encoder for `config` on `display`.
     pub fn new(display: &Arc<Display>, config: EncoderConfig) -> Result<Encoder> {
+        if config.bit_depth != 8 && config.bit_depth != 10 {
+            return Err(Error::config(format!(
+                "encoder bit depth {} : this crate encodes 8-bit, or 10-bit AV1",
+                config.bit_depth
+            )));
+        }
+        if config.bit_depth == 10 && config.codec != EncCodec::Av1 {
+            // Not a driver refusal: H264High and HEVCMain are 8-bit profiles
+            // by definition, and this crate configures no other.
+            return Err(Error::config(
+                "10-bit encode is AV1 only here: the H.264 and H.265 profiles this crate                  configures (High, Main) are 8-bit",
+            ));
+        }
         let profile = match config.codec {
             // High is the profile every H.264 encoder on this driver reports and
             // the one a High-profile decoder expects; Main is a strict subset.
@@ -217,6 +287,11 @@ impl Encoder {
             config.height.next_multiple_of(block),
         );
 
+        let rt_format = if config.bit_depth == 10 {
+            sys::VA_RT_FORMAT_YUV420_10
+        } else {
+            sys::VA_RT_FORMAT_YUV420
+        };
         let caps = CapReport::probe(display)?;
         let entry = caps.entry(profile, Entrypoint::EncSlice).ok_or_else(|| {
             Error::unsupported(
@@ -255,15 +330,18 @@ impl Encoder {
             profile,
             Entrypoint::EncSlice,
             &[
-                ConfigAttrib::rt_format(sys::VA_RT_FORMAT_YUV420),
+                ConfigAttrib::rt_format(rt_format),
+                ConfigAttrib {
+                    type_: sys::VAConfigAttribRateControl,
+                    value: config.rate_control.va_mode(),
+                },
                 ConfigAttrib {
                     type_: sys::VAConfigAttribEncPackedHeaders,
                     value: packed,
                 },
             ],
         )?;
-        let spec = SurfaceSpec::nv12(coded_size.0, coded_size.1)
-            .with_usage_hint(sys::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER);
+        let spec = surface_spec(config.bit_depth, coded_size);
         // Input, reconstruction, one reference, and slack for the driver to
         // keep a submission in flight.
         let pool = SurfacePool::new(display, &spec, 8)?;
@@ -309,6 +387,12 @@ impl Encoder {
 
     /// Encode one frame and return its coded bytes.
     pub fn encode(&mut self, frame: &I420, meta: FrameMetadata) -> Result<CodedFrame> {
+        if self.config.bit_depth != 8 {
+            return Err(Error::config(format!(
+                "encode: this encoder is configured for {} bits; call encode_16",
+                self.config.bit_depth
+            )));
+        }
         if frame.width != self.config.width || frame.height != self.config.height {
             return Err(Error::config(format!(
                 "encoder configured for {}x{} was given a {}x{} frame",
@@ -320,6 +404,32 @@ impl Encoder {
             .acquire()
             .ok_or_else(|| Error::config("encode: every surface is still in use"))?;
         self.upload(frame, &input)?;
+        self.encode_surface(Arc::clone(input.surface()), meta)
+    }
+
+    /// Encode one 10-bit frame; the [`Encoder::encode`] of a 10-bit encoder.
+    ///
+    /// Samples are 0..1023 in the low ten bits of each `u16`, as
+    /// [`crate::Frame::to_i420_16`] returns them, and are shifted into P010's
+    /// top ten bits on upload.
+    pub fn encode_16(&mut self, frame: &I420_16, meta: FrameMetadata) -> Result<CodedFrame> {
+        if self.config.bit_depth != 10 {
+            return Err(Error::config(format!(
+                "encode_16: this encoder is configured for {} bits; call encode",
+                self.config.bit_depth
+            )));
+        }
+        if frame.width != self.config.width || frame.height != self.config.height {
+            return Err(Error::config(format!(
+                "encoder configured for {}x{} was given a {}x{} frame",
+                self.config.width, self.config.height, frame.width, frame.height
+            )));
+        }
+        let input = self
+            .pool
+            .acquire()
+            .ok_or_else(|| Error::config("encode: every surface is still in use"))?;
+        self.upload_16(frame, &input)?;
         self.encode_surface(Arc::clone(input.surface()), meta)
     }
 
@@ -377,7 +487,9 @@ impl Encoder {
                 "encode_frame: the frame was decoded on a different Display than this encoder",
             ));
         }
-        let source = if frame.bit_depth == 10 || frame.coded_size != self.coded_size {
+        let source = if frame.bit_depth != self.config.bit_depth
+            || frame.coded_size != self.coded_size
+        {
             self.vpp_into_pool(frame.surface(), frame.display_size)?
         } else {
             Arc::clone(frame.surface())
@@ -397,12 +509,11 @@ impl Encoder {
         display_size: (u32, u32),
     ) -> Result<Arc<Surface>> {
         if self.vpp.is_none() {
-            let spec = SurfaceSpec::nv12(self.coded_size.0, self.coded_size.1)
-                .with_usage_hint(sys::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER);
+            let spec = surface_spec(self.config.bit_depth, self.coded_size);
             let display = self.context.display();
             let surfaces = Surface::create_pool(display, &spec, 2)?;
             for s in &surfaces {
-                Self::fill_black(s, self.coded_size)?;
+                Self::fill_black(s, self.coded_size, self.config.bit_depth)?;
             }
             let vpp = Vpp::new(
                 display,
@@ -427,16 +538,26 @@ impl Encoder {
     /// one-time initialisation [`Encoder::vpp_into_pool`] gives its pool so a
     /// region copy's untouched padding reads the same deterministic value on
     /// every driver instead of whatever the fresh allocation contained.
-    fn fill_black(surface: &Arc<Surface>, size: (u32, u32)) -> Result<()> {
-        let mut image = Image::create(surface.display(), sys::VA_FOURCC_NV12, size.0, size.1)?;
+    fn fill_black(surface: &Arc<Surface>, size: (u32, u32), bit_depth: u8) -> Result<()> {
+        let mut image = Image::create(surface.display(), fourcc(bit_depth), size.0, size.1)?;
         {
             let mut mapped = image.map()?;
-            if let Some(y) = mapped.plane_mut(0) {
-                y.fill(16);
-            }
-            if let Some(uv) = mapped.plane_mut(1) {
-                uv.fill(128);
-            }
+            // P010 carries the sample in the top ten bits, so black is the
+            // 8-bit value shifted up by six, little endian.
+            let (luma, chroma) = (16u16 << 6, 128u16 << 6);
+            let mut plane = |index: usize, eight: u8, ten: u16| {
+                if let Some(p) = mapped.plane_mut(index) {
+                    if bit_depth == 8 {
+                        p.fill(eight);
+                    } else {
+                        for sample in p.chunks_exact_mut(2) {
+                            sample.copy_from_slice(&ten.to_le_bytes());
+                        }
+                    }
+                }
+            };
+            plane(0, 16, luma);
+            plane(1, 128, chroma);
         }
         surface.write_from(&image, size.0, size.1)?;
         Ok(())
@@ -514,7 +635,7 @@ impl Encoder {
         if self.upload.is_none() {
             self.upload = Some(Image::create(
                 surface.display(),
-                sys::VA_FOURCC_NV12,
+                fourcc(self.config.bit_depth),
                 self.coded_size.0,
                 self.coded_size.1,
             )?);
@@ -558,23 +679,86 @@ impl Encoder {
         Ok(())
     }
 
+    /// Upload one 10-bit frame into a surface as P010.
+    ///
+    /// The same reused image as [`Encoder::upload`], created P010 because the
+    /// encoder's surfaces are; samples move from the low ten bits of the
+    /// caller's `u16` into P010's top ten.
+    fn upload_16(&mut self, frame: &I420_16, surface: &Arc<Surface>) -> Result<()> {
+        if self.upload.is_none() {
+            self.upload = Some(Image::create(
+                surface.display(),
+                fourcc(self.config.bit_depth),
+                self.coded_size.0,
+                self.coded_size.1,
+            )?);
+        }
+        let image = self
+            .upload
+            .as_mut()
+            .ok_or_else(|| Error::config("no upload image"))?;
+        let (w, h) = (frame.width as usize, frame.height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        {
+            let mut mapped = image.map()?;
+            let y_pitch = mapped.pitch(0).unwrap_or(0) as usize;
+            let uv_pitch = mapped.pitch(1).unwrap_or(0) as usize;
+            if let Some(dst) = mapped.plane_mut(0) {
+                for row in 0..h {
+                    let d = row * y_pitch;
+                    if d + w * 2 > dst.len() {
+                        break;
+                    }
+                    for col in 0..w {
+                        let v = (frame.y[row * w + col] & 0x3ff) << 6;
+                        dst[d + col * 2..d + col * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+            if let Some(dst) = mapped.plane_mut(1) {
+                for row in 0..ch {
+                    let d = row * uv_pitch;
+                    if d + cw * 4 > dst.len() {
+                        break;
+                    }
+                    for col in 0..cw {
+                        let u = (frame.u[row * cw + col] & 0x3ff) << 6;
+                        let v = (frame.v[row * cw + col] & 0x3ff) << 6;
+                        dst[d + col * 4..d + col * 4 + 2].copy_from_slice(&u.to_le_bytes());
+                        dst[d + col * 4 + 2..d + col * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        surface.write_from(image, self.coded_size.0, self.coded_size.1)?;
+        Ok(())
+    }
+
     /// The misc parameter buffers that carry rate control, resent when tuned.
     fn rate_control_buffers(&mut self) -> Result<Vec<Buffer>> {
         if !self.tunings_dirty {
             return Ok(Vec::new());
         }
         self.tunings_dirty = false;
-        let (initial_qp, min_qp, max_qp, bits) = match self.config.rate_control {
-            RateControlMode::ConstantQp { qp } => (qp, qp, qp, 0),
-            RateControlMode::ConstantBitrate => (0, 0, 0, self.tunings.bitrate),
+        // VBR's `bits_per_second` is the peak, not the average: libva takes
+        // the average as `target_percentage` of it, so an average-rate ask
+        // becomes a 1.5x ceiling at 66%.
+        let (initial_qp, min_qp, max_qp, bits, target, quality) = match self.config.rate_control {
+            RateControlMode::ConstantQp { qp } => (qp, qp, qp, 0, 100, 0),
+            RateControlMode::ConstantBitrate => (0, 0, 0, self.tunings.bitrate, 100, 0),
+            RateControlMode::VariableBitrate => {
+                (0, 0, 0, self.tunings.bitrate.saturating_mul(3) / 2, 66, 0)
+            }
+            RateControlMode::Qvbr { quality } => (0, 0, 0, self.tunings.bitrate, 100, quality),
         };
         let rc = RateControl {
             bits_per_second: bits,
-            target_percentage: 100,
+            target_percentage: target,
             window_size: 1000,
             initial_qp,
             min_qp,
             max_qp,
+            quality_factor: quality,
         };
         let mut out = vec![Buffer::from_bytes(
             &self.context,
@@ -591,9 +775,13 @@ impl Encoder {
             &misc_bytes(MISC_FRAME_RATE, &fr.words()),
         )?);
         if bits > 0 {
+            // One rate window of buffer, three quarters full to start, which
+            // is what ffmpeg's vaapi encoder asks for: a two-window buffer
+            // let radeonsi's AV1 CBR undershoot the ask by 20% where ffmpeg's
+            // own av1_vaapi undershot by 8% on the same clip (measured).
             let hrd = crate::params::enc::Hrd {
-                initial_buffer_fullness: bits,
-                buffer_size: bits * 2,
+                initial_buffer_fullness: bits / 4 * 3,
+                buffer_size: bits,
             };
             out.push(Buffer::from_bytes(
                 &self.context,
@@ -651,6 +839,25 @@ impl Encoder {
     /// The VA profile this encoder was configured with.
     pub fn profile(&self) -> Profile {
         self.profile
+    }
+}
+
+/// The surface format an encoder of `bit_depth` works in.
+fn surface_spec(bit_depth: u8, size: (u32, u32)) -> SurfaceSpec {
+    let spec = if bit_depth == 10 {
+        SurfaceSpec::p010(size.0, size.1)
+    } else {
+        SurfaceSpec::nv12(size.0, size.1)
+    };
+    spec.with_usage_hint(sys::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER)
+}
+
+/// The image fourcc matching `bit_depth`.
+fn fourcc(bit_depth: u8) -> u32 {
+    if bit_depth == 10 {
+        sys::VA_FOURCC_P010
+    } else {
+        sys::VA_FOURCC_NV12
     }
 }
 

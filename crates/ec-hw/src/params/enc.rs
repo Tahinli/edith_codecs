@@ -61,6 +61,11 @@ unsafe impl VaParam for PackedHeaderParameterBuffer {
     const TYPE: i32 = VAEncPackedHeaderParameterBufferType;
 }
 
+/// `VA_RC_QVBR`, `va.h:1652`. Not in `ec_va::sys` because this is the only
+/// crate that spends it; radeonsi advertises it in `VAConfigAttribRateControl`
+/// (probed 0x416 = CQP|CBR|VBR|QVBR on mesa 26.1.8).
+pub const VA_RC_QVBR: u32 = 0x0000_0400;
+
 /// `VAEncMiscParameterRateControl`, `va.h:2492`.
 ///
 /// Built as words rather than as a struct because a misc parameter is submitted
@@ -81,6 +86,8 @@ pub struct RateControl {
     pub min_qp: u32,
     /// Maximum quantiser.
     pub max_qp: u32,
+    /// QVBR target quality; ignored by every other mode.
+    pub quality_factor: u32,
 }
 
 impl RateControl {
@@ -96,7 +103,7 @@ impl RateControl {
             0, // rc_flags
             0, // ICQ_quality_factor
             self.max_qp,
-            0, // quality_factor
+            self.quality_factor,
             0, // target_frame_size
             0,
             0,
