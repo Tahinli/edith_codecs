@@ -3204,6 +3204,56 @@ mod tests {
         }
     }
 
+    /// The 1080p SHAPE at a fifth of its size (lane-sse): 384x216 is three
+    /// whole superblock columns and 1.6875 superblock rows, so the bottom
+    /// 88-pixel band straddles at EVERY level -- the 64x64 root lane-b64b
+    /// already clipped, and the 32x32 (216 = 6*32 + 24) and 16x16 (13*16 + 8)
+    /// leaves it did not. Every one of them is now scored over its inside
+    /// part alone, and a distortion change that moved a partition or a
+    /// transform decision the writer did not follow would desync the tile, so
+    /// both decoders reconstruct it sample-exact.
+    #[test]
+    fn a_1080p_shaped_clip_straddles_at_every_block_size_and_decodes_sample_exact() {
+        let _knobs = crate::speed::knob_write();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (384usize, 216usize);
+        let sources: Vec<Picture> = (0..3).map(|i| test_card(width, height, i)).collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 120,
+            gop: 8,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_luma(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+        for (i, (ours_i, theirs_i)) in ours.iter().zip(&theirs).enumerate() {
+            let got: Vec<u8> = ours_i.y.iter().map(|&v| v as u8).collect();
+            if let Some(at) = got.iter().zip(theirs_i).position(|(x, y)| x != y) {
+                panic!(
+                    "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                    at % width,
+                    at / width,
+                    got[at],
+                    theirs_i[at],
+                );
+            }
+        }
+    }
+
     /// A clip whose inter residual is HIGH-FREQUENCY (lane-b64b): every
     /// frame adds a 4-pixel checkerboard, so the 64x64 root's prediction is
     /// off by exactly the detail a TX_64X64 throws away (it codes only the

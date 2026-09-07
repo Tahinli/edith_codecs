@@ -1,0 +1,34 @@
+
+running 1 test
+test encode::tests::bd_rate_screen_native ... 
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+bars 1080p: edge 8x8 scores=960 inside_sse=0 padding_sse=288 (100.0% of raw)
+bars 1080p: edge 16x16 scores=3911 inside_sse=58676812 padding_sse=19548435 (25.0% of raw)
+bars 1080p: edge 32x32 scores=22030 inside_sse=306104516 padding_sse=43773571 (12.5% of raw)
+bars 1080p: edge 64x64 scores=8831 inside_sse=170331423 padding_sse=24328832 (12.5% of raw)
+bars 1080p: pricer armings default=17 real=182
+bars 1080p: 64x64 roots 18649 (with a residual 13455, split luma 3328, compound 7665)
+bars 1080p: motion_mode 32x32 SIMPLE=34617 OBMC=0 WARP=146 | 16x16 SIMPLE=5316 OBMC=0 WARP=364 | 8x8 SIMPLE=12757 OBMC=0 WARP=1643 (0.0% OBMC / 3.9% WARP of 54843 eligible)
+bars 1080p: inter var-tx depths of 12742 blocks -- leaf single 0=1551 1=1206 (43.7% split) | leaf compound 0=1828 1=667 (26.7% split) | 32x32 single 0=680 1=1969 (74.3% split) | 32x32 compound 0=902 1=3939 (81.4% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+bars 1080p: filter intra on=true blocks 18678 (modes DC=4101 V=2750 H=3464 D157=5694 PAETH=2669)
+LADDER DECODE FAILURE: libaom-av1 ["-cpu-used", "6", "-b:v", "0", "-crf", "5"]: our decoder refused the stream (unsupported: AV1 tile (a Golomb tail longer than this decoder reads))
+LADDER DECODE FAILURE: libaom-av1 ["-cpu-used", "6", "-b:v", "0", "-crf", "20"] frame 1 plane Y sample 4: our decoder decoded 80, ffmpeg 79
+| bars 1080p 1920x1080 | 44.08 dB/224463 B, 47.80 dB/335377 B, 51.16 dB/456394 B, 54.43 dB/601842 B | +8.7% | -4.1% | 43.5s:9.9s:24.0s |
+
+thread 'encode::tests::bd_rate_screen_native' (2340664) panicked at crates/ec-av1/src/encode.rs:15036:9:
+1920x1080 does not fit in 1920x792
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    encode::tests::bd_rate_screen_native
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 607 filtered out; finished in 83.71s
+
+RC=101
