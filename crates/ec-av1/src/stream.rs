@@ -1603,12 +1603,21 @@ fn decode_frame(
     // symbol four of the frame. Refuse by name rather than return a picture
     // that is silently wrong from luma sample 0 (class `refusal-hides-a-defect`
     // read the other way: a silent wrong decode is worse than a named gap).
-    if header.lossless.iter().any(|&l| l) {
+    // lane-lossless: `CodedLossless` (spec 5.9.12) -- every segment at
+    // `qindex == 0` with zero plane deltas. The tile reader then forces TX_4X4
+    // with the Walsh-Hadamard transform on every plane, codes no `tx_type`
+    // symbol and narrows `is_cfl_allowed` to `plane_bsize == BLOCK_4X4`
+    // (libaom `read_tx_size`/`read_tx_type`/`is_cfl_allowed`). A frame whose
+    // segments DISAGREE is still refused by name: every one of those rules is
+    // per segment there, and no gate covers a mixed frame.
+    let coded_lossless = header.lossless.iter().all(|&l| l);
+    if header.lossless.iter().any(|&l| l) && !coded_lossless {
         return Err(Error::unsupported(
             "AV1 decode_stream",
-            "a lossless frame (qindex 0): the TX_4X4 Walsh-Hadamard tile syntax and the lossless CfL rule are unimplemented",
+            "a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)",
         ));
     }
+    crate::decode::set_lossless(coded_lossless, fctx);
     crate::decode::set_bit_depth(bit_depth, fctx);
     // spec 7.16: this frame's superres state, for the filter chain --
     // `decode.rs` upscales between CDEF and loop restoration and sizes

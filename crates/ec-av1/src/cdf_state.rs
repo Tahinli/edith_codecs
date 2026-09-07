@@ -364,7 +364,11 @@ pub(crate) struct Cdfs {
     /// The all-zero flag of an 8x8 chroma transform.
     pub txb_skip_chroma_8: [[u16; 3]; 3],
     /// The all-zero flag of a 4x4 chroma transform.
-    pub txb_skip_chroma_4: [[u16; 3]; 3],
+    /// lane-lossless: SIX rows, like [`Self::txb_skip_chroma_32`] -- the last
+    /// three are `get_txb_ctx`'s `+10` rows (chroma plane block bigger than
+    /// its transform), which a lossless frame's TX_4X4 chroma reaches at
+    /// every block above 8x8.
+    pub txb_skip_chroma_4: [[u16; 3]; 6],
     /// The end-of-block group of a 16x16 luma transform.
     pub eob_pt_256_luma: [u16; 10],
     /// The end-of-block group of an 8x8 luma transform.
@@ -1031,13 +1035,23 @@ impl Cdfs {
                 cdf::TXB_SKIP_CHROMA_8,
                 cdf::TXB_SKIP_CHROMA_8_Q3,
             ),
-            txb_skip_chroma_4: pick(
-                q_ctx,
-                cdf::TXB_SKIP_CHROMA_4_Q0,
-                cdf::TXB_SKIP_CHROMA_4_Q1,
-                cdf::TXB_SKIP_CHROMA_4,
-                cdf::TXB_SKIP_CHROMA_4_Q3,
-            ),
+            txb_skip_chroma_4: {
+                let small = pick(
+                    q_ctx,
+                    cdf::TXB_SKIP_CHROMA_4_Q0,
+                    cdf::TXB_SKIP_CHROMA_4_Q1,
+                    cdf::TXB_SKIP_CHROMA_4,
+                    cdf::TXB_SKIP_CHROMA_4_Q3,
+                );
+                let big = pick(
+                    q_ctx,
+                    cdf::TXB_SKIP_CHROMA_4_BIG_Q0,
+                    cdf::TXB_SKIP_CHROMA_4_BIG_Q1,
+                    cdf::TXB_SKIP_CHROMA_4_BIG,
+                    cdf::TXB_SKIP_CHROMA_4_BIG_Q3,
+                );
+                [small[0], small[1], small[2], big[0], big[1], big[2]]
+            },
             eob_pt_256_luma: pick(
                 q_ctx,
                 cdf::EOB_PT_256_LUMA_Q0,
