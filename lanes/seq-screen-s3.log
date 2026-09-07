@@ -1,0 +1,16 @@
+
+running 1 test
+test encode::tests::bd_rate_screen_native ... 
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+screen capture (2026-07-25 02-09-04.mkv): sequence, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective None
+screen capture (2026-07-25 02-09-04.mkv): pricer armings default=163 real=0
+screen capture (2026-07-25 02-09-04.mkv): motion_mode 32x32 SIMPLE=0 OBMC=0 WARP=0 | 16x16 SIMPLE=0 OBMC=0 WARP=0 | 8x8 SIMPLE=0 OBMC=0 WARP=0 (0.0% OBMC / 0.0% WARP of 0 eligible)
+screen capture (2026-07-25 02-09-04.mkv): inter var-tx depths of 24027 blocks -- leaf single 0=3010 1=3181 (51.4% split) | leaf compound 0=2626 1=2078 (44.2% split) | 32x32 single 0=3051 1=6437 (67.8% split) | 32x32 compound 0=1287 1=2357 (64.7% split)
+screen capture (2026-07-25 02-09-04.mkv): screen frames on=48 off=0 (100.0% on); palette blocks luma 7280 chroma 1256; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| screen capture (2026-07-25 02-09-04.mkv) 1920x1024 | 45.89 dB/45757 B, 48.67 dB/58149 B, 51.08 dB/75412 B, 53.35 dB/97886 B | +54.3% | -13.2% | 34.9s:9.9s:12.4s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 583 filtered out; finished in 61.00s
+

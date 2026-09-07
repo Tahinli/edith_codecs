@@ -1,0 +1,362 @@
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:253:5
+    |
+253 |     pub signal_type: i32,
+    |     ^^^^^^^^^^^^^^^^^^^^
+    |
+note: the lint level is defined here
+   --> crates/ec-opus/src/lib.rs:62:9
+    |
+ 62 | #![warn(missing_docs)]
+    |         ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:254:5
+    |
+254 |     pub quant_offset_type: i32,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:255:5
+    |
+255 |     pub gains: [i8; 4],
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:256:5
+    |
+256 |     pub nlsf: [i8; 17],
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:257:5
+    |
+257 |     pub nlsf_interp_coef_q2: i32,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:258:5
+    |
+258 |     pub lag_index: i32,
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:259:5
+    |
+259 |     pub contour_index: i32,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:260:5
+    |
+260 |     pub per_index: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:261:5
+    |
+261 |     pub ltp_index: [usize; 4],
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:262:5
+    |
+262 |     pub ltp_scale_index: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:263:5
+    |
+263 |     pub seed: i32,
+    |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> crates/ec-opus/src/silk.rs:264:5
+    |
+264 |     pub frames_decoded: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:45:5
+   |
+45 |     pub voiced: bool,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:46:5
+   |
+46 |     pub signal_type: i32,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:47:5
+   |
+47 |     pub gain_idx: [i8; MAX_NB_SUBFR],
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:48:5
+   |
+48 |     pub nb_subfr: usize,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:49:5
+   |
+49 |     pub lag_index: i32,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:50:5
+   |
+50 |     pub pitch_l: [i32; MAX_NB_SUBFR],
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:51:5
+   |
+51 |     pub nlsf_interp: i32,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:52:5
+   |
+52 |     pub bytes: usize,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> crates/ec-opus/src/silk_enc_write.rs:53:5
+   |
+53 |     pub ltp_gain: f32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: `ec-opus` (lib) generated 21 warnings
+   Compiling ec-bench v0.1.0 (/home/tahinli/Documents/Code/Rust/edith_codecs-av1fast/tools/ec-bench)
+    Finished `release` profile [optimized] target(s) in 1.65s
+     Running `bash -c 'root=$(git rev-parse --show-toplevel) && exec "$root/scripts/memguard-runner.sh" "$@"' -- /home/tahinli/.cache/cargo-target-av1fast/release/ec-bench`
+| component | direction | content | media | wall ms | realtime factor |
+|---|---|---|---|---|---|
+| ec-h265 | encode | 640x360, 10 frames, IDR-only | 0.3s | 5928.0 | 0.06x |
+| ec-av1 | encode | speed 0 [full search], 640x384, 10 frames, gop=10, flat (gated: screen content), 0 hidden, 5.7 fps, 2711 B/frame | 0.3s | 1755.2 | 0.19x |
+| ec-av1 | encode | speed 3 [no 8x8 split, no warp, no angle delta, no CfL, no loop restoration, chroma top-3, no tpl], 640x384, 10 frames, gop=10, flat (gated: screen content), 0 hidden, 7.5 fps, 2749 B/frame | 0.3s | 1326.5 | 0.25x |
+| ec-h264 | encode | 640x360, 30 frames, 1 thread | 1.0s | 2490.6 | 0.40x |
+| ec-av1 | encode | speed 6 [no 8x8 split, no extra-reference NEWMV, no warp, no inter var-tx/tx-depth, no 32x32 tx depth, no compound var-tx, no angle delta, no CfL, no loop restoration, split-RD breakout 0.5, coeff breakout 1, intra top-4, inter-intra top-2, chroma top-2, no tpl], 640x384, 10 frames, gop=10, flat (gated: screen content), 0 hidden, 12.5 fps, 2698 B/frame | 0.3s | 801.8 | 0.42x |
+| ec-av1 | encode | speed 10 [no 8x8 split, no 32x32 split (32x32-only partitions), no leaf second-reference search, no extra-reference NEWMV, no leaf compound, no compound, no warp, no inter var-tx/tx-depth, no 32x32 tx depth, no compound var-tx, no key tx-depth, no angle delta, no CfL, no loop restoration, no deblock refine, no chroma deblock stage, split-RD breakout 4, coeff breakout 4, intra top-1, inter-intra top-1, chroma top-1, no tpl, no CDEF search, CDEF presets 0], 640x384, 10 frames, gop=10, flat (gated: screen content), 0 hidden, 19.6 fps, 3403 B/frame | 0.3s | 510.9 | 0.65x |
+| ec-h264 | decode | 1920x1080 film, 302 frames | 10.1s | 3850.6 | 2.61x |
+| ec-image | decode | interlaced-rgba16.png (320x240, 0.43 MB coded) | 0.08 MP | 24.5 | 3.14x |
+| ec-image | decode | rgb555.bmp (64x48, 0.01 MB coded) | 0.00 MP | 0.7 | 4.11x |
+| ec-truehd | encode | 3.0s wav16 stereo @ 48000Hz | 3.0s | 684.6 | 4.38x |
+| ec-image | decode | rgb16.tiff (64x48, 0.02 MB coded) | 0.00 MP | 0.5 | 5.80x |
+| ec-image | decode | source.png (320x240, 0.40 MB coded) | 0.08 MP | 12.4 | 6.20x |
+| ec-image | decode | rgba8.png (320x240, 0.10 MB coded) | 0.08 MP | 12.2 | 6.28x |
+| ec-h265 | decode | 640x360, 10 frames, own IDR stream | 0.3s | 51.7 | 6.45x |
+| ec-image | decode | interlaced-rgb8.png (320x240, 0.38 MB coded) | 0.08 MP | 11.3 | 6.78x |
+| ec-image | decode | rgba16.png (320x240, 0.40 MB coded) | 0.08 MP | 9.7 | 7.94x |
+| ec-image | decode | giphy.gif (480x270, 0.06 MB coded) | 0.13 MP | 15.9 | 8.16x |
+| ec-image | decode | tiny.png (32x24, 0.01 MB coded) | 0.00 MP | 0.1 | 8.55x |
+| ec-image | decode | source-odd.png (61x47, 0.02 MB coded) | 0.00 MP | 0.3 | 9.36x |
+| ec-image | decode | source-alpha.png (320x240, 0.40 MB coded) | 0.08 MP | 7.8 | 9.86x |
+| ec-av1 | decode | 640x384, 10 frames, gop=10 | 0.3s | 31.4 | 10.63x |
+| ec-image | decode | odd-lossless.webp (61x47, 0.01 MB coded) | 0.00 MP | 0.3 | 11.05x |
+| ec-image | decode | embedded-png.bmp (64x48, 0.02 MB coded) | 0.00 MP | 0.3 | 11.54x |
+| ec-image | decode | lossless.webp (320x240, 0.07 MB coded) | 0.08 MP | 6.5 | 11.75x |
+| ec-image | decode | tiny-lossy.webp (32x24, 0.00 MB coded) | 0.00 MP | 0.1 | 12.75x |
+| ec-image | decode | odd-interlaced.png (61x47, 0.02 MB coded) | 0.00 MP | 0.2 | 12.92x |
+| ec-image | decode | tiny-lossless.webp (32x24, 0.00 MB coded) | 0.00 MP | 0.1 | 13.32x |
+| ec-image | decode | odd24.bmp (37x29, 0.00 MB coded) | 0.00 MP | 0.1 | 13.83x |
+| ec-image | decode | rgb16.png (320x240, 0.36 MB coded) | 0.08 MP | 5.5 | 13.91x |
+| ec-image | decode | lossless-alpha.webp (320x240, 0.08 MB coded) | 0.08 MP | 5.0 | 15.47x |
+| ec-image | decode | odd-lossy.webp (61x47, 0.00 MB coded) | 0.00 MP | 0.2 | 15.58x |
+| ec-image | decode | odd-rgb8.png (61x47, 0.02 MB coded) | 0.00 MP | 0.2 | 16.16x |
+| ec-image | decode | tiny.tiff (32x24, 0.00 MB coded) | 0.00 MP | 0.0 | 16.53x |
+| ec-image | decode | trns-rgb.png (320x240, 0.36 MB coded) | 0.08 MP | 4.6 | 16.57x |
+| ec-image | decode | rgb8.png (320x240, 0.09 MB coded) | 0.08 MP | 4.4 | 17.44x |
+| ec-image | decode | rgb8-zip-pred.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.2 | 18.81x |
+| ec-image | decode | lossy-alpha.webp (320x240, 0.01 MB coded) | 0.08 MP | 4.1 | 18.93x |
+| ec-image | decode | rgb8.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.2 | 19.45x |
+| ec-image | decode | progressive-444.jpg (320x240, 0.02 MB coded) | 0.08 MP | 3.9 | 19.71x |
+| ec-mp3 | encode | 3.0s wav16 2ch @ 48000Hz | 3.0s | 150.6 | 19.91x |
+| ec-image | decode | rgb8-tiled.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.2 | 20.10x |
+| ec-image | decode | trns-gray.png (320x240, 0.03 MB coded) | 0.08 MP | 3.8 | 20.44x |
+| ec-image | decode | rgb8-lzw-pred.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.1 | 20.52x |
+| ec-image | decode | animated.gif (320x240, 0.03 MB coded) | 0.08 MP | 3.7 | 20.96x |
+| ec-image | decode | palette4-golden.png (64x48, 0.00 MB coded) | 0.00 MP | 0.1 | 21.43x |
+| ec-image | decode | still.gif (320x240, 0.03 MB coded) | 0.08 MP | 3.6 | 21.62x |
+| ec-image | decode | rgb8-lzw.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.1 | 22.10x |
+| ec-image | decode | rgb8-zip.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.1 | 22.57x |
+| ec-image | decode | interlaced.gif (320x240, 0.04 MB coded) | 0.08 MP | 3.3 | 23.51x |
+| ec-image | decode | rgba8.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.1 | 24.11x |
+| ec-image | decode | anim-alpha-f1.png (96x72, 0.01 MB coded) | 0.01 MP | 0.3 | 25.00x |
+| ec-image | decode | odd-422.jpg (61x47, 0.00 MB coded) | 0.00 MP | 0.1 | 25.26x |
+| ec-image | decode | progressive-420.jpg (320x240, 0.01 MB coded) | 0.08 MP | 2.9 | 26.16x |
+| ec-image | decode | anim-alpha-f0.png (96x72, 0.01 MB coded) | 0.01 MP | 0.3 | 26.48x |
+| ec-image | decode | baseline-444.jpg (320x240, 0.02 MB coded) | 0.08 MP | 2.9 | 26.79x |
+| ec-aac | encode | 3.0s wav16 2ch @ 48000Hz | 3.0s | 111.1 | 26.99x |
+| ec-image | decode | tiny.jpg (32x24, 0.00 MB coded) | 0.00 MP | 0.0 | 27.35x |
+| ec-image | decode | odd.gif (61x47, 0.00 MB coded) | 0.00 MP | 0.1 | 27.66x |
+| ec-image | decode | tiny.gif (32x24, 0.00 MB coded) | 0.00 MP | 0.0 | 28.52x |
+| ec-image | decode | odd-420.jpg (61x47, 0.00 MB coded) | 0.00 MP | 0.1 | 28.69x |
+| ec-image | decode | lossy-q40.webp (320x240, 0.00 MB coded) | 0.08 MP | 2.6 | 28.98x |
+| ec-image | decode | rgba8-assoc.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.1 | 32.06x |
+| ec-image | decode | gray1.png (320x240, 0.00 MB coded) | 0.08 MP | 2.3 | 33.23x |
+| ec-image | decode | lossy.webp (320x240, 0.01 MB coded) | 0.08 MP | 2.3 | 33.72x |
+| ec-image | decode | gray4.png (320x240, 0.01 MB coded) | 0.08 MP | 2.2 | 34.64x |
+| ec-image | decode | 20260722-233942.png (1920x1080, 3.33 MB coded) | 2.07 MP | 59.7 | 34.74x |
+| ec-image | decode | gray8.png (320x240, 0.03 MB coded) | 0.08 MP | 2.2 | 35.09x |
+| ec-image | decode | palette2.png (320x240, 0.00 MB coded) | 0.08 MP | 2.1 | 36.21x |
+| ec-image | decode | rgb8-be.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.1 | 39.91x |
+| ec-image | decode | baseline-422.jpg (320x240, 0.02 MB coded) | 0.08 MP | 1.9 | 40.34x |
+| ec-image | decode | embedded-jpeg.bmp (64x48, 0.00 MB coded) | 0.00 MP | 0.1 | 40.69x |
+| ec-image | decode | rgb8-planar.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.1 | 40.96x |
+| ec-image | decode | rgb8-packbits.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.1 | 45.65x |
+| ec-image | decode | restart-420.jpg (320x240, 0.02 MB coded) | 0.08 MP | 1.7 | 46.24x |
+| ec-image | decode | source-flat.png (320x240, 0.02 MB coded) | 0.08 MP | 1.6 | 47.38x |
+| ec-image | decode | graya8.png (320x240, 0.03 MB coded) | 0.08 MP | 1.6 | 48.71x |
+| ec-image | decode | palette8.png (320x240, 0.03 MB coded) | 0.08 MP | 1.6 | 49.10x |
+| ec-image | decode | gray16.png (320x240, 0.12 MB coded) | 0.08 MP | 1.5 | 51.61x |
+| ec-image | decode | palette4.png (320x240, 0.01 MB coded) | 0.08 MP | 1.4 | 55.21x |
+| ec-ac3 | encode | 3.0s wav16 2ch @ 48000Hz | 3.0s | 54.3 | 55.29x |
+| ec-image | decode | palette1.png (320x240, 0.00 MB coded) | 0.08 MP | 1.3 | 57.50x |
+| ec-image | decode | IMG_20260804_170612.jpg (4096x3072, 2.93 MB coded) | 12.58 MP | 217.5 | 57.84x |
+| ec-image | decode | anim-alpha-f2.png (96x72, 0.00 MB coded) | 0.01 MP | 0.1 | 61.18x |
+| ec-image | decode | baseline-420.jpg (320x240, 0.01 MB coded) | 0.08 MP | 1.2 | 63.19x |
+| ec-alac | encode | 3.0s wav16 2ch @ 48000Hz | 3.0s | 47.5 | 63.19x |
+| ec-image | decode | interlaced-palette.png (320x240, 0.02 MB coded) | 0.08 MP | 1.2 | 65.33x |
+| ec-image | decode | rle4.bmp (64x48, 0.00 MB coded) | 0.00 MP | 0.0 | 75.05x |
+| ec-image | decode | gray2.png (320x240, 0.00 MB coded) | 0.08 MP | 0.9 | 83.72x |
+| ec-image | decode | baseline-420-q50.jpg (320x240, 0.01 MB coded) | 0.08 MP | 0.8 | 90.98x |
+| ec-image | decode | gray.jpg (320x240, 0.01 MB coded) | 0.08 MP | 0.8 | 92.78x |
+| ec-image | decode | trns.gif (320x240, 0.02 MB coded) | 0.08 MP | 0.8 | 93.15x |
+| ec-image | decode | drawing-1.png (1088x526, 0.05 MB coded) | 0.57 MP | 5.6 | 102.60x |
+| ec-image | decode | palette4.tiff (64x48, 0.00 MB coded) | 0.00 MP | 0.0 | 104.59x |
+| ec-image | decode | trns-palette.png (320x240, 0.01 MB coded) | 0.08 MP | 0.7 | 105.85x |
+| ec-image | decode | alpha32.bmp (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 109.52x |
+| ec-image | decode | v5alpha.bmp (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 113.27x |
+| ec-image | decode | gray8.tiff (64x48, 0.00 MB coded) | 0.00 MP | 0.0 | 128.16x |
+| ec-image | decode | bf565.bmp (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 132.07x |
+| ec-image | decode | lossless-palette.webp (320x240, 0.01 MB coded) | 0.08 MP | 0.6 | 133.30x |
+| ec-probe/Alac | decode | alac24-mp4-5.1-48000.m4a | 3.0s | 21.3 | 140.46x |
+| ec-image | decode | bilevel.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 144.09x |
+| ec-probe/Opus | decode | opus-ogg-5.1-48000.opus | 3.0s | 20.5 | 146.32x |
+| ec-inflate | inflate | gray16.png IDAT stream, 0.12 MB in | 0.15 MB out | 1.0 | 153.21x |
+| ec-image | decode | pal8.bmp (64x48, 0.00 MB coded) | 0.00 MP | 0.0 | 159.42x |
+| ec-probe/Flac | decode | flac-5.1-48000.flac | 3.0s | 18.6 | 161.62x |
+| ec-probe/Alac | decode | alac-mp4-5.1-48000.m4a | 3.0s | 18.5 | 161.78x |
+| ec-probe/Vorbis | decode | vorbis-ogg-5.1-48000.ogg | 3.0s | 18.4 | 162.54x |
+| ec-flac | encode | 3.0s wav16 2ch @ 48000Hz | 3.0s | 17.8 | 168.78x |
+| ec-image | decode | gray16.tiff (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 170.48x |
+| ec-probe/Flac | decode | flac-5.1-44100.flac | 3.0s | 17.5 | 171.59x |
+| ec-probe/Alac | decode | alac-mp4-5.1-44100.m4a | 3.0s | 17.1 | 175.23x |
+| ec-image | decode | tiny.bmp (32x24, 0.00 MB coded) | 0.00 MP | 0.0 | 182.86x |
+| ec-probe/Vorbis | decode | vorbis-ogg-5.1-44100.ogg | 3.0s | 16.1 | 185.74x |
+| ec-image | decode | rle8.bmp (64x48, 0.00 MB coded) | 0.00 MP | 0.0 | 200.39x |
+| ec-opus | encode | 3.0s wav16 2ch @ 48000Hz | 3.0s | 14.4 | 208.71x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-48000-cbr320.mp3 | 3.0s | 12.4 | 243.57x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-44100-cbr320.mp3 | 3.0s | 12.1 | 250.09x |
+| ec-probe/Opus | decode | opus-ogg-stereo-48000.opus | 3.0s | 12.0 | 251.18x |
+| ec-image | decode | os2v2.bmp (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 262.32x |
+| ec-probe/Opus | decode | opus-mka-stereo-48000.mka | 3.0s | 11.4 | 265.27x |
+| ec-probe/Mp3 | decode | cover-mp3-stereo-44100.mp3 | 3.0s | 11.1 | 274.09x |
+| ec-probe/Mp3 | decode | mp3-stereo-48000.mp3 | 3.0s | 10.5 | 286.97x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-48000-vbr2.mp3 | 3.0s | 10.3 | 292.67x |
+| ec-probe/Mp3 | decode | mp3ext-simplestereo-44100-cbr192.mp3 | 3.0s | 10.3 | 294.87x |
+| ec-probe/Mp3 | decode | mp3-stereo-44100.mp3 | 3.0s | 10.2 | 295.73x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-48000-cbr128.mp3 | 3.0s | 10.2 | 297.57x |
+| ec-probe/Aac | decode | aac-mp4-5.1-48000.mp4 | 3.0s | 10.1 | 299.02x |
+| ec-probe/Aac | decode | aac-adts-5.1-48000.aac | 3.0s | 10.1 | 299.10x |
+| ec-image | decode | mono.bmp (64x48, 0.00 MB coded) | 0.00 MP | 0.0 | 300.88x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-32000-cbr320.mp3 | 3.1s | 9.9 | 308.27x |
+| ec-probe/Aac | decode | aac-mp4-5.1-44100.mp4 | 3.0s | 9.7 | 309.95x |
+| ec-probe/Aac | decode | aac-adts-5.1-44100.aac | 3.0s | 9.7 | 311.60x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-44100-cbr128.mp3 | 3.0s | 9.7 | 312.02x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-44100-vbr2.mp3 | 3.0s | 9.7 | 312.31x |
+| ec-image | decode | pal4.bmp (64x48, 0.00 MB coded) | 0.00 MP | 0.0 | 314.43x |
+| ec-probe/Mp3 | decode | 8a3b6d1d19.mp3 | 74.1s | 226.0 | 327.89x |
+| ec-image | decode | topdown24.bmp (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 342.47x |
+| ec-truehd | decode | own encoded stream, stereo | 3.0s | 8.7 | 345.66x |
+| ec-image | decode | os2v1.bmp (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 347.12x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-32000-vbr2.mp3 | 3.1s | 8.2 | 373.21x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-32000-cbr128.mp3 | 3.1s | 8.0 | 381.74x |
+| ec-probe/Mp3 | decode | mp3ext-mono-48000-cbr320.mp3 | 3.0s | 7.9 | 382.22x |
+| ec-image | decode | rgb24.bmp (64x48, 0.01 MB coded) | 0.00 MP | 0.0 | 391.84x |
+| ec-probe/Opus | decode | opus-ogg-mono-48000.opus | 3.0s | 7.5 | 404.28x |
+| ec-probe/Alac | decode | alac24-mp4-stereo-48000.m4a | 3.0s | 7.3 | 409.55x |
+| ec-probe/Mp3 | decode | mp3ext-mono-44100-cbr320.mp3 | 3.0s | 7.3 | 415.98x |
+| ec-probe/Aac | decode | aac-tool-tns-mp4-stereo-48000.m4a | 3.0s | 6.7 | 449.43x |
+| ec-probe/Aac | decode | aac-tool-ms-mp4-stereo-48000.m4a | 3.0s | 6.7 | 451.85x |
+| ec-probe/Aac | decode | aac-tool-is-mp4-stereo-48000.m4a | 3.0s | 6.4 | 471.80x |
+| ec-probe/Alac | decode | alac-mp4-stereo-48000.m4a | 3.0s | 6.3 | 473.74x |
+| ec-probe/Vorbis | decode | vorbis-ogg-stereo-48000.ogg | 3.0s | 6.3 | 478.10x |
+| ec-probe/Mp3 | decode | mp3ext-mono-48000-cbr128.mp3 | 3.0s | 6.3 | 479.49x |
+| ec-probe/Flac | decode | flac-mka-stereo-48000.mka | 3.0s | 6.1 | 489.78x |
+| ec-probe/Aac | decode | av-h264-aac-stereo-48000.mkv | 3.0s | 6.1 | 497.77x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-24000-cbr128.mp3 | 3.0s | 6.1 | 499.92x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-22050-vbr2.mp3 | 3.1s | 6.1 | 502.32x |
+| ec-probe/Flac | decode | flac-stereo-48000.flac | 3.0s | 6.0 | 502.78x |
+| ec-probe/Aac | decode | aac-tool-all-mp4-stereo-48000.m4a | 3.0s | 6.0 | 505.71x |
+| ec-probe/Mp3 | decode | mp3ext-mono-44100-cbr128.mp3 | 3.0s | 6.0 | 508.07x |
+| ec-vorbis | encode | 3.0s wav16 2ch @ 48000Hz | 3.0s | 5.9 | 510.14x |
+| ec-probe/Aac | decode | aac-mp4-stereo-48000.mp4 | 3.0s | 5.9 | 511.17x |
+| ec-probe/Aac | decode | aac-mka-stereo-48000.mka | 3.0s | 5.9 | 512.35x |
+| ec-probe/Aac | decode | aac-adts-stereo-48000.aac | 3.0s | 5.9 | 513.70x |
+| ec-probe/Alac | decode | alac-mp4-stereo-44100.m4a | 3.0s | 5.8 | 517.57x |
+| ec-probe/Aac | decode | aac-tool-pns-mp4-stereo-48000.m4a | 3.0s | 5.8 | 521.15x |
+| ec-probe/Aac | decode | cover-mp4-stereo-44100.m4a | 3.0s | 5.8 | 522.50x |
+| ec-probe/Aac | decode | aac-adts-stereo-44100.aac | 3.0s | 5.8 | 522.96x |
+| ec-probe/Vorbis | decode | vorbis-ogg-stereo-44100.ogg | 3.0s | 5.7 | 526.56x |
+| ec-probe/Aac | decode | aac-mp4-stereo-44100.mp4 | 3.0s | 5.8 | 528.06x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-24000-vbr2.mp3 | 3.0s | 5.7 | 536.42x |
+| ec-probe/Flac | decode | flac-stereo-44100.flac | 3.0s | 5.6 | 539.40x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-22050-cbr128.mp3 | 3.1s | 5.6 | 541.36x |
+| ec-probe/Mp3 | decode | mp3ext-mono-48000-vbr2.mp3 | 3.0s | 5.5 | 549.35x |
+| ec-probe/Mp3 | decode | mp3-mono-48000.mp3 | 3.0s | 5.5 | 552.29x |
+| ec-probe/Mp3 | decode | mp3-mono-44100.mp3 | 3.0s | 5.4 | 559.44x |
+| ec-probe/Mp3 | decode | mp3ext-mono-32000-cbr320.mp3 | 3.1s | 5.4 | 562.26x |
+| ec-probe/Mp3 | decode | mp3ext-mono-44100-vbr2.mp3 | 3.0s | 5.4 | 564.34x |
+| ec-probe/Mp3 | decode | mp3ext-mono-32000-cbr128.mp3 | 3.1s | 4.9 | 618.41x |
+| ec-probe/Aac | decode | aac-adts-mono-48000.aac | 3.0s | 4.5 | 680.08x |
+| ec-probe/Aac | decode | aac-mp4-mono-48000.mp4 | 3.0s | 4.4 | 695.34x |
+| ec-probe/Aac | decode | aac-adts-mono-44100.aac | 3.0s | 4.3 | 709.73x |
+| ec-mp4 | demux | he_is_not_the_only_one.mp4 (187.5 MB, 7113 packets) | 99.8s | 140.1 | 711.91x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-16000-cbr128.mp3 | 3.1s | 4.3 | 715.69x |
+| ec-probe/Aac | decode | aac-mp4-mono-44100.mp4 | 3.0s | 4.2 | 718.89x |
+| ec-probe/Mp3 | decode | mp3ext-mono-32000-vbr2.mp3 | 3.1s | 4.2 | 735.32x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-16000-vbr2.mp3 | 3.1s | 3.9 | 799.99x |
+| ec-matroska | demux | h264-1080p-60-8bit.mkv (6.9 MB, 120 packets) | 2.0s | 2.5 | 801.05x |
+| ec-probe/Mp3 | decode | mp3ext-mono-24000-cbr128.mp3 | 3.0s | 3.8 | 810.43x |
+| ec-probe/Mp3 | decode | mp3ext-mono-22050-cbr128.mp3 | 3.1s | 3.5 | 872.69x |
+| ec-probe/Alac | decode | alac-mp4-mono-48000.m4a | 3.0s | 3.2 | 947.79x |
+| ec-probe/Flac | decode | flac-mono-48000.flac | 3.0s | 3.1 | 969.93x |
+| ec-probe/Mp3 | decode | mp3ext-mono-24000-vbr2.mp3 | 3.0s | 3.1 | 970.04x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-12000-cbr128.mp3 | 3.1s | 3.0 | 1034.82x |
+| ec-probe/Alac | decode | alac-mp4-mono-44100.m4a | 3.0s | 2.9 | 1038.27x |
+| ec-probe/Vorbis | decode | vorbis-ogg-mono-48000.ogg | 3.0s | 2.8 | 1054.66x |
+| ec-probe/Mp3 | decode | mp3ext-mono-22050-vbr2.mp3 | 3.1s | 2.8 | 1079.37x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-12000-vbr2.mp3 | 3.1s | 2.8 | 1110.69x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-11025-cbr128.mp3 | 3.1s | 2.8 | 1114.36x |
+| ec-probe/Vorbis | decode | vorbis-ogg-mono-44100.ogg | 3.0s | 2.6 | 1142.04x |
+| ec-probe/PcmS16Le | decode | wav16-stereo-44100.wav | 3.0s | 2.6 | 1145.44x |
+| ec-probe/Mp3 | decode | mp3ext-mono-16000-cbr128.mp3 | 3.1s | 2.6 | 1175.33x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-11025-vbr2.mp3 | 3.1s | 2.6 | 1192.69x |
+| ec-probe/Flac | decode | flac-mono-44100.flac | 3.0s | 2.5 | 1197.36x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-8000-cbr128.mp3 | 3.2s | 2.3 | 1391.99x |
+| ec-probe/Mp3 | decode | mp3ext-mono-16000-vbr2.mp3 | 3.1s | 2.1 | 1470.44x |
+| ec-probe/Mp3 | decode | mp3ext-mono-12000-cbr128.mp3 | 3.1s | 1.9 | 1654.08x |
+| ec-probe/Mp3 | decode | mp3ext-stereo-8000-vbr2.mp3 | 3.2s | 1.9 | 1701.53x |
+| ec-probe/Mp3 | decode | mp3ext-mono-11025-cbr128.mp3 | 3.1s | 1.8 | 1764.01x |
+| ec-probe/Mp3 | decode | mp3ext-mono-12000-vbr2.mp3 | 3.1s | 1.6 | 1921.42x |
+| ec-probe/Mp3 | decode | mp3ext-mono-11025-vbr2.mp3 | 3.1s | 1.5 | 2100.53x |
+| ec-probe/Mp3 | decode | mp3ext-mono-8000-cbr128.mp3 | 3.2s | 1.4 | 2270.08x |
+| ec-probe/PcmS16Le | decode | wav16-5.1-48000.wav | 3.0s | 1.1 | 2611.23x |
+| ec-probe/PcmS16Le | decode | wav16-5.1-44100.wav | 3.0s | 1.1 | 2697.55x |
+| ec-probe/Mp3 | decode | mp3ext-mono-8000-vbr2.mp3 | 3.2s | 1.1 | 2785.05x |
+| ec-probe/PcmS16Le | decode | mp3src-mono-48000.wav | 3.0s | 0.6 | 4957.59x |
+| ec-probe/PcmS16Le | decode | mp3src-stereo-44100.wav | 3.0s | 0.5 | 6589.47x |
+| ec-probe/PcmS16Le | decode | wav16-stereo-48000.wav | 3.0s | 0.4 | 6791.92x |
+| ec-probe/PcmS16Le | decode | mp3src-stereo-48000.wav | 3.0s | 0.4 | 7191.81x |
+| ec-probe/PcmS16Le | decode | test.wav | 973.0s | 121.0 | 8039.81x |
+| ec-probe/PcmS16Le | decode | .mp3src.wav | 3.0s | 0.3 | 9248.07x |
+| ec-probe/PcmS16Le | decode | wav16-mono-48000.wav | 3.0s | 0.1 | 21371.94x |
+| ec-probe/PcmS16Le | decode | mp3src-mono-44100.wav | 3.0s | 0.1 | 24890.07x |
+| ec-probe/PcmS16Le | decode | wav16-mono-44100.wav | 3.0s | 0.1 | 25335.70x |
+RUN_RC=0
