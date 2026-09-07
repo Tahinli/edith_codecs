@@ -9373,8 +9373,13 @@ pub(crate) fn encode_inter_frame(
                 // superblock's own 16x16-mi window, the same stacks the tile
                 // writer's `Whole64` arm rebuilds. Empty unless the frame
                 // codes `reference_select`, which is what gates the syntax.
+                // `!screen` for the same reason the residual arm is gated
+                // there ([`b64_residual`]): a desktop capture's superblocks
+                // are flat runs the skip arm already codes for nothing, and
+                // MEASURED, compound at the root cost it +33.4/-23.8 ->
+                // +33.7/-23.6 while both film rows gained (step 1's table).
                 let sb_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
-                    if header.reference_select && b64_compound() {
+                    if header.reference_select && b64_compound() && !screen {
                         [
                             (crate::mvstack::GOLDEN_FRAME, golden),
                             (crate::mvstack::ALTREF_FRAME, altref),
@@ -13831,8 +13836,11 @@ mod tests {
         // base now, not 16 ([`crate::encoder::Pyramid::leaf_q_offset`]) -- 9778
         // -> 9835 at q=150 and 35450 -> 35798 at q=60.
         // `EC_AV1_PYRAMID=8:-32:16:-8:-48` restores these.
+        // Re-taken on lane-b64b: the 64x64 root prices COMPOUND references
+        // now ([`b64_compound`]) -- 9835 -> 9793 at q=150 and 35798 -> 35911
+        // at q=60. `EC_AV1_B64COMP=0` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9835, 0xfdac_0219_4a6e_111e), (60, 35798, 0xe57e_aa3f_8b48_d206)];
+            [(150, 9793, 0x31ac_a6a7_6a00_5ab7), (60, 35911, 0xcd51_00e3_7008_f372)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
@@ -14386,6 +14394,9 @@ mod tests {
             let _ = crate::tile::take_compound_pair_hits();
             let _ = crate::tile::take_compound_size_hits();
             let _ = crate::tile::take_compound_leaf_mode_hits();
+            let _ = take_b64_root_hits();
+            let _ = take_b64_residual_hits();
+            let _ = take_b64_compound_hits();
             let _ = crate::motion::take_census();
             // The entry-surface arm: run the SAME ladder through the
             // streaming facade the editor's export calls, which must print
@@ -14433,6 +14444,17 @@ mod tests {
             // a compound reference at all, which compound mode they took, and
             // which pair (gate-blind-to-feature -- a compound mode nobody
             // picks cannot be what a BD number credits).
+            // The 64x64 root's own fire shares (lane-b64/tx64/b64b): how many
+            // superblocks were left whole at all, and how many of those coded
+            // a residual or took a compound reference.
+            let (roots, root_res, root_comp) = (
+                take_b64_root_hits(),
+                take_b64_residual_hits(),
+                take_b64_compound_hits(),
+            );
+            eprintln!(
+                "{name}: 64x64 roots {roots} (with a residual {root_res}, compound {root_comp})"
+            );
             let comp_modes = crate::tile::take_compound_mode_hits();
             let comp_pairs = crate::tile::take_compound_pair_hits();
             let comp_sizes = crate::tile::take_compound_size_hits();
