@@ -26,6 +26,7 @@
 pub mod bits;
 pub mod cdf;
 mod cdf_state;
+pub mod census;
 mod compound;
 pub mod decode;
 pub mod encode;
