@@ -158,7 +158,12 @@ impl FrameCtx {
     /// predecessor was born with.
     pub(crate) fn new() -> Self {
         Self {
-            sb128_flag: std::cell::Cell::new(false),
+            // lane-sb128: an ENCODER context starts at the sequence size
+            // this process encodes (`crate::encode::sb128_on`) so the mode
+            // search's own `Reach` and the filter search's internal decodes
+            // agree with the tile writer; every real decode overwrites it
+            // from the parsed sequence header (`set_sb128`, stream.rs).
+            sb128_flag: std::cell::Cell::new(crate::encode::sb128_on()),
             lossless_flag: std::cell::Cell::new(false),
             cdef_bits: std::cell::Cell::new(0),
             bit_depth: std::cell::Cell::new(8),
@@ -203,7 +208,11 @@ impl FrameCtx {
             inter_last_mc: std::cell::Cell::new(None),
             enable_edge_filter: std::cell::Cell::new(false),
             last_frame_wide_margin: std::cell::RefCell::new(None),
-            reach_sb_px: std::cell::Cell::new(crate::encode::SUPERBLOCK),
+            reach_sb_px: std::cell::Cell::new(if crate::encode::sb128_on() {
+                128
+            } else {
+                crate::encode::SUPERBLOCK
+            }),
             grain_bit_depth: std::cell::Cell::new(8),
             recon_ops: std::cell::RefCell::new(Vec::new()),
             recon_spare: std::cell::RefCell::new(Vec::new()),
@@ -407,14 +416,14 @@ pub(crate) fn part128_split_hits() -> usize {
 /// has 8 symbols (no `PARTITION_HORZ_4`/`_VERT_4` at `BLOCK_128X128`, spec
 /// `partition_cdf_length`), so its forced-split gather sums 5 elements where
 /// the 64/32 levels sum 6.
-fn gather_of(cdf: &[u16], elements: &[usize]) -> [u16; 3] {
+pub(crate) fn gather_of(cdf: &[u16], elements: &[usize]) -> [u16; 3] {
     let split: u16 = elements.iter().map(|&e| element_prob(cdf, e)).sum();
     [32768 - split, 32768, 0]
 }
 
 /// [`VERT_ALIKE`]/[`HORZ_ALIKE`] without the 1:4 arms, for the 128 root.
-const VERT_ALIKE128: [usize; 5] = [2, PARTITION_SPLIT, 4, 6, 7];
-const HORZ_ALIKE128: [usize; 5] = [1, PARTITION_SPLIT, 4, 5, 6];
+pub(crate) const VERT_ALIKE128: [usize; 5] = [2, PARTITION_SPLIT, 4, 6, 7];
+pub(crate) const HORZ_ALIKE128: [usize; 5] = [1, PARTITION_SPLIT, 4, 5, 6];
 
 // How many `use_filter_intra` symbols this decoder has read as `1`, across
 // every call on the current thread -- the cheap counter [`filter_intra_hits`] gate

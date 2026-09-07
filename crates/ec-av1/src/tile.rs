@@ -85,19 +85,136 @@ pub(crate) fn arm_lr(
     });
 }
 
+// ---------------------------------------------------------------------------
+// lane-sb128: the sequence's `use_128x128_superblock`. Armed per tile write
+// like [`arm_lr`] (the encoder codes one tile at a time per thread) rather
+// than threaded through every writer signature. When set, the two tile
+// writers walk 128x128 superblocks -- loop restoration and one
+// `partition_w128` symbol at the 128 root, then the four 64x64 quadrants in
+// libaom `decode_partition`'s own TL, TR, BL, BR order -- which is exactly
+// what `crate::decode::read_sb128_root` reads.
+
+thread_local! {
+    static SB128: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms the next tile write with the sequence's 128x128 superblock size.
+pub(crate) fn arm_sb128(on: bool) {
+    SB128.with(|c| c.set(on));
+}
+
+/// How many 128x128 superblock roots the writers have coded since the last
+/// [`take_sb128_root_hits`] -- a gate reports how often the root fires rather
+/// than assuming it does (class `gate-blind-to-feature`). Process-global
+/// rather than thread-local because the tiles of one frame are written on
+/// worker threads.
+static SB128_ROOT_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The 128x128-root count since the last call, and zero it.
+pub fn take_sb128_root_hits() -> usize {
+    SB128_ROOT_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the next tile write codes 128x128 superblocks ([`arm_sb128`]).
+fn sb128_armed() -> bool {
+    SB128.with(std::cell::Cell::get)
+}
+
+/// The order a tile's 64x64 superblock cells are written in, mirroring
+/// `crate::decode::sb_visit_order` exactly: plain raster at a 64 superblock,
+/// and TL/TR/BL/BR inside each 128x128 superblock (in raster order over the
+/// 128 grid) at a 128 one. The two flags mark the first cell of a superblock
+/// ROW (where the left neighbour context resets) and the first cell of a
+/// superblock (where the 128 root's own restoration units and partition
+/// symbol are written).
+fn sb_write_order(r0: u32, r1: u32, c0: u32, c1: u32, sb128: bool) -> Vec<(u32, u32, bool, bool)> {
+    let mut out = Vec::new();
+    if !sb128 {
+        for r in r0..r1 {
+            for c in c0..c1 {
+                out.push((r, c, c == c0, true));
+            }
+        }
+        return out;
+    }
+    let mut r = r0;
+    while r < r1 {
+        let mut first_in_row = true;
+        let mut c = c0;
+        while c < c1 {
+            let mut first_in_sb = true;
+            for qr in 0..2 {
+                for qc in 0..2 {
+                    let (rr, cc) = (r + qr, c + qc);
+                    if rr >= r1 || cc >= c1 {
+                        continue;
+                    }
+                    out.push((rr, cc, first_in_row, first_in_sb));
+                    first_in_row = false;
+                    first_in_sb = false;
+                }
+            }
+            c += 2;
+        }
+        r += 2;
+    }
+    out
+}
+
+/// The 128x128 superblock root ([`sb_write_order`]'s `sb_start` cells): the
+/// units its own 128-sample span covers, then the partition symbol. Only
+/// `PARTITION_SPLIT` is written -- the four 64x64 quadrants below are today's
+/// superblocks -- and at a root the true frame edge cuts, the DECIDING
+/// gathered bit the decoder reads instead (`read_sb128_root`).
+fn write_sb128_root(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &Neighbours,
+    sb_r: u32,
+    sb_c: u32,
+    mi_cols: u32,
+    mi_rows: u32,
+) {
+    SB128_ROOT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (mi_r128, mi_c128) = ((sb_r & !1) * SB_MI, (sb_c & !1) * SB_MI);
+    write_lr(enc, cdfs, mi_r128, mi_c128, SB_MI * 2);
+    let at128 = ((mi_r128 / 4) as usize, (mi_c128 / 4) as usize);
+    let ctx128 = neighbours.partition_ctx(at128, 128);
+    let (has_cols128, has_rows128) = (mi_c128 + SB_MI < mi_cols, mi_r128 + SB_MI < mi_rows);
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
+        eprintln!("WTRACE partition_w128 ctx={ctx128} cols={has_cols128} rows={has_rows128}");
+    }
+    match (has_cols128, has_rows128) {
+        (true, true) => enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w128[ctx128]),
+        // As at the 64 root: the gathered CDF is built for the read and
+        // thrown away, so nothing adapts here. Value 1 is SPLIT.
+        (true, false) => enc.symbol_fixed(
+            1,
+            &crate::decode::gather_of(&cdfs.partition_w128[ctx128], &crate::decode::VERT_ALIKE128),
+        ),
+        (false, true) => enc.symbol_fixed(
+            1,
+            &crate::decode::gather_of(&cdfs.partition_w128[ctx128], &crate::decode::HORZ_ALIKE128),
+        ),
+        // Both halves outside: the split is the only partition left and the
+        // decoder reads nothing.
+        (false, false) => {}
+    }
+}
+
 /// `read_lr`'s write side, called once at the top of every superblock,
 /// before its partition symbol: writes the units this superblock's own
 /// mi span covers (`av1_loop_restoration_corners_in_sb`; no superres, so the
 /// column scaling is the plain mi one).
-fn write_lr(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, mi_row: u32, mi_col: u32) {
+fn write_lr(enc: &mut SymbolEncoder, cdfs: &mut Cdfs, mi_row: u32, mi_col: u32, span: u32) {
     LR_PLAN.with(|c| {
         let mut plan = c.borrow_mut();
         let Some(plan) = plan.as_mut() else { return };
         let unit = plan.unit_size;
         let rcol0 = (mi_col * 4).div_ceil(unit);
-        let rcol1 = ((mi_col + SB_MI_W) * 4).div_ceil(unit).min(plan.horz_units);
+        let rcol1 = ((mi_col + span) * 4).div_ceil(unit).min(plan.horz_units);
         let rrow0 = (mi_row * 4).div_ceil(unit);
-        let rrow1 = ((mi_row + SB_MI_W) * 4).div_ceil(unit).min(plan.vert_units);
+        let rrow1 = ((mi_row + span) * 4).div_ceil(unit).min(plan.vert_units);
         for rrow in rrow0..rrow1 {
             for rcol in rcol0..rcol1 {
                 let info = plan.units[(rcol + rrow * plan.horz_units) as usize];
@@ -177,9 +294,14 @@ impl TileLayout {
     pub(crate) fn new(mi_cols: u32, mi_rows: u32, cols_log2: u32, rows_log2: u32) -> Self {
         let (cols32, rows32) = block_grid(mi_cols, mi_rows);
         let (sb_cols, sb_rows) = (cols32.div_ceil(2), rows32.div_ceil(2));
+        // lane-sb128: a tile boundary is a SUPERBLOCK boundary, so under a
+        // 128 superblock the starts are laid out on the 128 grid and then
+        // doubled back into the 64-cell units the writers walk.
+        let unit = u32::from(crate::encode::sb128_on()) + 1;
         let starts = |total: u32, log2: u32| {
-            let step = total.div_ceil(1 << log2).max(1);
-            let mut v: Vec<u32> = (0..total).step_by(step as usize).collect();
+            let total128 = total.div_ceil(unit);
+            let step = total128.div_ceil(1 << log2).max(1);
+            let mut v: Vec<u32> = (0..total128).step_by(step as usize).map(|s| s * unit).collect();
             v.push(total);
             v
         };
@@ -1779,6 +1901,14 @@ const TX4: usize = 4;
 /// Side of a superblock, in samples, which is the size a block outside the
 /// tile reads as.
 const SB: usize = 64;
+
+/// The `above_side`/`left_side` value a cell with no coded neighbour holds
+/// (tile start, superblock-row start) -- the writer's copy of
+/// `crate::decode::NO_NEIGHBOUR_SIDE`, and 128 for the same reason: at 64 it
+/// reads identically at every level up to 64x64 but sets the bit at the
+/// `BLOCK_128X128` root (64 * 2 <= 128), putting that root's partition symbol
+/// on CDF row 3 where libaom uses row 0.
+const NO_NEIGHBOUR_SIDE: usize = 128;
 /// Side of the smallest block the writer codes, in samples, which is the grid
 /// the neighbour bookkeeping is kept on.
 const SUB: usize = 16;
@@ -2030,10 +2160,10 @@ impl Neighbours {
             left: vec![[Neighbour::default(); 3]; rows * (SUB / MI)],
             above_mode: vec![DC_PRED; cols],
             left_mode: vec![DC_PRED; rows],
-            above_side: vec![SB; cols],
-            left_side: vec![SB; rows],
-            above_side_mi: vec![SB; cols * (SUB / MI)],
-            left_side_mi: vec![SB; rows * (SUB / MI)],
+            above_side: vec![NO_NEIGHBOUR_SIDE; cols],
+            left_side: vec![NO_NEIGHBOUR_SIDE; rows],
+            above_side_mi: vec![NO_NEIGHBOUR_SIDE; cols * (SUB / MI)],
+            left_side_mi: vec![NO_NEIGHBOUR_SIDE; rows * (SUB / MI)],
             above_skip: vec![false; cols * (SUB / MI)],
             left_skip: vec![false; rows * (SUB / MI)],
             above_inter: vec![false; cols * (SUB / MI)],
@@ -2086,8 +2216,8 @@ impl Neighbours {
     fn start_row(&mut self) {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
-        self.left_side.iter_mut().for_each(|s| *s = SB);
-        self.left_side_mi.iter_mut().for_each(|s| *s = SB);
+        self.left_side.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE);
+        self.left_side_mi.iter_mut().for_each(|s| *s = NO_NEIGHBOUR_SIDE);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
         self.left_ref.iter_mut().for_each(|r| *r = -1);
@@ -2731,10 +2861,28 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
     // off.
     let mut cdfs = cdfs;
     let mut enc = SymbolEncoder::new();
-    for sb_r in tile.sb_row0..tile.sb_row1.min(sb_rows) {
-        neighbours.start_row();
-        for sb_c in tile.sb_col0..tile.sb_col1.min(sb_cols) {
-            write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
+    let sb128 = sb128_armed();
+    // lane-sb128: at a 128 superblock the four 64x64 cells of each root are
+    // written in libaom's own TL/TR/BL/BR order, the root's restoration units
+    // and partition symbol first; at a 64 one this is plain raster and every
+    // cell is its own superblock, i.e. byte-identical to the loop before.
+    for (sb_r, sb_c, row_start, sb_start) in sb_write_order(
+        tile.sb_row0,
+        tile.sb_row1.min(sb_rows),
+        tile.sb_col0,
+        tile.sb_col1.min(sb_cols),
+        sb128,
+    ) {
+        if row_start {
+            neighbours.start_row();
+        }
+        if sb128 && sb_start {
+            write_sb128_root(&mut enc, &mut cdfs, &neighbours, sb_r, sb_c, mi_cols, mi_rows);
+        }
+        {
+            if !sb128 {
+                write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W, SB_MI_W);
+            }
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
             ec_rng_trace(|| {
@@ -5892,10 +6040,28 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
         vec![0i32; TX16 * TX16],
     ];
 
-    for sb_r in tile.sb_row0..tile.sb_row1.min(sb_rows) {
-        neighbours.start_row();
-        for sb_c in tile.sb_col0..tile.sb_col1.min(sb_cols) {
-            write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W);
+    let sb128 = sb128_armed();
+    // lane-sb128: at a 128 superblock the four 64x64 cells of each root are
+    // written in libaom's own TL/TR/BL/BR order, the root's restoration units
+    // and partition symbol first; at a 64 one this is plain raster and every
+    // cell is its own superblock, i.e. byte-identical to the loop before.
+    for (sb_r, sb_c, row_start, sb_start) in sb_write_order(
+        tile.sb_row0,
+        tile.sb_row1.min(sb_rows),
+        tile.sb_col0,
+        tile.sb_col1.min(sb_cols),
+        sb128,
+    ) {
+        if row_start {
+            neighbours.start_row();
+        }
+        if sb128 && sb_start {
+            write_sb128_root(&mut enc, &mut cdfs, &neighbours, sb_r, sb_c, mi_cols, mi_rows);
+        }
+        {
+            if !sb128 {
+                write_lr(&mut enc, &mut cdfs, sb_r * SB_MI_W, sb_c * SB_MI_W, SB_MI_W);
+            }
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             // spec `decode_partition`'s hasRows/hasCols (5.11.4): a superblock
