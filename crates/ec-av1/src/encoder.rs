@@ -2540,7 +2540,11 @@ mod tests {
     /// display-order list and fails here.
     #[test]
     fn a_pyramid_stream_decodes_in_display_order_through_both_decoders() {
-        let _knobs = crate::speed::knob_read();
+        // `take_ref_frame_hits` is a process-global counter: a reader-locked
+        // sibling encoding at the same time zeroes it between our encode and
+        // our read (seen once: LAST 0 GOLDEN 0 ALTREF 0), so this takes the
+        // exclusive lock.
+        let _knobs = crate::speed::knob_write();
         pyramid_round_trip(Pyramid { mini_gop: 4, mid_q_offset: None, ..Pyramid::default() }, 2);
     }
 
@@ -2552,7 +2556,7 @@ mod tests {
     /// against ffmpeg exactly as a top ARF does.
     #[test]
     fn a_three_level_pyramid_stream_decodes_in_display_order() {
-        let _knobs = crate::speed::knob_read();
+        let _knobs = crate::speed::knob_write();
         pyramid_round_trip(
             Pyramid { mini_gop: 8, mid_q_offset: Some(-8), ..Pyramid::default() },
             2,
@@ -2569,7 +2573,7 @@ mod tests {
     /// display-order mismatch against ffmpeg.
     #[test]
     fn a_four_level_pyramid_stream_decodes_in_display_order() {
-        let _knobs = crate::speed::knob_read();
+        let _knobs = crate::speed::knob_write();
         pyramid_round_trip(
             Pyramid {
                 mini_gop: 8,
@@ -2722,7 +2726,7 @@ mod tests {
     /// nothing about whether a single 64x64 block was ever written.
     #[test]
     fn a_static_clip_codes_64x64_roots_and_decodes_sample_exact() {
-        let _knobs = crate::speed::knob_read();
+        let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (256usize, 128usize);
         let still = test_card(width, height, 0);
@@ -2784,6 +2788,7 @@ mod tests {
     /// desyncs the whole tile here.
     #[test]
     fn a_dc_stepped_clip_codes_a_64x64_residual_and_decodes_sample_exact() {
+        let _knobs = crate::speed::knob_write();
         let _gate_lock = crate::stream::tests::lock_gate_counters();
         let (width, height) = (256usize, 128usize);
         let still = test_card(width, height, 0);
