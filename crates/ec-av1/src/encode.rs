@@ -4112,14 +4112,16 @@ fn cfl_on() -> bool {
 /// all, and with them whether the sequence header sets `enable_filter_intra`
 /// (`EC_AV1_FILTER_INTRA=0` switches both off, which is how the lane measured
 /// its own on/off pair -- and how every byte pin written before it still
-/// reproduces).
+/// reproduces). It is also a speed lever: on at preset 0, off above it.
 pub(crate) fn filter_intra_on() -> bool {
     #[cfg(test)]
     if let Some(forced) = FILTER_INTRA_FORCE.with(std::cell::Cell::get) {
         return forced;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("EC_AV1_FILTER_INTRA").as_deref() != Ok("0"))
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_FILTER_INTRA").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::FILTER_INTRA))
 }
 
 /// Reads [`UV_MODE_HITS`] and zeroes it, so a gate can attribute the counts
