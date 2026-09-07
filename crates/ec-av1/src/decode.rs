@@ -69,6 +69,13 @@ pub(crate) struct FrameCtx {
     pub(crate) capture_stages: std::cell::Cell<bool>,
     pub(crate) stages: std::cell::RefCell<Option<FilterStages>>,
     pub(crate) sb128_flag: std::cell::Cell<bool>,
+    /// lane-lossless: this frame's `CodedLossless` (spec 5.9.12) -- every
+    /// segment at `qindex == 0` with zero plane deltas. It forces TX_4X4 with
+    /// the Walsh-Hadamard transform on every plane, drops the `tx_type`
+    /// symbol and narrows `is_cfl_allowed` (libaom `read_tx_size`
+    /// (`decodeframe.c`), `read_tx_type` (`decodetxb.c`), `is_cfl_allowed`
+    /// (`blockd.h`)).
+    pub(crate) lossless_flag: std::cell::Cell<bool>,
     pub(crate) cdef_bits: std::cell::Cell<u8>,
     pub(crate) bit_depth: std::cell::Cell<u8>,
     pub(crate) superres: std::cell::Cell<(u32, u32)>,
@@ -152,6 +159,7 @@ impl FrameCtx {
     pub(crate) fn new() -> Self {
         Self {
             sb128_flag: std::cell::Cell::new(false),
+            lossless_flag: std::cell::Cell::new(false),
             cdef_bits: std::cell::Cell::new(0),
             bit_depth: std::cell::Cell::new(8),
             superres: std::cell::Cell::new((0, 8)),
@@ -323,6 +331,38 @@ pub(crate) fn coeff_trace_on() -> bool {
 pub(crate) fn set_sb128(v: bool, fctx: &crate::decode::FrameCtx) {
     fctx.sb128_flag.with(|c| c.set(v));
     crate::encode::set_reach_superblock_px(if v { 128 } else { 64 }, fctx);
+}
+
+/// Sets [`FrameCtx::lossless_flag`] (called once per frame from `stream.rs`).
+pub(crate) fn set_lossless(v: bool, fctx: &crate::decode::FrameCtx) {
+    fctx.lossless_flag.with(|c| c.set(v));
+}
+
+/// This frame's `CodedLossless` -- see [`FrameCtx::lossless_flag`].
+pub(crate) fn lossless(fctx: &crate::decode::FrameCtx) -> bool {
+    fctx.lossless_flag.with(|c| c.get())
+}
+
+/// The transform side a block of `side` pixels codes: its own (capped at the
+/// caller's own largest) normally, 4 on a lossless frame, where libaom's
+/// `read_tx_size` returns TX_4X4 before it looks at anything else
+/// (`decodeframe.c`: `if (xd->lossless[xd->mi[0]->segment_id]) return
+/// TX_4X4;`).
+pub(crate) fn lossless_tx(px: usize, fctx: &crate::decode::FrameCtx) -> usize {
+    if lossless(fctx) { 4 } else { px }
+}
+
+/// `is_cfl_allowed` (libaom `blockd.h`): CfL is offered on a block up to
+/// 32x32 -- but on a LOSSLESS frame only when the block's CHROMA plane block
+/// is exactly BLOCK_4X4, i.e. (at 4:2:0) a luma block of 8x8 or smaller.
+/// Getting this wrong picks the 14-symbol CFL `uv_mode` alphabet where libaom
+/// picks the 13-symbol one (class `wrong-alphabet-same-value`).
+pub(crate) fn cfl_allowed_px(bw: usize, bh: usize, fctx: &crate::decode::FrameCtx) -> bool {
+    if lossless(fctx) {
+        bw <= 8 && bh <= 8
+    } else {
+        bw <= 32 && bh <= 32
+    }
 }
 
 fn sb128(fctx: &crate::decode::FrameCtx) -> bool {
@@ -2131,6 +2171,11 @@ pub(crate) struct TxParams {
     pub(crate) ac_delta: i32,
     pub(crate) tx_type: TxType,
     pub(crate) stride: usize,
+    /// lane-lossless: this transform unit belongs to a lossless frame, so the
+    /// residual comes off the 4x4 Walsh-Hadamard
+    /// ([`crate::transform::dequant_and_inverse_wht4x4`]) instead of the
+    /// DCT/ADST network (libaom `inv_txfm_add`, `av1/common/idct.c`).
+    pub(crate) lossless: bool,
 }
 
 impl TxParams {
@@ -2138,10 +2183,18 @@ impl TxParams {
     /// on the parse thread, the wavefront worker calls it on its own, so both
     /// are the same function on the same inputs and byte-identical.
     fn run(self, grid: &[i32]) -> Vec<i32> {
-        let residual = dequant_and_inverse_typed_wh(
-            grid, self.w, self.h, self.bit_depth, self.q_idx, self.dc_delta, self.ac_delta,
-            self.tx_type,
-        );
+        let residual = if self.lossless {
+            debug_assert_eq!((self.w, self.h), (4, 4));
+            debug_assert_eq!(self.tx_type, TxType::DctDct);
+            crate::transform::dequant_and_inverse_wht4x4(
+                grid, self.bit_depth, self.q_idx, self.dc_delta, self.ac_delta,
+            )
+        } else {
+            dequant_and_inverse_typed_wh(
+                grid, self.w, self.h, self.bit_depth, self.q_idx, self.dc_delta, self.ac_delta,
+                self.tx_type,
+            )
+        };
         // An all-zero grid transforms to the empty marker, and a strided copy
         // of zeros is still zeros: the marker passes straight through.
         if residual.is_empty() {
@@ -8848,7 +8901,7 @@ fn read_intra_mode_rect(
     // through -- a caller passing `true` for a >32 strip used to pick the
     // 14-symbol CFL CDF, same value but a different range (class
     // wrong-alphabet-same-value).
-    let cfl = cfl && bw <= 32 && bh <= 32;
+    let cfl = cfl && cfl_allowed_px(bw, bh, fctx);
     let uv_mode = if !has_chroma {
         DC_PRED
     } else if cfl {
@@ -9100,7 +9153,18 @@ struct RectStripModes {
 /// TX_32X16`) and only the second reaches a square -- the reason
 /// `bw.min(bh) >> (depth - 1)` (correct for a 2:1 strip, where step one is
 /// already square) mis-tiled 1:4 strips.
-fn depth_to_tx_wh(bw: usize, bh: usize, depth: usize) -> (usize, usize) {
+fn depth_to_tx_wh(
+    bw: usize,
+    bh: usize,
+    depth: usize,
+    fctx: &crate::decode::FrameCtx,
+) -> (usize, usize) {
+    // lane-lossless: TX_4X4 whatever the strip's own size and depth (libaom
+    // `read_tx_size`: the lossless early return comes before
+    // `max_txsize_rect_lookup`), and no `tx_depth` symbol was read to get here.
+    if lossless(fctx) {
+        return (4, 4);
+    }
     let (mut w, mut h) = (bw.min(64), bh.min(64));
     for _ in 0..depth {
         match w.cmp(&h) {
@@ -9501,6 +9565,58 @@ fn decode_rect_split(
             m.alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, m.smooth_neighbor_uv, fctx,
         );
         (zero.clone(), zero)
+    } else if lossless(fctx) {
+        // lane-lossless: the strip's chroma plane block is coded as 4x4
+        // transform units too (libaom `read_tx_size` returns TX_4X4 for every
+        // plane), PLANE-MAJOR inside the block -- U's units first, then V's
+        // (`decode_token_recon_block`'s mu-chunk loop, measured against
+        // aomdec's `EC_TRACE_COEFF` on a `-crf 0` stream: plane=1, plane=1,
+        // plane=2, plane=2 for a 16x8 strip). `get_txb_ctx` adds its `+10`
+        // offset (our `+3` row base) whenever the plane block is bigger than
+        // the transform.
+        let scan4 = default_scan(4);
+        let offset = (chroma_w > 4 || chroma_h > 4).then_some(3);
+        let (cw_n, ch_n) = (chroma_w / 4, chroma_h / 4);
+        let mut last = [Grid::Zero(16), Grid::Zero(16)];
+        for plane_idx in 1..=2 {
+            for cu_row in 0..ch_n {
+                for cu_col in 0..cw_n {
+                    let luma_span = 8;
+                    let cu_mi = (
+                        mi_r + cu_row * (luma_span / MI),
+                        mi_c + cu_col * (luma_span / MI),
+                    );
+                    let cu_around = neighbours.around_mi(cu_mi, luma_span);
+                    let cu_reach = tu_reach(
+                        bw, bh,
+                        cu_col * luma_span, cu_row * luma_span, luma_span,
+                        block_reach, px, py, y.width, y.height, fctx,
+                    );
+                    let (cu_x, cu_y) = (cpx + cu_col * 4, cpy + cu_row * 4);
+                    if let Some((ub, vb)) = &m.palette_uv {
+                        set_palette_pred(
+                            if plane_idx == 1 { ub.clone() } else { vb.clone() },
+                            fctx,
+                        );
+                    }
+                    let plane = if plane_idx == 1 { &mut *u } else { &mut *v };
+                    let grid = read_plane(
+                        dec, cdfs, TxbSet::Chroma4, &scan4, plane_idx,
+                        cu_around[plane_idx], m.mode, m.uv_predict_mode,
+                        m.angle_delta_uv, cu_reach, plane, cu_x, cu_y, 4, 4,
+                        base_q_idx,
+                        m.alpha.zip(ac).map(|((au, av), ac)| {
+                            (if plane_idx == 1 { au } else { av }, ac)
+                        }),
+                        None, offset, m.smooth_neighbor_uv, fctx,
+                    )?;
+                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, plane_idx, &grid);
+                    last[plane_idx - 1] = grid;
+                }
+            }
+        }
+        let [ug, vg] = last;
+        (ug, vg)
     } else {
         let (chroma_set, chroma_scan) = chroma.expect("refused above when None");
         // `av1_get_ext_tx_set_type`: a chroma transform whose square-up size
@@ -10073,7 +10189,7 @@ fn decode_intra_rect_in_inter(
     // `is_cfl_allowed` (spec 5.11.5) caps CFL at 32x32, so the
     // superblock-level strip reads the no-CFL alphabet -- the same split
     // [`read_intra_mode_rect`] makes for [`decode_block_rect64`].
-    let cfl_allowed = bw.max(bh) <= 32;
+    let cfl_allowed = cfl_allowed_px(bw, bh, fctx);
     let uv_mode = if cfl_allowed {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
@@ -10217,7 +10333,7 @@ fn decode_intra_rect_in_inter(
     } else {
         0
     };
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         hit!(TX_DEPTH_HITS);
         // lane-intrasplit r1: a split intra strip in an inter frame walks the
         // key frame's own per-TU path ([`decode_rect_split`] below); what was
@@ -10236,7 +10352,7 @@ fn decode_intra_rect_in_inter(
     if crate::envflags::env_flag!("EC_SPLITSTRIP") {
         eprintln!("EC_SPLITSTRIP mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} depth={depth}");
     }
-    let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+    let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
     // lane-inter16ab r8: libaom runs `set_txfm_ctxs(tx_size, n4_w, n4_h,
     // skip && is_inter, xd)` (decodeframe.c `decode_block`) for EVERY block
     // of an inter frame, intra ones included -- with the skip term 0 it
@@ -10430,13 +10546,13 @@ fn decode_block_rect(
     } else {
         0
     };
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         hit!(TX_DEPTH_HITS);
         // lane-rectsplit r1: a split transform is predicted and reconstructed
         // per transform unit, each unit taking its edges from the previous
         // unit's reconstruction inside this same strip (spec 5.11.36) --
         // [`decode_rect_split`], the unit named by [`depth_to_tx_wh`].
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         if crate::envflags::env_flag!("EC_SBPART_DUMP64") {
             eprintln!(
                 "DUMP64SPLIT mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} \
@@ -10936,13 +11052,13 @@ fn decode_leaf_rect(
     } else {
         0
     };
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         // The same per-transform-unit walk the bigger strips take
         // (`depth_to_tx_wh`: TX_16X8 -> TX_8X8 at depth 1, -> TX_4X4 at
         // depth 2), addressed at this leaf's own mi position.
         hit!(TX_DEPTH_HITS);
         hit!(SUB16_SPLIT_HITS);
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         let modes = RectStripModes {
             skip,
             mode,
@@ -11275,17 +11391,17 @@ fn decode_block_rect4(
     publish_txfm_bands_if_in_inter(
         neighbours,
         (mi_r, mi_c),
-        depth_to_tx_wh(bw, bh, depth),
+        depth_to_tx_wh(bw, bh, depth, fctx),
         (bw, bh), fctx,
     );
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         // lane-rectsplitx r1: the per-transform-unit walk, at this strip's
         // real mi position (strips 1 and 3 of a HORZ_4 start 8 px into a
         // 16-px [`SUB`] cell). depth 1 is the RECT unit TX_16X8/TX_8X16
         // (`sub_tx_size_map[TX_32X8] == TX_16X8`), depth 2 the square TX_8X8;
         // both interleave in every real stream.
         hit!(TX_DEPTH_HITS);
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         // lane-rectsplitx r2: both depths ship together, as the r1 handoff
         // predicted -- depth 1 fires FIRST in every attempt that splits at
         // all, so a depth-2-only lift could never be gated. The r1 mismatch
@@ -11800,7 +11916,7 @@ fn decode_rect4_16_strip(
             hit!(TX_DEPTH_HITS);
             hit!(RECT4_16_SPLIT_HITS);
         }
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         let (px, py) = (lmi.1 * MI, lmi.0 * MI);
         let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height, fctx);
         neighbours.record_mode_mi(lmi.0, lmi.1, mi_w, mi_h, mode);
@@ -12291,17 +12407,17 @@ fn decode_block_rect64(
     publish_txfm_bands_if_in_inter(
         neighbours,
         (mi_r, mi_c),
-        depth_to_tx_wh(bw, bh, depth),
+        depth_to_tx_wh(bw, bh, depth, fctx),
         (bw, bh), fctx,
     );
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         hit!(TX_DEPTH_HITS);
         // lane-rectsplit r1/r4: the superblock-level strip splits its
         // transform through the very same per-unit path as its 32x32-level
         // sibling; [`depth_to_tx_wh`] names the unit, which for a 64x16/16x64
         // 1:4 strip is the 2:1 rect TX_32X16 at depth 1 (lane-rectchroma r1
         // measured the old square formula mis-tiling exactly that strip).
-        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+        let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth, fctx);
         if bw.max(bh) / bw.min(bh) == 4 {
             let which = if depth == 1 {
                 &RECT4_SPLIT_DEPTH1_HITS
@@ -12888,7 +13004,7 @@ fn read_intra_mode(
     // lane-sb128c r3 (class sweep): `is_cfl_allowed` on the luma bsize, decided
     // here so every `decode_block` caller (64x64 and 128x128 roots included)
     // picks the right alphabet -- see [`read_intra_mode_rect`]'s twin.
-    let cfl = cfl && side <= 32;
+    let cfl = cfl && cfl_allowed_px(side, side, fctx);
     let uv_mode = if cfl {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
@@ -13654,6 +13770,14 @@ fn read_plane(
     // filter-intra in AV1).
     let tx_mode = if plane_idx == 0 { fi_tx_row(tx_mode, filter_intra) } else { tx_mode };
     let mut coding = cdfs.txb(set, tx_mode);
+    // libaom `read_tx_type` (`av1/decoder/decodetxb.c`): "No need to read
+    // transform type for lossless mode(qindex==0)" -- the symbol is not coded
+    // at all, and `av1_get_tx_type` (`blockd.h`) returns DCT_DCT for every
+    // plane of a lossless block (the residual then goes through the WHT, so
+    // the type only picks the scan, which is the default one).
+    if lossless(fctx) {
+        coding.tx_type = None;
+    }
     // Luma's `default_tx_type` is only a fallback for the sizes whose
     // `TxbSet` carries no symbol at all (32-point and up), which the spec
     // fixes at `DCT_DCT` regardless of mode; a chroma plane's `tx_type` is
@@ -13678,6 +13802,9 @@ fn read_plane(
     } else {
         default_intra_tx_type(predict_mode as u8)
     };
+    // libaom `av1_get_tx_type` (`blockd.h`): a lossless block's type is
+    // DCT_DCT on EVERY plane, so chroma never inherits or mode-derives one.
+    let default_tx_type = if lossless(fctx) { TxType::DctDct } else { default_tx_type };
     let (grid, tx_type) = read_coeffs(
         dec,
         &mut coding,
@@ -13703,7 +13830,7 @@ fn read_plane(
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let tx = TxParams {
         w: side, h: side, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta,
-        ac_delta, tx_type, stride: 0,
+        ac_delta, tx_type, stride: 0, lossless: lossless(fctx),
     };
     if crate::envflags::env_flag!("EC_AV1_TRACE") {
         let residual = tx.run(&levels);
@@ -13765,6 +13892,15 @@ fn decode_block(
     tx_select: bool,
     reduced_tx_set: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<()> {
+    // lane-lossless: a lossless frame's transform is TX_4X4 on every plane
+    // (libaom `read_tx_size`, `decodeframe.c`), so the caller's per-size
+    // tables/scans are replaced by the 4x4 ones and the block always takes the
+    // multi-transform-unit path below.
+    let (luma_set, chroma_set, luma_tx, chroma_tx, scans) = if lossless(fctx) {
+        (TxbSet::Luma4, TxbSet::Chroma4, 4, 4, (scan4, scan4))
+    } else {
+        (luma_set, chroma_set, luma_tx, chroma_tx, scans)
+    };
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
@@ -13879,7 +14015,7 @@ fn decode_block(
         // TX_64X64, so a 128x128 block is always FOUR luma transform units
         // even with `tx_select` off -- the TU loop below, never the
         // single-unit path.
-        (side.min(64), luma_tx)
+        (lossless_tx(side.min(64), fctx), luma_tx)
     };
     if tx_select && logical_tx < side && uv_mode != DC_PRED {
         hit!(SQ_CHROMA_TX_HITS);
@@ -14972,7 +15108,9 @@ fn decode_leaf8(
     } else if tx_select && intrabc_dv.is_none() {
         read_tx_size(dec, cdfs, neighbours, leaf_mi, 8, None)
     } else {
-        8
+        // lane-lossless: TX_4X4 on a lossless frame, no symbol
+        // (libaom `read_tx_size`).
+        lossless_tx(8, fctx)
     };
     let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
     let reach = Reach::of(8, px, py, y.width, y.height, fctx);
@@ -17395,6 +17533,18 @@ fn read_block_tx_size(
     is_inter: bool,
     skip: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<(usize, Option<Vec<(usize, usize, usize, usize)>>)> {
+    // lane-lossless: TX_4X4 over the whole block, and NO var-tx tree -- libaom
+    // `read_block_tx_size` (`decodeframe.c`) sends a lossless block down the
+    // `read_tx_size` arm, which returns TX_4X4 before it reads anything.
+    if lossless(fctx) {
+        let mut leaves = Vec::new();
+        for row in 0..side / MI {
+            for col in 0..side / MI {
+                leaves.push((row, col, 4, 4));
+            }
+        }
+        return Ok((4, Some(leaves)));
+    }
     if !fctx.tx_select_inter.with(std::cell::Cell::get) {
         // lane-sb128c r1: `max_txsize_rect_lookup[BLOCK_128X128]` is TX_64X64,
         // so a 128x128 inter block is FOUR luma units even with `tx_mode ==
@@ -17834,6 +17984,15 @@ fn read_block_tx_size_rect(
     (mi_cols, mi_rows): (usize, usize),
     skip: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<Option<Vec<(usize, usize, usize, usize)>>> {
+    if lossless(fctx) {
+        let mut leaves = Vec::new();
+        for row in 0..bh / MI {
+            for col in 0..bw / MI {
+                leaves.push((row, col, 4, 4));
+            }
+        }
+        return Ok(Some(leaves));
+    }
     if skip {
         // `set_txfm_ctxs(.., skip && is_inter)`: a skipped inter block records
         // its own BLOCK size -- width above, height left -- not a transform.
@@ -17993,12 +18152,23 @@ fn read_inter_plane_rect(
         usize::from(around.0) + usize::from(around.1)
     };
     let mut coding = cdfs.txb(set, tx_mode);
+    // libaom `read_tx_type` (`av1/decoder/decodetxb.c`): "No need to read
+    // transform type for lossless mode(qindex==0)" -- the symbol is not coded
+    // at all, and `av1_get_tx_type` (`blockd.h`) returns DCT_DCT for every
+    // plane of a lossless block (the residual then goes through the WHT, so
+    // the type only picks the scan, which is the default one).
+    if lossless(fctx) {
+        coding.tx_type = None;
+    }
     // `av1_get_ext_tx_set_type`'s DCT-only clamp is on `tx_size_sqr_up`, i.e.
     // the *longer* side of this rect transform.
     let default_tx_type = match inherited_luma_tx_type {
         Some(t) => reduce_inherited_chroma_tx_type(t, w, h, fctx),
         None => TxType::DctDct,
     };
+    // libaom `av1_get_tx_type` (`blockd.h`): a lossless block's type is
+    // DCT_DCT on EVERY plane, so chroma never inherits or mode-derives one.
+    let default_tx_type = if lossless(fctx) { TxType::DctDct } else { default_tx_type };
     // lane-r14 r2: a 64-length axis codes only its low 32 coefficients
     // (`av1_get_max_eob`), so the coded unit is the `min(w,32) x min(h,32)`
     // corner, zero-extended into the true `w x h` grid before the inverse
@@ -18053,7 +18223,7 @@ fn read_inter_plane_rect(
     // (`TxParams::stride`) after the inverse transform.
     let tx = TxParams {
         w, h, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta, ac_delta, tx_type,
-        stride,
+        stride, lossless: lossless(fctx),
     };
     push_mc_rect_tx(plane_idx, x, y, stride, w, h, prediction, tx, &grid, fctx);
     Ok((grid, tx_type))
@@ -18112,6 +18282,9 @@ fn read_inter_luma8(
     reduced_tx_set: bool,
     split: bool, fctx: &crate::decode::FrameCtx,
 ) -> Result<(Grid, TxType)> {
+    // lane-lossless: an 8x8 inter block is FOUR 4x4 units (libaom
+    // `read_block_tx_size`'s lossless TX_4X4), tree or no tree.
+    let split = split || lossless(fctx);
     if !split {
         return read_inter_plane(
             dec,
@@ -24209,10 +24382,21 @@ fn read_inter_plane(
         usize::from(around.0) + usize::from(around.1) + luma_skip_ctx.unwrap_or(0)
     };
     let mut coding = cdfs.txb(set, tx_mode);
+    // libaom `read_tx_type` (`av1/decoder/decodetxb.c`): "No need to read
+    // transform type for lossless mode(qindex==0)" -- the symbol is not coded
+    // at all, and `av1_get_tx_type` (`blockd.h`) returns DCT_DCT for every
+    // plane of a lossless block (the residual then goes through the WHT, so
+    // the type only picks the scan, which is the default one).
+    if lossless(fctx) {
+        coding.tx_type = None;
+    }
     let default_tx_type = match inherited_luma_tx_type {
         Some(t) => reduce_inherited_chroma_tx_type(t, side, side, fctx),
         None => TxType::DctDct,
     };
+    // libaom `av1_get_tx_type` (`blockd.h`): a lossless block's type is
+    // DCT_DCT on EVERY plane, so chroma never inherits or mode-derives one.
+    let default_tx_type = if lossless(fctx) { TxType::DctDct } else { default_tx_type };
     let (grid, tx_type) = read_coeffs(
         dec,
         &mut coding,
@@ -24238,7 +24422,7 @@ fn read_inter_plane(
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx, fctx);
     let tx = TxParams {
         w: side, h: side, bit_depth: bit_depth(fctx), q_idx: block_q_idx(fctx), dc_delta,
-        ac_delta, tx_type, stride: 0,
+        ac_delta, tx_type, stride: 0, lossless: lossless(fctx),
     };
     push_mc_rect_tx(plane_idx, x, y, side, side, side, prediction, tx, &grid, fctx);
     Ok((grid, tx_type))
@@ -28911,7 +29095,7 @@ fn decode_inter_block(
         // the 14-symbol CFL one gave the same DC_PRED VALUE but narrowed the
         // arithmetic coder by the wrong interval, desyncing the tile from this
         // block on.
-        let cfl_allowed = write_w.max(write_h) <= 32;
+        let cfl_allowed = cfl_allowed_px(write_w, write_h, fctx);
         if !cfl_allowed {
             hit!(NOCFL_UV_MODE_HITS);
         }

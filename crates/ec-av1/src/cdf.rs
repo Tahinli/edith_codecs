@@ -3860,6 +3860,24 @@ pub const TXB_SKIP_LUMA_8: [u16; 3] = [31957, 32768, 0];
 /// TXB_SKIP_LUMA_8_Q3, q-context 3: the same table as [`TXB_SKIP_LUMA_8`], for `base_q_idx` 121..=255.
 pub const TXB_SKIP_LUMA_8_Q3: [u16; 3] = [31903, 32768, 0];
 
+/// lane-lossless: `av1_default_txb_skip_cdfs[q][TX_4X4][10..13]`
+/// (`av1/common/token_cdfs.h:76`), the chroma `txb_skip` rows libaom's
+/// `get_txb_ctx` reaches through the `+10` offset -- a chroma plane block
+/// LARGER than its transform. At TX_4X4 that only happens on a lossless
+/// frame, which is why every q-context but 0 (`base_q_idx <= 20`) leaves
+/// them at the neutral 16384.
+pub const TXB_SKIP_CHROMA_4_BIG_Q0: [[u16; 3]; 3] =
+    [[9961, 32768, 0], [30242, 32768, 0], [32117, 32768, 0]];
+/// [`TXB_SKIP_CHROMA_4_BIG_Q0`] for q-context 1.
+pub const TXB_SKIP_CHROMA_4_BIG_Q1: [[u16; 3]; 3] =
+    [[16384, 32768, 0], [16384, 32768, 0], [16384, 32768, 0]];
+/// [`TXB_SKIP_CHROMA_4_BIG_Q0`] for q-context 2.
+pub const TXB_SKIP_CHROMA_4_BIG: [[u16; 3]; 3] =
+    [[16384, 32768, 0], [16384, 32768, 0], [16384, 32768, 0]];
+/// [`TXB_SKIP_CHROMA_4_BIG_Q0`] for q-context 3.
+pub const TXB_SKIP_CHROMA_4_BIG_Q3: [[u16; 3]; 3] =
+    [[16384, 32768, 0], [16384, 32768, 0], [16384, 32768, 0]];
+
 /// TXB_SKIP_CHROMA_4_Q0, q-context 0: the same table as [`TXB_SKIP_CHROMA_4`], for `base_q_idx` 0..=20.
 pub const TXB_SKIP_CHROMA_4_Q0: [[u16; 3]; 3] =
     [[7654, 32768, 0], [19473, 32768, 0], [29984, 32768, 0]];
