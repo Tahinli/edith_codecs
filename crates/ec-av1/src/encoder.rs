@@ -3669,8 +3669,22 @@ mod tests {
         let hits = crate::encode::take_tx_type_hits();
         // The type search is a speed lever (`speed::TX_TYPE_SEARCH`); above
         // the presets that carry it only `DCT_DCT` is offered, and the
-        // exactness half below is what still runs there.
+        // exactness half below is what still runs there. The FULL five-type
+        // fire count is preset 0's to make: a faster preset prunes modes and
+        // partitions before a type is ever priced on them, so `ADST_ADST` and
+        // `IDTX` stop winning on this clip at preset 6 (measured: hits
+        // `[0, 6192, 0, 79, 284, ..]`). Every preset that carries the lever
+        // still has to reach SOME non-`DCT_DCT` type -- that is the
+        // "reachable at all" statement, class `gate-blind-to-feature`.
         if crate::speed::at(&crate::speed::TX_TYPE_SEARCH) {
+            let non_dct: usize = hits.iter().sum::<usize>()
+                - hits[crate::transform::TxType::DctDct as usize];
+            assert!(
+                non_dct > 0,
+                "every luma transform unit took DCT_DCT: {hits:?}"
+            );
+        }
+        if crate::speed::at(&crate::speed::TX_TYPE_SEARCH) && crate::speed::speed() == 0 {
             for (name, ty) in [
                 ("DCT_DCT", crate::transform::TxType::DctDct),
                 ("ADST_ADST", crate::transform::TxType::AdstAdst),
@@ -3684,7 +3698,10 @@ mod tests {
                 );
             }
         } else {
-            eprintln!("SKIP the fire count at preset {}: no type search", crate::speed::speed());
+            eprintln!(
+                "SKIP the five-type fire count at preset {}: {hits:?}",
+                crate::speed::speed()
+            );
         }
         let ours = crate::stream::decode_stream(&stream).expect("our decoder");
         assert_eq!(ours.len(), sources.len(), "our decoder's frames");
