@@ -17,3 +17,22 @@ WINNER key -48 at arf -32: both films improve on both columns against the contro
 (film A -8.5 / -7.1, film B -13.2 / -9.3). -64 overshoots on film B (+140.7) and a
 deeper ARF (-40) with the same key gives the bytes back on both films, so the anchor
 is what the ARFs wanted, not more ARF.
+
+## 12-frame gate (encode::tests::bd_rate_screen_native) at the winner
+| clip | control (key 0) | key -48 |
+|---|---|---|
+| bars 1080p | +1.7 / -14.3 | +2.0 / -14.0 |
+| bars 2160p | +13.7 / -9.5 | +13.1 / -9.6 |
+| film A | +43.3 / +15.0 | +38.5 / +8.2 |
+| film B | +66.9 / +35.1 | +58.2 / +26.5 |
+| screen capture | +33.4 / -23.8 | +33.4 / -23.8 (pyramid gated off, byte-identical) |
+
+Both film rows improve on both columns at 12 frames too, so key_q_offset is NOT
+gated on GOP length (unlike mid_q_offset).
+
+## rate loop
+The key slot cannot steer the offset back (one key frame per run), so the finer key
+ran bitrate_target_lands_within_10_percent_over_48_frames +10.8% over target. The
+loop now prices the key's share through the calibration slope
+(KEY_WEIGHT * exp(-key_q_offset / GAIN)) and takes it out of the other gop-1
+pictures: 768 kbps pyramid arm -0.3%, 1536 kbps -6.2%.
