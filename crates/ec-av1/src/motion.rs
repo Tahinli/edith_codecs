@@ -340,17 +340,26 @@ pub(crate) fn search(
 fn dist_initial_step(dist: u32) -> i32 {
     let base = if seeded() { seeded_step() } else { SEARCH_INITIAL_STEP_PEL };
     static K: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    // lane-arfcen: readable in ANY build, like the encoder's other search
+    // margins -- the constant below was swept when the deepest reference in
+    // the GOP sat at distance 4, and the arm that re-sweeps it at the
+    // shipped mini-GOP of 8 runs through the release `enc_probe`.
     let k = *K.get_or_init(|| match std::env::var("EC_AV1_MV_DIST_SCALE").ok() {
-        Some(v) if cfg!(test) => v.parse().unwrap_or(MV_DIST_SCALE),
-        _ => MV_DIST_SCALE,
+        Some(v) => v.parse().unwrap_or(MV_DIST_SCALE),
+        None => MV_DIST_SCALE,
     });
     if dist <= 1 || k <= 0.0 {
         return base;
     }
     let scaled = f64::from(base) * k.mul_add(f64::from(dist - 1), 1.0);
-    // Past 4x the base the log stage spends its rounds on vectors no
-    // reference in this encoder's GOP reaches.
-    scaled.round().clamp(f64::from(base), f64::from(base * 4)) as i32
+    // The ceiling on that widening. `MV_DIST_CAP` x the base; swept by
+    // `EC_AV1_MV_DIST_CAP`.
+    static CAP: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let cap = *CAP.get_or_init(|| match std::env::var("EC_AV1_MV_DIST_CAP").ok() {
+        Some(v) => v.parse().unwrap_or(MV_DIST_CAP),
+        None => MV_DIST_CAP,
+    });
+    scaled.round().clamp(f64::from(base), f64::from(base * cap)) as i32
 }
 
 /// The distance scale [`dist_initial_step`] ships with. Swept on the BD gate
@@ -361,6 +370,14 @@ fn dist_initial_step(dist: u32) -> i32 {
 /// vector). 0.5 wins both film clips together; the ranking either side of it
 /// is near-tie churn, not a gradient.
 const MV_DIST_SCALE: f64 = 0.5;
+
+/// How many times the base step [`dist_initial_step`] may widen to. Written
+/// as 4 when the deepest reference in the GOP sat at distance 4 ("past 4x the
+/// base the log stage spends its rounds on vectors no reference in this
+/// encoder's GOP reaches"), which the shipped mini-GOP of 8 falsified: the
+/// top ARF predicts at distance 8 and its own widened step (36 at
+/// [`MV_DIST_SCALE`] 0.5) was being clamped back to 32.
+const MV_DIST_CAP: i32 = 4;
 
 /// [`search`], plus the running best cost after every round any of its three
 /// stages ran — what `cost_is_monotone_non_increasing_over_the_search` below

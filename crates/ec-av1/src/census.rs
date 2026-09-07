@@ -50,6 +50,11 @@ pub struct Frame {
     pub kind: &'static str,
     /// `base_q_idx`.
     pub qindex: u8,
+    /// `OrderHint` of this frame, i.e. its display position (lane-arfcen).
+    pub order_hint: u32,
+    /// `OrderHints[LAST..=ALTREF]`, so a row can name its references' display
+    /// distance rather than only which slot it read (lane-arfcen).
+    pub ref_hints: [u32; 7],
     /// Tile payload bytes of this frame.
     pub bytes: usize,
     /// `delta_q_present`.
@@ -132,6 +137,8 @@ pub(crate) fn frame_start(header: &ec_av1_syntax::FrameHeader, bytes: usize, idx
             idx,
             kind,
             qindex: header.quantization.base_q_idx,
+            order_hint: header.order_hint,
+            ref_hints: header.order_hints,
             bytes,
             delta_q: header.delta.q_present,
             segmentation: header.segmentation.enabled,
