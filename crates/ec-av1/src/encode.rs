@@ -292,6 +292,15 @@ pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType]
 /// (`IDTX`, `DCT_DCT`) and 32x32 is `EXT_TX_SET_DCT_IDTX` -- the same two
 /// types, a symbol the writer already codes and never varied. 64x64 codes no
 /// `tx_type` symbol at all, so it is not offered one.
+/// SCREEN CONTENT ONLY, measured (12-frame `bd_rate_screen_native`): the
+/// capture row goes +20.8/-30.1 -> +20.1/-30.4 while the two synthetic bars
+/// rows lose TWENTY points (-1.0/-16.8 -> +23.1/+3.3 and +9.4/-12.7 ->
+/// +31.2/+3.7) and film B 0.3 -- the `local-rd-on-references` class at its
+/// loudest, and restricting the offer to 16x16 and below does not soften it
+/// (`le16`: +22.9/+3.1, +31.6/+4.0). So this takes the same content gate the
+/// intra search, palette and intrabc stand behind: a non-screen frame is
+/// byte-identical to the encoder before the lane.
+///
 /// `EC_AV1_TXSET_INTER`: `0`/`off`, `screen` (screen frames only), `le16`
 /// (16x16 and below, the sizes libaom's own census picks a non-`DCT_DCT`
 /// inter type on -- it never takes `IDTX` at 32x32 on film B), anything else
@@ -354,7 +363,7 @@ fn inter_tx_type_search() -> InterTxSearch {
     });
     ENV.unwrap_or_else(|| {
         if crate::speed::at(&crate::speed::TX_TYPE_SEARCH_INTER) {
-            InterTxSearch::All
+            InterTxSearch::Screen
         } else {
             InterTxSearch::Off
         }

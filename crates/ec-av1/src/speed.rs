@@ -493,9 +493,15 @@ pub(crate) const TX_TYPE_SEARCH: [bool; 11] = [
 
 /// `tx_type_candidates`: whether an INTER luma transform unit searches the
 /// two-type `TX_SET_INTER_3` (`IDTX` vs `DCT_DCT`) the writer already codes a
-/// symbol for, instead of always coding `DCT_DCT` (lane-txset2). Off at every
-/// preset until the gate says otherwise; `EC_AV1_TXSET_INTER` overrides.
-pub(crate) const TX_TYPE_SEARCH_INTER: [bool; 11] = [false; 11];
+/// symbol for, instead of always coding `DCT_DCT` (lane-txset2). On at the
+/// presets that carry the intra search, and SCREEN CONTENT ONLY on top of it
+/// (measured, 12-frame `bd_rate_screen_native`: the capture goes
+/// +20.8/-30.1 -> +20.1/-30.4 while both synthetic bars rows lose twenty
+/// points and film B 0.3 -- see `encode::inter_tx_type_candidates`).
+/// `EC_AV1_TXSET_INTER` overrides.
+pub(crate) const TX_TYPE_SEARCH_INTER: [bool; 11] = [
+    true, true, true, true, true, true, true, false, false, false, false,
+];
 
 /// `filter_search`: whether the deblock ladder's +-1/+-2 refinement stage runs.
 pub(crate) const DEBLOCK_REFINE: [bool; 11] = [
