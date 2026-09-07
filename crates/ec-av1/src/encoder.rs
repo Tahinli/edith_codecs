@@ -2222,6 +2222,65 @@ mod tests {
     /// with each other and disagree with nothing -- so the ffmpeg half is
     /// the one that catches a tile boundary the writer respected and the
     /// spec does not, and the parser half catches the reverse.
+
+    /// A STATIC clip: every inter frame predicts perfectly from the last, so
+    /// the search takes the 64x64 root ([`crate::encode::B64_ROOT`]) instead
+    /// of coding four 32x32 quadrants, and the stream both decoders
+    /// reconstruct is still sample-exact against the encoder's own
+    /// reconstruction. The counter is the point (class
+    /// `gate-blind-to-feature`): without it a green three-way compare says
+    /// nothing about whether a single 64x64 block was ever written.
+    #[test]
+    fn a_static_clip_codes_64x64_roots_and_decodes_sample_exact() {
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (256usize, 128usize);
+        let still = test_card(width, height, 0);
+        let sources: Vec<Picture> = (0..3).map(|_| still.clone()).collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 120,
+            gop: 8,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        let _ = crate::encode::take_b64_root_hits();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let roots = crate::encode::take_b64_root_hits();
+        // 8 superblocks per frame, two inter frames.
+        assert!(
+            roots > 0,
+            "a static clip coded no 64x64 root at all (of 16 inter superblocks)"
+        );
+        eprintln!("64x64 roots on a static clip: {roots} of 16 inter superblocks");
+
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_luma(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+            if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                panic!(
+                    "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                    at % width,
+                    at / width,
+                    got[at],
+                    b[at],
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_tile_layout_decodes_sample_exact_through_both_decoders() {
         let (width, height) = (640usize, 384usize);
