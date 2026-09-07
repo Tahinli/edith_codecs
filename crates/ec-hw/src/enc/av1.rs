@@ -49,7 +49,8 @@ pub(super) fn parameters(
     let context = encoder.context();
     let (coded_w, coded_h) = encoder.coded_size();
     let (width, height) = (config.width.max(1), config.height.max(1));
-    let cqp = matches!(config.rate_control, RateControlMode::ConstantQp { .. });
+    let cqp = config.rate_control.is_cqp();
+    let ten_bit = config.bit_depth == 10;
     let level_idx = seq_level_idx(coded_w, coded_h, config.framerate);
 
     let mut seq = EncSequenceParameterBufferAV1 {
@@ -59,8 +60,8 @@ pub(super) fn parameters(
         intra_period: config.gop_size.max(1),
         ip_period: 1,
         bits_per_second: match config.rate_control {
-            RateControlMode::ConstantBitrate => config.bitrate,
             RateControlMode::ConstantQp { .. } => 0,
+            _ => config.bitrate,
         },
         order_hint_bits_minus_1: (av1_headers::ORDER_HINT_BITS - 1) as u8,
         ..EncSequenceParameterBufferAV1::default()
@@ -68,7 +69,7 @@ pub(super) fn parameters(
     seq.seq_fields = seq
         .seq_fields
         .enable_order_hint(1)
-        .bit_depth_minus8(0)
+        .bit_depth_minus8(if ten_bit { 2 } else { 0 })
         .subsampling_x(1)
         .subsampling_y(1);
     out.push(param_buffer(context, &seq)?);
@@ -84,7 +85,7 @@ pub(super) fn parameters(
     };
     let base_qindex = match config.rate_control {
         RateControlMode::ConstantQp { qp } => qp.clamp(1, 255) as u8,
-        RateControlMode::ConstantBitrate => 128,
+        _ => 128,
     };
     // One reference, refreshed every picture: slot 0 holds the previous
     // reconstruction and every ref_frame_idx points at it.
@@ -142,7 +143,7 @@ pub(super) fn parameters(
                 height,
                 seq_level_idx: level_idx,
                 seq_tier: 0,
-                high_bitdepth: false,
+                high_bitdepth: ten_bit,
                 colour: config.colour,
             }),
             out,

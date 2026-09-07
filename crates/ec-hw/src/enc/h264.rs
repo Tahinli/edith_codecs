@@ -44,8 +44,8 @@ pub(super) fn parameters(
         intra_idr_period: config.gop_size.max(1),
         ip_period: 1,
         bits_per_second: match config.rate_control {
-            RateControlMode::ConstantBitrate => config.bitrate,
             RateControlMode::ConstantQp { .. } => 0,
+            _ => config.bitrate,
         },
         max_num_ref_frames: 1,
         picture_width_in_mbs: (coded_w / 16) as u16,
@@ -84,7 +84,7 @@ pub(super) fn parameters(
         frame_num,
         pic_init_qp: match config.rate_control {
             RateControlMode::ConstantQp { qp } => qp.clamp(1, 51) as u8,
-            RateControlMode::ConstantBitrate => 26,
+            _ => 26,
         },
         ..EncPictureParameterBufferH264::default()
     };
