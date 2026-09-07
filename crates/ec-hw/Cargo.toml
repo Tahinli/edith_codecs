@@ -13,3 +13,7 @@ ec-h264-syntax.workspace = true
 ec-h265-syntax.workspace = true
 ec-va.workspace = true
 ec-vp9-syntax.workspace = true
+
+[dev-dependencies]
+# The second, independent decoder the AV1 encode gate compares ffmpeg against.
+ec-av1.workspace = true

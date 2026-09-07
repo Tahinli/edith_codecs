@@ -42,6 +42,7 @@ fn main() {
     bench_h264(&mut rows);
     bench_h265_encode(&mut rows);
     bench_av1_encode(&mut rows);
+    bench_hw_av1_encode(&mut rows);
     bench_audio_decode(&mut rows);
     bench_audio_encode(&mut rows);
     bench_truehd(&mut rows);
@@ -322,6 +323,77 @@ fn bench_h265_encode(rows: &mut Vec<Row>) {
         component: "ec-h265",
         direction: "decode",
         content: format!("{w}x{h}, {n} frames, own IDR stream"),
+        media: format!("{media_s:.1}s"),
+        wall_ms: wall * 1000.0,
+        rtf: (wall > 0.0).then_some(media_s / wall),
+    });
+}
+
+// ---------------------------------------------------------------------------
+// hardware av1: the GPU encoder, at the size his library is in.
+// ---------------------------------------------------------------------------
+
+/// AV1 encode on the GPU (`ec-hw`, VA-API). Skips as a row rather than a
+/// failure when there is no VA device or the driver has no AV1 encode
+/// entrypoint -- a machine without one is not a slow machine.
+fn bench_hw_av1_encode(rows: &mut Vec<Row>) {
+    let Some(src) = real_video("h264").or_else(|| real_video("hevc")) else {
+        rows.push(missing("ec-hw av1", "encode"));
+        return;
+    };
+    let display = match ec_va::Display::open() {
+        Ok(display) => display,
+        Err(e) => {
+            rows.push(missing_direction("ec-hw av1", "encode", &format!("no VA display ({e})")));
+            return;
+        }
+    };
+    let (planes, w, h, n) = extract_yuv420p(&src, 1920, 1080, 30);
+    if n == 0 {
+        rows.push(missing("ec-hw av1", "encode"));
+        return;
+    }
+    let mut cfg = ec_hw::EncoderConfig::new(ec_hw::EncCodec::Av1, w, h);
+    cfg.rate_control = ec_hw::RateControlMode::ConstantQp { qp: 120 };
+    let mut enc = match ec_hw::Encoder::new(&display, cfg) {
+        Ok(enc) => enc,
+        Err(e) => {
+            rows.push(missing_direction("ec-hw av1", "encode", &format!("driver refused ({e})")));
+            return;
+        }
+    };
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let frame_len = (w * h + 2 * cw * ch) as usize;
+    let start = Instant::now();
+    let mut coded = 0usize;
+    for (i, frame) in planes.chunks_exact(frame_len).enumerate() {
+        let (y, rest) = frame.split_at((w * h) as usize);
+        let (u, v) = rest.split_at(rest.len() / 2);
+        let picture = ec_hw::I420 {
+            y: y.to_vec(),
+            u: u.to_vec(),
+            v: v.to_vec(),
+            width: w,
+            height: h,
+        };
+        let meta = ec_hw::FrameMetadata {
+            timestamp: i as i64,
+            force_keyframe: false,
+        };
+        match enc.encode(&picture, meta) {
+            Ok(out) => coded += out.data.len(),
+            Err(e) => {
+                rows.push(missing_direction("ec-hw av1", "encode", &format!("encode failed ({e})")));
+                return;
+            }
+        }
+    }
+    let wall = start.elapsed().as_secs_f64();
+    let media_s = n as f64 / 30.0;
+    rows.push(Row {
+        component: "ec-hw av1",
+        direction: "encode",
+        content: format!("{w}x{h}, {n} frames, CQP 120, {} kB", coded / 1000),
         media: format!("{media_s:.1}s"),
         wall_ms: wall * 1000.0,
         rtf: (wall > 0.0).then_some(media_s / wall),
