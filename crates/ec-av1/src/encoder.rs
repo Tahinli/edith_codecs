@@ -3027,6 +3027,69 @@ mod tests {
     /// reconstruction. The counter is the point (class
     /// `gate-blind-to-feature`): without it a green three-way compare says
     /// nothing about whether a single 64x64 block was ever written.
+    /// lane-sb128 step 1: the same static clip under a 128x128 SUPERBLOCK.
+    /// Every partition decision below the root is the one the 64-superblock
+    /// encoder makes -- the root itself is always `PARTITION_SPLIT` into the
+    /// four 64x64 superblocks -- so the only thing this proves is the
+    /// structural syntax: the root's own partition symbol, its loop
+    /// restoration read once over the 128 span at the 128 unit size, and
+    /// libaom's TL/TR/BL/BR visit order. 256x128 is 2x1 128x128 superblocks
+    /// per frame over three frames, so the root fires 6 times.
+    ///
+    /// `#[ignore]`: [`crate::encode::force_sb128`] moves a process-global
+    /// (the superblock size is a sequence field), so this gate runs alone:
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_static_clip_codes_128x128_superblock_roots --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_static_clip_codes_128x128_superblock_roots_and_decodes_sample_exact() {
+        let _knobs = crate::speed::knob_write();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        crate::encode::force_sb128(true);
+        let (width, height) = (256usize, 128usize);
+        let still = test_card(width, height, 0);
+        let sources: Vec<Picture> = (0..3).map(|_| still.clone()).collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 120,
+            gop: 8,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        let _ = crate::tile::take_sb128_root_hits();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let roots = crate::tile::take_sb128_root_hits();
+        assert!(
+            roots >= 4,
+            "a 128x128-superblock clip coded {roots} superblock roots, wanted at least 4"
+        );
+        eprintln!("128x128 superblock roots: {roots}");
+
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        assert!(
+            crate::decode::part128_split_hits() >= 4,
+            "our decoder read no 128x128 superblock root"
+        );
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_luma(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+            assert_eq!(&got, b, "frame {i}: ffmpeg and our decoder disagree");
+        }
+    }
+
     #[test]
     fn a_static_clip_codes_64x64_roots_and_decodes_sample_exact() {
         let _knobs = crate::speed::knob_write();
