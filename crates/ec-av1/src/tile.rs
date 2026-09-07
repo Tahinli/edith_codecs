@@ -343,6 +343,80 @@ fn intrabc_armed() -> bool {
     INTRABC.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// This SEQUENCE header's `enable_filter_intra` (spec 5.5.2), armed
+    /// exactly like [`SCREEN`]: with it every DC_PRED intra block of at most
+    /// 32x32 that took no luma palette carries a `use_filter_intra` symbol
+    /// after the palette colours and before the colour-index maps (decode.rs
+    /// `read_intra_mode`), so a tile written without it and read with it
+    /// desyncs at the first such block.
+    static FILTER_INTRA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms the sequence's `enable_filter_intra` bit for the next tile written on
+/// this thread; cleared by [`CdefIdxGuard`] when that writer returns.
+pub(crate) fn arm_filter_intra(on: bool) {
+    FILTER_INTRA.with(|c| c.set(on));
+}
+
+fn filter_intra_armed() -> bool {
+    FILTER_INTRA.with(std::cell::Cell::get)
+}
+
+/// How many blocks this writer coded `use_filter_intra == 1`, and the
+/// histogram of the five `filter_intra_mode`s (index 1..=5) -- the fire count
+/// a gate prints so that "filter intra is on" is a measurement rather than a
+/// claim (class `gate-blind-to-feature`). Index 0 is the block count.
+static FILTER_INTRA_HITS: [std::sync::atomic::AtomicUsize; 6] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 6];
+
+/// Reads [`FILTER_INTRA_HITS`] and zeroes it, so a gate can attribute the
+/// counts to its own encode.
+pub(crate) fn take_filter_intra_hits() -> [usize; 6] {
+    std::array::from_fn(|i| FILTER_INTRA_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `filter_intra_mode_info` (spec 5.11.14) written out, mirrored symbol for
+/// symbol from decode.rs `read_intra_mode`: a `use_filter_intra` flag on every
+/// DC_PRED block whose sides `av1_filter_intra_allowed_bsize` admits (both <=
+/// 32, [`crate::decode::filter_intra_size_class`]) and that took no luma
+/// palette (`av1_filter_intra_allowed`, reconintra.h:77), then the chosen mode
+/// of five. Sits between the palette COLOUR lists and the colour-index maps,
+/// where libaom reads it (`av1_visit_palette` runs after
+/// `read_filter_intra_mode_info`).
+fn write_filter_intra(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    mode: usize,
+    side: usize,
+    has_palette_y: bool,
+    filter_intra: Option<u8>,
+) {
+    if !filter_intra_armed() || mode != DC_PRED || has_palette_y {
+        debug_assert!(filter_intra.is_none(), "no `use_filter_intra` symbol exists here");
+        return;
+    }
+    let Some(class) = crate::decode::filter_intra_size_class(side) else {
+        debug_assert!(filter_intra.is_none(), "past av1_filter_intra_allowed_bsize");
+        return;
+    };
+    enc.symbol(usize::from(filter_intra.is_some()), &mut cdfs.filter_intra[class]);
+    if let Some(fi) = filter_intra {
+        enc.symbol(usize::from(fi), &mut cdfs.filter_intra_mode);
+        FILTER_INTRA_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        FILTER_INTRA_HITS[usize::from(fi) + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The coefficient-table row a block's luma transform types are coded from:
+/// `fimode_to_intradir[filter_intra_mode]` for a filter-intra block, its own
+/// luma mode otherwise (class `filter-intra tx_type row`, decode.rs
+/// [`crate::decode::fi_tx_row`]). The block still PUBLISHES `DC_PRED` as its
+/// neighbour mode -- libaom's `mbmi->mode` is unchanged by filter intra.
+fn tx_row(mode: usize, filter_intra: Option<u8>) -> usize {
+    crate::decode::fi_tx_row(mode, filter_intra.map(usize::from))
+}
+
 /// How many blocks this writer coded `use_intrabc == 1`, and the histogram of
 /// their DV magnitudes in full pels (index 1..=6 = 1, 2, 4, 8, 16, 32 pels
 /// and up, by the larger component) -- the fire count a gate prints so that
@@ -935,6 +1009,7 @@ impl Drop for CdefIdxGuard {
         REFERENCE_SELECT.with(|c| c.set(false));
         MOTION_MODE.with(|c| c.set(false));
         INTRABC.with(|c| c.set(false));
+        FILTER_INTRA.with(|c| c.set(false));
         INTRABC_GRID.with(|c| *c.borrow_mut() = None);
         ORDER_HINTS.with(|c| c.set((7, 0, [0; 7])));
     }
@@ -1452,6 +1527,14 @@ pub struct BlockCoeffs {
     /// [`UV_CFL_PRED`]; at least one of the pair is nonzero, since the joint
     /// sign symbol has no (ZERO, ZERO) value.
     pub cfl_alphas: Option<(i32, i32)>,
+    /// This block's `filter_intra_mode` (spec 5.11.14, 0..=4) when it is
+    /// coded with recursive filter intra, or `None`. `Some` only on a DC_PRED
+    /// luma block of at most 32x32 with no luma palette, on a sequence whose
+    /// header set `enable_filter_intra` ([`arm_filter_intra`]); the block's
+    /// luma transform types are then coded from
+    /// `fimode_to_intradir[filter_intra_mode]`'s row ([`tx_row`]) while its
+    /// neighbour mode stays `DC_PRED`.
+    pub filter_intra: Option<u8>,
     /// This block's `angle_delta_y` (spec `read_intra_angle_info`, -3..=3),
     /// zero for every non-directional luma mode -- which is what
     /// [`Default`] gives, and what every writer coded before lane-av1cfl.
@@ -3446,6 +3529,7 @@ fn write_intra_mode(
         neighbours,
         block.palette.as_ref(),
         block.palette_uv.as_ref(),
+        block.filter_intra,
         mode,
         uv_mode,
         mi,
@@ -3474,12 +3558,18 @@ fn write_palette_syntax(
     neighbours: &mut Neighbours,
     palette: Option<&PaletteY>,
     palette_uv: Option<&PaletteUv>,
+    // lane-fintra: this block's chosen `filter_intra_mode`, or `None`. Written
+    // here rather than by the caller because its symbol sits BETWEEN the
+    // palette colour lists and the colour-index maps (decode.rs
+    // `read_intra_mode`), which is inside this function.
+    filter_intra: Option<u8>,
     mode: usize,
     uv_mode: usize,
     mi: (usize, usize),
     side: usize,
 ) {
     if !screen_armed() {
+        write_filter_intra(enc, cdfs, mode, side, false, filter_intra);
         return;
     }
     let palette = palette.filter(|_| mode == DC_PRED);
@@ -3509,6 +3599,7 @@ fn write_palette_syntax(
             enc.symbol(n - 2, &mut cdfs.palette_uv_size[bsize_ctx]);
             write_palette_colors_uv(enc, &pal.u_colors[..n], &pal.v_colors[..n], &uv_cache);
         }
+        write_filter_intra(enc, cdfs, mode, side, palette.is_some(), filter_intra);
         // Both colour-index maps come after BOTH colour lists, in plane order
         // (`av1_visit_palette` runs from the caller, past `filter_intra`).
         if let Some(pal) = palette {
@@ -3527,6 +3618,10 @@ fn write_palette_syntax(
             );
             note_palette_uv(n);
         }
+    } else {
+        // Below `av1_allow_palette`'s size bound there is no palette syntax at
+        // all, but `av1_filter_intra_allowed_bsize` still admits the block.
+        write_filter_intra(enc, cdfs, mode, side, false, filter_intra);
     }
     neighbours.pending_palette = palette.map(|p| (p.size, p.colors));
     neighbours.pending_palette_uv = palette_uv.map(|p| (p.size, p.u_colors));
@@ -3629,6 +3724,10 @@ fn write_block(
         at_mi,
         side,
     );
+    // The coefficient tables read `fimode_to_intradir[filter_intra_mode]`'s
+    // row on a filter-intra block; the neighbour publication below still gets
+    // the block's own `DC_PRED` ([`tx_row`]).
+    let tx_mode = tx_row(mode, block.filter_intra);
     let split = if tx_select {
         let tx = write_luma_select(
             enc,
@@ -3638,7 +3737,7 @@ fn write_block(
             side,
             usize::from(block.tx_depth),
             &grids[0],
-            mode,
+            tx_mode,
             all_scans,
         )?;
         tx < side
@@ -3652,7 +3751,7 @@ fn write_block(
         grids,
         &scans,
         &neighbours.around(at, side),
-        mode,
+        tx_mode,
         tx_select,
     );
     neighbours.record_planes(at, side, mode, grids, !split);
@@ -3724,6 +3823,9 @@ fn write_leaf8(
     // unchanged).
     let mode = write_intra_mode(enc, cdfs, neighbours, block, above_mode, left_mode, true, leaf_mi, 8);
     let planes = [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4];
+    // As [`write_block`]: the coefficient row follows the filter-intra mode,
+    // the mode this leaf publishes (and returns to the next leaf) does not.
+    let tx_mode = tx_row(mode, block.filter_intra);
     let split = if tx_select {
         let tx = write_luma_select(
             enc,
@@ -3733,7 +3835,7 @@ fn write_leaf8(
             8,
             usize::from(block.tx_depth),
             &grids[0],
-            mode,
+            tx_mode,
             all_scans,
         )?;
         tx < 8
@@ -3747,7 +3849,7 @@ fn write_leaf8(
         grids,
         &scans,
         &neighbours.around_mi(leaf_mi, 8),
-        mode,
+        tx_mode,
         tx_select,
     );
     neighbours.record_mi_planes(leaf_mi, 8, grids, !split);
@@ -5811,7 +5913,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     if (V_PRED..=D67_PRED).contains(&uv_mode) {
                         enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
                     }
-                    mode_for_tx = mode;
+                    mode_for_tx = tx_row(mode, block.filter_intra);
                     // Intra: no vote, but still a coded cell -- mvstack's
                     // extended-scan coverage must see it (module doc).
                     let (mi_row, mi_col) = (r32 as usize * 8, c32 as usize * 8);
@@ -5821,6 +5923,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         &mut neighbours,
                         block.palette.as_ref(),
                         block.palette_uv.as_ref(),
+                        block.filter_intra,
                         mode,
                         uv_mode,
                         (mi_row, mi_col),
@@ -6052,7 +6155,7 @@ fn write_inter_frame_leaf(
         if (V_PRED..=D67_PRED).contains(&uv_mode) {
             enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
         }
-        mode_for_tx = mode;
+        mode_for_tx = tx_row(mode, block.filter_intra);
         // Intra: no vote, but still a coded cell -- mvstack's extended-scan
         // coverage must see it (module doc).
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
@@ -6062,6 +6165,7 @@ fn write_inter_frame_leaf(
             neighbours,
             block.palette.as_ref(),
             block.palette_uv.as_ref(),
+            block.filter_intra,
             mode,
             uv_mode,
             (mi_row, mi_col),
@@ -6299,7 +6403,7 @@ fn write_inter_frame_leaf8(
         if (V_PRED..=D67_PRED).contains(&uv_mode) {
             enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[uv_mode - V_PRED]);
         }
-        mode_for_tx = mode;
+        mode_for_tx = tx_row(mode, block.filter_intra);
         // Intra: no vote, but still a coded cell -- mvstack's extended-scan
         // coverage must see it (module doc).
         let (mi_row, mi_col) = leaf_mi;
@@ -6309,6 +6413,7 @@ fn write_inter_frame_leaf8(
             neighbours,
             block.palette.as_ref(),
             block.palette_uv.as_ref(),
+            block.filter_intra,
             mode,
             uv_mode,
             leaf_mi,

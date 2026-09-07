@@ -8274,7 +8274,7 @@ impl Neighbours {
 /// `intra_ext_tx_cdf` row a luma transform reads. A filter-intra block's
 /// `mode` is always `DC_PRED`, so the row comes from the FILTER-INTRA mode
 /// instead (the defect commit 1a89ed9 fixed at the square sites).
-fn fi_tx_row(mode: usize, filter_intra: Option<usize>) -> usize {
+pub(crate) fn fi_tx_row(mode: usize, filter_intra: Option<usize>) -> usize {
     const FIMODE_TO_INTRADIR: [usize; 5] = [DC_PRED, V_PRED, H_PRED, D157_PRED, DC_PRED];
     filter_intra.map_or(mode, |fi| FIMODE_TO_INTRADIR[fi])
 }
@@ -8282,7 +8282,7 @@ fn fi_tx_row(mode: usize, filter_intra: Option<usize>) -> usize {
 /// A block-size class index into [`cdf::FILTER_INTRA`]/`Cdfs::filter_intra`,
 /// or `None` when `side` is past `av1_filter_intra_allowed_bsize`'s <=32
 /// bound (spec `filter_intra_mode_info` never reads a symbol there).
-fn filter_intra_size_class(side: usize) -> Option<usize> {
+pub(crate) fn filter_intra_size_class(side: usize) -> Option<usize> {
     match side {
         4 => Some(0),
         8 => Some(1),
@@ -33467,7 +33467,9 @@ pub(crate) fn decode_inter_frame_tile(
         loop_filter, allow_high_precision_mv, force_integer_mv, interp_fixed,
         enable_dual_filter, reference_select, tx_select,
         &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, false,
-        switchable_motion_mode, false, fctx,
+        // `enable_filter_intra`: as the `false`s beside it, this convenience
+        // entry names a stream written without the sequence bit (lane-fintra).
+        switchable_motion_mode, false, false, fctx,
     )
 }
 
@@ -33519,6 +33521,8 @@ pub(crate) fn decode_inter_frame_tile_lr(
     // `false` here desynced every stream this crate's encoder writes with the
     // warp knob on: the same stale-header class as the parameter above.
     allow_warped_motion: bool,
+    // lane-fintra: see [`decode_inter_frame_tiles_lr`]'s own parameter.
+    enable_filter_intra: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     let single_tile = TileInfo {
@@ -33549,6 +33553,7 @@ pub(crate) fn decode_inter_frame_tile_lr(
         allow_screen_content_tools,
         switchable_motion_mode,
         allow_warped_motion,
+        enable_filter_intra,
         fctx,
     )
 }
@@ -33590,6 +33595,12 @@ pub(crate) fn decode_inter_frame_tiles_lr(
     // `false` here desynced every stream this crate's encoder writes with the
     // warp knob on: the same stale-header class as the parameter above.
     allow_warped_motion: bool,
+    // lane-fintra: this sequence header's own `enable_filter_intra` bit (spec
+    // 5.5.2). Hard-coded `false` here until this lane -- the same stale-header
+    // class as `switchable_motion_mode`/`allow_warped_motion` above: the
+    // encoder's own trial decode desyncs at the first intra-in-inter DC_PRED
+    // block the moment its sequence header sets the bit.
+    enable_filter_intra: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> Result<Picture> {
     decode_inter_frame_tile_with_cdfs(
@@ -33628,10 +33639,7 @@ pub(crate) fn decode_inter_frame_tiles_lr(
         allow_warped_motion,
         allow_screen_content_tools,
         DeltaParams::default(),
-        // `enable_filter_intra`: this crate's own encoder never writes the
-        // sequence bit (`encode.rs`), so no intra-in-inter block of a stream
-        // reaching this entry point reads a `use_filter_intra` symbol.
-        false,
+        enable_filter_intra,
         None,
         fctx,
     )
@@ -37619,7 +37627,10 @@ mod tests {
             base_q_idx,
             w as u32,
             h as u32,
-            false,
+            // lane-fintra: the sequence bit the encoder wrote this tile under
+            // (stale-header class -- a hard-coded `false` here reads one symbol
+            // short at the first DC_PRED block once the search offers filter intra).
+            crate::encode::filter_intra_on(),
             &cdef,
             &loop_filter,
             tx_select,
@@ -37989,7 +38000,10 @@ mod tests {
                 encoded.base_q_idx,
                 coded_w,
                 coded_h,
-                false,
+                // lane-fintra: the sequence bit the encoder wrote this tile under
+                // (stale-header class -- a hard-coded `false` here reads one symbol
+                // short at the first DC_PRED block once the search offers filter intra).
+                crate::encode::filter_intra_on(),
                 &encoded.cdef,
                 &encoded.loop_filter,
                 encoded.tx_select,
@@ -38033,7 +38047,10 @@ mod tests {
                 encoded.base_q_idx,
                 width as u32,
                 height as u32,
-                false,
+                // lane-fintra: the sequence bit the encoder wrote this tile under
+                // (stale-header class -- a hard-coded `false` here reads one symbol
+                // short at the first DC_PRED block once the search offers filter intra).
+                crate::encode::filter_intra_on(),
                 &encoded.cdef,
                 &encoded.loop_filter,
                 tx_select,
@@ -38118,7 +38135,10 @@ mod tests {
             key.base_q_idx,
             width as u32,
             height as u32,
-            false,
+            // lane-fintra: the sequence bit the encoder wrote this tile under
+            // (stale-header class -- a hard-coded `false` here reads one symbol
+            // short at the first DC_PRED block once the search offers filter intra).
+            crate::encode::filter_intra_on(),
             &key.cdef,
             &key.loop_filter,
             key.tx_select,
@@ -38184,6 +38204,9 @@ mod tests {
                 // the warp bit must be the one it wrote too (lane-av1obmc2);
                 // the encoder only sets it under `EC_AV1_WARP`.
                 crate::encode::warp_on(),
+                // lane-fintra: the sequence bit the encoder wrote this tile
+                // under -- same stale-header class as the warp bit above.
+                crate::encode::filter_intra_on(),
                 fctx,
             )
             .unwrap();
@@ -38467,7 +38490,10 @@ mod tests {
             key.base_q_idx,
             coded_w,
             coded_h,
-            false,
+            // lane-fintra: the sequence bit the encoder wrote this tile under
+            // (stale-header class -- a hard-coded `false` here reads one symbol
+            // short at the first DC_PRED block once the search offers filter intra).
+            crate::encode::filter_intra_on(),
             &key.cdef,
             &key.loop_filter,
             key.tx_select,
@@ -38522,6 +38548,9 @@ mod tests {
                 // the warp bit must be the one it wrote too (lane-av1obmc2);
                 // the encoder only sets it under `EC_AV1_WARP`.
                 crate::encode::warp_on(),
+                // lane-fintra: the sequence bit the encoder wrote this tile
+                // under -- same stale-header class as the warp bit above.
+                crate::encode::filter_intra_on(),
                 fctx,
             )
             .unwrap();
