@@ -13057,8 +13057,14 @@ mod tests {
         // the blocks that take one code a filter-intra mode, a different
         // prediction and different coefficients -- 7321 -> 7373 at q=150 and
         // 27285 -> 27074 at q=60. `EC_AV1_FILTER_INTRA=0` restores these.
+        // Re-taken on lane-pyr4: the default pyramid is `8:-32:16` now, the
+        // long-GOP sweep's shape (`lanes/pyr4.sweep.txt`), so these four
+        // pictures code as one truncated group of 8 with its hidden ALTREF at
+        // `q-32` instead of one truncated group of 16 at `q-24`:
+        // 8076 -> 8755 at q=150 and 27585 -> 28637 at q=60.
+        // `EC_AV1_PYRAMID=16:-24:16` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8076, 0x8171_4818_e223_ab21), (60, 27585, 0xdbe7_eecd_6d64_c4f5)];
+            [(150, 8755, 0xa28f_a6d2_fe29_66ae), (60, 28637, 0xcdf1_ba94_4221_c10e)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(

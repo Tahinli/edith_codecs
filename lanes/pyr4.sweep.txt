@@ -1,0 +1,112 @@
+lane-pyr4 -- the coding pyramid decided on a LONG GOP
+=====================================================
+
+Why. main 38753f0a shipped `Pyramid::default` = 16:-24:16 off a sweep of
+`encode::tests::bd_rate_screen_native`, which codes 12 frames with gop = 12.
+`Av1Encoder::encode_frames` cuts a mini-GOP at every key frame, so ANY
+mini_gop over 12 codes the same stream in that gate: the shipped "16" was
+measured as "one hidden ARF per 12-picture GOP", never as a real 16-picture
+group (class `instrument at bound` / `gate blind to feature`). The user's
+exports are long GOPs.
+
+The instrument. `encode::tests::bd_rate_film_long_gop` (#[ignore], new this
+lane): the same native crop, three-way sample-exact decode (encoder / ffmpeg
+/ our decoder) and four-quantizer ladder as `bd_rate_screen_native`, over the
+two real film rows of `native_gate_clips` only, but 48 pictures with gop = 48
+(`encode_sequence` sets gop = pictures.len(); `external_ladder` passes ffmpeg
+`-g 48`).  Reference arms, unchanged from the 12-frame gate except that -g:
+  libaom-av1  -g 48 -cpu-used 6 -b:v 0 -crf {5,20,35,45}
+  librav1e    -g 48 -rav1e-params speed=6:quantizer={50,100,150,200}:
+              tile_cols=1:tile_rows=1:threads=1
+  ours        base_q_idx {150,120,90,60}, one tile, one thread
+Both wrappers honour -g (measured: a 96-frame clip at -g 48 codes exactly 2
+key frames under librav1e and under libaom-av1).
+Crops: film A 1920x768, film B 1920x1024 (the 4K source, centre crop).
+Wall per arm, 3 arms in parallel: ours 240-290 s per film row, libaom 33-80 s,
+rav1e 51-63 s; ~13-17 minutes per arm for both rows. Raw logs: lanes/pyr4/.
+
+Every row below is keyed by its own log's "pyramid requested/effective"
+print, never by argument order (lane-pyr3 misattributed three rows that way).
+Effective == requested on all 11 arms: neither film is gated to flat.
+
+LONG-GOP TABLE (48 frames, gop 48). BD-rate %, lower is better.
+
+| mini_gop:arf:leaf | film A vs libaom | film A vs rav1e | film B vs libaom | film B vs rav1e |
+|---|---|---|---|---|
+| 16:-24:16  (shipped)  | +67.4 | +21.0 | +165.5 | +57.6 |
+| 32:-24:16             | +79.0 | +29.8 | +164.4 | +58.8 |
+| 8:-24:16              | +58.5 | +15.5 | +166.1 | +56.8 |
+| 4:-24:16   (probe)    | +61.9 | +19.5 | +160.8 | +56.7 |
+| 8:-16:16              | +63.7 | +19.0 | +167.6 | +58.6 |
+| 8:-32:16   ** SHIPS **| +55.7 | +13.5 | +165.1 | +56.6 |
+| 8:-40:16   (probe)    | +56.1 | +13.3 | +167.6 | +57.3 |
+| 8:-24:12              | +60.2 | +17.3 | +166.8 | +58.0 |
+| 8:-24:20              | +57.1 | +14.0 | +166.2 | +56.6 |
+| 8:-32:12              | +56.5 | +14.7 | +163.0 | +56.3 |
+| 8:-32:20              | +55.4 | +12.9 | +167.9 | +57.4 |
+
+Axis 1, mini_gop at the shipped offsets -24:16 -- 32 / 16 / 8 / 4.
+Film A is strongly ordered 8 < 4 < 16 < 32 (8 is 8.9 / 5.5 points better than
+the shipped 16); film B is nearly flat over the whole axis (a 5.3-point span
+on the libaom column against a 165-point level, 2.1 on rav1e). 8 was the
+bottom of the requested set, so 4 was probed below it (class `search bounded
+by its heuristic`): film A turns back up at 4, so 8 is an interior optimum.
+
+Axis 2, the offsets at mini_gop 8. Requested grid arf {-16,-24,-32} x leaf
+{12,16,20}; 7 of the 9 were run plus a -40 probe. arf is the strong axis
+(-16 -> -32 is 8.0 points on film A) and -32 is an interior optimum: -40
+turns back up on film A's libaom column and on both of film B's. leaf is the
+weak axis (<= 3.1 points on film A, <= 4.9 on film B) and its optima are
+content-opposite (film A wants 20, film B wants 12), so 16 stays -- it is the
+only leaf value down on all four columns against the shipped shape.
+DROPPED, wall vs value: (-16,12) and (-16,20). arf -16 is last on all four
+columns at leaf 16 and the leaf axis is a third of the arf axis' size, so
+neither corner can reach 8:-32:16.
+
+DECISION: `Pyramid::default` 16:-24:16 -> 8:-32:16.
+Keep rule (both films down on both columns) is met:
+  film A  +67.4 -> +55.7 (-11.7)   +21.0 -> +13.5 (-7.5)
+  film B +165.5 -> +165.1 (-0.4)   +57.6 -> +56.6 (-1.0)
+
+THE PRICE, on the record. The 12-frame gate at the winning shape,
+`bd_rate_screen_native` with EC_AV1_PYRAMID=8:-32:16 (all five rows):
+
+| clip | vs libaom | vs rav1e | wall ours:libaom:rav1e |
+|---|---|---|---|
+| bars 1080p 1920x1024 | +4.8% | -11.5% | 38.9s:6.7s:16.7s |
+| bars 2160p 1920x1024 | +20.5% | -3.4% | 34.5s:5.7s:16.1s |
+| film A 1920x768 | +51.2% | +21.4% | 64.6s:9.9s:13.9s |
+| film B 1920x1024 | +91.0% | +53.5% | 69.1s:19.1s:15.2s |
+| screen capture 1920x1024 (gated flat) | +48.2% | -16.4% | 33.7s:8.8s:12.4s |
+
+against the shipped 16:-24:16 on the same gate (lanes/pyr3.sweep.txt):
+film A +44.2 / +15.7, film B +70.5 / +35.2. So the new shape is 7.0 / 5.7
+worse on film A and 20.5 / 18.3 worse on film B AT A 12-FRAME GOP, where a
+mini-GOP of 8 splits into 8 + 4 while 16 is a single group. The two gates
+disagree because the best shape depends on GOP LENGTH; the long GOP is what
+the editor exports, so it governs.
+DEFERRED: a GOP-length-adaptive mini_gop (e.g. the largest power of two that
+divides the GOP into whole groups, capped) would take both tables. Not
+measured here; unblocked by one more long/short pair of arms once the rule is
+written.
+
+VERIFICATION (lane-pyr4, at 8:-32:16)
+  pins re-taken: encode::tests::the_encoders_own_streams_are_byte_identical_to
+    _their_pins 8076 -> 8755 at q=150, 27585 -> 28637 at q=60 (the four-picture
+    clip codes as one truncated group of 8 with its ARF at q-32).
+  encode::tests::the_facade_codes_the_same_bytes_as_encode_sequence ok
+  tile_bytes_do_not_depend_on_the_thread_count (--include-ignored) ok
+  EC_COMP_MISMATCH=1 over the whole lib suite: 544 passed, 0 mismatch lines
+  encoder:: --include-ignored --test-threads 1: 27 passed
+  cargo test -p ec-av1 --release -j4: 544 passed / 0 failed / 43 ignored
+  cargo check --workspace --all-targets: 0 errors, 0 ec-av1 warnings
+    (25 warning lines, all pre-existing ec-opus / ec-vorbis)
+
+PRE-EXISTING, NOT THIS LANE: running the ignored encoder:: tests in PARALLEL
+(`--include-ignored encoder:: ...` with the default test-thread count) fails 5
+of them -- "a reference frame selected with no picture at this frame's own
+ref_frame_idx slot" and a short dav1d frame count. It reproduces identically
+on main's shape (EC_AV1_PYRAMID=16:-24:16, same binary: 5 failures, a superset
+of ours), and every one of them passes standalone and at --test-threads 1, so
+it is a shared-state/temp-file race between those heavy gates, not a pyramid
+defect. Class `PID-keyed temp path`. Log: lanes/pyr4/oldshape-combined.log.

@@ -585,18 +585,52 @@ impl Default for Pyramid {
     /// are minimal and the bound is not the answer. Deeper ARF is the same
     /// shape -- `-32` buys 0.6 on film A and gives 0.7 back on film B.
     ///
-    /// TWO THINGS THIS SWEEP DOES NOT SAY. The mini-GOP axis is measured
+    /// WHAT THAT SWEEP COULD NOT SAY, and the LONG-GOP sweep that answers it
+    /// (lane-pyr4, `lanes/pyr4.sweep.txt`). The table above is measured
     /// against a gate that codes 12 frames with `gop = 12`, and a group is
-    /// cut at every key frame (`encode_frames`), so `16` here is really
-    /// "one hidden ARF per GOP" and any mini-GOP over 12 codes the same
-    /// stream; on a stream with a longer GOP `16` is a genuine 16-picture
-    /// group, which this gate cannot measure. And the offsets were swept at
-    /// mini-GOP 8 before 16 won the first axis; the two joint corners at 16
-    /// confirm the same gradient, but the full grid at 16 is not measured.
+    /// cut at every key frame (`encode_frames`), so `16` there is really
+    /// "one hidden ARF per GOP" and ANY mini-GOP over 12 codes the same
+    /// stream (class `instrument at bound`). The user's exports are long
+    /// GOPs, so the shape is decided on
+    /// [`crate::encode::tests::bd_rate_film_long_gop`] -- 48 pictures, `gop
+    /// = 48`, the two real films, four quantizers, vs libaom `cpu-used 6`
+    /// and rav1e `speed=6` at the same key interval:
+    ///
+    /// | mini_gop:arf:leaf | film A vs libaom / rav1e | film B vs libaom / rav1e |
+    /// |---|---|---|
+    /// | 32:-24:16 | +79.0 / +29.8 | +164.4 / +58.8 |
+    /// | 16:-24:16 (was the default) | +67.4 / +21.0 | +165.5 / +57.6 |
+    /// | 8:-16:16 | +63.7 / +19.0 | +167.6 / +58.6 |
+    /// | 4:-24:16 | +61.9 / +19.5 | +160.8 / +56.7 |
+    /// | 8:-24:16 | +58.5 / +15.5 | +166.1 / +56.8 |
+    /// | 8:-24:12 | +60.2 / +17.3 | +166.8 / +58.0 |
+    /// | 8:-24:20 | +57.1 / +14.0 | +166.2 / +56.6 |
+    /// | 8:-40:16 | +56.1 / +13.3 | +167.6 / +57.3 |
+    /// | 8:-32:12 | +56.5 / +14.7 | +163.0 / +56.3 |
+    /// | 8:-32:20 | +55.4 / +12.9 | +167.9 / +57.4 |
+    /// | **8:-32:16** | **+55.7 / +13.5** | **+165.1 / +56.6** |
+    ///
+    /// `8:-32:16` ships: against the old `16:-24:16` it takes 11.7 / 7.5
+    /// points off film A and 0.4 / 1.0 off film B -- all four columns down.
+    /// A real 16- or 32-picture group is WORSE than an 8-picture one on film
+    /// A once the GOP is long enough for the distinction to exist, which the
+    /// 12-frame gate could not see; `4` was probed below the swept edge and
+    /// turns back up on film A. ARF `-32` is an interior optimum (`-40`
+    /// turns back on both films). The leaf axis has content-opposite optima
+    /// (film A wants `20`, film B wants `12`, within 1.1 and 4.9 points) so
+    /// `16` stays, being the only value down on all four columns.
+    ///
+    /// THE PRICE, stated: on the SHORT-GOP gate above (12 frames, `gop =
+    /// 12`, where a mini-GOP of 8 splits into 8 + 4 while 16 is one group)
+    /// `8:-32:16` reads film A +51.2 / +21.4 and film B +91.0 / +53.5
+    /// against `16:-24:16`'s +44.2 / +15.7 and +70.5 / +35.2. The two gates
+    /// disagree because the best shape depends on the GOP length, and the
+    /// long one is what the editor exports; a GOP-length-adaptive `mini_gop`
+    /// is the standing follow-up, not measured here.
     fn default() -> Self {
         Self {
-            mini_gop: 16,
-            arf_q_offset: -24,
+            mini_gop: 8,
+            arf_q_offset: -32,
             leaf_q_offset: 16,
         }
     }
