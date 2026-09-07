@@ -13348,8 +13348,14 @@ mod tests {
         // the blocks that take one code a filter-intra mode, a different
         // prediction and different coefficients -- 7321 -> 7373 at q=150 and
         // 27285 -> 27074 at q=60. `EC_AV1_FILTER_INTRA=0` restores these.
+        // Re-taken on lane-b64: the inter search offers the whole superblock
+        // as one 64x64 `PARTITION_NONE` block coded skip ([`B64_ROOT`]), and
+        // every superblock that takes one codes a single partition symbol,
+        // one mode/mv chain and no residual where four quadrants used to --
+        // 8076 -> 7291 at q=150 and 27585 -> 27466 at q=60. `EC_AV1_B64=0`
+        // restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8076, 0x8171_4818_e223_ab21), (60, 27585, 0xdbe7_eecd_6d64_c4f5)];
+            [(150, 7291, 0xa411_97e8_8a80_2a1b), (60, 27466, 0xdc87_26a3_c625_46ce)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
