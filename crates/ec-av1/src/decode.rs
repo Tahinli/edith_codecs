@@ -18428,7 +18428,7 @@ fn read_inter_luma8(
 /// both `TX_CLASS_2D`, so that mistake left the entropy stream perfectly in
 /// sync and only corrupted the inverse transform (one 64x64 superblock of
 /// high-frequency chroma noise, luma bit-exact).
-fn reduce_inherited_chroma_tx_type(t: TxType, w: usize, h: usize, fctx: &crate::decode::FrameCtx) -> TxType {
+pub(crate) fn reduce_inherited_chroma_tx_type(t: TxType, w: usize, h: usize, fctx: &crate::decode::FrameCtx) -> TxType {
     use TxType::*;
     let sqr_up = w.max(h);
     let sqr = w.min(h);

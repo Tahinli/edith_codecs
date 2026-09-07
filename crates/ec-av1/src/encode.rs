@@ -3961,6 +3961,52 @@ fn txfm_split_bits(side: usize, depth: usize) -> f64 {
         + 4.0 * symbol_bits(&cdf::TXFM_PARTITION[ctx(max_tx / 2)], 0)
 }
 
+/// spec 5.11.40 / libaom `av1_get_tx_type`: an INTER block's chroma transform
+/// type is never coded -- the decoder takes the LUMA type of the block's
+/// chroma-reference position and reduces it to the set the chroma size allows
+/// ([`crate::decode::reduce_inherited_chroma_tx_type`]). This encoder
+/// quantised chroma under a `DCT_DCT` basis whatever luma chose, so every
+/// non-`DCT_DCT` luma winner had its chroma levels inverse-transformed on a
+/// basis they were never produced for: on the bars gate row the luma of the
+/// unconditional tx-type arm came out BETTER on every frame (53.66 -> 53.70
+/// dB) while V lost seven decibels (52.52 -> 45.53) -- the whole 20-point BD
+/// collapse two lanes attributed to the type PRICE (class
+/// `parsed then discarded` / `override slot on one arm`: a decoder-derived
+/// field the encoder never mirrored).
+///
+/// Re-codes the two chroma planes of a committed inter block at the type the
+/// decoder will use, `None` when the inherited type reduces to `DCT_DCT` and
+/// the trials the caller already holds are right.
+#[allow(clippy::too_many_arguments)]
+fn recode_inter_chroma(
+    chroma: &[Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+    mv: (i32, i32),
+    refs: [(&[u16], usize, usize, usize); 2],
+    second: Option<((i32, i32), [(&[u16], usize, usize, usize); 2])>,
+    search: &Search,
+    set: TxbSet,
+    luma_tx_type: TxType,
+    fctx: &crate::decode::FrameCtx,
+) -> Option<[Trial; 2]> {
+    let c = side / 2;
+    let tx = crate::decode::reduce_inherited_chroma_tx_type(luma_tx_type, c.min(32), c.min(32), fctx);
+    if tx == TxType::DctDct {
+        return None;
+    }
+    Some([0usize, 1].map(|p| match second {
+        Some((mv1, r1)) => mc_trial_compound_typed(
+            &chroma[p], x / 2, y / 2, c, (mv, mv1), false, refs[p], r1[p], search.base_q_idx,
+            search.deadzone, set, tx, fctx,
+        ),
+        None => mc_trial_typed(
+            &chroma[p], x / 2, y / 2, c, mv, false, refs[p].0, refs[p].1, refs[p].2, refs[p].3,
+            false, search.base_q_idx, search.deadzone, set, tx, fctx,
+        ),
+    }))
+}
+
 /// The inter block's own var-tx decision, once its motion vector is settled:
 /// its residual as ONE transform over the whole block, or as the four
 /// transforms of half the side the tree's first halving names. The prediction
@@ -6214,6 +6260,30 @@ fn code_square_inter(
                     search, &luma_new, skip_new, second, fctx,
                 )
             };
+            // lane-txrd: chroma follows the luma type the search just chose.
+            let [u_new, v_new] = match luma_tx_types.first().copied() {
+                Some(t) => recode_inter_chroma(
+                    chroma, (x, y), side, info.mv,
+                    [
+                        (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                        (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                    ],
+                    info.ref1.filter(|_| motion_won == 0).and_then(|r| {
+                        refs[r as usize].map(|g| {
+                            (
+                                info.mv1,
+                                [
+                                    (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                                    (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                                ],
+                            )
+                        })
+                    }),
+                    search, chroma_set, t, fctx,
+                )
+                .unwrap_or([u_new, v_new]),
+                None => [u_new, v_new],
+            };
             chroma[0].commit(x / 2, y / 2, side / 2, &u_new);
             chroma[1].commit(x / 2, y / 2, side / 2, &v_new);
             return (
@@ -6252,6 +6322,20 @@ fn code_square_inter(
         let (levels, tx_depth, dcost, luma_tx_types) = commit_inter_luma(
             luma, (x, y), side, mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_trial, skip, None, fctx,
         );
+        // lane-txrd: chroma follows the luma type (this tail's block is
+        // single-reference `NEARESTMV`, so no compound second half).
+        let [u, v] = match luma_tx_types.first().copied() {
+            Some(t) => recode_inter_chroma(
+                chroma, (x, y), side, mv,
+                [
+                    (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                    (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                ],
+                None, search, chroma_set, t, fctx,
+            )
+            .unwrap_or([u, v]),
+            None => [u, v],
+        };
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
         chroma[1].commit(x / 2, y / 2, side / 2, &v);
         (BlockCoeffs {
@@ -9559,6 +9643,38 @@ fn search_inter_block(
             (best.luma.levels.clone(), 0, 0.0, Vec::new())
         }
     };
+    // lane-txrd: chroma follows the luma type the var-tx/type search chose.
+    let [bu, bv] = match (best.inter.filter(|_| motion_won == 0), luma_tx_types.first().copied()) {
+        (Some(info), Some(t)) => {
+            let (ou, ov) = match extra.iter().find(|(r, _, _)| *r == info.ref_frame) {
+                Some(&(_, g, _)) => (
+                    (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                    (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                ),
+                None => (
+                    (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                    (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                ),
+            };
+            let sec = info.ref1.and_then(|r| {
+                compound.iter().find(|(c, _, _)| *c == r).map(|&(_, g, _)| {
+                    (
+                        info.mv1,
+                        [
+                            (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                            (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                        ],
+                    )
+                })
+            });
+            recode_inter_chroma(
+                chroma, (x, y), BLOCK, info.mv, [ou, ov], sec, search, chroma_set, t, fctx,
+            )
+            .unwrap_or([best.u, best.v])
+        }
+        _ => [best.u, best.v],
+    };
+    let best = Candidate { u: bu, v: bv, ..best };
     chroma[0].commit(x / 2, y / 2, BLOCK / 2, &best.u);
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
     (
@@ -14966,6 +15082,19 @@ mod tests {
             if crate::envflags::env_flag!("EC_AV1_FRAME_PSNR") {
                 let row: Vec<String> = per_frame.iter().map(|p| format!("{p:.2}")).collect();
                 eprintln!("{name}: q={q} per-frame PSNR {}", row.join(" "));
+                // lane-txrd: per PLANE, because an all-plane mean hides a
+                // collapse in one of them (class `metric blind to a plane`).
+                let plane = |pick: fn(&Picture) -> &Vec<u16>| -> String {
+                    let v: Vec<String> = decoded
+                        .iter()
+                        .zip(source)
+                        .map(|(d, s)| format!("{:.2}", psnr(pick(d), pick(s))))
+                        .collect();
+                    v.join(" ")
+                };
+                eprintln!("{name}: q={q} Y {}", plane(|p| &p.y));
+                eprintln!("{name}: q={q} U {}", plane(|p| &p.u));
+                eprintln!("{name}: q={q} V {}", plane(|p| &p.v));
             }
             let mean: f64 = per_frame.iter().sum::<f64>() / source.len() as f64;
             ladder.push((mean, (encoded.stream.len() as f64).log10()));
