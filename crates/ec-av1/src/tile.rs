@@ -8488,6 +8488,82 @@ mod tests {
     /// be: every position exactly once, the origin first, and never a position
     /// before one it sits diagonally behind — which is what lets a decoder read
     /// a coefficient's context off the coefficients it has already decoded.
+    /// lane-rdoq's two contracts, on a block shaped like the ones the pass
+    /// exists for (a strong DC, two mid levels and a tail of barely-rounded
+    /// +-1s): it may only move a block to a LOWER `D + lambda * R`, and the
+    /// bits it hands back must be the price of the grid it leaves behind --
+    /// the search takes that number as the block's rate, so a stale one
+    /// would price a tile nobody writes.
+    #[test]
+    fn rdoq_only_lowers_the_cost_and_reports_its_own_grid() {
+        let (side, set, q, lambda) = (16usize, TxbSet::Luma16, 150u8, 0.0275);
+        let mut scaled = vec![0f32; side * side];
+        for (i, v) in [
+            (0usize, 7.4f32),
+            (1, 2.6),
+            (side, -1.55),
+            // The tail the pass exists for: coefficients the deadzone only
+            // just rounded up to +-1, which give a whole level back for a
+            // fraction of one step of squared error.
+            (2, 0.55),
+            (2 * side + 1, -0.52),
+            (3 * side + 3, 0.51),
+        ] {
+            scaled[i] = v;
+        }
+        // The deadzone quantiser this pass runs after, at the shipped 0.5.
+        let mut levels: Vec<i32> = scaled
+            .iter()
+            .map(|&v| {
+                let m = f64::from(v).abs() + 0.5;
+                let l = if m < 1.0 { 0 } else { m.floor() as i32 };
+                if v < 0.0 { -l } else { l }
+            })
+            .collect();
+        let before = levels.clone();
+        let dc = f64::from(crate::quant::dc_q(8, i32::from(q)));
+        let ac = f64::from(crate::quant::ac_q(8, i32::from(q)));
+        let dc_weight = (dc / ac) * (dc / ac);
+        let cost = |grid: &[i32]| -> f64 {
+            let d: f64 = grid
+                .iter()
+                .zip(&scaled)
+                .enumerate()
+                .map(|(i, (&l, &s))| {
+                    (if i == 0 { dc_weight } else { 1.0 })
+                        * (f64::from(s) - f64::from(l)).powi(2)
+                })
+                .sum();
+            d + lambda * coeff_bits(grid, set, crate::decode::q_ctx_of(q), 0, 0)
+        };
+        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda);
+        assert_eq!(bits, coeff_bits(&levels, set, crate::decode::q_ctx_of(q), 0, 0));
+        assert!(cost(&levels) <= cost(&before), "{:?} vs {:?}", cost(&levels), cost(&before));
+        // The tail is what it is for: the last coded position moves earlier.
+        let last = |g: &[i32]| scan_of(side).iter().rposition(|&p| g[usize::from(p)] != 0);
+        assert!(last(&levels) < last(&before), "eob {:?} -> {:?}", last(&before), last(&levels));
+        // A 64-point transform is priced on its top-left 32x32 corner, and
+        // the pass has to hand back THAT price (the dense path).
+        let (side, set) = (64usize, TxbSet::Luma64);
+        let mut scaled = vec![0f32; side * side];
+        for (i, v) in [(0usize, 6.1f32), (1, 0.55), (side + 1, -0.53)] {
+            scaled[i] = v;
+        }
+        let mut levels: Vec<i32> = scaled
+            .iter()
+            .map(|&v| {
+                let m = f64::from(v).abs() + 0.5;
+                let l = if m < 1.0 { 0 } else { m.floor() as i32 };
+                if v < 0.0 { -l } else { l }
+            })
+            .collect();
+        let bits = rdoq(&mut levels, &scaled, side, q, set, 0, 0, lambda);
+        let corner: Vec<i32> = (0..32)
+            .flat_map(|row| levels[row * side..][..32].to_vec())
+            .collect();
+        assert_eq!(bits, coeff_bits(&corner, set, crate::decode::q_ctx_of(q), 0, 0));
+    }
+
     #[test]
     fn the_default_scan_walks_every_position_outwards() {
         for side in [TX16, TX32] {
