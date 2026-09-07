@@ -16,6 +16,47 @@
 //! `EC_AV1_SPEED=<n>` is the environment form the gates and `ec-bench` use.
 //! Every individual `EC_AV1_*` lever override still wins over the preset.
 
+//! # The lever table (film A, native crop 1920x768, 12 frames)
+//!
+//! One ablation per lever on top of speed 0, `bd_rate_screen_native`'s film A
+//! row (BD-rate vs libaom `cpu-used 6` / rav1e `speed 6`), against the arm's
+//! own wall divided by the rav1e anchor's wall in the SAME arm -- the box ran
+//! three arms at a time, so only that ratio is comparable (class: wall tables
+//! are only comparable inside one interleaved batch). Baseline 75.7s/14.2s =
+//! 5.33 = 1.00x. Logs: `lanes/ab-*.log`.
+//!
+//! | lever switched off | BD vs libaom / rav1e | rel. wall |
+//! |---|---|---|
+//! | -- (speed 0) | +53.2 / +23.4 | 1.00 |
+//! | loop restoration | +53.0 / +23.3 | 0.83 |
+//! | warp | +53.0 / +23.3 | 0.88 |
+//! | tpl lambda map | +53.2 / +23.4 | 0.85 |
+//! | chroma top-2 | +53.3 / +23.4 | 0.79 |
+//! | split-RD breakout 0.5 | +53.6 / +23.7 | 0.82 |
+//! | extra-reference NEWMV | +53.7 / +23.9 | 0.90 |
+//! | **8x8 split** | **+53.8 / +23.6** | **0.41** |
+//! | intra top-2 | +54.0 / +24.2 | 0.96 |
+//! | CfL + angle delta | +54.1 / +24.2 | 0.71 |
+//! | coefficient breakout 1 | +54.3 / +24.3 | 0.73 |
+//! | 32x32 tx depth | +54.7 / +24.8 | 0.75 |
+//! | inter var-tx | +55.5 / +25.2 | 0.95 |
+//! | leaf second-reference search | +58.9 / +27.5 | 0.86 |
+//! | leaf compound | +62.8 / +29.7 | 0.74 |
+//! | compound | +83.7 / +45.8 | 0.62 |
+//!
+//! The ladder is that column read greedily by BD per wall: the 8x8 split is
+//! more than half the film wall for +0.6 points, three levers (LR, warp, the
+//! tpl map) are free or better on real film, and compound -- the tool the old
+//! bars-fixture sweeps rated cheap -- is the most expensive thing to lose, so
+//! it only goes at speed 9. MEASURED end to end on the same row:
+//!
+//! | preset | BD vs libaom / rav1e | rel. wall | 640x384 ec-bench fps |
+//! |---|---|---|---|
+//! | 0 | +53.2 / +23.4 | 1.00 | 6.8 |
+//! | 3 | +55.1 / +24.7 | 0.47 | 9.3 |
+//! | 6 | +60.9 / +29.1 | 0.32 | 14.2 |
+//! | 10 | +158.8 / +104.9 | 0.14 | 16.2 |
+
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The highest preset. 10 is the fastest, as in rav1e.
@@ -61,66 +102,150 @@ pub(crate) fn at<T: Copy>(table: &[T; 11]) -> T {
 
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
-pub(crate) const SPLIT_RD: [f64; 11] =
-    [crate::encode::SPLIT_RD_THRESHOLD, 0.125, 0.25, 0.5, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+pub(crate) const SPLIT_RD: [f64; 11] = [
+    crate::encode::SPLIT_RD_THRESHOLD,
+    0.125,
+    0.125,
+    0.125,
+    0.25,
+    0.25,
+    0.5,
+    0.5,
+    1.0,
+    2.0,
+    4.0,
+];
 
 /// `encode::SPLIT_BREAKOUT_COEFFS`: libaom's coefficient-count breakout.
-pub(crate) const SPLIT_BREAKOUT: [usize; 11] = [crate::encode::SPLIT_BREAKOUT_COEFFS, 0, 0, 0, 0, 0, 1, 1, 2, 4, 4];
+pub(crate) const SPLIT_BREAKOUT: [usize; 11] = [
+    crate::encode::SPLIT_BREAKOUT_COEFFS,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1,
+    2,
+    4,
+];
 
 /// `encode::SPLIT_INTER_8`: a 16x16 leaf may split into four 8x8 ones.
-pub(crate) const SPLIT_8: [bool; 11] =
-    [crate::encode::SPLIT_INTER_8, true, true, true, false, false, false, false, false, false, false];
+pub(crate) const SPLIT_8: [bool; 11] = [
+    crate::encode::SPLIT_INTER_8,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+];
 
 /// `encode::SPLIT_INTER_BLOCKS`: a 32x32 inter block may split at all
 /// (`false` = 32x32-only partitioning).
-pub(crate) const SPLIT_INTER: [bool; 11] =
-    [crate::encode::SPLIT_INTER_BLOCKS, true, true, true, true, true, true, true, false, false, false];
+pub(crate) const SPLIT_INTER: [bool; 11] = [
+    crate::encode::SPLIT_INTER_BLOCKS,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+];
 
 /// `encode::leaf_second_new_mv`: a leaf searches its SECOND reference.
-pub(crate) const LEAF_SECOND: [bool; 11] =
-    [true, true, true, false, false, false, false, false, false, false, false];
+pub(crate) const LEAF_SECOND: [bool; 11] = [
+    true, true, true, true, true, true, true, false, false, false, false,
+];
 
 /// `encode::EXTRA_REF_NEW_MV`: GOLDEN/ALTREF get a `NEWMV` search of their own.
-pub(crate) const EXTRA_REF_NEW: [bool; 11] =
-    [crate::encode::EXTRA_REF_NEW_MV, true, true, true, false, false, false, false, false, false, false];
+pub(crate) const EXTRA_REF_NEW: [bool; 11] = [
+    crate::encode::EXTRA_REF_NEW_MV,
+    true,
+    true,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+];
 
 /// `encode::LEAF_COMPOUND`: a leaf is offered compound candidates.
-pub(crate) const LEAF_COMPOUND: [bool; 11] =
-    [crate::encode::LEAF_COMPOUND, true, false, false, false, false, false, false, false, false, false];
+pub(crate) const LEAF_COMPOUND: [bool; 11] = [
+    crate::encode::LEAF_COMPOUND,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    false,
+    false,
+];
 
 /// `encode::REFERENCE_SELECT`: compound prediction at all.
-pub(crate) const COMPOUND: [bool; 11] =
-    [crate::encode::REFERENCE_SELECT, true, true, true, true, true, false, false, false, false, false];
+pub(crate) const COMPOUND: [bool; 11] = [
+    crate::encode::REFERENCE_SELECT,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    false,
+    false,
+];
 
 /// `encode::warp_on`: local warped motion.
-pub(crate) const WARP: [bool; 11] =
-    [true, true, true, false, false, false, false, false, false, false, false];
+pub(crate) const WARP: [bool; 11] = [
+    true, false, false, false, false, false, false, false, false, false, false,
+];
 
 /// `encode::tx_select_inter`: var-tx / tx-depth search inside inter frames.
-pub(crate) const TX_SELECT_INTER: [bool; 11] =
-    [true, true, true, true, true, false, false, false, false, false, false];
+pub(crate) const TX_SELECT_INTER: [bool; 11] = [
+    true, true, true, true, true, true, false, false, false, false, false,
+];
 
 /// `encode::tx32_depth_search`.
-pub(crate) const TX32_DEPTH: [bool; 11] =
-    [true, true, true, true, false, false, false, false, false, false, false];
+pub(crate) const TX32_DEPTH: [bool; 11] = [
+    true, true, true, true, true, false, false, false, false, false, false,
+];
 
 /// `encode::compound_var_tx`.
-pub(crate) const COMPOUND_VAR_TX: [bool; 11] =
-    [true, true, true, false, false, false, false, false, false, false, false];
+pub(crate) const COMPOUND_VAR_TX: [bool; 11] = [
+    true, true, true, true, true, true, false, false, false, false, false,
+];
 
 /// `encode::tx_select`: the KEY frame's transform-depth search.
-pub(crate) const TX_SELECT_KEY: [bool; 11] =
-    [true, true, true, true, true, true, true, false, false, false, false];
+pub(crate) const TX_SELECT_KEY: [bool; 11] = [
+    true, true, true, true, true, true, true, true, true, false, false,
+];
 
 /// `encode::PRUNE_TOP_K`: intra luma modes fully tried on a key frame.
 pub(crate) const PRUNE_K: [Option<usize>; 11] = [
     crate::encode::PRUNE_TOP_K,
     None,
+    None,
+    None,
+    None,
+    None,
     Some(4),
-    Some(4),
-    Some(3),
-    Some(3),
-    Some(2),
     Some(2),
     Some(2),
     Some(1),
@@ -133,11 +258,11 @@ pub(crate) const PRUNE_K_INTER: [Option<usize>; 11] = [
     crate::encode::INTER_PRUNE_TOP_K,
     Some(3),
     Some(3),
+    Some(3),
+    Some(3),
+    Some(3),
     Some(2),
     Some(2),
-    Some(2),
-    Some(1),
-    Some(1),
     Some(1),
     Some(1),
     Some(1),
@@ -146,48 +271,63 @@ pub(crate) const PRUNE_K_INTER: [Option<usize>; 11] = [
 /// `encode::CHROMA_TOP_K`: chroma modes fully tried.
 pub(crate) const CHROMA_K: [Option<usize>; 11] = [
     crate::encode::CHROMA_TOP_K,
-    Some(4),
+    None,
+    None,
     Some(3),
-    Some(3),
     Some(2),
     Some(2),
     Some(2),
-    Some(1),
+    Some(2),
     Some(1),
     Some(1),
     Some(1),
 ];
 
 /// `encode::angle_delta_on`: refining a directional intra winner's delta.
-pub(crate) const ANGLE: [bool; 11] =
-    [true, true, true, true, false, false, false, false, false, false, false];
+pub(crate) const ANGLE: [bool; 11] = [
+    true, true, true, false, false, false, false, false, false, false, false,
+];
 
 /// `encode::cfl_on`: chroma-from-luma in the chroma search.
-pub(crate) const CFL: [bool; 11] =
-    [true, true, true, true, true, false, false, false, false, false, false];
+pub(crate) const CFL: [bool; 11] = [
+    true, true, true, false, false, false, false, false, false, false, false,
+];
 
 /// `encode::RESTORATION`: the loop-restoration (Wiener) search.
-pub(crate) const RESTORATION: [bool; 11] =
-    [crate::encode::RESTORATION, true, true, true, true, false, false, false, false, false, false];
+pub(crate) const RESTORATION: [bool; 11] = [
+    crate::encode::RESTORATION,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+];
 
 /// `encode::TPL_DEPTH`: lookahead pictures the lambda map reads (1 = off).
-pub(crate) const TPL_DEPTH: [usize; 11] = [crate::encode::TPL_DEPTH, 8, 8, 4, 4, 2, 1, 1, 1, 1, 1];
+pub(crate) const TPL_DEPTH: [usize; 11] = [crate::encode::TPL_DEPTH, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 
 /// `filter_search`: whether the deblock ladder's +-1/+-2 refinement stage runs.
-pub(crate) const DEBLOCK_REFINE: [bool; 11] =
-    [true, true, true, true, true, false, false, false, false, false, false];
+pub(crate) const DEBLOCK_REFINE: [bool; 11] = [
+    true, true, true, true, true, true, true, false, false, false, false,
+];
 
 /// `filter_search`: whether chroma gets a deblock stage of its own.
-pub(crate) const DEBLOCK_CHROMA: [bool; 11] =
-    [true, true, true, true, true, true, false, false, false, false, false];
+pub(crate) const DEBLOCK_CHROMA: [bool; 11] = [
+    true, true, true, true, true, true, true, true, false, false, false,
+];
 
 /// `filter_search`: how many of `CDEF_PRI` / `CDEF_SEC` each CDEF stage tries
 /// (0 = no CDEF search at all, the frame keeps strength 0 = deblock only).
-pub(crate) const CDEF_STRENGTHS: [usize; 11] = [5, 5, 5, 5, 3, 3, 3, 2, 2, 0, 0];
+pub(crate) const CDEF_STRENGTHS: [usize; 11] = [5, 5, 5, 5, 5, 5, 5, 3, 3, 2, 0];
 
 /// `filter_search`: how many extra per-superblock CDEF presets the header may
 /// carry beyond the frame winner (0 = `cdef_bits` 0).
-pub(crate) const CDEF_PRESETS: [usize; 11] = [7, 7, 7, 7, 7, 3, 3, 0, 0, 0, 0];
+pub(crate) const CDEF_PRESETS: [usize; 11] = [7, 7, 7, 7, 7, 7, 7, 7, 3, 0, 0];
 
 /// What preset `n` switches off relative to speed 0, for a gate or a bench row
 /// to print (class `gate-blind-to-feature`: a preset that silently disables
@@ -227,7 +367,10 @@ pub fn levers(n: u8) -> Vec<String> {
         out.push(format!("intra top-{}", PRUNE_K[n].unwrap_or(13)));
     }
     if PRUNE_K_INTER[n] != PRUNE_K_INTER[0] {
-        out.push(format!("inter-intra top-{}", PRUNE_K_INTER[n].unwrap_or(13)));
+        out.push(format!(
+            "inter-intra top-{}",
+            PRUNE_K_INTER[n].unwrap_or(13)
+        ));
     }
     if CHROMA_K[n] != CHROMA_K[0] {
         out.push(format!("chroma top-{}", CHROMA_K[n].unwrap_or(7)));

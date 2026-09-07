@@ -1,0 +1,23 @@
+
+running 1 test
+test encode::tests::bd_rate_screen_native ... 
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 })
+bars 1080p: pricer armings default=17 real=174
+bars 1080p: motion_mode 32x32 SIMPLE=77232 OBMC=0 WARP=131 | 16x16 SIMPLE=4137 OBMC=0 WARP=260 | 8x8 SIMPLE=15659 OBMC=0 WARP=5512 (0.0% OBMC / 5.7% WARP of 102931 eligible)
+bars 1080p: inter var-tx depths of 8388 blocks -- leaf single 0=2049 1=1059 (34.1% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=1744 1=3536 (67.0% split) | 32x32 compound 0=0 1=0 (0.0% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| bars 1080p 1920x1024 | 44.28 dB/235899 B, 47.82 dB/339858 B, 51.07 dB/459777 B, 53.90 dB/586717 B | +6.4% | -10.2% | 37.7s:7.9s:19.9s |
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 }) effective Some(Pyramid { mini_gop: 4, arf_q_offset: -16, leaf_q_offset: 8 })
+film A (1080p source): pricer armings default=20 real=218
+film A (1080p source): motion_mode 32x32 SIMPLE=125243 OBMC=0 WARP=7968 | 16x16 SIMPLE=50615 OBMC=0 WARP=10167 | 8x8 SIMPLE=14528 OBMC=0 WARP=5005 (0.0% OBMC / 10.8% WARP of 213526 eligible)
+film A (1080p source): inter var-tx depths of 103858 blocks -- leaf single 0=48818 1=20325 (29.4% split) | leaf compound 0=0 1=0 (0.0% split) | 32x32 single 0=20167 1=14548 (41.9% split) | 32x32 compound 0=0 1=0 (0.0% split)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+| film A (1080p source) 1920x768 | 43.28 dB/76128 B, 45.13 dB/132061 B, 46.60 dB/245350 B, 47.78 dB/456388 B | +83.7% | +45.8% | 54.5s:11.6s:17.7s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 583 filtered out; finished in 156.60s
+
+RC=0
