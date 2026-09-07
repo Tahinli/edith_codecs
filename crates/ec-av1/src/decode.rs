@@ -15718,6 +15718,19 @@ fn decode_leaf_split4(
             neighbours.above[leaf_mi.1 + cell][2] = v_state;
         }
     }
+    // lane-dkey: a sub-8x8 leaf can never use palette (`av1_allow_palette`
+    // needs BLOCK_8X8 and up), and libaom's mi grid says so -- its
+    // `palette_size` is 0 in every one of these mi cells, so the NEXT block's
+    // `av1_get_palette_mode_ctx` and colour cache read 0 here. This decoder
+    // only ever WROTE palette state from the >=8x8 readers, so an 8x8 palette
+    // block above a 4x4 group left its size/colours standing in the mi-granular
+    // bands: the block below the group read `palette_y_mode` off CDF row 1
+    // where libaom reads row 0 (class [[cdf-row-held-constant]]), decoded a
+    // palette libaom never coded, and then skipped the `use_filter_intra`
+    // symbol that a palette block has none of -- one symbol short, tile
+    // desynced. Publishing the group's own zeros is the clear.
+    neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
     Ok((leaf_modes[2], leaf_modes[1]))
 }
 
@@ -16078,6 +16091,19 @@ fn decode_leaf_rect8(
             neighbours.above[leaf_mi.1 + cell][2] = v_state;
         }
     }
+    // lane-dkey (same clear as `decode_leaf_split4`): a sub-8x8 leaf can never use palette (`av1_allow_palette`
+    // needs BLOCK_8X8 and up), and libaom's mi grid says so -- its
+    // `palette_size` is 0 in every one of these mi cells, so the NEXT block's
+    // `av1_get_palette_mode_ctx` and colour cache read 0 here. This decoder
+    // only ever WROTE palette state from the >=8x8 readers, so an 8x8 palette
+    // block above a 4x4 group left its size/colours standing in the mi-granular
+    // bands: the block below the group read `palette_y_mode` off CDF row 1
+    // where libaom reads row 0 (class [[cdf-row-held-constant]]), decoded a
+    // palette libaom never coded, and then skipped the `use_filter_intra`
+    // symbol that a palette block has none of -- one symbol short, tile
+    // desynced. Publishing the group's own zeros is the clear.
+    neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
     // `(below_mode, right_mode)`: the sub-block a neighbour below sees is the
     // bottom one (the second under HORZ, the left one under VERT), the one a
     // neighbour to the right sees is the top-right (the second under VERT).
@@ -29589,6 +29615,15 @@ fn decode_inter_block(
         write_h / MI,
         skip,
     );
+    // lane-dkey sweep: an INTER block (and every sub-8x8 leaf) has
+    // `palette_size == 0` in libaom's mi grid, so the next block's
+    // `av1_get_palette_mode_ctx`/colour cache must read 0 across this
+    // footprint. Only the >=8x8 intra readers published palette state, so a
+    // palette block's size/colours stayed standing in the mi-granular bands
+    // and a later intra block read `palette_y_mode` off the wrong CDF row
+    // (class [[cdf-row-held-constant]]).
+    neighbours.record_palette_y_rect((rmi, cmi), write_w, write_h, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect((rmi, cmi), write_w, write_h, 0, [0u16; 8]);
     neighbours.fill_lf_grid_rect(
         (rmi, cmi),
         write_w / MI,
@@ -30073,6 +30108,15 @@ fn decode_inter_sub8_split4(
         // var-tx context instead of leaving whatever the previous block left.
         set_txfm_ctxs(neighbours, lmi, B4, 1, 1, false);
         neighbours.fill_skip_grid_rect(lmi, 1, 1, skip);
+        // lane-dkey sweep: an INTER block (and every sub-8x8 leaf) has
+        // `palette_size == 0` in libaom's mi grid, so the next block's
+        // `av1_get_palette_mode_ctx`/colour cache must read 0 across this
+        // footprint. Only the >=8x8 intra readers published palette state, so a
+        // palette block's size/colours stayed standing in the mi-granular bands
+        // and a later intra block read `palette_y_mode` off the wrong CDF row
+        // (class [[cdf-row-held-constant]]).
+        neighbours.record_palette_y_rect(lmi, MI, MI, 0, [0u16; 8]);
+        neighbours.record_palette_uv_rect(lmi, MI, MI, 0, [0u16; 8]);
         neighbours.fill_lf_grid_rect(lmi, 1, 1, B4 as u8, B4 as u8, ref_frame.max(LAST_FRAME), fctx);
         last_skip = skip;
     }
@@ -30530,6 +30574,15 @@ fn decode_intra_sub8_leaf(
     }
     let (tx_w, tx_h) = if split { (4, 4) } else { (bw, bh) };
     neighbours.fill_skip_grid_rect(lmi, w_mi, h_mi, skip);
+    // lane-dkey sweep: an INTER block (and every sub-8x8 leaf) has
+    // `palette_size == 0` in libaom's mi grid, so the next block's
+    // `av1_get_palette_mode_ctx`/colour cache must read 0 across this
+    // footprint. Only the >=8x8 intra readers published palette state, so a
+    // palette block's size/colours stayed standing in the mi-granular bands
+    // and a later intra block read `palette_y_mode` off the wrong CDF row
+    // (class [[cdf-row-held-constant]]).
+    neighbours.record_palette_y_rect(lmi, w_mi * MI, h_mi * MI, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect(lmi, w_mi * MI, h_mi * MI, 0, [0u16; 8]);
     neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, tx_w as u8, tx_h as u8, 0, fctx);
     // `set_txfm_ctxs(tx_size, n4_w, n4_h, skip && is_inter == 0, xd)`: an
     // intra block of an inter frame publishes its TRANSFORM dims, never its
@@ -31143,6 +31196,15 @@ fn decode_inter_sub8_rect2(
         neighbours.record_mode_mi(rmi, cmi, w_mi, h_mi, DC_PRED);
         neighbours.record_inter_rect_mi(lmi, w_mi, h_mi, skip, true, ref_frame, resolved_filter, false);
         neighbours.fill_skip_grid_rect(lmi, w_mi, h_mi, skip);
+        // lane-dkey sweep: an INTER block (and every sub-8x8 leaf) has
+        // `palette_size == 0` in libaom's mi grid, so the next block's
+        // `av1_get_palette_mode_ctx`/colour cache must read 0 across this
+        // footprint. Only the >=8x8 intra readers published palette state, so a
+        // palette block's size/colours stayed standing in the mi-granular bands
+        // and a later intra block read `palette_y_mode` off the wrong CDF row
+        // (class [[cdf-row-held-constant]]).
+        neighbours.record_palette_y_rect(lmi, w_mi * MI, h_mi * MI, 0, [0u16; 8]);
+        neighbours.record_palette_uv_rect(lmi, w_mi * MI, h_mi * MI, 0, [0u16; 8]);
         last_skip = skip;
     }
     // lane-sub8intra: when the chroma-reference sub-block was INTRA it coded
@@ -32245,6 +32307,15 @@ fn decode_inter_block8(
                 // dlist excludes it (3 luma samples on a 192x128 inter frame).
                 hit!(INTER8_SKIP_BAND_HITS);
                 neighbours.fill_skip_grid(leaf_mi, 2, skip);
+                // lane-dkey sweep: an INTER block (and every sub-8x8 leaf) has
+                // `palette_size == 0` in libaom's mi grid, so the next block's
+                // `av1_get_palette_mode_ctx`/colour cache must read 0 across this
+                // footprint. Only the >=8x8 intra readers published palette state, so a
+                // palette block's size/colours stayed standing in the mi-granular bands
+                // and a later intra block read `palette_y_mode` off the wrong CDF row
+                // (class [[cdf-row-held-constant]]).
+                neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+                neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
                 // lane-sub8x4 r2: `split8` is this leaf's OWN var-tx split, so
                 // the deblock grid must publish the TX_4X4 leaves' width the
                 // same way the fall-through arm below does (libaom
@@ -33442,6 +33513,15 @@ fn decode_inter_block8(
     // gate failed on an instrumentation gap, with the band written either way.
     hit!(INTER8_SKIP_BAND_HITS);
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
+    // lane-dkey sweep: an INTER block (and every sub-8x8 leaf) has
+    // `palette_size == 0` in libaom's mi grid, so the next block's
+    // `av1_get_palette_mode_ctx`/colour cache must read 0 across this
+    // footprint. Only the >=8x8 intra readers published palette state, so a
+    // palette block's size/colours stayed standing in the mi-granular bands
+    // and a later intra block read `palette_y_mode` off the wrong CDF row
+    // (class [[cdf-row-held-constant]]).
+    neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
     neighbours.fill_lf_grid(
         leaf_mi,
         2,

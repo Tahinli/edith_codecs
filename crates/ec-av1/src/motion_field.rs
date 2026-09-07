@@ -201,7 +201,11 @@ pub fn lower_mv_precision(
                 _ => v - m,
             }
         };
-        return (round(mv.0), round(mv.1));
+        let out = (round(mv.0), round(mv.1));
+        if out != mv && crate::envflags::env_flag!("EC_TRACE_TPL") {
+            eprintln!("EC_INTMV rounded {mv:?} -> {out:?}");
+        }
+        return out;
     }
     if allow_high_precision_mv {
         return mv;
