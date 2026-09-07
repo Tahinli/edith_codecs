@@ -13636,8 +13636,13 @@ mod tests {
         // superblock of these four pictures is priced at its own lambda --
         // 9835 -> 9859 at q=150 and 35798 -> 35904 at q=60.
         // `EC_AV1_TPL_PYRAMID=0` restores these.
+        // Re-taken again on lane-arfcen: a group's top ARF names the ARF from
+        // two groups back as its own `ALTREF_FRAME`
+        // (`crate::encoder::arf_altref`) instead of the key frame it already
+        // reads as `GOLDEN` -- 9859 -> 9853 at q=150 and 35904 -> 35866 at
+        // q=60. `EC_AV1_ARF_ALTREF=0` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9859, 0x4409_f8db_e152_9fe7), (60, 35904, 0xc408_f126_2877_0ffb)];
+            [(150, 9853, 0x0f6d_bbc8_b72c_ceb3), (60, 35866, 0xbd00_f4ed_e283_3ce4)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(

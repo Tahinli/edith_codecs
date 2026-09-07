@@ -918,8 +918,11 @@ fn arf_altref() -> bool {
     }
 }
 
-/// [`arf_altref`]'s default.
-const ARF_ALTREF: bool = false;
+/// [`arf_altref`]'s default. ON since its long-GOP arm: film A
+/// +42.8%/+4.5% -> +40.9%/+3.1% and film B +127.3%/+32.9% -> +125.6%/+32.0%
+/// (BD vs libaom cpu-used 6 / vs rav1e speed 6), i.e. both films down on both
+/// columns.
+const ARF_ALTREF: bool = true;
 
 /// The AV1 software encoder: [`EncoderConfig`] in, one [`Packet`] out per
 /// [`Av1Encoder::encode`] call — or, with a [`Pyramid`] configured, a
