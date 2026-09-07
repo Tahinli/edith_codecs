@@ -13480,7 +13480,14 @@ mod tests {
         let mut wall = 0.0;
         for &q in &[150u8, 120, 90, 60] {
             let start = std::time::Instant::now();
-            let encoded = encode_sequence_with_ctx(source, q, 0.5, fctx).unwrap();
+            // lane-rdoq: the deadzone was fitted WITHOUT the RDOQ pass, so
+            // the gate has to be able to re-sweep it. 0.5 is the shipped one
+            // (`crate::encoder::DEADZONE`).
+            let deadzone = std::env::var("EC_AV1_DEADZONE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.5);
+            let encoded = encode_sequence_with_ctx(source, q, deadzone, fctx).unwrap();
             wall += start.elapsed().as_secs_f64();
             let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, source.len());
             let ours = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
