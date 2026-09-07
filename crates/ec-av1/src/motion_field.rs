@@ -174,11 +174,35 @@ fn get_mv_projection(mv: (i32, i32), num: i32, den: i32) -> (i32, i32) {
     (scale(mv.0), scale(mv.1))
 }
 
-/// `lower_mv_precision` (`mvref_common.h`), the `is_integer == false` half
-/// only — every stream this decoder ever reaches has `force_integer_mv ==
-/// false` on an inter frame (`allow_screen_content_tools`, the only source
-/// of a `true` value here, is refused outright at the stream level).
-pub fn lower_mv_precision(mv: (i32, i32), allow_high_precision_mv: bool) -> (i32, i32) {
+/// `lower_mv_precision` (`mvref_common.h`), both halves. lane-dgolomb: the
+/// `is_integer` half used to be dropped as unreachable on the claim that
+/// `allow_screen_content_tools` is refused at the stream level -- it is not,
+/// and libaom turns screen-content tools on for dark, smooth FILM (its
+/// `av1_set_screen_content_options` counts near-flat blocks), so a real
+/// libaom stream carries `force_integer_mv == 1` on an inter frame and every
+/// temporal MV candidate has to be rounded to full pel. Without it the
+/// candidates were 1/8-pel values libaom never produces: a whole-frame
+/// prediction mismatch behind a clean parse (class
+/// `branch-dropped-as-unreachable`).
+pub fn lower_mv_precision(
+    mv: (i32, i32),
+    allow_high_precision_mv: bool,
+    force_integer_mv: bool,
+) -> (i32, i32) {
+    if force_integer_mv {
+        // `integer_mv_precision`: drop to the nearest full pel, ties away
+        // from zero (`abs(mod) > 4`).
+        let round = |v: i32| {
+            let m = v % 8;
+            match m {
+                0 => v,
+                _ if m > 4 => v - m + 8,
+                _ if m < -4 => v - m - 8,
+                _ => v - m,
+            }
+        };
+        return (round(mv.0), round(mv.1));
+    }
     if allow_high_precision_mv {
         return mv;
     }
@@ -526,6 +550,7 @@ pub fn add_tpl_ref_mv(
     blk_col: isize,
     cur_offset_0: i32,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> Option<TplCandidate> {
     let probe = tpl.probe(mi_row, mi_col).cell(blk_row, blk_col);
     if crate::envflags::env_flag!("EC_TRACE_TPL") {
@@ -539,7 +564,13 @@ pub fn add_tpl_ref_mv(
     }
     let (fwd_mv, ref_frame_offset) = probe?;
     Some(TplCandidate {
-        mv: project_tpl_mv(fwd_mv, cur_offset_0, ref_frame_offset, allow_high_precision_mv),
+        mv: project_tpl_mv(
+            fwd_mv,
+            cur_offset_0,
+            ref_frame_offset,
+            allow_high_precision_mv,
+            force_integer_mv,
+        ),
     })
 }
 
@@ -552,9 +583,10 @@ pub fn project_tpl_mv(
     cur_offset: i32,
     ref_frame_offset: i32,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> (i32, i32) {
     let projected = get_mv_projection(fwd_mv, cur_offset, ref_frame_offset);
-    lower_mv_precision(projected, allow_high_precision_mv)
+    lower_mv_precision(projected, allow_high_precision_mv, force_integer_mv)
 }
 
 /// One query block's view of [`TplField`] (lane-tpl). `add_tpl_ref_mv`'s
@@ -709,7 +741,37 @@ mod tests {
         // ref_frame_offset = get_relative_dist(2,1) = 1, scaling (-64,0) by
         // 2/1 -> (-128,0); get_block_position's sign_bias (dir=2) subtracts
         // the offset, landing at 8x8 cell (2, 0).
-        let cand = add_tpl_ref_mv(&tpl, 4, 0, 0isize, 0isize, get_relative_dist(7, 4, 2), true);
+        let cand =
+            add_tpl_ref_mv(&tpl, 4, 0, 0isize, 0isize, get_relative_dist(7, 4, 2), true, false);
         assert!(cand.is_some(), "expected a projected temporal candidate");
+    }
+
+    /// lane-dgolomb: `lower_mv_precision`'s `force_integer_mv` half, which
+    /// this decoder used to drop as unreachable. The values are the ones a
+    /// real libaom stream (film B, `-cpu-used 6 -crf 35`, the one inter frame
+    /// whose header carries `force_integer_mv == 1`) produces at its first
+    /// 128x128 block: the same 16 temporal probes, projected and then rounded
+    /// to full pel, are what put `(16,0)`/`(16,-8)`/`(8,-40)` in libaom's own
+    /// traced mv stack where the eighth-pel values were `(14,-4)`/`(12,-2)`/
+    /// `(12,-38)`/`(16,-4)`.
+    #[test]
+    fn force_integer_mv_rounds_a_projected_candidate_to_full_pel() {
+        // (mfmv0, ref_frame_offset) -> (eighth-pel value, full-pel value),
+        // all at cur_offset_0 == 1.
+        for (mv, rfo, eighth, integer) in [
+            ((74, -20), 5, (14, -4), (16, 0)),
+            ((74, -24), 5, (14, -4), (16, -8)),
+            ((82, -24), 5, (16, -4), (16, -8)),
+            ((66, -16), 5, (12, -2), (16, 0)),
+            ((24, -76), 2, (12, -38), (8, -40)),
+        ] {
+            assert_eq!(project_tpl_mv(mv, 1, rfo, false, false), eighth, "{mv:?}");
+            assert_eq!(project_tpl_mv(mv, 1, rfo, false, true), integer, "{mv:?}");
+        }
+        // `integer_mv_precision`'s tie rule is away from zero on |mod| > 4
+        // only, and it is signed-symmetric.
+        assert_eq!(lower_mv_precision((4, -4), false, true), (0, 0));
+        assert_eq!(lower_mv_precision((5, -5), false, true), (8, -8));
+        assert_eq!(lower_mv_precision((-12, 8), false, true), (-8, 8));
     }
 }

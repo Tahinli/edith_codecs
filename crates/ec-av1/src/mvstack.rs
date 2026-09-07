@@ -154,6 +154,10 @@ pub struct TplArgs<'a> {
     pub cur_offset_0: i32,
     /// The frame header's own `allow_high_precision_mv`.
     pub allow_high_precision_mv: bool,
+    /// The frame header's own `force_integer_mv` (`lower_mv_precision`'s
+    /// `is_integer`): a screen-content frame rounds every projected temporal
+    /// candidate to full pel.
+    pub force_integer_mv: bool,
 }
 
 /// [`MiInfo::ref_frame1`]'s "this unit was not coded compound" value. Slot 1
@@ -1036,6 +1040,7 @@ fn tpl_trace_sample(
     blk_col: isize,
     cur_offset: i32,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> Option<(i32, i32)> {
     crate::motion_field::add_tpl_ref_mv(
         field,
@@ -1045,6 +1050,7 @@ fn tpl_trace_sample(
         blk_col,
         cur_offset,
         allow_high_precision_mv,
+        force_integer_mv,
     )
     .map(|c| c.mv)
 }
@@ -1061,6 +1067,7 @@ fn tpl_trace_sample_compound(
     blk_col: isize,
     cur_offsets: (i32, i32),
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) {
     for off in [cur_offsets.0, cur_offsets.1] {
         let _ = crate::motion_field::add_tpl_ref_mv(
@@ -1071,6 +1078,7 @@ fn tpl_trace_sample_compound(
             blk_col,
             off,
             allow_high_precision_mv,
+            force_integer_mv,
         );
     }
 }
@@ -1093,6 +1101,7 @@ fn tpl_sample(
     blk_col: isize,
     cur_offset: i32,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> Option<(i32, i32)> {
     if trace_tpl {
         return tpl_trace_sample(
@@ -1103,6 +1112,7 @@ fn tpl_sample(
             blk_col,
             cur_offset,
             allow_high_precision_mv,
+            force_integer_mv,
         );
     }
     let (fwd_mv, rfo) = probe.cell(blk_row, blk_col)?;
@@ -1111,6 +1121,7 @@ fn tpl_sample(
         cur_offset,
         rfo,
         allow_high_precision_mv,
+        force_integer_mv,
     ))
 }
 
@@ -1128,6 +1139,7 @@ fn tpl_sample_compound(
     blk_col: isize,
     cur_offsets: (i32, i32),
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> Option<((i32, i32), (i32, i32))> {
     if trace_tpl {
         tpl_trace_sample_compound(
@@ -1138,12 +1150,25 @@ fn tpl_sample_compound(
             blk_col,
             cur_offsets,
             allow_high_precision_mv,
+            force_integer_mv,
         );
     }
     let (fwd_mv, rfo) = probe.cell(blk_row, blk_col)?;
     Some((
-        crate::motion_field::project_tpl_mv(fwd_mv, cur_offsets.0, rfo, allow_high_precision_mv),
-        crate::motion_field::project_tpl_mv(fwd_mv, cur_offsets.1, rfo, allow_high_precision_mv),
+        crate::motion_field::project_tpl_mv(
+            fwd_mv,
+            cur_offsets.0,
+            rfo,
+            allow_high_precision_mv,
+            force_integer_mv,
+        ),
+        crate::motion_field::project_tpl_mv(
+            fwd_mv,
+            cur_offsets.1,
+            rfo,
+            allow_high_precision_mv,
+            force_integer_mv,
+        ),
     ))
 }
 
@@ -1312,6 +1337,7 @@ pub fn find_mv_stack_with_sign_bias(
         field,
         cur_offset_0,
         allow_high_precision_mv,
+        force_integer_mv,
     }) = tpl
     {
         let mut any_hit = false;
@@ -1342,6 +1368,7 @@ pub fn find_mv_stack_with_sign_bias(
                 blk_col,
                 cur_offset_0,
                 allow_high_precision_mv,
+                force_integer_mv,
             )
         };
         let mut blk_row = 0usize;
@@ -2116,6 +2143,7 @@ pub fn find_mv_stack_compound(
         cur_offset_0,
         cur_offset_1,
         allow_high_precision_mv,
+        force_integer_mv,
     }) = tpl
     {
         let mut any_hit = false;
@@ -2144,6 +2172,7 @@ pub fn find_mv_stack_compound(
                 blk_col,
                 (cur_offset_0, cur_offset_1),
                 allow_high_precision_mv,
+                force_integer_mv,
             )
         };
         let mut blk_row = 0usize;
@@ -2411,6 +2440,10 @@ pub struct CompoundTplArgs<'a> {
     pub cur_offset_1: i32,
     /// The frame header's own `allow_high_precision_mv`.
     pub allow_high_precision_mv: bool,
+    /// The frame header's own `force_integer_mv` (`lower_mv_precision`'s
+    /// `is_integer`): a screen-content frame rounds every projected temporal
+    /// candidate to full pel.
+    pub force_integer_mv: bool,
 }
 
 /// The single-reference context shared by the `single_ref_p1`/`p3`/`p4`

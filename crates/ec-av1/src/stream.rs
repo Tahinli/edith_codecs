@@ -3758,6 +3758,115 @@ pub(crate) mod tests {
         }
     }
 
+    /// lane-dgolomb: the `force_integer_mv` gate. libaom turns screen-content
+    /// tools on for DARK, SMOOTH content -- its `av1_set_screen_content_options`
+    /// counts 16x16 blocks with 2..=4 distinct luma values -- and then sets
+    /// `force_integer_mv` on any inter frame whose source is pixel-identical to
+    /// the previously coded source (`av1_is_integer_mv`: `cs_rate >= 0.8` and
+    /// `C == T`, every collocated 8x8 block matching, is the only path that
+    /// returns 1). Both hold on his real AV1 films, and this decoder used to
+    /// drop `lower_mv_precision`'s `is_integer` half as unreachable, so every
+    /// temporal MV candidate on such a frame came out at eighth-pel: the frame
+    /// decoded without any error into a whole-frame prediction mismatch, and
+    /// the desync surfaced blocks later as "a Golomb tail longer than this
+    /// decoder reads".
+    ///
+    /// The source is SYNTHETIC (no film sample lives in `fixtures`): a
+    /// near-flat dark background at the film-B crop size, 1920x1024, with one
+    /// textured patch stepping 9 px every SECOND frame, so half the frames are
+    /// exact duplicates of their predecessor (the `C == T` trigger) while the
+    /// motion field still holds non-zero MVs whose projections are not
+    /// multiples of 8. The gate asserts both halves: at least one INTER frame
+    /// really carries `force_integer_mv` (class `gate-blind-to-feature`), and
+    /// every shown frame decodes sample-exact against ffmpeg's own decode.
+    #[test]
+    fn a_libaom_force_integer_mv_stream_decodes_exact() {
+        const NAME: &str = "a_libaom_force_integer_mv_stream_decodes_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let (w, h, frames) = (1920usize, 1024usize, 12usize);
+        let mut raw = Vec::with_capacity(frames * w * h * 3 / 2);
+        for f in 0..frames {
+            let mut y = vec![0u8; w * h];
+            for row in 0..h {
+                for col in 0..w {
+                    // 2..=4 distinct values per 16x16 block, all dark: the
+                    // screen-content detector's own counting rule.
+                    y[row * w + col] =
+                        16 + ((col / 32 + row / 32) % 5) as u8 + ((col / 4 + row / 4) % 3) as u8;
+                }
+            }
+            let x0 = 200 + 9 * (f / 2);
+            for row in 300..428 {
+                for col in x0..x0 + 192 {
+                    y[row * w + col] =
+                        ((((col - x0) / 3) * 7 + ((row - 300) / 5) * 13) % 200 + 30) as u8;
+                }
+            }
+            raw.extend_from_slice(&y);
+            raw.extend(std::iter::repeat_n(128u8, w * h / 2));
+        }
+        // [[pid-keyed-temp-path]]: parallel test binaries must not share a name.
+        let src = std::env::temp_dir().join(format!("ec-av1-intmv-{}.yuv", std::process::id()));
+        std::fs::write(&src, &raw).expect("raw source");
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p"])
+            .args(["-s", &format!("{w}x{h}"), "-r", "24", "-i"])
+            .arg(&src)
+            .args(["-an", "-threads", "1", "-g", "12", "-c:v", "libaom-av1"])
+            .args(["-cpu-used", "6", "-b:v", "0", "-crf", "35", "-f", "obu", "-"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        let _ = std::fs::remove_file(&src);
+        if !out.status.success() {
+            eprintln!(
+                "SKIP {NAME}: ffmpeg has no libaom-av1 encoder ({})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let stream = out.stdout;
+
+        // Half of the gate: the stream must actually carry the feature.
+        let mut parser = Av1Parser::new();
+        let (mut pos, mut int_mv_inter) = (0usize, 0usize);
+        while pos < stream.len() {
+            let obu = parser.parse_obu(&stream[pos..]).expect("libaom OBU parses");
+            pos += obu.total_size.max(1);
+            let header = match &obu.kind {
+                ObuKind::FrameHeader(h) | ObuKind::Frame(h, _) => h,
+                _ => continue,
+            };
+            if header.force_integer_mv && !header.frame_is_intra && header.use_ref_frame_mvs {
+                int_mv_inter += 1;
+            }
+        }
+        assert!(
+            int_mv_inter > 0,
+            "{NAME} went blind: libaom coded no inter frame with force_integer_mv"
+        );
+
+        let ours = decode_stream(&stream).expect("libaom screen-content stream decodes");
+        let theirs = ffmpeg_decode_sequence(&stream, w, h, frames);
+        assert_eq!(ours.len(), frames, "shown frame count");
+        for (i, (a, b)) in ours.iter().zip(theirs.iter()).enumerate() {
+            for (plane, l, r) in [("Y", &a.y, &b.y), ("U", &a.u, &b.u), ("V", &a.v, &b.v)] {
+                let first = l.iter().zip(r.iter()).position(|(x, y)| x != y);
+                assert!(
+                    first.is_none(),
+                    "frame {i} plane {plane} differs from ffmpeg at sample {} \
+                     ({int_mv_inter} force_integer_mv inter frames in this stream)",
+                    first.unwrap()
+                );
+            }
+        }
+    }
+
     /// Hardened past the report-only test above: a real libaom-av1 gradients
     /// stream, pinned deterministic (`gradients`' own `seed=`, plus
     /// `-threads 1`/`-row-mt 0`/no tiling so libaom's `cpu-used 8` RD search
