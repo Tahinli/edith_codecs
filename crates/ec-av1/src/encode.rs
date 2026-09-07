@@ -3921,10 +3921,18 @@ fn code_square(
     // The five recursive filter-intra modes (spec 5.11.14), priced against
     // whatever the mode, transform-depth and palette searches settled on --
     // the same "one candidate loop after the incumbent is known" shape the
-    // palette above uses. A block that takes one is `DC_PRED` with `tx_depth`
-    // 0 and no palette by construction (`av1_filter_intra_allowed`), and its
-    // luma transform types are coded from `fimode_to_intradir`'s row
-    // (`crate::tile::tx_row`).
+    // palette above uses. A block that takes one is `DC_PRED` with no palette
+    // by construction (`av1_filter_intra_allowed`), and its luma transform
+    // types are coded from `fimode_to_intradir`'s row (`crate::tile::tx_row`).
+    //
+    // corner-cut, ceiling named: the candidate is only ever priced at
+    // `tx_depth` 0 (one transform over the whole block), so a block whose
+    // ordinary intra winner wanted a SPLIT transform is compared against a
+    // handicapped filter-intra arm -- and only 19-44% of this encoder's intra
+    // blocks code depth 0. Upgrade path: predict per transform unit inside
+    // [`Plane::code_tx_depth`] (the decoder already reads `filter_intra` per
+    // unit, decode.rs:11835) and run the depth search under the winning
+    // filter mode.
     let mut filter_intra: Option<u8> = None;
     if filter_intra_on()
         && palette.is_none()
