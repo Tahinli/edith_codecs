@@ -1,0 +1,41 @@
+lane-pyr5: the third pyramid level, swept on encode::tests::bd_rate_film_long_gop
+(48 pictures, gop 48, film rows only, -g 48). Every row keyed by the log's own
+"pyramid requested/effective" print; logs in lanes/pyr5/<arm>.log.
+Head 3aadd65b + the mid-level commit; the control arm is on THIS head, so the
+comparison is not against lanes/pyr4.sweep.txt (main moved since).
+
+| arm | EC_AV1_PYRAMID | film A vs libaom / rav1e | film B vs libaom / rav1e |
+|---|---|---|---|
+| ctl (2-level, shipped) | 8:-32:16:off | +55.2 / +12.8 | +151.3 / +47.4 |
+| mid4 | 8:-32:16:-4 | +51.8 / +11.4 | +146.2 / +45.4 |
+| mid8 (KEPT) | 8:-32:16:-8 | +52.1 / +11.7 | +145.3 / +45.0 |
+| mid16 | 8:-32:16:-16 | +53.4 / +13.0 | +146.0 / +46.1 |
+| leaf20 | 8:-32:20:-8 | +52.4 / +11.5 | +148.0 / +46.1 |
+| g16mid8 | 16:-32:16:-8 | +55.0 / +12.3 | +146.0 / +44.3 |
+| g16mid | 16:-32:16:-16 | +54.6 / +12.1 | +148.7 / +46.0 |
+| g4mid8 | 4:-32:16:-8 | +61.7 / +20.4 | +147.5 / +51.3 |
+
+Keep rule (both films down on both columns at 48 frames): mid4, mid8, mid16 and
+leaf20 all pass; mid8 is the best on film B (the wider gap) and within 0.3 of
+mid4 on film A. mini_gop 16 with a mid level is no better than the 2-level 8,
+and mini_gop 4 -- rav1e's own group size -- is much worse: the third level, not
+a shorter group, is what pays here.
+
+Encoder wall is unchanged within noise (231-280 s per 4-point ladder across
+every arm, ctl 272 s / 255 s).
+
+## The 12-frame gate (encode::tests::bd_rate_screen_native), keyed by each log's
+## own mid_q_offset print
+
+| mid | film A vs libaom / rav1e | film B vs libaom / rav1e |
+|---|---|---|
+| None (control) | +43.9 / +15.6 | +68.4 / +38.2 |
+| -4 | +43.8 / +15.8 | +71.1 / +38.1 |
+| -8 | +43.7 / +15.7 | +71.2 / +37.8 |
+| -8, run-length gated (SHIPPED) | +43.9 / +15.6 | +68.4 / +38.2 (byte-identical to the control) |
+
+A 12-picture GOP under mini_gop 8 is ONE group of 11 (group_target absorbs the
+tail), and a second hidden frame inside it costs 2.7-2.8 points against libaom
+on film B at every offset measured. So the third level is gated on the RUN's
+length -- `gop > mini_gop + mini_gop / 2`, i.e. a GOP that holds more than one
+mini-GOP -- and the 12-frame gate codes byte for byte what it coded before.

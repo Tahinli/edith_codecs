@@ -379,6 +379,15 @@ pub struct Pyramid {
     /// Added to `base_q_idx` for each shown leaf — positive, since nothing
     /// predicts off a leaf but the next leaf.
     pub leaf_q_offset: i16,
+    /// THE THIRD LEVEL, or `None` for the two-level pyramid: the offset a
+    /// second hidden frame, at the middle of the mini-GOP, is coded at
+    /// (between [`Pyramid::arf_q_offset`] and [`Pyramid::leaf_q_offset`], so
+    /// the group reads key -> top ARF -> mid ARF -> leaves). The leaves
+    /// before it name it as their `ALTREF_FRAME` and the leaves after it
+    /// start their chain from it, which halves every leaf's distance to its
+    /// nearest good reference. Ignored by a group of fewer than four
+    /// pictures, where there is no leaf on both sides of a midpoint.
+    pub mid_q_offset: Option<i16>,
 }
 
 /// How many pictures the mini-GOP now being collected takes, given how many
@@ -416,7 +425,8 @@ fn absorb_tail() -> bool {
 
 impl Pyramid {
     /// The pyramid a run asks for through the environment:
-    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>]`, with
+    /// `EC_AV1_PYRAMID=<mini_gop>[:<arf_q_offset>:<leaf_q_offset>[:<mid>]]`,
+    /// where `<mid>` is the third level's offset or `off` for none, with
     /// `0` (or anything that is not a mini-GOP of at least 2, e.g. `flat`)
     /// meaning the flat one-picture-one-frame path. UNSET is
     /// [`Pyramid::default`]: the pyramid is what
@@ -437,6 +447,14 @@ impl Pyramid {
             mini_gop,
             arf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.arf_q_offset),
             leaf_q_offset: f.next().and_then(|v| v.parse().ok()).unwrap_or(d.leaf_q_offset),
+            // A fourth field is the mid-level offset; the literal `off` asks
+            // for the two-level pyramid at the same shape (the A/B arm the
+            // sweep needs), and no field at all keeps the default's.
+            mid_q_offset: match f.next() {
+                None => d.mid_q_offset,
+                Some("off") => None,
+                Some(v) => v.parse().ok().or(d.mid_q_offset),
+            },
         })
     }
 }
@@ -666,11 +684,36 @@ impl Default for Pyramid {
     /// columns better than `16:-24:16` ever was, film B vs rav1e 3.0 short),
     /// while 47 inter pictures still take 8 x 5 + 7 -- the long-GOP table
     /// above is coded byte for byte as it was measured.
+    /// THE THIRD LEVEL (lane-pyr5, `lanes/pyr5.sweep.txt`), swept on the
+    /// long-GOP gate against a control arm on this very head:
+    ///
+    /// | mini_gop:arf:leaf:mid | film A vs libaom / rav1e | film B vs libaom / rav1e |
+    /// |---|---|---|
+    /// | 8:-32:16 (control, 2-level) | +55.2 / +12.8 | +151.3 / +47.4 |
+    /// | 8:-32:16:-4 | +51.8 / +11.4 | +146.2 / +45.4 |
+    /// | **8:-32:16:-8** | **+52.1 / +11.7** | **+145.3 / +45.0** |
+    /// | 8:-32:16:-16 | +53.4 / +13.0 | +146.0 / +46.1 |
+    /// | 8:-32:20:-8 | +52.4 / +11.5 | +148.0 / +46.1 |
+    /// | 16:-32:16:-8 | +55.0 / +12.3 | +146.0 / +44.3 |
+    /// | 16:-32:16:-16 | +54.6 / +12.1 | +148.7 / +46.0 |
+    /// | 4:-32:16:-8 | +61.7 / +20.4 | +147.5 / +51.3 |
+    ///
+    /// `-4` and `-8` are within a point of each other and split the two
+    /// films; `-8` ships because film B is the wider gap. A mini-GOP of 4
+    /// with a mid level -- rav1e's own shape at speed 6 -- is far worse here,
+    /// so the third level is worth more than a shorter group, and the census
+    /// (`lanes/census-longgop.md`) says why: at 8 pictures our leaves are
+    /// already cheap and the bytes sit in the ARFs.
+    ///
+    /// The 12-frame gate keeps its numbers exactly (+43.9 / +15.6 and +68.4 /
+    /// +38.2, byte-identical streams): a GOP that is one single mini-GOP does
+    /// not code the third level at all (see `drain_pending`).
     fn default() -> Self {
         Self {
             mini_gop: 8,
             arf_q_offset: -32,
             leaf_q_offset: 16,
+            mid_q_offset: MID_DEFAULT,
         }
     }
 }
@@ -701,6 +744,17 @@ const ANCHOR_SLOTS: [u8; 2] = [3, 4];
 
 /// The slot the leaf chain refreshes and reads as `LAST_FRAME`.
 const LEAF_SLOT: u8 = 0;
+
+/// The slot the mid-level hidden frame of a three-level group refreshes
+/// ([`Pyramid::mid_q_offset`]): free of the two anchors (3, 4), of the leaf
+/// chain (0) and of `GOLDEN_SLOT` (1), so all four levels are live at once.
+const MID_SLOT: u8 = 2;
+
+/// [`Pyramid::default`]'s third level (`None` = the two-level pyramid), the
+/// long-GOP sweep's winner (`lanes/pyr5.sweep.txt`): every one of the four
+/// long-GOP columns improves against the two-level shape, film B (the wider
+/// gap) by 6.0 / 2.4 BD points.
+const MID_DEFAULT: Option<i16> = Some(-8);
 
 /// The AV1 software encoder: [`EncoderConfig`] in, one [`Packet`] out per
 /// [`Av1Encoder::encode`] call — or, with a [`Pyramid`] configured, a
@@ -1273,14 +1327,14 @@ impl Av1Encoder {
         altref_slot: u8,
         show_frame: bool,
         level: Level,
+        // The quantizer offset comes from the CALLER, not from `level`: a
+        // three-level group codes two `Level::Arf` frames (the group's top
+        // ARF and the mid one) at different offsets, and they share the
+        // rate-control slot but not the offset.
+        offset: i16,
     ) -> Result<Packet> {
         let render = (self.config.width, self.config.height);
         let order_hint = (order & 0x7f) as u32;
-        let pyramid = self.pyramid.expect("pyramid mode");
-        let offset = match level {
-            Level::Arf => pyramid.arf_q_offset,
-            _ => pyramid.leaf_q_offset,
-        };
         let base = self
             .rate_loop
             .as_ref()
@@ -1385,6 +1439,7 @@ impl Av1Encoder {
         let anchor_slot = ANCHOR_SLOTS[self.anchor];
         let next_anchor_slot = ANCHOR_SLOTS[1 - self.anchor];
         let (arf_order, arf_picture) = group.last().cloned().expect("non-empty");
+        let pyramid = self.pyramid.expect("pyramid mode");
         if group.len() == 1 {
             // Nothing to predict backward, so no hidden frame: one shown leaf
             // that also becomes the next group's anchor.
@@ -1396,10 +1451,12 @@ impl Av1Encoder {
                 GOLDEN_SLOT,
                 true,
                 Level::Leaf,
+                pyramid.leaf_q_offset,
             )?);
             self.anchor = 1 - self.anchor;
             return Ok(packets);
         }
+        // The group's top level: the last picture, hidden, off the anchor.
         packets.push(self.encode_pyramid_inter(
             arf_order,
             &arf_picture,
@@ -1408,17 +1465,39 @@ impl Av1Encoder {
             GOLDEN_SLOT,
             false,
             Level::Arf,
+            pyramid.arf_q_offset,
         )?);
-        for (i, (order, picture)) in group[..group.len() - 1].iter().enumerate() {
-            let last_slot = if i == 0 { anchor_slot } else { LEAF_SLOT };
+        let leaves = group.len() - 1;
+        // THE THIRD LEVEL: a second hidden frame at the middle of the leaf
+        // run, coded off the anchor with the top ARF as its own backward
+        // reference. It needs a leaf on both sides of it, so a group of
+        // three or fewer stays two-level.
+        //
+        // AND IT NEEDS A RUN LONG ENOUGH TO AMORTISE IT: a GOP that is one
+        // single mini-GOP (`group_target` absorbs a tail, so a 12-picture GOP
+        // under `mini_gop` 8 is ONE group of 11) pays for the second hidden
+        // frame out of eleven pictures and reads +2.8 BD points worse against
+        // libaom on film B at every mid offset measured (-4: +71.1, -8:
+        // +71.2, against the two-level +68.4), while the 48-picture GOP -- six
+        // groups sharing the same machinery -- is 6.0 points BETTER. So the
+        // third level is switched on by the RUN's length, not by the group's:
+        // the same GOP-length dependence `group_target` itself was built for.
+        let long_run = self.config.gop > pyramid.mini_gop + pyramid.mini_gop / 2;
+        let mid = pyramid.mid_q_offset.filter(|_| leaves >= 3 && long_run).map(|offset| {
+            let at = (leaves - 1) / 2;
+            (at, offset)
+        });
+        if let Some((at, offset)) = mid {
+            let (order, picture) = group[at].clone();
             packets.push(self.encode_pyramid_inter(
-                *order,
-                picture,
-                last_slot,
-                LEAF_SLOT,
+                order,
+                &picture,
+                anchor_slot,
+                MID_SLOT,
                 next_anchor_slot,
-                true,
-                Level::Leaf,
+                false,
+                Level::Arf,
+                offset,
             )?);
         }
         let (seq, _) = crate::encode::key_frame_headers(
@@ -1426,12 +1505,45 @@ impl Av1Encoder {
             self.config.height,
             self.config.base_q_idx,
         )?;
-        let mut data = crate::obu::temporal_delimiter();
-        data.extend_from_slice(&crate::frame::show_existing_frame_obu(
-            &seq,
-            next_anchor_slot,
-        )?);
-        packets.push(self.packet(data, false, arf_order, Level::ShowExisting));
+        let show_existing = |encoder: &mut Self, slot: u8, order: u64| -> Result<Packet> {
+            let mut data = crate::obu::temporal_delimiter();
+            data.extend_from_slice(&crate::frame::show_existing_frame_obu(&seq, slot)?);
+            Ok(encoder.packet(data, false, order, Level::ShowExisting))
+        };
+        // The leaves, in display order, so every `show_existing_frame` lands
+        // in its own display position. A leaf before the mid frame names it
+        // as `ALTREF_FRAME` (the nearer backward reference); the first leaf
+        // after it starts its chain FROM it.
+        for (i, (order, picture)) in group[..leaves].iter().enumerate() {
+            if let Some((at, _)) = mid {
+                if i == at {
+                    let packet = show_existing(self, MID_SLOT, *order)?;
+                    packets.push(packet);
+                    continue;
+                }
+            }
+            let last_slot = match (i, mid) {
+                (0, _) => anchor_slot,
+                (i, Some((at, _))) if i == at + 1 => MID_SLOT,
+                _ => LEAF_SLOT,
+            };
+            let altref_slot = match mid {
+                Some((at, _)) if i < at => MID_SLOT,
+                _ => next_anchor_slot,
+            };
+            packets.push(self.encode_pyramid_inter(
+                *order,
+                picture,
+                last_slot,
+                LEAF_SLOT,
+                altref_slot,
+                true,
+                Level::Leaf,
+                pyramid.leaf_q_offset,
+            )?);
+        }
+        let packet = show_existing(self, next_anchor_slot, arf_order)?;
+        packets.push(packet);
         self.anchor = 1 - self.anchor;
         Ok(packets)
     }
@@ -2248,6 +2360,25 @@ mod tests {
     #[test]
     fn a_pyramid_stream_decodes_in_display_order_through_both_decoders() {
         let _knobs = crate::speed::knob_read();
+        pyramid_round_trip(Pyramid { mini_gop: 4, mid_q_offset: None, ..Pyramid::default() }, 2);
+    }
+
+    /// The same round trip over a THREE-level group (`mid_q_offset`): each
+    /// mini-GOP now codes two hidden frames -- the top ARF at the group's
+    /// last picture and the mid ARF at the middle of the leaf run -- and
+    /// re-outputs both with `show_existing_frame`, so a mid frame emitted in
+    /// the wrong display position, or twice, fails the display-order compare
+    /// against ffmpeg exactly as a top ARF does.
+    #[test]
+    fn a_three_level_pyramid_stream_decodes_in_display_order() {
+        let _knobs = crate::speed::knob_read();
+        pyramid_round_trip(
+            Pyramid { mini_gop: 8, mid_q_offset: Some(-8), ..Pyramid::default() },
+            2,
+        );
+    }
+
+    fn pyramid_round_trip(pyramid: Pyramid, hidden: usize) {
         let (width, height) = (128usize, 128usize);
         let config = EncoderConfig {
             width,
@@ -2257,10 +2388,6 @@ mod tests {
             colour: Colour::Bt709Limited,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
-        };
-        let pyramid = Pyramid {
-            mini_gop: 4,
-            ..Pyramid::default()
         };
         // The content gate ([`Av1Encoder::encode_frames`]) would drop a
         // screen-content stream to the flat path, and a synthetic test card
@@ -2288,7 +2415,7 @@ mod tests {
         assert_eq!(sorted, (0..9).collect::<Vec<u64>>(), "one packet per picture");
         assert_ne!(coded, sorted, "the pyramid never reordered anything");
         let shown = packets.iter().filter(|p| p.level == Level::ShowExisting).count();
-        assert_eq!(shown, 2, "one show_existing_frame per closed mini-GOP");
+        assert_eq!(shown, hidden, "one show_existing_frame per hidden frame");
         for (i, p) in packets.iter().enumerate() {
             assert_eq!(p.dts, i as u64, "packet {i}: dts is the coding position");
         }
@@ -2300,7 +2427,7 @@ mod tests {
             hist(Level::Leaf),
             hist(Level::ShowExisting),
         );
-        assert_eq!(hist(Level::Arf), 2, "two hidden frames");
+        assert_eq!(hist(Level::Arf), hidden, "hidden frames");
         let refs = crate::encode::take_ref_frame_hits();
         eprintln!(
             "blocks per reference: LAST {} GOLDEN {} ALTREF {}",
