@@ -118,3 +118,42 @@ beside it on the same box (the lane runs two arms in parallel), which is what
 the gate's own "noisy" label means. Best-of the five preset-0 RDOQ arms
 (lambda 1.0/1.3/1.6/2.2/3.2, all the same work) is film A 131.7s, film B
 118.6s, screen 78.5s against the control's 77.1 / 78.1 / 45.1s -- 1.7-1.8x.
+
+## Long-GOP gate (`bd_rate_film_long_gop`, 48 frames, `-g 48`), at what ships
+
+| row | control (`EC_AV1_RDOQ=0`, this head) | SHIPPED |
+|---|---|---|
+| film A | +40.9 / +3.1 | **+29.4 / -3.9** |
+| film B | +125.6 / +32.0 | **+100.2 / +16.6** |
+
+Both control rows reproduce the charter's numbers exactly, so the long-GOP
+baseline is not stale either. -11.5 / -7.0 on film A and -25.4 / -15.4 on
+film B; film A now beats rav1e speed 6 over a 48-frame GOP.
+
+## Invariants (release lib binary, on this head)
+
+| check | result |
+|---|---|
+| pins, RDOQ on | 9853 -> **8618** at q=150, 35866 -> **33339** at q=60, test ok |
+| pins, `EC_AV1_RDOQ=0` | restores 9853 / 35866 (the test passes against the OLD pins with the flag set) |
+| `EC_COMP_MISMATCH=1`, presets 0 and 6 | 0 lines, over `tile_bytes_do_not_depend_on_the_thread_count` and `the_facade_codes_the_same_bytes_as_encode_sequence` |
+| `tile_bytes_do_not_depend_on_the_thread_count --include-ignored` | ok at preset 0 and at preset 6 |
+| `the_facade_codes_the_same_bytes_as_encode_sequence` | ok at preset 0 and at preset 6 |
+| `every_speed_preset_decodes_sample_exact_through_both_decoders --ignored` | ok (presets 0..10) |
+| `predicted_coeff_bits_track_the_tile_the_writer_wrote` | ok -- the pass hands the search the price of its OWN grid |
+| every gate arm above | RC=0, i.e. the three-way (encoder / ffmpeg / our decoder) sample-exactness assertion held on all 12 arms |
+| full ec-av1 lib suite | 560 passed / 0 failed / 44 ignored in 883s (559 + this lane's one) |
+| `cargo check --workspace --all-targets -j4` | 0 errors, 0 ec-av1 warnings (22 warnings, all pre-existing in ec-opus) |
+
+## Deferred
+
+* deadzone 0.35 -- one gate arm, and 0.42 is already 22 points the wrong way.
+* the lambda multiplier is fitted (2.2x); the named cause is the unadapted
+  pricing tables, and the real fix is an adapted price, not this constant.
+* the per-superblock temporal lambda map and the key/hidden frame factors do
+  not reach the pass (both frame factors are 1.0 as shipped); the upgrade is a
+  `lambda` on the trial call sites.
+* incremental candidate pricing (rav1e's table lookup instead of a whole
+  `write_coeffs` per candidate) is what would let the bounds go: at the
+  budget of 24 the pass leaves ~1% of the bytes the unbounded pass took
+  (9059 vs 8959 at the q=150 pin).
