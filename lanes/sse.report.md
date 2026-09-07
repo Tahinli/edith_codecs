@@ -83,6 +83,9 @@ crop that still codes the same stream.
   (384x216 = the 1080p shape at a fifth: 3 whole SB columns, 1.6875 SB rows,
   straddling at 64/32/16) decodes sample-exact against our decoder AND ffmpeg.
 - metric unit check `a_block_the_frame_edge_cuts_is_scored_over_its_inside_only`.
+- full lib suite (release, detached): **564 passed, 0 failed, 44 ignored**
+  in 714s (`lanes/sse-suite.log`); the charter's 561 baseline plus this lane's
+  two new tests plus one that landed on main since.
 - `cargo check --workspace --all-targets -j4`: 0 errors, 0 ec-av1 warnings
   (the 25 remaining are pre-existing ec-opus/ec-vorbis doc warnings).
 
