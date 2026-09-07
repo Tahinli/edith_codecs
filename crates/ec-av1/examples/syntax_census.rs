@@ -116,6 +116,9 @@ fn pct(n: u64, total: u64) -> String {
     format!("{:.1}%", 100.0 * n as f64 / total.max(1) as f64)
 }
 
+const REFS: [&str; 8] =
+    ["INTRA", "LAST", "LAST2", "LAST3", "GOLDEN", "BWDREF", "ALTREF2", "ALTREF"];
+
 fn report(label: &str, f: &Frame, frames: usize) {
     let area = f.area.iter().sum::<u64>().max(1);
     println!("\n== {label} ({frames} frames, {} bytes) ==", f.bytes);
@@ -126,8 +129,6 @@ fn report(label: &str, f: &Frame, frames: usize) {
         pct(f.area[2], area),
         pct(f.skip_area, area),
     );
-    const REFS: [&str; 8] =
-        ["INTRA", "LAST", "LAST2", "LAST3", "GOLDEN", "BWDREF", "ALTREF2", "ALTREF"];
     println!(
         "  refs (area): {}",
         REFS.iter()
@@ -252,6 +253,7 @@ fn main() {
     // the frames above are coded in (a pyramid codes a hidden ARF ahead of the
     // leaves that predict from it, and re-outputs it later with
     // `show_existing_frame`) -- so it is its own table rather than a column.
+    let mut psnrs: Vec<f64> = Vec::new();
     if let Some(src) = args.get(1).map(|p| std::fs::read(p).expect("source")) {
         let mut sum = 0.0;
         let mut rows = Vec::new();
@@ -261,6 +263,7 @@ fn main() {
             let Some(b) = src.get(i * frame_len..(i + 1) * frame_len) else { break };
             let want: Vec<u16> = b[..luma].iter().map(|&v| u16::from(v)).collect();
             let p = psnr(&pic.y, &want);
+            psnrs.push(p);
             sum += p;
             rows.push(format!("{i}:{p:.2}"));
         }
@@ -271,6 +274,36 @@ fn main() {
             sum / rows.len() as f64,
             rows.len(),
         );
+    }
+
+    // lane-arfcen: one full report PER CODED FRAME, so an ARF of ours can be
+    // put next to the reference encoder's ARF at the same display position.
+    if std::env::var("EC_CENSUS_PERFRAME").as_deref() == Ok("1") {
+        for f in &frames {
+            let p = psnrs.get(f.order_hint as usize).copied().unwrap_or(f64::NAN);
+            let refs: Vec<String> = (0..7)
+                .filter(|i| f.refs[i + 1] > 0)
+                .map(|i| {
+                    format!(
+                        "{}@{:+}",
+                        REFS[i + 1],
+                        i64::from(f.ref_hints[i]) - i64::from(f.order_hint),
+                    )
+                })
+                .collect();
+            report(
+                &format!(
+                    "frame {} {} hint {} q {} PSNR-Y {p:.2} dB refs [{}]",
+                    f.idx,
+                    f.kind,
+                    f.order_hint,
+                    f.qindex,
+                    refs.join(" "),
+                ),
+                f,
+                1,
+            );
+        }
     }
 
     for kind in ["key", "arf", "leaf"] {
