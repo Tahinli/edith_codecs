@@ -1,0 +1,668 @@
+
+running 604 tests
+test bits::tests::delta_q_roundtrip ... ok
+test bits::tests::le_roundtrip ... ok
+test bits::tests::leb128_roundtrip ... ok
+test bits::tests::su_roundtrip ... ok
+test bits::tests::trailing_bits_and_byte_alignment_are_byte_aligned ... ok
+test cdf::tests::eob_pt_class1_rows_cover_every_size ... ok
+test cdf::tests::inter_frame_tables_are_well_formed_cdfs ... ok
+test cdf::tests::inter_frame_tables_have_the_spec_alphabet_size ... ok
+test cdf_state::tests::the_luma_end_of_block_table_is_shared_and_chromas_is_not ... ok
+test cdf_state::tests::the_mv_components_are_separate_and_do_not_share_adaptation ... ok
+test bits::tests::ns_roundtrip ... ok
+test cdf_state::tests::the_sign_tables_are_shared_within_a_plane_type_and_not_across ... ok
+test cdf_state::tests::the_state_starts_at_the_defaults ... ok
+test cdf_state::tests::the_two_luma_sets_share_the_base_range_table ... ok
+test compound::tests::equidistant_references_pick_the_first_weight_row ... ok
+test compound::tests::weights_always_sum_to_sixteen ... ok
+test compound::tests::zero_distance_reference_takes_the_index_3_row ... ok
+test decode::a_var_tx_tree_never_presents_a_leaf_larger_than_the_unit_it_entered ... ok
+test decode::every_intra_in_inter_shape_the_census_lists_has_a_size_group_row ... ok
+test decode::every_rect_transform_shape_the_census_lists_has_a_coefficient_table_and_scan ... ok
+test decode::every_shape_that_allows_motion_variation_has_a_motion_mode_cdf_row ... ok
+test decode::size_group_wh_matches_libaom_size_group_lookup ... ok
+test decode::sub_tx_size_map_matches_libaom ... ok
+test decode::tests::a_frame_with_no_mode_info_grid_is_refused ... ok
+test bits::tests::uvlc_roundtrip ... ok
+test decode::tests::a_nearmv_block_predicts_from_the_stacks_second_candidate ... ok
+test decode::tests::a_rect_strip_below_16x16_reads_its_own_filter_intra_cdf_row ... ok
+test decode::tests::a_non_split_inter_sb_partition_refuses_by_name_instead_of_desyncing ... ok
+test decode::tests::an_inter_chroma_transform_narrows_its_inherited_tx_type_to_its_own_set ... ok
+test decode::tests::a_selected_reference_with_an_empty_ref_frame_idx_slot_refuses_by_name ... ok
+test decode::tests::an_obmc_neighbour_with_no_recorded_filter_refuses_instead_of_panicking ... ok
+test decode::tests::base_ctx_rect_offsets_match_the_transcribed_tables_over_the_whole_domain ... ok
+test decode::tests::a_skipped_block_decodes_to_pure_prediction ... ok
+test decode::tests::compound_mode_ctx_map_matches_libaom_corners ... ok
+test decode::tests::a_sub16_leaf_after_a_palette_block_yields_palette_ctx_zero ... ok
+test decode::tests::cdef_find_dir_matches_the_per_sample_reference ... ok
+test decode::tests::filter_intra_classes_carry_their_own_libaom_default_row ... ok
+test decode::tests::cdef_gather_and_shifted_constrain_match_the_spec_forms ... ok
+test decode::tests::is_uni_comp_ref_matches_forward_backward_sides ... ok
+test decode::tests::every_inter_record_publishes_an_obmc_readable_filter ... ok
+test decode::tests::flat_taps_match_the_row_col_neighbour_reads ... ok
+test decode::tests::narrowed_publish_surface_keeps_neighbour_semantics ... ok
+test decode::tests::padded_level_buffers_cover_every_neighbour_read_at_every_transform_size ... ok
+test decode::tests::deblock_simd_kernel_matches_the_scalar_filter ... ok
+test decode::tests::record_compound_ctx_stamps_ref1_for_the_next_block_to_read ... ok
+test decode::tests::scan_8x4_and_4x8_are_not_transposed_against_each_other ... ok
+test decode::tests::the_rect4_scans_are_transposed_pairs ... ok
+test decode::tx4x8_table_tests::the_32_position_eob_tables_are_well_formed ... ok
+test decode::tx4x8_table_tests::the_rect_4x8_scans_are_each_other_transposed ... ok
+test decode::tx4x8_table_tests::the_rect_class1_scans_match_libaom ... ok
+test decode::tx4x8_table_tests::the_sub8_rect_reach_tables_are_shape_specific ... ok
+test decode::tests::a_gop_round_trips_bit_exact_against_the_encoder_reconstruction ... ok
+test decode::tests::a_key_frames_tile_needs_the_headers_own_tx_select_bit ... ok
+test encode::tests::a_flat_picture_costs_almost_nothing ... ok
+test encode::tests::a_frame_of_real_video_decodes_to_what_the_encoder_reconstructed ... ok
+test decode::tests::an_odd_size_gop_round_trips_bit_exact_against_the_encoder_reconstruction ... ok
+test encode::tests::a_mode_the_encoder_cannot_predict_is_refused ... ok
+test decode::tests::cdef_simd_kernel_matches_the_scalar_filter ... ok
+test decode::tests::real_yuv_round_trips_bit_exact_against_the_encoder_reconstruction ... ok
+test decode::tests::ffmpeg_and_this_decoder_agree_on_a_gop ... ok
+test decode::tests::a_filter_intra_key_frame_decodes_pixel_exact_through_ffmpeg ... ok
+test decode::tests::every_intra_mode_round_trips_bit_exact_against_the_encoder_reconstruction ... ok
+test decode::tests::ffmpeg_and_this_decoder_agree_on_a_key_frame ... ok
+test encode::tests::a_640x360_half_straddle_sequence_round_trips_through_ffmpeg ... ok
+test encode::tests::bd_rate_film_long_gop ... ignored, the long-GOP native BD arm: ~7 minutes per film row, needs ffmpeg
+test encode::tests::bd_rate_screen_native ... ignored, the native-resolution BD arm: minutes per row, needs ffmpeg
+test encode::tests::bd_rate_vs_libaom_and_rav1e ... ignored, the encoder BD-rate baseline: minutes per clip, needs ffmpeg
+test encode::tests::calibration_sweep_base_q_idx ... ignored, a calibration probe, not a gate
+test encode::tests::a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames ... ok
+test decode::tests::leaf8_straddle_sizes_round_trip_bit_exact_against_the_encoder_reconstruction ... ok
+test decode::tests::odd_sizes_round_trip_bit_exact_against_the_encoder_reconstruction ... ok
+test encode::tests::every_rect_shape_reaches_what_libaom_says_over_the_whole_superblock ... ok
+test encode::tests::a_frame_round_trips_at_its_own_size ... ok
+test encode::tests::a_nearestmv_block_with_one_nonzero_coefficient_decodes_clean ... ok
+test encode::tests::a_repeated_pattern_key_frame_codes_intrabc_blocks_ffmpeg_decodes_exactly ... ok
+test encode::tests::every_mode_decodes_to_what_the_encoder_predicted ... ok
+test encode::tests::a_picture_off_the_block_grid_encodes_and_a_malformed_one_is_refused ... ok
+test encode::tests::of_tu_follows_the_block_row_including_under_vert_ab ... ok
+test encode::tests::of_tu_matches_libaom_has_top_right_and_has_bottom_left_per_unit ... ok
+test encode::tests::odd_dimensions_are_refused ... ok
+test encode::tests::a_single_axis_straddle_round_trips_through_ffmpeg ... ok
+test encode::tests::pricer_error_census_on_clips ... ignored, reads the real library, needs ffmpeg
+test encode::tests::probe_directional ... ignored, a sweep, not a gate
+test encode::tests::probe_intrabc_key_frame ... ignored, needs the real-library manifest and ffmpeg
+test encode::tests::probe_ladder ... ignored, a sweep, not a gate
+test encode::tests::probe_lambda ... ignored, a sweep, not a gate
+test encode::tests::probe_parity_point ... ignored, diagnostic: needs ffmpeg and a clip
+test encode::tests::probe_screen_detect ... ignored, reads the real library
+test encode::tests::probe_screen_library ... ignored, reads the real library
+test encode::tests::probe_split ... ignored, a sweep, not a gate
+test encode::tests::prune_k_quality_sweep ... ignored, needs real clips and ffmpeg; prints numbers for the lane report to judge
+test encode::tests::prune_k_quality_sweep_inter ... ignored, needs real clips and ffmpeg; prints numbers for the lane report to judge
+test encode::tests::reach_matches_libaom_has_top_right_and_has_bottom_left ... ok
+test encode::tests::low_motion_makes_an_inter_frame_smaller_than_the_key_frame ... ok
+test encode::tests::pricer_error_census_by_block_class ... ok
+test encode::tests::rect_reach_tables_are_indexed_with_a_32_mi_row_stride ... ok
+test encode::tests::sequence_bench_sanity ... ignored, a perf probe, not a gate
+test encode::tests::every_frame_of_a_sequence_decodes_through_our_own_decoder ... ok
+test encode::tests::stage_timing_breakdown ... ignored, a perf probe, not a gate
+test encode::tests::stage_timing_breakdown_inter ... ignored, a perf probe, not a gate
+test encode::tests::key_frame_and_inter_frame_both_encode_at_half_straddle_size ... ok
+test encode::tests::every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed ... ok
+test encode::tests::predicted_coeff_bits_track_the_tile_the_writer_wrote ... ok
+test encode::tests::the_filter_search_picks_real_filters ... ok
+test encode::tests::the_encoded_picture_is_the_one_that_went_in ... ok
+test encode::tests::sequence_round_trips_at_a_non_multiple_size ... ok
+test encode::tests::fidelity_and_rate_move_with_the_quantizer ... ok
+test encode::tests::an_854x480_picture_round_trips_through_its_padding ... ok
+test encode::tests::ffmpeg_decodes_exactly_what_the_encoder_reconstructed ... ok
+test encode::tests::tpl_factors_are_flat_on_a_uniform_repeat_and_fall_where_the_window_leans ... ok
+test encode::tests::tpl_intra_denominator_histogram ... ignored, needs ffmpeg and the film fixtures
+test encode::tests::vert_ab_partition_flips_below_left_for_the_top_right_8x8 ... ok
+test encoder::tests::a_1080p_multi_tile_stream_decodes_sample_exact_through_both_decoders ... ignored, 1080p encode: minutes, run it with --ignored
+test encode::tests::a_screen_content_picture_codes_palette_blocks_ffmpeg_decodes_exactly ... ok
+test encode::tests::the_diagonals_beat_the_modes_that_read_no_further ... ok
+test encode::tests::a_sequence_round_trips_at_the_exactly_half_straddle_size ... ok
+test encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins ... ok
+test encode::tests::real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size ... ok
+test encode::tests::real_clip_encodes_within_its_quality_and_size_budget ... ok
+test encode::tests::the_final_filter_replay_matches_the_capture_decode_at_odd_sizes ... ok
+test encode::tests::the_probe_arms_the_gates_source ... ok
+test encode::tests::the_search_picks_the_diagonal_the_picture_runs ... ok
+test encode::tests::the_search_picks_the_direction_the_picture_runs ... ok
+test encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders ... ignored, sets the process-global speed preset: run it alone
+test encoder::tests::a_dc_stepped_clip_codes_a_64x64_residual_and_decodes_sample_exact ... ok
+test encoder::tests::a_four_level_pyramid_stream_decodes_in_display_order ... ok
+test encoder::tests::a_pyramid_stream_decodes_in_display_order_through_both_decoders ... ok
+test encoder::tests::a_static_clip_codes_64x64_roots_and_decodes_sample_exact ... ok
+test encoder::tests::filter_stage_wall_1080p ... ignored, wall measurement: minutes, run it with --ignored --nocapture
+test encoder::tests::filter_stage_wall_4k ... ignored, wall measurement: minutes, run it with --ignored --nocapture
+test encoder::tests::filter_stage_wall_film ... ignored, wall measurement: minutes, run it with --ignored --nocapture
+test encoder::tests::a_three_level_pyramid_stream_decodes_in_display_order ... ok
+test encoder::tests::filter_stage_bytes_do_not_depend_on_the_thread_count ... ok
+test encoder::tests::geometry_mismatch_is_refused ... ok
+test encoder::tests::bt601_limited_colour_is_reported_by_ffprobe ... ok
+test encode::tests::the_search_beats_dc_alone ... ok
+test encoder::tests::bt709_limited_colour_is_reported_by_ffprobe ... ok
+test encoder::tests::gop_cadence_is_honored ... ok
+test encoder::tests::the_mini_gop_layout_leaves_no_short_tail ... ok
+test encoder::tests::the_key_q_offset_reaches_the_key_frame ... ok
+test encoder::tests::one_in_one_out_delayed_by_the_lookahead_depth ... ok
+test encoder::tests::the_content_gate_keeps_screen_streams_flat ... ok
+test encoder::tests::tile_search_wall_1080p ... ignored, wall measurement: minutes, run it with --ignored --nocapture
+test encoder::tests::tile_search_wall_4k ... ignored, wall measurement: minutes, run it with --ignored --nocapture
+test encoder::tests::tile_wall_table_at_1080p ... ignored, 1080p wall table: minutes, run it with --ignored
+test encoder::tests::thirty_pictures_at_gop_fifteen_decode_to_two_key_frames ... ok
+test envflags::tests::snapshot_matches_process_env ... ok
+test film_grain::grain2_tests::untouched_planes_and_ragged_tail_come_back_clean ... ok
+test film_grain::perf5_tests::simd_matches_scalar_chroma_noise_row ... ok
+test film_grain::perf5_tests::simd_matches_scalar_luma_noise_row ... ok
+test film_grain::ragged_grain_tests::ragged_overlap_tail_matches_spec_reference ... ok
+test filter_search::tests::unit_sse_matches_the_naive_sum ... ok
+test frame::tests::four_tile_columns_roundtrip ... ok
+test frame::tests::key_and_inter_frames_roundtrip ... ok
+test frame::tests::key_frame_header_roundtrips ... ok
+test frame::tests::loop_restoration_roundtrips_with_its_own_type_codes ... ok
+test frame::tests::segmentation_and_delta_q_roundtrip ... ok
+test frame::tests::unsupported_frames_are_refused_by_name ... ok
+test gate_coverage::tests::default_on_tools_do_not_duplicate_the_universe ... ok
+test gate_coverage::tests::every_gate_disabling_a_tool_is_a_listed_coverage_hole ... ok
+test gate_coverage::tests::never_exercised_10bit_matches_the_gate_recipes ... ok
+test gate_coverage::tests::never_exercised_8bit_matches_the_gate_recipes ... ok
+test gate_coverage::tests::never_on_10bit_matches_the_gate_recipes ... ok
+test gate_coverage::tests::never_on_8bit_matches_the_gate_recipes ... ok
+test gate_coverage::tests::print_never_exercised_per_bit_depth ... ok
+test gate_coverage::tests::print_never_on_per_bit_depth ... ok
+test gate_coverage::tests::tool_settings_reads_whole_flags ... ok
+test intra::tests::filter_intra_matches_the_libaom_predictor_for_every_mode_and_shape ... ok
+test intra::tests::rect_predictors_match_c_dump ... ok
+test mc::compound_intermediate_whole_pel_identity_round_trips_through_combine ... ok
+test mc::tests::a_narrow_block_reads_the_regular_four_tap_kernel_under_every_sharpness ... ok
+test mc::tests::constant_plane_has_unit_dc_gain_at_every_subpel_position ... ok
+test mc::tests::half_pel_reproduces_the_ramp_midpoint ... ok
+test mc::tests::horizontal_and_vertical_only_filtering_differ ... ok
+test mc::tests::horizontal_intermediate_fits_i16 ... ok
+test mc::tests::integer_mv_is_identity ... ok
+test mc::tests::mv_past_the_edge_clamps_instead_of_panicking ... ok
+test mc::tests::predict_scaled_at_no_scale_matches_predict_with_filters ... ok
+test mc::tests::simd_matches_scalar_horizontal_pass ... ok
+test mc::tests::simd_matches_scalar_vertical_pass ... ok
+test mc::tests::smooth_filter_matches_aomdec_chroma_inter_block ... ok
+test mc::tests::whole_pel_horizontal_matches_the_two_pass_form ... ok
+test motion::tests::cost_is_monotone_non_increasing_over_the_search ... ok
+test motion::tests::finds_exact_integer_translation_all_four_signs ... ok
+test motion::tests::finds_half_pel_translation ... ok
+test motion::tests::mv_bits_prices_a_larger_residual_higher ... ok
+test motion::tests::sweep_initial_step ... ok
+test motion_field::tests::an_unprojected_tpl_cell_reads_as_none_but_a_zero_mv_one_does_not ... ok
+test motion_field::tests::force_integer_mv_rounds_a_projected_candidate_to_full_pel ... ok
+test motion_field::tests::mv_projection_scales_by_the_distance_ratio ... ok
+test motion_field::tests::probe_cell_matches_the_spec_parity_derivation ... ok
+test motion_field::tests::relative_dist_wraps_at_order_hint_bits ... ok
+test motion_field::tests::setup_motion_field_projects_last_frame_forward ... ok
+test msac::tests::adaptive_symbols_roundtrip ... ok
+test msac::tests::bulk_bit_reads_match_the_per_bit_form ... ok
+test msac::tests::empty_payload_is_short ... ok
+test msac::tests::fast_paths_match_the_spec_literal_walk ... ok
+test msac::tests::literals_roundtrip ... ok
+test msac::tests::mixed_symbols_and_literals_roundtrip ... ok
+test msac::tests::skewed_symbols_cost_less_than_a_bit ... ok
+test msac::tests::the_bit_account_matches_the_bytes_written ... ok
+test mvstack::tests::a_candidate_far_outside_the_frame_is_clamped_to_it ... ok
+test mvstack::tests::a_corner_only_match_raises_new_mv_ctx_even_when_nearest_match_is_zero ... ok
+test mvstack::tests::a_diagonal_corner_match_raises_ref_mv_ctx_past_nearest_match ... ok
+test mvstack::tests::a_missing_compound_combine_slot_takes_that_sides_global_mv_not_zero ... ok
+test mvstack::tests::a_neighbour_coded_newmv_raises_the_new_mv_context ... ok
+test mvstack::tests::a_wider_neighbour_than_the_query_block_gets_libaoms_real_weight ... ok
+test mvstack::tests::all_same_mv_neighbourhood_dedupes_to_one_entry ... ok
+test mvstack::tests::clamp_mv_ref_window_is_signed_at_the_frame_bottom_edge ... ok
+test mvstack::tests::combine_compound_candidates_zips_ref_id_then_ref_diff_per_side ... ok
+test mvstack::tests::comp_reference_type_ctx_bidir_bidir_is_zero ... ok
+test mvstack::tests::comp_reference_type_ctx_intra_intra_is_two ... ok
+test mvstack::tests::comp_reference_type_ctx_no_edges_is_two ... ok
+test mvstack::tests::comp_reference_type_ctx_single_single ... ok
+test mvstack::tests::comp_reference_type_ctx_unidir_unidir ... ok
+test mvstack::tests::compound_dedupes_same_pair_and_sums_weight ... ok
+test mvstack::tests::compound_extension_pass_tops_up_a_short_stack ... ok
+test mvstack::tests::compound_scan_only_matches_the_exact_pair ... ok
+test mvstack::tests::compound_two_distinct_pairs_sort_by_weight ... ok
+test mvstack::tests::extended_col_scan_is_a_no_op_at_8mi_geometry_even_behind_an_intra_neighbour ... ok
+test mvstack::tests::extended_row_scan_is_a_no_op_at_8mi_geometry_behind_an_inter_neighbour ... ok
+test mvstack::tests::extended_row_scan_is_a_no_op_at_8mi_geometry_even_behind_an_intra_neighbour ... ok
+test mvstack::tests::mi_info_cell_stays_compact ... ok
+test mvstack::tests::mi_info_stays_small_enough_for_a_4k_grid ... ok
+test mvstack::tests::mi_units_outside_the_tile_contribute_nothing ... ok
+test mvstack::tests::process_compound_ref_mv_candidate_splits_exact_vs_borrowed ... ok
+test mvstack::tests::reference_mode_ctx_compound_compound_is_four ... ok
+test mvstack::tests::reference_mode_ctx_no_edges_is_one ... ok
+test mvstack::tests::reference_mode_ctx_single_and_compound ... ok
+test mvstack::tests::reference_mode_ctx_single_single ... ok
+test mvstack::tests::single_ref_ctx_matches_libaoms_collapsed_forward_only_case ... ok
+test mvstack::tests::the_ninth_distinct_candidate_is_dropped_at_insertion_not_after_sorting ... ok
+test mvstack::tests::the_row_reach_is_clamped_to_the_tile_origin_not_the_frame_edge ... ok
+test mvstack::tests::transposing_above_and_left_produces_a_different_stack ... ok
+test mvstack::tests::two_distinct_neighbour_mvs_yield_two_entries_in_weight_order ... ok
+test mvstack::tests::uni_comp_ref_p1_ctx_matches_ref_ctx_shape ... ok
+test obu::tests::obu_header_extension_roundtrip ... ok
+test obu::tests::obu_header_plain_roundtrip ... ok
+test obu::tests::temporal_delimiter_is_two_bytes ... ok
+test obu::tests::wrap_obu_size_field_matches_payload ... ok
+test quant::tests::buffered_dequant_matches_the_per_coefficient_form ... ok
+test quant::tests::denominator_follows_the_area ... ok
+test quant::tests::dequant_is_symmetric_in_sign ... ok
+test quant::tests::table_anchors ... ok
+test refusal_inventory::tests::capability_claims_are_declared_not_scattered ... ok
+test refusal_inventory::tests::every_intra_mode_symbol_of_the_y_mode_alphabet_is_coded ... ok
+test refusal_inventory::tests::every_partition_value_of_an_enumerated_alphabet_has_an_arm ... ok
+test refusal_inventory::tests::every_partition_value_of_an_if_chain_alphabet_is_named_by_a_branch ... ok
+test refusal_inventory::tests::every_proven_refusal_names_a_test_that_exists ... ok
+test refusal_inventory::tests::every_read_intra_mode_call_site_hands_the_reader_a_palette_cache ... ok
+test refusal_inventory::tests::every_rect_strip_shape_the_split_path_codes_has_a_luma_and_chroma_table ... ok
+test refusal_inventory::tests::every_tx_type_symbol_of_every_cdf_width_maps_into_its_own_set ... ok
+test refusal_inventory::tests::gates_that_swallow_a_decode_error_are_declared ... ok
+test refusal_inventory::tests::no_128_root_half_reads_a_cfl_filter_intra_or_palette_symbol ... ok
+test refusal_inventory::tests::no_block_footprint_with_a_128_pixel_side_can_carry_palette_syntax ... ok
+test refusal_inventory::tests::read_golomb_reads_every_value_a_conformant_stream_can_carry ... ok
+test refusal_inventory::tests::the_decode_path_refuses_exactly_the_listed_cases ... ok
+test restoration::tests::signed_subexp_with_ref_roundtrips ... ok
+test restoration::tests::subexp_roundtrips_every_value ... ok
+test restoration::tests::unsigned_subexp_with_ref_roundtrips ... ok
+test restoration::tests::wiener_filter_roundtrips ... ok
+test sequence::tests::sequence_header_obu_size_matches_payload ... ok
+test sequence::tests::sequence_header_roundtrip ... ok
+test speed::tests::presets_are_monotone_in_speed ... ok
+test speed::tests::speed_zero_disables_nothing ... ok
+test stream::tests::a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_decode_pixel_exact ... ok
+test stream::tests::a_10bit_film_frames_with_frame_edge_mv_clamping_decode_pixel_exact ... ok
+test stream::tests::a_10bit_film_frames_with_rect64_corner_tus_decode_pixel_exact ... ok
+test stream::tests::a_10bit_film_frames_with_small_side_globalmv_and_rect_warp_reach_decode_pixel_exact ... ok
+test encoder::tests::quality_target_is_monotone_in_bytes_and_psnr ... ok
+test encoder::tests::filter_replay_final_matches_the_capture_decode ... ok
+test stream::tests::a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact ... ok
+test stream::tests::a_128_superblock_stream_whose_skipped_blocks_are_var_tx_decodes_pixel_exact ... ok
+test stream::tests::a_10bit_key_frame_with_skipped_8x8_intra_leaves_that_split_their_transform_decodes_luma_exact ... ok
+test stream::tests::a_10bit_film_hidden_arf_with_split_superblock_strips_decodes_pixel_exact ... ok
+test stream::tests::a_block_shape_census_over_three_real_streams_leaves_the_rect_residual_refusal_unreachable ... ok
+test encoder::tests::bytes_per_frame_controller_never_oscillates_past_its_clamp ... ok
+test stream::tests::a_directional_16x8_strip_reads_the_right_above_right_samples ... ok
+test stream::tests::a_frame_obu_that_parses_always_carries_at_least_one_tile ... ok
+test stream::tests::a_frame_whose_segmentation_overrides_a_block_mode_is_refused_by_name ... ok
+test stream::tests::a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg ... ok
+test encoder::tests::the_rate_loop_prices_the_frames_the_pyramid_codes ... ok
+test encoder::tests::bitrate_target_lands_within_5_percent_over_48_frames has been running for over 60 seconds
+test stream::tests::a_libaom_screen_stream_with_sub8_groups_beside_palette_blocks_decodes_exact ... ok
+test stream::tests::a_libaom_stream_with_128_intra_blocks_in_inter_frames_decodes_exact ... ok
+test stream::tests::a_lossless_libaom_key_frame_decodes_sample_exact ... ok
+test stream::tests::a_libaom_force_integer_mv_stream_decodes_exact ... ok
+test encoder::tests::bytes_per_frame_target_settles_within_20_percent ... ok
+test stream::tests::a_lossless_libaom_inter_frame_decodes_sample_exact ... ok
+test encoder::tests::filter_replay_codes_the_same_stream_as_a_full_decode ... ok
+test encoder::tests::every_tile_layout_decodes_sample_exact_through_both_decoders has been running for over 60 seconds
+test stream::tests::a_real_aomenc_10bit_film_grain_stream_decodes_pixel_exact ... ok
+test encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence ... ok
+test stream::tests::a_32x32_frame_edge_rect_partition_with_a_flat_band_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_a_class1_chroma_eob_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_a_directional_intra_block_with_angle_delta_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_a_non_dc_chroma_8x8_intra_leaf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_a_split_transform_intra_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_a_split_transform_intra_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_a_whole_superblock_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact ... ok
+test encoder::tests::tile_bytes_do_not_depend_on_the_thread_count has been running for over 60 seconds
+test encoder::tests::zero_gop_is_refused has been running for over 60 seconds
+test encoder::tests::every_tile_layout_decodes_sample_exact_through_both_decoders ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_filter_intra_on_an_intra_block_decodes_pixel_exact ... ok
+test stream::tests::a_frame_edge_straddling_band_decodes_pixel_exact ... ok
+test stream::tests::a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag ... ok
+test stream::tests::a_pinned_rect_stream_with_a_64x64_intra_block_in_an_inter_frame_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_intra_tools_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_affine_global_motion_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_compound_mv_stack_at_128_superblocks_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_restoration_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_rect_and_ab_partitions_decode_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_stream_with_a_32_level_ab_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_obmc_over_1to4_strip_neighbours_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_superres_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips ... ok
+test stream::tests::a_real_aomenc_10bit_partial_bottom_stripe_restoration_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_stream_with_a_diffwtd_compound_64x64_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_stream_with_aq_segmentation_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_stream_with_interintra_wedge_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_stream_with_onesided_compound_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_128x128_superblock_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_altref_sequence_hidden_frames_decode_pixel_exact ... ok
+test stream::tests::a_real_aomenc_filter_intra_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_band_stream_seed46_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_10bit_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_both_axes_cut_corner_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_both_axes_cut_corner_inter_frames_decode_pixel_exact ... ok
+test stream::tests::a_real_aomenc_compound_mv_stack_across_two_tile_columns_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_compound_mv_stack_with_global_motion_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_compound_mv_stack_with_temporal_mvs_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_class1_chroma_eob_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_128x128_none_root_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_directional_intra_block_with_angle_delta_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_non_dc_chroma_8x8_intra_leaf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_split_transform_intra_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_frame_edge_half_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_split_transform_intra_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_frame_with_a_64x64_intra_block_reads_the_no_cfl_uv_alphabet ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_whole_superblock_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_an_8x8_leaf_split_across_tile_columns_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_128x128_superblocks_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact ... ignored, gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a 32-level intra 1:4 strip in an inter frame -- class gate-blind-to-feature
+test stream::tests::a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit ... ignored, gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a 32-level intra 1:4 strip in an inter frame -- class gate-blind-to-feature
+test stream::tests::a_real_aomenc_inter_sequence_with_an_intra_rect_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_an_intra_rect_strip_decodes_pixel_exact_10bit ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_filter_intra_on_an_intra_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_16x16_level_ab_partitions_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_32x32_level_1to4_strips_codes_their_rect_residual has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_a_16_level_rect_leaf_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_a_coded_rectangular_residual_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_an_angle_delta_8x8_intra_leaf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_intra_sub8x8_leaves_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_sub8x8_inter_split_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_a_superblock_level_rect_partition_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_16x16_level_ab_partitions_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_32x32_level_1to4_strips_codes_their_rect_residual ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact_10bit ... ok
+test stream::tests::a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_16_level_rect_leaf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_forward_keyframes_and_temporal_mvs_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_a_coded_rectangular_residual_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_superblock_level_ab_partitions_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_temporal_mv_candidates_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_a_sub8x8_inter_split_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_a_superblock_level_rect_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_forward_keyframes_and_temporal_mvs_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_key_and_inter_superres_sequence_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_multi_tile_inter_10bit_stream_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_multi_tile_inter_stream_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_multi_tile_intra_10bit_stream_decodes_pixel_exact has been running for over 60 seconds
+test encoder::tests::bitrate_target_lands_within_5_percent_over_48_frames ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_intra_16x4_strips_in_1to4_partitions_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_multi_tile_intra_stream_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_inter_sequence_with_superblock_level_ab_partitions_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_palette_stream_decodes_pixel_exact_at_8_and_10_bit ... ok
+test stream::tests::a_real_aomenc_inter_sequence_with_temporal_mv_candidates_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_key_and_inter_superres_sequence_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_multi_tile_inter_10bit_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_rect_strip_palette_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_multi_tile_inter_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_multi_tile_intra_10bit_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_screen_key_frame_reads_use_intrabc_on_rect_strips ... ok
+test stream::tests::a_real_aomenc_screen_stream_with_palette_blocks_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_screen_inter_sequence_codes_palette_syntax_on_rect_intra_strips ... ok
+test stream::tests::a_real_aomenc_palette_stream_with_8x8_leaves_decodes_pixel_exact ... ok
+test encoder::tests::tile_bytes_do_not_depend_on_the_thread_count ... ok
+test encoder::tests::zero_gop_is_refused ... ok
+test stream::tests::a_real_aomenc_multi_tile_intra_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_multi_tile_palette_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_rect_inter_block_predicts_chroma_with_the_narrow_kernel_pixel_exact ... ok
+test stream::tests::a_real_aomenc_sb128_ab_partition_at_the_128_root_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_sb128_gathered_edge_horz_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_sb128_intra_rect_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_sb128_stream_whose_skipped_cfl_and_1to4_chroma_pairs_decode_pixel_exact ... ok
+test stream::tests::a_real_aomenc_square_only_inter_sequence_with_a_64x64_intra_superblock_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_whose_chroma_edge_filter_reads_a_sub16_neighbours_uv_mode_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_whose_frame_edge_partition_bit_is_horz_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_whose_square_block_reads_a_sub16_neighbours_mode_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_128x128_superblocks_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_16_level_1to4_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_32_level_ab_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_32x32_frame_edge_rect_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_32x32_level_1to4_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_bwdref_reference_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_sub8_rect_leaf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_coded_rect_strip_below_16x16_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact ... ignored, gate recipe never fires the feature (40/40 streams pixel-exact); needs a recipe that produces a rect64 dequant call with CURRENT_Q_IDX != base_q_idx -- class gate-blind-to-feature
+test stream::tests::a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_diffwtd_compound_64x64_block_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_last2_reference_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_last3_reference_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_rectangular_compound_wedge_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_coded_strip_whose_chroma_is_a_4to1_or_sub8_rect_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_diffwtd_compound_64x64_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_10bit_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_last2_reference_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_last3_reference_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_superblock_level_1to4_partition_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_superblock_level_ab_partition_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_rectangular_compound_wedge_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_10bit_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_cdef_and_sub16_inter_leaves_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_a_skipped_8x8_intra_leaf_whose_tx_split_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_directional_chroma_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_film_grain_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_superblock_level_1to4_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_superblock_level_ab_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_filter_intra_on_a_sub8_rect_leaf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_ab_partitions_below_16x16_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_ab_partitions_below_16x16_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_ab_partitions_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_an_altref2_reference_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_an_altref_reference_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_ab_partitions_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_an_altref2_reference_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_an_altref_reference_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_non_uniform_tile_spacing_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_cdef_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_compound_references_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_palette_uv_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_palette_y_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_delta_q_and_delta_lf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_filter_intra_on_a_32_level_1to4_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_filter_intra_on_a_horz_vert_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_filter_intra_on_a_sub16_horz_vert_strip_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_several_tile_group_obus_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_skipped_rect_inter_strips_keeps_the_cdef_skip_band ... ok
+test stream::tests::a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_free_partitions_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_two_tile_columns_and_an_inter_frame_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_interintra_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_interintra_wedge_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream ... ok
+test stream::tests::a_real_aomenc_stream_with_mandelbrot_fires_the_vert_b_partition_arm has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_interintra_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_two_tile_rows_decodes_through_decode_stream ... ok
+test stream::tests::a_real_aomenc_stream_with_obmc_8x8_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_obmc_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_rect_palette_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_interintra_wedge_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_rect_screen_content_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_mandelbrot_fires_the_vert_b_partition_arm ... ok
+test stream::tests::a_real_aomenc_stream_with_reference_select_reads_comp_mode_correctly has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_temporal_mvs_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_obmc_8x8_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_obmc_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_two_tile_inter_sequence_with_a_non_dc_chroma_8x8_intra_leaf_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_variance_aq_segmentation_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_warped_motion_refuses_or_matches has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_rect_palette_decodes_pixel_exact ... ok
+test stream::tests::a_real_film_key_frame_with_a_skipped_cfl_block_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_tiny_frame_size_sweep_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_superres_key_frame_sequence_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::a_real_aomenc_stream_with_rect_screen_content_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_stream_with_reference_select_reads_comp_mode_correctly ... ok
+test stream::tests::a_real_libaom_cfl_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_libaom_gradients_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact ... ok
+test stream::tests::a_real_libaom_stream_with_adst_decodes_end_to_end ... ok
+test stream::tests::a_real_obmc_stream_reads_a_recorded_switchable_filter_for_every_neighbour ... ok
+test stream::tests::a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly ... ok
+test stream::tests::a_real_aomenc_stream_with_temporal_mvs_decodes_pixel_exact ... ok
+test stream::tests::a_real_stream_decodes_identically_with_one_and_four_threads ... ok
+test stream::tests::a_real_aomenc_stream_with_variance_aq_segmentation_decodes_pixel_exact ... ok
+test stream::tests::a_screen_stream_with_16x4_intra_strips_in_inter_frames_decodes_pixel_exact ... ok
+test stream::tests::a_screen_stream_with_palette_8x8_leaves_in_inter_frames_decodes_pixel_exact ... ok
+test stream::tests::a_segmentation_census_over_real_aq_streams_finds_no_mode_overriding_feature ... ok
+test stream::tests::a_show_existing_frame_header_naming_an_empty_slot_is_refused_by_name ... ok
+test stream::tests::a_sub8_footprint_census_over_real_streams_leaves_the_intra_16x4_pairing_refusal_unreachable ... ok
+test stream::tests::a_real_aomenc_stream_with_warped_motion_refuses_or_matches ... ok
+test stream::tests::a_real_aomenc_superres_key_frame_sequence_decodes_pixel_exact ... ok
+test stream::tests::a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact ... ok
+test stream::tests::a_superres_census_over_six_real_streams_records_which_scaled_refusals_fire ... ok
+test stream::tests::a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg ... ok
+test stream::tests::a_twelve_bit_sequence_header_is_refused_by_name ... ok
+test stream::tests::an_inter_frame_naming_an_unrefreshed_primary_ref_slot_is_refused_by_name ... ok
+test stream::tests::an_inter_frame_opening_a_stream_is_refused_by_name ... ok
+test stream::tests::an_inter_frame_shorter_than_its_reference_is_refused_by_name ... ok
+test stream::tests::a_real_compound_global_warp_10bit_stream_decodes_pixel_exact ... ok
+test stream::tests::an_intra_coded_128_half_in_a_screen_content_inter_frame_decodes_pixel_exact ... ok
+test stream::tests::an_intra_coded_128_half_inside_an_inter_frame_decodes_pixel_exact ... ok
+test stream::tests::an_intrabc_block_under_tx_mode_select_decodes_pixel_exact ... ok
+test stream::tests::a_real_compound_global_warp_stream_decodes_pixel_exact ... ok
+test stream::tests::an_intrabc_census_over_screen_key_frames_measures_the_tx_select_refusal ... ok
+test stream::tests::debug_part32_r2_sbpart_pin_mismatch_geometry ... ignored, debug harness, run manually with EC_AV1_GATE_DUMP_PIN
+test stream::tests::decode_stream_agrees_with_ffmpeg_on_a_gop ... ok
+test stream::tests::decode_stream_matches_the_tile_path_on_a_key_frame ... ok
+test stream::tests::decode_stream_round_trips_a_gop ... ok
+test stream::tests::decode_stream_round_trips_an_odd_size_gop ... ok
+test stream::tests::every_frame_size_a_header_can_code_has_a_mode_info_grid ... ok
+test stream::tests::a_real_force_integer_mv_warp_10bit_stream_decodes_pixel_exact ... ok
+test stream::tests::no_per_frame_state_is_thread_local_any_more ... ok
+test stream::tests::pinned_golden3_stream_decodes_pixel_exact ... ignored, reads a pinned fixture path outside the repo; run manually
+test stream::tests::pinned_golden4_stream_decodes_pixel_exact ... ignored, reads a pinned fixture path outside the repo; run manually
+test stream::tests::pinned_golden7_stream_decodes_pixel_exact ... ignored, reads a pinned fixture path outside the repo; run manually
+test stream::tests::pinned_lr_sgr_stream_call_unique_dump ... ignored, reads a pinned fixture under the gitignored fixtures dir; run manually with EC_LR_CALL_DUMP=1
+test stream::tests::pinned_sbpart_stream_decodes_pixel_exact ... ignored, reads a pinned fixture path outside the repo; run manually
+test stream::tests::pinned_warp_stream_decodes_pixel_exact ... ignored, reads pinned fixture paths under the gitignored fixtures dir; run manually
+test stream::tests::probe_tiny_32x32_trace ... ignored, diagnostic, run manually with --nocapture
+test stream::tests::probe_tiny_fixture_trace ... ignored, diagnostic, run manually with --nocapture and EC_TINY_FIXTURE_PATH set
+test stream::tests::gradients_source_is_reproducible_per_seed ... ok
+test stream::tests::real_aomenc_film_grain_streams_decode_pixel_exact ... ok
+test stream::tests::a_real_force_integer_mv_warp_stream_decodes_pixel_exact ... ok
+test stream::tests::sb128_r2_control_sb64 ... ignored, lane-sb128 r2 diagnostic: is the frame-6 mismatch sb128-specific?
+test stream::tests::scratch_decode_pinned_stream_once ... ignored
+test stream::tests::scratch_isolate_pinned_mismatch ... ignored
+test stream::tests::streaming_decode_matches_the_collecting_one ... ok
+test stream::tests::sweep_rectx_recipes ... ignored, lane-rectx r3 scratch sweep
+test stream::tests::a_real_globalmv_8x8_leaf_stream_decodes_pixel_exact ... ok
+test stream::tests::a_real_stream_filters_identically_with_one_and_four_filter_threads ... ok
+test stream::tests::the_hunger_games_head_key_frame_decodes_pixel_exact ... ok
+test stream::tests::the_hunger_games_ss300_key_frame_skipped_cfl_decodes_pixel_exact ... ok
+test stream::tests::the_hunger_games_ss600_key_frame_skipped_split_tx_decodes_pixel_exact ... ok
+test superres::tests::upscale_row_matches_libaom_in8_out12 ... ok
+test superres::tests::upscale_row_matches_libaom_in8_out16 ... ok
+test superres::tests::upscale_row_of_a_flat_input_is_flat ... ok
+test superres::tests::upscale_row_with_real_margin_matches_libaom_in43_out64 ... ok
+test tile::tests::a_block_gathers_the_cells_its_neighbours_cover ... ok
+test tile::tests::a_coefficient_in_the_far_corner_reaches_the_last_end_of_block_group ... ok
+test tile::tests::a_coefficient_off_the_origin_selects_its_own_basis_function ... ok
+test stream::tests::a_real_stream_reconstructs_identically_with_one_and_four_recon_threads ... ok
+test tile::tests::a_dc_level_is_worth_half_as_much_each_time_the_transform_doubles ... ok
+test tile::tests::a_frame_that_hangs_off_the_bottom_codes_every_block ... ok
+test tile::tests::a_frame_that_is_not_a_whole_number_of_blocks_is_refused ... ok
+test tile::tests::a_frame_that_is_not_a_whole_number_of_superblocks_codes_every_block ... ok
+test tile::tests::a_level_grid_that_does_not_cover_the_frame_is_refused ... ok
+test tile::tests::a_newmv_block_reads_back_the_exact_symbol_sequence_it_was_written_with ... ok
+test tile::tests::a_quadrant_splits_into_four_sixteens ... ok
+test tile::tests::a_quantized_picture_decodes_to_what_the_encoder_reconstructed ... ok
+test tile::tests::a_single_ac_coefficient_varies_along_its_own_axis ... ok
+test tile::tests::a_split_superblock_decodes_each_quadrant_on_its_own_level ... ok
+test tile::tests::a_whole_superblock_at_the_frame_edge_is_refused ... ok
+test tile::tests::a_whole_superblock_covers_all_four_of_its_quadrants ... ok
+test tile::tests::an_all_skip_inter_superblock_is_small_and_reads_back ... ok
+test tile::tests::an_intra_block_in_an_inter_frame_is_caught_reading_kf_y_mode ... ok
+test tile::tests::an_intra_mode_outside_the_key_frame_set_is_refused ... ok
+test tile::tests::chroma_dc_signs_read_their_neighbours ... ok
+test tile::tests::coefficients_the_writer_cannot_code_are_refused ... ok
+test tile::tests::dc_levels_the_base_syntax_cannot_carry_are_refused ... ok
+test tile::tests::directional_modes_predict_from_the_neighbours_they_name ... ok
+test tile::tests::each_chroma_plane_codes_its_own_basis_function ... ok
+test tile::tests::a_dc_coefficient_moves_the_whole_block_off_mid_grey ... ok
+test tile::tests::each_superblock_decodes_to_the_grey_its_own_level_asks_for ... ok
+test tile::tests::every_quadrant_carries_its_own_coefficients ... ok
+test tile::tests::flat_key_frame_decodes_to_mid_grey ... ok
+test tile::tests::negating_the_levels_negates_the_residual ... ok
+test tile::tests::partial_superblocks_are_refused ... ok
+test tile::tests::rdoq_only_lowers_the_cost_and_reports_its_own_grid ... ok
+test tile::tests::the_default_scan_walks_every_position_outwards ... ok
+test tile::tests::the_golomb_tail_reads_back_as_the_level_it_was_written_for ... ok
+test tile::tests::the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_16x16_block ... ok
+test tile::tests::the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_32x32_block ... ok
+test tile::tests::the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_64x64_block ... ok
+test tile::tests::the_inverse_transform_reproduces_the_pinned_split_residuals ... ok
+test tile::tests::the_inverse_transform_reproduces_the_pinned_whole_superblock_residuals ... ok
+test tile::tests::the_price_grows_with_the_levels ... ok
+test tile::tests::the_priced_coefficient_bits_match_the_bytes_written ... ok
+test transform::lossless_tx_tests::the_walsh_hadamard_round_trip_is_exact ... ok
+test transform::tests::a_64x64_transform_keeps_what_fits_in_its_coded_quarter ... ok
+test transform::tests::a_fine_quantizer_roundtrips_a_residual_almost_exactly ... ok
+test transform::tests::a_flat_residual_is_a_dc_level_alone ... ok
+test transform::tests::a_typed_forward_round_trips_like_the_dct_one ... ok
+test transform::tests::a_wider_deadzone_codes_fewer_coefficients ... ok
+test transform::tests::a_zero_vector_transforms_to_zero ... ok
+test transform::tests::adst_dct_and_dct_adst_disagree_on_an_asymmetric_grid ... ok
+test transform::tests::iadst16_matches_libaoms_own_output ... ok
+test transform::tests::iadst4_an_all_zero_input_short_circuits_to_zero ... ok
+test transform::tests::iadst4_matches_libaoms_own_output ... ok
+test transform::tests::iadst8_is_not_symmetric_in_its_input_position ... ok
+test transform::tests::iadst8_matches_libaoms_own_output ... ok
+test transform::tests::iidentity_matches_libaoms_own_output_at_every_size ... ok
+test transform::tests::negating_the_residual_negates_every_level ... ok
+test transform::tests::rect_sizes_pinned_against_libaom ... ok
+test transform::tests::scratch_probe_32x32_dequant ... ignored
+test transform::tests::square_wrapper_matches_wh_core ... ok
+test transform::tests::the_avx2_dct_matches_the_scalar_one_over_the_full_range ... ok
+test transform::tests::the_eight_wide_dct_matches_the_scalar_one ... ok
+test transform::tests::the_fixed_point_forward_matches_the_exact_matmul ... ok
+test transform::tests::the_forward_network_has_one_uniform_gain ... ok
+test transform::tests::the_inverse_network_is_an_orthonormal_dct_over_eight ... ok
+test transform::tests::the_roundtrip_error_is_the_quantizer_and_only_the_quantizer ... ok
+test transform::tests::the_typed_forward_transform_is_bit_identical_to_the_strided_form ... ok
+test warp::gm_mv_tests::identity_is_always_zero ... ok
+test warp::gm_mv_tests::rotzoom_projects_block_centre_hp ... ok
+test warp::gm_mv_tests::rotzoom_projects_block_centre_no_hp ... ok
+test warp::gm_mv_tests::translation_force_integer_mv_rounds_to_full_pel ... ok
+test warp::gm_mv_tests::translation_shifts_params_by_13 ... ok
+test wedge::tests::wedge_codebook_matches_libaom_dump ... ok
+test tile::tests::levels_above_the_base_range_tail_carry_a_golomb_tail ... ok
+test stream::tests::a_real_warped_causal_8x8_leaf_stream_decodes_pixel_exact ... ok
+test stream::tests::a_sub8_leaf_census_over_intrabc_screen_streams_measures_the_sub8_refusal ... ok
+test stream::tests::a_superres_all_tools_sb128_stream_decodes_pixel_exact ... ok
+test stream::tests::a_superres_key_frame_with_cdef_and_loop_restoration_decodes_pixel_exact ... ok
+test stream::tests::an_intrabc_vartx_census_measures_the_mixed_leaf_refusal ... ok
+test stream::tests::an_sb128_screen_stream_with_intrabc_decodes_pixel_exact ... ok
+test stream::tests::real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal has been running for over 60 seconds
+test stream::tests::real_superres_streams_with_sub8_leaf8_and_warp_decode_pixel_exact has been running for over 60 seconds
+test stream::tests::the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact has been running for over 60 seconds
+test stream::tests::the_worker_pool_stays_bounded_across_repeated_threaded_decodes has been running for over 60 seconds
+test stream::tests::real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal ... ok
+test stream::tests::real_superres_streams_with_sub8_leaf8_and_warp_decode_pixel_exact ... ok
+test stream::tests::the_chroma_rect_gates_excluded_seed_46_decodes_pixel_exact ... ok
+test stream::tests::the_worker_pool_stays_bounded_across_repeated_threaded_decodes ... ok
+
+test result: ok. 560 passed; 0 failed; 44 ignored; 0 measured; 0 filtered out; finished in 883.57s
+
+RC=0
