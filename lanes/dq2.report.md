@@ -103,3 +103,15 @@ standing between it and the default is the capture row.
 * `deferred: long-GOP tpl depth above preset 0 --` only preset 0 was run; presets 3..6 already
   ship 4 and the preset-0 arm shows the axis is flat over a long GOP -- `unblocked by a lane that
   finds a reason to care`.
+
+## Invariants (release lib binary `ec_av1-8fef0196ab10338d`, this head, encoder unchanged)
+
+| check | result |
+|---|---|
+| full suite, detached | **567 passed / 0 failed / 45 ignored**, 1066s (the charter expected 44 ignored; this head has 45 and this lane added no test) |
+| `EC_COMP_MISMATCH=1`, presets 3 and 6 | **0 mismatch lines**, over `tile_bytes_do_not_depend_on_the_thread_count --include-ignored` and `the_facade_codes_the_same_bytes_as_encode_sequence` (all four runs ok) |
+| `every_speed_preset_decodes_sample_exact_through_both_decoders --ignored` | ok |
+| byte pins | `encode.rs:14681` unchanged: **8562** @ q150, **33357** @ q60; the pin test is in the suite above and passed |
+| `cargo check --workspace --all-targets -j4` | 0 errors, 0 ec-av1 warnings (21 pre-existing `ec-opus` doc warnings, 1 `ec-vorbis` oracle warning) |
+
+Logs: `~/.cache/dq2/{p3ctl,p3dq,p6ctl,p6dq,lg0ctl,lg0d4,lg6ctl,lg6dq,inv}.log`.
