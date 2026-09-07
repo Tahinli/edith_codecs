@@ -13570,8 +13570,12 @@ mod tests {
         // `base_q - 48` now ([`crate::encoder::Pyramid::key_q_offset`]), and
         // one of these four pictures is the key -- 8590 -> 9778 at q=150 and
         // 28535 -> 35450 at q=60. `EC_AV1_PYRAMID=8:-32:16:-8:0` restores these.
+        // Re-taken on lane-arfq: the leaves are coded 12 quantizer steps above
+        // base now, not 16 ([`crate::encoder::Pyramid::leaf_q_offset`]) -- 9778
+        // -> 9835 at q=150 and 35450 -> 35798 at q=60.
+        // `EC_AV1_PYRAMID=8:-32:16:-8:-48` restores these.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 9778, 0x1f95_859a_9851_8fd6), (60, 35450, 0xd404_19e7_e2ba_84ad)];
+            [(150, 9835, 0xfdac_0219_4a6e_111e), (60, 35798, 0xe57e_aa3f_8b48_d206)];
         for (q, bytes, hash) in pins {
             let encoded = encode_sequence(&source, q, 0.5).unwrap();
             assert_eq!(
