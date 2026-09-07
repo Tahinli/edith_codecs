@@ -1,6 +1,6 @@
 # lane-lossless2 — AV1 lossless INTER decode
 
-Branch `lane-lossless2`, base `99823eef`. Head `9fab5e37`.
+Branch `lane-lossless2`, base `99823eef`. Head `f4c75f48`.
 
 The refusal `"a lossless INTER frame (its chroma plane is still coded as one
 transform per block here)"` is gone from `stream.rs` and from
@@ -52,5 +52,27 @@ TEXTURED luma AND chroma and per-frame motion.
 | 320x192, 6 frames `-g 3`, 8-bit | same gate | EXACT |
 | 256x256, 4 frames `-g 2`, `-aom-params sb-size=128` | same gate | EXACT |
 
+## Screen content (palette) — three more defects, found by a `tune-content=screen` stream
+| defect | libaom | fix |
+|---|---|---|
+| a 4x4 chroma unit got the WHOLE-BLOCK palette prediction buffer and read it at its own stride, so every unit reconstructed the block's top-left corner | the luma split-transform paths already windowed; `predict_and_reconstruct_intra_block` predicts per unit | `decode::palette_window`, shared by `decode_block`, `decode_rect_split` and `read_intra_chroma_lossless`. 320x192 screen key frame: 9600/15360 chroma samples wrong -> 0 |
+| the two-cell neighbour read ran past the band for a unit whose block hangs off the frame edge (libaom still codes that unit: `max_blocks_high` clips in LUMA mi and then ROUNDS UP for chroma) | `get_txb_ctx` reads exactly ONE chroma entropy entry for TX_4X4 (`a[0]`/`l[0]`) | both helpers read one cell (`around_mi(cu_mi, MI)`) -- our bands carry that entry replicated over the unit's two luma-mi cells, so it is the same answer and never runs off |
+| a unit whose ORIGIN is past the frame edge was still read | `max_blocks_wide/high` | origin clip in both helpers |
+
+`tune-content=screen -crf 0` KEY frames at 320x192 and 640x384: sample-exact
+(`dump_yuv` vs `ffmpeg -pix_fmt yuv420p10le`, 0/122880 and 0/368640).
+
+## Gate results
+- `a_lossless_libaom_key_frame_decodes_sample_exact` + `a_lossless_libaom_inter_frame_decodes_sample_exact`: PASS (2 passed).
+- `cargo check --workspace --all-targets -j4`: RC=0, 0 errors, 0 ec-av1 warnings (the 21 warnings are pre-existing `ec-opus`).
+- DECIDING GATE `bd_rate_screen_native`: **RED**, one reference point:
+  `LADDER DECODE FAILURE: libaom-av1 ["-cpu-used","6","-b:v","0","-crf","5"] frame 0 plane Y sample 625: our decoder decoded 41, ffmpeg 40`.
+  That point used to be refused; it now decodes, and frame 0 (a KEY frame) is
+  wrong in ONE luma sample at (col 625, row 0) of 1920x1024. The BD row itself
+  computed: +33.4% vs libaom, -23.8% vs rav1e.
+
 ## Deferred
-- `deferred: a frame mixing lossless and lossy segments — still refused by name ("a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)"): every rule above keys off a frame-wide `lossless_flag`, so per-segment support means threading `segment_id` through `lossless()`, `lossless_tx()`, the WHT switch and the filter gates — unblocks: a libaom recipe that emits one (see below).`
+- `deferred: the bd_rate_screen_native crf-5 screen point — ONE luma sample (625, row 0) of frame 0, a lossless KEY frame, decodes 41 where ffmpeg decodes 40; every other sample of every other point is exact. Not reproduced by a synthetic 1920x1024 tune-content=screen -crf 5 key frame (0 samples differ), so it needs the gate's own stream — unblocks: dump the ladder stream (EC_ENC_OUT / the external_ladder recipe) and diff EC_TRACE_COEFF against aomdec around that block.`
+- `deferred: lossless INTER frames of SCREEN content desync — reproduced at 640x384 tune-content=screen -crf 0 -g 3: key frames 0 and 3 are sample-exact, inter frames 1/2/4/5 are not. Localised with the aomdec oracle to all_zero unit #23422 of the stream: the first LUMA unit of a block right after a sub-8x8 group reads txb_skip_ctx 3 where libaom reads 1 (one neighbour magnitude > 3 where libaom sees 0) — unblocks: that one block's above-band luma level; the synthetic non-screen inter fixtures in the gate are all exact, so it is screen/sub-8x8 specific.`
+- `deferred: a screen-content KEY-frame fixture is not yet IN the gate — verified by hand with dump_yuv this round; adding it to a_lossless_libaom_inter_frame_decodes_sample_exact is a one-case edit but the crate suite for this report was already running — unblocks: one suite re-run.`
+- `deferred: a frame mixing lossless and lossy segments — still refused by name ("a frame mixing lossless and lossy segments (the TX_4X4/WHT rules are per segment there)"): every rule above keys off a frame-wide `lossless_flag`, so per-segment support means threading `segment_id` through `lossless()`, `lossless_tx()`, the WHT switch and the filter gates — unblocks: a libaom recipe that emits one. Four tried this round at -crf 0 (aom-params aq-mode=1, aq-mode=2, aq-mode=3, deltaq-mode=1): none produced a frame whose segments disagree — the refusal never fired, i.e. every segment stayed at qindex 0.`
