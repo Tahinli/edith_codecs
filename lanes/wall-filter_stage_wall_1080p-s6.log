@@ -1,0 +1,20 @@
+
+running 1 test
+test encoder::tests::filter_stage_wall_1080p ... 
+1920x1080, 8 frames, 4x2 tiles, 8 tile threads: 4.36s wall, 1.83 fps
+| stage | ms | ms/frame | % of wall |
+| tile search | 2478 | 309.7 | 56.8% |
+| tile write | 64 | 8.1 | 1.5% |
+| filter: deblock replay | 366 | 45.7 | 8.4% |
+| filter: cdef replay | 501 | 62.6 | 11.5% |
+| filter: sse | 146 | 18.2 | 3.3% |
+| filter search (total) | 1561 | 195.2 | 35.8% |
+| capture decode | 0 | 0.0 | 0.0% |
+| lr search | 0 | 0.0 | 0.0% |
+| filter: plane copies | 434 | 54.3 | 9.9% |
+| filter: first decode | 204 | 25.5 | 4.7% |
+accounted 94.0% of wall; outside the tile search 43.2%
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 583 filtered out; finished in 4.73s
+
