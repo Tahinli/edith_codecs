@@ -12678,6 +12678,254 @@ mod tests {
         }
     }
 
+    /// The detector against the WHOLE real library (class
+    /// `unswept-decision-constants`, user rule "his data is the gate"):
+    /// every VIDEO row of `fixtures/real-library-manifest.tsv` -- plus the
+    /// two colour-bar fixtures as anchors -- decoded at 10/50/90% of its
+    /// duration, four frames each, 8-bit 4:2:0, at native size or a
+    /// 1920x1080 centred crop when larger (the crop keeps a capture's exact
+    /// repeats, which a downscale destroys -- class `gate-recipe-confound`).
+    /// Prints per file and offset the share of qualifying 16x16 blocks, the
+    /// [`screen_content`] verdict and a content hint (mean luma, luma
+    /// standard deviation, inter MAD), then sweeps the colour bound against
+    /// the variance floor over the whole library: for each (N, V) the worst
+    /// (highest) share among the camera/film rows against the best (lowest)
+    /// among the screen-recording rows, so the rule with the widest gap can
+    /// be read off. Rows carry the manifest index, codec and size only --
+    /// no titles, no home paths.
+    /// `cargo test -p ec-av1 --release --lib -- --ignored probe_screen_library --nocapture`
+    #[test]
+    #[ignore = "reads the real library"]
+    fn probe_screen_library() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP probe_screen_library: no ffmpeg");
+            return;
+        }
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let Ok(manifest) = std::fs::read_to_string(fixtures.join("real-library-manifest.tsv")) else {
+            eprintln!("SKIP probe_screen_library: no real-library manifest");
+            return;
+        };
+        let limits = [4usize, 8, 16, 32, 64];
+        let floors = [0u64, 4, 8, 16, 32, 64, 128];
+        // Whatever ffmpeg gave us, without the exact-count assertion the
+        // gate loaders make: a seek near the end of a clip returns fewer
+        // frames, and that is a row to print, not a panic.
+        let decode = |clip: &str, seek: &str, vf: &str, w: usize, h: usize, n: usize| -> Vec<Picture> {
+            let out = Command::new("ffmpeg")
+                .args(["-v", "error", "-ss", seek, "-i", clip])
+                .args(["-frames:v", &n.to_string()])
+                .args(["-vf", vf])
+                .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+                .output();
+            let Ok(out) = out else { return Vec::new() };
+            if !out.status.success() {
+                return Vec::new();
+            }
+            let (luma, chroma) = (w * h, w * h / 4);
+            let frame_len = luma + 2 * chroma;
+            (0..out.stdout.len() / frame_len)
+                .map(|i| {
+                    let b = &out.stdout[i * frame_len..][..frame_len];
+                    Picture {
+                        width: w,
+                        height: h,
+                        y: b[..luma].iter().map(|&v| u16::from(v)).collect(),
+                        u: b[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                        v: b[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+                    }
+                })
+                .collect()
+        };
+        // Share (%) of 16x16 blocks with 2..=N colours and per-pixel
+        // variance > V, for every (N, V) of the sweep grid, over one frame.
+        let census = |y: &[u8], w: usize, h: usize| -> [[f64; 7]; 5] {
+            let mut hit = [[0usize; 7]; 5];
+            let mut blocks = 0usize;
+            for by in (0..h).step_by(16) {
+                for bx in (0..w).step_by(16) {
+                    let (bh, bw) = ((h - by).min(16), (w - bx).min(16));
+                    let mut seen = [false; 256];
+                    let (mut colors, mut sum, mut sq) = (0usize, 0u64, 0u64);
+                    for row in 0..bh {
+                        for col in 0..bw {
+                            let v = y[(by + row) * w + bx + col];
+                            sum += u64::from(v);
+                            sq += u64::from(v) * u64::from(v);
+                            if !seen[usize::from(v)] {
+                                seen[usize::from(v)] = true;
+                                colors += 1;
+                            }
+                        }
+                    }
+                    let n = (bh * bw) as u64;
+                    let var = (sq - sum * sum / n) / n;
+                    blocks += 1;
+                    for (li, &limit) in limits.iter().enumerate() {
+                        if colors > 1 && colors <= limit {
+                            for (fi, &floor) in floors.iter().enumerate() {
+                                hit[li][fi] += usize::from(var > floor);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut out = [[0f64; 7]; 5];
+            for li in 0..5 {
+                for fi in 0..7 {
+                    out[li][fi] = 100.0 * hit[li][fi] as f64 / blocks.max(1) as f64;
+                }
+            }
+            out
+        };
+        // (index, label, path, duration, screen-by-its-own-content). The
+        // OBS directory and the OBS file-name shape ("YYYY-MM-DD HH-MM-SS")
+        // are desktop recordings; everything else in this library is camera
+        // or film material.
+        let mut rows: Vec<(String, String, String, f64, bool)> = Vec::new();
+        for (label, file) in [("bars 1080p", "h264-1080p-23.976-8bit.mp4"), ("bars 2160p", "h264-2160p-23.976-8bit.mp4")] {
+            let path = fixtures.join("video").join(file);
+            if path.exists() {
+                rows.push(("fx".into(), label.into(), path.to_str().unwrap().into(), 10.0, false));
+            }
+        }
+        for (i, line) in manifest.lines().skip(1).enumerate() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 10 {
+                continue;
+            }
+            let (path, codec) = (f[0], f[2]);
+            if codec == "-" || codec.is_empty() {
+                continue;
+            }
+            let (Ok(w), Ok(h)) = (f[3].parse::<usize>(), f[4].parse::<usize>()) else {
+                eprintln!("SKIP {}: manifest carries no coded size", i + 1);
+                continue;
+            };
+            if !std::path::Path::new(path).exists() {
+                eprintln!("SKIP {}: file is gone", i + 1);
+                continue;
+            }
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let is_capture = path.contains("/OBS/")
+                || (name.len() > 19
+                    && name.as_bytes()[4] == b'-'
+                    && name.as_bytes()[7] == b'-'
+                    && name.as_bytes()[10] == b' '
+                    && name.as_bytes()[13] == b'-');
+            rows.push((
+                format!("{}", i + 1),
+                format!("{codec} {w}x{h}"),
+                path.to_string(),
+                f[8].parse::<f64>().unwrap_or(0.0),
+                is_capture,
+            ));
+        }
+        // Per (N, V): the worst camera/film row and the best screen row, so
+        // the separation of the whole library is one subtraction.
+        let (mut cam_max, mut scr_min) = ([[0f64; 7]; 5], [[100f64; 7]; 5]);
+        eprintln!("| idx | codec size | class | offset | qualifying blocks | verdict | mean/sd/MAD |");
+        for (idx, label, path, dur, is_capture) in &rows {
+            let Some((nw, nh)) = probe_dims(path) else {
+                eprintln!("SKIP {idx}: ffprobe gave no size");
+                continue;
+            };
+            let (cw, ch) = (nw.min(1920) & !1, nh.min(1080) & !1);
+            let (x, y0) = ((nw - cw) / 2 & !1, (nh - ch) / 2 & !1);
+            let vf = format!("crop={cw}:{ch}:{x}:{y0}");
+            let mut file_grid = [[0f64; 7]; 5];
+            let mut file_frames = 0usize;
+            for pct in [10u32, 50, 90] {
+                let seek = format!("{:.3}", dur * f64::from(pct) / 100.0);
+                let frames = decode(path, &seek, &vf, cw, ch, 4);
+                if frames.is_empty() {
+                    eprintln!("| {idx} | {label} | {} | {pct}% | SKIP: ffmpeg decoded no frame here |", if *is_capture { "screen" } else { "camera" });
+                    continue;
+                }
+                let (mut share, mut yes, mut mean, mut sd, mut mad) = (0f64, 0usize, 0f64, 0f64, 0f64);
+                let mut prev: Option<Vec<u8>> = None;
+                for picture in &frames {
+                    let y: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
+                    let grid = census(&y, cw, ch);
+                    for li in 0..5 {
+                        for fi in 0..7 {
+                            file_grid[li][fi] += grid[li][fi];
+                        }
+                    }
+                    file_frames += 1;
+                    // The shipped rule is (16 colours, var > 16): grid row 2,
+                    // floor 16 is column 3.
+                    share += grid[2][3];
+                    yes += usize::from(screen_content(&y, cw, cw, ch));
+                    let n = y.len() as f64;
+                    let sum: f64 = y.iter().map(|&v| f64::from(v)).sum();
+                    let sq: f64 = y.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+                    mean += sum / n;
+                    sd += (sq / n - (sum / n) * (sum / n)).max(0.0).sqrt();
+                    if let Some(p) = &prev {
+                        mad += p.iter().zip(&y).map(|(&a, &b)| f64::from(a.abs_diff(b))).sum::<f64>() / n;
+                    }
+                    prev = Some(y);
+                }
+                let f = frames.len() as f64;
+                eprintln!(
+                    "| {idx} | {label} | {} | {pct}% | {:.1}% | {} ({yes}/{} frames) | {:.0}/{:.1}/{:.2} |",
+                    if *is_capture { "screen" } else { "camera" },
+                    share / f,
+                    if yes * 2 > frames.len() { "SCREEN" } else { "camera" },
+                    frames.len(),
+                    mean / f,
+                    sd / f,
+                    mad / (f - 1.0).max(1.0),
+                );
+            }
+            if file_frames == 0 {
+                continue;
+            }
+            for li in 0..5 {
+                for fi in 0..7 {
+                    let s = file_grid[li][fi] / file_frames as f64;
+                    match is_capture {
+                        true => scr_min[li][fi] = scr_min[li][fi].min(s),
+                        false => cam_max[li][fi] = cam_max[li][fi].max(s),
+                    }
+                }
+            }
+        }
+        eprintln!("sweep over the whole library -- worst camera/film share vs best screen share, per (N colours, var > V):");
+        eprintln!("  N \\ V |{}", floors.iter().map(|f| format!("{:>18}", format!("V>{f}"))).collect::<String>());
+        let (mut best, mut best_rule) = (f64::MIN, (16usize, 16u64));
+        for (li, &limit) in limits.iter().enumerate() {
+            let mut row = String::new();
+            for fi in 0..7 {
+                let (c, s) = (cam_max[li][fi], scr_min[li][fi]);
+                row.push_str(&format!("{:>18}", format!("{c:.1}/{s:.1} {:+.1}", s - c)));
+                if s - c > best {
+                    best = s - c;
+                    best_rule = (limit, floors[fi]);
+                }
+            }
+            eprintln!("  {limit:>5} |{row}");
+        }
+        // The threshold sits at the midpoint of the widest gap; the shipped
+        // constant is its reciprocal in whole parts of the frame.
+        let (li, fi) = (
+            limits.iter().position(|&l| l == best_rule.0).unwrap(),
+            floors.iter().position(|&f| f == best_rule.1).unwrap(),
+        );
+        let mid = (cam_max[li][fi] + scr_min[li][fi]) / 2.0;
+        eprintln!(
+            "widest split: {} colours, var > {}, gap {:+.1} points (camera <= {:.1}%, screen >= {:.1}%); threshold {:.1}% = EC_AV1_SCREEN_PCT {}",
+            best_rule.0,
+            best_rule.1,
+            best,
+            cam_max[li][fi],
+            scr_min[li][fi],
+            mid,
+            (100.0 / mid.max(0.1)).round() as usize,
+        );
+    }
+
     /// The missing instrument: what this encoder costs against libaom and
     /// rav1e at matched fidelity, and how long it takes to get there.
     ///
