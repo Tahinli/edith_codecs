@@ -372,6 +372,7 @@ static FILTER_INTRA_HITS: [std::sync::atomic::AtomicUsize; 6] =
 
 /// Reads [`FILTER_INTRA_HITS`] and zeroes it, so a gate can attribute the
 /// counts to its own encode.
+#[cfg(test)]
 pub(crate) fn take_filter_intra_hits() -> [usize; 6] {
     std::array::from_fn(|i| FILTER_INTRA_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
