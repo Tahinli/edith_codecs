@@ -2846,6 +2846,72 @@ mod tests {
         }
     }
 
+    /// A clip whose inter residual is HIGH-FREQUENCY (lane-b64b): every
+    /// frame adds a 4-pixel checkerboard, so the 64x64 root's prediction is
+    /// off by exactly the detail a TX_64X64 throws away (it codes only the
+    /// top-left 32x32 corner of its coefficient space) and the root's var-tx
+    /// arm splits its luma into four TX_32X32 units instead. The counter is
+    /// the gate (class `gate-blind-to-feature`), and a `txfm_split` the
+    /// reader does not expect desyncs the whole tile, so both decoders have
+    /// to reconstruct it sample-exact.
+    #[test]
+    fn a_high_frequency_clip_splits_the_64x64_roots_luma_and_decodes_sample_exact() {
+        let _knobs = crate::speed::knob_write();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (256usize, 128usize);
+        let still = test_card(width, height, 0);
+        let sources: Vec<Picture> = (0..4)
+            .map(|t| {
+                let mut p = still.clone();
+                for (i, v) in p.y.iter_mut().enumerate() {
+                    let checker = ((i % width) / 4 + (i / width) / 4) % 2;
+                    let bump = (t * 5 * (checker + 1)) as u16;
+                    *v = (*v + bump).min(255);
+                }
+                p
+            })
+            .collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 90,
+            gop: 8,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        let _ = crate::encode::take_b64_var_tx_hits();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let split = crate::encode::take_b64_var_tx_hits();
+        assert!(split > 0, "no 64x64 root split its luma transform at all");
+        eprintln!("64x64 roots with a SPLIT luma transform: {split}");
+
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_luma(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+        for (i, (ours_i, theirs_i)) in ours.iter().zip(&theirs).enumerate() {
+            let got: Vec<u8> = ours_i.y.iter().map(|&v| v as u8).collect();
+            if let Some(at) = got.iter().zip(theirs_i).position(|(x, y)| x != y) {
+                panic!(
+                    "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                    at % width,
+                    at / width,
+                    got[at],
+                    theirs_i[at],
+                );
+            }
+        }
+    }
+
     /// A CROSSFADE clip (lane-b64b): each picture is a linear blend of two
     /// stills, so on a leaf frame the average of its past (`LAST`) and future
     /// (`ALTREF`) references IS the source and neither reference alone is --

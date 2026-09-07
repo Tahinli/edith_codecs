@@ -493,6 +493,30 @@ pub fn take_b64_compound_hits() -> usize {
     B64_COMPOUND_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether a 64x64 root that codes a residual may SPLIT its luma transform
+/// (lane-b64b): four TX_32X32 units instead of the one TX_64X64, decided by
+/// [`commit_inter_luma`] like every other inter block's var-tx, and coded by
+/// the writer's `Whole64` arm as `txfm_split = 1`. It exists because
+/// TX_64X64 zeroes everything outside its 32x32 corner, so a root whose
+/// residual has detail in the other three quadrants cannot code it at all.
+///
+/// Off by `EC_AV1_B64VARTX=0`.
+fn b64_var_tx() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B64VARTX").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b64_root()
+}
+
+/// How many 64x64 roots split their luma transform since the last
+/// [`take_b64_var_tx_hits`].
+static B64_VAR_TX_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The split-luma 64x64-root count since the last call, and zero it.
+pub fn take_b64_var_tx_hits() -> usize {
+    B64_VAR_TX_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the encoder searches loop restoration at all (spec 7.17): one
 /// Wiener filter per 64x64 luma restoration unit, picked from
 /// [`crate::filter_search::WIENER_CANDIDATES`]. Swept by `EC_AV1_LR` in a
@@ -3412,7 +3436,7 @@ fn commit_inter_luma(
         && !skip
         && side >= 16
         && (second.is_none() || compound_var_tx())
-        && (side < BLOCK || tx32_depth_search())
+        && (side != BLOCK || tx32_depth_search())
         && x + side <= luma.true_width
         && y + side <= luma.true_height;
     if !eligible {
@@ -3420,7 +3444,14 @@ fn commit_inter_luma(
         return (flat.levels.clone(), 0, 0.0);
     }
     let tx = side / 2;
-    let set = if tx >= 16 { TxbSet::Luma16Inter } else { TxbSet::Luma8Inter };
+    let set = if tx >= 32 {
+        // lane-b64b: the 64x64 root's halved transform is TX_32X32.
+        TxbSet::Luma32Inter
+    } else if tx >= 16 {
+        TxbSet::Luma16Inter
+    } else {
+        TxbSet::Luma8Inter
+    };
     let mut levels = vec![0i32; side * side];
     let (mut sse, mut bits) = (0.0, 0.0);
     let mut units = Vec::with_capacity(4);
@@ -3454,14 +3485,22 @@ fn commit_inter_luma(
     let split_cost = sse + search.lambda * (bits + txfm_split_bits(side, 1));
     let flat_cost = flat.sse + search.lambda * (flat.bits + txfm_split_bits(side, 0));
     let class = usize::from(side == BLOCK) * 4 + usize::from(second.is_some()) * 2;
+    // The depth census has a leaf row and a 32x32 row and no 64 one, so the
+    // 64x64 root counts itself ([`take_b64_var_tx_hits`]) instead of landing
+    // in the leaf row (class `gate-blind-to-feature`).
+    let counted = side <= BLOCK;
     if split_cost < flat_cost {
         for (tu_x, tu_y, trial) in &units {
             luma.commit(*tu_x, *tu_y, tx, trial);
         }
-        INTER_TX_SPLIT_HITS[class + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if counted {
+            INTER_TX_SPLIT_HITS[class + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return (levels, 1, split_cost - flat_cost);
     }
-    INTER_TX_SPLIT_HITS[class].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if counted {
+        INTER_TX_SPLIT_HITS[class].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     luma.commit(x, y, side, flat);
     (flat.levels.clone(), 0, 0.0)
 }
@@ -7642,6 +7681,13 @@ fn search_skip_64(
     // two numbers are comparable: `fixed` charged `skip` coded 1, and this
     // arm charges 0 instead and adds its three planes' coefficient bits.
     let mut chosen = (skip_cost, true, skip_trials);
+    // Set when [`commit_inter_luma`] already wrote the residual arm's luma
+    // into the plane, so the tail below does not commit over its units.
+    let mut luma_committed = false;
+    // The residual arm's luma levels and the `txfm_split` depth the writer
+    // codes: depth 0 is the TX_64X64 corner in 32x32 coordinates, depth 1 is
+    // four TX_32X32 units in 64x64 ones.
+    let mut luma_levels: Option<(Vec<i32>, u8)> = None;
     if residual {
         let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
         let residual_trials = [0usize, 1, 2].map(|plane| {
@@ -7663,16 +7709,54 @@ fn search_skip_64(
         });
         let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
         let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
+        // lane-b64b: the root's own var-tx decision -- one TX_64X64 or the
+        // four TX_32X32 units of `txfm_split = 1`, taken by the same
+        // `commit_inter_luma` every other inter block's is (it commits the
+        // winner and hands back the cost it took off the flat arm).
+        let (levels, depth, gain) = if b64_var_tx() {
+            let second = info.ref1.and_then(|r1| {
+                compound.iter().find(|(r, _, _)| *r == r1).map(|&(_, g, _)| {
+                    (
+                        info.mv1,
+                        (g.y.as_slice(), g.width, luma.true_width, luma.true_height),
+                    )
+                })
+            });
+            luma_committed = true;
+            commit_inter_luma(
+                luma,
+                (x, y),
+                side,
+                info.mv,
+                (&reference.y, reference.width, luma.true_width, luma.true_height),
+                search,
+                &residual_trials[0],
+                false,
+                second,
+                fctx,
+            )
+        } else {
+            (residual_trials[0].levels.clone(), 0, 0.0)
+        };
         let cost = residual_trials.iter().map(|t| t.sse).sum::<f64>()
-            + search.lambda * (syntax + unskip + coeff_bits);
+            + search.lambda * (syntax + unskip + coeff_bits)
+            + gain;
         if cost < skip_cost {
             B64_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if depth == 1 {
+                B64_VAR_TX_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            luma_levels = Some((levels, depth));
             chosen = (cost, false, residual_trials);
         }
     }
 
     let (cost, skip, trials) = chosen;
-    luma.commit(x, y, side, &trials[0]);
+    // `commit_inter_luma` already wrote the residual arm's luma (its four
+    // split units are not one 64-sided trial); a skip winner overwrites it.
+    if skip || !luma_committed {
+        luma.commit(x, y, side, &trials[0]);
+    }
     chroma[0].commit(x / 2, y / 2, side / 2, &trials[1]);
     chroma[1].commit(x / 2, y / 2, side / 2, &trials[2]);
     Some((
@@ -7680,9 +7764,16 @@ fn search_skip_64(
         BlockCoeffs {
             skip,
             inter: Some(info),
-            // Both grids are 32-sided: the luma one is the 64-point
-            // transform's coded corner, the chroma ones are whole TX_32X32.
-            luma: if skip { Vec::new() } else { coeffs(&trials[0].levels, BLOCK) },
+            // The chroma grids are whole TX_32X32; the luma one is the
+            // 64-point transform's coded 32x32 corner at depth 0 and the
+            // whole 64-sided block at depth 1 (lane-b64b).
+            tx_depth: luma_levels.as_ref().map_or(0, |&(_, d)| d),
+            luma: match (skip, &luma_levels) {
+                (true, _) => Vec::new(),
+                (false, Some((levels, 1))) => coeffs(levels, SUPERBLOCK),
+                (false, Some((levels, _))) => coeffs(levels, BLOCK),
+                (false, None) => coeffs(&trials[0].levels, BLOCK),
+            },
             u: if skip { Vec::new() } else { coeffs(&trials[1].levels, side / 2) },
             v: if skip { Vec::new() } else { coeffs(&trials[2].levels, side / 2) },
             ..BlockCoeffs::default()
@@ -15024,6 +15115,17 @@ mod tests {
             // the real side, a screen clip none of them.
             let (price_default, price_real) = crate::tile::take_pricing_hits();
             eprintln!("{name}: pricer armings default={price_default} real={price_real}");
+            // The 64x64 root's own fire shares (lane-b64/tx64/b64b): how many
+            // superblocks stayed whole, and how many of those coded a
+            // residual, split that residual's luma, or took a compound
+            // reference (class `gate-blind-to-feature`).
+            eprintln!(
+                "{name}: 64x64 roots {} (with a residual {}, split luma {}, compound {})",
+                take_b64_root_hits(),
+                take_b64_residual_hits(),
+                take_b64_var_tx_hits(),
+                take_b64_compound_hits(),
+            );
             // lane-av1obmc2: the same motion_mode census the 640x384 gate
             // prints (class `gate-blind-to-feature`) -- how many blocks coded
             // the symbol at each footprint and how many took OBMC. Without it

@@ -3962,13 +3962,13 @@ fn write_luma_tus(
     // tables, not the intra ones (`TxbSet::Luma*Inter`).
     inter: bool,
 ) -> Result<()> {
-    if tx < side && side > 32 {
+    if tx < side && side > 32 && tx < 32 {
         // A 64x64 block's own levels reach the writer as the 32x32 corner a
-        // 64-point transform codes, not as a 64x64 block grid, so there is
-        // nothing to slice per unit here.
+        // 64-point transform codes unless the whole block was SPLIT into
+        // TX_32X32 units (lane-b64b), so any finer split has nothing to slice.
         return Err(Error::unsupported(
             "AV1 tile",
-            "a 64x64 block's split luma transform is not written yet",
+            "a 64x64 block's luma transform splits no finer than TX_32X32",
         ));
     }
     let coeff_side = tx.min(32);
@@ -4377,8 +4377,25 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
                     return match block.skip {
                         true => 0.0,
                         false => {
-                            coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx, 0, 0)
-                                + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx, 0, 0)
+                            // lane-b64b: at `tx_depth = 1` the luma levels are
+                            // the whole 64-sided block, written as four
+                            // TX_32X32 units, so the pricer slices them the
+                            // same way the writer does.
+                            let luma = if block.tx_depth == 1 {
+                                let g = dense(&block.luma, 64);
+                                (0..4)
+                                    .map(|tu| {
+                                        let (r0, c0) = ((tu / 2) * 32, (tu % 2) * 32);
+                                        let unit: Vec<i32> = (0..32)
+                                            .flat_map(|row| g[(r0 + row) * 64 + c0..][..32].to_vec())
+                                            .collect();
+                                        coeff_bits(&unit, TxbSet::Luma32Inter, q_ctx, 0, 0)
+                                    })
+                                    .sum::<f64>()
+                            } else {
+                                coeff_bits(&dense(&block.luma, 32), TxbSet::Luma64, q_ctx, 0, 0)
+                            };
+                            luma + coeff_bits(&dense(&block.u, 32), TxbSet::Chroma32, q_ctx, 0, 0)
                                 + coeff_bits(&dense(&block.v, 32), TxbSet::Chroma32, q_ctx, 0, 0)
                         }
                     };
@@ -5734,9 +5751,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     // A skipped inter block writes no `txfm_split` at all --
                     // that call only publishes the max transform size the
                     // reader infers for it; an unskipped one writes the
-                    // `txfm_split` flag, 0 here because a 64x64 root's luma
-                    // is one whole TX_64X64 (depth 1 is lane-tx64's deferred
-                    // var-tx arm).
+                    // `txfm_split` flag: 0 when the root's luma is one whole
+                    // TX_64X64, 1 when it is the four TX_32X32 units
+                    // lane-b64b's var-tx arm chose.
                     write_tx_syntax_inter(
                         &mut enc,
                         &mut cdfs,
@@ -5745,7 +5762,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         SB,
                         true,
                         block.skip,
-                        0,
+                        usize::from(block.tx_depth),
                     );
                 }
                 if block.skip {
@@ -5757,11 +5774,32 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     // `sb_coeff_key_frame_tile`'s `Superblock::Whole` writes),
                     // chroma one whole TX_32X32 per plane, and `split` is
                     // false because the luma transform covers the block.
+                    // lane-b64b: at `txfm_split = 1` the luma levels arrive in
+                    // 64x64 block coordinates and are written as the four
+                    // TX_32X32 units `write_luma_tus` slices out, each
+                    // publishing its own coefficient context before the next
+                    // one reads it; chroma is one TX_32X32 per plane either
+                    // way.
+                    let split = block.tx_depth == 1;
                     let grids = [
-                        level_grid(&block.luma, TX32)?,
+                        level_grid(&block.luma, if split { SB } else { TX32 })?,
                         level_grid(&block.u, TX32)?,
                         level_grid(&block.v, TX32)?,
                     ];
+                    if split {
+                        write_luma_tus(
+                            &mut enc,
+                            &mut cdfs,
+                            &mut neighbours,
+                            (mi_r, mi_c),
+                            SB,
+                            TX32,
+                            &grids[0],
+                            0,
+                            &all_scans,
+                            true,
+                        )?;
+                    }
                     write_block_planes(
                         &mut enc,
                         &mut cdfs,
@@ -5770,9 +5808,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         &[&scan32, &scan32, &scan32],
                         &neighbours.around(sb_at, SB),
                         0,
-                        false,
+                        split,
                     );
-                    neighbours.record_planes(sb_at, SB, 0, &grids, true);
+                    neighbours.record_planes(sb_at, SB, 0, &grids, !split);
                 }
                 neighbours.record_inter(sb_at, SB, block.skip, true, block_ref(block));
                 record_block_compound(&mut neighbours, (mi_r, mi_c), SB, block);
