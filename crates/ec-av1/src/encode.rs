@@ -14348,6 +14348,7 @@ mod tests {
     ///     EC_AV1_PAL_MAXCOLORS=256 ... same command        # palette bound
     ///     EC_AV1_TILES=1:1 EC_AV1_TILE_THREADS=4 ...       # 2x2 tiles
     ///     EC_AV1_PYRAMID=0 ... same command                # no coding pyramid
+    ///     EC_AV1_GOP_LAYOUT=fixed ... same command          # no tail absorbing
     ///     EC_AV1_GATE_FACADE=1 ... same command            # the facade arm
     ///
     /// The coding pyramid is the DEFAULT of the sequence path this arm codes

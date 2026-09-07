@@ -1,0 +1,84 @@
+lane-gopad -- a GOP-LENGTH-AWARE mini-GOP layout
+================================================
+
+Why. `Pyramid::default` is 8:-32:16, decided on the 48-frame gate
+(`encode::tests::bd_rate_film_long_gop`, lanes/pyr4.sweep.txt). The 12-frame
+gate `bd_rate_screen_native` preferred 16:-24:16 there, and lane-pyr4 wrote
+the price down: at gop 12 a FIXED mini-GOP of 8 splits 11 inter pictures into
+8 + 3, and the 3-picture tail group is the expensive part. The shape was
+never the disagreement -- the tail was.
+
+The change (crates/ec-av1/src/encoder.rs). `Av1Encoder::encode_frames` no
+longer closes a group at `pyramid.mini_gop` flat; it asks `group_target()`
+how big the group being collected should be, given the pictures left before
+the next key frame (`config.gop - run_start % config.gop`, known to both
+entry points: `encode_sequence` sets gop = pictures.len(), the facade has it
+in its config). The rule shipped is ABSORB TAIL: while more than 1.5 x
+mini_gop is left, take mini_gop; otherwise take all of it.
+  remaining 11, mini_gop 8 -> 11          (was 8 + 3)
+  remaining 47, mini_gop 8 -> 8,8,8,8,8,7 (unchanged -> byte-identical)
+  remaining  3, mini_gop 8 -> 3           (the 4-picture pin clip, unchanged)
+`EC_AV1_GOP_LAYOUT=fixed` restores the old rule for an A/B.
+
+SHORT-GOP TABLE (`bd_rate_screen_native`, 12 frames, gop 12, EC_AV1_NATIVE_FILM=1
+EC_AV1_NATIVE_FILM4K=1, pyramid 8:-32:16 on every row; BD-rate %, lower better).
+Rows keyed by each log's own "pyramid requested/effective" print.
+
+| layout | film A vs libaom / rav1e | film B vs libaom / rav1e | bars 1080p | bars 2160p |
+|---|---|---|---|---|
+| fixed 8 + 3 (shipped, lanes/pyr4) | +51.2 / +21.4 | +91.0 / +53.5 | +4.8 / -11.5 | +20.5 / -3.4 |
+| balanced 6 + 5 (lanes/gopad/s12-balanced.log) | +48.4 / +18.5 | +82.0 / +46.0 | +3.6 / -12.5 | +14.2 / -8.7 |
+| absorb -> 11 ** SHIPS ** (lanes/gopad/s12-absorb.log) | +43.9 / +15.6 | +68.4 / +38.2 | +2.0 / -14.0 | +13.5 / -9.6 |
+| (reference) fixed with mini_gop 16, arf -24, lanes/pyr3 | +44.2 / +15.7 | +70.5 / +35.2 | -- | -- |
+
+Both films improve on both columns against the shipped fixed layout, by
+7.3 / 5.8 (film A) and 22.6 / 15.3 (film B); the two bars rows improve too.
+Against the 16:-24:16 shape the 12-frame gate used to prefer, absorb at
+8:-32:16 is better on three columns (+43.9 vs +44.2, +15.6 vs +15.7, +68.4 vs
++70.5) and 3.0 short on one (film B vs rav1e +38.2 vs +35.2). The balanced
+split (equal groups <= mini_gop) is measurably WORSE than absorbing on every
+row: at gop 12 the longer single group wins, so 6 + 5 was dropped.
+
+CANDIDATE (c), per-group ARF offset scaled by log2(group_len)/log2(mini_gop):
+NOT BUILT. Its purpose was to give the longer (absorbed) group the -24 the
+12-frame gate liked, and the measurement above says the opposite -- the group
+of 11 at arf -32 already beats the recorded -24 arm on three of four columns,
+so the scaling would move away from the optimum. Skipped, with the numbers.
+
+LONG-GOP TABLE (`bd_rate_film_long_gop`, 48 frames, gop 48, 8:-32:16).
+
+| layout | film A vs libaom / rav1e | film B vs libaom / rav1e |
+|---|---|---|
+| fixed, as recorded on the pyr4 BRANCH | +55.7 / +13.5 | +165.1 / +56.6 |
+| fixed, control on THIS head (lanes/gopad/s48-fixed.log) | +55.2 / +12.8 | +151.3 / +47.4 |
+| absorb ** SHIPS ** (lanes/gopad/s48-absorb.log) | +55.2 / +12.8 | +151.3 / +47.4 |
+
+The control arm is the row that matters: main has moved since lane-pyr4
+measured (filter intra among others), so the pyr4 row is not this head's
+baseline -- film B is 13.8 / 9.2 better here for reasons that predate this
+lane. Against the control, absorb is IDENTICAL: every one of the eight ladder
+points matches byte for byte (film A 195531 / 356977 / 619801 / 1331401 B,
+film B 76541 / 171950 / 393470 / 1006532 B) at the same PSNR, so the 48-frame
+gate does not move by 0.0 on any of the four columns, not merely by <= 0.3.
+
+47 inter pictures take 8,8,8,8,8,7 under BOTH rules -- a group's boundaries
+are all `drain_pending` consumes, so the 48-frame stream is byte-identical
+and the confirmation arm reproduces the recorded numbers rather than
+approaching them. Pinned by `encoder::tests::the_mini_gop_layout_leaves_no
+_short_tail`, which walks both rules over mini_gop 2..=16 x remaining 1..=64.
+
+VERIFICATION
+  pins UNCHANGED (8446 / 28548): a 4-picture clip is a 3-picture run, one
+    group under both rules -- encode::tests::the_encoders_own_streams_are
+    _byte_identical_to_their_pins ok
+  encoder::tests::the_facade_codes_the_same_bytes_as_encode_sequence ok
+  encoder:: --include-ignored --test-threads 1: 29 passed / 0 failed
+    (includes bitrate_target_lands_within_10_percent_over_48_frames, whose
+    rate loop now sees a last group of up to 1.5 x mini_gop)
+  tile_bytes_do_not_depend_on_the_thread_count (--include-ignored) ok
+  EC_COMP_MISMATCH=1 over the whole lib suite: 546 passed / 0 failed /
+    43 ignored, 0 mismatch lines (lanes/gopad/suite.log)
+  cargo check --workspace --all-targets -j4: 0 errors, 0 ec-av1 warnings
+    (the 25 warning lines are pre-existing ec-opus / ec-vorbis)
+  Logs: lanes/gopad/{s12-balanced,s12-absorb,s48-absorb,s48-fixed,suite,
+    encoder-tests}.log

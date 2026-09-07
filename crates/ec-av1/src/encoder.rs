@@ -368,7 +368,10 @@ pub struct Packet {
 pub struct Pyramid {
     /// Pictures per mini-GOP: the hidden frame is `mini_gop` pictures ahead
     /// of the group's anchor, and `mini_gop - 1` leaves sit between them.
-    /// `1` would leave no leaf at all and is refused.
+    /// `1` would leave no leaf at all and is refused. It is the group size a
+    /// long run takes; the last group of a run is up to 1.5x it, since
+    /// [`group_target`] absorbs a tail shorter than half a group rather than
+    /// leaving one behind.
     pub mini_gop: usize,
     /// Added to `base_q_idx` for the hidden `ALTREF_FRAME` — negative, since
     /// every leaf of the group predicts off it.
@@ -376,6 +379,39 @@ pub struct Pyramid {
     /// Added to `base_q_idx` for each shown leaf — positive, since nothing
     /// predicts off a leaf but the next leaf.
     pub leaf_q_offset: i16,
+}
+
+/// How many pictures the mini-GOP now being collected takes, given how many
+/// are left in this run (the pictures before the next key frame) and the
+/// [`Pyramid::mini_gop`] shape.
+///
+/// A fixed `mini_gop` leaves a SHORT TAIL group whenever the run is not a
+/// multiple of it: a 12-picture GOP under `mini_gop` 8 codes 8 + 3, and that
+/// 3-picture tail is the expensive part -- the 12-frame gate preferred one
+/// group of 11 by 7.0 / 20.5 BD points while the 48-frame gate picked 8
+/// (lane-pyr4). The rule here ABSORBS a tail shorter than half a group into
+/// the group before it, so a run takes groups of `mini_gop` until at most
+/// 1.5 x `mini_gop` is left and then one final group of all of it:
+///   remaining 11 under 8 -> 11 (was 8 + 3)
+///   remaining 47 under 8 -> 8, 8, 8, 8, 8, 7 -- what the fixed rule already
+///   coded, so a long GOP is byte-identical
+/// (`the_mini_gop_layout_leaves_no_short_tail`; sweep `lanes/gopad.sweep.txt`).
+///
+/// `EC_AV1_GOP_LAYOUT=fixed` restores the old fixed-size rule for an A/B.
+fn group_target(remaining: usize, mini_gop: usize, absorb_tail: bool) -> usize {
+    match absorb_tail && remaining <= mini_gop + mini_gop / 2 {
+        true => remaining.max(1),
+        false => mini_gop,
+    }
+}
+
+/// Whether this run absorbs a short tail group (the default) or cuts every
+/// mini-GOP at `mini_gop`: `EC_AV1_GOP_LAYOUT=fixed`, read once.
+fn absorb_tail() -> bool {
+    static ABSORB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("EC_AV1_GOP_LAYOUT").ok().as_deref() != Some("fixed")
+    });
+    *ABSORB
 }
 
 impl Pyramid {
@@ -620,13 +656,16 @@ impl Default for Pyramid {
     /// (film A wants `20`, film B wants `12`, within 1.1 and 4.9 points) so
     /// `16` stays, being the only value down on all four columns.
     ///
-    /// THE PRICE, stated: on the SHORT-GOP gate above (12 frames, `gop =
-    /// 12`, where a mini-GOP of 8 splits into 8 + 4 while 16 is one group)
-    /// `8:-32:16` reads film A +51.2 / +21.4 and film B +91.0 / +53.5
-    /// against `16:-24:16`'s +44.2 / +15.7 and +70.5 / +35.2. The two gates
-    /// disagree because the best shape depends on the GOP length, and the
-    /// long one is what the editor exports; a GOP-length-adaptive `mini_gop`
-    /// is the standing follow-up, not measured here.
+    /// THE PRICE THAT WAS, and how it was paid (lane-gopad): on the
+    /// SHORT-GOP gate (12 frames, `gop = 12`) a fixed mini-GOP of 8 split the
+    /// run into 8 + 3 and read film A +51.2 / +21.4, film B +91.0 / +53.5,
+    /// against `16:-24:16`'s +44.2 / +15.7 and +70.5 / +35.2 -- the tail
+    /// group, not the shape, was the cost. [`group_target`] now absorbs a
+    /// short tail, so the same 12 pictures code as ONE group of 11 and read
+    /// film A +43.9 / +15.6 and film B +68.4 / +38.2 (three of the four
+    /// columns better than `16:-24:16` ever was, film B vs rav1e 3.0 short),
+    /// while 47 inter pictures still take 8 x 5 + 7 -- the long-GOP table
+    /// above is coded byte for byte as it was measured.
     fn default() -> Self {
         Self {
             mini_gop: 8,
@@ -992,10 +1031,16 @@ impl Av1Encoder {
             return Ok(packets);
         }
         self.pending.push((order, picture.clone()));
-        // The group closes on its own size, or early when the next picture
-        // would be a key frame.
+        // The group closes on the size the LAYOUT gives it (which depends on
+        // how many pictures are left before the next key frame, so no short
+        // tail group is left behind), or early when the next picture would be
+        // a key frame.
+        let run_start = self.pending[0].0;
+        let remaining = self.config.gop - (run_start % self.config.gop as u64) as usize;
         let next_is_key = (order + 1).is_multiple_of(self.config.gop as u64);
-        if self.pending.len() >= pyramid.mini_gop || next_is_key {
+        if self.pending.len() >= group_target(remaining, pyramid.mini_gop, absorb_tail())
+            || next_is_key
+        {
             return self.drain_pending();
         }
         Ok(Vec::new())
@@ -1451,6 +1496,45 @@ mod tests {
         }
         packets.extend(enc.flush().unwrap_or_else(|e| panic!("flush: {e}")));
         packets
+    }
+
+    /// The mini-GOP layout leaves no short tail group, and leaves the long
+    /// GOP the fixed rule already coded alone: 47 inter pictures are
+    /// 8 x 5 + 7 under both rules (so a 48-picture GOP is byte-identical),
+    /// while a 12-picture GOP stops being 8 + 3 (lane-gopad).
+    #[test]
+    fn the_mini_gop_layout_leaves_no_short_tail() {
+        let groups = |remaining: usize, mini_gop: usize, absorb: bool| {
+            let (mut left, mut out) = (remaining, Vec::new());
+            while left > 0 {
+                let g = group_target(left, mini_gop, absorb).min(left);
+                assert!(g > 0);
+                out.push(g);
+                left -= g;
+            }
+            out
+        };
+        // gop 48: what mini_gop 8 already coded, under either rule.
+        assert_eq!(groups(47, 8, true), vec![8, 8, 8, 8, 8, 7]);
+        assert_eq!(groups(47, 8, false), vec![8, 8, 8, 8, 8, 7]);
+        // gop 12: 8 + 3 becomes one group of 11.
+        assert_eq!(groups(11, 8, false), vec![8, 3]);
+        assert_eq!(groups(11, 8, true), vec![11]);
+        // A run shorter than a group is one group, as before (the 4-picture
+        // pin clip).
+        assert_eq!(groups(3, 8, true), vec![3]);
+        // No group is ever below half the shape, and none is over 1.5x it.
+        for mini_gop in 2..=16 {
+            for remaining in 1..=64 {
+                for g in groups(remaining, mini_gop, true) {
+                    assert!(g * 2 <= 3 * mini_gop, "{remaining}/{mini_gop}: long {g}");
+                    assert!(
+                        g * 2 >= mini_gop || remaining < mini_gop,
+                        "{remaining}/{mini_gop}: short tail {g}"
+                    );
+                }
+            }
+        }
     }
 
     /// Every OBU stream this test writes to `ffmpeg`/`ffprobe`, concatenated
