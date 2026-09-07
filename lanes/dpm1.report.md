@@ -117,3 +117,5 @@ film A +38.5/+8.2, film B +58.2/+26.5, screen +33.4/-23.8 vs libaom/rav1e).
   not what any defect in this lane needed, and the previous naive stamp
   regressed 13 tests — unblocks: derive each inter reader's real band footprint
   from how `record_palette_*` indexes the bands.`
+
+`cargo test -p ec-av1 --release --lib`: **554 passed, 0 failed, 43 ignored** (552 + the two new gates); pins `the_encoders_own_streams_are_byte_identical_to_their_pins` green (9778 / 35450 untouched -- no encoder file changed). /tmp at 66%.
