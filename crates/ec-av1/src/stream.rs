@@ -2993,7 +2993,10 @@ pub(crate) mod tests {
                 encoded.base_q_idx,
                 width as u32,
                 height as u32,
-                false,
+                // lane-fintra: the sequence bit the encoder wrote this tile under
+                // (stale-header class -- a hard-coded `false` here reads one symbol
+                // short at the first DC_PRED block once the search offers filter intra).
+                crate::encode::filter_intra_on(),
                 &encoded.cdef,
                 &encoded.loop_filter,
                 encoded.tx_select,
