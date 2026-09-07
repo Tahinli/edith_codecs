@@ -50,8 +50,8 @@ pub(super) fn parameters(
         intra_idr_period: config.gop_size.max(1),
         ip_period: 1,
         bits_per_second: match config.rate_control {
-            RateControlMode::ConstantBitrate => config.bitrate,
             RateControlMode::ConstantQp { .. } => 0,
+            _ => config.bitrate,
         },
         pic_width_in_luma_samples: coded_w as u16,
         pic_height_in_luma_samples: coded_h as u16,
@@ -87,7 +87,7 @@ pub(super) fn parameters(
         collocated_ref_pic_index: 0xff,
         pic_init_qp: match config.rate_control {
             RateControlMode::ConstantQp { qp } => qp.clamp(1, 51) as u8,
-            RateControlMode::ConstantBitrate => 26,
+            _ => 26,
         },
         nal_unit_type: if keyframe {
             NAL_IDR_W_RADL
