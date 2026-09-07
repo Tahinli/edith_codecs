@@ -1,0 +1,32 @@
+
+running 1 test
+test encode::tests::bd_rate_screen_native ... 
+native crop, 12 frames, gop=12; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+bars 1080p: sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+bars 1080p: pricer armings default=17 real=185
+bars 1080p: key 64x64 intra roots 1520 of 1920 offered (79.2%)
+bars 1080p: 64x64 roots 17500 (with a residual 12845, split luma 3239, compound 6705)
+bars 1080p: motion_mode 32x32 SIMPLE=35055 OBMC=0 WARP=215 | 16x16 SIMPLE=4774 OBMC=0 WARP=473 | 8x8 SIMPLE=17123 OBMC=0 WARP=3793 (0.0% OBMC / 7.3% WARP of 61433 eligible)
+bars 1080p: inter var-tx depths of 10602 blocks -- leaf single 0=1573 1=1019 (39.3% split) | leaf compound 0=620 1=567 (47.8% split) | 32x32 single 0=720 1=1832 (71.8% split) | 32x32 compound 0=2092 1=2179 (51.0% split)
+bars 1080p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+bars 1080p: filter intra on=true blocks 29233 (modes DC=6917 V=3572 H=5281 D157=8651 PAETH=4812)
+| bars 1080p 1920x1024 | 43.53 dB/194497 B, 47.32 dB/299067 B, 50.84 dB/419042 B, 54.03 dB/567789 B | -1.0% | -16.8% | 179.7s:7.5s:17.7s |
+bars 2160p: sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+bars 2160p: pricer armings default=14 real=177
+bars 2160p: key 64x64 intra roots 1704 of 1920 offered (88.8%)
+bars 2160p: 64x64 roots 18502 (with a residual 12508, split luma 2504, compound 6874)
+bars 2160p: motion_mode 32x32 SIMPLE=29604 OBMC=0 WARP=233 | 16x16 SIMPLE=2900 OBMC=0 WARP=470 | 8x8 SIMPLE=7267 OBMC=0 WARP=200 (0.0% OBMC / 2.2% WARP of 40674 eligible)
+bars 2160p: inter var-tx depths of 8577 blocks -- leaf single 0=1118 1=455 (28.9% split) | leaf compound 0=759 1=268 (26.1% split) | 32x32 single 0=343 1=1255 (78.5% split) | 32x32 compound 0=105 1=4274 (97.6% split)
+bars 2160p: screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+bars 2160p: filter intra on=true blocks 12895 (modes DC=3440 V=865 H=2501 D157=4142 PAETH=1947)
+| bars 2160p 1920x1024 | 43.14 dB/205409 B, 47.27 dB/321883 B, 50.96 dB/435765 B, 54.35 dB/564573 B | +9.4% | -12.7% | 142.5s:6.1s:17.0s |
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -48 })
+film A (1080p source): pricer armings default=20 real=209
+film A (1080p source): key 64x64 intra roots 385 of 1440 offered (26.7%)
+film A (1080p source): 64x64 roots 8836 (with a residual 8291, split luma 4425, compound 3412)
+film A (1080p source): motion_mode 32x32 SIMPLE=38433 OBMC=0 WARP=1920 | 16x16 SIMPLE=14687 OBMC=0 WARP=1686 | 8x8 SIMPLE=4482 OBMC=0 WARP=886 (0.0% OBMC / 7.2% WARP of 62094 eligible)
+film A (1080p source): inter var-tx depths of 60744 blocks -- leaf single 0=11396 1=1720 (13.1% split) | leaf compound 0=23384 1=3510 (13.1% split) | 32x32 single 0=6025 1=4434 (42.4% split) | 32x32 compound 0=6384 1=3891 (37.9% split)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film A (1080p source): filter intra on=true blocks 19962 (modes DC=4726 V=3122 H=3767 D157=5794 PAETH=2553)
