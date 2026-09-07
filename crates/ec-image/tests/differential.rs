@@ -11,6 +11,15 @@
 use image::GenericImageView;
 use std::path::{Path, PathBuf};
 
+/// The fixture's own name — never the whole path, which carries the checkout
+/// directory and has matched fixture keywords by accident.
+fn name_of(p: &std::path::Path) -> String {
+    p.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/stills")
 }
@@ -115,7 +124,7 @@ fn png_decodes_pixel_exactly() {
 fn webp_lossless_decodes_pixel_exactly() {
     let files: Vec<PathBuf> = corpus("webp")
         .into_iter()
-        .filter(|p| p.to_string_lossy().contains("lossless"))
+        .filter(|p| name_of(p).contains("lossless"))
         .collect();
     if files.is_empty() && skip("webp") {
         return;
@@ -183,7 +192,7 @@ fn jpeg_matches_the_incumbent_within_rounding() {
 fn webp_lossy_reconstructs_at_least_as_well_as_the_incumbent() {
     let files: Vec<PathBuf> = corpus("webp")
         .into_iter()
-        .filter(|p| p.to_string_lossy().contains("lossy"))
+        .filter(|p| name_of(p).contains("lossy"))
         .collect();
     if files.is_empty() && skip("webp") {
         return;
@@ -235,7 +244,7 @@ fn header_dimensions_match_the_incumbent() {
     let mut checked = 0;
     for extension in ["png", "jpg", "webp"] {
         for path in corpus(extension) {
-            if path.to_string_lossy().contains("animated") {
+            if name_of(&path).contains("animated") {
                 continue;
             }
             let bytes = std::fs::read(&path).unwrap();

@@ -366,13 +366,23 @@ fn compare_against_ffmpeg(files: &[PathBuf], codec: Codec, ten_bit: bool) {
     }
 }
 
+/// The fixture's own name. Never the whole path: a checkout directory called
+/// `edith_codecs-av1fast` made every `.ivf` — VP9 included — select as an AV1
+/// fixture, and the VP9 streams then came back as `obu_forbidden_bit is set`.
+fn name_of(p: &Path) -> String {
+    p.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
 /// The 4:2:0 fixtures of one kind; the 4:4:4 and monochrome ones are the
 /// profiles this GPU does not decode, and have their own test.
 fn profile_420(pattern: &str, codec: &str) -> Vec<PathBuf> {
     fixtures(pattern)
         .into_iter()
         .filter(|p| {
-            let name = p.to_string_lossy().to_string();
+            let name = name_of(p);
             name.contains(codec) && !name.contains("444") && !name.contains("monochrome")
         })
         .collect()
@@ -381,15 +391,34 @@ fn profile_420(pattern: &str, codec: &str) -> Vec<PathBuf> {
 fn eight_bit(pattern: &str, codec: &str) -> Vec<PathBuf> {
     profile_420(pattern, codec)
         .into_iter()
-        .filter(|p| !p.to_string_lossy().contains("10bit"))
+        .filter(|p| !name_of(p).contains("10bit"))
         .collect()
 }
 
 fn ten_bit(pattern: &str, codec: &str) -> Vec<PathBuf> {
     profile_420(pattern, codec)
         .into_iter()
-        .filter(|p| p.to_string_lossy().contains("10bit"))
+        .filter(|p| name_of(p).contains("10bit"))
         .collect()
+}
+
+/// The selection must not depend on where the repository is checked out.
+#[test]
+fn fixture_selection_ignores_the_checkout_path() {
+    for p in eight_bit(".ivf", "av1") {
+        let name = name_of(&p);
+        assert!(
+            name.starts_with("av1") && !name.contains("10bit"),
+            "{name} is not an 8-bit AV1 fixture"
+        );
+    }
+    for p in ten_bit(".ivf", "vp9") {
+        let name = name_of(&p);
+        assert!(
+            name.starts_with("vp9") && name.contains("10bit"),
+            "{name} is not a 10-bit VP9 fixture"
+        );
+    }
 }
 
 #[test]
