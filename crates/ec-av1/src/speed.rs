@@ -215,9 +215,9 @@ pub(crate) const I64_ROOT: [bool; 11] = [crate::encode::I64_ROOT; 11];
 /// against libaom. Coarser steps (res 8) are worse everywhere. The syntax is
 /// all there and proven three ways
 /// (`a_moving_detail_clip_codes_two_delta_q_levels_both_decoders_read_exactly`);
-/// `EC_AV1_DELTAQ=2` switches it on. Above preset 0 it is inert anyway --
-/// [`TPL_DEPTH`] cuts the lookahead to one picture, so there is no map to
-/// vary the quantizer by.
+/// `EC_AV1_DELTAQ=2` switches it on. Above preset 6 it is inert anyway --
+/// [`TPL_DEPTH`] cuts the lookahead to one picture there, so there is no map
+/// to vary the quantizer by (lane-tplwin gave presets 1..6 a window back).
 pub(crate) const DELTAQ_RES: [u8; 11] = [4; 11];
 
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
@@ -435,7 +435,53 @@ pub(crate) const RESTORATION: [bool; 11] = [
 ];
 
 /// `encode::TPL_DEPTH`: lookahead pictures the lambda map reads (1 = off).
-pub(crate) const TPL_DEPTH: [usize; 11] = [crate::encode::TPL_DEPTH, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+///
+/// MEASURED per preset (lane-tplwin, 12-frame `bd_rate_screen_native`, all
+/// five rows, BD vs libaom `cpu-used 6` / rav1e `speed 6`; the two arms of a
+/// batch ran side by side so only the ours:rav1e ratio inside one arm is a
+/// wall statement). The film rows code through the pyramid, whose window is
+/// the mini-GOP's display successors, so a depth above 8 cannot mean anything
+/// there.
+///
+/// | preset | depth | film A | film B | screen | wall vs its own depth-1 arm |
+/// |---|---|---|---|---|---|
+/// | 0 | 8 (shipped) | +21.7 / -4.4 | +26.9 / -0.6 | +27.8 / -26.0 | -- |
+/// | 0 | 4 | +21.5 / -4.5 | **+27.6 / +0.1** | +27.7 / -26.1 | -8% .. +4% |
+/// | 3 | 1 | +22.5 / -3.9 | +27.6 / +0.1 | +33.5 / -23.1 | 1.00 |
+/// | 3 | **4** | **+22.3 / -4.1** | **+27.3 / -0.3** | **+33.4 / -23.2** | not batched |
+/// | 3 | 8 | +22.5 / -3.9 | +27.7 / +0.1 | +32.9 / -23.4 | -2% .. -4% |
+/// | 6 | 1 | +27.0 / -0.3 | +35.9 / +7.2 | +34.7 / -22.4 | 1.00 |
+/// | 6 | **4** | +27.2 / -0.2 | **+35.2 / +6.6** | +34.8 / -22.3 | -8% .. +2% |
+/// | 6 | 8 | +27.0 / -0.4 | +35.6 / +6.9 | +34.9 / -22.3 | +3% .. +8% |
+///
+/// Every ladder above reproduced BYTE-IDENTICALLY on a second run of the
+/// preset-6 depth-1 and depth-4 arms, so these BD deltas are signal; only the
+/// wall column carries the box's noise (another lane ran throughout, load
+/// 13-15), which is why depth 4's cost reads as a spread straddling zero.
+///
+/// Read greedily, the way the lever table above is read:
+///
+/// * **preset 0 keeps 8.** Shortening to 4 costs film B 0.7 points on BOTH
+///   columns -- the largest single move in the whole sweep -- for at most 8%
+///   of that row's wall. The byte pins do not move.
+/// * **presets 3..6 take 4**, up from the 1 that shipped before. At preset 3
+///   it is the best arm on every real-content row (film A -0.2/-0.2, film B
+///   -0.3/-0.4, screen -0.1/-0.1 against depth 1) and the lookahead pass does
+///   not appear in the wall at all. At preset 6 it buys film B 0.7/0.6 for a
+///   wall that still measures below this box's noise, where depth 8 buys only
+///   0.3/0.3 and does cost a visible 3-8%. Film A moves +0.2 at preset 6, so
+///   this is 0.5 net film points across the two rows for no measured wall --
+///   which clears the frontier the preset already dropped (CfL + angle at
+///   0.031 BD points per 1% wall, coefficient breakout at 0.041) by an order
+///   of magnitude.
+/// * **presets 1..2 keep 8**, unmeasured: their search is within a quarter of
+///   preset 0's wall, so the pass is the same negligible share there, and 8
+///   is the optimum at the nearest MEASURED neighbour (0). The monotone rule
+///   (`presets_are_monotone_in_speed`) forbids them going below preset 3's 4
+///   in any case.
+/// * **presets 7..10 stay at 1**, unmeasured: not swept by this lane.
+pub(crate) const TPL_DEPTH: [usize; 11] =
+    [crate::encode::TPL_DEPTH, 8, 8, 4, 4, 4, 4, 1, 1, 1, 1];
 
 /// `filter_search`: whether the deblock ladder's +-1/+-2 refinement stage runs.
 pub(crate) const DEBLOCK_REFINE: [bool; 11] = [
@@ -533,6 +579,10 @@ mod tests {
         assert_eq!(SPLIT_RD[0], 0.125);
         assert_eq!(SPLIT_BREAKOUT[0], 0);
         assert_eq!(TPL_DEPTH[0], 8);
+        // lane-tplwin: the fast presets carry a window too, but never a longer
+        // one than the full search's.
+        assert_eq!(TPL_DEPTH[6], 4);
+        assert_eq!(TPL_DEPTH[7], 1);
         assert_eq!(PRUNE_K[0], None);
         assert_eq!(PRUNE_K_INTER[0], Some(3));
         assert_eq!(CHROMA_K[0], None);
