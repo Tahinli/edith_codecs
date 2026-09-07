@@ -2849,10 +2849,16 @@ mod tests {
 /// dequantization exactly -- that is what makes the round trip lossless.
 pub fn inverse_wht4x4(dq: &[i32]) -> Vec<i32> {
     debug_assert_eq!(dq.len(), 16);
+    // libaom runs pass 1 down the COLUMNS (`ip[4 * k]`, `ip++`) and pass 2
+    // along the intermediate's ROWS writing dest COLUMNS (`dest[stride * k]`,
+    // `dest++`); transposing both passes -- rows first, then columns, output
+    // in place -- is the same map and is what a raster `dq`/residual pair
+    // wants here. MEASURED: the other orientation reconstructs sample 0 and
+    // the DC-only units correctly and drifts by +-1 everywhere else.
     let mut out = [0i32; 16];
     for i in 0..4 {
-        let ip = &dq[i * 4..];
-        let (mut a1, mut c1, mut d1, mut b1) = (ip[0] >> 2, ip[1] >> 2, ip[2] >> 2, ip[3] >> 2);
+        let (mut a1, mut c1, mut d1, mut b1) =
+            (dq[i * 4] >> 2, dq[i * 4 + 1] >> 2, dq[i * 4 + 2] >> 2, dq[i * 4 + 3] >> 2);
         a1 += c1;
         d1 -= b1;
         let e1 = (a1 - d1) >> 1;
@@ -2867,7 +2873,8 @@ pub fn inverse_wht4x4(dq: &[i32]) -> Vec<i32> {
     }
     let mut res = vec![0i32; 16];
     for i in 0..4 {
-        let (mut a1, mut c1, mut d1, mut b1) = (out[i], out[4 + i], out[8 + i], out[12 + i]);
+        let (mut a1, mut c1, mut d1, mut b1) =
+            (out[i], out[4 + i], out[8 + i], out[12 + i]);
         a1 += c1;
         d1 -= b1;
         let e1 = (a1 - d1) >> 1;
@@ -2925,23 +2932,23 @@ mod lossless_tx_tests {
             (a1 - c, b, c, d1 + b)
         }
         fn fwht(residual: &[i32]) -> Vec<i32> {
-            let mut t = residual.to_vec();
+            let mut t = [0i32; 16];
+            for i in 0..4 {
+                let (a, b, c, d) = undo(residual[i], residual[4 + i], residual[8 + i], residual[12 + i]);
+                t[i * 4] = a;
+                t[i * 4 + 1] = c;
+                t[i * 4 + 2] = d;
+                t[i * 4 + 3] = b;
+            }
+            let mut dq = vec![0i32; 16];
             for i in 0..4 {
                 let (a, b, c, d) = undo(t[i], t[4 + i], t[8 + i], t[12 + i]);
-                t[i] = a;
-                t[4 + i] = c;
-                t[8 + i] = d;
-                t[12 + i] = b;
+                dq[i] = a * 4;
+                dq[4 + i] = c * 4;
+                dq[8 + i] = d * 4;
+                dq[12 + i] = b * 4;
             }
-            let mut out = vec![0i32; 16];
-            for i in 0..4 {
-                let (a, b, c, d) = undo(t[i * 4], t[i * 4 + 1], t[i * 4 + 2], t[i * 4 + 3]);
-                out[i * 4] = a * 4;
-                out[i * 4 + 1] = c * 4;
-                out[i * 4 + 2] = d * 4;
-                out[i * 4 + 3] = b * 4;
-            }
-            out
+            dq
         }
         let mut state = 0x1234_5678u32;
         for _ in 0..200 {

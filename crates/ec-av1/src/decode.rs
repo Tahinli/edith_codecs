@@ -9565,6 +9565,58 @@ fn decode_rect_split(
             m.alpha.zip(ac).map(|((_, av), ac)| (av, ac)), None, m.smooth_neighbor_uv, fctx,
         );
         (zero.clone(), zero)
+    } else if lossless(fctx) {
+        // lane-lossless: the strip's chroma plane block is coded as 4x4
+        // transform units too (libaom `read_tx_size` returns TX_4X4 for every
+        // plane), PLANE-MAJOR inside the block -- U's units first, then V's
+        // (`decode_token_recon_block`'s mu-chunk loop, measured against
+        // aomdec's `EC_TRACE_COEFF` on a `-crf 0` stream: plane=1, plane=1,
+        // plane=2, plane=2 for a 16x8 strip). `get_txb_ctx` adds its `+10`
+        // offset (our `+3` row base) whenever the plane block is bigger than
+        // the transform.
+        let scan4 = default_scan(4);
+        let offset = (chroma_w > 4 || chroma_h > 4).then_some(3);
+        let (cw_n, ch_n) = (chroma_w / 4, chroma_h / 4);
+        let mut last = [Grid::Zero(16), Grid::Zero(16)];
+        for plane_idx in 1..=2 {
+            for cu_row in 0..ch_n {
+                for cu_col in 0..cw_n {
+                    let luma_span = 8;
+                    let cu_mi = (
+                        mi_r + cu_row * (luma_span / MI),
+                        mi_c + cu_col * (luma_span / MI),
+                    );
+                    let cu_around = neighbours.around_mi(cu_mi, luma_span);
+                    let cu_reach = tu_reach(
+                        bw, bh,
+                        cu_col * luma_span, cu_row * luma_span, luma_span,
+                        block_reach, px, py, y.width, y.height, fctx,
+                    );
+                    let (cu_x, cu_y) = (cpx + cu_col * 4, cpy + cu_row * 4);
+                    if let Some((ub, vb)) = &m.palette_uv {
+                        set_palette_pred(
+                            if plane_idx == 1 { ub.clone() } else { vb.clone() },
+                            fctx,
+                        );
+                    }
+                    let plane = if plane_idx == 1 { &mut *u } else { &mut *v };
+                    let grid = read_plane(
+                        dec, cdfs, TxbSet::Chroma4, &scan4, plane_idx,
+                        cu_around[plane_idx], m.mode, m.uv_predict_mode,
+                        m.angle_delta_uv, cu_reach, plane, cu_x, cu_y, 4, 4,
+                        base_q_idx,
+                        m.alpha.zip(ac).map(|((au, av), ac)| {
+                            (if plane_idx == 1 { au } else { av }, ac)
+                        }),
+                        None, offset, m.smooth_neighbor_uv, fctx,
+                    )?;
+                    neighbours.record_mi_chroma(cu_mi, luma_span, luma_span, plane_idx, &grid);
+                    last[plane_idx - 1] = grid;
+                }
+            }
+        }
+        let [ug, vg] = last;
+        (ug, vg)
     } else {
         let (chroma_set, chroma_scan) = chroma.expect("refused above when None");
         // `av1_get_ext_tx_set_type`: a chroma transform whose square-up size
@@ -10281,7 +10333,7 @@ fn decode_intra_rect_in_inter(
     } else {
         0
     };
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         hit!(TX_DEPTH_HITS);
         // lane-intrasplit r1: a split intra strip in an inter frame walks the
         // key frame's own per-TU path ([`decode_rect_split`] below); what was
@@ -10494,7 +10546,7 @@ fn decode_block_rect(
     } else {
         0
     };
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         hit!(TX_DEPTH_HITS);
         // lane-rectsplit r1: a split transform is predicted and reconstructed
         // per transform unit, each unit taking its edges from the previous
@@ -11000,7 +11052,7 @@ fn decode_leaf_rect(
     } else {
         0
     };
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         // The same per-transform-unit walk the bigger strips take
         // (`depth_to_tx_wh`: TX_16X8 -> TX_8X8 at depth 1, -> TX_4X4 at
         // depth 2), addressed at this leaf's own mi position.
@@ -11342,7 +11394,7 @@ fn decode_block_rect4(
         depth_to_tx_wh(bw, bh, depth, fctx),
         (bw, bh), fctx,
     );
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         // lane-rectsplitx r1: the per-transform-unit walk, at this strip's
         // real mi position (strips 1 and 3 of a HORZ_4 start 8 px into a
         // 16-px [`SUB`] cell). depth 1 is the RECT unit TX_16X8/TX_8X16
@@ -12358,7 +12410,7 @@ fn decode_block_rect64(
         depth_to_tx_wh(bw, bh, depth, fctx),
         (bw, bh), fctx,
     );
-    if depth != 0 {
+    if depth != 0 || lossless(fctx) {
         hit!(TX_DEPTH_HITS);
         // lane-rectsplit r1/r4: the superblock-level strip splits its
         // transform through the very same per-unit path as its 32x32-level
