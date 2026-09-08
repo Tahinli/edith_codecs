@@ -8303,6 +8303,17 @@ fn mv_component_bits(diff: i32) -> Option<f64> {
     Some(bits)
 }
 
+/// Whether `LAST2_FRAME` gets a `NEWMV` search of its own beside the
+/// neighbour-derived modes ([`extra_ref_new_mv`]'s per-reference switch,
+/// `EC_AV1_LAST2_NEW=0`): the charter's "free arm", i.e. the reference's
+/// value without the second motion search's wall.
+fn last2_new_mv() -> bool {
+    match std::env::var("EC_AV1_LAST2_NEW").ok() {
+        Some(v) => v != "0",
+        None => true,
+    }
+}
+
 /// Whether an extra reference (GOLDEN/ALTREF) is offered a `NEWMV` of its
 /// own -- a second motion search per block against that reference's picture,
 /// priced off that reference's own stack. `EC_AV1_MV_EXTRA_NEW=0` turns it
@@ -9111,14 +9122,22 @@ fn search_inter_block(
     let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
     let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
     // `write_single_ref`'s own tree, at the fixed context this pricer uses
-    // for every neighbour-derived symbol: LAST is p1=0,p3=0,p4=0 and GOLDEN
-    // p1=0,p3=1,p5=1.
+    // for every neighbour-derived symbol: LAST is p1=0,p3=0,p4=0, LAST2
+    // p1=0,p3=0,p4=1 and GOLDEN p1=0,p3=1,p5=1. A BACKWARD reference
+    // (`ALTREF`, p1=1,p2=1) is priced as LAST here and always has been --
+    // wrong by two symbols, but fixing it moves every shipped stream, so it
+    // is a lever of its own and not this lane's (lanes/last2.report.md).
     let single_ref_bits = |ref_frame: i8| {
+        use crate::mvstack::{GOLDEN_FRAME, LAST2_FRAME};
         symbol_bits(&cdf::SINGLE_REF[0][0], 0)
-            + if ref_frame == crate::mvstack::GOLDEN_FRAME {
+            + if ref_frame == GOLDEN_FRAME {
                 symbol_bits(&cdf::SINGLE_REF[0][2], 1) + symbol_bits(&cdf::SINGLE_REF[0][4], 1)
             } else {
-                symbol_bits(&cdf::SINGLE_REF[0][2], 0) + symbol_bits(&cdf::SINGLE_REF[0][3], 0)
+                symbol_bits(&cdf::SINGLE_REF[0][2], 0)
+                    + symbol_bits(
+                        &cdf::SINGLE_REF[0][3],
+                        usize::from(ref_frame == LAST2_FRAME),
+                    )
             }
     };
 
@@ -9406,8 +9425,15 @@ fn search_inter_block(
         // prices out `margin` times better than LAST's best vector does --
         // one candidate evaluation (`motion::cost_at`) standing in for a
         // whole search of ~50.
+        // lane-last2: the SEARCH-FREE arm for the second past leaf picture
+        // (`EC_AV1_LAST2_NEW=0`) -- LAST2 is then coded only at a vector some
+        // neighbour already found, which is how GOLDEN/ALTREF were offered
+        // before `EXTRA_REF_NEW_MV`, and it is what separates the reference's
+        // own value from the second motion search's wall.
+        let searched = extra_ref_new_mv()
+            && (ref_frame != crate::mvstack::LAST2_FRAME || last2_new_mv());
         let margin = extra_new_skip_margin();
-        let skip_search = extra_ref_new_mv()
+        let skip_search = searched
             && margin > 0.0
             && motion::cost_at(
                 &g.y,
@@ -9425,7 +9451,7 @@ fn search_inter_block(
                 fctx,
             ) * margin
                 <= found.cost;
-        if extra_ref_new_mv() && !skip_search {
+        if searched && !skip_search {
             let (gseeds, gn) = mv_seeds(gstack);
             #[cfg(test)]
             let t = stage_start();
@@ -10567,6 +10593,12 @@ pub(crate) struct PyramidFrame {
     /// The slot `ALTREF_FRAME` reads -- a FUTURE frame for a leaf of a
     /// pyramid, which is what makes `sign_bias`'s last entry true.
     pub altref_slot: u8,
+    /// lane-last2: the slot `LAST2_FRAME` reads -- a SECOND, older past
+    /// picture (the leaf chain alternates its refresh between two slots, so
+    /// the frame before `LAST` is still intact). `None` leaves
+    /// `ref_frame_idx[1]` naming `last_slot`, as every frame this encoder
+    /// wrote before, and the caller then passes no `last2` picture either.
+    pub last2_slot: Option<u8>,
     /// `show_frame`: false for a hidden frame, output later by a
     /// `show_existing_frame` header.
     pub show_frame: bool,
@@ -10602,7 +10634,14 @@ pub(crate) fn encode_inter_frame(
     // The frame two back, held in the slot this frame is about to refresh
     // (the encoder alternates 0/2): `ALTREF_FRAME`. `None` for the first two
     // inter frames of a GOP, where the frame two back IS the key frame.
-    altref: Option<&Picture>, fctx: &crate::decode::FrameCtx,
+    altref: Option<&Picture>,
+    // lane-last2: the picture in [`PyramidFrame::last2_slot`] -- the shown
+    // frame BEFORE `reference` on the leaf chain, offered to the 32x32
+    // search as `LAST2_FRAME` through the same search path `GOLDEN`/`ALTREF`
+    // take. `None` (every caller but the pyramid leaves) codes the frame
+    // with the reference set unchanged.
+    last2: Option<&Picture>,
+    fctx: &crate::decode::FrameCtx,
     // Where this frame sits in the coding-order pyramid; `None` is the flat
     // one-shown-frame-per-picture stream this encoder wrote before.
     pyramid: Option<PyramidFrame>,
@@ -10683,6 +10722,14 @@ pub(crate) fn encode_inter_frame(
     // `GOLDEN_FRAME` is the key frame, order hint 0. Only
     // `frame::write_frame_header`'s `skipModeAllowed` reads this.
     header.order_hints = order_hints;
+    // lane-last2: `inter_frame_headers_slots` points every un-named
+    // reference at `last_slot`; the pyramid's leaf chain retains a second,
+    // older picture and names it here. The caller's `sign_bias` /
+    // `order_hints` entry 1 is derived from this same slot, so the stack
+    // scans and `skipModeAllowed` read what the decoder will.
+    if let Some(slot) = pyramid.and_then(|p| p.last2_slot) {
+        header.ref_frame_idx[1] = slot;
+    }
     header.reference_select = reference_select();
     // Armed HERE, not only beside the tile write below: `ref_distance`'s own
     // per-reference order-hint distance is read by the block SEARCH, which
@@ -10918,6 +10965,7 @@ pub(crate) fn encode_inter_frame(
         // built once per tile job (`obmc_prediction`).
         let mut obmc_refs: [Option<&Picture>; 8] = [None; 8];
         obmc_refs[crate::mvstack::LAST_FRAME as usize] = Some(reference);
+        obmc_refs[crate::mvstack::LAST2_FRAME as usize] = last2;
         obmc_refs[crate::mvstack::GOLDEN_FRAME as usize] = golden;
         obmc_refs[crate::mvstack::ALTREF_FRAME as usize] = altref;
         grid.set_tile_bounds(
@@ -11109,6 +11157,7 @@ pub(crate) fn encode_inter_frame(
                     let stack =
                         find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
                     let extra_stacks: Vec<(i8, &Picture, MvStack)> = [
+                        (crate::mvstack::LAST2_FRAME, last2),
                         (crate::mvstack::GOLDEN_FRAME, golden),
                         (crate::mvstack::ALTREF_FRAME, altref),
                     ]
@@ -11664,8 +11713,22 @@ pub(crate) fn encode_inter_frame(
             }
         }
     });
+    let trial_last2 = last2.map(|l| {
+        if (l.width, l.height) == (fw, fh) {
+            l.clone()
+        } else {
+            Picture {
+                width: fw,
+                height: fh,
+                y: crop_plane(&l.y, l.width, fw, fh),
+                u: crop_plane(&l.u, l.width / 2, fw / 2, fh / 2),
+                v: crop_plane(&l.v, l.width / 2, fw / 2, fh / 2),
+            }
+        }
+    });
     let mut refs: [Option<&Picture>; 8] = [None; 8];
     refs[1] = Some(&trial_ref);
+    refs[2] = trial_last2.as_ref();
     refs[4] = trial_golden.as_ref();
     refs[7] = trial_altref.as_ref();
     let refpix = crate::decode::RefPix::ready(refs);
@@ -11941,7 +12004,9 @@ pub(crate) fn encode_sequence_with_ctx(
             render,
             Some(&carried.0),
             Some(&golden),
-            prev2.as_ref(), fctx,
+            prev2.as_ref(),
+            None,
+            fctx,
             None,
             &lookahead,
         )?;
@@ -14644,7 +14709,7 @@ mod tests {
             let padded_pic = picture.padded_to(SUPERBLOCK);
             let t = Instant::now();
             let inter =
-                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None, &[]).unwrap();
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, None, fctx, None, &[]).unwrap();
             let inter_t = t.elapsed();
             eprintln!(
                 "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
@@ -14743,7 +14808,7 @@ mod tests {
         stage_reset();
         let t = Instant::now();
         let inter =
-            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, fctx, None, &[]).unwrap();
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, flat_order_hints(1, 0, false), (width, height), None, None, None, None, fctx, None, &[]).unwrap();
         let total_t = t.elapsed();
         let [motion_search, interpolation, transform_quant, entropy] = stage_read();
         let accounted = motion_search + transform_quant + entropy;
@@ -14923,7 +14988,7 @@ mod tests {
                     0.5,
                     1,
                     flat_order_hints(1, 0, false),
-                    (width, height), None, None, None, fctx, None, &[],
+                    (width, height), None, None, None, None, fctx, None, &[],
                 )
                 .unwrap();
                 let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
@@ -14941,7 +15006,7 @@ mod tests {
                         0.5,
                         1,
                         flat_order_hints(1, 0, false),
-                        (width, height), None, None, None, fctx, None, &[],
+                        (width, height), None, None, None, None, fctx, None, &[],
                     )
                     .unwrap();
                     let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
@@ -15557,7 +15622,12 @@ mod tests {
     /// (`EC_AV1_ANGLE=0` restores that half).
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
-        let _knobs = crate::speed::knob_read();
+        // These are DEFAULT-PRESET pins: a speed preset switches search levers
+        // off, so it legitimately moves every byte. Encode at speed 0 whatever
+        // `EC_AV1_SPEED` says (write guard: the preset is process-global).
+        let _knobs = crate::speed::knob_write();
+        let was = crate::speed::speed();
+        crate::speed::set_speed(0);
         if !have_ffmpeg() {
             eprintln!("SKIP the_encoders_own_streams_are_byte_identical_to_their_pins: no ffmpeg");
             return;
@@ -15620,13 +15690,16 @@ mod tests {
         // now. `EC_AV1_I64=0` restores 8557 / 33345.
         let pins: [(u8, usize, u64); 2] =
             [(150, 8562, 0x66f5_4ffc_aacf_964f), (60, 33357, 0x1d61_9ca4_e960_b044)];
-        for (q, bytes, hash) in pins {
-            let encoded = encode_sequence(&source, q, 0.5).unwrap();
-            assert_eq!(
-                (encoded.stream.len(), fnv(&encoded.stream)),
-                (bytes, hash),
-                "q={q}: the encoder's stream moved"
-            );
+        let coded: Vec<(u8, usize, u64)> = pins
+            .iter()
+            .map(|&(q, _, _)| {
+                let e = encode_sequence(&source, q, 0.5).unwrap();
+                (q, e.stream.len(), fnv(&e.stream))
+            })
+            .collect();
+        crate::speed::set_speed(was);
+        for (&(q, bytes, hash), &got) in pins.iter().zip(&coded) {
+            assert_eq!(got, (q, bytes, hash), "q={q}: the encoder's stream moved");
         }
     }
 
@@ -16934,6 +17007,19 @@ mod tests {
                 mm.iter().sum::<usize>(),
             );
             print_inter_tx_census(name);
+            // lane-last2 (class `gate-blind-to-feature`): which reference the
+            // 32x32-and-below inter blocks of this clip's four encodes chose.
+            // The native table is the standing keep table, so a second past
+            // reference that never won a block has to be visible HERE and not
+            // only in a synthetic witness.
+            let rh = crate::encode::take_ref_frame_hits();
+            let rtot: usize = rh.iter().sum();
+            eprintln!(
+                "{name}: references LAST {} LAST2 {} GOLDEN {} ALTREF {} of {} inter blocks \
+                 (LAST2 {:.1}%)",
+                rh[1], rh[2], rh[4], rh[7], rtot,
+                100.0 * rh[2] as f64 / rtot.max(1) as f64,
+            );
             let palette = crate::tile::take_palette_hits();
             let palette_uv = crate::tile::take_palette_uv_hits();
             let ibc = crate::tile::take_intrabc_hits();
