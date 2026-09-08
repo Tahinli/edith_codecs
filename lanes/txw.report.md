@@ -105,13 +105,26 @@ ADST_DCT 5.3% / DCT_ADST 3.8%` to `IDTX 4.1% / DCT_DCT 78.0% / ADST_ADST
 2.4% / ADST_DCT 3.0% / DCT_ADST 2.3% / V_DCT 2.8% / H_DCT 7.4%`: the win is
 the two types that only exist in the wide set.
 
-FILMS: no arm was run and none is needed to state the keep rule's second
-half. `encode::wide_tx_set` takes the preset value through the SCREEN gate
-(`InterTxSearch::Screen` -> the frame's own screen flag), so a non-screen
-frame writes the same `reduced_tx_set = 1` header bit and takes the same
-code path as before the lane -- the bit alone never reaches a film frame.
-The byte pins (8562 / 33357) are unchanged with the lever ON, which is the
-in-suite instance of that statement.
+FILM rows (`EC_AV1_NATIVE_FILM4K=1`), the HEADER BIT ALONE -- the intra type
+search left screen-gated as shipped, so a film frame searches no type and
+only the ALPHABET it names changes (`EC_AV1_TXSET_WIDE=1`, every frame):
+
+| row | control | bit on every frame |
+|---|---|---|
+| bars 2160p | +9.4% / -12.7%, 205409 B at point 1 | +9.6% / -12.6%, 208456 B |
+| film B 2160p | +26.9% / -0.6%, 27442 B at point 1 | +27.2% / -0.3%, 27562 B |
+
+So the answer to the charter's question is YES: the header bit alone MOVES
+BYTES on a film. Every intra 8x8/4x4 luma unit still codes a `tx_type`
+symbol, and coding `DCT_DCT` into the seven-symbol `TX_SET_INTRA_1` CDF is
+not the same number of bits as coding it into the five-symbol
+`TX_SET_INTRA_2` one -- both films come out 0.2/0.3 WORSE against libaom
+(and 0.1/0.3 better against rav1e) for it. That fails the keep rule's film
+half, which is exactly why the lever ships behind the SCREEN gate:
+`encode::wide_tx_set` returns the frame's own screen flag, so a non-screen
+frame writes `reduced_tx_set = 1` and the same bytes as before the lane.
+The byte pins (8562 / 33357) unmoved with the lever ON are the in-suite
+instance of that.
 
 DECISION: `speed::WIDE_TX_SET[0] = true` (preset 0 only). Presets 1..6 carry
 the type search but were not measured with the wider alphabets, so they stay
