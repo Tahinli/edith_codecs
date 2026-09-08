@@ -120,3 +120,14 @@ suggests the instrument itself hangs, but nothing here exercises it either —
 * ~200k-sample misses on the INTER frames of those same synthetic screen
   streams (their frame 0 is not the only wrong frame). A separate lane: this
   one only closes the key-frame palette block.
+
+## Gates on 68c61d33
+
+| gate | result |
+|---|---|
+| `encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins` | ok, 1 passed (unchanged on this base) |
+| s1 `--skip stream::` | ok, 335 passed, 0 failed, 32 ignored (571 s) |
+| s2 `stream:: --skip 10bit` | ok, 200 passed, 0 failed, 15 ignored (752 s) |
+| s3 `10bit` | ok, 42 passed, 0 failed, 1 ignored (60 s) |
+| `cargo check --workspace --all-targets` | 0 errors, 0 ec-av1 warnings (21 pre-existing in ec-opus, 1 in ec-vorbis) |
+| kept stream, 12 frames, all planes | 0 differing samples |
