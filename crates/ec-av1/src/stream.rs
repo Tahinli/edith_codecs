@@ -35201,55 +35201,91 @@ pub(crate) mod tests {
         }
         const FRAMES: usize = 4;
         let mut checked = 0usize;
-        // The PINNED half of this gate. The generated rows below are the
-        // general regression; these two files are rav1e's own answer to a
-        // 384x152 crop of a REAL film (`speed=6`, quantizer 100 and 150,
-        // `-g 4`), which is the only recipe measured to turn on the
-        // activity segmentation whose `SEG_LVL_ALT_Q` the rect dequant path
-        // dropped -- a `testsrc2` or repo-fixture source codes one segment
-        // and passes this gate with the defect still in (both verified by
-        // reverting the fix under it). Bytes live in the shared `fixtures`
-        // directory, which is gitignored, so a missing file SKIPs.
-        for name in [
-            "d792_straddle_rav1e_384x152_q100.obu",
-            "d792_straddle_rav1e_384x152_q150.obu",
-        ] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../fixtures")
-                .join(name);
-            let Ok(stream) = std::fs::read(&path) else {
-                eprintln!("SKIP {NAME}: {name} missing");
-                continue;
-            };
-            let (w, h) = (384usize, 152usize);
-            let want = ffmpeg_decode_sequence(&stream, w, h, FRAMES);
-            let got = decode_stream(&stream)
-                .unwrap_or_else(|e| panic!("{NAME}: {name} refused: {e}"));
-            assert_eq!(got.len(), want.len(), "{NAME}: {name} frame count");
-            for (f, (o, r)) in got.iter().zip(&want).enumerate() {
-                for (plane, a, b) in [("Y", &o.y, &r.y), ("U", &o.u, &r.u), ("V", &o.v, &r.v)] {
-                    if let Some(i) = a.iter().zip(b.iter()).position(|(x, y)| x != y) {
-                        let stride = if plane == "Y" { w } else { w / 2 };
-                        panic!(
-                            "{NAME}: {name}, frame {f} plane {plane} sample ({}, {}): ours {} \
-                             vs ffmpeg {}",
-                            i % stride,
-                            i / stride,
-                            a[i],
-                            b[i],
-                        );
+        // The SEGMENTED half of this gate, built BY RECIPE.
+        //
+        // The defect this gate exists for only shows on a stream whose
+        // segments carry distinct `SEG_LVL_ALT_Q`, and neither `testsrc2` nor
+        // the repo's own clip turns activity segmentation on at all (ledger
+        // dead-end: 16 ladder points all pass with the defect still in). The
+        // contrast is therefore built here -- half flat grey, half heavy
+        // noise -- and libaom's `-aq-mode 1` answers it with segments whose
+        // quantizer indices differ; `block_q_span()` asserts exactly that, so
+        // the gate cannot go quietly blind (class `gate-blind-to-feature`).
+        // This replaces two crops of a real film that could never be
+        // committed and so SKIPped on every fresh clone.
+        for (w, h) in [(384usize, 152usize), (384, 184)] {
+            for crf in ["20", "35"] {
+                let half = (w / 2).to_string();
+                let flat = format!("color=c=gray:s={half}x{h}:r=25:d=1");
+                let busy = format!("{flat},noise=alls=80:all_seed=7:allf=t+u");
+                let args: Vec<String> = [
+                    "-v", "error", "-f", "lavfi", "-i", &flat, "-f", "lavfi", "-i", &busy,
+                    "-filter_complex", "[0:v][1:v]hstack=inputs=2,format=yuv420p",
+                    "-frames:v", &FRAMES.to_string(), "-pix_fmt", "yuv420p", "-an",
+                    "-threads", "1", "-g", &FRAMES.to_string(), "-c:v", "libaom-av1",
+                    "-cpu-used", "6", "-b:v", "0", "-crf", crf,
+                    // libaom's activity segmentation, i.e. `SEG_LVL_ALT_Q`.
+                    "-aq-mode", "1", "-f", "obu", "-",
+                ]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+                let out = Command::new("ffmpeg")
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                if !out.status.success() {
+                    eprintln!(
+                        "SKIP {NAME}: ffmpeg cannot encode the segmented {w}x{h} recipe ({})",
+                        String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+                    );
+                    continue;
+                }
+                let stream = out.stdout;
+                let want = ffmpeg_decode_sequence(&stream, w, h, FRAMES);
+                crate::decode::reset_segment_hits();
+                let got = decode_stream(&stream).unwrap_or_else(|e| {
+                    panic!("{NAME}: the segmented {w}x{h} crf {crf} recipe refused: {e}")
+                });
+                let (lo, hi) = crate::decode::block_q_span();
+                assert!(
+                    hi > lo,
+                    "{NAME}: the segmented {w}x{h} crf {crf} recipe dequantized every block \
+                     with q {lo} -- no segment carried a distinct SEG_LVL_ALT_Q, so this row \
+                     would pass with the rect dequant defect back in ({} segment ids seen)",
+                    crate::decode::segment_ids_seen()
+                );
+                assert_eq!(got.len(), want.len(), "{NAME}: segmented {w}x{h} frame count");
+                for (f, (o, r)) in got.iter().zip(&want).enumerate() {
+                    for (plane, a, b) in [("Y", &o.y, &r.y), ("U", &o.u, &r.u), ("V", &o.v, &r.v)] {
+                        if let Some(i) = a.iter().zip(b.iter()).position(|(x, y)| x != y) {
+                            let stride = if plane == "Y" { w } else { w / 2 };
+                            panic!(
+                                "{NAME}: segmented {w}x{h} crf {crf}, frame {f} plane {plane} \
+                                 sample ({}, {}): ours {} vs ffmpeg {} (block q span {lo}..{hi})",
+                                i % stride,
+                                i / stride,
+                                a[i],
+                                b[i],
+                            );
+                        }
                     }
                 }
+                eprintln!(
+                    "{NAME}: segmented {w}x{h} crf {crf} exact, block q span {lo}..{hi}"
+                );
+                checked += 1;
             }
-            checked += 1;
         }
         for (w, h) in [(384usize, 152usize), (384, 184)] {
-            // REAL content, not colour bars (class `gate film rows are colour
-            // bars`): both encoders only turn segmentation on -- the feature
-            // this gate is about -- when the picture's activity varies, and
-            // `testsrc2` codes one segment, so a bars source passes this gate
-            // with the defect still in (verified by reverting the fix under
-            // it).
+            // The ENCODER-LADDER half: both reference encoders, every
+            // ladder point, on real (non-bars) content. These rows code ONE
+            // segment, so they do not gate `SEG_LVL_ALT_Q` -- that is the
+            // recipe rows' job above -- but they are the rectangular
+            // partition coverage rav1e's straddle answer adds.
             let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
             if !clip.exists() {
