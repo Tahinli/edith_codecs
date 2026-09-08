@@ -53,6 +53,16 @@ reads" — a desync symptom, never a reader bound, as the standing class says).
 * `decode_color_index_map{,_wh}` take `(onscreenWidth, onscreenHeight)`, read
   the wavefront over that corner at the full-block stride, then replicate the
   last on-screen column and row (libaom's own two extension loops).
+* A second commit (fe850816's successor) restricts the clamp to contexts
+  where the frame's mi dims are known: the ENCODER's own in-process
+  reconstruct runs on a `FrameCtx::for_encoder` that never saw
+  `set_segmentation`, so its dims are `(0, 0)` and the first version read
+  every map as 1x1 there -- 16 round-trip gates (10 in s1, 6 in s2) refused
+  with a bogus "a reference frame selected with no picture at this frame's own
+  ref_frame_idx slot" (verified NOT pre-existing: the same 10 tests pass on
+  base 5e14d407, `$HOME/.cache/svtinter/sub-base.log`). That path's writer
+  half is unclamped too, so the two mirror each other; the branch carries a
+  `corner-cut:` comment naming the ceiling (see Open).
 
 ### Same-shape sweep (class: a per-cell map read over a block that straddles
 the frame edge)
