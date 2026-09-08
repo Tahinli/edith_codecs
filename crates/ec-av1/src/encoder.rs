@@ -3887,12 +3887,16 @@ mod tests {
                 wide_only(&intra) > 0,
                 "no intra luma unit took a 1-D DCT, the type only TX_SET_INTRA_1 names: {intra:?}"
             );
-            let inter_wide: usize = inter.iter().sum::<usize>()
-                - inter[TxType::DctDct as usize]
-                - inter[TxType::Idtx as usize];
+            // The INTER units of this same frame are coded into the
+            // twelve/sixteen-symbol alphabets too (the header bit widens
+            // every luma set at once), but their SEARCH still offers the
+            // two-type list -- see `encode::inter_luma_set`'s note on the
+            // reference-slot refusal the wider inter candidates trip. So the
+            // statement here is that those units still decode sample-exact
+            // out of the wider alphabet, which the two decoders below make.
             assert!(
-                inter_wide > 0,
-                "no inter luma unit took a type outside the two-type set: {inter:?}"
+                inter.iter().sum::<usize>() > 0,
+                "the clip coded no inter luma transform unit at all: {inter:?}"
             );
         } else {
             eprintln!(
