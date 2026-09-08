@@ -15618,7 +15618,12 @@ mod tests {
     /// (`EC_AV1_ANGLE=0` restores that half).
     #[test]
     fn the_encoders_own_streams_are_byte_identical_to_their_pins() {
-        let _knobs = crate::speed::knob_read();
+        // These are DEFAULT-PRESET pins: a speed preset switches search levers
+        // off, so it legitimately moves every byte. Encode at speed 0 whatever
+        // `EC_AV1_SPEED` says (write guard: the preset is process-global).
+        let _knobs = crate::speed::knob_write();
+        let was = crate::speed::speed();
+        crate::speed::set_speed(0);
         if !have_ffmpeg() {
             eprintln!("SKIP the_encoders_own_streams_are_byte_identical_to_their_pins: no ffmpeg");
             return;
@@ -15681,13 +15686,16 @@ mod tests {
         // now. `EC_AV1_I64=0` restores 8557 / 33345.
         let pins: [(u8, usize, u64); 2] =
             [(150, 8562, 0x66f5_4ffc_aacf_964f), (60, 33357, 0x1d61_9ca4_e960_b044)];
-        for (q, bytes, hash) in pins {
-            let encoded = encode_sequence(&source, q, 0.5).unwrap();
-            assert_eq!(
-                (encoded.stream.len(), fnv(&encoded.stream)),
-                (bytes, hash),
-                "q={q}: the encoder's stream moved"
-            );
+        let coded: Vec<(u8, usize, u64)> = pins
+            .iter()
+            .map(|&(q, _, _)| {
+                let e = encode_sequence(&source, q, 0.5).unwrap();
+                (q, e.stream.len(), fnv(&e.stream))
+            })
+            .collect();
+        crate::speed::set_speed(was);
+        for (&(q, bytes, hash), &got) in pins.iter().zip(&coded) {
+            assert_eq!(got, (q, bytes, hash), "q={q}: the encoder's stream moved");
         }
     }
 
