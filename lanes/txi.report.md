@@ -94,11 +94,14 @@ byte-identical to the control on these rows).
 
 | clip | control | 1x (the plain arm) | 2x (`EC_AV1_TXRD_LAMBDA=2`) | 0.5x |
 |---|---|---|---|---|
-| bars 1080p | -1.0% / -16.8% | -2.3% / -17.8% | -1.2% / -16.9% | (see below) |
-| film A | +21.7% / -4.4% | +22.1% / -4.0% | **+21.7% / -4.3%** | (see below) |
+| bars 1080p | -1.0% / -16.8% | -2.3% / -17.8% | -1.2% / -16.9% | -0.8% / -16.5% |
+| film A | +21.7% / -4.4% | +22.1% / -4.0% | **+21.7% / -4.3%** | +22.3% / -3.9% |
 
 film A bytes: control 64392/102508/170169/413430, 1x 65201/103781/172167/419156
-(+1.2..1.4%), 2x 64518/102989/170564/414763 (+0.2..0.3%).
+(+1.2..1.4%), 2x 64518/102989/170564/414763 (+0.2..0.3%), 0.5x
+64731/103742/171929/418934. The sweep is MONOTONE in the weight on both rows:
+0.5x spends more and loses more (film A +22.3/-3.9), 2x spends least and loses
+least.
 
 READING: the surcharge does exactly what the instrument predicted -- it buys
 the rate back (the arm's +1.3% of bytes collapses to +0.2%) and the film A row
