@@ -16488,8 +16488,14 @@ mod tests {
         // pays the `comp_mode = 0` symbol the writer codes ahead of it, so
         // single and compound are priced against the same syntax -- 8311 ->
         // 8325 bytes at q=150 and 33087 -> 33014 at q=60.
+        // Re-taken on lane-newmv: the motion search charges its own rate term
+        // at half the block RD lambda ([`crate::motion::MV_SEARCH_LAMBDA`])
+        // and each subpel stage re-runs from its own winner
+        // ([`crate::motion::MV_SUBPEL_ITERS`]), so every inter block's vector
+        // -- and with it its residual -- moved: 8325 -> 8288 bytes at q=150
+        // and 33014 -> 33090 at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8325, 0xf004_8258_bc60_ff05), (60, 33014, 0x5bc2_5dfd_bd13_18de)];
+            [(150, 8288, 0x241d_8115_0a6d_0f34), (60, 33090, 0x7e02_777c_01b4_f035)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
