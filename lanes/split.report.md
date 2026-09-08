@@ -125,6 +125,6 @@ Whatever film B's +25% is, it is not the transform-split margin.`
 
 `deferred: a bug found while building the census — encoder.rs used
 bool::then_some to build a Drop guard, which CONSTRUCTS and then DROPS the
-guard when the flag is off. Fixed here (then_some -> then); no other
-then_some in the crate builds a value with a Drop impl (grep: 3 hits, all
-Copy scalars).`
+guard when the flag is off. Fixed here (then_some -> then); swept the class: the crate's
+other 9 `then_some` calls all pass a reference or a `Copy` scalar, none of
+which has a `Drop` impl.`
