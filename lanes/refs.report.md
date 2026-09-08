@@ -140,3 +140,60 @@ Invariants, all green, all on the prebuilt release binary:
   table is its refutation, not a gap.
 * The long-GOP gate was not run: nothing from this lane changes a default, so
   there is nothing for it to confirm.
+
+## 6. The LAST2 build charter (the next lane)
+
+The census (§1) is the go/no-go and it says GO at the ARF level: 10.31% /
+8.38% of prediction SAD, ~4 blocks in 10 choosing the older picture. This
+section is the plan so the next lane spends its budget on the desync hunt and
+not on re-deriving the shape.
+
+**The slot plan.** Today's map has one free slot:
+
+| slot | holds | written by | read as |
+|---|---|---|---|
+| 0 (`LEAF_SLOT`) | the previous shown leaf | every leaf | `LAST_FRAME` of the next leaf |
+| 1 (`GOLDEN_SLOT`) | the key frame | the key | `GOLDEN_FRAME` everywhere |
+| 2 (`MID_SLOT`) | the mid ARF | the mid ARF | `LAST`/`ALTREF` of the leaves and quarters around it |
+| 3, 4 (`ANCHOR_SLOTS`) | this group's anchor and the next | the key, each top ARF | anchor = `LAST`, next = `ALTREF` |
+| 5, 6 (`QUARTER_SLOTS`) | the two quarter ARFs (off by default) | the quarter ARFs | `LAST`/`ALTREF` of the leaves beside them |
+| 7 | UNUSED: the key frame writes it and nothing ever reads it back | the key | -- |
+
+So: the LEAF chain alternates its refresh between slots 0 and 7 (leaf n
+refreshes the slot leaf n-2 wrote, which is read-before-write and safe), names
+the slot leaf n-1 wrote as `LAST_FRAME` and the other as `LAST2_FRAME`. The
+ARF levels need no new slot at all -- the anchor pair already holds two
+distinct past anchors (that is what `arf_altref()` exploits as `ALTREF`), so
+an ARF's `ref_frame_idx[1]` points at the anchor from two groups back. Both
+changes are `ref_frame_idx` + `refresh_frame_flags` bookkeeping in
+`encoder.rs`; `refresh_frame_flags` stays a single bit per frame.
+
+What must follow the slot, in one diff or the stream desyncs: `sign_bias[1]`
+(from the new slot's order hint, same `ahead()` walk), `order_hints[1]` (for
+`skipModeAllowed`), the mv stack for `LAST2_FRAME` and the compound pair
+`LAST_LAST2`, `record_mi` publishing the reference so neighbours vote it, the
+motion field, and `write_single_ref`'s tree (LAST2 is p1=0, p2=1 -- the
+pricer's `single_ref_bits` only knows LAST and GOLDEN today).
+
+**The search cost, which is the whole risk.** `search_inter_block` offers
+GOLDEN/ALTREF search-FREE (NEARESTMV/GLOBALMV only) precisely because a second
+motion search doubles the stage that owns most of the encode wall, and speed
+is the user's stated priority. Two arms, in this order:
+
+1. **Free arm**: LAST2 through the existing `extra` path, no search. Costs
+   one extra `single_ref` price per block and no motion estimation. This is
+   the arm that tells us how much of the census is reachable for free.
+2. **Seeded arm**: a REAL search on LAST2 seeded from LAST's own result -- the
+   census showed a plain diamond from the zero mv finds the win, and the LAST
+   search has already paid for the coarse stage, so LAST2 starts at LAST's
+   best mv scaled by the order-hint distance ratio (`ref_distance` is already
+   armed for the search) and runs the refinement steps only. That is the
+   cheap second search; a second full search is NOT chartered.
+
+**Per-level offer**: ARF levels first (the census's strongest level, and the
+level libaom/rav1e spend their slots on), leaves only if the ARF arm keeps.
+Gate: the 12-frame native gate's keep rule, then the long-GOP arm at what
+ships. Witness the lane must land: a clip where the picture before LAST is the
+better reference, >= N blocks coded off LAST2 (a fire counter, not a
+byte-count claim -- class `gate blind to feature`), exact through ffmpeg AND
+`decode_stream`, with the hidden-frame display order intact.
