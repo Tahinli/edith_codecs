@@ -36,6 +36,13 @@ const HALF_PEL_Q3: i32 = 4;
 /// refines by. Fixed by the unit, not swept.
 const QUARTER_PEL_Q3: i32 = 2;
 
+/// One eighth sample — the step of the fourth refinement stage, which runs
+/// only in a frame coded with `allow_high_precision_mv` (lane-hpmv): without
+/// that flag the writer cannot code an odd eighth-pel residual at all
+/// (`encode::round_to_valid_mv` rounds it away), so refining to it would only
+/// spend evaluations on vectors the stream cannot name.
+const EIGHTH_PEL_Q3: i32 = 1;
+
 /// The widest step the integer-pel search starts its log search at, in whole
 /// samples.
 ///
@@ -565,11 +572,17 @@ fn search_traced_from_step(
         step_pel /= 2;
     }
 
-    // Stages 2 and 3: one ±1-step refinement each at half-pel then
-    // quarter-pel, through the same cost function (so the refinement is
+    // Stages 2..4: one ±1-step refinement each at half-pel, quarter-pel and
+    // (high-precision frames only) eighth-pel, through the same cost function (so the refinement is
     // costed at the precision it commits to, not the integer-pel SAD alone).
     let integer_evals = evals.get();
-    for step in [HALF_PEL_Q3, QUARTER_PEL_Q3] {
+    // lane-hpmv: the eighth-pel stage runs only in a high-precision frame.
+    let stages: &[i32] = if crate::tile::high_precision_mv() {
+        &[HALF_PEL_Q3, QUARTER_PEL_Q3, EIGHTH_PEL_Q3]
+    } else {
+        &[HALF_PEL_Q3, QUARTER_PEL_Q3]
+    };
+    for &step in stages {
         // lane-newmv, class `search bounded by its heuristic`: ONE round per
         // step means a subpel winner two half-pels away from the integer
         // centre is unreachable. `EC_AV1_MV_SUBPEL_ITERS` runs the round

@@ -819,6 +819,45 @@ pub(crate) fn order_hints() -> (u32, u32, [u32; 7]) {
     ORDER_HINTS.with(std::cell::Cell::get)
 }
 
+thread_local! {
+    /// lane-hpmv: this frame's `allow_high_precision_mv`, armed per worker
+    /// beside [`arm_order_hints`] -- the writer's eighth-pel symbol, the
+    /// pricer's mv bits and the motion search's finest step all read it.
+    static HIGH_PRECISION_MV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms this frame's `allow_high_precision_mv` for the next tile written --
+/// or searched -- on this thread.
+pub(crate) fn arm_high_precision_mv(on: bool) {
+    HIGH_PRECISION_MV.with(|c| c.set(on));
+}
+
+/// What [`arm_high_precision_mv`] last armed on this thread.
+pub(crate) fn high_precision_mv() -> bool {
+    HIGH_PRECISION_MV.with(std::cell::Cell::get)
+}
+
+/// lane-hpmv's witness counters: `[0]` counts every `mv_hp`/`mv_class0_hp`
+/// symbol this process's writers coded (zero without
+/// `allow_high_precision_mv`, one per non-zero mv component with it), `[1]`
+/// counts the ones that came out ZERO -- an eighth-pel vector, i.e. one a
+/// frame without the flag cannot name at all.
+static HP_SYMBOLS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Reads and clears [`HP_SYMBOLS`]: `(hp symbols coded, eighth-pel ones)`.
+#[allow(dead_code)] // read only from the `#[cfg(test)]` witness
+pub(crate) fn take_hp_symbols() -> (u64, u64) {
+    let all = HP_SYMBOLS[0].swap(0, std::sync::atomic::Ordering::Relaxed);
+    (all, HP_SYMBOLS[1].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// [`take_hp_symbols`] without clearing -- what the NEWMV census prints.
+pub(crate) fn hp_symbols() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (HP_SYMBOLS[0].load(Relaxed), HP_SYMBOLS[1].load(Relaxed))
+}
+
 /// Writer-side counterpart of decode.rs `read_compound_ref_frames` (spec
 /// 5.11.25's `comp_reference_type`/`uni_comp_ref`/`comp_ref`/`comp_bwdref`
 /// trees), symbol for symbol at the same contexts -- which are, as that
@@ -5765,22 +5804,24 @@ fn mv_class_of(z: i32) -> usize {
 
 /// Writes one motion vector component's non-zero diff (spec 5.11.32
 /// `read_mv_component`, run backwards): sign, class, then the class's own
-/// bits. `allow_high_precision_mv` is off in every frame this writer codes,
-/// so the eighth-pel bit is always inferred as one rather than coded — which
-/// means only diffs whose eighth-pel bit really is one are representable;
-/// anything else is refused rather than rounded, since rounding would silently
-/// code a different vector than the caller asked for.
+/// bits, and (lane-hpmv) the eighth-pel bit when the frame armed through
+/// [`arm_high_precision_mv`] carries `allow_high_precision_mv`. Without that
+/// flag the eighth-pel bit is inferred as one rather than coded, so only
+/// diffs whose eighth-pel bit really is one are representable; anything else
+/// is refused rather than rounded, since rounding would silently code a
+/// different vector than the caller asked for.
 ///
 /// # Errors
-/// Returns an error when `diff` needs the eighth-pel precision this writer's
-/// frames do not carry.
+/// Returns an error when `diff` needs eighth-pel precision in a frame coded
+/// without `allow_high_precision_mv`.
 fn write_mv_component(enc: &mut SymbolEncoder, c: &mut MvComponentCdfs, diff: i32) -> Result<()> {
     debug_assert_ne!(diff, 0);
+    let hp_frame = high_precision_mv();
     let sign = diff < 0;
     enc.symbol(usize::from(sign), &mut c.sign);
     let mag = diff.unsigned_abs() as i32;
     let z = mag - 1;
-    if z & 1 == 0 {
+    if !hp_frame && z & 1 == 0 {
         return Err(Error::unsupported(
             "AV1 tile",
             "a motion vector component needs eighth-pel precision, which \
@@ -5790,11 +5831,18 @@ fn write_mv_component(enc: &mut SymbolEncoder, c: &mut MvComponentCdfs, diff: i3
     let class = mv_class_of(z);
     enc.symbol(class, &mut c.class);
     let local = z - mv_class_base(class);
+    let hp = (local & 1) as usize;
     if class == 0 {
         let bit = (local >> 3) & 1;
         let fr = (local >> 1) & 3;
         enc.symbol(bit as usize, &mut c.class0_bit);
         enc.symbol(fr as usize, &mut c.class0_fr[bit as usize]);
+        // spec 5.11.32: the eighth-pel bit is CODED when the frame allows
+        // high-precision motion vectors, and inferred as one otherwise ("if
+        // (allow_high_precision_mv) mv_class0_hp ... else mv_class0_hp = 1").
+        if hp_frame {
+            enc.symbol(hp, &mut c.class0_hp);
+        }
     } else {
         let d = local >> 3;
         let fr = (local >> 1) & 3;
@@ -5802,9 +5850,16 @@ fn write_mv_component(enc: &mut SymbolEncoder, c: &mut MvComponentCdfs, diff: i3
             enc.symbol(((d >> i) & 1) as usize, &mut c.bit[i]);
         }
         enc.symbol(fr as usize, &mut c.fr);
+        if hp_frame {
+            enc.symbol(hp, &mut c.hp);
+        }
     }
-    // The eighth-pel bit itself is inferred, not coded (spec 5.11.32: "if
-    // (allow_high_precision_mv) mv_class0_hp ... else mv_class0_hp = 1").
+    if hp_frame {
+        HP_SYMBOLS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if hp == 0 {
+            HP_SYMBOLS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     Ok(())
 }
 
