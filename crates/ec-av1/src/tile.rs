@@ -852,6 +852,12 @@ pub(crate) fn take_hp_symbols() -> (u64, u64) {
     (all, HP_SYMBOLS[1].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// [`take_hp_symbols`] without clearing -- what the NEWMV census prints.
+pub(crate) fn hp_symbols() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (HP_SYMBOLS[0].load(Relaxed), HP_SYMBOLS[1].load(Relaxed))
+}
+
 /// Writer-side counterpart of decode.rs `read_compound_ref_frames` (spec
 /// 5.11.25's `comp_reference_type`/`uni_comp_ref`/`comp_ref`/`comp_bwdref`
 /// trees), symbol for symbol at the same contexts -- which are, as that

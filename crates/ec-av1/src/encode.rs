@@ -4486,6 +4486,13 @@ pub(crate) fn dump_newmv_census() {
             v[7] as f64 / off / 64.0,
         );
     }
+    // lane-hpmv: how many mv components this encode coded an eighth-pel bit
+    // for, and how many of those named a vector no non-hp frame can code.
+    let (hp_all, hp_eighth) = crate::tile::hp_symbols();
+    eprintln!(
+        "NEWMVCENSUS hp symbols {hp_all}, of them eighth-pel {hp_eighth} ({:.1}%)",
+        100.0 * hp_eighth as f64 / hp_all.max(1) as f64,
+    );
     let g: [u64; 4] = std::array::from_fn(|i| NEWMV_CENSUS[32 + i].load(Relaxed));
     eprintln!(
         "NEWMVCENSUS pre-RD margin skips: extra-reference {}/{} ({:.1}%), \
