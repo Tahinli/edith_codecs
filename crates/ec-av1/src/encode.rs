@@ -17032,7 +17032,11 @@ mod tests {
         // ([`crate::speed::DQ_LEVEL_K`]), so the hidden frames' quantizer
         // grids -- and every decision priced against them -- moved:
         // 8252 -> 8269 bytes at q=150 and 33053 -> 33044 at q=60.
-        let pins: [(u8, usize, u64); 2] = [(150, 8269, 0xf0a10bafe7b45fe2), (60, 33044, 0x077e9c22ff6f41fb)];
+        // Re-taken on lane-arfpred: the top ARF is coded from a temporally
+        // FILTERED source ([`crate::speed::ARF_TF`]), so every hidden frame's
+        // pixels -- and the leaves that predict from them -- moved:
+        // 8269 -> 8218 bytes at q=150 and 33044 -> 33017 at q=60.
+        let pins: [(u8, usize, u64); 2] = [(150, 8218, 0xd533_c8ea_14ca_ae6e), (60, 33017, 0xbced_b694_dcfe_9146)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {

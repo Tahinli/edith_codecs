@@ -378,7 +378,22 @@ pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.5, 1.0, 1.0];
 /// vs lag 4 1.114 per pixel), so what the residual codes is mostly source
 /// grain. Filtering it out of the picture the anchor is coded from is the
 /// mechanism libaom uses (`arnr`) and rav1e 0.8.1 does not have at all.
-pub(crate) const ARF_TF: [f64; 11] = [0.0; 11];
+/// Long-GOP gate (48 pictures, BD vs libaom / rav1e), strength 3 against the
+/// control: film A +23.5/-8.0 -> **+22.7/-7.9**, film B +85.3/+6.7 ->
+/// **+79.0/+2.7**. Film B takes 6.3 and 4.0 points off; film A takes 0.8 off
+/// the libaom column and hands back 0.1 on the rav1e one, which is the
+/// keep rule's "one column >=0.5 down, the other flat" clause. It is also
+/// FASTER (film B two-point probe 167 s -> 147 s): the anchor has fewer
+/// coefficients to code. Uniform over the presets -- above preset 6
+/// [`TPL_DEPTH`] leaves the group window empty and the filter is inert by
+/// construction.
+///
+/// Strength is single-peaked and SHARP: the film B two-point probe reads
+/// -1.4% bytes at equal PSNR at 3, +3.4% at 8, +6.9% at 15 and +15.8% at 30
+/// (`lanes/arfpred.report.md` section 3). Hard filtering does remove 6-7% of
+/// the stream's bytes and gives all of it back in quality, because the leaves
+/// still carry the grain the anchor no longer has.
+pub(crate) const ARF_TF: [f64; 11] = [3.0; 11];
 
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
