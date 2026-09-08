@@ -1,0 +1,35 @@
+
+running 1 test
+test encode::tests::bd_rate_film_long_gop ... 
+native crop, 48 frames, gop=48; tiles (0, 0), tile threads 1, intrabc false, palette maxcolors 128
+| clip | ours PSNR/bytes per point | BD-rate vs libaom | BD-rate vs rav1e | wall ours:libaom:rav1e (noisy) |
+|---|---|---|---|---|
+film A (1080p source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -56 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -56 })
+film A (1080p source): pricer armings default=19 real=895
+film A (1080p source): key 64x64 intra roots 344 of 1440 offered (23.9%), 0 on a superblock the frame edge cuts
+film A (1080p source): 64x64 roots 29996 (with a residual 31543, split luma 19227, compound 16186)
+film A (1080p source): motion_mode 32x32 SIMPLE=146476 OBMC=0 WARP=6459 | 16x16 SIMPLE=100411 OBMC=0 WARP=8091 | 8x8 SIMPLE=82824 OBMC=0 WARP=9092 (0.0% OBMC / 6.7% WARP of 353353 eligible)
+film A (1080p source): inter var-tx depths of 252606 blocks -- leaf single 0=43321 1=5942 (12.1% split) | leaf compound 0=103223 1=17443 (14.5% split) | 32x32 single 0=20968 1=13332 (38.9% split) | 32x32 compound 0=28693 1=19684 (40.7% split)
+film A (1080p source): inter tx_type of 1495528 units -- DCT_DCT=1495528 (100.0%)
+film A (1080p source): intra tx_type of 16067492 units -- DCT_DCT=16067492 (100.0%)
+film A (1080p source): references LAST 238098 LAST2 0 GOLDEN 583 ALTREF 8751 of 247432 inter blocks (LAST2 0.0%)
+film A (1080p source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film A (1080p source): filter intra on=true blocks 93156 (modes DC=21897 V=14781 H=17720 D157=25414 PAETH=13344)
+| film A (1080p source) 1920x768 | 44.36 dB/195380 B, 45.90 dB/335212 B, 47.11 dB/576639 B, 48.29 dB/1487426 B | +23.8% | -9.4% | 639.8s:38.0s:59.1s |
+film B (2160p HDR source): sequence, pyramid requested Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -56 }) effective Some(Pyramid { mini_gop: 8, arf_q_offset: -32, leaf_q_offset: 12, mid_q_offset: Some(-8), quarter_q_offset: None, key_q_offset: -56 })
+film B (2160p HDR source): pricer armings default=19 real=795
+film B (2160p HDR source): key 64x64 intra roots 674 of 1920 offered (35.1%), 0 on a superblock the frame edge cuts
+film B (2160p HDR source): 64x64 roots 54428 (with a residual 23280, split luma 14026, compound 28056)
+film B (2160p HDR source): motion_mode 32x32 SIMPLE=189527 OBMC=0 WARP=5720 | 16x16 SIMPLE=92075 OBMC=0 WARP=4672 | 8x8 SIMPLE=63011 OBMC=0 WARP=4021 (0.0% OBMC / 4.0% WARP of 359026 eligible)
+film B (2160p HDR source): inter var-tx depths of 202766 blocks -- leaf single 0=39341 1=6374 (13.9% split) | leaf compound 0=75786 1=12219 (13.9% split) | 32x32 single 0=19315 1=14420 (42.7% split) | 32x32 compound 0=20507 1=14804 (41.9% split)
+film B (2160p HDR source): inter tx_type of 1334618 units -- DCT_DCT=1334618 (100.0%)
+film B (2160p HDR source): intra tx_type of 13521004 units -- DCT_DCT=13521004 (100.0%)
+film B (2160p HDR source): references LAST 237518 LAST2 0 GOLDEN 2035 ALTREF 13171 of 252724 inter blocks (LAST2 0.0%)
+film B (2160p HDR source): screen frames on=0 off=4 (0.0% on); palette blocks luma 0 chroma 0; intrabc blocks 0 (searched 0 / valid 0 / won 0)
+film B (2160p HDR source): filter intra on=true blocks 52835 (modes DC=13510 V=7795 H=8162 D157=17644 PAETH=5724)
+| film B (2160p HDR source) 1920x1024 | 46.93 dB/79434 B, 48.03 dB/164321 B, 48.93 dB/358588 B, 50.02 dB/1220321 B | +90.1% | +6.4% | 541.8s:80.5s:58.3s |
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 629 filtered out; finished in 1449.15s
+
+RC=0
