@@ -8299,6 +8299,17 @@ fn mv_component_bits(diff: i32) -> Option<f64> {
     Some(bits)
 }
 
+/// Whether `LAST2_FRAME` gets a `NEWMV` search of its own beside the
+/// neighbour-derived modes ([`extra_ref_new_mv`]'s per-reference switch,
+/// `EC_AV1_LAST2_NEW=0`): the charter's "free arm", i.e. the reference's
+/// value without the second motion search's wall.
+fn last2_new_mv() -> bool {
+    match std::env::var("EC_AV1_LAST2_NEW").ok() {
+        Some(v) => v != "0",
+        None => true,
+    }
+}
+
 /// Whether an extra reference (GOLDEN/ALTREF) is offered a `NEWMV` of its
 /// own -- a second motion search per block against that reference's picture,
 /// priced off that reference's own stack. `EC_AV1_MV_EXTRA_NEW=0` turns it
@@ -9410,8 +9421,15 @@ fn search_inter_block(
         // prices out `margin` times better than LAST's best vector does --
         // one candidate evaluation (`motion::cost_at`) standing in for a
         // whole search of ~50.
+        // lane-last2: the SEARCH-FREE arm for the second past leaf picture
+        // (`EC_AV1_LAST2_NEW=0`) -- LAST2 is then coded only at a vector some
+        // neighbour already found, which is how GOLDEN/ALTREF were offered
+        // before `EXTRA_REF_NEW_MV`, and it is what separates the reference's
+        // own value from the second motion search's wall.
+        let searched = extra_ref_new_mv()
+            && (ref_frame != crate::mvstack::LAST2_FRAME || last2_new_mv());
         let margin = extra_new_skip_margin();
-        let skip_search = extra_ref_new_mv()
+        let skip_search = searched
             && margin > 0.0
             && motion::cost_at(
                 &g.y,
@@ -9429,7 +9447,7 @@ fn search_inter_block(
                 fctx,
             ) * margin
                 <= found.cost;
-        if extra_ref_new_mv() && !skip_search {
+        if searched && !skip_search {
             let (gseeds, gn) = mv_seeds(gstack);
             #[cfg(test)]
             let t = stage_start();
