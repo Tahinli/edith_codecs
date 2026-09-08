@@ -798,11 +798,7 @@ fn record_block_compound(neighbours: &mut Neighbours, at_mi: (usize, usize), sid
 
 /// decode.rs' own `is_uni_comp_ref`: a pair is `UNIDIR_COMP_REFERENCE`
 /// exactly when both references sit on the same temporal side.
-fn is_uni_comp_ref(ref0: i8, ref1: i8) -> bool {
-    let backward =
-        |r: i8| (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&r);
-    backward(ref0) == backward(ref1)
-}
+use crate::mvstack::is_uni_comp_ref;
 
 thread_local! {
     /// `(order_hint_bits, this frame's order hint, each reference's order
@@ -5723,7 +5719,12 @@ fn dc_sign_ctx(vote: i32) -> usize {
 /// `pred_common.c`): both neighbours' intra/inter state when both are
 /// available, one neighbour's when only one is, and zero at a tile's own
 /// top-left corner.
-fn intra_inter_ctx(has_above: bool, has_left: bool, above_inter: bool, left_inter: bool) -> usize {
+pub(crate) fn intra_inter_ctx(
+    has_above: bool,
+    has_left: bool,
+    above_inter: bool,
+    left_inter: bool,
+) -> usize {
     match (has_above, has_left) {
         (true, true) => {
             let (above_intra, left_intra) = (!above_inter, !left_inter);

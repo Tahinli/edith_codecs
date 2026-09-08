@@ -251,6 +251,14 @@ pub struct MiGrid {
     cols: usize,
     rows: usize,
     cells: Vec<Option<MiInfo>>,
+    /// One `skip` flag per cell, beside `cells` rather than inside `MiInfo`
+    /// -- the mv-stack scan walks `cells` for every inter block, so the CELL
+    /// must stay 16 bytes (`mi_info_cell_stays_compact`), and nothing on the
+    /// scan path reads this. Only the ENCODER's own grid fills it
+    /// (`encode::record_mi`), for the RD pricer's `skip` context; the tile
+    /// writer and the decoder read their `skip` neighbours from their own
+    /// bands and leave this `false` (lane-ctx).
+    skips: Vec<bool>,
     /// lane-tiles r6: the current tile's own mi-unit bounds (spec: an MV
     /// candidate scan never reaches across a tile boundary, mirroring
     /// `PlaneBuf`'s `tile_x0`/`tile_x1` reach clamp for intra prediction).
@@ -279,6 +287,7 @@ impl MiGrid {
             cols,
             rows,
             cells: vec![None; cols * rows],
+            skips: vec![false; cols * rows],
             tile_row0: 0,
             tile_col0: 0,
             tile_row1: rows,
@@ -325,6 +334,25 @@ impl MiGrid {
         if row < self.rows && col < self.cols {
             self.cells[row * self.cols + col] = Some(info);
         }
+    }
+
+    /// Records the `skip` flag of the unit at `(row, col)` -- see `skips`.
+    pub fn set_skip(&mut self, row: usize, col: usize, skip: bool) {
+        if row < self.rows && col < self.cols {
+            self.skips[row * self.cols + col] = skip;
+        }
+    }
+
+    /// The `skip` flag of the unit at `(row, col)`, `false` outside this
+    /// tile's own window (the same clamp [`Self::get`] applies).
+    pub fn skip_at(&self, row: usize, col: usize) -> bool {
+        row < self.rows
+            && col < self.cols
+            && row >= self.tile_row0
+            && row < self.tile_row1
+            && col >= self.tile_col0
+            && col < self.tile_col1
+            && self.skips[row * self.cols + col]
     }
 
     /// Records one block's whole `bh4` x `bw4` footprint at once. Every
@@ -500,6 +528,20 @@ pub struct MvStack {
     pub above_refs: (Option<i8>, Option<i8>),
     /// The immediate LEFT neighbour's `(ref0, ref1)` -- see `above_refs`.
     pub left_refs: (Option<i8>, Option<i8>),
+    /// The immediate above/left neighbours exactly as tile.rs' `above_nbr`/
+    /// `left_nbr` build them for `reference_mode_ctx`/
+    /// `comp_reference_type_ctx`, `None` outside the tile (which is what the
+    /// writer's `has_above`/`has_left` gate says). Carried so the RD pricer
+    /// prices `comp_mode` and the compound reference tree at the writer's own
+    /// contexts instead of context 0 (lane-ctx).
+    pub above_nbr: Option<NeighbourRef>,
+    /// The immediate LEFT neighbour -- see `above_nbr`.
+    pub left_nbr: Option<NeighbourRef>,
+    /// The two `skip` flags the writer's `skip_ctx` sums (its
+    /// `above_skip[mi_c]` + `left_skip[mi_r]`), `false` outside the tile.
+    pub above_skip: bool,
+    /// The immediate LEFT neighbour's `skip` -- see `above_skip`.
+    pub left_skip: bool,
 }
 
 /// Spec 7.10.2.8's threshold a candidate's weight is compared against to
@@ -1673,6 +1715,33 @@ pub fn find_mv_stack_with_sign_bias(
     let above_refs = refs_of(mi_row.checked_sub(1).and_then(|r| grid.get(r, mi_col)));
     let left_refs = refs_of(mi_col.checked_sub(1).and_then(|c| grid.get(mi_row, c)));
 
+    // The same two cells again, in the shape tile.rs `above_nbr`/`left_nbr`
+    // hand `reference_mode_ctx`/`comp_reference_type_ctx`, plus each side's
+    // `skip` -- what the pricer's own `comp_mode`/compound-tree/`skip`/
+    // `is_inter` contexts read (lane-ctx).
+    let above_cell = mi_row.checked_sub(1).and_then(|r| grid.get(r, mi_col));
+    let left_cell = mi_col.checked_sub(1).and_then(|c| grid.get(mi_row, c));
+    let nbr_of = |cell: Option<MiInfo>| {
+        cell.map(|mi| {
+            let ref0 = if mi.is_inter { mi.ref_frame } else { 0 };
+            let ref1 = (mi.is_inter && mi.ref_frame1 > 0).then_some(mi.ref_frame1);
+            NeighbourRef {
+                is_inter: mi.is_inter,
+                ref0,
+                ref1,
+                uni: ref1.is_some_and(|r1| is_uni_comp_ref(ref0, r1)),
+            }
+        })
+    };
+    let above_nbr = nbr_of(above_cell);
+    let left_nbr = nbr_of(left_cell);
+    let above_skip = mi_row
+        .checked_sub(1)
+        .is_some_and(|r| grid.skip_at(r, mi_col));
+    let left_skip = mi_col
+        .checked_sub(1)
+        .is_some_and(|c| grid.skip_at(mi_row, c));
+
     MvStack {
         entries: candidates,
         nearest_mv,
@@ -1684,6 +1753,10 @@ pub fn find_mv_stack_with_sign_bias(
         drl_ctx,
         above_refs,
         left_refs,
+        above_nbr,
+        left_nbr,
+        above_skip,
+        left_skip,
     }
 }
 
@@ -2636,12 +2709,23 @@ pub(crate) fn uni_comp_ref_p1_ctx(
 /// `ref1`'s meaning only when compound: whether the pair libaom's
 /// `has_uni_comp_refs` would call unidirectional (both refs on the same
 /// side of the current frame).
-#[derive(Clone, Copy)]
-pub(crate) struct NeighbourRef {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NeighbourRef {
+    /// Whether the neighbour was coded inter.
     pub is_inter: bool,
+    /// Its `RefFrame[0]`, `0` (`INTRA_FRAME`) when it is intra.
     pub ref0: i8,
+    /// Its `RefFrame[1]`, `None` unless it was coded compound.
     pub ref1: Option<i8>,
+    /// Whether that compound pair is unidirectional.
     pub uni: bool,
+}
+
+/// libaom `has_uni_comp_refs`: a compound pair is unidirectional when both
+/// of its references sit on the same side of the current frame. One copy,
+/// shared by the tile writer and the RD pricer (lane-ctx).
+pub(crate) fn is_uni_comp_ref(ref0: i8, ref1: i8) -> bool {
+    is_backward(ref0) == is_backward(ref1)
 }
 
 fn is_backward(r: i8) -> bool {

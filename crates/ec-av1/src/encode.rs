@@ -4004,6 +4004,114 @@ fn warp_prediction(
     Some([u8s(&py_buf), u8s(&pu_buf), u8s(&pv_buf)])
 }
 
+/// What tile.rs' `write_compound_ref_frames` pays for the pair
+/// `(ref0, ref1)`, symbol for symbol, each at the context its own
+/// `single_ref_p*_ctx`/`uni_comp_ref_p1_ctx`/`comp_reference_type_ctx`
+/// derives from the block's above/left neighbours -- plus the `comp_mode`
+/// symbol itself at `reference_mode_ctx`.
+///
+/// Before lane-ctx this was four constants at CDF row 0 that assumed the pair
+/// was LAST+GOLDEN or LAST+ALTREF: `comp_bwdref[0][0] = 1` prices a BWDREF or
+/// ALTREF2 partner as ALTREF and drops its `p6` symbol entirely, and the
+/// `uni_comp_ref` leaves price a LAST+LAST2 pair as LAST+GOLDEN.
+pub(crate) fn compound_ref_bits(
+    (ref0, ref1): (i8, i8),
+    stack: &crate::mvstack::MvStack,
+) -> f64 {
+    use crate::mvstack::{
+        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        comp_reference_type_ctx, is_uni_comp_ref, single_ref_p1_ctx, single_ref_p2_ctx,
+        single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
+        uni_comp_ref_p1_ctx,
+    };
+    let (a, a1) = stack.above_refs;
+    let (l, l1) = stack.left_refs;
+    let unidir = is_uni_comp_ref(ref0, ref1);
+    let comp_mode = symbol_bits(
+        &cdf::COMP_MODE[crate::mvstack::reference_mode_ctx(stack.above_nbr, stack.left_nbr)],
+        1,
+    );
+    let ref_type = symbol_bits(
+        &cdf::COMP_REF_TYPE[comp_reference_type_ctx(stack.above_nbr, stack.left_nbr)],
+        usize::from(!unidir),
+    );
+    if unidir {
+        let both_backward = (ref0, ref1) == (BWDREF_FRAME, ALTREF_FRAME);
+        let p0 = symbol_bits(
+            &cdf::UNI_COMP_REF[single_ref_p1_ctx(a, a1, l, l1)][0],
+            usize::from(both_backward),
+        );
+        if both_backward {
+            return comp_mode + ref_type + p0;
+        }
+        let past_last2 = ref1 != LAST2_FRAME;
+        let p1 = symbol_bits(
+            &cdf::UNI_COMP_REF[uni_comp_ref_p1_ctx(a, a1, l, l1)][1],
+            usize::from(past_last2),
+        );
+        let p2 = if past_last2 {
+            symbol_bits(
+                &cdf::UNI_COMP_REF[single_ref_p5_ctx(a, a1, l, l1)][2],
+                usize::from(ref1 == GOLDEN_FRAME),
+            )
+        } else {
+            0.0
+        };
+        return comp_mode + ref_type + p0 + p1 + p2;
+    }
+    let far = ref0 == LAST3_FRAME || ref0 == GOLDEN_FRAME;
+    let fwd = symbol_bits(
+        &cdf::COMP_REF[single_ref_p3_ctx(a, a1, l, l1)][0],
+        usize::from(far),
+    ) + if far {
+        symbol_bits(
+            &cdf::COMP_REF[single_ref_p5_ctx(a, a1, l, l1)][2],
+            usize::from(ref0 == GOLDEN_FRAME),
+        )
+    } else {
+        symbol_bits(
+            &cdf::COMP_REF[single_ref_p4_ctx(a, a1, l, l1)][1],
+            usize::from(ref0 == LAST2_FRAME),
+        )
+    };
+    let is_altref = ref1 == ALTREF_FRAME;
+    let bwd = symbol_bits(
+        &cdf::COMP_BWDREF[single_ref_p2_ctx(a, a1, l, l1)][0],
+        usize::from(is_altref),
+    ) + if is_altref {
+        0.0
+    } else {
+        symbol_bits(
+            &cdf::COMP_BWDREF[single_ref_p6_ctx(a, a1, l, l1)][1],
+            usize::from(ref1 == ALTREF2_FRAME),
+        )
+    };
+    comp_mode + ref_type + fwd + bwd
+}
+
+/// What the `skip` symbol costs at the context tile.rs really codes it with
+/// (`above_skip[mi_c] + left_skip[mi_r]`, the two cells the MV stack now
+/// carries) instead of row 0 -- the pricer's skip-versus-residual margin is
+/// exactly the difference between this symbol's two values, so the row it is
+/// read from moves that decision (class pricer-context-zero, lane-ctx).
+pub(crate) fn skip_bits_at(stack: &crate::mvstack::MvStack, skip: bool) -> f64 {
+    let ctx = usize::from(stack.above_skip) + usize::from(stack.left_skip);
+    symbol_bits(&cdf::SKIP[ctx], usize::from(skip))
+}
+
+/// What the `is_inter` symbol costs at tile.rs' own `intra_inter_ctx` -- the
+/// neighbours' intra/inter state, with an out-of-tile side contributing
+/// nothing, off the same two cells (lane-ctx).
+pub(crate) fn intra_inter_bits_at(stack: &crate::mvstack::MvStack, inter: bool) -> f64 {
+    let ctx = crate::tile::intra_inter_ctx(
+        stack.above_nbr.is_some(),
+        stack.left_nbr.is_some(),
+        stack.above_nbr.is_some_and(|n| n.is_inter),
+        stack.left_nbr.is_some_and(|n| n.is_inter),
+    );
+    symbol_bits(&cdf::INTRA_INTER[ctx], usize::from(inter))
+}
+
 /// What tile.rs' `write_single_ref` pays for `ref_frame`, symbol for symbol,
 /// at the fixed context this RD pricer uses for every neighbour-derived
 /// symbol (the writer contexts each symbol off its above/left neighbours'
@@ -6003,8 +6111,8 @@ fn code_square_inter(
         TxbSet::Chroma8
     };
 
-    let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
-    let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
+    let skip_bits = |skip: bool| skip_bits_at(stack, skip);
+    let intra_inter_bits = |inter: bool| intra_inter_bits_at(stack, inter);
     let single_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
         + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
@@ -6241,20 +6349,9 @@ fn code_square_inter(
     // compound-only syntax the writer emits.
     for (ref1, g, cstack) in compound.iter().filter(|_| leaf_compound()) {
         let (ref1, g) = (*ref1, *g);
-        let uni =
-            (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&ref1);
-        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
-            + if uni {
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
-                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
-                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
-            } else {
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
-            };
+        // The whole `comp_mode` + reference-pair tree at the writer's own
+        // contexts, for THIS pair (lane-ctx).
+        let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
         let mode_ctx =
             cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
@@ -6704,7 +6801,16 @@ fn code_square_inter(
 /// MV stack reads, over the `size` x `size` 4x4 units it covers. An intra
 /// block casts no vote but is still a coded cell (see `code_square_inter`'s
 /// note on `processed_rows`/`processed_cols`).
-fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: Option<InterInfo>) {
+fn record_mi(
+    grid: &mut MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    size: u8,
+    inter: Option<InterInfo>,
+    // lane-ctx: the block's own `skip`, so the next block's MV stack can hand
+    // the RD pricer the two cells the writer's `skip_ctx` sums.
+    skip: bool,
+) {
     let info = match inter {
         Some(info) => MiInfo {
             is_inter: true,
@@ -6748,6 +6854,7 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
     for dr in 0..usize::from(size) {
         for dc in 0..usize::from(size) {
             grid.set(mi_row + dr, mi_col + dc, info);
+            grid.set_skip(mi_row + dr, mi_col + dc, skip);
         }
     }
 }
@@ -8793,7 +8900,7 @@ fn search_skip_64(
     let ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     // What every candidate pays whatever its vector: `skip` coded 1, then
     // `is_inter` coded 1, then the LAST chain above.
-    let fixed = symbol_bits(&cdf::SKIP[0], 1) + symbol_bits(&cdf::INTRA_INTER[0], 1) + ref_bits;
+    let fixed = skip_bits_at(stack, true) + intra_inter_bits_at(stack, true) + ref_bits;
     let info_of = |mode: InterMode, mv: (i32, i32), ref_mv_idx: u8| InterInfo {
         ref1: None,
         mv1: (0, 0),
@@ -8907,19 +9014,9 @@ fn search_skip_64(
     // reference's tree, plus the pair tree and the compound mode.
     for (ref1, g, cstack) in compound.iter().filter(|_| b64_compound()) {
         let (ref1, g) = (*ref1, *g);
-        let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&ref1);
-        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
-            + if uni {
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
-                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
-                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
-            } else {
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
-            };
+        // The whole `comp_mode` + reference-pair tree at the writer's own
+        // contexts, for THIS pair (lane-ctx).
+        let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
         let mode_ctx =
             cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
@@ -9057,7 +9154,7 @@ fn search_skip_64(
                 sets[plane],
             )
         });
-        let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
+        let unskip = skip_bits_at(stack, false) - skip_bits_at(stack, true);
         let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
         // lane-b64b: the root's own var-tx decision -- one TX_64X64 or the
         // four TX_32X32 units of `txfm_split = 1`, taken by the same
@@ -9171,8 +9268,8 @@ fn search_inter_block(
 
     // skip / intra_inter symbol costs at a fixed context -- see this
     // function's doc comment.
-    let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
-    let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
+    let skip_bits = |skip: bool| skip_bits_at(stack, skip);
+    let intra_inter_bits = |inter: bool| intra_inter_bits_at(stack, inter);
 
     struct Candidate {
         cost: f64,
@@ -9542,23 +9639,9 @@ fn search_inter_block(
     let half_new = true;
     for (ref1, g, cstack) in compound {
         let (ref1, g) = (*ref1, *g);
-        let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME)
-            .contains(&ref1);
-        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
-            + if uni {
-                // LAST + a backward reference: `comp_ref_type` = bidirectional,
-                // `comp_ref` LAST, `comp_bwdref` ALTREF.
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
-                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
-                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
-            } else {
-                // LAST + GOLDEN: unidirectional, `uni_comp_ref` p0/p1/p2.
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
-            };
+        // The whole `comp_mode` + reference-pair tree at the writer's own
+        // contexts, for THIS pair (lane-ctx).
+        let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
         let mode_ctx =
             cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
@@ -11393,7 +11476,7 @@ pub(crate) fn encode_inter_frame(
                                                 fctx,
                                             );
                                             cost8 += cost;
-                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter);
+                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter, leaf8.skip);
                                             eight.push(leaf8);
                                         }
                                         (eight, cost8)
@@ -11415,7 +11498,7 @@ pub(crate) fn encode_inter_frame(
                                 }
                                 partition_hit(2);
                                 cost += leaf_cost;
-                                record_mi(&mut grid, mi_row, mi_col, 4, leaf.inter);
+                                record_mi(&mut grid, mi_row, mi_col, 4, leaf.inter, leaf.skip);
                                 leaves.push(leaf);
                             }
                             (leaves, cost)
@@ -11434,7 +11517,7 @@ pub(crate) fn encode_inter_frame(
                     }
                     partition_hit(0);
                     sb_cost += cost_whole;
-                    record_mi(&mut grid, mi_row, mi_col, 8, block.inter);
+                    record_mi(&mut grid, mi_row, mi_col, 8, block.inter, block.skip);
                     blocks.push((r32 * cols + c32, Quadrant::Whole(block)));
                 } else {
                     // The sub-positions actually inside the true frame, same
@@ -11501,7 +11584,7 @@ pub(crate) fn encode_inter_frame(
                             // to (0,0), which is the encoder-grid-drift class
                             // -- correct only for as long as a leaf can never
                             // be compound.
-                            record_mi(&mut grid, mi_row, mi_col, 4, block.inter);
+                            record_mi(&mut grid, mi_row, mi_col, 4, block.inter, block.skip);
                             leaves.push(block);
                         } else {
                             let (x_sub, y_sub) = (sc * SUB, sr * SUB);
@@ -11540,7 +11623,7 @@ pub(crate) fn encode_inter_frame(
                                 );
                                 // Same publication point as the 16x16
                                 // straddling leaf above (`record_mi`).
-                                record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter);
+                                record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter, leaf.skip);
                                 eight.push(leaf);
                             }
                             leaves.push(BlockCoeffs {
@@ -11571,7 +11654,7 @@ pub(crate) fn encode_inter_frame(
                 // Overwrites every 16x16 mi cell the quadrant searches
                 // published under this superblock, so the next block's stack
                 // is built off the block that was really coded.
-                record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter);
+                record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter, block.skip);
                 blocks.push(((sb_r * 2) * cols + sb_c * 2, Quadrant::Whole64(block)));
                 for q in 1..4 {
                     let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
@@ -12061,6 +12144,196 @@ pub(crate) fn encode_sequence_with_ctx(
 #[cfg(test)]
 mod tests {
 
+    /// An [`crate::mvstack::MvStack`] with every context at zero and no
+    /// neighbours, for the pricer tests below to fill the one band each of
+    /// them is about.
+    fn bare_stack() -> crate::mvstack::MvStack {
+        crate::mvstack::MvStack {
+            entries: Default::default(),
+            nearest_mv: (0, 0),
+            near_mv: (0, 0),
+            pred_mv: (0, 0),
+            new_mv_ctx: 0,
+            ref_mv_ctx: 0,
+            zero_mv_ctx: 0,
+            drl_ctx: Default::default(),
+            above_refs: (None, None),
+            left_refs: (None, None),
+            above_nbr: None,
+            left_nbr: None,
+            above_skip: false,
+            left_skip: false,
+        }
+    }
+
+    /// [`super::compound_ref_bits`] pays exactly the symbols tile.rs'
+    /// `write_compound_ref_frames` codes for a pair, each at that symbol's
+    /// own neighbour-derived context. Red before lane-ctx, where the pricer
+    /// spent four constants at CDF row 0 that assumed the pair was
+    /// LAST+GOLDEN or LAST+ALTREF -- so a LAST+BWDREF pair was priced as
+    /// LAST+ALTREF with its `comp_bwdref` p6 symbol missing entirely.
+    #[test]
+    fn the_compound_ref_pricer_pays_the_writers_own_symbol_sequence() {
+        use crate::cdf::{COMP_BWDREF, COMP_MODE, COMP_REF, COMP_REF_TYPE, UNI_COMP_REF};
+        use crate::encode::symbol_bits as b;
+        use crate::mvstack::{
+            ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+            LAST_FRAME, NeighbourRef, comp_reference_type_ctx, reference_mode_ctx,
+            single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
+            single_ref_p5_ctx, single_ref_p6_ctx, uni_comp_ref_p1_ctx,
+        };
+        // (pair, unidirectional?, the tree's symbols as (table, p index,
+        // context selector, value)) -- transcribed from the writer.
+        // selector: 1..=6 are `single_ref_p*_ctx`, 7 is `uni_comp_ref_p1_ctx`.
+        type Sym = (char, usize, usize, usize);
+        let cases: [((i8, i8), bool, &[Sym]); 7] = [
+            ((LAST_FRAME, LAST2_FRAME), true, &[('u', 0, 1, 0), ('u', 1, 7, 0)]),
+            (
+                (LAST_FRAME, LAST3_FRAME),
+                true,
+                &[('u', 0, 1, 0), ('u', 1, 7, 1), ('u', 2, 5, 0)],
+            ),
+            (
+                (LAST_FRAME, GOLDEN_FRAME),
+                true,
+                &[('u', 0, 1, 0), ('u', 1, 7, 1), ('u', 2, 5, 1)],
+            ),
+            ((BWDREF_FRAME, ALTREF_FRAME), true, &[('u', 0, 1, 1)]),
+            (
+                (LAST_FRAME, ALTREF_FRAME),
+                false,
+                &[('c', 0, 3, 0), ('c', 1, 4, 0), ('b', 0, 2, 1)],
+            ),
+            (
+                (LAST_FRAME, BWDREF_FRAME),
+                false,
+                &[('c', 0, 3, 0), ('c', 1, 4, 0), ('b', 0, 2, 0), ('b', 1, 6, 0)],
+            ),
+            (
+                (LAST_FRAME, ALTREF2_FRAME),
+                false,
+                &[('c', 0, 3, 0), ('c', 1, 4, 0), ('b', 0, 2, 0), ('b', 1, 6, 1)],
+            ),
+        ];
+        let nbr = |ref0, ref1: Option<i8>| {
+            Some(NeighbourRef {
+                is_inter: true,
+                ref0,
+                ref1,
+                uni: ref1.is_some_and(|r1| crate::mvstack::is_uni_comp_ref(ref0, r1)),
+            })
+        };
+        // No neighbours (every context zero), then a mixed pair that puts the
+        // p* rows, `comp_reference_type_ctx` and `reference_mode_ctx` off 0.
+        for (above_nbr, left_nbr, above_refs, left_refs) in [
+            (None, None, (None, None), (None, None)),
+            (
+                nbr(LAST_FRAME, None),
+                nbr(ALTREF_FRAME, Some(GOLDEN_FRAME)),
+                (Some(LAST_FRAME), None),
+                (Some(ALTREF_FRAME), Some(GOLDEN_FRAME)),
+            ),
+        ] {
+            let stack = crate::mvstack::MvStack {
+                above_nbr,
+                left_nbr,
+                above_refs,
+                left_refs,
+                ..bare_stack()
+            };
+            let (a, a1) = above_refs;
+            let (l, l1) = left_refs;
+            let ctx_of = |sel: usize| match sel {
+                1 => single_ref_p1_ctx(a, a1, l, l1),
+                2 => single_ref_p2_ctx(a, a1, l, l1),
+                3 => single_ref_p3_ctx(a, a1, l, l1),
+                4 => single_ref_p4_ctx(a, a1, l, l1),
+                5 => single_ref_p5_ctx(a, a1, l, l1),
+                6 => single_ref_p6_ctx(a, a1, l, l1),
+                _ => uni_comp_ref_p1_ctx(a, a1, l, l1),
+            };
+            for (pair, unidir, symbols) in cases {
+                let mut want = b(&COMP_MODE[reference_mode_ctx(above_nbr, left_nbr)], 1)
+                    + b(
+                        &COMP_REF_TYPE[comp_reference_type_ctx(above_nbr, left_nbr)],
+                        usize::from(!unidir),
+                    );
+                for &(table, p, sel, v) in symbols {
+                    let row = ctx_of(sel);
+                    want += match table {
+                        'u' => b(&UNI_COMP_REF[row][p], v),
+                        'c' => b(&COMP_REF[row][p], v),
+                        _ => b(&COMP_BWDREF[row][p], v),
+                    };
+                }
+                let got = super::compound_ref_bits(pair, &stack);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "pair {pair:?} above {above_refs:?} left {left_refs:?}: \
+                     priced {got} bits, writer codes {want}"
+                );
+            }
+        }
+    }
+
+    /// The `skip` and `is_inter` symbols are priced at the SAME context
+    /// tile.rs codes them with -- `above_skip + left_skip` for the first and
+    /// `intra_inter_ctx` for the second -- not at row 0. Red before lane-ctx
+    /// on every neighbour configuration whose context is not zero (class
+    /// pricer-context-zero).
+    #[test]
+    fn the_skip_and_intra_inter_pricers_use_the_writers_own_contexts() {
+        use crate::cdf::{INTRA_INTER, SKIP};
+        use crate::encode::symbol_bits as b;
+        use crate::mvstack::NeighbourRef;
+        let nbr = |is_inter| NeighbourRef {
+            is_inter,
+            ref0: if is_inter { crate::mvstack::LAST_FRAME } else { 0 },
+            ref1: None,
+            uni: false,
+        };
+        for (above, left, above_skip, left_skip) in [
+            (None, None, false, false),
+            (Some(nbr(true)), Some(nbr(true)), true, false),
+            (Some(nbr(false)), Some(nbr(false)), true, true),
+            (Some(nbr(false)), None, false, true),
+            (None, Some(nbr(true)), true, true),
+        ] {
+            let stack = crate::mvstack::MvStack {
+                above_nbr: above,
+                left_nbr: left,
+                above_skip,
+                left_skip,
+                ..bare_stack()
+            };
+            let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
+            let ii_ctx = crate::tile::intra_inter_ctx(
+                above.is_some(),
+                left.is_some(),
+                above.is_some_and(|n| n.is_inter),
+                left.is_some_and(|n| n.is_inter),
+            );
+            for v in [false, true] {
+                let (got, want) = (
+                    super::skip_bits_at(&stack, v),
+                    b(&SKIP[skip_ctx], usize::from(v)),
+                );
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "skip {v} at ctx {skip_ctx}: priced {got}, writer codes {want}"
+                );
+                let (got, want) = (
+                    super::intra_inter_bits_at(&stack, v),
+                    b(&INTRA_INTER[ii_ctx], usize::from(v)),
+                );
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "is_inter {v} at ctx {ii_ctx}: priced {got}, writer codes {want}"
+                );
+            }
+        }
+    }
+
     /// [`super::single_ref_bits`] pays exactly what tile.rs'
     /// `write_single_ref` codes: the p1/p2/p6 chain for a BACKWARD
     /// reference and the p1/p3/p4/p5 chain for a forward one, each symbol at
@@ -12077,16 +12350,9 @@ mod tests {
             single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
         };
         let stack_with = |above_refs, left_refs| MvStack {
-            entries: Default::default(),
-            nearest_mv: (0, 0),
-            near_mv: (0, 0),
-            pred_mv: (0, 0),
-            new_mv_ctx: 0,
-            ref_mv_ctx: 0,
-            zero_mv_ctx: 0,
-            drl_ctx: Default::default(),
             above_refs,
             left_refs,
+            ..bare_stack()
         };
         // (reference, the symbols `write_single_ref` emits as (p index, value))
         let cases: [(i8, &[(usize, usize)]); 7] = [
@@ -15805,8 +16071,13 @@ mod tests {
         // reference through the tree and the neighbour contexts the writer
         // really codes it with, so every inter picture's reference decisions
         // move -- 8562 -> 8535 at q=150 and 33357 -> 33221 at q=60.
+        // Re-taken on lane-ctx: the RD pricer reads the writer's own contexts
+        // for `skip`/`is_inter` and for the whole compound reference tree, so
+        // every inter block's cost -- and with it the skip and reference
+        // decisions -- moved: 8535 -> 8311 bytes at q=150 and 33221 -> 33087
+        // at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8535, 0x7b7f_4eeb_1080_7b45), (60, 33221, 0x720b_821e_5dd2_90e4)];
+            [(150, 8311, 0xfb6d_75a4_5d13_3833), (60, 33087, 0x4d11_a03c_bdc6_e2d5)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
