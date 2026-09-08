@@ -1067,6 +1067,16 @@ const KEY_DEFAULT: i16 = -48;
 /// shipped on the flat path -- was inert on every frame of every pyramid
 /// stream, including the ARFs that carry 54% of a long-GOP stream's bytes
 /// (class `tool disabled in every gate recipe`).
+/// lane-arfpred: the top ARF source temporal filter's strength
+/// ([`crate::speed::ARF_TF`]), `EC_AV1_ARF_TF=<strength>` overriding it;
+/// `0` is off.
+fn arf_tf_strength() -> f64 {
+    std::env::var("EC_AV1_ARF_TF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| crate::speed::at(&crate::speed::ARF_TF))
+}
+
 fn tpl_pyramid() -> bool {
     match std::env::var("EC_AV1_TPL_PYRAMID").ok() {
         Some(v) => v != "0",
@@ -1782,8 +1792,20 @@ impl Av1Encoder {
             .then(|| self.dpb[altref_slot as usize].as_ref().map(|s| s.picture.clone()))
             .flatten();
         let start_cdfs = self.dpb[last_slot as usize].as_ref().map(|s| s.cdfs.0.clone());
+        // lane-arfpred: the top ARF is coded from a TEMPORALLY FILTERED
+        // source when `speed::ARF_TF` is non-zero -- the grain it would
+        // otherwise spend its residual on is averaged out against the
+        // group's own display neighbours (`lookahead`, already padded).
+        let source = picture.padded_to(SUPERBLOCK);
+        let tf = arf_tf_strength();
+        let source = match (tf > 0.0, dq_level) {
+            (true, crate::encode::DqLevel::TopArf) => {
+                crate::encode::arf_temporal_filter(&source, lookahead, tf)
+            }
+            _ => source,
+        };
         let encoded = || -> Result<Encoded> { encode_inter_frame(
-            &picture.padded_to(SUPERBLOCK),
+            &source,
             &reference,
             base_q_idx,
             DEADZONE,
