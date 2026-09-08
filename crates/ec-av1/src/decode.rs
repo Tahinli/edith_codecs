@@ -2131,6 +2131,24 @@ pub fn skip_split_tx_hits() -> usize {
     SKIP_SPLIT_TX_HITS.with(|c| c.get())
 }
 
+// lane-svt1: SKIPPED square blocks carrying a palette/intrabc prediction whose
+// `tx_depth` split the luma transform -- the arm that predicted DC off the
+// block edges before the fix. Like [`SKIP_SPLIT_TX_HITS`] only the pixels
+// witness this path, so a gate that wants it needs the counter.
+thread_local! {
+    static SKIP_SPLIT_TX_OVERRIDE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SKIP_SPLIT_TX_OVERRIDE_HITS`] (blocks).
+pub fn skip_split_tx_override_hits() -> usize {
+    SKIP_SPLIT_TX_OVERRIDE_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`SKIP_SPLIT_TX_OVERRIDE_HITS`] before a gate's own decode attempt.
+pub fn reset_skip_split_tx_override_hits() {
+    SKIP_SPLIT_TX_OVERRIDE_HITS.with(|c| c.set(0));
+}
+
 /// Zeroes [`SKIP_SPLIT_TX_HITS`] before a gate's own decode attempt.
 pub fn reset_skip_split_tx_hits() {
     SKIP_SPLIT_TX_HITS.with(|c| c.set(0));
@@ -14221,8 +14239,23 @@ fn decode_block(
     // `logical_tx`-sized window of that same map, set fresh inside the TU loop
     // below (lane-palette2 r7) -- setting the full-block buffer here would be
     // taken by the FIRST unit and indexed at the wrong stride.
+    // lane-svt1: a SKIPPED block predicts the whole `side`x`side` in ONE call
+    // (the `else` arm below -- a palette/intrabc block never takes the per-unit
+    // `split_tx_skip` walk), so its map must be armed here even when the
+    // transform is split. Gating the arm on `logical_tx == side` alone left a
+    // 16x16 palette block with `tx_depth == 1` and `skip == 1` predicting DC
+    // off its own edges: right symbols, wrong pixels (SVT-AV1 preset-8 screen
+    // key frame; class override-slot-on-one-arm). Neither prediction is
+    // edge-derived, so the whole-block buffer at the block's own stride is
+    // exactly what that single call wants.
+    // Counted on the SHAPE, not on the arm below, so a gate can tell a stream
+    // that reaches this block apart from one that never does (class
+    // gate-blind-to-feature).
+    if palette_y_buf.is_some() && skip && logical_tx < side {
+        hit!(SKIP_SPLIT_TX_OVERRIDE_HITS);
+    }
     if let Some(buf) = &palette_y_buf
-        && logical_tx == side
+        && (logical_tx == side || skip)
     {
         set_palette_pred(buf.clone(), fctx);
     }
@@ -21274,6 +21307,7 @@ fn pipe_filters_ok(fctx: &crate::decode::FrameCtx, tile_cols: u32, lf_present: b
         || crate::envflags::is_set("EC_AV1_POSTCDEF_DUMP16")
         || crate::envflags::is_set("EC_AV1_DEBUG_SKIP_DEBLOCK")
         || crate::envflags::is_set("EC_AV1_DEBUG_SKIP_CDEF")
+        || crate::envflags::is_set("EC_AV1_DEBUG_SKIP_LR")
         || crate::envflags::is_set("EC_AV1_DEBUG_CDEF_BAND")
         || crate::envflags::is_set("EC_AV1_DEBLOCK_TRACE")
         || crate::envflags::is_set("EC_AV1_DEBLOCK_TRACE_V"))
@@ -21538,6 +21572,10 @@ fn apply_loop_restoration(
     // (class av1-truesize-lane: true frame size vs mi-rounded).
     (frame_w, frame_h): (usize, usize), fctx: &crate::decode::FrameCtx,
 ) {
+    // lane-svt1 debug rung, env-gated: see `apply_cdef`/`apply_deblock`'s siblings.
+    if crate::envflags::env_flag!("EC_AV1_DEBUG_SKIP_LR") {
+        return;
+    }
     let mut out = scratch_empty();
     crate::restoration::apply_loop_restoration_plane(
         &y.data,
