@@ -1386,13 +1386,19 @@ impl Av1Encoder {
         struct SplitCensusDump;
         impl Drop for SplitCensusDump {
             fn drop(&mut self) {
-                crate::encode::dump_split_census();
+                if crate::encode::split_census_on() {
+                    crate::encode::dump_split_census();
+                }
+                if crate::encode::newmv_census_on() {
+                    crate::encode::dump_newmv_census();
+                }
             }
         }
         // `then_some` would CONSTRUCT the guard eagerly and drop it when the
         // flag is off, which runs `Drop` -- and printed the census header on
         // every unarmed encode. `then` builds it only when armed.
-        let _census = crate::encode::split_census_on().then(|| SplitCensusDump);
+        let _census = (crate::encode::split_census_on() || crate::encode::newmv_census_on())
+            .then(|| SplitCensusDump);
         if (picture.width, picture.height) != (self.config.width, self.config.height) {
             return Err(Error::unsupported(
                 "AV1 encode",
