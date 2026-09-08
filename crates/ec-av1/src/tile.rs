@@ -5959,6 +5959,7 @@ fn note_drl_clamp(target: usize, signalled: usize, entries: usize) {
 }
 
 /// Takes and clears [`DRL_CLAMP_HITS`], for a gate's own before/after delta.
+#[cfg(test)]
 pub(crate) fn take_drl_clamp_hits() -> usize {
     DRL_CLAMP_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
