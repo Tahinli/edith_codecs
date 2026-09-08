@@ -733,6 +733,97 @@ fn b128_root() -> bool {
     *ENV
 }
 
+/// lane-b128r: whether the 128 root prices a REAL residual as well as the
+/// skip arm -- four TX_64X64 luma units interleaved with a TX_32X32 chroma
+/// pair per 64x64 mu chunk, var-tx depth 0 (the shape
+/// [`crate::tile::write_inter_block_128`] codes and `decode_inter_block`
+/// reads). Written, witnessed and byte-exact through both decoders, and
+/// **off by default** (`EC_AV1_B128RES=1` turns it on) for two measured
+/// reasons:
+///
+///  * it is INERT on content: over the native 12-frame gate the RD takes it
+///    0-2 times per frame against ~90 whole 128 roots, so the BD effect is
+///    inside the noise either way;
+///  * with it on, `bd_rate_screen_native`'s bars 2160p row q=90 frame 11
+///    reads 8 luma samples (rows 126..127, cols 1611..1616 -- the two rows
+///    above a 128-superblock horizontal edge) where ffmpeg and this
+///    encoder's own reconstruction disagree. The residual arm's own witness
+///    clip is byte-exact through ffmpeg over 420 forced blocks at 1280x768,
+///    so the open half is a FILTER-stage interaction (deblock/CDEF at a 128
+///    block's own edge), not the coefficient path.
+///
+/// An inert candidate does not buy a live filter mismatch, so the default
+/// stays off until that is root-caused; the knob is the gate for it.
+fn b128_residual() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B128RES").ok().map(|v| v != "0")
+    });
+    (ENV.unwrap_or(false) || FORCE_B128_RESIDUAL.load(std::sync::atomic::Ordering::Relaxed))
+        && b128_root()
+}
+
+/// lane-b128r: whether the 128 root offers the COMPOUND candidates the 64
+/// root already does (`NEAREST_NEARESTMV`, `GLOBAL_GLOBALMV`,
+/// `NEW_NEARESTMV` over the LAST+GOLDEN / LAST+ALTREF pairs), at the block's
+/// own 32x32-mi window. `EC_AV1_B128COMP=0` turns it off, which is this
+/// arm's attribution control; the writer has always had the path
+/// (`write_inter_block_128` calls `write_compound_block` for a block that
+/// names a second reference).
+fn b128_compound() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B128COMP").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b128_root()
+}
+
+/// How many 128 roots came out COMPOUND since the last
+/// [`take_b128_compound_hits`] (class `gate-blind-to-feature`).
+static B128_COMPOUND_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The compound-128 count since the last call, and zero it.
+pub fn take_b128_compound_hits() -> usize {
+    B128_COMPOUND_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only: take the 128 root's residual arm whatever it costs, so a
+/// witness clip codes the shape rather than waiting for content on which the
+/// RD picks it (the same role [`force_sb128`] plays for the superblock size).
+/// Never read outside `#[cfg(test)]` builds.
+static FORCE_B128_RESIDUAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only twin of [`FORCE_B128_RESIDUAL`] for the PARTITION decision: take
+/// the 128 root whenever it produced a candidate at all, whatever its four
+/// cells cost, so a witness codes the block it is about rather than waiting
+/// for content on which the root also wins its own comparison.
+static FORCE_B128_ROOT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arms [`FORCE_B128_RESIDUAL`] -- and with it [`FORCE_B128_ROOT`], since a
+/// forced residual block only reaches the writer if its root is taken.
+#[cfg(test)]
+pub(crate) fn force_b128_residual(on: bool) {
+    FORCE_B128_RESIDUAL.store(on, std::sync::atomic::Ordering::Relaxed);
+    force_b128_root(on);
+}
+
+/// Arms [`FORCE_B128_ROOT`] for the rest of the process.
+#[cfg(test)]
+pub(crate) fn force_b128_root(on: bool) {
+    FORCE_B128_ROOT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many 128 roots came out cheaper WITH a residual than skipped, since
+/// the last [`take_b128_residual_hits`] (class `gate-blind-to-feature`).
+static B128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The 128-residual count since the last call, and zero it.
+pub fn take_b128_residual_hits() -> usize {
+    B128_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many 128x128 `PARTITION_NONE` roots the search took since the last
 /// [`take_b128_none_hits`] (class `gate-blind-to-feature`): a flat BD result
 /// is only attributable once the fire count is known.
@@ -9393,6 +9484,11 @@ fn search_root_128(
     tpl_cells_x: usize,
     base_q_idx: u8,
     reference: &Picture,
+    // The `LAST` + extra-reference pairs at THIS ROOT's own 32x32-mi window,
+    // built by the caller off the same grid the tile writer rebuilds its
+    // stack from (empty unless the frame carries `reference_select` and
+    // [`b128_compound`] is on).
+    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
     fctx: &crate::decode::FrameCtx,
 ) -> Option<(f64, f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> {
     const SIDE: usize = SUPERBLOCK * 2;
@@ -9428,7 +9524,16 @@ fn search_root_128(
         .map(|&(dr, dc)| cell_lambda(root_r + dr, root_c + dc))
         .sum::<f64>()
         / 4.0;
-    let root_search = Search { lambda, ..search };
+    // The qindex this root is really quantized at: the delta_q unit is the
+    // 128 superblock, so the root's own top-left cell is the one coded
+    // (lane-b128m), and the residual arm below has to quantize at exactly it.
+    let root_search = Search {
+        lambda,
+        ..match sb_q {
+            Some(q) => sb_q_search(q, sb_cols, base_q_idx, (root_r, root_c), search),
+            None => search,
+        }
+    };
     let stack = find_mv_stack(
         grid,
         mi_row,
@@ -9449,10 +9554,90 @@ fn search_root_128(
         false,
         reference,
         &stack,
-        &[],
+        compound,
         fctx,
     );
-    let (cost, block) = found?;
+    let (mut cost, mut block) = found?;
+    if block.inter.is_some_and(|i| i.ref1.is_some()) {
+        B128_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // lane-b128r: the same prediction with a REAL residual, priced against
+    // the skip arm the search just committed to the planes (which IS the
+    // winner's prediction, sample for sample). The block's residual is four
+    // TX_64X64 luma units, one per 64x64 mu chunk, each interleaved with its
+    // own TX_32X32 chroma pair -- so it is coded here as twelve trials at
+    // sides the forward network already reaches, never as one 128-point
+    // transform. Var-tx depth 0 only: the four units ARE the tree's leaves.
+    //
+    // The four `txfm_partition` symbols the writer codes for them are not
+    // priced, exactly as the 64 root does not price its own (their contexts
+    // are only known at write time); at four symbols a root this is under a
+    // bit against residuals of hundreds.
+    if b128_residual() && block.skip {
+        // Every unit's coded level grid is 32x32 (a 64-point transform codes
+        // only its top-left corner), packed per plane into one 64-wide grid
+        // with chunk (cr, cc) at (cr * 32, cc * 32) -- the layout
+        // `write_inter_block_128` slices back out in the same chunk order.
+        let mut packed = [vec![0i32; 64 * 64], vec![0i32; 64 * 64], vec![0i32; 64 * 64]];
+        let mut chunks: Vec<((usize, usize), [Trial; 3])> = Vec::new();
+        let (mut sse_skip, mut sse_res, mut coeff_bits) = (0.0f64, 0.0f64, 0.0f64);
+        for (cr, cc) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+            let (px, py) = (x128 + cc * SUPERBLOCK, y128 + cr * SUPERBLOCK);
+            let (cx, cy) = (px / 2, py / 2);
+            let half = SUPERBLOCK / 2;
+            let pred_y = rows_of(&luma.reconstruction, luma.width, px, py, SUPERBLOCK);
+            let pred_u = rows_of(&chroma[0].reconstruction, chroma[0].width, cx, cy, half);
+            let pred_v = rows_of(&chroma[1].reconstruction, chroma[1].width, cx, cy, half);
+            sse_skip += luma.block_sse(px, py, SUPERBLOCK, &pred_y)
+                + chroma[0].block_sse(cx, cy, half, &pred_u)
+                + chroma[1].block_sse(cx, cy, half, &pred_v);
+            let trials = [
+                luma.code_from_prediction(
+                    px, py, SUPERBLOCK, &pred_y, false, root_search.base_q_idx,
+                    root_search.deadzone, TxbSet::Luma64,
+                ),
+                chroma[0].code_from_prediction(
+                    cx, cy, half, &pred_u, false, root_search.base_q_idx,
+                    root_search.deadzone, TxbSet::Chroma32,
+                ),
+                chroma[1].code_from_prediction(
+                    cx, cy, half, &pred_v, false, root_search.base_q_idx,
+                    root_search.deadzone, TxbSet::Chroma32,
+                ),
+            ];
+            for (plane, trial) in trials.iter().enumerate() {
+                sse_res += trial.sse;
+                coeff_bits += trial.bits;
+                for row in 0..32 {
+                    packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32]
+                        .copy_from_slice(&trial.levels[row * 32..][..32]);
+                }
+            }
+            chunks.push(((cr, cc), trials));
+        }
+        // `cost` is the skip arm's own `sse + lambda * syntax`; the residual
+        // arm pays the same syntax with `skip` coded 0 instead of 1, plus its
+        // coefficients.
+        let unskip = skip_bits_at(&stack, false) - skip_bits_at(&stack, true);
+        let res_cost = cost - sse_skip + sse_res + lambda * (unskip + coeff_bits);
+        if res_cost < cost || FORCE_B128_RESIDUAL.load(std::sync::atomic::Ordering::Relaxed) {
+            B128_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for ((cr, cc), trials) in &chunks {
+                let (px, py) = (x128 + cc * SUPERBLOCK, y128 + cr * SUPERBLOCK);
+                let half = SUPERBLOCK / 2;
+                luma.commit(px, py, SUPERBLOCK, &trials[0]);
+                chroma[0].commit(px / 2, py / 2, half, &trials[1]);
+                chroma[1].commit(px / 2, py / 2, half, &trials[2]);
+            }
+            cost = res_cost;
+            block.skip = false;
+            block.tx_depth = 0;
+            block.luma_tx_types = Vec::new();
+            block.luma = coeffs(&packed[0], 64);
+            block.u = coeffs(&packed[1], 64);
+            block.v = coeffs(&packed[2], 64);
+        }
+    }
     let after = snapshot(luma, chroma, (x128, y128), SIDE);
     restore(luma, chroma, (x128, y128), SIDE, &base);
     Some((
@@ -12125,6 +12310,40 @@ pub(crate) fn encode_inter_frame(
         // 128x128 candidate is weighed.
         let mark128 = blocks.len();
         let mut root_cost = 0.0f64;
+        // The 128 root's own compound pairs, at its 32x32-mi window (the 64
+        // root builds the same list one size down, per superblock).
+        let root_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> =
+            if header.reference_select && b128_compound() && !screen && sb128_search {
+                [
+                    (crate::mvstack::GOLDEN_FRAME, golden),
+                    (crate::mvstack::ALTREF_FRAME, altref),
+                ]
+                .into_iter()
+                .filter_map(|(r, pic)| {
+                    pic.map(|p| {
+                        (
+                            r,
+                            p,
+                            crate::mvstack::find_mv_stack_compound(
+                                &grid,
+                                root_r * 16,
+                                root_c * 16,
+                                32,
+                                32,
+                                (crate::mvstack::LAST_FRAME, r),
+                                mi_cols,
+                                mi_rows,
+                                grid.sign_bias_table(),
+                                &[(0, 0); 7],
+                                None,
+                            ),
+                        )
+                    })
+                })
+                .collect()
+            } else {
+                Vec::new()
+            };
         let root128 = (sb128_search && b128_root() && cells.len() == 4)
             .then(|| search_root_128(
                 &mut luma,
@@ -12140,6 +12359,7 @@ pub(crate) fn encode_inter_frame(
                 tpl_cells_x,
                 base_q_idx,
                 reference,
+                &root_compound,
                 fctx,
             ))
             .flatten();
@@ -12722,7 +12942,10 @@ pub(crate) fn encode_inter_frame(
         // cost, the same weighing the 64 root does one size down. Both sides
         // carry their own partition symbol, so the comparison is complete.
         if let Some((cost128, lambda128, block, after)) = root128
-            && cost128 < root_cost + lambda128 * crate::tile::partition_bits(128, true)
+            && (cost128 < root_cost + lambda128 * crate::tile::partition_bits(128, true)
+                // The witness knob takes the root whatever it costs, so the
+                // forced residual block really reaches the writer.
+                || FORCE_B128_ROOT.load(std::sync::atomic::Ordering::Relaxed))
         {
             B128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
@@ -12772,8 +12995,24 @@ pub(crate) fn encode_inter_frame(
             .iter()
             .filter(|q| !matches!(q, Quadrant::Covered))
             .count();
+        // lane-b128r: of those roots, how many code a REAL residual rather
+        // than the skip-only block lane-b128 shipped -- the fire count this
+        // arm's own gate row is read against.
+        let residual = blocks
+            .iter()
+            .filter(|q| matches!(q, Quadrant::Whole128(b) if !b.skip))
+            .count();
+        // lane-b128r: and how many named a second reference (the compound
+        // arm at the 128 root).
+        let compound = blocks
+            .iter()
+            .filter(|q| {
+                matches!(q, Quadrant::Whole128(b) if b.inter.is_some_and(|i| i.ref1.is_some()))
+            })
+            .count();
         eprintln!(
-            "B128 census: inter frame, {whole} whole 128x128 roots, {roots} coded blocks              ({:.1}% of the frame's area at 128)",
+            "B128 census: inter frame, {whole} whole 128x128 roots ({residual} with a residual, \
+             {compound} compound), {roots} coded blocks ({:.1}% of the frame's area at 128)",
             100.0 * (whole * 16) as f64 / blocks.len().max(1) as f64,
         );
     }
@@ -16061,6 +16300,149 @@ mod tests {
         }
     }
 
+    /// lane-b128r: the 128 root's own RESIDUAL arm -- four TX_64X64 luma
+    /// units interleaved with a TX_32X32 chroma pair per 64x64 mu chunk. The
+    /// same pan the skip-only witness above uses, with the arm FORCED
+    /// ([`force_b128_residual`]): on synthetic bars the RD picks the residual
+    /// about once per frame, which witnesses the shape but not every context
+    /// it reads, and forcing codes all 420 roots of the clip through it. RED
+    /// before this lane by construction (`write_inter_block_128` refused
+    /// every non-skip 128 block, so no such block existed to decode), and RED
+    /// again on the first draft of the writer, whose neighbour band recorded
+    /// `skip = true` for a block that carries a residual -- the next root's
+    /// `skip` symbol then took CDF row 1 where the reader takes row 0.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_128_root_block_with_a_real_residual --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_128_root_block_with_a_real_residual_decodes_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-b128r-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("smpte-pan-1280x768.y4m");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "smptebars=size=1600x768:rate=24"])
+            .args(["-vf", "crop=1280:768:'min(n*2,300)':0", "-frames:v", "8"])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
+        let _ = take_b128_residual_hits();
+        let _ = crate::tile::take_sb128_residual_hits();
+        force_b128_residual(true);
+        let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
+        let (won, coded) =
+            (take_b128_residual_hits(), crate::tile::take_sb128_residual_hits());
+        eprintln!("128x128 blocks WITH a residual: search won {won}, writer coded {coded}");
+        assert!(
+            coded > 0,
+            "no 128x128 block carried a residual on this clip, so it cannot witness the arm",
+        );
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            let recon = &frame.reconstruction;
+            for (plane, got, want) in [
+                ("luma", &dec.y, &recon.y),
+                ("U", &dec.u, &recon.u),
+                ("V", &dec.v, &recon.v),
+            ] {
+                let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ, 0,
+                    "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
+                     own reconstruction",
+                    got.len()
+                );
+            }
+        }
+        let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: ffmpeg V");
+        }
+    }
+
+    /// lane-b128r: the COMPOUND arm at the 128 root -- one 128x128 block
+    /// naming `LAST` plus `GOLDEN`/`ALTREF`, through the same
+    /// `write_compound_block` chain every smaller compound block takes, at a
+    /// window it had never been exercised at. RED before this lane: the
+    /// search passed an empty compound list at the 128 root, so the count was
+    /// 0 and no such block existed to decode.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_128_root_compound_block --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_128_root_compound_block_decodes_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-b128c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("testsrc2-1280x768.y4m");
+        // Moving objects that occlude each other: a pan is coded by one
+        // reference outright, and a compound pair only pays where the two
+        // references disagree.
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=1280x768:rate=24"])
+            .args(["-frames:v", "12", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        // The compound candidate wins the 128 block's own search on this pan
+        // but the root then loses to its four cells, so the root is forced
+        // (the residual arm is left at its default, off).
+        force_b128_root(true);
+        let _ = take_b128_compound_hits();
+        let _ = crate::tile::take_sb128_compound_hits();
+        let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
+        let (won, coded) =
+            (take_b128_compound_hits(), crate::tile::take_sb128_compound_hits());
+        eprintln!("COMPOUND 128x128 blocks: search won {won}, writer coded {coded}");
+        assert!(coded > 0, "no compound 128x128 block was coded on this clip");
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            for (plane, got, want) in [
+                ("luma", &dec.y, &frame.reconstruction.y),
+                ("U", &dec.u, &frame.reconstruction.u),
+                ("V", &dec.v, &frame.reconstruction.v),
+            ] {
+                let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(differ, 0, "frame {i}: {plane} -- {differ} samples differ");
+            }
+        }
+        let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: ffmpeg V");
+        }
+    }
+
     #[test]
     #[ignore = "sets the process-global superblock size: run it alone"]
     fn a_128_superblock_clip_whose_drl_index_the_write_time_stack_cannot_carry_decodes_exact() {
@@ -17224,6 +17606,32 @@ mod tests {
             );
             for (i, (d, e)) in decoded.iter().zip(&encoded.frames).enumerate() {
                 if let Some((plane, s, got, want)) = first_plane_mismatch(d, &e.reconstruction) {
+                    // TEMPORARY (lane-b128r bisect): the whole mismatch map.
+                    let (l, r) = match plane {
+                        "Y" => (&d.y, &e.reconstruction.y),
+                        "U" => (&d.u, &e.reconstruction.u),
+                        _ => (&d.v, &e.reconstruction.v),
+                    };
+                    let w = if plane == "Y" { width } else { width / 2 };
+                    let bad: Vec<usize> = l
+                        .iter()
+                        .zip(r.iter())
+                        .enumerate()
+                        .filter(|(_, (a, b))| a != b)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let rows: Vec<usize> = bad.iter().map(|i| i / w).collect();
+                    let cols: Vec<usize> = bad.iter().map(|i| i % w).collect();
+                    eprintln!(
+                        "B128R MISMATCH {name} q={q} frame {i} plane {plane}: {} samples, \
+                         rows {}..{}, cols {}..{}, first 8 {:?}",
+                        bad.len(),
+                        rows.iter().min().copied().unwrap_or(0),
+                        rows.iter().max().copied().unwrap_or(0),
+                        cols.iter().min().copied().unwrap_or(0),
+                        cols.iter().max().copied().unwrap_or(0),
+                        bad.iter().take(8).map(|i| (i / w, i % w)).collect::<Vec<_>>(),
+                    );
                     panic!(
                         "{name} q={q} frame {i} plane {plane} sample {s}: ffmpeg decoded \
                          {got}, the encoder reconstructed {want}"
@@ -17501,7 +17909,12 @@ mod tests {
         // q=150 and 33194 at q=60. `EC_AV1_SB128=0` restores 8252 / 33053.
         // Re-taken at the merge of lane-b128m onto main (128 superblocks on
         // by default, on top of the ARF temporal filter).
-        let pins: [(u8, usize, u64); 2] = [(150, 8354, 0x1290b8628438c6d4), (60, 33222, 0xc7f92971ab1264c3)];
+        // Re-taken on lane-b128r: the 128 root now offers the COMPOUND
+        // candidates the 64 root already did ([`b128_compound`]), so every
+        // inter frame that carries `reference_select` codes different blocks
+        // -- 8354 -> 8364 bytes at q=150 and 33222 -> 33257 at q=60.
+        // `EC_AV1_B128COMP=0` restores 8354 / 33222 exactly.
+        let pins: [(u8, usize, u64); 2] = [(150, 8364, 0xcb2ad7936d5127c5), (60, 33257, 0x87db250ba556e5a6)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
