@@ -1044,7 +1044,7 @@ fn write_compound_block(
             }
             stack
                 .entries
-                .get(idx)
+                .get(walk)
                 .map_or(stack.near_mv, |e| (e.mv0, e.mv1))
         }
         InterMode::NearestNewMv | InterMode::NewNearestMv => {
@@ -1076,7 +1076,7 @@ fn write_compound_block(
             }
             let base = stack
                 .entries
-                .get(idx)
+                .get(walk)
                 .map_or(stack.nearest_mv, |e| (e.mv0, e.mv1));
             write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv, base.0)?;
             write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv1, base.1)?;
@@ -5959,23 +5959,31 @@ pub(crate) fn take_drl_hits() -> [usize; 4] {
 /// `drl_mode` bit per stack entry past `start`, `1` to advance and `0` to
 /// stop, at most two bits. `drl_ctx[idx]` is the context between
 /// `entries[idx]` and `entries[idx + 1]`, exactly the pair the bit chooses
-/// between.
+/// between. Returns the index the symbols actually SIGNAL, which is `target`
+/// clamped by the stack (`min(target, start + 2, entries.len() - 1)`): the
+/// decoder derives its predictor from THAT index, so every caller must take
+/// its own base MV from the returned value and not from `target` (lane-sb128b:
+/// a search-chosen `ref_mv_idx` of 2 against a two-entry write-time stack
+/// signalled index 1 and priced the residual against `pred_mv`, and the
+/// decoder's MV silently drifted a whole frame before the drl symbols
+/// desynced).
 fn write_drl_idx(
     enc: &mut SymbolEncoder,
     cdfs: &mut Cdfs,
     stack: &crate::mvstack::MvStack,
     start: usize,
     target: usize,
-) {
+) -> usize {
     let mut idx = start;
     while idx < start + 2 && stack.entries.len() > idx + 1 {
         let advance = idx < target;
         enc.symbol(usize::from(advance), &mut cdfs.drl_mode[stack.drl_ctx[idx]]);
         if !advance {
-            return;
+            return idx;
         }
         idx += 1;
     }
+    idx
 }
 
 /// Writer-side counterpart of the decoder's single-reference
@@ -6008,7 +6016,7 @@ fn write_inter_mode(
     match info.mode {
         InterMode::NewMv => {
             enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]);
-            write_drl_idx(enc, cdfs, stack, 0, idx);
+            let idx = write_drl_idx(enc, cdfs, stack, 0, idx);
             let base = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
             write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv, base)?;
             note_inter_mode(3, idx);
@@ -6033,7 +6041,7 @@ fn write_inter_mode(
             enc.symbol(1, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARMV
             // `RefMvIdx` starts at 1 for NEARMV (spec 5.11.24).
             let idx = idx.max(1);
-            write_drl_idx(enc, cdfs, stack, 1, idx);
+            let idx = write_drl_idx(enc, cdfs, stack, 1, idx);
             let mv = stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv);
             note_inter_mode(1, idx);
             Ok((mv, false))
@@ -6327,6 +6335,10 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         mi_rows as usize,
                     );
                     let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
+                    crate::msac::symtrace::note(&format!(
+                        "  MODE mi=({mi_r},{mi_c}) mode={:?} idx={} mv={mv:?} info_mv={:?}",
+                        info.mode, info.ref_mv_idx, info.mv
+                    ));
                     (mv, (0, 0), is_new_mv)
                 };
                 for dr in 0..SB_MI as usize {
@@ -6722,6 +6734,10 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     );
 
                     let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
+                    crate::msac::symtrace::note(&format!(
+                        "  MODE mi=({mi_r},{mi_c}) mode={:?} idx={} mv={mv:?} info_mv={:?}",
+                        info.mode, info.ref_mv_idx, info.mv
+                    ));
                     grid.set(
                         mi_row,
                         mi_col,
