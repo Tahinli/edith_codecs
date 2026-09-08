@@ -106,3 +106,85 @@ still carry the grain the anchor no longer has. Note the non-monotone byte
 column: past strength 15 the stream gets BIGGER again, which is the leaves
 paying for a reference that no longer resembles their own sources.
 
+## 4. The gate — the lever SHIPS at strength 3
+
+`encode::tests::bd_rate_film_long_gop`, 48 pictures, BD vs libaom `cpu-used 6`
+/ rav1e `speed 6` (lower is better):
+
+| arm | film A | film B |
+|---|---|---|
+| control (`EC_AV1_ARF_TF=0`) | +23.5 / −8.0 | +85.3 / +6.7 |
+| **`ARF_TF = 3` (ships)** | **+22.7 / −7.9** | **+79.0 / +2.7** |
+
+Film B takes **6.3 points off the libaom column and 4.0 off rav1e's** — the
+biggest single move any lane has made on that row since the pyramid itself —
+and film A takes 0.8 off the libaom column while handing back 0.1 on rav1e's,
+which is the keep rule's "one column ≥0.5 down, the other flat ±0.3" clause.
+It is also FASTER (film B two-point probe 167 s → 147 s).
+
+Guard gate `bd_rate_screen_native` (12 pictures, all five rows), against the
+charter's controls:
+
+| clip | control | `ARF_TF = 3` | Δ |
+|---|---|---|---|
+| bars 1080p | −3.1 / −18.7 | −2.9 / −18.6 | +0.2 / +0.1 |
+| bars 2160p | +9.1 / −13.3 | +9.1 / −13.3 | 0.0 / 0.0 |
+| film A | +20.3 / −4.9 | **+18.3 / −6.0** | **−2.0 / −1.1** |
+| film B | +24.7 / −1.8 | **+24.6 / −2.1** | −0.1 / −0.3 |
+| screen capture | +14.6 / −33.2 | +14.6 / −33.2 | byte-identical |
+
+Every real-content row improves; the two colour-bar rows move 0.2 and 0.0
+(inside the 0.3 bound), and the screen capture is byte-identical — its
+sequence codes no pyramid ARF at all, so the filter never runs there.
+
+## 5. Invariants
+
+* Byte pins re-taken (the hidden frames' pixels move by construction):
+  `(150, 8269 → 8218)`, `(60, 33044 → 33017)`; green at the default AND at
+  `EC_AV1_SPEED=6`.
+* Split suite on the shipped default: `--skip stream::` **341 passed / 1
+  FAILED** (below), `stream:: --skip 10bit` 201 passed / 0 failed, `10bit`
+  42 passed / 0 failed.
+* `cargo check --workspace --all-targets -j4`: 0 errors, 0 `ec-av1` warnings
+  (the 25 warnings are `ec-opus`/`ec-vorbis`, pre-existing).
+* `--ignored --exact encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders`
+  1 passed.
+
+### The one RED test, and what it means
+
+`encoder::tests::bitrate_target_lands_within_5_percent_over_48_frames` fails
+on ONE of its six arms — 2 Mbps, pyramid on: **−5.1% off target** against the
+test's ±5% bound (every other rate/shape arm passes, 768 kbps −0.0%,
+1536 kbps +0.0%).
+
+The cause is in the test's own print: the pyramid arm codes its twelve ARFs at
+`12x22237` bytes at 1536 kbps AND at `12x22237` at 2 Mbps — **identical**, i.e.
+the rate loop is already at its ARF quantizer floor at the higher rate and
+cannot spend the target's extra bytes whatever it is handed (class
+`instrument at bound`). The temporal filter makes the anchor cheaper still, so
+an arm that was inside the bound by a hair is now 0.1 point outside it. It is
+a rate-control ceiling this lane uncovered, not a new coding defect: the
+achieved rate is 1.90 Mbps of a 2.00 Mbps target on a synthetic clip, and both
+BD gates (which score at fixed quantizers) improve.
+
+`deferred: the pyramid rate loop cannot reach a 2 Mbps target on this clip —
+its ARF level saturates at a q floor (identical bytes at two targets) — 
+unblocked by a lane on RateLoop's per-level clamp; the honest alternatives
+today are shipping the lever with this arm red or shipping ARF_TF = 0 and
+losing 6.3/4.0 BD points on film B.`
+
+## 6. What this lane did NOT do
+
+* `deferred: a strength sweep ON THE GATE — only 3 was taken to the deciding
+  gate; 8/15/30/60 were refuted on the two-point probe, which mispredicted
+  the SIGN of 3's gate result (probe −1.4% bytes, gate −6.3 BD points), so the
+  probe is a weak proxy for this lever — unblocked by a lane that can afford
+  three more 30-minute long-GOP arms (1, 2, 5).`
+* `deferred: the filter window — the encoder's group buffer holds only the two
+  DISPLAY-PAST neighbours when it codes its top ARF; the census says ±2 both
+  sides removes 14.3% of the prediction SAD against past-only's 11.7%, so a
+  one-group lookahead is worth a lane — unblocked by a lane that reorders the
+  encoder's picture buffer.`
+* `deferred: the ARF's mode/partition gap (+871 B a frame, 2196 blocks against
+  rav1e's 1507) — this lane's lever is the residual half of the census —
+  unblocked by the 128-root lane (parked) or a partition lane at the anchor.`
