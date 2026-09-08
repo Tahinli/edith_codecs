@@ -89,3 +89,37 @@ Control +26.6 / -0.4. "gain" = BD points the lever takes off the vs-rav1e column
 
 See `q3.tsv`/`q5.tsv` logs; the threaded fps sweep (`fps2.log`) is NOT usable at
 this box load -- preset 3 read slower than preset 0 in every pass.
+
+## Phase 3 -- serial wall arms (q3/q5, one at a time on MY side; other lanes still ran)
+
+| arm | film A BD (libaom / rav1e) | our ladder wall |
+|---|---|---|
+| control (preset 6 as it shipped) | +26.6 / -0.4 | 66.3s, 71.1s, 75.2s (three arms) |
+| + extra-reference NEWMV | +24.4 / -2.4 | 103.2s, 86.4s |
+| + coefficient breakout 0 | +24.8 / -1.6 | 73.7s |
+| + both | +23.0 / -3.2 | 67.7s (contended, discarded), 95.6s |
+
+Control spread is 13%, so anything cheaper than that is unmeasurable here; the
+95.6s / 75.2s serial pair is the price of this lane's change: +27% wall.
+
+## Phase 4 -- the recomposed presets, re-run for real (q6)
+
+| preset | film A | film B | screen |
+|---|---|---|---|
+| 4 | +22.5 / -3.9 | -- | -- |
+| 5 | +22.5 / -3.6 | -- | -- |
+| 6 | +23.0 / -3.2 | +30.7 / +3.0 | +23.2 / -28.5 |
+
+Monotone in speed, and film B gained 3.4 points (+34.7/+6.4 -> +30.7/+3.0)
+without an arm of its own.
+
+## Deferred
+
+* threaded fps at 1080p / 3840x1608 (4x2 tiles, 8 and 12 threads): NOT
+  measurable at load 16-25 with two other lanes on the box -- three
+  interleaved passes put preset 3 below preset 0 every time. Unblocked by a
+  quiet box; command is `EC_AV1_SPEED=<n> <testbin> --ignored --nocapture
+  filter_stage_wall_1080p` / `_4k` (see `fps2.log`).
+* recomposing preset 6 by REMOVING a lever it keeps (delta_q, tpl 4): the
+  candidates' BD stakes are 0.1-0.2 points and their wall sits under this
+  box's 13% floor, so the arms cannot rank them. Same unblock.
