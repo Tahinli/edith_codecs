@@ -722,6 +722,17 @@ pub fn take_b64_root_hits() -> usize {
     B64_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the 128 superblock root offers its `PARTITION_NONE` candidate at
+/// all ([`search_root_128`]). On by default; `EC_AV1_B128=0` turns it off,
+/// which is the attribution arm for a 128-superblock stream: it separates
+/// what the SIZE costs from what the 128x128 BLOCK buys.
+fn b128_root() -> bool {
+    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B128").ok().is_none_or(|v| v != "0")
+    });
+    *ENV
+}
+
 /// How many 128x128 `PARTITION_NONE` roots the search took since the last
 /// [`take_b128_none_hits`] (class `gate-blind-to-feature`): a flat BD result
 /// is only attributable once the fire count is known.
@@ -11638,7 +11649,7 @@ pub(crate) fn encode_inter_frame(
         // 128x128 candidate is weighed.
         let mark128 = blocks.len();
         let mut root_cost = 0.0f64;
-        let root128 = sb128_search
+        let root128 = (sb128_search && b128_root() && cells.len() == 4)
             .then(|| search_root_128(
                 &mut luma,
                 &mut chroma,
