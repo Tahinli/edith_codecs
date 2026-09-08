@@ -4283,6 +4283,13 @@ pub(crate) fn split_census_on() -> bool {
     *ON
 }
 
+/// Where one (site, frame type, block side) bucket starts in [`SPLIT_CENSUS`].
+/// Sides below 8 and above 64 fold into the end rows, which no caller offers.
+fn split_census_base(site: usize, key: bool, side: usize) -> usize {
+    let side_idx = (side.trailing_zeros() as usize).saturating_sub(3).min(3);
+    ((site * 2 + usize::from(!key)) * 4 + side_idx) * 10
+}
+
 /// Records one split trial into [`SPLIT_CENSUS`]. `split` and `flat` are each
 /// `(rate in bits, distortion as squared error)`.
 fn split_census(
@@ -4294,8 +4301,7 @@ fn split_census(
     flat: (f64, f64),
 ) {
     use std::sync::atomic::Ordering::Relaxed;
-    let side_idx = (side.trailing_zeros() as usize).saturating_sub(3).min(3);
-    let base = ((site * 2 + usize::from(!key)) * 4 + side_idx) * 10;
+    let base = split_census_base(site, key, side);
     let add = |i: usize, v: u64| {
         SPLIT_CENSUS[base + i].fetch_add(v, Relaxed);
     };
@@ -4326,7 +4332,7 @@ pub(crate) fn dump_split_census() {
     for site in 0..2 {
         for key in [true, false] {
             for side_idx in 0..4 {
-                let base = ((site * 2 + usize::from(!key)) * 4 + side_idx) * 10;
+                let base = split_census_base(site, key, 8 << side_idx);
                 let v: [u64; 10] = std::array::from_fn(|i| SPLIT_CENSUS[base + i].load(Relaxed));
                 if v[0] == 0 {
                     continue;
@@ -12313,6 +12319,25 @@ pub(crate) fn encode_sequence_with_ctx(
 
 #[cfg(test)]
 mod tests {
+
+    /// Every (site, frame type, block side) the census can be called with
+    /// lands in its own ten-counter bucket, inside the array (class
+    /// `enumerate-table-domain`: an off-by-one here would silently add two
+    /// sites' trials together).
+    #[test]
+    fn the_split_census_buckets_are_distinct_and_in_bounds() {
+        let mut seen = std::collections::BTreeSet::new();
+        for site in 0..2 {
+            for key in [true, false] {
+                for side in [8usize, 16, 32, 64] {
+                    let base = super::split_census_base(site, key, side);
+                    assert!(base + 10 <= super::SPLIT_CENSUS.len(), "{site} {key} {side}");
+                    assert!(seen.insert(base), "{site} {key} {side} collides");
+                }
+            }
+        }
+        assert_eq!(seen.len(), 16);
+    }
 
     /// An [`crate::mvstack::MvStack`] with every context at zero and no
     /// neighbours, for the pricer tests below to fill the one band each of
