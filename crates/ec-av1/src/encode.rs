@@ -11657,6 +11657,9 @@ pub(crate) fn encode_inter_frame(
                 Some(mc::InterpFilterKind::Regular),
                 seq.enable_dual_filter,
                 h.reference_select,
+                // lane-txi: this frame's own bit, not the hardcoded `true`
+                // the wrapper used to pass.
+                h.reduced_tx_set,
                 tx_select,
                 lr,
                 // The trial decode re-reads the tile the writer just wrote,
