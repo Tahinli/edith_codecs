@@ -2149,6 +2149,24 @@ pub fn reset_skip_split_tx_override_hits() {
     SKIP_SPLIT_TX_OVERRIDE_HITS.with(|c| c.set(0));
 }
 
+// lane-svtinter: palette colour-index maps whose block is cut by the frame's
+// bottom/right mi edge, so spec 5.11.50's `onscreenWidth`/`onscreenHeight`
+// really are smaller than the block and FEWER symbols are read than the
+// block has cells (class map-read-past-frame-edge).
+thread_local! {
+    static PALETTE_ONSCREEN_CUT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_ONSCREEN_CUT_HITS`] (colour-index maps).
+pub fn palette_onscreen_cut_hits() -> usize {
+    PALETTE_ONSCREEN_CUT_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`PALETTE_ONSCREEN_CUT_HITS`] before a gate's own decode attempt.
+pub fn reset_palette_onscreen_cut_hits() {
+    PALETTE_ONSCREEN_CUT_HITS.with(|c| c.set(0));
+}
+
 /// Zeroes [`SKIP_SPLIT_TX_HITS`] before a gate's own decode attempt.
 pub fn reset_skip_split_tx_hits() {
     SKIP_SPLIT_TX_HITS.with(|c| c.set(0));
@@ -8803,21 +8821,64 @@ pub(crate) fn palette_color_index_context(
     (ctx as usize, color_order)
 }
 
+/// spec 5.11.50 `palette_tokens` / `av1_get_block_dimensions` (blockd.h:1512):
+/// the ON-SCREEN part of a block at `(mi_r, mi_c)`, in luma pixels. A block
+/// cut by the frame's bottom or right mi edge codes its colour-index map only
+/// over this part and replicates it outward -- reading the full `bw x bh` grid
+/// consumed symbols libaom never wrote and desynced the rest of the tile
+/// (lane-svtinter; class map-read-past-frame-edge).
+fn palette_onscreen(
+    mi_r: usize,
+    mi_c: usize,
+    bw: usize,
+    bh: usize,
+    fctx: &crate::decode::FrameCtx,
+) -> (usize, usize) {
+    let (mi_rows, mi_cols) = fctx.seg_mi_dims.with(|c| c.get());
+    // corner-cut: no mi dims means this is not a real frame decode but the
+    // ENCODER's own in-process reconstruct (`FrameCtx::for_encoder`, where
+    // `set_segmentation` never runs), whose writer half
+    // (`tile::write_color_index_map`) is unclamped too -- the two mirror each
+    // other, and clamping only one of them read every map as 1x1. Ceiling:
+    // our encoder still writes a full map for a palette block cut by the
+    // frame edge, which a conformant decoder reads short. Upgrade path: clamp
+    // the writer, publish the mi dims on the encoder's ctx, drop this branch.
+    if mi_rows == 0 || mi_cols == 0 {
+        return (bw, bh);
+    }
+    (
+        bw.min(mi_cols.saturating_sub(mi_c) * MI),
+        bh.min(mi_rows.saturating_sub(mi_r) * MI),
+    )
+}
+
+/// [`palette_onscreen`] carried into the chroma plane: `>> subsampling` plus
+/// the SAME sub-8 bump the caller's own `(bw / 2).max(4)` applies to the block
+/// dimensions (`is_chroma_sub8_x/y`, blockd.h:1533) -- both must move together
+/// or a cut 8-wide block reads its chroma map at the wrong width.
+fn palette_onscreen_uv(
+    luma: (usize, usize),
+    on: (usize, usize),
+    chroma: (usize, usize),
+) -> (usize, usize) {
+    (
+        (on.0 >> 1) + (chroma.0 - (luma.0 >> 1)),
+        (on.1 >> 1) + (chroma.1 - (luma.1 >> 1)),
+    )
+}
+
 /// `decode_color_map_tokens` (detokenize.c:25): the palette-Y colour-index
-/// map's wavefront decode over a `side x side` grid -- this decoder's
-/// palette blocks are always square and never straddle the frame's true
-/// (possibly odd) edge without already allocating the full `side*side`
-/// region (every other skip/residual path here does the same), so no
-/// rows/cols-vs-plane_width/height cropping special case is needed, unlike
-/// libaom's own non-block-aligned split.
+/// map's wavefront decode over a `side x side` grid, read over the on-screen
+/// `on_side x on_side` corner (see [`palette_onscreen`]).
 fn decode_color_index_map(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
     n: usize,
     side: usize,
+    on: (usize, usize),
     uv: bool,
 ) -> Vec<u8> {
-    decode_color_index_map_wh(dec, cdfs, n, side, side, uv)
+    decode_color_index_map_wh(dec, cdfs, n, side, side, on, uv)
 }
 
 /// [`decode_color_index_map`], generalised to a true `bw`x`bh` rect strip
@@ -8831,9 +8892,15 @@ fn decode_color_index_map_wh(
     n: usize,
     bw: usize,
     bh: usize,
+    // `(onscreenWidth, onscreenHeight)` in this plane's own units.
+    on: (usize, usize),
     uv: bool,
 ) -> Vec<u8> {
     let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
+    let (on_bw, on_bh) = (on.0.clamp(1, bw), on.1.clamp(1, bh));
+    if on_bw < bw || on_bh < bh {
+        hit!(PALETTE_ONSCREEN_CUT_HITS);
+    }
     let mut map = vec![0u8; bw * bh];
     if trace {
         let (rng, _) = dec.debug_state();
@@ -8844,9 +8911,9 @@ fn decode_color_index_map_wh(
         let (rng, _) = dec.debug_state();
         eprintln!("EC_PAL_VAL row=0 col=0 color_idx={} rng={rng}", map[0]);
     }
-    for i in 1..(bw + bh - 1) {
-        let j_hi = i.min(bw - 1);
-        let j_lo = i.saturating_sub(bh - 1);
+    for i in 1..(on_bw + on_bh - 1) {
+        let j_hi = i.min(on_bw - 1);
+        let j_lo = i.saturating_sub(on_bh - 1);
         for j in (j_lo..=j_hi).rev() {
             let row = i - j;
             let col = j;
@@ -8871,6 +8938,17 @@ fn decode_color_index_map_wh(
                 eprintln!("EC_PAL_VAL row={row} col={col} color_idx={symbol} rng={rng}");
             }
         }
+    }
+    // `decode_color_map_tokens`'s own two extension loops (detokenize.c:71):
+    // the last on-screen column then the last on-screen row are replicated
+    // over the off-screen remainder, so the prediction still covers the whole
+    // block.
+    for row in 0..on_bh {
+        let last = map[row * bw + on_bw - 1];
+        map[row * bw + on_bw..row * bw + bw].fill(last);
+    }
+    for row in on_bh..bh {
+        map.copy_within((on_bh - 1) * bw..on_bh * bw, row * bw);
     }
     map
 }
@@ -9115,7 +9193,8 @@ fn read_intra_mode_rect(
     // `av1_visit_palette`: plane 0 (Y) then plane 1 (chroma, shared U/V map),
     // same order as [`read_intra_mode`]'s own square path.
     let palette_y = palette_y_pending.map(|(n, colors)| {
-        let map = decode_color_index_map_wh(dec, cdfs, n, bw, bh, false);
+        let map =
+            decode_color_index_map_wh(dec, cdfs, n, bw, bh, palette_onscreen(mi_r, mi_c, bw, bh, fctx), false);
         hit!(PALETTE_HITS);
         hit!(PALETTE_RECT_HITS);
         PaletteY { size: n, colors, map }
@@ -9127,7 +9206,8 @@ fn read_intra_mode_rect(
         // axis to 2 read HALF the colour-index symbols of a 1:4 strip's
         // chroma palette and desynced the tile from there.
         let (cw, ch) = ((bw / 2).max(4), (bh / 2).max(4));
-        let map = decode_color_index_map_wh(dec, cdfs, n, cw, ch, true);
+        let on = palette_onscreen_uv((bw, bh), palette_onscreen(mi_r, mi_c, bw, bh, fctx), (cw, ch));
+        let map = decode_color_index_map_wh(dec, cdfs, n, cw, ch, on, true);
         hit!(PALETTE_UV_HITS);
         PaletteUv { size: n, u_colors, v_colors, map }
     });
@@ -10419,7 +10499,8 @@ fn decode_intra_rect_in_inter(
     }
     // `av1_visit_palette`: Y's colour-index map then the shared chroma one.
     let palette_y = palette_y_pending.map(|(n, colors)| {
-        let map = decode_color_index_map_wh(dec, cdfs, n, bw, bh, false);
+        let map =
+            decode_color_index_map_wh(dec, cdfs, n, bw, bh, palette_onscreen(mi_r, mi_c, bw, bh, fctx), false);
         hit!(PALETTE_HITS);
         hit!(PALETTE_RECT_HITS);
         hit!(INTRA_IN_INTER_PALETTE_Y_HITS);
@@ -10427,7 +10508,8 @@ fn decode_intra_rect_in_inter(
     });
     let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
         let (cw, ch) = ((bw / 2).max(4), (bh / 2).max(4));
-        let map = decode_color_index_map_wh(dec, cdfs, n, cw, ch, true);
+        let on = palette_onscreen_uv((bw, bh), palette_onscreen(mi_r, mi_c, bw, bh, fctx), (cw, ch));
+        let map = decode_color_index_map_wh(dec, cdfs, n, cw, ch, on, true);
         hit!(PALETTE_UV_HITS);
         hit!(INTRA_IN_INTER_PALETTE_UV_HITS);
         PaletteUv { size: n, u_colors, v_colors, map }
@@ -13290,7 +13372,8 @@ fn read_intra_mode(
     // `av1_visit_palette` (decoder.c:234): plane 0 (Y) then plane 1 (chroma,
     // shared U/V map) -- the same order libaom's own loop visits them in.
     let palette_y = palette_y_pending.map(|(n, colors)| {
-        let map = decode_color_index_map(dec, cdfs, n, side, false);
+        let map =
+            decode_color_index_map(dec, cdfs, n, side, palette_onscreen(mi_r, mi_c, side, side, fctx), false);
         hit!(PALETTE_HITS);
         if trace {
             eprintln!("TRACE palette_y size={n} colors={:?}", &colors[..n]);
@@ -13298,7 +13381,12 @@ fn read_intra_mode(
         PaletteY { size: n, colors, map }
     });
     let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
-        let map = decode_color_index_map(dec, cdfs, n, side / 2, true);
+        let on = palette_onscreen_uv(
+            (side, side),
+            palette_onscreen(mi_r, mi_c, side, side, fctx),
+            (side / 2, side / 2),
+        );
+        let map = decode_color_index_map(dec, cdfs, n, side / 2, on, true);
         hit!(PALETTE_UV_HITS);
         if trace {
             eprintln!(
@@ -29713,7 +29801,10 @@ fn decode_inter_block(
         // `av1_visit_palette`: the two colour-index maps, Y then the shared
         // chroma one, after the WHOLE mode-info read.
         let palette_y = palette_y_pending.map(|(n, colors)| {
-            let map = decode_color_index_map_wh(dec, cdfs, n, write_w, write_h, false);
+            let map = decode_color_index_map_wh(
+                dec, cdfs, n, write_w, write_h,
+                palette_onscreen(rmi, cmi, write_w, write_h, fctx), false,
+            );
             hit!(PALETTE_HITS);
             hit!(INTRA_IN_INTER_PALETTE_Y_HITS);
             PaletteY { size: n, colors, map }
@@ -29722,7 +29813,12 @@ fn decode_inter_block(
             // `av1_get_plane_block_size(bsize, 1, 1)` floors at the 4-px
             // transform, as the rect reader's own copy.
             let (cw, ch) = ((write_w / 2).max(4), (write_h / 2).max(4));
-            let map = decode_color_index_map_wh(dec, cdfs, n, cw, ch, true);
+            let on = palette_onscreen_uv(
+                (write_w, write_h),
+                palette_onscreen(rmi, cmi, write_w, write_h, fctx),
+                (cw, ch),
+            );
+            let map = decode_color_index_map_wh(dec, cdfs, n, cw, ch, on, true);
             hit!(PALETTE_UV_HITS);
             hit!(INTRA_IN_INTER_PALETTE_UV_HITS);
             PaletteUv { size: n, u_colors, v_colors, map }
@@ -33855,7 +33951,10 @@ fn decode_inter_block8(
         // lane-t900 r23: `av1_visit_palette` -- the two colour-index maps, Y
         // then the shared chroma one, after the WHOLE mode-info read.
         let palette_y = palette_y_pending.map(|(n, colors)| {
-            let map = decode_color_index_map_wh(dec, cdfs, n, SIDE, SIDE, false);
+            let map = decode_color_index_map_wh(
+                dec, cdfs, n, SIDE, SIDE,
+                palette_onscreen(rmi, cmi, SIDE, SIDE, fctx), false,
+            );
             hit!(PALETTE_HITS);
             hit!(INTRA_IN_INTER_PALETTE_Y_HITS);
             hit_do! {
@@ -33869,7 +33968,13 @@ fn decode_inter_block8(
         });
         let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
             // `av1_get_plane_block_size(BLOCK_8X8, 1, 1)` = BLOCK_4X4.
-            let map = decode_color_index_map_wh(dec, cdfs, n, CHROMA_SIDE, CHROMA_SIDE, true);
+            let on = palette_onscreen_uv(
+                (SIDE, SIDE),
+                palette_onscreen(rmi, cmi, SIDE, SIDE, fctx),
+                (CHROMA_SIDE, CHROMA_SIDE),
+            );
+            let map =
+                decode_color_index_map_wh(dec, cdfs, n, CHROMA_SIDE, CHROMA_SIDE, on, true);
             hit!(PALETTE_UV_HITS);
             hit!(INTRA_IN_INTER_PALETTE_UV_HITS);
             hit_do! {

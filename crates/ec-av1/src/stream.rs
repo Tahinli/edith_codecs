@@ -3344,6 +3344,68 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// lane-svtinter: an SVT-AV1 screen stream whose frame height is not a
+    /// multiple of the superblock size codes PALETTE blocks in the bottom
+    /// (and right) superblock row that hang off the mi grid. Spec 5.11.50
+    /// `palette_tokens` reads the colour-index map only over the block's
+    /// `onscreenWidth x onscreenHeight` corner and replicates it outward;
+    /// this decoder read the full block grid, so it consumed colour-index
+    /// symbols libaom never wrote and desynced the rest of the tile -- either
+    /// a wrong bottom superblock row (1599 luma samples in this stream's
+    /// frame 0, ~80k per inter frame after) or, further along the same tile,
+    /// a bogus "a Golomb tail longer than this decoder reads" refusal.
+    ///
+    /// Unlike its lane-svt1 sibling above this one BUILDS its stream: the
+    /// recipe is synthetic (`smptebars,drawgrid` through `libsvtav1 -preset 8
+    /// -svtav1-params screen-content-mode=1`), and 384x152 puts a 32x32
+    /// palette block at mi row 32 of a 38-mi-tall frame, 24 of its 32 rows
+    /// on screen. `palette_onscreen_cut_hits` is asserted non-zero so the row
+    /// cannot pass on a stream that never cuts a palette map (class
+    /// gate-blind-to-feature).
+    #[test]
+    fn an_svt_screen_palette_map_cut_by_the_frame_edge_decodes_exactly() {
+        const NAME: &str = "an_svt_screen_palette_map_cut_by_the_frame_edge_decodes_exactly";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let (width, height) = (384usize, 152usize);
+        let out = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i",
+                "smptebars=s=384x152:r=12,drawgrid=w=8:h=8:t=1:c=black",
+                "-frames:v", "4", "-c:v", "libsvtav1", "-preset", "8", "-crf", "30",
+                "-svtav1-params", "lp=1:screen-content-mode=1", "-g", "12", "-f", "obu", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        if !out.status.success() || out.stdout.is_empty() {
+            eprintln!(
+                "SKIP {NAME}: no libsvtav1 in this ffmpeg: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let stream = out.stdout;
+        crate::decode::reset_palette_onscreen_cut_hits();
+        let decoded = decode_stream(&stream).expect("the SVT-AV1 screen stream decodes");
+        assert_eq!(decoded.len(), 4, "{NAME}: frame count");
+        assert!(
+            crate::decode::palette_onscreen_cut_hits() > 0,
+            "{NAME}: no palette map is cut by the frame edge here -- the gate would pass blind"
+        );
+        let want = ffmpeg_decode_sequence(&stream, width, height, decoded.len());
+        assert_eq!(want.len(), decoded.len(), "{NAME}: ffmpeg frame count");
+        for (i, (got, want)) in decoded.iter().zip(&want).enumerate() {
+            assert_eq!(got.y, want.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(got.u, want.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+    }
+
     /// lane-svt1: an SVT-AV1 (v3.1.2, `-preset 8 -crf 35`) screen key frame
     /// codes 16x16 PALETTE blocks with `skip == 1` whose `tx_depth` split the
     /// luma transform. [`crate::decode::decode_block`] armed the palette
