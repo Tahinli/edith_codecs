@@ -13510,7 +13510,11 @@ mod tests {
     /// (the horizontal shapes, which those partitions never produce).
     #[test]
     fn every_rect_shape_reaches_what_libaom_says_over_the_whole_superblock() {
-        let fctx = &crate::decode::FrameCtx::for_encoder();
+        // lane-b128m: this test's oracle is libaom's 64-SUPERBLOCK table, so
+        // it pins the 64 reach explicitly instead of following the process's
+        // own superblock knob (`for_encoder`), which made it red under
+        // `EC_AV1_SB128=1` for no defect of the code under test.
+        let fctx = &crate::decode::FrameCtx::new();
         // (bw, bh, has_tr len, has_tr byte sum, has_bl len, has_bl byte sum).
         const SHAPES: [(usize, usize, usize, u32, usize, u32); 14] = [
         (4, 8, 64, 9280, 64, 550),
@@ -14437,7 +14441,11 @@ mod tests {
     /// wrong for one block size while looking plausible for the other.
     #[test]
     fn reach_matches_libaom_has_top_right_and_has_bottom_left() {
-        let fctx = &crate::decode::FrameCtx::for_encoder();
+        // lane-b128m: this test's oracle is libaom's 64-SUPERBLOCK table, so
+        // it pins the 64 reach explicitly instead of following the process's
+        // own superblock knob (`for_encoder`), which made it red under
+        // `EC_AV1_SB128=1` for no defect of the code under test.
+        let fctx = &crate::decode::FrameCtx::new();
         // Transcribed from has_top_right/has_bottom_left's row_off==0,
         // col_off==0 (whole-transform) path, with MAX_MIB_SIZE_LOG2 = 5 (a
         // 128px reference grid) pinned as libaom pins it, independent of the

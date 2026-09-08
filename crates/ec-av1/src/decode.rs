@@ -275,6 +275,13 @@ pub(crate) fn filter_ctx_copy(fctx: &FrameCtx) -> FrameCtx {
     out.seg_mi_dims.set(fctx.seg_mi_dims.get());
     out.seg.replace(fctx.seg.borrow().clone());
     out.seg_ids.replace(fctx.seg_ids.borrow().clone());
+    // lane-b128m: the superblock size travels with the copy. A tile SEARCH
+    // worker (`encode::search_tiles`) gets its context from here, so dropping
+    // it made every worker search at 64 while the calling thread searched at
+    // 128 -- the bytes a frame came out as then depended on the tile thread
+    // count under `EC_AV1_SB128`.
+    out.sb128_flag.set(fctx.sb128_flag.get());
+    out.reach_sb_px.set(fctx.reach_sb_px.get());
     out
 }
 
