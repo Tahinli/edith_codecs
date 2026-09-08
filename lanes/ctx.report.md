@@ -23,3 +23,65 @@ Open, found while enumerating: the single-reference candidates pay **no**
 `comp_mode = 0` term at all while the compound ones pay `comp_mode = 1`, so
 compound is still overcharged by `comp_mode(0)` relative to single. Left alone
 here so arm C measures one thing.
+
+## 2. Arms and gates (12-frame native gate, BD-rate vs libaom cpu-used 6 / rav1e speed 6)
+
+Control reproduced in this worktree at `e74e7229`, exactly the charter's numbers.
+
+| row | control | arm A (skip + is_inter) | arm C (cumulative, + compound tree) |
+|---|---|---|---|
+| film A | +21.5 / −4.4 | +21.5 / −4.5 | **+21.0 / −4.8** |
+| film B | +26.9 / −0.4 | +26.4 / −0.7 | **+25.0 / −1.8** |
+| screen | +14.4 / −33.2 | +14.5 / −33.2 | **+14.5 / −33.2** |
+| bars 1080p | −1.4 / −17.2 | −1.8 / −17.4 | −1.8 / −17.5 |
+| bars 2160p | +8.8 / −13.2 | +8.5 / −13.5 | +8.8 / −13.3 |
+
+**arm A ships** under the second keep rule: film B is 0.5 down on libaom and
+0.3 down on rav1e, film A flat on both (0.0 / −0.1), screen 0.1 up on libaom
+(inside the 0.3 the rule allows).
+
+**arm C ships** under the first keep rule: both film rows improve on both
+columns (−0.5/−0.3 and −1.4/−1.1), screen flat.
+
+Cumulative long-GOP gate (`bd_rate_film_long_gop`), both arms in:
+
+| row | control | shipped |
+|---|---|---|
+| film A | +26.4 / −6.4 | **+25.2 / −7.1** |
+| film B | +89.6 / +9.1 | **+87.1 / +7.7** |
+
+## 3. Unit tests
+
+* `encode::tests::the_skip_and_intra_inter_pricers_use_the_writers_own_contexts`
+  — RED at row 0: `skip false at ctx 1: priced 0.049125199808023, writer codes
+  0.9885106508271125`. Green after arm A.
+* `encode::tests::the_compound_ref_pricer_pays_the_writers_own_symbol_sequence`
+  — RED against the old constant pricer: `pair (1, 2) ... priced
+  10.19573638784928 bits, writer codes 5.455955052750427` (a LAST+LAST2 pair
+  priced as LAST+GOLDEN). Green after arm C.
+
+## 4. Pins and suite
+
+* Stream pins re-taken: `[(150, 8311, 0xfb6d_75a4_5d13_3833), (60, 33087,
+  0x4d11_a03c_bdc6_e2d5)]` (was 8535 / 33221), green at the default preset and
+  at `EC_AV1_SPEED=6`.
+* `mi_info_cell_stays_compact` / `mi_info_stays_small_enough_for_a_4k_grid`
+  went RED mid-lane: `skip` as a `MiInfo` field took the cell 16 → 18 bytes,
+  and that struct is the mv-stack scan's memory traffic. The flag moved to a
+  `Vec<bool>` beside `MiGrid::cells`, filled only by the encoder's `record_mi`
+  and read only by the stack. Both pins unchanged by that move, so the gate
+  numbers above stand.
+* `timeout 900 cargo check --workspace --all-targets -j4`: 0 errors, 0 ec-av1
+  warnings (the workspace's 22 warnings are pre-existing, in ec-opus and
+  ec-vorbis).
+
+## 5. Deferred
+
+`deferred: arm B (tx_size depth category context) — the pricer's
+tx_depth_bits lives in code_square, which takes neither the mi grid nor the
+block's mi coordinates, and the writer's tx_size_ctx/tx_size_ctx_txfm read a
+PER-TRANSFORM-UNIT published side (Neighbours::record_tx) that MiGrid does not
+carry at all; reproducing it needs a new published tx band plus a parameter
+through every code_square caller — what unblocks it: publish the resolved
+transform side per mi cell beside MiGrid::cells the way this lane's skip band
+now rides, then thread (grid, mi) into code_square.`
