@@ -73,3 +73,55 @@ always `DCT_DCT` in this encoder.
 ## Gates
 
 See the table appended below; the arms are running at the time of writing.
+
+### The 12-frame native gate (`bd_rate_screen_native`, 12 frames, gop 12)
+
+BD-rate vs libaom `cpu-used 6` / rav1e `speed 6`; lower is better.
+
+| clip | control (pre-lane) | unconditional BEFORE the fix | unconditional AFTER the fix | shipped (screen-gated) AFTER |
+|---|---|---|---|---|
+| bars 1080p | -1.0% / -16.8% | +23.1% / +3.3% | **-0.6% / -16.2%** | -1.0% / -16.8% |
+| bars 2160p | +9.4% / -12.7% | +31.2% / +3.7% | **+10.3% / -11.7%** | +9.4% / -12.7% |
+| film A | +21.7% / -4.4% | +21.5% / -4.5% | +21.6% / -4.5% | +21.7% / -4.4% |
+| film B | +26.9% / -0.6% | +27.2% / -0.3% | +27.2% / -0.3% | +26.9% / -0.6% |
+| screen capture | +20.1% / -30.4% (shipped) | +20.1% / -30.4% | +19.8% / -30.5% | **+19.8% / -30.5%** |
+
+The twenty-point collapse is GONE: the two bars rows come back to within
+0.4/0.6 and 0.9/1.0 of the control instead of 24/20 points off it.
+
+DECISION: the unconditional arm still does NOT pass the keep rule (bars
+1080p 0.4/0.6 down, bars 2160p 0.9/1.0 down, film B 0.3/0.3 down -- the
+charter's bound was 0.3), so the inter search STAYS screen-gated and the
+default is unchanged on every non-screen row: the four non-screen rows print
+the control's own byte counts to the digit (194497/299067/419042/567789,
+205409/321883/435765/564573, 64392/102508/170169/413430,
+27442/50374/105485/296813). What the fix does change is the row the search
+already ships on: the screen capture goes +20.1/-30.4 -> **+19.8/-30.5**,
+i.e. the shipped screen-gated search was carrying this defect and is 0.3
+better against libaom with it repaired.
+
+What is left on the bars rows is now the real `local-rd-on-references`
+residue, not a correctness bug -- a whole order of magnitude smaller than
+what was attributed to the price.
+
+### Invariants
+
+* `cargo test -p ec-av1 --release --lib` (detached): **569 passed, 0 failed,
+  46 ignored** (45 + this lane's `txrd_gain_probe` measurement).
+* `cargo check --workspace --all-targets -j4`: 0 errors, 0 ec-av1 warnings.
+* The BD gate itself asserts, at all four quantizers of all five rows, that
+  ffmpeg's decode AND our decoder's both equal the encoder's reconstruction
+  sample for sample -- three-way exact under the fix, in both arms.
+
+### Instruments this lane leaves
+
+* `EC_AV1_TXRD_LAMBDA=<f>` -- rate weight of the transform-TYPE decision
+  only (`0` = compare types on reconstruction error alone).
+* `EC_AV1_TXRD_CENSUS=1` -- chosen vs `DCT_DCT` summed sse/bits over the flat
+  inter luma decisions, printed by the gate.
+* `EC_AV1_FRAME_PSNR=1` -- per-frame all-plane AND per-plane (Y/U/V) PSNR per
+  ladder point, plus `EC_PREFILTER`/`EC_POSTFILTER` frame luma SSE around
+  `pick_and_apply_filters`, which is what separates a bad trial from a bad
+  filter choice.
+* `transform::tests::txrd_gain_probe` (`--ignored`) -- the measured
+  forward-inverse gain per type and size.
