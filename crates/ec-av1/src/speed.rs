@@ -338,6 +338,14 @@ pub(crate) const DELTAQ_RES: [u8; 11] = [2, 4, 4, 4, 4, 2, 2, 4, 4, 4, 4];
 /// on a screen frame at all (lane-dq3's content gate).
 pub(crate) const DQ_TPL_K: [f64; 11] = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
+/// lane-arfq: a per-LEVEL multiplier on [`DQ_TPL_K`], indexed by
+/// [`crate::encode::DqLevel`] -- `[top ARF, mid ARF, leaf]`. The key frame is
+/// absent because it codes no `delta_q` syntax at all.
+///
+/// `EC_AV1_DQ_K=<top>:<mid>:<leaf>` overrides it for an A/B. The default is
+/// flat: see `lanes/arfq.report.md` for the sweep this table records.
+pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.0, 1.0, 1.0];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [

@@ -1724,6 +1724,16 @@ impl Av1Encoder {
                 i16::from(r.q_idx(level))
             });
         let base_q_idx = (base + offset).clamp(1, 255) as u8;
+        // lane-arfq: the top ARF of a mini-GOP is the hidden frame coded at
+        // the pyramid's OWN `arf_q_offset` (the mid and quarter levels are
+        // `Level::Arf` too but sit at their own offsets), and it is the level
+        // the whole group predicts from -- so it reads its own `delta_q`
+        // strength (`crate::speed::DQ_LEVEL_K`).
+        let dq_level = match (show_frame, self.pyramid.map(|p| p.arf_q_offset)) {
+            (true, _) => crate::encode::DqLevel::Leaf,
+            (false, Some(arf)) if arf == offset => crate::encode::DqLevel::TopArf,
+            (false, _) => crate::encode::DqLevel::MidArf,
+        };
         // spec 5.9.2's `ref_frame_sign_bias`, derived from what the slots
         // this frame names actually hold: a reference whose order hint is
         // AHEAD of this frame's is backward-biased, and the MV stack scans
@@ -1792,6 +1802,7 @@ impl Av1Encoder {
                 last2_slot,
                 show_frame,
                 sign_bias,
+                dq_level,
             }),
             // lane-arfcen: the group's own sources ARE this frame's window
             // (`tpl_window`); it was `&[]` here, which switched the temporal
