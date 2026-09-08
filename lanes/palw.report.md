@@ -105,3 +105,21 @@ Every per-cell syntax family this writer emits, at a block cut by the mi grid:
 | partition | tile.rs:184 / 2972 / 3052 `has_cols`/`has_rows` inferred split at 128, 64 and 32 | clipped |
 | segment ids | none: this encoder writes no segmentation map (`write_segment_id` exists only in decode.rs) | n/a |
 | CfL, intrabc | one alpha pair / one vector per block, no per-cell loop | n/a |
+
+## Gates
+
+| gate | result |
+|---|---|
+| witness (RED / GREEN) | Golomb-tail refusal / `ok. 1 passed`, 12 cut maps |
+| `encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins` (default) | ok -- pins UNMOVED, the pin clip cuts no palette block |
+| same, `EC_AV1_SPEED=6` | ok -- unmoved |
+| `--ignored --exact encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders` | ok (presets 0/3/6/10, 32045/30867/35517/92817 bytes) |
+| `EC_AV1_NATIVE_SCREEN=1 ... bd_rate_screen_native` | +14.6% vs libaom / -33.2% vs rav1e -- the control to the digit (the 1920x1024 crop is superblock-aligned: "0 on a superblock the frame edge cuts") |
+| s1 `--skip stream::` | ok. 343 passed; 0 failed; 33 ignored (394 s, RC=0) |
+| s2 `stream:: --skip 10bit` | ok. 202 passed; 0 failed; 15 ignored (602 s, RC=0) |
+| s3 `10bit` | ok. 42 passed; 0 failed; 1 ignored (51 s, RC=0) |
+| `cargo check --workspace --all-targets -j4` | RC=0, 0 errors, 0 ec-av1 warnings (22 pre-existing in ec-opus/ec-vorbis) |
+
+The sweep tables above were produced by a scratch `examples/palw_sweep.rs`
+(encode_sequence -> decode_stream + ffmpeg over the size x q grid), deleted
+before the lane closed; the witness row covers the same path in-suite.
