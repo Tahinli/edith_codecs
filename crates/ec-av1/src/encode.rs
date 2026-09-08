@@ -4004,6 +4004,91 @@ fn warp_prediction(
     Some([u8s(&py_buf), u8s(&pu_buf), u8s(&pv_buf)])
 }
 
+/// What tile.rs' `write_compound_ref_frames` pays for the pair
+/// `(ref0, ref1)`, symbol for symbol, each at the context its own
+/// `single_ref_p*_ctx`/`uni_comp_ref_p1_ctx`/`comp_reference_type_ctx`
+/// derives from the block's above/left neighbours -- plus the `comp_mode`
+/// symbol itself at `reference_mode_ctx`.
+///
+/// Before lane-ctx this was four constants at CDF row 0 that assumed the pair
+/// was LAST+GOLDEN or LAST+ALTREF: `comp_bwdref[0][0] = 1` prices a BWDREF or
+/// ALTREF2 partner as ALTREF and drops its `p6` symbol entirely, and the
+/// `uni_comp_ref` leaves price a LAST+LAST2 pair as LAST+GOLDEN.
+pub(crate) fn compound_ref_bits(
+    (ref0, ref1): (i8, i8),
+    stack: &crate::mvstack::MvStack,
+) -> f64 {
+    use crate::mvstack::{
+        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        comp_reference_type_ctx, is_uni_comp_ref, single_ref_p1_ctx, single_ref_p2_ctx,
+        single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
+        uni_comp_ref_p1_ctx,
+    };
+    let (a, a1) = stack.above_refs;
+    let (l, l1) = stack.left_refs;
+    let unidir = is_uni_comp_ref(ref0, ref1);
+    let comp_mode = symbol_bits(
+        &cdf::COMP_MODE[crate::mvstack::reference_mode_ctx(stack.above_nbr, stack.left_nbr)],
+        1,
+    );
+    let ref_type = symbol_bits(
+        &cdf::COMP_REF_TYPE[comp_reference_type_ctx(stack.above_nbr, stack.left_nbr)],
+        usize::from(!unidir),
+    );
+    if unidir {
+        let both_backward = (ref0, ref1) == (BWDREF_FRAME, ALTREF_FRAME);
+        let p0 = symbol_bits(
+            &cdf::UNI_COMP_REF[single_ref_p1_ctx(a, a1, l, l1)][0],
+            usize::from(both_backward),
+        );
+        if both_backward {
+            return comp_mode + ref_type + p0;
+        }
+        let past_last2 = ref1 != LAST2_FRAME;
+        let p1 = symbol_bits(
+            &cdf::UNI_COMP_REF[uni_comp_ref_p1_ctx(a, a1, l, l1)][1],
+            usize::from(past_last2),
+        );
+        let p2 = if past_last2 {
+            symbol_bits(
+                &cdf::UNI_COMP_REF[single_ref_p5_ctx(a, a1, l, l1)][2],
+                usize::from(ref1 == GOLDEN_FRAME),
+            )
+        } else {
+            0.0
+        };
+        return comp_mode + ref_type + p0 + p1 + p2;
+    }
+    let far = ref0 == LAST3_FRAME || ref0 == GOLDEN_FRAME;
+    let fwd = symbol_bits(
+        &cdf::COMP_REF[single_ref_p3_ctx(a, a1, l, l1)][0],
+        usize::from(far),
+    ) + if far {
+        symbol_bits(
+            &cdf::COMP_REF[single_ref_p5_ctx(a, a1, l, l1)][2],
+            usize::from(ref0 == GOLDEN_FRAME),
+        )
+    } else {
+        symbol_bits(
+            &cdf::COMP_REF[single_ref_p4_ctx(a, a1, l, l1)][1],
+            usize::from(ref0 == LAST2_FRAME),
+        )
+    };
+    let is_altref = ref1 == ALTREF_FRAME;
+    let bwd = symbol_bits(
+        &cdf::COMP_BWDREF[single_ref_p2_ctx(a, a1, l, l1)][0],
+        usize::from(is_altref),
+    ) + if is_altref {
+        0.0
+    } else {
+        symbol_bits(
+            &cdf::COMP_BWDREF[single_ref_p6_ctx(a, a1, l, l1)][1],
+            usize::from(ref1 == ALTREF2_FRAME),
+        )
+    };
+    comp_mode + ref_type + fwd + bwd
+}
+
 /// What the `skip` symbol costs at the context tile.rs really codes it with
 /// (`above_skip[mi_c] + left_skip[mi_r]`, the two cells the MV stack now
 /// carries) instead of row 0 -- the pricer's skip-versus-residual margin is
@@ -6264,20 +6349,9 @@ fn code_square_inter(
     // compound-only syntax the writer emits.
     for (ref1, g, cstack) in compound.iter().filter(|_| leaf_compound()) {
         let (ref1, g) = (*ref1, *g);
-        let uni =
-            (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&ref1);
-        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
-            + if uni {
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
-                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
-                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
-            } else {
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
-            };
+        // The whole `comp_mode` + reference-pair tree at the writer's own
+        // contexts, for THIS pair (lane-ctx).
+        let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
         let mode_ctx =
             cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
@@ -8941,19 +9015,9 @@ fn search_skip_64(
     // reference's tree, plus the pair tree and the compound mode.
     for (ref1, g, cstack) in compound.iter().filter(|_| b64_compound()) {
         let (ref1, g) = (*ref1, *g);
-        let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&ref1);
-        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
-            + if uni {
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
-                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
-                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
-            } else {
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
-            };
+        // The whole `comp_mode` + reference-pair tree at the writer's own
+        // contexts, for THIS pair (lane-ctx).
+        let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
         let mode_ctx =
             cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
@@ -9576,23 +9640,9 @@ fn search_inter_block(
     let half_new = true;
     for (ref1, g, cstack) in compound {
         let (ref1, g) = (*ref1, *g);
-        let uni = (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME)
-            .contains(&ref1);
-        let pair_bits = symbol_bits(&cdf::COMP_MODE[0], 1)
-            + if uni {
-                // LAST + a backward reference: `comp_ref_type` = bidirectional,
-                // `comp_ref` LAST, `comp_bwdref` ALTREF.
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 1)
-                    + symbol_bits(&cdf::COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::COMP_REF[0][1], 0)
-                    + symbol_bits(&cdf::COMP_BWDREF[0][0], 1)
-            } else {
-                // LAST + GOLDEN: unidirectional, `uni_comp_ref` p0/p1/p2.
-                symbol_bits(&cdf::COMP_REF_TYPE[0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][0], 0)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][1], 1)
-                    + symbol_bits(&cdf::UNI_COMP_REF[0][2], 1)
-            };
+        // The whole `comp_mode` + reference-pair tree at the writer's own
+        // contexts, for THIS pair (lane-ctx).
+        let pair_bits = compound_ref_bits((crate::mvstack::LAST_FRAME, ref1), stack);
         let mode_ctx =
             cdf::COMPOUND_MODE_CTX_MAP[cstack.ref_mv_ctx >> 1][cstack.new_mv_ctx.min(4)];
         let mode_bits_of =
@@ -12114,6 +12164,116 @@ mod tests {
             left_nbr: None,
             above_skip: false,
             left_skip: false,
+        }
+    }
+
+    /// [`super::compound_ref_bits`] pays exactly the symbols tile.rs'
+    /// `write_compound_ref_frames` codes for a pair, each at that symbol's
+    /// own neighbour-derived context. Red before lane-ctx, where the pricer
+    /// spent four constants at CDF row 0 that assumed the pair was
+    /// LAST+GOLDEN or LAST+ALTREF -- so a LAST+BWDREF pair was priced as
+    /// LAST+ALTREF with its `comp_bwdref` p6 symbol missing entirely.
+    #[test]
+    fn the_compound_ref_pricer_pays_the_writers_own_symbol_sequence() {
+        use crate::cdf::{COMP_BWDREF, COMP_MODE, COMP_REF, COMP_REF_TYPE, UNI_COMP_REF};
+        use crate::encode::symbol_bits as b;
+        use crate::mvstack::{
+            ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+            LAST_FRAME, NeighbourRef, comp_reference_type_ctx, reference_mode_ctx,
+            single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
+            single_ref_p5_ctx, single_ref_p6_ctx, uni_comp_ref_p1_ctx,
+        };
+        // (pair, unidirectional?, the tree's symbols as (table, p index,
+        // context selector, value)) -- transcribed from the writer.
+        // selector: 1..=6 are `single_ref_p*_ctx`, 7 is `uni_comp_ref_p1_ctx`.
+        type Sym = (char, usize, usize, usize);
+        let cases: [((i8, i8), bool, &[Sym]); 7] = [
+            ((LAST_FRAME, LAST2_FRAME), true, &[('u', 0, 1, 0), ('u', 1, 7, 0)]),
+            (
+                (LAST_FRAME, LAST3_FRAME),
+                true,
+                &[('u', 0, 1, 0), ('u', 1, 7, 1), ('u', 2, 5, 0)],
+            ),
+            (
+                (LAST_FRAME, GOLDEN_FRAME),
+                true,
+                &[('u', 0, 1, 0), ('u', 1, 7, 1), ('u', 2, 5, 1)],
+            ),
+            ((BWDREF_FRAME, ALTREF_FRAME), true, &[('u', 0, 1, 1)]),
+            (
+                (LAST_FRAME, ALTREF_FRAME),
+                false,
+                &[('c', 0, 3, 0), ('c', 1, 4, 0), ('b', 0, 2, 1)],
+            ),
+            (
+                (LAST_FRAME, BWDREF_FRAME),
+                false,
+                &[('c', 0, 3, 0), ('c', 1, 4, 0), ('b', 0, 2, 0), ('b', 1, 6, 0)],
+            ),
+            (
+                (LAST_FRAME, ALTREF2_FRAME),
+                false,
+                &[('c', 0, 3, 0), ('c', 1, 4, 0), ('b', 0, 2, 0), ('b', 1, 6, 1)],
+            ),
+        ];
+        let nbr = |ref0, ref1: Option<i8>| {
+            Some(NeighbourRef {
+                is_inter: true,
+                ref0,
+                ref1,
+                uni: ref1.is_some_and(|r1| crate::mvstack::is_uni_comp_ref(ref0, r1)),
+            })
+        };
+        // No neighbours (every context zero), then a mixed pair that puts the
+        // p* rows, `comp_reference_type_ctx` and `reference_mode_ctx` off 0.
+        for (above_nbr, left_nbr, above_refs, left_refs) in [
+            (None, None, (None, None), (None, None)),
+            (
+                nbr(LAST_FRAME, None),
+                nbr(ALTREF_FRAME, Some(GOLDEN_FRAME)),
+                (Some(LAST_FRAME), None),
+                (Some(ALTREF_FRAME), Some(GOLDEN_FRAME)),
+            ),
+        ] {
+            let stack = crate::mvstack::MvStack {
+                above_nbr,
+                left_nbr,
+                above_refs,
+                left_refs,
+                ..bare_stack()
+            };
+            let (a, a1) = above_refs;
+            let (l, l1) = left_refs;
+            let ctx_of = |sel: usize| match sel {
+                1 => single_ref_p1_ctx(a, a1, l, l1),
+                2 => single_ref_p2_ctx(a, a1, l, l1),
+                3 => single_ref_p3_ctx(a, a1, l, l1),
+                4 => single_ref_p4_ctx(a, a1, l, l1),
+                5 => single_ref_p5_ctx(a, a1, l, l1),
+                6 => single_ref_p6_ctx(a, a1, l, l1),
+                _ => uni_comp_ref_p1_ctx(a, a1, l, l1),
+            };
+            for (pair, unidir, symbols) in cases {
+                let mut want = b(&COMP_MODE[reference_mode_ctx(above_nbr, left_nbr)], 1)
+                    + b(
+                        &COMP_REF_TYPE[comp_reference_type_ctx(above_nbr, left_nbr)],
+                        usize::from(!unidir),
+                    );
+                for &(table, p, sel, v) in symbols {
+                    let row = ctx_of(sel);
+                    want += match table {
+                        'u' => b(&UNI_COMP_REF[row][p], v),
+                        'c' => b(&COMP_REF[row][p], v),
+                        _ => b(&COMP_BWDREF[row][p], v),
+                    };
+                }
+                let got = super::compound_ref_bits(pair, &stack);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "pair {pair:?} above {above_refs:?} left {left_refs:?}: \
+                     priced {got} bits, writer codes {want}"
+                );
+            }
         }
     }
 
