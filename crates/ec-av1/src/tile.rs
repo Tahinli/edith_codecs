@@ -452,7 +452,7 @@ fn write_inter_block_128(
     } else {
         neighbours.record(sb_at, SIDE, 0, &zero_grids);
     }
-    neighbours.record_inter(sb_at, SIDE, true, true, block_ref(block));
+    neighbours.record_inter(sb_at, SIDE, block.skip, true, block_ref(block));
     record_block_compound(neighbours, (mi_r, mi_c), SIDE, block);
     SB128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !block.skip {
