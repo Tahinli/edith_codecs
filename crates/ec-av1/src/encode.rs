@@ -5161,7 +5161,9 @@ fn intrabc_step() -> usize {
 const IBC_HASH: usize = 16;
 
 /// libaom `INTRABC_DELAY_PIXELS / 64` -- how many 64x64 superblocks behind
-/// the current one the source's bottom-right corner must already be.
+/// the current one the source's bottom-right corner must already be. Under
+/// 128 superblocks the same 256 pixels are two superblocks, which
+/// [`Ibc::dv_valid`] derives from the size itself.
 const INTRABC_DELAY_SB64: i32 = 4;
 
 /// FNV-1a over one `IBC_HASH`-square of `plane` at `(x, y)`.
@@ -5297,22 +5299,28 @@ impl Ibc {
         if sx < tx0 || sy < ty0 || sx + w > tx1 || sy + h > ty1 {
             return false;
         }
-        let active_sb_row = (y as i32 - ty0) >> 6;
-        let active_sb_col = (x as i32 - tx0) >> 6;
-        let src_sb_row = (sy + h - 1 - ty0) >> 6;
-        let src_sb_col = (sx + w - 1 - tx0) >> 6;
+        // lane-b128m: libaom counts this wavefront in SUPERBLOCKS, and the
+        // superblock is 128 wide under `EC_AV1_SB128` (`INTRABC_DELAY_SB =
+        // INTRABC_DELAY_PIXELS >> sb_size_log2`, i.e. 2 there and 4 here).
+        // Counting 64s under a 128 superblock let the search take a source
+        // from a 64 row the 128 visit order had not reconstructed yet.
+        let sb_log2 = if crate::encode::sb128_on() { 7 } else { 6 };
+        let delay: i32 = if sb_log2 == 7 { INTRABC_DELAY_SB64 / 2 } else { INTRABC_DELAY_SB64 };
+        let active_sb_row = (y as i32 - ty0) >> sb_log2;
+        let active_sb_col = (x as i32 - tx0) >> sb_log2;
+        let src_sb_row = (sy + h - 1 - ty0) >> sb_log2;
+        let src_sb_col = (sx + w - 1 - tx0) >> sb_log2;
         // This lane's own restriction (see the doc comment).
         if src_sb_row >= active_sb_row {
             return false;
         }
-        let total = ((tx1 - tx0 - 1) >> 6) + 1;
-        if src_sb_row * total + src_sb_col >= active_sb_row * total + active_sb_col - INTRABC_DELAY_SB64
-        {
+        let total = ((tx1 - tx0 - 1) >> sb_log2) + 1;
+        if src_sb_row * total + src_sb_col >= active_sb_row * total + active_sb_col - delay {
             return false;
         }
         // libaom's wavefront: only the top-left cone of the frame is legal.
-        let wf = (1 + INTRABC_DELAY_SB64) * (active_sb_row - src_sb_row);
-        src_sb_col < active_sb_col - INTRABC_DELAY_SB64 + wf
+        let wf = (1 + delay) * (active_sb_row - src_sb_row);
+        src_sb_col < active_sb_col - delay + wf
     }
 }
 
