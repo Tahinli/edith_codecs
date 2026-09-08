@@ -515,10 +515,18 @@ pub(crate) const TX_TYPE_SEARCH_INTER: [bool; 11] = [
 /// `encode::wide_tx_set`: whether a frame codes `reduced_tx_set = 0`, the
 /// wider `tx_type` alphabets (intra 8x8/4x4 seven types, inter 16x16 twelve,
 /// inter 8x8/4x4 sixteen) instead of the reduced sets every stream this
-/// encoder wrote before lane-txi carries. OFF at every preset until the gate
-/// says otherwise; `EC_AV1_TXSET_WIDE` overrides.
+/// encoder wrote before lane-txi carries. ON at preset 0, SCREEN CONTENT ONLY
+/// like both halves of the type search itself (`encode::wide_tx_set` returns
+/// the screen flag), so a non-screen frame codes the same
+/// `reduced_tx_set = 1` bit and the same bytes as before.
+/// MEASURED at preset 0 (lane-txw, 12-frame `bd_rate_screen_native`, screen
+/// row): +19.8/-30.5 -> +14.8/-32.9 -- five BD points against libaom and 2.4
+/// against rav1e, on 2.8% `V_DCT` + 7.4% `H_DCT` of the row's intra units,
+/// the two types only the seven-type `TX_SET_INTRA_1` can name. It costs
+/// wall: 92.8s -> 123.3s for the row. Presets 1..6 carry the type search but
+/// are UNMEASURED here, so they stay off. `EC_AV1_TXSET_WIDE` overrides.
 pub(crate) const WIDE_TX_SET: [bool; 11] = [
-    false, false, false, false, false, false, false, false, false, false, false,
+    true, false, false, false, false, false, false, false, false, false, false,
 ];
 
 /// `filter_search`: whether the deblock ladder's +-1/+-2 refinement stage runs.

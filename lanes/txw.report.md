@@ -82,5 +82,46 @@ bytes, and both decoders (ours and ffmpeg) read every frame sample-exact.
   `write_block_planes` codes chroma as `DCT_DCT` whatever luma chose --
   unblocked by threading the frame bit into the encoder's `FrameCtx` and
   giving the writer the inherited chroma type.
-* `deferred: the BD arms for shipping `WIDE_TX_SET` at preset 0 -- see the
-  gate section.
+## Gate and decision
+
+12-frame `bd_rate_screen_native`, SCREEN row (`EC_AV1_NATIVE_SCREEN=1`),
+preset 0, control vs `EC_AV1_TXSET_WIDE=screen`:
+
+| arm | ours (4 points) | BD vs libaom | BD vs rav1e | wall |
+|---|---|---|---|---|
+| control | 45.50/36806, 48.20/45672, 50.78/56996, 53.14/71310 | +19.8% | -30.5% | 92.8s |
+| wide | 45.38/35791, 48.19/43938, 50.88/55290, 53.24/68250 | +14.8% | -32.9% | 123.3s |
+
+The row's intra census goes `IDTX 7.5% / DCT_DCT 80.1% / ADST_ADST 3.3% /
+ADST_DCT 5.3% / DCT_ADST 3.8%` to `IDTX 4.1% / DCT_DCT 78.0% / ADST_ADST
+2.4% / ADST_DCT 3.0% / DCT_ADST 2.3% / V_DCT 2.8% / H_DCT 7.4%`: the win is
+the two types that only exist in the wide set.
+
+FILMS: no arm was run and none is needed to state the keep rule's second
+half. `encode::wide_tx_set` takes the preset value through the SCREEN gate
+(`InterTxSearch::Screen` -> the frame's own screen flag), so a non-screen
+frame writes the same `reduced_tx_set = 1` header bit and takes the same
+code path as before the lane -- the bit alone never reaches a film frame.
+The byte pins (8562 / 33357) are unchanged with the lever ON, which is the
+in-suite instance of that statement.
+
+DECISION: `speed::WIDE_TX_SET[0] = true` (preset 0 only). Presets 1..6 carry
+the type search but were not measured with the wider alphabets, so they stay
+off; the wall cost at preset 0 is +33% on this row.
+
+## Invariants
+
+* full `ec-av1` lib suite: 570 passed / 0 failed / 47 ignored (the charter
+  expected 569 + the witness; the witness KEEPS an `#[ignore]` -- it sets
+  process-global levers, like `every_speed_preset` -- so the ignored count
+  is unchanged).
+* `--include-ignored thread_count`: 2 passed. `--ignored
+  every_speed_preset`: 1 passed. Byte pins: 1 passed, 8562 / 33357 unmoved.
+  `predicted_coeff_bits_track_the_tile_the_writer_wrote` and the facade
+  identity are inside the suite run.
+* `timeout 900 cargo check --workspace --all-targets -j4`: 0 errors, 0
+  ec-av1 warnings (the 21 `ec-opus` + 1 `ec-vorbis` warnings pre-date the
+  lane).
+* `EC_COMP_MISMATCH` is a STALE charter item: the flag exists in no source
+  file in this repo any more (`grep -rn COMP_MISMATCH crates/` matches only
+  older lane reports).
