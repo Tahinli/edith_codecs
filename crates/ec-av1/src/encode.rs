@@ -5914,16 +5914,12 @@ fn cfl_on() -> bool {
 /// and the long-GOP gate agrees (film A +24.7/-7.5 -> +24.4/-7.7, film B
 /// +86.8/+7.4 -> +85.6/+6.6).
 ///
-/// STILL OFF all the same, and this is the whole reason: the 128-superblock
-/// PLUMBING under it (lane-sb128's SPLIT-only roots) still desyncs on eleven
-/// of this crate's own round-trip tests -- odd frame sizes, doubly-cut
-/// roots, multi-tile layouts and the `decode_stream` GOPs -- with the
-/// refusal lane-sb128b named ("a reference frame selected with no picture at
-/// this frame's own ref_frame_idx slot"). Those failures REPRODUCE with the
-/// 128x128 block switched off (`EC_AV1_B128=0`), so they are not this lane's
-/// block; flipping the default before they are fixed would ship a broken
-/// encoder for a 0.6-point BD win. `EC_AV1_SB128=1` turns it on.
-pub(crate) const SB128_DEFAULT: bool = false;
+/// ON since lane-b128m closed the eleven 128-superblock desyncs that held it
+/// off (the delta_q unit at the 128 superblock, the superblock size travelling
+/// with a `FrameCtx` copy into a tile search worker, the writer's intrabc DV
+/// predictor and wavefront, and seven test harnesses that handed the encoder a
+/// 64-superblock context). `EC_AV1_SB128=0` turns it off.
+pub(crate) const SB128_DEFAULT: bool = true;
 
 /// Whether this process's sequences code 128x128 superblocks. An ENCODER
 /// knob (like `speed::SPEED`), never read by a decode: read through a
@@ -17241,10 +17237,13 @@ mod tests {
         // quantizer grid -- and every decision priced against it -- moved
         // (8325 -> 8419 / 33014 -> 33029 on its own base); re-taken once more
         // at the merge of both lanes.
-        // NOT re-taken on lane-b128: [`SB128_DEFAULT`] stays off, so the
-        // shipped stream does not move; under `EC_AV1_SB128=1` the same four
-        // pictures code through the 128 root's own `PARTITION_NONE` block.
-        let pins: [(u8, usize, u64); 2] = [(150, 8252, 0x5b6e40a2b5498988), (60, 33053, 0x9a0abfc234eccc37)];
+        // NOT re-taken on lane-b128: [`SB128_DEFAULT`] stayed off there, so
+        // the shipped stream did not move.
+        // Re-taken on lane-b128m, which flips [`SB128_DEFAULT`] on: every
+        // picture is coded in 128x128 superblocks now, the inter ones
+        // offering the 128 root's own `PARTITION_NONE` block -- 8327 bytes at
+        // q=150 and 33194 at q=60. `EC_AV1_SB128=0` restores 8252 / 33053.
+        let pins: [(u8, usize, u64); 2] = [(150, 8327, 0x33eb7bd59beaf2e3), (60, 33194, 0xafded5cfca824703)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
