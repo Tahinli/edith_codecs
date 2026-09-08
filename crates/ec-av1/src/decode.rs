@@ -818,7 +818,17 @@ fn maybe_read_delta_lf(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi
 /// `read_cdef_params` already forces `bits = 0` under `coded_lossless`/
 /// `allow_intrabc`, so neither needs a separate check here. Reads once per
 /// superblock, at the first non-skip block.
-fn maybe_read_cdef_idx(dec: &mut SymbolDecoder, mi_r: usize, mi_c: usize, skip: bool, fctx: &crate::decode::FrameCtx) {
+fn maybe_read_cdef_idx(
+    dec: &mut SymbolDecoder,
+    mi_r: usize,
+    mi_c: usize,
+    // The reading BLOCK's own span in 4x4 mode-info units: a block wider or
+    // taller than one 64x64 CDEF unit is the first non-skip block of EVERY
+    // unit it covers, so its one literal drives all of them (lane-b128r).
+    (w_mi, h_mi): (usize, usize),
+    skip: bool,
+    fctx: &crate::decode::FrameCtx,
+) {
     let bits = fctx.cdef_bits.with(|c| c.get());
     if bits == 0 || skip || fctx.cdef_transmitted.with(|c| c.get()) {
         return;
@@ -829,11 +839,26 @@ fn maybe_read_cdef_idx(dec: &mut SymbolDecoder, mi_r: usize, mi_c: usize, skip: 
     let (sb_r, sb_c) = (mi_r / SB_MI as usize, mi_c / SB_MI as usize);
     let sb_cols = fctx.cdef_sb_cols.with(|c| c.get());
     if sb_cols > 0 {
+        // lane-b128r: libaom's four CDEF units of a 128 superblock all read
+        // their strength off the MB_MODE_INFO of the first non-skip block in
+        // their own unit -- and a block that COVERS several units (the 128
+        // root's own 128x128 block, the only one there is) is that block for
+        // every unit it covers, so one literal drives all four. This grid is
+        // per 64x64 unit, so the read stamps every unit the block covers; one
+        // that is smaller than a unit stamps exactly the cell it always did.
+        let (rows, cols) = (
+            (h_mi / SB_MI as usize).max(1),
+            (w_mi / SB_MI as usize).max(1),
+        );
         fctx.cdef_idx_grid.with(|g| {
             let mut g = g.borrow_mut();
-            let i = sb_r * sb_cols + sb_c;
-            if i < g.len() {
-                g[i] = idx;
+            for dr in 0..rows {
+                for dc in 0..cols {
+                    let i = (sb_r + dr) * sb_cols + sb_c + dc;
+                    if sb_c + dc < sb_cols && i < g.len() {
+                        g[i] = idx;
+                    }
+                }
             }
         });
     }
@@ -9066,7 +9091,7 @@ fn read_intra_mode_rect(
     if !seg_id_pre_skip(fctx) {
         intra_segment_id(dec, cdfs, mi_r, mi_c, seg_w_mi, seg_h_mi, skip, fctx);
     }
-    maybe_read_cdef_idx(dec, mi_r, mi_c, skip, fctx);
+    maybe_read_cdef_idx(dec, mi_r, mi_c, (bw / MI, bh / MI), skip, fctx);
     istep!("cdef", 0);
     // A HORZ/VERT rect strip is never the whole superblock (`bw`/`bh` never
     // both 64 here -- see this fn's own doc), so `is_whole_sb` is always
@@ -13184,7 +13209,7 @@ fn read_intra_mode(
     }
     // spec order (see the comment below on `read_intrabc_info`): `skip`,
     // `segment_id`, `cdef`, `delta_q` -- `cdef` lands right here.
-    maybe_read_cdef_idx(dec, mi_r, mi_c, skip, fctx);
+    maybe_read_cdef_idx(dec, mi_r, mi_c, (side / MI, side / MI), skip, fctx);
     istep!("cdef", 0);
     // lane-sb128b r1: "this leaf IS the superblock" is `side == sb_size`, not
     // a hardcoded 64 -- a `PARTITION_NONE` 128x128 root is the whole
@@ -15919,7 +15944,7 @@ fn read_intra_mode_sub8(
     if !seg_id_pre_skip(fctx) {
         intra_segment_id(dec, cdfs, mi_r, mi_c, seg_w_mi, seg_h_mi, skip, fctx);
     }
-    maybe_read_cdef_idx(dec, mi_r, mi_c, skip, fctx);
+    maybe_read_cdef_idx(dec, mi_r, mi_c, (2, 2), skip, fctx);
     istep!("cdef", 0);
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip, fctx);
     maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, false, skip, fctx);
@@ -26812,7 +26837,7 @@ fn decode_inter_block(
     let skip_ctx = usize::from(neighbours.above_skip[cmi]) + usize::from(neighbours.left_skip[rmi]);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
     inter_segment_id(dec, cdfs, seg_mi_r, seg_mi_c, seg_w_mi, seg_h_mi, skip, false, fctx);
-    maybe_read_cdef_idx(dec, rmi, cmi, skip, fctx);
+    maybe_read_cdef_idx(dec, rmi, cmi, (write_w / MI, write_h / MI), skip, fctx);
     // lane-inter4 r1: spec 5.11.6's `bSize == sbSize` -- a 64x32/64x16 strip
     // is NOT the whole superblock, so its `skip` never suppresses the read.
     // lane-sb128c r7: `sbSize` is 128 under `--sb-size=128`, so the whole-block
@@ -30611,7 +30636,7 @@ fn decode_inter_sub8_split4(
         let skip_ctx = usize::from(neighbours.above_skip[cmi]) + usize::from(neighbours.left_skip[rmi]);
         let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
         inter_segment_id(dec, cdfs, rmi, cmi, 1, 1, skip, false, fctx);
-        maybe_read_cdef_idx(dec, rmi, cmi, skip, fctx);
+        maybe_read_cdef_idx(dec, rmi, cmi, (2, 2), skip, fctx);
         maybe_read_delta_q(dec, cdfs, rmi, cmi, false, skip, fctx);
         maybe_read_delta_lf(dec, cdfs, rmi, cmi, false, skip, fctx);
         let (has_above, has_left) = (
@@ -31654,7 +31679,7 @@ fn decode_inter_sub8_rect2(
             usize::from(neighbours.above_skip[cmi]) + usize::from(neighbours.left_skip[rmi]);
         let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
         inter_segment_id(dec, cdfs, rmi, cmi, w_mi, h_mi, skip, false, fctx);
-        maybe_read_cdef_idx(dec, rmi, cmi, skip, fctx);
+        maybe_read_cdef_idx(dec, rmi, cmi, (2, 2), skip, fctx);
         maybe_read_delta_q(dec, cdfs, rmi, cmi, false, skip, fctx);
         maybe_read_delta_lf(dec, cdfs, rmi, cmi, false, skip, fctx);
         let (has_above, has_left) = (
@@ -32402,7 +32427,7 @@ fn decode_inter_block8(
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
     inter_segment_id(dec, cdfs, leaf_mi.0, leaf_mi.1, 2, 2, skip, false, fctx);
-    maybe_read_cdef_idx(dec, leaf_mi.0, leaf_mi.1, skip, fctx);
+    maybe_read_cdef_idx(dec, leaf_mi.0, leaf_mi.1, (2, 2), skip, fctx);
     // Always a `BLOCK_8X8` leaf here, never the whole superblock.
     maybe_read_delta_q(dec, cdfs, leaf_mi.0, leaf_mi.1, false, skip, fctx);
     maybe_read_delta_lf(dec, cdfs, leaf_mi.0, leaf_mi.1, false, skip, fctx);
