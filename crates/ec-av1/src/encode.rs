@@ -10748,17 +10748,58 @@ fn tpl_frame_ratio(ratio: &[f64]) -> f64 {
 /// `EC_AV1_DQ_TPL=0`/`1` forces the mapping either way and `EC_AV1_DQ_TPL_K`
 /// the strength (default 1.0 = libaom's own offset when the flag armed it);
 /// with neither set the preset decides, see [`crate::speed::DQ_TPL_K`].
-fn dq_tpl_strength() -> Option<f64> {
+fn dq_tpl_strength(level: DqLevel) -> Option<f64> {
+    let m = dq_level_k()[level as usize];
     let env_k = crate::envflags::var("EC_AV1_DQ_TPL_K")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|k| k.is_finite() && *k >= 0.0);
-    match crate::envflags::var("EC_AV1_DQ_TPL").ok().as_deref().map(str::trim) {
+    let base = match crate::envflags::var("EC_AV1_DQ_TPL").ok().as_deref().map(str::trim) {
         Some("0") => return None,
-        Some(_) => return Some(env_k.unwrap_or(1.0)),
-        None => {}
+        Some(_) => Some(env_k.unwrap_or(1.0)),
+        None => env_k.or_else(|| Some(crate::speed::at(&crate::speed::DQ_TPL_K))),
+    };
+    base.map(|k| k * m).filter(|k| *k > 0.0)
+}
+
+/// lane-arfq: which pyramid level the frame asking for a
+/// [`dq_tpl_strength`] sits at. The KEY frame is not here on purpose: it
+/// codes no `delta_q` syntax at all (the whole lever lives in
+/// [`encode_inter_frame`]), so a per-level strength cannot touch it -- the
+/// key's allocation is [`crate::encoder::Pyramid::key_q_offset`]'s job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DqLevel {
+    /// The mini-GOP's own hidden `ALTREF`, which every other frame of the
+    /// group predicts from (directly or through the mid level).
+    TopArf = 0,
+    /// A hidden mid/quarter-point `ALTREF`, read by the leaves around it.
+    MidArf = 1,
+    /// A shown leaf -- and every frame of the flat, non-pyramid path.
+    Leaf = 2,
+}
+
+/// The per-level multiplier on the [`dq_tpl_strength`] the preset carries:
+/// `EC_AV1_DQ_K=<top arf>:<mid arf>:<leaf>`, else
+/// [`crate::speed::DQ_LEVEL_K`]. Three fields, not four: the key frame codes
+/// no `delta_q` (see [`DqLevel`]).
+fn dq_level_k() -> [f64; 3] {
+    dq_level_k_of(crate::envflags::var("EC_AV1_DQ_K").ok().as_deref())
+}
+
+/// [`dq_level_k`]'s parse, pure: a missing spec, a missing field and an
+/// unparseable one all keep [`crate::speed::DQ_LEVEL_K`]'s entry.
+fn dq_level_k_of(spec: Option<&str>) -> [f64; 3] {
+    let mut k = crate::speed::DQ_LEVEL_K;
+    if let Some(spec) = spec {
+        for (slot, field) in k.iter_mut().zip(spec.split(':')) {
+            if let Some(v) =
+                field.trim().parse::<f64>().ok().filter(|v: &f64| v.is_finite() && *v >= 0.0)
+            {
+                *slot = v;
+            }
+        }
     }
-    env_k.or_else(|| Some(crate::speed::at(&crate::speed::DQ_TPL_K))).filter(|k| *k > 0.0)
+    k
 }
 
 /// `EC_AV1_DQ_CENSUS=1`: per inter frame, one line comparing the offsets the
@@ -11254,6 +11295,10 @@ pub(crate) struct PyramidFrame {
     /// `show_frame`: false for a hidden frame, output later by a
     /// `show_existing_frame` header.
     pub show_frame: bool,
+    /// lane-arfq: which level's `delta_q` strength this frame reads
+    /// ([`DqLevel`]) -- the caller knows it, since the top ARF and the mid
+    /// one share `Level::Arf` and differ only by their q offset.
+    pub dq_level: DqLevel,
     /// This frame's `ref_frame_sign_bias` (spec 5.9.2).
     pub sign_bias: crate::mvstack::SignBiasTable,
 }
@@ -11544,6 +11589,9 @@ pub(crate) fn encode_inter_frame(
     // 0.5 loss vs libaom on the desktop capture, so a frame that set
     // `allow_screen_content_tools` codes no delta syntax at all and stays
     // byte-identical to the pre-lane encoder.
+    // lane-arfq: the level whose `delta_q` strength this frame reads; the
+    // flat path (no pyramid) is a leaf.
+    let dq_level = pyramid.map_or(DqLevel::Leaf, |p| p.dq_level);
     let deltaq_res: Option<i32> = tpl_factors
         .as_ref()
         .filter(|_| !screen)
@@ -11573,7 +11621,7 @@ pub(crate) fn encode_inter_frame(
     };
     let sb_q: Option<Vec<u8>> = match (&tpl_factors, deltaq_res) {
         (Some(f), Some(res)) => {
-            let libaom = dq_tpl_strength();
+            let libaom = dq_tpl_strength(dq_level);
             Some((0..sb_cols * _sb_rows).map(|sb| sb_qindex(f, res, sb, libaom)).collect())
         }
         _ => None,
@@ -11589,7 +11637,7 @@ pub(crate) fn encode_inter_frame(
                     .map(|sb| i32::from(sb_qindex(f, res, sb, libaom)) - i32::from(base_q_idx))
                     .collect()
             };
-            let strength = dq_tpl_strength();
+            let strength = dq_tpl_strength(dq_level);
             let (ours, aom) = (off(None), off(Some(strength.unwrap_or(1.0))));
             let coded = match (deltaq_res.is_some(), strength) {
                 (false, _) => "none".to_string(),
@@ -11597,7 +11645,7 @@ pub(crate) fn encode_inter_frame(
                 (true, Some(k)) => format!("libaom k={k}"),
             };
             eprintln!(
-                "dq census: base={base_q_idx} res={res} sbs={} coded={coded} r_frame={:.4}\n                   ours   {}\n  libaom {}",
+                "dq census: level={dq_level:?} base={base_q_idx} res={res} sbs={} coded={coded} r_frame={:.4}\n                   ours   {}\n  libaom {}",
                 sb_cols * _sb_rows,
                 r_frame.unwrap_or(f64::NAN),
                 dq_summary(&ours),
@@ -13082,6 +13130,22 @@ mod tests {
         assert!(d(0.5) <= d(1.0) && d(1.0) <= d(1.5), "strength must be monotone: {} {} {}", d(0.5), d(1.0), d(1.5));
         // The frame reference is libaom's log-mean: flat in, the same value out.
         assert!((super::tpl_frame_ratio(&[2.5; 16]) - 2.5).abs() < 1e-9);
+    }
+
+    /// lane-arfq: the per-level `delta_q` strength -- the spec parses onto
+    /// [`super::DqLevel`]'s own indices, a missing or broken field keeps the
+    /// shipped default, and the multiplier reaches the strength.
+    #[test]
+    fn the_per_level_delta_q_strength_indexes_the_levels_it_names() {
+        let d = crate::speed::DQ_LEVEL_K;
+        assert_eq!(super::dq_level_k_of(None), d, "no spec = the shipped table");
+        assert_eq!(super::dq_level_k_of(Some("2:3:4")), [2.0, 3.0, 4.0]);
+        // Short and broken fields fall back per SLOT, not per spec.
+        assert_eq!(super::dq_level_k_of(Some("2")), [2.0, d[1], d[2]]);
+        assert_eq!(super::dq_level_k_of(Some("2:x:-1")), [2.0, d[1], d[2]]);
+        assert_eq!(super::DqLevel::TopArf as usize, 0);
+        assert_eq!(super::DqLevel::MidArf as usize, 1);
+        assert_eq!(super::DqLevel::Leaf as usize, 2);
     }
 
     #[test]
@@ -16820,7 +16884,12 @@ mod tests {
         // quantizer grid -- and every decision priced against it -- moved
         // (8325 -> 8419 / 33014 -> 33029 on its own base); re-taken once more
         // at the merge of both lanes.
-        let pins: [(u8, usize, u64); 2] = [(150, 8252, 0x5b6e40a2b5498988), (60, 33053, 0x9a0abfc234eccc37)];
+        // Re-taken on lane-arfq: the top ARF of a mini-GOP codes its
+        // per-superblock `delta_qindex` at 1.5x the preset's strength
+        // ([`crate::speed::DQ_LEVEL_K`]), so the hidden frames' quantizer
+        // grids -- and every decision priced against them -- moved:
+        // 8252 -> 8269 bytes at q=150 and 33053 -> 33044 at q=60.
+        let pins: [(u8, usize, u64); 2] = [(150, 8269, 0xf0a10bafe7b45fe2), (60, 33044, 0x077e9c22ff6f41fb)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
