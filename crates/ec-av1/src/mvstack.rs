@@ -492,6 +492,14 @@ pub struct MvStack {
     /// Context for each `drl_mode` symbol between consecutive stack
     /// entries, `entries.len().saturating_sub(1)` long.
     pub drl_ctx: DrlVec,
+    /// The immediate above/left neighbours' references, `(ref0, ref1)` each
+    /// with `None` for intra/unavailable -- exactly what tile.rs
+    /// `write_single_ref` hands `single_ref_p1_ctx`..`p6_ctx`. Carried here
+    /// so the RD pricer can price the reference symbols at the context the
+    /// writer really codes them with, instead of context 0 (lane-pricer).
+    pub above_refs: (Option<i8>, Option<i8>),
+    /// The immediate LEFT neighbour's `(ref0, ref1)` -- see `above_refs`.
+    pub left_refs: (Option<i8>, Option<i8>),
 }
 
 /// Spec 7.10.2.8's threshold a candidate's weight is compared against to
@@ -1651,6 +1659,20 @@ pub fn find_mv_stack_with_sign_bias(
         })
         .collect();
 
+    // The two cells `write_single_ref` reads its contexts from (its
+    // `above_ref`/`above_ref1`/`left_ref`/`left_ref1` bands are this same
+    // grid one block back), `None` where the neighbour is intra or outside
+    // the tile.
+    let refs_of = |cell: Option<MiInfo>| match cell {
+        Some(mi) if mi.is_inter && mi.ref_frame > 0 => (
+            Some(mi.ref_frame),
+            (mi.ref_frame1 > 0).then_some(mi.ref_frame1),
+        ),
+        _ => (None, None),
+    };
+    let above_refs = refs_of(mi_row.checked_sub(1).and_then(|r| grid.get(r, mi_col)));
+    let left_refs = refs_of(mi_col.checked_sub(1).and_then(|c| grid.get(mi_row, c)));
+
     MvStack {
         entries: candidates,
         nearest_mv,
@@ -1660,6 +1682,8 @@ pub fn find_mv_stack_with_sign_bias(
         ref_mv_ctx,
         zero_mv_ctx,
         drl_ctx,
+        above_refs,
+        left_refs,
     }
 }
 

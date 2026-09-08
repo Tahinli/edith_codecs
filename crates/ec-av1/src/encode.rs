@@ -4004,6 +4004,62 @@ fn warp_prediction(
     Some([u8s(&py_buf), u8s(&pu_buf), u8s(&pv_buf)])
 }
 
+/// What tile.rs' `write_single_ref` pays for `ref_frame`, symbol for symbol,
+/// at the fixed context this RD pricer uses for every neighbour-derived
+/// symbol (the writer contexts each symbol off its above/left neighbours'
+/// references; the search does not have them). LAST is p1=0,p3=0,p4=0,
+/// LAST2 p1=0,p3=0,p4=1, LAST3 p1=0,p3=1,p5=0, GOLDEN p1=0,p3=1,p5=1,
+/// BWDREF p1=1,p2=0,p6=0, ALTREF2 p1=1,p2=0,p6=1 and ALTREF p1=1,p2=1.
+/// Before lane-pricer every BACKWARD reference was priced as LAST -- three
+/// symbols off the wrong CDFs -- which is what made the search believe an
+/// ALTREF block cost the same syntax as a LAST one.
+pub(crate) fn single_ref_bits(ref_frame: i8, stack: &crate::mvstack::MvStack) -> f64 {
+    use crate::mvstack::{
+        ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
+        single_ref_p5_ctx, single_ref_p6_ctx,
+    };
+    let (a, a1) = stack.above_refs;
+    let (l, l1) = stack.left_refs;
+    let backward = ref_frame >= BWDREF_FRAME;
+    let p1 = symbol_bits(
+        &cdf::SINGLE_REF[single_ref_p1_ctx(a, a1, l, l1)][0],
+        usize::from(backward),
+    );
+    if backward {
+        let is_altref = ref_frame == ALTREF_FRAME;
+        let p2 = symbol_bits(
+            &cdf::SINGLE_REF[single_ref_p2_ctx(a, a1, l, l1)][1],
+            usize::from(is_altref),
+        );
+        return p1
+            + p2
+            + if is_altref {
+                0.0
+            } else {
+                symbol_bits(
+                    &cdf::SINGLE_REF[single_ref_p6_ctx(a, a1, l, l1)][5],
+                    usize::from(ref_frame == ALTREF2_FRAME),
+                )
+            };
+    }
+    let far = ref_frame == LAST3_FRAME || ref_frame == GOLDEN_FRAME;
+    p1 + symbol_bits(
+        &cdf::SINGLE_REF[single_ref_p3_ctx(a, a1, l, l1)][2],
+        usize::from(far),
+    ) + if far {
+        symbol_bits(
+            &cdf::SINGLE_REF[single_ref_p5_ctx(a, a1, l, l1)][4],
+            usize::from(ref_frame == GOLDEN_FRAME),
+        )
+    } else {
+        symbol_bits(
+            &cdf::SINGLE_REF[single_ref_p4_ctx(a, a1, l, l1)][3],
+            usize::from(ref_frame == LAST2_FRAME),
+        )
+    }
+}
+
 pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
     let low = if symbol == 0 { 0 } else { cdf[symbol - 1] };
     let width = cdf[symbol] - low;
@@ -5949,9 +6005,7 @@ fn code_square_inter(
 
     let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
     let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
-    let single_ref_bits = symbol_bits(&cdf::SINGLE_REF[0][0], 0)
-        + symbol_bits(&cdf::SINGLE_REF[0][2], 0)
-        + symbol_bits(&cdf::SINGLE_REF[0][3], 0);
+    let single_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
         + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
         + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0); // NEARESTMV
@@ -8736,9 +8790,7 @@ fn search_skip_64(
     let side = SUPERBLOCK;
     let not_new = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1);
     let not_zero = symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1);
-    let ref_bits = symbol_bits(&cdf::SINGLE_REF[0][0], 0)
-        + symbol_bits(&cdf::SINGLE_REF[0][2], 0)
-        + symbol_bits(&cdf::SINGLE_REF[0][3], 0);
+    let ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     // What every candidate pays whatever its vector: `skip` coded 1, then
     // `is_inter` coded 1, then the LAST chain above.
     let fixed = symbol_bits(&cdf::SKIP[0], 1) + symbol_bits(&cdf::INTRA_INTER[0], 1) + ref_bits;
@@ -9121,25 +9173,6 @@ fn search_inter_block(
     // function's doc comment.
     let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
     let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
-    // `write_single_ref`'s own tree, at the fixed context this pricer uses
-    // for every neighbour-derived symbol: LAST is p1=0,p3=0,p4=0, LAST2
-    // p1=0,p3=0,p4=1 and GOLDEN p1=0,p3=1,p5=1. A BACKWARD reference
-    // (`ALTREF`, p1=1,p2=1) is priced as LAST here and always has been --
-    // wrong by two symbols, but fixing it moves every shipped stream, so it
-    // is a lever of its own and not this lane's (lanes/last2.report.md).
-    let single_ref_bits = |ref_frame: i8| {
-        use crate::mvstack::{GOLDEN_FRAME, LAST2_FRAME};
-        symbol_bits(&cdf::SINGLE_REF[0][0], 0)
-            + if ref_frame == GOLDEN_FRAME {
-                symbol_bits(&cdf::SINGLE_REF[0][2], 1) + symbol_bits(&cdf::SINGLE_REF[0][4], 1)
-            } else {
-                symbol_bits(&cdf::SINGLE_REF[0][2], 0)
-                    + symbol_bits(
-                        &cdf::SINGLE_REF[0][3],
-                        usize::from(ref_frame == LAST2_FRAME),
-                    )
-            }
-    };
 
     struct Candidate {
         cost: f64,
@@ -9295,7 +9328,7 @@ fn search_inter_block(
     // the loop cannot reach is never offered below -- every candidate's
     // index is one this same loop walks to.
     let drl_bits = |start: usize, target: usize| drl_bits_for(stack, start, target);
-    let last_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME);
+    let last_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     let mut cands: Vec<((i32, i32), f64, InterInfo)> = vec![
         (
             stack.nearest_mv,
@@ -9388,7 +9421,7 @@ fn search_inter_block(
     // `NEW_NEWMV` candidate below to pair with `LAST`'s.
     let mut extra_new_mvs: Vec<(i8, (i32, i32))> = Vec::new();
     for &(ref_frame, g, gstack) in extra {
-        let g_ref_bits = single_ref_bits(ref_frame);
+        let g_ref_bits = single_ref_bits(ref_frame, gstack);
         let g_not_new = symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 1);
         cands.push((
             gstack.nearest_mv,
@@ -12027,6 +12060,72 @@ pub(crate) fn encode_sequence_with_ctx(
 
 #[cfg(test)]
 mod tests {
+
+    /// [`super::single_ref_bits`] pays exactly what tile.rs'
+    /// `write_single_ref` codes: the p1/p2/p6 chain for a BACKWARD
+    /// reference and the p1/p3/p4/p5 chain for a forward one, each symbol at
+    /// the context that symbol's own `single_ref_p*_ctx` derives from the
+    /// block's above/left neighbours. Red before lane-pricer, where every
+    /// backward reference was priced as LAST (p1=0,p3=0,p4=0) at context 0.
+    #[test]
+    fn the_single_ref_pricer_pays_the_writers_own_symbol_sequence() {
+        use crate::cdf::SINGLE_REF as SR;
+        use crate::encode::symbol_bits as b;
+        use crate::mvstack::{
+            ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+            LAST_FRAME, MvStack, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx,
+            single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
+        };
+        let stack_with = |above_refs, left_refs| MvStack {
+            entries: Default::default(),
+            nearest_mv: (0, 0),
+            near_mv: (0, 0),
+            pred_mv: (0, 0),
+            new_mv_ctx: 0,
+            ref_mv_ctx: 0,
+            zero_mv_ctx: 0,
+            drl_ctx: Default::default(),
+            above_refs,
+            left_refs,
+        };
+        // (reference, the symbols `write_single_ref` emits as (p index, value))
+        let cases: [(i8, &[(usize, usize)]); 7] = [
+            (LAST_FRAME, &[(0, 0), (2, 0), (3, 0)]),
+            (LAST2_FRAME, &[(0, 0), (2, 0), (3, 1)]),
+            (LAST3_FRAME, &[(0, 0), (2, 1), (4, 0)]),
+            (GOLDEN_FRAME, &[(0, 0), (2, 1), (4, 1)]),
+            (BWDREF_FRAME, &[(0, 1), (1, 0), (5, 0)]),
+            (ALTREF2_FRAME, &[(0, 1), (1, 0), (5, 1)]),
+            (ALTREF_FRAME, &[(0, 1), (1, 1)]),
+        ];
+        // Both neighbours intra, and the mixed LAST-above/ALTREF-left pair
+        // that puts every p* context on a different row.
+        for (above_refs, left_refs) in [
+            ((None, None), (None, None)),
+            ((Some(LAST_FRAME), None), (Some(ALTREF_FRAME), Some(LAST_FRAME))),
+        ] {
+            let stack = stack_with(above_refs, left_refs);
+            let (a, a1) = above_refs;
+            let (l, l1) = left_refs;
+            let ctx_of = |p: usize| match p {
+                0 => single_ref_p1_ctx(a, a1, l, l1),
+                1 => single_ref_p2_ctx(a, a1, l, l1),
+                2 => single_ref_p3_ctx(a, a1, l, l1),
+                3 => single_ref_p4_ctx(a, a1, l, l1),
+                4 => single_ref_p5_ctx(a, a1, l, l1),
+                _ => single_ref_p6_ctx(a, a1, l, l1),
+            };
+            for (ref_frame, symbols) in cases {
+                let want: f64 = symbols.iter().map(|&(p, v)| b(&SR[ctx_of(p)][p], v)).sum();
+                let got = super::single_ref_bits(ref_frame, &stack);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "ref {ref_frame} above {above_refs:?} left {left_refs:?}: \
+                     priced {got} bits, writer codes {want}"
+                );
+            }
+        }
+    }
 
     /// lane-av1tpl2's propagated map, on the two properties every decision
     /// under it rests on: a frame the whole lookahead window repeats exactly
@@ -15702,8 +15801,12 @@ mod tests {
         // gave 9808 / 35791) and the lane-i64 merge: the KEY frame -- one of
         // these four pictures -- offers every superblock a 64x64 intra root
         // now. `EC_AV1_I64=0` restores 8557 / 33345.
+        // Re-taken on lane-pricer: the inter RD search prices a single
+        // reference through the tree and the neighbour contexts the writer
+        // really codes it with, so every inter picture's reference decisions
+        // move -- 8562 -> 8535 at q=150 and 33357 -> 33221 at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8562, 0x66f5_4ffc_aacf_964f), (60, 33357, 0x1d61_9ca4_e960_b044)];
+            [(150, 8535, 0x7b7f_4eeb_1080_7b45), (60, 33221, 0x720b_821e_5dd2_90e4)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
