@@ -3014,7 +3014,10 @@ pub(crate) mod tests {
     /// the encoder's own reconstruction, at an even and an odd size.
     #[test]
     fn decode_stream_matches_the_tile_path_on_a_key_frame() {
-    let fctx = &crate::decode::FrameCtx::new();
+        // lane-b128m: the ENCODER writes at this process's superblock size, so
+        // its own trial decode -- and the raw tile decode below -- must be given
+        // that size too (class: stale header in the test harness).
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         for &(width, height) in &[(64usize, 64usize), (216, 96)] {
             let picture = test_card(width, height);
             let encoded = encode_key_frame_with_ctx(&picture, 100, 0.5, fctx).unwrap();
@@ -3085,7 +3088,7 @@ pub(crate) mod tests {
 
     #[test]
     fn decode_stream_round_trips_a_gop() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder();
         gop_round_trips(128, 64, fctx);
     }
 
@@ -3093,7 +3096,7 @@ pub(crate) mod tests {
     /// the inter frame's 16x16-leaf split path is exercised too.
     #[test]
     fn decode_stream_round_trips_an_odd_size_gop() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder();
         gop_round_trips(216, 96, fctx);
     }
 
@@ -3105,7 +3108,7 @@ pub(crate) mod tests {
     /// decode indices non-decreasing, and an `Err` from the sink aborting.
     #[test]
     fn streaming_decode_matches_the_collecting_one() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder();
         let pictures: Vec<_> = (0..4).map(|i| panned_test_card(128, 64, i * 3)).collect();
         let stream = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx).unwrap().stream;
         let collected = decode_stream(&stream).unwrap();
@@ -3464,7 +3467,7 @@ pub(crate) mod tests {
     /// independent decoder, not just this crate checking its own tile path.
     #[test]
     fn decode_stream_agrees_with_ffmpeg_on_a_gop() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP decode_stream_agrees_with_ffmpeg_on_a_gop: no ffmpeg");
             return;
@@ -3518,7 +3521,7 @@ pub(crate) mod tests {
     /// geometry that never fires it.
     #[test]
     fn a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg() {
-        let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP a_sweep_of_doubly_straddling_sizes_round_trips_through_ffmpeg: no ffmpeg");
             return;
@@ -3578,7 +3581,7 @@ pub(crate) mod tests {
     /// reconstruction, and ffmpeg.
     #[test]
     fn a_doubly_cut_superblock_root_round_trips_in_every_plane() {
-        let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::for_encoder();
         if !have_ffmpeg() {
             eprintln!("SKIP a_doubly_cut_superblock_root_round_trips_in_every_plane: no ffmpeg");
             return;
