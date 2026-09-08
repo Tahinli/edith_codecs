@@ -395,6 +395,20 @@ pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.5, 1.0, 1.0];
 /// still carry the grain the anchor no longer has.
 pub(crate) const ARF_TF: [f64; 11] = [3.0; 11];
 
+/// lane-arftf: the same filter on the MID ARF (the second hidden frame of a
+/// group), whose window is the group's later leaves -- so it filters FORWARD
+/// where the top ARF filters backward. `EC_AV1_ARF_TF_MID=<strength>`
+/// overrides it; `0` is off, which is where the long-GOP gate left it.
+pub(crate) const ARF_TF_MID: [f64; 11] = [0.0; 11];
+
+/// lane-arftf: how many window pictures [`crate::encode::arf_temporal_filter`]
+/// averages in. The top ARF is its group's LAST picture and the next group's
+/// sources are not buffered when it is coded, so the window holds only
+/// display-PAST neighbours and this widens the filter backwards only (a
+/// symmetric +-2 needs a one-group lookahead the encoder does not have).
+/// `EC_AV1_ARF_TF_WIN=<n>` overrides it.
+pub(crate) const ARF_TF_WIN: [usize; 11] = [2; 11];
+
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at
 /// the high-quality end for the same reason: a picture we are about to
