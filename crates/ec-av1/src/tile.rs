@@ -6370,10 +6370,12 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         mi_rows as usize,
                     );
                     let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
-                    crate::msac::symtrace::note(&format!(
-                        "  MODE mi=({mi_r},{mi_c}) mode={:?} idx={} mv={mv:?} info_mv={:?}",
-                        info.mode, info.ref_mv_idx, info.mv
-                    ));
+                    if crate::msac::symtrace::dir().is_some() {
+                        crate::msac::symtrace::note(&format!(
+                            "  MODE mi=({mi_r},{mi_c}) mode={:?} idx={} mv={mv:?} info_mv={:?}",
+                            info.mode, info.ref_mv_idx, info.mv
+                        ));
+                    }
                     (mv, (0, 0), is_new_mv)
                 };
                 for dr in 0..SB_MI as usize {
@@ -6769,10 +6771,12 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     );
 
                     let (mv, is_new_mv) = write_inter_mode(&mut enc, &mut cdfs, info, &stack)?;
-                    crate::msac::symtrace::note(&format!(
-                        "  MODE mi=({mi_r},{mi_c}) mode={:?} idx={} mv={mv:?} info_mv={:?}",
-                        info.mode, info.ref_mv_idx, info.mv
-                    ));
+                    if crate::msac::symtrace::dir().is_some() {
+                        crate::msac::symtrace::note(&format!(
+                            "  MODE mi=({mi_r},{mi_c}) mode={:?} idx={} mv={mv:?} info_mv={:?}",
+                            info.mode, info.ref_mv_idx, info.mv
+                        ));
+                    }
                     grid.set(
                         mi_row,
                         mi_col,

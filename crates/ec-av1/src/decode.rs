@@ -28178,9 +28178,11 @@ fn decode_inter_block(
                 };
                 (mv, false)
             };
-            crate::msac::symtrace::note(&format!(
-                "  MODE mi=({mi_row},{mi_col}) dbg={dbg_mode} mv={mv:?}"
-            ));
+            if crate::msac::symtrace::dir().is_some() {
+                crate::msac::symtrace::note(&format!(
+                    "  MODE mi=({mi_row},{mi_col}) dbg={dbg_mode} mv={mv:?}"
+                ));
+            }
             if crate::envflags::env_flag!("EC_TRACE_MODE") {
                 for (i, e) in stack.entries.iter().enumerate() {
                     eprintln!(
