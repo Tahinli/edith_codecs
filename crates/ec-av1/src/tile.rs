@@ -3724,12 +3724,13 @@ fn intrabc_dv_pred(mi_r: usize, mi_c: usize, side: usize) -> (i32, i32) {
     });
     let mut pred = stack_pred.unwrap_or((0, 0));
     if pred == (0, 0) {
-        // 64x64 superblocks: the only size this encoder's sequence header
-        // signals (`use_128x128_superblock: false`), so `mib_size` is 16 mi.
-        // The tile row start is 0, exactly as decode.rs `read_intrabc_dv`
-        // takes it -- both are written for the single-tile-row streams this
-        // encoder produces.
-        let sb_mi = 16i32;
+        // `av1_find_ref_dv` takes `mib_size`, the SEQUENCE's superblock size
+        // in mi units (lane-b128m: hardcoding 16 here made the writer's DV
+        // predictor one 64 superblock up while decode.rs `read_intrabc_dv`
+        // took 128 -- identical symbols, different reconstructed DV). The
+        // tile row start is 0, exactly as the reader takes it -- both are
+        // written for the single-tile-row streams this encoder produces.
+        let sb_mi = if sb128_armed() { 32i32 } else { 16i32 };
         let sb_px = sb_mi * MI as i32;
         pred = if (mi_r as i32) < sb_mi {
             (0, -(sb_px + INTRABC_DELAY_PIXELS) * 8)
