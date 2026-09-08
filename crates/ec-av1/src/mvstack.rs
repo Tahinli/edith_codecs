@@ -1742,6 +1742,24 @@ pub fn find_mv_stack_with_sign_bias(
         .checked_sub(1)
         .is_some_and(|c| grid.skip_at(mi_row, c));
 
+    // lane-sb128b: the writer/reader stack diff instrument (`EC_AV1_MVDBG=1`)
+    // -- one line per built stack, in build order, so the two sides' logs
+    // diff to the first block whose candidate list differs.
+    if crate::msac::symtrace::dir().is_some() {
+        crate::msac::symtrace::note(&format!(
+            "MVDBG mi=({mi_row},{mi_col}) b=({bw4}x{bh4}) ref={ref_frame} n={} mv={:?}",
+            candidates.len(),
+            candidates.iter().map(|e| (e.mv, e.weight)).collect::<Vec<_>>(),
+        ));
+        let row = mi_row.checked_sub(1).map(|r| {
+            (mi_col..mi_col + bw4).map(|c| grid.get(r, c).map(|m| (m.ref_frame, m.mv))).collect::<Vec<_>>()
+        });
+        let col = mi_col.checked_sub(1).map(|c| {
+            (mi_row..mi_row + bh4).map(|r| grid.get(r, c).map(|m| (m.ref_frame, m.mv))).collect::<Vec<_>>()
+        });
+        crate::msac::symtrace::note(&format!("  above={row:?}"));
+        crate::msac::symtrace::note(&format!("  left={col:?}"));
+    }
     MvStack {
         entries: candidates,
         nearest_mv,
