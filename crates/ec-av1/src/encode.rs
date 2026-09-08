@@ -4112,15 +4112,32 @@ pub(crate) fn intra_inter_bits_at(stack: &crate::mvstack::MvStack, inter: bool) 
     symbol_bits(&cdf::INTRA_INTER[ctx], usize::from(inter))
 }
 
+/// The `comp_mode = 0` symbol tile.rs' `write_comp_mode` codes ahead of a
+/// SINGLE-reference block's reference syntax, at `reference_mode_ctx`'s own
+/// context -- zero on a frame that carries no `reference_select` bit, where
+/// the writer codes no symbol at all.
+fn comp_mode_single_bits(stack: &crate::mvstack::MvStack) -> f64 {
+    if !reference_select() {
+        return 0.0;
+    }
+    symbol_bits(
+        &cdf::COMP_MODE[crate::mvstack::reference_mode_ctx(stack.above_nbr, stack.left_nbr)],
+        0,
+    )
+}
+
 /// What tile.rs' `write_single_ref` pays for `ref_frame`, symbol for symbol,
-/// at the fixed context this RD pricer uses for every neighbour-derived
-/// symbol (the writer contexts each symbol off its above/left neighbours'
-/// references; the search does not have them). LAST is p1=0,p3=0,p4=0,
+/// each at the context that symbol's own `single_ref_p*_ctx` derives from the
+/// block's above/left neighbours -- plus the `comp_mode = 0` symbol
+/// `write_comp_mode` codes ahead of it on a `reference_select` frame.
+/// LAST is p1=0,p3=0,p4=0,
 /// LAST2 p1=0,p3=0,p4=1, LAST3 p1=0,p3=1,p5=0, GOLDEN p1=0,p3=1,p5=1,
 /// BWDREF p1=1,p2=0,p6=0, ALTREF2 p1=1,p2=0,p6=1 and ALTREF p1=1,p2=1.
 /// Before lane-pricer every BACKWARD reference was priced as LAST -- three
 /// symbols off the wrong CDFs -- which is what made the search believe an
-/// ALTREF block cost the same syntax as a LAST one.
+/// ALTREF block cost the same syntax as a LAST one. The `comp_mode` term is
+/// lane-ctx2's: a compound candidate paid `comp_mode = 1` while a single one
+/// paid nothing at all, so compound was overcharged by the whole symbol.
 pub(crate) fn single_ref_bits(ref_frame: i8, stack: &crate::mvstack::MvStack) -> f64 {
     use crate::mvstack::{
         ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
@@ -4129,6 +4146,7 @@ pub(crate) fn single_ref_bits(ref_frame: i8, stack: &crate::mvstack::MvStack) ->
     };
     let (a, a1) = stack.above_refs;
     let (l, l1) = stack.left_refs;
+    let comp_mode = comp_mode_single_bits(stack);
     let backward = ref_frame >= BWDREF_FRAME;
     let p1 = symbol_bits(
         &cdf::SINGLE_REF[single_ref_p1_ctx(a, a1, l, l1)][0],
@@ -4140,7 +4158,8 @@ pub(crate) fn single_ref_bits(ref_frame: i8, stack: &crate::mvstack::MvStack) ->
             &cdf::SINGLE_REF[single_ref_p2_ctx(a, a1, l, l1)][1],
             usize::from(is_altref),
         );
-        return p1
+        return comp_mode
+            + p1
             + p2
             + if is_altref {
                 0.0
@@ -4152,7 +4171,7 @@ pub(crate) fn single_ref_bits(ref_frame: i8, stack: &crate::mvstack::MvStack) ->
             };
     }
     let far = ref_frame == LAST3_FRAME || ref_frame == GOLDEN_FRAME;
-    p1 + symbol_bits(
+    comp_mode + p1 + symbol_bits(
         &cdf::SINGLE_REF[single_ref_p3_ctx(a, a1, l, l1)][2],
         usize::from(far),
     ) + if far {
@@ -12349,10 +12368,15 @@ mod tests {
             LAST_FRAME, MvStack, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx,
             single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
         };
-        let stack_with = |above_refs, left_refs| MvStack {
+        let stack_with = |above_refs, left_refs, above_nbr, left_nbr| MvStack {
             above_refs,
             left_refs,
+            above_nbr,
+            left_nbr,
             ..bare_stack()
+        };
+        let nbr = |ref0, ref1| {
+            Some(crate::mvstack::NeighbourRef { is_inter: true, ref0, ref1, uni: false })
         };
         // (reference, the symbols `write_single_ref` emits as (p index, value))
         let cases: [(i8, &[(usize, usize)]); 7] = [
@@ -12364,13 +12388,20 @@ mod tests {
             (ALTREF2_FRAME, &[(0, 1), (1, 0), (5, 1)]),
             (ALTREF_FRAME, &[(0, 1), (1, 1)]),
         ];
-        // Both neighbours intra, and the mixed LAST-above/ALTREF-left pair
-        // that puts every p* context on a different row.
-        for (above_refs, left_refs) in [
-            ((None, None), (None, None)),
-            ((Some(LAST_FRAME), None), (Some(ALTREF_FRAME), Some(LAST_FRAME))),
+        // Both neighbours intra, then the mixed LAST-above/ALTREF-left pair
+        // that puts every p* context on a different row -- the second with a
+        // COMPOUND left neighbour, which is what takes `reference_mode_ctx`
+        // off row 0.
+        for (above_refs, left_refs, above_nbr, left_nbr) in [
+            ((None, None), (None, None), None, None),
+            (
+                (Some(LAST_FRAME), None),
+                (Some(ALTREF_FRAME), Some(LAST_FRAME)),
+                nbr(LAST_FRAME, None),
+                nbr(ALTREF_FRAME, Some(LAST_FRAME)),
+            ),
         ] {
-            let stack = stack_with(above_refs, left_refs);
+            let stack = stack_with(above_refs, left_refs, above_nbr, left_nbr);
             let (a, a1) = above_refs;
             let (l, l1) = left_refs;
             let ctx_of = |p: usize| match p {
@@ -12382,7 +12413,17 @@ mod tests {
                 _ => single_ref_p6_ctx(a, a1, l, l1),
             };
             for (ref_frame, symbols) in cases {
-                let want: f64 = symbols.iter().map(|&(p, v)| b(&SR[ctx_of(p)][p], v)).sum();
+                // Plus the `comp_mode = 0` symbol the writer codes ahead of
+                // the reference syntax on a `reference_select` frame.
+                let mut want: f64 = symbols.iter().map(|&(p, v)| b(&SR[ctx_of(p)][p], v)).sum();
+                if super::reference_select() {
+                    want += b(
+                        &crate::cdf::COMP_MODE[crate::mvstack::reference_mode_ctx(
+                            above_nbr, left_nbr,
+                        )],
+                        0,
+                    );
+                }
                 let got = super::single_ref_bits(ref_frame, &stack);
                 assert!(
                     (got - want).abs() < 1e-9,
@@ -16075,9 +16116,12 @@ mod tests {
         // for `skip`/`is_inter` and for the whole compound reference tree, so
         // every inter block's cost -- and with it the skip and reference
         // decisions -- moved: 8535 -> 8311 bytes at q=150 and 33221 -> 33087
-        // at q=60.
+        // at q=60. Re-taken on lane-ctx2: a single-reference candidate now
+        // pays the `comp_mode = 0` symbol the writer codes ahead of it, so
+        // single and compound are priced against the same syntax -- 8311 ->
+        // 8325 bytes at q=150 and 33087 -> 33014 at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8311, 0xfb6d_75a4_5d13_3833), (60, 33087, 0x4d11_a03c_bdc6_e2d5)];
+            [(150, 8325, 0xf004_8258_bc60_ff05), (60, 33014, 0x5bc2_5dfd_bd13_18de)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
