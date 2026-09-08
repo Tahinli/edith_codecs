@@ -3839,6 +3839,42 @@ fn tx_depth_bits(side: usize, depth: usize) -> f64 {
 pub(crate) static INTER_TX_TYPE_HITS: [std::sync::atomic::AtomicUsize; 16] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 16];
 
+/// lane-txrd: a multiplier on the rate term of the TRANSFORM-TYPE decision
+/// only (`EC_AV1_TXRD_LAMBDA`, default 1.0 = the mode search's own weight).
+/// `0` compares types on reconstruction error alone, which is what separates
+/// a rate-term calibration (class `rd-rate-term-calibration`) from a
+/// distortion the trial mis-measures.
+pub(crate) fn tx_type_lambda_mult() -> f64 {
+    static M: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_TXRD_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1.0)
+    });
+    *M
+}
+
+/// lane-txrd instrument: over the FLAT inter luma decision, the summed
+/// reconstruction error and priced bits of the type the search chose against
+/// the `DCT_DCT` trial it was compared with. Both are `* 64` so they fit an
+/// integer counter. `EC_AV1_TXRD_CENSUS`.
+pub(crate) static TXRD_STATS: [std::sync::atomic::AtomicU64; 7] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Reads [`TXRD_STATS`] and zeroes it. Only the gate reads it, so the lib
+/// build would warn `dead_code` (class from lane-txset2's `coeff_bits`).
+#[cfg(test)]
+pub(crate) fn take_txrd_stats() -> [u64; 7] {
+    std::array::from_fn(|i| TXRD_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Reads [`INTER_TX_TYPE_HITS`] and zeroes it.
 #[cfg(test)]
 pub(crate) fn take_inter_tx_type_hits() -> [usize; 16] {
@@ -3964,6 +4000,52 @@ fn txfm_split_bits(side: usize, depth: usize) -> f64 {
         + 4.0 * symbol_bits(&cdf::TXFM_PARTITION[ctx(max_tx / 2)], 0)
 }
 
+/// spec 5.11.40 / libaom `av1_get_tx_type`: an INTER block's chroma transform
+/// type is never coded -- the decoder takes the LUMA type of the block's
+/// chroma-reference position and reduces it to the set the chroma size allows
+/// ([`crate::decode::reduce_inherited_chroma_tx_type`]). This encoder
+/// quantised chroma under a `DCT_DCT` basis whatever luma chose, so every
+/// non-`DCT_DCT` luma winner had its chroma levels inverse-transformed on a
+/// basis they were never produced for: on the bars gate row the luma of the
+/// unconditional tx-type arm came out BETTER on every frame (53.66 -> 53.70
+/// dB) while V lost seven decibels (52.52 -> 45.53) -- the whole 20-point BD
+/// collapse two lanes attributed to the type PRICE (class
+/// `parsed then discarded` / `override slot on one arm`: a decoder-derived
+/// field the encoder never mirrored).
+///
+/// Re-codes the two chroma planes of a committed inter block at the type the
+/// decoder will use, `None` when the inherited type reduces to `DCT_DCT` and
+/// the trials the caller already holds are right.
+#[allow(clippy::too_many_arguments)]
+fn recode_inter_chroma(
+    chroma: &[Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+    mv: (i32, i32),
+    refs: [(&[u16], usize, usize, usize); 2],
+    second: Option<((i32, i32), [(&[u16], usize, usize, usize); 2])>,
+    search: &Search,
+    set: TxbSet,
+    luma_tx_type: TxType,
+    fctx: &crate::decode::FrameCtx,
+) -> Option<[Trial; 2]> {
+    let c = side / 2;
+    let tx = crate::decode::reduce_inherited_chroma_tx_type(luma_tx_type, c.min(32), c.min(32), fctx);
+    if tx == TxType::DctDct {
+        return None;
+    }
+    Some([0usize, 1].map(|p| match second {
+        Some((mv1, r1)) => mc_trial_compound_typed(
+            &chroma[p], x / 2, y / 2, c, (mv, mv1), false, refs[p], r1[p], search.base_q_idx,
+            search.deadzone, set, tx, fctx,
+        ),
+        None => mc_trial_typed(
+            &chroma[p], x / 2, y / 2, c, mv, false, refs[p].0, refs[p].1, refs[p].2, refs[p].3,
+            false, search.base_q_idx, search.deadzone, set, tx, fctx,
+        ),
+    }))
+}
+
 /// The inter block's own var-tx decision, once its motion vector is settled:
 /// its residual as ONE transform over the whole block, or as the four
 /// transforms of half the side the tree's first halving names. The prediction
@@ -4003,7 +4085,8 @@ fn commit_inter_luma(
     let mut flat_type = TxType::DctDct;
     if !skip {
         if let Some(fset) = inter_luma_set(side) {
-            let cost = |t: &Trial| t.sse + search.lambda * t.bits;
+            let lambda = search.lambda * tx_type_lambda_mult();
+            let cost = |t: &Trial| t.sse + lambda * t.bits;
             for &tx_type in inter_tx_type_candidates(fset, search.screen) {
                 if tx_type == TxType::DctDct {
                     continue;
@@ -4035,6 +4118,45 @@ fn commit_inter_luma(
         }
     };
     let flat_ref: &Trial = flat_typed.as_ref().unwrap_or(flat);
+    if crate::envflags::env_flag!("EC_AV1_TXRD_CENSUS") && !skip {
+        use std::sync::atomic::Ordering::Relaxed;
+        TXRD_STATS[0].fetch_add(1, Relaxed);
+        TXRD_STATS[1].fetch_add(flat_ref.sse as u64, Relaxed);
+        TXRD_STATS[2].fetch_add(flat.sse as u64, Relaxed);
+        TXRD_STATS[3].fetch_add((flat_ref.bits * 64.0) as u64, Relaxed);
+        TXRD_STATS[4].fetch_add((flat.bits * 64.0) as u64, Relaxed);
+        // Is the `DCT_DCT` baseline the search compares against the trial
+        // THIS function would build for the same block? A stale or
+        // differently-predicted baseline is what would let a candidate win on
+        // both terms at once (class `local-rd-on-references` vs a real
+        // pricing defect); re-predicting it here is the only way to tell.
+        if let Some(fset) = inter_luma_set(side) {
+            let here = match second {
+                Some((mv1, ref1)) => mc_trial_compound_typed(
+                    luma, x, y, side, (mv, mv1), true, reference, ref1, search.base_q_idx,
+                    search.deadzone, fset, TxType::DctDct, fctx,
+                ),
+                None => mc_trial_typed(
+                    luma, x, y, side, mv, true, reference.0, reference.1, reference.2,
+                    reference.3, false, search.base_q_idx, search.deadzone, fset,
+                    TxType::DctDct, fctx,
+                ),
+            };
+            TXRD_STATS[5].fetch_add(here.sse as u64, Relaxed);
+            TXRD_STATS[6].fetch_add((here.bits * 64.0) as u64, Relaxed);
+            static DUMPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = TXRD_STATS[0].load(Relaxed);
+            if here.sse * 2.0 < flat.sse && DUMPED.fetch_add(1, Relaxed) < 30 {
+                eprintln!(
+                    "TXRD block {n} at ({x},{y}) side={side} compound={} mv={mv:?} \
+                     flat sse={:.0} bits={:.1} | here sse={:.0} bits={:.1} | chosen {flat_type:?} \
+                     sse={:.0} bits={:.1}",
+                    second.is_some(), flat.sse, flat.bits, here.sse, here.bits,
+                    flat_ref.sse, flat_ref.bits,
+                );
+            }
+        }
+    }
     // What the caller's already-counted `flat` cost has to be corrected by
     // when a non-`DCT_DCT` type won it, the same way the split delta below is.
     let flat_gain = (flat_ref.sse + search.lambda * flat_ref.bits)
@@ -4087,7 +4209,7 @@ fn commit_inter_luma(
             let mut best: Option<(f64, TxType, Trial)> = None;
             for &tx_type in inter_tx_type_candidates(set, search.screen) {
                 let candidate = unit(tx_type);
-                let cost = candidate.sse + search.lambda * candidate.bits;
+                let cost = candidate.sse + search.lambda * tx_type_lambda_mult() * candidate.bits;
                 if best.as_ref().is_none_or(|(b, _, _)| cost < *b) {
                     best = Some((cost, tx_type, candidate));
                 }
@@ -6177,6 +6299,30 @@ fn code_square_inter(
                     search, &luma_new, skip_new, second, fctx,
                 )
             };
+            // lane-txrd: chroma follows the luma type the search just chose.
+            let [u_new, v_new] = match luma_tx_types.first().copied() {
+                Some(t) => recode_inter_chroma(
+                    chroma, (x, y), side, info.mv,
+                    [
+                        (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                        (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                    ],
+                    info.ref1.filter(|_| motion_won == 0).and_then(|r| {
+                        refs[r as usize].map(|g| {
+                            (
+                                info.mv1,
+                                [
+                                    (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                                    (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                                ],
+                            )
+                        })
+                    }),
+                    search, chroma_set, t, fctx,
+                )
+                .unwrap_or([u_new, v_new]),
+                None => [u_new, v_new],
+            };
             chroma[0].commit(x / 2, y / 2, side / 2, &u_new);
             chroma[1].commit(x / 2, y / 2, side / 2, &v_new);
             return (
@@ -6215,6 +6361,20 @@ fn code_square_inter(
         let (levels, tx_depth, dcost, luma_tx_types) = commit_inter_luma(
             luma, (x, y), side, mv, (ref_luma.0.as_slice(), ref_luma.1, ref_luma.2, ref_luma.3), search, &luma_trial, skip, None, fctx,
         );
+        // lane-txrd: chroma follows the luma type (this tail's block is
+        // single-reference `NEARESTMV`, so no compound second half).
+        let [u, v] = match luma_tx_types.first().copied() {
+            Some(t) => recode_inter_chroma(
+                chroma, (x, y), side, mv,
+                [
+                    (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                    (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                ],
+                None, search, chroma_set, t, fctx,
+            )
+            .unwrap_or([u, v]),
+            None => [u, v],
+        };
         chroma[0].commit(x / 2, y / 2, side / 2, &u);
         chroma[1].commit(x / 2, y / 2, side / 2, &v);
         (BlockCoeffs {
@@ -9522,6 +9682,38 @@ fn search_inter_block(
             (best.luma.levels.clone(), 0, 0.0, Vec::new())
         }
     };
+    // lane-txrd: chroma follows the luma type the var-tx/type search chose.
+    let [bu, bv] = match (best.inter.filter(|_| motion_won == 0), luma_tx_types.first().copied()) {
+        (Some(info), Some(t)) => {
+            let (ou, ov) = match extra.iter().find(|(r, _, _)| *r == info.ref_frame) {
+                Some(&(_, g, _)) => (
+                    (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                    (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                ),
+                None => (
+                    (ref_u.0.as_slice(), ref_u.1, ref_u.2, ref_u.3),
+                    (ref_v.0.as_slice(), ref_v.1, ref_v.2, ref_v.3),
+                ),
+            };
+            let sec = info.ref1.and_then(|r| {
+                compound.iter().find(|(c, _, _)| *c == r).map(|&(_, g, _)| {
+                    (
+                        info.mv1,
+                        [
+                            (g.u.as_slice(), g.width / 2, chroma[0].true_width, chroma[0].true_height),
+                            (g.v.as_slice(), g.width / 2, chroma[1].true_width, chroma[1].true_height),
+                        ],
+                    )
+                })
+            });
+            recode_inter_chroma(
+                chroma, (x, y), BLOCK, info.mv, [ou, ov], sec, search, chroma_set, t, fctx,
+            )
+            .unwrap_or([best.u, best.v])
+        }
+        _ => [best.u, best.v],
+    };
+    let best = Candidate { u: bu, v: bv, ..best };
     chroma[0].commit(x / 2, y / 2, BLOCK / 2, &best.u);
     chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
     (
@@ -11200,6 +11392,41 @@ pub(crate) fn encode_inter_frame(
     refs[4] = trial_golden.as_ref();
     refs[7] = trial_altref.as_ref();
     let refpix = crate::decode::RefPix::ready(refs);
+    // lane-txrd: the frame's luma error BEFORE the loop filters, i.e. the
+    // sum the block search believed it was minimising. Against the
+    // post-filter per-frame PSNR the gate prints, this separates a trial
+    // whose reconstruction is a lie from a filter stage that undoes the win.
+    if crate::envflags::env_flag!("EC_AV1_FRAME_PSNR") {
+        let sse: u64 = luma
+            .reconstruction
+            .chunks(luma.width)
+            .take(luma.true_height)
+            .zip(picture_y8.chunks(luma.width))
+            .flat_map(|(r, s)| r[..luma.true_width].iter().zip(&s[..luma.true_width]))
+            .map(|(&r, &s)| {
+                let d = i64::from(r) - i64::from(s);
+                (d * d) as u64
+            })
+            .sum();
+        eprintln!("EC_PREFILTER q={base_q_idx} luma sse={sse}");
+    }
+    let post = |luma: &Plane<'_>, tag: &str| {
+        if !crate::envflags::env_flag!("EC_AV1_FRAME_PSNR") {
+            return;
+        }
+        let sse: u64 = luma
+            .reconstruction
+            .chunks(luma.width)
+            .take(luma.true_height)
+            .zip(picture_y8.chunks(luma.width))
+            .flat_map(|(r, s)| r[..luma.true_width].iter().zip(&s[..luma.true_width]))
+            .map(|(&r, &s)| {
+                let d = i64::from(r) - i64::from(s);
+                (d * d) as u64
+            })
+            .sum();
+        eprintln!("{tag} q={base_q_idx} luma sse={sse}");
+    };
     pick_and_apply_filters(
         &mut header,
         &mut luma,
@@ -11255,6 +11482,7 @@ pub(crate) fn encode_inter_frame(
             )
         },
     )?;
+    post(&luma, "EC_POSTFILTER");
     let mut cdfs = end_cdfs
         .into_inner()
         .unwrap_or_else(|| start_cdfs.0.clone());
@@ -14892,12 +15120,28 @@ mod tests {
                     );
                 }
             }
-            let mean: f64 = decoded
-                .iter()
-                .zip(source)
-                .map(|(d, s)| psnr_all(d, s))
-                .sum::<f64>()
-                / source.len() as f64;
+            let per_frame: Vec<f64> = decoded.iter().zip(source).map(|(d, s)| psnr_all(d, s)).collect();
+            // lane-txrd: does a tool's loss start at the FIRST inter frame
+            // (a local mispricing) or grow down the GOP (propagation into
+            // the reference chain)? One line per q point answers it.
+            if crate::envflags::env_flag!("EC_AV1_FRAME_PSNR") {
+                let row: Vec<String> = per_frame.iter().map(|p| format!("{p:.2}")).collect();
+                eprintln!("{name}: q={q} per-frame PSNR {}", row.join(" "));
+                // lane-txrd: per PLANE, because an all-plane mean hides a
+                // collapse in one of them (class `metric blind to a plane`).
+                let plane = |pick: fn(&Picture) -> &Vec<u16>| -> String {
+                    let v: Vec<String> = decoded
+                        .iter()
+                        .zip(source)
+                        .map(|(d, s)| format!("{:.2}", psnr(pick(d), pick(s))))
+                        .collect();
+                    v.join(" ")
+                };
+                eprintln!("{name}: q={q} Y {}", plane(|p| &p.y));
+                eprintln!("{name}: q={q} U {}", plane(|p| &p.u));
+                eprintln!("{name}: q={q} V {}", plane(|p| &p.v));
+            }
+            let mean: f64 = per_frame.iter().sum::<f64>() / source.len() as f64;
             ladder.push((mean, (encoded.stream.len() as f64).log10()));
         }
         // What this clip asked for and what the content gate left it coding
@@ -15981,6 +16225,42 @@ mod tests {
             row("32x32 single", 4),
             row("32x32 compound", 6),
         );
+        // lane-txrd: which types the two searches actually COMMITTED over
+        // this row's four encodes -- the gate could not say whether a type
+        // search fired at all (class `gate-blind-to-feature`).
+        const NAMES: [&str; 16] = [
+            "IDTX", "DCT_DCT", "ADST_ADST", "ADST_DCT", "DCT_ADST", "V_DCT", "H_DCT",
+            "FLIPADST_DCT", "DCT_FLIPADST", "FLIPADST_FLIPADST", "ADST_FLIPADST",
+            "FLIPADST_ADST", "V_ADST", "H_ADST", "V_FLIPADST", "H_FLIPADST",
+        ];
+        let name_of = |t: usize| NAMES[t];
+        for (label, hits) in [("inter", take_inter_tx_type_hits()), ("intra", take_tx_type_hits())] {
+            let total: usize = hits.iter().sum();
+            let live: Vec<String> = hits
+                .iter()
+                .enumerate()
+                .filter(|&(_, &n)| n > 0)
+                .map(|(t, &n)| format!("{}={n} ({:.1}%)", name_of(t), 100.0 * n as f64 / total.max(1) as f64))
+                .collect();
+            eprintln!("{name}: {label} tx_type of {total} units -- {}", live.join(" "));
+        }
+        let t = take_txrd_stats();
+        if t[0] > 0 {
+            eprintln!(
+                "{name}: txrd flat decisions={} chosen sse={} bits={:.0} | DCT_DCT sse={} \
+                 bits={:.0} (dsse {:+.2}%, dbits {:+.2}%)",
+                t[0], t[1], t[3] as f64 / 64.0, t[2], t[4] as f64 / 64.0,
+                100.0 * (t[1] as f64 - t[2] as f64) / t[2].max(1) as f64,
+                100.0 * (t[3] as f64 - t[4] as f64) / t[4].max(1) as f64,
+            );
+            eprintln!(
+                "{name}: txrd DCT_DCT re-predicted HERE sse={} bits={:.0} (vs the passed-in \
+                 flat: dsse {:+.2}%, dbits {:+.2}%)",
+                t[5], t[6] as f64 / 64.0,
+                100.0 * (t[5] as f64 - t[2] as f64) / t[2].max(1) as f64,
+                100.0 * (t[6] as f64 - t[4] as f64) / t[4].max(1) as f64,
+            );
+        }
     }
 
     /// The video stream's coded size, from ffprobe.
