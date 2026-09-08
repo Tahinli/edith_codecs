@@ -6642,6 +6642,19 @@ fn read_coeffs_rect(
         };
         grid[pos] = if negative { -level } else { level };
     }
+    // lane-d792: the rect unit's LEVEL grid in row-major (w) order, the
+    // twin of the oracle's `EC_DQCOEFF` rung -- a residual mismatch whose
+    // grids differ is a reader defect, one whose grids agree is a transform
+    // defect.
+    if crate::envflags::env_flag!("EC_DQCOEFF") {
+        let nz: Vec<String> = grid
+            .iter()
+            .enumerate()
+            .filter(|&(_, &v)| v != 0)
+            .map(|(i, &v)| format!("{}/{}:{v}", i / w, i % w))
+            .collect();
+        eprintln!("OUR_LEVELS w={w} h={h} eob={eob} tx={tx_type:?} nz={}", nz.join(","));
+    }
     Ok((Grid::Own(grid), tx_type))
 }
 
@@ -13647,6 +13660,17 @@ impl PlaneBuf<'_> {
                 let sample = (base + residual[idx]).clamp(0, sample_max(fctx)) as u16;
                 self.data.to_mut()[(y + row) * self.width + x + col] = sample;
             }
+        }
+        // lane-d792: the RECONSTRUCTION rung beside `EC_PRED`'s prediction one
+        // -- a block whose prediction matches the oracle's but whose written
+        // samples do not is either a residual defect or a later overwrite, and
+        // only this print separates the two.
+        if crate::envflags::env_flag!("EC_PRED") {
+            let row0: Vec<u16> =
+                (0..bw.min(8)).map(|c| self.data[y * self.width + x + c]).collect();
+            let col0: Vec<u16> =
+                (0..bh.min(8)).map(|r| self.data[(y + r) * self.width + x]).collect();
+            eprintln!("OUR_RECON x={x} y={y} bw={bw} bh={bh} row0={row0:?} col0={col0:?}");
         }
     }
 

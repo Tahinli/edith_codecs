@@ -3105,3 +3105,38 @@ mod lossless_tx_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod d792_tests {
+    /// lane-d792: ONE 16x8 DCT_DCT inverse against libaom's own numbers.
+    ///
+    /// The dequantized grid below is `EC_DQCOEFF`'s dump of the first
+    /// TX_16X8 unit of `$HOME/.cache/d792/small/f100.obu` (a rav1e
+    /// `speed=6 quantizer=100` encode of a 384x152 crop, whose bottom
+    /// straddle is where the reference-ladder decode failures live), in
+    /// libaom's own column-major `input[c * h + r]` order; the expected
+    /// residual is `aomdec`'s reconstruction of that block minus its
+    /// prediction (the two decoders' predictions are byte-identical there,
+    /// checked with the oracle's `EC_PREDOUT8` rung).
+    #[test]
+    fn a_16x8_inverse_matches_libaoms_own_dqcoeff_and_residual() {
+        const H: usize = 8;
+        const W: usize = 16;
+        // (libaom index, dequantized value).
+        const NZ: [(usize, i32); 17] = [
+            (0, 1554), (1, -1768), (2, 624), (3, -104), (9, 104), (10, -520), (11, 312),
+            (16, -104), (17, 104), (18, -104), (24, -104), (25, 104), (27, -104), (32, 208),
+            (33, -104), (35, -104), (40, 104),
+        ];
+        let mut grid = vec![0i32; W * H];
+        for (i, v) in NZ {
+            let (r, c) = (i % H, i / H);
+            grid[r * W + c] = v;
+        }
+        let out = super::inverse_transform_2d_typed_wh(&grid, W, H, 8, super::TxType::DctDct);
+        let col0: Vec<i32> = (0..H).map(|r| out[r * W]).collect();
+        let row0: Vec<i32> = out[..8].to_vec();
+        assert_eq!(col0, vec![-7, -2, 6, 17, 27, 34, 36, 37], "column 0");
+        assert_eq!(row0, vec![-7, -7, -6, -5, -2, 0, 1, -1], "row 0");
+    }
+}
