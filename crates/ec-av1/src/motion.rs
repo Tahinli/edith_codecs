@@ -88,9 +88,15 @@ fn seeded() -> bool {
 /// 1 total candidate evaluations (one `predict` + SAD each), 2 of which in
 /// the two subpel stages, 3 integer-stage rounds, 4 calls whose winner is
 /// within one whole sample of `pred_mv`, 5 calls whose winner is the
-/// starting centre itself. A gate prints these rather than assume where the
-/// wall-owning stage goes (gate-blind-to-feature).
-static CENSUS: [std::sync::atomic::AtomicU64; 6] = [
+/// starting centre itself, 6 calls that moved at least once at the log
+/// stage's WIDEST step (the class `instrument at bound`: a search whose
+/// winner was reached by walking at its own initial step is measuring its
+/// step, not the content), 7 the total such widest-step moves. A gate prints
+/// these rather than assume where the wall-owning stage goes
+/// (gate-blind-to-feature).
+static CENSUS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -100,9 +106,8 @@ static CENSUS: [std::sync::atomic::AtomicU64; 6] = [
 ];
 
 /// Takes (and clears) the census.
-#[cfg(test)]
-pub(crate) fn take_census() -> [u64; 6] {
-    [0, 1, 2, 3, 4, 5].map(|i| CENSUS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+pub(crate) fn take_census() -> [u64; 8] {
+    [0, 1, 2, 3, 4, 5, 6, 7].map(|i| CENSUS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The eight offsets, at `step` in each axis, a diamond/log search round
@@ -198,6 +203,25 @@ fn mv_bits((diff_row, diff_col): (i32, i32)) -> f64 {
     bits
 }
 
+/// lane-newmv: what the SEARCH's own rate term is weighted by, on top of the
+/// block RD lambda it is handed. The RD lambda is an SSE-domain weight
+/// (`encode::Search::lambda` is `LAMBDA_SCALE * step * step`, compared against
+/// squared error) while this search compares SAD, so charging mv bits at the
+/// full RD lambda over-prices motion by whatever the SSE/SAD ratio of the
+/// content is -- the census fact this lane started from is that we code
+/// 0.83-2.5 mv bits/block where libaom codes 3.2-7.5. `EC_AV1_MV_SEARCH_LAMBDA`
+/// (any build, like the encoder's other search margins); 1.0 is the control.
+const MV_SEARCH_LAMBDA: f64 = 1.0;
+
+/// [`MV_SEARCH_LAMBDA`], read once (this is the per-candidate cost path).
+fn search_lambda_mult() -> f64 {
+    static M: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("EC_AV1_MV_SEARCH_LAMBDA").ok() {
+        Some(v) => v.parse().unwrap_or(MV_SEARCH_LAMBDA),
+        None => MV_SEARCH_LAMBDA,
+    })
+}
+
 /// One search's outcome: the best MV found and the `SAD + lambda * mv_bits`
 /// cost it settled at.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -244,7 +268,7 @@ fn cost_of_mv(
         .map(|(&a, &b)| (i32::from(a) - i32::from(b)).unsigned_abs())
         .sum();
     let diff = (mv.0 - pred_mv.0, mv.1 - pred_mv.1);
-    f64::from(sad) + lambda * mv_bits(diff)
+    f64::from(sad) + lambda * search_lambda_mult() * mv_bits(diff)
 }
 
 /// [`cost_of_mv`] for one vector, on its own scratch -- what a caller uses to
@@ -480,6 +504,7 @@ fn search_traced_from_step(
     // Stage 1: log/diamond search over whole-pel steps, halving the step
     // each time a round finds no better neighbour, down to one sample.
     let mut step_pel = initial_step_pel;
+    let mut widest_moves = 0u64;
     while step_pel >= SEARCH_MIN_STEP_PEL {
         let step = step_pel * PEL_Q3;
         loop {
@@ -498,6 +523,9 @@ fn search_traced_from_step(
                 }
             }
             let moved = best_in_round < best_cost;
+            if moved && step_pel == initial_step_pel {
+                widest_moves += 1;
+            }
             best_cost = best_in_round;
             CENSUS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             trace.push(best_cost);
@@ -534,6 +562,10 @@ fn search_traced_from_step(
     }
     if centre == start_centre {
         CENSUS[5].fetch_add(1, Relaxed);
+    }
+    if widest_moves > 0 {
+        CENSUS[6].fetch_add(1, Relaxed);
+        CENSUS[7].fetch_add(widest_moves, Relaxed);
     }
 
     (
