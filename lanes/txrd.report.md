@@ -125,3 +125,18 @@ what was attributed to the price.
   filter choice.
 * `transform::tests::txrd_gain_probe` (`--ignored`) -- the measured
   forward-inverse gain per type and size.
+* `every_speed_preset_decodes_sample_exact_through_both_decoders --ignored`:
+  PASS (presets 0..6, 27.7s).
+* `an_inter_clip_codes_both_inter_set_tx_types_both_decoders_read_exactly`
+  under `EC_COMP_MISMATCH=1`: PASS, no mismatch line.
+
+### Deferred
+
+* `deferred: the unconditional inter type search -- still 0.4-1.0 BD points
+  short of the control on the two synthetic bars rows once the chroma defect
+  is out -- what unblocks it: the residual is `local-rd-on-references` (a
+  block whose type wins locally is a worse reference), so the lever is a
+  propagation-aware type cost (tpl weight per block), not another pricing fix.`
+* `deferred: the intra 5-type search's own unconditional arm was not re-run
+  under this fix -- intra chroma does not inherit from luma, so nothing this
+  lane found applies to it; its screen gate stands on lane-txset's own table.`
