@@ -11357,7 +11357,7 @@ pub(crate) fn arf_temporal_filter(src: &Picture, window: &[Picture], strength: f
     let neighbours: Vec<&Picture> = window
         .iter()
         .filter(|p| p.width == src.width && p.height == src.height)
-        .take(2)
+        .take(crate::encoder::arf_tf_window())
         .collect();
     if neighbours.is_empty() || strength <= 0.0 {
         return src.clone();
