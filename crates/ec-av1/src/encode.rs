@@ -4004,6 +4004,29 @@ fn warp_prediction(
     Some([u8s(&py_buf), u8s(&pu_buf), u8s(&pv_buf)])
 }
 
+/// What the `skip` symbol costs at the context tile.rs really codes it with
+/// (`above_skip[mi_c] + left_skip[mi_r]`, the two cells the MV stack now
+/// carries) instead of row 0 -- the pricer's skip-versus-residual margin is
+/// exactly the difference between this symbol's two values, so the row it is
+/// read from moves that decision (class pricer-context-zero, lane-ctx).
+pub(crate) fn skip_bits_at(stack: &crate::mvstack::MvStack, skip: bool) -> f64 {
+    let ctx = usize::from(stack.above_skip) + usize::from(stack.left_skip);
+    symbol_bits(&cdf::SKIP[ctx], usize::from(skip))
+}
+
+/// What the `is_inter` symbol costs at tile.rs' own `intra_inter_ctx` -- the
+/// neighbours' intra/inter state, with an out-of-tile side contributing
+/// nothing, off the same two cells (lane-ctx).
+pub(crate) fn intra_inter_bits_at(stack: &crate::mvstack::MvStack, inter: bool) -> f64 {
+    let ctx = crate::tile::intra_inter_ctx(
+        stack.above_nbr.is_some(),
+        stack.left_nbr.is_some(),
+        stack.above_nbr.is_some_and(|n| n.is_inter),
+        stack.left_nbr.is_some_and(|n| n.is_inter),
+    );
+    symbol_bits(&cdf::INTRA_INTER[ctx], usize::from(inter))
+}
+
 /// What tile.rs' `write_single_ref` pays for `ref_frame`, symbol for symbol,
 /// at the fixed context this RD pricer uses for every neighbour-derived
 /// symbol (the writer contexts each symbol off its above/left neighbours'
@@ -6003,8 +6026,8 @@ fn code_square_inter(
         TxbSet::Chroma8
     };
 
-    let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
-    let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
+    let skip_bits = |skip: bool| skip_bits_at(stack, skip);
+    let intra_inter_bits = |inter: bool| intra_inter_bits_at(stack, inter);
     let single_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
         + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
@@ -6704,9 +6727,19 @@ fn code_square_inter(
 /// MV stack reads, over the `size` x `size` 4x4 units it covers. An intra
 /// block casts no vote but is still a coded cell (see `code_square_inter`'s
 /// note on `processed_rows`/`processed_cols`).
-fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: Option<InterInfo>) {
+fn record_mi(
+    grid: &mut MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    size: u8,
+    inter: Option<InterInfo>,
+    // lane-ctx: the block's own `skip`, so the next block's MV stack can hand
+    // the RD pricer the two cells the writer's `skip_ctx` sums.
+    skip: bool,
+) {
     let info = match inter {
         Some(info) => MiInfo {
+            skip,
             is_inter: true,
             ref_frame: info.ref_frame,
             // A COMPOUND block votes with BOTH of its references and both of
@@ -6733,6 +6766,7 @@ fn record_mi(grid: &mut MiGrid, mi_row: usize, mi_col: usize, size: u8, inter: O
             is_global_mv1: false,
         },
         None => MiInfo {
+            skip,
             is_inter: false,
             ref_frame: -1,
             ref_frame1: NO_REF1,
@@ -8793,7 +8827,7 @@ fn search_skip_64(
     let ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     // What every candidate pays whatever its vector: `skip` coded 1, then
     // `is_inter` coded 1, then the LAST chain above.
-    let fixed = symbol_bits(&cdf::SKIP[0], 1) + symbol_bits(&cdf::INTRA_INTER[0], 1) + ref_bits;
+    let fixed = skip_bits_at(stack, true) + intra_inter_bits_at(stack, true) + ref_bits;
     let info_of = |mode: InterMode, mv: (i32, i32), ref_mv_idx: u8| InterInfo {
         ref1: None,
         mv1: (0, 0),
@@ -9057,7 +9091,7 @@ fn search_skip_64(
                 sets[plane],
             )
         });
-        let unskip = symbol_bits(&cdf::SKIP[0], 0) - symbol_bits(&cdf::SKIP[0], 1);
+        let unskip = skip_bits_at(stack, false) - skip_bits_at(stack, true);
         let coeff_bits: f64 = residual_trials.iter().map(|t| t.bits).sum();
         // lane-b64b: the root's own var-tx decision -- one TX_64X64 or the
         // four TX_32X32 units of `txfm_split = 1`, taken by the same
@@ -9171,8 +9205,8 @@ fn search_inter_block(
 
     // skip / intra_inter symbol costs at a fixed context -- see this
     // function's doc comment.
-    let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
-    let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
+    let skip_bits = |skip: bool| skip_bits_at(stack, skip);
+    let intra_inter_bits = |inter: bool| intra_inter_bits_at(stack, inter);
 
     struct Candidate {
         cost: f64,
@@ -11393,7 +11427,7 @@ pub(crate) fn encode_inter_frame(
                                                 fctx,
                                             );
                                             cost8 += cost;
-                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter);
+                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter, leaf8.skip);
                                             eight.push(leaf8);
                                         }
                                         (eight, cost8)
@@ -11415,7 +11449,7 @@ pub(crate) fn encode_inter_frame(
                                 }
                                 partition_hit(2);
                                 cost += leaf_cost;
-                                record_mi(&mut grid, mi_row, mi_col, 4, leaf.inter);
+                                record_mi(&mut grid, mi_row, mi_col, 4, leaf.inter, leaf.skip);
                                 leaves.push(leaf);
                             }
                             (leaves, cost)
@@ -11434,7 +11468,7 @@ pub(crate) fn encode_inter_frame(
                     }
                     partition_hit(0);
                     sb_cost += cost_whole;
-                    record_mi(&mut grid, mi_row, mi_col, 8, block.inter);
+                    record_mi(&mut grid, mi_row, mi_col, 8, block.inter, block.skip);
                     blocks.push((r32 * cols + c32, Quadrant::Whole(block)));
                 } else {
                     // The sub-positions actually inside the true frame, same
@@ -11501,7 +11535,7 @@ pub(crate) fn encode_inter_frame(
                             // to (0,0), which is the encoder-grid-drift class
                             // -- correct only for as long as a leaf can never
                             // be compound.
-                            record_mi(&mut grid, mi_row, mi_col, 4, block.inter);
+                            record_mi(&mut grid, mi_row, mi_col, 4, block.inter, block.skip);
                             leaves.push(block);
                         } else {
                             let (x_sub, y_sub) = (sc * SUB, sr * SUB);
@@ -11540,7 +11574,7 @@ pub(crate) fn encode_inter_frame(
                                 );
                                 // Same publication point as the 16x16
                                 // straddling leaf above (`record_mi`).
-                                record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter);
+                                record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter, leaf.skip);
                                 eight.push(leaf);
                             }
                             leaves.push(BlockCoeffs {
@@ -11571,7 +11605,7 @@ pub(crate) fn encode_inter_frame(
                 // Overwrites every 16x16 mi cell the quadrant searches
                 // published under this superblock, so the next block's stack
                 // is built off the block that was really coded.
-                record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter);
+                record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter, block.skip);
                 blocks.push(((sb_r * 2) * cols + sb_c * 2, Quadrant::Whole64(block)));
                 for q in 1..4 {
                     let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
@@ -12061,6 +12095,86 @@ pub(crate) fn encode_sequence_with_ctx(
 #[cfg(test)]
 mod tests {
 
+    /// An [`crate::mvstack::MvStack`] with every context at zero and no
+    /// neighbours, for the pricer tests below to fill the one band each of
+    /// them is about.
+    fn bare_stack() -> crate::mvstack::MvStack {
+        crate::mvstack::MvStack {
+            entries: Default::default(),
+            nearest_mv: (0, 0),
+            near_mv: (0, 0),
+            pred_mv: (0, 0),
+            new_mv_ctx: 0,
+            ref_mv_ctx: 0,
+            zero_mv_ctx: 0,
+            drl_ctx: Default::default(),
+            above_refs: (None, None),
+            left_refs: (None, None),
+            above_nbr: None,
+            left_nbr: None,
+            above_skip: false,
+            left_skip: false,
+        }
+    }
+
+    /// The `skip` and `is_inter` symbols are priced at the SAME context
+    /// tile.rs codes them with -- `above_skip + left_skip` for the first and
+    /// `intra_inter_ctx` for the second -- not at row 0. Red before lane-ctx
+    /// on every neighbour configuration whose context is not zero (class
+    /// pricer-context-zero).
+    #[test]
+    fn the_skip_and_intra_inter_pricers_use_the_writers_own_contexts() {
+        use crate::cdf::{INTRA_INTER, SKIP};
+        use crate::encode::symbol_bits as b;
+        use crate::mvstack::NeighbourRef;
+        let nbr = |is_inter| NeighbourRef {
+            is_inter,
+            ref0: if is_inter { crate::mvstack::LAST_FRAME } else { 0 },
+            ref1: None,
+            uni: false,
+        };
+        for (above, left, above_skip, left_skip) in [
+            (None, None, false, false),
+            (Some(nbr(true)), Some(nbr(true)), true, false),
+            (Some(nbr(false)), Some(nbr(false)), true, true),
+            (Some(nbr(false)), None, false, true),
+            (None, Some(nbr(true)), true, true),
+        ] {
+            let stack = crate::mvstack::MvStack {
+                above_nbr: above,
+                left_nbr: left,
+                above_skip,
+                left_skip,
+                ..bare_stack()
+            };
+            let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
+            let ii_ctx = crate::tile::intra_inter_ctx(
+                above.is_some(),
+                left.is_some(),
+                above.is_some_and(|n| n.is_inter),
+                left.is_some_and(|n| n.is_inter),
+            );
+            for v in [false, true] {
+                let (got, want) = (
+                    super::skip_bits_at(&stack, v),
+                    b(&SKIP[skip_ctx], usize::from(v)),
+                );
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "skip {v} at ctx {skip_ctx}: priced {got}, writer codes {want}"
+                );
+                let (got, want) = (
+                    super::intra_inter_bits_at(&stack, v),
+                    b(&INTRA_INTER[ii_ctx], usize::from(v)),
+                );
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "is_inter {v} at ctx {ii_ctx}: priced {got}, writer codes {want}"
+                );
+            }
+        }
+    }
+
     /// [`super::single_ref_bits`] pays exactly what tile.rs'
     /// `write_single_ref` codes: the p1/p2/p6 chain for a BACKWARD
     /// reference and the p1/p3/p4/p5 chain for a forward one, each symbol at
@@ -12077,16 +12191,9 @@ mod tests {
             single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
         };
         let stack_with = |above_refs, left_refs| MvStack {
-            entries: Default::default(),
-            nearest_mv: (0, 0),
-            near_mv: (0, 0),
-            pred_mv: (0, 0),
-            new_mv_ctx: 0,
-            ref_mv_ctx: 0,
-            zero_mv_ctx: 0,
-            drl_ctx: Default::default(),
             above_refs,
             left_refs,
+            ..bare_stack()
         };
         // (reference, the symbols `write_single_ref` emits as (p index, value))
         let cases: [(i8, &[(usize, usize)]); 7] = [

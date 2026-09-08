@@ -798,11 +798,7 @@ fn record_block_compound(neighbours: &mut Neighbours, at_mi: (usize, usize), sid
 
 /// decode.rs' own `is_uni_comp_ref`: a pair is `UNIDIR_COMP_REFERENCE`
 /// exactly when both references sit on the same temporal side.
-fn is_uni_comp_ref(ref0: i8, ref1: i8) -> bool {
-    let backward =
-        |r: i8| (crate::mvstack::BWDREF_FRAME..=crate::mvstack::ALTREF_FRAME).contains(&r);
-    backward(ref0) == backward(ref1)
-}
+use crate::mvstack::is_uni_comp_ref;
 
 thread_local! {
     /// `(order_hint_bits, this frame's order hint, each reference's order
@@ -3533,6 +3529,7 @@ fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>
             return;
         };
         let info = crate::mvstack::MiInfo {
+            skip: false,
             is_inter: dv.is_some(),
             ref_frame: 0,
             ref_frame1: crate::mvstack::NO_REF1,
@@ -5723,7 +5720,12 @@ fn dc_sign_ctx(vote: i32) -> usize {
 /// `pred_common.c`): both neighbours' intra/inter state when both are
 /// available, one neighbour's when only one is, and zero at a tile's own
 /// top-left corner.
-fn intra_inter_ctx(has_above: bool, has_left: bool, above_inter: bool, left_inter: bool) -> usize {
+pub(crate) fn intra_inter_ctx(
+    has_above: bool,
+    has_left: bool,
+    above_inter: bool,
+    left_inter: bool,
+) -> usize {
     match (has_above, has_left) {
         (true, true) => {
             let (above_intra, left_intra) = (!above_inter, !left_inter);
@@ -6334,6 +6336,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                             mi_r + dr,
                             mi_c + dc,
                             MiInfo {
+                                skip: block.skip,
                                 is_inter: true,
                                 ref_frame: info.ref_frame,
                                 ref_frame1: info.ref1.unwrap_or(NO_REF1),
@@ -6692,6 +6695,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         for dr in 0..8 {
                             for dc in 0..8 {
                                 grid.set(mi_row + dr, mi_col + dc, MiInfo {
+                                    skip: block.skip,
                                     is_inter: true,
                                     ref_frame: info.ref_frame,
                                     ref_frame1: info.ref1.unwrap_or(NO_REF1),
@@ -6725,6 +6729,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         mi_row,
                         mi_col,
                         MiInfo {
+                            skip: block.skip,
                             is_inter: true,
                             ref_frame: info.ref_frame,
                             ref_frame1: NO_REF1,
@@ -6746,6 +6751,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                                 mi_row + dr,
                                 mi_col + dc,
                                 MiInfo {
+                                    skip: block.skip,
                                     is_inter: true,
                                     ref_frame: info.ref_frame,
                                     ref_frame1: NO_REF1,
@@ -6812,6 +6818,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                                 mi_row + dr,
                                 mi_col + dc,
                                 MiInfo {
+                                    skip: block.skip,
                                     is_inter: false,
                                     ref_frame: -1,
                                     ref_frame1: NO_REF1,
@@ -6956,6 +6963,7 @@ fn write_inter_frame_leaf(
             for dr in 0..n {
                 for dc in 0..n {
                     grid.set(mi_row + dr, mi_col + dc, MiInfo {
+                        skip: block.skip,
                         is_inter: true,
                         ref_frame: info.ref_frame,
                         ref_frame1: info.ref1.unwrap_or(NO_REF1),
@@ -6991,6 +6999,7 @@ fn write_inter_frame_leaf(
                     mi_row + dr,
                     mi_col + dc,
                     MiInfo {
+                        skip: block.skip,
                         is_inter: true,
                         ref_frame: info.ref_frame,
                         ref_frame1: NO_REF1,
@@ -7057,6 +7066,7 @@ fn write_inter_frame_leaf(
                     mi_row + dr,
                     mi_col + dc,
                     MiInfo {
+                        skip: block.skip,
                         is_inter: false,
                         ref_frame: -1,
                         ref_frame1: NO_REF1,
@@ -7207,6 +7217,7 @@ fn write_inter_frame_leaf8(
             for dr in 0..2 {
                 for dc in 0..2 {
                     grid.set(mi_row + dr, mi_col + dc, MiInfo {
+                        skip: block.skip,
                         is_inter: true,
                         ref_frame: info.ref_frame,
                         ref_frame1: info.ref1.unwrap_or(NO_REF1),
@@ -7242,6 +7253,7 @@ fn write_inter_frame_leaf8(
                     mi_row + dr,
                     mi_col + dc,
                     MiInfo {
+                        skip: block.skip,
                         is_inter: true,
                         ref_frame: info.ref_frame,
                         ref_frame1: NO_REF1,
@@ -7308,6 +7320,7 @@ fn write_inter_frame_leaf8(
                     mi_row + dr,
                     mi_col + dc,
                     MiInfo {
+                        skip: block.skip,
                         is_inter: false,
                         ref_frame: -1,
                         ref_frame1: NO_REF1,
@@ -9690,6 +9703,7 @@ mod tests {
                             mi_row + dr,
                             mi_col + dc,
                             MiInfo {
+                                skip,
                                 is_inter: true,
                                 ref_frame: 1,
                                 ref_frame1: NO_REF1,

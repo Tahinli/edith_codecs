@@ -3616,6 +3616,7 @@ fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>
             return;
         };
         let info = crate::mvstack::MiInfo {
+            skip: false,
             is_inter: dv.is_some(),
             ref_frame: 0,
             ref_frame1: NO_REF1,
@@ -26986,6 +26987,7 @@ fn decode_inter_block(
                 bh4,
                 bw4,
                 MiInfo {
+                    skip: false,
                     is_inter: true,
                     ref_frame: ref0,
                     ref_frame1: ref1,
@@ -28589,6 +28591,7 @@ fn decode_inter_block(
                 bh4,
                 bw4,
                 MiInfo {
+                    skip: false,
                     is_inter: true,
                     ref_frame,
                     // An interintra block records ref_frame[1] ==
@@ -29490,6 +29493,7 @@ fn decode_inter_block(
                 write_h / MI,
                 write_w / MI,
                 MiInfo {
+                    skip: false,
                     is_inter: false,
                     ref_frame: -1,
                     ref_frame1: NO_REF1,
@@ -29712,6 +29716,7 @@ fn decode_inter_block(
             side / 4,
             side / 4,
             MiInfo {
+                skip: false,
                 is_inter: false,
                 ref_frame: -1,
                 ref_frame1: NO_REF1,
@@ -30687,6 +30692,7 @@ fn decode_inter_sub8_split4(
             rmi,
             cmi,
             MiInfo {
+                skip: false,
                 is_inter: true,
                 ref_frame,
                 ref_frame1: NO_REF1,
@@ -31281,6 +31287,7 @@ fn decode_intra_sub8_leaf(
         h_mi,
         w_mi,
         MiInfo {
+            skip: false,
             is_inter: false,
             ref_frame: -1,
             ref_frame1: NO_REF1,
@@ -32052,6 +32059,7 @@ fn grid_stamp_rect(
         h_mi,
         w_mi,
         MiInfo {
+            skip: false,
             is_inter: true,
             ref_frame,
             ref_frame1: NO_REF1,
@@ -32627,6 +32635,7 @@ fn decode_inter_block8(
                     2,
                     2,
                     MiInfo {
+                        skip: false,
                         is_inter: true,
                         ref_frame: ref0,
                         ref_frame1: ref1,
@@ -33359,6 +33368,7 @@ fn decode_inter_block8(
             2,
             2,
             MiInfo {
+                skip: false,
                 is_inter: true,
                 ref_frame,
                 // INTRA_FRAME marker for interintra blocks -- keeps
@@ -33863,6 +33873,7 @@ fn decode_inter_block8(
             2,
             2,
             MiInfo {
+                skip: false,
                 is_inter: false,
                 ref_frame: -1,
                 ref_frame1: NO_REF1,
@@ -39148,6 +39159,7 @@ mod tests {
         let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
         let (above_mv, left_mv) = ((4, 4), (8, 8));
         let neighbour = |mv: (i32, i32)| MiInfo {
+            skip: false,
             is_inter: true,
             ref_frame: LAST_FRAME,
             ref_frame1: NO_REF1,
