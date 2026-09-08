@@ -24892,6 +24892,12 @@ impl<'p> RefPix<'p> {
 /// (lane-defer8).
 fn ref_dims(ref_frame: i8, refpix: &RefPix<'_>) -> Result<(usize, usize)> {
     refpix.dims(ref_frame).ok_or_else(|| {
+        if crate::envflags::env_flag!("EC_AV1_REFPROBE") {
+            eprintln!(
+                "EC_REFPROBE missing ref {ref_frame}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         unsupported(
             "a reference frame selected with no picture at this frame's own \
                  ref_frame_idx slot for it",
@@ -34221,6 +34227,9 @@ pub(crate) fn decode_inter_frame_tile_lr(
         interp_fixed,
         enable_dual_filter,
         reference_select,
+        // lane-txi: this wrapper's callers are the decoder's own tests, which
+        // all code the reduced sets.
+        true,
         tx_select,
         lr,
         initial_cdfs,
@@ -34253,6 +34262,12 @@ pub(crate) fn decode_inter_frame_tiles_lr(
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     reference_select: bool,
+    // lane-txi: this frame header's own `reduced_tx_set` bit. It used to be
+    // hardcoded `true` at the call below -- the encoder's own trial decode of
+    // the tile it just wrote then read every luma `tx_type` out of the
+    // reduced alphabet whatever the header said (class: a header bit a raw
+    // tile decode cannot guess, the same one `tx_select` carries).
+    reduced_tx_set: bool,
     tx_select: bool,
     lr: &LoopRestorationParams,
     initial_cdfs: Option<Cdfs>,
@@ -34315,7 +34330,7 @@ pub(crate) fn decode_inter_frame_tiles_lr(
         false,
         false,
         [0; 2],
-        true,
+        reduced_tx_set,
         tx_select,
         switchable_motion_mode,
         allow_warped_motion,
