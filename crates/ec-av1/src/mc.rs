@@ -1048,7 +1048,12 @@ pub(crate) fn predict(
         y_q4,
         block_w,
         block_h,
-        InterpFilterKind::Regular,
+        // lane-refs: the FRAME's kernel (spec 6.8.9), not a hardwired
+        // `Regular` -- `FrameCtx::interp_filter` is what the encoder set from
+        // the header it is about to write, and every decode leaves it at
+        // `Regular` (the decoder's own inter path calls
+        // `predict_with_filters` with the kernels it parsed).
+        fctx.interp_filter.get(),
         dst, fctx,
     );
 }
