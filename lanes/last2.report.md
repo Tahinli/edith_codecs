@@ -136,6 +136,13 @@ comes back (194 s / 171 s against the control's 208 s / 165 s, i.e. inside the
 gate's own wall noise), so the cost of the searched arm was indeed the second
 motion search — but the reference itself does not pay for its own syntax.
 
+**The screen row** (`EC_AV1_NATIVE_SCREEN=1`, the keep rule's third column):
+control and the search-free arm are BYTE-IDENTICAL at all four quantizers
+(+19.8% / -30.5%, 143.6 s vs 144.1 s), and the census prints `LAST2 0 of 23942
+inter blocks` — the screen clip's leaves never take the older picture, so the
+screen half of the keep rule is neutral either way and the decision rests on
+the two film rows.
+
 **Fire share, on the real film rows** (the census the gate now prints):
 
 | clip | LAST | LAST2 | GOLDEN | ALTREF | LAST2 share |
