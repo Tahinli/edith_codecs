@@ -12254,6 +12254,24 @@ pub(crate) fn encode_inter_frame(
         blocks[at] = quadrant;
     }
 
+    // lane-b128, `EC_AV1_B128_CENSUS=1`: how many of this INTER frame's 128
+    // superblock roots the search left whole, so a flat BD result is
+    // attributable (class `gate-blind-to-feature`). A key frame codes none:
+    // only the inter writer has a 128x128 block.
+    if crate::envflags::env_flag!("EC_AV1_B128_CENSUS") {
+        let whole = blocks
+            .iter()
+            .filter(|q| matches!(q, Quadrant::Whole128(_)))
+            .count();
+        let roots = blocks
+            .iter()
+            .filter(|q| !matches!(q, Quadrant::Covered))
+            .count();
+        eprintln!(
+            "B128 census: inter frame, {whole} whole 128x128 roots, {roots} coded blocks              ({:.1}% of the frame's area at 128)",
+            100.0 * (whole * 16) as f64 / blocks.len().max(1) as f64,
+        );
+    }
     let modes = blocks
         .iter()
         .flat_map(Quadrant::blocks)
@@ -18180,6 +18198,11 @@ mod tests {
                 "{name}: key 64x64 intra roots {i64_whole} of {i64_offered} offered ({:.1}%), \
                  {i64_edge} on a superblock the frame edge cuts",
                 100.0 * i64_whole as f64 / i64_offered.max(1) as f64,
+            );
+            eprintln!(
+                "{name}: 128x128 roots {} (search) / {} (writer)",
+                take_b128_none_hits(),
+                crate::tile::take_sb128_none_hits(),
             );
             eprintln!(
                 "{name}: 64x64 roots {} (with a residual {}, split luma {}, compound {})",
