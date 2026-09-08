@@ -88,9 +88,15 @@ fn seeded() -> bool {
 /// 1 total candidate evaluations (one `predict` + SAD each), 2 of which in
 /// the two subpel stages, 3 integer-stage rounds, 4 calls whose winner is
 /// within one whole sample of `pred_mv`, 5 calls whose winner is the
-/// starting centre itself. A gate prints these rather than assume where the
-/// wall-owning stage goes (gate-blind-to-feature).
-static CENSUS: [std::sync::atomic::AtomicU64; 6] = [
+/// starting centre itself, 6 calls that moved at least once at the log
+/// stage's WIDEST step (the class `instrument at bound`: a search whose
+/// winner was reached by walking at its own initial step is measuring its
+/// step, not the content), 7 the total such widest-step moves. A gate prints
+/// these rather than assume where the wall-owning stage goes
+/// (gate-blind-to-feature).
+static CENSUS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -100,9 +106,8 @@ static CENSUS: [std::sync::atomic::AtomicU64; 6] = [
 ];
 
 /// Takes (and clears) the census.
-#[cfg(test)]
-pub(crate) fn take_census() -> [u64; 6] {
-    [0, 1, 2, 3, 4, 5].map(|i| CENSUS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+pub(crate) fn take_census() -> [u64; 8] {
+    [0, 1, 2, 3, 4, 5, 6, 7].map(|i| CENSUS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The eight offsets, at `step` in each axis, a diamond/log search round
@@ -198,6 +203,54 @@ fn mv_bits((diff_row, diff_col): (i32, i32)) -> f64 {
     bits
 }
 
+/// lane-newmv: what the SEARCH's own rate term is weighted by, on top of the
+/// block RD lambda it is handed. The RD lambda is an SSE-domain weight
+/// (`encode::Search::lambda` is `LAMBDA_SCALE * step * step`, compared against
+/// squared error) while this search compares SAD, so charging mv bits at the
+/// full RD lambda over-prices motion by whatever the SSE/SAD ratio of the
+/// content is -- the census fact this lane started from is that we code
+/// 0.83-2.5 mv bits/block where libaom codes 3.2-7.5. `EC_AV1_MV_SEARCH_LAMBDA`
+/// (any build, like the encoder's other search margins); 1.0 was the control.
+///
+/// SWEPT on the native 12-frame BD gate, film B (vs libaom / vs rav1e), with
+/// [`MV_SUBPEL_ITERS`] still at 1: 0.25 +25.2/-1.7, 0.5 +24.9/-2.0,
+/// 0.75 +24.8/-1.9, 1.0 (control) +24.9/-1.9, 2.0 +26.9/-0.2. Over-charging
+/// motion is the expensive direction -- the 2.0 arm loses 2.0/1.7 points --
+/// and the floor of the bowl sits at 0.5-0.75. 0.5 ships together with
+/// [`MV_SUBPEL_ITERS`] 4; the pair's rows are in lanes/newmv.report.md.
+const MV_SEARCH_LAMBDA: f64 = 0.5;
+
+/// [`MV_SEARCH_LAMBDA`], read once (this is the per-candidate cost path).
+fn search_lambda_mult() -> f64 {
+    static M: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("EC_AV1_MV_SEARCH_LAMBDA").ok() {
+        Some(v) => v.parse().unwrap_or(MV_SEARCH_LAMBDA),
+        None => MV_SEARCH_LAMBDA,
+    })
+}
+
+/// How many times each subpel refinement round may re-run from its own
+/// winner ([`search_traced_from_step`]'s stages 2 and 3).
+/// `EC_AV1_MV_SUBPEL_ITERS`; 1 was the single round the search shipped with.
+///
+/// MEASURED on the native BD gate at [`MV_SEARCH_LAMBDA`] 0.5: film A
+/// 12-frame +21.0/-4.8 -> +20.6/-5.1, film B 12-frame +24.9/-1.9 ->
+/// +24.8/-2.1, screen +14.5/-33.2 -> +14.6/-33.2, film A long-GOP
+/// +25.2/-7.2 -> +24.7/-7.5, film B long-GOP +86.7/+7.3 -> +86.8/+7.4. Each
+/// half alone is worth about half of it on film A (+20.8/-4.9 either way);
+/// on film B this iteration alone LOSES (+25.2/-1.7) and only pays with the
+/// lighter search rate term beside it. It costs 5-7% encoder wall.
+const MV_SUBPEL_ITERS: u32 = 4;
+
+/// [`MV_SUBPEL_ITERS`], read once.
+fn subpel_iters() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("EC_AV1_MV_SUBPEL_ITERS").ok() {
+        Some(v) => v.parse().unwrap_or(MV_SUBPEL_ITERS),
+        None => MV_SUBPEL_ITERS,
+    })
+}
+
 /// One search's outcome: the best MV found and the `SAD + lambda * mv_bits`
 /// cost it settled at.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -244,7 +297,7 @@ fn cost_of_mv(
         .map(|(&a, &b)| (i32::from(a) - i32::from(b)).unsigned_abs())
         .sum();
     let diff = (mv.0 - pred_mv.0, mv.1 - pred_mv.1);
-    f64::from(sad) + lambda * mv_bits(diff)
+    f64::from(sad) + lambda * search_lambda_mult() * mv_bits(diff)
 }
 
 /// [`cost_of_mv`] for one vector, on its own scratch -- what a caller uses to
@@ -480,6 +533,7 @@ fn search_traced_from_step(
     // Stage 1: log/diamond search over whole-pel steps, halving the step
     // each time a round finds no better neighbour, down to one sample.
     let mut step_pel = initial_step_pel;
+    let mut widest_moves = 0u64;
     while step_pel >= SEARCH_MIN_STEP_PEL {
         let step = step_pel * PEL_Q3;
         loop {
@@ -498,6 +552,9 @@ fn search_traced_from_step(
                 }
             }
             let moved = best_in_round < best_cost;
+            if moved && step_pel == initial_step_pel {
+                widest_moves += 1;
+            }
             best_cost = best_in_round;
             CENSUS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             trace.push(best_cost);
@@ -513,13 +570,23 @@ fn search_traced_from_step(
     // costed at the precision it commits to, not the integer-pel SAD alone).
     let integer_evals = evals.get();
     for step in [HALF_PEL_Q3, QUARTER_PEL_Q3] {
-        let round_centre = centre;
-        for (dr, dc) in neighbor_offsets(step) {
-            let candidate = (round_centre.0 + dr, round_centre.1 + dc);
-            let cost = cost_of(candidate);
-            if cost < best_cost {
-                best_cost = cost;
-                centre = candidate;
+        // lane-newmv, class `search bounded by its heuristic`: ONE round per
+        // step means a subpel winner two half-pels away from the integer
+        // centre is unreachable. `EC_AV1_MV_SUBPEL_ITERS` runs the round
+        // again from its own winner, up to that many times; 1 is the
+        // control's single round.
+        for _ in 0..subpel_iters() {
+            let round_centre = centre;
+            for (dr, dc) in neighbor_offsets(step) {
+                let candidate = (round_centre.0 + dr, round_centre.1 + dc);
+                let cost = cost_of(candidate);
+                if cost < best_cost {
+                    best_cost = cost;
+                    centre = candidate;
+                }
+            }
+            if centre == round_centre {
+                break;
             }
         }
         trace.push(best_cost);
@@ -534,6 +601,10 @@ fn search_traced_from_step(
     }
     if centre == start_centre {
         CENSUS[5].fetch_add(1, Relaxed);
+    }
+    if widest_moves > 0 {
+        CENSUS[6].fetch_add(1, Relaxed);
+        CENSUS[7].fetch_add(widest_moves, Relaxed);
     }
 
     (

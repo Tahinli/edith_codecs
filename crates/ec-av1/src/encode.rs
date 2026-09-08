@@ -4360,6 +4360,155 @@ pub(crate) fn dump_split_census() {
     }
 }
 
+/// lane-newmv: a multiplier on the mv RATE term of the BLOCK-level inter
+/// decision only -- the `NEWMV` candidate's own mv residual + DRL bits, not
+/// its mode/reference syntax and not the search's own cost function
+/// ([`crate::motion`]'s `EC_AV1_MV_SEARCH_LAMBDA` is that one). `1.0` is the
+/// control; below 1 a coded vector is charged less and `NEWMV` wins more
+/// blocks. `EC_AV1_MV_LAMBDA`, class `rd-rate-term-calibration`.
+pub(crate) fn mv_lambda_mult() -> f64 {
+    static M: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_MV_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MV_LAMBDA)
+    });
+    *M
+}
+
+/// The shipped value of [`mv_lambda_mult`]. See lanes/newmv.report.md.
+const MV_LAMBDA: f64 = 1.0;
+
+/// What a `NEWMV` candidate is charged ON TOP of its own priced mv syntax
+/// bits, `(EC_AV1_MV_LAMBDA - 1) * mv_bits` (added to the candidate's bits,
+/// which the RD cost multiplies by lambda). Zero at the default weight.
+fn mv_rate_surcharge(mv_bits: f64) -> f64 {
+    (mv_lambda_mult() - 1.0) * mv_bits
+}
+
+/// lane-newmv census (`EC_AV1_NEWMV_CENSUS=1`): the block-level `NEWMV`
+/// decision, bucketed by block side (8/16/32/64). Eight counters per bucket:
+/// 0 blocks that ran a `LAST` motion search, 1 of those whose vector the
+/// writer could name (offered to RD), 2 blocks `NEWMV` won, 3 the summed RD
+/// cost it won by, 4 the summed cost it lost by, 5 the summed
+/// `|mv - nearest_mv|` (1/8-pel units, both axes), 6 blocks whose searched
+/// vector IS the stack's `NEARESTMV`, 7 the summed mv syntax bits (x64, as
+/// [`SPLIT_CENSUS`]'s rate terms are). Four globals follow at 32: extra-
+/// reference searches offered/skipped by [`EXTRA_NEW_SKIP_MARGIN`], leaf
+/// second-reference searches offered/skipped by [`LEAF_SECOND_NEW_MARGIN`].
+static NEWMV_CENSUS: [std::sync::atomic::AtomicU64; 36] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 36];
+
+/// Whether [`NEWMV_CENSUS`] is armed, read once.
+pub(crate) fn newmv_census_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::envflags::env_flag!("EC_AV1_NEWMV_CENSUS"));
+    *ON
+}
+
+/// Bumps one of [`NEWMV_CENSUS`]'s four global counters (32..36).
+fn newmv_census_global(i: usize) {
+    if newmv_census_on() {
+        NEWMV_CENSUS[32 + i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Records one block's `NEWMV` decision into [`NEWMV_CENSUS`]. `other_cost`
+/// is the best cost the block had WITHOUT the `NEWMV` candidate (its
+/// `NEAREST`/`NEAR`/`GLOBAL`/intra winner), `new_cost` the `NEWMV`
+/// candidate's own; both `f64::INFINITY` is a block that offered neither.
+fn newmv_census_block(
+    side: usize,
+    offered: bool,
+    new_cost: f64,
+    other_cost: f64,
+    mv: (i32, i32),
+    nearest: (i32, i32),
+    mv_bits: f64,
+) {
+    if !newmv_census_on() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = (side.trailing_zeros() as usize).saturating_sub(3).min(3) * 8;
+    let add = |i: usize, v: u64| {
+        NEWMV_CENSUS[base + i].fetch_add(v, Relaxed);
+    };
+    add(0, 1);
+    if !offered {
+        return;
+    }
+    add(1, 1);
+    if new_cost < other_cost {
+        add(2, 1);
+        add(3, (other_cost - new_cost).max(0.0) as u64);
+    } else {
+        add(4, (new_cost - other_cost).max(0.0) as u64);
+    }
+    add(5, ((mv.0 - nearest.0).unsigned_abs() + (mv.1 - nearest.1).unsigned_abs()) as u64);
+    if mv == nearest {
+        add(6, 1);
+    }
+    add(7, (mv_bits * 64.0).max(0.0) as u64);
+}
+
+/// Prints [`NEWMV_CENSUS`] to stderr when `EC_AV1_NEWMV_CENSUS=1`, on the
+/// same guard [`dump_split_census`] rides (cumulative, so the last table a
+/// run prints is the whole encode's).
+pub(crate) fn dump_newmv_census() {
+    use std::sync::atomic::Ordering::Relaxed;
+    eprintln!(
+        "NEWMVCENSUS side searched offered won won% win_margin lose_margin \
+         mv_dist_q3 mv==nearest% mv_bits"
+    );
+    for side_idx in 0..4 {
+        let base = side_idx * 8;
+        let v: [u64; 8] = std::array::from_fn(|i| NEWMV_CENSUS[base + i].load(Relaxed));
+        if v[0] == 0 {
+            continue;
+        }
+        let off = v[1].max(1) as f64;
+        eprintln!(
+            "NEWMVCENSUS {:>3} {:>8} {:>8} {:>7} {:>5.1} {:>10.0} {:>11.0} {:>10.2} {:>12.1} {:>7.2}",
+            8 << side_idx,
+            v[0],
+            v[1],
+            v[2],
+            100.0 * v[2] as f64 / off,
+            v[3] as f64 / v[2].max(1) as f64,
+            v[4] as f64 / (v[1] - v[2]).max(1) as f64,
+            v[5] as f64 / off,
+            100.0 * v[6] as f64 / off,
+            v[7] as f64 / off / 64.0,
+        );
+    }
+    let g: [u64; 4] = std::array::from_fn(|i| NEWMV_CENSUS[32 + i].load(Relaxed));
+    eprintln!(
+        "NEWMVCENSUS pre-RD margin skips: extra-reference {}/{} ({:.1}%), \
+         leaf second reference {}/{} ({:.1}%)",
+        g[1],
+        g[0],
+        100.0 * g[1] as f64 / g[0].max(1) as f64,
+        g[3],
+        g[2],
+        100.0 * g[3] as f64 / g[2].max(1) as f64,
+    );
+    let [calls, evals, _subpel, rounds, near_pred, unmoved, widest, widest_moves] =
+        crate::motion::take_census();
+    let per = |n: u64| n as f64 / calls.max(1) as f64;
+    eprintln!(
+        "NEWMVCENSUS search: {calls} calls, {:.1} evals/call, {:.2} integer rounds/call; \
+         winner within +-1 pel of pred_mv {:.1}%, winner = starting seed {:.1}%, \
+         moved at the WIDEST step {:.1}% of calls ({:.2} such moves/call)",
+        per(evals),
+        per(rounds),
+        100.0 * near_pred as f64 / calls.max(1) as f64,
+        100.0 * unmoved as f64 / calls.max(1) as f64,
+        100.0 * widest as f64 / calls.max(1) as f64,
+        per(widest_moves),
+    );
+}
+
 /// [`TX_TYPE_HITS`] for the INTER luma units (lane-txset2), counted apart so
 /// the intra witness's fire count stays its own.
 pub(crate) static INTER_TX_TYPE_HITS: [std::sync::atomic::AtomicUsize; 16] =
@@ -6435,7 +6584,12 @@ fn code_square_inter(
         );
         let new_mv = round_to_valid_mv(found.mv, stack.pred_mv);
         searched_new_cost = Some(found.cost);
-        if let Some(mv_bits) = mv_residual_bits(new_mv, stack.pred_mv) {
+        let mv_residual = mv_residual_bits(new_mv, stack.pred_mv);
+        if mv_residual.is_none() {
+            // lane-newmv: a vector the writer cannot name never reaches RD.
+            newmv_census_block(side, false, f64::INFINITY, best.0, new_mv, stack.nearest_mv, 0.0);
+        }
+        if let Some(mv_bits) = mv_residual {
             searched_new = Some(new_mv);
             // Same reuse as `search_inter_block`: a NEWMV equal to the
             // stack's NEARESTMV is the same three trials, already run above.
@@ -6477,11 +6631,13 @@ fn code_square_inter(
                         + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
                         + drl_bits
                         + mv_bits
+                        + mv_rate_surcharge(mv_bits)
                         + if skip_new {
                             0.0
                         } else {
                             luma_new.bits + u_new.bits + v_new.bits
                         });
+            newmv_census_block(side, true, cost_new, best.0, new_mv, stack.nearest_mv, mv_bits);
             if cost_new < best.0 {
                 single_syntax = intra_inter_bits(true)
                     + single_ref_bits
@@ -6571,6 +6727,7 @@ fn code_square_inter(
         let margin = leaf_second_new_margin();
         let mut second_new: Option<(i32, i32)> = None;
         if leaf_second_new_mv() {
+            newmv_census_global(2);
             let skip = margin > 0.0
                 && searched_new_cost.is_some_and(|last| {
                     motion::cost_at(
@@ -6579,6 +6736,9 @@ fn code_square_inter(
                     ) * margin
                         <= last
                 });
+            if skip {
+                newmv_census_global(3);
+            }
             if !skip {
                 let mut seeds = [(0, 0); 4];
                 let mut seed_n = 1;
@@ -9130,7 +9290,7 @@ fn search_skip_64(
         if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(stack, mv) {
             last_new_mv = Some(mv);
             cands.push((
-                symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
+                symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits + mv_rate_surcharge(bits),
                 info_of(InterMode::NewMv, mv, ref_mv_idx),
             ));
         }
@@ -9672,13 +9832,20 @@ fn search_inter_block(
     #[cfg(test)]
     stage_since(0, t);
     let mv = round_to_valid_mv(found.mv, stack.pred_mv);
+    // lane-newmv: this block's own `NEWMV` vector and what its mv syntax
+    // costs, for the census below (`None` when the writer cannot name it).
+    let mut newmv_syntax: Option<((i32, i32), f64)> = None;
     // Each DRL entry is a different `PredMv` (spec 7.10.2.10 `assign_mv`), so
     // the same vector costs a different residual from each: take the index
     // whose residual plus DRL bits is cheapest, not entry 0 by default.
     if let Some((bits, ref_mv_idx)) = best_new_mv_syntax(stack, mv) {
+        newmv_syntax = Some((mv, bits));
         cands.push((
             mv,
-            last_ref_bits + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0) + bits,
+            last_ref_bits
+                + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
+                + bits
+                + mv_rate_surcharge(bits),
             InterInfo {
                 ref1: None,
                 mv1: (0, 0),
@@ -9739,6 +9906,9 @@ fn search_inter_block(
         let searched = extra_ref_new_mv()
             && (ref_frame != crate::mvstack::LAST2_FRAME || last2_new_mv());
         let margin = extra_new_skip_margin();
+        if searched {
+            newmv_census_global(0);
+        }
         let skip_search = searched
             && margin > 0.0
             && motion::cost_at(
@@ -9757,6 +9927,9 @@ fn search_inter_block(
                 fctx,
             ) * margin
                 <= found.cost;
+        if skip_search {
+            newmv_census_global(1);
+        }
         if searched && !skip_search {
             let (gseeds, gn) = mv_seeds(gstack);
             #[cfg(test)]
@@ -9980,6 +10153,10 @@ fn search_inter_block(
     });
     cands.dedup_by_key(|c| (c.2.ref_frame, c.0));
     census_add(7, cands.len());
+    // lane-newmv: the NEWMV candidate's own RD cost against the best cost
+    // this block reaches WITHOUT it, taken inside the one loop that prices
+    // them all (a second pricing pass would be a second oracle).
+    let (mut new_cost, mut other_cost) = (f64::INFINITY, f64::INFINITY);
     {
         for (mv, mode_bits_inter, info) in cands {
             let (ref_luma, ref_u, ref_v) = match extra
@@ -10066,7 +10243,22 @@ fn search_inter_block(
                 mode_bits: mode_bits_inter,
                 inter: Some(info),
             });
+            if newmv_census_on() {
+                if info.mode == InterMode::NewMv
+                    && info.ref1.is_none()
+                    && info.ref_frame == crate::mvstack::LAST_FRAME
+                {
+                    new_cost = cost;
+                } else {
+                    other_cost = other_cost.min(cost);
+                }
+            }
         }
+    }
+    if let Some((new_mv, bits)) = newmv_syntax {
+        newmv_census_block(BLOCK, true, new_cost, other_cost, new_mv, stack.nearest_mv, bits);
+    } else {
+        newmv_census_block(BLOCK, false, f64::INFINITY, other_cost, mv, stack.nearest_mv, 0.0);
     }
 
     let best = best.expect("the search offers at least the intra modes");
@@ -16296,8 +16488,14 @@ mod tests {
         // pays the `comp_mode = 0` symbol the writer codes ahead of it, so
         // single and compound are priced against the same syntax -- 8311 ->
         // 8325 bytes at q=150 and 33087 -> 33014 at q=60.
+        // Re-taken on lane-newmv: the motion search charges its own rate term
+        // at half the block RD lambda ([`crate::motion::MV_SEARCH_LAMBDA`])
+        // and each subpel stage re-runs from its own winner
+        // ([`crate::motion::MV_SUBPEL_ITERS`]), so every inter block's vector
+        // -- and with it its residual -- moved: 8325 -> 8288 bytes at q=150
+        // and 33014 -> 33090 at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8325, 0xf004_8258_bc60_ff05), (60, 33014, 0x5bc2_5dfd_bd13_18de)];
+            [(150, 8288, 0x241d_8115_0a6d_0f34), (60, 33090, 0x7e02_777c_01b4_f035)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
@@ -16944,7 +17142,8 @@ mod tests {
             // evaluations (one `mc::predict` + SAD each) a search spends, how
             // many of them are subpel, and how often the winner is the seed
             // it started from -- the census the seeded search is judged by.
-            let [calls, evals, subpel, rounds, near_pred, unmoved] = crate::motion::take_census();
+            let [calls, evals, subpel, rounds, near_pred, unmoved, widest, widest_moves] =
+                crate::motion::take_census();
             let per = |n: u64| n as f64 / calls.max(1) as f64;
             eprintln!(
                 "{name}: motion search {calls} calls, {evals} candidate evals ({:.1}/call, \
@@ -16955,6 +17154,15 @@ mod tests {
                 per(rounds),
                 100.0 * near_pred as f64 / calls.max(1) as f64,
                 100.0 * unmoved as f64 / calls.max(1) as f64,
+            );
+            // lane-newmv, class `instrument at bound`: how often the winner
+            // was walked to at the log stage's own WIDEST step -- a high
+            // share means the search stops where its step lets it, not where
+            // the content is.
+            eprintln!(
+                "{name}: motion search moved at the widest step in {:.1}% of calls                  ({:.2} such moves/call)",
+                100.0 * widest as f64 / calls.max(1) as f64,
+                per(widest_moves),
             );
             eprintln!(
                 "{name}: references LAST {} GOLDEN {} (LAST2 {} LAST3 {} BWD {} ALT2 {} ALT {})",
