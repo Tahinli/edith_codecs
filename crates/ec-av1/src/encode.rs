@@ -4227,21 +4227,17 @@ fn max_tx_depth(side: usize) -> usize {
     }
 }
 
-/// What the `tx_depth` symbol itself costs, off the size category's own CDF
-/// at `ctx` -- the row [`crate::tile::tx_size_ctx_of`] picks from the
-/// transform sides the blocks above and to the left published, which is what
-/// the writer's `write_luma_select` codes the symbol against.
-///
-/// Before lane-ctx2 this was row 0 for every block (class
-/// `pricer-context-zero`): the term shifts the depth-0-versus-split margin,
-/// and row 0 is the row where BOTH neighbours are narrower than this block's
-/// transform -- the case in which splitting reads cheapest.
-fn tx_depth_bits(ctx: usize, side: usize, depth: usize) -> f64 {
+/// What the `tx_depth` symbol itself costs, off the size category's own CDF.
+/// Priced at context row 0 -- the writer picks the real row from its
+/// neighbours' transform sizes, which the search has no view of; the term is
+/// the same for every depth of one block either way, so it only shifts the
+/// depth-0-versus-split margin, never the ordering between two splits.
+fn tx_depth_bits(side: usize, depth: usize) -> f64 {
     match side {
-        8 => symbol_bits(&cdf::TX_SIZE_CAT0[ctx], depth),
-        16 => symbol_bits(&cdf::TX_SIZE_CAT1[ctx], depth),
-        32 => symbol_bits(&cdf::TX_SIZE_CAT2[ctx], depth),
-        _ => symbol_bits(&cdf::TX_SIZE_CAT3[ctx], depth),
+        8 => symbol_bits(&cdf::TX_SIZE_CAT0[0], depth),
+        16 => symbol_bits(&cdf::TX_SIZE_CAT1[0], depth),
+        32 => symbol_bits(&cdf::TX_SIZE_CAT2[0], depth),
+        _ => symbol_bits(&cdf::TX_SIZE_CAT3[0], depth),
     }
 }
 
@@ -5345,13 +5341,9 @@ fn code_square(
     // This tile's intra block-copy state ([`Ibc`]), `None` on a frame whose
     // header did not set `allow_intrabc`.
     ibc: Option<&mut Ibc>,
-    // The CDF row this block's `tx_depth` symbol is priced against
-    // ([`tx_depth_bits`]), read by the caller off its own published transform
-    // bands -- `0` where the caller keeps none.
-    tx_ctx: usize,
     // Whether this is a KEY frame's block, read only by the split census
-    // ([`SPLIT_CENSUS`]): the two frame types price `tx_depth` off different
-    // band sets and split at different rates, which is the whole finding.
+    // ([`SPLIT_CENSUS`]): the two frame types split at very different rates,
+    // which is this lane's whole finding.
     census_key: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
@@ -5397,11 +5389,11 @@ fn code_square(
     // `tx_depth_bits(32, 0)` -- otherwise the 64-versus-four-32 comparison
     // below hands the root a symbol for free.
     if tx_select && side == SUPERBLOCK {
-        cost += search.lambda * tx_depth_bits(tx_ctx, side, 0);
+        cost += search.lambda * tx_depth_bits(side, 0);
     }
     if tx_select && max_tx_depth(side) > 0 {
         let mut best = (
-            cost + search.lambda * tx_depth_bits(tx_ctx, side, 0),
+            cost + search.lambda * tx_depth_bits(side, 0),
             0usize,
             luma.snapshot(x, y, side),
             luma_coeffs,
@@ -5415,16 +5407,16 @@ fn code_square(
             let (_, sse, bits, _) =
                 luma.code_tx_depth(at, mode, angle_delta, 0, None, search, fctx);
             luma.restore(x, y, side, &kept);
-            (bits + tx_depth_bits(tx_ctx, side, 0), sse)
+            (bits + tx_depth_bits(side, 0), sse)
         });
         let mut census_split: Option<(f64, f64)> = None;
         for depth in 1..=max_tx_depth(side) {
             let (levels, sse, bits, types) =
                 luma.code_tx_depth(at, mode, angle_delta, depth, None, search, fctx);
-            let rate = bits + mode_bits[usize::from(mode)] + tx_depth_bits(tx_ctx, side, depth);
+            let rate = bits + mode_bits[usize::from(mode)] + tx_depth_bits(side, depth);
             let cost_d = sse + search.lambda * split_lambda_mult() * rate;
             if census_flat.is_some() {
-                let c = (bits + tx_depth_bits(tx_ctx, side, depth), sse);
+                let c = (bits + tx_depth_bits(side, depth), sse);
                 if census_split.is_none_or(|b| sse + search.lambda * rate < b.1 + search.lambda * b.0)
                 {
                     census_split = Some(c);
@@ -5480,7 +5472,7 @@ fn code_square(
                     * (trial.bits
                         + mode_bits[DC_PRED as usize]
                         + crate::tile::palette_bits(&pal, side)
-                        + if tx_select { tx_depth_bits(tx_ctx, side, 0) } else { 0.0 });
+                        + if tx_select { tx_depth_bits(side, 0) } else { 0.0 });
             if cost_p < cost {
                 cost = cost_p;
                 mode = DC_PRED as u8;
@@ -5546,7 +5538,7 @@ fn code_square(
                             + mode_bits[DC_PRED as usize]
                             + one_bits
                             + symbol_bits(&cdf::FILTER_INTRA_MODE, usize::from(fi))
-                            + if tx_select { tx_depth_bits(tx_ctx, side, depth) } else { 0.0 });
+                            + if tx_select { tx_depth_bits(side, depth) } else { 0.0 });
                 if cost_f < cost && best.as_ref().is_none_or(|b| cost_f < b.0) {
                     best = Some((
                         cost_f,
@@ -6268,11 +6260,6 @@ fn code_square_inter(
             mode_bits,
             tx_select() && tx_select_inter(),
             None,
-            // lane-txd: an INTER frame's intra block takes its `tx_depth` row
-            // from the `TXFM_CONTEXT` bands (`tx_size_ctx_txfm`, where an
-            // inter neighbour votes its own BLOCK size), which `record_mi`
-            // now publishes per cell.
-            tx_ctx_txfm(grid, (mi_row, mi_col), side.min(64)),
             false,
             fctx,
         );
@@ -6977,31 +6964,6 @@ fn code_square_inter(
 /// MV stack reads, over the `size` x `size` 4x4 units it covers. An intra
 /// block casts no vote but is still a coded cell (see `code_square_inter`'s
 /// note on `processed_rows`/`processed_cols`).
-/// What one coded block publishes into the `TXFM_CONTEXT` bands, in pixels:
-/// a SKIPPED inter block records its own BLOCK size (`set_txfm_ctxs`'s
-/// `skip_inter` term), every other block its resolved transform
-/// (`tile::write_tx_syntax_inter`'s `record_txfm` calls, all of which cover
-/// the block's whole span with one value).
-fn txfm_px(side: usize, inter: bool, skip: bool, tx_depth: u8) -> u8 {
-    if inter && skip { side as u8 } else { (side.min(64) >> tx_depth) as u8 }
-}
-
-/// The CDF row an INTER frame's intra block has its `tx_depth` symbol coded
-/// against ([`crate::tile::Neighbours::tx_size_ctx_txfm`]), read off the grid
-/// the encoder publishes its own blocks into -- the above/left 4x4 cell, each
-/// contributing nothing when it falls outside this tile (`MiGrid::get`'s own
-/// window, which is the writer's `has_above`/`has_left`).
-fn tx_ctx_txfm(grid: &MiGrid, (mi_row, mi_col): (usize, usize), own_side: usize) -> usize {
-    let cell = |r: usize, c: usize| {
-        grid.get(r, c).map(|i| (grid.txfm_at(r, c), i.is_inter, usize::from(i.size) * 4))
-    };
-    crate::tile::tx_size_ctx_txfm_of(
-        mi_row.checked_sub(1).and_then(|r| cell(r, mi_col)),
-        mi_col.checked_sub(1).and_then(|c| cell(mi_row, c)),
-        own_side,
-    )
-}
-
 fn record_mi(
     grid: &mut MiGrid,
     mi_row: usize,
@@ -7011,10 +6973,6 @@ fn record_mi(
     // lane-ctx: the block's own `skip`, so the next block's MV stack can hand
     // the RD pricer the two cells the writer's `skip_ctx` sums.
     skip: bool,
-    // lane-txd: the transform side, in pixels, this block leaves in the
-    // `TXFM_CONTEXT` bands ([`txfm_px`]), which is the state the next intra
-    // block's `tx_depth` row is read from.
-    txfm: u8,
 ) {
     let info = match inter {
         Some(info) => MiInfo {
@@ -7060,7 +7018,6 @@ fn record_mi(
         for dc in 0..usize::from(size) {
             grid.set(mi_row + dr, mi_col + dc, info);
             grid.set_skip(mi_row + dr, mi_col + dc, skip);
-            grid.set_txfm(mi_row + dr, mi_col + dc, txfm);
         }
     }
 }
@@ -7859,38 +7816,6 @@ pub(crate) fn encode_key_frame_inner(
         clip_planes_to_tile(&mut luma, &mut chroma, rect);
         let mut above_mode = vec![DC_PRED; cols * 2];
         let mut left_mode = vec![DC_PRED; rows * 2];
-        // lane-ctx2: the two bands `Neighbours::tx_size_ctx` reads -- every
-        // coded block's resolved luma transform side in pixels, over each 4x4
-        // unit it covers, the way the writer's `record_tx` publishes it. The
-        // indices are frame-absolute, so a new superblock row needs no reset
-        // (the writer's `start_row` clears a band indexed within the tile),
-        // and a block trial that loses is overwritten by the winner's own
-        // publish, exactly as `above_mode`/`left_mode` are.
-        let mut above_tx = vec![0u8; cols * 8];
-        let mut left_tx = vec![0u8; rows * 8];
-        let tx_ctx = |above_tx: &[u8], left_tx: &[u8], (x, y): (usize, usize), side: usize| {
-            let (mi_r, mi_c) = (y / 4, x / 4);
-            crate::tile::tx_size_ctx_of(
-                (mi_r > rect.mi_row0 as usize, mi_c > rect.mi_col0 as usize),
-                (above_tx[mi_c], left_tx[mi_r]),
-                side.min(64),
-            )
-        };
-        let publish_tx = |above_tx: &mut Vec<u8>,
-                          left_tx: &mut Vec<u8>,
-                          (x, y): (usize, usize),
-                          side: usize,
-                          depth: u8| {
-            let tx = (side.min(64) >> depth) as u8;
-            for cell in 0..side / 4 {
-                if let Some(c) = above_tx.get_mut(x / 4 + cell) {
-                    *c = tx;
-                }
-                if let Some(c) = left_tx.get_mut(y / 4 + cell) {
-                    *c = tx;
-                }
-            }
-        };
         let mut ibc = allow_intrabc.then(|| {
             Ibc::new(
                 (
@@ -7970,7 +7895,6 @@ pub(crate) fn encode_key_frame_inner(
                     &mode_bits(above_mode[c64], left_mode[r64]),
                     tx_select,
                     None,
-                    tx_ctx(&above_tx, &left_tx, (x64, y64), SUPERBLOCK),
                     true,
                     fctx,
                 );
@@ -8056,7 +7980,6 @@ pub(crate) fn encode_key_frame_inner(
                     &mode_bits(above_mode[c0], left_mode[r0]),
                     tx_select,
                     ibc.as_mut(),
-                    tx_ctx(&above_tx, &left_tx, (x, y), BLOCK),
                     true,
                     fctx,
                 );
@@ -8094,12 +8017,6 @@ pub(crate) fn encode_key_frame_inner(
                             &mode_bits(above_mode[sc], left_mode[sr]),
                             tx_select,
                             ibc.as_mut(),
-                            tx_ctx(
-                                &above_tx,
-                                &left_tx,
-                                (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
-                                SUB,
-                            ),
                             true,
                             fctx,
                         );
@@ -8107,13 +8024,6 @@ pub(crate) fn encode_key_frame_inner(
                         split_modes.push(block.mode);
                         above_mode[sc] = block.mode;
                         left_mode[sr] = block.mode;
-                        publish_tx(
-                            &mut above_tx,
-                            &mut left_tx,
-                            (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
-                            SUB,
-                            block.tx_depth,
-                        );
                         split.push(block);
                     } else {
                         // A straddling 16x16: two (or, at a true corner, one)
@@ -8142,13 +8052,11 @@ pub(crate) fn encode_key_frame_inner(
                                 &leaf_mode_bits,
                                 tx_select,
                                 None,
-                                tx_ctx(&above_tx, &left_tx, (leaf_x, leaf_y), 8),
                                 true,
                                 fctx,
                             );
                             cost_split += cost;
                             split_modes.push(leaf.mode);
-                            publish_tx(&mut above_tx, &mut left_tx, (leaf_x, leaf_y), 8, leaf.tx_depth);
                             leaves.push(leaf);
                         }
                         split.push(BlockCoeffs {
@@ -8177,7 +8085,6 @@ pub(crate) fn encode_key_frame_inner(
                         above_mode[c0 + cell] = whole.mode;
                         left_mode[r0 + cell] = whole.mode;
                     }
-                    publish_tx(&mut above_tx, &mut left_tx, (x, y), BLOCK, whole.tx_depth);
                     modes.push(whole.mode);
                     blocks.push(Quadrant::Whole(whole));
                 }
@@ -8190,7 +8097,6 @@ pub(crate) fn encode_key_frame_inner(
                         above_mode[sb_col * 4 + cell] = block.mode;
                         left_mode[sb_row * 4 + cell] = block.mode;
                     }
-                    publish_tx(&mut above_tx, &mut left_tx, (x64, y64), SUPERBLOCK, block.tx_depth);
                     I64_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if !whole_inside {
                         I64_HITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -11740,8 +11646,7 @@ pub(crate) fn encode_inter_frame(
                                                 fctx,
                                             );
                                             cost8 += cost;
-                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter, leaf8.skip,
-                                                txfm_px(8, leaf8.inter.is_some(), leaf8.skip, leaf8.tx_depth));
+                                            record_mi(&mut grid, mr, mc, 2, leaf8.inter, leaf8.skip);
                                             eight.push(leaf8);
                                         }
                                         (eight, cost8)
@@ -11763,8 +11668,7 @@ pub(crate) fn encode_inter_frame(
                                 }
                                 partition_hit(2);
                                 cost += leaf_cost;
-                                record_mi(&mut grid, mi_row, mi_col, 4, leaf.inter, leaf.skip,
-                                    txfm_px(SUB, leaf.inter.is_some(), leaf.skip, leaf.tx_depth));
+                                record_mi(&mut grid, mi_row, mi_col, 4, leaf.inter, leaf.skip);
                                 leaves.push(leaf);
                             }
                             (leaves, cost)
@@ -11783,8 +11687,7 @@ pub(crate) fn encode_inter_frame(
                     }
                     partition_hit(0);
                     sb_cost += cost_whole;
-                    record_mi(&mut grid, mi_row, mi_col, 8, block.inter, block.skip,
-                        txfm_px(BLOCK, block.inter.is_some(), block.skip, block.tx_depth));
+                    record_mi(&mut grid, mi_row, mi_col, 8, block.inter, block.skip);
                     blocks.push((r32 * cols + c32, Quadrant::Whole(block)));
                 } else {
                     // The sub-positions actually inside the true frame, same
@@ -11851,8 +11754,7 @@ pub(crate) fn encode_inter_frame(
                             // to (0,0), which is the encoder-grid-drift class
                             // -- correct only for as long as a leaf can never
                             // be compound.
-                            record_mi(&mut grid, mi_row, mi_col, 4, block.inter, block.skip,
-                                txfm_px(SUB, block.inter.is_some(), block.skip, block.tx_depth));
+                            record_mi(&mut grid, mi_row, mi_col, 4, block.inter, block.skip);
                             leaves.push(block);
                         } else {
                             let (x_sub, y_sub) = (sc * SUB, sr * SUB);
@@ -11891,8 +11793,7 @@ pub(crate) fn encode_inter_frame(
                                 );
                                 // Same publication point as the 16x16
                                 // straddling leaf above (`record_mi`).
-                                record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter, leaf.skip,
-                                    txfm_px(8, leaf.inter.is_some(), leaf.skip, leaf.tx_depth));
+                                record_mi(&mut grid, mi_row, mi_col, 2, leaf.inter, leaf.skip);
                                 eight.push(leaf);
                             }
                             leaves.push(BlockCoeffs {
@@ -11923,8 +11824,7 @@ pub(crate) fn encode_inter_frame(
                 // Overwrites every 16x16 mi cell the quadrant searches
                 // published under this superblock, so the next block's stack
                 // is built off the block that was really coded.
-                record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter, block.skip,
-                    txfm_px(SUPERBLOCK, block.inter.is_some(), block.skip, block.tx_depth));
+                record_mi(&mut grid, sb_r * 16, sb_c * 16, 16, block.inter, block.skip);
                 blocks.push(((sb_r * 2) * cols + sb_c * 2, Quadrant::Whole64(block)));
                 for q in 1..4 {
                     let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
@@ -12680,81 +12580,6 @@ mod tests {
                     (got - want).abs() < 1e-9,
                     "ref {ref_frame} above {above_refs:?} left {left_refs:?}: \
                      priced {got} bits, writer codes {want}"
-                );
-            }
-        }
-    }
-
-    /// The `tx_depth` symbol is priced off the row the WRITER codes it
-    /// against, on BOTH frame types (class `pricer-context-zero`; lane-ctx2
-    /// built only the key-frame half, which lost on its own).
-    ///
-    /// Key frames read the deblock grid (`tile::tx_size_ctx_of`, off
-    /// `Neighbours::record_tx`'s bands); an inter frame's INTRA block reads
-    /// the `TXFM_CONTEXT` bands instead (`tile::tx_size_ctx_txfm_of`, where an
-    /// inter neighbour votes its own BLOCK size and a skipped inter block
-    /// publishes its block size), which the encoder now publishes per mi cell
-    /// through `record_mi`. Row 0 -- both neighbours narrower, where splitting
-    /// reads cheapest -- is what both halves used to price at.
-    #[test]
-    fn the_tx_depth_pricer_uses_the_writers_own_context_row() {
-        use crate::cdf::{TX_SIZE_CAT1, TX_SIZE_CAT2};
-        use crate::encode::symbol_bits as b;
-        use crate::tile::{tx_size_ctx_of, tx_size_ctx_txfm_of};
-        // The key-frame rule: (has_above, has_left), the two band cells, this
-        // block's own largest transform -> the row. A neighbour outside the
-        // tile contributes nothing however wide its band cell reads.
-        for (has, bands, max_tx, want) in [
-            ((false, false), (64u8, 64u8), 32usize, 0usize),
-            ((true, true), (16, 16), 32, 0),
-            ((true, true), (32, 16), 32, 1),
-            ((true, false), (32, 64), 32, 1),
-            ((true, true), (32, 64), 32, 2),
-            ((true, true), (8, 8), 8, 2),
-        ] {
-            assert_eq!(tx_size_ctx_of(has, bands, max_tx), want, "key {has:?} {bands:?} {max_tx}");
-        }
-        // An inter frame's intra block, its above/left neighbours coded INTER
-        // and published through `record_mi`: a 16x16 intra block at mi (4, 4)
-        // with 32x32 inter neighbours, which vote their BLOCK size (32 >= 16)
-        // whatever transform they left in the band.
-        let mut grid = MiGrid::new(16, 16);
-        let inter = Some(crate::tile::InterInfo {
-            ref1: None,
-            mv1: (0, 0),
-            ref_frame: crate::mvstack::LAST_FRAME,
-            mode: crate::tile::InterMode::NearestMv,
-            mv: (0, 0),
-            ref_mv_idx: 0,
-        });
-        // A SKIPPED 32x32 inter block publishes its block size (32), an
-        // unskipped one its resolved transform (32 at depth 0).
-        assert_eq!(txfm_px(BLOCK, true, true, 0), 32);
-        assert_eq!(txfm_px(BLOCK, true, false, 1), 16);
-        for (mi_row, mi_col) in [(0usize, 0usize), (0, 4), (4, 0)] {
-            record_mi(&mut grid, mi_row, mi_col, 8, inter, true, txfm_px(BLOCK, true, true, 0));
-        }
-        let ctx = tx_ctx_txfm(&grid, (4, 4), 16);
-        assert_eq!(
-            ctx,
-            tx_size_ctx_txfm_of(Some((32, true, 32)), Some((32, true, 32)), 16),
-            "the grid's row is not the writer's"
-        );
-        assert_eq!(ctx, 2, "two inter neighbours at least as wide vote row 2");
-        // libaom's default tables give rows 0 and 1 IDENTICAL probabilities in
-        // every category, so row 2 is the only row that moves a price -- and
-        // pricing at it is exactly what was red before this lane.
-        for (side, table) in [(16usize, &TX_SIZE_CAT1), (32, &TX_SIZE_CAT2)] {
-            for depth in 0..3 {
-                let got = tx_depth_bits(ctx, side, depth);
-                assert!(
-                    (got - b(&table[ctx], depth)).abs() < 1e-9,
-                    "side {side} depth {depth} at ctx {ctx}: priced {got}, writer codes {}",
-                    b(&table[ctx], depth)
-                );
-                assert!(
-                    (got - b(&table[0], depth)).abs() > 1e-9,
-                    "side {side} depth {depth}: row {ctx} prices the same as row 0"
                 );
             }
         }
@@ -16445,15 +16270,9 @@ mod tests {
         // at q=60. Re-taken on lane-ctx2: a single-reference candidate now
         // pays the `comp_mode = 0` symbol the writer codes ahead of it, so
         // single and compound are priced against the same syntax -- 8311 ->
-        // 8325 bytes at q=150 and 33087 -> 33014 at q=60. Re-taken again in
-        // Re-taken on lane-txd: the `tx_depth` symbol is priced at the
-        // writer's own row on BOTH frame types (a key frame off the deblock
-        // grid, an inter frame's intra block off the TXFM_CONTEXT bands the
-        // encoder now publishes), so every intra block's depth-versus-split
-        // margin moved -- 8325 -> 8381 bytes at q=150 and 33014 -> 33016 at
-        // q=60.
+        // 8325 bytes at q=150 and 33087 -> 33014 at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8381, 0x36ac_5783_4a20_499a), (60, 33016, 0xfcd0_be7a_3600_34ce)];
+            [(150, 8325, 0xf004_8258_bc60_ff05), (60, 33014, 0x5bc2_5dfd_bd13_18de)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
