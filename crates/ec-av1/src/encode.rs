@@ -733,6 +733,42 @@ fn b128_root() -> bool {
     *ENV
 }
 
+/// lane-b128r: whether the 128 root prices a REAL residual as well as the
+/// skip arm -- four TX_64X64 luma units interleaved with a TX_32X32 chroma
+/// pair per 64x64 mu chunk, var-tx depth 0 (the shape
+/// [`crate::tile::write_inter_block_128`] codes and `decode_inter_block`
+/// reads). On by default; `EC_AV1_B128RES=0` restores lane-b128's skip-only
+/// root, which is this arm's own attribution control.
+fn b128_residual() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B128RES").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b128_root()
+}
+
+/// Test-only: take the 128 root's residual arm whatever it costs, so a
+/// witness clip codes the shape rather than waiting for content on which the
+/// RD picks it (the same role [`force_sb128`] plays for the superblock size).
+/// Never read outside `#[cfg(test)]` builds.
+static FORCE_B128_RESIDUAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arms [`FORCE_B128_RESIDUAL`] for the rest of the process.
+#[cfg(test)]
+pub(crate) fn force_b128_residual(on: bool) {
+    FORCE_B128_RESIDUAL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many 128 roots came out cheaper WITH a residual than skipped, since
+/// the last [`take_b128_residual_hits`] (class `gate-blind-to-feature`).
+static B128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The 128-residual count since the last call, and zero it.
+pub fn take_b128_residual_hits() -> usize {
+    B128_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many 128x128 `PARTITION_NONE` roots the search took since the last
 /// [`take_b128_none_hits`] (class `gate-blind-to-feature`): a flat BD result
 /// is only attributable once the fire count is known.
@@ -9428,7 +9464,16 @@ fn search_root_128(
         .map(|&(dr, dc)| cell_lambda(root_r + dr, root_c + dc))
         .sum::<f64>()
         / 4.0;
-    let root_search = Search { lambda, ..search };
+    // The qindex this root is really quantized at: the delta_q unit is the
+    // 128 superblock, so the root's own top-left cell is the one coded
+    // (lane-b128m), and the residual arm below has to quantize at exactly it.
+    let root_search = Search {
+        lambda,
+        ..match sb_q {
+            Some(q) => sb_q_search(q, sb_cols, base_q_idx, (root_r, root_c), search),
+            None => search,
+        }
+    };
     let stack = find_mv_stack(
         grid,
         mi_row,
@@ -9452,7 +9497,84 @@ fn search_root_128(
         &[],
         fctx,
     );
-    let (cost, block) = found?;
+    let (mut cost, mut block) = found?;
+    // lane-b128r: the same prediction with a REAL residual, priced against
+    // the skip arm the search just committed to the planes (which IS the
+    // winner's prediction, sample for sample). The block's residual is four
+    // TX_64X64 luma units, one per 64x64 mu chunk, each interleaved with its
+    // own TX_32X32 chroma pair -- so it is coded here as twelve trials at
+    // sides the forward network already reaches, never as one 128-point
+    // transform. Var-tx depth 0 only: the four units ARE the tree's leaves.
+    //
+    // The four `txfm_partition` symbols the writer codes for them are not
+    // priced, exactly as the 64 root does not price its own (their contexts
+    // are only known at write time); at four symbols a root this is under a
+    // bit against residuals of hundreds.
+    if b128_residual() && block.skip {
+        // Every unit's coded level grid is 32x32 (a 64-point transform codes
+        // only its top-left corner), packed per plane into one 64-wide grid
+        // with chunk (cr, cc) at (cr * 32, cc * 32) -- the layout
+        // `write_inter_block_128` slices back out in the same chunk order.
+        let mut packed = [vec![0i32; 64 * 64], vec![0i32; 64 * 64], vec![0i32; 64 * 64]];
+        let mut chunks: Vec<((usize, usize), [Trial; 3])> = Vec::new();
+        let (mut sse_skip, mut sse_res, mut coeff_bits) = (0.0f64, 0.0f64, 0.0f64);
+        for (cr, cc) in [(0usize, 0usize), (0, 1), (1, 0), (1, 1)] {
+            let (px, py) = (x128 + cc * SUPERBLOCK, y128 + cr * SUPERBLOCK);
+            let (cx, cy) = (px / 2, py / 2);
+            let half = SUPERBLOCK / 2;
+            let pred_y = rows_of(&luma.reconstruction, luma.width, px, py, SUPERBLOCK);
+            let pred_u = rows_of(&chroma[0].reconstruction, chroma[0].width, cx, cy, half);
+            let pred_v = rows_of(&chroma[1].reconstruction, chroma[1].width, cx, cy, half);
+            sse_skip += luma.block_sse(px, py, SUPERBLOCK, &pred_y)
+                + chroma[0].block_sse(cx, cy, half, &pred_u)
+                + chroma[1].block_sse(cx, cy, half, &pred_v);
+            let trials = [
+                luma.code_from_prediction(
+                    px, py, SUPERBLOCK, &pred_y, false, root_search.base_q_idx,
+                    root_search.deadzone, TxbSet::Luma64,
+                ),
+                chroma[0].code_from_prediction(
+                    cx, cy, half, &pred_u, false, root_search.base_q_idx,
+                    root_search.deadzone, TxbSet::Chroma32,
+                ),
+                chroma[1].code_from_prediction(
+                    cx, cy, half, &pred_v, false, root_search.base_q_idx,
+                    root_search.deadzone, TxbSet::Chroma32,
+                ),
+            ];
+            for (plane, trial) in trials.iter().enumerate() {
+                sse_res += trial.sse;
+                coeff_bits += trial.bits;
+                for row in 0..32 {
+                    packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32]
+                        .copy_from_slice(&trial.levels[row * 32..][..32]);
+                }
+            }
+            chunks.push(((cr, cc), trials));
+        }
+        // `cost` is the skip arm's own `sse + lambda * syntax`; the residual
+        // arm pays the same syntax with `skip` coded 0 instead of 1, plus its
+        // coefficients.
+        let unskip = skip_bits_at(&stack, false) - skip_bits_at(&stack, true);
+        let res_cost = cost - sse_skip + sse_res + lambda * (unskip + coeff_bits);
+        if res_cost < cost || FORCE_B128_RESIDUAL.load(std::sync::atomic::Ordering::Relaxed) {
+            B128_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for ((cr, cc), trials) in &chunks {
+                let (px, py) = (x128 + cc * SUPERBLOCK, y128 + cr * SUPERBLOCK);
+                let half = SUPERBLOCK / 2;
+                luma.commit(px, py, SUPERBLOCK, &trials[0]);
+                chroma[0].commit(px / 2, py / 2, half, &trials[1]);
+                chroma[1].commit(px / 2, py / 2, half, &trials[2]);
+            }
+            cost = res_cost;
+            block.skip = false;
+            block.tx_depth = 0;
+            block.luma_tx_types = Vec::new();
+            block.luma = coeffs(&packed[0], 64);
+            block.u = coeffs(&packed[1], 64);
+            block.v = coeffs(&packed[2], 64);
+        }
+    }
     let after = snapshot(luma, chroma, (x128, y128), SIDE);
     restore(luma, chroma, (x128, y128), SIDE, &base);
     Some((
@@ -12722,7 +12844,10 @@ pub(crate) fn encode_inter_frame(
         // cost, the same weighing the 64 root does one size down. Both sides
         // carry their own partition symbol, so the comparison is complete.
         if let Some((cost128, lambda128, block, after)) = root128
-            && cost128 < root_cost + lambda128 * crate::tile::partition_bits(128, true)
+            && (cost128 < root_cost + lambda128 * crate::tile::partition_bits(128, true)
+                // The witness knob takes the root whatever it costs, so the
+                // forced residual block really reaches the writer.
+                || FORCE_B128_RESIDUAL.load(std::sync::atomic::Ordering::Relaxed))
         {
             B128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
@@ -12772,8 +12897,15 @@ pub(crate) fn encode_inter_frame(
             .iter()
             .filter(|q| !matches!(q, Quadrant::Covered))
             .count();
+        // lane-b128r: of those roots, how many code a REAL residual rather
+        // than the skip-only block lane-b128 shipped -- the fire count this
+        // arm's own gate row is read against.
+        let residual = blocks
+            .iter()
+            .filter(|q| matches!(q, Quadrant::Whole128(b) if !b.skip))
+            .count();
         eprintln!(
-            "B128 census: inter frame, {whole} whole 128x128 roots, {roots} coded blocks              ({:.1}% of the frame's area at 128)",
+            "B128 census: inter frame, {whole} whole 128x128 roots ({residual} with a residual),              {roots} coded blocks ({:.1}% of the frame's area at 128)",
             100.0 * (whole * 16) as f64 / blocks.len().max(1) as f64,
         );
     }
@@ -16035,6 +16167,78 @@ mod tests {
             "no 128x128 block was coded on this clip, so it cannot witness the root search",
         );
         assert_eq!(won, coded, "every 128x128 root the search took must be coded as one");
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            let recon = &frame.reconstruction;
+            for (plane, got, want) in [
+                ("luma", &dec.y, &recon.y),
+                ("U", &dec.u, &recon.u),
+                ("V", &dec.v, &recon.v),
+            ] {
+                let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ, 0,
+                    "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
+                     own reconstruction",
+                    got.len()
+                );
+            }
+        }
+        let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: ffmpeg V");
+        }
+    }
+
+    /// lane-b128r: the 128 root's own RESIDUAL arm -- four TX_64X64 luma
+    /// units interleaved with a TX_32X32 chroma pair per 64x64 mu chunk. The
+    /// same pan the skip-only witness above uses, coded at a quantizer where
+    /// the residual is worth its bits, so the counters below are non-zero;
+    /// RED before this lane by construction (`write_inter_block_128` refused
+    /// every non-skip 128 block, so the count was 0 and no such block
+    /// existed to decode).
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_128_root_block_with_a_real_residual --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_128_root_block_with_a_real_residual_decodes_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-b128r-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("smpte-pan-1280x768.y4m");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "smptebars=size=1600x768:rate=24"])
+            .args(["-vf", "crop=1280:768:'min(n*2,300)':0", "-frames:v", "8"])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
+        let _ = take_b128_residual_hits();
+        let _ = crate::tile::take_sb128_residual_hits();
+        force_b128_residual(true);
+        let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
+        let (won, coded) =
+            (take_b128_residual_hits(), crate::tile::take_sb128_residual_hits());
+        eprintln!("128x128 blocks WITH a residual: search won {won}, writer coded {coded}");
+        assert!(
+            coded > 0,
+            "no 128x128 block carried a residual on this clip, so it cannot witness the arm",
+        );
         let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
         assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
         for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
