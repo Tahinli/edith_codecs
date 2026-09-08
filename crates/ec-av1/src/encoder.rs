@@ -1380,6 +1380,16 @@ impl Av1Encoder {
     /// As [`Av1Encoder::encode`], minus the pyramid refusal.
     pub fn encode_frames(&mut self, picture: &Picture) -> Result<Vec<Packet>> {
         crate::encode::arm_tiles(self.config.tile_cols_log2, self.config.tile_rows_log2);
+        // lane-split: the split census prints on every exit of this call when
+        // armed, so no `return` path loses it; the counters are cumulative, so
+        // the last table a run prints is that run's total.
+        struct SplitCensusDump;
+        impl Drop for SplitCensusDump {
+            fn drop(&mut self) {
+                crate::encode::dump_split_census();
+            }
+        }
+        let _census = crate::encode::split_census_on().then_some(SplitCensusDump);
         if (picture.width, picture.height) != (self.config.width, self.config.height) {
             return Err(Error::unsupported(
                 "AV1 encode",
