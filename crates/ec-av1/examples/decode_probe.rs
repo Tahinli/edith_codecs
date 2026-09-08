@@ -50,6 +50,10 @@ fn main() {
         let (rtu, rsplit, robmc) = ec_av1::stream::rect_inter_tu_counters();
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         println!("sub8_inter_split: groups={}", ec_av1::decode::sub8_inter_split_hits());
+        println!(
+            "skip_split_tx_override: {}",
+            ec_av1::decode::skip_split_tx_override_hits()
+        );
         println!("interintra_rect: {}", ec_av1::decode::interintra_rect_hits());
         println!("gm_nontrans_small_side: {}", ec_av1::decode::gm_nontrans_small_side_hits());
         println!("tr_reach_longer_side: {}", ec_av1::decode::tr_reach_longer_side_hits());
