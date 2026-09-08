@@ -259,14 +259,6 @@ pub struct MiGrid {
     /// writer and the decoder read their `skip` neighbours from their own
     /// bands and leave this `false` (lane-ctx).
     skips: Vec<bool>,
-    /// The transform side, in pixels, each cell's block published into libaom's
-    /// `TXFM_CONTEXT` bands (`tile::write_tx_syntax_inter`'s `record_txfm`) --
-    /// a skipped inter block's own BLOCK size, everything else's resolved
-    /// transform. Beside `cells` for the same reason `skips` is: the cell must
-    /// stay 16 bytes, and the mv scan never reads this. Only the ENCODER fills
-    /// it (`encode::record_mi`), so the RD pricer can read an inter frame's
-    /// intra block `tx_depth` row off the writer's own bands (lane-txd).
-    txfm: Vec<u8>,
     /// lane-tiles r6: the current tile's own mi-unit bounds (spec: an MV
     /// candidate scan never reaches across a tile boundary, mirroring
     /// `PlaneBuf`'s `tile_x0`/`tile_x1` reach clamp for intra prediction).
@@ -296,7 +288,6 @@ impl MiGrid {
             rows,
             cells: vec![None; cols * rows],
             skips: vec![false; cols * rows],
-            txfm: vec![0; cols * rows],
             tile_row0: 0,
             tile_col0: 0,
             tile_row1: rows,
@@ -349,23 +340,6 @@ impl MiGrid {
     pub fn set_skip(&mut self, row: usize, col: usize, skip: bool) {
         if row < self.rows && col < self.cols {
             self.skips[row * self.cols + col] = skip;
-        }
-    }
-
-    /// Records the transform side one block published at `(row, col)` -- see
-    /// `txfm`.
-    pub fn set_txfm(&mut self, row: usize, col: usize, tx_px: u8) {
-        if row < self.rows && col < self.cols {
-            self.txfm[row * self.cols + col] = tx_px;
-        }
-    }
-
-    /// The transform side published at `(row, col)`, `0` outside the grid.
-    pub fn txfm_at(&self, row: usize, col: usize) -> u8 {
-        if row < self.rows && col < self.cols {
-            self.txfm[row * self.cols + col]
-        } else {
-            0
         }
     }
 
