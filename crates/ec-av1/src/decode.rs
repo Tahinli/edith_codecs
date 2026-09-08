@@ -8835,6 +8835,17 @@ fn palette_onscreen(
     fctx: &crate::decode::FrameCtx,
 ) -> (usize, usize) {
     let (mi_rows, mi_cols) = fctx.seg_mi_dims.with(|c| c.get());
+    // corner-cut: no mi dims means this is not a real frame decode but the
+    // ENCODER's own in-process reconstruct (`FrameCtx::for_encoder`, where
+    // `set_segmentation` never runs), whose writer half
+    // (`tile::write_color_index_map`) is unclamped too -- the two mirror each
+    // other, and clamping only one of them read every map as 1x1. Ceiling:
+    // our encoder still writes a full map for a palette block cut by the
+    // frame edge, which a conformant decoder reads short. Upgrade path: clamp
+    // the writer, publish the mi dims on the encoder's ctx, drop this branch.
+    if mi_rows == 0 || mi_cols == 0 {
+        return (bw, bh);
+    }
     (
         bw.min(mi_cols.saturating_sub(mi_c) * MI),
         bh.min(mi_rows.saturating_sub(mi_r) * MI),
