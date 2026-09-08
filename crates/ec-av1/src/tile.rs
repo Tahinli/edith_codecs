@@ -4959,7 +4959,19 @@ pub(crate) fn rdoq(
     //    cannot cost two hundred re-codings.
     let mut budget = rdoq_budget();
     let max_level = rdoq_max_level();
-    for &position in scan_of(coded).iter().rev() {
+    // lane-txw: the tail this walks back from is the tail of the unit's OWN
+    // scan -- a `V_DCT`/`H_DCT` unit is coded in `Mrow_Scan`/`Mcol_Scan`, so
+    // the 2D zigzag's last positions are not the ones whose removal shortens
+    // its eob. Every candidate is still priced through the class-aware writer
+    // ([`write_coeffs`]), so this changes which positions the budget reaches,
+    // never whether a decision is right.
+    let class = crate::decode::TxClass::of(tx_type);
+    let order: &[u16] = if class == crate::decode::TxClass::TwoD {
+        scan_of(coded)
+    } else {
+        class_scan_of(coded, class)
+    };
+    for &position in order.iter().rev() {
         if budget == 0 {
             break;
         }
