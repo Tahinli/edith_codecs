@@ -13279,7 +13279,7 @@ mod tests {
             eprintln!("SKIP probe_intrabc_key_frame: no OBS recording");
             return;
         };
-        let (width, height) = (640usize, 384usize);
+        let (width, height) = (1280usize, 768usize);
         let picture = clip_frame(clip, "0", width, height);
         eprintln!("| base_q_idx | intrabc | bytes | PSNR | blocks | searches/found/won |");
         for q in [5u8, 20, 35, 45] {
@@ -14938,6 +14938,77 @@ mod tests {
     /// symbol (`EC_TRACE_MODE_STEP`) on the very stream that broke. This is
     /// the instrument the inter `TxMode::Select` hunt lacked; on failure it
     /// names the first differing frame, plane and position.
+    /// lane-sb128b: the writer used to price a `NEWMV` residual against
+    /// `stack.pred_mv` whenever the SEARCH chose a `ref_mv_idx` the
+    /// write-time stack could not carry, while the drl symbols signalled the
+    /// clamped index -- so the decoder derived a DIFFERENT motion vector with
+    /// the entropy stream still in sync, and the drift only surfaced frames
+    /// later as a drl desync (on film B, as the encoder's own trial decode
+    /// refusing a reference slot).
+    ///
+    /// The clamp needs a stack that shrinks between search and write, which
+    /// is what a 128x128 superblock's visit order does; the counter is the
+    /// point (class `gate-blind-to-feature`): a green round trip on a clip
+    /// that never clamps proves nothing.
+    ///
+    /// `#[ignore]`: [`force_sb128`] moves a process-global.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_128_superblock_clip_whose_drl_index_the_write_time_stack --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_128_superblock_clip_whose_drl_index_the_write_time_stack_cannot_carry_decodes_exact() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-sb128b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("mandelbrot-1280x768.y4m");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "mandelbrot=size=1280x768:rate=24"])
+            .args(["-frames:v", "12", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let path = clip.to_str().unwrap();
+        let (width, height) = (1280usize, 768usize);
+        let pictures = crate::probe::source(path, "0", "null", width, height, 12);
+
+        let _ = crate::tile::take_drl_clamp_hits();
+        let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
+        let clamps = crate::tile::take_drl_clamp_hits();
+        assert!(
+            clamps > 0,
+            "this clip never asked for a drl index the write-time stack could not carry, \
+             so it cannot witness the defect"
+        );
+        eprintln!("clamped drl indices: {clamps}");
+
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            let recon = &frame.reconstruction;
+            for (plane, got, want) in [
+                ("luma", &dec.y, &recon.y),
+                ("U", &dec.u, &recon.u),
+                ("V", &dec.v, &recon.v),
+            ] {
+                let differ = got.iter().zip(want).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ, 0,
+                    "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
+                     own reconstruction",
+                    got.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_frame_of_a_sequence_decodes_through_our_own_decoder() {
         let _knobs = crate::speed::knob_read();

@@ -1042,10 +1042,13 @@ fn write_compound_block(
                 }
                 walk += 1;
             }
-            stack
-                .entries
-                .get(walk)
-                .map_or(stack.near_mv, |e| (e.mv0, e.mv1))
+            let near = |i: usize| {
+                stack.entries.get(i).map_or(stack.near_mv, |e| (e.mv0, e.mv1))
+            };
+            if walk != idx && near(walk) != near(idx) {
+                note_drl_clamp(idx, walk, stack.entries.len());
+            }
+            near(walk)
         }
         InterMode::NearestNewMv | InterMode::NewNearestMv => {
             // Neither mode codes a DRL index (the decoder leaves `ref_mv_idx`
@@ -1074,10 +1077,13 @@ fn write_compound_block(
                 }
                 walk += 1;
             }
-            let base = stack
-                .entries
-                .get(walk)
-                .map_or(stack.nearest_mv, |e| (e.mv0, e.mv1));
+            let nearest = |i: usize| {
+                stack.entries.get(i).map_or(stack.nearest_mv, |e| (e.mv0, e.mv1))
+            };
+            if walk != idx && nearest(walk) != nearest(idx) {
+                note_drl_clamp(idx, walk, stack.entries.len());
+            }
+            let base = nearest(walk);
             write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv, base.0)?;
             write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv1, base.1)?;
             (info.mv, info.mv1)
@@ -5937,6 +5943,26 @@ pub(crate) fn take_ref_hits() -> [usize; 7] {
 }
 
 /// Bumps the two histograms for one coded inter block.
+/// How many blocks this process wrote whose search-chosen `ref_mv_idx` the
+/// write-time stack could not carry, so the writer signalled a SMALLER index
+/// (lane-sb128b). Every one of these used to price its residual against a
+/// predictor the decoder never derives.
+static DRL_CLAMP_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one clamped DRL index whose predictor differs from the one the
+/// search asked for -- the harmful case, and the only one a witness can see.
+fn note_drl_clamp(target: usize, signalled: usize, entries: usize) {
+    DRL_CLAMP_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if crate::envflags::env_flag!("EC_AV1_TRACE") {
+        eprintln!("DRL_CLAMP target={target} signalled={signalled} entries={entries}");
+    }
+}
+
+/// Takes and clears [`DRL_CLAMP_HITS`], for a gate's own before/after delta.
+pub(crate) fn take_drl_clamp_hits() -> usize {
+    DRL_CLAMP_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn note_inter_mode(mode: usize, drl: usize) {
     INTER_MODE_HITS[mode].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     DRL_HITS[drl.min(3)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6016,8 +6042,12 @@ fn write_inter_mode(
     match info.mode {
         InterMode::NewMv => {
             enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]);
-            let idx = write_drl_idx(enc, cdfs, stack, 0, idx);
-            let base = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+            let signalled = write_drl_idx(enc, cdfs, stack, 0, idx);
+            let base = stack.entries.get(signalled).map_or(stack.pred_mv, |e| e.mv);
+            if signalled != idx && base != stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv) {
+                note_drl_clamp(idx, signalled, stack.entries.len());
+            }
+            let idx = signalled;
             write_mv(enc, &mut cdfs.mv_comp, &mut cdfs.mv_joint, info.mv, base)?;
             note_inter_mode(3, idx);
             Ok((info.mv, true))
@@ -6041,8 +6071,12 @@ fn write_inter_mode(
             enc.symbol(1, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARMV
             // `RefMvIdx` starts at 1 for NEARMV (spec 5.11.24).
             let idx = idx.max(1);
-            let idx = write_drl_idx(enc, cdfs, stack, 1, idx);
-            let mv = stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv);
+            let signalled = write_drl_idx(enc, cdfs, stack, 1, idx);
+            let mv = stack.entries.get(signalled).map_or(stack.near_mv, |e| e.mv);
+            if signalled != idx && mv != stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv) {
+                note_drl_clamp(idx, signalled, stack.entries.len());
+            }
+            let idx = signalled;
             note_inter_mode(1, idx);
             Ok((mv, false))
         }
