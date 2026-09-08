@@ -1868,6 +1868,16 @@ pub fn inter_frame_headers_slots(
             idx
         },
         allow_high_precision_mv: false,
+        // A FIXED frame-level filter, so no block codes an `interp_filter`
+        // symbol. lane-obmc3 instrumented whether that costs anything: a
+        // libaom `cpu-used 6` crf 41 stream of the long-GOP film B window
+        // (45941 B, the same point `lanes/libcen.report.md` matched) read
+        // back through `EC_AV1_BITCENSUS=1 syntax_census` codes
+        // `switchable_interp 0/0` in EVERY frame -- libaom picks a fixed
+        // frame filter here too, so there are ZERO per-block filter bits at
+        // stake on this content and the per-block switchable search was not
+        // built (the charter's premise that libaom codes switchable interp
+        // per block on film B is refuted by its own stream).
         interpolation_filter: ec_av1_syntax::InterpolationFilter::Eighttap,
         // lane-av1obmc: with this bit set every single-reference inter block
         // libaom's `motion_mode_allowed` accepts carries a `motion_mode`
@@ -3574,6 +3584,33 @@ pub(crate) fn warp_on() -> bool {
 /// margin is loosened. On warp alone it looked like a keep (+16.3/-0.9 at
 /// min 8, +16.6/-0.7 at min 16 against warp's +16.7/-0.5) -- that gain and
 /// the margin's gain are the same bytes. It stays OFF.
+///
+/// RE-MEASURED on lane-obmc3 (2026-09-08) on the REAL film rows -- every
+/// judgement above was taken when the gate's "film" rows were the `testsrc2`
+/// COLOUR BARS fixtures (class `gate film rows are colour bars`), so this is
+/// the first OBMC measurement on film. BD vs libaom / vs rav1e, 12 pictures,
+/// the standing native keep table (`bd_rate_screen_native`):
+///
+/// | arm | film A | film B | screen | OBMC fire A/B |
+/// |---|---|---|---|---|
+/// | off (control) | +21.7 / -4.4 | +26.9 / -0.6 | +20.1 / -30.4 | 0% / 0% |
+/// | min side 8 | +21.7 / -4.3 | +27.2 / -0.3 | +20.0 / -30.4 | 15.5% / 9.7% |
+/// | min side 16 | +21.5 / -4.5 | +27.6 / +0.1 | +20.1 / -30.4 | 10.0% / 6.9% |
+///
+/// and on the LONG-GOP gate (`bd_rate_film_long_gop`, 48 pictures, film B
+/// only), where the anchors' non-skip area is the known gap:
+///
+/// | arm | film B long GOP | wall ours |
+/// |---|---|---|
+/// | off (control) | +89.8 / +9.1 | 477.5s |
+/// | min side 8 | +89.6 / +9.0 | 514.1s |
+///
+/// The two gates disagree in SIGN on film B -- 0.3/0.3 worse over 12
+/// pictures, 0.2/0.1 better over 48 -- and film A moves 0.2/0.1 the good way
+/// only at min side 16, which is exactly where film B loses 0.7 on both
+/// columns. Nothing here meets the keep rule (both films down on both
+/// columns, or one down >=0.5 with the other flat), and the long-GOP gain
+/// costs +7.7% wall. OBMC stays OFF at every preset.
 fn obmc_min_side() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
