@@ -97,3 +97,14 @@ survives.
 
 Controls reproduce to the digit: film A +21.7 / −4.4, film B +26.9 / −0.6.
 
+| arm | film A (vs libaom / rav1e) | film B | wall ours, film A / film B |
+|---|---|---|---|
+| control (`EC_AV1_LAST2=0`) | +21.7 / −4.4 | +26.9 / −0.6 | 208.2 s / 165.0 s |
+| LAST2 at the 32x32 search, with its own NEWMV | +21.4 / −4.5 | **+27.3 / −0.1** | 242.0 s / 202.5 s |
+
+Film A moves 0.3 down on the libaom column and 0.1 UP on rav1e's; film B moves
+0.4 and 0.5 the WRONG way on both. The keep rule ("both film rows improve on
+both columns, or one ≥0.5 down and the other flat ±0.3") is not met — and the
+arm costs +16% / +23% encoder wall, on the stage the user's speed order is
+about. So the searched arm is refuted.
+
