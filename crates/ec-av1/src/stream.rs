@@ -3450,6 +3450,69 @@ pub(crate) mod tests {
         );
     }
 
+    /// lane-corner: sizes whose LAST superblock is cut by the true frame
+    /// edge on BOTH axes with more than half of each still inside -- so
+    /// `has_cols` and `has_rows` are both true and the spec lets that
+    /// superblock stay a whole 64x64 `PARTITION_NONE` block, which this
+    /// encoder's roots take (`EC_AV1_B64EDGE` on the inter side, the key
+    /// frame's own `Superblock::Whole`). The sibling luma-only test
+    /// (`encoder.rs`'s `a_non_superblock_aligned_clip_...`) is blind to
+    /// chroma (class `metric-blind-to-a-plane`), so this one compares all
+    /// three planes three ways: our decoder, the encoder's own
+    /// reconstruction, and ffmpeg.
+    #[test]
+    fn a_doubly_cut_superblock_root_round_trips_in_every_plane() {
+        let fctx = &crate::decode::FrameCtx::new();
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_doubly_cut_superblock_root_round_trips_in_every_plane: no ffmpeg");
+            return;
+        }
+        const FRAMES: usize = 4;
+        // Each size leaves MORE than half of its last superblock row (and,
+        // but for 200x120's 8-px column, of its last column) inside, which is
+        // what makes the root legal there at all; 248x168/232x168/248x184 are
+        // cut on BOTH axes at once. 1920x1080 -- the user's own export shape
+        // -- is the same case: 1080 = 16*64 + 56, a 56-px bottom straddle.
+        for &(width, height) in &[(248usize, 168usize), (232, 168), (200, 120), (248, 184)] {
+            let pictures: Vec<_> = (0..FRAMES as i64)
+                .map(|i| panned_test_card(width, height, i * 3))
+                .collect();
+            let _ = crate::encode::take_b64_edge_hits();
+            let _ = crate::encode::take_i64_root_hits();
+            let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx)
+                .unwrap_or_else(|e| panic!("{width}x{height}: encoder refused: {e}"));
+            let edges = crate::encode::take_b64_edge_hits();
+            let [i64_whole, i64_offered, i64_edge] = crate::encode::take_i64_root_hits();
+            eprintln!(
+                "{width}x{height}: edge inter 64 roots {edges}, key 64 roots {i64_whole} of \
+                 {i64_offered} offered, {i64_edge} of them cut by the frame edge"
+            );
+            // gate-blind-to-feature: without this the three-way compare below
+            // passes on a stream that never coded a whole root at the cut
+            // superblock at all.
+            assert!(
+                i64_edge > 0,
+                "{width}x{height}: no 64x64 root sat on a superblock the frame edge cuts"
+            );
+            let decoded = decode_stream(&encoded.stream)
+                .unwrap_or_else(|e| panic!("{width}x{height}: our decoder refused: {e}"));
+            let ffmpeg_frames = ffmpeg_decode_sequence(&encoded.stream, width, height, FRAMES);
+            assert_eq!(ffmpeg_frames.len(), FRAMES, "{width}x{height}: ffmpeg frame count");
+            assert_eq!(decoded.len(), FRAMES, "{width}x{height}: frame count");
+            for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{width}x{height} frame {i} luma: ours vs ffmpeg");
+                assert_eq!(got.u, want.u, "{width}x{height} frame {i} U: ours vs ffmpeg");
+                assert_eq!(got.v, want.v, "{width}x{height} frame {i} V: ours vs ffmpeg");
+            }
+            for (i, (frame, want)) in encoded.frames.iter().zip(&ffmpeg_frames).enumerate() {
+                let rec = &frame.reconstruction;
+                assert_eq!(rec.y, want.y, "{width}x{height} frame {i} luma: recon vs ffmpeg");
+                assert_eq!(rec.u, want.u, "{width}x{height} frame {i} U: recon vs ffmpeg");
+                assert_eq!(rec.v, want.v, "{width}x{height} frame {i} V: recon vs ffmpeg");
+            }
+        }
+    }
+
     /// A hand-built 3-frame stream that actually fires `GOLDEN_FRAME`
     /// through [`decode_stream`], proving the round-4 flip (`decode.rs`'s
     /// `decode_inter_block` `GOLDEN_FRAME` arm) the way 120+ real aomenc
