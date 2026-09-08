@@ -857,6 +857,12 @@ thread_local! {
     /// ids any block ended up with -- the gate's proof the feature fired.
     static SEG_ID_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEG_IDS_SEEN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// lane-golomb2: the (lowest, highest) quantizer index any block has been
+    /// dequantized with, i.e. `block_q_idx`'s own span. A gate that means to
+    /// exercise `SEG_LVL_ALT_Q` needs a stream where this span is WIDER than
+    /// zero (class `gate-blind-to-feature`): segmentation being enabled says
+    /// nothing about the segments carrying distinct quantizers.
+    static BLOCK_Q_SPAN: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((i32::MAX, i32::MIN)) };
     /// How many `seg_id_predicted` symbols were read (temporal update).
     static SEG_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -906,6 +912,13 @@ pub(crate) fn segment_ids_seen() -> usize {
     SEG_IDS_SEEN.with(|c| c.get().count_ones() as usize)
 }
 
+/// The lowest and highest quantizer index any decoded block was dequantized
+/// with (`(i32::MAX, i32::MIN)` when nothing decoded).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn block_q_span() -> (i32, i32) {
+    BLOCK_Q_SPAN.with(|c| c.get())
+}
+
 /// How many `seg_id_predicted` symbols have been read (temporal update).
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn segment_pred_hits() -> usize {
@@ -918,6 +931,7 @@ pub(crate) fn reset_segment_hits() {
     SEG_ID_HITS.with(|c| c.set(0));
     SEG_IDS_SEEN.with(|c| c.set(0));
     SEG_PRED_HITS.with(|c| c.set(0));
+    BLOCK_Q_SPAN.with(|c| c.set((i32::MAX, i32::MIN)));
 }
 
 /// `seg_feature_active_idx(segment_id, feature)` for the frame currently
@@ -947,6 +961,10 @@ fn block_q_idx(fctx: &crate::decode::FrameCtx) -> i32 {
     if crate::envflags::env_flag!("EC_DQCOEFF") {
         eprintln!("OUR_Q base={base} seg={seg_id} q={q}");
     }
+    hit_do!(BLOCK_Q_SPAN.with(|c| {
+        let (lo, hi) = c.get();
+        c.set((lo.min(q), hi.max(q)));
+    }););
     q
 }
 
@@ -6026,18 +6044,22 @@ pub(crate) fn tx_type_symbol(cdf_len: usize, tx_type: TxType) -> Option<usize> {
 /// (spec 5.11.40): its bit length in unary, then that many of its own bits,
 /// most significant first — the exact inverse of [`crate::tile::write_golomb`].
 pub(crate) fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
-    // lane-scaledref r1: this cap MASKS A REAL DEFECT and must not be lifted
-    // on its own. Reading up to 32 leading zeros (dav1d's `len < 32`; libaom
-    // itself calls a 21st bit a corrupt frame, decodetxb.c:30) is bit-identical
-    // for every tail any encoder writes -- our own writer tops out at 19 zeros
-    // (`tile::MAX_LEVEL == MAX_BR_LEVEL + (1 << 19)`) -- and was implemented
-    // and round-trip tested here (commit ee1f980, reverted in 314ee08). It
+    // THIS CAP IS libaom's OWN, TO THE BIT -- do not "widen" it (lane-golomb2
+    // re-read the source: `av1/decoder/decodetxb.c:22-43` counts the same
+    // prefix and calls the 21st zero bit `AOM_CODEC_CORRUPT_FRAME`, "Invalid
+    // length in read_golomb"; spec 5.11.40 BREAKS at `length == 20` and 5.11.39
+    // masks the level with `0xFFFFF`, so no conformant stream carries a longer
+    // tail). `refusal_inventory::read_golomb_reads_every_value_a_conformant_
+    // stream_can_carry` enumerates that whole value domain.
+    //
+    // So this refusal never names a reader gap: it is always the SYMPTOM of an
+    // earlier desync (class `refusal-hides-a-defect`), and every historical
+    // instance was closed by fixing that desync -- lane-dgolomb's
+    // `force_integer_mv`, lane-dkey's palette, lane-t900 r12's `uv_mode_grid`.
+    // Raising the cap only trades a clean refusal for silent corruption:
+    // lane-scaledref r1 tried it (commit ee1f980, reverted in 314ee08) and
     // turned `a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`
-    // RED: seed 67 stops here today, and with the cap raised it decodes to a
-    // frame-0 LUMA MISMATCH instead. A key frame cannot legitimately carry a
-    // level above 1<<19, so the long tail is the SYMPTOM of an earlier desync
-    // in that intra rect64 stream -- class `refusal-hides-a-defect`. Lift this
-    // together with that defect's fix, not before.
+    // from a refusal into a frame-0 LUMA MISMATCH.
     let mut length = 1u32;
     while dec.literal(1) == 0 {
         length += 1;
