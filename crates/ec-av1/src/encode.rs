@@ -291,7 +291,7 @@ pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType]
     ];
     match set {
         TxbSet::Luma16 | TxbSet::Luma8 | TxbSet::Luma4
-            if (screen || intra_tx_all_frames()) && tx_type_search() =>
+            if intra_tx_search_on(screen) =>
         {
             &INTRA2
         }
@@ -301,7 +301,7 @@ pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType]
         // extra members are the 1-D DCTs, and the order is the reader's own
         // map (`decode::tx_type_from_symbol`, 8-wide CDF).
         TxbSet::Luma8Set1 | TxbSet::Luma4Set1
-            if (screen || intra_tx_all_frames()) && tx_type_search() =>
+            if intra_tx_search_on(screen) =>
         {
             &INTRA1
         }
@@ -369,6 +369,11 @@ pub(crate) fn inter_tx_type_candidates(set: TxbSet, screen: bool) -> &'static [T
 /// else every frame; unset takes [`crate::speed::WIDE_TX_SET`], screen-gated
 /// like both halves of the type search itself.
 pub(crate) fn wide_tx_set(screen: bool) -> bool {
+    match WIDE_TX_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
     static ENV: std::sync::LazyLock<Option<InterTxSearch>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_TXSET_WIDE").ok().map(|v| match v.as_str() {
             "0" | "off" => InterTxSearch::Off,
@@ -385,6 +390,23 @@ pub(crate) fn wide_tx_set(screen: bool) -> bool {
         InterTxSearch::Screen => screen,
         _ => true,
     }
+}
+
+/// A PROCESS-GLOBAL [`wide_tx_set`] override that wins over both the
+/// environment and the preset (`u8::MAX` = unset), the shape
+/// [`set_inter_tx_search`] has: the lever is OFF at every preset, so the
+/// witness that has to see the wider alphabets turns it on through this while
+/// holding [`crate::speed::knob_write`].
+static WIDE_TX_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Sets [`WIDE_TX_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` gates
+pub(crate) fn set_wide_tx_set(on: Option<bool>) {
+    WIDE_TX_OVERRIDE.store(
+        on.map_or(u8::MAX, u8::from),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// The luma [`TxbSet`] the SEARCH and its pricer name for a frame that codes
@@ -450,14 +472,25 @@ fn inter_tx_type_search() -> InterTxSearch {
 
 /// The inter luma [`TxbSet`] a `tx`-sided transform unit reads, `None` for the
 /// 64-point one (it codes no `tx_type` symbol).
-fn inter_luma_set(tx: usize, screen: bool) -> Option<TxbSet> {
-    Some(luma_set_for(match tx {
+/// lane-txi: the INTER half of the widening is deliberately NOT applied
+/// here. A `reduced_tx_set = 0` frame's writer still codes its inter luma
+/// `tx_type` into the twelve/sixteen-symbol alphabet (the frame bit widens
+/// every luma set at once, spec `get_tx_set`), but the SEARCH keeps offering
+/// the two-type list: with the wider inter candidates priced, some block's
+/// winner selects a reference slot this encoder holds no picture in
+/// ("a reference frame selected with no picture at this frame's own
+/// ref_frame_idx slot for it", refused out of the encoder's own MC), which is
+/// the `refs` lane's DPB bookkeeping (`encoder.rs` maps LAST2/LAST3 onto
+/// LAST's slot), not a transform defect -- measured by bisection: the intra
+/// half alone passes every witness, the inter half alone refuses.
+fn inter_luma_set(tx: usize) -> Option<TxbSet> {
+    Some(match tx {
         4 => TxbSet::Luma4Inter,
         8 => TxbSet::Luma8Inter,
         16 => TxbSet::Luma16Inter,
         32 => TxbSet::Luma32Inter,
         _ => return None,
-    }, screen))
+    })
 }
 
 fn tx_type_search() -> bool {
@@ -467,6 +500,34 @@ fn tx_type_search() -> bool {
             .map(|v| !matches!(v.as_str(), "0" | "off"))
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX_TYPE_SEARCH))
+}
+
+/// Whether an intra luma unit of this frame searches its own type at all:
+/// the preset lever ([`tx_type_search`]) under the screen content gate, which
+/// `EC_AV1_TXSET=all` ([`intra_tx_all_frames`]) lifts and the process-global
+/// [`set_intra_tx_search`] override wins over (the witness needs the search
+/// on a frame the detector called non-screen).
+fn intra_tx_search_on(screen: bool) -> bool {
+    match INTRA_TX_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    (screen || intra_tx_all_frames()) && tx_type_search()
+}
+
+/// A PROCESS-GLOBAL [`intra_tx_search_on`] override (`u8::MAX` = unset), the
+/// shape [`set_inter_tx_search`] has.
+static INTRA_TX_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Sets [`INTRA_TX_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` gates
+pub(crate) fn set_intra_tx_search(on: Option<bool>) {
+    INTRA_TX_OVERRIDE.store(
+        on.map_or(u8::MAX, u8::from),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// lane-txi: `EC_AV1_TXSET=all` offers the five-type intra set on EVERY
@@ -2692,7 +2753,18 @@ impl Plane<'_> {
                                 tu, mode, angle_delta, search.base_q_idx, search.deadzone,
                                 tx_type, fctx,
                             );
-                            let cost = candidate.sse + search.lambda * candidate.bits;
+                            // lane-txi: a non-`DCT_DCT` type is charged its
+                            // bits at `EC_AV1_TXRD_LAMBDA` times the mode
+                            // search's weight (default 1 = unchanged). The
+                            // film rows buy 0.04 dB for 1.2% more bytes at
+                            // weight 1 on every frame and every PLANE, key
+                            // frame included -- a rate term this decision
+                            // under-charges (class
+                            // `rd-rate-term-calibration`), not the
+                            // propagation loss the leaves would have shown.
+                            let cost = candidate.sse
+                                + search.lambda * candidate.bits
+                                + non_dct_surcharge(search.lambda, tx_type, candidate.bits);
                             if best.as_ref().is_none_or(|(best, _, _)| cost < *best) {
                                 best = Some((cost, tx_type, candidate));
                             }
@@ -3083,7 +3155,10 @@ impl Plane<'_> {
             );
             let cost_t =
                 candidate.sse + search.lambda * (candidate.bits + mode_bits[usize::from(mode)]);
-            if cost_t < cost {
+            // lane-txi's surcharge, as in `code_tx_depth`: the incumbent is
+            // `DCT_DCT` and pays none of it, so the returned `cost` stays the
+            // block's true one for the caller's own decision.
+            if cost_t + non_dct_surcharge(search.lambda, candidate_type, candidate.bits) < cost {
                 cost = cost_t;
                 tx_type = candidate_type;
                 trial = candidate;
@@ -3946,6 +4021,20 @@ pub(crate) fn tx_type_lambda_mult() -> f64 {
     *M
 }
 
+/// lane-txi: what a non-`DCT_DCT` transform type is charged ON TOP of its own
+/// priced bits -- `(EC_AV1_TXRD_LAMBDA - 1) * lambda * bits`, zero at the
+/// default weight of 1 and for `DCT_DCT` itself. The instrument the film
+/// question needs: at weight 1 the five-type intra search spends 1.2% more
+/// bytes for 0.04 dB on both film rows, so what it under-charges is the rate
+/// of the type it picks.
+pub(crate) fn non_dct_surcharge(lambda: f64, tx_type: TxType, bits: f64) -> f64 {
+    if tx_type == TxType::DctDct {
+        0.0
+    } else {
+        lambda * (tx_type_lambda_mult() - 1.0) * bits
+    }
+}
+
 /// lane-txrd instrument: over the FLAT inter luma decision, the summed
 /// reconstruction error and priced bits of the type the search chose against
 /// the `DCT_DCT` trial it was compared with. Both are `* 64` so they fit an
@@ -4176,7 +4265,7 @@ fn commit_inter_luma(
     let mut flat_typed: Option<Trial> = None;
     let mut flat_type = TxType::DctDct;
     if !skip {
-        if let Some(fset) = inter_luma_set(side, search.screen) {
+        if let Some(fset) = inter_luma_set(side) {
             let lambda = search.lambda * tx_type_lambda_mult();
             let cost = |t: &Trial| t.sse + lambda * t.bits;
             for &tx_type in inter_tx_type_candidates(fset, search.screen) {
@@ -4222,7 +4311,7 @@ fn commit_inter_luma(
         // differently-predicted baseline is what would let a candidate win on
         // both terms at once (class `local-rd-on-references` vs a real
         // pricing defect); re-predicting it here is the only way to tell.
-        if let Some(fset) = inter_luma_set(side, search.screen) {
+        if let Some(fset) = inter_luma_set(side) {
             let here = match second {
                 Some((mv1, ref1)) => mc_trial_compound_typed(
                     luma, x, y, side, (mv, mv1), true, reference, ref1, search.base_q_idx,
@@ -4267,14 +4356,14 @@ fn commit_inter_luma(
         return (flat_ref.levels.clone(), 0, flat_gain, vec![flat_type]);
     }
     let tx = side / 2;
-    let set = luma_set_for(if tx >= 32 {
+    let set = if tx >= 32 {
         // lane-b64b: the 64x64 root's halved transform is TX_32X32.
         TxbSet::Luma32Inter
     } else if tx >= 16 {
         TxbSet::Luma16Inter
     } else {
         TxbSet::Luma8Inter
-    }, search.screen);
+    };
     let mut levels = vec![0i32; side * side];
     let (mut sse, mut bits) = (0.0, 0.0);
     let mut units = Vec::with_capacity(4);

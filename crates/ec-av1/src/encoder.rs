@@ -3811,6 +3811,117 @@ mod tests {
         eprintln!("inter tx_type witness: hits {hits:?}, {} bytes", stream.len());
     }
 
+    /// lane-txi's witness: a `reduced_tx_set = 0` frame codes the WIDER
+    /// `tx_type` alphabets -- the seven-type `TX_SET_INTRA_1` at intra
+    /// 8x8/4x4 and the twelve/sixteen-type inter sets at 16x16 and below --
+    /// and both decoders reconstruct every frame sample-exact from them. The
+    /// statement is that the types only those alphabets can NAME (`V_DCT`,
+    /// `H_DCT`, and any inter type outside the two-type `DCT_IDTX`) are
+    /// reachable at all, and that the header bit, the writer's set map and
+    /// the search's pricer agree on which alphabet a symbol was coded into
+    /// (class `wrong-alphabet-same-value`: a disagreement here changes no
+    /// symbol VALUE and desyncs the arithmetic coder anyway).
+    #[test]
+    fn a_wide_tx_set_clip_codes_the_new_alphabets_both_decoders_read_exactly() {
+        // Every lever below is process-global: the same exclusive lock the
+        // presets take.
+        let _knobs = crate::speed::knob_write();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        crate::encode::set_intra_tx_search(Some(true));
+        crate::encode::set_inter_tx_search(Some(true));
+        crate::encode::set_wide_tx_set(Some(true));
+        let (width, height) = (320usize, 192usize);
+        // The same moving hard-edge card the two narrow-set witnesses use:
+        // vertical steps are what a 1-D `V_DCT`/`H_DCT` pass wins on, the
+        // ramps are `ADST`'s and the moving plateaus `IDTX`'s.
+        let sources: Vec<Picture> = (0..4)
+            .map(|t| {
+                let mut p = test_card(width, height, t * 3);
+                for y in 0..height {
+                    for x in 0..width {
+                        let v = match ((x + t * 5) / 16 % 2, (y + t * 3) / 16 % 2) {
+                            (0, 0) => 16u16,
+                            (1, 0) => 235,
+                            (0, 1) => ((x + t) % 64 * 3) as u16,
+                            _ => ((y + t) % 64 * 3) as u16,
+                        };
+                        p.y[y * width + x] = v;
+                    }
+                }
+                p
+            })
+            .collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 90,
+            gop: 4,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let _ = crate::encode::take_tx_type_hits();
+        let _ = crate::encode::take_inter_tx_type_hits();
+        let mut stream = Vec::new();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let (intra, inter) = (
+            crate::encode::take_tx_type_hits(),
+            crate::encode::take_inter_tx_type_hits(),
+        );
+        crate::encode::set_wide_tx_set(None);
+        crate::encode::set_inter_tx_search(None);
+        crate::encode::set_intra_tx_search(None);
+        eprintln!("wide tx_type witness: intra {intra:?} inter {inter:?}, {} bytes", stream.len());
+        // The fire count is preset 0's, for the reason the five-type witness
+        // spells out: a faster preset prunes the modes and partitions a type
+        // wins on before it is ever priced (class `gate-blind-to-feature`).
+        if crate::speed::at(&crate::speed::TX_TYPE_SEARCH) && crate::speed::speed() == 0 {
+            use crate::transform::TxType;
+            let wide_only = |hits: &[usize; 16]| -> usize {
+                hits[TxType::VDct as usize] + hits[TxType::HDct as usize]
+            };
+            assert!(
+                wide_only(&intra) > 0,
+                "no intra luma unit took a 1-D DCT, the type only TX_SET_INTRA_1 names: {intra:?}"
+            );
+            let inter_wide: usize = inter.iter().sum::<usize>()
+                - inter[TxType::DctDct as usize]
+                - inter[TxType::Idtx as usize];
+            assert!(
+                inter_wide > 0,
+                "no inter luma unit took a type outside the two-type set: {inter:?}"
+            );
+        } else {
+            eprintln!(
+                "SKIP the wide-alphabet fire count at preset {}",
+                crate::speed::speed()
+            );
+        }
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if have_ffmpeg() {
+            let theirs = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                    panic!(
+                        "frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                        at % width,
+                        at / width,
+                        got[at],
+                        b[at],
+                    );
+                }
+            }
+        } else {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+        }
+    }
+
     /// Every SHIPPED SPEED PRESET codes a stream both decoders reconstruct
     /// sample-exact -- ours and ffmpeg's -- and codes a DIFFERENT stream from
     /// its neighbour (a preset that changes no byte is a preset that buys no
