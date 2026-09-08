@@ -890,9 +890,10 @@ mod tests {
     ///
     /// The residue is a bit pattern, not a value: the spec's break makes the
     /// 20th prefix bit a don't-care, so a stream whose 20th prefix bit is 0
-    /// decodes to the same value there and is refused here. Every encoder
-    /// writes the terminating 1 (our own writer tops out at 19 zeros), and
-    /// lifting the cap is blocked on the defect it currently masks -- see the
+    /// decodes to the same value there and is refused here. libaom refuses the
+    /// same bit (`av1/decoder/decodetxb.c:30`, `AOM_CODEC_CORRUPT_FRAME` at
+    /// `length > 20`), so this refusal is NOT a reader gap to widen: when it
+    /// fires on a real stream it is an earlier desync's symptom -- see the
     /// comment on `read_golomb`.
     #[test]
     fn read_golomb_reads_every_value_a_conformant_stream_can_carry() {
