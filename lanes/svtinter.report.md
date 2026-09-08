@@ -54,10 +54,28 @@ reads" — a desync symptom, never a reader bound, as the standing class says).
   the wavefront over that corner at the full-block stride, then replicate the
   last on-screen column and row (libaom's own two extension loops).
 
-Same-shape sweep — all five reader call sites take the clamp: key-frame square
+### Same-shape sweep (class: a per-cell map read over a block that straddles
+the frame edge)
+
+Reader call sites of the fixed function — all five take the clamp: key-frame square
 (`read_intra_mode`), rect strip (`read_intra_mode_rect`), intra-in-inter rect
 (`decode_intra_rect_in_inter`), inter block intra (`decode_inter_block`), 8x8
 inter leaf (`decode_inter_block8`), luma and chroma each.
+
+Every OTHER syntax family whose symbol COUNT is clipped by the mi grid was
+checked and already carries its clip — this was the last unclipped one:
+
+| family | site | state |
+|---|---|---|
+| residual transform units, luma | decode.rs:9546 `if tu_px >= y.true_width \|\| tu_py >= y.true_height` | clipped (lane-hgkf) |
+| residual transform units, chroma | decode.rs:24773, 24881 (`max_blocks_wide/high`) | clipped |
+| var-tx recursion | decode.rs:17745 `if blk_row >= max_h_mi \|\| blk_col >= max_w_mi` | clipped |
+| segment ids | decode.rs:989, 1012 (`x_mis`/`y_mis`) | clipped |
+| partition | `hasRows`/`hasCols` inferred split | clipped |
+| palette colour-index map | decode.rs `decode_color_index_map_wh` | **fixed here** |
+
+CfL and intrabc read no per-cell map (CfL is one alpha pair per block, intrabc
+one vector), so neither can spend symbols past the edge.
 
 ## Pass table
 
