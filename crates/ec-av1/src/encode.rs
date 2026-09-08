@@ -8564,6 +8564,9 @@ pub(crate) fn encode_key_frame_inner(
         &mut tiles,
         search.lambda,
         fctx,
+        // A key frame codes no 128x128 root block (the writer has no intra
+        // path at that size), so every unit carries its own literal.
+        &[],
         // Every re-code starts from this frame's OWN starting tables, never
         // from where the first write left them: the second tile is the same
         // symbol sequence plus new ones, so it must adapt from the same
@@ -8656,6 +8659,10 @@ fn pick_and_apply_filters(
     tiles: &mut Vec<Vec<u8>>,
     lambda: f64,
     fctx: &crate::decode::FrameCtx,
+    // lane-edge128: `crate::tile::cdef_unit_owner` for the blocks these tiles
+    // carry -- empty (the identity map) for a frame whose every block covers
+    // one 64x64 CDEF unit.
+    cdef_owner: &[u32],
     recode: impl Fn(
         u8,
         usize,
@@ -8708,6 +8715,7 @@ fn pick_and_apply_filters(
         damping,
         (sb_cols, sb_rows),
         lambda,
+        cdef_owner,
     );
     drop(ft);
     let (lf, cdef, idx_grid, picture) = search_result?;
@@ -13228,6 +13236,7 @@ pub(crate) fn encode_inter_frame(
         &mut tiles,
         search.lambda,
         fctx,
+        &crate::tile::cdef_unit_owner(&blocks, mi_cols, mi_rows),
         // As in `encode_key_frame_inner`, but this frame's end-of-tile tables
         // are what the NEXT frame writes from, so the winning re-code
         // publishes its own into `end_cdfs` -- the first write's are stale
@@ -16376,6 +16385,90 @@ mod tests {
         }
     }
 
+    /// lane-edge128: a 128x128 root block WITH a residual on a clip whose
+    /// CDEF search codes a per-64x64 `cdef_idx` list. `read_cdef` (spec
+    /// 5.11.56) codes ONE literal for the block that first reaches a unit and
+    /// copies it over every unit the block SPANS, so the four units of a 128
+    /// root share one index -- while the encoder's CDEF search prices a
+    /// preset per unit and its filter replay applied all four. Only the first
+    /// reached the stream, so every decoder filtered the other three with the
+    /// origin's strengths and the encoder's reconstruction (the picture the
+    /// next frame predicts from) was a filter apart from what a decoder
+    /// produces. RED before this lane on the native BD gate's bars 2160p row
+    /// (`EC_AV1_B128RES=1`, q=90, frame 11: 8 luma and 702 chroma samples,
+    /// the rows above the 128 superblock's own edge); the stream itself was
+    /// always right -- ffmpeg and our own decoder agreed with each other and
+    /// disagreed with the encoder.
+    ///
+    /// `take_cdef_covered_units` is the gate on the fixture (class
+    /// `gate-blind-to-feature`): a clip whose CDEF picks one strength pair
+    /// for the whole frame codes no literal at all and witnesses nothing.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_128_root_residual_block_under_a_per_unit_cdef --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_128_root_residual_block_under_a_per_unit_cdef_list_decodes_exact() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-edge128-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("testsrc2-1280x768.y4m");
+        // Detailed synthetic content: its CDEF search spends more than one
+        // strength pair, which is what puts a `cdef_idx` literal in the tile.
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=1280x768:rate=24"])
+            .args(["-frames:v", "12", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        force_b128_root(true);
+        force_b128_residual(true);
+        let _ = crate::tile::take_sb128_residual_hits();
+        let _ = crate::filter_search::take_cdef_covered_units();
+        let encoded = encode_sequence(&pictures, 90, 0.5).unwrap();
+        let coded = crate::tile::take_sb128_residual_hits();
+        let covered = crate::filter_search::take_cdef_covered_units();
+        eprintln!(
+            "128x128 blocks WITH a residual: writer coded {coded}; 64x64 CDEF units taking \
+             another unit's literal: {covered}"
+        );
+        assert!(coded > 0, "no 128x128 block carried a residual on this clip");
+        assert!(
+            covered > 0,
+            "no 64x64 unit took a non-zero preset from another unit's literal, so this clip \
+             cannot witness the rule",
+        );
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            for (plane, got, want) in [
+                ("luma", &dec.y, &frame.reconstruction.y),
+                ("U", &dec.u, &frame.reconstruction.u),
+                ("V", &dec.v, &frame.reconstruction.v),
+            ] {
+                let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(differ, 0, "frame {i}: {plane} -- {differ} samples differ");
+            }
+        }
+        let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: ffmpeg V");
+        }
+    }
+
     /// lane-b128r: the COMPOUND arm at the 128 root -- one 128x128 block
     /// naming `LAST` plus `GOLDEN`/`ALTREF`, through the same
     /// `write_compound_block` chain every smaller compound block takes, at a
@@ -17607,6 +17700,15 @@ mod tests {
             for (i, (d, e)) in decoded.iter().zip(&encoded.frames).enumerate() {
                 if let Some((plane, s, got, want)) = first_plane_mismatch(d, &e.reconstruction) {
                     // TEMPORARY (lane-b128r bisect): the whole mismatch map.
+                    if let Ok(dir) = std::env::var("EC_B128R_DUMP") {
+                        std::fs::write(format!("{dir}/gate-q{q}.obu"), &encoded.stream).unwrap();
+                        let r = &e.reconstruction;
+                        let mut buf = Vec::new();
+                        for pl in [&r.y, &r.u, &r.v] {
+                            buf.extend(pl.iter().flat_map(|s| s.to_le_bytes()));
+                        }
+                        std::fs::write(format!("{dir}/recon-q{q}.f{i}.yuv"), &buf).unwrap();
+                    }
                     let (l, r) = match plane {
                         "Y" => (&d.y, &e.reconstruction.y),
                         "U" => (&d.u, &e.reconstruction.u),
