@@ -38468,7 +38468,7 @@ mod tests {
 
     #[test]
     fn real_yuv_round_trips_bit_exact_against_the_encoder_reconstruction() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: this test ENCODES, so its decode context starts at the superblock size this process encodes at (stale-header class, as `filter_intra_on` below)
         for (w, h) in [(128usize, 128usize), (192, 128)] {
             round_trips(w, h, &[DC_PRED as u8], fctx);
         }
@@ -38480,7 +38480,7 @@ mod tests {
     /// decoder round adds, not just `DC_PRED`.
     #[test]
     fn every_intra_mode_round_trips_bit_exact_against_the_encoder_reconstruction() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: this test ENCODES, so its decode context starts at the superblock size this process encodes at (stale-header class, as `filter_intra_on` below)
         for (w, h) in [(128usize, 128usize), (192, 128)] {
             round_trips(w, h, &crate::intra::KEY_FRAME_MODES, fctx);
         }
@@ -38491,7 +38491,7 @@ mod tests {
     /// this decoder round adds.
     #[test]
     fn odd_sizes_round_trip_bit_exact_against_the_encoder_reconstruction() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: encodes, so the decode context takes this process's superblock size
         for (w, h) in [(854usize, 480usize), (216, 96)] {
             round_trips(w, h, &crate::intra::KEY_FRAME_MODES, fctx);
         }
@@ -38505,7 +38505,7 @@ mod tests {
     /// bit, `partition_w8` leaves).
     #[test]
     fn leaf8_straddle_sizes_round_trip_bit_exact_against_the_encoder_reconstruction() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: this test ENCODES, so its decode context starts at the superblock size this process encodes at (stale-header class, as `filter_intra_on` below)
         for (w, h) in [(40usize, 32usize), (640, 360)] {
             round_trips(w, h, &crate::intra::KEY_FRAME_MODES, fctx);
         }
@@ -38801,7 +38801,7 @@ mod tests {
     /// crate's own writer and reader could otherwise share.
     #[test]
     fn ffmpeg_and_this_decoder_agree_on_a_key_frame() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: this test ENCODES, so its decode context starts at the superblock size this process encodes at (stale-header class, as `filter_intra_on` below)
         if !have_ffmpeg() {
             eprintln!("SKIP ffmpeg_and_this_decoder_agree_on_a_key_frame: no ffmpeg");
             return;
@@ -38848,7 +38848,7 @@ mod tests {
     /// between the palette colours and the colour-index maps).
     #[test]
     fn a_filter_intra_key_frame_decodes_pixel_exact_through_ffmpeg() {
-        let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: this test ENCODES, so its decode context starts at the superblock size this process encodes at (stale-header class, as `filter_intra_on` below)
         if !crate::encode::filter_intra_on() {
             eprintln!("SKIP a_filter_intra_key_frame...: EC_AV1_FILTER_INTRA=0");
             return;
@@ -38918,7 +38918,7 @@ mod tests {
     /// wire).
     #[test]
     fn a_key_frames_tile_needs_the_headers_own_tx_select_bit() {
-        let fctx = &crate::decode::FrameCtx::new();
+        let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: encodes, so the decode context takes this process's superblock size
         use crate::encode::encode_key_frame_with_ctx;
         let (width, height) = (64usize, 64usize);
         let picture = round_trip_test_card(width, height);
@@ -39118,7 +39118,7 @@ mod tests {
 
     #[test]
     fn a_gop_round_trips_bit_exact_against_the_encoder_reconstruction() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: this test ENCODES, so its decode context starts at the superblock size this process encodes at (stale-header class, as `filter_intra_on` below)
         gop_round_trips(128, 64, fctx);
     }
 
@@ -39127,7 +39127,7 @@ mod tests {
     /// split path is exercised too.
     #[test]
     fn an_odd_size_gop_round_trips_bit_exact_against_the_encoder_reconstruction() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: this test ENCODES, so its decode context starts at the superblock size this process encodes at (stale-header class, as `filter_intra_on` below)
         gop_round_trips(216, 96, fctx);
     }
 
@@ -39357,7 +39357,7 @@ mod tests {
 
     #[test]
     fn ffmpeg_and_this_decoder_agree_on_a_gop() {
-    let fctx = &crate::decode::FrameCtx::new();
+    let fctx = &crate::decode::FrameCtx::for_encoder(); // lane-b128: this test ENCODES, so its decode context starts at the superblock size this process encodes at (stale-header class, as `filter_intra_on` below)
         if !have_ffmpeg() {
             eprintln!("SKIP ffmpeg_and_this_decoder_agree_on_a_gop: no ffmpeg");
             return;
