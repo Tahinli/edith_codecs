@@ -5616,8 +5616,19 @@ fn code_square(
             .flat_map(|row| luma.source[row * luma.width + x..][..side].to_vec())
             .collect();
         let kept = luma.snapshot(x, y, side);
-        for pal in palette_candidates(&source) {
+        // spec 5.11.50: a block cut by the frame's right/bottom edge codes
+        // its map over the ON-SCREEN corner only and the decoder replicates
+        // that outward, so the searched map is folded the same way here --
+        // the prediction priced, the reconstruction committed and the symbols
+        // `write_color_index_map` writes are then one and the same map
+        // (lane-palw).
+        let on = (
+            side.min(luma.true_width.saturating_sub(x)),
+            side.min(luma.true_height.saturating_sub(y)),
+        );
+        for mut pal in palette_candidates(&source) {
             let n = usize::from(pal.size);
+            crate::decode::palette_replicate(&mut pal.map, side, side, on);
             let prediction: Vec<u8> = pal
                 .map
                 .iter()
@@ -5637,7 +5648,7 @@ fn code_square(
                 + search.lambda
                     * (trial.bits
                         + mode_bits[DC_PRED as usize]
-                        + crate::tile::palette_bits(&pal, side)
+                        + crate::tile::palette_bits(&pal, side, on)
                         + if tx_select { tx_depth_bits(side, 0) } else { 0.0 });
             if cost_p < cost {
                 cost = cost_p;
@@ -6056,8 +6067,19 @@ fn search_chroma(
                 .collect()
         };
         let (u_source, v_source) = (plane_source(&chroma[0]), plane_source(&chroma[1]));
-        for pal in palette_candidates(&u_source) {
+        // The luma on-screen extent carried into this plane exactly as the
+        // reader does it (`decode::palette_onscreen_uv`); see the luma arm.
+        let on_uv = crate::decode::palette_onscreen_uv(
+            (side, side),
+            (
+                side.min(luma.true_width.saturating_sub(x)),
+                side.min(luma.true_height.saturating_sub(y)),
+            ),
+            (at.side, at.side),
+        );
+        for mut pal in palette_candidates(&u_source) {
             let n = usize::from(pal.size);
+            crate::decode::palette_replicate(&mut pal.map, at.side, at.side, on_uv);
             // V's base colour per cluster: the mean of the samples the shared
             // map assigns to it (an empty cluster cannot happen -- every
             // colour `palette_candidates` returns is some pixel's nearest).
@@ -6101,7 +6123,7 @@ fn search_chroma(
                 + search.lambda
                     * (u_trial.bits
                         + v_trial.bits
-                        + crate::tile::palette_uv_bits(&candidate, side));
+                        + crate::tile::palette_uv_bits(&candidate, side, on_uv));
             if cost_p < cost {
                 cost = cost_p;
                 mode = DC_PRED;
@@ -7881,6 +7903,14 @@ pub(crate) fn encode_key_frame_inner(
     // Prediction reads no further than this, in each plane's own units --
     // see `Plane::true_width`/`true_height`.
     let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
+    // lane-palw: the encoder's own in-process reconstruct reads its palette
+    // colour-index maps back through `decode::palette_onscreen`, which takes
+    // the frame's mi dims off the `FrameCtx` -- a real decode gets them from
+    // `set_segmentation`, which never runs on `FrameCtx::for_encoder`. Publish
+    // them here so the reconstruct clamps a block cut by the frame edge
+    // exactly as the writer now does.
+    let frame_mi_dims = (header.mi_rows as usize, header.mi_cols as usize);
+    fctx.seg_mi_dims.set(frame_mi_dims);
     // lane-hbd r4: `Picture.y/u/v` widened to `Vec<u16>` for the decoder's
     // sake (DPB reference slots, 10-bit output); the encoder stays 8-bit by
     // design (see `intra_predict_u8`'s doc comment), so narrow the source
@@ -8351,6 +8381,7 @@ pub(crate) fn encode_key_frame_inner(
             crate::tile::arm_sb128(sb128_on());
             let mut cdfs = start_cdfs.0.clone();
             crate::tile::arm_screen(screen);
+            crate::tile::arm_frame_mi_dims(frame_mi_dims);
             crate::tile::arm_filter_intra(filter_intra_on());
             crate::tile::arm_intrabc(allow_intrabc);
             crate::tile::arm_pricing_cdfs(None, false);
@@ -11453,6 +11484,14 @@ pub(crate) fn encode_inter_frame(
     }
 
     let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
+    // lane-palw: the encoder's own in-process reconstruct reads its palette
+    // colour-index maps back through `decode::palette_onscreen`, which takes
+    // the frame's mi dims off the `FrameCtx` -- a real decode gets them from
+    // `set_segmentation`, which never runs on `FrameCtx::for_encoder`. Publish
+    // them here so the reconstruct clamps a block cut by the frame edge
+    // exactly as the writer now does.
+    let frame_mi_dims = (header.mi_rows as usize, header.mi_cols as usize);
+    fctx.seg_mi_dims.set(frame_mi_dims);
     // lane-hbd r4: encoder stays 8-bit by design; narrow the source once
     // here (see `encode_key_frame_inner`).
     let picture_y8: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
@@ -12385,6 +12424,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
             crate::tile::arm_high_precision_mv(hp_mv);
             crate::tile::arm_screen(screen);
+            crate::tile::arm_frame_mi_dims(frame_mi_dims);
             crate::tile::arm_filter_intra(filter_intra_on());
             let mut cdfs = start_cdfs.0.clone();
             crate::tile::arm_pricing_cdfs(Some(&cdfs), screen);
