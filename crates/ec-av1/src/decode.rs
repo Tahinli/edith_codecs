@@ -14236,12 +14236,15 @@ fn decode_block(
     // key frame; class override-slot-on-one-arm). Neither prediction is
     // edge-derived, so the whole-block buffer at the block's own stride is
     // exactly what that single call wants.
+    // Counted on the SHAPE, not on the arm below, so a gate can tell a stream
+    // that reaches this block apart from one that never does (class
+    // gate-blind-to-feature).
+    if palette_y_buf.is_some() && skip && logical_tx < side {
+        hit!(SKIP_SPLIT_TX_OVERRIDE_HITS);
+    }
     if let Some(buf) = &palette_y_buf
-        && (logical_tx == side)
+        && (logical_tx == side || skip)
     {
-        if skip && logical_tx < side {
-            hit!(SKIP_SPLIT_TX_OVERRIDE_HITS);
-        }
         set_palette_pred(buf.clone(), fctx);
     }
     // A UV-palette block's own chroma prediction override (lane-palette2 r1),

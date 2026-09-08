@@ -3344,6 +3344,60 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// lane-svt1: an SVT-AV1 (v3.1.2, `-preset 8 -crf 35`) screen key frame
+    /// codes 16x16 PALETTE blocks with `skip == 1` whose `tx_depth` split the
+    /// luma transform. [`crate::decode::decode_block`] armed the palette
+    /// prediction only when the transform covered the whole block, so that one
+    /// block predicted DC off its own edges instead: the right symbols (the
+    /// whole mode ladder diffs clean against an instrumented aomdec) and the
+    /// wrong pixels -- 812 luma samples in frame 0, carried by the V_PRED
+    /// blocks under it to 10122 samples over the 12-frame stream.
+    ///
+    /// No lavfi recipe witnesses it in a stream this decoder otherwise decodes:
+    /// 6 sources x 5 sizes x 6 crf values through `libsvtav1 -preset 8
+    /// -svtav1-params screen-content-mode=1` produced 8 streams that reach the
+    /// path, and every one of them either refuses on an unrelated Golomb tail
+    /// or misses by ~200k samples on unrelated inter-frame defects (both
+    /// recorded in `lanes/svt1.report.md`). So the gate rides the kept stream
+    /// named by `EC_AV1_SVT1_STREAM` and SKIPs when it is unset -- the screen
+    /// crop itself is never committed to `fixtures/`.
+    ///
+    /// `skip_split_tx_override_hits` is asserted non-zero so the row cannot
+    /// pass on a stream that never reaches the fixed arm (class
+    /// gate-blind-to-feature).
+    #[test]
+    fn an_svt_screen_palette_block_with_a_split_transform_decodes_exactly() {
+        const NAME: &str = "an_svt_screen_palette_block_with_a_split_transform_decodes_exactly";
+        let Ok(path) = std::env::var("EC_AV1_SVT1_STREAM") else {
+            eprintln!("SKIP {NAME}: EC_AV1_SVT1_STREAM names no stream");
+            return;
+        };
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let data = match std::fs::read(&path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("SKIP {NAME}: {path}: {e}");
+                return;
+            }
+        };
+        crate::decode::reset_skip_split_tx_override_hits();
+        let decoded = decode_stream(&data).expect("the kept SVT-AV1 screen stream decodes");
+        assert!(
+            crate::decode::skip_split_tx_override_hits() > 0,
+            "{NAME}: no skipped split-transform palette block in {path} -- the gate would pass blind"
+        );
+        let (width, height) = (decoded[0].width, decoded[0].height);
+        let want = ffmpeg_decode_sequence(&data, width, height, decoded.len());
+        for (i, (got, want)) in decoded.iter().zip(&want).enumerate() {
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg");
+        }
+    }
+
     /// `decode_stream` agrees with ffmpeg/dav1d on the same wire bytes -- an
     /// independent decoder, not just this crate checking its own tile path.
     #[test]
