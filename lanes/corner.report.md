@@ -86,3 +86,22 @@ every gate clip is aligned and takes the identical path),
 the four thread-determinism tests `--include-ignored`, and
 `EC_COMP_MISMATCH=1` at `EC_AV1_SPEED` 0 and 6 over the two straddling-size
 tests and the 232x168 encoder test: zero mismatch lines.
+
+### Suite and check
+
+`cargo test -p ec-av1 --release`: **570 passed, 0 failed, 46 ignored** (569 +
+this lane's new test), 1135s, RC=0.
+`cargo check --workspace --all-targets -j4`: 0 errors, 0 `ec-av1` warnings
+(the 22 that print are pre-existing `ec-opus` missing-doc and one `ec-vorbis`
+dead-code warning).
+
+## Class
+
+`refusal-lifted-without-a-gate`'s mirror: **a guard written from a desync that
+the guard's own repro cannot reach**. The `aligned` line named a 248x152
+corner as its evidence, but 248x152 makes that corner's `PARTITION_NONE`
+illegal in the first place, so no build of this encoder ever coded the block
+the guard forbade -- while the guard cost every key root on every unaligned
+frame. Sibling shape to `stale-premise lanes` and to
+`fixture-proves-symbol-not-signal`: the ceiling comment quoted a measurement
+whose fire count was never asserted.
