@@ -39,7 +39,15 @@ writer site that codes coefficients:
 
 * `tile::write_coeffs` -- the one coefficient writer (luma and chroma, all
   four square sides, both the tile writer and the pricer through
-  `coeff_bits_typed`): FIXED.
+  `coeff_bits_typed`): FIXED. Every other pricer funnels through it, so the
+  class reaches them with the fix: `coeff_bits_typed` (the search's price),
+  `coeff_bits` and `predicted_coeff_bits`/`predicted_coeff_bits_sb` (the
+  `#[cfg(test)]` pricers, `DCT_DCT` only by construction -- `TxClass::TwoD`)
+  and `luma_32_coeff_bits` (32x32, which codes no `tx_type` symbol at all).
+* `tile::rdoq` -- prices every candidate through `coeff_bits_typed`, so its
+  DECISIONS were already class-correct, but it spends its budget from the
+  TAIL of the scan backwards and read the 2D zigzag's tail on a 1-D unit:
+  now walks `class_scan_of` (commit "RDOQ walked the 2D zigzag's tail").
 * `tile::write_dc_coeffs` -- the fixed-CDF 32x32 luma DC path; 32x32 codes no
   `tx_type` symbol and is always `DCT_DCT`, so 2D is correct there.
 * `tile::write_block_planes` chroma -- codes chroma as `DCT_DCT` while an
