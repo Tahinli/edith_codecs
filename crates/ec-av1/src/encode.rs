@@ -15787,8 +15787,12 @@ mod tests {
         // gave 9808 / 35791) and the lane-i64 merge: the KEY frame -- one of
         // these four pictures -- offers every superblock a 64x64 intra root
         // now. `EC_AV1_I64=0` restores 8557 / 33345.
+        // Re-taken on lane-pricer: the inter RD search prices a single
+        // reference through the tree and the neighbour contexts the writer
+        // really codes it with, so every inter picture's reference decisions
+        // move -- 8562 -> 8535 at q=150 and 33357 -> 33221 at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8562, 0x66f5_4ffc_aacf_964f), (60, 33357, 0x1d61_9ca4_e960_b044)];
+            [(150, 8535, 0x7b7f_4eeb_1080_7b45), (60, 33221, 0x720b_821e_5dd2_90e4)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
