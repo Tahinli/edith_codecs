@@ -120,3 +120,20 @@ all four frames against ffmpeg.
   a palette block straddling the mi grid (screen-content mode at a frame size
   whose bottom/right block is cut) — not fixed here because a writer change
   moves the encoder pins, which this lane must leave byte-identical.
+
+## Gates on 58b83958
+
+| gate | result |
+|---|---|
+| `cargo check --workspace --all-targets -j4` | RC=0, 0 ec-av1 warnings (25 pre-existing `missing documentation` warnings, all in ec-opus) |
+| `encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins` | ok, 1 passed — pins unchanged |
+| the new witness | ok, 1 passed |
+| kept-film SVT gate (`EC_AV1_SVT1_STREAM`, `an_svt_screen_palette_block_with_a_split_transform_decodes_exactly`) | ok, 1 passed |
+| s1 `--skip stream::` | ok, 341 passed, 0 failed, 33 ignored (389 s) |
+| s2 `stream:: --skip 10bit` | ok, 202 passed, 0 failed, 15 ignored (607 s) |
+| s3 `10bit` | ok, 42 passed, 0 failed, 1 ignored (43 s) |
+| 180 kept `w3` streams vs ffmpeg | 180/180 exact |
+| fresh sweep (12 streams) vs ffmpeg | 12/12 exact |
+
+The first fix alone (f70ec3f9) reddened 16 of these rows; both suites are
+green only with 58b83958 on top.
