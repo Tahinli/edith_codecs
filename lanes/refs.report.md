@@ -2,38 +2,35 @@
 
 Worktree `edith_codecs-refs`, branch `lane-refs` off main 68e96c56. Every gate
 arm is the prebuilt release lib-test binary running `bd_rate_screen_native`
-(12 pictures, `gop 12`, four quantizers); each row is read off that log's own
-header line, one selector env var per arm (the 5-row gate does not fit a 900 s
-timeout).
+(12 pictures, `gop 12`, four quantizers, native `gate_crop` window); every row
+is read off that log's own header line, never off the argument order.
 
-## 0. The controls reproduce, to the digit
+## 0. The controls reproduce
 
-| clip | control vs libaom / vs rav1e | charter |
+| clip | control (vs libaom / vs rav1e) | charter |
 |---|---|---|
 | film A, 12 frames | +21.7 / -4.4 | +21.7 / -4.4 |
 | film B, 12 frames | +26.9 / -0.6 | +26.9 / -0.6 |
 | screen capture, 12 frames | +20.1 / -30.4 | +20.1 / -30.4 |
 
-## 1. LAST2 — the census, taken BEFORE the slot bookkeeping
+All three land to the digit.
+
+## 1. LAST2 — the census, before the machinery
 
 `encoder.rs`'s `ref_frame_idx` maps LAST2/LAST3 onto LAST's own DPB slot, so
 the picture before LAST is not merely unoffered to the search, it is not
-retained. Building the real thing is not a small diff (a second retained
-slot at every level, `ref_frame_idx`/`refresh_frame_flags`, sign bias, order
-hints, `record_mi`, the motion field, the search offering LAST2 through the
-per-reference mv stack, and a second MOTION SEARCH per block -- today even
-GOLDEN and ALTREF are offered search-FREE, `search_inter_block`'s `extra`
-prices only their NEARESTMV/GLOBALMV, precisely because a second search
-doubles the stage that already owns most of the encode wall).
+retained at all. Building it out is not a small diff (a second retained slot
+per level, `ref_frame_idx` / `refresh_frame_flags` / `ref_frame_sign_bias` /
+order hints for it, a per-reference mv stack, the writer's `single_ref` tree,
+`record_mi`, and — the expensive part — a SECOND motion search per block, on
+the stage that already owns most of the encode wall: `search_inter_block`'s
+existing extra references are priced search-FREE for exactly that reason).
+So the lever was PRICED first (`last2_census`, `--ignored`, 3.3 s):
 
-So `last2_census` (`encode.rs`, `--ignored`) prices the lever first, on the
-gate's OWN window and loader (`probe::gate_crop`, 12 pictures): every 16x16
-luma block of every picture gets one full-pel diamond search against the NEAR
-reference and the same search against the FAR one, at the two lags the pyramid
-offers -- (1, 2) for the leaf chain, (4, 8) for the ARF level (rav1e's own
-pair: its ARFs read LAST@-4 + LAST2@-8).
-
-    cargo test -p ec-av1 --release --lib -- --ignored last2_census --nocapture
+every 16x16 luma block of the gate's own 12-picture window of both real films
+gets one full-pel diamond search against the NEAR reference and the same
+search against the FAR one, at the two lags the pyramid offers — (1, 2) for
+the leaf chain, (4, 8) for the ARF level, which is rav1e's own pair.
 
 | clip | level (near/far lag) | blocks | far wins | far wins >10% | SAD near | SAD best-of | prediction energy removed |
 |---|---|---|---|---|---|---|---|
@@ -42,42 +39,75 @@ pair: its ARFs read LAST@-4 + LAST2@-8).
 | film B | leaf (1/2) | 76800 | 38.1% | 21.2% | 18946199 | 17572121 | **7.25%** |
 | film B | ARF (4/8) | 30720 | 44.3% | 22.5% | 8539904 | 7824079 | **8.38%** |
 
-READ IT HONESTLY: the last column is prediction ENERGY (SAD), not bytes. A
-second reference wins about 4 blocks in 10 and wins by more than 10% on 1 in 5,
-and best-of-{LAST, LAST2} removes 7-10% of the frame's total absolute
-prediction error -- before any of it is paid back in the `single_ref` bits
-that name the second reference, the mv bits its own stack costs, and the
-second motion search's wall. 7-10% of SAD is the CEILING of the lever, and the
-ARF level (10.3% / 8.4%) is where it sits, not the leaf chain.
+READ IT AS: a second past reference is chosen by ~4 blocks in 10 and by more
+than 10% of SAD by ~1 in 5; best-of-two removes 7-10% of the total residual
+ENERGY before any rate is paid for naming the reference or for the second
+search. That is the largest un-taken prediction lever measured on this content
+so far (the anchors' non-skip area is the standing film B gap), and the ARF
+level — where the census is strongest — is exactly the level libaom and rav1e
+spend their extra slots on.
 
-## 2. The frame interpolation filter
+**Decision: the lever is worth building, and it does not fit this lane.** The
+census is the charter's own first step ("before wiring the full search"), and
+the build is chartered as its own lane below.
 
-Wired (this lane): `mc::predict` hardwired `InterpFilterKind::Regular`, so the
-encoder could not have coded a non-REGULAR frame whatever its header said.
-The kernel now lives on `FrameCtx::interp_filter` (copied into every
-tile-search worker by `filter_ctx_copy`), `encode_inter_frame` writes the SAME
-kernel into the frame header, and the search, the block trials, the compound
-predictors and the trial decode all read it. `EC_AV1_INTERP=smooth|sharp` or
-the process-global `set_frame_interp` select it; the default stays REGULAR and
-byte-identical.
+## 2. The frame interpolation filter — WIRED, MEASURED, REJECTED as a default
 
-Witness (not ignored):
-`each_frame_interpolation_filter_codes_its_own_stream_ffmpeg_decodes_exactly`
--- the three kernels code three DIFFERENT streams (a filter that never reached
-the prediction would code REGULAR's bytes, class `symbol consumption gap`) and
-ffmpeg reconstructs every frame of each of them exactly.
+The premise held: `mc::predict` hardwired `InterpFilterKind::Regular`, so the
+encoder could not have coded a SMOOTH or SHARP frame whatever the header said.
+The kernel now travels on `FrameCtx::interp_filter` (copied into every
+tile-search worker by `filter_ctx_copy`, so a threaded search reads the same
+kernel), and `encode_inter_frame` writes that one kernel into the header —
+one place, so header and prediction cannot disagree. `EC_AV1_INTERP=
+smooth|sharp` (or `set_frame_interp`) selects it; the default is unchanged
+REGULAR and byte-identical.
 
-### SMOOTH on the 12-frame gate
+| arm | film A | film B | keep rule |
+|---|---|---|---|
+| REGULAR (control) | +21.7 / -4.4 | +26.9 / -0.6 | — |
+| SMOOTH | **+40.9 / +10.2** | +26.3 / -0.4 | film A loses 19.2 / 14.6 |
+| SHARP | +24.0 / -2.9 | +28.4 / +0.6 | both rows worse on both columns |
 
-| clip | control | EC_AV1_INTERP=smooth |
-|---|---|---|
-| film A | +21.7 / -4.4 | **+40.9 / +10.2** |
-| film B | +26.9 / -0.6 | **+26.3 / -0.4** |
-| bars 1080p | -1.0 / -16.8 | -1.4 / -17.2 |
-| bars 2160p | +9.4 / -12.7 | +9.3 / -12.9 |
+SMOOTH is a catastrophe on film A (19 BD points) for 0.6 of a point on film B's
+libaom column while its rav1e column goes 0.2 the wrong way; SHARP is worse
+everywhere. The keep rule (both films down on both columns) is nowhere near
+met, so **REGULAR stays the default at every preset** and the per-frame
+CHOOSER was not built: its ceiling is film B's +0.6/-0.2 mixed-sign move, and
+its downside when a proxy mispicks is film A's 19 points (ladder rung 1 — it
+does not need to exist). The wiring stays because it is what makes the
+measurement possible at all and because it removes the hardwired-kernel
+ceiling; it is proved by a witness rather than left as a claim.
 
-Film B and both bars rows improve; film A loses NINETEEN BD points (0.2 dB at
-every quantizer). The two real films disagree in sign, so SMOOTH is not a
-default -- the keep rule ("both film rows improve") is unmet by a wide margin.
+## 3. Invariants
 
-(SHARP arms pending.)
+* `each_frame_interpolation_filter_codes_its_own_stream_ffmpeg_decodes_exactly`
+  (new, NOT ignored): each of the three kernels codes a DISTINCT stream (a
+  kernel that never reached the prediction would code REGULAR's bytes — class
+  `symbol consumption gap`) and ffmpeg reconstructs every frame of each of them
+  exactly against our own reconstruction. Green.
+* `cargo test -p ec-av1 --release --lib`: see §4.
+* `cargo check --workspace --all-targets`: see §4.
+
+## 4. Suite and check
+
+(filled in below from the detached runs)
+
+## 5. Deferred
+
+* **LAST2 / a real second past reference — deferred, chartered.** What it
+  needs: DPB slot 7 is free (the key's copy, never read back), so the leaf
+  chain can alternate its refresh between slots 0 and 7 and name the older of
+  the two as LAST2 while the ARF levels take theirs from the anchor pair;
+  `ref_frame_idx[1]`, `refresh_frame_flags`, `ref_frame_sign_bias`, the order
+  hints and a per-reference mv stack follow; the cheapest first arm offers
+  LAST2 through the EXISTING search-free `extra` path (NEARESTMV/GLOBALMV
+  only, as GOLDEN is offered today) so the second motion search — and its wall,
+  which is the user's stated priority — is a second arm, not a prerequisite.
+  Witness: a clip where the picture before LAST is the better reference, N
+  blocks coded off LAST2, exact through ffmpeg and `decode_stream`, hidden
+  frame display order intact. Unblocked by: a lane of its own with the wall
+  budget for the desync hunt.
+* **The per-frame interpolation-filter chooser — dropped, not deferred**: §2's
+  table is its refutation, not a gap.
+* The long-GOP gate was not run: nothing from this lane changes a default, so
+  there is nothing for it to confirm.
