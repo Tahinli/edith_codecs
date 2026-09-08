@@ -395,6 +395,20 @@ pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.5, 1.0, 1.0];
 /// still carry the grain the anchor no longer has.
 pub(crate) const ARF_TF: [f64; 11] = [3.0; 11];
 
+/// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
+/// libaom scales `arnr` strength with the quantizer and stops filtering at
+/// the high-quality end for the same reason: a picture we are about to
+/// reproduce almost exactly should not have detail averaged out of it first.
+///
+/// 16 is under the gate's own finest anchor (its `q = 60` ladder point codes
+/// the top ARF at qindex 28) and over the rate-loop floor a high bitrate
+/// target drives the anchor to. `encoder::tests::bitrate_target_lands_within_5/// _percent_over_48_frames` is what named the floor: at 2 Mbps on the 640x384
+/// fixture the loop codes IDENTICAL 22237-byte anchors as at 1536 kbps, i.e.
+/// the anchor's `base_q_idx + arf_q_offset` has clamped to 1 and the loop
+/// cannot spend the target's remaining bytes -- and a cheaper (filtered)
+/// anchor there makes the miss worse, not better.
+pub(crate) const ARF_TF_QMIN: u8 = 16;
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [

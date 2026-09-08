@@ -1797,7 +1797,13 @@ impl Av1Encoder {
         // otherwise spend its residual on is averaged out against the
         // group's own display neighbours (`lookahead`, already padded).
         let source = picture.padded_to(SUPERBLOCK);
-        let tf = arf_tf_strength();
+        // ... and never at the very top of the quality range, where the
+        // anchor's own quantizer has hit the rate loop's floor
+        // ([`crate::speed::ARF_TF_QMIN`]).
+        let tf = match base_q_idx >= crate::speed::ARF_TF_QMIN {
+            true => arf_tf_strength(),
+            false => 0.0,
+        };
         let source = match (tf > 0.0, dq_level) {
             (true, crate::encode::DqLevel::TopArf) => {
                 crate::encode::arf_temporal_filter(&source, lookahead, tf)
