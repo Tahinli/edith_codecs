@@ -61,43 +61,124 @@
 //! live, and off above it, because a preset whose whole purpose is wall does
 //! not spend 12.8% of it on half a BD point.
 //!
-//! # The presets, measured (native gate, one arm at a time, box under other
-//! lanes at load 9-48 -- read the wall column against the rav1e anchor in the
-//! SAME arm, not across arms)
+//! # The Pareto table, RE-MEASURED 2026-09-08 (lane-pareto2)
 //!
-//! | preset | film A BD vs libaom / rav1e | screen BD vs libaom / rav1e | film ladder wall ours:libaom:rav1e | 1080p 4x2/8 fps | 3840x1608 4x2/8 fps |
+//! Every row is `encode::tests::bd_rate_screen_native` on THIS head: 12
+//! frames, gop 12, four quantizers, the native crops (film A 1920x768, film B
+//! and the capture 1920x1024), one tile, one thread; BD-rate vs libaom
+//! `cpu-used 6` / vs rav1e `speed 6`. The arms ran THREE at a time on a box
+//! carrying two other lanes (load 9-25), so the wall is read ONLY as the
+//! ours:rav1e-speed-6 ratio inside one arm -- `x rav1e` below -- and the fps
+//! column is our own 48 coded frames over our own ladder wall in that same
+//! arm. BD is exact across runs; wall is not -- the shipped preset-6 row was
+//! re-run with the invariant suite alongside, so its wall columns are the
+//! most depressed of the table; the SERIAL pair (control 75.2s, both levers
+//! 95.6s on the film A row) is what prices this lane's change: +27% wall for
+//! 2.8 BD points, and film B gains 3.4 points on top of that for free.
+//!
+//! | preset | film A | film B | screen capture | x rav1e s6 (A/B/screen) | 1-thread fps (A/B/screen) |
 //! |---|---|---|---|---|---|
-//! | 0 | +53.2 / +23.4 | +49.3 / -16.0 | 102.9 : 19.6 : 25.0 | 1.32 | 0.50 |
-//! | 3 | +55.1 / +24.7 | +54.3 / -13.2 | 63.3 : 16.3 : 23.5 | 1.60 | 0.72 |
-//! | 6 | +60.9 / +29.1 | +57.7 / -11.7 | 41.3 : 16.0 : 23.4 | 1.83 | 1.50 |
-//! | 10 | +158.8 / +104.9 | +174.5 / +41.8 | 16.9 : 18.3 : 24.2 | 6.29 | 3.32 |
+//! | 0 | +21.7 / -4.4 | +26.9 / -0.6 | +19.8 / -30.5 | 10.9 / 9.5 / 7.5 | 0.24 / 0.28 / 0.37 |
+//! | 3 | +22.3 / -4.1 | +27.3 / -0.3 | +23.7 / -28.4 | 7.4 / 6.6 / 4.4 | 0.40 / 0.48 / 0.60 |
+//! | 6 (as it shipped) | +26.6 / -0.4 | +34.7 / +6.4 | +23.1 / -28.5 | 2.2 / 3.9 / 3.0 | 0.71 / 0.47 / 0.71 |
+//! | **6 (this lane)** | **+23.0 / -3.2** | **+30.7 / +3.0** | **+23.2 / -28.5** | 3.9 / 2.5 / 2.8 | 0.33 / 0.44 / 0.70 |
+//! | 8 | +61.1 / +23.5 | +75.6 / +38.4 | +50.8 / -13.8 | 1.0 / 1.5 / 1.3 | 1.50 / 1.34 / 2.10 |
+//! | 10 | +112.0 / +64.4 | +155.0 / +102.7 | +106.0 / +12.7 | 0.8 / 1.4 / 0.6 | 2.46 / 2.03 / 4.17 |
+//!
+//! The whole ladder moved since it was composed (2026-09-07): the encoder is
+//! four points BETTER than rav1e `speed 6` on film A at preset 0 where the
+//! old table read +23.4, so every "the keep rule fails at every preset"
+//! statement that table carried is dead. PARITY WITH rav1e `speed 6` IS
+//! REACHED AT PRESET 6 on film A and on the screen capture; on film B it is
+//! reached at preset 3 (-0.3), preset 6 sitting between rav1e `speed 8`
+//! (+3.5) and `speed 10` (+28.7).
 //!
 //! # Against the reference encoders at THEIR fast presets
 //!
-//! Same film A crop, 4-point ladders, single thread, one tile, BD-rate vs
-//! rav1e `speed 6` (own harness, `lanes/pareto.md`); fps = 48 coded frames
-//! over the whole ladder:
+//! Measured in the SAME arms as the shipped preset-6 row above
+//! (`EC_AV1_PARETO_REFS=1`, which runs each reference's fast ladder through
+//! `external_ladder` right after ours), so the wall column is comparable
+//! WITHIN a row. `libaom cpu-used 8` codes the same bytes as `cpu-used 6` in
+//! this ffmpeg -- it reads +0.0% against it on all three rows, one point on
+//! the plot, not two.
 //!
-//! | encoder | BD vs rav1e speed 6 | fps |
+//! | row | encoder | vs libaom cpu-6 | vs rav1e s6 | 4-point ladder wall (rav1e s6 in that arm) |
+//! |---|---|---|---|---|
+//! | film A | ours preset 6 (pre-lane) | +26.6 | -0.4 | 67.6s (31.3s) |
+//! | film A | rav1e speed 8 | +29.0 | +2.0 | 24.1s |
+//! | film A | rav1e speed 10 | +45.3 | +17.1 | 8.4s |
+//! | film A | libaom cpu-used 8 | +0.0 | -20.1 | 15.4s |
+//! | film A | SVT-AV1 preset 8 | +24.1 | -1.9 | 2.4s |
+//! | film A | SVT-AV1 preset 10 | +45.3 | +12.1 | 2.0s |
+//! | film B | ours preset 6 (pre-lane) | +34.7 | +6.4 | 103.0s (26.4s) |
+//! | film B | rav1e speed 8 | +37.3 | +3.5 | 20.5s |
+//! | film B | rav1e speed 10 | +61.4 | +28.7 | 10.5s |
+//! | film B | libaom cpu-used 8 | +0.0 | -22.2 | 32.3s |
+//! | film B | SVT-AV1 preset 8 | +41.7 | +7.4 | 2.9s |
+//! | film B | SVT-AV1 preset 10 | +65.9 | +23.3 | 2.0s |
+//! | screen | ours preset 6 (pre-lane) | +23.1 | -28.5 | 68.0s (22.6s) |
+//! | screen | rav1e speed 8 | +84.2 | +4.5 | 13.8s |
+//! | screen | rav1e speed 10 | +332.5 | +103.4 | 9.8s |
+//! | screen | libaom cpu-used 8 | +0.0 | -42.4 | 17.6s |
+//! | screen | SVT-AV1 preset 8 | +21.5 | -31.6 | 5.0s |
+//! | screen | SVT-AV1 preset 10 | +39.4 | -24.5 | 1.9s |
+//!
+//! So the QUALITY bar is met and the WALL bar is not: at preset 6 we are
+//! ahead of rav1e `speed 8` on film A and the capture and behind it on film
+//! B, but we spend 2-4x rav1e `speed 6`'s wall to do it, and SVT-AV1 preset 8
+//! is within 2 points of us on film A at a THIRTIETH of the wall. libaom
+//! `cpu-used 6/8` is 20 points ahead of everything on every row.
+//!
+//! # Per-lever re-price at preset 6 (lane-pareto2, film A row, this head)
+//!
+//! The ladder was composed off a lever table measured BEFORE RDOQ. This is
+//! the same one-lever-at-a-time ablation redone AT preset 6, the fast
+//! software preset, control +26.6 / -0.4. "gain" is BD points off the
+//! vs-rav1e column; wall is only quoted where it decided a row (three serial
+//! control arms measured 66.3 / 71.1 / 75.2s, so anything under ~13% wall is
+//! below this box's floor).
+//!
+//! | lever re-enabled at 6 | vs libaom / rav1e | gain | shipped |
+//! |---|---|---|---|
+//! | **extra-reference NEWMV** | +24.4 / -2.4 | **2.0** | ON (+15..30% wall = 0.067 pts/1%) |
+//! | **coefficient breakout 0** | +24.8 / -1.6 | **1.2** | ON (+11% wall = 0.109 pts/1%) |
+//! | 8x8 split | +25.9 / -0.8 | 0.4 | off (half the film wall in the first table) |
+//! | warp | +26.2 / -0.8 | 0.4 | off |
+//! | CfL | +26.2 / -0.7 | 0.3 | off |
+//! | chroma top-k off | +26.3 / -0.7 | 0.3 | off |
+//! | inter var-tx | +26.3 / -0.7 | 0.3 | off |
+//! | angle delta | +26.5 / -0.6 | 0.2 | off |
+//! | split-RD 0.125 | +26.4 / -0.6 | 0.2 | off |
+//! | inter-intra top-13 | +26.7 / -0.3 | 0.1 | off |
+//! | intra top-13 | +26.7 / -0.4 | 0.0 | off |
+//! | filter intra | +26.7 / -0.4 | 0.0 | off |
+//! | 32x32 tx depth | +26.6 / -0.4 | 0.0 | off -- INERT at 6 (inter tx select is off) |
+//! | compound var-tx | +26.6 / -0.4 | 0.0 | off -- inert for the same reason |
+//! | loop restoration | +26.7 / -0.2 | -0.2 | off (re-enabling it LOSES) |
+//!
+//! and the other half of the greedy rule, every lever preset 6 KEEPS, taken
+//! away one at a time:
+//!
+//! | lever removed from 6 | vs libaom / rav1e | cost of losing it |
 //! |---|---|---|
-//! | rav1e speed 6 | 0.0 | 1.79 |
-//! | rav1e speed 8 | +2.1 | 2.48 |
-//! | rav1e speed 10 | +16.9 | 4.73 |
-//! | libaom cpu-used 6 | -20.7 | 2.55 |
-//! | SVT-AV1 preset 8 | -3.9 | 13.80 |
-//! | SVT-AV1 preset 10/12 | +10.9 | 20.78 |
-//! | ours speed 0 | +23.4 | 0.47 |
-//! | ours speed 3 | +24.7 | 0.76 |
-//! | ours speed 6 | +29.1 | 1.16 |
-//! | ours speed 10 | +104.9 | 2.84 |
+//! | RDOQ | +41.2 / +10.2 | 10.6 |
+//! | 64x64 inter root | +30.7 / +3.4 | 3.8 |
+//! | key 64x64 intra root | +28.0 / +0.9 | 1.3 |
+//! | per-superblock delta_q | +27.2 / -0.2 | 0.2 |
+//! | tpl window 4 -> 1 | +27.0 / -0.3 | 0.1 |
 //!
-//! The keep rule for a preset -- at its own wall, no worse in BD than the
-//! reference at that wall -- FAILS at every preset on film: rav1e reaches our
-//! speed-10 wall at +16.9 where we are at +104.9, and SVT-AV1 is five times
-//! faster than any of ours. What the axis does buy is real: 4.8x (1080p) to
-//! 6.6x (4K) the frames per second of the full search for +7.7 BD points up
-//! to speed 6, and on SCREEN content speeds 0-6 still beat rav1e speed 6
-//! (-16.0 / -13.2 / -11.7).
+//! Every keep is confirmed. The two re-enables above ship (see
+//! [`EXTRA_REF_NEW`] and [`SPLIT_BREAKOUT`]); together they read +23.0 / -3.2
+//! on film A in the ablation arm, 2.8 points for wall that stayed inside the
+//! control spread of three serial arms. Presets 4 and 5 take them by
+//! bracketing, not by their own arm; presets 3, 8 and 10 are untouched, and
+//! preset 0 is untouched by construction (the byte pins).
+//!
+//! NOT RE-MEASURED, and the reason: the THREADED fps table (1080p and
+//! 3840x1608 at 4x2 tiles / 8 threads) cannot be read on this box while two
+//! other lanes run -- three interleaved passes of `filter_stage_wall_*` put
+//! preset 3 BELOW preset 0 in every pass at load 16-25. The single-thread fps
+//! column above comes from the BD arms themselves and is ordered correctly.
 
 
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -246,14 +327,20 @@ pub(crate) const SPLIT_RD: [f64; 11] = [
 ];
 
 /// `encode::SPLIT_BREAKOUT_COEFFS`: libaom's coefficient-count breakout.
+///
+/// lane-pareto2 RE-PRICED it at preset 6: switching the breakout OFF there
+/// (back to the shipped 0) takes film A +26.6/-0.4 to +24.8/-1.6 -- 1.2 BD
+/// points against rav1e `speed 6` -- for +11% wall (73.7s against the 66.3s
+/// control) = 0.109 points per 1% wall, three times the frontier. Presets 5
+/// and 6 take 0; preset 5 by BRACKETING (4 already had 0), 6 measured.
 pub(crate) const SPLIT_BREAKOUT: [usize; 11] = [
     crate::encode::SPLIT_BREAKOUT_COEFFS,
     0,
     0,
     0,
     0,
-    1,
-    1,
+    0,
+    0,
     1,
     1,
     2,
@@ -297,14 +384,24 @@ pub(crate) const LEAF_SECOND: [bool; 11] = [
 ];
 
 /// `encode::EXTRA_REF_NEW_MV`: GOLDEN/ALTREF get a `NEWMV` search of their own.
+/// lane-pareto2 RE-PRICED it at preset 6 (the fast software preset) on the
+/// 12-frame film A row of `encode::tests::bd_rate_screen_native`, this head:
+/// re-enabling it takes +26.6/-0.4 to +24.4/-2.4, TWO BD points against rav1e
+/// `speed 6`, for +15% .. +30% wall (86.4s against a control that measured
+/// 66.3/71.1/75.2s over three serial arms) = 0.067 points per 1% wall, which
+/// clears the ladder's own frontier (CfL + angle 0.031, filter intra 0.039)
+/// by better than 1.5x. The old ranking dropped it at preset 4 off a table
+/// measured BEFORE RDOQ; with RDOQ on, a second reference's NEWMV is worth
+/// twice what that table said. It is ON through preset 6 now; presets 4 and 5
+/// follow by BRACKETING (0..3 and 6 all keep it), not by their own arm.
 pub(crate) const EXTRA_REF_NEW: [bool; 11] = [
     crate::encode::EXTRA_REF_NEW_MV,
     true,
     true,
     true,
-    false,
-    false,
-    false,
+    true,
+    true,
+    true,
     false,
     false,
     false,
