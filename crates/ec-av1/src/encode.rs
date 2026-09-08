@@ -16299,13 +16299,14 @@ mod tests {
         // pays the `comp_mode = 0` symbol the writer codes ahead of it, so
         // single and compound are priced against the same syntax -- 8311 ->
         // 8325 bytes at q=150 and 33087 -> 33014 at q=60. Re-taken again in
-        // the same lane: a key frame's `tx_depth` symbol is priced off the
-        // row the writer codes it against (the transform sides its above/left
-        // neighbours published) instead of row 0, so every intra block's
-        // depth-versus-split margin moved -- 8325 bytes at q=150 (the same
-        // size, different depths) and 33014 at q=60, both hashes new.
+        // Re-taken on lane-txd: the `tx_depth` symbol is priced at the
+        // writer's own row on BOTH frame types (a key frame off the deblock
+        // grid, an inter frame's intra block off the TXFM_CONTEXT bands the
+        // encoder now publishes), so every intra block's depth-versus-split
+        // margin moved -- 8325 -> 8381 bytes at q=150 and 33014 -> 33016 at
+        // q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8325, 0x774a_4716_1cc1_b0ed), (60, 33014, 0xa19b_4fa6_cde1_1180)];
+            [(150, 8381, 0x36ac_5783_4a20_499a), (60, 33016, 0xfcd0_be7a_3600_34ce)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
