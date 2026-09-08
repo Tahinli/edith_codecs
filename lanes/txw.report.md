@@ -119,14 +119,22 @@ off; the wall cost at preset 0 is +33% on this row.
 
 ## Invariants
 
-* full `ec-av1` lib suite: 570 passed / 0 failed / 47 ignored (the charter
-  expected 569 + the witness; the witness KEEPS an `#[ignore]` -- it sets
-  process-global levers, like `every_speed_preset` -- so the ignored count
-  is unchanged).
+* `ec-av1` lib suite, split under `$HOME/.cache/txw` (final state, lever ON
+  at preset 0): `--skip stream::` 332 passed / 31 ignored; `stream:: --skip
+  10bit` 198 passed / 15 ignored; `10bit` 42 passed / 1 ignored -- 0 failed
+  in all three (572 / 47 with the `10bit` rows counted twice; one earlier
+  unsplit run of the same tree read 570 passed / 47 ignored). The witness
+  KEEPS an `#[ignore]` -- it sets process-global levers, like
+  `every_speed_preset` -- so the ignored count is unchanged from the
+  charter's 47.
 * `--include-ignored thread_count`: 2 passed. `--ignored
-  every_speed_preset`: 1 passed. Byte pins: 1 passed, 8562 / 33357 unmoved.
-  `predicted_coeff_bits_track_the_tile_the_writer_wrote` and the facade
-  identity are inside the suite run.
+  every_speed_preset` (presets 0/3/6/10, both decoders sample-exact): 1
+  passed. Byte pins: passed inside the first split, 8562 / 33357 unmoved
+  WITH the lever on. `predicted_coeff_bits_track_the_tile_the_writer_wrote`
+  and the facade identity are inside the same split.
+* the witness at the final tree: `intra [949, 25443, 1659, 1660, 1891,
+  1785, 2448, ..]` -- 1785 `V_DCT` + 2448 `H_DCT` -- 8724 bytes, ffmpeg and
+  `decode_stream` both sample-exact.
 * `timeout 900 cargo check --workspace --all-targets -j4`: 0 errors, 0
   ec-av1 warnings (the 21 `ec-opus` + 1 `ec-vorbis` warnings pre-date the
   lane).
