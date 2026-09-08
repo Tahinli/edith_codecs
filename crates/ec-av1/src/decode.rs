@@ -927,10 +927,17 @@ fn seg_feature(segment_id: usize, feature: usize, fctx: &crate::decode::FrameCtx
 fn block_q_idx(fctx: &crate::decode::FrameCtx) -> i32 {
     let base = fctx.current_q_idx.with(|c| c.get());
     let seg_id = fctx.cur_segment_id.with(|c| c.get()) as usize;
-    match seg_feature(seg_id, SEG_LVL_ALT_Q, fctx) {
+    let q = match seg_feature(seg_id, SEG_LVL_ALT_Q, fctx) {
         Some(data) => (base + data).clamp(0, 255),
         None => base,
+    };
+    // lane-d792: which SEGMENT a block's quantizer came out of, beside the
+    // `EC_DQCOEFF` grid rung -- a dequant that is too low with the levels
+    // already proven equal is a segment-id defect, not a quantizer one.
+    if crate::envflags::env_flag!("EC_DQCOEFF") {
+        eprintln!("OUR_Q base={base} seg={seg_id} q={q}");
     }
+    q
 }
 
 /// The segment id recorded for one mi cell of the current frame's map.
@@ -9715,7 +9722,12 @@ fn decode_rect_split(
                 chroma_w,
                 chroma_h,
                 crate::decode::bit_depth(fctx),
-                fctx.current_q_idx.with(|c| c.get()),
+                // lane-d792: the BLOCK's quantizer index, i.e. the frame's
+                // own index PLUS this block's segment `SEG_LVL_ALT_Q` --
+                // reading `current_q_idx` here dropped the segment feature
+                // that every other dequant site applies (class
+                // `parsed-then-discarded`).
+                block_q_idx(fctx),
                 plane_q_delta(plane_idx, fctx).0,
                 plane_q_delta(plane_idx, fctx).1,
                 tx_type,
@@ -11222,7 +11234,7 @@ fn decode_leaf_rect(
         luma_levels = l_levels;
         let luma_residual = dequant_and_inverse_typed_wh(
             &luma_levels, bw, bh, crate::decode::bit_depth(fctx),
-            fctx.current_q_idx.with(|c| c.get()), plane_q_delta(0, fctx).0, plane_q_delta(0, fctx).1, luma_tx_type,
+            block_q_idx(fctx), plane_q_delta(0, fctx).0, plane_q_delta(0, fctx).1, luma_tx_type,
         );
         if let Some(b) = &palette_y_buf {
             set_palette_pred(b.clone(), fctx);
@@ -11242,7 +11254,7 @@ fn decode_leaf_rect(
         u_levels = u_l;
         let u_residual = dequant_and_inverse_typed_wh(
             &u_levels, chroma_w, chroma_h, crate::decode::bit_depth(fctx),
-            fctx.current_q_idx.with(|c| c.get()), plane_q_delta(1, fctx).0, plane_q_delta(1, fctx).1, u_tx_type,
+            block_q_idx(fctx), plane_q_delta(1, fctx).0, plane_q_delta(1, fctx).1, u_tx_type,
         );
         if let Some((ub, _)) = &palette_uv_bufs {
             set_palette_pred(ub.clone(), fctx);
@@ -11261,7 +11273,7 @@ fn decode_leaf_rect(
         v_levels = v_l;
         let v_residual = dequant_and_inverse_typed_wh(
             &v_levels, chroma_w, chroma_h, crate::decode::bit_depth(fctx),
-            fctx.current_q_idx.with(|c| c.get()), plane_q_delta(2, fctx).0, plane_q_delta(2, fctx).1, v_tx_type,
+            block_q_idx(fctx), plane_q_delta(2, fctx).0, plane_q_delta(2, fctx).1, v_tx_type,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
             set_palette_pred(vb.clone(), fctx);
@@ -16225,7 +16237,9 @@ fn decode_leaf_rect8(
                 bw,
                 bh,
                 crate::decode::bit_depth(fctx),
-                fctx.current_q_idx.with(|q| q.get()),
+                // lane-d792 sweep: the block's segment `SEG_LVL_ALT_Q`, as at
+                // every other dequant site (class `parsed-then-discarded`).
+                block_q_idx(fctx),
                 plane_q_delta(0, fctx).0,
                 plane_q_delta(0, fctx).1,
                 tx_type,
@@ -31132,7 +31146,9 @@ fn decode_intra_sub8_leaf(
                 bw,
                 bh,
                 crate::decode::bit_depth(fctx),
-                fctx.current_q_idx.with(|q| q.get()),
+                // lane-d792 sweep: the block's segment `SEG_LVL_ALT_Q`, as at
+                // every other dequant site (class `parsed-then-discarded`).
+                block_q_idx(fctx),
                 plane_q_delta(0, fctx).0,
                 plane_q_delta(0, fctx).1,
                 tx_type,

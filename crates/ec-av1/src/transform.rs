@@ -1346,6 +1346,22 @@ pub fn dequant_and_inverse_typed_wh(
     DQ_SCRATCH.with(|cell| {
         let mut dq = cell.borrow_mut();
         crate::quant::dequant_wh_into(levels, &mut dq, w, h, bit_depth, q_idx, dc_delta, ac_delta);
+        // lane-d792: the DEQUANTIZED grid, in row-major `(row/col)` pairs --
+        // the twin of the oracle's `EC_DQCOEFF` rung (whose own layout is
+        // column-major `input[c * h + r]`), so a residual mismatch whose
+        // levels already agree is separable into dequant vs transform.
+        if crate::envflags::env_flag!("EC_DQCOEFF") {
+            let nz: Vec<String> = dq
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v != 0)
+                .map(|(i, &v)| format!("{}/{}:{v}", i / w, i % w))
+                .collect();
+            eprintln!(
+                "OUR_DQ w={w} h={h} q={q_idx} dcd={dc_delta} acd={ac_delta} tx={tx_type:?} nz={}",
+                nz.join(",")
+            );
+        }
         inverse_transform_2d_typed_wh(&dq, w, h, bit_depth, tx_type)
     })
 }
