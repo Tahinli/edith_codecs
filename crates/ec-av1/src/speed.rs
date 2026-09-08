@@ -308,7 +308,35 @@ pub(crate) const I64_ROOT: [bool; 11] = [crate::encode::I64_ROOT; 11];
 /// `EC_AV1_DELTAQ=2` forces it on at any preset, `EC_AV1_DELTAQ=0` off.
 /// Above preset 6 it is inert anyway -- [`TPL_DEPTH`] cuts the lookahead to
 /// one picture there, so there is no map to vary the quantizer by.
-pub(crate) const DELTAQ_RES: [u8; 11] = [4, 4, 4, 4, 4, 2, 2, 4, 4, 4, 4];
+pub(crate) const DELTAQ_RES: [u8; 11] = [2, 4, 4, 4, 4, 2, 2, 4, 4, 4, 4];
+
+/// lane-dq: the strength of libaom's OBJECTIVE per-superblock mapping
+/// ([`crate::encode::deltaq_libaom`]) -- `0` keeps the shipped
+/// `deltaq_for_factor` derivation, anything above it takes that fraction of
+/// libaom's own offset. Only meaningful where [`DELTAQ_RES`] is on.
+///
+/// Preset 0 only, at 0.25. The census (`EC_AV1_DQ_CENSUS=1`) says the two
+/// mappings read the SAME tpl map into offsets an order of magnitude apart --
+/// on film B's 12-frame window, ours is `-4..8` with `|mean| 3.0` while
+/// libaom's is `-24..32` with `|mean| 14` -- so a strength is the only honest
+/// knob between them. Measured on the 48-picture long-GOP gate (BD vs libaom
+/// / rav1e), which is the shape his exports have:
+///
+/// | arm | film A | film B |
+/// |---|---|---|
+/// | control (no delta_q) | +25.2/-7.2 | +86.7/+7.3 |
+/// | shipped mapping | +24.6/-7.3 | +86.1/+7.5 |
+/// | **objective, 0.25** | **+24.4/-7.5** | **+86.0/+7.3** |
+/// | objective, 0.5 | +23.8/-7.6 | +86.5/+7.9 |
+/// | objective, 1.0 | +24.0/-7.0 | +88.4/+9.7 |
+///
+/// 0.25 is the only arm down on both films on the libaom column with neither
+/// rav1e column worse; 0.5 buys film A another 0.6 and gives film B back 0.6.
+/// The 12-frame gate reads the same arm as flat (film A +21.0/-4.8 ->
+/// +20.7/-4.8, film B +24.9/-1.9 -> +24.8/-1.7) and the screen capture is
+/// BYTE-IDENTICAL at every arm -- `encode_inter_frame` codes no delta syntax
+/// on a screen frame at all (lane-dq3's content gate).
+pub(crate) const DQ_TPL_K: [f64; 11] = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
