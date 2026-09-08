@@ -4013,39 +4013,51 @@ fn warp_prediction(
 /// Before lane-pricer every BACKWARD reference was priced as LAST -- three
 /// symbols off the wrong CDFs -- which is what made the search believe an
 /// ALTREF block cost the same syntax as a LAST one.
-pub(crate) fn single_ref_bits(ref_frame: i8) -> f64 {
+pub(crate) fn single_ref_bits(ref_frame: i8, stack: &crate::mvstack::MvStack) -> f64 {
     use crate::mvstack::{
         ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
+        single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
+        single_ref_p5_ctx, single_ref_p6_ctx,
     };
+    let (a, a1) = stack.above_refs;
+    let (l, l1) = stack.left_refs;
     let backward = ref_frame >= BWDREF_FRAME;
-    let p1 = symbol_bits(&cdf::SINGLE_REF[0][0], usize::from(backward));
+    let p1 = symbol_bits(
+        &cdf::SINGLE_REF[single_ref_p1_ctx(a, a1, l, l1)][0],
+        usize::from(backward),
+    );
     if backward {
         let is_altref = ref_frame == ALTREF_FRAME;
-        let p2 = symbol_bits(&cdf::SINGLE_REF[0][1], usize::from(is_altref));
+        let p2 = symbol_bits(
+            &cdf::SINGLE_REF[single_ref_p2_ctx(a, a1, l, l1)][1],
+            usize::from(is_altref),
+        );
         return p1
             + p2
             + if is_altref {
                 0.0
             } else {
                 symbol_bits(
-                    &cdf::SINGLE_REF[0][5],
+                    &cdf::SINGLE_REF[single_ref_p6_ctx(a, a1, l, l1)][5],
                     usize::from(ref_frame == ALTREF2_FRAME),
                 )
             };
     }
     let far = ref_frame == LAST3_FRAME || ref_frame == GOLDEN_FRAME;
-    p1 + symbol_bits(&cdf::SINGLE_REF[0][2], usize::from(far))
-        + if far {
-            symbol_bits(
-                &cdf::SINGLE_REF[0][4],
-                usize::from(ref_frame == GOLDEN_FRAME),
-            )
-        } else {
-            symbol_bits(
-                &cdf::SINGLE_REF[0][3],
-                usize::from(ref_frame == LAST2_FRAME),
-            )
-        }
+    p1 + symbol_bits(
+        &cdf::SINGLE_REF[single_ref_p3_ctx(a, a1, l, l1)][2],
+        usize::from(far),
+    ) + if far {
+        symbol_bits(
+            &cdf::SINGLE_REF[single_ref_p5_ctx(a, a1, l, l1)][4],
+            usize::from(ref_frame == GOLDEN_FRAME),
+        )
+    } else {
+        symbol_bits(
+            &cdf::SINGLE_REF[single_ref_p4_ctx(a, a1, l, l1)][3],
+            usize::from(ref_frame == LAST2_FRAME),
+        )
+    }
 }
 
 pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
@@ -5993,7 +6005,7 @@ fn code_square_inter(
 
     let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
     let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
-    let single_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME);
+    let single_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
         + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
         + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0); // NEARESTMV
@@ -8778,7 +8790,7 @@ fn search_skip_64(
     let side = SUPERBLOCK;
     let not_new = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1);
     let not_zero = symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1);
-    let ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME);
+    let ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     // What every candidate pays whatever its vector: `skip` coded 1, then
     // `is_inter` coded 1, then the LAST chain above.
     let fixed = symbol_bits(&cdf::SKIP[0], 1) + symbol_bits(&cdf::INTRA_INTER[0], 1) + ref_bits;
@@ -9316,7 +9328,7 @@ fn search_inter_block(
     // the loop cannot reach is never offered below -- every candidate's
     // index is one this same loop walks to.
     let drl_bits = |start: usize, target: usize| drl_bits_for(stack, start, target);
-    let last_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME);
+    let last_ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
     let mut cands: Vec<((i32, i32), f64, InterInfo)> = vec![
         (
             stack.nearest_mv,
@@ -9409,7 +9421,7 @@ fn search_inter_block(
     // `NEW_NEWMV` candidate below to pair with `LAST`'s.
     let mut extra_new_mvs: Vec<(i8, (i32, i32))> = Vec::new();
     for &(ref_frame, g, gstack) in extra {
-        let g_ref_bits = single_ref_bits(ref_frame);
+        let g_ref_bits = single_ref_bits(ref_frame, gstack);
         let g_not_new = symbol_bits(&cdf::NEW_MV[gstack.new_mv_ctx], 1);
         cands.push((
             gstack.nearest_mv,
@@ -12050,18 +12062,31 @@ pub(crate) fn encode_sequence_with_ctx(
 mod tests {
 
     /// [`super::single_ref_bits`] pays exactly what tile.rs'
-    /// `write_single_ref` codes, symbol for symbol, at context 0: the p1/p2/
-    /// p6 chain for a BACKWARD reference and the p1/p3/p4/p5 chain for a
-    /// forward one. Red before lane-pricer, where every backward reference
-    /// was priced as LAST (p1=0,p3=0,p4=0) -- ALTREF read 1.34 bits instead
-    /// of its true 4.79.
+    /// `write_single_ref` codes: the p1/p2/p6 chain for a BACKWARD
+    /// reference and the p1/p3/p4/p5 chain for a forward one, each symbol at
+    /// the context that symbol's own `single_ref_p*_ctx` derives from the
+    /// block's above/left neighbours. Red before lane-pricer, where every
+    /// backward reference was priced as LAST (p1=0,p3=0,p4=0) at context 0.
     #[test]
     fn the_single_ref_pricer_pays_the_writers_own_symbol_sequence() {
         use crate::cdf::SINGLE_REF as SR;
         use crate::encode::symbol_bits as b;
         use crate::mvstack::{
             ALTREF2_FRAME, ALTREF_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST2_FRAME, LAST3_FRAME,
-            LAST_FRAME,
+            LAST_FRAME, MvStack, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx,
+            single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
+        };
+        let stack_with = |above_refs, left_refs| MvStack {
+            entries: Default::default(),
+            nearest_mv: (0, 0),
+            near_mv: (0, 0),
+            pred_mv: (0, 0),
+            new_mv_ctx: 0,
+            ref_mv_ctx: 0,
+            zero_mv_ctx: 0,
+            drl_ctx: Default::default(),
+            above_refs,
+            left_refs,
         };
         // (reference, the symbols `write_single_ref` emits as (p index, value))
         let cases: [(i8, &[(usize, usize)]); 7] = [
@@ -12073,13 +12098,32 @@ mod tests {
             (ALTREF2_FRAME, &[(0, 1), (1, 0), (5, 1)]),
             (ALTREF_FRAME, &[(0, 1), (1, 1)]),
         ];
-        for (ref_frame, symbols) in cases {
-            let want: f64 = symbols.iter().map(|&(p, v)| b(&SR[0][p], v)).sum();
-            let got = super::single_ref_bits(ref_frame);
-            assert!(
-                (got - want).abs() < 1e-9,
-                "ref {ref_frame}: priced {got} bits, writer codes {want}"
-            );
+        // Both neighbours intra, and the mixed LAST-above/ALTREF-left pair
+        // that puts every p* context on a different row.
+        for (above_refs, left_refs) in [
+            ((None, None), (None, None)),
+            ((Some(LAST_FRAME), None), (Some(ALTREF_FRAME), Some(LAST_FRAME))),
+        ] {
+            let stack = stack_with(above_refs, left_refs);
+            let (a, a1) = above_refs;
+            let (l, l1) = left_refs;
+            let ctx_of = |p: usize| match p {
+                0 => single_ref_p1_ctx(a, a1, l, l1),
+                1 => single_ref_p2_ctx(a, a1, l, l1),
+                2 => single_ref_p3_ctx(a, a1, l, l1),
+                3 => single_ref_p4_ctx(a, a1, l, l1),
+                4 => single_ref_p5_ctx(a, a1, l, l1),
+                _ => single_ref_p6_ctx(a, a1, l, l1),
+            };
+            for (ref_frame, symbols) in cases {
+                let want: f64 = symbols.iter().map(|&(p, v)| b(&SR[ctx_of(p)][p], v)).sum();
+                let got = super::single_ref_bits(ref_frame, &stack);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "ref {ref_frame} above {above_refs:?} left {left_refs:?}: \
+                     priced {got} bits, writer codes {want}"
+                );
+            }
         }
     }
 
