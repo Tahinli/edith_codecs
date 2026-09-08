@@ -722,6 +722,16 @@ pub fn take_b64_root_hits() -> usize {
     B64_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many 128x128 `PARTITION_NONE` roots the search took since the last
+/// [`take_b128_none_hits`] (class `gate-blind-to-feature`): a flat BD result
+/// is only attributable once the fire count is known.
+static B128_NONE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The 128x128-root count since the last call, and zero it.
+pub fn take_b128_none_hits() -> usize {
+    B128_NONE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Rate-distortion optimised quantisation ([`crate::tile::rdoq`], lane-rdoq).
 /// Preset-gated: it re-prices the block once per candidate level, so it buys
 /// bits with wall (see `crate::speed::RDOQ` for the per-preset table).
@@ -9204,6 +9214,113 @@ fn predict_compound_u8(
     blended.iter().map(|&v| v as u8).collect()
 }
 
+/// lane-b128: the 128x128 `PARTITION_NONE` candidate for a whole 128
+/// superblock root, the lever cen3's L1 asks for -- one block, one mode and
+/// one motion vector where the four 64x64 roots below spend four of each.
+///
+/// SKIP only (`residual: false`): a 128x128 block's residual is four
+/// TX_64X64 luma units interleaved with a TX_32X32 chroma pair per 64x64 mu
+/// chunk, which neither the writer nor [`Plane::code_from_prediction`] has a
+/// path for -- offering one here would price a block
+/// [`crate::tile::write_inter_block_128`] refuses. Single reference only for
+/// the same reason: the compound arm at this size is untested against the
+/// writer's own `write_compound_block` window.
+///
+/// Only a root whose whole 128x128 lies inside the true frame AND inside
+/// this tile is offered: the writer's own root codes `PARTITION_NONE` only
+/// where the spec's `has_rows`/`has_cols` are both set, and a straddling
+/// block would have to be ranked over its inside part alone.
+///
+/// Returns `(cost, lambda, block, reconstruction)` -- the cost already
+/// carries the root's own `PARTITION_NONE` symbol, so the caller weighs it
+/// against the four superblocks plus the SPLIT symbol.
+#[allow(clippy::too_many_arguments)]
+fn search_root_128(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    grid: &crate::mvstack::MiGrid,
+    (root_r, root_c): (usize, usize),
+    // The 32x32-block grid this tile's `blocks` vector is indexed on.
+    (rows, cols): (usize, usize),
+    // The frame's own mode-info grid, which bounds the root.
+    (mi_cols, mi_rows): (u32, u32),
+    search: Search<'_>,
+    tpl_factors: &Option<Vec<f64>>,
+    sb_q: Option<&Vec<u8>>,
+    sb_cols: usize,
+    tpl_cells_x: usize,
+    base_q_idx: u8,
+    reference: &Picture,
+    fctx: &crate::decode::FrameCtx,
+) -> Option<(f64, f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> {
+    const SIDE: usize = SUPERBLOCK * 2;
+    const SIDE_MI: usize = SIDE / 4;
+    let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
+    let (mi_row, mi_col) = (root_r * 16, root_c * 16);
+    if root_r * 2 + 3 >= rows
+        || root_c * 2 + 3 >= cols
+        || (mi_row + SIDE_MI) as u32 > mi_rows
+        || (mi_col + SIDE_MI) as u32 > mi_cols
+        || x128 + SIDE > luma.true_width
+        || y128 + SIDE > luma.true_height
+    {
+        return None;
+    }
+    // One lambda for the whole root, the mean of what its four superblocks
+    // would each be searched at -- the 128-vs-four comparison weighs one cost
+    // against four, so both sides have to be priced at the same lambda (the
+    // same rule the 64 root's own mean-of-sixteen tpl cells follows).
+    let cell_lambda = |sb_r: usize, sb_c: usize| match (sb_q, tpl_factors) {
+        (Some(q), _) => sb_q_search(q, sb_cols, base_q_idx, (sb_r, sb_c), search).lambda,
+        (None, Some(f)) => {
+            let mean = (0..16)
+                .map(|i| f[(sb_r * 4 + i / 4) * tpl_cells_x + sb_c * 4 + i % 4])
+                .sum::<f64>()
+                / 16.0;
+            search.lambda * mean
+        }
+        (None, None) => search.lambda,
+    };
+    let lambda = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        .iter()
+        .map(|&(dr, dc)| cell_lambda(root_r + dr, root_c + dc))
+        .sum::<f64>()
+        / 4.0;
+    let root_search = Search { lambda, ..search };
+    let stack = find_mv_stack(
+        grid,
+        mi_row,
+        mi_col,
+        SIDE_MI,
+        SIDE_MI,
+        LAST_FRAME,
+        mi_cols as usize,
+        mi_rows as usize,
+    );
+    let base = snapshot(luma, chroma, (x128, y128), SIDE);
+    let found = search_skip_64(
+        luma,
+        chroma,
+        (x128, y128),
+        SIDE,
+        &root_search,
+        false,
+        reference,
+        &stack,
+        &[],
+        fctx,
+    );
+    let (cost, block) = found?;
+    let after = snapshot(luma, chroma, (x128, y128), SIDE);
+    restore(luma, chroma, (x128, y128), SIDE, &base);
+    Some((
+        cost + lambda * crate::tile::partition_bits(SIDE, false),
+        lambda,
+        block,
+        after,
+    ))
+}
+
 /// The 64x64 `PARTITION_NONE` candidate for a whole superblock ([`B64_ROOT`]):
 /// single-reference LAST at `NEARESTMV`/`GLOBALMV`/`NEARMV`/`NEWMV`, coded
 /// SKIP, priced through the same `symbol_bits` path every other candidate
@@ -9218,6 +9335,12 @@ fn search_skip_64(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
+    // The root's side in samples: [`SUPERBLOCK`] at a 64 root, twice that at
+    // the 128 one [`search_root_128`] drives (lane-b128). Every trial below
+    // is a square of this side and its half in chroma, and the residual arm
+    // is only ever asked for at 64 -- a 128 block's residual is four
+    // TX_64X64 units the writer has no path for.
+    side: usize,
     search: &Search,
     // Whether the non-skip arm is priced at all ([`b64_residual`], and off on
     // screen content -- see that function's doc).
@@ -9230,7 +9353,7 @@ fn search_skip_64(
     compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
     fctx: &crate::decode::FrameCtx,
 ) -> Option<(f64, BlockCoeffs)> {
-    let side = SUPERBLOCK;
+    debug_assert!(side == SUPERBLOCK || !residual, "a 128 root has no residual arm");
     let not_new = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1);
     let not_zero = symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1);
     let ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
@@ -11459,8 +11582,63 @@ pub(crate) fn encode_inter_frame(
             rect.mi_col1 as usize,
         );
         let mut blocks: Vec<(usize, Quadrant)> = Vec::new();
-    for sb_r in rect.sb_row0 as usize..rect.sb_row1 as usize {
-        for sb_c in rect.sb_col0 as usize..rect.sb_col1 as usize {
+    // lane-b128: under a 128x128 superblock the search walks the roots the
+    // WRITER walks (`tile::sb_write_order`: TL, TR, BL, BR inside each root),
+    // not plain raster -- a search that visits BL before TR builds every mv
+    // stack and neighbour context off blocks the writer has not coded yet,
+    // which is what made the write-time drl clamp fire at all (lane-sb128b).
+    // At a 64 superblock the two orders are identical and this is the same
+    // raster loop as before.
+    let sb128_search = sb128_on();
+    let root_step = if sb128_search { 2 } else { 1 };
+    let mut roots: Vec<(usize, usize)> = Vec::new();
+    {
+        let (r0, r1) = (rect.sb_row0 as usize, rect.sb_row1 as usize);
+        let (c0, c1) = (rect.sb_col0 as usize, rect.sb_col1 as usize);
+        let mut r = r0;
+        while r < r1 {
+            let mut c = c0;
+            while c < c1 {
+                roots.push((r, c));
+                c += root_step;
+            }
+            r += root_step;
+        }
+    }
+    for (root_r, root_c) in roots {
+        // The 64x64 cells of this root, in the writer's own order.
+        let cells: Vec<(usize, usize)> = if sb128_search {
+            [(0, 0), (0, 1), (1, 0), (1, 1)]
+                .into_iter()
+                .map(|(dr, dc)| (root_r + dr, root_c + dc))
+                .filter(|&(r, c)| r < rect.sb_row1 as usize && c < rect.sb_col1 as usize)
+                .collect()
+        } else {
+            vec![(root_r, root_c)]
+        };
+        // What the four cells below really cost, against which the whole
+        // 128x128 candidate is weighed.
+        let mark128 = blocks.len();
+        let mut root_cost = 0.0f64;
+        let root128 = sb128_search
+            .then(|| search_root_128(
+                &mut luma,
+                &mut chroma,
+                &grid,
+                (root_r, root_c),
+                (rows, cols),
+                (header.mi_cols, header.mi_rows),
+                search,
+                &tpl_factors,
+                sb_q.as_ref(),
+                sb_cols,
+                tpl_cells_x,
+                base_q_idx,
+                reference,
+                fctx,
+            ))
+            .flatten();
+        for (sb_r, sb_c) in cells {
             // lane-b64: the whole superblock as ONE 64x64 block, tried before
             // its quadrants are (`search_skip_64`) and compared against the
             // four of them below. Only a superblock wholly inside the true
@@ -11559,6 +11737,7 @@ pub(crate) fn encode_inter_frame(
                     &mut luma,
                     &mut chroma,
                     (x64, y64),
+                    SUPERBLOCK,
                     &sb_search,
                     b64_residual() && !screen,
                     reference,
@@ -12028,6 +12207,27 @@ pub(crate) fn encode_inter_frame(
                     let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
                     blocks.push((r32 * cols + c32, Quadrant::Covered));
                 }
+                root_cost += cost64;
+            } else {
+                root_cost += sb_cost;
+            }
+        }
+        // lane-b128: the whole 128x128 root (`PARTITION_NONE` at the root's
+        // `partition_w128` symbol) against what its four superblocks really
+        // cost, the same weighing the 64 root does one size down. Both sides
+        // carry their own partition symbol, so the comparison is complete.
+        if let Some((cost128, lambda128, block, after)) = root128
+            && cost128 < root_cost + lambda128 * crate::tile::partition_bits(128, true)
+        {
+            B128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
+            blocks.truncate(mark128);
+            restore(&mut luma, &mut chroma, (x128, y128), SUPERBLOCK * 2, &after);
+            record_mi(&mut grid, root_r * 16, root_c * 16, 32, block.inter, block.skip);
+            blocks.push(((root_r * 2) * cols + root_c * 2, Quadrant::Whole128(block)));
+            for q in 1..16 {
+                let (r32, c32) = (root_r * 2 + q / 4, root_c * 2 + q % 4);
+                blocks.push((r32 * cols + c32, Quadrant::Covered));
             }
         }
     }
@@ -12534,6 +12734,57 @@ mod tests {
     /// An [`crate::mvstack::MvStack`] with every context at zero and no
     /// neighbours, for the pricer tests below to fill the one band each of
     /// them is about.
+    /// lane-b128 task 0: every `ref_mv_idx` the `NEWMV`/`NEARMV` pricer
+    /// offers must be one [`crate::tile::write_drl_idx`] can really SIGNAL
+    /// against the same stack -- an offer the writer clamps prices the
+    /// residual against a predictor the decoder never derives, which is the
+    /// silent MV drift lane-sb128b root-caused (there fixed on the WRITER
+    /// side, so the stream stays legal; here the pricer's own offer set is
+    /// enumerated, class `enumerate-table-domain`).
+    ///
+    ///     cargo test -p ec-av1 --lib -- every_drl_index_the_new_mv_pricer
+    #[test]
+    fn every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal() {
+        for n in 0..=4usize {
+            let mut stack = bare_stack();
+            for i in 0..n {
+                stack.entries.push(crate::mvstack::StackEntry {
+                    mv: (8 * (i as i32 + 1), -8 * (i as i32 + 1)),
+                    weight: 1,
+                });
+                stack.drl_ctx.push(0);
+            }
+            stack.nearest_mv = stack.entries.first().map_or((0, 0), |e| e.mv);
+            stack.near_mv = stack.entries.get(1).map_or((0, 0), |e| e.mv);
+            stack.pred_mv = stack.nearest_mv;
+            // Aim the vector at each entry in turn, so every index the offer
+            // set holds is the one that wins at least once.
+            for target in 0..n.max(1) {
+                let mv = stack.entries.get(target).map_or(stack.pred_mv, |e| e.mv);
+                let (_, idx) = best_new_mv_syntax(&stack, mv)
+                    .expect("a zero residual is always codable");
+                let idx = usize::from(idx);
+                assert_eq!(
+                    crate::tile::signalled_drl_idx(n, 0, idx),
+                    idx,
+                    "NEWMV: a {n}-entry stack cannot signal the offered drl index {idx}",
+                );
+            }
+            // The NEARMV arm's own offer set (`search_inter_block`,
+            // `search_skip_64`): indices 1 and 2, offered only when the stack
+            // really holds that entry.
+            for idx in 1..=2usize {
+                if stack.entries.get(idx).is_some() {
+                    assert_eq!(
+                        crate::tile::signalled_drl_idx(n, 1, idx),
+                        idx,
+                        "NEARMV: a {n}-entry stack cannot signal the offered drl index {idx}",
+                    );
+                }
+            }
+        }
+    }
+
     fn bare_stack() -> crate::mvstack::MvStack {
         crate::mvstack::MvStack {
             entries: Default::default(),
@@ -15147,6 +15398,86 @@ mod tests {
     ///
     ///     cargo test -p ec-av1 --release --lib -- --ignored \
     ///         a_128_superblock_clip_whose_drl_index_the_write_time_stack --nocapture
+    /// lane-b128: the 128x128 `PARTITION_NONE` root -- one block, one mode
+    /// and one motion vector where the four 64x64 roots below spend four of
+    /// each (cen3's L1). The counter is the gate on the fixture (class
+    /// `gate-blind-to-feature`): a green round trip on a clip that never
+    /// codes a 128x128 block proves nothing. RED before the search existed
+    /// (zero such blocks coded, `tile::write_sb128_root` wrote SPLIT at every
+    /// root by construction).
+    ///
+    /// Both readers: our own decoder sample-exact against the encoder's
+    /// reconstruction (a writer/reader desync surfaces as a pixel miss or a
+    /// refusal here, not in the BD gate) AND ffmpeg as the bitstream oracle.
+    ///
+    /// `#[ignore]`: [`force_sb128`] moves a process-global.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_128_superblock_clip_whose_root_search --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_128_superblock_clip_whose_root_search_codes_128x128_blocks_decodes_exact() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-b128-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("smpte-1280x768.y4m");
+        // A slow horizontal pan over a still pattern: whole 128x128 regions
+        // share one motion vector, which is exactly what a 128 root can code
+        // as one block and four 64 roots cannot.
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "smptebars=size=1600x768:rate=24"])
+            .args(["-vf", "crop=1280:768:'min(n*2,300)':0", "-frames:v", "8"])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
+        let _ = take_b128_none_hits();
+        let _ = crate::tile::take_sb128_none_hits();
+        let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
+        let (won, coded) = (take_b128_none_hits(), crate::tile::take_sb128_none_hits());
+        eprintln!("128x128 PARTITION_NONE blocks: search won {won}, writer coded {coded}");
+        assert!(
+            coded > 0,
+            "no 128x128 block was coded on this clip, so it cannot witness the root search",
+        );
+        assert_eq!(won, coded, "every 128x128 root the search took must be coded as one");
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            let recon = &frame.reconstruction;
+            for (plane, got, want) in [
+                ("luma", &dec.y, &recon.y),
+                ("U", &dec.u, &recon.u),
+                ("V", &dec.v, &recon.v),
+            ] {
+                let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ, 0,
+                    "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
+                     own reconstruction",
+                    got.len()
+                );
+            }
+        }
+        let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: ffmpeg V");
+        }
+    }
+
     #[test]
     #[ignore = "sets the process-global superblock size: run it alone"]
     fn a_128_superblock_clip_whose_drl_index_the_write_time_stack_cannot_carry_decodes_exact() {
