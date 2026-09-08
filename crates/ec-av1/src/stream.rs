@@ -35385,4 +35385,91 @@ pub(crate) mod tests {
         eprintln!("{NAME}: {checked} straddling reference points decoded sample-exact");
     }
 
+    /// lane-seg2: a SEGMENTED key frame that also codes sub-8x8 INTRA leaves.
+    ///
+    /// WHY IT EXISTS: `read_intra_mode_sub8` -- the reader every `BLOCK_4X4`
+    /// split leaf and every 8x4/4x8 leaf goes through -- never called spec
+    /// 5.11.6's `intra_segment_id` at all. On a stream with segmentation on
+    /// it therefore (a) left the block's `segment_id` symbol unread, so the
+    /// tile desynced from the frame's first sub-8x8 partition on, and (b)
+    /// dequantized the leaf with the PREVIOUS block's `SEG_LVL_ALT_Q`.
+    /// Reading it with a hardcoded 1x1 mi footprint was the second half of
+    /// the same defect: an 8x4 leaf left its second mi cell at segment 0,
+    /// which the next block read back as its spatial prediction and CDF row.
+    ///
+    /// RECIPE: flat gray + heavy `noise` (the contrast is what turns libaom's
+    /// activity segmentation on -- a `testsrc2`/bars source codes ONE segment
+    /// and passes with the defect in, ledger dead-end `gate film rows are
+    /// colour bars`), at `-crf 5 -cpu-used 2`, which is the measured corner
+    /// where libaom answers with sub-8x8 intra partitions. Measured on this
+    /// exact stream: red before either half of the fix (134k/134k samples
+    /// off), green with both.
+    #[test]
+    fn a_segmented_key_frame_with_sub_8x8_intra_leaves_decodes_exactly() {
+        const NAME: &str = "a_segmented_key_frame_with_sub_8x8_intra_leaves_decodes_exactly";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        const FRAMES: usize = 4;
+        let (w, h) = (384usize, 152usize);
+        let src = format!(
+            "color=c=gray:s={w}x{h}:r=25,noise=alls=80:all_seed=7:allf=t+u"
+        );
+        let args: Vec<String> = [
+            "-v", "error", "-f", "lavfi", "-i", &src, "-frames:v", "4", "-pix_fmt", "yuv420p",
+            "-an", "-threads", "1", "-g", "4", "-c:v", "libaom-av1", "-cpu-used", "2", "-b:v",
+            "0", "-crf", "5", "-aq-mode", "1", "-f", "obu", "-",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let out = Command::new("ffmpeg")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        if !out.status.success() {
+            eprintln!(
+                "SKIP {NAME}: ffmpeg cannot encode with libaom-av1 ({})",
+                String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+            );
+            return;
+        }
+        let stream = out.stdout;
+        crate::decode::reset_segment_hits();
+        let want = ffmpeg_decode_sequence(&stream, w, h, FRAMES);
+        let got = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME}: refused: {e}"));
+        assert_eq!(got.len(), want.len(), "{NAME}: frame count");
+        for (f, (o, r)) in got.iter().zip(&want).enumerate() {
+            for (plane, a, b) in [("Y", &o.y, &r.y), ("U", &o.u, &r.u), ("V", &o.v, &r.v)] {
+                if let Some(i) = a.iter().zip(b.iter()).position(|(x, y)| x != y) {
+                    let stride = if plane == "Y" { w } else { w / 2 };
+                    panic!(
+                        "{NAME}: frame {f} plane {plane} sample ({}, {}): ours {} vs ffmpeg {}",
+                        i % stride,
+                        i / stride,
+                        a[i],
+                        b[i],
+                    );
+                }
+            }
+        }
+        // The property is asserted, not hoped for: without more than one
+        // segment this row would pass with the defect still in.
+        assert!(
+            crate::decode::segment_ids_seen() >= 2,
+            "{NAME}: vacuous run -- {} distinct segment ids",
+            crate::decode::segment_ids_seen()
+        );
+        eprintln!(
+            "{NAME}: {FRAMES} frames sample-exact, {} segment_id symbols, {} distinct ids",
+            crate::decode::segment_id_hits(),
+            crate::decode::segment_ids_seen()
+        );
+    }
+
 }
