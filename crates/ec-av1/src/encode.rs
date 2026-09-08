@@ -662,13 +662,16 @@ pub(crate) const I64_ROOT: bool = true;
 /// the last [`take_i64_root_hits`], so a gate reports the fire rate rather
 /// than assuming it (class `gate-blind-to-feature`).
 /// Index 1 is how many were OFFERED the trial at all, so a gate reads a
-/// SHARE and not a bare count.
-static I64_HITS: [std::sync::atomic::AtomicUsize; 2] =
-    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+/// SHARE and not a bare count, and index 2 how many of the whole ones sat on
+/// a superblock the true frame edge CUTS THROUGH (lane-corner) -- the
+/// `gate-blind-to-feature` guard for the edge path, which no
+/// superblock-aligned clip fires at all.
+static I64_HITS: [std::sync::atomic::AtomicUsize; 3] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
 
-/// The key-frame `(whole, offered)` 64x64-intra-root counts since the last
-/// call, and zero them.
-pub fn take_i64_root_hits() -> [usize; 2] {
+/// The key-frame `(whole, offered, edge)` 64x64-intra-root counts since the
+/// last call, and zero them.
+pub fn take_i64_root_hits() -> [usize; 3] {
     std::array::from_fn(|i| I64_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -792,10 +795,17 @@ pub fn take_b64_var_tx_hits() -> usize {
 ///
 /// Off by `EC_AV1_B64EDGE=0`.
 fn b64_edge() -> bool {
+    edge_root_enabled() && b64_root()
+}
+
+/// What `EC_AV1_B64EDGE` names on its own, without the inter root's own
+/// preset switch -- the key frame's root ([`I64_ROOT`]) reads the same flag
+/// but is gated by [`i64_root`].
+fn edge_root_enabled() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_B64EDGE").ok().map(|v| v != "0")
     });
-    ENV.unwrap_or(true) && b64_root()
+    ENV.unwrap_or(true)
 }
 
 /// How many 64x64 roots the frame edge cut through since the last
@@ -7271,34 +7281,47 @@ pub(crate) fn encode_key_frame_inner(
             // BEFORE its quadrants (so both start from the same
             // reconstruction) and compared against the four of them below --
             // the shape the inter frame's own 64 root takes
-            // (`search_skip_64`). Only a superblock wholly inside the true
-            // frame is offered it: the writer's `Superblock::Whole` arm
-            // refuses one the edge cuts through, and a frame that allows
-            // intrabc is refused outright ([`I64_ROOT`]) because the quadrant
-            // searches below carry DV state a discarded trial would desync.
+            // (`search_skip_64`). A frame that allows intrabc is refused
+            // outright ([`I64_ROOT`]) because the quadrant searches below
+            // carry DV state a discarded trial would desync.
             let (x64, y64) = (sb_col * SUPERBLOCK, sb_row * SUPERBLOCK);
-            // corner-cut, ceiling named: only a frame whose true size is a
-            // WHOLE number of superblocks is offered the root at all.
-            // MEASURED (lane-i64): on a 248x152 frame -- whose bottom-right
-            // superblock is cut on BOTH axes -- a frame carrying whole 64
-            // roots elsewhere desyncs that corner's CHROMA three ways (our
-            // writer's reconstruction, our decoder and ffmpeg all disagree,
-            // luma stays exact), i.e. a defect in the whole-64 chroma
-            // neighbour publication that only the doubly-cut tail block
-            // reads (class `last-block-desync-reads-as-reconstruction`).
-            // Every clip on the BD gates, and every real film/screen source,
-            // is superblock aligned, so nothing measured is withheld.
-            // Ceiling: trace the corner block's chroma `txb_skip`/dc context
-            // against aomdec and lift this line.
-            let aligned = header.mi_cols % crate::tile::SB_MI == 0
-                && header.mi_rows % crate::tile::SB_MI == 0;
+            // lane-corner LIFTED the two guards this root shipped with: the
+            // frame no longer has to be a whole number of superblocks, and
+            // the superblock no longer has to be wholly inside the frame.
+            // The desync the guards were written for (a 248x152 corner's
+            // chroma disagreeing three ways) does NOT reproduce at this
+            // revision -- see
+            // `stream::tests::a_doubly_cut_superblock_root_round_trips_in_every_plane`,
+            // which pins all three planes of the encoder's reconstruction,
+            // our decoder and ffmpeg on four straddling sizes, three of them
+            // cut on BOTH axes, with the edge fire count asserted. What the
+            // guards cost was every key-frame root on an arbitrary export
+            // size (the `aligned` line switched the whole feature off on, for
+            // instance, a 1920x792 frame).
+            let whole_inside = x64 + SUPERBLOCK <= luma.true_width
+                && y64 + SUPERBLOCK <= luma.true_height;
+            // lane-corner: and the superblock the true frame edge CUTS
+            // THROUGH with more than half of each axis still inside, which is
+            // all AV1 asks of a `PARTITION_NONE` root (spec
+            // `decode_partition`'s `has_cols`/`has_rows`, the same pair the
+            // key writer's `Superblock::Whole` arm checks) -- the shape the
+            // inter root already takes ([`b64_edge`]).
+            let edge_inside = edge_root_enabled()
+                && crate::tile::has_half(
+                    sb_col as u32 * crate::tile::SB_MI,
+                    crate::tile::SB_MI,
+                    header.mi_cols,
+                )
+                && crate::tile::has_half(
+                    sb_row as u32 * crate::tile::SB_MI,
+                    crate::tile::SB_MI,
+                    header.mi_rows,
+                );
             let sb64_legal = i64_root()
-                && aligned
                 && ibc.is_none()
                 && sb_row * 2 + 1 < rows
                 && sb_col * 2 + 1 < cols
-                && x64 + SUPERBLOCK <= luma.true_width
-                && y64 + SUPERBLOCK <= luma.true_height;
+                && (whole_inside || edge_inside);
             let mut sb64: Option<(f64, BlockCoeffs, [(Vec<u8>, Vec<CoefCtx>); 3])> = None;
             if sb64_legal {
                 I64_HITS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7509,6 +7532,9 @@ pub(crate) fn encode_key_frame_inner(
                         left_mode[sb_row * 4 + cell] = block.mode;
                     }
                     I64_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !whole_inside {
+                        I64_HITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let mode = block.mode;
                     coded.push((index, Superblock::Whole(block), vec![mode]));
                 }
@@ -12088,7 +12114,7 @@ mod tests {
         }
         let _ = take_i64_root_hits();
         let encoded = encode_key_frame_with_ctx(&picture, 120, 0.5, fctx).unwrap();
-        let [roots, _offered] = take_i64_root_hits();
+        let [roots, _offered, _edge] = take_i64_root_hits();
         // The counters are process-global, so another test encoding in
         // parallel can only ADD to them -- the per-FRAME fact is the mode
         // list, which carries one entry per coded block and so exactly 12
@@ -16604,9 +16630,10 @@ mod tests {
             // reference (class `gate-blind-to-feature`).
             // lane-i64: the KEY frame's own 64x64 intra root -- how many of
             // the superblocks offered the trial were coded whole.
-            let [i64_whole, i64_offered] = take_i64_root_hits();
+            let [i64_whole, i64_offered, i64_edge] = take_i64_root_hits();
             eprintln!(
-                "{name}: key 64x64 intra roots {i64_whole} of {i64_offered} offered ({:.1}%)",
+                "{name}: key 64x64 intra roots {i64_whole} of {i64_offered} offered ({:.1}%), \
+                 {i64_edge} on a superblock the frame edge cuts",
                 100.0 * i64_whole as f64 / i64_offered.max(1) as f64,
             );
             eprintln!(
