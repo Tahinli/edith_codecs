@@ -11739,7 +11739,21 @@ pub(crate) fn encode_inter_frame(
     let sb_q: Option<Vec<u8>> = match (&tpl_factors, deltaq_res) {
         (Some(f), Some(res)) => {
             let libaom = dq_tpl_strength();
-            Some((0..sb_cols * _sb_rows).map(|sb| sb_qindex(f, res, sb, libaom)).collect())
+            let mut g: Vec<u8> =
+                (0..sb_cols * _sb_rows).map(|sb| sb_qindex(f, res, sb, libaom)).collect();
+            // lane-b128m: under 128 superblocks the delta_q syntax is coded
+            // ONCE per 128 root (the reader's own unit), so all four 64x64
+            // cells of a root have to be searched -- and quantized -- at the
+            // one qindex the root's top-left cell codes.
+            if sb128_on() {
+                for sb_r in 0.._sb_rows {
+                    for sb_c in 0..sb_cols {
+                        let q = g[(sb_r & !1) * sb_cols + (sb_c & !1)];
+                        g[sb_r * sb_cols + sb_c] = q;
+                    }
+                }
+            }
+            Some(g)
         }
         _ => None,
     };
