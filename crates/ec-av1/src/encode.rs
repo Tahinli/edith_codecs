@@ -17076,7 +17076,11 @@ mod tests {
         // FILTERED source ([`crate::speed::ARF_TF`]), so every hidden frame's
         // pixels -- and the leaves that predict from them -- moved:
         // 8269 -> 8218 bytes at q=150 and 33044 -> 33017 at q=60.
-        let pins: [(u8, usize, u64); 2] = [(150, 8218, 0xd533_c8ea_14ca_ae6e), (60, 33017, 0xbced_b694_dcfe_9146)];
+        // Re-taken on lane-arftf: that filter's strength swept on the deciding
+        // gate lands at 2, not 3 ([`crate::speed::ARF_TF`]), so the filtered
+        // anchors' pixels moved once more: 8218 -> 8307 bytes at q=150 and
+        // 33017 at q=60 (the same LENGTH, different bytes).
+        let pins: [(u8, usize, u64); 2] = [(150, 8307, 0xd759_b4f4_cad1_f9a8), (60, 33017, 0xfee7_d4b8_5cea_19d7)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
