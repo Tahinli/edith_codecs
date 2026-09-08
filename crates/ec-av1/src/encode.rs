@@ -737,13 +737,29 @@ fn b128_root() -> bool {
 /// skip arm -- four TX_64X64 luma units interleaved with a TX_32X32 chroma
 /// pair per 64x64 mu chunk, var-tx depth 0 (the shape
 /// [`crate::tile::write_inter_block_128`] codes and `decode_inter_block`
-/// reads). On by default; `EC_AV1_B128RES=0` restores lane-b128's skip-only
-/// root, which is this arm's own attribution control.
+/// reads). Written, witnessed and byte-exact through both decoders, and
+/// **off by default** (`EC_AV1_B128RES=1` turns it on) for two measured
+/// reasons:
+///
+///  * it is INERT on content: over the native 12-frame gate the RD takes it
+///    0-2 times per frame against ~90 whole 128 roots, so the BD effect is
+///    inside the noise either way;
+///  * with it on, `bd_rate_screen_native`'s bars 2160p row q=90 frame 11
+///    reads 8 luma samples (rows 126..127, cols 1611..1616 -- the two rows
+///    above a 128-superblock horizontal edge) where ffmpeg and this
+///    encoder's own reconstruction disagree. The residual arm's own witness
+///    clip is byte-exact through ffmpeg over 420 forced blocks at 1280x768,
+///    so the open half is a FILTER-stage interaction (deblock/CDEF at a 128
+///    block's own edge), not the coefficient path.
+///
+/// An inert candidate does not buy a live filter mismatch, so the default
+/// stays off until that is root-caused; the knob is the gate for it.
 fn b128_residual() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_B128RES").ok().map(|v| v != "0")
     });
-    ENV.unwrap_or(true) && b128_root()
+    (ENV.unwrap_or(false) || FORCE_B128_RESIDUAL.load(std::sync::atomic::Ordering::Relaxed))
+        && b128_root()
 }
 
 /// Test-only: take the 128 root's residual arm whatever it costs, so a
@@ -17432,6 +17448,32 @@ mod tests {
             );
             for (i, (d, e)) in decoded.iter().zip(&encoded.frames).enumerate() {
                 if let Some((plane, s, got, want)) = first_plane_mismatch(d, &e.reconstruction) {
+                    // TEMPORARY (lane-b128r bisect): the whole mismatch map.
+                    let (l, r) = match plane {
+                        "Y" => (&d.y, &e.reconstruction.y),
+                        "U" => (&d.u, &e.reconstruction.u),
+                        _ => (&d.v, &e.reconstruction.v),
+                    };
+                    let w = if plane == "Y" { width } else { width / 2 };
+                    let bad: Vec<usize> = l
+                        .iter()
+                        .zip(r.iter())
+                        .enumerate()
+                        .filter(|(_, (a, b))| a != b)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let rows: Vec<usize> = bad.iter().map(|i| i / w).collect();
+                    let cols: Vec<usize> = bad.iter().map(|i| i % w).collect();
+                    eprintln!(
+                        "B128R MISMATCH {name} q={q} frame {i} plane {plane}: {} samples, \
+                         rows {}..{}, cols {}..{}, first 8 {:?}",
+                        bad.len(),
+                        rows.iter().min().copied().unwrap_or(0),
+                        rows.iter().max().copied().unwrap_or(0),
+                        cols.iter().min().copied().unwrap_or(0),
+                        cols.iter().max().copied().unwrap_or(0),
+                        bad.iter().take(8).map(|i| (i / w, i % w)).collect::<Vec<_>>(),
+                    );
                     panic!(
                         "{name} q={q} frame {i} plane {plane} sample {s}: ffmpeg decoded \
                          {got}, the encoder reconstructed {want}"
