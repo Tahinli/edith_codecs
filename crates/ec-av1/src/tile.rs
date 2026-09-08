@@ -175,6 +175,12 @@ fn write_sb128_root(
     sb_c: u32,
     mi_cols: u32,
     mi_rows: u32,
+    // lane-b128: the partition the root's own search chose --
+    // `PARTITION_SPLIT` (the four 64x64 quadrants below, which is every root
+    // this writer coded before) or `PARTITION_NONE` (one 128x128 block,
+    // written by the caller right after this). Only offered at a root wholly
+    // inside the frame, so the gathered edge arms below still code SPLIT.
+    part: usize,
 ) {
     SB128_ROOT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (mi_r128, mi_c128) = ((sb_r & !1) * SB_MI, (sb_c & !1) * SB_MI);
@@ -186,7 +192,7 @@ fn write_sb128_root(
         eprintln!("WTRACE partition_w128 ctx={ctx128} cols={has_cols128} rows={has_rows128}");
     }
     match (has_cols128, has_rows128) {
-        (true, true) => enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w128[ctx128]),
+        (true, true) => enc.symbol(part, &mut cdfs.partition_w128[ctx128]),
         // As at the 64 root: the gathered CDF is built for the read and
         // thrown away, so nothing adapts here. Value 1 is SPLIT.
         (true, false) => enc.symbol_fixed(
@@ -201,6 +207,160 @@ fn write_sb128_root(
         // decoder reads nothing.
         (false, false) => {}
     }
+}
+
+/// lane-b128: one 128x128 inter block at a `PARTITION_NONE` 128 superblock
+/// root -- the syntax `decode_inter_block` reads for `sb128_none` (decode.rs
+/// ~35110): `skip`, `is_inter`, the reference/mode chain at the block's own
+/// 32x32-mi window, the motion mode, and the transform syntax, with the mi
+/// grid and every neighbour band published over all thirty-two mi cells.
+///
+/// SKIP only, and refused otherwise: a 128x128 block's residual is four
+/// TX_64X64 luma units interleaved with a TX_32X32 chroma pair per 64x64 mu
+/// chunk (the chroma units reading the offset-10 `txb_skip` rows), which
+/// this writer has no path for. A skipped block writes no `cdef_idx` and no
+/// `delta_q` either, exactly as the 64 root's skip arm does.
+///
+/// # Errors
+/// A block that is intra, or carries a residual, at this size.
+#[allow(clippy::too_many_arguments)]
+fn write_inter_block_128(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    grid: &mut MiGrid,
+    // The root's top-left position in [`SUB`] (16x16) units.
+    sb_at: (usize, usize),
+    block: &BlockCoeffs,
+    mi_cols: u32,
+    mi_rows: u32,
+    tx_select: bool,
+) -> Result<()> {
+    /// The block's side in samples and in 4x4 mode-info units.
+    const SIDE: usize = 128;
+    const SIDE_MI: usize = SIDE / MI;
+    let info = block.inter.ok_or_else(|| {
+        Error::unsupported("AV1 tile", "a 128x128 superblock root block is coded inter")
+    })?;
+    if !block.skip {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a 128x128 superblock root block carries a residual",
+        ));
+    }
+    let (mi_r, mi_c) = (sb_at.0 * (SUB / MI), sb_at.1 * (SUB / MI));
+    let has_above = neighbours.has_above(mi_r);
+    let has_left = neighbours.has_left(mi_c);
+    let skip_ctx =
+        usize::from(neighbours.above_skip[mi_c]) + usize::from(neighbours.left_skip[mi_r]);
+    enc.symbol(1, &mut cdfs.skip[skip_ctx]);
+    write_cdef_idx(enc, (mi_r, mi_c), true);
+    write_delta_q(enc, cdfs, (mi_r, mi_c), true, true);
+    let ii_ctx = intra_inter_ctx(
+        has_above,
+        has_left,
+        neighbours.above_inter[mi_c],
+        neighbours.left_inter[mi_r],
+    );
+    enc.symbol(1, &mut cdfs.intra_inter[ii_ctx]);
+    write_comp_mode(
+        enc,
+        cdfs,
+        neighbours,
+        (mi_r, mi_c),
+        (has_above, has_left),
+        info.ref1.is_some(),
+    );
+    let (mv, mv1, is_new_mv) = if info.ref1.is_some() {
+        write_compound_block(
+            enc,
+            cdfs,
+            neighbours,
+            grid,
+            (mi_r, mi_c),
+            (SIDE_MI, SIDE_MI),
+            (has_above, has_left),
+            info,
+            (mi_cols as usize, mi_rows as usize),
+        )?
+    } else {
+        write_single_ref(
+            enc,
+            cdfs,
+            info.ref_frame,
+            neighbours.above_ref[mi_c],
+            neighbours.above_ref1[mi_c],
+            neighbours.left_ref[mi_r],
+            neighbours.left_ref1[mi_r],
+        );
+        let stack = find_mv_stack(
+            grid,
+            mi_r,
+            mi_c,
+            SIDE_MI,
+            SIDE_MI,
+            info.ref_frame,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+        let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
+        (mv, (0, 0), is_new_mv)
+    };
+    for dr in 0..SIDE_MI {
+        for dc in 0..SIDE_MI {
+            grid.set(
+                mi_r + dr,
+                mi_c + dc,
+                MiInfo {
+                    is_inter: true,
+                    ref_frame: info.ref_frame,
+                    ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                    mv1: mv16(mv1),
+                    mv: mv16(mv),
+                    is_new_mv,
+                    size: SIDE_MI as u8,
+                    size_h: SIDE_MI as u8,
+                    is_global_mv0: false,
+                    is_global_mv1: false,
+                },
+            );
+        }
+    }
+    if info.ref1.is_none() {
+        write_motion_mode(
+            enc,
+            cdfs,
+            grid,
+            (mi_r, mi_c),
+            (SIDE_MI, SIDE_MI),
+            (SIDE, SIDE),
+            (mi_cols as usize, mi_rows as usize),
+            info.ref_frame,
+            block.motion_mode,
+        )?;
+    }
+    if tx_select {
+        write_tx_syntax_inter(enc, cdfs, neighbours, (mi_r, mi_c), SIDE, true, true, 0);
+    }
+    let zero_grids = [
+        vec![0i32; TX32 * TX32],
+        vec![0i32; TX32 * TX32],
+        vec![0i32; TX32 * TX32],
+    ];
+    neighbours.record(sb_at, SIDE, 0, &zero_grids);
+    neighbours.record_inter(sb_at, SIDE, true, true, block_ref(block));
+    record_block_compound(neighbours, (mi_r, mi_c), SIDE, block);
+    SB128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// How many 128x128 `PARTITION_NONE` blocks the inter writer has coded since
+/// the last [`take_sb128_none_hits`] (class `gate-blind-to-feature`).
+static SB128_NONE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The 128x128-block count since the last call, and zero it.
+pub fn take_sb128_none_hits() -> usize {
+    SB128_NONE_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `read_lr`'s write side, called once at the top of every superblock,
@@ -2034,6 +2194,15 @@ pub enum Quadrant {
     /// whose coded quarter is a 32x32 level grid, and one TX_32X32 per chroma
     /// plane (lane-tx64, `crate::encode::b64_residual`).
     Whole64(BlockCoeffs),
+    /// lane-b128: the whole 128x128 SUPERBLOCK ROOT this quadrant is the
+    /// top-left of, coded as one block (`PARTITION_NONE` at the root's
+    /// `partition_w128` symbol). Carried by the top-left 32x32 entry of the
+    /// root's sixteen; the other fifteen carry [`Covered`](Quadrant::Covered).
+    ///
+    /// SKIP only: a 128x128 block's residual is four TX_64X64 luma units
+    /// interleaved with its chroma per 64x64 mu chunk, which this writer has
+    /// no path for; [`crate::tile::write_inter_block_128`] refuses one.
+    Whole128(BlockCoeffs),
     /// A quadrant a [`Whole64`](Quadrant::Whole64) at its superblock's
     /// top-left already coded; it carries no block of its own.
     Covered,
@@ -2043,7 +2212,9 @@ impl Quadrant {
     /// The blocks it carries, in the order they are coded.
     pub(crate) fn blocks(&self) -> &[BlockCoeffs] {
         match self {
-            Quadrant::Whole(block) | Quadrant::Whole64(block) => std::slice::from_ref(block),
+            Quadrant::Whole(block) | Quadrant::Whole64(block) | Quadrant::Whole128(block) => {
+                std::slice::from_ref(block)
+            }
             Quadrant::Split(blocks) => blocks.as_slice(),
             Quadrant::Covered => &[],
         }
@@ -2923,7 +3094,7 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
             neighbours.start_row();
         }
         if sb128 && sb_start {
-            write_sb128_root(&mut enc, &mut cdfs, &neighbours, sb_r, sb_c, mi_cols, mi_rows);
+            write_sb128_root(&mut enc, &mut cdfs, &neighbours, sb_r, sb_c, mi_cols, mi_rows, PARTITION_SPLIT);
         }
         {
             if !sb128 {
@@ -3040,7 +3211,7 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
                         match quadrant {
                             // A 64x64 root is an INTER-frame partition; a
                             // key frame codes one as `Superblock::Whole`.
-                            Quadrant::Whole64(_) | Quadrant::Covered => {
+                            Quadrant::Whole64(_) | Quadrant::Whole128(_) | Quadrant::Covered => {
                                 return Err(Error::unsupported(
                                     "AV1 tile",
                                     "a key frame codes a 64x64 block as `Superblock::Whole`",
@@ -4664,6 +4835,10 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
         .iter()
         .map(|q| {
             let side = match q {
+                // lane-b128: a 128x128 root is SKIP by construction (the
+                // writer refuses a residual at that size), so it names no
+                // coefficients on any plane.
+                Quadrant::Whole128(_) => return 0.0,
                 Quadrant::Whole(_) => 32,
                 Quadrant::Split(_) => 16,
                 // lane-tx64: a 64x64 root that codes a residual pays for one
@@ -5270,6 +5445,8 @@ pub(crate) fn partition_bits(side: usize, split: bool) -> f64 {
     static CDFS: LazyLock<Cdfs> = LazyLock::new(|| Cdfs::new(2));
     let cdfs = &*CDFS;
     let cdf: &[u16] = match side {
+        // lane-b128: the 128 superblock root's own eight-symbol alphabet.
+        128 => &cdfs.partition_w128[0],
         SB => &cdfs.partition_w64[0],
         BLOCK => &cdfs.partition_w32[0],
         TX8 => &cdfs.partition_w8[0],
@@ -6049,6 +6226,19 @@ pub(crate) fn take_drl_hits() -> [usize; 4] {
 /// signalled index 1 and priced the residual against `pred_mv`, and the
 /// decoder's MV silently drifted a whole frame before the drl symbols
 /// desynced).
+/// The DRL index [`write_drl_idx`]'s walk can actually SIGNAL against a stack
+/// of `entries` candidates: at most two `drl_mode` symbols past `start`, and
+/// each one needs a further entry to advance into (spec 5.11.24's
+/// `for (idx = 0; idx < 2; idx++) if (NumMvFound > idx + 1)`).
+///
+/// A search that offers an index this clamps prices its residual against a
+/// predictor the decoder never derives (lane-sb128b's silent MV drift); the
+/// pricer's own offer set is enumerated against this rule by
+/// `crate::encode::tests::every_drl_index_the_new_mv_pricer_offers_is_one_the_writer_can_signal`.
+pub(crate) fn signalled_drl_idx(entries: usize, start: usize, target: usize) -> usize {
+    target.min(start + 2).min(entries.saturating_sub(1)).max(start)
+}
+
 fn write_drl_idx(
     enc: &mut SymbolEncoder,
     cdfs: &mut Cdfs,
@@ -6056,6 +6246,17 @@ fn write_drl_idx(
     start: usize,
     target: usize,
 ) -> usize {
+    debug_assert_eq!(
+        signalled_drl_idx(stack.entries.len(), start, target),
+        {
+            let mut i = start;
+            while i < start + 2 && stack.entries.len() > i + 1 && i < target {
+                i += 1;
+            }
+            i
+        },
+        "the drl clamp rule and the writer's own walk disagree",
+    );
     let mut idx = start;
     while idx < start + 2 && stack.entries.len() > idx + 1 {
         let advance = idx < target;
@@ -6312,6 +6513,9 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
     ];
 
     let sb128 = sb128_armed();
+    // lane-b128: set at a root whose own `PARTITION_NONE` 128x128 block was
+    // just written, so the root's remaining 64x64 cells code nothing.
+    let mut sb128_none = false;
     // lane-sb128: at a 128 superblock the four 64x64 cells of each root are
     // written in libaom's own TL/TR/BL/BR order, the root's restoration units
     // and partition symbol first; at a 64 one this is plain raster and every
@@ -6326,8 +6530,50 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
         if row_start {
             neighbours.start_row();
         }
+        if sb_start {
+            sb128_none = false;
+        }
+        // lane-b128: the remaining three 64x64 cells of a root the search
+        // left WHOLE carry no syntax at all -- the same skip the decoder's
+        // own `sb128_none` runs.
+        if sb128_none {
+            continue;
+        }
         if sb128 && sb_start {
-            write_sb128_root(&mut enc, &mut cdfs, &neighbours, sb_r, sb_c, mi_cols, mi_rows);
+            // The 128x128 block a `PARTITION_NONE` root carries, held by the
+            // top-left 32x32 entry of the root's sixteen.
+            let root_block = ((sb_r & !1) * 2 < rows && (sb_c & !1) * 2 < cols)
+                .then(|| &blocks[(((sb_r & !1) * 2) * cols + (sb_c & !1) * 2) as usize])
+                .and_then(|q| match q {
+                    Quadrant::Whole128(block) => Some(block),
+                    _ => None,
+                });
+            write_sb128_root(
+                &mut enc,
+                &mut cdfs,
+                &neighbours,
+                sb_r,
+                sb_c,
+                mi_cols,
+                mi_rows,
+                if root_block.is_some() { PARTITION_NONE } else { PARTITION_SPLIT },
+            );
+            if let Some(block) = root_block {
+                let at128 = ((sb_r & !1) as usize * 4, (sb_c & !1) as usize * 4);
+                write_inter_block_128(
+                    &mut enc,
+                    &mut cdfs,
+                    &mut neighbours,
+                    &mut grid,
+                    at128,
+                    block,
+                    mi_cols,
+                    mi_rows,
+                    tx_select,
+                )?;
+                sb128_none = true;
+                continue;
+            }
         }
         {
             if !sb128 {
@@ -6573,7 +6819,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 let block = match site {
                     // Already coded by the `Whole64` above -- but only inside
                     // a superblock that really carried one.
-                    Quadrant::Whole64(_) | Quadrant::Covered => {
+                    Quadrant::Whole64(_) | Quadrant::Whole128(_) | Quadrant::Covered => {
                         return Err(Error::unsupported(
                             "AV1 tile",
                             "a `Whole64`/`Covered` quadrant needs its superblock's \
