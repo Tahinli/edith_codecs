@@ -3831,7 +3831,9 @@ pub(crate) static TXRD_STATS: [std::sync::atomic::AtomicU64; 7] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
-/// Reads [`TXRD_STATS`] and zeroes it.
+/// Reads [`TXRD_STATS`] and zeroes it. Only the gate reads it, so the lib
+/// build would warn `dead_code` (class from lane-txset2's `coeff_bits`).
+#[cfg(test)]
 pub(crate) fn take_txrd_stats() -> [u64; 7] {
     std::array::from_fn(|i| TXRD_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
