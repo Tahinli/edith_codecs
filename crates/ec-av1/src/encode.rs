@@ -11930,6 +11930,20 @@ mod tests {
         present
     }
 
+    /// Whether this ffmpeg was built with `encoder` (lane-pareto2: the
+    /// SVT-AV1 Pareto rows are skipped, never failed, on a build without it).
+    fn have_encoder(encoder: &str) -> bool {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-encoders"])
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(encoder))
+            })
+    }
+
     /// Decodes an AV1 OBU stream with ffmpeg and hands back the three planes.
     fn ffmpeg_decode(stream: &[u8], width: usize, height: usize) -> Picture {
         let mut child = Command::new("ffmpeg")
@@ -16698,6 +16712,85 @@ mod tests {
                 bd_rate(&aom, &ours) * 100.0,
                 bd_rate(&rav1e, &ours) * 100.0,
             );
+            // lane-pareto2: the two references at THEIR fast presets, plus
+            // SVT-AV1, measured in the SAME arm as the row above -- the only
+            // way the wall column of a Pareto table means anything (class:
+            // wall tables are comparable only inside one interleaved batch).
+            // `EC_AV1_PARETO_REFS=1` only: it roughly doubles the arm.
+            if std::env::var("EC_AV1_PARETO_REFS").ok().as_deref() == Some("1") {
+                let rav1e_at = |sp: u32| -> Vec<Vec<String>> {
+                    [50, 100, 150, 200]
+                        .iter()
+                        .map(|q| {
+                            vec![
+                                "-rav1e-params".to_string(),
+                                format!(
+                                    "speed={sp}:quantizer={q}:tile_cols=1:tile_rows=1:threads=1"
+                                ),
+                            ]
+                        })
+                        .collect()
+                };
+                let aom_at = |cu: u32| -> Vec<Vec<String>> {
+                    [5, 20, 35, 45]
+                        .iter()
+                        .map(|q| {
+                            vec![
+                                "-cpu-used".to_string(),
+                                cu.to_string(),
+                                "-b:v".to_string(),
+                                "0".to_string(),
+                                "-crf".to_string(),
+                                q.to_string(),
+                            ]
+                        })
+                        .collect()
+                };
+                let svt_at = |pr: u32| -> Vec<Vec<String>> {
+                    [20, 35, 45, 55]
+                        .iter()
+                        .map(|q| {
+                            vec![
+                                "-preset".to_string(),
+                                pr.to_string(),
+                                "-crf".to_string(),
+                                q.to_string(),
+                                "-svtav1-params".to_string(),
+                                "lp=1".to_string(),
+                            ]
+                        })
+                        .collect()
+                };
+                let mut arms: Vec<(String, &str, Vec<Vec<String>>)> = vec![
+                    ("rav1e speed 8".into(), "librav1e", rav1e_at(8)),
+                    ("rav1e speed 10".into(), "librav1e", rav1e_at(10)),
+                    ("libaom cpu-used 8".into(), "libaom-av1", aom_at(8)),
+                ];
+                if have_encoder("libsvtav1") {
+                    arms.push(("svt-av1 preset 8".into(), "libsvtav1", svt_at(8)));
+                    arms.push(("svt-av1 preset 10".into(), "libsvtav1", svt_at(10)));
+                } else {
+                    eprintln!("SKIP the SVT-AV1 rows: this ffmpeg has no libsvtav1");
+                }
+                for (label, encoder, points) in arms {
+                    let (lad, wall) = external_ladder(&source, cw, ch, encoder, &points);
+                    // A REFERENCE stream our decoder cannot read is a note in
+                    // this table, not a gate failure: these rows exist to
+                    // price the references, and `assert_ladder_decodes` keeps
+                    // its teeth for the two ladders the keep table is read off.
+                    let notes =
+                        std::mem::take(&mut *LADDER_FAILURES.lock().expect("ladder failures"));
+                    if !notes.is_empty() {
+                        eprintln!("{name} {label}: {} point(s) our decoder could not read (reference row, not a gate failure)", notes.len());
+                    }
+                    assert_monotone(&format!("{name}: {label}"), &lad);
+                    println!(
+                        "| {name} {cw}x{ch} / {label} | -- | {:+.1}% | {:+.1}% | {wall:.1}s (ours {ours_wall:.1}s, rav1e s6 {rav1e_wall:.1}s) |",
+                        bd_rate(&aom, &lad) * 100.0,
+                        bd_rate(&rav1e, &lad) * 100.0,
+                    );
+                }
+            }
         }
         assert_ladder_decodes();
     }
