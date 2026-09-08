@@ -144,6 +144,9 @@ impl SymbolEncoder {
     /// shorter than a two-symbol alphabet's three entries.
     pub fn symbol_fixed(&mut self, symbol: usize, cdf: &[u16]) {
         assert!(cdf.len() >= 3, "a CDF covers at least two symbols");
+        if !self.pricing && symtrace::dir().is_some() {
+            symtrace::push(symbol, cdf.len() - 1, cdf[0]);
+        }
         let nsyms = cdf.len() - 1;
         assert!(symbol < nsyms, "symbol {symbol} is outside the alphabet");
 
@@ -201,6 +204,7 @@ impl SymbolEncoder {
     /// payload end on a byte boundary with no terminator.
     pub fn finish(mut self) -> Vec<u8> {
         assert!(!self.pricing, "a pricer holds no bytes to flush");
+        symtrace::flush('w');
         // Round the interval's low end up to a value with 14 low zero bits,
         // then set bit 14: the result is inside the interval (the interval is
         // at least 2^15 wide before normalisation) and its tail bits are all
@@ -303,6 +307,12 @@ pub struct SymbolDecoder<'a> {
     max_bits: i32,
 }
 
+impl Drop for SymbolDecoder<'_> {
+    fn drop(&mut self) {
+        symtrace::flush('r');
+    }
+}
+
 impl<'a> SymbolDecoder<'a> {
     /// `init_symbol` (spec 8.2.2).
     #[must_use]
@@ -397,6 +407,16 @@ impl<'a> SymbolDecoder<'a> {
     /// [`SymbolEncoder::symbol_fixed`].
     #[inline]
     pub fn symbol_fixed(&mut self, cdf: &[u16]) -> usize {
+        if symtrace::dir().is_some() {
+            let s = self.symbol_fixed_raw(cdf);
+            symtrace::push(s, cdf.len() - 1, cdf[0]);
+            return s;
+        }
+        self.symbol_fixed_raw(cdf)
+    }
+
+    #[inline]
+    fn symbol_fixed_raw(&mut self, cdf: &[u16]) -> usize {
         let nsyms = cdf.len() - 1;
         // Two-symbol alphabets are most of the stream (every flag, every bit of
         // a literal), and their walk has exactly one boundary: computing it
@@ -493,7 +513,11 @@ impl<'a> SymbolDecoder<'a> {
             // `EQUIPROBABLE`'s single boundary: `f >> EC_PROB_SHIFT` is 256, so
             // the range multiply is a shift.
             let cur = ((self.range >> 8) << 7) + EC_MIN_PROB;
-            v = (v << 1) | self.bool_cur(cur) as u32;
+            let bit = self.bool_cur(cur);
+            if symtrace::dir().is_some() {
+                symtrace::push(bit, 2, EQUIPROBABLE[0]);
+            }
+            v = (v << 1) | bit as u32;
         }
         v
     }
@@ -788,5 +812,80 @@ pub(crate) mod tests {
             );
             assert_eq!(fast_cdfs[pick.min(14)], slow_cdfs[pick.min(14)], "cdf after item {i}");
         }
+    }
+}
+
+/// Symbol-by-symbol writer/reader trace (`EC_AV1_SYMTRACE=<dir>`), the
+/// instrument a desync between OUR writer and OUR reader is bisected with:
+/// every non-pricing [`SymbolEncoder`] and every [`SymbolDecoder`] dumps one
+/// line per symbol (`index value nsyms cdf0`) into `<dir>/w-<n>.txt` /
+/// `<dir>/r-<n>.txt`, and the first line where the two differ names the
+/// divergent symbol. `EC_AV1_SYMTRACE_AT=<index>` additionally prints a
+/// backtrace at that index on both sides, which names the syntax element.
+/// Off (the variable unset) this is one relaxed load per symbol.
+pub(crate) mod symtrace {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+
+    static DIR: OnceLock<Option<String>> = OnceLock::new();
+    static AT: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    thread_local! {
+        static BUF: RefCell<(String, usize)> = const { RefCell::new((String::new(), 0)) };
+    }
+
+    pub(crate) fn dir() -> Option<&'static str> {
+        DIR.get_or_init(|| crate::envflags::var("EC_AV1_SYMTRACE").ok().filter(|v| !v.is_empty()))
+            .as_deref()
+    }
+
+    /// `EC_AV1_SYMTRACE_AT=<i>` or `=<from>:<to>` (inclusive).
+    fn at() -> Option<(usize, usize)> {
+        *AT.get_or_init(|| {
+            let v = crate::envflags::var("EC_AV1_SYMTRACE_AT").ok()?;
+            let (a, b) = v.split_once(':').unwrap_or((v.as_str(), v.as_str()));
+            Some((a.parse().ok()?, b.parse().ok()?))
+        })
+    }
+
+    /// A caller's own annotation, interleaved with this coder's symbol lines
+    /// (`# ...`) so the writer/reader diff shows the state around a desync.
+    pub(crate) fn note(line: &str) {
+        if dir().is_none() {
+            return;
+        }
+        BUF.with(|b| {
+            let (buf, _) = &mut *b.borrow_mut();
+            buf.push_str("# ");
+            buf.push_str(line);
+            buf.push('\n');
+        });
+    }
+
+    pub(crate) fn push(value: usize, nsyms: usize, cdf0: u16) {
+        BUF.with(|b| {
+            let (buf, n) = &mut *b.borrow_mut();
+            if at().is_some_and(|(a, b)| (a..=b).contains(n)) {
+                eprintln!("SYMTRACE at {n}: {}", std::backtrace::Backtrace::force_capture());
+            }
+            buf.push_str(&format!("{n} {value} {nsyms} {cdf0}\n"));
+            *n += 1;
+        });
+    }
+
+    /// Flushes this coder's lines as `<dir>/<side>-<n>.txt` and starts the
+    /// next coder's trace.
+    pub(crate) fn flush(side: char) {
+        let Some(dir) = dir() else { return };
+        BUF.with(|b| {
+            let (buf, n) = &mut *b.borrow_mut();
+            if !buf.is_empty() {
+                let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = std::fs::write(format!("{dir}/{side}-{seq:05}.txt"), buf.as_bytes());
+            }
+            buf.clear();
+            *n = 0;
+        });
     }
 }
