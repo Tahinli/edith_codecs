@@ -10435,6 +10435,97 @@ fn deltaq_for_factor(base: u8, f: f64, k: f64, clamp: i32, res: i32) -> u8 {
     (i32::from(base) + delta).clamp(1, 255) as u8
 }
 
+/// lane-dq: derive the per-superblock qindex libaom's `deltaq-mode 1`
+/// objective would, from the SAME tpl dependence ratio our own map already
+/// carries (`EC_AV1_DQ_TPL=1`).
+///
+/// libaom (`av1_get_q_for_deltaq_objective`, encodeframe_utils.c) forms a
+/// superblock dependence ratio `rk = exp((intra_cost - mc_dep_cost)/w)` in the
+/// LOG domain, divides the frame-level `r0` (`encoder_utils.c:627`, the very
+/// same expression at frame scope) by it, and asks
+/// `av1_get_deltaq_offset(bit_depth, base, beta)` for the qindex whose
+/// **DC** step is `dc_q(base)/sqrt(beta)`. With per-cell costs `intra` and
+/// `intra + mc_dep`, `rk` is `1/(1 + r)` for this crate's `r = mc_dep/intra`,
+/// so `beta = (1 + r_sb) / (1 + r_frame)` with `r_frame` read the log-mean way
+/// libaom reads `r0`. The offset is clamped to libaom's own
+/// `+-(delta_q_res * 9 - 1)`, which at `res = 4` is +-8 steps -- more than
+/// twice the +-16 qindex [`deltaq_for_factor`] allows.
+///
+/// Two things differ from [`deltaq_for_factor`] and both are the point of the
+/// arm: the table inverted is `dc_q` not `ac_q`, and the ratio is read raw
+/// (`sqrt(1 + r)`) rather than through the map's `log2`-compressed,
+/// `TPL_POWER`-flattened, mean-normalised lambda factor -- so this mapping is
+/// much stronger for the same map. `strength` scales the offset.
+fn deltaq_libaom(base: u8, r_sb: f64, r_frame: f64, strength: f64, res: i32) -> u8 {
+    let beta = ((1.0 + r_sb.max(0.0)) / (1.0 + r_frame.max(0.0))).max(1e-6);
+    let target = f64::from(crate::quant::dc_q(8, i32::from(base))) / beta.sqrt();
+    let exact = (1..=255)
+        .min_by(|&a, &b| {
+            let d = |q: i32| (f64::from(crate::quant::dc_q(8, q)) - target).abs();
+            d(a).partial_cmp(&d(b)).expect("dc_q is finite")
+        })
+        .expect("the qindex range is not empty")
+        - i32::from(base);
+    let want = exact as f64 * strength;
+    // Snapped onto the `res` grid first, so the coded delta is a whole number
+    // of steps, then bounded by libaom's own `res * 9 - 1`.
+    let max_steps = (res * 9 - 1) / res;
+    let steps = (want / f64::from(res)).round() as i32;
+    let delta = steps.clamp(-max_steps, max_steps) * res;
+    (i32::from(base) + delta).clamp(1, 255) as u8
+}
+
+/// The frame-level `r0` libaom's objective divides by: the log-mean of
+/// `1 + r` over the frame's cells, minus 1.
+fn tpl_frame_ratio(ratio: &[f64]) -> f64 {
+    if ratio.is_empty() {
+        return 0.0;
+    }
+    let m = ratio.iter().map(|&r| (1.0 + r.max(0.0)).ln()).sum::<f64>() / ratio.len() as f64;
+    m.exp() - 1.0
+}
+
+/// `EC_AV1_DQ_TPL=1`: take the per-superblock qindex from [`deltaq_libaom`]
+/// instead of [`deltaq_for_factor`]. Off by default.
+fn dq_tpl() -> bool {
+    crate::envflags::var("EC_AV1_DQ_TPL").ok().as_deref().map(str::trim) == Some("1")
+}
+
+/// The [`deltaq_libaom`] strength multiplier (`EC_AV1_DQ_TPL_K`, default 1.0
+/// = libaom's own offset).
+fn dq_tpl_k() -> f64 {
+    crate::envflags::var("EC_AV1_DQ_TPL_K")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|k| k.is_finite() && *k >= 0.0)
+        .unwrap_or(1.0)
+}
+
+/// `EC_AV1_DQ_CENSUS=1`: per inter frame, one line comparing the offsets the
+/// shipped mapping ([`deltaq_for_factor`]) WOULD emit against the ones
+/// libaom's objective ([`deltaq_libaom`]) gives for the same superblocks and
+/// the same tpl map -- and which of the two the frame actually coded.
+fn dq_census() -> bool {
+    crate::envflags::var("EC_AV1_DQ_CENSUS").ok().as_deref().map(str::trim) == Some("1")
+}
+
+/// The histogram/extent summary [`dq_census`] prints for one set of offsets.
+fn dq_summary(offsets: &[i32]) -> String {
+    let n = offsets.len().max(1);
+    let (lo, hi) = offsets.iter().fold((0i32, 0i32), |(l, h), &o| (l.min(o), h.max(o)));
+    let nz = offsets.iter().filter(|&&o| o != 0).count();
+    let mean = offsets.iter().map(|&o| f64::from(o)).sum::<f64>() / n as f64;
+    let absmean = offsets.iter().map(|&o| f64::from(o.abs())).sum::<f64>() / n as f64;
+    let mut levels: Vec<i32> = offsets.to_vec();
+    levels.sort_unstable();
+    levels.dedup();
+    format!(
+        "range {lo}..{hi} mean {mean:+.2} |mean| {absmean:.2} nonzero {nz}/{} levels {}",
+        offsets.len(),
+        levels.len()
+    )
+}
+
 /// How many DISTINCT per-superblock quantizer levels the last inter frame's
 /// [`sb_q`](encode_inter_frame) grid carried -- lane-deltaq's fire counter
 /// (class `gate-blind-to-feature`: every exactness assert below passes on a
@@ -10743,7 +10834,16 @@ fn tpl_sb_factors(map: &[f64], cells_x: usize, cells_y: usize, k: f64) -> Vec<f6
 /// more distortion-averse (smaller lambda), and the frame's TOTAL lambda
 /// scale only moves around, never up or down -- a global move is what
 /// lane-av1lambda already measured inert.
-fn tpl_lambda_factors(frames: &[&[u8]], width: usize, height: usize, k: f64) -> Vec<f64> {
+/// Returns the per-cell lambda factors AND the per-cell dependence ratio
+/// `mc_dep / intra` they were derived from -- the second half is what
+/// [`deltaq_libaom`] needs, since the factor alone has been through a
+/// mean normalisation the raw ratio cannot be recovered across.
+fn tpl_lambda_factors(
+    frames: &[&[u8]],
+    width: usize,
+    height: usize,
+    k: f64,
+) -> (Vec<f64>, Vec<f64>) {
     let start = std::time::Instant::now();
     let (cells_x, cells_y) = (width / 16, height / 16);
     let cells = cells_x * cells_y;
@@ -10862,7 +10962,7 @@ fn tpl_lambda_factors(frames: &[&[u8]], width: usize, height: usize, k: f64) -> 
             TPL_NANOS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
         );
     }
-    out
+    (out, ratio)
 }
 
 /// Where one inter frame sits in a coding-order pyramid: which DPB slots its
@@ -11134,11 +11234,15 @@ pub(crate) fn encode_inter_frame(
     let tpl_sources: Vec<Vec<u8>> =
         window.iter().map(|n| n.y.iter().map(|&v| v as u8).collect()).collect();
     let tpl_cells_x = picture.width / 16;
-    let tpl_factors: Option<Vec<f64>> = (tpl_k > 0.0 && !tpl_sources.is_empty()).then(|| {
+    // `.1` is the propagating map's raw per-cell dependence ratio, which only
+    // [`deltaq_libaom`] reads; the one-frame area map has no such ratio.
+    let tpl_both: Option<(Vec<f64>, Option<Vec<f64>>)> =
+        (tpl_k > 0.0 && !tpl_sources.is_empty()).then(|| {
         if tpl_propagating() {
             let mut frames: Vec<&[u8]> = vec![&picture_y8];
             frames.extend(tpl_sources.iter().map(Vec::as_slice));
-            tpl_lambda_factors(&frames, picture.width, picture.height, tpl_k)
+            let (f, r) = tpl_lambda_factors(&frames, picture.width, picture.height, tpl_k);
+            (f, Some(r))
         } else {
             // The shipped map is one factor per 64x64; it is spread over that
             // superblock's own 16 cells so the application site below (which
@@ -11148,11 +11252,16 @@ pub(crate) fn encode_inter_frame(
                 tpl_area_map(&picture_y8, &tpl_sources[0], picture.width, picture.height);
             let cells_y = picture.height / 16;
             let sb = tpl_sb_factors(&map, tpl_cells_x, cells_y, tpl_k);
-            (0..tpl_cells_x * cells_y)
+            let f: Vec<f64> = (0..tpl_cells_x * cells_y)
                 .map(|c| sb[(c / tpl_cells_x / 4) * (tpl_cells_x / 4) + (c % tpl_cells_x) / 4])
-                .collect()
+                .collect();
+            (f, None)
         }
     });
+    let (tpl_factors, tpl_ratio) = match tpl_both {
+        Some((f, r)) => (Some(f), r),
+        None => (None, None),
+    };
 
     // The true grid ([`crate::tile::block_grid`]'s ceiling), not the padded
     // coding surface's: `blocks` carries one entry per 32x32 block the tile
@@ -11175,30 +11284,64 @@ pub(crate) fn encode_inter_frame(
         .as_ref()
         .filter(|_| !screen)
         .and(deltaq_res_log2().map(|r| 1i32 << r));
+    // The same 16-cell mean the superblock's own lambda takes, clamped to the
+    // map the frame actually has -- read over the factors or over the raw
+    // dependence ratios, whichever mapping is asking.
+    let sb_mean = |m: &[f64], sb: usize| {
+        let (sb_r, sb_c) = (sb / sb_cols, sb % sb_cols);
+        (0..16)
+            .map(|i| {
+                let (cy, cx) = (sb_r * 4 + i / 4, sb_c * 4 + i % 4);
+                m[(cy.min(m.len() / tpl_cells_x - 1)) * tpl_cells_x + cx.min(tpl_cells_x - 1)]
+            })
+            .sum::<f64>()
+            / 16.0
+    };
+    // lane-dq: `EC_AV1_DQ_TPL=1` takes libaom's own objective mapping off the
+    // raw dependence ratio; without it (and always without a ratio map, i.e.
+    // on the one-frame area map) the shipped derivation stands.
+    let r_frame = tpl_ratio.as_deref().map(tpl_frame_ratio);
+    let sb_qindex = |f: &[f64], res: i32, sb: usize, libaom: bool| -> u8 {
+        match (libaom, tpl_ratio.as_deref(), r_frame) {
+            (true, Some(r), Some(rf)) => {
+                deltaq_libaom(base_q_idx, sb_mean(r, sb), rf, dq_tpl_k(), res)
+            }
+            _ => deltaq_for_factor(base_q_idx, sb_mean(f, sb), deltaq_k(), deltaq_clamp(), res),
+        }
+    };
     let sb_q: Option<Vec<u8>> = match (&tpl_factors, deltaq_res) {
         (Some(f), Some(res)) => {
-            let (k, clamp) = (deltaq_k(), deltaq_clamp());
-            Some(
-                (0..sb_cols * _sb_rows)
-                    .map(|sb| {
-                        let (sb_r, sb_c) = (sb / sb_cols, sb % sb_cols);
-                        // The same 16-cell mean the superblock's own lambda
-                        // takes, clamped to the map the frame actually has.
-                        let mean = (0..16)
-                            .map(|i| {
-                                let (cy, cx) = (sb_r * 4 + i / 4, sb_c * 4 + i % 4);
-                                f[(cy.min(f.len() / tpl_cells_x - 1)) * tpl_cells_x
-                                    + cx.min(tpl_cells_x - 1)]
-                            })
-                            .sum::<f64>()
-                            / 16.0;
-                        deltaq_for_factor(base_q_idx, mean, k, clamp, res)
-                    })
-                    .collect(),
-            )
+            let libaom = dq_tpl();
+            Some((0..sb_cols * _sb_rows).map(|sb| sb_qindex(f, res, sb, libaom)).collect())
         }
         _ => None,
     };
+    // lane-dq census: both mappings on the SAME superblocks, whether or not
+    // the frame codes any delta syntax (`deltaq_res` is `None` with the lever
+    // off, and the census then prices the default `res = 4` grid).
+    if dq_census() {
+        if let Some(f) = &tpl_factors {
+            let res = deltaq_res.unwrap_or(4);
+            let off = |libaom: bool| -> Vec<i32> {
+                (0..sb_cols * _sb_rows)
+                    .map(|sb| i32::from(sb_qindex(f, res, sb, libaom)) - i32::from(base_q_idx))
+                    .collect()
+            };
+            let (ours, aom) = (off(false), off(true));
+            let coded = if deltaq_res.is_some() {
+                if dq_tpl() { "libaom" } else { "ours" }
+            } else {
+                "none"
+            };
+            eprintln!(
+                "dq census: base={base_q_idx} res={res} sbs={} coded={coded} r_frame={:.4}\n                   ours   {}\n  libaom {}",
+                sb_cols * _sb_rows,
+                r_frame.unwrap_or(f64::NAN),
+                dq_summary(&ours),
+                dq_summary(&aom),
+            );
+        }
+    }
     if let Some(res) = deltaq_res.filter(|_| sb_q.is_some()) {
         header.delta.q_present = true;
         header.delta.q_res = res.trailing_zeros() as u8;
@@ -12651,7 +12794,7 @@ mod tests {
         let (w, h) = (256usize, 64usize);
         let uniform: Vec<u8> = (0..w * h).map(|i| ((i * 37) % 251) as u8).collect();
         let frames: Vec<&[u8]> = vec![&uniform, &uniform, &uniform];
-        let f = super::tpl_lambda_factors(&frames, w, h, 1.0);
+        let (f, _) = super::tpl_lambda_factors(&frames, w, h, 1.0);
         assert_eq!(f.len(), 64, "16x4 cells of 16x16");
         for (i, &v) in f.iter().enumerate() {
             assert!((v - 1.0).abs() < 1e-6, "cell {i} factor {v}, a flat map must move no lambda");
@@ -12665,7 +12808,7 @@ mod tests {
         let frames: Vec<&[u8]> = vec![&split, &split, &split];
         let cells_x = w / 16;
         for k in [0.25f64, 0.5, 1.0, 2.0] {
-            let f = super::tpl_lambda_factors(&frames, w, h, k);
+            let (f, _) = super::tpl_lambda_factors(&frames, w, h, k);
             for r in 0..h / 16 {
                 let (lean, idle) = (f[r * cells_x], f[r * cells_x + cells_x - 1]);
                 assert!(lean < 1.0, "k={k} row {r}: leaned-on cell factor {lean} must be < 1");
