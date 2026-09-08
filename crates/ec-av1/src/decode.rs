@@ -871,6 +871,12 @@ pub(crate) fn set_segmentation(
     mi_cols: usize,
     prev: Option<&[u8]>, fctx: &crate::decode::FrameCtx,
 ) {
+    if crate::envflags::env_flag!("EC_HDR") {
+        eprintln!(
+            "EC_SEGHDR enabled={} update_map={} temporal={} preskip={} last_active={} data={:?}",
+            seg.enabled, seg.update_map, seg.temporal_update, seg.seg_id_pre_skip, seg.last_active_seg_id, seg.feature_data
+        );
+    }
     fctx.seg.with(|s| *s.borrow_mut() = seg);
     fctx.seg_mi_dims.with(|c| c.set((mi_rows, mi_cols)));
     fctx.seg_ids.with(|m| *m.borrow_mut() = vec![0u8; mi_rows * mi_cols]);
@@ -1058,7 +1064,13 @@ fn read_segment_id(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_c: 
     let coded = dec.symbol(&mut cdfs.segment_id[ctx]) as i32;
     hit!(SEG_ID_HITS);
     let last_active = fctx.seg.with(|s| i32::from(s.borrow().last_active_seg_id));
-    neg_deinterleave(coded, pred, last_active + 1).clamp(0, last_active) as u8
+    let id = neg_deinterleave(coded, pred, last_active + 1).clamp(0, last_active);
+    // Mirrors the oracle's own `EC_SEG mi_row=.. cdf=.. pred=.. coded=.. id=..`
+    // (libaom `decodemv.c:read_segment_id`), for a cross-decoder segment diff.
+    if crate::envflags::env_flag!("EC_TRACE_SEG") {
+        eprintln!("EC_SEG mi_row={mi_r} mi_col={mi_c} cdf={ctx} pred={pred} coded={coded} id={id} rng={}", dec.debug_state().0);
+    }
+    id as u8
 }
 
 /// `read_intra_segment_id` (spec 5.11.7): called twice per intra-frame block
@@ -15703,11 +15715,27 @@ fn read_intra_mode_sub8(
     skip_ctx: usize,
     allow_intrabc: bool,
     mi_r: usize,
-    mi_c: usize, fctx: &crate::decode::FrameCtx,
+    mi_c: usize,
+    // The leaf's own mi footprint for `set_segment_id`: 1x1 for a `BLOCK_4X4`
+    // split leaf, 2x1/1x2 for an 8x4/4x8 one. Stamping 1x1 for a rect leaf
+    // left the second mi column at segment 0, which reads back as a
+    // neighbour's `cdf_index`/prediction two blocks later.
+    seg_w_mi: usize,
+    seg_h_mi: usize, fctx: &crate::decode::FrameCtx,
 ) -> Result<(bool, usize, i32, Option<(usize, i32, Option<(i32, i32)>)>, Option<usize>)> {
     let trace = crate::envflags::env_flag!("EC_AV1_TRACE");
-    if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
+    let ec_istep = crate::envflags::env_flag!("EC_TRACE_MODE_STEP");
+    if ec_istep {
         eprintln!("EC_IMODE mi_row={mi_r} mi_col={mi_c} fn=sub8 rng={}", dec.debug_state().0);
+    }
+    // Same `EC_ISTEP` ladder the square/rect readers print, so a cross-decoder
+    // range diff lands on the ELEMENT inside a 4x4 leaf, not just the block.
+    macro_rules! istep {
+        ($name:literal, $val:expr) => {
+            if ec_istep {
+                eprintln!("EC_ISTEP mi_row={mi_r} mi_col={mi_c} name={} val={} rng={}", $name, $val, dec.debug_state().0);
+            }
+        };
     }
     // lane-seg2: same `intra_segment_id` placement as the square and rect
     // readers (spec 5.11.6) -- a `BLOCK_4X4` leaf codes its own `segment_id`
@@ -15716,18 +15744,21 @@ fn read_intra_mode_sub8(
     // split) and left `cur_segment_id` on the previous block, so the leaf
     // dequantized with a neighbour's `SEG_LVL_ALT_Q`.
     if seg_id_pre_skip(fctx) {
-        intra_segment_id(dec, cdfs, mi_r, mi_c, 1, 1, false, fctx);
+        intra_segment_id(dec, cdfs, mi_r, mi_c, seg_w_mi, seg_h_mi, false, fctx);
     }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
         eprintln!("TRACE sub8 skip mi=({mi_r},{mi_c}) ctx={skip_ctx} value={} rng={}", skip as i32, dec.debug_state().0);
     }
+    istep!("skip", skip as i32);
     if !seg_id_pre_skip(fctx) {
-        intra_segment_id(dec, cdfs, mi_r, mi_c, 1, 1, skip, fctx);
+        intra_segment_id(dec, cdfs, mi_r, mi_c, seg_w_mi, seg_h_mi, skip, fctx);
     }
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip, fctx);
+    istep!("cdef", 0);
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip, fctx);
     maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, false, skip, fctx);
+    istep!("dq", 0);
     if allow_intrabc {
         let use_intrabc = dec.symbol(&mut cdfs.intrabc) != 0;
         if use_intrabc {
@@ -15739,6 +15770,7 @@ fn read_intra_mode_sub8(
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
+    istep!("mode", mode);
     if trace {
         eprintln!("TRACE sub8 y_mode mi=({mi_r},{mi_c}) ctx=({above_ctx},{left_ctx}) value={mode} rng={}", dec.debug_state().0);
     }
@@ -15855,7 +15887,7 @@ fn decode_leaf_split4(
         let (skip, mode, angle_delta_y, chroma, filter_intra) = read_intra_mode_sub8(
             dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra,
             filter_intra_size_class(4).expect("BLOCK_4X4 has its own filter_intra row"),
-            skip_ctx, allow_intrabc, lmi.0, lmi.1, fctx,
+            skip_ctx, allow_intrabc, lmi.0, lmi.1, 1, 1, fctx,
         )?;
         leaf_modes[i] = mode;
         leaf_skips[i] = skip;
@@ -16081,7 +16113,7 @@ fn decode_leaf_rect8(
             dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra,
             filter_intra_size_class_rect(bw, bh)
                 .expect("BLOCK_4X8/BLOCK_8X4 are inside av1_filter_intra_allowed_bsize"),
-            skip_ctx, allow_intrabc, lmi.0, lmi.1, fctx,
+            skip_ctx, allow_intrabc, lmi.0, lmi.1, bw / 4, bh / 4, fctx,
         )?;
         if filter_intra.is_some() {
             // lane-fi8 r1: `predict_filter_intra` walks its 4x2 patches over
