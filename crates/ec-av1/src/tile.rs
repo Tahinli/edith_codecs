@@ -1414,7 +1414,12 @@ fn write_delta_q(
     DELTA_Q.with(|c| {
         let mut plan = c.borrow_mut();
         let Some(plan) = plan.as_mut() else { return };
-        if mi.0 % SB_MI as usize != 0 || mi.1 % SB_MI as usize != 0 {
+        // lane-b128m: the delta_q unit is the SUPERBLOCK, so it is 128 wide
+        // under `EC_AV1_SB128` -- decode.rs `maybe_read_delta_q` gates on
+        // `sb_mi_cur`, and a writer gating on a hardcoded 64 codes three
+        // symbol groups per 128 root the reader never reads.
+        let sb_mi = if sb128_armed() { SB_MI as usize * 2 } else { SB_MI as usize };
+        if mi.0 % sb_mi != 0 || mi.1 % sb_mi != 0 {
             return;
         }
         if is_whole_sb && skip {
@@ -6619,7 +6624,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     + usize::from(neighbours.left_skip[mi_r]);
                 enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
                 write_cdef_idx(&mut enc, (mi_r, mi_c), block.skip);
-                write_delta_q(&mut enc, &mut cdfs, (mi_r, mi_c), true, block.skip);
+                write_delta_q(&mut enc, &mut cdfs, (mi_r, mi_c), !sb128_armed(), block.skip);
                 let ii_ctx = intra_inter_ctx(
                     has_above,
                     has_left,
