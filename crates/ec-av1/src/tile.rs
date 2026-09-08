@@ -669,6 +669,44 @@ impl TileLayout {
     }
 }
 
+/// lane-edge128: which 64x64 CDEF unit's `cdef_idx` literal covers each unit
+/// of this frame, in the same raster order [`arm_cdef_idx`]'s grid is in.
+///
+/// `read_cdef` (spec 5.11.56) codes ONE literal for the block that first
+/// reaches a unit and copies it over every unit that block SPANS, so a whole
+/// 128x128 root block puts one literal in the stream for all four of its
+/// units -- the encoder's CDEF search, which prices a preset per unit, may
+/// not hand those four units different presets: only the first would be
+/// coded, and every decoder (ours and ffmpeg's alike) would apply it to all
+/// four while the encoder's own filter replay applied four different ones.
+/// That is the shape this map exists to collapse
+/// ([`crate::filter_search::pick_filters`]).
+///
+/// Identity everywhere else: every block this writer codes at 64x64 or below
+/// covers exactly one unit.
+pub(crate) fn cdef_unit_owner(blocks: &[Quadrant], mi_cols: u32, mi_rows: u32) -> Vec<u32> {
+    let (cols, rows) = block_grid(mi_cols, mi_rows);
+    let (sb_cols, sb_rows) = (cols.div_ceil(2) as usize, rows.div_ceil(2) as usize);
+    let mut owner: Vec<u32> = (0..(sb_cols * sb_rows) as u32).collect();
+    for sb_r in (0..sb_rows).step_by(2) {
+        for sb_c in (0..sb_cols).step_by(2) {
+            let root = ((sb_r * 2) < rows as usize && (sb_c * 2) < cols as usize)
+                .then(|| &blocks[(sb_r * 2) * cols as usize + sb_c * 2])
+                .is_some_and(|q| matches!(q, Quadrant::Whole128(_)));
+            if !root {
+                continue;
+            }
+            let origin = (sb_r * sb_cols + sb_c) as u32;
+            for r in sb_r..(sb_r + 2).min(sb_rows) {
+                for c in sb_c..(sb_c + 2).min(sb_cols) {
+                    owner[r * sb_cols + c] = origin;
+                }
+            }
+        }
+    }
+    owner
+}
+
 /// One frame's per-superblock `cdef_idx` plan (see [`arm_cdef_idx`]).
 struct CdefIdxPlan {
     /// The header's `cdef_bits`; never 0 while armed.
