@@ -5860,11 +5860,27 @@ fn cfl_on() -> bool {
 /// (`EC_AV1_FILTER_INTRA=0` switches both off, which is how the lane measured
 /// its own on/off pair -- and how every byte pin written before it still
 /// reproduces). It is also a speed lever: on at preset 0, off above it.
-// lane-sb128: `use_128x128_superblock` (spec 5.5.1). Off by default until
-// the BD gate says otherwise; `EC_AV1_SB128=1` turns it on for the whole
-// process (a sequence-header field, so it cannot change mid-stream anyway),
-// the same env-flag shape `EC_AV1_FILTER_INTRA` uses. NOT an `EncoderConfig`
-// field: that struct is built by 90 literal sites in this workspace.
+// lane-sb128: `use_128x128_superblock` (spec 5.5.1). `EC_AV1_SB128=0` turns
+// it off for the whole process (a sequence-header field, so it cannot change
+// mid-stream anyway), the same env-flag shape `EC_AV1_FILTER_INTRA` uses.
+// NOT an `EncoderConfig` field: that struct is built by 90 literal sites in
+// this workspace.
+
+/// Whether a sequence codes 128x128 superblocks when the environment says
+/// nothing. ON since lane-b128 gave the 128 root a real `PARTITION_NONE`
+/// candidate ([`search_root_128`]): with SPLIT-only roots the size was pure
+/// cost (lane-sb128b measured film B +24.9 -> +37.5 vs libaom), and with the
+/// 128x128 block in it every row of the native BD gate is down or flat on
+/// both columns (BD-rate vs libaom cpu-6 / rav1e s6, 12 frames):
+///
+/// | row | 64 superblocks | 128 + the 128 root |
+/// |---|---|---|
+/// | bars 1080p | -2.6 / -18.3 | **-3.3 / -18.9** |
+/// | bars 2160p | +8.8 / -13.2 | **+7.9 / -14.0** |
+/// | film A | +20.6 / -5.1 | **+20.4 / -5.2** |
+/// | film B | +24.8 / -2.1 | **+24.2 / -2.5** |
+/// | screen capture | +14.6 / -33.2 | **+14.4 / -33.2** |
+pub(crate) const SB128_DEFAULT: bool = true;
 
 /// Whether this process's sequences code 128x128 superblocks. An ENCODER
 /// knob (like `speed::SPEED`), never read by a decode: read through a
@@ -5877,7 +5893,9 @@ pub(crate) fn sb128_on() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     match ENC_SB128.load(Relaxed) {
         2 => {
-            let on = crate::envflags::var("EC_AV1_SB128").ok().is_some_and(|v| v != "0");
+            let on = crate::envflags::var("EC_AV1_SB128")
+                .ok()
+                .map_or(SB128_DEFAULT, |v| v != "0");
             ENC_SB128.store(u8::from(on), Relaxed);
             on
         }
@@ -16914,8 +16932,12 @@ mod tests {
         // ([`crate::motion::MV_SUBPEL_ITERS`]), so every inter block's vector
         // -- and with it its residual -- moved: 8325 -> 8288 bytes at q=150
         // and 33014 -> 33090 at q=60.
+        // Re-taken on lane-b128: sequences code 128x128 superblocks by
+        // default now ([`SB128_DEFAULT`]), and their roots can leave a whole
+        // 128x128 block whole -- 8288 -> 8303 bytes at q=150 and 33090 ->
+        // 33132 at q=60. `EC_AV1_SB128=0` restores the 64-superblock stream.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8288, 0x241d_8115_0a6d_0f34), (60, 33090, 0x7e02_777c_01b4_f035)];
+            [(150, 8303, 0x0368_e400_f09d_02ba), (60, 33132, 0x884b_c219_5ea9_6416)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
