@@ -5905,14 +5905,14 @@ fn cfl_on() -> bool {
 ///
 /// | row | 64 superblocks | 128 + the 128 root |
 /// |---|---|---|
-/// | bars 1080p | -2.6 / -18.3 | **-3.3 / -18.9** |
-/// | bars 2160p | +8.8 / -13.2 | **+7.9 / -14.0** |
-/// | film A | +20.6 / -5.1 | **+20.4 / -5.2** |
-/// | film B | +24.8 / -2.1 | **+24.2 / -2.5** |
+/// | bars 1080p | -3.1 / -18.7 | **-3.7 / -19.2** |
+/// | bars 2160p | +9.1 / -13.3 | **+8.5 / -13.8** |
+/// | film A | +20.3 / -5.0 | **+20.1 / -5.2** |
+/// | film B | +24.6 / -2.0 | **+24.3 / -2.2** |
 /// | screen capture | +14.6 / -33.2 | **+14.4 / -33.2** |
 ///
-/// and the long-GOP gate agrees (film A +24.7/-7.5 -> +24.4/-7.7, film B
-/// +86.8/+7.4 -> +85.6/+6.6).
+/// and the long-GOP gate agrees (film A +24.0/-7.6 -> +23.6/-7.9, film B
+/// +85.8/+7.1 -> +85.1/+6.6). Both arms re-run on lane-b128m's own base.
 ///
 /// ON since lane-b128m closed the eleven 128-superblock desyncs that held it
 /// off (the delta_q unit at the 128 superblock, the superblock size travelling
