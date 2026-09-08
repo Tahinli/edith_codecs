@@ -47,4 +47,42 @@ writes 64x64 superblocks only, so there is no whole-128 chroma path to sweep.
 
 ## Measurements
 
-(filled in below as the arms land)
+### What the lift buys: `EC_AV1_NATIVE_CROP=1920x792`, film A
+
+An unaligned crop is exactly the case the `aligned` guard switched the whole
+key root off on, so `EC_AV1_I64=0` reproduces the old code on this arm to the
+byte. `bd_rate_screen_native --ignored`, `EC_AV1_NATIVE_FILM=1`:
+
+| arm | bytes per ladder point | BD vs libaom | BD vs rav1e | wall ours | key 64 roots |
+| --- | --- | --- | --- | --- | --- |
+| before (`EC_AV1_I64=0`) | 69541 / 110325 / 180401 / 426318 | +23.2% | -1.6% | 170.7s | 0 of 0 |
+| after (default) | 68847 / 109557 / 178345 / 426318 | +22.5% | -2.3% | 178.6s | 390 of 1440 (27.1%) |
+
+PSNR is equal to the hundredth at every point (44.03 / 45.60-45.61 / 46.92 /
+48.20 dB), so the ~1.0% of bytes is the whole of it: **0.7 BD points on both
+reference columns** for +4.6% encode wall.
+
+Zero of those roots sat on a cut superblock: 792 = 12*64 + 24, and a 24-px
+straddle fails `has_rows`, so this crop cannot carry one. The edge half of
+the lift is proven by the round-trip test, not by this row; the crop that
+would measure it is 1920x1080 (a 56-px straddle) --
+`deferred: the BD value of the EDGE root on a 1920x1080 crop -- 7 min/arm and
+the box is shared -- unblocked by one `EC_AV1_NATIVE_CROP=1920x1080` pair`.
+
+Both arms end with the same 9 pre-existing REFERENCE-ladder decode failures
+(libaom crf 5 "a Golomb tail longer than this decoder reads", a rav1e +-1) --
+identical before and after, ours decode fine; that is lane-dgolomb's open
+debt, not this lane's.
+
+### Invariants (release test binary, `$HOME/.cache/corner/inv.log`)
+
+All green, 15 runs: pins `the_encoders_own_streams_are_byte_identical_to_their_pins`
+(8562 / 33357 -- the 640x384 pin clip is superblock-aligned and its bytes did
+NOT move, which is the same reason the 12-frame gate rows stay byte-identical:
+every gate clip is aligned and takes the identical path),
+`the_facade_codes_the_same_bytes_as_encode_sequence`,
+`predicted_coeff_bits_track_the_tile_the_writer_wrote`,
+`every_speed_preset_decodes_sample_exact_through_both_decoders --ignored`,
+the four thread-determinism tests `--include-ignored`, and
+`EC_COMP_MISMATCH=1` at `EC_AV1_SPEED` 0 and 6 over the two straddling-size
+tests and the 232x168 encoder test: zero mismatch lines.
