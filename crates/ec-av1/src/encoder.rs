@@ -974,10 +974,32 @@ const LEAF_SLOTS: [u8; 2] = [LEAF_SLOT, 7];
 /// that priced the lever is `lanes/refs.report.md` §1; what it buys on the
 /// gate is `lanes/last2.report.md`.
 fn last2() -> bool {
+    match LAST2_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
     match std::env::var("EC_AV1_LAST2").ok() {
         Some(v) => v != "0",
         None => LAST2,
     }
+}
+
+/// A PROCESS-GLOBAL [`last2`] override that wins over the environment
+/// (`u8::MAX` = unset), the shape `crate::encode::set_frame_interp` has --
+/// this crate's tests never call `set_var` (`crate::envflags`), so the
+/// witness turns the lever on through this while holding
+/// [`crate::speed::knob_write`].
+static LAST2_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Sets [`LAST2_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` witness
+pub(crate) fn set_last2(on: Option<bool>) {
+    LAST2_OVERRIDE.store(
+        on.map_or(u8::MAX, u8::from),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// [`last2`]'s default.
@@ -2999,6 +3021,91 @@ mod tests {
         let (base, finer) = (key_bytes(0), key_bytes(-48));
         eprintln!("key at base q {base} bytes, at base q - 48 {finer} bytes");
         assert!(finer > base, "key_q_offset -48 did not reach the key frame ({finer} <= {base})");
+    }
+
+    /// lane-last2's witness: a clip whose pictures ALTERNATE between two
+    /// textures, so for every leaf the picture two back is an exact match and
+    /// the one before it (`LAST_FRAME`) is not. With the lever on, the leaf
+    /// chain alternates its refresh over [`LEAF_SLOTS`] and names the older
+    /// slot `LAST2_FRAME`; blocks must actually be CODED off it
+    /// ([[gate-blind-to-feature]]: a slot that is retained but never chosen
+    /// proves only that the bookkeeping compiles), the stream must decode
+    /// sample-exact through OUR decoder and through ffmpeg, and the hidden
+    /// frames must still come out in display order. With the lever OFF the
+    /// same clip codes ZERO `LAST2` blocks, which is what makes the counter a
+    /// measurement of this lane and not of the reference set we already had.
+    #[test]
+    fn a_leaf_predicts_off_last2_when_the_picture_two_back_matches() {
+        let _knobs = crate::speed::knob_write();
+        crate::encode::force_screen(Some(false));
+        let (width, height) = (128usize, 128usize);
+        let sources: Vec<Picture> =
+            (0..9).map(|t| test_card(width, height, (t % 2) * 24)).collect();
+        let run = |on: bool| -> ([usize; 8], Vec<u8>, Vec<Packet>) {
+            set_last2(Some(on));
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop: 32,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let pyramid = Pyramid { mini_gop: 4, mid_q_offset: None, ..Pyramid::default() };
+            let mut enc = Av1Encoder::with_pyramid(config, pyramid).unwrap();
+            let _ = crate::encode::take_ref_frame_hits();
+            let mut packets = Vec::new();
+            for picture in &sources {
+                packets.extend(enc.encode_frames(picture).unwrap());
+            }
+            packets.extend(enc.flush().unwrap());
+            let hits = crate::encode::take_ref_frame_hits();
+            (hits, concat(&packets), packets)
+        };
+        let (off_hits, off_stream, _) = run(false);
+        let (on_hits, stream, packets) = run(true);
+        set_last2(None);
+        eprintln!(
+            "LAST2 off: LAST {} LAST2 {} GOLDEN {} ALTREF {} ({} B); \
+             on: LAST {} LAST2 {} GOLDEN {} ALTREF {} ({} B)",
+            off_hits[1], off_hits[2], off_hits[4], off_hits[7], off_stream.len(),
+            on_hits[1], on_hits[2], on_hits[4], on_hits[7], stream.len(),
+        );
+        assert_eq!(off_hits[2], 0, "LAST2 was coded with the lever OFF");
+        assert!(
+            on_hits[2] >= 8,
+            "the picture two back matches exactly and only {} blocks were coded off LAST2",
+            on_hits[2],
+        );
+
+        // Display order and sample-exactness, both decoders (the same shape
+        // `pyramid_round_trip` gates the hidden frames with).
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's display-order count");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half of the LAST2 witness: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_luma(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "ffmpeg's display-order count");
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+            assert_eq!(got.len(), b.len(), "frame {i}: luma size");
+            if let Some(at) = got.iter().zip(b).position(|(x, y)| x != y) {
+                panic!(
+                    "display frame {i}: luma differs first at ({}, {}): ours {} vs ffmpeg {}",
+                    at % width,
+                    at / width,
+                    got[at],
+                    b[at],
+                );
+            }
+        }
+        // The reordering itself is unchanged by the second leaf slot.
+        let shown = packets.iter().filter(|p| p.level == Level::ShowExisting).count();
+        let arfs = packets.iter().filter(|p| p.level == Level::Arf).count();
+        assert_eq!(shown, arfs, "one show_existing_frame per hidden frame");
     }
 
     fn pyramid_round_trip(pyramid: Pyramid, hidden: usize) {
