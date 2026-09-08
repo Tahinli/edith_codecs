@@ -187,10 +187,6 @@ pub fn mv16(mv: (i32, i32)) -> (i16, i16) {
 /// in by the time it asks for a block's MV stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MiInfo {
-    /// Whether this unit coded `skip` (spec 5.11.15). Published so the RD
-    /// pricer can context its own `skip` symbol off the same two cells the
-    /// tile writer's `above_skip`/`left_skip` bands hold (lane-ctx).
-    pub skip: bool,
     /// Whether this unit was coded inter (as opposed to intra).
     pub is_inter: bool,
     /// The single reference frame this unit's MV points into. Ignored (and
@@ -255,6 +251,14 @@ pub struct MiGrid {
     cols: usize,
     rows: usize,
     cells: Vec<Option<MiInfo>>,
+    /// One `skip` flag per cell, beside `cells` rather than inside `MiInfo`
+    /// -- the mv-stack scan walks `cells` for every inter block, so the CELL
+    /// must stay 16 bytes (`mi_info_cell_stays_compact`), and nothing on the
+    /// scan path reads this. Only the ENCODER's own grid fills it
+    /// (`encode::record_mi`), for the RD pricer's `skip` context; the tile
+    /// writer and the decoder read their `skip` neighbours from their own
+    /// bands and leave this `false` (lane-ctx).
+    skips: Vec<bool>,
     /// lane-tiles r6: the current tile's own mi-unit bounds (spec: an MV
     /// candidate scan never reaches across a tile boundary, mirroring
     /// `PlaneBuf`'s `tile_x0`/`tile_x1` reach clamp for intra prediction).
@@ -283,6 +287,7 @@ impl MiGrid {
             cols,
             rows,
             cells: vec![None; cols * rows],
+            skips: vec![false; cols * rows],
             tile_row0: 0,
             tile_col0: 0,
             tile_row1: rows,
@@ -329,6 +334,25 @@ impl MiGrid {
         if row < self.rows && col < self.cols {
             self.cells[row * self.cols + col] = Some(info);
         }
+    }
+
+    /// Records the `skip` flag of the unit at `(row, col)` -- see `skips`.
+    pub fn set_skip(&mut self, row: usize, col: usize, skip: bool) {
+        if row < self.rows && col < self.cols {
+            self.skips[row * self.cols + col] = skip;
+        }
+    }
+
+    /// The `skip` flag of the unit at `(row, col)`, `false` outside this
+    /// tile's own window (the same clamp [`Self::get`] applies).
+    pub fn skip_at(&self, row: usize, col: usize) -> bool {
+        row < self.rows
+            && col < self.cols
+            && row >= self.tile_row0
+            && row < self.tile_row1
+            && col >= self.tile_col0
+            && col < self.tile_col1
+            && self.skips[row * self.cols + col]
     }
 
     /// Records one block's whole `bh4` x `bw4` footprint at once. Every
@@ -1711,8 +1735,12 @@ pub fn find_mv_stack_with_sign_bias(
     };
     let above_nbr = nbr_of(above_cell);
     let left_nbr = nbr_of(left_cell);
-    let above_skip = above_cell.is_some_and(|mi| mi.skip);
-    let left_skip = left_cell.is_some_and(|mi| mi.skip);
+    let above_skip = mi_row
+        .checked_sub(1)
+        .is_some_and(|r| grid.skip_at(r, mi_col));
+    let left_skip = mi_col
+        .checked_sub(1)
+        .is_some_and(|c| grid.skip_at(mi_row, c));
 
     MvStack {
         entries: candidates,
@@ -2817,7 +2845,6 @@ mod tests {
 
     fn inter(mv: (i32, i32)) -> MiInfo {
         MiInfo {
-            skip: false,
             is_inter: true,
             ref_frame: 1,
             ref_frame1: NO_REF1,
@@ -2979,7 +3006,6 @@ mod tests {
             1,
             2,
             MiInfo {
-                skip: false,
                 is_inter: true,
                 ref_frame: 1,
                 ref_frame1: NO_REF1,
@@ -3063,7 +3089,6 @@ mod tests {
             mi_row - 1,
             mi_col,
             MiInfo {
-                skip: false,
                 is_inter: true,
                 ref_frame: 1,
                 ref_frame1: NO_REF1,
@@ -3096,7 +3121,6 @@ mod tests {
     /// `processed_rows`/`processed_cols` from any candidate's `bsize` alone.
     fn intra8() -> MiInfo {
         MiInfo {
-            skip: false,
             is_inter: false,
             ref_frame: -1,
             ref_frame1: NO_REF1,
@@ -3116,7 +3140,6 @@ mod tests {
     /// geometry.
     fn inter8(mv: (i32, i32)) -> MiInfo {
         MiInfo {
-            skip: false,
             is_inter: true,
             ref_frame: 1,
             ref_frame1: NO_REF1,
@@ -3357,7 +3380,6 @@ mod tests {
 
     fn comp_inter(mv0: (i32, i32), mv1: (i32, i32)) -> MiInfo {
         MiInfo {
-            skip: false,
             is_inter: true,
             ref_frame: COMP_PAIR.0,
             ref_frame1: COMP_PAIR.1,
@@ -3381,7 +3403,6 @@ mod tests {
             1,
             3,
             MiInfo {
-                skip: false,
                 is_inter: true,
                 ref_frame: LAST_FRAME,
                 ref_frame1: GOLDEN_FRAME,
@@ -3485,7 +3506,6 @@ mod tests {
         // Exact match on side 0 (LAST_FRAME), wrong ref on side 1 -> borrowed
         // into ref_diff[1] with no sign flip (NO_SIGN_BIAS).
         let candidate = MiInfo {
-            skip: false,
             is_inter: true,
             ref_frame: LAST_FRAME,
             ref_frame1: NO_REF1,
@@ -3515,7 +3535,6 @@ mod tests {
             1,
             2,
             MiInfo {
-                skip: false,
                 is_inter: true,
                 ref_frame: LAST_FRAME,
                 ref_frame1: NO_REF1,
@@ -3532,7 +3551,6 @@ mod tests {
             2,
             1,
             MiInfo {
-                skip: false,
                 is_inter: true,
                 ref_frame: ALTREF_FRAME,
                 ref_frame1: NO_REF1,
