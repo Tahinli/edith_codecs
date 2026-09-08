@@ -6813,7 +6813,6 @@ fn record_mi(
 ) {
     let info = match inter {
         Some(info) => MiInfo {
-            skip,
             is_inter: true,
             ref_frame: info.ref_frame,
             // A COMPOUND block votes with BOTH of its references and both of
@@ -6840,7 +6839,6 @@ fn record_mi(
             is_global_mv1: false,
         },
         None => MiInfo {
-            skip,
             is_inter: false,
             ref_frame: -1,
             ref_frame1: NO_REF1,
@@ -6856,6 +6854,7 @@ fn record_mi(
     for dr in 0..usize::from(size) {
         for dc in 0..usize::from(size) {
             grid.set(mi_row + dr, mi_col + dc, info);
+            grid.set_skip(mi_row + dr, mi_col + dc, skip);
         }
     }
 }
