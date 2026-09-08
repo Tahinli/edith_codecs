@@ -16977,6 +16977,19 @@ mod tests {
                 mm.iter().sum::<usize>(),
             );
             print_inter_tx_census(name);
+            // lane-last2 (class `gate-blind-to-feature`): which reference the
+            // 32x32-and-below inter blocks of this clip's four encodes chose.
+            // The native table is the standing keep table, so a second past
+            // reference that never won a block has to be visible HERE and not
+            // only in a synthetic witness.
+            let rh = crate::encode::take_ref_frame_hits();
+            let rtot: usize = rh.iter().sum();
+            eprintln!(
+                "{name}: references LAST {} LAST2 {} GOLDEN {} ALTREF {} of {} inter blocks \
+                 (LAST2 {:.1}%)",
+                rh[1], rh[2], rh[4], rh[7], rtot,
+                100.0 * rh[2] as f64 / rtot.max(1) as f64,
+            );
             let palette = crate::tile::take_palette_hits();
             let palette_uv = crate::tile::take_palette_uv_hits();
             let ibc = crate::tile::take_intrabc_hits();
