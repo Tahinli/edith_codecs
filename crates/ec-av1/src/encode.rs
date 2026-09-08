@@ -11334,6 +11334,149 @@ pub(crate) struct PyramidFrame {
     pub sign_bias: crate::mvstack::SignBiasTable,
 }
 
+/// lane-arfpred: the temporal filter of a top ARF's SOURCE picture, libaom's
+/// `temporal_filter` in the small: every 16x16 luma block of `src` is
+/// motion-compensated from each picture of `window` (the group's own display
+/// neighbours, nearest first) and averaged in with weight
+/// `exp(-mse / strength)`, so a neighbour that matches badly contributes
+/// nothing and one that matches well cancels the grain the block's residual
+/// would otherwise have to code.
+///
+/// `strength` is [`crate::speed::ARF_TF`]; `0` never reaches here. Chroma
+/// rides the luma block's own vector (halved), which is what libaom does at
+/// this block size. The picture is the SUPERBLOCK-padded one, so the 16x16
+/// grid tiles it exactly.
+///
+/// Priced before it was built by `encode::tests::arf_pred_census`: on film B
+/// the filtered ARF's prediction SAD at lag 8 is 11.7% below the unfiltered
+/// one's (film A 5.9%) with the two past neighbours at strength 30, and the
+/// filtered picture is 50.1 dB from the source it replaces -- 4 dB above the
+/// quality the ARF is coded at, so the substitution itself costs little.
+pub(crate) fn arf_temporal_filter(src: &Picture, window: &[Picture], strength: f64) -> Picture {
+    const SIDE: usize = 16;
+    let neighbours: Vec<&Picture> = window
+        .iter()
+        .filter(|p| p.width == src.width && p.height == src.height)
+        .take(2)
+        .collect();
+    if neighbours.is_empty() || strength <= 0.0 {
+        return src.clone();
+    }
+    let mut out = src.clone();
+    // SAD of `src`'s block at `(bx, by)` against `r` displaced by `mv`, or
+    // `None` when the displaced block leaves the picture.
+    let sad = |r: &Picture, bx: usize, by: usize, mv: (isize, isize)| {
+        let (sy, sx) = (by as isize + mv.0, bx as isize + mv.1);
+        if sy < 0 || sx < 0 || sy as usize + SIDE > r.height || sx as usize + SIDE > r.width {
+            return None;
+        }
+        let (sy, sx) = (sy as usize, sx as usize);
+        let mut acc = 0u64;
+        for row in 0..SIDE {
+            let c = &src.y[(by + row) * src.width + bx..][..SIDE];
+            let p = &r.y[(sy + row) * r.width + sx..][..SIDE];
+            acc += c.iter().zip(p).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum::<u64>();
+        }
+        Some((acc, (sy, sx)))
+    };
+    // The log-step diamond `arf_pred_census` priced this with.
+    let search = |r: &Picture, bx: usize, by: usize| -> Option<(usize, usize)> {
+        let mut best = sad(r, bx, by, (0, 0))?;
+        let mut centre = (0isize, 0isize);
+        let mut step = 16isize;
+        while step >= 1 {
+            let from = centre;
+            for (dy, dx) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+                let mv = (from.0 + dy * step, from.1 + dx * step);
+                if let Some(s) = sad(r, bx, by, mv) {
+                    if s.0 < best.0 {
+                        best = s;
+                        centre = mv;
+                    }
+                }
+            }
+            step /= 2;
+        }
+        Some(best.1)
+    };
+    let (cw, ch) = (src.width / 2, src.height / 2);
+    for by in (0..src.height).step_by(SIDE) {
+        for bx in (0..src.width).step_by(SIDE) {
+            if by + SIDE > src.height || bx + SIDE > src.width {
+                continue;
+            }
+            let mut y_acc = vec![0f64; SIDE * SIDE];
+            let mut c_acc = [vec![0f64; SIDE * SIDE / 4], vec![0f64; SIDE * SIDE / 4]];
+            let mut wsum = 1.0f64;
+            // Chroma keeps its OWN weight sum: an edge block whose halved
+            // vector leaves the chroma plane contributes to luma only, and
+            // dividing chroma by the luma sum would darken it (class
+            // `metric blind to a plane`, on the encoder side).
+            let mut cwsum = 1.0f64;
+            for row in 0..SIDE {
+                for col in 0..SIDE {
+                    y_acc[row * SIDE + col] = f64::from(src.y[(by + row) * src.width + bx + col]);
+                }
+            }
+            for row in 0..SIDE / 2 {
+                for col in 0..SIDE / 2 {
+                    let i = (by / 2 + row) * cw + bx / 2 + col;
+                    c_acc[0][row * SIDE / 2 + col] = f64::from(src.u[i]);
+                    c_acc[1][row * SIDE / 2 + col] = f64::from(src.v[i]);
+                }
+            }
+            for r in &neighbours {
+                let Some((sy, sx)) = search(r, bx, by) else { continue };
+                let mut sse = 0f64;
+                for row in 0..SIDE {
+                    for col in 0..SIDE {
+                        let d = f64::from(src.y[(by + row) * src.width + bx + col])
+                            - f64::from(r.y[(sy + row) * r.width + sx + col]);
+                        sse += d * d;
+                    }
+                }
+                let w = (-sse / (SIDE * SIDE) as f64 / strength).exp();
+                for row in 0..SIDE {
+                    for col in 0..SIDE {
+                        y_acc[row * SIDE + col] +=
+                            w * f64::from(r.y[(sy + row) * r.width + sx + col]);
+                    }
+                }
+                // Chroma reads the luma vector halved; a block on the picture
+                // edge whose halved vector would leave the chroma plane is
+                // left to luma alone rather than clamped to a different
+                // displacement than the luma it must stay registered with.
+                let (cy, cx) = (sy / 2, sx / 2);
+                if cy + SIDE / 2 <= ch && cx + SIDE / 2 <= cw {
+                    for row in 0..SIDE / 2 {
+                        for col in 0..SIDE / 2 {
+                            let i = (cy + row) * cw + cx + col;
+                            c_acc[0][row * SIDE / 2 + col] += w * f64::from(r.u[i]);
+                            c_acc[1][row * SIDE / 2 + col] += w * f64::from(r.v[i]);
+                        }
+                    }
+                    cwsum += w;
+                }
+                wsum += w;
+            }
+            for row in 0..SIDE {
+                for col in 0..SIDE {
+                    out.y[(by + row) * src.width + bx + col] =
+                        (y_acc[row * SIDE + col] / wsum).round() as u16;
+                }
+            }
+            for row in 0..SIDE / 2 {
+                for col in 0..SIDE / 2 {
+                    let i = (by / 2 + row) * cw + bx / 2 + col;
+                    out.u[i] = (c_acc[0][row * SIDE / 2 + col] / cwsum).round() as u16;
+                    out.v[i] = (c_acc[1][row * SIDE / 2 + col] / cwsum).round() as u16;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Encodes one picture as an inter frame predicting from `reference`'s
 /// reconstruction, which the caller decoded (or, for the frame right after
 /// the key frame, is the key frame's own reconstruction).
@@ -16929,7 +17072,11 @@ mod tests {
         // ([`crate::speed::DQ_LEVEL_K`]), so the hidden frames' quantizer
         // grids -- and every decision priced against them -- moved:
         // 8252 -> 8269 bytes at q=150 and 33053 -> 33044 at q=60.
-        let pins: [(u8, usize, u64); 2] = [(150, 8269, 0xf0a10bafe7b45fe2), (60, 33044, 0x077e9c22ff6f41fb)];
+        // Re-taken on lane-arfpred: the top ARF is coded from a temporally
+        // FILTERED source ([`crate::speed::ARF_TF`]), so every hidden frame's
+        // pixels -- and the leaves that predict from them -- moved:
+        // 8269 -> 8218 bytes at q=150 and 33044 -> 33017 at q=60.
+        let pins: [(u8, usize, u64); 2] = [(150, 8218, 0xd533_c8ea_14ca_ae6e), (60, 33017, 0xbced_b694_dcfe_9146)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
@@ -18657,6 +18804,173 @@ mod tests {
                     100.0 * (near_sad - best_sad) as f64 / near_sad.max(1) as f64,
                 );
             }
+        }
+    }
+
+    /// lane-arfpred: WHAT THE TOP ARF'S PREDICTION IS WORTH, and what a
+    /// temporal filter of its SOURCE would take off it, priced before any
+    /// encoder change (class `gate-blind-to-feature`).
+    ///
+    /// The stream census says our top ARF costs 6992 B a frame against
+    /// rav1e's 3872 at a COARSER quantizer (118 vs 104) for the same picture
+    /// quality, and that 61% of the gap is residual, not syntax. Two
+    /// explanations are separable here without an encoder: our anchor
+    /// predicts across 8 pictures where rav1e's predicts across 4 (lag), and
+    /// the residual it codes at that lag is dominated by film grain, which no
+    /// motion search can predict (source noise). So, per ARF position of the
+    /// gate's own 48-picture window:
+    ///
+    /// * mean full-pel SAD per pixel at lag 8 (ours) and lag 4 (rav1e's),
+    /// * the same at lag 8 with the CURRENT picture temporally filtered --
+    ///   a libaom-shaped motion-compensated average of the +-2 display
+    ///   neighbours, weights `exp(-mse / strength)` -- which is the residual
+    ///   energy an ARF temporal filter would remove, and
+    /// * PSNR of that filtered picture against the unfiltered one, the
+    ///   CEILING the filtered ARF's own PSNR is then measured under (the
+    ///   BD gate scores against the unfiltered source).
+    ///
+    ///     EC_ARF_TF_S=<strength> cargo test -p ec-av1 --release --lib -- \
+    ///         --ignored arf_pred_census --nocapture
+    #[test]
+    #[ignore = "reads the real films"]
+    fn arf_pred_census() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP arf_pred_census: no ffmpeg");
+            return;
+        }
+        const SIDE: usize = 16;
+        let strength: f64 = std::env::var("EC_ARF_TF_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30.0);
+        let past = std::env::var("EC_ARF_TF_PAST").as_deref() == Ok("1");
+        // SAD and the matching block of `r` at full-pel `(dy, dx)`, or `None`
+        // when the displaced block leaves the picture.
+        let at = |cur: &[u16], cw: usize, r: &Picture, bx: usize, by: usize, mv: (isize, isize)| {
+            let (sy, sx) = (by as isize + mv.0, bx as isize + mv.1);
+            if sy < 0 || sx < 0 {
+                return None;
+            }
+            let (sy, sx) = (sy as usize, sx as usize);
+            if sy + SIDE > r.height || sx + SIDE > r.width {
+                return None;
+            }
+            let mut acc = 0u64;
+            for row in 0..SIDE {
+                let c = &cur[row * cw..][..SIDE];
+                let p = &r.y[(sy + row) * r.width + sx..][..SIDE];
+                acc += c.iter().zip(p).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum::<u64>();
+            }
+            Some((acc, (sy, sx)))
+        };
+        // The same log-step diamond `last2_census` uses, so the two censuses'
+        // SADs are comparable.
+        let search = |cur: &[u16], cw: usize, r: &Picture, bx: usize, by: usize| {
+            let mut best = match at(cur, cw, r, bx, by, (0, 0)) {
+                Some(v) => v,
+                None => return (u64::MAX, (by, bx)),
+            };
+            let mut centre = (0isize, 0isize);
+            let mut step = 16isize;
+            while step >= 1 {
+                let from = centre;
+                for (dy, dx) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+                    let mv = (from.0 + dy * step, from.1 + dx * step);
+                    if let Some(s) = at(cur, cw, r, bx, by, mv) {
+                        if s.0 < best.0 {
+                            best = s;
+                            centre = mv;
+                        }
+                    }
+                }
+                step /= 2;
+            }
+            best
+        };
+        println!(
+            "| clip | ARFs | strength {strength} past {past} | lag8 SAD/px | lag4 SAD/px | tf lag8 SAD/px | tf removes | tf PSNR ceiling |"
+        );
+        println!("|---|---|---|---|---|---|---|");
+        for (name, path, seek) in native_gate_clips() {
+            if !name.starts_with("film ") {
+                continue;
+            }
+            let (vf, cw, ch) = crate::probe::gate_crop(&path);
+            let pictures = clip_frames_vf(&path, &seek, &vf, cw, ch, 48);
+            let (mut n8, mut n4, mut ntf, mut px, mut arfs) = (0u64, 0u64, 0u64, 0u64, 0usize);
+            let (mut tf_sse, mut tf_px) = (0f64, 0u64);
+            for i in (8..pictures.len()).step_by(8) {
+                arfs += 1;
+                let cur = &pictures[i];
+                for by in (0..ch.saturating_sub(SIDE - 1)).step_by(SIDE) {
+                    for bx in (0..cw.saturating_sub(SIDE - 1)).step_by(SIDE) {
+                        let block: Vec<u16> = (0..SIDE)
+                            .flat_map(|row| cur.y[(by + row) * cur.width + bx..][..SIDE].to_vec())
+                            .collect();
+                        n8 += search(&block, SIDE, &pictures[i - 8], bx, by).0;
+                        n4 += search(&block, SIDE, &pictures[i - 4], bx, by).0;
+                        // The temporal filter: each +-2 display neighbour is
+                        // motion-compensated onto this block and averaged in
+                        // with libaom's shape, a weight that falls with the
+                        // match's own mean squared error.
+                        let mut acc: Vec<f64> = block.iter().map(|&v| f64::from(v)).collect();
+                        let mut wsum = 1.0f64;
+                        // `EC_ARF_TF_PAST=1` restricts the filter to the
+                        // DISPLAY-PAST neighbours -- the only ones the
+                        // encoder's own group buffer holds when it codes its
+                        // top ARF (the group's future is not buffered yet).
+                        let offs: &[isize] = match past {
+                            true => &[-2, -1],
+                            false => &[-2, -1, 1, 2],
+                        };
+                        for &d in offs {
+                            let j = i as isize + d;
+                            let Some(nb) = usize::try_from(j).ok().and_then(|j| pictures.get(j))
+                            else {
+                                continue;
+                            };
+                            let (_, (sy, sx)) = search(&block, SIDE, nb, bx, by);
+                            let mut sse = 0f64;
+                            for row in 0..SIDE {
+                                for col in 0..SIDE {
+                                    let d = f64::from(block[row * SIDE + col])
+                                        - f64::from(nb.y[(sy + row) * nb.width + sx + col]);
+                                    sse += d * d;
+                                }
+                            }
+                            let w = (-sse / ((SIDE * SIDE) as f64) / strength).exp();
+                            for row in 0..SIDE {
+                                for col in 0..SIDE {
+                                    acc[row * SIDE + col] +=
+                                        w * f64::from(nb.y[(sy + row) * nb.width + sx + col]);
+                                }
+                            }
+                            wsum += w;
+                        }
+                        let filtered: Vec<u16> = acc
+                            .iter()
+                            .map(|v| (v / wsum).round().clamp(0.0, 1023.0) as u16)
+                            .collect();
+                        for (a, b) in filtered.iter().zip(&block) {
+                            let d = f64::from(*a) - f64::from(*b);
+                            tf_sse += d * d;
+                        }
+                        tf_px += (SIDE * SIDE) as u64;
+                        ntf += search(&filtered, SIDE, &pictures[i - 8], bx, by).0;
+                        px += (SIDE * SIDE) as u64;
+                    }
+                }
+            }
+            let per = |v: u64| v as f64 / px.max(1) as f64;
+            let mse = tf_sse / tf_px.max(1) as f64;
+            println!(
+                "| {name} | {arfs} | s{strength} p{past} | {:.3} | {:.3} | {:.3} | {:.1}% | {:.2} dB |",
+                per(n8),
+                per(n4),
+                per(ntf),
+                100.0 * (n8 - ntf) as f64 / n8.max(1) as f64,
+                10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10(),
+            );
         }
     }
 

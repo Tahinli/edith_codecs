@@ -294,7 +294,7 @@ fn main() {
     // the frames above are coded in (a pyramid codes a hidden ARF ahead of the
     // leaves that predict from it, and re-outputs it later with
     // `show_existing_frame`) -- so it is its own table rather than a column.
-    let mut psnrs: Vec<f64> = Vec::new();
+    let mut psnrs: Vec<(f64, f64, f64)> = Vec::new();
     if let Some(src) = args.get(1).map(|p| std::fs::read(p).expect("source")) {
         let mut sum = 0.0;
         let mut rows = Vec::new();
@@ -303,8 +303,13 @@ fn main() {
             let frame_len = luma + 2 * chroma;
             let Some(b) = src.get(i * frame_len..(i + 1) * frame_len) else { break };
             let want: Vec<u16> = b[..luma].iter().map(|&v| u16::from(v)).collect();
+            // lane-arfpred: the chroma planes too -- an anchor's byte gap can
+            // sit in a plane the luma-only line cannot see (class
+            // `metric blind to a plane`).
+            let wu: Vec<u16> = b[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect();
+            let wv: Vec<u16> = b[luma + chroma..frame_len].iter().map(|&v| u16::from(v)).collect();
             let p = psnr(&pic.y, &want);
-            psnrs.push(p);
+            psnrs.push((p, psnr(&pic.u, &wu), psnr(&pic.v, &wv)));
             sum += p;
             rows.push(format!("{i}:{p:.2}"));
         }
@@ -321,7 +326,8 @@ fn main() {
     // put next to the reference encoder's ARF at the same display position.
     if std::env::var("EC_CENSUS_PERFRAME").as_deref() == Ok("1") {
         for f in &frames {
-            let p = psnrs.get(f.order_hint as usize).copied().unwrap_or(f64::NAN);
+            let (p, pu, pv) =
+                psnrs.get(f.order_hint as usize).copied().unwrap_or((f64::NAN, f64::NAN, f64::NAN));
             let refs: Vec<String> = (0..7)
                 .filter(|i| f.refs[i + 1] > 0)
                 .map(|i| {
@@ -334,7 +340,7 @@ fn main() {
                 .collect();
             report(
                 &format!(
-                    "frame {} {} hint {} q {} PSNR-Y {p:.2} dB refs [{}]",
+                    "frame {} {} hint {} q {} PSNR-Y {p:.2} U {pu:.2} V {pv:.2} dB refs [{}]",
                     f.idx,
                     f.kind,
                     f.order_hint,

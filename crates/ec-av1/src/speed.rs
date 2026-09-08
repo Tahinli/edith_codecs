@@ -366,6 +366,49 @@ pub(crate) const DQ_TPL_K: [f64; 11] = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
 /// `lanes/arfq.report.md`.
 pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.5, 1.0, 1.0];
 
+/// lane-arfpred: the strength of the top ARF's SOURCE temporal filter
+/// ([`crate::encode::arf_temporal_filter`]) -- `0` is off, higher filters
+/// harder (the weight of a motion-compensated neighbour is
+/// `exp(-mse / strength)`). `EC_AV1_ARF_TF=<strength>` overrides it.
+///
+/// The top ARF carries 55% of a 48-picture film B stream at 6992 B a frame
+/// against rav1e's 3872 at a FINER quantizer, and the per-frame census says
+/// 61% of that gap is residual, not syntax -- while `arf_pred_census` says
+/// the anchor's own lag is worth only 7% of its prediction SAD (lag 8 1.199
+/// vs lag 4 1.114 per pixel), so what the residual codes is mostly source
+/// grain. Filtering it out of the picture the anchor is coded from is the
+/// mechanism libaom uses (`arnr`) and rav1e 0.8.1 does not have at all.
+/// Long-GOP gate (48 pictures, BD vs libaom / rav1e), strength 3 against the
+/// control: film A +23.5/-8.0 -> **+22.7/-7.9**, film B +85.3/+6.7 ->
+/// **+79.0/+2.7**. Film B takes 6.3 and 4.0 points off; film A takes 0.8 off
+/// the libaom column and hands back 0.1 on the rav1e one, which is the
+/// keep rule's "one column >=0.5 down, the other flat" clause. It is also
+/// FASTER (film B two-point probe 167 s -> 147 s): the anchor has fewer
+/// coefficients to code. Uniform over the presets -- above preset 6
+/// [`TPL_DEPTH`] leaves the group window empty and the filter is inert by
+/// construction.
+///
+/// Strength is single-peaked and SHARP: the film B two-point probe reads
+/// -1.4% bytes at equal PSNR at 3, +3.4% at 8, +6.9% at 15 and +15.8% at 30
+/// (`lanes/arfpred.report.md` section 3). Hard filtering does remove 6-7% of
+/// the stream's bytes and gives all of it back in quality, because the leaves
+/// still carry the grain the anchor no longer has.
+pub(crate) const ARF_TF: [f64; 11] = [3.0; 11];
+
+/// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
+/// libaom scales `arnr` strength with the quantizer and stops filtering at
+/// the high-quality end for the same reason: a picture we are about to
+/// reproduce almost exactly should not have detail averaged out of it first.
+///
+/// 16 is under the gate's own finest anchor (its `q = 60` ladder point codes
+/// the top ARF at qindex 28) and over the rate-loop floor a high bitrate
+/// target drives the anchor to. `encoder::tests::bitrate_target_lands_within_5/// _percent_over_48_frames` is what named the floor: at 2 Mbps on the 640x384
+/// fixture the loop codes IDENTICAL 22237-byte anchors as at 1536 kbps, i.e.
+/// the anchor's `base_q_idx + arf_q_offset` has clamped to 1 and the loop
+/// cannot spend the target's remaining bytes -- and a cheaper (filtered)
+/// anchor there makes the miss worse, not better.
+pub(crate) const ARF_TF_QMIN: u8 = 16;
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [
