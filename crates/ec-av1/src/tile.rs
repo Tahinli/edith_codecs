@@ -2410,16 +2410,13 @@ impl Neighbours {
     /// off a CDF row one higher than the decoder's, which is the first
     /// divergence of the inter `TxMode::Select` stream.
     fn tx_size_ctx_txfm(&self, (mi_r, mi_c): (usize, usize), own_side: usize) -> usize {
-        let (has_above, has_left) = (self.has_above(mi_r), self.has_left(mi_c));
-        let mut above = usize::from(self.above_txfm[mi_c]) >= own_side;
-        let mut left = usize::from(self.left_txfm[mi_r]) >= own_side;
-        if has_above && self.above_inter[mi_c] {
-            above = self.above_side_mi[mi_c] >= own_side;
-        }
-        if has_left && self.left_inter[mi_r] {
-            left = self.left_side_mi[mi_r] >= own_side;
-        }
-        usize::from(has_above && above) + usize::from(has_left && left)
+        tx_size_ctx_txfm_of(
+            self.has_above(mi_r)
+                .then(|| (self.above_txfm[mi_c], self.above_inter[mi_c], self.above_side_mi[mi_c])),
+            self.has_left(mi_c)
+                .then(|| (self.left_txfm[mi_r], self.left_inter[mi_r], self.left_side_mi[mi_r])),
+            own_side,
+        )
     }
 
     /// `get_tx_size_context` (decode.rs [`crate::decode::tx_size_context`]):
@@ -2427,8 +2424,11 @@ impl Neighbours {
     /// largest transform, plus whether the one to the left is at least as
     /// tall. A neighbour outside the tile contributes nothing.
     fn tx_size_ctx(&self, (mi_r, mi_c): (usize, usize), max_tx: usize) -> usize {
-        usize::from(self.has_above(mi_r) && usize::from(self.above_tx[mi_c]) >= max_tx)
-            + usize::from(self.has_left(mi_c) && usize::from(self.left_tx[mi_r]) >= max_tx)
+        tx_size_ctx_of(
+            (self.has_above(mi_r), self.has_left(mi_c)),
+            (self.above_tx[mi_c], self.left_tx[mi_r]),
+            max_tx,
+        )
     }
 
     /// Publishes one block's resolved transform side over every 4x4 unit it
@@ -4307,6 +4307,46 @@ fn write_luma_tus(
         }
     }
     Ok(())
+}
+
+/// `get_tx_size_context` (decode.rs [`crate::decode::tx_size_context`]) over
+/// the two band cells themselves: whether the transform above is at least as
+/// wide as this block's own largest transform, plus whether the one to the
+/// left is at least as tall; a neighbour outside the tile contributes nothing.
+///
+/// Free-standing so the RD pricer can read the row the writer really codes a
+/// `tx_depth` symbol against off its own published band, without two
+/// transcriptions of the same rule (lane-ctx2).
+pub(crate) fn tx_size_ctx_of(
+    (has_above, has_left): (bool, bool),
+    (above_tx, left_tx): (u8, u8),
+    max_tx: usize,
+) -> usize {
+    usize::from(has_above && usize::from(above_tx) >= max_tx)
+        + usize::from(has_left && usize::from(left_tx) >= max_tx)
+}
+
+/// [`Neighbours::tx_size_ctx_txfm`] over the neighbours' own published state:
+/// each of `above`/`left` is `None` outside the tile (which contributes
+/// nothing), else its `TXFM_CONTEXT` band cell, whether it was coded inter,
+/// and its BLOCK side in pixels -- an INTER neighbour votes that block side
+/// rather than its transform.
+///
+/// Free-standing so the RD pricer reads the row an inter frame's intra block
+/// is really coded against off its own published bands, with no second
+/// transcription of the rule (lane-txd).
+pub(crate) fn tx_size_ctx_txfm_of(
+    above: Option<(u8, bool, usize)>,
+    left: Option<(u8, bool, usize)>,
+    own_side: usize,
+) -> usize {
+    let vote = |n: Option<(u8, bool, usize)>| match n {
+        Some((txfm, is_inter, block_side)) => {
+            if is_inter { block_side >= own_side } else { usize::from(txfm) >= own_side }
+        }
+        None => false,
+    };
+    usize::from(vote(above)) + usize::from(vote(left))
 }
 
 /// Writes one intra block's luma residual under `TxMode::Select`: the
