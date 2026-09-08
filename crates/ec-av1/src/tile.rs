@@ -215,14 +215,20 @@ fn write_sb128_root(
 /// 32x32-mi window, the motion mode, and the transform syntax, with the mi
 /// grid and every neighbour band published over all thirty-two mi cells.
 ///
-/// SKIP only, and refused otherwise: a 128x128 block's residual is four
-/// TX_64X64 luma units interleaved with a TX_32X32 chroma pair per 64x64 mu
-/// chunk (the chroma units reading the offset-10 `txb_skip` rows), which
-/// this writer has no path for. A skipped block writes no `cdef_idx` and no
-/// `delta_q` either, exactly as the 64 root's skip arm does.
+/// lane-b128r: a block that carries a RESIDUAL codes it as the four 64x64 mu
+/// chunks libaom's `decode_token_recon_block` walks -- per chunk one
+/// TX_64X64 luma unit (its coded 32x32 corner, `TxbSet::Luma64`, DCT-only at
+/// this size) then one TX_32X32 unit per chroma plane on the offset-10
+/// `txb_skip` rows, each publishing its own coefficient context before the
+/// next unit reads it. Its transform syntax is the var-tx tree's four
+/// depth-0 `txfm_partition` symbols, one per chunk. The levels arrive packed
+/// per plane into a 64-wide grid, chunk (cr, cc) at (cr * 32, cc * 32)
+/// ([`crate::encode::search_root_128`]). A skipped block writes no
+/// `cdef_idx` and no `delta_q`, exactly as the 64 root's skip arm does.
 ///
 /// # Errors
-/// A block that is intra, or carries a residual, at this size.
+/// A block that is intra, that is compound with a residual, or whose var-tx
+/// depth is not 0, at this size.
 #[allow(clippy::too_many_arguments)]
 fn write_inter_block_128(
     enc: &mut SymbolEncoder,
@@ -239,13 +245,16 @@ fn write_inter_block_128(
     /// The block's side in samples and in 4x4 mode-info units.
     const SIDE: usize = 128;
     const SIDE_MI: usize = SIDE / MI;
+    /// The four 64x64 "mu" chunks, in the order libaom's
+    /// `decode_token_recon_block` walks them (raster).
+    const CHUNKS: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
     let info = block.inter.ok_or_else(|| {
         Error::unsupported("AV1 tile", "a 128x128 superblock root block is coded inter")
     })?;
-    if !block.skip {
+    if !block.skip && block.tx_depth != 0 {
         return Err(Error::unsupported(
             "AV1 tile",
-            "a 128x128 superblock root block carries a residual",
+            "a 128x128 superblock root block splits its var-tx tree below TX_64X64",
         ));
     }
     let (mi_r, mi_c) = (sb_at.0 * (SUB / MI), sb_at.1 * (SUB / MI));
@@ -253,9 +262,9 @@ fn write_inter_block_128(
     let has_left = neighbours.has_left(mi_c);
     let skip_ctx =
         usize::from(neighbours.above_skip[mi_c]) + usize::from(neighbours.left_skip[mi_r]);
-    enc.symbol(1, &mut cdfs.skip[skip_ctx]);
-    write_cdef_idx(enc, (mi_r, mi_c), true);
-    write_delta_q(enc, cdfs, (mi_r, mi_c), true, true);
+    enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+    write_cdef_idx(enc, (mi_r, mi_c), block.skip);
+    write_delta_q(enc, cdfs, (mi_r, mi_c), true, block.skip);
     let ii_ctx = intra_inter_ctx(
         has_above,
         has_left,
@@ -340,18 +349,141 @@ fn write_inter_block_128(
         )?;
     }
     if tx_select {
-        write_tx_syntax_inter(enc, cdfs, neighbours, (mi_r, mi_c), SIDE, true, true, 0);
+        if block.skip {
+            write_tx_syntax_inter(enc, cdfs, neighbours, (mi_r, mi_c), SIDE, true, true, 0);
+        } else {
+            // The var-tx tree of a 128x128 block enters at TX_64X64 once per
+            // mu chunk (`read_block_tx_size`'s `max_tx = side.min(64)` loop),
+            // so it is four depth-0 `txfm_split` flags of zero, each read
+            // against the bands the chunks before it published.
+            for (cr, cc) in CHUNKS {
+                let unit = (mi_r + cr * 16, mi_c + cc * 16);
+                let ctx = txfm_partition_ctx_rect(
+                    neighbours.above_txfm[unit.1],
+                    neighbours.left_txfm[unit.0],
+                    SIDE,
+                    64,
+                    64,
+                );
+                enc.symbol(0, &mut cdfs.txfm_partition[ctx]);
+                neighbours.record_txfm(unit, 64, 64, 64);
+            }
+        }
     }
     let zero_grids = [
         vec![0i32; TX32 * TX32],
         vec![0i32; TX32 * TX32],
         vec![0i32; TX32 * TX32],
     ];
-    neighbours.record(sb_at, SIDE, 0, &zero_grids);
-    neighbours.record_inter(sb_at, SIDE, true, true, block_ref(block));
+    if !block.skip {
+        // The packed 64-wide level grids the search hands over, one plane
+        // each (see this function's doc).
+        let packed = [
+            level_grid(&block.luma, 64)?,
+            level_grid(&block.u, 64)?,
+            level_grid(&block.v, 64)?,
+        ];
+        let scan32 = default_scan(TX32);
+        let unit_of = |plane: usize, cr: usize, cc: usize| -> Vec<i32> {
+            (0..32)
+                .flat_map(|row| {
+                    packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32].to_vec()
+                })
+                .collect()
+        };
+        let mut chroma_units: Vec<((usize, usize), [Vec<i32>; 2])> = Vec::new();
+        for (cr, cc) in CHUNKS {
+            let unit_mi = (mi_r + cr * 16, mi_c + cc * 16);
+            // The luma unit: its own `txb_skip_ctx` is the neighbour
+            // magnitude table (the unit is smaller than its block), and it
+            // publishes its context before the next chunk reads it.
+            let luma = unit_of(0, cr, cc);
+            let skip_ctx = neighbours.luma_skip_ctx(unit_mi, 64 / MI);
+            let around = neighbours.around_mi(unit_mi, 64);
+            write_coeffs(
+                enc,
+                &mut cdfs.txb(TxbSet::Luma64, 0),
+                &luma,
+                &scan32,
+                skip_ctx,
+                dc_sign_ctx(around[0].dc_vote),
+                Some(0),
+                TxType::DctDct,
+            );
+            neighbours.record_mi_luma(unit_mi, 64, &luma);
+            // Then this chunk's chroma pair, before the next chunk's luma:
+            // libaom codes every plane of a mu chunk before moving on. The
+            // chroma `txb_skip_ctx` takes `get_txb_ctx`'s offset-10 rows
+            // (+3 here) because the uv plane block is bigger than the unit.
+            let mut pair = [Vec::new(), Vec::new()];
+            for plane in 1..3usize {
+                let grid = unit_of(plane, cr, cc);
+                let around = neighbours.around_mi(unit_mi, 64)[plane];
+                write_coeffs(
+                    enc,
+                    &mut cdfs.txb(TxbSet::Chroma32, 0),
+                    &grid,
+                    &scan32,
+                    usize::from(around.above_coded) + usize::from(around.left_coded) + 3,
+                    dc_sign_ctx(around.dc_vote),
+                    Some(plane),
+                    TxType::DctDct,
+                );
+                neighbours.record_mi_chroma(unit_mi, 64, plane, &grid);
+                pair[plane - 1] = grid;
+            }
+            chroma_units.push((unit_mi, pair));
+        }
+        // decode.rs' own tail (`record_split_luma_rect_mi` then the
+        // `mu_chroma_units` re-stamp): the block-level write off the WHOLE
+        // assembled chroma plane grid, luma kept because each unit already
+        // published its own, and then the per-unit chroma writes replayed
+        // over it -- last writer wins, so the next block reads the units.
+        let block_grids = [
+            vec![0i32; TX32 * TX32],
+            packed[1].clone(),
+            packed[2].clone(),
+        ];
+        neighbours.record_planes(sb_at, SIDE, 0, &block_grids, false);
+        for (unit_mi, pair) in &chroma_units {
+            neighbours.record_mi_chroma(*unit_mi, 64, 1, &pair[0]);
+            neighbours.record_mi_chroma(*unit_mi, 64, 2, &pair[1]);
+        }
+    } else {
+        neighbours.record(sb_at, SIDE, 0, &zero_grids);
+    }
+    neighbours.record_inter(sb_at, SIDE, block.skip, true, block_ref(block));
     record_block_compound(neighbours, (mi_r, mi_c), SIDE, block);
     SB128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !block.skip {
+        SB128_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if info.ref1.is_some() {
+        SB128_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
+}
+
+/// lane-b128r: how many of those blocks carried a REAL residual (four
+/// TX_64X64 luma units plus their per-chunk chroma pair) rather than being
+/// skipped, since the last [`take_sb128_residual_hits`].
+static SB128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The 128x128-with-residual count since the last call, and zero it.
+pub fn take_sb128_residual_hits() -> usize {
+    SB128_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// lane-b128r: how many of those blocks named a SECOND reference (the
+/// compound arm at the 128 root), since the last
+/// [`take_sb128_compound_hits`].
+static SB128_COMPOUND_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The compound-128 count since the last call, and zero it.
+pub fn take_sb128_compound_hits() -> usize {
+    SB128_COMPOUND_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How many 128x128 `PARTITION_NONE` blocks the inter writer has coded since
@@ -2715,6 +2847,30 @@ impl Neighbours {
             if mi_c + cell < self.mi_cols {
                 self.above[mi_c + cell][0] = state;
             }
+        }
+    }
+
+    /// lane-b128r: publishes ONE chroma transform unit's coefficient context,
+    /// the decoder's own `record_mi_chroma` -- a 128x128 block's chroma is one
+    /// TX_32X32 unit per plane per 64x64 mu chunk, and the next chunk reads
+    /// the previous one's state (its `txb_skip_ctx` base 1 from the left
+    /// neighbour). `span_px` is the unit's LUMA span, which is what the
+    /// luma-mi-indexed bands are addressed in.
+    fn record_mi_chroma(
+        &mut self,
+        (mi_r, mi_c): (usize, usize),
+        span_px: usize,
+        plane: usize,
+        grid: &[i32],
+    ) {
+        let round_up_even = |n: usize| n.div_ceil(2) * 2;
+        let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
+        let state = neighbour_state(grid);
+        for cell in 0..(span_px / MI).min(bound_h.saturating_sub(mi_r)) {
+            self.left[mi_r + cell][plane] = state;
+        }
+        for cell in 0..(span_px / MI).min(bound_w.saturating_sub(mi_c)) {
+            self.above[mi_c + cell][plane] = state;
         }
     }
 
