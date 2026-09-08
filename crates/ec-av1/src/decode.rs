@@ -69,6 +69,14 @@ pub(crate) struct FrameCtx {
     pub(crate) capture_stages: std::cell::Cell<bool>,
     pub(crate) stages: std::cell::RefCell<Option<FilterStages>>,
     pub(crate) sb128_flag: std::cell::Cell<bool>,
+    /// lane-refs: the frame-level `interpolation_filter` (spec 6.8.9) every
+    /// motion compensation of THIS frame runs, already resolved to a kernel.
+    /// `mc::predict` used to hardwire `Regular`, so the encoder's search,
+    /// trial and recon could only ever build a REGULAR prediction whatever
+    /// the frame header said; it lives here (and is copied by
+    /// [`filter_ctx_copy`]) so a tile-search worker thread reads the same
+    /// kernel the frame header wrote instead of the default.
+    pub(crate) interp_filter: std::cell::Cell<crate::mc::InterpFilterKind>,
     /// lane-lossless: this frame's `CodedLossless` (spec 5.9.12) -- every
     /// segment at `qindex == 0` with zero plane deltas. It forces TX_4X4 with
     /// the Walsh-Hadamard transform on every plane, drops the `tx_type`
@@ -163,6 +171,7 @@ impl FrameCtx {
             // (`set_sb128`, stream.rs). The encoder's own contexts start at
             // the size this process encodes -- see [`FrameCtx::for_encoder`].
             sb128_flag: std::cell::Cell::new(false),
+            interp_filter: std::cell::Cell::new(crate::mc::InterpFilterKind::Regular),
             lossless_flag: std::cell::Cell::new(false),
             cdef_bits: std::cell::Cell::new(0),
             bit_depth: std::cell::Cell::new(8),
@@ -260,6 +269,7 @@ impl<T: ?Sized> WithRef for T {}
 pub(crate) fn filter_ctx_copy(fctx: &FrameCtx) -> FrameCtx {
     let out = FrameCtx::new();
     out.bit_depth.set(fctx.bit_depth.get());
+    out.interp_filter.set(fctx.interp_filter.get());
     out.grain_bit_depth.set(fctx.grain_bit_depth.get());
     out.superres.set(fctx.superres.get());
     out.seg_mi_dims.set(fctx.seg_mi_dims.get());

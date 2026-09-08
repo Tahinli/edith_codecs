@@ -1807,6 +1807,23 @@ pub(crate) fn key_frame_headers_colour(
 /// 1 still holds the key frame however long the GOP runs.
 pub const GOLDEN_SLOT: u8 = 1;
 
+/// lane-refs: the frame-level `interpolation_filter` (spec 6.8.9) every inter
+/// frame this encoder writes carries. `EC_AV1_INTERP=smooth|sharp` codes the
+/// EIGHTTAP_SMOOTH / EIGHTTAP_SHARP kernel instead of the default REGULAR --
+/// one filter for the whole frame, which is what libaom does on this content
+/// too (`lanes/obmc3.report.md` read `switchable_interp 0/0` out of its own
+/// stream, so a per-BLOCK filter search has no bits to win). The kernel
+/// reaches the search, the trials and the recon through
+/// `FrameCtx::interp_filter`, so the stream a decoder reads and the
+/// prediction the search priced are the same one.
+fn frame_interp_filter() -> ec_av1_syntax::InterpolationFilter {
+    match std::env::var("EC_AV1_INTERP").ok().as_deref() {
+        Some("smooth") => ec_av1_syntax::InterpolationFilter::EighttapSmooth,
+        Some("sharp") => ec_av1_syntax::InterpolationFilter::EighttapSharp,
+        _ => ec_av1_syntax::InterpolationFilter::Eighttap,
+    }
+}
+
 /// The frame header for a shown inter frame that predicts from the single
 /// slot `last_slot` (every `ref_frame_idx` entry names it) and refreshes that
 /// same slot with itself once coded. The sequence header is [`key_frame_headers`]'s,
@@ -5506,7 +5523,7 @@ fn obmc_prediction(
         x / 2,
         y / 2,
         &refpix,
-        Some(mc::InterpFilterKind::Regular),
+        Some(fctx.interp_filter.get()),
         frame_width,
     )
     .ok()?;
@@ -6900,6 +6917,10 @@ pub(crate) fn encode_key_frame_inner(
     render: (usize, usize),
     color_config: ColorConfig, fctx: &crate::decode::FrameCtx,
 ) -> Result<Encoded> {
+    // lane-refs: an intra frame runs no motion compensation, and the
+    // context is shared across the sequence -- put the kernel back to the
+    // default so nothing reads the previous inter frame's.
+    fctx.interp_filter.set(mc::InterpFilterKind::Regular);
     picture.check()?;
     if modes.is_empty() {
         return Err(Error::unsupported(
@@ -8169,8 +8190,8 @@ fn mc_trial_compound_typed(
             mc::REF_NO_SCALE,
             side,
             side,
-            mc::InterpFilterKind::Regular,
-            mc::InterpFilterKind::Regular,
+            fctx.interp_filter.get(),
+            fctx.interp_filter.get(),
             dst,
         );
     }
@@ -8262,8 +8283,8 @@ fn predict_compound_u8(
             mc::REF_NO_SCALE,
             side,
             side,
-            mc::InterpFilterKind::Regular,
-            mc::InterpFilterKind::Regular,
+            fctx.interp_filter.get(),
+            fctx.interp_filter.get(),
             dst,
         );
     }
@@ -10213,6 +10234,12 @@ pub(crate) fn encode_inter_frame(
     )?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
+    // lane-refs: this frame's motion-compensation kernel, written into the
+    // header AND armed on the context every prediction reads, in one place so
+    // the two cannot disagree (a header saying SMOOTH over a REGULAR-searched
+    // tile decodes to different pixels than the encoder scored).
+    header.interpolation_filter = frame_interp_filter();
+    fctx.interp_filter.set(mc::InterpFilterKind::from_header(header.interpolation_filter));
     let sign_bias = pyramid.map_or(crate::mvstack::NO_SIGN_BIAS, |p| p.sign_bias);
     // The order hint behind each `ref_frame_idx` entry. The flat path's own
     // slot plan (`inter_frame_headers_slots`) is: every reference but
@@ -11233,7 +11260,7 @@ pub(crate) fn encode_inter_frame(
                 lf,
                 h.allow_high_precision_mv,
                 h.force_integer_mv,
-                Some(mc::InterpFilterKind::Regular),
+                Some(fctx.interp_filter.get()),
                 seq.enable_dual_filter,
                 h.reference_select,
                 tx_select,
@@ -16579,4 +16606,109 @@ mod tests {
         eprintln!("PARITY q={q} bytes={} fnv1a={hash:016x} speed={} pyramid {:?} effective {:?}",
             e.stream.len(), crate::speed::speed(), crate::encoder::Pyramid::from_env(), last_sequence_pyramid());
     }
+    /// lane-refs: IS A SECOND PAST REFERENCE WORTH RETAINING? `encoder.rs`'s
+    /// `ref_frame_idx` maps `LAST2`/`LAST3` onto `LAST`'s own DPB slot, so no
+    /// block can predict from the picture before `LAST` -- while rav1e's ARFs
+    /// read LAST@-4 plus LAST2@-8 and libaom holds up to seven distinct
+    /// pictures. Building that (a second retained slot, the search offering
+    /// it, a witness, a second motion search per block) is a week of wall on
+    /// the stage that already owns most of the encode, so this census prices
+    /// the lever FIRST (class `gate-blind-to-feature`, "count how often the
+    /// feature would fire before building the machine").
+    ///
+    /// The measurement is on the gate's own window and loader (`gate_crop`,
+    /// 12 pictures) of the two real films: every 16x16 luma block of every
+    /// picture gets one full-pel diamond search against the NEAR reference
+    /// and the same search against the FAR one, at the two lags the pyramid
+    /// actually offers -- (1, 2) for the leaf chain and (4, 8) for the ARF
+    /// level, rav1e's own pair. Reported per lag: the share of blocks the far
+    /// reference wins at all and by more than 10%, and -- the number the
+    /// decision is taken on -- the total SAD of best-of-{near, far} against
+    /// the total SAD of near alone, which is the prediction energy a second
+    /// reference could remove before any rate is paid for naming it.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored last2_census --nocapture
+    #[test]
+    #[ignore = "reads the real films"]
+    fn last2_census() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP last2_census: no ffmpeg");
+            return;
+        }
+        const SIDE: usize = 16;
+        // SAD of one 16x16 block against `r` at full-pel `(dy, dx)`, or
+        // `None` when the displaced block leaves the picture.
+        let sad = |cur: &Picture, r: &Picture, bx: usize, by: usize, mv: (isize, isize)| {
+            let (sy, sx) = (by as isize + mv.0, bx as isize + mv.1);
+            if sy < 0 || sx < 0 {
+                return None;
+            }
+            let (sy, sx) = (sy as usize, sx as usize);
+            if sy + SIDE > r.height || sx + SIDE > r.width {
+                return None;
+            }
+            let mut acc = 0u64;
+            for row in 0..SIDE {
+                let c = &cur.y[(by + row) * cur.width + bx..][..SIDE];
+                let p = &r.y[(sy + row) * r.width + sx..][..SIDE];
+                acc += c.iter().zip(p).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum::<u64>();
+            }
+            Some(acc)
+        };
+        // A log-step diamond from the zero motion vector: the cheapest search
+        // that still finds real pans. Both references get exactly this one,
+        // so the comparison is search-fair.
+        let search = |cur: &Picture, r: &Picture, bx: usize, by: usize| -> u64 {
+            let mut best = (sad(cur, r, bx, by, (0, 0)).unwrap_or(u64::MAX), (0isize, 0isize));
+            let mut step = 16isize;
+            while step >= 1 {
+                let centre = best.1;
+                for (dy, dx) in [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)] {
+                    let mv = (centre.0 + dy * step, centre.1 + dx * step);
+                    if let Some(s) = sad(cur, r, bx, by, mv) {
+                        if s < best.0 {
+                            best = (s, mv);
+                        }
+                    }
+                }
+                step /= 2;
+            }
+            best.0
+        };
+        println!("| clip | level (near/far lag) | blocks | far wins | far wins >10% | SAD near | SAD best-of | energy removed |");
+        println!("|---|---|---|---|---|---|---|---|");
+        for (name, path, seek) in native_gate_clips() {
+            if !name.starts_with("film ") {
+                continue;
+            }
+            let (vf, cw, ch) = crate::probe::gate_crop(&path);
+            let pictures = clip_frames_vf(&path, &seek, &vf, cw, ch, 12);
+            for (near, far, level) in [(1usize, 2usize, "leaf"), (4usize, 8usize, "ARF")] {
+                let (mut blocks, mut wins, mut big) = (0u64, 0u64, 0u64);
+                let (mut near_sad, mut best_sad) = (0u64, 0u64);
+                for i in far..pictures.len() {
+                    let cur = &pictures[i];
+                    let (rn, rf) = (&pictures[i - near], &pictures[i - far]);
+                    for by in (0..ch.saturating_sub(SIDE - 1)).step_by(SIDE) {
+                        for bx in (0..cw.saturating_sub(SIDE - 1)).step_by(SIDE) {
+                            let (n, f) = (search(cur, rn, bx, by), search(cur, rf, bx, by));
+                            blocks += 1;
+                            wins += u64::from(f < n);
+                            big += u64::from(f as f64 * 1.1 < n as f64);
+                            near_sad += n;
+                            best_sad += n.min(f);
+                        }
+                    }
+                }
+                let pct = |a: u64| 100.0 * a as f64 / blocks.max(1) as f64;
+                println!(
+                    "| {name} | {level} ({near}/{far}) | {blocks} | {:.1}% | {:.1}% | {near_sad} | {best_sad} | {:.2}% |",
+                    pct(wins),
+                    pct(big),
+                    100.0 * (near_sad - best_sad) as f64 / near_sad.max(1) as f64,
+                );
+            }
+        }
+    }
+
 }
