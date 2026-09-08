@@ -857,6 +857,12 @@ thread_local! {
     /// ids any block ended up with -- the gate's proof the feature fired.
     static SEG_ID_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEG_IDS_SEEN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// lane-golomb2: the (lowest, highest) quantizer index any block has been
+    /// dequantized with, i.e. `block_q_idx`'s own span. A gate that means to
+    /// exercise `SEG_LVL_ALT_Q` needs a stream where this span is WIDER than
+    /// zero (class `gate-blind-to-feature`): segmentation being enabled says
+    /// nothing about the segments carrying distinct quantizers.
+    static BLOCK_Q_SPAN: std::cell::Cell<(i32, i32)> = const { std::cell::Cell::new((i32::MAX, i32::MIN)) };
     /// How many `seg_id_predicted` symbols were read (temporal update).
     static SEG_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -906,6 +912,13 @@ pub(crate) fn segment_ids_seen() -> usize {
     SEG_IDS_SEEN.with(|c| c.get().count_ones() as usize)
 }
 
+/// The lowest and highest quantizer index any decoded block was dequantized
+/// with (`(i32::MAX, i32::MIN)` when nothing decoded).
+#[allow(dead_code)] // read only from the `#[cfg(test)]` gates
+pub(crate) fn block_q_span() -> (i32, i32) {
+    BLOCK_Q_SPAN.with(|c| c.get())
+}
+
 /// How many `seg_id_predicted` symbols have been read (temporal update).
 #[allow(dead_code)] // read only from the `#[cfg(test)]` gates
 pub(crate) fn segment_pred_hits() -> usize {
@@ -918,6 +931,7 @@ pub(crate) fn reset_segment_hits() {
     SEG_ID_HITS.with(|c| c.set(0));
     SEG_IDS_SEEN.with(|c| c.set(0));
     SEG_PRED_HITS.with(|c| c.set(0));
+    BLOCK_Q_SPAN.with(|c| c.set((i32::MAX, i32::MIN)));
 }
 
 /// `seg_feature_active_idx(segment_id, feature)` for the frame currently
@@ -947,6 +961,10 @@ fn block_q_idx(fctx: &crate::decode::FrameCtx) -> i32 {
     if crate::envflags::env_flag!("EC_DQCOEFF") {
         eprintln!("OUR_Q base={base} seg={seg_id} q={q}");
     }
+    hit_do!(BLOCK_Q_SPAN.with(|c| {
+        let (lo, hi) = c.get();
+        c.set((lo.min(q), hi.max(q)));
+    }););
     q
 }
 
