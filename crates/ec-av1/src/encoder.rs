@@ -1389,7 +1389,10 @@ impl Av1Encoder {
                 crate::encode::dump_split_census();
             }
         }
-        let _census = crate::encode::split_census_on().then_some(SplitCensusDump);
+        // `then_some` would CONSTRUCT the guard eagerly and drop it when the
+        // flag is off, which runs `Drop` -- and printed the census header on
+        // every unarmed encode. `then` builds it only when armed.
+        let _census = crate::encode::split_census_on().then(|| SplitCensusDump);
         if (picture.width, picture.height) != (self.config.width, self.config.height) {
             return Err(Error::unsupported(
                 "AV1 encode",
