@@ -10485,20 +10485,23 @@ fn tpl_frame_ratio(ratio: &[f64]) -> f64 {
     m.exp() - 1.0
 }
 
-/// `EC_AV1_DQ_TPL=1`: take the per-superblock qindex from [`deltaq_libaom`]
-/// instead of [`deltaq_for_factor`]. Off by default.
-fn dq_tpl() -> bool {
-    crate::envflags::var("EC_AV1_DQ_TPL").ok().as_deref().map(str::trim) == Some("1")
-}
-
-/// The [`deltaq_libaom`] strength multiplier (`EC_AV1_DQ_TPL_K`, default 1.0
-/// = libaom's own offset).
-fn dq_tpl_k() -> f64 {
-    crate::envflags::var("EC_AV1_DQ_TPL_K")
+/// The [`deltaq_libaom`] strength, or `None` to keep the shipped
+/// [`deltaq_for_factor`] derivation.
+///
+/// `EC_AV1_DQ_TPL=0`/`1` forces the mapping either way and `EC_AV1_DQ_TPL_K`
+/// the strength (default 1.0 = libaom's own offset when the flag armed it);
+/// with neither set the preset decides, see [`crate::speed::DQ_TPL_K`].
+fn dq_tpl_strength() -> Option<f64> {
+    let env_k = crate::envflags::var("EC_AV1_DQ_TPL_K")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|k| k.is_finite() && *k >= 0.0)
-        .unwrap_or(1.0)
+        .filter(|k| k.is_finite() && *k >= 0.0);
+    match crate::envflags::var("EC_AV1_DQ_TPL").ok().as_deref().map(str::trim) {
+        Some("0") => return None,
+        Some(_) => return Some(env_k.unwrap_or(1.0)),
+        None => {}
+    }
+    env_k.or_else(|| Some(crate::speed::at(&crate::speed::DQ_TPL_K))).filter(|k| *k > 0.0)
 }
 
 /// `EC_AV1_DQ_CENSUS=1`: per inter frame, one line comparing the offsets the
@@ -11301,17 +11304,15 @@ pub(crate) fn encode_inter_frame(
     // raw dependence ratio; without it (and always without a ratio map, i.e.
     // on the one-frame area map) the shipped derivation stands.
     let r_frame = tpl_ratio.as_deref().map(tpl_frame_ratio);
-    let sb_qindex = |f: &[f64], res: i32, sb: usize, libaom: bool| -> u8 {
+    let sb_qindex = |f: &[f64], res: i32, sb: usize, libaom: Option<f64>| -> u8 {
         match (libaom, tpl_ratio.as_deref(), r_frame) {
-            (true, Some(r), Some(rf)) => {
-                deltaq_libaom(base_q_idx, sb_mean(r, sb), rf, dq_tpl_k(), res)
-            }
+            (Some(k), Some(r), Some(rf)) => deltaq_libaom(base_q_idx, sb_mean(r, sb), rf, k, res),
             _ => deltaq_for_factor(base_q_idx, sb_mean(f, sb), deltaq_k(), deltaq_clamp(), res),
         }
     };
     let sb_q: Option<Vec<u8>> = match (&tpl_factors, deltaq_res) {
         (Some(f), Some(res)) => {
-            let libaom = dq_tpl();
+            let libaom = dq_tpl_strength();
             Some((0..sb_cols * _sb_rows).map(|sb| sb_qindex(f, res, sb, libaom)).collect())
         }
         _ => None,
@@ -11322,16 +11323,17 @@ pub(crate) fn encode_inter_frame(
     if dq_census() {
         if let Some(f) = &tpl_factors {
             let res = deltaq_res.unwrap_or(4);
-            let off = |libaom: bool| -> Vec<i32> {
+            let off = |libaom: Option<f64>| -> Vec<i32> {
                 (0..sb_cols * _sb_rows)
                     .map(|sb| i32::from(sb_qindex(f, res, sb, libaom)) - i32::from(base_q_idx))
                     .collect()
             };
-            let (ours, aom) = (off(false), off(true));
-            let coded = if deltaq_res.is_some() {
-                if dq_tpl() { "libaom" } else { "ours" }
-            } else {
-                "none"
+            let strength = dq_tpl_strength();
+            let (ours, aom) = (off(None), off(Some(strength.unwrap_or(1.0))));
+            let coded = match (deltaq_res.is_some(), strength) {
+                (false, _) => "none".to_string(),
+                (true, None) => "ours".to_string(),
+                (true, Some(k)) => format!("libaom k={k}"),
             };
             eprintln!(
                 "dq census: base={base_q_idx} res={res} sbs={} coded={coded} r_frame={:.4}\n                   ours   {}\n  libaom {}",
@@ -16473,8 +16475,12 @@ mod tests {
         // pays the `comp_mode = 0` symbol the writer codes ahead of it, so
         // single and compound are priced against the same syntax -- 8311 ->
         // 8325 bytes at q=150 and 33087 -> 33014 at q=60.
+        // Re-taken on lane-dq: preset 0 codes a per-superblock `delta_qindex`
+        // from libaom's objective tpl mapping, so every inter picture's
+        // quantizer grid -- and every decision priced against it -- moved:
+        // 8325 -> 8419 bytes at q=150 and 33014 -> 33029 at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8325, 0xf004_8258_bc60_ff05), (60, 33014, 0x5bc2_5dfd_bd13_18de)];
+            [(150, 8419, 0x123c_501c_9753_1347), (60, 33029, 0x8178_2340_81cd_6630)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
