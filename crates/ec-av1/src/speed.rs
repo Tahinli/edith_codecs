@@ -342,9 +342,29 @@ pub(crate) const DQ_TPL_K: [f64; 11] = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
 /// [`crate::encode::DqLevel`] -- `[top ARF, mid ARF, leaf]`. The key frame is
 /// absent because it codes no `delta_q` syntax at all.
 ///
-/// `EC_AV1_DQ_K=<top>:<mid>:<leaf>` overrides it for an A/B. The default is
-/// flat: see `lanes/arfq.report.md` for the sweep this table records.
-pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.0, 1.0, 1.0];
+/// `EC_AV1_DQ_K=<top>:<mid>:<leaf>` overrides it for an A/B.
+///
+/// The top ARF is coded 1.5x the preset's strength (0.375 at preset 0, where
+/// the leaves keep 0.25): it feeds a whole mini-GOP, and the census
+/// (`EC_AV1_DQ_CENSUS=1`, film B 48 pictures) says the objective mapping is
+/// normalised BY the frame's own dependence ratio, so the top ARF's much
+/// higher `r_frame` (2.91 vs the leaves' 1.74) buys it nothing at all --
+/// what a level's strength moves is the CONTRAST inside that frame. Long-GOP
+/// gate (48 pictures, BD vs libaom / rav1e):
+///
+/// | top-ARF strength | film A | film B |
+/// |---|---|---|
+/// | 0.25 (flat, control) | +24.0/-7.6 | +85.8/+7.1 |
+/// | **0.375** | **+23.5/-8.0** | **+85.3/+6.7** |
+/// | 0.5 | +23.0/-8.2 | +86.0/+7.3 |
+/// | 0.75 | +22.7/-8.4 | +86.8/+7.8 |
+/// | 1.0 | +21.8/-8.9 | +88.7/+9.1 |
+///
+/// Film A goes on improving with strength and film B turns at 0.375, which is
+/// the last point down on all four columns; 0.5 is also the point where the
+/// 12-frame gate hands film B back 0.4 (0.375 costs it 0.1). See
+/// `lanes/arfq.report.md`.
+pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.5, 1.0, 1.0];
 
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.

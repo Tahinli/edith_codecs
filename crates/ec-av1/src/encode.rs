@@ -16813,7 +16813,12 @@ mod tests {
         // quantizer grid -- and every decision priced against it -- moved
         // (8325 -> 8419 / 33014 -> 33029 on its own base); re-taken once more
         // at the merge of both lanes.
-        let pins: [(u8, usize, u64); 2] = [(150, 8252, 0x5b6e40a2b5498988), (60, 33053, 0x9a0abfc234eccc37)];
+        // Re-taken on lane-arfq: the top ARF of a mini-GOP codes its
+        // per-superblock `delta_qindex` at 1.5x the preset's strength
+        // ([`crate::speed::DQ_LEVEL_K`]), so the hidden frames' quantizer
+        // grids -- and every decision priced against them -- moved:
+        // 8252 -> 8269 bytes at q=150 and 33053 -> 33044 at q=60.
+        let pins: [(u8, usize, u64); 2] = [(150, 8269, 0xf0a10bafe7b45fe2), (60, 33044, 0x077e9c22ff6f41fb)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
