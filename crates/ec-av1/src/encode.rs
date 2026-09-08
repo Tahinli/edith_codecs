@@ -4227,21 +4227,17 @@ fn max_tx_depth(side: usize) -> usize {
     }
 }
 
-/// What the `tx_depth` symbol itself costs, off the size category's own CDF
-/// at `ctx` -- the row [`crate::tile::tx_size_ctx_of`] picks from the
-/// transform sides the blocks above and to the left published, which is what
-/// the writer's `write_luma_select` codes the symbol against.
-///
-/// Before lane-ctx2 this was row 0 for every block (class
-/// `pricer-context-zero`): the term shifts the depth-0-versus-split margin,
-/// and row 0 is the row where BOTH neighbours are narrower than this block's
-/// transform -- the case in which splitting reads cheapest.
-fn tx_depth_bits(ctx: usize, side: usize, depth: usize) -> f64 {
+/// What the `tx_depth` symbol itself costs, off the size category's own CDF.
+/// Priced at context row 0 -- the writer picks the real row from its
+/// neighbours' transform sizes, which the search has no view of; the term is
+/// the same for every depth of one block either way, so it only shifts the
+/// depth-0-versus-split margin, never the ordering between two splits.
+fn tx_depth_bits(side: usize, depth: usize) -> f64 {
     match side {
-        8 => symbol_bits(&cdf::TX_SIZE_CAT0[ctx], depth),
-        16 => symbol_bits(&cdf::TX_SIZE_CAT1[ctx], depth),
-        32 => symbol_bits(&cdf::TX_SIZE_CAT2[ctx], depth),
-        _ => symbol_bits(&cdf::TX_SIZE_CAT3[ctx], depth),
+        8 => symbol_bits(&cdf::TX_SIZE_CAT0[0], depth),
+        16 => symbol_bits(&cdf::TX_SIZE_CAT1[0], depth),
+        32 => symbol_bits(&cdf::TX_SIZE_CAT2[0], depth),
+        _ => symbol_bits(&cdf::TX_SIZE_CAT3[0], depth),
     }
 }
 
@@ -5226,12 +5222,7 @@ fn code_square(
     tx_select: bool,
     // This tile's intra block-copy state ([`Ibc`]), `None` on a frame whose
     // header did not set `allow_intrabc`.
-    ibc: Option<&mut Ibc>,
-    // The CDF row this block's `tx_depth` symbol is priced against
-    // ([`tx_depth_bits`]), read by the caller off its own published transform
-    // bands -- `0` where the caller keeps none.
-    tx_ctx: usize,
-    fctx: &crate::decode::FrameCtx,
+    ibc: Option<&mut Ibc>, fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (luma_set, chroma_set) = if side == SUPERBLOCK {
         // A whole superblock coded as ONE intra block (lane-i64): one
@@ -5275,11 +5266,11 @@ fn code_square(
     // `tx_depth_bits(32, 0)` -- otherwise the 64-versus-four-32 comparison
     // below hands the root a symbol for free.
     if tx_select && side == SUPERBLOCK {
-        cost += search.lambda * tx_depth_bits(tx_ctx, side, 0);
+        cost += search.lambda * tx_depth_bits(side, 0);
     }
     if tx_select && max_tx_depth(side) > 0 {
         let mut best = (
-            cost + search.lambda * tx_depth_bits(tx_ctx, side, 0),
+            cost + search.lambda * tx_depth_bits(side, 0),
             0usize,
             luma.snapshot(x, y, side),
             luma_coeffs,
@@ -5290,7 +5281,7 @@ fn code_square(
                 luma.code_tx_depth(at, mode, angle_delta, depth, None, search, fctx);
             let cost_d = sse
                 + search.lambda
-                    * (bits + mode_bits[usize::from(mode)] + tx_depth_bits(tx_ctx, side, depth));
+                    * (bits + mode_bits[usize::from(mode)] + tx_depth_bits(side, depth));
             if cost_d < best.0 {
                 best = (cost_d, depth, luma.snapshot(x, y, side), coeffs(&levels, side));
                 best_types = types;
@@ -5338,7 +5329,7 @@ fn code_square(
                     * (trial.bits
                         + mode_bits[DC_PRED as usize]
                         + crate::tile::palette_bits(&pal, side)
-                        + if tx_select { tx_depth_bits(tx_ctx, side, 0) } else { 0.0 });
+                        + if tx_select { tx_depth_bits(side, 0) } else { 0.0 });
             if cost_p < cost {
                 cost = cost_p;
                 mode = DC_PRED as u8;
@@ -5404,7 +5395,7 @@ fn code_square(
                             + mode_bits[DC_PRED as usize]
                             + one_bits
                             + symbol_bits(&cdf::FILTER_INTRA_MODE, usize::from(fi))
-                            + if tx_select { tx_depth_bits(tx_ctx, side, depth) } else { 0.0 });
+                            + if tx_select { tx_depth_bits(side, depth) } else { 0.0 });
                 if cost_f < cost && best.as_ref().is_none_or(|b| cost_f < b.0) {
                     best = Some((
                         cost_f,
@@ -6126,11 +6117,6 @@ fn code_square_inter(
             mode_bits,
             tx_select() && tx_select_inter(),
             None,
-            // deferred: an INTER frame's intra block takes its `tx_depth` row
-            // from the `TXFM_CONTEXT` bands instead (`tx_size_ctx_txfm`, with
-            // an inter neighbour voting its own BLOCK size), which this path
-            // publishes nowhere -- priced at row 0 as before.
-            0,
             fctx,
         );
     let luma_set = if side == 8 {
@@ -7686,38 +7672,6 @@ pub(crate) fn encode_key_frame_inner(
         clip_planes_to_tile(&mut luma, &mut chroma, rect);
         let mut above_mode = vec![DC_PRED; cols * 2];
         let mut left_mode = vec![DC_PRED; rows * 2];
-        // lane-ctx2: the two bands `Neighbours::tx_size_ctx` reads -- every
-        // coded block's resolved luma transform side in pixels, over each 4x4
-        // unit it covers, the way the writer's `record_tx` publishes it. The
-        // indices are frame-absolute, so a new superblock row needs no reset
-        // (the writer's `start_row` clears a band indexed within the tile),
-        // and a block trial that loses is overwritten by the winner's own
-        // publish, exactly as `above_mode`/`left_mode` are.
-        let mut above_tx = vec![0u8; cols * 8];
-        let mut left_tx = vec![0u8; rows * 8];
-        let tx_ctx = |above_tx: &[u8], left_tx: &[u8], (x, y): (usize, usize), side: usize| {
-            let (mi_r, mi_c) = (y / 4, x / 4);
-            crate::tile::tx_size_ctx_of(
-                (mi_r > rect.mi_row0 as usize, mi_c > rect.mi_col0 as usize),
-                (above_tx[mi_c], left_tx[mi_r]),
-                side.min(64),
-            )
-        };
-        let publish_tx = |above_tx: &mut Vec<u8>,
-                          left_tx: &mut Vec<u8>,
-                          (x, y): (usize, usize),
-                          side: usize,
-                          depth: u8| {
-            let tx = (side.min(64) >> depth) as u8;
-            for cell in 0..side / 4 {
-                if let Some(c) = above_tx.get_mut(x / 4 + cell) {
-                    *c = tx;
-                }
-                if let Some(c) = left_tx.get_mut(y / 4 + cell) {
-                    *c = tx;
-                }
-            }
-        };
         let mut ibc = allow_intrabc.then(|| {
             Ibc::new(
                 (
@@ -7797,7 +7751,6 @@ pub(crate) fn encode_key_frame_inner(
                     &mode_bits(above_mode[c64], left_mode[r64]),
                     tx_select,
                     None,
-                    tx_ctx(&above_tx, &left_tx, (x64, y64), SUPERBLOCK),
                     fctx,
                 );
                 let cost = cost + search.lambda * crate::tile::partition_bits(SUPERBLOCK, false);
@@ -7881,9 +7834,7 @@ pub(crate) fn encode_key_frame_inner(
                     &search,
                     &mode_bits(above_mode[c0], left_mode[r0]),
                     tx_select,
-                    ibc.as_mut(),
-                    tx_ctx(&above_tx, &left_tx, (x, y), BLOCK),
-                    fctx,
+                    ibc.as_mut(), fctx,
                 );
                 cost_whole += search.lambda * partition_bits(BLOCK, false);
                 let after_whole = snapshot(&luma, &chroma, (x, y), BLOCK);
@@ -7918,26 +7869,12 @@ pub(crate) fn encode_key_frame_inner(
                             &search,
                             &mode_bits(above_mode[sc], left_mode[sr]),
                             tx_select,
-                            ibc.as_mut(),
-                            tx_ctx(
-                                &above_tx,
-                                &left_tx,
-                                (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
-                                SUB,
-                            ),
-                            fctx,
+                            ibc.as_mut(), fctx,
                         );
                         cost_split += cost;
                         split_modes.push(block.mode);
                         above_mode[sc] = block.mode;
                         left_mode[sr] = block.mode;
-                        publish_tx(
-                            &mut above_tx,
-                            &mut left_tx,
-                            (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
-                            SUB,
-                            block.tx_depth,
-                        );
                         split.push(block);
                     } else {
                         // A straddling 16x16: two (or, at a true corner, one)
@@ -7965,13 +7902,10 @@ pub(crate) fn encode_key_frame_inner(
                                 &search,
                                 &leaf_mode_bits,
                                 tx_select,
-                                None,
-                                tx_ctx(&above_tx, &left_tx, (leaf_x, leaf_y), 8),
-                                fctx,
+                                None, fctx,
                             );
                             cost_split += cost;
                             split_modes.push(leaf.mode);
-                            publish_tx(&mut above_tx, &mut left_tx, (leaf_x, leaf_y), 8, leaf.tx_depth);
                             leaves.push(leaf);
                         }
                         split.push(BlockCoeffs {
@@ -8000,7 +7934,6 @@ pub(crate) fn encode_key_frame_inner(
                         above_mode[c0 + cell] = whole.mode;
                         left_mode[r0 + cell] = whole.mode;
                     }
-                    publish_tx(&mut above_tx, &mut left_tx, (x, y), BLOCK, whole.tx_depth);
                     modes.push(whole.mode);
                     blocks.push(Quadrant::Whole(whole));
                 }
@@ -8013,7 +7946,6 @@ pub(crate) fn encode_key_frame_inner(
                         above_mode[sb_col * 4 + cell] = block.mode;
                         left_mode[sb_row * 4 + cell] = block.mode;
                     }
-                    publish_tx(&mut above_tx, &mut left_tx, (x64, y64), SUPERBLOCK, block.tx_depth);
                     I64_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if !whole_inside {
                         I64_HITS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12502,55 +12434,6 @@ mod tests {
         }
     }
 
-    /// The `tx_depth` symbol is priced off the row the writer really codes it
-    /// against -- `Neighbours::tx_size_ctx`, shared with the pricer as
-    /// [`crate::tile::tx_size_ctx_of`], off the transform sides the blocks
-    /// above and to the left published -- instead of row 0 for every block
-    /// (class `pricer-context-zero`). The second half is what was red before
-    /// lane-ctx2: at a non-zero row the writer's price is a different number.
-    #[test]
-    fn the_tx_depth_pricer_uses_the_writers_own_context_row() {
-        use crate::cdf::{TX_SIZE_CAT1, TX_SIZE_CAT2};
-        use crate::encode::symbol_bits as b;
-        use crate::tile::tx_size_ctx_of;
-        // (has_above, has_left), the two band cells, this block's own largest
-        // transform -> the row the writer picks. A neighbour outside the tile
-        // votes nothing however wide its band cell reads.
-        for (has, bands, max_tx, want) in [
-            ((false, false), (64u8, 64u8), 32usize, 0usize),
-            ((true, true), (16, 16), 32, 0),
-            ((true, true), (32, 16), 32, 1),
-            ((true, false), (32, 64), 32, 1),
-            ((false, true), (64, 32), 32, 1),
-            ((true, true), (32, 64), 32, 2),
-            ((true, true), (8, 8), 8, 2),
-        ] {
-            assert_eq!(
-                tx_size_ctx_of(has, bands, max_tx),
-                want,
-                "tile {has:?} bands {bands:?} max_tx {max_tx}"
-            );
-        }
-        // libaom's default tables give rows 0 and 1 the same probabilities in
-        // every category, so row 2 -- both neighbours at least as wide as this
-        // block's transform -- is the row that moves a price.
-        for (ctx, depth) in [(2usize, 0usize), (2, 1), (2, 2)] {
-            for (side, table) in [(16usize, &TX_SIZE_CAT1), (32, &TX_SIZE_CAT2)] {
-                let got = super::tx_depth_bits(ctx, side, depth);
-                assert!(
-                    (got - b(&table[ctx], depth)).abs() < 1e-9,
-                    "side {side} depth {depth} at ctx {ctx}: priced {got}, \
-                     writer codes {}",
-                    b(&table[ctx], depth)
-                );
-                assert!(
-                    (got - b(&table[0], depth)).abs() > 1e-9,
-                    "side {side} depth {depth}: row {ctx} prices the same as row 0"
-                );
-            }
-        }
-    }
-
     /// lane-av1tpl2's propagated map, on the two properties every decision
     /// under it rests on: a frame the whole lookahead window repeats exactly
     /// (uniform texture) leans on every cell alike, so every factor is 1 and
@@ -16236,14 +16119,9 @@ mod tests {
         // at q=60. Re-taken on lane-ctx2: a single-reference candidate now
         // pays the `comp_mode = 0` symbol the writer codes ahead of it, so
         // single and compound are priced against the same syntax -- 8311 ->
-        // 8325 bytes at q=150 and 33087 -> 33014 at q=60. Re-taken again in
-        // the same lane: a key frame's `tx_depth` symbol is priced off the
-        // row the writer codes it against (the transform sides its above/left
-        // neighbours published) instead of row 0, so every intra block's
-        // depth-versus-split margin moved -- 8325 bytes at q=150 (the same
-        // size, different depths) and 33014 at q=60, both hashes new.
+        // 8325 bytes at q=150 and 33087 -> 33014 at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8325, 0x774a_4716_1cc1_b0ed), (60, 33014, 0xa19b_4fa6_cde1_1180)];
+            [(150, 8325, 0xf004_8258_bc60_ff05), (60, 33014, 0x5bc2_5dfd_bd13_18de)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {

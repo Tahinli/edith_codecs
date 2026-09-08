@@ -2427,11 +2427,8 @@ impl Neighbours {
     /// largest transform, plus whether the one to the left is at least as
     /// tall. A neighbour outside the tile contributes nothing.
     fn tx_size_ctx(&self, (mi_r, mi_c): (usize, usize), max_tx: usize) -> usize {
-        tx_size_ctx_of(
-            (self.has_above(mi_r), self.has_left(mi_c)),
-            (self.above_tx[mi_c], self.left_tx[mi_r]),
-            max_tx,
-        )
+        usize::from(self.has_above(mi_r) && usize::from(self.above_tx[mi_c]) >= max_tx)
+            + usize::from(self.has_left(mi_c) && usize::from(self.left_tx[mi_r]) >= max_tx)
     }
 
     /// Publishes one block's resolved transform side over every 4x4 unit it
@@ -4310,23 +4307,6 @@ fn write_luma_tus(
         }
     }
     Ok(())
-}
-
-/// `get_tx_size_context` (decode.rs [`crate::decode::tx_size_context`]) over
-/// the two band cells themselves: whether the transform above is at least as
-/// wide as this block's own largest transform, plus whether the one to the
-/// left is at least as tall; a neighbour outside the tile contributes nothing.
-///
-/// Free-standing so the RD pricer can read the row the writer really codes a
-/// `tx_depth` symbol against off its own published band, without two
-/// transcriptions of the same rule (lane-ctx2).
-pub(crate) fn tx_size_ctx_of(
-    (has_above, has_left): (bool, bool),
-    (above_tx, left_tx): (u8, u8),
-    max_tx: usize,
-) -> usize {
-    usize::from(has_above && usize::from(above_tx) >= max_tx)
-        + usize::from(has_left && usize::from(left_tx) >= max_tx)
 }
 
 /// Writes one intra block's luma residual under `TxMode::Select`: the
