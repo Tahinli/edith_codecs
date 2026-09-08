@@ -15709,9 +15709,21 @@ fn read_intra_mode_sub8(
     if crate::envflags::env_flag!("EC_TRACE_MODE_STEP") {
         eprintln!("EC_IMODE mi_row={mi_r} mi_col={mi_c} fn=sub8 rng={}", dec.debug_state().0);
     }
+    // lane-seg2: same `intra_segment_id` placement as the square and rect
+    // readers (spec 5.11.6) -- a `BLOCK_4X4` leaf codes its own `segment_id`
+    // like any other block, over its own 1x1 mi footprint. Dropping it here
+    // both ate a symbol (the tile desynced at the frame's first sub-8x8
+    // split) and left `cur_segment_id` on the previous block, so the leaf
+    // dequantized with a neighbour's `SEG_LVL_ALT_Q`.
+    if seg_id_pre_skip(fctx) {
+        intra_segment_id(dec, cdfs, mi_r, mi_c, 1, 1, false, fctx);
+    }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
         eprintln!("TRACE sub8 skip mi=({mi_r},{mi_c}) ctx={skip_ctx} value={} rng={}", skip as i32, dec.debug_state().0);
+    }
+    if !seg_id_pre_skip(fctx) {
+        intra_segment_id(dec, cdfs, mi_r, mi_c, 1, 1, skip, fctx);
     }
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip, fctx);
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip, fctx);
