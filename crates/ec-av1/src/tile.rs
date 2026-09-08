@@ -458,6 +458,9 @@ fn write_inter_block_128(
     if !block.skip {
         SB128_RESIDUAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    if info.ref1.is_some() {
+        SB128_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -470,6 +473,17 @@ static SB128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize =
 /// The 128x128-with-residual count since the last call, and zero it.
 pub fn take_sb128_residual_hits() -> usize {
     SB128_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// lane-b128r: how many of those blocks named a SECOND reference (the
+/// compound arm at the 128 root), since the last
+/// [`take_sb128_compound_hits`].
+static SB128_COMPOUND_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The compound-128 count since the last call, and zero it.
+pub fn take_sb128_compound_hits() -> usize {
+    SB128_COMPOUND_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How many 128x128 `PARTITION_NONE` blocks the inter writer has coded since
