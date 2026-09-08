@@ -4245,6 +4245,119 @@ fn tx_depth_bits(ctx: usize, side: usize, depth: usize) -> f64 {
     }
 }
 
+/// lane-split: a multiplier on the RATE term of the transform-SPLIT trial
+/// only -- the intra `tx_depth` depth>0 candidates in [`code_square`] and the
+/// inter var-tx depth-1 trial in [`commit_inter_luma`]. `1.0` is the control
+/// (the mode search's own weight); below 1 the split trial is charged less
+/// for its bits and fires more often.
+///
+/// The knob the class `rd-rate-term-calibration` asks for: lane-txd made the
+/// `tx_depth` SYMBOL price correct and every film row got worse, because the
+/// correct row is a one-sided push away from splitting (depth 0 up to 1.5
+/// bits cheaper at ctx 2, which is 66% of an inter frame's intra blocks) --
+/// so what is mis-calibrated is the weight the split's rate is judged under,
+/// not the price. `EC_AV1_SPLIT_LAMBDA`.
+pub(crate) fn split_lambda_mult() -> f64 {
+    static M: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_SPLIT_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SPLIT_LAMBDA)
+    });
+    *M
+}
+
+/// The shipped value of [`split_lambda_mult`]. See lanes/split.report.md for
+/// the sweep that chose it.
+const SPLIT_LAMBDA: f64 = 1.0;
+
+/// lane-split census (`EC_AV1_SPLIT_CENSUS=1`): the split decision itself,
+/// bucketed by site (0 = intra `tx_depth`, 1 = inter var-tx), frame type
+/// (0 = key, 1 = inter) and block side (8/16/32/64). Ten counters per bucket:
+/// trials offered, trials the split won, then the (rate, distortion) of the
+/// split and flat arms summed apart for the split-won and flat-won trials --
+/// rate scaled by 64 into an integer counter, as [`TXRD_STATS`] is.
+static SPLIT_CENSUS: [std::sync::atomic::AtomicU64; 160] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 160];
+
+/// Whether [`SPLIT_CENSUS`] is armed, read once.
+pub(crate) fn split_census_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::envflags::env_flag!("EC_AV1_SPLIT_CENSUS"));
+    *ON
+}
+
+/// Records one split trial into [`SPLIT_CENSUS`]. `split` and `flat` are each
+/// `(rate in bits, distortion as squared error)`.
+fn split_census(
+    site: usize,
+    key: bool,
+    side: usize,
+    split_won: bool,
+    split: (f64, f64),
+    flat: (f64, f64),
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let side_idx = (side.trailing_zeros() as usize).saturating_sub(3).min(3);
+    let base = ((site * 2 + usize::from(!key)) * 4 + side_idx) * 10;
+    let add = |i: usize, v: u64| {
+        SPLIT_CENSUS[base + i].fetch_add(v, Relaxed);
+    };
+    add(0, 1);
+    let off = if split_won {
+        add(1, 1);
+        2
+    } else {
+        6
+    };
+    let (win, lose) = if split_won { (split, flat) } else { (flat, split) };
+    add(off, (win.0 * 64.0).max(0.0) as u64);
+    add(off + 1, win.1.max(0.0) as u64);
+    add(off + 2, (lose.0 * 64.0).max(0.0) as u64);
+    add(off + 3, lose.1.max(0.0) as u64);
+}
+
+/// Prints [`SPLIT_CENSUS`] to stderr when `EC_AV1_SPLIT_CENSUS=1`. Called at
+/// the end of every `Av1Encoder::encode_frames` call and NOT reset, so the
+/// last table a run prints is the whole encode's total (there is no flush
+/// hook the encoder API guarantees to reach).
+pub(crate) fn dump_split_census() {
+    use std::sync::atomic::Ordering::Relaxed;
+    eprintln!(
+        "SPLITCENSUS site frame side offered split share% \
+         win_rate win_dist lose_rate lose_dist"
+    );
+    for site in 0..2 {
+        for key in [true, false] {
+            for side_idx in 0..4 {
+                let base = ((site * 2 + usize::from(!key)) * 4 + side_idx) * 10;
+                let v: [u64; 10] = std::array::from_fn(|i| SPLIT_CENSUS[base + i].load(Relaxed));
+                if v[0] == 0 {
+                    continue;
+                }
+                let (n, s) = (v[0] as f64, v[1] as f64);
+                // Winner terms live at 2,3 (split won) and 6,7 (flat won),
+                // loser terms at 4,5 and 8,9 -- so each mean is one sum over
+                // all `n` trials, not a mean of two means.
+                eprintln!(
+                    "SPLITCENSUS {} {} {:>3} {:>7} {:>7} {:>5.1} \
+                     {:>9.2} {:>9.0} {:>9.2} {:>9.0}",
+                    if site == 0 { "intra" } else { "inter" },
+                    if key { "key  " } else { "inter" },
+                    8 << side_idx,
+                    v[0],
+                    v[1],
+                    100.0 * s / n,
+                    (v[2] + v[6]) as f64 / n / 64.0,
+                    (v[3] + v[7]) as f64 / n,
+                    (v[4] + v[8]) as f64 / n / 64.0,
+                    (v[5] + v[9]) as f64 / n,
+                );
+            }
+        }
+    }
+}
+
 /// [`TX_TYPE_HITS`] for the INTER luma units (lane-txset2), counted apart so
 /// the intra witness's fire count stays its own.
 pub(crate) static INTER_TX_TYPE_HITS: [std::sync::atomic::AtomicUsize; 16] =
@@ -4651,8 +4764,13 @@ fn commit_inter_luma(
         }
     }
     luma.ctx.tu_split = false;
-    let split_cost = sse + search.lambda * (bits + txfm_split_bits(side, 1));
-    let flat_cost = flat_ref.sse + search.lambda * (flat_ref.bits + txfm_split_bits(side, 0));
+    let split_rate = bits + txfm_split_bits(side, 1);
+    let flat_rate = flat_ref.bits + txfm_split_bits(side, 0);
+    let split_cost = sse + search.lambda * split_lambda_mult() * split_rate;
+    let flat_cost = flat_ref.sse + search.lambda * flat_rate;
+    if split_census_on() {
+        split_census(1, false, side, split_cost < flat_cost, (split_rate, sse), (flat_rate, flat_ref.sse));
+    }
     let class = usize::from(side == BLOCK) * 4 + usize::from(second.is_some()) * 2;
     // The depth census has a leaf row and a 32x32 row and no 64 one, so the
     // 64x64 root counts itself ([`take_b64_var_tx_hits`]) instead of landing
@@ -5231,6 +5349,10 @@ fn code_square(
     // ([`tx_depth_bits`]), read by the caller off its own published transform
     // bands -- `0` where the caller keeps none.
     tx_ctx: usize,
+    // Whether this is a KEY frame's block, read only by the split census
+    // ([`SPLIT_CENSUS`]): the two frame types price `tx_depth` off different
+    // band sets and split at different rates, which is the whole finding.
+    census_key: bool,
     fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
     let (luma_set, chroma_set) = if side == SUPERBLOCK {
@@ -5285,16 +5407,36 @@ fn code_square(
             luma_coeffs,
         );
         let mut best_types = std::mem::take(&mut luma_tx_types);
+        // The census wants the flat arm's own (rate, distortion), which
+        // `search_block` only hands back folded into one cost -- so under the
+        // env flag alone it is re-coded at depth 0 and the plane restored.
+        let census_flat = split_census_on().then(|| {
+            let kept = luma.snapshot(x, y, side);
+            let (_, sse, bits, _) =
+                luma.code_tx_depth(at, mode, angle_delta, 0, None, search, fctx);
+            luma.restore(x, y, side, &kept);
+            (bits + tx_depth_bits(tx_ctx, side, 0), sse)
+        });
+        let mut census_split: Option<(f64, f64)> = None;
         for depth in 1..=max_tx_depth(side) {
             let (levels, sse, bits, types) =
                 luma.code_tx_depth(at, mode, angle_delta, depth, None, search, fctx);
-            let cost_d = sse
-                + search.lambda
-                    * (bits + mode_bits[usize::from(mode)] + tx_depth_bits(tx_ctx, side, depth));
+            let rate = bits + mode_bits[usize::from(mode)] + tx_depth_bits(tx_ctx, side, depth);
+            let cost_d = sse + search.lambda * split_lambda_mult() * rate;
+            if census_flat.is_some() {
+                let c = (bits + tx_depth_bits(tx_ctx, side, depth), sse);
+                if census_split.is_none_or(|b| sse + search.lambda * rate < b.1 + search.lambda * b.0)
+                {
+                    census_split = Some(c);
+                }
+            }
             if cost_d < best.0 {
                 best = (cost_d, depth, luma.snapshot(x, y, side), coeffs(&levels, side));
                 best_types = types;
             }
+        }
+        if let (Some(flat), Some(split)) = (census_flat, census_split) {
+            split_census(0, census_key, side, best.1 > 0, split, flat);
         }
         luma_tx_types = best_types;
         luma.restore(x, y, side, &best.2);
@@ -6131,6 +6273,7 @@ fn code_square_inter(
             // inter neighbour votes its own BLOCK size), which `record_mi`
             // now publishes per cell.
             tx_ctx_txfm(grid, (mi_row, mi_col), side.min(64)),
+            false,
             fctx,
         );
     let luma_set = if side == 8 {
@@ -7828,6 +7971,7 @@ pub(crate) fn encode_key_frame_inner(
                     tx_select,
                     None,
                     tx_ctx(&above_tx, &left_tx, (x64, y64), SUPERBLOCK),
+                    true,
                     fctx,
                 );
                 let cost = cost + search.lambda * crate::tile::partition_bits(SUPERBLOCK, false);
@@ -7913,6 +8057,7 @@ pub(crate) fn encode_key_frame_inner(
                     tx_select,
                     ibc.as_mut(),
                     tx_ctx(&above_tx, &left_tx, (x, y), BLOCK),
+                    true,
                     fctx,
                 );
                 cost_whole += search.lambda * partition_bits(BLOCK, false);
@@ -7955,6 +8100,7 @@ pub(crate) fn encode_key_frame_inner(
                                 (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
                                 SUB,
                             ),
+                            true,
                             fctx,
                         );
                         cost_split += cost;
@@ -7997,6 +8143,7 @@ pub(crate) fn encode_key_frame_inner(
                                 tx_select,
                                 None,
                                 tx_ctx(&above_tx, &left_tx, (leaf_x, leaf_y), 8),
+                                true,
                                 fctx,
                             );
                             cost_split += cost;
