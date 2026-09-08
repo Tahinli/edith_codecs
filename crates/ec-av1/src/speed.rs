@@ -366,6 +366,20 @@ pub(crate) const DQ_TPL_K: [f64; 11] = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
 /// `lanes/arfq.report.md`.
 pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.5, 1.0, 1.0];
 
+/// lane-arfpred: the strength of the top ARF's SOURCE temporal filter
+/// ([`crate::encode::arf_temporal_filter`]) -- `0` is off, higher filters
+/// harder (the weight of a motion-compensated neighbour is
+/// `exp(-mse / strength)`). `EC_AV1_ARF_TF=<strength>` overrides it.
+///
+/// The top ARF carries 55% of a 48-picture film B stream at 6992 B a frame
+/// against rav1e's 3872 at a FINER quantizer, and the per-frame census says
+/// 61% of that gap is residual, not syntax -- while `arf_pred_census` says
+/// the anchor's own lag is worth only 7% of its prediction SAD (lag 8 1.199
+/// vs lag 4 1.114 per pixel), so what the residual codes is mostly source
+/// grain. Filtering it out of the picture the anchor is coded from is the
+/// mechanism libaom uses (`arnr`) and rav1e 0.8.1 does not have at all.
+pub(crate) const ARF_TF: [f64; 11] = [0.0; 11];
+
 /// `encode::SPLIT_RD_THRESHOLD`: how cheap a block has to be before its split
 /// trial is withheld. The single biggest wall lever in the tile search.
 pub(crate) const SPLIT_RD: [f64; 11] = [
