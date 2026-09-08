@@ -318,11 +318,48 @@ impl TxbSet {
                 | Self::ChromaRect32x16
         )
     }
+
+    /// lane-txi: this set's `reduced_tx_set == 0` counterpart -- the WIDER
+    /// `tx_type` alphabet the same coefficient tables are read with when the
+    /// frame header's bit is off. Every pair here is the one
+    /// `decode::txbset_for`/`txbset_for_inter`/`inter_txbset_for` resolve off
+    /// that bit, transcribed from the DECODER's own map so writer and reader
+    /// cannot drift (class `table-and-reader-move-together`); a set with no
+    /// counterpart -- intra 16x16 and 32x32, inter 32x32, 64x64, every
+    /// chroma set -- is its own, and widening an already-wide set is the
+    /// identity.
+    pub(crate) fn wide(self) -> Self {
+        match self {
+            Self::Luma8 => Self::Luma8Set1,
+            Self::Luma4 => Self::Luma4Set1,
+            Self::Luma16Inter => Self::Luma16InterSet1,
+            Self::Luma8Inter => Self::Luma8InterSet1,
+            Self::Luma4Inter => Self::Luma4InterSet1,
+            Self::LumaRect16x8 => Self::LumaRect16x8Set1,
+            Self::LumaRect4x8 => Self::LumaRect4x8Set1,
+            Self::LumaRect16x4 => Self::LumaRect16x4Set1,
+            Self::LumaRect16x8Inter => Self::LumaRect16x8InterSet1,
+            Self::LumaRect8x4Inter => Self::LumaRect8x4InterSet1,
+            Self::LumaRect16x4Inter => Self::LumaRect16x4Inter1,
+            other => other,
+        }
+    }
 }
 
 /// Every table a key frame's tile writer adapts.
 #[derive(Clone)]
 pub(crate) struct Cdfs {
+    /// lane-txi: this FRAME's `reduced_tx_set` header bit (spec 5.9.2).
+    /// `true` -- the default, and what every stream this encoder wrote
+    /// before the lane carries -- leaves [`Self::txb`]'s luma set exactly as
+    /// its caller named it. `false` widens it to the `Set1` counterpart
+    /// ([`TxbSet::wide`]), which is the ONE place the writer and its pricer
+    /// read the bit from, so a site that forgets it cannot code the right
+    /// value against the wrong CDF (class `wrong-alphabet-same-value`).
+    /// The DECODER never sets this: it names the widened set itself off the
+    /// header (`decode::txbset_for`), and widening an already-wide set is the
+    /// identity.
+    pub reduced_tx_set: bool,
     /// The coefficient q-context these tables were built for (spec 8.3.2's
     /// `Get_Qctx`), so a writer can price a block against the same tables the
     /// search did (`tile::coeff_bits`).
@@ -996,6 +1033,7 @@ impl Cdfs {
     /// quantizer, so they are the same for every `q_ctx`.
     pub fn new(q_ctx: usize) -> Cdfs {
         Cdfs {
+            reduced_tx_set: true,
             q_ctx,
             partition_w128: cdf::PARTITION_W128,
             partition_w64: cdf::PARTITION_W64,
@@ -1602,6 +1640,7 @@ impl Cdfs {
 
     /// The tables one table set is coded with, borrowed out of the state.
     pub fn txb(&mut self, set: TxbSet, mode: usize) -> TxbTables<'_> {
+        let set = if self.reduced_tx_set { set } else { set.wide() };
         match set {
             TxbSet::Luma32 => TxbTables {
                 side: 32,

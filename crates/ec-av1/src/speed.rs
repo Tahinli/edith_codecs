@@ -512,6 +512,15 @@ pub(crate) const TX_TYPE_SEARCH_INTER: [bool; 11] = [
     true, true, true, true, true, true, true, false, false, false, false,
 ];
 
+/// `encode::wide_tx_set`: whether a frame codes `reduced_tx_set = 0`, the
+/// wider `tx_type` alphabets (intra 8x8/4x4 seven types, inter 16x16 twelve,
+/// inter 8x8/4x4 sixteen) instead of the reduced sets every stream this
+/// encoder wrote before lane-txi carries. OFF at every preset until the gate
+/// says otherwise; `EC_AV1_TXSET_WIDE` overrides.
+pub(crate) const WIDE_TX_SET: [bool; 11] = [
+    false, false, false, false, false, false, false, false, false, false, false,
+];
+
 /// `filter_search`: whether the deblock ladder's +-1/+-2 refinement stage runs.
 pub(crate) const DEBLOCK_REFINE: [bool; 11] = [
     true, true, true, true, true, true, true, false, false, false, false,
