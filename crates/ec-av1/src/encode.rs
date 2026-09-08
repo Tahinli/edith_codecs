@@ -5891,7 +5891,20 @@ fn cfl_on() -> bool {
 /// | film A | +20.6 / -5.1 | **+20.4 / -5.2** |
 /// | film B | +24.8 / -2.1 | **+24.2 / -2.5** |
 /// | screen capture | +14.6 / -33.2 | **+14.4 / -33.2** |
-pub(crate) const SB128_DEFAULT: bool = true;
+///
+/// and the long-GOP gate agrees (film A +24.7/-7.5 -> +24.4/-7.7, film B
+/// +86.8/+7.4 -> +85.6/+6.6).
+///
+/// STILL OFF all the same, and this is the whole reason: the 128-superblock
+/// PLUMBING under it (lane-sb128's SPLIT-only roots) still desyncs on eleven
+/// of this crate's own round-trip tests -- odd frame sizes, doubly-cut
+/// roots, multi-tile layouts and the `decode_stream` GOPs -- with the
+/// refusal lane-sb128b named ("a reference frame selected with no picture at
+/// this frame's own ref_frame_idx slot"). Those failures REPRODUCE with the
+/// 128x128 block switched off (`EC_AV1_B128=0`), so they are not this lane's
+/// block; flipping the default before they are fixed would ship a broken
+/// encoder for a 0.6-point BD win. `EC_AV1_SB128=1` turns it on.
+pub(crate) const SB128_DEFAULT: bool = false;
 
 /// Whether this process's sequences code 128x128 superblocks. An ENCODER
 /// knob (like `speed::SPEED`), never read by a decode: read through a
@@ -16943,12 +16956,12 @@ mod tests {
         // ([`crate::motion::MV_SUBPEL_ITERS`]), so every inter block's vector
         // -- and with it its residual -- moved: 8325 -> 8288 bytes at q=150
         // and 33014 -> 33090 at q=60.
-        // Re-taken on lane-b128: sequences code 128x128 superblocks by
-        // default now ([`SB128_DEFAULT`]), and their roots can leave a whole
-        // 128x128 block whole -- 8288 -> 8303 bytes at q=150 and 33090 ->
-        // 33132 at q=60. `EC_AV1_SB128=0` restores the 64-superblock stream.
+        // NOT re-taken on lane-b128: [`SB128_DEFAULT`] stays off, so the
+        // shipped stream does not move. Under `EC_AV1_SB128=1` the same four
+        // pictures code 8303 bytes at q=150 and 33132 at q=60, through the
+        // 128 root's own `PARTITION_NONE` block.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8303, 0x0368_e400_f09d_02ba), (60, 33132, 0x884b_c219_5ea9_6416)];
+            [(150, 8288, 0x241d_8115_0a6d_0f34), (60, 33090, 0x7e02_777c_01b4_f035)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
