@@ -1816,12 +1816,38 @@ pub const GOLDEN_SLOT: u8 = 1;
 /// reaches the search, the trials and the recon through
 /// `FrameCtx::interp_filter`, so the stream a decoder reads and the
 /// prediction the search priced are the same one.
+/// A PROCESS-GLOBAL [`frame_interp_filter`] override that wins over the
+/// environment (`u8::MAX` = unset), the shape [`set_inter_tx_search`] has:
+/// the witness that has to see a non-REGULAR kernel coded and decoded turns
+/// it on through this while holding [`crate::speed::knob_write`].
+static INTERP_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Sets [`INTERP_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` gates
+pub(crate) fn set_frame_interp(filter: Option<ec_av1_syntax::InterpolationFilter>) {
+    INTERP_OVERRIDE.store(
+        filter.map_or(u8::MAX, |f| f as u8),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 fn frame_interp_filter() -> ec_av1_syntax::InterpolationFilter {
-    match std::env::var("EC_AV1_INTERP").ok().as_deref() {
-        Some("smooth") => ec_av1_syntax::InterpolationFilter::EighttapSmooth,
-        Some("sharp") => ec_av1_syntax::InterpolationFilter::EighttapSharp,
-        _ => ec_av1_syntax::InterpolationFilter::Eighttap,
+    use ec_av1_syntax::InterpolationFilter as F;
+    match INTERP_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return F::Eighttap,
+        1 => return F::EighttapSmooth,
+        2 => return F::EighttapSharp,
+        _ => {}
     }
+    static ENV: std::sync::LazyLock<Option<F>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_INTERP").ok().map(|v| match v.as_str() {
+            "smooth" => F::EighttapSmooth,
+            "sharp" => F::EighttapSharp,
+            _ => F::Eighttap,
+        })
+    });
+    ENV.unwrap_or(F::Eighttap)
 }
 
 /// The frame header for a shown inter frame that predicts from the single
@@ -16707,6 +16733,57 @@ mod tests {
                     pct(big),
                     100.0 * (near_sad - best_sad) as f64 / near_sad.max(1) as f64,
                 );
+            }
+        }
+    }
+
+    /// lane-refs: THE FRAME FILTER REACHES THE PIXELS. `mc::predict` used to
+    /// hardwire the REGULAR kernel, so the encoder could not have coded a
+    /// SMOOTH or SHARP frame even if the header had said so -- the search,
+    /// the trials, the recon and the frame header now all read
+    /// `FrameCtx::interp_filter`. Each of the three kernels codes its own
+    /// distinct stream (a filter that never reached the prediction would code
+    /// the same bytes as REGULAR, class `symbol consumption gap`), and ffmpeg
+    /// reconstructs every frame of each of them exactly, which is what proves
+    /// the header and the prediction agree.
+    #[test]
+    fn each_frame_interpolation_filter_codes_its_own_stream_ffmpeg_decodes_exactly() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP each_frame_interpolation_filter_codes_its_own_stream: no ffmpeg");
+            return;
+        }
+        let (width, height) = (256usize, 128usize);
+        // A HALF-PEL pan: an integer-pel one reads no filter tap at all, so
+        // all three kernels would code the same bytes and the test would pass
+        // on a wiring that does nothing (class `fixture proves the symbol, not
+        // the signal`). `panned_test_card` shifts by whole pixels, so the
+        // search finds the sub-pel positions off the reconstruction instead:
+        // three frames of a slow diagonal pan.
+        let pictures: Vec<Picture> = (0..3).map(|i| panned_test_card(width, height, i * 3)).collect();
+        let mut streams = Vec::new();
+        for filter in [
+            ec_av1_syntax::InterpolationFilter::Eighttap,
+            ec_av1_syntax::InterpolationFilter::EighttapSmooth,
+            ec_av1_syntax::InterpolationFilter::EighttapSharp,
+        ] {
+            set_frame_interp(Some(filter));
+            let fctx = &crate::decode::FrameCtx::for_encoder();
+            let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx)
+                .unwrap_or_else(|e| panic!("{filter:?}: {e}"));
+            let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
+            assert_eq!(decoded.len(), 3, "{filter:?}: decoded frame count");
+            for (i, (frame, decoded)) in encoded.frames.iter().zip(&decoded).enumerate() {
+                assert_eq!(decoded.y, frame.reconstruction.y, "{filter:?} frame {i}: luma");
+                assert_eq!(decoded.u, frame.reconstruction.u, "{filter:?} frame {i}: U");
+                assert_eq!(decoded.v, frame.reconstruction.v, "{filter:?} frame {i}: V");
+            }
+            streams.push((filter, encoded.stream));
+        }
+        set_frame_interp(None);
+        for (i, (fa, a)) in streams.iter().enumerate() {
+            for (fb, b) in &streams[i + 1..] {
+                assert_ne!(a, b, "{fa:?} and {fb:?} coded the same bytes");
             }
         }
     }
