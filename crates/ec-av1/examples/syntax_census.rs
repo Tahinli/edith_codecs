@@ -240,11 +240,19 @@ fn report(label: &str, f: &Frame, frames: usize) {
     }
     let mut tables: Vec<_> = f.families.iter().collect();
     tables.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+    // lane-cen3: how many tables the row names. The default 8 hides the
+    // mode family's own split (a level can spend 40% of its bits on `mode`
+    // with no mode table in its top 8), so a census that has to rank
+    // per-table gaps between two encoders sets `EC_CENSUS_TABLES`.
+    let top = std::env::var("EC_CENSUS_TABLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8usize);
     println!(
         "    top tables: {}",
         tables
             .iter()
-            .take(8)
+            .take(top)
             .map(|(name, (_, bits))| format!("{name} {:.1}%", 100.0 * bits / total_bits.max(1.0)))
             .collect::<Vec<_>>()
             .join("  "),
