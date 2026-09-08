@@ -3675,6 +3675,19 @@ mod tests {
                 tile_rows_log2: rows_log2,
             };
             let layout = format!("{}x{} tiles", 1 << cols_log2, 1 << rows_log2);
+            // lane-b128m: the SPEC's uniform spacing derives the tile count
+            // from the superblock grid (`tileWidthSb = ceil(sbCols >> log2)`),
+            // so a frame with fewer superblock columns than the requested
+            // count codes fewer tiles -- which is what a 128-superblock
+            // sequence does here. The grid the encoder itself computes is the
+            // expectation; at 64 superblocks it is `1 << log2` exactly.
+            let grid = crate::tile::TileLayout::new(
+                (width as u32).div_ceil(4),
+                (height as u32).div_ceil(4),
+                cols_log2,
+                rows_log2,
+            );
+            let (want_cols, want_rows) = (grid.cols(), grid.rows());
             let mut enc = Av1Encoder::new(config).unwrap();
             let mut stream = Vec::new();
             for packet in encode_all(&mut enc, &sources) {
@@ -3693,12 +3706,12 @@ mod tests {
                     if let ec_av1_syntax::ObuKind::Frame(parsed, tiles) = &obu.kind {
                         assert_eq!(
                             (parsed.tile_info.cols, parsed.tile_info.rows),
-                            (1 << cols_log2, 1 << rows_log2),
+                            (want_cols, want_rows),
                             "{layout}: the header's own tile grid"
                         );
                         assert_eq!(
                             tiles.len(),
-                            1 << (cols_log2 + rows_log2),
+                            (want_cols * want_rows) as usize,
                             "{layout}: tile payloads located in the tile group"
                         );
                         frames += 1;
