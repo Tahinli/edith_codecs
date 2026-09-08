@@ -273,6 +273,15 @@ fn tx_select_inter() -> bool {
 /// here.
 pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType] {
     const DCT: [TxType; 1] = [TxType::DctDct];
+    const INTRA1: [TxType; 7] = [
+        TxType::DctDct,
+        TxType::AdstAdst,
+        TxType::AdstDct,
+        TxType::DctAdst,
+        TxType::Idtx,
+        TxType::VDct,
+        TxType::HDct,
+    ];
     const INTRA2: [TxType; 5] = [
         TxType::DctDct,
         TxType::AdstAdst,
@@ -281,7 +290,21 @@ pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType]
         TxType::Idtx,
     ];
     match set {
-        TxbSet::Luma16 | TxbSet::Luma8 | TxbSet::Luma4 if screen && tx_type_search() => &INTRA2,
+        TxbSet::Luma16 | TxbSet::Luma8 | TxbSet::Luma4
+            if (screen || intra_tx_all_frames()) && tx_type_search() =>
+        {
+            &INTRA2
+        }
+        // lane-txi: a `reduced_tx_set == 0` frame's intra 8x8/4x4 reads the
+        // SEVEN-type `TX_SET_INTRA_1` (`decode::txbset_for`'s `Luma{8,4}Set1`;
+        // 16x16 stays `TX_SET_INTRA_2`, there is no `Luma16Set1`). The two
+        // extra members are the 1-D DCTs, and the order is the reader's own
+        // map (`decode::tx_type_from_symbol`, 8-wide CDF).
+        TxbSet::Luma8Set1 | TxbSet::Luma4Set1
+            if (screen || intra_tx_all_frames()) && tx_type_search() =>
+        {
+            &INTRA1
+        }
         _ => &DCT,
     }
 }
@@ -308,6 +331,15 @@ pub(crate) fn tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType]
 pub(crate) fn inter_tx_type_candidates(set: TxbSet, screen: bool) -> &'static [TxType] {
     const DCT: [TxType; 1] = [TxType::DctDct];
     const INTER3: [TxType; 2] = [TxType::DctDct, TxType::Idtx];
+    const INTER_WIDE: [TxType; 7] = [
+        TxType::DctDct,
+        TxType::AdstAdst,
+        TxType::AdstDct,
+        TxType::DctAdst,
+        TxType::Idtx,
+        TxType::VDct,
+        TxType::HDct,
+    ];
     let mode = inter_tx_type_search();
     let on = match mode {
         InterTxSearch::Off => false,
@@ -317,7 +349,53 @@ pub(crate) fn inter_tx_type_candidates(set: TxbSet, screen: bool) -> &'static [T
     match set {
         TxbSet::Luma32Inter if on && mode != InterTxSearch::Le16 => &INTER3,
         TxbSet::Luma16Inter | TxbSet::Luma8Inter | TxbSet::Luma4Inter if on => &INTER3,
+        // lane-txi: a `reduced_tx_set == 0` frame's inter 16x16 reads the
+        // TWELVE-type `TX_SET_INTER_2` and its 8x8/4x4 `ALL16` (inter 32x32
+        // stays the two-type `DCT_IDTX`). The seven offered here are the
+        // members those two alphabets SHARE with the intra set -- the four
+        // DTT combinations, `IDTX` and the two 1-D DCTs -- which is the
+        // candidate list rav1e's speed 6 prunes to; the FLIPADST family and
+        // the 1-D ADSTs are codable and left unoffered (deferred).
+        TxbSet::Luma16InterSet1 | TxbSet::Luma8InterSet1 | TxbSet::Luma4InterSet1 if on => {
+            &INTER_WIDE
+        }
         _ => &DCT,
+    }
+}
+
+/// lane-txi: does THIS frame code `reduced_tx_set = 0` (spec 5.9.2), i.e.
+/// the wider `tx_type` alphabets at intra 8x8/4x4 and inter 16x16 and below?
+/// `EC_AV1_TXSET_WIDE`: `0`/`off`, `screen` (screen frames only), anything
+/// else every frame; unset takes [`crate::speed::WIDE_TX_SET`], screen-gated
+/// like both halves of the type search itself.
+pub(crate) fn wide_tx_set(screen: bool) -> bool {
+    static ENV: std::sync::LazyLock<Option<InterTxSearch>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_TXSET_WIDE").ok().map(|v| match v.as_str() {
+            "0" | "off" => InterTxSearch::Off,
+            "screen" => InterTxSearch::Screen,
+            _ => InterTxSearch::All,
+        })
+    });
+    match ENV.unwrap_or(if crate::speed::at(&crate::speed::WIDE_TX_SET) {
+        InterTxSearch::Screen
+    } else {
+        InterTxSearch::Off
+    }) {
+        InterTxSearch::Off => false,
+        InterTxSearch::Screen => screen,
+        _ => true,
+    }
+}
+
+/// The luma [`TxbSet`] the SEARCH and its pricer name for a frame that codes
+/// `reduced_tx_set = 0`: the writer reads the bit once, off the frame's own
+/// [`crate::cdf_state::Cdfs`], but the trial that prices a type has to read
+/// the same alphabet or the two disagree on what a `tx_type` symbol costs.
+pub(crate) fn luma_set_for(set: TxbSet, screen: bool) -> TxbSet {
+    if wide_tx_set(screen) {
+        set.wide()
+    } else {
+        set
     }
 }
 
@@ -372,14 +450,14 @@ fn inter_tx_type_search() -> InterTxSearch {
 
 /// The inter luma [`TxbSet`] a `tx`-sided transform unit reads, `None` for the
 /// 64-point one (it codes no `tx_type` symbol).
-fn inter_luma_set(tx: usize) -> Option<TxbSet> {
-    Some(match tx {
+fn inter_luma_set(tx: usize, screen: bool) -> Option<TxbSet> {
+    Some(luma_set_for(match tx {
         4 => TxbSet::Luma4Inter,
         8 => TxbSet::Luma8Inter,
         16 => TxbSet::Luma16Inter,
         32 => TxbSet::Luma32Inter,
         _ => return None,
-    })
+    }, screen))
 }
 
 fn tx_type_search() -> bool {
@@ -389,6 +467,17 @@ fn tx_type_search() -> bool {
             .map(|v| !matches!(v.as_str(), "0" | "off"))
     });
     ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::TX_TYPE_SEARCH))
+}
+
+/// lane-txi: `EC_AV1_TXSET=all` offers the five-type intra set on EVERY
+/// frame -- the unconditional arm the gate measures -- instead of the screen
+/// content gate [`tx_type_candidates`] ships behind. Any other value keeps
+/// the gate (`0`/`off` still switches the search off entirely).
+fn intra_tx_all_frames() -> bool {
+    static ENV: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_TXSET").is_ok_and(|v| v == "all")
+    });
+    *ENV
 }
 
 fn tx_select() -> bool {
@@ -2536,12 +2625,15 @@ impl Plane<'_> {
         let At { x, y, side, reach, .. } = at;
         let tx = side >> depth;
         let n = 1usize << depth;
-        let set = match tx {
-            32 => TxbSet::Luma32,
-            16 => TxbSet::Luma16,
-            8 => TxbSet::Luma8,
-            _ => TxbSet::Luma4,
-        };
+        let set = luma_set_for(
+            match tx {
+                32 => TxbSet::Luma32,
+                16 => TxbSet::Luma16,
+                8 => TxbSet::Luma8,
+                _ => TxbSet::Luma4,
+            },
+            search.screen,
+        );
         let mut levels = vec![0i32; side * side];
         census_add(4, n * n);
         // A unit smaller than its block reads the neighbour magnitude table
@@ -4084,7 +4176,7 @@ fn commit_inter_luma(
     let mut flat_typed: Option<Trial> = None;
     let mut flat_type = TxType::DctDct;
     if !skip {
-        if let Some(fset) = inter_luma_set(side) {
+        if let Some(fset) = inter_luma_set(side, search.screen) {
             let lambda = search.lambda * tx_type_lambda_mult();
             let cost = |t: &Trial| t.sse + lambda * t.bits;
             for &tx_type in inter_tx_type_candidates(fset, search.screen) {
@@ -4130,7 +4222,7 @@ fn commit_inter_luma(
         // differently-predicted baseline is what would let a candidate win on
         // both terms at once (class `local-rd-on-references` vs a real
         // pricing defect); re-predicting it here is the only way to tell.
-        if let Some(fset) = inter_luma_set(side) {
+        if let Some(fset) = inter_luma_set(side, search.screen) {
             let here = match second {
                 Some((mv1, ref1)) => mc_trial_compound_typed(
                     luma, x, y, side, (mv, mv1), true, reference, ref1, search.base_q_idx,
@@ -4175,14 +4267,14 @@ fn commit_inter_luma(
         return (flat_ref.levels.clone(), 0, flat_gain, vec![flat_type]);
     }
     let tx = side / 2;
-    let set = if tx >= 32 {
+    let set = luma_set_for(if tx >= 32 {
         // lane-b64b: the 64x64 root's halved transform is TX_32X32.
         TxbSet::Luma32Inter
     } else if tx >= 16 {
         TxbSet::Luma16Inter
     } else {
         TxbSet::Luma8Inter
-    };
+    }, search.screen);
     let mut levels = vec![0i32; side * side];
     let (mut sse, mut bits) = (0.0, 0.0);
     let mut units = Vec::with_capacity(4);
@@ -4830,7 +4922,7 @@ fn code_square(
         y,
         side,
         reach: Reach::of(side, x, y, luma.true_width, luma.true_height, fctx),
-        set: luma_set,
+        set: luma_set_for(luma_set, search.screen),
     };
     let (mut luma_coeffs, mode, angle_delta, mut cost, tx_type) =
         luma.search_block(at, search, mode_bits, fctx);
@@ -7118,6 +7210,9 @@ pub(crate) fn encode_key_frame_inner(
     IBC_SHARE.with(|c| c.set(ibc_share));
     let (seq, mut header) = key_frame_headers_colour(render.0, render.1, base_q_idx, color_config)?;
     header.allow_screen_content_tools = screen;
+    // lane-txi: the wider `tx_type` alphabets, gated by the same content
+    // rule the type search itself stands behind ([`wide_tx_set`]).
+    header.reduced_tx_set = !wide_tx_set(screen);
     header.allow_intrabc = allow_intrabc;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
@@ -7556,7 +7651,10 @@ pub(crate) fn encode_key_frame_inner(
     // defaults again (spec 7.20's `started_from` arm) -- the first inter
     // frame after it therefore starts from the defaults too.
     let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
-    let cdfs = crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx));
+    let mut cdfs = crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx));
+    // lane-txi: the ONE place the writer reads the frame's `reduced_tx_set`
+    // from -- `Cdfs::txb` widens every luma set under it.
+    cdfs.reduced_tx_set = header.reduced_tx_set;
     let start_cdfs = CdfSnapshot(cdfs);
     // The luma restoration-unit grid this frame's `lr_params` implies
     // (`av1_lr_count_units` rounds to nearest, so a short last unit is
@@ -10448,6 +10546,9 @@ pub(crate) fn encode_inter_frame(
     let screen = seq_screen()
         && screen_content(&picture_y8, picture.width, true_width, true_height);
     header.allow_screen_content_tools = screen;
+    // lane-txi, as on the key frame: the header bit the writer's own
+    // `Cdfs` then reads for every luma `tx_type` symbol.
+    header.reduced_tx_set = !wide_tx_set(screen);
     // The search prices coefficients against the tables this frame's writer
     // starts from, not against the defaults (lane-av1txbits) -- but only on a
     // frame the screen detector said no to (lane-av1price2): armed HERE, after
@@ -11272,9 +11373,13 @@ pub(crate) fn encode_inter_frame(
     // next frame's writer starts from them -- exactly what
     // `crate::stream::stored_cdfs_for` hands the decoder.
     let (mi_cols, mi_rows) = (header.mi_cols, header.mi_rows);
-    let cdfs = start_cdfs
+    let mut cdfs = start_cdfs
         .cloned()
         .unwrap_or_else(|| crate::cdf_state::Cdfs::new(crate::tile::q_ctx_of(base_q_idx)));
+    // lane-txi: set per frame, never inherited from the snapshot the
+    // previous frame stored -- the content gate can flip the bit between
+    // frames (class `per-tile-state-not-reset`).
+    cdfs.reduced_tx_set = header.reduced_tx_set;
     let start_cdfs = CdfSnapshot(cdfs);
     let reference_select_bit = header.reference_select;
     let switchable_motion_mode = header.is_motion_mode_switchable;
