@@ -12785,6 +12785,40 @@ mod tests {
         assert_eq!(plane.block_sse(32, 32, 16, &block), (190.0 * 190.0) * 64.0);
     }
 
+    /// lane-dq: libaom's objective mapping ([`super::deltaq_libaom`]) must
+    /// spend WHERE THE WINDOW LEANS, stay congruent to the base on the
+    /// `delta_q_res` grid, and stop at libaom's own `+-(res * 9 - 1)` bound.
+    #[test]
+    fn the_objective_delta_q_mapping_leans_the_right_way_and_stops_at_libaom_s_clamp() {
+        let (base, res) = (162u8, 4i32);
+        let rf = 2.0;
+        // A superblock the window leans on more than the frame average is
+        // coded FINER (lower qindex); a slack one coarser; the average one
+        // exactly at the base.
+        assert!(super::deltaq_libaom(base, 8.0, rf, 1.0, res) < base, "leaned-on SB must go finer");
+        assert!(super::deltaq_libaom(base, 0.2, rf, 1.0, res) > base, "idle SB must go coarser");
+        assert_eq!(super::deltaq_libaom(base, rf, rf, 1.0, res), base, "the average SB moves 0");
+        // Every offset is a whole number of steps and inside +-(res * 9 - 1).
+        let max = ((res * 9 - 1) / res) * res;
+        for r in [0.0f64, 0.01, 0.5, 1.0, 3.0, 50.0, 1e6] {
+            for k in [0.5f64, 1.0, 1.5] {
+                let q = i32::from(super::deltaq_libaom(base, r, rf, k, res));
+                let d = q - i32::from(base);
+                assert_eq!(d % res, 0, "r={r} k={k}: offset {d} is not a whole {res}-step");
+                assert!(d.abs() <= max, "r={r} k={k}: offset {d} past libaom's +-{max}");
+            }
+        }
+        // The clamp is REACHED from both ends, so the bound is a real bound
+        // and not a formula that never gets there.
+        assert_eq!(i32::from(super::deltaq_libaom(base, 1e9, rf, 1.0, res)) - i32::from(base), -max);
+        assert_eq!(i32::from(super::deltaq_libaom(base, 0.0, 1e9, 1.0, res)) - i32::from(base), max);
+        // A stronger `k` never moves less than a weaker one.
+        let d = |k: f64| (i32::from(super::deltaq_libaom(base, 8.0, rf, k, res)) - i32::from(base)).abs();
+        assert!(d(0.5) <= d(1.0) && d(1.0) <= d(1.5), "strength must be monotone: {} {} {}", d(0.5), d(1.0), d(1.5));
+        // The frame reference is libaom's log-mean: flat in, the same value out.
+        assert!((super::tpl_frame_ratio(&[2.5; 16]) - 2.5).abs() < 1e-9);
+    }
+
     #[test]
     fn tpl_factors_are_flat_on_a_uniform_repeat_and_fall_where_the_window_leans() {
         // Four 64x64 superblocks across: the shipped map forms its ratio per
