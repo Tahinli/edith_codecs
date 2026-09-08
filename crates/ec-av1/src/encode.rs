@@ -2074,7 +2074,11 @@ pub fn inter_frame_headers_slots(
             idx[6] = altref_slot;
             idx
         },
-        allow_high_precision_mv: false,
+        // lane-hpmv: libaom's own rule (`av1_pick_and_set_high_precision_mv`:
+        // `use_hp = qindex < HIGH_PRECISION_MV_QTHRESH`), with this crate's
+        // threshold in [`HP_MV_QTHRESH`]. `force_integer_mv` is false in
+        // every frame this constructor builds, so no further guard is needed.
+        allow_high_precision_mv: high_precision_mv_at(base_q_idx),
         // A FIXED frame-level filter, so no block codes an `interp_filter`
         // symbol. lane-obmc3 instrumented whether that costs anything: a
         // libaom `cpu-used 6` crf 41 stream of the long-GOP film B window
@@ -8771,24 +8775,31 @@ fn mv_class_of(z: i32) -> usize {
 /// through, not the tile writer's own adapting state, which this encoder has
 /// no way to read without duplicating it block for block.
 ///
-/// Returns `None` when `diff` needs the eighth-pel precision this crate's
-/// frames never carry (`allow_high_precision_mv` is always off), which is
-/// what [`round_to_valid_mv`] exists to avoid ever happening.
+/// Returns `None` when `diff` needs eighth-pel precision in a frame coded
+/// without `allow_high_precision_mv`, which is what [`round_to_valid_mv`]
+/// exists to avoid ever happening.
 fn mv_component_bits(diff: i32) -> Option<f64> {
+    let hp_frame = crate::tile::high_precision_mv();
     let mag = diff.unsigned_abs() as i32;
     let z = mag - 1;
-    if z & 1 == 0 {
+    if !hp_frame && z & 1 == 0 {
         return None;
     }
     let mut bits = symbol_bits(&cdf::MV_SIGN, usize::from(diff < 0));
     let class = mv_class_of(z);
     bits += symbol_bits(&cdf::MV_CLASS, class);
     let local = z - mv_class_base(class);
+    let hp = (local & 1) as usize;
     if class == 0 {
         let bit = (local >> 3) & 1;
         let fr = (local >> 1) & 3;
         bits += symbol_bits(&cdf::MV_CLASS0_BIT, bit as usize);
         bits += symbol_bits(&cdf::MV_CLASS0_FR[bit as usize], fr as usize);
+        // lane-hpmv: the writer codes the eighth-pel bit in a high-precision
+        // frame, so the pricer charges for it there and only there.
+        if hp_frame {
+            bits += symbol_bits(&cdf::MV_CLASS0_HP, hp);
+        }
     } else {
         let d = local >> 3;
         let fr = (local >> 1) & 3;
@@ -8796,6 +8807,9 @@ fn mv_component_bits(diff: i32) -> Option<f64> {
             bits += symbol_bits(&cdf::MV_BIT[i], ((d >> i) & 1) as usize);
         }
         bits += symbol_bits(&cdf::MV_FR, fr as usize);
+        if hp_frame {
+            bits += symbol_bits(&cdf::MV_HP, hp);
+        }
     }
     Some(bits)
 }
@@ -8951,7 +8965,51 @@ fn mv_residual_bits(mv: (i32, i32), pred: (i32, i32)) -> Option<f64> {
 /// down keeps every coded MV — and so every `nearest_mv` a later block's
 /// stack votes with — built from an even displacement from `(0, 0)`, so the
 /// invariant holds without this function seeing the whole stack.
+/// A PROCESS-GLOBAL [`high_precision_mv_at`] override that wins over both
+/// the threshold and the environment (`u8::MAX` = unset, `0` = never, `1` =
+/// always), the shape [`set_frame_interp`] has: the witness that has to see
+/// `mv_hp` symbols coded turns it on through this while holding
+/// [`crate::speed::knob_write`].
+static HP_MV_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Sets [`HP_MV_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` gates
+pub(crate) fn set_high_precision_mv(on: Option<bool>) {
+    HP_MV_OVERRIDE.store(on.map_or(u8::MAX, u8::from), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The qindex below which an inter frame codes `allow_high_precision_mv`
+/// (lane-hpmv). libaom's `HIGH_PRECISION_MV_QTHRESH` is 128; `0` is this
+/// crate's shipped value, i.e. high-precision motion vectors off in every
+/// frame -- see `lanes/hpmv.report.md` for the sweep that chose it.
+pub(crate) const HP_MV_QTHRESH: u8 = 0;
+
+/// Whether an inter frame at `base_q_idx` carries `allow_high_precision_mv`:
+/// [`HP_MV_QTHRESH`], overridable by `EC_AV1_HP_MV` (`0`/`off` never, `all`
+/// always, any number as the threshold) so the BD gate can sweep the policy
+/// without a rebuild.
+pub(crate) fn high_precision_mv_at(base_q_idx: u8) -> bool {
+    match HP_MV_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static T: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    let threshold = *T.get_or_init(|| match std::env::var("EC_AV1_HP_MV").ok().as_deref() {
+        Some("all" | "always") => 256,
+        Some("0" | "off") => 0,
+        Some(v) => v.parse().unwrap_or(u16::from(HP_MV_QTHRESH)),
+        None => u16::from(HP_MV_QTHRESH),
+    });
+    u16::from(base_q_idx) < threshold
+}
+
 fn round_to_valid_mv(mv: (i32, i32), pred: (i32, i32)) -> (i32, i32) {
+    // lane-hpmv: with `allow_high_precision_mv` on, every eighth-pel
+    // residual is codable and there is nothing to round away.
+    if crate::tile::high_precision_mv() {
+        return mv;
+    }
     let round = |m: i32, p: i32| {
         let diff = m - p;
         let mag = diff.unsigned_abs() as i32;
@@ -11324,6 +11382,10 @@ pub(crate) fn encode_inter_frame(
     // read `(0, 0, [0; 7])` and came out 1 for every reference -- the knob
     // never reached the tool).
     crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
+    // lane-hpmv: armed here for the same reason the order hints are -- the
+    // block SEARCH reads it (its eighth-pel stage) long before the writer.
+    let hp_mv = header.allow_high_precision_mv;
+    crate::tile::arm_high_precision_mv(hp_mv);
     if let Some(p) = pyramid {
         header.show_frame = p.show_frame;
         header.showable_frame = !p.show_frame;
@@ -11580,6 +11642,7 @@ pub(crate) fn encode_inter_frame(
         // search step) is read by the SEARCH, so every worker arms it or the
         // tile's bits depend on the thread count.
         crate::tile::arm_order_hints(seq.order_hint_bits, order_hint, order_hints);
+        crate::tile::arm_high_precision_mv(hp_mv);
         crate::tile::arm_pricing_cdfs(start_cdfs, screen);
         let rect = layout.rect(index);
         let mut luma = fresh_plane(&picture_y8, frame_width, frame_height, true_width, true_height);
@@ -12265,6 +12328,7 @@ pub(crate) fn encode_inter_frame(
             crate::tile::arm_motion_mode(switchable_motion_mode);
             crate::tile::arm_warped_motion(warped_motion);
             crate::tile::arm_order_hints(order_hint_bits, order_hint, order_hints);
+            crate::tile::arm_high_precision_mv(hp_mv);
             crate::tile::arm_screen(screen);
             crate::tile::arm_filter_intra(filter_intra_on());
             let mut cdfs = start_cdfs.0.clone();
@@ -18531,4 +18595,72 @@ mod tests {
         }
     }
 
+
+    /// lane-hpmv: THE EIGHTH-PEL VECTOR REACHES THE STREAM. With
+    /// `allow_high_precision_mv` off the writer refuses an odd eighth-pel
+    /// residual outright (`round_to_valid_mv` rounds it away first), so the
+    /// finest vector the encoder could commit to was a quarter pel. With the
+    /// header bit on, the writer codes an `mv_hp`/`mv_class0_hp` symbol per
+    /// non-zero component and the search's fourth stage refines to the
+    /// eighth: this asserts ZERO hp symbols in the off arm, non-zero in the
+    /// on arm, and -- the part that makes it a signal rather than a symbol
+    /// count (class `fixture proves the symbol, not the signal`) -- that some
+    /// of them come out ZERO, i.e. name a vector the off arm cannot code at
+    /// all. Both streams are decoded by ffmpeg AND by this crate's own
+    /// decoder and asserted sample-exact against the encoder's own
+    /// reconstruction, which is what proves the header bit and the symbols
+    /// agree.
+    #[test]
+    fn a_high_precision_frame_codes_eighth_pel_motion_vectors_both_decoders_read() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_high_precision_frame_codes_eighth_pel_motion_vectors: no ffmpeg");
+            return;
+        }
+        let (width, height) = (256usize, 128usize);
+        let pictures: Vec<Picture> = (0..3).map(|i| panned_test_card(width, height, i * 3)).collect();
+        let mut arms = Vec::new();
+        for hp in [false, true] {
+            set_high_precision_mv(Some(hp));
+            let _ = crate::tile::take_hp_symbols();
+            let fctx = &crate::decode::FrameCtx::for_encoder();
+            let encoded = encode_sequence_with_ctx(&pictures, 100, 0.5, fctx)
+                .unwrap_or_else(|e| panic!("hp={hp}: {e}"));
+            let (symbols, eighth) = crate::tile::take_hp_symbols();
+            let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+            let ours = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+            assert_eq!(decoded.len(), pictures.len(), "hp={hp}: ffmpeg frame count");
+            assert_eq!(ours.len(), pictures.len(), "hp={hp}: our decoder frame count");
+            for (i, e) in encoded.frames.iter().enumerate() {
+                for (who, got) in [("ffmpeg", &decoded[i]), ("our decoder", &ours[i])] {
+                    if let Some((plane, s, got, want)) = first_plane_mismatch(got, &e.reconstruction)
+                    {
+                        panic!(
+                            "hp={hp} frame {i} plane {plane} sample {s}: {who} decoded {got}, \
+                             the encoder reconstructed {want}"
+                        );
+                    }
+                }
+            }
+            arms.push((symbols, eighth, encoded.stream));
+        }
+        set_high_precision_mv(None);
+        let (off, on) = (&arms[0], &arms[1]);
+        assert_eq!(off.0, 0, "a frame without the header bit codes no hp symbol");
+        assert!(on.0 > 0, "a high-precision frame codes hp symbols (got {})", on.0);
+        assert!(
+            on.1 > 0,
+            "a high-precision frame codes eighth-pel vectors ({} hp symbols, none of them zero)",
+            on.0
+        );
+        assert_ne!(off.2, on.2, "the two arms coded the same bytes");
+        println!(
+            "hp witness: off {} hp symbols / {} B, on {} hp symbols ({} eighth-pel) / {} B",
+            off.0,
+            off.2.len(),
+            on.0,
+            on.1,
+            on.2.len()
+        );
+    }
 }
