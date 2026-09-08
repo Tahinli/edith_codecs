@@ -4724,6 +4724,29 @@ fn scan_of(side: usize) -> &'static Vec<u16> {
     }
 }
 
+/// [`scan_of`]'s `TX_CLASS_HORIZ`/`TX_CLASS_VERT` sibling (lane-txw): the
+/// `Mrow_Scan`/`Mcol_Scan` a `V_DCT`/`H_DCT` unit is coded in, built off the
+/// DECODER's own table so the two cannot drift, cached per size and class.
+fn class_scan_of(side: usize, class: crate::decode::TxClass) -> &'static [u16] {
+    static SCANS: LazyLock<[[Vec<u16>; 2]; 4]> = LazyLock::new(|| {
+        use crate::decode::{TxClass, class_scan_table};
+        [TX4, TX8, TX16, TX32].map(|side| {
+            [
+                class_scan_table(side, TxClass::Horiz),
+                class_scan_table(side, TxClass::Vert),
+            ]
+        })
+    });
+    let size = match side {
+        TX4 => 0,
+        TX8 => 1,
+        TX16 => 2,
+        _ => 3,
+    };
+    let idx = usize::from(class == crate::decode::TxClass::Vert);
+    &SCANS[size][idx]
+}
+
 /// [`coeff_bits_typed`] at `DCT_DCT`, the only type the test-only pricers
 /// ([`predicted_coeff_bits`]) model.
 #[cfg(test)]
@@ -4936,7 +4959,19 @@ pub(crate) fn rdoq(
     //    cannot cost two hundred re-codings.
     let mut budget = rdoq_budget();
     let max_level = rdoq_max_level();
-    for &position in scan_of(coded).iter().rev() {
+    // lane-txw: the tail this walks back from is the tail of the unit's OWN
+    // scan -- a `V_DCT`/`H_DCT` unit is coded in `Mrow_Scan`/`Mcol_Scan`, so
+    // the 2D zigzag's last positions are not the ones whose removal shortens
+    // its eob. Every candidate is still priced through the class-aware writer
+    // ([`write_coeffs`]), so this changes which positions the budget reaches,
+    // never whether a decision is right.
+    let class = crate::decode::TxClass::of(tx_type);
+    let order: &[u16] = if class == crate::decode::TxClass::TwoD {
+        scan_of(coded)
+    } else {
+        class_scan_of(coded, class)
+    };
+    for &position in order.iter().rev() {
         if budget == 0 {
             break;
         }
@@ -5233,6 +5268,22 @@ fn write_coeffs(
         ec_rng_trace(|| format!("EC_PLANE plane={plane} tell_before={}", enc.tell()));
     }
     let side = coding.side;
+    // lane-txw ROOT CAUSE: this writer used to code every transform unit as
+    // `TX_CLASS_2D` -- default zigzag scan, the 2D `eob_pt` table and the 2D
+    // neighbour taps -- while the decoder resolves `V_DCT`/`H_DCT` to
+    // `TX_CLASS_VERT`/`TX_CLASS_HORIZ` (`decode::TxClass::of`), which read
+    // their own scan (`class_scan_table`), their own `eob_pt` row
+    // (`eob_pt_class1`) and their own context offsets. So the first 1-D type
+    // the search ever offered (the wider `reduced_tx_set == 0` alphabets)
+    // desynced the tile from its own trial decode. The class is a property of
+    // the type alone, so it is resolved here, once per unit, exactly as the
+    // reader does it.
+    let class = crate::decode::TxClass::of(tx_type);
+    let scan: &[u16] = if class == crate::decode::TxClass::TwoD {
+        scan
+    } else {
+        class_scan_of(side, class)
+    };
     // The scan-order search reads the grid in scan order, one dependent load
     // per position, and an all-zero block makes it walk every one of them --
     // which the pricer does for candidate after candidate. A straight-line
@@ -5280,7 +5331,7 @@ fn write_coeffs(
         }
     }
 
-    write_eob(enc, coding, eob, plane);
+    write_eob(enc, coding, eob, plane, class);
 
     // lane-av1speed3: `side` is 4, 8, 16 or 32, but it is a runtime value --
     // `pos / side` compiles to a real integer division, once per coefficient,
@@ -5305,7 +5356,7 @@ fn write_coeffs(
                 });
             }
         } else {
-            let ctx = base_ctx(grid, side, row, col);
+            let ctx = base_ctx(grid, side, row, col, class);
             let sym = level.min(NUM_BASE_LEVELS + 1) as usize;
             enc.symbol(sym, &mut coding.base[ctx]);
             if plane.is_some() {
@@ -5318,7 +5369,7 @@ fn write_coeffs(
             }
         }
         if level > NUM_BASE_LEVELS {
-            let ctx = br_ctx(grid, side, row, col);
+            let ctx = br_ctx(grid, side, row, col, class);
             let mut remaining = level - (NUM_BASE_LEVELS + 1);
             let mut sent = 0;
             while sent < COEFF_BASE_RANGE {
@@ -5379,7 +5430,13 @@ fn write_coeffs(
 /// The end-of-block position (spec 5.11.39): which group of scan positions the
 /// last coded coefficient falls in, then its offset inside that group — the
 /// offset's top bit from a CDF and the rest as raw bits.
-fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize, plane: Option<usize>) {
+fn write_eob(
+    enc: &mut SymbolEncoder,
+    coding: &mut TxbTables,
+    eob: usize,
+    plane: Option<usize>,
+    class: crate::decode::TxClass,
+) {
     /// `Eob_Group_Start` (spec 5.11.39): the first scan position each group of
     /// end-of-block positions covers, indexed by the group's own number.
     const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
@@ -5391,8 +5448,14 @@ fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize, plane:
         .rposition(|&start| start <= eob)
         .expect("the first group starts at zero");
     // The groups are numbered from one, and how many of them the transform
-    // reaches is the size of its own end-of-block alphabet.
-    enc.symbol(group - 1, coding.eob_pt);
+    // reaches is the size of its own end-of-block alphabet. A
+    // `TX_CLASS_HORIZ`/`TX_CLASS_VERT` unit adapts a wholly separate row
+    // (libaom's `eob_multi_ctx`), which is what `decode::read_eob` reads.
+    let eob_pt: &mut [u16] = match (class, coding.eob_pt_class1.as_deref_mut()) {
+        (crate::decode::TxClass::TwoD, _) | (_, None) => coding.eob_pt,
+        (_, Some(class1)) => class1,
+    };
+    enc.symbol(group - 1, eob_pt);
     if let Some(plane) = plane {
         ec_rng_trace(|| {
             format!(
@@ -5460,9 +5523,34 @@ fn eob_coeff_ctx(scan_idx: usize, area: usize) -> usize {
 /// five neighbours below and to the right of it — the ones a decoder walking
 /// the scan backwards already has — plus a term for where in the transform it
 /// sits. The DC reads context 0 whatever its neighbours carry.
-fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
-    if row == 0 && col == 0 {
+fn base_ctx(
+    grid: &[i32],
+    side: usize,
+    row: usize,
+    col: usize,
+    class: crate::decode::TxClass,
+) -> usize {
+    use crate::decode::TxClass;
+    // Only `TX_CLASS_2D` short-circuits its DC to context 0
+    // (`get_nz_map_ctx_from_stats`'s `(tx_class | coeff_idx) == 0`); a 1-D
+    // class runs the DC through the same neighbour sum as every other
+    // position.
+    if class == TxClass::TwoD && row == 0 && col == 0 {
         return 0;
+    }
+    if class != TxClass::TwoD {
+        let offsets: [(usize, usize); 5] = if class == TxClass::Horiz {
+            [(1, 0), (0, 1), (0, 2), (0, 3), (0, 4)]
+        } else {
+            [(1, 0), (0, 1), (2, 0), (3, 0), (4, 0)]
+        };
+        let mag: i32 = offsets
+            .iter()
+            .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs().min(3))
+            .sum();
+        let along = if class == TxClass::Horiz { col } else { row };
+        return (((mag + 1) >> 1).min(4) as usize)
+            + crate::decode::nz_map_ctx_offset_1d(along.min(31));
     }
     // A coefficient two rows and two columns clear of the far edges reaches
     // all five neighbours, so the gather is five loads off one index with no
@@ -5487,7 +5575,30 @@ fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
 /// The context of a coefficient's base-range tail (spec 8.3.2): the magnitudes
 /// of its three closest neighbours below and to the right, uncapped, and a
 /// term separating the DC, the corner of the transform, and the rest.
-fn br_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
+fn br_ctx(
+    grid: &[i32],
+    side: usize,
+    row: usize,
+    col: usize,
+    class: crate::decode::TxClass,
+) -> usize {
+    use crate::decode::TxClass;
+    if class != TxClass::TwoD {
+        let extra = if class == TxClass::Horiz {
+            neighbour(grid, side, row, col + 2)
+        } else {
+            neighbour(grid, side, row + 2, col)
+        };
+        let mag = neighbour(grid, side, row + 1, col).abs()
+            + neighbour(grid, side, row, col + 1).abs()
+            + extra.abs();
+        let mag = (((mag + 1) >> 1).min(6)) as usize;
+        if row == 0 && col == 0 {
+            return mag;
+        }
+        let near_origin = if class == TxClass::Horiz { col == 0 } else { row == 0 };
+        return if near_origin { mag + 7 } else { mag + 14 };
+    }
     let p = row * side + col;
     let mag: i32 = if row + 1 < side && col + 1 < side {
         grid[p + side].abs() + grid[p + 1].abs() + grid[p + side + 1].abs()

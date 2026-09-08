@@ -472,17 +472,21 @@ fn inter_tx_type_search() -> InterTxSearch {
 
 /// The inter luma [`TxbSet`] a `tx`-sided transform unit reads, `None` for the
 /// 64-point one (it codes no `tx_type` symbol).
-/// lane-txi: the INTER half of the widening is deliberately NOT applied
-/// here. A `reduced_tx_set = 0` frame's writer still codes its inter luma
-/// `tx_type` into the twelve/sixteen-symbol alphabet (the frame bit widens
-/// every luma set at once, spec `get_tx_set`), but the SEARCH keeps offering
-/// the two-type list: with the wider inter candidates priced, some block's
-/// winner selects a reference slot this encoder holds no picture in
-/// ("a reference frame selected with no picture at this frame's own
-/// ref_frame_idx slot for it", refused out of the encoder's own MC), which is
-/// the `refs` lane's DPB bookkeeping (`encoder.rs` maps LAST2/LAST3 onto
-/// LAST's slot), not a transform defect -- measured by bisection: the intra
-/// half alone passes every witness, the inter half alone refuses.
+/// lane-txw: the INTER half of the widening is still NOT applied here, and
+/// the reason lane-txi recorded (the `refs` lane's DPB bookkeeping) was
+/// WRONG -- the refusal is `refusal-from-own-desync` twice over. Half of it
+/// was this writer coding a `V_DCT`/`H_DCT` unit as `TX_CLASS_2D`
+/// (`tile::write_coeffs`, fixed by this lane, which is what unblocked the
+/// intra half). What remains is the CHROMA inheritance: an inter block's
+/// chroma transform type is the luma type reduced to the chroma size's set
+/// (`decode::reduce_inherited_chroma_tx_type`), and (a) the encoder never
+/// sets `FrameCtx::reduced_tx_set_inter`, so [`recode_inter_chroma`] reduces
+/// against the REDUCED allowance while a `reduced_tx_set = 0` frame's
+/// decoder allows the full one, and (b) `tile::write_block_planes` codes
+/// every chroma plane as `DCT_DCT`, so an inherited 1-D type desyncs the
+/// chroma exactly as luma did. Both are deferred with the wider inter search
+/// itself; the intra half needs neither (an intra block's chroma type comes
+/// off its own UV mode, never off luma).
 fn inter_luma_set(tx: usize) -> Option<TxbSet> {
     Some(match tx {
         4 => TxbSet::Luma4Inter,
