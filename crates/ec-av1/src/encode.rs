@@ -16072,8 +16072,13 @@ mod tests {
         // reference through the tree and the neighbour contexts the writer
         // really codes it with, so every inter picture's reference decisions
         // move -- 8562 -> 8535 at q=150 and 33357 -> 33221 at q=60.
+        // Re-taken on lane-ctx: the RD pricer reads the writer's own contexts
+        // for `skip`/`is_inter` and for the whole compound reference tree, so
+        // every inter block's cost -- and with it the skip and reference
+        // decisions -- moved: 8535 -> 8311 bytes at q=150 and 33221 -> 33087
+        // at q=60.
         let pins: [(u8, usize, u64); 2] =
-            [(150, 8535, 0x7b7f_4eeb_1080_7b45), (60, 33221, 0x720b_821e_5dd2_90e4)];
+            [(150, 8311, 0xfb6d_75a4_5d13_3833), (60, 33087, 0x4d11_a03c_bdc6_e2d5)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
