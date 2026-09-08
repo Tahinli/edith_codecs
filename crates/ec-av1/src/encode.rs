@@ -16195,11 +16195,15 @@ mod tests {
 
     /// lane-b128r: the 128 root's own RESIDUAL arm -- four TX_64X64 luma
     /// units interleaved with a TX_32X32 chroma pair per 64x64 mu chunk. The
-    /// same pan the skip-only witness above uses, coded at a quantizer where
-    /// the residual is worth its bits, so the counters below are non-zero;
-    /// RED before this lane by construction (`write_inter_block_128` refused
-    /// every non-skip 128 block, so the count was 0 and no such block
-    /// existed to decode).
+    /// same pan the skip-only witness above uses, with the arm FORCED
+    /// ([`force_b128_residual`]): on synthetic bars the RD picks the residual
+    /// about once per frame, which witnesses the shape but not every context
+    /// it reads, and forcing codes all 420 roots of the clip through it. RED
+    /// before this lane by construction (`write_inter_block_128` refused
+    /// every non-skip 128 block, so no such block existed to decode), and RED
+    /// again on the first draft of the writer, whose neighbour band recorded
+    /// `skip = true` for a block that carries a residual -- the next root's
+    /// `skip` symbol then took CDF row 1 where the reader takes row 0.
     ///
     ///     cargo test -p ec-av1 --release --lib -- --ignored \
     ///         a_128_root_block_with_a_real_residual --nocapture
