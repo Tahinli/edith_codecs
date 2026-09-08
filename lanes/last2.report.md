@@ -45,3 +45,55 @@ every key frame (which writes all eight slots with one picture `GOLDEN`
 already names). A leaf whose `LAST` is a hidden frame reads the previous leaf
 as `LAST2`. The hidden levels pass `None`: see §0.
 
+## 2. What changed
+
+`crates/ec-av1/src/encoder.rs`
+* `LEAF_SLOTS = [0, 7]`, `Av1Encoder::leaf_hist` (the last two leaf slots,
+  cleared by every key frame), the leaf loop alternates `self_slot` and names
+  the older slot; `encode_pyramid_inter` takes `last2_slot: Option<u8>`,
+  drops it when it holds no picture or the same one `LAST` names, and derives
+  `sign_bias[1]` / `order_hints[1]` from it through the existing `slots` array
+  (so the writer and the decoder scan the same stacks).
+* `last2()` / `set_last2` — `EC_AV1_LAST2`, default OFF this lane, plus the
+  process-global override the witness uses (this crate's tests never call
+  `set_var`).
+
+`crates/ec-av1/src/encode.rs`
+* `PyramidFrame::last2_slot`; `encode_inter_frame` takes `last2:
+  Option<&Picture>` and, when the slot is named, sets
+  `header.ref_frame_idx[1]`.
+* The picture reaches: the 32x32 `extra` search list (`NEAREST`/`NEAR`/
+  `GLOBAL` plus the existing `EXTRA_REF_NEW_MV` search under
+  `EXTRA_NEW_SKIP_MARGIN` — the charter's "free arm" and its seeded arm are
+  the SAME code path here, since extra references already get a NEWMV), the
+  OBMC neighbour picture table, and the trial decode's `RefPix` slot 2.
+* The RD pricer's `single_ref_bits` gained LAST2's `p4 = 1` leaf.
+* The native gate prints a per-clip reference census (`LAST / LAST2 / GOLDEN /
+  ALTREF`), so the keep table can see whether the tool fires at all.
+
+The 16x16/8x8 leaves are NOT offered LAST2 as a single reference: that path
+(`code_square_inter`) takes no `extra` list at all, only compound pairs. The
+64x64 root goes through `search_skip_64`, likewise no `extra`. So this arm is
+the 32x32 level, which is where the existing extra references live too.
+
+## 3. The witness
+
+`encoder::tests::a_leaf_predicts_off_last2_when_the_picture_two_back_matches`
+(not ignored, 3.6 s): nine 128x128 pictures ALTERNATING between two textures,
+`mini_gop` 4, so every leaf's picture two back is an exact match.
+
+| lever | LAST | LAST2 | GOLDEN | ALTREF | stream |
+|---|---|---|---|---|---|
+| off | 67 | **0** | 18 | 8 | 2969 B |
+| on | 25 | **36** | 15 | 8 | 2300 B |
+
+36 blocks coded off LAST2 (0 with the lever off — the counter measures this
+lane and not the reference set we already had), −22.5% bytes on the clip the
+lever is built for, `decode_stream` and ffmpeg both reconstruct all nine
+display positions sample-exact, and one `show_existing_frame` per hidden frame
+survives.
+
+## 4. The 12-frame native gate
+
+Controls reproduce to the digit: film A +21.7 / −4.4, film B +26.9 / −0.6.
+
