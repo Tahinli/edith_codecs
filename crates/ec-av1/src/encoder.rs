@@ -3822,9 +3822,7 @@ mod tests {
     /// (class `wrong-alphabet-same-value`: a disagreement here changes no
     /// symbol VALUE and desyncs the arithmetic coder anyway).
     #[test]
-    #[ignore = "reduced_tx_set = 0 desyncs the encoder's own trial decode when the \
-                seven-type intra search is on -- bisected in lanes/txi.report.md; \
-                the lever is off at every preset until that is closed"]
+    #[ignore = "sets process-global search levers: run it alone"]
     fn a_wide_tx_set_clip_codes_the_new_alphabets_both_decoders_read_exactly() {
         // Every lever below is process-global: the same exclusive lock the
         // presets take.
