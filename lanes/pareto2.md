@@ -123,3 +123,36 @@ without an arm of its own.
 * recomposing preset 6 by REMOVING a lever it keeps (delta_q, tpl 4): the
   candidates' BD stakes are 0.1-0.2 points and their wall sits under this
   box's 13% floor, so the arms cannot rank them. Same unblock.
+
+## OPEN, for a decoder lane: an SVT-AV1 stream our decoder reads one sample off
+
+`EC_AV1_PARETO_REFS=1` collected this on the screen row (it is a NOTE on a
+reference row, not a gate failure):
+
+    LADDER DECODE FAILURE: libsvtav1 ["-preset", "8", "-crf", "35",
+      "-svtav1-params", "lp=1"] frame 0 plane Y sample 1471489:
+      our decoder decoded 53, ffmpeg 52
+
+i.e. frame 0 (the key frame), luma, sample 1471489 of 1920x1024 = row 766,
+column 1729. One sample, off by one; every other point of every other
+reference ladder in this lane decoded sample-exact.
+
+Reproduce (SvtAv1 v3.1.2 through ffmpeg, no repo fixture touched -- the
+artifacts live in `$HOME/.cache/pareto2/`):
+
+    # the gate's own screen clip: the first OBS .mkv in the manifest that exists
+    SRC=$(awk -F'\t' 'NR>1 && $1 ~ /\/OBS\// && $1 ~ /\.mkv$/ {print $1; exit}' \
+          fixtures/real-library-manifest.tsv)
+    # probe::gate_crop of a 2560x1440 source = 1920x1024 from the middle
+    ffmpeg -v error -y -ss 0 -i "$SRC" -frames:v 12 \
+           -vf crop=1920:1024:320:208 -f rawvideo -pix_fmt yuv420p \
+           $HOME/.cache/pareto2/svt-screen-1920x1024-12f.yuv   # md5 d10969be96c8d4e3888401759f562db4
+    ffmpeg -v error -y -f rawvideo -pix_fmt yuv420p -s 1920x1024 -r 24 \
+           -i $HOME/.cache/pareto2/svt-screen-1920x1024-12f.yuv \
+           -an -threads 1 -g 12 -c:v libsvtav1 -preset 8 -crf 35 \
+           -svtav1-params lp=1 -f obu \
+           $HOME/.cache/pareto2/svt-p8-crf35-screen.obu       # 74769 B, md5 ca517253599f1ef8d5bf61371c0f578c
+
+Then `crate::stream::decode_stream` on that .obu against
+`encode::tests::ffmpeg_decode_sequence` of the same bytes, comparing Y of
+frame 0 at index 1471489. Both artifacts are kept at those paths.
