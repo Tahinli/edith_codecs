@@ -71,6 +71,11 @@ Cumulative long-GOP gate (`bd_rate_film_long_gop`), both arms in:
   `Vec<bool>` beside `MiGrid::cells`, filled only by the encoder's `record_mi`
   and read only by the stack. Both pins unchanged by that move, so the gate
   numbers above stand.
+* Split suite, release lib, all RC=0: s1 (`--skip stream::`) 338 passed / 0
+  failed / 32 ignored; s2 (`stream:: --skip 10bit`) 42 / 0 / 1; s3 (`10bit`)
+  208 / 0 / 16. `--ignored
+  encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders`
+  passed.
 * `timeout 900 cargo check --workspace --all-targets -j4`: 0 errors, 0 ec-av1
   warnings (the workspace's 22 warnings are pre-existing, in ec-opus and
   ec-vorbis).
