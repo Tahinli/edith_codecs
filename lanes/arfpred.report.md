@@ -137,43 +137,36 @@ Every real-content row improves; the two colour-bar rows move 0.2 and 0.0
 (inside the 0.3 bound), and the screen capture is byte-identical — its
 sequence codes no pyramid ARF at all, so the filter never runs there.
 
-## 5. Invariants
+## 5. Where the filter is OFF — `ARF_TF_QMIN`
+
+The filter runs on the top ARF of every preset (above preset 6 `TPL_DEPTH`
+leaves the group window empty and it is inert by construction) **except when
+the anchor's own `base_q_idx` is below 16** (`speed::ARF_TF_QMIN`), which is
+libaom's own rule for `arnr` and is what a red test named:
+
+`encoder::tests::bitrate_target_lands_within_5_percent_over_48_frames` codes
+its 2 Mbps pyramid arm with IDENTICAL 22358-byte anchors to its 1536 kbps arm
+— the rate loop has clamped `base_q_idx + arf_q_offset` to 1 and cannot spend
+the target's remaining bytes at all, so that arm sits at −4.8% of target
+BEFORE this lane touches anything (measured: `EC_AV1_ARF_TF=0`, −4.8%). A
+cheaper anchor there made the miss −5.1%, outside the test's ±5% bound. With
+`ARF_TF_QMIN = 16` the arm reads **−4.8%, the control's own number**, and the
+gate is untouched: its finest ladder point (`q = 60`) codes the top ARF at
+qindex 28, and both byte pins are unchanged by the threshold.
+
+## 6. Invariants
 
 * Byte pins re-taken (the hidden frames' pixels move by construction):
   `(150, 8269 → 8218)`, `(60, 33044 → 33017)`; green at the default AND at
-  `EC_AV1_SPEED=6`.
-* Split suite on the shipped default: `--skip stream::` **341 passed / 1
-  FAILED** (below), `stream:: --skip 10bit` 201 passed / 0 failed, `10bit`
-  42 passed / 0 failed.
+  `EC_AV1_SPEED=6`, and unchanged again after `ARF_TF_QMIN` landed.
+* Split suite on the shipped default: `--skip stream::` **342 passed / 0 failed**, `stream::
+  --skip 10bit` **201 passed / 0 failed**, `10bit` **42 passed / 0 failed** (585 in all).
 * `cargo check --workspace --all-targets -j4`: 0 errors, 0 `ec-av1` warnings
   (the 25 warnings are `ec-opus`/`ec-vorbis`, pre-existing).
 * `--ignored --exact encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders`
   1 passed.
 
-### The one RED test, and what it means
-
-`encoder::tests::bitrate_target_lands_within_5_percent_over_48_frames` fails
-on ONE of its six arms — 2 Mbps, pyramid on: **−5.1% off target** against the
-test's ±5% bound (every other rate/shape arm passes, 768 kbps −0.0%,
-1536 kbps +0.0%).
-
-The cause is in the test's own print: the pyramid arm codes its twelve ARFs at
-`12x22237` bytes at 1536 kbps AND at `12x22237` at 2 Mbps — **identical**, i.e.
-the rate loop is already at its ARF quantizer floor at the higher rate and
-cannot spend the target's extra bytes whatever it is handed (class
-`instrument at bound`). The temporal filter makes the anchor cheaper still, so
-an arm that was inside the bound by a hair is now 0.1 point outside it. It is
-a rate-control ceiling this lane uncovered, not a new coding defect: the
-achieved rate is 1.90 Mbps of a 2.00 Mbps target on a synthetic clip, and both
-BD gates (which score at fixed quantizers) improve.
-
-`deferred: the pyramid rate loop cannot reach a 2 Mbps target on this clip —
-its ARF level saturates at a q floor (identical bytes at two targets) — 
-unblocked by a lane on RateLoop's per-level clamp; the honest alternatives
-today are shipping the lever with this arm red or shipping ARF_TF = 0 and
-losing 6.3/4.0 BD points on film B.`
-
-## 6. What this lane did NOT do
+## 7. What this lane did NOT do
 
 * `deferred: a strength sweep ON THE GATE — only 3 was taken to the deciding
   gate; 8/15/30/60 were refuted on the two-point probe, which mispredicted
