@@ -35173,4 +35173,180 @@ pub(crate) mod tests {
         );
     }
 
+
+    /// lane-d792: a frame whose height the superblock grid CUTS, decoded
+    /// against ffmpeg on every ladder point of BOTH reference encoders.
+    ///
+    /// WHY IT EXISTS: the reference encoders answer a straddling frame with
+    /// rectangular partitions in the cut superblock row -- the only place
+    /// these streams code a 16x8/8x4 transform unit at all -- and the rect
+    /// intra dequant path was reading the FRAME's quantizer index where every
+    /// square path reads the block's segment-adjusted one
+    /// (`SEG_LVL_ALT_Q`, class `parsed-then-discarded`). Every gate size
+    /// before this one was a whole number of superblocks, so no gate ever
+    /// decoded such a unit: the 1920x792 native BD arm's reference-decode
+    /// assertion was red on all four rav1e points and this is its small,
+    /// fast, encoder-independent form.
+    ///
+    /// 384x152 is 2 superblocks + 24 px (the 1920x792 straddle, film A's own
+    /// coded size) and 384x184 is 2 + 56 px (the 1920x1080 straddle), so both
+    /// the "less than half inside" and the "more than half inside" edge
+    /// superblock shapes are covered.
+    #[test]
+    fn a_straddling_frame_decodes_exactly_on_both_reference_encoders_ladders() {
+        const NAME: &str = "a_straddling_frame_decodes_exactly_on_both_reference_encoders_ladders";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        const FRAMES: usize = 4;
+        let mut checked = 0usize;
+        // The PINNED half of this gate. The generated rows below are the
+        // general regression; these two files are rav1e's own answer to a
+        // 384x152 crop of a REAL film (`speed=6`, quantizer 100 and 150,
+        // `-g 4`), which is the only recipe measured to turn on the
+        // activity segmentation whose `SEG_LVL_ALT_Q` the rect dequant path
+        // dropped -- a `testsrc2` or repo-fixture source codes one segment
+        // and passes this gate with the defect still in (both verified by
+        // reverting the fix under it). Bytes live in the shared `fixtures`
+        // directory, which is gitignored, so a missing file SKIPs.
+        for name in [
+            "d792_straddle_rav1e_384x152_q100.obu",
+            "d792_straddle_rav1e_384x152_q150.obu",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures")
+                .join(name);
+            let Ok(stream) = std::fs::read(&path) else {
+                eprintln!("SKIP {NAME}: {name} missing");
+                continue;
+            };
+            let (w, h) = (384usize, 152usize);
+            let want = ffmpeg_decode_sequence(&stream, w, h, FRAMES);
+            let got = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: {name} refused: {e}"));
+            assert_eq!(got.len(), want.len(), "{NAME}: {name} frame count");
+            for (f, (o, r)) in got.iter().zip(&want).enumerate() {
+                for (plane, a, b) in [("Y", &o.y, &r.y), ("U", &o.u, &r.u), ("V", &o.v, &r.v)] {
+                    if let Some(i) = a.iter().zip(b.iter()).position(|(x, y)| x != y) {
+                        let stride = if plane == "Y" { w } else { w / 2 };
+                        panic!(
+                            "{NAME}: {name}, frame {f} plane {plane} sample ({}, {}): ours {} \
+                             vs ffmpeg {}",
+                            i % stride,
+                            i / stride,
+                            a[i],
+                            b[i],
+                        );
+                    }
+                }
+            }
+            checked += 1;
+        }
+        for (w, h) in [(384usize, 152usize), (384, 184)] {
+            // REAL content, not colour bars (class `gate film rows are colour
+            // bars`): both encoders only turn segmentation on -- the feature
+            // this gate is about -- when the picture's activity varies, and
+            // `testsrc2` codes one segment, so a bars source passes this gate
+            // with the defect still in (verified by reverting the fix under
+            // it).
+            let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
+            if !clip.exists() {
+                eprintln!("SKIP {NAME}: {} missing", clip.display());
+                return;
+            }
+            for (encoder, points) in [
+                ("librav1e", ["50", "100", "150", "200"]),
+                ("libaom-av1", ["5", "20", "35", "45"]),
+            ] {
+                for point in points {
+                    let mut args: Vec<String> =
+                        ["-v", "error", "-i", clip.to_str().expect("fixture path")]
+                            .iter()
+                            .map(|s| (*s).to_string())
+                            .collect();
+                    args.extend(
+                        [
+                            "-frames:v",
+                            &FRAMES.to_string(),
+                            "-vf",
+                            &format!("crop={w}:{h}:768:400"),
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-an",
+                        ]
+                        .iter()
+                        .map(|s| (*s).to_string()),
+                    );
+                    args.extend(
+                        ["-threads", "1", "-g", &FRAMES.to_string(), "-c:v", encoder]
+                            .iter()
+                            .map(|s| (*s).to_string()),
+                    );
+                    if encoder == "librav1e" {
+                        args.push("-rav1e-params".into());
+                        args.push(format!(
+                            "speed=6:quantizer={point}:tile_cols=1:tile_rows=1:threads=1"
+                        ));
+                    } else {
+                        args.extend(
+                            // `-aq-mode 1`: libaom's activity segmentation,
+                            // i.e. `SEG_LVL_ALT_Q` -- the feature the rect
+                            // dequant path used to drop.
+                            ["-cpu-used", "6", "-b:v", "0", "-crf", point, "-aq-mode", "1"]
+                                .iter()
+                                .map(|s| (*s).to_string()),
+                        );
+                    }
+                    args.extend(["-f", "obu", "-"].iter().map(|s| (*s).to_string()));
+                    let out = Command::new("ffmpeg")
+                        .args(&args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("ffmpeg failed to run");
+                    if !out.status.success() {
+                        eprintln!(
+                            "SKIP {NAME}: ffmpeg cannot encode {w}x{h} with {encoder} ({})",
+                            String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+                        );
+                        continue;
+                    }
+                    let stream = out.stdout;
+                    let want = ffmpeg_decode_sequence(&stream, w, h, FRAMES);
+                    let got = decode_stream(&stream).unwrap_or_else(|e| {
+                        panic!("{NAME}: {encoder} {point} at {w}x{h} refused: {e}")
+                    });
+                    assert_eq!(
+                        got.len(),
+                        want.len(),
+                        "{NAME}: {encoder} {point} at {w}x{h} frame count"
+                    );
+                    for (f, (o, r)) in got.iter().zip(&want).enumerate() {
+                        for (plane, a, b) in
+                            [("Y", &o.y, &r.y), ("U", &o.u, &r.u), ("V", &o.v, &r.v)]
+                        {
+                            if let Some(i) = a.iter().zip(b.iter()).position(|(x, y)| x != y) {
+                                let stride = if plane == "Y" { w } else { w / 2 };
+                                panic!(
+                                    "{NAME}: {encoder} {point} at {w}x{h}, frame {f} plane \
+                                     {plane} sample ({}, {}): ours {} vs ffmpeg {}",
+                                    i % stride,
+                                    i / stride,
+                                    a[i],
+                                    b[i],
+                                );
+                            }
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0, "{NAME}: neither reference encoder was available");
+        eprintln!("{NAME}: {checked} straddling reference points decoded sample-exact");
+    }
+
 }
