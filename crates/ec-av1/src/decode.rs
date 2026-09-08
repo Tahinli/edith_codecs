@@ -8834,18 +8834,26 @@ fn palette_onscreen(
     bh: usize,
     fctx: &crate::decode::FrameCtx,
 ) -> (usize, usize) {
+    // lane-palw: the ENCODER's own in-process reconstruct runs on a
+    // `FrameCtx::for_encoder`, which never sees `set_segmentation` -- both
+    // frame encoders publish the header's mi dims onto it themselves
+    // (`encode.rs`, beside their `true_width`/`true_height`) so that this
+    // clamp and `tile::write_color_index_map`'s now agree there too.
     let (mi_rows, mi_cols) = fctx.seg_mi_dims.with(|c| c.get());
-    // corner-cut: no mi dims means this is not a real frame decode but the
-    // ENCODER's own in-process reconstruct (`FrameCtx::for_encoder`, where
-    // `set_segmentation` never runs), whose writer half
-    // (`tile::write_color_index_map`) is unclamped too -- the two mirror each
-    // other, and clamping only one of them read every map as 1x1. Ceiling:
-    // our encoder still writes a full map for a palette block cut by the
-    // frame edge, which a conformant decoder reads short. Upgrade path: clamp
-    // the writer, publish the mi dims on the encoder's ctx, drop this branch.
-    if mi_rows == 0 || mi_cols == 0 {
-        return (bw, bh);
-    }
+    palette_onscreen_dims(mi_r, mi_c, bw, bh, (mi_rows, mi_cols))
+}
+
+/// [`palette_onscreen`] off explicit mi dims, which is how the WRITER reaches
+/// it (`tile::write_palette_syntax`, armed per frame): the two sides must
+/// compute the same on-screen extent or the decoder reads a different number
+/// of symbols than the encoder wrote.
+pub(crate) fn palette_onscreen_dims(
+    mi_r: usize,
+    mi_c: usize,
+    bw: usize,
+    bh: usize,
+    (mi_rows, mi_cols): (usize, usize),
+) -> (usize, usize) {
     (
         bw.min(mi_cols.saturating_sub(mi_c) * MI),
         bh.min(mi_rows.saturating_sub(mi_r) * MI),
@@ -8856,7 +8864,7 @@ fn palette_onscreen(
 /// the SAME sub-8 bump the caller's own `(bw / 2).max(4)` applies to the block
 /// dimensions (`is_chroma_sub8_x/y`, blockd.h:1533) -- both must move together
 /// or a cut 8-wide block reads its chroma map at the wrong width.
-fn palette_onscreen_uv(
+pub(crate) fn palette_onscreen_uv(
     luma: (usize, usize),
     on: (usize, usize),
     chroma: (usize, usize),
@@ -8939,10 +8947,18 @@ fn decode_color_index_map_wh(
             }
         }
     }
-    // `decode_color_map_tokens`'s own two extension loops (detokenize.c:71):
-    // the last on-screen column then the last on-screen row are replicated
-    // over the off-screen remainder, so the prediction still covers the whole
-    // block.
+    palette_replicate(&mut map, bw, bh, on);
+    map
+}
+
+/// `decode_color_map_tokens`'s own two extension loops (detokenize.c:71): the
+/// last on-screen column then the last on-screen row are replicated over the
+/// off-screen remainder, so the prediction still covers the whole block. The
+/// ENCODER runs this over its searched map too (`encode.rs`'s palette arms),
+/// so the pixels it prices and reconstructs are the ones the on-screen
+/// symbols it writes really decode to.
+pub(crate) fn palette_replicate(map: &mut [u8], bw: usize, bh: usize, on: (usize, usize)) {
+    let (on_bw, on_bh) = (on.0.clamp(1, bw), on.1.clamp(1, bh));
     for row in 0..on_bh {
         let last = map[row * bw + on_bw - 1];
         map[row * bw + on_bw..row * bw + bw].fill(last);
@@ -8950,7 +8966,6 @@ fn decode_color_index_map_wh(
     for row in on_bh..bh {
         map.copy_within((on_bh - 1) * bw..on_bh * bw, row * bw);
     }
-    map
 }
 
 /// [`read_intra_mode`] for a true `bw`x`bh` rect strip (lane-intradisp r1,

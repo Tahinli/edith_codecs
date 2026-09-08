@@ -2940,7 +2940,11 @@ mod tests {
     /// entry per coded frame, in order — this facade's own equivalent of
     /// `encode::tests::ffmpeg_decode_sequence`, needed here too since a
     /// PSNR check needs the decoded pixels, not just the coded byte count.
-    fn ffmpeg_decode_luma(stream: &[u8], width: usize, height: usize) -> Vec<Vec<u8>> {
+    fn ffmpeg_decode_planes(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let path = std::env::temp_dir().join(format!(
             "ec-av1-facade-rate-decode-{}-{}.obu",
             std::process::id(),
@@ -2963,8 +2967,109 @@ mod tests {
         let frame_len = luma + 2 * chroma;
         out.stdout
             .chunks_exact(frame_len)
-            .map(|f| f[..luma].to_vec())
+            .map(|f| {
+                (
+                    f[..luma].to_vec(),
+                    f[luma..luma + chroma].to_vec(),
+                    f[luma + chroma..].to_vec(),
+                )
+            })
             .collect()
+    }
+
+    /// [`ffmpeg_decode_planes`]' luma half, which is what most rows compare.
+    fn ffmpeg_decode_luma(stream: &[u8], width: usize, height: usize) -> Vec<Vec<u8>> {
+        ffmpeg_decode_planes(stream, width, height)
+            .into_iter()
+            .map(|(y, _, _)| y)
+            .collect()
+    }
+
+    /// lane-palw: OUR encoder's own witness for the writer half of the
+    /// palette on-screen defect. `screen_card` at 384x152 is 38 mi rows tall,
+    /// so the bottom superblock row's palette blocks hang 8 luma rows off the
+    /// mi grid: spec 5.11.50 codes their colour-index map over the ON-SCREEN
+    /// corner only and replicates it outward, and the writer used to code the
+    /// full block grid -- symbols a conformant decoder never reads, so
+    /// ffmpeg/dav1d desynced the rest of the tile while our own trial decode
+    /// (unclamped on both sides) agreed with itself. Class
+    /// `writer-phantom-units-past-edge`.
+    ///
+    /// Driven through the ENTRY SURFACE, `Av1Encoder` (what the editor's
+    /// export calls), and compared on EVERY plane -- a chroma palette map is
+    /// cut by the same edge. `palette_cut_maps_written` is asserted non-zero
+    /// so the row cannot pass on a stream that cuts no palette map (class
+    /// gate-blind-to-feature).
+    #[test]
+    fn a_palette_block_cut_by_the_frame_edge_decodes_exactly_through_ffmpeg() {
+        const NAME: &str = "a_palette_block_cut_by_the_frame_edge_decodes_exactly_through_ffmpeg";
+        let _knobs = crate::speed::knob_read();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        let (width, height) = (384usize, 152usize);
+        // A 16-px two-tone checkerboard: every 16x16 and 32x32 block holds at
+        // most two luma values, so the palette arm wins across the WHOLE
+        // frame -- including the bottom superblock row, whose 16x16 blocks at
+        // y=144 and 32x32 blocks at y=128 hang past the 152-row mi grid.
+        // `screen_card`'s 4-px bands fire only 9 palettes here and none of
+        // them at the cut edge (class gate-blind-to-feature).
+        let card = |shift: usize| -> Picture {
+            let mut picture = Picture::grey(width, height);
+            for y in 0..height {
+                for x in 0..width {
+                    let cell = ((x + shift) / 8 + y / 8) % 2;
+                    picture.y[y * width + x] = if cell == 0 { 40 } else { 200 };
+                }
+            }
+            picture
+        };
+        let sources: Vec<Picture> = (0..2).map(|t| card(t * 16)).collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 60,
+            gop: 2,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        crate::tile::reset_palette_cut_maps_written();
+        let mut stream = Vec::new();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        eprintln!("{NAME}: {} cut colour-index maps written", crate::tile::palette_cut_maps_written());
+        assert!(
+            crate::tile::palette_cut_maps_written() > 0,
+            "{NAME}: no palette block is cut by the frame edge here -- the gate would pass blind"
+        );
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "{NAME}: our decoder's frames");
+        if !have_ffmpeg() {
+            eprintln!("SKIP the ffmpeg half of {NAME}: no ffmpeg");
+            return;
+        }
+        let theirs = ffmpeg_decode_planes(&stream, width, height);
+        assert_eq!(theirs.len(), sources.len(), "{NAME}: ffmpeg's frames");
+        for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+            for (plane, got, want) in [
+                ("luma", &a.y, &b.0),
+                ("U", &a.u, &b.1),
+                ("V", &a.v, &b.2),
+            ] {
+                let got: Vec<u8> = got.iter().map(|&v| v as u8).collect();
+                if let Some(at) = got.iter().zip(want).position(|(x, y)| x != y) {
+                    let w = if plane == "luma" { width } else { width / 2 };
+                    panic!(
+                        "{NAME}: frame {i} {plane} differs first at ({}, {}): ours {} vs ffmpeg {}",
+                        at % w,
+                        at / w,
+                        got[at],
+                        want[at],
+                    );
+                }
+            }
+        }
     }
 
     /// A pyramid stream reorders pictures: the hidden `ALTREF` of each
