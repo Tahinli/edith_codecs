@@ -16298,7 +16298,7 @@ mod tests {
         // at q=60. Re-taken on lane-ctx2: a single-reference candidate now
         // pays the `comp_mode = 0` symbol the writer codes ahead of it, so
         // single and compound are priced against the same syntax -- 8311 ->
-        // 8325 bytes at q=150 and 33087 -> 33014 at q=60. Re-taken again in
+        // 8325 bytes at q=150 and 33087 -> 33014 at q=60.
         // Re-taken on lane-txd: the `tx_depth` symbol is priced at the
         // writer's own row on BOTH frame types (a key frame off the deblock
         // grid, an inter frame's intra block off the TXFM_CONTEXT bands the
