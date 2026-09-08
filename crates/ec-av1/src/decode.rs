@@ -5508,7 +5508,7 @@ fn default_scan_gen(side: usize) -> Vec<u16> {
 /// `Mrow_Scan` visits row 0 across every column, then row 1, ... — precisely
 /// `0..side*side` in our own indexing — and `Mcol_Scan` is that walk
 /// transposed (column 0 down every row, then column 1, ...).
-fn class_scan_table(side: usize, class: TxClass) -> Vec<u16> {
+pub(crate) fn class_scan_table(side: usize, class: TxClass) -> Vec<u16> {
     class_scan_table_wh(side, side, class)
 }
 
@@ -5555,14 +5555,14 @@ fn neighbour(grid: &[u8], stride: usize, row: usize, col: usize) -> i32 {
 /// `txb_common.h`): everything but the two lone-axis-identity types this
 /// decoder reads (`V_DCT`/`H_DCT`) is `TX_CLASS_2D`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TxClass {
+pub(crate) enum TxClass {
     TwoD,
     Horiz,
     Vert,
 }
 
 impl TxClass {
-    fn of(tx_type: TxType) -> Self {
+    pub(crate) fn of(tx_type: TxType) -> Self {
         match tx_type {
             // `TX_CLASS_VERT`/`TX_CLASS_HORIZ` (`txb_common.h`'s `tx_type_to_class`)
             // key on axis alone -- FLIPADST is still ADST for this purpose.
@@ -5578,7 +5578,7 @@ impl TxClass {
 /// `col` for horiz, `row` for vert) that places their contexts past the 2D
 /// table's own 26 rows (`SIG_COEF_CONTEXTS_2D`), 16 rows total
 /// (`SIG_COEF_CONTEXTS_1D`) split 26/31/36.
-fn nz_map_ctx_offset_1d(i: usize) -> usize {
+pub(crate) fn nz_map_ctx_offset_1d(i: usize) -> usize {
     match i {
         0 => 26,
         1 => 31,
