@@ -90,7 +90,36 @@ ceiling; it is proved by a witness rather than left as a claim.
 
 ## 4. Suite and check
 
-(filled in below from the detached runs)
+`timeout 900 cargo check --workspace --all-targets -j4`: **0 errors, 0 ec-av1
+warnings** (the 22 warnings are ec-opus' missing struct-field docs and
+ec-vorbis' unused `decode_capture`, both pre-existing on main).
+
+THE LIB SUITE DOES NOT FIT A 900 s CAP ON THIS BOX. Two whole-suite arms died
+`RC=124` -- the second one alone on the prebuilt binary, 168 of 253
+`stream::` tests in, no failure anywhere -- so the suite was SPLIT into three
+disjoint-by-filter arms, each under the cap:
+
+| arm | filter | result |
+|---|---|---|
+| A | `--skip stream::` | 333 passed, 0 failed, 30 ignored (661 s) |
+| B | `stream:: --skip 10bit` | 197 passed, 0 failed, 15 ignored (822 s) |
+| C | `10bit` | 42 passed, 0 failed, 1 ignored (99 s) |
+
+Arms A and C overlap on exactly 2 tests (the two `10bit` names outside
+`stream::`, counted from `--list`), and the binary holds 616 tests, so the
+UNION is **570 passed / 46 ignored / 0 failed**, which accounts for every test
+in the binary (570 + 46 = 616) and includes this lane's two: the filter
+witness (passed) and `last2_census` (ignored).
+
+Invariants, all green, all on the prebuilt release binary:
+
+| invariant | run | result |
+|---|---|---|
+| every preset decodes sample-exact through both decoders | `--include-ignored`, `EC_COMP_MISMATCH=1` | 1 passed |
+| tile / filter-stage bytes do not depend on the thread count | `--include-ignored` | 2 passed |
+| facade identity + `predicted_coeff_bits_track_the_tile_the_writer_wrote` | default | 2 passed |
+| pins 8562 / 33357 | `the_encoders_own_streams_are_byte_identical_to_their_pins`, in arm A | passed, UNCHANGED -- every lever ships off, so nothing was re-pinned |
+| the filter witness | `each_frame_interpolation_filter_codes_its_own_stream_ffmpeg_decodes_exactly` | passed (landed in f6a107ff) |
 
 ## 5. Deferred
 
