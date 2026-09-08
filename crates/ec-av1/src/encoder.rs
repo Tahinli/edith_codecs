@@ -961,6 +961,28 @@ const ANCHOR_SLOTS: [u8; 2] = [3, 4];
 /// The slot the leaf chain refreshes and reads as `LAST_FRAME`.
 const LEAF_SLOT: u8 = 0;
 
+/// lane-last2: the two slots the leaf chain alternates its refresh between
+/// once [`last2`] is on, so that the shown frame BEFORE `LAST_FRAME` is still
+/// in the DPB and can be named `LAST2_FRAME`. Slot 7 is the one the key frame
+/// writes and nothing has ever read back, so this costs no other level a slot;
+/// leaf `k` refreshes `LEAF_SLOTS[k % 2]`, which is the slot leaf `k - 2`
+/// wrote -- read before write, spec 7.20's decode order.
+const LEAF_SLOTS: [u8; 2] = [LEAF_SLOT, 7];
+
+/// Whether the leaf chain retains that second past picture and offers it to
+/// the block search as `LAST2_FRAME` (`EC_AV1_LAST2=0` / `=1`). The census
+/// that priced the lever is `lanes/refs.report.md` §1; what it buys on the
+/// gate is `lanes/last2.report.md`.
+fn last2() -> bool {
+    match std::env::var("EC_AV1_LAST2").ok() {
+        Some(v) => v != "0",
+        None => LAST2,
+    }
+}
+
+/// [`last2`]'s default.
+const LAST2: bool = false;
+
 /// The slot the mid-level hidden frame of a three-level group refreshes
 /// ([`Pyramid::mid_q_offset`]): free of the two anchors (3, 4), of the leaf
 /// chain (0) and of `GOLDEN_SLOT` (1), so all four levels are live at once.
@@ -1108,6 +1130,11 @@ pub struct Av1Encoder {
     /// Which of [`ANCHOR_SLOTS`] the group about to be coded reads as its
     /// anchor.
     anchor: usize,
+    /// lane-last2: the [`LEAF_SLOTS`] the last two SHOWN leaves refreshed,
+    /// most recent first, across mini-GOP boundaries (the first leaf of a
+    /// group reads the anchor as `LAST_FRAME`, so its `LAST2_FRAME` is the
+    /// previous group's last leaf). Cleared by every key frame.
+    leaf_hist: Vec<u8>,
     /// Coding-order position of the next packet — a packet's `dts`.
     next_dts: u64,
     /// Set by [`Av1Encoder::encode_sequence_pyramid`]: every coded frame's
@@ -1197,6 +1224,7 @@ impl Av1Encoder {
             pending: Vec::new(),
             held: std::collections::VecDeque::new(),
             anchor: 0,
+            leaf_hist: Vec::new(),
             next_dts: 0,
             collected: None,
         })
@@ -1468,6 +1496,7 @@ impl Av1Encoder {
                 self.carried_cdfs.as_ref().map(|c| &c.0),
                 self.golden.as_ref(),
                 self.prev2.as_ref(),
+                None,
                 &self.fctx,
                 None,
                 &lookahead.iter().map(|n| n.padded_to(SUPERBLOCK)).collect::<Vec<_>>(),
@@ -1607,6 +1636,9 @@ impl Av1Encoder {
         )?;
         self.refresh(&[0, 1, 2, 3, 4, 5, 6, 7], &encoded, 0);
         self.anchor = 0;
+        // Every leaf slot now holds the key frame, which `GOLDEN_FRAME`
+        // already names: the chain starts empty again.
+        self.leaf_hist.clear();
         let cropped = crop_encoded(&encoded, render.0, render.1);
         if let Some(rate_loop) = self.rate_loop.as_mut() {
             rate_loop.update(Level::Key, 0, cropped.stream.len());
@@ -1626,6 +1658,10 @@ impl Av1Encoder {
         last_slot: u8,
         self_slot: u8,
         altref_slot: u8,
+        // lane-last2: the slot read as `LAST2_FRAME`. `None` -- and any slot
+        // holding no picture, or the same one `LAST_FRAME` reads -- leaves
+        // the reference set exactly as it was before this lane.
+        last2_slot: Option<u8>,
         show_frame: bool,
         level: Level,
         // The quantizer offset comes from the CALLER, not from `level`: a
@@ -1659,8 +1695,19 @@ impl Av1Encoder {
                 .as_ref()
                 .is_some_and(|s| s.order_hint > order_hint)
         };
+        // A LAST2 slot only counts when it holds a picture that is not the
+        // one `LAST_FRAME` already names; otherwise the frame codes the
+        // reference set it always did.
+        let last2_slot = last2_slot
+            .filter(|&s| s != last_slot && self.dpb[s as usize].is_some());
         let slots = [
-            last_slot, last_slot, last_slot, GOLDEN_SLOT, last_slot, last_slot, altref_slot,
+            last_slot,
+            last2_slot.unwrap_or(last_slot),
+            last_slot,
+            GOLDEN_SLOT,
+            last_slot,
+            last_slot,
+            altref_slot,
         ];
         for (i, slot) in slots.into_iter().enumerate() {
             sign_bias[i] = ahead(slot, &self.dpb);
@@ -1678,6 +1725,7 @@ impl Av1Encoder {
             .ok_or_else(|| {
                 Error::unsupported("AV1 encode", "an inter frame needs a previous reconstruction")
             })?;
+        let last2 = last2_slot.and_then(|s| self.dpb[s as usize].as_ref().map(|d| d.picture.clone()));
         let golden = self.dpb[GOLDEN_SLOT as usize].as_ref().map(|s| s.picture.clone());
         let altref = (altref_slot != GOLDEN_SLOT)
             .then(|| self.dpb[altref_slot as usize].as_ref().map(|s| s.picture.clone()))
@@ -1694,11 +1742,13 @@ impl Av1Encoder {
             start_cdfs.as_ref(),
             golden.as_ref(),
             altref.as_ref(),
+            last2.as_ref(),
             &self.fctx,
             Some(crate::encode::PyramidFrame {
                 last_slot,
                 self_slot,
                 altref_slot,
+                last2_slot,
                 show_frame,
                 sign_bias,
             }),
@@ -1715,7 +1765,8 @@ impl Av1Encoder {
                 "AV1 encode",
                 format!(
                     "{level:?} frame at order {order} (last slot {last_slot}, self {self_slot}, \
-                     altref {altref_slot}, shown {show_frame}, golden {}, altref pic {}): {e}",
+                     altref {altref_slot}, last2 {last2_slot:?}, shown {show_frame}, golden {}, \
+                     altref pic {}): {e}",
                     golden.is_some(),
                     altref.is_some(),
                 ),
@@ -1758,6 +1809,13 @@ impl Av1Encoder {
             };
             window.into_iter().take(depth - 1).map(|p| p.padded_to(SUPERBLOCK)).collect()
         };
+        // lane-last2: the slot a frame reading `last_slot` as `LAST_FRAME`
+        // names as `LAST2_FRAME` -- the most recent shown leaf that is not
+        // the one it already reads. `None` with the lever off, or before two
+        // distinct past pictures exist.
+        let last2_of = |hist: &[u8], last_slot: u8| -> Option<u8> {
+            last2().then(|| hist.iter().copied().find(|&s| s != last_slot)).flatten()
+        };
         let anchor_slot = ANCHOR_SLOTS[self.anchor];
         let next_anchor_slot = ANCHOR_SLOTS[1 - self.anchor];
         let (arf_order, arf_picture) = group.last().cloned().expect("non-empty");
@@ -1771,6 +1829,7 @@ impl Av1Encoder {
                 anchor_slot,
                 next_anchor_slot,
                 GOLDEN_SLOT,
+                last2_of(&self.leaf_hist, anchor_slot),
                 true,
                 Level::Leaf,
                 pyramid.leaf_q_offset,
@@ -1793,6 +1852,10 @@ impl Av1Encoder {
                 true => next_anchor_slot,
                 false => GOLDEN_SLOT,
             },
+            // The ARF levels take no LAST2: the anchor pair already gives a
+            // top ARF two distinct past anchors (`arf_altref`), and the mid
+            // and quarter frames have only the one past anchor in the DPB.
+            None,
             false,
             Level::Arf,
             pyramid.arf_q_offset,
@@ -1826,6 +1889,7 @@ impl Av1Encoder {
                 anchor_slot,
                 MID_SLOT,
                 next_anchor_slot,
+                None,
                 false,
                 Level::Arf,
                 offset,
@@ -1862,6 +1926,7 @@ impl Av1Encoder {
                     last_slot,
                     QUARTER_SLOTS[i],
                     altref_slot,
+                    None,
                     false,
                     Level::Arf,
                     offset,
@@ -1902,23 +1967,42 @@ impl Av1Encoder {
                 packets.push(packet);
                 continue;
             }
+            // The previous shown leaf's own slot: `LEAF_SLOT` with the
+            // lever off, and with it on whichever of [`LEAF_SLOTS`] that leaf
+            // refreshed.
+            let prev_leaf = self.leaf_hist.first().copied().unwrap_or(LEAF_SLOT);
             let last_slot = match i {
                 0 => anchor_slot,
                 i => inner
                     .iter()
                     .find(|(at, _)| at + 1 == i)
-                    .map_or(LEAF_SLOT, |&(_, slot)| slot),
+                    .map_or(prev_leaf, |&(_, slot)| slot),
             };
+            // Alternate the refresh: this leaf takes the leaf slot the
+            // PREVIOUS leaf did not, which is the one the leaf before that
+            // wrote and which this frame may still read as `LAST2_FRAME`
+            // (read before write).
+            let self_slot = match last2() {
+                true => LEAF_SLOTS
+                    .into_iter()
+                    .find(|&s| Some(s) != self.leaf_hist.first().copied())
+                    .unwrap_or(LEAF_SLOT),
+                false => LEAF_SLOT,
+            };
+            let last2_slot = last2_of(&self.leaf_hist, last_slot);
             let altref_slot = inner
                 .iter()
                 .find(|(at, _)| *at > i)
                 .map_or(next_anchor_slot, |&(_, slot)| slot);
+            self.leaf_hist.insert(0, self_slot);
+            self.leaf_hist.truncate(2);
             packets.push(self.encode_pyramid_inter(
                 *order,
                 picture,
                 last_slot,
-                LEAF_SLOT,
+                self_slot,
                 altref_slot,
+                last2_slot,
                 true,
                 Level::Leaf,
                 pyramid.leaf_q_offset,
