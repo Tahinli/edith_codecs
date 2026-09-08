@@ -469,6 +469,31 @@ pub(crate) fn arm_screen(on: bool) {
     SCREEN.with(|c| c.set(on));
 }
 
+thread_local! {
+    /// This frame's `(mi_rows, mi_cols)` (spec `compute_image_size`), armed
+    /// beside [`SCREEN`] by both frame encoders: a palette block cut by the
+    /// frame's right/bottom mi edge codes its colour-index map over the
+    /// ON-SCREEN part only, so the writer needs the same dims the decoder's
+    /// `palette_onscreen` reads off its `FrameCtx` (lane-palw). `(0, 0)`
+    /// -- an unarmed writer, i.e. a unit test coding one block -- clamps
+    /// nothing, which is what every stream without a cut palette block codes.
+    static FRAME_MI_DIMS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Arms the next tile write with this frame's `(mi_rows, mi_cols)`.
+pub(crate) fn arm_frame_mi_dims(dims: (usize, usize)) {
+    FRAME_MI_DIMS.with(|c| c.set(dims));
+}
+
+/// The armed `(mi_rows, mi_cols)`, or a grid big enough to clamp nothing.
+fn frame_mi_dims() -> (usize, usize) {
+    match FRAME_MI_DIMS.with(std::cell::Cell::get) {
+        (0, 0) => (usize::MAX / 8, usize::MAX / 8),
+        dims => dims,
+    }
+}
+
 fn screen_armed() -> bool {
     SCREEN.with(std::cell::Cell::get)
 }
@@ -3460,10 +3485,18 @@ fn write_color_index_map(
     map: &[u8],
     side: usize,
     n: usize,
+    // spec 5.11.50 `onscreenWidth`/`onscreenHeight` in this map's own units:
+    // a block cut by the frame's right/bottom mi edge codes ONLY this corner
+    // and the decoder replicates it outward (`decode::palette_replicate`).
+    // Writing the full grid spent symbols a conformant decoder never reads,
+    // desyncing the rest of the tile (lane-palw, class
+    // writer-phantom-units-past-edge).
+    on: (usize, usize),
 ) {
+    let (on_w, on_h) = (on.0.clamp(1, side), on.1.clamp(1, side));
     write_uniform(enc, usize::from(map[0]), n);
-    for i in 1..(2 * side - 1) {
-        for j in (i.saturating_sub(side - 1)..=i.min(side - 1)).rev() {
+    for i in 1..(on_w + on_h - 1) {
+        for j in (i.saturating_sub(on_h - 1)..=i.min(on_w - 1)).rev() {
             let (row, col) = (i - j, j);
             let (ctx, color_order) =
                 crate::decode::palette_color_index_context(map, side, row, col, n);
@@ -3483,7 +3516,7 @@ fn write_color_index_map(
 /// search reads the rate the tile will really spend, not an estimate of it.
 /// The neighbour cache is taken as empty (the search runs before the tile
 /// knows what its neighbours will be), which only ever over-prices.
-pub(crate) fn palette_bits(pal: &PaletteY, side: usize) -> f64 {
+pub(crate) fn palette_bits(pal: &PaletteY, side: usize, on: (usize, usize)) -> f64 {
     let Some(bsize_ctx) = crate::decode::palette_bsize_ctx(side) else {
         return f64::INFINITY;
     };
@@ -3495,14 +3528,14 @@ pub(crate) fn palette_bits(pal: &PaletteY, side: usize) -> f64 {
     enc.symbol(n - 2, &mut size_cdf);
     write_palette_colors_y(&mut enc, &pal.colors[..n], &[]);
     let mut idx_cdfs = cdf::PALETTE_Y_COLOR_INDEX[n - 2];
-    write_color_index_map(&mut enc, &mut idx_cdfs, &pal.map, side, n);
+    write_color_index_map(&mut enc, &mut idx_cdfs, &pal.map, side, n, on);
     enc.bits()
 }
 
 /// [`palette_bits`] for the chroma palette: the `palette_uv_mode` flag, the
 /// size symbol, both colour lists and the shared colour-index map, priced
 /// through the very writers above (empty cache, which only over-prices).
-pub(crate) fn palette_uv_bits(pal: &PaletteUv, side: usize) -> f64 {
+pub(crate) fn palette_uv_bits(pal: &PaletteUv, side: usize, on: (usize, usize)) -> f64 {
     let Some(bsize_ctx) = crate::decode::palette_bsize_ctx(side) else {
         return f64::INFINITY;
     };
@@ -3514,7 +3547,7 @@ pub(crate) fn palette_uv_bits(pal: &PaletteUv, side: usize) -> f64 {
     enc.symbol(n - 2, &mut size_cdf);
     write_palette_colors_uv(&mut enc, &pal.u_colors[..n], &pal.v_colors[..n], &[]);
     let mut idx_cdfs = cdf::PALETTE_UV_COLOR_INDEX[n - 2];
-    write_color_index_map(&mut enc, &mut idx_cdfs, &pal.map, palette_uv_side(side), n);
+    write_color_index_map(&mut enc, &mut idx_cdfs, &pal.map, palette_uv_side(side), n, on);
     enc.bits()
 }
 
@@ -3903,19 +3936,34 @@ fn write_palette_syntax(
         write_filter_intra(enc, cdfs, mode, side, palette.is_some(), filter_intra);
         // Both colour-index maps come after BOTH colour lists, in plane order
         // (`av1_visit_palette` runs from the caller, past `filter_intra`).
+        // The on-screen extent of THIS block, from the frame mi dims armed
+        // for this tile write -- the decoder's `palette_onscreen` half.
+        let on = crate::decode::palette_onscreen_dims(mi.0, mi.1, side, side, frame_mi_dims());
+        if (on.0 < side || on.1 < side) && (palette.is_some() || palette_uv.is_some()) {
+            PALETTE_CUT_MAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(pal) = palette {
             let n = usize::from(pal.size);
-            write_color_index_map(enc, &mut cdfs.palette_y_color_index[n - 2], &pal.map, side, n);
+            write_color_index_map(
+                enc,
+                &mut cdfs.palette_y_color_index[n - 2],
+                &pal.map,
+                side,
+                n,
+                on,
+            );
             note_palette(n);
         }
         if let Some(pal) = palette_uv {
             let n = usize::from(pal.size);
+            let uv_side = palette_uv_side(side);
             write_color_index_map(
                 enc,
                 &mut cdfs.palette_uv_color_index[n - 2],
                 &pal.map,
-                palette_uv_side(side),
+                uv_side,
                 n,
+                crate::decode::palette_onscreen_uv((side, side), on, (uv_side, uv_side)),
             );
             note_palette_uv(n);
         }
@@ -3942,6 +3990,23 @@ pub(crate) fn palette_uv_side(side: usize) -> usize {
 /// per-size histogram.
 static PALETTE_HITS: [std::sync::atomic::AtomicUsize; 9] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; 9];
+
+/// lane-palw: colour-index maps written over the ON-SCREEN corner only,
+/// i.e. palette blocks this writer cut at the frame's right/bottom mi edge.
+/// A gate asserts it non-zero so it cannot pass on a stream that never cuts
+/// one (class `gate-blind-to-feature`).
+static PALETTE_CUT_MAPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`PALETTE_CUT_MAPS`] (colour-index maps).
+pub fn palette_cut_maps_written() -> usize {
+    PALETTE_CUT_MAPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Zeroes [`PALETTE_CUT_MAPS`] before a gate's own encode.
+pub fn reset_palette_cut_maps_written() {
+    PALETTE_CUT_MAPS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
 
 fn note_palette(n: usize) {
     PALETTE_HITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
