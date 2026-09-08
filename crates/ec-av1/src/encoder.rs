@@ -186,6 +186,29 @@ fn census_on() -> bool {
     std::env::var("EC_AV1_RL_CENSUS").is_ok_and(|v| v == "1")
 }
 
+/// One level of a run, as the re-plan sees it: how much of the run's weight
+/// it carries, how much of that is still to be coded, and -- once its
+/// effective quantizer has hit the coder's 1..=255 bound -- the leaf-
+/// equivalent bytes it actually spends there.
+#[derive(Debug, Clone, Copy)]
+struct LevelPlan {
+    /// The controller slot this level shares ([`RateLoop::slot`]).
+    slot: usize,
+    /// The level's own `base_q_idx` offset: what tells two hidden levels
+    /// apart inside slot 1.
+    offset: i16,
+    weight: f64,
+    left: f64,
+    bound: bool,
+    rate: f64,
+}
+
+impl LevelPlan {
+    fn new(slot: usize, offset: i16, weight: f64) -> Self {
+        Self { slot, offset, weight, left: weight, bound: false, rate: 0.0 }
+    }
+}
+
 /// The closed-loop controller behind [`RateTarget::BytesPerFrame`] and
 /// [`RateTarget::Bitrate`]: a proportional step on `base_q_idx`, sized from
 /// the calibration sweep's own log-linear slope (bytes roughly halve every
@@ -228,17 +251,16 @@ struct RateLoop {
     /// What is left of both, ahead of the next frame.
     left_weight: f64,
     left_bytes: f64,
-    /// The same weights split PER SLOT ([`RateLoop::slot`]): the run's, and
-    /// what is left of it. A level whose effective quantizer has hit a bound
+    /// The run's shape, ONE ENTRY PER LEVEL: the key, each distinct hidden
+    /// offset, the leaves. A level whose effective quantizer has hit a bound
     /// cannot follow the plan, so [`RateLoop::replan`] prices its remaining
     /// weight at what it MEASURABLY spends and re-solves the run's budget
-    /// over the levels that can still move.
-    run_weight_slot: [f64; 3],
-    left_weight_slot: [f64; 3],
-    /// Per slot: whether its last coded frame's `base_q_idx + offset` hit the
-    /// 1..=255 bound, and the leaf-equivalent bytes it spends while it does.
-    bound: [bool; 3],
-    bound_rate: [f64; 3],
+    /// over the levels that can still move. Per LEVEL and not per slot: the
+    /// hidden slot mixes the top and mid ARFs, whose leaf-equivalent rates
+    /// differ by 4x at the floor (both code the same bytes at `q_idx` 1, at
+    /// weights that differ by that much), and projecting one onto the other's
+    /// remaining weight drove the whole plan negative.
+    plans: [Option<LevelPlan>; 5],
     /// The plan's scale at construction — the WINDUP BOUND on the re-plan:
     /// a level held at its bound hands its unspent bytes to the others, but
     /// no level's target may exceed this many times its own opening share.
@@ -262,6 +284,12 @@ impl RateLoop {
     /// its opening share. Without it a run whose hidden levels are all at the
     /// floor would keep piling the whole run's budget onto the leaves.
     const REPLAN_CLAMP: f64 = 4.0;
+    /// The same bound the other way: a re-plan may not drive a level's target
+    /// below this multiple of its opening share. A target of zero would STOP
+    /// the loop outright ([`RateLoop::update`] returns on a non-positive
+    /// target), which is how the first cut of this fix froze every level of a
+    /// run at whatever quantizer it had reached.
+    const REPLAN_FLOOR: f64 = 0.25;
 
     fn new(target_bytes: f64, start_q: f64, pyramid: Option<Pyramid>, gop: usize) -> Self {
         let Some(p) = pyramid else {
@@ -276,10 +304,7 @@ impl RateLoop {
                 run_bytes: 0.0,
                 left_weight: 0.0,
                 left_bytes: 0.0,
-                run_weight_slot: [0.0; 3],
-                left_weight_slot: [0.0; 3],
-                bound: [false; 3],
-                bound_rate: [0.0; 3],
+                plans: [None; 5],
                 scale0: target_bytes,
                 census: census_on(),
                 coded: 0,
@@ -313,7 +338,16 @@ impl RateLoop {
         // `w(offset)`. Measuring each hidden frame against its OWN predicted
         // size is what keeps the shared slot from oscillating between the
         // levels it mixes.
-        let hidden_weight: f64 = hidden.iter().map(|&(o, n)| n as f64 * w(o)).sum();
+        // One plan per level, in coding order: key, hidden levels (at most
+        // three distinct offsets -- top, mid, quarters), leaves.
+        let mut plans = [None; 5];
+        plans[0] = Some(LevelPlan::new(0, p.key_q_offset, key));
+        let mut i = 1;
+        for &(o, n) in hidden.iter().take(3) {
+            plans[i] = Some(LevelPlan::new(1, o, n as f64 * w(o)));
+            i += 1;
+        }
+        plans[i] = Some(LevelPlan::new(2, p.leaf_q_offset, leaves as f64));
         Self {
             target: [scale * key, scale, scale],
             q: [start_q; 3],
@@ -325,10 +359,7 @@ impl RateLoop {
             run_bytes: target_bytes * gop.max(1) as f64,
             left_weight: total,
             left_bytes: target_bytes * gop.max(1) as f64,
-            run_weight_slot: [key, hidden_weight, leaves as f64],
-            left_weight_slot: [key, hidden_weight, leaves as f64],
-            bound: [false; 3],
-            bound_rate: [0.0; 3],
+            plans,
             scale0: scale,
             census: census_on(),
             coded: 0,
@@ -339,6 +370,14 @@ impl RateLoop {
     /// leaf-equivalent bytes ([`WEIGHT_LEVEL_GAIN`]).
     fn weight(&self, offset: i16) -> f64 {
         ((f64::from(self.leaf_q_offset) - f64::from(offset)) * WEIGHT_LEVEL_GAIN).exp()
+    }
+
+    /// Which [`LevelPlan`] a coded frame belongs to. Only the hidden slot
+    /// holds more than one level, so only there does the offset decide.
+    fn plan_of(&self, slot: usize, offset: i16) -> Option<usize> {
+        self.plans
+            .iter()
+            .position(|p| p.is_some_and(|p| p.slot == slot && (slot != 1 || p.offset == offset)))
     }
 
     /// Which controller a level uses: one shared slot on the flat path, three
@@ -401,8 +440,11 @@ impl RateLoop {
             raw
         };
         self.q[slot] = (self.q[slot] + step).clamp(0.0, 255.0);
-        self.bound[slot] = !(1..=255).contains(&raw_q);
-        self.bound_rate[slot] = actual_bytes as f64 / frame_weight.max(f64::EPSILON);
+        let bound = !(1..=255).contains(&raw_q);
+        if let Some(plan) = self.plan_of(slot, offset).and_then(|i| self.plans[i].as_mut()) {
+            plan.bound = bound;
+            plan.rate = actual_bytes as f64 / frame_weight.max(f64::EPSILON);
+        }
         if self.census {
             eprintln!(
                 "RLCENSUS n={} level={level:?} slot={slot} target={target:.0} actual={actual_bytes} \
@@ -410,13 +452,13 @@ impl RateLoop {
                 self.coded,
                 self.q[slot],
                 raw_q.clamp(1, 255),
-                self.bound[slot],
+                bound,
                 self.left_bytes,
                 self.left_weight,
             );
             self.coded += 1;
         }
-        self.replan(level, slot, frame_weight, actual_bytes as f64);
+        self.replan(level, slot, offset, frame_weight, actual_bytes as f64);
     }
 
     /// Re-plans the REST OF THE RUN from what it has actually spent: the
@@ -436,18 +478,22 @@ impl RateLoop {
     /// clamped proportional step, the re-plan only moves the TARGET the next
     /// frame is measured against, and every key frame resets the whole plan,
     /// so no debt outlives one run.
-    fn replan(&mut self, level: Level, slot: usize, frame_weight: f64, actual_bytes: f64) {
+    fn replan(&mut self, level: Level, slot: usize, offset: i16, frame_weight: f64, actual_bytes: f64) {
         if !self.per_level {
             return;
         }
         if level == Level::Key {
             self.left_weight = self.run_weight;
             self.left_bytes = self.run_bytes;
-            self.left_weight_slot = self.run_weight_slot;
+            for plan in self.plans.iter_mut().flatten() {
+                plan.left = plan.weight;
+            }
         }
         self.left_weight -= frame_weight;
         self.left_bytes -= actual_bytes;
-        self.left_weight_slot[slot] = (self.left_weight_slot[slot] - frame_weight).max(0.0);
+        if let Some(plan) = self.plan_of(slot, offset).and_then(|i| self.plans[i].as_mut()) {
+            plan.left = (plan.left - frame_weight).max(0.0);
+        }
         // The tail of a run is not re-planned: under a leaf's worth of weight
         // left, the division is noise.
         if self.left_weight <= 1.0 {
@@ -469,18 +515,19 @@ impl RateLoop {
             return;
         }
         let (mut bytes, mut weight) = (self.left_bytes, 0.0);
-        for s in 0..3 {
-            if self.bound[s] {
-                bytes -= self.bound_rate[s] * self.left_weight_slot[s];
+        for plan in self.plans.iter().flatten() {
+            if plan.bound {
+                bytes -= plan.rate * plan.left;
             } else {
-                weight += self.left_weight_slot[s];
+                weight += plan.left;
             }
         }
         if weight <= 1.0 {
             // Every movable level is spent: nothing left to re-solve over.
             return;
         }
-        let scale = (bytes / weight).max(0.0).min(self.scale0 * Self::REPLAN_CLAMP);
+        let scale = (bytes / weight)
+            .clamp(self.scale0 * Self::REPLAN_FLOOR, self.scale0 * Self::REPLAN_CLAMP);
         self.target = [scale * self.key_weight, scale, scale];
     }
 }
@@ -2340,15 +2387,15 @@ mod tests {
         // floor and spends half of its.
         let key_bytes = rl.target[0].round();
         rl.update(Level::Key, 0, 100, key_bytes as usize);
-        let (offset, _) = hidden[0];
+        let (offset, n0) = hidden[0];
         let arf_bytes = (0.5 * scale0 * rl.weight(offset)).round();
         rl.update(Level::Arf, offset, 0, arf_bytes as usize);
-        // Every hidden frame still to come is priced at the rate the bound
-        // one measured; the leaves get the whole rest.
-        let rate = arf_bytes / rl.weight(offset);
-        let want =
-            (run_bytes - key_bytes - arf_bytes - rate * (hidden_weight - rl.weight(offset)))
-                / leaves as f64;
+        // Every frame of THAT LEVEL still to come is priced at what the bound
+        // one measured -- and only that level: its slot-mates (the mid ARF)
+        // sit at their own offset and are still free to follow the plan.
+        // Everything else shares the rest.
+        let want = (run_bytes - key_bytes - arf_bytes * n0 as f64)
+            / (leaves as f64 + hidden_weight - n0 as f64 * rl.weight(offset));
         assert!(
             want < scale0 * RateLoop::REPLAN_CLAMP,
             "this arm must not reach the windup bound: {want:.1} vs {:.1}",
@@ -2375,6 +2422,21 @@ mod tests {
             "the re-plan is unbounded: leaf target {:.1} past {:.1}",
             rl.target[2],
             scale0 * RateLoop::REPLAN_CLAMP
+        );
+        // ... and BOTH ways: a re-plan that reached zero would stop the loop
+        // dead (`update` returns on a non-positive target).
+        let mut rl = RateLoop::new(target_bytes, 100.0, Some(pyramid), gop);
+        rl.update(Level::Key, 0, 100, key_bytes as usize);
+        for &(offset, n) in &hidden {
+            for _ in 0..n {
+                rl.update(Level::Arf, offset, 0, 40 * key_bytes as usize);
+            }
+        }
+        assert!(
+            rl.target[2] >= scale0 * RateLoop::REPLAN_FLOOR - 1e-9,
+            "the re-plan froze the loop: leaf target {:.1} under {:.1}",
+            rl.target[2],
+            scale0 * RateLoop::REPLAN_FLOOR
         );
     }
 
