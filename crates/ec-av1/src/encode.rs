@@ -11964,12 +11964,13 @@ pub(crate) struct PyramidFrame {
 /// one's (film A 5.9%) with the two past neighbours at strength 30, and the
 /// filtered picture is 50.1 dB from the source it replaces -- 4 dB above the
 /// quality the ARF is coded at, so the substitution itself costs little.
+// lane-lookahead: the CALLER sizes `window` (`ARF_TF_WIN` past neighbours and
+// `ARF_TF_WIN_FUT` future ones); this takes every picture in it.
 pub(crate) fn arf_temporal_filter(src: &Picture, window: &[Picture], strength: f64) -> Picture {
     const SIDE: usize = 16;
     let neighbours: Vec<&Picture> = window
         .iter()
         .filter(|p| p.width == src.width && p.height == src.height)
-        .take(crate::encoder::arf_tf_window())
         .collect();
     if neighbours.is_empty() || strength <= 0.0 {
         return src.clone();
