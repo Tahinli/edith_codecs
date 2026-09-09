@@ -826,6 +826,80 @@ pub(crate) fn force_b128_rect(which: u8) {
     FORCE_B128_RECT.store(which, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// lane-ab128: whether the 128 superblock root offers its four AB shapes --
+/// `PARTITION_HORZ_A` (two 64x64 on top, one 128x64 below), `_HORZ_B` (one
+/// 128x64 on top, two 64x64 below), `_VERT_A` (two 64x64 left, one 64x128
+/// right) and `_VERT_B` (one 64x128 left, two 64x64 right). Every piece is
+/// the same skip-only single-reference/compound block the NONE and HORZ/VERT
+/// arms ship, at its own footprint ([`search_root_128_ab`],
+/// `crate::tile::write_inter_block_128_rect`). `EC_AV1_B128AB=0` is this
+/// arm's attribution control.
+///
+/// **Off by default** (`EC_AV1_B128AB=1` turns it on): measured on both gates
+/// and it does not pay. The shapes fire 0-2 roots a frame against ~1000 coded
+/// blocks (`EC_AV1_B128_CENSUS`), and every row is flat or 0.1 worse --
+/// long-GOP film A +22.0/-8.5 against a +21.9/-8.6 control, film B +75.8/+0.8
+/// against the same, 12-frame film A +18.1/-6.2 against +18.0/-6.3, film B
+/// +23.1/-3.3 against +23.0/-3.5, screen byte-identical (lane-ab128). The
+/// machinery is written, witnessed sample-exact through both decoders on all
+/// four shapes, and kept for the arm that makes it pay: a non-skip piece (the
+/// 64x64 pieces could carry the 64 root's residual, which is where libaom's
+/// AB shapes earn their keep) or a cheaper partition price.
+fn b128_ab() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B128AB").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(false) && b128_root()
+}
+
+/// How many 128 roots the search left as each AB shape since the last take,
+/// in `PARTITION_HORZ_A`, `_HORZ_B`, `_VERT_A`, `_VERT_B` order (class
+/// `gate-blind-to-feature`).
+static B128_AB_HITS: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+
+/// The four per-shape AB-root counts since the last call, and zero them.
+pub fn take_b128_ab_hits() -> [usize; 4] {
+    std::array::from_fn(|i| B128_AB_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Test-only: force the 128 root's AB shape whatever it costs -- 0 off, then
+/// 4..=7, the partition symbol itself ([`force_b128_rect`]'s twin; synthetic
+/// content is where the shapes are cheapest to decode-check and the RD there
+/// prefers one whole block).
+static FORCE_B128_AB: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Arms [`FORCE_B128_AB`] for the rest of the process (0 off, else 4..=7).
+#[cfg(test)]
+pub(crate) fn force_b128_ab(which: u8) {
+    FORCE_B128_AB.store(which, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// lane-ab128: the three pieces of an AB shape at a 128 root, in the order
+/// libaom's `decode_partition` codes them and decode.rs' `sb128_ab` arm
+/// reads them (decode.rs ~35269) -- HORZ_A = TL, TR, bottom half; HORZ_B =
+/// top half, BL, BR; VERT_A = TL, BL, right half; VERT_B = left half, TR, BR.
+/// Each entry is the piece's own top-left in mode-info units and its
+/// footprint in samples.
+pub(crate) fn ab128_pieces(
+    symbol: usize,
+    (mi_row, mi_col): (usize, usize),
+) -> [((usize, usize), (usize, usize)); 3] {
+    const S: usize = SUPERBLOCK;
+    let (r, c) = (mi_row, mi_col);
+    let (r1, c1) = (mi_row + 16, mi_col + 16);
+    match symbol {
+        // PARTITION_HORZ_A
+        4 => [((r, c), (S, S)), ((r, c1), (S, S)), ((r1, c), (S * 2, S))],
+        // PARTITION_HORZ_B
+        5 => [((r, c), (S * 2, S)), ((r1, c), (S, S)), ((r1, c1), (S, S))],
+        // PARTITION_VERT_A
+        6 => [((r, c), (S, S)), ((r1, c), (S, S)), ((r, c1), (S, S * 2))],
+        // PARTITION_VERT_B
+        _ => [((r, c), (S, S * 2)), ((r, c1), (S, S)), ((r1, c1), (S, S))],
+    }
+}
+
 /// Test-only: take the 128 root's residual arm whatever it costs, so a
 /// witness clip codes the shape rather than waiting for content on which the
 /// RD picks it (the same role [`force_sb128`] plays for the superblock size).
@@ -9891,6 +9965,156 @@ fn search_root_128_rect(
     ))
 }
 
+/// lane-ab128: one AB shape at a 128 superblock root -- two 64x64 blocks and
+/// one 128x64 / 64x128 half, in the order [`ab128_pieces`] gives (the
+/// decoder's own). Each piece is priced through the same `search_skip_64`
+/// the NONE and HORZ/VERT arms use, at its own footprint, and is published
+/// into `grid` before the next is searched -- the writer publishes it too, so
+/// a later piece searched against a stale grid would be priced (and its mv
+/// predicted) off a stack the decoder never derives (class
+/// `encoder-grid-drift-invisible-to-pixel-gate`). The grid and both planes
+/// are put back before returning; the caller re-applies the winner.
+///
+/// SKIP only, for the reason [`search_root_128_rect`] gives: the 128 residual
+/// arm the pieces would share is itself parked behind `EC_AV1_B128RES`.
+///
+/// Returns `(cost, lambda, the three pieces, reconstruction)`, the cost
+/// already carrying the root's own partition symbol so it ranks against the
+/// other root candidates and against the four superblocks below.
+#[allow(clippy::too_many_arguments)]
+fn search_root_128_ab(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    grid: &mut crate::mvstack::MiGrid,
+    (root_r, root_c): (usize, usize),
+    (rows, cols): (usize, usize),
+    (mi_cols, mi_rows): (u32, u32),
+    search: Search<'_>,
+    tpl_factors: &Option<Vec<f64>>,
+    sb_q: Option<&Vec<u8>>,
+    sb_cols: usize,
+    tpl_cells_x: usize,
+    base_q_idx: u8,
+    reference: &Picture,
+    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
+    // The partition symbol, 4..=7.
+    symbol: usize,
+    fctx: &crate::decode::FrameCtx,
+) -> Option<(f64, f64, [BlockCoeffs; 3], [(Vec<u8>, Vec<CoefCtx>); 3])> {
+    const SIDE: usize = SUPERBLOCK * 2;
+    const SIDE_MI: usize = SIDE / 4;
+    let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
+    let (mi_row, mi_col) = (root_r * 16, root_c * 16);
+    if root_r * 2 + 3 >= rows
+        || root_c * 2 + 3 >= cols
+        || (mi_row + SIDE_MI) as u32 > mi_rows
+        || (mi_col + SIDE_MI) as u32 > mi_cols
+        || x128 + SIDE > luma.true_width
+        || y128 + SIDE > luma.true_height
+    {
+        return None;
+    }
+    // The root's own lambda, the mean of its four superblocks' -- the same one
+    // [`search_root_128`] prices with, so every root candidate and the
+    // four-superblock arm are comparable.
+    let cell_lambda = |sb_r: usize, sb_c: usize| match (sb_q, tpl_factors) {
+        (Some(q), _) => sb_q_search(q, sb_cols, base_q_idx, (sb_r, sb_c), search).lambda,
+        (None, Some(f)) => {
+            let mean = (0..16)
+                .map(|i| f[(sb_r * 4 + i / 4) * tpl_cells_x + sb_c * 4 + i % 4])
+                .sum::<f64>()
+                / 16.0;
+            search.lambda * mean
+        }
+        (None, None) => search.lambda,
+    };
+    let lambda = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        .iter()
+        .map(|&(dr, dc)| cell_lambda(root_r + dr, root_c + dc))
+        .sum::<f64>()
+        / 4.0;
+    let root_search = Search {
+        lambda,
+        ..match sb_q {
+            Some(q) => sb_q_search(q, sb_cols, base_q_idx, (root_r, root_c), search),
+            None => search,
+        }
+    };
+    let base = snapshot(luma, chroma, (x128, y128), SIDE);
+    let grid_base = grid.snapshot_rect(mi_row, mi_col, SIDE_MI, SIDE_MI);
+    let mut cost = 0.0f64;
+    let mut pieces: Vec<BlockCoeffs> = Vec::with_capacity(3);
+    for ((mr, mc), (w, h)) in ab128_pieces(symbol, (mi_row, mi_col)) {
+        let (w_mi, h_mi) = (w / 4, h / 4);
+        let stack = find_mv_stack(
+            grid,
+            mr,
+            mc,
+            w_mi,
+            h_mi,
+            LAST_FRAME,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+        let piece_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> = compound
+            .iter()
+            .map(|&(r, pic, _)| {
+                (
+                    r,
+                    pic,
+                    crate::mvstack::find_mv_stack_compound(
+                        grid,
+                        mr,
+                        mc,
+                        w_mi,
+                        h_mi,
+                        (LAST_FRAME, r),
+                        mi_cols as usize,
+                        mi_rows as usize,
+                        grid.sign_bias_table(),
+                        &[(0, 0); 7],
+                        None,
+                    ),
+                )
+            })
+            .collect();
+        let found = search_skip_64(
+            luma,
+            chroma,
+            (mc * 4, mr * 4),
+            (w, h),
+            &root_search,
+            false,
+            reference,
+            &stack,
+            &piece_compound,
+            fctx,
+        );
+        match found {
+            Some((c, block)) => {
+                cost += c;
+                record_mi_rect(grid, mr, mc, (w_mi, h_mi), block.inter, block.skip);
+                pieces.push(block);
+            }
+            None => {
+                restore(luma, chroma, (x128, y128), SIDE, &base);
+                grid.restore_rect(mi_row, mi_col, SIDE_MI, SIDE_MI, &grid_base);
+                return None;
+            }
+        }
+    }
+    let after = snapshot(luma, chroma, (x128, y128), SIDE);
+    restore(luma, chroma, (x128, y128), SIDE, &base);
+    grid.restore_rect(mi_row, mi_col, SIDE_MI, SIDE_MI, &grid_base);
+    let [b0, b1, b2] = <[BlockCoeffs; 3]>::try_from(pieces).ok()?;
+    Some((
+        cost + lambda * crate::tile::partition_bits_sym(SIDE, symbol),
+        lambda,
+        [b0, b1, b2],
+        after,
+    ))
+}
+
 /// The 64x64 `PARTITION_NONE` candidate for a whole superblock ([`B64_ROOT`]):
 /// single-reference LAST at `NEARESTMV`/`GLOBALMV`/`NEARMV`/`NEWMV`, coded
 /// SKIP, priced through the same `symbol_bits` path every other candidate
@@ -12660,6 +12884,47 @@ pub(crate) fn encode_inter_frame(
                 best
             })
             .flatten();
+        // lane-ab128: and the same root as one of the four AB shapes -- two
+        // 64x64 pieces plus one 128x64 / 64x128 half. All four are priced;
+        // the cheapest joins the candidate list below.
+        let forced_ab = FORCE_B128_AB.load(std::sync::atomic::Ordering::Relaxed);
+        let root_ab = (sb128_search
+            && (b128_ab() || forced_ab != 0)
+            && cells.len() == 4
+            && forced_rect == 0)
+            .then(|| {
+                let mut best: Option<(usize, _)> = None;
+                for symbol in 4..=7usize {
+                    if forced_ab != 0 && usize::from(forced_ab) != symbol {
+                        continue;
+                    }
+                    let Some(found) = search_root_128_ab(
+                        &mut luma,
+                        &mut chroma,
+                        &mut grid,
+                        (root_r, root_c),
+                        (rows, cols),
+                        (header.mi_cols, header.mi_rows),
+                        search,
+                        &tpl_factors,
+                        sb_q.as_ref(),
+                        sb_cols,
+                        tpl_cells_x,
+                        base_q_idx,
+                        reference,
+                        &root_compound,
+                        symbol,
+                        fctx,
+                    ) else {
+                        continue;
+                    };
+                    if best.as_ref().is_none_or(|b: &(usize, (f64, f64, _, _))| found.0 < b.1.0) {
+                        best = Some((symbol, found));
+                    }
+                }
+                best
+            })
+            .flatten();
         for (sb_r, sb_c) in cells {
             // lane-b64: the whole superblock as ONE 64x64 block, tried before
             // its quadrants are (`search_skip_64`) and compared against the
@@ -13238,18 +13503,26 @@ pub(crate) fn encode_inter_frame(
         // `partition_w128` symbol) against what its four superblocks really
         // cost, the same weighing the 64 root does one size down. Both sides
         // carry their own partition symbol, so the comparison is complete.
-        // lane-b128hv: `None` is the NONE arm, `Some(horz)` a rect cut.
-        let mut cands: Vec<(f64, f64, Option<bool>, Vec<BlockCoeffs>, _)> = Vec::new();
+        // The root candidates, each tagged with the PARTITION symbol its
+        // writer codes: 0 NONE, 1 HORZ, 2 VERT (lane-b128hv), 4..=7 the AB
+        // shapes (lane-ab128).
+        let mut cands: Vec<(f64, f64, usize, Vec<BlockCoeffs>, _)> = Vec::new();
         if let Some((c, l, b, a)) = root128 {
-            cands.push((c, l, None, vec![b], a));
+            cands.push((c, l, 0, vec![b], a));
         }
         if let Some((horz, (c, l, halves, a))) = root_rect {
-            cands.push((c, l, Some(horz), halves.to_vec(), a));
+            cands.push((c, l, usize::from(!horz) + 1, halves.to_vec(), a));
         }
-        // The rect witness knob drops the NONE arm outright: on synthetic
+        if let Some((symbol, (c, l, pieces, a))) = root_ab {
+            cands.push((c, l, symbol, pieces.to_vec(), a));
+        }
+        // The witness knobs drop every other arm outright: on synthetic
         // content the whole block always wins its own comparison.
         if forced_rect != 0 {
-            cands.retain(|c| c.2.is_some());
+            cands.retain(|c| c.2 == 1 || c.2 == 2);
+        }
+        if forced_ab != 0 {
+            cands.retain(|c| c.2 == usize::from(forced_ab));
         }
         cands.sort_by(|a, b| a.0.total_cmp(&b.0));
         if let Some((cost128, lambda128, shape, halves, after)) = cands.into_iter().next()
@@ -13257,20 +13530,40 @@ pub(crate) fn encode_inter_frame(
                 // The witness knobs take the root whatever it costs, so the
                 // forced block really reaches the writer.
                 || FORCE_B128_ROOT.load(std::sync::atomic::Ordering::Relaxed)
-                || forced_rect != 0)
+                || forced_rect != 0
+                || forced_ab != 0)
         {
             let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
             blocks.truncate(mark128);
             restore(&mut luma, &mut chroma, (x128, y128), SUPERBLOCK * 2, &after);
             let at = (root_r * 2) * cols + root_c * 2;
             match shape {
-                None => {
+                0 => {
                     B128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let block = halves.into_iter().next().expect("the NONE arm's block");
                     record_mi(&mut grid, root_r * 16, root_c * 16, 32, block.inter, block.skip);
                     blocks.push((at, Quadrant::Whole128(block)));
                 }
-                Some(horz) => {
+                // lane-ab128: three pieces, published at their own footprints
+                // in the writer's own order ([`ab128_pieces`]).
+                symbol @ 4..=7 => {
+                    B128_AB_HITS[symbol - 4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    for (((mr, mc), (w, h)), piece) in
+                        ab128_pieces(symbol, (root_r * 16, root_c * 16)).iter().zip(&halves)
+                    {
+                        record_mi_rect(
+                            &mut grid,
+                            *mr,
+                            *mc,
+                            (w / 4, h / 4),
+                            piece.inter,
+                            piece.skip,
+                        );
+                    }
+                    blocks.push((at, Quadrant::Ab128(symbol as u8, halves)));
+                }
+                symbol => {
+                    let horz = symbol == 1;
                     if horz {
                         B128_HORZ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
@@ -13362,11 +13655,26 @@ pub(crate) fn encode_inter_frame(
                     if hs.iter().any(|b| b.inter.is_some_and(|i| i.ref1.is_some())))
             })
             .count();
+        // lane-ab128: and how many took each AB shape, in PARTITION_HORZ_A
+        // .. _VERT_B order -- the per-shape fire count its gate rows are read
+        // against.
+        let ab: [usize; 4] = std::array::from_fn(|i| {
+            blocks
+                .iter()
+                .filter(|q| matches!(q, Quadrant::Ab128(s, _) if *s as usize == i + 4))
+                .count()
+        });
         eprintln!(
             "B128 census: inter frame, {whole} whole 128x128 roots ({residual} with a residual, \
              {compound} compound), {horz} HORZ + {vert} VERT roots ({rect_compound} with a \
-             compound half), {roots} coded blocks ({:.1}% of the frame's area at 128)",
-            100.0 * ((whole + horz + vert) * 16) as f64 / blocks.len().max(1) as f64,
+             compound half), AB roots {}/{}/{}/{} (HORZ_A/HORZ_B/VERT_A/VERT_B), \
+             {roots} coded blocks ({:.1}% of the frame's area at 128)",
+            ab[0],
+            ab[1],
+            ab[2],
+            ab[3],
+            100.0 * ((whole + horz + vert + ab.iter().sum::<usize>()) * 16) as f64
+                / blocks.len().max(1) as f64,
         );
     }
     let modes = blocks
@@ -16974,6 +17282,97 @@ mod tests {
         eprintln!(
             "unforced on testsrc2: {} HORZ + {} VERT roots over 12 frames",
             unforced.0, unforced.1
+        );
+    }
+
+    /// lane-ab128: the 128 root's four AB shapes -- `PARTITION_HORZ_A` (two
+    /// 64x64 on top, one 128x64 below), `_HORZ_B`, `_VERT_A`, `_VERT_B`.
+    /// Five passes over the same `testsrc2` clip
+    /// `a_128_root_horz_and_vert_halves_decode_exact_through_both_decoders`
+    /// uses: each shape forced at every root ([`force_b128_ab`]), so every
+    /// context and every visit order the shape reads is exercised rather than
+    /// the handful the RD would pick, and then an UNFORCED pass whose
+    /// per-shape count is REPORTED (it is the number the gate rows are read
+    /// against).
+    ///
+    /// Each pass is sample-exact against the encoder's own reconstruction
+    /// through `decode_stream` AND through ffmpeg; a writer/reader mismatch
+    /// surfaces here as a refusal or a pixel miss, never in the BD gate. RED
+    /// before this lane by construction: `write_sb128_root` could only name
+    /// NONE / HORZ / VERT / SPLIT, so all four counts were 0.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_128_root_ab_shapes --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_128_root_ab_shapes_decode_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-ab128-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("testsrc2-1280x768.y4m");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=1280x768:rate=24"])
+            .args(["-frames:v", "12", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        let names = ["HORZ_A", "HORZ_B", "VERT_A", "VERT_B"];
+        let mut unforced = [0usize; 4];
+        for force in [4u8, 5, 6, 7, 0] {
+            force_b128_ab(force);
+            let label = if force == 0 { "unforced" } else { names[usize::from(force) - 4] };
+            let _ = take_b128_ab_hits();
+            let _ = crate::tile::take_sb128_ab_hits();
+            let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
+            let won = take_b128_ab_hits();
+            let coded = crate::tile::take_sb128_ab_hits();
+            eprintln!(
+                "{label}: search won {won:?} AB roots, writer coded {coded:?} \
+                 (HORZ_A/HORZ_B/VERT_A/VERT_B)"
+            );
+            if force == 0 {
+                // The unforced counts are REPORTED, not asserted: a zero here
+                // would be an RD result, not a defect (the four forced passes
+                // already prove the writer and the reader agree on the shape).
+                unforced = won;
+            } else {
+                let i = usize::from(force) - 4;
+                assert!(coded[i] > 0, "no {label} root was coded with {label} forced");
+            }
+            let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+            assert_eq!(decoded.len(), encoded.frames.len(), "{label}: frame count");
+            for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+                for (plane, got, want) in [
+                    ("luma", &dec.y, &frame.reconstruction.y),
+                    ("U", &dec.u, &frame.reconstruction.u),
+                    ("V", &dec.v, &frame.reconstruction.v),
+                ] {
+                    let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                    assert_eq!(differ, 0, "{label} frame {i}: {plane} -- {differ} samples differ");
+                }
+            }
+            let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+            for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+                assert_eq!(dec.y, frame.reconstruction.y, "{label} frame {i}: ffmpeg luma");
+                assert_eq!(dec.u, frame.reconstruction.u, "{label} frame {i}: ffmpeg U");
+                assert_eq!(dec.v, frame.reconstruction.v, "{label} frame {i}: ffmpeg V");
+            }
+        }
+        force_b128_ab(0);
+        eprintln!(
+            "unforced on testsrc2 over 12 frames: {} HORZ_A + {} HORZ_B + {} VERT_A + {} VERT_B",
+            unforced[0], unforced[1], unforced[2], unforced[3],
         );
     }
 
