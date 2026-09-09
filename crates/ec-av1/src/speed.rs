@@ -475,6 +475,28 @@ pub(crate) const ARF_TF_WIN_FUT: [usize; 11] = [3; 11];
 /// two-pass-like allocation would need.
 pub(crate) const LOOKAHEAD: bool = true;
 
+/// lane-tplfut: which pictures the TOP ARF's temporal lambda map
+/// ([`crate::encode::tpl_lambda_factors`]) propagates back through. The top
+/// ARF is its group's LAST picture in display order, so the group's own
+/// sources -- what [`crate::encoder::Av1Encoder::code_group`] hands it today
+/// -- are all display-PAST, i.e. the window is time-REVERSED against every
+/// other frame's (and against the flat path's, which always looks forward).
+/// libaom's tpl at an ARF looks FORWARD, over the next group. With
+/// [`LOOKAHEAD`] on those pictures are buffered, so the window is a choice:
+///
+/// * `0` -- the past window (time-reversed), the shipped behaviour.
+/// * `1` -- the display-FUTURE pictures only, nearest first, up to
+///   `tpl_depth() - 1` of them.
+/// * `2` -- past then future, concatenated nearest-first. NOTE the chain has
+///   a discontinuity in the middle (the coarse pass between the last past
+///   neighbour and the nearest future one spans the whole group).
+/// * `3` -- future-only over the WHOLE next group, ignoring `tpl_depth()`.
+///
+/// Falls back to `0`'s window whenever no future picture is buffered (the
+/// lookahead off, or the end of the stream). `EC_AV1_TPL_FUT=<n>` overrides
+/// it.
+pub(crate) const TPL_FUT: [usize; 11] = [0; 11];
+
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at
 /// the high-quality end for the same reason: a picture we are about to
