@@ -617,9 +617,12 @@ fn write_inter_block_128_rect(
     if let Some(r1) = info.ref1 {
         neighbours.record_compound_rect_mi((mi_r, mi_c), (w, h), r1, 0, 1);
     }
+    // lane-ab128: an AB shape codes its two 64x64 pieces through this same
+    // function, and they are neither a 128x64 nor a 64x128 half -- the
+    // witness reads these two counters for the HORZ/VERT shape alone.
     if w > h {
         SB128_HORZ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    } else {
+    } else if h > w {
         SB128_VERT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
@@ -640,6 +643,17 @@ pub fn take_sb128_horz_hits() -> usize {
 /// The 64x128-half count since the last call, and zero it.
 pub fn take_sb128_vert_hits() -> usize {
     SB128_VERT_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// lane-ab128: how many AB-shape roots the inter writer has coded since the
+/// last [`take_sb128_ab_hits`], in `PARTITION_HORZ_A` .. `_VERT_B` order
+/// (class `gate-blind-to-feature`).
+static SB128_AB_HITS: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+
+/// The four per-shape AB-root counts since the last call, and zero them.
+pub fn take_sb128_ab_hits() -> [usize; 4] {
+    std::array::from_fn(|i| SB128_AB_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// lane-b128r: how many of those blocks carried a REAL residual (four
@@ -2594,6 +2608,17 @@ pub enum Quadrant {
     /// SKIP only ([`crate::tile::write_inter_block_128_rect`] refuses a
     /// residual), single reference or compound.
     Rect128(bool, Vec<BlockCoeffs>),
+    /// lane-ab128: the THREE inter blocks an AB shape at a 128 superblock
+    /// root carries -- two 64x64 pieces and one 128x64 / 64x128 half -- in
+    /// the order the decoder reads them
+    /// ([`crate::encode::ab128_pieces`]). The `u8` is the partition symbol
+    /// itself (4 `PARTITION_HORZ_A` .. 7 `PARTITION_VERT_B`). Carried by the
+    /// top-left 32x32 entry of the root's sixteen, exactly as
+    /// [`Rect128`](Quadrant::Rect128) is.
+    ///
+    /// SKIP only, same writer ([`crate::tile::write_inter_block_128_rect`])
+    /// and same reason.
+    Ab128(u8, Vec<BlockCoeffs>),
     /// A quadrant a [`Whole64`](Quadrant::Whole64) at its superblock's
     /// top-left already coded; it carries no block of its own.
     Covered,
@@ -2606,7 +2631,9 @@ impl Quadrant {
             Quadrant::Whole(block) | Quadrant::Whole64(block) | Quadrant::Whole128(block) => {
                 std::slice::from_ref(block)
             }
-            Quadrant::Split(blocks) | Quadrant::Rect128(_, blocks) => blocks.as_slice(),
+            Quadrant::Split(blocks)
+            | Quadrant::Rect128(_, blocks)
+            | Quadrant::Ab128(_, blocks) => blocks.as_slice(),
             Quadrant::Covered => &[],
         }
     }
@@ -3742,6 +3769,7 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
                             Quadrant::Whole64(_)
                             | Quadrant::Whole128(_)
                             | Quadrant::Rect128(..)
+                            | Quadrant::Ab128(..)
                             | Quadrant::Covered => {
                                 return Err(Error::unsupported(
                                     "AV1 tile",
@@ -5410,7 +5438,9 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
                 // lane-b128: a 128x128 root is SKIP by construction (the
                 // writer refuses a residual at that size), so it names no
                 // coefficients on any plane.
-                Quadrant::Whole128(_) | Quadrant::Rect128(..) => return 0.0,
+                Quadrant::Whole128(_) | Quadrant::Rect128(..) | Quadrant::Ab128(..) => {
+                    return 0.0;
+                }
                 Quadrant::Whole(_) => 32,
                 Quadrant::Split(_) => 16,
                 // lane-tx64: a 64x64 root that codes a residual pays for one
@@ -7141,6 +7171,12 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 Quadrant::Rect128(horz, halves) => Some((*horz, halves)),
                 _ => None,
             });
+            // lane-ab128: the three pieces an AB-shape root carries, and the
+            // partition symbol it is coded under.
+            let root_ab = root_entry.and_then(|q| match q {
+                Quadrant::Ab128(symbol, pieces) => Some((*symbol as usize, pieces)),
+                _ => None,
+            });
             write_sb128_root(
                 &mut enc,
                 &mut cdfs,
@@ -7149,10 +7185,11 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 sb_c,
                 mi_cols,
                 mi_rows,
-                match (root_block.is_some(), root_rect) {
-                    (true, _) => PARTITION_NONE,
-                    (_, Some((true, _))) => PARTITION_HORZ,
-                    (_, Some((false, _))) => PARTITION_VERT,
+                match (root_block.is_some(), root_rect, root_ab) {
+                    (true, ..) => PARTITION_NONE,
+                    (_, Some((true, _)), _) => PARTITION_HORZ,
+                    (_, Some((false, _)), _) => PARTITION_VERT,
+                    (_, _, Some((symbol, _))) => symbol,
                     _ => PARTITION_SPLIT,
                 },
             );
@@ -7198,6 +7235,38 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         tx_select,
                     )?;
                 }
+                sb128_none = true;
+                continue;
+            }
+            if let Some((symbol, pieces)) = root_ab {
+                // libaom `decode_partition` at BLOCK_128X128, AB arm: two
+                // 64x64 blocks and one 128x64 / 64x128 half, in the order
+                // decode.rs' `sb128_ab` reads them
+                // ([`crate::encode::ab128_pieces`]). An AB shape only comes
+                // from the full alphabet symbol (both halves in frame), so
+                // there is no edge break to mirror -- the search offers one
+                // only at a root wholly inside.
+                let base_mi = (
+                    (sb_r & !1) as usize * SB_MI as usize,
+                    (sb_c & !1) as usize * SB_MI as usize,
+                );
+                for (((mi_r, mi_c), (w, h)), piece) in
+                    crate::encode::ab128_pieces(symbol, base_mi).iter().zip(pieces)
+                {
+                    write_inter_block_128_rect(
+                        &mut enc,
+                        &mut cdfs,
+                        &mut neighbours,
+                        &mut grid,
+                        (*mi_r, *mi_c),
+                        (*w, *h),
+                        piece,
+                        mi_cols,
+                        mi_rows,
+                        tx_select,
+                    )?;
+                }
+                SB128_AB_HITS[symbol - 4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 sb128_none = true;
                 continue;
             }
@@ -7449,6 +7518,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     Quadrant::Whole64(_)
                     | Quadrant::Whole128(_)
                     | Quadrant::Rect128(..)
+                    | Quadrant::Ab128(..)
                     | Quadrant::Covered => {
                         return Err(Error::unsupported(
                             "AV1 tile",
