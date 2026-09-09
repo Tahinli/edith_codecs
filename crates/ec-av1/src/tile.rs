@@ -464,6 +464,184 @@ fn write_inter_block_128(
     Ok(())
 }
 
+/// lane-b128hv: one 128x64 (HORZ) or 64x128 (VERT) inter block, the two
+/// halves a `PARTITION_HORZ`/`PARTITION_VERT` 128 superblock root carries --
+/// the syntax `decode_inter_block` reads for `sb128_rect` (decode.rs ~35343):
+/// the same chain [`write_inter_block_128`] writes, at the block's own
+/// rectangular window. Every CDF/context decision is taken at the enclosing
+/// square `side` of 128 (what the decoder's `inter_piece!` passes), and the
+/// block's true footprint governs only its mv-stack window, its mi/grid stamp
+/// and its neighbour bands (decode.rs' own `write_w`/`write_h` split).
+///
+/// SKIP only: the decoder reads a rect half's residual through the mu-chunk
+/// loop, but the 128 NONE residual arm it would share is itself parked
+/// (`EC_AV1_B128RES`), so offering one here would buy the same open filter
+/// mismatch for a candidate the RD takes 0-2 times a frame.
+///
+/// # Errors
+/// A block that is intra or that is not skipped.
+#[allow(clippy::too_many_arguments)]
+fn write_inter_block_128_rect(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    grid: &mut MiGrid,
+    // The half's own top-left position in mode-info (4x4) units.
+    at_mi: (usize, usize),
+    // Its true footprint in samples: (128, 64) at HORZ, (64, 128) at VERT.
+    (w, h): (usize, usize),
+    block: &BlockCoeffs,
+    mi_cols: u32,
+    mi_rows: u32,
+    tx_select: bool,
+) -> Result<()> {
+    let info = block.inter.ok_or_else(|| {
+        Error::unsupported("AV1 tile", "a 128-root rectangular half is coded inter")
+    })?;
+    if !block.skip {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a 128-root rectangular half carries a residual",
+        ));
+    }
+    let (mi_r, mi_c) = at_mi;
+    let (w_mi, h_mi) = (w / MI, h / MI);
+    let has_above = neighbours.has_above(mi_r);
+    let has_left = neighbours.has_left(mi_c);
+    let skip_ctx =
+        usize::from(neighbours.above_skip[mi_c]) + usize::from(neighbours.left_skip[mi_r]);
+    enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+    write_cdef_idx(enc, (mi_r, mi_c), block.skip);
+    // NOT a whole superblock: decode.rs' `whole_sb` is `write_w == write_h ==
+    // sb_px`, so a rect half reads its `delta_q` group even when skipped.
+    write_delta_q(enc, cdfs, (mi_r, mi_c), false, block.skip);
+    let ii_ctx = intra_inter_ctx(
+        has_above,
+        has_left,
+        neighbours.above_inter[mi_c],
+        neighbours.left_inter[mi_r],
+    );
+    enc.symbol(1, &mut cdfs.intra_inter[ii_ctx]);
+    write_comp_mode(
+        enc,
+        cdfs,
+        neighbours,
+        (mi_r, mi_c),
+        (has_above, has_left),
+        info.ref1.is_some(),
+    );
+    let (mv, mv1, is_new_mv) = if info.ref1.is_some() {
+        write_compound_block(
+            enc,
+            cdfs,
+            neighbours,
+            grid,
+            (mi_r, mi_c),
+            (w_mi, h_mi),
+            (has_above, has_left),
+            info,
+            (mi_cols as usize, mi_rows as usize),
+        )?
+    } else {
+        write_single_ref(
+            enc,
+            cdfs,
+            info.ref_frame,
+            neighbours.above_ref[mi_c],
+            neighbours.above_ref1[mi_c],
+            neighbours.left_ref[mi_r],
+            neighbours.left_ref1[mi_r],
+        );
+        let stack = find_mv_stack(
+            grid,
+            mi_r,
+            mi_c,
+            w_mi,
+            h_mi,
+            info.ref_frame,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+        let (mv, is_new_mv) = write_inter_mode(enc, cdfs, info, &stack)?;
+        (mv, (0, 0), is_new_mv)
+    };
+    for dr in 0..h_mi {
+        for dc in 0..w_mi {
+            grid.set(
+                mi_r + dr,
+                mi_c + dc,
+                MiInfo {
+                    is_inter: true,
+                    ref_frame: info.ref_frame,
+                    ref_frame1: info.ref1.unwrap_or(NO_REF1),
+                    mv1: mv16(mv1),
+                    mv: mv16(mv),
+                    is_new_mv,
+                    size: w_mi as u8,
+                    size_h: h_mi as u8,
+                    is_global_mv0: false,
+                    is_global_mv1: false,
+                },
+            );
+        }
+    }
+    if info.ref1.is_none() {
+        write_motion_mode(
+            enc,
+            cdfs,
+            grid,
+            (mi_r, mi_c),
+            (w_mi, h_mi),
+            (w, h),
+            (mi_cols as usize, mi_rows as usize),
+            info.ref_frame,
+            block.motion_mode,
+        )?;
+    }
+    if tx_select {
+        // `read_block_tx_size_rect`'s skip arm: `txfm_partition_update_rect`
+        // with the BLOCK's own size in both bands, no symbol.
+        neighbours.record_txfm_rect((mi_r, mi_c), (w, h), (w, h));
+    }
+    let zero_grids = [
+        vec![0i32; TX32 * TX32],
+        vec![0i32; TX32 * TX32],
+        vec![0i32; TX32 * TX32],
+    ];
+    // A 128 root's half is always SUB (16 px) aligned, so the coarse mode /
+    // side bands are named by the same SUB-grid origin every square block
+    // uses.
+    let at_sub = (mi_r / (SUB / MI), mi_c / (SUB / MI));
+    neighbours.record_planes_rect(at_sub, (w, h), 0, &zero_grids, true);
+    neighbours.record_inter_rect_mi((mi_r, mi_c), (w, h), block.skip, true, block_ref(block));
+    if let Some(r1) = info.ref1 {
+        neighbours.record_compound_rect_mi((mi_r, mi_c), (w, h), r1, 0, 1);
+    }
+    if w > h {
+        SB128_HORZ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        SB128_VERT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// lane-b128hv: how many 128x64 / 64x128 halves the inter writer has coded
+/// since the last [`take_sb128_horz_hits`] / [`take_sb128_vert_hits`] (class
+/// `gate-blind-to-feature`).
+static SB128_HORZ_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The VERT twin of [`SB128_HORZ_HITS`].
+static SB128_VERT_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The 128x64-half count since the last call, and zero it.
+pub fn take_sb128_horz_hits() -> usize {
+    SB128_HORZ_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The 64x128-half count since the last call, and zero it.
+pub fn take_sb128_vert_hits() -> usize {
+    SB128_VERT_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// lane-b128r: how many of those blocks carried a REAL residual (four
 /// TX_64X64 luma units plus their per-chunk chroma pair) rather than being
 /// skipped, since the last [`take_sb128_residual_hits`].
@@ -1672,6 +1850,10 @@ fn ec_rng_trace(msg: impl FnOnce() -> String) {
 
 /// `PARTITION_NONE` (spec 6.10.4): the whole block, undivided.
 const PARTITION_NONE: usize = 0;
+/// `PARTITION_HORZ` (spec 6.10.4): the block cut into a top and a bottom half.
+const PARTITION_HORZ: usize = 1;
+/// `PARTITION_VERT` (spec 6.10.4): the block cut into a left and a right half.
+const PARTITION_VERT: usize = 2;
 /// `PARTITION_SPLIT` (spec 6.10.4): the block cut into four quadrants.
 const PARTITION_SPLIT: usize = 3;
 
@@ -2403,6 +2585,15 @@ pub enum Quadrant {
     /// interleaved with its chroma per 64x64 mu chunk, which this writer has
     /// no path for; [`crate::tile::write_inter_block_128`] refuses one.
     Whole128(BlockCoeffs),
+    /// lane-b128hv: the two 128x64 (`true`) or 64x128 (`false`) inter blocks a
+    /// `PARTITION_HORZ` / `PARTITION_VERT` 128 superblock root carries, in the
+    /// order the decoder reads them (top then bottom, left then right).
+    /// Carried by the top-left 32x32 entry of the root's sixteen, exactly as
+    /// [`Whole128`](Quadrant::Whole128) is.
+    ///
+    /// SKIP only ([`crate::tile::write_inter_block_128_rect`] refuses a
+    /// residual), single reference or compound.
+    Rect128(bool, Vec<BlockCoeffs>),
     /// A quadrant a [`Whole64`](Quadrant::Whole64) at its superblock's
     /// top-left already coded; it carries no block of its own.
     Covered,
@@ -2415,7 +2606,7 @@ impl Quadrant {
             Quadrant::Whole(block) | Quadrant::Whole64(block) | Quadrant::Whole128(block) => {
                 std::slice::from_ref(block)
             }
-            Quadrant::Split(blocks) => blocks.as_slice(),
+            Quadrant::Split(blocks) | Quadrant::Rect128(_, blocks) => blocks.as_slice(),
             Quadrant::Covered => &[],
         }
     }
@@ -2760,14 +2951,18 @@ impl Neighbours {
     /// [`Self::record_palette_y`] for the chroma bands (decode.rs
     /// `record_palette_uv_rect`) -- `size == 0` clears stale state the same
     /// way, and the span is in LUMA pixels for both planes' bands alike.
-    fn record_palette_uv(&mut self, (r, c): (usize, usize), side: usize, size: u8, colors: [u16; 8]) {
-        for cell in 0..(side / MI).max(1) {
+    fn record_palette_uv(&mut self, (r, c): (usize, usize), (w, h): (usize, usize), size: u8, colors: [u16; 8]) {
+        // lane-b128hv: the above band spans the block's WIDTH and the left
+        // band its HEIGHT; identical to the one loop this replaces at w == h.
+        for cell in 0..(w / MI).max(1) {
             if let Some(e) = self.above_palette_uv_size.get_mut(c + cell) {
                 *e = size;
                 if size > 0 {
                     self.above_palette_uv_colors[c + cell] = colors;
                 }
             }
+        }
+        for cell in 0..(h / MI).max(1) {
             if let Some(e) = self.left_palette_uv_size.get_mut(r + cell) {
                 *e = size;
                 if size > 0 {
@@ -2780,14 +2975,18 @@ impl Neighbours {
     /// What a just-written block leaves in the palette bands (decode.rs
     /// `record_palette_y_rect`): its size and colours over every 4x4 unit it
     /// spans, `0` for a block that took no palette.
-    fn record_palette_y(&mut self, (r, c): (usize, usize), side: usize, size: u8, colors: [u16; 8]) {
-        for cell in 0..(side / MI).max(1) {
+    fn record_palette_y(&mut self, (r, c): (usize, usize), (w, h): (usize, usize), size: u8, colors: [u16; 8]) {
+        // lane-b128hv: the above band spans the block's WIDTH and the left
+        // band its HEIGHT; identical to the one loop this replaces at w == h.
+        for cell in 0..(w / MI).max(1) {
             if let Some(e) = self.above_palette_size.get_mut(c + cell) {
                 *e = size;
                 if size > 0 {
                     self.above_palette_colors[c + cell] = colors;
                 }
             }
+        }
+        for cell in 0..(h / MI).max(1) {
             if let Some(e) = self.left_palette_size.get_mut(r + cell) {
                 *e = size;
                 if size > 0 {
@@ -2810,6 +3009,27 @@ impl Neighbours {
         for i in 0..w_px / MI {
             if let Some(cell) = self.above_txfm.get_mut(mi_c + i) {
                 *cell = tx_px as u8;
+            }
+        }
+    }
+
+    /// lane-b128hv: decode.rs `txfm_partition_update_rect` -- the two bands
+    /// take the transform's own HEIGHT (left) and WIDTH (above), over the
+    /// txb's own rect span. [`Self::record_txfm`] is this at `tx_w == tx_h`.
+    fn record_txfm_rect(
+        &mut self,
+        (mi_r, mi_c): (usize, usize),
+        (tx_w, tx_h): (usize, usize),
+        (txb_w, txb_h): (usize, usize),
+    ) {
+        for i in 0..txb_h / MI {
+            if let Some(cell) = self.left_txfm.get_mut(mi_r + i) {
+                *cell = tx_h as u8;
+            }
+        }
+        for i in 0..txb_w / MI {
+            if let Some(cell) = self.above_txfm.get_mut(mi_c + i) {
+                *cell = tx_w as u8;
             }
         }
     }
@@ -2936,14 +3156,30 @@ impl Neighbours {
         grids: &[Vec<i32>; 3],
         luma: bool,
     ) {
+        self.record_planes_rect(at, (side, side), mode, grids, luma);
+    }
+
+    /// lane-b128hv: [`Self::record_planes`] with independent above (width) /
+    /// left (height) extents, decode.rs `record_rect_mi`'s own split -- the
+    /// 128 root's HORZ/VERT halves are the writer's first rect blocks.
+    fn record_planes_rect(
+        &mut self,
+        at: (usize, usize),
+        (w, h): (usize, usize),
+        mode: usize,
+        grids: &[Vec<i32>; 3],
+        luma: bool,
+    ) {
         let (r, c) = at;
-        for cell in 0..side / SUB {
+        for cell in 0..w / SUB {
             self.above_mode[c + cell] = mode;
-            self.left_mode[r + cell] = mode;
-            self.above_side[c + cell] = side;
-            self.left_side[r + cell] = side;
+            self.above_side[c + cell] = w;
         }
-        self.record_mi_planes((r * (SUB / MI), c * (SUB / MI)), side, grids, luma);
+        for cell in 0..h / SUB {
+            self.left_mode[r + cell] = mode;
+            self.left_side[r + cell] = h;
+        }
+        self.record_mi_planes_rect((r * (SUB / MI), c * (SUB / MI)), (w, h), grids, luma);
     }
 
     /// The coefficient-context half of [`Self::record`], taking the block's
@@ -2965,18 +3201,32 @@ impl Neighbours {
         grids: &[Vec<i32>; 3],
         luma: bool,
     ) {
+        self.record_mi_planes_rect(at_mi, (side, side), grids, luma);
+    }
+
+    /// [`Self::record_mi_planes`] with independent above (width) / left
+    /// (height) extents (lane-b128hv, decode.rs `record_mi_rect`).
+    fn record_mi_planes_rect(
+        &mut self,
+        at_mi: (usize, usize),
+        (w, h): (usize, usize),
+        grids: &[Vec<i32>; 3],
+        luma: bool,
+    ) {
         let (mi_r, mi_c) = at_mi;
         if screen_armed() {
             let (size, colors) = self.pending_palette.take().unwrap_or((0, [0u16; 8]));
-            self.record_palette_y(at_mi, side, size, colors);
+            self.record_palette_y(at_mi, (w, h), size, colors);
             let (uv_size, uv_colors) = self.pending_palette_uv.take().unwrap_or((0, [0u16; 8]));
-            self.record_palette_uv(at_mi, side, uv_size, uv_colors);
+            self.record_palette_uv(at_mi, (w, h), uv_size, uv_colors);
         }
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
-        let side_mi = side / MI;
-        for cell in 0..side_mi {
-            self.left_side_mi[mi_r + cell] = side;
-            self.above_side_mi[mi_c + cell] = side;
+        let (w_mi, h_mi) = (w / MI, h / MI);
+        for cell in 0..h_mi {
+            self.left_side_mi[mi_r + cell] = h;
+        }
+        for cell in 0..w_mi {
+            self.above_side_mi[mi_c + cell] = w;
         }
         // libaom rounds the luma edge up to the plane's own 4x4 unit before
         // clamping a subsampled plane (`ROUND_POWER_OF_TWO(max_blocks_high,
@@ -2995,18 +3245,10 @@ impl Neighbours {
             round_up_even(self.mi_cols),
             round_up_even(self.mi_cols),
         ];
-        for cell in 0..side_mi {
+        for cell in 0..h_mi {
             let keep_left = self.left[mi_r + cell][0];
-            let keep_above = self.above[mi_c + cell][0];
             self.left[mi_r + cell] = std::array::from_fn(|plane| {
-                if cell < side_mi.min(bound_h[plane].saturating_sub(mi_r)) {
-                    states[plane]
-                } else {
-                    Default::default()
-                }
-            });
-            self.above[mi_c + cell] = std::array::from_fn(|plane| {
-                if cell < side_mi.min(bound_w[plane].saturating_sub(mi_c)) {
+                if cell < h_mi.min(bound_h[plane].saturating_sub(mi_r)) {
                     states[plane]
                 } else {
                     Default::default()
@@ -3014,6 +3256,18 @@ impl Neighbours {
             });
             if !luma {
                 self.left[mi_r + cell][0] = keep_left;
+            }
+        }
+        for cell in 0..w_mi {
+            let keep_above = self.above[mi_c + cell][0];
+            self.above[mi_c + cell] = std::array::from_fn(|plane| {
+                if cell < w_mi.min(bound_w[plane].saturating_sub(mi_c)) {
+                    states[plane]
+                } else {
+                    Default::default()
+                }
+            });
+            if !luma {
                 self.above[mi_c + cell][0] = keep_above;
             }
         }
@@ -3025,6 +3279,56 @@ impl Neighbours {
     fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool, ref_frame: i8) {
         let (r, c) = at;
         self.record_inter_mi((r * (SUB / MI), c * (SUB / MI)), side, skip, is_inter, ref_frame);
+    }
+
+    /// lane-b128hv: [`Self::record_inter_mi`] with independent above (width)
+    /// / left (height) spans, decode.rs `record_inter_rect_mi`'s own split.
+    fn record_inter_rect_mi(
+        &mut self,
+        (mi_r, mi_c): (usize, usize),
+        (w, h): (usize, usize),
+        skip: bool,
+        is_inter: bool,
+        ref_frame: i8,
+    ) {
+        let altref = is_inter && ref_frame == crate::mvstack::ALTREF_FRAME;
+        for cell in 0..h / MI {
+            self.left_skip[mi_r + cell] = skip;
+            self.left_inter[mi_r + cell] = is_inter;
+            self.left_ref[mi_r + cell] = ref_frame;
+            self.left_ref1[mi_r + cell] = None;
+            self.left_comp_group_idx[mi_r + cell] = if altref { 3 } else { 0 };
+            self.left_compound_idx[mi_r + cell] = u8::from(altref);
+        }
+        for cell in 0..w / MI {
+            self.above_skip[mi_c + cell] = skip;
+            self.above_inter[mi_c + cell] = is_inter;
+            self.above_ref[mi_c + cell] = ref_frame;
+            self.above_ref1[mi_c + cell] = None;
+            self.above_comp_group_idx[mi_c + cell] = if altref { 3 } else { 0 };
+            self.above_compound_idx[mi_c + cell] = u8::from(altref);
+        }
+    }
+
+    /// [`Self::record_compound_mi`] over a rect block's own two spans.
+    fn record_compound_rect_mi(
+        &mut self,
+        (mi_r, mi_c): (usize, usize),
+        (w, h): (usize, usize),
+        ref1: i8,
+        comp_group_idx: u8,
+        compound_idx: u8,
+    ) {
+        for cell in 0..h / MI {
+            self.left_ref1[mi_r + cell] = Some(ref1);
+            self.left_comp_group_idx[mi_r + cell] = comp_group_idx;
+            self.left_compound_idx[mi_r + cell] = compound_idx;
+        }
+        for cell in 0..w / MI {
+            self.above_ref1[mi_c + cell] = Some(ref1);
+            self.above_comp_group_idx[mi_c + cell] = comp_group_idx;
+            self.above_compound_idx[mi_c + cell] = compound_idx;
+        }
     }
 
     /// [`Self::record_inter_mi`]'s compound half (decode.rs
@@ -3435,7 +3739,10 @@ pub(crate) fn sb_coeff_key_frame_tile_cdfs(
                         match quadrant {
                             // A 64x64 root is an INTER-frame partition; a
                             // key frame codes one as `Superblock::Whole`.
-                            Quadrant::Whole64(_) | Quadrant::Whole128(_) | Quadrant::Covered => {
+                            Quadrant::Whole64(_)
+                            | Quadrant::Whole128(_)
+                            | Quadrant::Rect128(..)
+                            | Quadrant::Covered => {
                                 return Err(Error::unsupported(
                                     "AV1 tile",
                                     "a key frame codes a 64x64 block as `Superblock::Whole`",
@@ -5103,7 +5410,7 @@ pub(crate) fn predicted_coeff_bits(blocks: &[Quadrant], base_q_idx: u8) -> f64 {
                 // lane-b128: a 128x128 root is SKIP by construction (the
                 // writer refuses a residual at that size), so it names no
                 // coefficients on any plane.
-                Quadrant::Whole128(_) => return 0.0,
+                Quadrant::Whole128(_) | Quadrant::Rect128(..) => return 0.0,
                 Quadrant::Whole(_) => 32,
                 Quadrant::Split(_) => 16,
                 // lane-tx64: a 64x64 root that codes a residual pays for one
@@ -5721,6 +6028,22 @@ pub(crate) fn partition_bits(side: usize, split: bool) -> f64 {
         PARTITION_SPLIT
     } else {
         PARTITION_NONE
+    };
+    crate::encode::symbol_bits(cdf, symbol)
+}
+
+/// lane-b128hv: [`partition_bits`] for any partition symbol, at the same
+/// fixed (round-2) tables -- what the 128 root's HORZ/VERT candidate is priced
+/// with (`PARTITION_HORZ` = 1, `PARTITION_VERT` = 2).
+pub(crate) fn partition_bits_sym(side: usize, symbol: usize) -> f64 {
+    static CDFS: LazyLock<Cdfs> = LazyLock::new(|| Cdfs::new(2));
+    let cdfs = &*CDFS;
+    let cdf: &[u16] = match side {
+        128 => &cdfs.partition_w128[0],
+        SB => &cdfs.partition_w64[0],
+        BLOCK => &cdfs.partition_w32[0],
+        TX8 => &cdfs.partition_w8[0],
+        _ => &cdfs.partition_w16[0],
     };
     crate::encode::symbol_bits(cdf, symbol)
 }
@@ -6807,12 +7130,17 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
         if sb128 && sb_start {
             // The 128x128 block a `PARTITION_NONE` root carries, held by the
             // top-left 32x32 entry of the root's sixteen.
-            let root_block = ((sb_r & !1) * 2 < rows && (sb_c & !1) * 2 < cols)
-                .then(|| &blocks[(((sb_r & !1) * 2) * cols + (sb_c & !1) * 2) as usize])
-                .and_then(|q| match q {
-                    Quadrant::Whole128(block) => Some(block),
-                    _ => None,
-                });
+            let root_entry = ((sb_r & !1) * 2 < rows && (sb_c & !1) * 2 < cols)
+                .then(|| &blocks[(((sb_r & !1) * 2) * cols + (sb_c & !1) * 2) as usize]);
+            let root_block = root_entry.and_then(|q| match q {
+                Quadrant::Whole128(block) => Some(block),
+                _ => None,
+            });
+            // lane-b128hv: the two rectangular halves a HORZ/VERT root carries.
+            let root_rect = root_entry.and_then(|q| match q {
+                Quadrant::Rect128(horz, halves) => Some((*horz, halves)),
+                _ => None,
+            });
             write_sb128_root(
                 &mut enc,
                 &mut cdfs,
@@ -6821,7 +7149,12 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 sb_c,
                 mi_cols,
                 mi_rows,
-                if root_block.is_some() { PARTITION_NONE } else { PARTITION_SPLIT },
+                match (root_block.is_some(), root_rect) {
+                    (true, _) => PARTITION_NONE,
+                    (_, Some((true, _))) => PARTITION_HORZ,
+                    (_, Some((false, _))) => PARTITION_VERT,
+                    _ => PARTITION_SPLIT,
+                },
             );
             if let Some(block) = root_block {
                 let at128 = ((sb_r & !1) as usize * 4, (sb_c & !1) as usize * 4);
@@ -6836,6 +7169,35 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                     mi_rows,
                     tx_select,
                 )?;
+                sb128_none = true;
+                continue;
+            }
+            if let Some((horz, halves)) = root_rect {
+                // libaom `decode_partition` at BLOCK_128X128: `subsize` at
+                // (mi_row, mi_col) and a second one at + hbs (16 mi) along the
+                // cut axis, the second only when it is inside the frame -- the
+                // search only offers a root wholly inside, so both are.
+                let base_mi = ((sb_r & !1) as usize * SB_MI as usize, (sb_c & !1) as usize * SB_MI as usize);
+                let (w, h) = if horz { (128usize, 64usize) } else { (64, 128) };
+                for (i, half) in halves.iter().enumerate() {
+                    let at_mi = if horz {
+                        (base_mi.0 + i * 16, base_mi.1)
+                    } else {
+                        (base_mi.0, base_mi.1 + i * 16)
+                    };
+                    write_inter_block_128_rect(
+                        &mut enc,
+                        &mut cdfs,
+                        &mut neighbours,
+                        &mut grid,
+                        at_mi,
+                        (w, h),
+                        half,
+                        mi_cols,
+                        mi_rows,
+                        tx_select,
+                    )?;
+                }
                 sb128_none = true;
                 continue;
             }
@@ -7084,7 +7446,10 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                 let block = match site {
                     // Already coded by the `Whole64` above -- but only inside
                     // a superblock that really carried one.
-                    Quadrant::Whole64(_) | Quadrant::Whole128(_) | Quadrant::Covered => {
+                    Quadrant::Whole64(_)
+                    | Quadrant::Whole128(_)
+                    | Quadrant::Rect128(..)
+                    | Quadrant::Covered => {
                         return Err(Error::unsupported(
                             "AV1 tile",
                             "a `Whole64`/`Covered` quadrant needs its superblock's \

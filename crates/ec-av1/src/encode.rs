@@ -786,6 +786,46 @@ pub fn take_b128_compound_hits() -> usize {
     B128_COMPOUND_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// lane-b128hv: whether the 128 superblock root offers its `PARTITION_HORZ`
+/// and `PARTITION_VERT` candidates -- two 128x64 / 64x128 inter blocks, the
+/// same skip-only single-reference/compound machinery the NONE arm ships,
+/// halved ([`search_root_128_rect`], `crate::tile::write_inter_block_128_rect`).
+/// `EC_AV1_B128HV=0` is this arm's attribution control.
+fn b128_rect() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_B128HV").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true) && b128_root()
+}
+
+/// How many 128 roots the search left as two 128x64 (HORZ) / 64x128 (VERT)
+/// halves since the last take (class `gate-blind-to-feature`).
+static B128_HORZ_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The VERT twin of [`B128_HORZ_HITS`].
+static B128_VERT_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The HORZ-128-root count since the last call, and zero it.
+pub fn take_b128_horz_hits() -> usize {
+    B128_HORZ_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The VERT-128-root count since the last call, and zero it.
+pub fn take_b128_vert_hits() -> usize {
+    B128_VERT_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only: force the 128 root's rect partition whatever it costs -- 0 off,
+/// 1 `PARTITION_HORZ`, 2 `PARTITION_VERT`. The witness needs it because
+/// synthetic content is where the shape is cheapest to decode-check and the
+/// RD there prefers one whole block; the gate census is the unforced count.
+static FORCE_B128_RECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Arms [`FORCE_B128_RECT`] for the rest of the process (0 / 1 HORZ / 2 VERT).
+#[cfg(test)]
+pub(crate) fn force_b128_rect(which: u8) {
+    FORCE_B128_RECT.store(which, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Test-only: take the 128 root's residual arm whatever it costs, so a
 /// witness clip codes the shape rather than waiting for content on which the
 /// RD picks it (the same role [`force_sb128`] plays for the superblock size).
@@ -3077,6 +3117,17 @@ impl Plane<'_> {
     /// by [`Self::width`].
     fn source_block(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
         rows_of(self.source, self.width, x, y, side)
+    }
+
+    /// lane-b128hv: [`Self::source_block`] over a rectangle, for the 128
+    /// root's own HORZ/VERT motion search.
+    fn source_block_rect(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        let mut out = vec![0u8; w * h];
+        for row in 0..h {
+            out[row * w..][..w]
+                .copy_from_slice(&self.source[(y + row) * self.width + x..][..w]);
+        }
+        out
     }
 
     /// The reconstructed samples of one square, so that a partition trial can
@@ -7368,6 +7419,31 @@ fn record_mi(
     }
 }
 
+/// lane-b128hv: [`record_mi`] for a RECTANGULAR block -- the mi stamp the
+/// writer's own `write_inter_block_128_rect` makes, so the second half of a
+/// HORZ/VERT 128 root searches against the stack the writer will rebuild.
+fn record_mi_rect(
+    grid: &mut MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    (w_mi, h_mi): (usize, usize),
+    inter: Option<InterInfo>,
+    skip: bool,
+) {
+    record_mi(grid, mi_row, mi_col, w_mi.min(h_mi) as u8, inter, skip);
+    // `record_mi` stamped the square corner; widen it to the true footprint,
+    // with the block's own (rect) size fields.
+    let mut info = grid.get_frame(mi_row, mi_col).expect("just recorded");
+    info.size = w_mi as u8;
+    info.size_h = h_mi as u8;
+    for dr in 0..h_mi {
+        for dc in 0..w_mi {
+            grid.set(mi_row + dr, mi_col + dc, info);
+            grid.set_skip(mi_row + dr, mi_col + dc, skip);
+        }
+    }
+}
+
 /// The reconstructed samples one 32x32 square covers in all three planes, so
 /// that a partition trial can be undone.
 /// One square of a plane, row-major, the inverse of [`Plane::restore`].
@@ -9557,7 +9633,7 @@ fn search_root_128(
         luma,
         chroma,
         (x128, y128),
-        SIDE,
+        (SIDE, SIDE),
         &root_search,
         false,
         reference,
@@ -9656,6 +9732,165 @@ fn search_root_128(
     ))
 }
 
+/// lane-b128hv: the `PARTITION_HORZ` / `PARTITION_VERT` candidate for a whole
+/// 128 superblock root -- two 128x64 (`horz`) or 64x128 inter blocks, the
+/// shipped NONE machinery halved. Skip only, single reference or compound,
+/// exactly what `crate::tile::write_inter_block_128_rect` codes and
+/// `decode_inter_block` reads at `sb128_rect`.
+///
+/// The FIRST half is published into `grid` before the second is searched --
+/// the writer publishes it too, so a second half searched against the stale
+/// grid would be priced (and its mv predicted) off a stack the decoder never
+/// derives (class `encoder-grid-drift-invisible-to-pixel-gate`). The grid and
+/// both planes are put back before returning; the caller re-applies the
+/// winner.
+///
+/// Returns `(cost, lambda, the two halves, reconstruction)`, the cost already
+/// carrying the root's own partition symbol so it ranks against
+/// [`search_root_128`] and against the four superblocks below.
+#[allow(clippy::too_many_arguments)]
+fn search_root_128_rect(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    grid: &mut crate::mvstack::MiGrid,
+    (root_r, root_c): (usize, usize),
+    (rows, cols): (usize, usize),
+    (mi_cols, mi_rows): (u32, u32),
+    search: Search<'_>,
+    tpl_factors: &Option<Vec<f64>>,
+    sb_q: Option<&Vec<u8>>,
+    sb_cols: usize,
+    tpl_cells_x: usize,
+    base_q_idx: u8,
+    reference: &Picture,
+    // The `LAST` + extra-reference pairs offered at this root; only the
+    // reference and its picture are read here, since each HALF derives its
+    // own compound stack at its own rectangular window.
+    compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
+    horz: bool,
+    fctx: &crate::decode::FrameCtx,
+) -> Option<(f64, f64, [BlockCoeffs; 2], [(Vec<u8>, Vec<CoefCtx>); 3])> {
+    const SIDE: usize = SUPERBLOCK * 2;
+    const SIDE_MI: usize = SIDE / 4;
+    let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
+    let (mi_row, mi_col) = (root_r * 16, root_c * 16);
+    if root_r * 2 + 3 >= rows
+        || root_c * 2 + 3 >= cols
+        || (mi_row + SIDE_MI) as u32 > mi_rows
+        || (mi_col + SIDE_MI) as u32 > mi_cols
+        || x128 + SIDE > luma.true_width
+        || y128 + SIDE > luma.true_height
+    {
+        return None;
+    }
+    // The root's own lambda, the mean of its four superblocks' -- the same
+    // one [`search_root_128`] prices with, so the three root candidates and
+    // the four-superblock arm are all comparable.
+    let cell_lambda = |sb_r: usize, sb_c: usize| match (sb_q, tpl_factors) {
+        (Some(q), _) => sb_q_search(q, sb_cols, base_q_idx, (sb_r, sb_c), search).lambda,
+        (None, Some(f)) => {
+            let mean = (0..16)
+                .map(|i| f[(sb_r * 4 + i / 4) * tpl_cells_x + sb_c * 4 + i % 4])
+                .sum::<f64>()
+                / 16.0;
+            search.lambda * mean
+        }
+        (None, None) => search.lambda,
+    };
+    let lambda = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        .iter()
+        .map(|&(dr, dc)| cell_lambda(root_r + dr, root_c + dc))
+        .sum::<f64>()
+        / 4.0;
+    let root_search = Search {
+        lambda,
+        ..match sb_q {
+            Some(q) => sb_q_search(q, sb_cols, base_q_idx, (root_r, root_c), search),
+            None => search,
+        }
+    };
+    let (w, h) = if horz { (SIDE, SUPERBLOCK) } else { (SUPERBLOCK, SIDE) };
+    let (w_mi, h_mi) = (w / 4, h / 4);
+    let base = snapshot(luma, chroma, (x128, y128), SIDE);
+    let grid_base = grid.snapshot_rect(mi_row, mi_col, SIDE_MI, SIDE_MI);
+    let mut cost = 0.0f64;
+    let mut halves: Vec<BlockCoeffs> = Vec::with_capacity(2);
+    for i in 0..2usize {
+        let (mr, mc) = if horz {
+            (mi_row + i * 16, mi_col)
+        } else {
+            (mi_row, mi_col + i * 16)
+        };
+        let stack = find_mv_stack(
+            grid,
+            mr,
+            mc,
+            w_mi,
+            h_mi,
+            LAST_FRAME,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+        let half_compound: Vec<(i8, &Picture, crate::mvstack::CompoundMvStack)> = compound
+            .iter()
+            .map(|&(r, pic, _)| {
+                (
+                    r,
+                    pic,
+                    crate::mvstack::find_mv_stack_compound(
+                        grid,
+                        mr,
+                        mc,
+                        w_mi,
+                        h_mi,
+                        (LAST_FRAME, r),
+                        mi_cols as usize,
+                        mi_rows as usize,
+                        grid.sign_bias_table(),
+                        &[(0, 0); 7],
+                        None,
+                    ),
+                )
+            })
+            .collect();
+        let found = search_skip_64(
+            luma,
+            chroma,
+            (mc * 4, mr * 4),
+            (w, h),
+            &root_search,
+            false,
+            reference,
+            &stack,
+            &half_compound,
+            fctx,
+        );
+        match found {
+            Some((c, block)) => {
+                cost += c;
+                record_mi_rect(grid, mr, mc, (w_mi, h_mi), block.inter, block.skip);
+                halves.push(block);
+            }
+            None => {
+                restore(luma, chroma, (x128, y128), SIDE, &base);
+                grid.restore_rect(mi_row, mi_col, SIDE_MI, SIDE_MI, &grid_base);
+                return None;
+            }
+        }
+    }
+    let after = snapshot(luma, chroma, (x128, y128), SIDE);
+    restore(luma, chroma, (x128, y128), SIDE, &base);
+    grid.restore_rect(mi_row, mi_col, SIDE_MI, SIDE_MI, &grid_base);
+    let symbol = if horz { 1 } else { 2 };
+    let [b0, b1] = <[BlockCoeffs; 2]>::try_from(halves).ok()?;
+    Some((
+        cost + lambda * crate::tile::partition_bits_sym(SIDE, symbol),
+        lambda,
+        [b0, b1],
+        after,
+    ))
+}
+
 /// The 64x64 `PARTITION_NONE` candidate for a whole superblock ([`B64_ROOT`]):
 /// single-reference LAST at `NEARESTMV`/`GLOBALMV`/`NEARMV`/`NEWMV`, coded
 /// SKIP, priced through the same `symbol_bits` path every other candidate
@@ -9670,12 +9905,14 @@ fn search_skip_64(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
-    // The root's side in samples: [`SUPERBLOCK`] at a 64 root, twice that at
-    // the 128 one [`search_root_128`] drives (lane-b128). Every trial below
-    // is a square of this side and its half in chroma, and the residual arm
-    // is only ever asked for at 64 -- a 128 block's residual is four
+    // The root's footprint in samples: [`SUPERBLOCK`] square at a 64 root,
+    // twice that at the 128 one [`search_root_128`] drives (lane-b128), and
+    // 128x64 / 64x128 at the rect halves of [`search_root_128_rect`]
+    // (lane-b128hv). Every trial below tiles it into squares of its SHORTER
+    // side (one square when it is square, two otherwise), and the residual
+    // arm is only ever asked for at 64 -- a 128 block's residual is four
     // TX_64X64 units the writer has no path for.
-    side: usize,
+    (bw, bh): (usize, usize),
     search: &Search,
     // Whether the non-skip arm is priced at all ([`b64_residual`], and off on
     // screen content -- see that function's doc).
@@ -9688,7 +9925,23 @@ fn search_skip_64(
     compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
     fctx: &crate::decode::FrameCtx,
 ) -> Option<(f64, BlockCoeffs)> {
-    debug_assert!(side == SUPERBLOCK || !residual, "a 128 root has no residual arm");
+    debug_assert!(
+        (bw, bh) == (SUPERBLOCK, SUPERBLOCK) || !residual,
+        "only a 64 root has a residual arm"
+    );
+    // The square units every trial below is taken on: the block itself when
+    // it is square, its two halves otherwise. Luma first (in raster order),
+    // then each chroma plane over the same tiling at half the side -- which is
+    // exactly `[(0, x, y, side), (1, ..), (2, ..)]` at bw == bh.
+    let sq = bw.min(bh);
+    let units: Vec<(usize, usize, usize, usize, bool)> = (0..3usize)
+        .flat_map(|plane| {
+            let (ox, oy, s) = if plane == 0 { (x, y, sq) } else { (x / 2, y / 2, sq / 2) };
+            (0..bh / sq).flat_map(move |j| {
+                (0..bw / sq).map(move |i| (plane, ox + i * s, oy + j * s, s, plane == 0))
+            })
+        })
+        .collect();
     let not_new = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1);
     let not_zero = symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1);
     let ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
@@ -9726,7 +9979,7 @@ fn search_skip_64(
     // candidate below to pair with the second reference's NEAREST half.
     let mut last_new_mv: Option<(i32, i32)> = None;
     if leaf_new_mv() {
-        let source_block = luma.source_block(x, y, side);
+        let source_block = luma.source_block_rect(x, y, bw, bh);
         let (seeds, seed_n) = mv_seeds(stack);
         let found = motion::search(
             &reference.y,
@@ -9736,8 +9989,8 @@ fn search_skip_64(
             &source_block,
             x,
             y,
-            side,
-            side,
+            bw,
+            bh,
             stack.pred_mv,
             &seeds[..seed_n],
             search.lambda,
@@ -9754,14 +10007,11 @@ fn search_skip_64(
         }
     }
 
-    let mut best: Option<(f64, f64, InterInfo, [Trial; 3])> = None;
+    let mut best: Option<(f64, f64, InterInfo, Vec<Trial>)> = None;
     for (bits, info) in cands {
-        let trials = [
-            (0usize, x, y, side, true),
-            (1, x / 2, y / 2, side / 2, false),
-            (2, x / 2, y / 2, side / 2, false),
-        ]
-        .map(|(plane, px, py, s, is_luma)| {
+        let trials: Vec<Trial> = units
+            .iter()
+            .map(|&(plane, px, py, s, is_luma)| {
             let (samples, stride, w, h) = match plane {
                 0 => (&reference.y, reference.width, luma.true_width, luma.true_height),
                 1 => (
@@ -9792,11 +10042,10 @@ fn search_skip_64(
                 search.deadzone,
                 TxbSet::Luma32Inter,
             )
-        });
-        let cost = trials[0].sse
-            + trials[1].sse
-            + trials[2].sse
-            + search.lambda * (fixed + bits);
+            })
+            .collect();
+        let cost =
+            trials.iter().map(|t| t.sse).sum::<f64>() + search.lambda * (fixed + bits);
         if best.as_ref().is_none_or(|b| cost < b.0) {
             best = Some((cost, fixed + bits, info, trials));
         }
@@ -9855,12 +10104,9 @@ fn search_skip_64(
         ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         ccands.dedup_by_key(|c| c.0);
         for (mvs, bits, info) in ccands {
-            let trials = [
-                (0usize, x, y, side, true),
-                (1, x / 2, y / 2, side / 2, false),
-                (2, x / 2, y / 2, side / 2, false),
-            ]
-            .map(|(plane, px, py, s, is_luma)| {
+            let trials: Vec<Trial> = units
+                .iter()
+                .map(|&(plane, px, py, s, is_luma)| {
                 let (r0, r1) = match plane {
                     0 => (
                         (reference.y.as_slice(), reference.width, luma.true_width, luma.true_height),
@@ -9898,10 +10144,10 @@ fn search_skip_64(
                     search.deadzone,
                     TxbSet::Luma32Inter,
                 )
-            });
+                })
+                .collect();
             let syntax = fixed - ref_bits + bits;
-            let cost =
-                trials[0].sse + trials[1].sse + trials[2].sse + search.lambda * syntax;
+            let cost = trials.iter().map(|t| t.sse).sum::<f64>() + search.lambda * syntax;
             if best.as_ref().is_none_or(|b| cost < b.0) {
                 best = Some((cost, syntax, info, trials));
             }
@@ -9931,11 +10177,13 @@ fn search_skip_64(
     let mut luma_levels: Option<(Vec<i32>, u8, Vec<TxType>)> = None;
     if residual {
         let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
+        // Square by construction (the `debug_assert` above), so `units` is
+        // one entry per plane and `chosen.2[plane]` is that plane's trial.
         let residual_trials = [0usize, 1, 2].map(|plane| {
             let (target, px, py, s) = if plane == 0 {
-                (&*luma, x, y, side)
+                (&*luma, x, y, bw)
             } else {
-                (&chroma[plane - 1], x / 2, y / 2, side / 2)
+                (&chroma[plane - 1], x / 2, y / 2, bw / 2)
             };
             target.code_from_prediction(
                 px,
@@ -9967,7 +10215,7 @@ fn search_skip_64(
             commit_inter_luma(
                 luma,
                 (x, y),
-                side,
+                bw,
                 info.mv,
                 (&reference.y, reference.width, luma.true_width, luma.true_height),
                 search,
@@ -9988,18 +10236,20 @@ fn search_skip_64(
                 B64_VAR_TX_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             luma_levels = Some((levels, depth, tx_types));
-            chosen = (cost, false, residual_trials);
+            chosen = (cost, false, residual_trials.to_vec());
         }
     }
 
     let (cost, skip, trials) = chosen;
     // `commit_inter_luma` already wrote the residual arm's luma (its four
     // split units are not one 64-sided trial); a skip winner overwrites it.
-    if skip || !luma_committed {
-        luma.commit(x, y, side, &trials[0]);
+    for (&(plane, px, py, s, _), trial) in units.iter().zip(&trials) {
+        match plane {
+            0 if skip || !luma_committed => luma.commit(px, py, s, trial),
+            0 => {}
+            _ => chroma[plane - 1].commit(px, py, s, trial),
+        }
     }
-    chroma[0].commit(x / 2, y / 2, side / 2, &trials[1]);
-    chroma[1].commit(x / 2, y / 2, side / 2, &trials[2]);
     Some((
         cost,
         BlockCoeffs {
@@ -10019,8 +10269,8 @@ fn search_skip_64(
                 (false, Some((levels, _, _))) => coeffs(levels, BLOCK),
                 (false, None) => coeffs(&trials[0].levels, BLOCK),
             },
-            u: if skip { Vec::new() } else { coeffs(&trials[1].levels, side / 2) },
-            v: if skip { Vec::new() } else { coeffs(&trials[2].levels, side / 2) },
+            u: if skip { Vec::new() } else { coeffs(&trials[1].levels, bw / 2) },
+            v: if skip { Vec::new() } else { coeffs(&trials[2].levels, bw / 2) },
             ..BlockCoeffs::default()
         },
     ))
@@ -12371,6 +12621,44 @@ pub(crate) fn encode_inter_frame(
                 fctx,
             ))
             .flatten();
+        // lane-b128hv: the same root as two 128x64 / 64x128 halves. Both cuts
+        // are priced; the cheaper one competes with the NONE block and with
+        // the four superblocks below.
+        let forced_rect = FORCE_B128_RECT.load(std::sync::atomic::Ordering::Relaxed);
+        let root_rect = (sb128_search && b128_rect() && cells.len() == 4)
+            .then(|| {
+                let mut best: Option<(bool, _)> = None;
+                for horz in [true, false] {
+                    if forced_rect != 0 && forced_rect != u8::from(horz) + u8::from(!horz) * 2 {
+                        continue;
+                    }
+                    let Some(found) = search_root_128_rect(
+                        &mut luma,
+                        &mut chroma,
+                        &mut grid,
+                        (root_r, root_c),
+                        (rows, cols),
+                        (header.mi_cols, header.mi_rows),
+                        search,
+                        &tpl_factors,
+                        sb_q.as_ref(),
+                        sb_cols,
+                        tpl_cells_x,
+                        base_q_idx,
+                        reference,
+                        &root_compound,
+                        horz,
+                        fctx,
+                    ) else {
+                        continue;
+                    };
+                    if best.as_ref().is_none_or(|b: &(bool, (f64, f64, _, _))| found.0 < b.1.0) {
+                        best = Some((horz, found));
+                    }
+                }
+                best
+            })
+            .flatten();
         for (sb_r, sb_c) in cells {
             // lane-b64: the whole superblock as ONE 64x64 block, tried before
             // its quadrants are (`search_skip_64`) and compared against the
@@ -12470,7 +12758,7 @@ pub(crate) fn encode_inter_frame(
                     &mut luma,
                     &mut chroma,
                     (x64, y64),
-                    SUPERBLOCK,
+                    (SUPERBLOCK, SUPERBLOCK),
                     &sb_search,
                     b64_residual() && !screen,
                     reference,
@@ -12949,18 +13237,56 @@ pub(crate) fn encode_inter_frame(
         // `partition_w128` symbol) against what its four superblocks really
         // cost, the same weighing the 64 root does one size down. Both sides
         // carry their own partition symbol, so the comparison is complete.
-        if let Some((cost128, lambda128, block, after)) = root128
+        // lane-b128hv: `None` is the NONE arm, `Some(horz)` a rect cut.
+        let mut cands: Vec<(f64, f64, Option<bool>, Vec<BlockCoeffs>, _)> = Vec::new();
+        if let Some((c, l, b, a)) = root128 {
+            cands.push((c, l, None, vec![b], a));
+        }
+        if let Some((horz, (c, l, halves, a))) = root_rect {
+            cands.push((c, l, Some(horz), halves.to_vec(), a));
+        }
+        // The rect witness knob drops the NONE arm outright: on synthetic
+        // content the whole block always wins its own comparison.
+        if forced_rect != 0 {
+            cands.retain(|c| c.2.is_some());
+        }
+        cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((cost128, lambda128, shape, halves, after)) = cands.into_iter().next()
             && (cost128 < root_cost + lambda128 * crate::tile::partition_bits(128, true)
-                // The witness knob takes the root whatever it costs, so the
-                // forced residual block really reaches the writer.
-                || FORCE_B128_ROOT.load(std::sync::atomic::Ordering::Relaxed))
+                // The witness knobs take the root whatever it costs, so the
+                // forced block really reaches the writer.
+                || FORCE_B128_ROOT.load(std::sync::atomic::Ordering::Relaxed)
+                || forced_rect != 0)
         {
-            B128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (x128, y128) = (root_c * SUPERBLOCK, root_r * SUPERBLOCK);
             blocks.truncate(mark128);
             restore(&mut luma, &mut chroma, (x128, y128), SUPERBLOCK * 2, &after);
-            record_mi(&mut grid, root_r * 16, root_c * 16, 32, block.inter, block.skip);
-            blocks.push(((root_r * 2) * cols + root_c * 2, Quadrant::Whole128(block)));
+            let at = (root_r * 2) * cols + root_c * 2;
+            match shape {
+                None => {
+                    B128_NONE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let block = halves.into_iter().next().expect("the NONE arm's block");
+                    record_mi(&mut grid, root_r * 16, root_c * 16, 32, block.inter, block.skip);
+                    blocks.push((at, Quadrant::Whole128(block)));
+                }
+                Some(horz) => {
+                    if horz {
+                        B128_HORZ_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        B128_VERT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let (w_mi, h_mi) = if horz { (32usize, 16usize) } else { (16, 32) };
+                    for (i, half) in halves.iter().enumerate() {
+                        let (mr, mc) = if horz {
+                            (root_r * 16 + i * 16, root_c * 16)
+                        } else {
+                            (root_r * 16, root_c * 16 + i * 16)
+                        };
+                        record_mi_rect(&mut grid, mr, mc, (w_mi, h_mi), half.inter, half.skip);
+                    }
+                    blocks.push((at, Quadrant::Rect128(horz, halves)));
+                }
+            }
             for q in 1..16 {
                 let (r32, c32) = (root_r * 2 + q / 4, root_c * 2 + q % 4);
                 blocks.push((r32 * cols + c32, Quadrant::Covered));
@@ -13018,10 +13344,28 @@ pub(crate) fn encode_inter_frame(
                 matches!(q, Quadrant::Whole128(b) if b.inter.is_some_and(|i| i.ref1.is_some()))
             })
             .count();
+        // lane-b128hv: and how many roots took a rect cut instead, per shape
+        // -- the HORZ/VERT fire count the gate rows are read against.
+        let horz = blocks
+            .iter()
+            .filter(|q| matches!(q, Quadrant::Rect128(true, _)))
+            .count();
+        let vert = blocks
+            .iter()
+            .filter(|q| matches!(q, Quadrant::Rect128(false, _)))
+            .count();
+        let rect_compound = blocks
+            .iter()
+            .filter(|q| {
+                matches!(q, Quadrant::Rect128(_, hs)
+                    if hs.iter().any(|b| b.inter.is_some_and(|i| i.ref1.is_some())))
+            })
+            .count();
         eprintln!(
             "B128 census: inter frame, {whole} whole 128x128 roots ({residual} with a residual, \
-             {compound} compound), {roots} coded blocks ({:.1}% of the frame's area at 128)",
-            100.0 * (whole * 16) as f64 / blocks.len().max(1) as f64,
+             {compound} compound), {horz} HORZ + {vert} VERT roots ({rect_compound} with a \
+             compound half), {roots} coded blocks ({:.1}% of the frame's area at 128)",
+            100.0 * ((whole + horz + vert) * 16) as f64 / blocks.len().max(1) as f64,
         );
     }
     let modes = blocks
@@ -16536,6 +16880,102 @@ mod tests {
         }
     }
 
+    /// lane-b128hv: the 128 root's `PARTITION_HORZ` and `PARTITION_VERT`
+    /// arms -- two 128x64 / 64x128 inter blocks where the NONE arm codes one
+    /// square. Three passes over one `testsrc2` clip:
+    ///
+    ///  * HORZ forced at every root ([`force_b128_rect`]), so every context
+    ///    the 128x64 shape reads is exercised rather than the handful the RD
+    ///    would pick;
+    ///  * VERT forced the same way;
+    ///  * UNFORCED, which is the count the gate rows are read against -- the
+    ///    same clip with the RD free to choose among NONE / HORZ / VERT /
+    ///    four superblocks.
+    ///
+    /// Each pass is sample-exact against the encoder's own reconstruction
+    /// through `decode_stream` AND through ffmpeg; a writer/reader mismatch
+    /// surfaces here as a refusal or a pixel miss, never in the BD gate. RED
+    /// before this lane by construction: `write_sb128_root` could only name
+    /// `PARTITION_NONE` or `PARTITION_SPLIT`, so the count was 0 on all three.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored \
+    ///         a_128_root_horz_and_vert --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_128_root_horz_and_vert_halves_decode_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-b128hv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("testsrc2-1280x768.y4m");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=1280x768:rate=24"])
+            .args(["-frames:v", "12", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        let mut unforced = (0usize, 0usize);
+        for (label, force) in [("HORZ", 1u8), ("VERT", 2), ("unforced", 0)] {
+            force_b128_rect(force);
+            let _ = take_b128_horz_hits();
+            let _ = take_b128_vert_hits();
+            let _ = crate::tile::take_sb128_horz_hits();
+            let _ = crate::tile::take_sb128_vert_hits();
+            let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
+            let (won_h, won_v) = (take_b128_horz_hits(), take_b128_vert_hits());
+            let (coded_h, coded_v) = (
+                crate::tile::take_sb128_horz_hits(),
+                crate::tile::take_sb128_vert_hits(),
+            );
+            eprintln!(
+                "{label}: search won {won_h} HORZ + {won_v} VERT roots, writer coded \
+                 {coded_h} 128x64 + {coded_v} 64x128 halves"
+            );
+            match force {
+                1 => assert!(coded_h > 0, "no 128x64 half was coded with HORZ forced"),
+                2 => assert!(coded_v > 0, "no 64x128 half was coded with VERT forced"),
+                // The unforced count is REPORTED, not asserted: it is the
+                // number the gate is read against, and a zero here would be
+                // an RD result, not a defect (the forced passes already prove
+                // the writer and the reader agree on the shape).
+                _ => unforced = (won_h, won_v),
+            }
+            let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+            assert_eq!(decoded.len(), encoded.frames.len(), "{label}: frame count");
+            for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+                for (plane, got, want) in [
+                    ("luma", &dec.y, &frame.reconstruction.y),
+                    ("U", &dec.u, &frame.reconstruction.u),
+                    ("V", &dec.v, &frame.reconstruction.v),
+                ] {
+                    let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                    assert_eq!(differ, 0, "{label} frame {i}: {plane} -- {differ} samples differ");
+                }
+            }
+            let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+            for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+                assert_eq!(dec.y, frame.reconstruction.y, "{label} frame {i}: ffmpeg luma");
+                assert_eq!(dec.u, frame.reconstruction.u, "{label} frame {i}: ffmpeg U");
+                assert_eq!(dec.v, frame.reconstruction.v, "{label} frame {i}: ffmpeg V");
+            }
+        }
+        force_b128_rect(0);
+        eprintln!(
+            "unforced on testsrc2: {} HORZ + {} VERT roots over 12 frames",
+            unforced.0, unforced.1
+        );
+    }
+
     #[test]
     #[ignore = "sets the process-global superblock size: run it alone"]
     fn a_128_superblock_clip_whose_drl_index_the_write_time_stack_cannot_carry_decodes_exact() {
@@ -17987,7 +18427,13 @@ mod tests {
         // 33017 at q=60 (the same LENGTH, different bytes).
         // Re-taken at the merge of lane-arftf (ARF filter strength 2) and
         // lane-rlclamp onto the 128 compound default.
-        let pins: [(u8, usize, u64); 2] = [(150, 8290, 0x92cb11033d1f5813), (60, 33227, 0x57ee6b1f8eacd881)];
+        // Re-taken on lane-b128hv: the 128 root now also offers PARTITION_HORZ
+        // and PARTITION_VERT ([`b128_rect`]), two 128x64 / 64x128 skip blocks,
+        // so every inter frame whose RD takes one codes a different partition
+        // -- 8290 -> 8291 bytes at q=150. The q=60 pin does NOT move: at that
+        // quantizer the rect cut never wins its own comparison on this clip.
+        // `EC_AV1_B128HV=0` restores 8290 exactly.
+        let pins: [(u8, usize, u64); 2] = [(150, 8291, 0x1f00bb0eb099a27f), (60, 33227, 0x57ee6b1f8eacd881)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
