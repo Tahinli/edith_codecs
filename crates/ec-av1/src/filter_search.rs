@@ -48,6 +48,18 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// lane-edge128: 64x64 CDEF units that took a NON-ZERO preset index from
+/// another unit's `cdef_idx` literal -- the units of a whole 128x128 root
+/// block, the only shape whose literal covers more than one unit. Zero makes
+/// any witness for that rule vacuous (class `gate-blind-to-feature`).
+static CDEF_COVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Takes and clears [`CDEF_COVERED`].
+#[allow(dead_code)] // read from the `#[cfg(test)]` witness
+pub(crate) fn take_cdef_covered_units() -> usize {
+    CDEF_COVERED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Takes and clears [`PRESET_COUNTS`].
 #[allow(dead_code)] // read from the `#[cfg(test)]` BD gate
 pub(crate) fn take_cdef_presets() -> Vec<(u8, Vec<usize>)> {
@@ -203,6 +215,12 @@ pub(crate) fn pick_filters(
     damping: u8,
     (sb_cols, sb_rows): (usize, usize),
     lambda: f64,
+    // lane-edge128: which unit's `cdef_idx` literal covers each 64x64 unit
+    // (`crate::tile::cdef_unit_owner`). A unit covered by ANOTHER unit's
+    // literal -- the four units of a whole 128x128 root block -- cannot be
+    // given a preset of its own, so its error is scored into its owner's and
+    // it takes its owner's index. Empty means the identity map.
+    cdef_owner: &[u32],
 ) -> Result<(LoopFilterParams, CdefParams, Vec<u8>, Picture)> {
     let (cw, ch) = (fw.div_ceil(2), fh.div_ceil(2));
     let nsb = sb_cols * sb_rows;
@@ -252,11 +270,19 @@ pub(crate) fn pick_filters(
             st.chroma.push((ckey, (sse, units)));
         }
         drop(sst);
-        let (sse_y, sse_uv, sse64) = {
+        let (sse_y, sse_uv, mut sse64): (u64, u64, Vec<u64>) = {
             let l = &st.luma.iter().find(|(k, _)| *k == lkey).expect("just inserted").1;
             let c = &st.chroma.iter().find(|(k, _)| *k == ckey).expect("just inserted").1;
             (l.0, c.0, l.1.iter().zip(&c.1).map(|(a, b)| a + b).collect())
         };
+        // A unit that codes no literal of its own carries its error into the
+        // one that does, so every choice below is made per GROUP.
+        for (u, &owner) in cdef_owner.iter().enumerate() {
+            if owner as usize != u {
+                sse64[owner as usize] += sse64[u];
+                sse64[u] = 0;
+            }
+        }
         st.trials.push(Trial { cand, picture, sse_y, sse_uv, sse64 });
         Ok(st.trials.len() - 1)
     };
@@ -382,7 +408,7 @@ pub(crate) fn pick_filters(
             bits = b;
         }
     }
-    let grid: Vec<u8> = if bits == 0 {
+    let mut grid: Vec<u8> = if bits == 0 {
         Vec::new()
     } else {
         let n = 1usize << bits;
@@ -394,6 +420,17 @@ pub(crate) fn pick_filters(
             })
             .collect()
     };
+    // The covered units scored zero above, so they would all read preset 0
+    // here: give them the index their owner's literal actually carries.
+    if !grid.is_empty() {
+        for u in 0..nsb {
+            let owner = cdef_owner.get(u).map_or(u, |&o| o as usize);
+            if owner != u && grid[owner] != 0 {
+                CDEF_COVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            grid[u] = grid[owner];
+        }
+    }
     let mut params = cdef(best, damping);
     params.bits = bits;
     for (i, c) in presets.iter().take(1usize << bits).enumerate() {
