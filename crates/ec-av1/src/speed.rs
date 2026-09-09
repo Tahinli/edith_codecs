@@ -494,8 +494,26 @@ pub(crate) const LOOKAHEAD: bool = true;
 ///
 /// Falls back to `0`'s window whenever no future picture is buffered (the
 /// lookahead off, or the end of the stream). `EC_AV1_TPL_FUT=<n>` overrides
-/// it.
-pub(crate) const TPL_FUT: [usize; 11] = [0; 11];
+/// it, and `EC_AV1_TPL_FUT_HALF=<n>` moves mode 2's split (default half the
+/// budget each side).
+///
+/// The 48-picture long-GOP gate, both films, against the past window:
+///
+/// | arm | film A | film B | wall A | wall B |
+/// |---|---|---|---|---|
+/// | 0, past (the control) | +21.3/-8.8 | +72.1/-1.2 | 671.1s | 461.6s |
+/// | 1, future only | +22.0/-8.6 | +73.1/-1.1 | 629.6s | 583.1s |
+/// | **2, 3 past then 4 future (ships)** | **+21.2/-8.8** | **+71.6/-1.5** | 692.3s | 462.5s |
+/// | 3, the whole next group | +21.9/-8.7 | +72.7/-1.4 | 573.1s | 455.7s |
+///
+/// A future-ONLY window is worse than the past one on every column: the
+/// nearest past neighbours are what the map's propagation is carried by (the
+/// witness sees the same thing -- mode 2 at its default split is byte-
+/// identical to mode 0 on a 128x128 fixture, and only moves once the past
+/// half is cut to one). Mode 2 is film B -0.5/-0.3 and film A -0.1/0.0, so it
+/// keeps by the lane's rule (one row >=0.5 down, the other flat within
+/// +-0.3) at +3.2% / +0.2% wall.
+pub(crate) const TPL_FUT: [usize; 11] = [2; 11];
 
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at
