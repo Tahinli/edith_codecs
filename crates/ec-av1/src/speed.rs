@@ -435,6 +435,22 @@ pub(crate) const ARF_TF_MID: [f64; 11] = [0.0; 11];
 /// the leaves it has to predict.
 pub(crate) const ARF_TF_WIN: [usize; 11] = [2; 11];
 
+/// lane-lookahead: how many DISPLAY-FUTURE neighbours the top ARF's temporal
+/// filter averages in, on top of [`ARF_TF_WIN`] past ones. Non-zero needs
+/// [`LOOKAHEAD`] -- the future pictures are the next group's sources, which
+/// the encoder buffers only with the lookahead on.
+/// `EC_AV1_ARF_TF_WIN_FUT=<n>` overrides it.
+pub(crate) const ARF_TF_WIN_FUT: [usize; 11] = [0; 11];
+
+/// lane-lookahead: whether [`crate::encoder::Av1Encoder`] holds one whole
+/// mini-GOP of lookahead -- the next group's sources are buffered before the
+/// current group's top ARF is coded, so that ARF has display-FUTURE pictures
+/// available. Costs one group of latency (`mini_gop` pictures, 8 by default:
+/// ~99 MB of buffered source at 4K 8-bit 4:2:0) and nothing else: with
+/// [`ARF_TF_WIN_FUT`] at 0 nothing reads the future half and the streams are
+/// byte-identical. `EC_AV1_LOOKAHEAD=0|1` overrides it.
+pub(crate) const LOOKAHEAD: bool = false;
+
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at
 /// the high-quality end for the same reason: a picture we are about to

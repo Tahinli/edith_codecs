@@ -1238,6 +1238,58 @@ pub(crate) fn arf_tf_window() -> usize {
         .unwrap_or_else(|| crate::speed::at(&crate::speed::ARF_TF_WIN))
 }
 
+/// lane-lookahead: how many DISPLAY-FUTURE neighbours the top ARF's filter
+/// takes out of the buffered next group ([`crate::speed::ARF_TF_WIN_FUT`],
+/// `EC_AV1_ARF_TF_WIN_FUT=<n>`). Inert without [`lookahead`].
+pub(crate) fn arf_tf_window_future() -> usize {
+    match ARF_TF_FUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => {}
+        n => return n,
+    }
+    std::env::var("EC_AV1_ARF_TF_WIN_FUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| crate::speed::at(&crate::speed::ARF_TF_WIN_FUT))
+}
+
+/// PROCESS-GLOBAL overrides of the two lane-lookahead knobs, the shape
+/// [`set_last2`] has (this crate's tests never call `set_var`); `u8::MAX` /
+/// `usize::MAX` is unset, and a witness holds [`crate::speed::knob_write`]
+/// while it uses them.
+static LOOKAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(u8::MAX);
+static ARF_TF_FUT_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Sets [`LOOKAHEAD_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` witness
+pub(crate) fn set_lookahead(on: Option<bool>) {
+    LOOKAHEAD_OVERRIDE.store(
+        on.map_or(u8::MAX, u8::from),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Sets [`ARF_TF_FUT_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` witness
+pub(crate) fn set_arf_tf_future(n: Option<usize>) {
+    ARF_TF_FUT_OVERRIDE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// lane-lookahead: whether the pyramid path holds one group of lookahead
+/// ([`crate::speed::LOOKAHEAD`], `EC_AV1_LOOKAHEAD=0|1`).
+fn lookahead() -> bool {
+    match LOOKAHEAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    match std::env::var("EC_AV1_LOOKAHEAD").ok() {
+        Some(v) => v != "0",
+        None => crate::speed::LOOKAHEAD,
+    }
+}
+
 fn tpl_pyramid() -> bool {
     match std::env::var("EC_AV1_TPL_PYRAMID").ok() {
         Some(v) => v != "0",
@@ -1315,6 +1367,11 @@ pub struct Av1Encoder {
     dpb: [Option<DpbSlot>; 8],
     /// Pictures held back waiting for their mini-GOP's hidden frame.
     pending: Vec<(u64, Picture)>,
+    /// lane-lookahead: the CLOSED group waiting for the next group's sources
+    /// before it is coded, so its top ARF -- the group's last picture in
+    /// display order -- has display-future neighbours available. Always empty
+    /// with [`lookahead`] off.
+    ready: Vec<(u64, Picture)>,
     /// The flat path's delay queue: pictures whose packets later calls
     /// return, each coded with the ones behind it as its lookahead window
     /// (lane-av1facade, deepened to [`crate::encode::tpl_depth`] - 1 on
@@ -1415,6 +1472,7 @@ impl Av1Encoder {
             pyramid: None,
             dpb: [const { None }; 8],
             pending: Vec::new(),
+            ready: Vec::new(),
             held: std::collections::VecDeque::new(),
             anchor: 0,
             leaf_hist: Vec::new(),
@@ -1618,7 +1676,7 @@ impl Av1Encoder {
             // A key frame closes whatever group is open (there is nothing for
             // its leaves to point forward at across the boundary) and then
             // restarts the pyramid from the key itself.
-            let mut packets = self.drain_pending()?;
+            let mut packets = self.drain_all(Some(picture))?;
             packets.push(self.encode_key(order, picture)?);
             return Ok(packets);
         }
@@ -1655,7 +1713,7 @@ impl Av1Encoder {
             }
             return Ok(packets);
         }
-        self.drain_pending()
+        self.drain_all(None)
     }
 
     /// The flat path: one picture and its lookahead (the next source picture,
@@ -1885,6 +1943,11 @@ impl Av1Encoder {
         // from, already padded (lane-arfcen). Empty codes the frame at one
         // lambda, which is what the whole pyramid path used to do.
         lookahead: &[Picture],
+        // lane-lookahead: DISPLAY-FUTURE pictures for the SOURCE temporal
+        // filter only (the top ARF's, out of the buffered next group), never
+        // for the temporal lambda map -- keeping the filter's window and the
+        // tpl window separate levers. Empty everywhere else.
+        future: &[Picture],
     ) -> Result<Packet> {
         let render = (self.config.width, self.config.height);
         let order_hint = (order & 0x7f) as u32;
@@ -1973,7 +2036,18 @@ impl Av1Encoder {
             false => 0.0,
         };
         let source = match tf > 0.0 {
-            true => crate::encode::arf_temporal_filter(&source, lookahead, tf),
+            true => {
+                // lane-lookahead: the filter's window is sized HERE -- up to
+                // `ARF_TF_WIN` display-past neighbours (nearest first) and
+                // then the display-future ones the caller buffered.
+                let window: Vec<Picture> = lookahead
+                    .iter()
+                    .take(arf_tf_window())
+                    .chain(future.iter())
+                    .cloned()
+                    .collect();
+                crate::encode::arf_temporal_filter(&source, &window, tf)
+            }
             false => source,
         };
         let encoded = || -> Result<Encoded> { encode_inter_frame(
@@ -2029,14 +2103,52 @@ impl Av1Encoder {
         Ok(self.packet(cropped.stream, false, order, level))
     }
 
-    /// Codes the open mini-GOP: its hidden frame first, then its leaves, then
-    /// the `show_existing_frame` header that puts the hidden frame back in
-    /// display order.
+    /// Closes the open mini-GOP. With the lookahead off that codes it
+    /// straight away, which is byte for byte what this encoder did before
+    /// lane-lookahead; with it on the open group takes the `ready` slot and
+    /// the group ALREADY there is coded, with the open one's sources as its
+    /// display-future window.
     fn drain_pending(&mut self) -> Result<Vec<Packet>> {
-        if self.pending.is_empty() {
+        if !lookahead() {
+            let group = std::mem::take(&mut self.pending);
+            return self.code_group(group, &[]);
+        }
+        let group = std::mem::take(&mut self.ready);
+        let next = std::mem::take(&mut self.pending);
+        let packets = self.code_group(group, &next);
+        self.ready = next;
+        packets
+    }
+
+    /// Codes every group still buffered, in coding order -- what a key frame
+    /// (`next` is the key picture, the last buffered group's own
+    /// display-future) and the end of stream (`None`) both need. The tail
+    /// group can be any length, down to the single picture `code_group`
+    /// codes as one shown leaf.
+    fn drain_all(&mut self, next: Option<&Picture>) -> Result<Vec<Packet>> {
+        let tail: Vec<(u64, Picture)> = next
+            .filter(|_| lookahead())
+            .map(|p| vec![(self.next_index, p.clone())])
+            .unwrap_or_default();
+        let ready = std::mem::take(&mut self.ready);
+        let pending = std::mem::take(&mut self.pending);
+        let mut packets = self.code_group(ready, &pending)?;
+        packets.extend(self.code_group(pending, &tail)?);
+        Ok(packets)
+    }
+
+    /// Codes one mini-GOP: its hidden frame first, then its leaves, then
+    /// the `show_existing_frame` header that puts the hidden frame back in
+    /// display order. `future` is the display-future sources the caller has
+    /// buffered past this group (lane-lookahead), empty without a lookahead.
+    fn code_group(
+        &mut self,
+        group: Vec<(u64, Picture)>,
+        future: &[(u64, Picture)],
+    ) -> Result<Vec<Packet>> {
+        if group.is_empty() {
             return Ok(Vec::new());
         }
-        let group: Vec<(u64, Picture)> = std::mem::take(&mut self.pending);
         let mut packets = Vec::with_capacity(group.len() + 1);
         // The lookahead window of the group's picture at index `pos`: the
         // display-order successors inside this group, or -- for the group's
@@ -2080,10 +2192,21 @@ impl Av1Encoder {
                 Level::Leaf,
                 pyramid.leaf_q_offset,
                 &tpl_window(0, false),
+                &[],
             )?);
             self.anchor = 1 - self.anchor;
             return Ok(packets);
         }
+        // lane-lookahead: the display-future half of the top ARF's temporal
+        // filter window, padded like the frame itself. Empty when the
+        // lookahead is off (`future` is then always empty) or when the filter
+        // asks for no future neighbours, which is what keeps the default
+        // stream byte-identical.
+        let arf_future: Vec<Picture> = future
+            .iter()
+            .take(arf_tf_window_future())
+            .map(|(_, p)| p.padded_to(SUPERBLOCK))
+            .collect();
         // The group's top level: the last picture, hidden, off the anchor.
         packets.push(self.encode_pyramid_inter(
             arf_order,
@@ -2106,6 +2229,10 @@ impl Av1Encoder {
             Level::Arf,
             pyramid.arf_q_offset,
             &tpl_window(group.len() - 1, true),
+            // lane-lookahead: the group's top ARF is its LAST picture in
+            // display order, so every picture of the next group is a
+            // display-future neighbour of it -- nearest first.
+            &arf_future,
         )?);
         let leaves = group.len() - 1;
         // THE THIRD LEVEL: a second hidden frame at the middle of the leaf
@@ -2140,6 +2267,7 @@ impl Av1Encoder {
                 Level::Arf,
                 offset,
                 &tpl_window(at, false),
+                &[],
             )?);
         }
         // THE FOURTH LEVEL: one hidden frame at the middle of each half of
@@ -2177,6 +2305,7 @@ impl Av1Encoder {
                     Level::Arf,
                     offset,
                     &tpl_window(pos, false),
+                    &[],
                 )?);
             }
         }
@@ -2253,6 +2382,7 @@ impl Av1Encoder {
                 Level::Leaf,
                 pyramid.leaf_q_offset,
                 &tpl_window(i, false),
+                &[],
             )?);
         }
         let packet = show_existing(self, next_anchor_slot, arf_order)?;
@@ -3513,6 +3643,121 @@ mod tests {
         let shown = packets.iter().filter(|p| p.level == Level::ShowExisting).count();
         let arfs = packets.iter().filter(|p| p.level == Level::Arf).count();
         assert_eq!(shown, arfs, "one show_existing_frame per hidden frame");
+    }
+
+    /// A picture whose content is a static gradient plus a per-picture
+    /// pseudo-random +-2 of noise: motion search matches the neighbours
+    /// almost exactly, so the ARF temporal filter's weights are near 1 and
+    /// the filter actually changes the source (a moving test card gives every
+    /// neighbour a large MSE, weight ~0, and the filter is a no-op that would
+    /// make the future-window witness below pass blind).
+    fn noisy_card(width: usize, height: usize, t: usize) -> Picture {
+        let mut picture = Picture::grey(width, height);
+        let mut seed = (t as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        for y in 0..height {
+            for x in 0..width {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let noise = ((seed >> 33) % 5) as i32 - 2;
+                let base = 40 + (x + y) as i32 / 2;
+                picture.y[y * width + x] = base.saturating_add(noise).clamp(0, 255) as u16;
+            }
+        }
+        for i in 0..(width / 2) * (height / 2) {
+            picture.u[i] = 110;
+            picture.v[i] = 140;
+        }
+        picture
+    }
+
+    /// lane-lookahead's correctness witness. One group of lookahead
+    /// (`Av1Encoder::drain_pending` hands the closed group to `ready` and
+    /// codes the group before it) must not change WHAT is coded:
+    ///
+    /// * with the future half of the filter window empty the stream is byte
+    ///   for byte the one the encoder coded without a lookahead, at every
+    ///   run length -- 1 picture (no hidden frame at all), 7 (a short group),
+    ///   8 (exactly `mini_gop`), 9 (a group plus a tail) and 17 -- and at a
+    ///   GOP short enough (8) that key frames drain the buffer mid-run;
+    /// * every run decodes to exactly its picture count through OUR decoder
+    ///   and through ffmpeg, sample-exact between the two, so the flush and
+    ///   the `show_existing_frame` order survive the delay;
+    /// * and with ONE future neighbour the top ARF's source filter actually
+    ///   reads it -- the stream MOVES (class gate-blind-to-feature: a
+    ///   buffered picture nothing consumes would pass every check above).
+    #[test]
+    fn the_lookahead_holds_one_group_and_still_codes_every_picture() {
+        let _knobs = crate::speed::knob_write();
+        crate::encode::force_screen(Some(false));
+        let (width, height) = (128usize, 128usize);
+        let run = |n: usize, gop: usize, on: bool, fut: usize| -> (Vec<u8>, Vec<Packet>) {
+            set_lookahead(Some(on));
+            set_arf_tf_future(Some(fut));
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 120,
+                gop,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let mut enc = Av1Encoder::with_pyramid(config, Pyramid::default()).unwrap();
+            let sources: Vec<Picture> = (0..n).map(|t| noisy_card(width, height, t)).collect();
+            let packets = encode_all(&mut enc, &sources);
+            (concat(&packets), packets)
+        };
+        for gop in [32usize, 8] {
+            for n in [1usize, 7, 8, 9, 17] {
+                let (flat, flat_packets) = run(n, gop, false, 0);
+                let (held, packets) = run(n, gop, true, 0);
+                assert_eq!(
+                    flat.len(),
+                    held.len(),
+                    "{n} pictures at gop {gop}: the lookahead changed the stream LENGTH"
+                );
+                assert!(flat == held, "{n} pictures at gop {gop}: the stream is not byte-identical");
+                assert_eq!(
+                    packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                    flat_packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                    "{n} pictures at gop {gop}: coding order/levels moved"
+                );
+                let ours = crate::stream::decode_stream(&held).expect("our decoder");
+                assert_eq!(ours.len(), n, "{n} pictures at gop {gop}: our decoder's count");
+                if !have_ffmpeg() {
+                    continue;
+                }
+                let theirs = ffmpeg_decode_luma(&held, width, height);
+                assert_eq!(theirs.len(), n, "{n} pictures at gop {gop}: ffmpeg's count");
+                for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                    let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                    assert!(
+                        got == *b,
+                        "{n} pictures at gop {gop}, display frame {i}: ours differs from ffmpeg"
+                    );
+                }
+            }
+        }
+        // The future half REACHES the filter, and what it produces still
+        // decodes exactly.
+        let (base, _) = run(17, 32, true, 0);
+        let (symmetric, _) = run(17, 32, true, 1);
+        set_lookahead(None);
+        set_arf_tf_future(None);
+        assert!(
+            base != symmetric,
+            "one display-future neighbour left the top ARF's filter unchanged ({} B both)",
+            base.len()
+        );
+        let ours = crate::stream::decode_stream(&symmetric).expect("our decoder");
+        assert_eq!(ours.len(), 17, "the symmetric arm's display-order count");
+        if have_ffmpeg() {
+            let theirs = ffmpeg_decode_luma(&symmetric, width, height);
+            assert_eq!(theirs.len(), 17, "the symmetric arm's ffmpeg count");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                assert!(got == *b, "symmetric arm, display frame {i}: ours differs from ffmpeg");
+            }
+        }
     }
 
     fn pyramid_round_trip(pyramid: Pyramid, hidden: usize) {
