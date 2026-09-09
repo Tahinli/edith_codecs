@@ -798,6 +798,93 @@ fn b128_rect() -> bool {
     ENV.unwrap_or(true) && b128_root()
 }
 
+/// lane-rectdq: whether the delta_q symbol group is priced on the root
+/// candidates that really code it. `EC_AV1_RECTDQ=0` is this fix's
+/// attribution control (the pre-lane pricing, where a 128 rect root and the
+/// four-superblock arm were both priced as if the group were free).
+fn rectdq() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_RECTDQ").ok().map(|v| v != "0")
+    });
+    ENV.unwrap_or(true)
+}
+
+/// lane-rectdq: what `crate::tile::write_delta_q` spends to move
+/// `CurrentQIndex` from `cur` to `target` at `1 << delta_q_res` steps of
+/// `res` -- the same three pieces that writer codes, in its order: the
+/// `delta_q_abs` symbol of `min(abs, 3)` against the DEFAULT table (the
+/// writer's own `cdfs.delta_q`, which every tile arms fresh, adapts from
+/// exactly this row), the escape literal pair when `abs >= 3`, and the sign
+/// bit when `abs != 0`. Zero when the plan is disarmed (`res <= 0`).
+pub(crate) fn delta_q_bits(target: i32, cur: i32, res: i32) -> f64 {
+    if res <= 0 {
+        return 0.0;
+    }
+    /// spec `DELTA_Q_SMALL`, as in the writer.
+    const DELTA_Q_SMALL: usize = 3;
+    let reduced = (target - cur) / res;
+    let abs = reduced.unsigned_abs() as usize;
+    // A pricing coder, not a sum of table entries: the escape's literal bits
+    // are equiprobable SYMBOLS whose narrowing carries the `EC_MIN_PROB`
+    // floor, so each really costs a little over one bit (class
+    // `price-the-narrowing-not-the-table`). Read off the same
+    // `SymbolEncoder::bits` account the writer's own coder keeps.
+    let mut enc = crate::msac::SymbolEncoder::pricer();
+    enc.reset_bits();
+    enc.symbol_fixed(abs.min(DELTA_Q_SMALL), &cdf::DELTA_Q);
+    if abs >= DELTA_Q_SMALL {
+        let rem_bits = 31 - ((abs as u32) - 1).leading_zeros();
+        enc.literal(rem_bits - 1, 3);
+        enc.literal(abs as u32 - ((1u32 << rem_bits) + 1), rem_bits);
+    }
+    if abs != 0 {
+        enc.literal(u32::from(reduced < 0), 1);
+    }
+    enc.bits()
+}
+
+/// [`delta_q_bits`] for the 128 superblock root at `(root_r, root_c)` (in 64
+/// superblock units): the group every root shape but a SKIPPED
+/// `PARTITION_NONE` root codes, since decode.rs' `whole_sb` asks for
+/// `side == write_w == write_h == sb_px` and neither a rect half nor a 64
+/// superblock under a 128 grid is that.
+///
+/// The target is the root's own cell of the `sb_q` grid, exactly the entry
+/// `write_delta_q` indexes. `CurrentQIndex` is NOT knowable in the search --
+/// the writer's `plan.cur` only advances at the roots that really code a
+/// group, and which those are is decided by this very comparison -- so the
+/// PREVIOUS 128 root's target in raster order stands in for it (the frame's
+/// `base_q_idx` at the first root of the frame, which is also the writer's
+/// own per-tile reset). Wrong only where a neighbouring root came out a
+/// skipped NONE block, and then only by the difference of two adjacent tpl
+/// cells.
+fn delta_q_bits_at_root(
+    sb_q: Option<&Vec<u8>>,
+    sb_cols: usize,
+    base_q_idx: u8,
+    res: i32,
+    (root_r, root_c): (usize, usize),
+) -> f64 {
+    if !rectdq() || res <= 0 {
+        return 0.0;
+    }
+    let Some(q) = sb_q.filter(|q| !q.is_empty()) else {
+        return 0.0;
+    };
+    let at = |r: usize, c: usize| i32::from(q[(r * sb_cols + c).min(q.len() - 1)]);
+    let target = at(root_r, root_c);
+    let cur = if root_c >= 2 {
+        at(root_r, root_c - 2)
+    } else if root_r >= 2 {
+        // The last 128 root of the row above, i.e. the previous one in the
+        // writer's raster walk.
+        at(root_r - 2, (sb_cols.saturating_sub(1)) & !1)
+    } else {
+        i32::from(base_q_idx)
+    };
+    delta_q_bits(target, cur, res)
+}
+
 /// How many 128 roots the search left as two 128x64 (HORZ) / 64x128 (VERT)
 /// halves since the last take (class `gate-blind-to-feature`).
 static B128_HORZ_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -9567,6 +9654,9 @@ fn search_root_128(
     sb_cols: usize,
     tpl_cells_x: usize,
     base_q_idx: u8,
+    // lane-rectdq: `1 << delta_q_res` when this frame codes a delta_q plan,
+    // zero when it does not -- what [`delta_q_bits_at_root`] prices with.
+    dq_res: i32,
     reference: &Picture,
     // The `LAST` + extra-reference pairs at THIS ROOT's own 32x32-mi window,
     // built by the caller off the same grid the tile writer rebuilds its
@@ -9724,8 +9814,16 @@ fn search_root_128(
     }
     let after = snapshot(luma, chroma, (x128, y128), SIDE);
     restore(luma, chroma, (x128, y128), SIDE, &base);
+    // lane-rectdq: a SKIPPED whole-superblock root is the one shape that
+    // codes no delta_q group (`write_delta_q`'s `is_whole_sb && skip`); the
+    // residual arm above codes it like every other block does.
+    let dq = if block.skip {
+        0.0
+    } else {
+        delta_q_bits_at_root(sb_q, sb_cols, base_q_idx, dq_res, (root_r, root_c))
+    };
     Some((
-        cost + lambda * crate::tile::partition_bits(SIDE, false),
+        cost + lambda * (crate::tile::partition_bits(SIDE, false) + dq),
         lambda,
         block,
         after,
@@ -9762,6 +9860,8 @@ fn search_root_128_rect(
     sb_cols: usize,
     tpl_cells_x: usize,
     base_q_idx: u8,
+    // lane-rectdq: see [`search_root_128`]'s own `dq_res`.
+    dq_res: i32,
     reference: &Picture,
     // The `LAST` + extra-reference pairs offered at this root; only the
     // reference and its picture are read here, since each HALF derives its
@@ -9883,8 +9983,13 @@ fn search_root_128_rect(
     grid.restore_rect(mi_row, mi_col, SIDE_MI, SIDE_MI, &grid_base);
     let symbol = if horz { 1 } else { 2 };
     let [b0, b1] = <[BlockCoeffs; 2]>::try_from(halves).ok()?;
+    // lane-rectdq: the FIRST half sits at the root's own mode-info origin and
+    // codes the delta_q group whether it is skipped or not
+    // (`write_inter_block_128_rect` passes `is_whole_sb = false`); the second
+    // half is at a non-origin mi and codes none.
+    let dq = delta_q_bits_at_root(sb_q, sb_cols, base_q_idx, dq_res, (root_r, root_c));
     Some((
-        cost + lambda * crate::tile::partition_bits_sym(SIDE, symbol),
+        cost + lambda * (crate::tile::partition_bits_sym(SIDE, symbol) + dq),
         lambda,
         [b0, b1],
         after,
@@ -12465,6 +12570,9 @@ pub(crate) fn encode_inter_frame(
         header.delta.q_present = true;
         header.delta.q_res = res.trailing_zeros() as u8;
     }
+    // lane-rectdq: what the tile writer's own `arm_delta_q` is armed with
+    // below, so the root search prices the group the writer really codes.
+    let dq_res: i32 = deltaq_res.filter(|_| sb_q.is_some()).unwrap_or(0);
     if let Some(g) = &sb_q {
         let mut levels: Vec<u8> = g.clone();
         levels.sort_unstable();
@@ -12616,6 +12724,7 @@ pub(crate) fn encode_inter_frame(
                 sb_cols,
                 tpl_cells_x,
                 base_q_idx,
+                dq_res,
                 reference,
                 &root_compound,
                 fctx,
@@ -12645,6 +12754,7 @@ pub(crate) fn encode_inter_frame(
                         sb_cols,
                         tpl_cells_x,
                         base_q_idx,
+                        dq_res,
                         reference,
                         &root_compound,
                         horz,
@@ -13251,8 +13361,19 @@ pub(crate) fn encode_inter_frame(
             cands.retain(|c| c.2.is_some());
         }
         cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // lane-rectdq class sweep: under a 128 superblock grid the FOUR-
+        // superblock arm codes the delta_q group too -- the Whole64 writer
+        // (tile.rs `sb_coeff_inter_frame_tile_cdfs`, the `write_delta_q` call
+        // with `!sb128_armed()`) and every smaller shape below it pass
+        // `is_whole_sb = false` under a 128 grid, so the arm's first
+        // (root-origin) superblock codes the group even when skipped. Only the skipped 128
+        // NONE root escapes it, so the split side is charged here at the same
+        // root lambda the candidates are priced with.
+        let split_dq =
+            delta_q_bits_at_root(sb_q.as_ref(), sb_cols, base_q_idx, dq_res, (root_r, root_c));
         if let Some((cost128, lambda128, shape, halves, after)) = cands.into_iter().next()
-            && (cost128 < root_cost + lambda128 * crate::tile::partition_bits(128, true)
+            && (cost128
+                < root_cost + lambda128 * (crate::tile::partition_bits(128, true) + split_dq)
                 // The witness knobs take the root whatever it costs, so the
                 // forced block really reaches the writer.
                 || FORCE_B128_ROOT.load(std::sync::atomic::Ordering::Relaxed)
