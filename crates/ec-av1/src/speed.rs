@@ -515,6 +515,34 @@ pub(crate) const LOOKAHEAD: bool = true;
 /// +-0.3) at +3.2% / +0.2% wall.
 pub(crate) const TPL_FUT: [usize; 11] = [2; 11];
 
+/// lane-tplhalf: mode 2's SPLIT -- how many display-PAST neighbours the top
+/// ARF's window opens with; the rest of [`TPL_FUT_WIN`] comes from the
+/// buffered future. `EC_AV1_TPL_FUT_HALF=<n>` overrides it, and the value is
+/// clamped up to 1 (a zero past half is mode 1, refuted).
+///
+/// Swept on the 48-picture long-GOP gate at `TPL_DEPTH = 8` (budget 7),
+/// BD-rate vs libaom / vs rav1e, lower better:
+///
+/// | past half | film A | film B | wall A | wall B |
+/// |---|---|---|---|---|
+/// | 1 (6 future) | +21.1/-8.9 | +71.2/-1.9 | 548.5s | 429.1s |
+/// | **2 (5 future, ships)** | **+20.9/-9.0** | **+71.0/-1.8** | 551.3s | 442.3s |
+/// | 3 (4 future, the old default) | +21.1/-8.9 | +71.5/-1.5 | 547.0s | 423.0s |
+/// | 5 (2 future) | +21.1/-8.9 | +71.5/-1.6 | 561.8s | 438.6s |
+///
+/// Bracketed on both sides: 2 is down on all four columns against 3, and 1
+/// and 5 are both worse than it. Presets 3..6 run `TPL_DEPTH = 4`, where the
+/// old `(depth-1)/2` split was 1 -- left there, unswept.
+pub(crate) const TPL_FUT_HALF: [usize; 11] = [2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1];
+
+/// lane-tplhalf: how many entries mode 2's window holds in TOTAL, `0` meaning
+/// `encode::tpl_depth() - 1` (the budget every other tpl path uses).
+/// `EC_AV1_TPL_FUT_WIN=<n>` overrides it. It exists because the winning split
+/// takes its whole future side from the budget's edge, so the budget had to
+/// be tested apart from it (class `instrument at bound`) -- and apart from
+/// `EC_AV1_TPL_D`, which deepens EVERY frame's lambda pass, not the ARF's.
+pub(crate) const TPL_FUT_WIN: [usize; 11] = [0; 11];
+
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at
 /// the high-quality end for the same reason: a picture we are about to
