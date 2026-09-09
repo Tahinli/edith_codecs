@@ -18360,7 +18360,13 @@ mod tests {
         // 33017 at q=60 (the same LENGTH, different bytes).
         // Re-taken at the merge of lane-arftf (ARF filter strength 2) and
         // lane-rlclamp onto the 128 compound default.
-        let pins: [(u8, usize, u64); 2] = [(150, 8290, 0x92cb11033d1f5813), (60, 33227, 0x57ee6b1f8eacd881)];
+        // Re-taken on lane-b128hv: the 128 root now also offers PARTITION_HORZ
+        // and PARTITION_VERT ([`b128_rect`]), two 128x64 / 64x128 skip blocks,
+        // so every inter frame whose RD takes one codes a different partition
+        // -- 8290 -> 8291 bytes at q=150. The q=60 pin does NOT move: at that
+        // quantizer the rect cut never wins its own comparison on this clip.
+        // `EC_AV1_B128HV=0` restores 8290 exactly.
+        let pins: [(u8, usize, u64); 2] = [(150, 8291, 0x1f00bb0eb099a27f), (60, 33227, 0x57ee6b1f8eacd881)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
