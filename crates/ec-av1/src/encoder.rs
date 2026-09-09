@@ -1215,6 +1215,29 @@ fn arf_tf_strength() -> f64 {
         .unwrap_or_else(|| crate::speed::at(&crate::speed::ARF_TF))
 }
 
+/// lane-arftf: the same filter's strength on the MID ARF, whose own window
+/// is the display-FUTURE leaves of its group (`tpl_window(at, false)`).
+/// `EC_AV1_ARF_TF_MID=<strength>` overrides [`crate::speed::ARF_TF_MID`];
+/// `0` is off.
+fn arf_tf_mid_strength() -> f64 {
+    std::env::var("EC_AV1_ARF_TF_MID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| crate::speed::at(&crate::speed::ARF_TF_MID))
+}
+
+/// lane-arftf: how many of the window's pictures the filter averages in
+/// ([`crate::speed::ARF_TF_WIN`], `EC_AV1_ARF_TF_WIN=<n>`). The top ARF's
+/// window holds only DISPLAY-PAST neighbours -- it is the group's last
+/// picture and the next group's sources are not buffered when it is coded --
+/// so this widens the filter backwards only.
+pub(crate) fn arf_tf_window() -> usize {
+    std::env::var("EC_AV1_ARF_TF_WIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| crate::speed::at(&crate::speed::ARF_TF_WIN))
+}
+
 fn tpl_pyramid() -> bool {
     match std::env::var("EC_AV1_TPL_PYRAMID").ok() {
         Some(v) => v != "0",
@@ -1938,15 +1961,20 @@ impl Av1Encoder {
         // ... and never at the very top of the quality range, where the
         // anchor's own quantizer has hit the rate loop's floor
         // ([`crate::speed::ARF_TF_QMIN`]).
+        let tf = match dq_level {
+            crate::encode::DqLevel::TopArf => arf_tf_strength(),
+            // lane-arftf: the mid ARF gets its own strength -- its window is
+            // the group's later leaves, i.e. the filter runs FORWARD there.
+            crate::encode::DqLevel::MidArf => arf_tf_mid_strength(),
+            crate::encode::DqLevel::Leaf => 0.0,
+        };
         let tf = match base_q_idx >= crate::speed::ARF_TF_QMIN {
-            true => arf_tf_strength(),
+            true => tf,
             false => 0.0,
         };
-        let source = match (tf > 0.0, dq_level) {
-            (true, crate::encode::DqLevel::TopArf) => {
-                crate::encode::arf_temporal_filter(&source, lookahead, tf)
-            }
-            _ => source,
+        let source = match tf > 0.0 {
+            true => crate::encode::arf_temporal_filter(&source, lookahead, tf),
+            false => source,
         };
         let encoded = || -> Result<Encoded> { encode_inter_frame(
             &source,

@@ -393,7 +393,47 @@ pub(crate) const DQ_LEVEL_K: [f64; 3] = [1.5, 1.0, 1.0];
 /// (`lanes/arfpred.report.md` section 3). Hard filtering does remove 6-7% of
 /// the stream's bytes and gives all of it back in quality, because the leaves
 /// still carry the grain the anchor no longer has.
-pub(crate) const ARF_TF: [f64; 11] = [3.0; 11];
+///
+/// lane-arftf SWEPT IT ON THE DECIDING GATE (48 pictures, film A / film B,
+/// BD vs libaom `cpu-used 6` / rav1e `speed 6`, lower is better) -- the probe
+/// of lane-arfpred mispredicts this lever's sign, so only these count:
+///
+/// | strength | film A | film B |
+/// |---|---|---|
+/// | 1 | +22.6/-8.1 | +81.6/+4.8 |
+/// | **2 (ships)** | **+22.2/-8.2** | **+78.6/+2.7** |
+/// | 3 (was) | +22.7/-7.9 | +79.0/+2.7 |
+/// | 5 | +23.9/-7.4 | +83.6/+5.1 |
+///
+/// The curve is single-peaked at 2 and bracketed on both sides; 2 is down on
+/// all four columns against the shipped 3 (film A -0.5/-0.3, film B
+/// -0.4/0.0).
+pub(crate) const ARF_TF: [f64; 11] = [2.0; 11];
+
+/// lane-arftf: the same filter on the MID ARF (the second hidden frame of a
+/// group), whose window is the group's later leaves -- so it filters FORWARD
+/// where the top ARF filters backward. `EC_AV1_ARF_TF_MID=<strength>`
+/// overrides it; `0` is off, which is where the long-GOP gate left it:
+/// filtering the mid ARF at the same strength as the top one reads film A
+/// +22.2/-8.3 and film B +78.9/+2.6 against the top-only +22.2/-8.2 and
+/// +78.6/+2.7 -- inside the noise on three columns and 0.3 WORSE on film B's
+/// libaom one, so the mechanism does not pay a second time one level down.
+pub(crate) const ARF_TF_MID: [f64; 11] = [0.0; 11];
+
+/// lane-arftf: how many window pictures [`crate::encode::arf_temporal_filter`]
+/// averages in. The top ARF is its group's LAST picture and the next group's
+/// sources are not buffered when it is coded, so the window holds only
+/// display-PAST neighbours and this widens the filter backwards only (a
+/// symmetric +-2 needs a one-group lookahead the encoder does not have).
+/// `EC_AV1_ARF_TF_WIN=<n>` overrides it.
+///
+/// 4 (past-only +-2) is REFUTED on the long-GOP gate at strength 2: film A
+/// +22.8/-7.8 and film B +78.9/+2.8 against 2's +22.2/-8.2 and +78.6/+2.7 --
+/// worse on three of the four columns. The census's 14.3% SAD removal was
+/// measured with two neighbours on EACH side; four pictures of one-sided
+/// past is a different (and worse) window, and the anchor drifts away from
+/// the leaves it has to predict.
+pub(crate) const ARF_TF_WIN: [usize; 11] = [2; 11];
 
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at

@@ -11711,7 +11711,7 @@ pub(crate) fn arf_temporal_filter(src: &Picture, window: &[Picture], strength: f
     let neighbours: Vec<&Picture> = window
         .iter()
         .filter(|p| p.width == src.width && p.height == src.height)
-        .take(2)
+        .take(crate::encoder::arf_tf_window())
         .collect();
     if neighbours.is_empty() || strength <= 0.0 {
         return src.clone();
@@ -17914,7 +17914,13 @@ mod tests {
         // inter frame that carries `reference_select` codes different blocks
         // -- 8354 -> 8364 bytes at q=150 and 33222 -> 33257 at q=60.
         // `EC_AV1_B128COMP=0` restores 8354 / 33222 exactly.
-        let pins: [(u8, usize, u64); 2] = [(150, 8364, 0xcb2ad7936d5127c5), (60, 33257, 0x87db250ba556e5a6)];
+        // Re-taken on lane-arftf: that filter's strength swept on the deciding
+        // gate lands at 2, not 3 ([`crate::speed::ARF_TF`]), so the filtered
+        // anchors' pixels moved once more: 8218 -> 8307 bytes at q=150 and
+        // 33017 at q=60 (the same LENGTH, different bytes).
+        // Re-taken at the merge of lane-arftf (ARF filter strength 2) and
+        // lane-rlclamp onto the 128 compound default.
+        let pins: [(u8, usize, u64); 2] = [(150, 8290, 0x92cb11033d1f5813), (60, 33227, 0x57ee6b1f8eacd881)];
         let coded: Vec<(u8, usize, u64)> = pins
             .iter()
             .map(|&(q, _, _)| {
