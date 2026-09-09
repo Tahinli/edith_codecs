@@ -834,11 +834,22 @@ pub(crate) fn force_b128_rect(which: u8) {
 /// arms ship, at its own footprint ([`search_root_128_ab`],
 /// `crate::tile::write_inter_block_128_rect`). `EC_AV1_B128AB=0` is this
 /// arm's attribution control.
+///
+/// **Off by default** (`EC_AV1_B128AB=1` turns it on): measured on both gates
+/// and it does not pay. The shapes fire 0-2 roots a frame against ~1000 coded
+/// blocks (`EC_AV1_B128_CENSUS`), and every row is flat or 0.1 worse --
+/// long-GOP film A +22.0/-8.5 against a +21.9/-8.6 control, film B +75.8/+0.8
+/// against the same, 12-frame film A +18.1/-6.2 against +18.0/-6.3, film B
+/// +23.1/-3.3 against +23.0/-3.5, screen byte-identical (lane-ab128). The
+/// machinery is written, witnessed sample-exact through both decoders on all
+/// four shapes, and kept for the arm that makes it pay: a non-skip piece (the
+/// 64x64 pieces could carry the 64 root's residual, which is where libaom's
+/// AB shapes earn their keep) or a cheaper partition price.
 fn b128_ab() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_B128AB").ok().map(|v| v != "0")
     });
-    ENV.unwrap_or(true) && b128_root()
+    ENV.unwrap_or(false) && b128_root()
 }
 
 /// How many 128 roots the search left as each AB shape since the last take,
@@ -12876,7 +12887,10 @@ pub(crate) fn encode_inter_frame(
         // 64x64 pieces plus one 128x64 / 64x128 half. All four are priced;
         // the cheapest joins the candidate list below.
         let forced_ab = FORCE_B128_AB.load(std::sync::atomic::Ordering::Relaxed);
-        let root_ab = (sb128_search && b128_ab() && cells.len() == 4 && forced_rect == 0)
+        let root_ab = (sb128_search
+            && (b128_ab() || forced_ab != 0)
+            && cells.len() == 4
+            && forced_rect == 0)
             .then(|| {
                 let mut best: Option<(usize, _)> = None;
                 for symbol in 4..=7usize {
