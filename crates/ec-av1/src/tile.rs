@@ -10939,4 +10939,46 @@ mod tests {
             "KF_Y_MODE's different probabilities must decode a different mode"
         );
     }
+
+    /// lane-rectdq witness: [`crate::encode::delta_q_bits`] prices exactly
+    /// what [`write_delta_q`] writes, over the whole `delta_q_abs` domain
+    /// (0..=20 steps, both signs -- the escape literal pair starts at 3 and
+    /// its `rem_bits` widens at 4, 5, 9 and 17). The writer is run into a
+    /// PRICING coder whose account (`SymbolEncoder::bits`) is the same
+    /// arithmetic-coder cost the pricer's `symbol_bits` sums, so the two
+    /// agree to floating-point noise, not to a tolerance band.
+    ///
+    /// Both sides read the DEFAULT `delta_q` row: the writer's `cdfs` is
+    /// rebuilt per case, exactly as every tile's is armed before its first
+    /// superblock.
+    #[test]
+    fn the_delta_q_pricer_matches_the_writer_over_the_whole_domain() {
+        const RES: i32 = 4;
+        const CUR: i32 = 128;
+        for steps in -20i32..=20 {
+            let target = CUR + steps * RES;
+            arm_delta_q(RES, 1, vec![u8::try_from(target).expect("in range")], 128);
+            let mut cdfs = Cdfs::new(2);
+            let mut enc = SymbolEncoder::pricer();
+            enc.reset_bits();
+            // `is_whole_sb = false`: the rect half / 64-superblock shape,
+            // the one whose pricer this witnesses.
+            write_delta_q(&mut enc, &mut cdfs, (0, 0), false, true);
+            let written = enc.bits();
+            let priced = crate::encode::delta_q_bits(target, CUR, RES);
+            assert!(
+                (written - priced).abs() < 1e-9,
+                "steps {steps}: writer {written} bits, pricer {priced}"
+            );
+        }
+        // Disarmed plan: the writer codes nothing and the pricer charges
+        // nothing.
+        arm_delta_q(0, 1, Vec::new(), 128);
+        let mut cdfs = Cdfs::new(2);
+        let mut enc = SymbolEncoder::pricer();
+        enc.reset_bits();
+        write_delta_q(&mut enc, &mut cdfs, (0, 0), false, true);
+        assert!(enc.bits().abs() < 1e-9, "a disarmed plan writes no symbol");
+        assert!((crate::encode::delta_q_bits(200, 128, 0)).abs() < 1e-9);
+    }
 }
