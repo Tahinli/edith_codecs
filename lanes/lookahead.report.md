@@ -45,11 +45,17 @@ buffer mid-run), with a gradient-plus-noise fixture:
   really consumed ([[gate-blind-to-feature]]: everything above would pass over
   a lookahead nothing reads) — and still decodes sample-exact.
 
-RED first: in the split suite (not standalone) the future-half assertion
-failed with "493 B both" — another test had left the process-global preset
-high, every block coded as skip and the source filter could not change a byte
-(class `process-global-knob-races-tests`). The test pins `set_speed(0)` under
-`knob_write` now, the way the byte pins do; green in the suite below.
+RED first, twice, and both reds were the FIXTURE, not the encoder. In the
+split suite (never standalone) the future-half assertion failed with "493 B
+both": at the q=120 the other facade tests use, this fixture's ARF codes
+almost pure skip, and a filtered source quantizes back to the same bytes —
+whether it does depends on where the suite's other tests left the
+process-global preset, which is why it passed alone and failed in company
+(class `process-global-knob-races-tests`). Pinning `set_speed(0)` under
+`knob_write` (the byte pins' shape) did NOT fix it — the added assertion that
+`enc.pyramid()` survived the content gate ruled the second suspect out — and
+what fixed it is coding the witness at **q=60**, where the anchor carries real
+coefficients and a filtered source must move them. Both guards ship.
 
 The gate is a second witness: `native_bd_arm` asserts our decoder's
 display-order count and ffmpeg sample-exactness for every one of its 48-picture
