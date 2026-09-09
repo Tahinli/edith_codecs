@@ -180,7 +180,6 @@
 //! preset 3 BELOW preset 0 in every pass at load 16-25. The single-thread fps
 //! column above comes from the BD arms themselves and is ordered correctly.
 
-
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// The highest preset. 10 is the fastest, as in rav1e.
@@ -515,6 +514,46 @@ pub(crate) const LOOKAHEAD: bool = true;
 /// +-0.3) at +3.2% / +0.2% wall.
 pub(crate) const TPL_FUT: [usize; 11] = [2; 11];
 
+/// lane-tplhalf: mode 2's SPLIT -- how many display-PAST neighbours the top
+/// ARF's window opens with; the rest of [`TPL_FUT_WIN`] comes from the
+/// buffered future. `EC_AV1_TPL_FUT_HALF=<n>` overrides it, and the value is
+/// clamped up to 1 (a zero past half is mode 1, refuted).
+///
+/// Swept on the 48-picture long-GOP gate at `TPL_DEPTH = 8` (budget 7),
+/// BD-rate vs libaom / vs rav1e, lower better:
+///
+/// | past half | film A | film B | wall A | wall B |
+/// |---|---|---|---|---|
+/// | 1 (6 future) | +21.1/-8.9 | +71.2/-1.9 | 548.5s | 429.1s |
+/// | **2 (5 future, ships)** | **+20.9/-9.0** | **+71.0/-1.8** | 551.3s | 442.3s |
+/// | 3 (4 future, the old default) | +21.1/-8.9 | +71.5/-1.5 | 547.0s | 423.0s |
+/// | 5 (2 future) | +21.1/-8.9 | +71.5/-1.6 | 561.8s | 438.6s |
+///
+/// Bracketed on both sides: 2 is down on all four columns against 3, and 1
+/// and 5 are both worse than it. Presets 3..6 run `TPL_DEPTH = 4`, where the
+/// old `(depth-1)/2` split was 1 -- left there, unswept.
+pub(crate) const TPL_FUT_HALF: [usize; 11] = [2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1];
+
+/// lane-tplhalf: how many entries mode 2's window holds in TOTAL, `0` meaning
+/// `encode::tpl_depth() - 1` (the budget every other tpl path uses).
+/// `EC_AV1_TPL_FUT_WIN=<n>` overrides it. The winning split takes its whole
+/// future side from the budget's edge, so the budget was swept apart from
+/// it (class `instrument at bound`) and apart from `EC_AV1_TPL_D`, which
+/// deepens EVERY frame's lambda pass. 48-picture long-GOP, half=2:
+///
+/// | window | film A | film B |
+/// |---|---|---|
+/// | 7 (`tpl_depth-1`, the split's own arm) | +20.9/-9.0 | +71.0/-1.8 |
+/// | 9 | +21.0/-9.0 | +70.7/-2.0 |
+/// | **11 (ships at presets 0..=2)** | **+20.9/-9.0** | **+70.4/-2.2** |
+///
+/// 11 is film B -0.6/-0.4 against 7 with film A flat -- the keep rule -- and
+/// saturates the one-group lookahead (2 past + 8 future available). Presets
+/// 3..=6 keep 0 (`depth-1` = 3 at `TPL_DEPTH=4`), unswept. `TPL_D=10` at
+/// half=2 was byte-identical to WIN=9: extra depth on non-ARF frames is
+/// unused because a pyramid leaf's window is the group's own successors.
+pub(crate) const TPL_FUT_WIN: [usize; 11] = [11, 11, 11, 0, 0, 0, 0, 0, 0, 0, 0];
+
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at
 /// the high-quality end for the same reason: a picture we are about to
@@ -805,8 +844,7 @@ pub(crate) const RESTORATION: [bool; 11] = [
 ///   (`presets_are_monotone_in_speed`) forbids them going below preset 3's 4
 ///   in any case.
 /// * **presets 7..10 stay at 1**, unmeasured: not swept by this lane.
-pub(crate) const TPL_DEPTH: [usize; 11] =
-    [crate::encode::TPL_DEPTH, 8, 8, 4, 4, 4, 4, 1, 1, 1, 1];
+pub(crate) const TPL_DEPTH: [usize; 11] = [crate::encode::TPL_DEPTH, 8, 8, 4, 4, 4, 4, 1, 1, 1, 1];
 
 /// `encode::tx_type_search`: whether an intra luma transform unit searches
 /// its own `tx_type` instead of coding `DCT_DCT` (lane-txset). The five-type
@@ -988,12 +1026,16 @@ static KNOBS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 #[cfg(test)]
 #[must_use]
 pub(crate) fn knob_read() -> std::sync::RwLockReadGuard<'static, ()> {
-    KNOBS.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    KNOBS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Held by a test that SETS a process-global knob; see [`KNOBS`].
 #[cfg(test)]
 #[must_use]
 pub(crate) fn knob_write() -> std::sync::RwLockWriteGuard<'static, ()> {
-    KNOBS.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    KNOBS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
