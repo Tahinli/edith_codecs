@@ -3755,11 +3755,15 @@ mod tests {
     /// (`Av1Encoder::drain_pending` hands the closed group to `ready` and
     /// codes the group before it) must not change WHAT is coded:
     ///
-    /// * with the future half of the filter window empty the stream is byte
-    ///   for byte the one the encoder coded without a lookahead, at every
-    ///   run length -- 1 picture (no hidden frame at all), 7 (a short group),
-    ///   8 (exactly `mini_gop`), 9 (a group plus a tail) and 17 -- and at a
-    ///   GOP short enough (8) that key frames drain the buffer mid-run;
+    /// * with the future half of the filter window empty AND the top ARF's
+    ///   temporal lambda window pinned to the past (`TPL_FUT=0`) the stream
+    ///   is byte for byte the one the encoder coded without a lookahead, at
+    ///   every run length -- 1 picture (no hidden frame at all), 7 (a short
+    ///   group), 8 (exactly `mini_gop`), 9 (a group plus a tail) and 17 --
+    ///   and at a GOP short enough (8) that key frames drain the buffer
+    ///   mid-run. lane-tplhalf's WIN=11 default also reads that buffer, so
+    ///   the identity arm pins the lambda window off or this witness tests
+    ///   a different lever;
     /// * every run decodes to exactly its picture count through OUR decoder
     ///   and through ffmpeg, sample-exact between the two, so the flush and
     ///   the `show_existing_frame` order survive the delay;
@@ -3781,6 +3785,7 @@ mod tests {
         let run = |n: usize, gop: usize, on: bool, fut: usize| -> (Vec<u8>, Vec<Packet>) {
             set_lookahead(Some(on));
             set_arf_tf_future(Some(fut));
+            set_tpl_fut(Some(0));
             let config = EncoderConfig {
                 // FINE (not the 120 the other facade tests use): at a coarse
                 // quantizer this fixture's ARF codes almost pure skip (17
@@ -3849,6 +3854,7 @@ mod tests {
         let (symmetric, _) = run(17, 32, true, 1);
         set_lookahead(None);
         set_arf_tf_future(None);
+        set_tpl_fut(None);
         assert!(
             base != symmetric,
             "one display-future neighbour left the top ARF's filter unchanged \
