@@ -3079,6 +3079,17 @@ impl Plane<'_> {
         rows_of(self.source, self.width, x, y, side)
     }
 
+    /// lane-b128hv: [`Self::source_block`] over a rectangle, for the 128
+    /// root's own HORZ/VERT motion search.
+    fn source_block_rect(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        let mut out = vec![0u8; w * h];
+        for row in 0..h {
+            out[row * w..][..w]
+                .copy_from_slice(&self.source[(y + row) * self.width + x..][..w]);
+        }
+        out
+    }
+
     /// The reconstructed samples of one square, so that a partition trial can
     /// be undone.
     /// The reconstructed samples of one square AND the coefficient contexts
@@ -9549,7 +9560,7 @@ fn search_root_128(
         luma,
         chroma,
         (x128, y128),
-        SIDE,
+        (SIDE, SIDE),
         &root_search,
         false,
         reference,
@@ -9662,12 +9673,14 @@ fn search_skip_64(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
-    // The root's side in samples: [`SUPERBLOCK`] at a 64 root, twice that at
-    // the 128 one [`search_root_128`] drives (lane-b128). Every trial below
-    // is a square of this side and its half in chroma, and the residual arm
-    // is only ever asked for at 64 -- a 128 block's residual is four
+    // The root's footprint in samples: [`SUPERBLOCK`] square at a 64 root,
+    // twice that at the 128 one [`search_root_128`] drives (lane-b128), and
+    // 128x64 / 64x128 at the rect halves of [`search_root_128_rect`]
+    // (lane-b128hv). Every trial below tiles it into squares of its SHORTER
+    // side (one square when it is square, two otherwise), and the residual
+    // arm is only ever asked for at 64 -- a 128 block's residual is four
     // TX_64X64 units the writer has no path for.
-    side: usize,
+    (bw, bh): (usize, usize),
     search: &Search,
     // Whether the non-skip arm is priced at all ([`b64_residual`], and off on
     // screen content -- see that function's doc).
@@ -9680,7 +9693,23 @@ fn search_skip_64(
     compound: &[(i8, &Picture, crate::mvstack::CompoundMvStack)],
     fctx: &crate::decode::FrameCtx,
 ) -> Option<(f64, BlockCoeffs)> {
-    debug_assert!(side == SUPERBLOCK || !residual, "a 128 root has no residual arm");
+    debug_assert!(
+        (bw, bh) == (SUPERBLOCK, SUPERBLOCK) || !residual,
+        "only a 64 root has a residual arm"
+    );
+    // The square units every trial below is taken on: the block itself when
+    // it is square, its two halves otherwise. Luma first (in raster order),
+    // then each chroma plane over the same tiling at half the side -- which is
+    // exactly `[(0, x, y, side), (1, ..), (2, ..)]` at bw == bh.
+    let sq = bw.min(bh);
+    let units: Vec<(usize, usize, usize, usize, bool)> = (0..3usize)
+        .flat_map(|plane| {
+            let (ox, oy, s) = if plane == 0 { (x, y, sq) } else { (x / 2, y / 2, sq / 2) };
+            (0..bh / sq).flat_map(move |j| {
+                (0..bw / sq).map(move |i| (plane, ox + i * s, oy + j * s, s, plane == 0))
+            })
+        })
+        .collect();
     let not_new = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1);
     let not_zero = symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1);
     let ref_bits = single_ref_bits(crate::mvstack::LAST_FRAME, stack);
@@ -9718,7 +9747,7 @@ fn search_skip_64(
     // candidate below to pair with the second reference's NEAREST half.
     let mut last_new_mv: Option<(i32, i32)> = None;
     if leaf_new_mv() {
-        let source_block = luma.source_block(x, y, side);
+        let source_block = luma.source_block_rect(x, y, bw, bh);
         let (seeds, seed_n) = mv_seeds(stack);
         let found = motion::search(
             &reference.y,
@@ -9728,8 +9757,8 @@ fn search_skip_64(
             &source_block,
             x,
             y,
-            side,
-            side,
+            bw,
+            bh,
             stack.pred_mv,
             &seeds[..seed_n],
             search.lambda,
@@ -9746,14 +9775,11 @@ fn search_skip_64(
         }
     }
 
-    let mut best: Option<(f64, f64, InterInfo, [Trial; 3])> = None;
+    let mut best: Option<(f64, f64, InterInfo, Vec<Trial>)> = None;
     for (bits, info) in cands {
-        let trials = [
-            (0usize, x, y, side, true),
-            (1, x / 2, y / 2, side / 2, false),
-            (2, x / 2, y / 2, side / 2, false),
-        ]
-        .map(|(plane, px, py, s, is_luma)| {
+        let trials: Vec<Trial> = units
+            .iter()
+            .map(|&(plane, px, py, s, is_luma)| {
             let (samples, stride, w, h) = match plane {
                 0 => (&reference.y, reference.width, luma.true_width, luma.true_height),
                 1 => (
@@ -9784,11 +9810,10 @@ fn search_skip_64(
                 search.deadzone,
                 TxbSet::Luma32Inter,
             )
-        });
-        let cost = trials[0].sse
-            + trials[1].sse
-            + trials[2].sse
-            + search.lambda * (fixed + bits);
+            })
+            .collect();
+        let cost =
+            trials.iter().map(|t| t.sse).sum::<f64>() + search.lambda * (fixed + bits);
         if best.as_ref().is_none_or(|b| cost < b.0) {
             best = Some((cost, fixed + bits, info, trials));
         }
@@ -9847,12 +9872,9 @@ fn search_skip_64(
         ccands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
         ccands.dedup_by_key(|c| c.0);
         for (mvs, bits, info) in ccands {
-            let trials = [
-                (0usize, x, y, side, true),
-                (1, x / 2, y / 2, side / 2, false),
-                (2, x / 2, y / 2, side / 2, false),
-            ]
-            .map(|(plane, px, py, s, is_luma)| {
+            let trials: Vec<Trial> = units
+                .iter()
+                .map(|&(plane, px, py, s, is_luma)| {
                 let (r0, r1) = match plane {
                     0 => (
                         (reference.y.as_slice(), reference.width, luma.true_width, luma.true_height),
@@ -9890,10 +9912,10 @@ fn search_skip_64(
                     search.deadzone,
                     TxbSet::Luma32Inter,
                 )
-            });
+                })
+                .collect();
             let syntax = fixed - ref_bits + bits;
-            let cost =
-                trials[0].sse + trials[1].sse + trials[2].sse + search.lambda * syntax;
+            let cost = trials.iter().map(|t| t.sse).sum::<f64>() + search.lambda * syntax;
             if best.as_ref().is_none_or(|b| cost < b.0) {
                 best = Some((cost, syntax, info, trials));
             }
@@ -9923,11 +9945,13 @@ fn search_skip_64(
     let mut luma_levels: Option<(Vec<i32>, u8, Vec<TxType>)> = None;
     if residual {
         let sets = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
+        // Square by construction (the `debug_assert` above), so `units` is
+        // one entry per plane and `chosen.2[plane]` is that plane's trial.
         let residual_trials = [0usize, 1, 2].map(|plane| {
             let (target, px, py, s) = if plane == 0 {
-                (&*luma, x, y, side)
+                (&*luma, x, y, bw)
             } else {
-                (&chroma[plane - 1], x / 2, y / 2, side / 2)
+                (&chroma[plane - 1], x / 2, y / 2, bw / 2)
             };
             target.code_from_prediction(
                 px,
@@ -9959,7 +9983,7 @@ fn search_skip_64(
             commit_inter_luma(
                 luma,
                 (x, y),
-                side,
+                bw,
                 info.mv,
                 (&reference.y, reference.width, luma.true_width, luma.true_height),
                 search,
@@ -9980,18 +10004,20 @@ fn search_skip_64(
                 B64_VAR_TX_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             luma_levels = Some((levels, depth, tx_types));
-            chosen = (cost, false, residual_trials);
+            chosen = (cost, false, residual_trials.to_vec());
         }
     }
 
     let (cost, skip, trials) = chosen;
     // `commit_inter_luma` already wrote the residual arm's luma (its four
     // split units are not one 64-sided trial); a skip winner overwrites it.
-    if skip || !luma_committed {
-        luma.commit(x, y, side, &trials[0]);
+    for (&(plane, px, py, s, _), trial) in units.iter().zip(&trials) {
+        match plane {
+            0 if skip || !luma_committed => luma.commit(px, py, s, trial),
+            0 => {}
+            _ => chroma[plane - 1].commit(px, py, s, trial),
+        }
     }
-    chroma[0].commit(x / 2, y / 2, side / 2, &trials[1]);
-    chroma[1].commit(x / 2, y / 2, side / 2, &trials[2]);
     Some((
         cost,
         BlockCoeffs {
@@ -10011,8 +10037,8 @@ fn search_skip_64(
                 (false, Some((levels, _, _))) => coeffs(levels, BLOCK),
                 (false, None) => coeffs(&trials[0].levels, BLOCK),
             },
-            u: if skip { Vec::new() } else { coeffs(&trials[1].levels, side / 2) },
-            v: if skip { Vec::new() } else { coeffs(&trials[2].levels, side / 2) },
+            u: if skip { Vec::new() } else { coeffs(&trials[1].levels, bw / 2) },
+            v: if skip { Vec::new() } else { coeffs(&trials[2].levels, bw / 2) },
             ..BlockCoeffs::default()
         },
     ))
@@ -12462,7 +12488,7 @@ pub(crate) fn encode_inter_frame(
                     &mut luma,
                     &mut chroma,
                     (x64, y64),
-                    SUPERBLOCK,
+                    (SUPERBLOCK, SUPERBLOCK),
                     &sb_search,
                     b64_residual() && !screen,
                     reference,
