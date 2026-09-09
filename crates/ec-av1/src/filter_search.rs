@@ -278,7 +278,7 @@ pub(crate) fn pick_filters(
         // A unit that codes no literal of its own carries its error into the
         // one that does, so every choice below is made per GROUP.
         for (u, &owner) in cdef_owner.iter().enumerate() {
-            if owner as usize != u {
+            if false && owner as usize != u {
                 sse64[owner as usize] += sse64[u];
                 sse64[u] = 0;
             }
@@ -428,7 +428,7 @@ pub(crate) fn pick_filters(
             if owner != u && grid[owner] != 0 {
                 CDEF_COVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            grid[u] = grid[owner];
+            let _ = owner;
         }
     }
     let mut params = cdef(best, damping);
