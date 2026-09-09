@@ -17699,41 +17699,6 @@ mod tests {
             );
             for (i, (d, e)) in decoded.iter().zip(&encoded.frames).enumerate() {
                 if let Some((plane, s, got, want)) = first_plane_mismatch(d, &e.reconstruction) {
-                    // TEMPORARY (lane-b128r bisect): the whole mismatch map.
-                    if let Ok(dir) = std::env::var("EC_B128R_DUMP") {
-                        std::fs::write(format!("{dir}/gate-q{q}.obu"), &encoded.stream).unwrap();
-                        let r = &e.reconstruction;
-                        let mut buf = Vec::new();
-                        for pl in [&r.y, &r.u, &r.v] {
-                            buf.extend(pl.iter().flat_map(|s| s.to_le_bytes()));
-                        }
-                        std::fs::write(format!("{dir}/recon-q{q}.f{i}.yuv"), &buf).unwrap();
-                    }
-                    let (l, r) = match plane {
-                        "Y" => (&d.y, &e.reconstruction.y),
-                        "U" => (&d.u, &e.reconstruction.u),
-                        _ => (&d.v, &e.reconstruction.v),
-                    };
-                    let w = if plane == "Y" { width } else { width / 2 };
-                    let bad: Vec<usize> = l
-                        .iter()
-                        .zip(r.iter())
-                        .enumerate()
-                        .filter(|(_, (a, b))| a != b)
-                        .map(|(i, _)| i)
-                        .collect();
-                    let rows: Vec<usize> = bad.iter().map(|i| i / w).collect();
-                    let cols: Vec<usize> = bad.iter().map(|i| i % w).collect();
-                    eprintln!(
-                        "B128R MISMATCH {name} q={q} frame {i} plane {plane}: {} samples, \
-                         rows {}..{}, cols {}..{}, first 8 {:?}",
-                        bad.len(),
-                        rows.iter().min().copied().unwrap_or(0),
-                        rows.iter().max().copied().unwrap_or(0),
-                        cols.iter().min().copied().unwrap_or(0),
-                        cols.iter().max().copied().unwrap_or(0),
-                        bad.iter().take(8).map(|i| (i / w, i % w)).collect::<Vec<_>>(),
-                    );
                     panic!(
                         "{name} q={q} frame {i} plane {plane} sample {s}: ffmpeg decoded \
                          {got}, the encoder reconstructed {want}"
