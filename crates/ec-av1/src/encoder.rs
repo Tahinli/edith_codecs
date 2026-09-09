@@ -1260,6 +1260,8 @@ static LOOKAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(u8::MAX);
 static ARF_TF_FUT_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
+static TPL_FUT_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 /// Sets [`LOOKAHEAD_OVERRIDE`]; `None` clears it.
 #[allow(dead_code)] // set only from the `#[cfg(test)]` witness
@@ -1274,6 +1276,26 @@ pub(crate) fn set_lookahead(on: Option<bool>) {
 #[allow(dead_code)] // set only from the `#[cfg(test)]` witness
 pub(crate) fn set_arf_tf_future(n: Option<usize>) {
     ARF_TF_FUT_OVERRIDE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Sets [`TPL_FUT_OVERRIDE`]; `None` clears it.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` witness
+pub(crate) fn set_tpl_fut(n: Option<usize>) {
+    TPL_FUT_OVERRIDE.store(n.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// lane-tplfut: which window the TOP ARF's temporal lambda map propagates
+/// back through ([`crate::speed::TPL_FUT`], `EC_AV1_TPL_FUT=<n>`). Inert
+/// without [`lookahead`] -- mode 0 is the shipped past window.
+pub(crate) fn tpl_fut() -> usize {
+    match TPL_FUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => {}
+        n => return n,
+    }
+    std::env::var("EC_AV1_TPL_FUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| crate::speed::at(&crate::speed::TPL_FUT))
 }
 
 /// lane-lookahead: whether the pyramid path holds one group of lookahead
@@ -2207,6 +2229,41 @@ impl Av1Encoder {
             .take(arf_tf_window_future())
             .map(|(_, p)| p.padded_to(SUPERBLOCK))
             .collect();
+        // lane-tplfut: the top ARF's TEMPORAL LAMBDA window. Mode 0 (and any
+        // mode with no buffered future picture) keeps the group's own
+        // display-PAST sources, reversed -- the only window that exists
+        // without a lookahead, and the one every measurement so far was
+        // taken with. The other modes read the next group's sources, which
+        // is the direction libaom's tpl looks at an ARF.
+        // `n` of the buffered display-future sources, nearest first, padded
+        // like the frame being coded.
+        let arf_tpl_future = |n: usize| -> Vec<Picture> {
+            future.iter().take(n).map(|(_, p)| p.padded_to(SUPERBLOCK)).collect()
+        };
+        let arf_tpl: Vec<Picture> = {
+            let depth = crate::encode::tpl_depth();
+            let past = || tpl_window(group.len() - 1, true);
+            match (tpl_fut(), future.is_empty(), tpl_pyramid() && depth >= 2) {
+                (_, _, false) => Vec::new(),
+                (0, _, _) | (_, true, _) => past(),
+                (1, _, _) => arf_tpl_future(depth - 1),
+                // Half the budget each side (`EC_AV1_TPL_FUT_HALF=<n>`
+                // moves the split), past first: the chain then has
+                // ONE discontinuity in the middle (the coarse pass between
+                // the nearest past and the nearest future neighbour spans the
+                // whole group), which is the arm's known cost.
+                (2, _, _) => {
+                    let half = std::env::var("EC_AV1_TPL_FUT_HALF").ok().and_then(|v| v.parse().ok()).unwrap_or((depth - 1) / 2);
+                    let mut w = past();
+                    w.truncate(half.max(1));
+                    let room = (depth - 1).saturating_sub(w.len());
+                    w.extend(arf_tpl_future(room));
+                    w
+                }
+                // Mode 3 and anything above: the WHOLE buffered next group.
+                (_, _, _) => arf_tpl_future(future.len()),
+            }
+        };
         // The group's top level: the last picture, hidden, off the anchor.
         packets.push(self.encode_pyramid_inter(
             arf_order,
@@ -2228,7 +2285,7 @@ impl Av1Encoder {
             false,
             Level::Arf,
             pyramid.arf_q_offset,
-            &tpl_window(group.len() - 1, true),
+            &arf_tpl,
             // lane-lookahead: the group's top ARF is its LAST picture in
             // display order, so every picture of the next group is a
             // display-future neighbour of it -- nearest first.
@@ -3785,6 +3842,101 @@ mod tests {
                 assert!(got == *b, "symmetric arm, display frame {i}: ours differs from ffmpeg");
             }
         }
+        crate::speed::set_speed(was);
+    }
+
+    /// lane-tplfut's correctness witness, the sibling of
+    /// [`the_lookahead_holds_one_group_and_still_codes_every_picture`]: with
+    /// the top ARF's TEMPORAL LAMBDA window taken out of the buffered next
+    /// group (`speed::TPL_FUT`), every picture is still coded, the streams
+    /// decode exactly through our decoder and ffmpeg, and the stream MOVES
+    /// against the knob off wherever a next group exists (class
+    /// gate-blind-to-feature). Coded at q=60, not 120: at a coarse
+    /// quantizer this fixture's ARF is almost pure skip and a different
+    /// lambda map re-quantises to identical bytes.
+    #[test]
+    fn the_future_tpl_window_still_codes_every_picture_and_moves_the_stream() {
+        let _knobs = crate::speed::knob_write();
+        let was = crate::speed::speed();
+        crate::speed::set_speed(0);
+        crate::encode::force_screen(Some(false));
+        let (width, height) = (128usize, 128usize);
+        let run = |n: usize, gop: usize, fut: usize| -> (Vec<u8>, Vec<Packet>) {
+            set_lookahead(Some(true));
+            set_arf_tf_future(Some(0));
+            set_tpl_fut(Some(fut));
+            let config = EncoderConfig {
+                base_q_idx: 60,
+                width,
+                height,
+                gop,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let mut enc = Av1Encoder::with_pyramid(config, Pyramid::default()).unwrap();
+            let sources: Vec<Picture> = (0..n).map(|t| noisy_card(width, height, t)).collect();
+            let packets = encode_all(&mut enc, &sources);
+            assert!(
+                enc.pyramid().is_some(),
+                "{n} pictures at gop {gop}: the content gate dropped the pyramid (speed {})",
+                crate::speed::speed(),
+            );
+            (concat(&packets), packets)
+        };
+        for gop in [32usize, 8] {
+            for n in [1usize, 7, 8, 9, 17] {
+                let (off, off_packets) = run(n, gop, 0);
+                for mode in [1usize, 2, 3] {
+                    let (on, packets) = run(n, gop, mode);
+                    assert_eq!(
+                        packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                        off_packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                        "{n} pictures at gop {gop} mode {mode}: coding order/levels moved"
+                    );
+                    let ours = crate::stream::decode_stream(&on).expect("our decoder");
+                    assert_eq!(ours.len(), n, "{n} pictures at gop {gop} mode {mode}: our count");
+                    if !have_ffmpeg() {
+                        continue;
+                    }
+                    let theirs = ffmpeg_decode_luma(&on, width, height);
+                    assert_eq!(theirs.len(), n, "{n} pictures at gop {gop} mode {mode}: ffmpeg count");
+                    for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                        let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                        assert!(
+                            got == *b,
+                            "{n} pictures at gop {gop} mode {mode}, frame {i}: ours differs from ffmpeg"
+                        );
+                    }
+                }
+                let _ = &off;
+            }
+        }
+        // The future window REACHES the lambda map: 17 pictures at gop 32 is
+        // three groups, so the first two top ARFs each have a next group
+        // buffered and their windows really are display-future.
+        let (off, _) = run(17, 32, 0);
+        // Mode 2 is NOT in this list: at its default split it keeps the three
+        // NEAREST past neighbours, and those dominate the propagation -- on
+        // this 128x128 fixture the map moves too little to flip an RD
+        // decision and the stream comes back byte-identical to mode 0. Not a
+        // dead knob: the same run with `EC_AV1_TPL_FUT_HALF=1` (one past
+        // neighbour, six future) does move the stream, and the gate below
+        // measures mode 2 on real content.
+        for mode in [1usize, 3] {
+            let (on, _) = run(17, 32, mode);
+            assert!(
+                off != on,
+                "mode {mode} left the top ARF's temporal lambda map unchanged \
+                 ({} B vs {} B, preset {})",
+                off.len(),
+                on.len(),
+                crate::speed::speed()
+            );
+        }
+        set_lookahead(None);
+        set_arf_tf_future(None);
+        set_tpl_fut(None);
         crate::speed::set_speed(was);
     }
 

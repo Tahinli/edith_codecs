@@ -475,6 +475,46 @@ pub(crate) const ARF_TF_WIN_FUT: [usize; 11] = [3; 11];
 /// two-pass-like allocation would need.
 pub(crate) const LOOKAHEAD: bool = true;
 
+/// lane-tplfut: which pictures the TOP ARF's temporal lambda map
+/// ([`crate::encode::tpl_lambda_factors`]) propagates back through. The top
+/// ARF is its group's LAST picture in display order, so the group's own
+/// sources -- what [`crate::encoder::Av1Encoder::code_group`] hands it today
+/// -- are all display-PAST, i.e. the window is time-REVERSED against every
+/// other frame's (and against the flat path's, which always looks forward).
+/// libaom's tpl at an ARF looks FORWARD, over the next group. With
+/// [`LOOKAHEAD`] on those pictures are buffered, so the window is a choice:
+///
+/// * `0` -- the past window (time-reversed), the shipped behaviour.
+/// * `1` -- the display-FUTURE pictures only, nearest first, up to
+///   `tpl_depth() - 1` of them.
+/// * `2` -- past then future, concatenated nearest-first. NOTE the chain has
+///   a discontinuity in the middle (the coarse pass between the last past
+///   neighbour and the nearest future one spans the whole group).
+/// * `3` -- future-only over the WHOLE next group, ignoring `tpl_depth()`.
+///
+/// Falls back to `0`'s window whenever no future picture is buffered (the
+/// lookahead off, or the end of the stream). `EC_AV1_TPL_FUT=<n>` overrides
+/// it, and `EC_AV1_TPL_FUT_HALF=<n>` moves mode 2's split (default half the
+/// budget each side).
+///
+/// The 48-picture long-GOP gate, both films, against the past window:
+///
+/// | arm | film A | film B | wall A | wall B |
+/// |---|---|---|---|---|
+/// | 0, past (the control) | +21.3/-8.8 | +72.1/-1.2 | 671.1s | 461.6s |
+/// | 1, future only | +22.0/-8.6 | +73.1/-1.1 | 629.6s | 583.1s |
+/// | **2, 3 past then 4 future (ships)** | **+21.2/-8.8** | **+71.6/-1.5** | 692.3s | 462.5s |
+/// | 3, the whole next group | +21.9/-8.7 | +72.7/-1.4 | 573.1s | 455.7s |
+///
+/// A future-ONLY window is worse than the past one on every column: the
+/// nearest past neighbours are what the map's propagation is carried by (the
+/// witness sees the same thing -- mode 2 at its default split is byte-
+/// identical to mode 0 on a 128x128 fixture, and only moves once the past
+/// half is cut to one). Mode 2 is film B -0.5/-0.3 and film A -0.1/0.0, so it
+/// keeps by the lane's rule (one row >=0.5 down, the other flat within
+/// +-0.3) at +3.2% / +0.2% wall.
+pub(crate) const TPL_FUT: [usize; 11] = [2; 11];
+
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at
 /// the high-quality end for the same reason: a picture we are about to
