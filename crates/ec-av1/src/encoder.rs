@@ -1298,6 +1298,31 @@ pub(crate) fn tpl_fut() -> usize {
         .unwrap_or_else(|| crate::speed::at(&crate::speed::TPL_FUT))
 }
 
+/// lane-tplhalf: mode 2's split -- how many display-PAST neighbours the top
+/// ARF's window opens with, the rest of the budget coming from the buffered
+/// future ([`crate::speed::TPL_FUT_HALF`], `EC_AV1_TPL_FUT_HALF=<n>`).
+pub(crate) fn tpl_fut_half() -> usize {
+    std::env::var("EC_AV1_TPL_FUT_HALF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| crate::speed::at(&crate::speed::TPL_FUT_HALF))
+}
+
+/// lane-tplhalf: how many entries mode 2's window holds in total, `0` meaning
+/// `tpl_depth() - 1` -- the ARF window's budget alone, so raising it does not
+/// deepen every other frame's lambda pass the way `EC_AV1_TPL_D` does
+/// ([`crate::speed::TPL_FUT_WIN`], `EC_AV1_TPL_FUT_WIN=<n>`).
+pub(crate) fn tpl_fut_win(depth: usize) -> usize {
+    match std::env::var("EC_AV1_TPL_FUT_WIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| crate::speed::at(&crate::speed::TPL_FUT_WIN))
+    {
+        0 => depth - 1,
+        n => n,
+    }
+}
+
 /// lane-lookahead: whether the pyramid path holds one group of lookahead
 /// ([`crate::speed::LOOKAHEAD`], `EC_AV1_LOOKAHEAD=0|1`).
 fn lookahead() -> bool {
@@ -2253,10 +2278,10 @@ impl Av1Encoder {
                 // the nearest past and the nearest future neighbour spans the
                 // whole group), which is the arm's known cost.
                 (2, _, _) => {
-                    let half = std::env::var("EC_AV1_TPL_FUT_HALF").ok().and_then(|v| v.parse().ok()).unwrap_or((depth - 1) / 2);
+                    let budget = tpl_fut_win(depth);
                     let mut w = past();
-                    w.truncate(half.max(1));
-                    let room = (depth - 1).saturating_sub(w.len());
+                    w.truncate(tpl_fut_half().max(1));
+                    let room = budget.saturating_sub(w.len());
                     w.extend(arf_tpl_future(room));
                     w
                 }
