@@ -433,23 +433,47 @@ pub(crate) const ARF_TF_MID: [f64; 11] = [0.0; 11];
 /// measured with two neighbours on EACH side; four pictures of one-sided
 /// past is a different (and worse) window, and the anchor drifts away from
 /// the leaves it has to predict.
-pub(crate) const ARF_TF_WIN: [usize; 11] = [2; 11];
+///
+/// lane-lookahead gave the encoder the future half ([`LOOKAHEAD`]) and swept
+/// the SYMMETRIC window (this many past neighbours and [`ARF_TF_WIN_FUT`]
+/// future ones) on the long-GOP gate at strength 2:
+///
+/// | window | film A | film B |
+/// |---|---|---|
+/// | +-0 (2 past, the control) | +22.0/-8.4 | +76.5/+1.2 |
+/// | +-1 | +21.4/-8.8 | +74.3/+0.3 |
+/// | +-2 | +21.2/-8.8 | +72.3/-0.9 |
+/// | **+-3 (ships)** | **+21.2/-8.8** | **+72.1/-1.2** |
+/// | +-4 | +21.5/-8.7 | +72.5/-1.0 |
+///
+/// Bracketed on both sides and down on all four columns against the control
+/// (film A -0.8/-0.4, film B -4.4/-2.4). The census's shape is confirmed:
+/// what a wider window cost past-only, it buys symmetric.
+pub(crate) const ARF_TF_WIN: [usize; 11] = [3; 11];
 
 /// lane-lookahead: how many DISPLAY-FUTURE neighbours the top ARF's temporal
 /// filter averages in, on top of [`ARF_TF_WIN`] past ones. Non-zero needs
 /// [`LOOKAHEAD`] -- the future pictures are the next group's sources, which
 /// the encoder buffers only with the lookahead on.
-/// `EC_AV1_ARF_TF_WIN_FUT=<n>` overrides it.
-pub(crate) const ARF_TF_WIN_FUT: [usize; 11] = [0; 11];
+/// `EC_AV1_ARF_TF_WIN_FUT=<n>` overrides it. The sweep is [`ARF_TF_WIN`]'s
+/// table (the two move together, +-n); strength 3 at +-2 loses to strength 2
+/// (film A +21.5/-8.7, film B +73.1/-0.7 against +21.2/-8.8 and +72.3/-0.9),
+/// so [`ARF_TF`] stays where lane-arftf put it.
+pub(crate) const ARF_TF_WIN_FUT: [usize; 11] = [3; 11];
 
 /// lane-lookahead: whether [`crate::encoder::Av1Encoder`] holds one whole
 /// mini-GOP of lookahead -- the next group's sources are buffered before the
 /// current group's top ARF is coded, so that ARF has display-FUTURE pictures
-/// available. Costs one group of latency (`mini_gop` pictures, 8 by default:
-/// ~99 MB of buffered source at 4K 8-bit 4:2:0) and nothing else: with
+/// available. Costs one group of latency (`mini_gop` pictures, 8 by default)
+/// and one group of source buffer -- [`crate::encode::Picture`] holds u16
+/// samples, so a 3840x2160 4:2:0 picture is 24.9 MB and the group is 199 MB
+/// on top of the group the encoder already buffered -- and nothing else: with
 /// [`ARF_TF_WIN_FUT`] at 0 nothing reads the future half and the streams are
-/// byte-identical. `EC_AV1_LOOKAHEAD=0|1` overrides it.
-pub(crate) const LOOKAHEAD: bool = false;
+/// byte-identical. `EC_AV1_LOOKAHEAD=0|1` overrides it. What it BUYS is
+/// [`ARF_TF_WIN_FUT`]: the symmetric filter window is the long-GOP gate's
+/// film A -0.8/-0.4 and film B -4.4/-2.4, and the buffer is also what a
+/// two-pass-like allocation would need.
+pub(crate) const LOOKAHEAD: bool = true;
 
 /// lane-arfpred: the qindex below which the ARF temporal filter is OFF --
 /// libaom scales `arnr` strength with the quantizer and stops filtering at

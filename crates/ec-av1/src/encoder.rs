@@ -3687,6 +3687,13 @@ mod tests {
     #[test]
     fn the_lookahead_holds_one_group_and_still_codes_every_picture() {
         let _knobs = crate::speed::knob_write();
+        // The preset is PROCESS-GLOBAL and another test may have left it
+        // anywhere: at a high one every block of this fixture codes as skip
+        // (17 pictures in 493 bytes) and the source filter cannot change a
+        // byte, which failed the future-half assertion below in the suite and
+        // passed it standalone (class process-global-knob-races-tests).
+        let was = crate::speed::speed();
+        crate::speed::set_speed(0);
         crate::encode::force_screen(Some(false));
         let (width, height) = (128usize, 128usize);
         let run = |n: usize, gop: usize, on: bool, fut: usize| -> (Vec<u8>, Vec<Packet>) {
@@ -3758,6 +3765,7 @@ mod tests {
                 assert!(got == *b, "symmetric arm, display frame {i}: ours differs from ffmpeg");
             }
         }
+        crate::speed::set_speed(was);
     }
 
     fn pyramid_round_trip(pyramid: Pyramid, hidden: usize) {
