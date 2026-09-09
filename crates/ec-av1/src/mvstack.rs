@@ -372,6 +372,49 @@ impl MiGrid {
         }
     }
 
+    /// lane-b128hv: the raw cells and skip flags of one rect region, and the
+    /// write-back that undoes a trial that published into it -- the 128
+    /// root's HORZ/VERT search stamps its FIRST half so that the second
+    /// half's mv stack is the one the writer will rebuild, then puts the grid
+    /// back for the four-superblock arm it is weighed against.
+    pub fn snapshot_rect(
+        &self,
+        row: usize,
+        col: usize,
+        h: usize,
+        w: usize,
+    ) -> (Vec<Option<MiInfo>>, Vec<bool>) {
+        let mut cells = Vec::with_capacity(h * w);
+        let mut skips = Vec::with_capacity(h * w);
+        for r in row..(row + h).min(self.rows) {
+            let c1 = (col + w).min(self.cols);
+            cells.extend_from_slice(&self.cells[r * self.cols + col..r * self.cols + c1]);
+            skips.extend_from_slice(&self.skips[r * self.cols + col..r * self.cols + c1]);
+        }
+        (cells, skips)
+    }
+
+    /// Puts a [`Self::snapshot_rect`] back.
+    pub fn restore_rect(
+        &mut self,
+        row: usize,
+        col: usize,
+        h: usize,
+        w: usize,
+        snap: &(Vec<Option<MiInfo>>, Vec<bool>),
+    ) {
+        let mut i = 0;
+        for r in row..(row + h).min(self.rows) {
+            let c1 = (col + w).min(self.cols);
+            let n = c1 - col;
+            self.cells[r * self.cols + col..r * self.cols + c1]
+                .copy_from_slice(&snap.0[i..i + n]);
+            self.skips[r * self.cols + col..r * self.cols + c1]
+                .copy_from_slice(&snap.1[i..i + n]);
+            i += n;
+        }
+    }
+
     /// The unit at `(row, col)`, or `None` when it is outside the grid, hasn't
     /// been coded, or sits outside the current tile's own bounds ([`Self::set_tile_bounds`]).
     pub fn get(&self, row: usize, col: usize) -> Option<MiInfo> {
