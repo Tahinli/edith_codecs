@@ -150,7 +150,7 @@ through adds candidate-independent constants that cannot move an argmin.
 
 ## 7. Suite / checks
 
-    s1  --skip stream::        344 passed; 0 failed; 37 ignored  RC=0
+    s1  --skip stream::        344 passed; 0 failed; 38 ignored  RC=0
     s2  stream:: --skip 10bit  202 passed; 0 failed; 15 ignored  RC=0
     s3  10bit                   42 passed; 0 failed;  1 ignored  RC=0
     --ignored every_speed_preset_decodes_sample_exact_through_both_decoders  ok
