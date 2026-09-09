@@ -3700,9 +3700,16 @@ mod tests {
             set_lookahead(Some(on));
             set_arf_tf_future(Some(fut));
             let config = EncoderConfig {
+                // FINE (not the 120 the other facade tests use): at a coarse
+                // quantizer this fixture's ARF codes almost pure skip (17
+                // pictures in 493 bytes) and a filtered source quantizes back
+                // to the same bytes, which made the future-half assertion
+                // below depend on where the suite's other tests had left the
+                // process-global preset. At q=60 the anchor carries real
+                // coefficients and the filter must move them.
+                base_q_idx: 60,
                 width,
                 height,
-                base_q_idx: 120,
                 gop,
                 colour: Colour::Bt709Limited,
                 tile_cols_log2: 0,
@@ -3711,6 +3718,16 @@ mod tests {
             let mut enc = Av1Encoder::with_pyramid(config, Pyramid::default()).unwrap();
             let sources: Vec<Picture> = (0..n).map(|t| noisy_card(width, height, t)).collect();
             let packets = encode_all(&mut enc, &sources);
+            // The content gate is process-global and so is the preset: if
+            // either has been flipped under this test the pyramid is gone and
+            // there is no ARF to filter, which is a different failure from
+            // "the future neighbour changed nothing" (the suite reported the
+            // second when it meant the first).
+            assert!(
+                enc.pyramid().is_some(),
+                "{n} pictures at gop {gop}: the content gate dropped the pyramid,                  so no ARF was coded (speed {})",
+                crate::speed::speed(),
+            );
             (concat(&packets), packets)
         };
         for gop in [32usize, 8] {
@@ -3752,8 +3769,11 @@ mod tests {
         set_arf_tf_future(None);
         assert!(
             base != symmetric,
-            "one display-future neighbour left the top ARF's filter unchanged ({} B both)",
-            base.len()
+            "one display-future neighbour left the top ARF's filter unchanged \
+             ({} B vs {} B, preset {})",
+            base.len(),
+            symmetric.len(),
+            crate::speed::speed()
         );
         let ours = crate::stream::decode_stream(&symmetric).expect("our decoder");
         assert_eq!(ours.len(), 17, "the symmetric arm's display-order count");
