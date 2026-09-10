@@ -738,22 +738,23 @@ fn b128_root() -> bool {
 /// pair per 64x64 mu chunk, var-tx depth 0 (the shape
 /// [`crate::tile::write_inter_block_128`] codes and `decode_inter_block`
 /// reads). Written, witnessed and byte-exact through both decoders, and
-/// **off by default** (`EC_AV1_B128RES=1` turns it on) for two measured
-/// reasons:
+/// **off by default** (`EC_AV1_B128RES=1` turns it on) because it is INERT
+/// on content: the RD takes it 0.7-1.9 times per frame against thousands of
+/// whole 128 roots (lane-b128res census, native 12-frame gate, every clip),
+/// and the BD effect is inside the noise on both gates -- long-GOP films
+/// -0.1/+0.1 and all five 12-frame rows within 0.1 of the off default.
 ///
-///  * it is INERT on content: over the native 12-frame gate the RD takes it
-///    0-2 times per frame against ~90 whole 128 roots, so the BD effect is
-///    inside the noise either way;
-///  * with it on, `bd_rate_screen_native`'s bars 2160p row q=90 frame 11
-///    reads 8 luma samples (rows 126..127, cols 1611..1616 -- the two rows
-///    above a 128-superblock horizontal edge) where ffmpeg and this
-///    encoder's own reconstruction disagree. The residual arm's own witness
-///    clip is byte-exact through ffmpeg over 420 forced blocks at 1280x768,
-///    so the open half is a FILTER-stage interaction (deblock/CDEF at a 128
-///    block's own edge), not the coefficient path.
-///
-/// An inert candidate does not buy a live filter mismatch, so the default
-/// stays off until that is root-caused; the knob is the gate for it.
+/// The historical reason for the parking is CLOSED: the bars 2160p q=90
+/// frame 11 disagreement with ffmpeg (8 luma samples at the rows above a
+/// 128-superblock horizontal edge) was the CDEF search pricing a preset per
+/// 64x64 unit under a root that codes ONE literal for all four -- lane-
+/// edge128's `crate::tile::cdef_unit_owner` collapses the four to the one
+/// the decoder derives, and on this HEAD the same row re-measures three-way
+/// EXACT (encoder reconstruction == ffmpeg == `decode_stream`, every frame,
+/// every plane, both gates). The knob stays as the arm's gate, not as a
+/// defect flag; the residual arm is also what
+/// [`crate::tile::write_inter_block_128_rect`]'s skip-only halves would
+/// share if they ever carry one.
 fn b128_residual() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_B128RES").ok().map(|v| v != "0")
@@ -17095,6 +17096,15 @@ mod tests {
     /// `skip = true` for a block that carries a residual -- the next root's
     /// `skip` symbol then took CDF row 1 where the reader takes row 0.
     ///
+    /// lane-b128res: the fixture's q moved 150 -> 60. The forced arm replaces
+    /// the skip arm's cost unconditionally (that is what makes the writer see
+    /// the residual), and the cost model moved under it since lane-b128r --
+    /// lane-rectdq made every non-skipped root pay its delta_q group and the
+    /// pyramid re-prices the leaves -- so at q=150, then q=90, the NONE root
+    /// lost its partition at ALL 420 roots and the writer coded none. q=60
+    /// puts 52 written blocks back on this clip; the `coded > 0` assert below
+    /// is the guard that catches the next such drift.
+    ///
     ///     cargo test -p ec-av1 --release --lib -- --ignored \
     ///         a_128_root_block_with_a_real_residual --nocapture
     #[test]
@@ -17125,7 +17135,7 @@ mod tests {
         let _ = take_b128_residual_hits();
         let _ = crate::tile::take_sb128_residual_hits();
         force_b128_residual(true);
-        let encoded = encode_sequence(&pictures, 150, 0.5).unwrap();
+        let encoded = encode_sequence(&pictures, 60, 0.5).unwrap();
         let (won, coded) =
             (take_b128_residual_hits(), crate::tile::take_sb128_residual_hits());
         eprintln!("128x128 blocks WITH a residual: search won {won}, writer coded {coded}");
@@ -20239,9 +20249,12 @@ mod tests {
                 100.0 * i64_whole as f64 / i64_offered.max(1) as f64,
             );
             eprintln!(
-                "{name}: 128x128 roots {} (search) / {} (writer)",
+                "{name}: 128x128 roots {} (search) / {} (writer), with a residual \
+                 {} (search) / {} (writer)",
                 take_b128_none_hits(),
                 crate::tile::take_sb128_none_hits(),
+                take_b128_residual_hits(),
+                crate::tile::take_sb128_residual_hits(),
             );
             eprintln!(
                 "{name}: 64x64 roots {} (with a residual {}, split luma {}, compound {})",
