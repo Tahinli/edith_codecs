@@ -71,9 +71,20 @@ witness: the long-GOP gate is the measurement.
 
 ## 6. Other gates
 
-Recorded at merge time (this file's suite line). Pins are expected
-unmoved: the 4-picture pin fixture has no next group, so the fallback
-keeps the past window.
+* Pins `encode::tests::the_encoders_own_streams_are_byte_identical_to_their_pins`:
+  PASS at the default and at `EC_AV1_SPEED=6`, unmoved (8291 / 33227). The
+  4-picture fixture has no next group, so the fallback keeps the past window.
+* `encoder::tests::the_future_tpl_window_still_codes_every_picture_and_moves_the_stream`:
+  PASS.
+* `encoder::tests::every_speed_preset_decodes_sample_exact_through_both_decoders`
+  (--ignored): PASS.
+* `encoder::tests::the_lookahead_holds_one_group_and_still_codes_every_picture`
+  went red under WIN=11 (17 pictures at gop 32: 5375 vs 5335 B). The identity
+  arm now pins `TPL_FUT=0` so it tests drain, not the lambda window
+  (`9f81a05e`). PASS after that pin.
+* `cargo check --workspace --all-targets -j4`: 0 errors, 0 ec-av1 warnings
+  (21 ec-opus missing-doc warnings and the ec-vorbis oracle one are
+  pre-existing).
 
 ## Deviations
 
@@ -81,7 +92,13 @@ keeps the past window.
   logs; this close is from those logs plus the WIN default they keep.
 * Presets 3..=6 split and budget left unswept (named in the tables).
 * 12-frame rows not re-measured (structurally blind, accepted).
+* The lookahead drain witness had to pin `TPL_FUT=0`; that is a test
+  isolation fix, not a WIN revert.
 
 ## Suite line
 
-Pending merge gates on this close.
+`ec-av1` lib suite, three detached lanes off one release binary at
+`9f81a05e`: 348 passed / 0 failed (`--skip stream::`), 202 / 0
+(`stream:: --skip 10bit`), 42 / 0 (`10bit`) -- 592 passed, 0 failed,
+56 ignored. Log `~/.cache/tplhalf/suite2.log`.
+`cargo check --workspace --all-targets -j4`: 0 errors, 0 ec-av1 warnings.
