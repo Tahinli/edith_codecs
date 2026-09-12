@@ -34444,6 +34444,10 @@ pub(crate) fn decode_inter_frame_tile(
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     reference_select: bool,
+    // lane-intertx: this frame header's own `reduced_tx_set` (spec 5.9.2) --
+    // see [`decode_inter_frame_tile_lr`]'s parameter. Same stale-header
+    // class as `tx_select` below.
+    reduced_tx_set: bool,
     // This frame header's `tx_mode == TxMode::Select`: `Encoded::tx_select`.
     // Hard-coding `false` here desynced at the first `tx_depth` symbol once
     // inter frames coded Select by default (class: test asserts against a
@@ -34464,7 +34468,7 @@ pub(crate) fn decode_inter_frame_tile(
     decode_inter_frame_tile_lr(
         data, mi_cols, mi_rows, base_q_idx, frame_width, frame_height, refpix, cdef,
         loop_filter, allow_high_precision_mv, force_integer_mv, interp_fixed,
-        enable_dual_filter, reference_select, tx_select,
+        enable_dual_filter, reference_select, reduced_tx_set, tx_select,
         &LoopRestorationParams::default(), initial_cdfs, NO_SIGN_BIAS, false,
         // `enable_filter_intra`: as the `false`s beside it, this convenience
         // entry names a stream written without the sequence bit (lane-fintra).
@@ -34490,6 +34494,15 @@ pub(crate) fn decode_inter_frame_tile_lr(
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     reference_select: bool,
+    // lane-intertx: this frame header's own `reduced_tx_set` (spec 5.9.2).
+    // The wrapper used to hard-code `true` ("the tests all code the reduced
+    // sets") -- true until the widened inter search put 1-D/DTT types on
+    // `reduced_tx_set = 0` frames' inter luma, whose CHROMA then inherits
+    // the type against this very bit
+    // ([`reduce_inherited_chroma_tx_type`]): guessing `true` mis-derives
+    // every inherited chroma type and desyncs the tile (class: test asserts
+    // against a stale header, next instance).
+    reduced_tx_set: bool,
     tx_select: bool,
     lr: &LoopRestorationParams,
     initial_cdfs: Option<Cdfs>,
@@ -34547,9 +34560,9 @@ pub(crate) fn decode_inter_frame_tile_lr(
         interp_fixed,
         enable_dual_filter,
         reference_select,
-        // lane-txi: this wrapper's callers are the decoder's own tests, which
-        // all code the reduced sets.
-        true,
+        // lane-intertx: this frame's own bit, not the hardcoded `true` --
+        // see the parameter's note above.
+        reduced_tx_set,
         tx_select,
         lr,
         initial_cdfs,
@@ -38785,6 +38798,9 @@ mod tests {
             Some(mc::InterpFilterKind::Regular),
             false,
             false,
+            // The fixture's own implied header codes the reduced sets (the
+            // wrapper's old hardcoded value).
+            true,
             false,
             None,
             false,
@@ -39278,6 +39294,12 @@ mod tests {
                 // `false` (stale-header class -- a `reference_select` stream
                 // reads a `comp_mode` symbol this decode would skip).
                 crate::encode::reference_select(),
+                // lane-intertx: this frame's own `reduced_tx_set` -- the
+                // bit the chroma inheritance reduces against. The wrapper
+                // used to guess `true`, which mis-derived every inherited
+                // chroma type on a screen frame's widened inter blocks
+                // (stale-header class).
+                frame.reduced_tx_set,
                 frame.tx_select,
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),
@@ -39620,9 +39642,10 @@ mod tests {
                 // The encoder's own `reference_select` (spec 5.9.22): these
                 // GOP round trips decode a tile the ENCODER wrote, so the
                 // header bit must be the one it wrote, not a hard-coded
-                // `false` (stale-header class -- a `reference_select` stream
-                // reads a `comp_mode` symbol this decode would skip).
                 crate::encode::reference_select(),
+                // lane-intertx: the frame's own `reduced_tx_set` -- see the
+                // first GOP round trip's note.
+                frame.reduced_tx_set,
                 frame.tx_select,
                 &frame.loop_restoration,
                 Some(frame.start_cdfs.0.clone()),

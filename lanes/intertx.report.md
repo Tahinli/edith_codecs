@@ -1,7 +1,7 @@
 # lane-intertx — the inter tx-type search on film (chroma inheritance made honest)
 
-Base: `810d8972` (charter). Fix commit: `9af60b4d`. Report commit: this one.
-Disposition: **stays-off** — the `InterTxSearch::All` lever does NOT ship
+Base: `810d8972` (charter). Fix commit: `9af60b4d`. Regression fix + report
+commit: this one. Disposition: **stays-off**
 (`crate::speed::TX_TYPE_SEARCH_INTER` keeps `Screen` at presets 0-6; the keep
 rule's deciding column fails at best -0.1 against the required -0.5), but the
 lane's correctness work is real and committed: the chroma inheritance desync
@@ -192,3 +192,67 @@ ok, both pins byte-identical.
   + tests compile warning-free; the three tx witnesses; the pin test) and
   project-wide validation stays with the main agent. `FLIPADST` family and
   the 1-D ADSTs remain unoffered (the standing lane-txi deferral).
+
+## 7. Regression caught by the merge tier: the raw-tile decode wrapper's
+## stale `reduced_tx_set`
+
+Main's regression tier caught three `decode::tests` failures on the lane
+HEAD (`a_gop_round_trips_bit_exact_against_the_encoder_reconstruction`,
+`an_odd_size_gop_round_trips_bit_exact_against_the_encoder_reconstruction`,
+`ffmpeg_and_this_decoder_agree_on_a_gop`), all refusing with "a reference
+frame selected with no picture at this frame's own ref_frame_idx slot".
+
+Root cause (class: **test asserts against a stale header** -- the wrapper's
+own parameter docs document five prior instances of exactly this class):
+`decode::decode_inter_frame_tile_lr`, the raw-tile decode helper the GOP
+round-trip tests use, hard-coded `reduced_tx_set: true`
+(`decode.rs:34552` at the fix commit's parent) with the comment "this
+wrapper's callers are the decoder's own tests, which all code the reduced
+sets". True until this lane: no inter block ever inherited a non-`DCT_DCT`
+chroma type. With the widened inter search live, a screen-detected GOP at
+the default preset codes `reduced_tx_set = 0` frames whose inter luma takes
+`V_DCT` (the traces show the first inter block at (0,0) 16x16 winning
+exactly that), and the chroma inheritance reduces the inherited type
+against the very bit the wrapper guessed: the test's decode derived
+`DCT_DCT` from `inh=Some(V_DCT)` at chroma 8x8 where the writer coded
+`V_DCT`, desynced, and the garbage symbols eventually read a ref_frame_idx
+that names an empty slot -- the named refusal is downstream noise, the
+first divergence is the chroma type.
+
+Fix (this commit): the wrapper takes the frame's own
+`reduced_tx_set: bool` (placed before `tx_select`, mirroring the plural
+fn), `Encoded` carries the bit (`encode.rs`, the `screen`/`tx_select`
+pattern), the GOP tests and the key-frame tile test (`stream.rs`, whose
+"our own encoder always writes `reduced_tx_set: true`" comment had the
+same latent stale-header bug) pass the honest value.
+
+Why the gates and witnesses did not see it: every production decode path
+(`stream.rs`'s parser, `decode_stream`, ffmpeg) reads the bit off the wire
+honestly -- the gates' three-way exactness and all witnesses ride those.
+Only the raw-tile test helper guessed.
+
+Encoder output is UNCHANGED by the fix: the diff touches the `Encoded`
+metadata struct, the test-facing decode wrappers and one test call -- no
+writer or search code (tile.rs is not in the fix diff at all), and the
+three witnesses code byte-identical streams after it (8143 / 8211 bytes,
+same census). The VPS-1 BD tables in sections 2-4 remain valid; no gate
+re-run needed.
+
+EVIDENCE: ~/.cache/intertx/regression-repro.log | the three tests on the
+unfixed lane HEAD | 3 failed, all with the named refusal.
+EVIDENCE: ~/.cache/intertx/regression-fix.log | the three tests + the pin
+test after the fix | 4 passed.
+EVIDENCE: ~/.cache/intertx/witness-rerun.log | all three tx witnesses
+re-run after the fix | byte-identical streams (8143 / 8211 bytes), ok.
+
+## 8. Full suite and workspace check (post-fix)
+
+Three-lane lib suite LOCALLY on the fix commit, `--release --lib`:
+`--skip stream::` 348 passed / 0 failed; `stream:: --skip 10bit` 202
+passed / 0 failed; `10bit` 42 passed / 0 failed -- **592 passed, 0
+failed**. `timeout 900 cargo check --workspace --all-targets -j4`: 0
+ec-av1 warnings (the 25 workspace warnings are ec-opus's, pre-existing).
+
+EVIDENCE: ~/.cache/intertx/suite-lane1.log | --skip stream:: | 348 passed.
+EVIDENCE: ~/.cache/intertx/suite-lane2.log | stream:: --skip 10bit | 202 passed.
+EVIDENCE: ~/.cache/intertx/suite-lane3.log | 10bit | 42 passed.

@@ -1797,6 +1797,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         tx_select: encoded.tx_select,
         switchable_motion_mode: encoded.switchable_motion_mode,
         screen: encoded.screen,
+        reduced_tx_set: encoded.reduced_tx_set,
         start_cdfs: encoded.start_cdfs.clone(),
         next_cdfs: encoded.next_cdfs.clone(),
         loop_filter: encoded.loop_filter,
@@ -1883,6 +1884,14 @@ pub struct Encoded {
     /// palette-mode symbols under it, so a raw tile decode that guessed
     /// `false` would desync at the first block (same class as `tx_select`).
     pub(crate) screen: bool,
+    /// This frame header's own `reduced_tx_set` (spec 5.9.2) -- the bit that
+    /// picks the inter `tx_type` alphabets AND, on an inter block, the
+    /// allowance the chroma transform's inherited type reduces against
+    /// ([`crate::decode::reduce_inherited_chroma_tx_type`]). A raw tile
+    /// decode that guesses `true` here mis-derives every inherited chroma
+    /// type on a `reduced_tx_set = 0` frame (lane-intertx; same class as
+    /// `tx_select`/`screen` above).
+    pub(crate) reduced_tx_set: bool,
     /// This frame header's chosen loop restoration parameters, threaded for
     /// the same reason as `loop_filter` -- and doubly so: the per-unit
     /// filters themselves are coded in `tile`, so a decode of it under a
@@ -8873,6 +8882,7 @@ pub(crate) fn encode_key_frame_inner(
         // A key frame codes no inter block, so no motion_mode symbol.
         switchable_motion_mode: false,
         screen,
+        reduced_tx_set: header.reduced_tx_set,
         next_cdfs: start_cdfs.clone(),
         start_cdfs,
         loop_filter: header.loop_filter,
@@ -12609,7 +12619,7 @@ pub(crate) fn encode_inter_frame(
     // `Cdfs` then reads for every luma `tx_type` symbol.
     header.reduced_tx_set = !wide_tx_set(screen);
     // lane-intertx, desync (a): the frame context this value is read back
-    // through ( [`decode::reduce_inherited_chroma_tx_type`] inside
+    // through ([`decode::reduce_inherited_chroma_tx_type`] inside
     // `recode_inter_chroma`, and every inter decode helper the search's own
     // trial decode shares) must carry THIS frame's bit, not whatever the
     // previous frame's trial decode last left in the shared cell -- a stale
@@ -14110,6 +14120,7 @@ pub(crate) fn encode_inter_frame(
         tx_select,
         switchable_motion_mode,
         screen,
+        reduced_tx_set: header.reduced_tx_set,
         start_cdfs,
         next_cdfs,
         loop_filter: header.loop_filter,
