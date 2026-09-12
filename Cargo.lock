@@ -486,6 +486,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-vp8"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+]
+
+[[package]]
 name = "ec-vp9-syntax"
 version = "0.1.0"
 dependencies = [
