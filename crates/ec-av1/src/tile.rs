@@ -473,13 +473,18 @@ fn write_inter_block_128(
 /// block's true footprint governs only its mv-stack window, its mi/grid stamp
 /// and its neighbour bands (decode.rs' own `write_w`/`write_h` split).
 ///
-/// SKIP only: the decoder reads a rect half's residual through the mu-chunk
-/// loop, but the 128 NONE residual arm it would share is itself parked
-/// (`EC_AV1_B128RES`), so offering one here would buy the same open filter
-/// mismatch for a candidate the RD takes 0-2 times a frame.
+/// lane-ab128: also the two 64x64 squares an AB shape codes (the `w == h`
+/// arm below) and its 128x64 / 64x128 half.
+///
+/// lane-rectres: a piece may CARRY A RESIDUAL -- the search only ever hands
+/// one over under `EC_AV1_RECTRES` ([`crate::encode::rectres`]), and then it
+/// is coded here exactly as `decode_inter_block` reads it: one TX_64X64 luma
+/// unit plus a TX_32X32 chroma pair per 64x64 mu chunk (two chunks for a
+/// half, one for a square), each depth-0 in the var-tx tree (a half codes
+/// two `txfm_partition` flags under `TxMode::Select`, a square one).
 ///
 /// # Errors
-/// A block that is intra or that is not skipped.
+/// A block that is intra.
 #[allow(clippy::too_many_arguments)]
 fn write_inter_block_128_rect(
     enc: &mut SymbolEncoder,
@@ -498,12 +503,6 @@ fn write_inter_block_128_rect(
     let info = block.inter.ok_or_else(|| {
         Error::unsupported("AV1 tile", "a 128-root rectangular half is coded inter")
     })?;
-    if !block.skip {
-        return Err(Error::unsupported(
-            "AV1 tile",
-            "a 128-root rectangular half carries a residual",
-        ));
-    }
     let (mi_r, mi_c) = at_mi;
     let (w_mi, h_mi) = (w / MI, h / MI);
     let has_above = neighbours.has_above(mi_r);
@@ -598,10 +597,46 @@ fn write_inter_block_128_rect(
             block.motion_mode,
         )?;
     }
+    // The 64x64 mu chunks the residual is coded in, raster order -- the
+    // decoder's own walk: two for a half, one for a square piece.
+    let chunks: &[(usize, usize)] = match (w, h) {
+        (128, 64) => &[(0, 0), (0, 1)],
+        (64, 128) => &[(0, 0), (1, 0)],
+        _ => &[(0, 0)],
+    };
+    // A half's uv plane block (64x32 / 32x64) is wider or taller than its
+    // 32x32 unit, so the unit's `txb_skip_ctx` takes `get_txb_ctx`'s
+    // offset-10 rows (+3 here); a 64x64 piece's uv block IS the unit and
+    // takes none. The half is also the only shape whose chroma is re-stamped
+    // per mu chunk at the end (decode.rs' `mu_chroma`).
+    let is_half = w.max(h) > 64;
     if tx_select {
-        // `read_block_tx_size_rect`'s skip arm: `txfm_partition_update_rect`
-        // with the BLOCK's own size in both bands, no symbol.
-        neighbours.record_txfm_rect((mi_r, mi_c), (w, h), (w, h));
+        if block.skip {
+            // `read_block_tx_size_rect`'s skip arm: `txfm_partition_update_rect`
+            // with the BLOCK's own size in both bands, no symbol.
+            neighbours.record_txfm_rect((mi_r, mi_c), (w, h), (w, h));
+        } else if is_half {
+            // The var-tx tree of a 128x64 / 64x128 block enters at TX_64X64
+            // once per mu chunk (`read_block_tx_size_rect`'s `max_tx = 64`
+            // loop), so it is two depth-0 `txfm_split` flags of zero, each
+            // read against the bands the chunks before it published.
+            for &(cr, cc) in chunks {
+                let unit = (mi_r + cr * 16, mi_c + cc * 16);
+                let ctx = txfm_partition_ctx_rect(
+                    neighbours.above_txfm[unit.1],
+                    neighbours.left_txfm[unit.0],
+                    w.max(h),
+                    64,
+                    64,
+                );
+                enc.symbol(0, &mut cdfs.txfm_partition[ctx]);
+                neighbours.record_txfm(unit, 64, 64, 64);
+            }
+        } else {
+            // A 64x64 piece is one whole TX_64X64: the single depth-0 flag
+            // the 64 root's own writer codes (`write_tx_syntax_inter`).
+            write_tx_syntax_inter(enc, cdfs, neighbours, (mi_r, mi_c), SB, true, false, 0);
+        }
     }
     let zero_grids = [
         vec![0i32; TX32 * TX32],
@@ -612,7 +647,94 @@ fn write_inter_block_128_rect(
     // side bands are named by the same SUB-grid origin every square block
     // uses.
     let at_sub = (mi_r / (SUB / MI), mi_c / (SUB / MI));
-    neighbours.record_planes_rect(at_sub, (w, h), 0, &zero_grids, true);
+    if !block.skip {
+        // lane-rectres: the packed 64-wide level grids the search hands over,
+        // one plane each (the same layout `write_inter_block_128` slices for
+        // the whole block, here with the piece's own chunk list).
+        let packed = [
+            level_grid(&block.luma, 64)?,
+            level_grid(&block.u, 64)?,
+            level_grid(&block.v, 64)?,
+        ];
+        let scan32 = default_scan(TX32);
+        let unit_of = |plane: usize, cr: usize, cc: usize| -> Vec<i32> {
+            (0..32)
+                .flat_map(|row| {
+                    packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32].to_vec()
+                })
+                .collect()
+        };
+        let mut chroma_units: Vec<((usize, usize), [Vec<i32>; 2])> = Vec::new();
+        for &(cr, cc) in chunks {
+            let unit_mi = (mi_r + cr * 16, mi_c + cc * 16);
+            // The luma unit, and the context its all-zero flag reads: a
+            // HALF's unit is smaller than its block (neighbour magnitude
+            // table), a square's IS the whole plane block (fixed zero --
+            // `read_inter_plane`'s `luma_skip_ctx.unwrap_or(0)`, the 64
+            // root's own writer rule). It publishes its context before the
+            // next chunk reads it.
+            let luma = unit_of(0, cr, cc);
+            let skip_ctx = if is_half {
+                neighbours.luma_skip_ctx(unit_mi, 64 / MI)
+            } else {
+                0
+            };
+            let around = neighbours.around_mi(unit_mi, 64);
+            write_coeffs(
+                enc,
+                &mut cdfs.txb(TxbSet::Luma64, 0),
+                &luma,
+                &scan32,
+                skip_ctx,
+                dc_sign_ctx(around[0].dc_vote),
+                Some(0),
+                TxType::DctDct,
+            );
+            neighbours.record_mi_luma(unit_mi, 64, &luma);
+            // Then this chunk's chroma pair, before the next chunk's luma:
+            // libaom codes every plane of a mu chunk before moving on.
+            let mut pair = [Vec::new(), Vec::new()];
+            for plane in 1..3usize {
+                let grid = unit_of(plane, cr, cc);
+                let around = neighbours.around_mi(unit_mi, 64)[plane];
+                write_coeffs(
+                    enc,
+                    &mut cdfs.txb(TxbSet::Chroma32, 0),
+                    &grid,
+                    &scan32,
+                    usize::from(around.above_coded) + usize::from(around.left_coded)
+                        + 3 * usize::from(is_half),
+                    dc_sign_ctx(around.dc_vote),
+                    Some(plane),
+                    TxType::DctDct,
+                );
+                neighbours.record_mi_chroma(unit_mi, 64, plane, &grid);
+                pair[plane - 1] = grid;
+            }
+            chroma_units.push((unit_mi, pair));
+        }
+        // decode.rs' own tail (`record_split_luma_rect_mi` then, on a half,
+        // the per-chunk chroma re-stamp): the block-level write off the
+        // whole assembled chroma plane grid, luma kept because each unit
+        // already published its own, and then the per-unit chroma writes
+        // replayed over it -- last writer wins, so the next block reads the
+        // units.
+        let block_grids = [
+            vec![0i32; TX32 * TX32],
+            packed[1].clone(),
+            packed[2].clone(),
+        ];
+        neighbours.record_planes_rect(at_sub, (w, h), 0, &block_grids, false);
+        if is_half {
+            for (unit_mi, pair) in &chroma_units {
+                neighbours.record_mi_chroma(*unit_mi, 64, 1, &pair[0]);
+                neighbours.record_mi_chroma(*unit_mi, 64, 2, &pair[1]);
+            }
+        }
+        SB128_RECTRES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        neighbours.record_planes_rect(at_sub, (w, h), 0, &zero_grids, true);
+    }
     neighbours.record_inter_rect_mi((mi_r, mi_c), (w, h), block.skip, true, block_ref(block));
     if let Some(r1) = info.ref1 {
         neighbours.record_compound_rect_mi((mi_r, mi_c), (w, h), r1, 0, 1);
@@ -665,6 +787,17 @@ static SB128_RESIDUAL_HITS: std::sync::atomic::AtomicUsize =
 /// The 128x128-with-residual count since the last call, and zero it.
 pub fn take_sb128_residual_hits() -> usize {
     SB128_RESIDUAL_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+/// lane-rectres: how many RECT/AB pieces (the halves and 64x64 squares
+/// [`write_inter_block_128_rect`] codes) carried a REAL residual rather than
+/// being skipped, since the last [`take_sb128_rectres_hits`] -- the writer
+/// side of [`crate::encode::take_b128_rectres_hits`]'s search count.
+static SB128_RECTRES_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The rect/AB-piece-with-residual count since the last call, and zero it.
+pub fn take_sb128_rectres_hits() -> usize {
+    SB128_RECTRES_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// lane-b128r: how many of those blocks named a SECOND reference (the
@@ -874,25 +1007,80 @@ impl TileLayout {
 /// That is the shape this map exists to collapse
 /// ([`crate::filter_search::pick_filters`]).
 ///
-/// Identity everywhere else: every block this writer codes at 64x64 or below
-/// covers exactly one unit.
+/// lane-rectres: the same holds for a Rect128 half or an Ab128 half that
+/// carries a residual (`EC_AV1_RECTRES`) -- it codes one literal at its own
+/// origin and the decoder stamps BOTH units it spans with it, so its pair is
+/// collapsed onto the origin unit too. Its 64x64 squares cover exactly one
+/// unit each, and a SKIP-ONLY rect/AB piece codes no literal at all (the
+/// decoder's per-piece `cdef_transmitted` reset never fires), so neither
+/// touches this map -- only pieces the writer really codes a residual for.
 pub(crate) fn cdef_unit_owner(blocks: &[Quadrant], mi_cols: u32, mi_rows: u32) -> Vec<u32> {
     let (cols, rows) = block_grid(mi_cols, mi_rows);
     let (sb_cols, sb_rows) = (cols.div_ceil(2) as usize, rows.div_ceil(2) as usize);
     let mut owner: Vec<u32> = (0..(sb_cols * sb_rows) as u32).collect();
+    // Collapses every 64x64 unit `(ur, uc) ..` a residual piece at unit
+    // `(ur, uc)` with footprint `(w, h)` spans onto the piece's origin --
+    // [`crate::encode::write_inter_block_128_rect`]'s one `write_cdef_idx`
+    // is what the decoder copies over all of them.
+    let collapse = |owner: &mut Vec<u32>, (ur, uc): (usize, usize), (w, h): (usize, usize)| {
+        let origin = (ur * sb_cols + uc) as u32;
+        for r in ur..(ur + (h / 64).max(1)).min(sb_rows) {
+            for c in uc..(uc + (w / 64).max(1)).min(sb_cols) {
+                owner[r * sb_cols + c] = origin;
+            }
+        }
+    };
     for sb_r in (0..sb_rows).step_by(2) {
         for sb_c in (0..sb_cols).step_by(2) {
-            let root = ((sb_r * 2) < rows as usize && (sb_c * 2) < cols as usize)
+            let Some(root) = ((sb_r * 2) < rows as usize && (sb_c * 2) < cols as usize)
                 .then(|| &blocks[(sb_r * 2) * cols as usize + sb_c * 2])
-                .is_some_and(|q| matches!(q, Quadrant::Whole128(_)));
-            if !root {
+            else {
                 continue;
-            }
-            let origin = (sb_r * sb_cols + sb_c) as u32;
-            for r in sb_r..(sb_r + 2).min(sb_rows) {
-                for c in sb_c..(sb_c + 2).min(sb_cols) {
-                    owner[r * sb_cols + c] = origin;
+            };
+            match root {
+                Quadrant::Whole128(_) => {
+                    let origin = (sb_r * sb_cols + sb_c) as u32;
+                    for r in sb_r..(sb_r + 2).min(sb_rows) {
+                        for c in sb_c..(sb_c + 2).min(sb_cols) {
+                            owner[r * sb_cols + c] = origin;
+                        }
+                    }
                 }
+                // lane-rectres: the two halves of a HORZ/VERT root sit in
+                // different unit rows (HORZ) / columns (VERT); each
+                // non-skip half collapses its own pair.
+                Quadrant::Rect128(horz, halves) => {
+                    for (i, half) in halves.iter().enumerate() {
+                        if half.skip {
+                            continue;
+                        }
+                        let (ur, uc) = if *horz {
+                            (sb_r + i, sb_c)
+                        } else {
+                            (sb_r, sb_c + i)
+                        };
+                        let (w, h) = if *horz { (128, 64) } else { (64, 128) };
+                        collapse(&mut owner, (ur, uc), (w, h));
+                    }
+                }
+                // lane-rectres: the AB half is the only multi-unit piece
+                // (its two squares are one unit each); only a non-skip one
+                // codes a literal, so only it fires.
+                Quadrant::Ab128(symbol, pieces) => {
+                    for (piece, ((mi_r, mi_c), (w, h))) in
+                        pieces.iter().zip(crate::encode::ab128_pieces(
+                            usize::from(*symbol),
+                            (0, 0),
+                        ))
+                    {
+                        if piece.skip {
+                            continue;
+                        }
+                        let (ur, uc) = (sb_r + mi_r / 16, sb_c + mi_c / 16);
+                        collapse(&mut owner, (ur, uc), (w, h));
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -2605,8 +2793,9 @@ pub enum Quadrant {
     /// Carried by the top-left 32x32 entry of the root's sixteen, exactly as
     /// [`Whole128`](Quadrant::Whole128) is.
     ///
-    /// SKIP only ([`crate::tile::write_inter_block_128_rect`] refuses a
-    /// residual), single reference or compound.
+    /// Skip-only by default; a piece carries a real residual under
+    /// `EC_AV1_RECTRES` (`crate::encode::rectres`), single reference or
+    /// compound either way.
     Rect128(bool, Vec<BlockCoeffs>),
     /// lane-ab128: the THREE inter blocks an AB shape at a 128 superblock
     /// root carries -- two 64x64 pieces and one 128x64 / 64x128 half -- in
@@ -2616,8 +2805,8 @@ pub enum Quadrant {
     /// top-left 32x32 entry of the root's sixteen, exactly as
     /// [`Rect128`](Quadrant::Rect128) is.
     ///
-    /// SKIP only, same writer ([`crate::tile::write_inter_block_128_rect`])
-    /// and same reason.
+    /// Skip-only by default, same writer; under `EC_AV1_RECTRES` any of the
+    /// three pieces may carry a real residual.
     Ab128(u8, Vec<BlockCoeffs>),
     /// A quadrant a [`Whole64`](Quadrant::Whole64) at its superblock's
     /// top-left already coded; it carries no block of its own.
