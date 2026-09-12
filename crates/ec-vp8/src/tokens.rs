@@ -156,7 +156,7 @@ fn get_coeffs(
     ac_factor: i16,
     out: &mut [i16; 16],
 ) -> usize {
-    let trace = std::env::var_os("EC_VP8_TRACE").is_some();
+    let trace = crate::trace_enabled();
     // One token decision: decode the bool, then — under EC_VP8_TRACE —
     // print the consulted (n, band, ctx, prob) and the decoded bit so the
     // stream can be diffed read-for-read against scripts/vp8ref_model.py.
@@ -268,11 +268,11 @@ pub(crate) fn decode_mb_tokens(
             let n0 = usize::from($ptype == 0);
             let (l, a) = ctxs.ctx_pair(mb_col, $idx);
             let ctx = (usize::from(l) + usize::from(a)).min(2);
-            if std::env::var_os("EC_VP8_TRACE").is_some() {
+            if crate::trace_enabled() {
                 eprintln!("TB {} ctx={} l={} a={}", $idx, ctx, l, a);
             }
             let eob = get_coeffs(bc, &probs[$ptype], ctx, n0, $dc, $ac, $slot);
-            if std::env::var_os("EC_VP8_TRACE").is_some() {
+            if crate::trace_enabled() {
                 eprintln!("TBE {} eob={}", $idx, eob);
             }
             out.eobs[$idx] = eob as u8;

@@ -29,3 +29,37 @@ pub mod transform;
 
 pub use ec_core::{Error, Result};
 pub use header::PersistedState;
+
+/// Whether `EC_VP8_TRACE` decision tracing is enabled, resolved once per
+/// process. A `var_os` per bool read was 46% of the decode profile (each
+/// call locks std's ENV lock and allocates); `OnceLock::get_or_init` was
+/// no better, so the hot path is a single relaxed atomic load.
+pub(crate) fn trace_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var_os("EC_VP8_TRACE").is_some();
+            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        1 => false,
+        _ => true,
+    }
+}
+
+/// Whether `EC_VP8_DEBUG` per-macroblock dumps are enabled (same shape as
+/// [`trace_enabled`]; the check sits in the per-MB reconstruct path).
+pub(crate) fn debug_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var_os("EC_VP8_DEBUG").is_some();
+            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        1 => false,
+        _ => true,
+    }
+}

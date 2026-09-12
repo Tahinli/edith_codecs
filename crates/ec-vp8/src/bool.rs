@@ -91,7 +91,6 @@ impl<'a> BoolDecoder<'a> {
     /// the same line scripts/vp8ref_model.py prints — so the two
     /// decoders can be diffed read-for-read.
     pub fn read_bool(&mut self, prob: u8) -> bool {
-        let trace = std::env::var_os("EC_VP8_TRACE").is_some();
         let prob = u32::from(prob);
         let split = 1 + (((self.range - 1) * prob) >> 8);
         let bigsplit = split << 8;
@@ -112,7 +111,7 @@ impl<'a> BoolDecoder<'a> {
                 self.value |= self.next_byte();
             }
         }
-        if trace {
+        if crate::trace_enabled() {
             eprintln!("B {} {} {} {}", self.pos, self.bit_count, prob, u8::from(bit));
         }
         bit
