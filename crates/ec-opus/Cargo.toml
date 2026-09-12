@@ -10,7 +10,15 @@ authors.workspace = true
 ec-core.workspace = true
 ec-dsp.workspace = true
 wide.workspace = true
+# Optional FFT backend (pure Rust, runtime-detected AVX kernels, no C): the
+# family stays dependency-free without it (`--no-default-features`); the
+# speed bench pulls it in behind `fft-rustfft`.
+rustfft = { version = "6", optional = true, default-features = false }
 
 [dev-dependencies]
 ec-dsp.workspace = true
 ec-ogg.workspace = true
+
+[features]
+default = ["fft-rustfft"]
+fft-rustfft = ["dep:rustfft"]
