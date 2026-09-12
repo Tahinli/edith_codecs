@@ -21044,15 +21044,18 @@ mod tests {
         eprintln!("PARITY q={q} bytes={} fnv1a={hash:016x} speed={} pyramid {:?} effective {:?}",
             e.stream.len(), crate::speed::speed(), crate::encoder::Pyramid::from_env(), last_sequence_pyramid());
     }
-    /// lane-refs: IS A SECOND PAST REFERENCE WORTH RETAINING? `encoder.rs`'s
-    /// `ref_frame_idx` maps `LAST2`/`LAST3` onto `LAST`'s own DPB slot, so no
-    /// block can predict from the picture before `LAST` -- while rav1e's ARFs
-    /// read LAST@-4 plus LAST2@-8 and libaom holds up to seven distinct
-    /// pictures. Building that (a second retained slot, the search offering
-    /// it, a witness, a second motion search per block) is a week of wall on
-    /// the stage that already owns most of the encode, so this census prices
-    /// the lever FIRST (class `gate-blind-to-feature`, "count how often the
-    /// feature would fire before building the machine").
+    /// lane-refs/lane-last2: IS A SECOND PAST REFERENCE WORTH RETAINING? The
+    /// lever this census priced SHIPS since lane-last2 (merge `321b2dc1`):
+    /// `EC_AV1_LAST2` (default OFF) retains a second past leaf picture in
+    /// `LEAF_SLOTS`, names it `ref_frame_idx[1]`, and offers it to the 32x32
+    /// search with its own `NEWMV` (`EC_AV1_LAST2_NEW`); the ARF-level lags
+    /// the census's far row measures were already banked by `arf_altref`.
+    /// This census stays the PRICING arm (class `gate-blind-to-feature`): its
+    /// best-of-two SAD shares are read against the fire share the gate census
+    /// prints (`references ... LAST2 n (n%)`) and the refutation in
+    /// `lanes/last2.report.md` §4 -- a pure-SAD best-of-two over-counts the
+    /// lever by more than an order of magnitude once NEAR/NEAREST/DRL off
+    /// `LAST`, the backward `ALTREF`, and the rate term price in.
     ///
     /// The measurement is on the gate's own window and loader (`gate_crop`,
     /// 12 pictures) of the two real films: every 16x16 luma block of every
