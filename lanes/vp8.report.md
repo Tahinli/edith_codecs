@@ -8,7 +8,7 @@ Never merged, never pushed. Pins untouched (no ec-av1 changes at all).
 | Milestone | State | Evidence |
 |---|---|---|
 | M1 bool decoder + frame tag + full first-partition header | **done/verified** | commit `57b5a53a`; 12 unit tests green; real vpxenc/ffmpeg streams (6 sizes/q, 8-token-partition, WebP still) parse with exact partition tiling, correct dims (incl. 76x52 non-MB-aligned), 0 desyncs |
-| M2 key-frame-only decode, sample-exact vs ffmpeg | **implemented, NOT verified** | commit `20f7d742`; 49 lib tests + 4 header tests green (all kernels differential-fuzzed vs libvpx C); ffmpeg byte-compare witnesses (`tests/keyframe_exact.rs`) RED — see "known gap" |
+| M2 key-frame-only decode, sample-exact vs ffmpeg | **implemented, NOT verified — 2 of 3 root-cause bugs FIXED, 1 remaining, precisely localized** | commits `20f7d742`, `072f842f`; single-MB 16x16 black fixture decodes BYTE-EXACT vs ffmpeg; multi-MB witnesses still RED (decision 2563, see below) |
 | M3 inter frames | **not attempted** (fixtures + spec recon done) | `clip-obs-320x192.ivf` (169 fr, 4 KFs), `altref-160x96.ivf`, `mparts-160x96.ivf` (8 partitions), `gop-160x96.ivf`; §16-18 read; inter trees/tables in `modes.rs` |
 | M4 public API + docs | **not attempted** | `Decoder::decode(&[u8]) -> Result<Option<Picture>>` exists; ec-av1-style `decode_stream` not yet |
 
@@ -69,21 +69,31 @@ Never merged, never pushed. Pins untouched (no ec-av1 changes at all).
   (`ffmpeg -v error -i F -f rawvideo -pix_fmt yuv420p -`) on 6 kf fixtures
   + mparts + WebP still. **FAILING — 0/3** (see below).
 
-## Known gap (the M2 blocker), localized as far as budget allowed
+## Known gap (the M2 blocker) — TWO of three root causes FIXED this session
 
-Single 16x16 black q=0 frame: chroma decodes exact (u=v=128), luma is
-~99-130 where ffmpeg says 16. The MB is B_PRED, coeffs plausible
-(Y0 = [-216,-8,-4,4] dequantized, y1dc=4). Predicted: wrong luma
-residual application or subblock-mode/border interaction in the B_PRED
-path; LF excluded (pixel (0,0) is never filtered; failure predates it).
-Debug aids left in place: `EC_VP8_DEBUG=1` per-MB coeff dump,
-`examples/dbg_first.rs`. Next steps for the session that picks this up:
-(1) hand-decode the 44-byte black frame partition-0 + token partition
-against dixie by script; (2) check B_PRED sub-mode context indexing
-(above/left border MBs) and the per-subblock predict->write->add
-sequencing against dixie predict.c/idct_add.c; (3) the missing
-`reset_left` per MB row was found and fixed during the sweep — re-check
-its dixie position (row start, after above reset).
+Method: a dixie-faithful python model of the whole partition-0 + token
+parse (`/tmp/vp8ref.py`, decision-for-decision trace) diffed against the
+Rust decoder's `EC_VP8_TRACE` decision stream.
+
+1. FIXED — MV probability updates were parsed on KEY frames (dixie
+   parses them only for interframes): 38 extra bool reads desynced
+   partition 0. Moved inside `!is_keyframe`.
+2. FIXED — decode_keyframe created a FRESH bool decoder over partition
+   0 for the mode records (restarting the stream); `FrameHeader::parse`
+   now returns its partition-0 decoder and the mode records CONTINUE
+   from where the header stopped.
+3. FIXED (earlier sweep) — per-MB-row token `reset_left` was never called.
+
+Result: `kf-16x16-black-q0.ivf` (single MB) decodes byte-exact vs
+ffmpeg. Multi-MB fixtures still diverge; the decision traces now match
+to decision 2562 and split at 2563 inside the token walk (MB(0,1)
+block 0): the reference consults probability 11, rust 4, at the same
+stream position — a coefficient-context/bookkeeping difference that
+only manifests from the second MB onward (cross-MB token contexts or a
+block-sequencing slip). Debug aids: `EC_VP8_TRACE` (decision + node
+trace), `EC_VP8_DEBUG` (per-MB coeff dump), `examples/dbg_first.rs`,
+python model at `/tmp/vp8ref.py` (re-create from this description if
+lost; it needs the RFC at ~/.cache/vp8/rfc6386.txt and tables.rs).
 
 ## Repro
 
