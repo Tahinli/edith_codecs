@@ -124,26 +124,65 @@ fn tap6_16(data: &[u8], at: usize, step: usize) -> i16x16 {
 
 /// `Clip1Y( ( v + 16 ) >> 5 )` over a row, storing the first `dst.len()` lanes.
 #[inline]
-fn store_half8(dst: &mut [u8], v: i16x8) {
+fn store_half8(dst: &mut [u8], v: i16x8, put: Put) {
     let c = ((v + i16x8::splat(16)) >> 5u32)
         .max(i16x8::ZERO)
         .min(i16x8::splat(255));
-    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
-        *o = s as u8;
+    match put {
+        Put::Set => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = s as u8;
+            }
+        }
+        Put::Avg => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = avg(*o, s as u8);
+            }
+        }
+        Put::AvgW {
+            w0,
+            w1,
+            shift,
+            round,
+            off,
+        } => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                store_weighted(o, s as u8, w0, w1, shift, round, off);
+            }
+        }
     }
 }
 
 /// The same over sixteen lanes.
 #[inline]
-fn store_half16(dst: &mut [u8], v: i16x16) {
+fn store_half16(dst: &mut [u8], v: i16x16, put: Put) {
     let c = ((v + i16x16::splat(16)) >> 5u32)
         .max(i16x16::ZERO)
         .min(i16x16::splat(255));
-    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
-        *o = s as u8;
+    match put {
+        Put::Set => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = s as u8;
+            }
+        }
+        Put::Avg => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = avg(*o, s as u8);
+            }
+        }
+        Put::AvgW {
+            w0,
+            w1,
+            shift,
+            round,
+            off,
+        } => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                store_weighted(o, s as u8, w0, w1, shift, round, off);
+            }
+        }
     }
 }
-
 /// One 6-tap half-sample pass over a `w` x `h` block whose top-left sample is
 /// `base`, into a `w`-pitch buffer. `step` is the tap spacing: 1 for the
 /// horizontal filter, the plane stride for the vertical one.
@@ -166,6 +205,7 @@ fn half_block(
             store_half16(
                 &mut dst[row * 16..row * 16 + 16],
                 tap6_16(data, base + row * stride, step),
+                Put::Set,
             );
         }
     } else {
@@ -173,6 +213,7 @@ fn half_block(
             store_half8(
                 &mut dst[row * w..row * w + w],
                 tap6_8(data, base + row * stride, step),
+                Put::Set,
             );
         }
     }
@@ -201,12 +242,32 @@ fn tap6_inter8(v: &[i16], at: usize, step: usize) -> i32x8 {
 
 /// `Clip1Y( ( v + 512 ) >> 10 )` over eight lanes.
 #[inline]
-fn store_centre(dst: &mut [u8], v: i32x8) {
+fn store_centre(dst: &mut [u8], v: i32x8, put: Put) {
     let c = ((v + i32x8::splat(512)) >> 10u32)
         .max(i32x8::ZERO)
         .min(i32x8::splat(255));
-    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
-        *o = s as u8;
+    match put {
+        Put::Set => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = s as u8;
+            }
+        }
+        Put::Avg => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = avg(*o, s as u8);
+            }
+        }
+        Put::AvgW {
+            w0,
+            w1,
+            shift,
+            round,
+            off,
+        } => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                store_weighted(o, s as u8, w0, w1, shift, round, off);
+            }
+        }
     }
 }
 
@@ -225,27 +286,65 @@ fn avg_rows(out: &mut [u8], a: &[u8], b: &[u8], n: usize) {
 /// The same average, written into a destination of pitch `os` from two
 /// `w`-pitch sources.
 #[inline]
-fn avg_rows_to(out: &mut [u8], os: usize, a: &[u8], b: &[u8], w: usize, h: usize) {
+fn avg_rows_to(out: &mut [u8], os: usize, a: &[u8], b: &[u8], w: usize, h: usize, put: Put) {
     if os == w {
-        avg_rows(out, a, b, w * h);
+        avg_rows_to_contig(out, a, b, w * h, put);
         return;
     }
     for row in 0..h {
-        avg_rows(
+        avg_rows_to_contig(
             &mut out[row * os..row * os + w],
             &a[row * w..],
             &b[row * w..],
             w,
+            put,
         );
     }
 }
 
-/// Copy `w` x `h` samples from a `w`-pitch source into an `os`-pitch
-/// destination.
+/// The average over contiguous equal-length slices, honouring `put`.
 #[inline]
-fn copy_rows(out: &mut [u8], os: usize, src: &[u8], w: usize, h: usize) {
+fn avg_rows_to_contig(out: &mut [u8], a: &[u8], b: &[u8], n: usize, put: Put) {
+    match put {
+        Put::Set => avg_rows(out, a, b, n),
+        Put::Avg => {
+            let (out, a, b) = (&mut out[..n], &a[..n], &b[..n]);
+            for i in 0..n {
+                out[i] = avg(avg(a[i], b[i]), out[i]);
+            }
+        }
+        Put::AvgW {
+            w0,
+            w1,
+            shift,
+            round,
+            off,
+        } => avg_rows_weighted(out, a, b, n, w0, w1, shift, round, off),
+    }
+}
+
+/// Copy `w` x `h` samples from a `w`-pitch source into an `os`-pitch
+/// destination, honouring `put`.
+#[inline]
+fn copy_rows(out: &mut [u8], os: usize, src: &[u8], w: usize, h: usize, put: Put) {
     for row in 0..h {
-        out[row * os..row * os + w].copy_from_slice(&src[row * w..row * w + w]);
+        let dst = &mut out[row * os..row * os + w];
+        let src = &src[row * w..row * w + w];
+        match put {
+            Put::Set => dst.copy_from_slice(src),
+            Put::Avg => {
+                for (d, &s) in dst.iter_mut().zip(src) {
+                    *d = avg(*d, s);
+                }
+            }
+            Put::AvgW {
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            } => copy_rows_weighted(dst, src, w0, w1, shift, round, off),
+        }
     }
 }
 
@@ -275,10 +374,10 @@ pub(crate) fn integer_origin(r: &RefPlane<'_>, x: i32, y: i32, w: usize, h: usiz
     let yi = clamp_origin(y, h, r.height, r.pad, 2, 3);
     r.at(xi, yi)
 }
-
-/// Luma quarter-sample interpolation (8.4.2.2.1) of a `w` x `h` partition whose
-/// full-sample origin is `(x, y)` and whose motion vector is `mv` in quarter
-/// samples. Writes `w` x `h` prediction samples into `out` at pitch `os`.
+/// Luma quarter-sample interpolation (8.4.2.2.1) of a `w` x `h` partition
+/// whose full-sample origin is `(x, y)` and whose motion vector is `mv` in
+/// quarter samples. Writes `w` x `h` prediction samples into `out` at pitch
+/// `os`, honouring `put` (see [`Put`]).
 ///
 /// The pitch is a parameter so that the single-list, default-weight case —
 /// which is most of a P slice — interpolates straight into the picture instead
@@ -293,6 +392,7 @@ pub(crate) fn mc_luma(
     h: usize,
     os: usize,
     out: &mut [u8],
+    put: Put,
 ) {
     let (fx, fy) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
     let xi = clamp_origin(x + (mv[0] as i32 >> 2), w, r.width, r.pad, 2, 3);
@@ -302,9 +402,41 @@ pub(crate) fn mc_luma(
 
     // Full sample: a straight copy.
     if fx == 0 && fy == 0 {
-        for row in 0..h {
-            let src = base + row * stride;
-            out[row * os..row * os + w].copy_from_slice(&r.data[src..src + w]);
+        match put {
+            Put::Set => {
+                for row in 0..h {
+                    let src = base + row * stride;
+                    out[row * os..row * os + w].copy_from_slice(&r.data[src..src + w]);
+                }
+            }
+            Put::Avg => {
+                for row in 0..h {
+                    let src = base + row * stride;
+                    let dst = &mut out[row * os..row * os + w];
+                    for (d, &v) in dst.iter_mut().zip(&r.data[src..src + w]) {
+                        *d = avg(*d, v);
+                    }
+                }
+            }
+            Put::AvgW {
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            } => copy_weighted(
+                out,
+                os,
+                &r.data[base..],
+                stride,
+                w,
+                h,
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            ),
         }
         return;
     }
@@ -350,7 +482,7 @@ pub(crate) fn mc_luma(
             for col in (0..w).step_by(8) {
                 let v = tap6_inter8(&inter, (row + 2) * TMP_W + col, TMP_W);
                 let n = (w - col).min(8);
-                store_centre(&mut jj[row * w + col..row * w + col + n], v);
+                store_centre(&mut jj[row * w + col..row * w + col + n], v, Put::Set);
             }
         }
     }
@@ -359,11 +491,11 @@ pub(crate) fn mc_luma(
     // the average of two of them. Resolving it once per partition rather than
     // once per sample is what keeps the copy loops straight.
     match (fx, fy) {
-        (2, 0) => copy_rows(out, os, &bb, w, h),
-        (0, 2) => copy_rows(out, os, &hh, w, h),
-        (2, 2) => copy_rows(out, os, &jj, w, h),
-        (2, 1) | (2, 3) => avg_rows_to(out, os, &bb, &jj, w, h),
-        (1, 2) | (3, 2) => avg_rows_to(out, os, &hh, &jj, w, h),
+        (2, 0) => copy_rows(out, os, &bb, w, h, put),
+        (0, 2) => copy_rows(out, os, &hh, w, h, put),
+        (2, 2) => copy_rows(out, os, &jj, w, h, put),
+        (2, 1) | (2, 3) => avg_rows_to(out, os, &bb, &jj, w, h, put),
+        (1, 2) | (3, 2) => avg_rows_to(out, os, &hh, &jj, w, h, put),
         (1, 0) | (3, 0) | (0, 1) | (0, 3) => {
             // Averaged with an integer sample one row or column over.
             let (dx, dy) = match (fx, fy) {
@@ -377,13 +509,41 @@ pub(crate) fn mc_luma(
                 let s = &r.data[src..src + w];
                 let hl = &half[row * w..row * w + w];
                 let dst = &mut out[row * os..row * os + w];
-                for col in 0..w {
-                    dst[col] = avg(s[col], hl[col]);
+                match put {
+                    Put::Set => {
+                        for col in 0..w {
+                            dst[col] = avg(s[col], hl[col]);
+                        }
+                    }
+                    Put::Avg => {
+                        for col in 0..w {
+                            dst[col] = avg(dst[col], avg(s[col], hl[col]));
+                        }
+                    }
+                    Put::AvgW {
+                        w0,
+                        w1,
+                        shift,
+                        round,
+                        off,
+                    } => {
+                        for col in 0..w {
+                            store_weighted(
+                                &mut dst[col],
+                                avg(s[col], hl[col]),
+                                w0,
+                                w1,
+                                shift,
+                                round,
+                                off,
+                            );
+                        }
+                    }
                 }
             }
         }
         // Diagonal quarter positions: the two nearest half samples.
-        _ => avg_rows_to(out, os, &bb, &hh, w, h),
+        _ => avg_rows_to(out, os, &bb, &hh, w, h, put),
     }
 }
 
@@ -403,6 +563,7 @@ fn chroma_rows<const W: usize>(
     wt: [u16; 4],
     os: usize,
     out: &mut [u8],
+    put: Put,
 ) {
     for row in 0..h {
         let src = base + row * stride;
@@ -415,7 +576,17 @@ fn chroma_rows<const W: usize>(
                 + u16::from(q[c]) * wt[2]
                 + u16::from(q[c + 1]) * wt[3]
                 + 32;
-            dst[c] = (v >> 6) as u8;
+            match put {
+                Put::Set => dst[c] = (v >> 6) as u8,
+                Put::Avg => dst[c] = avg(dst[c], (v >> 6) as u8),
+                Put::AvgW {
+                    w0,
+                    w1,
+                    shift,
+                    round,
+                    off,
+                } => store_weighted(&mut dst[c], (v >> 6) as u8, w0, w1, shift, round, off),
+            }
         }
     }
 }
@@ -431,6 +602,7 @@ pub(crate) fn mc_chroma(
     h: usize,
     os: usize,
     out: &mut [u8],
+    put: Put,
 ) {
     let (fx, fy) = ((mv[0] & 7) as u16, (mv[1] & 7) as u16);
     let xi = clamp_origin(x + (mv[0] as i32 >> 3), w, r.width, r.pad, 0, 1);
@@ -441,20 +613,51 @@ pub(crate) fn mc_chroma(
     // Full sample: a straight copy. A zero motion vector is the most common
     // vector in real content, and it lands here.
     if fx == 0 && fy == 0 {
-        for row in 0..h {
-            let src = base + row * stride;
-            out[row * os..row * os + w].copy_from_slice(&r.data[src..src + w]);
+        match put {
+            Put::Set => {
+                for row in 0..h {
+                    let src = base + row * stride;
+                    out[row * os..row * os + w].copy_from_slice(&r.data[src..src + w]);
+                }
+            }
+            Put::Avg => {
+                for row in 0..h {
+                    let src = base + row * stride;
+                    let dst = &mut out[row * os..row * os + w];
+                    for (d, &v) in dst.iter_mut().zip(&r.data[src..src + w]) {
+                        *d = avg(*d, v);
+                    }
+                }
+            }
+            Put::AvgW {
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            } => copy_weighted(
+                out,
+                os,
+                &r.data[base..],
+                stride,
+                w,
+                h,
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            ),
         }
         return;
     }
-
     // The four weights sum to 64, so the weighted sum of Equation 8-270 never
     // exceeds 64 * 255 and the whole bilinear fits in 16-bit lanes.
     let wt = [(8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy];
     match w {
-        2 => chroma_rows::<2>(r.data, base, stride, h, wt, os, out),
-        4 => chroma_rows::<4>(r.data, base, stride, h, wt, os, out),
-        _ => chroma_rows::<8>(r.data, base, stride, h, wt, os, out),
+        2 => chroma_rows::<2>(r.data, base, stride, h, wt, os, out, put),
+        4 => chroma_rows::<4>(r.data, base, stride, h, wt, os, out, put),
+        _ => chroma_rows::<8>(r.data, base, stride, h, wt, os, out, put),
     }
 }
 
@@ -482,6 +685,101 @@ impl Weights {
     /// final prediction and needs no combining pass at all.
     pub(crate) fn is_default(&self) -> bool {
         *self == Weights::DEFAULT
+    }
+}
+
+/// How an interpolation result lands in `out`: written outright, or rounded
+/// into what is already there.
+///
+/// The weighted second pass of 8.4.2.3.2 is a fusion mode as well: the first
+/// prediction sits in `out`, and the second list's sample `v` combines with
+/// it as `clip((out*w0 + v*w1 + round) >> shift) + off` — the same integer
+/// formula, on the same bytes, as running the combining pass over the two
+/// clipped predictions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Put {
+    /// Write the prediction.
+    Set,
+    /// Average the prediction into the bytes already in `out`.
+    Avg,
+    /// Weighted-average the prediction into the bytes already in `out`.
+    AvgW {
+        w0: i32,
+        w1: i32,
+        shift: u32,
+        round: i32,
+        off: i32,
+    },
+}
+
+/// The 8.4.2.3.2 combining step for one sample: list 0's prediction is the
+/// byte already in `dst`, list 1's is `v`.
+#[inline]
+fn store_weighted(dst: &mut u8, v: u8, w0: i32, w1: i32, shift: u32, round: i32, off: i32) {
+    let p0 = i32::from(*dst);
+    *dst = clip8((((p0 * w0 + i32::from(v) * w1 + round) >> shift) + off) as i32);
+}
+/// The weighted combining pass over a whole block: `h` rows of `w` samples
+/// from a `stride`-pitch source into an `os`-pitch destination.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn copy_weighted(
+    out: &mut [u8],
+    os: usize,
+    src: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    w0: i32,
+    w1: i32,
+    shift: u32,
+    round: i32,
+    off: i32,
+) {
+    for row in 0..h {
+        let dst = &mut out[row * os..row * os + w];
+        let s = &src[row * stride..row * stride + w];
+        for (d, &v) in dst.iter_mut().zip(s) {
+            store_weighted(d, v, w0, w1, shift, round, off);
+        }
+    }
+}
+
+/// The weighted combining pass over contiguous equal-length slices, where
+/// list 1's sample is the rounded average of `a` and `b`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn avg_rows_weighted(
+    out: &mut [u8],
+    a: &[u8],
+    b: &[u8],
+    n: usize,
+    w0: i32,
+    w1: i32,
+    shift: u32,
+    round: i32,
+    off: i32,
+) {
+    let (out, a, b) = (&mut out[..n], &a[..n], &b[..n]);
+    for i in 0..n {
+        store_weighted(&mut out[i], avg(a[i], b[i]), w0, w1, shift, round, off);
+    }
+}
+
+/// The weighted combining pass over a whole block from a `w`-pitch source.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn copy_rows_weighted(
+    out: &mut [u8],
+    src: &[u8],
+    w0: i32,
+    w1: i32,
+    shift: u32,
+    round: i32,
+    off: i32,
+) {
+    for (d, &s) in out.iter_mut().zip(src) {
+        store_weighted(d, s, w0, w1, shift, round, off);
     }
 }
 
@@ -674,7 +972,7 @@ mod tests {
                 for fx in 0..4i16 {
                     for &(pw, ph) in &[(16usize, 16usize), (8, 4), (4, 8), (4, 4)] {
                         let mv = [fx - 20 * 4, fy + 12];
-                        mc_luma(&r, px, py, mv, pw, ph, pw, &mut ours);
+                        mc_luma(&r, px, py, mv, pw, ph, pw, &mut ours, Put::Set);
                         spec_luma(&data, stride, origin, w, h, px, py, mv, pw, ph, &mut theirs);
                         assert_eq!(
                             ours[..pw * ph],
@@ -682,6 +980,38 @@ mod tests {
                             "({px},{py}) frac ({fx},{fy}) {pw}x{ph}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// `Put::Avg` turns `mc_luma` into the second half of a default-weighted
+    /// bi-prediction: averaging into the first list's bytes is bit-exact with
+    /// running the combining pass over the two clipped predictions (8.4.2.3.1).
+    #[test]
+    fn avg_mode_matches_the_combining_pass() {
+        let (w, h, pad) = (48usize, 32usize, 32usize);
+        let (data, stride, origin) = ramp_plane(w, h, pad);
+        let r = plane(&data, stride, origin, w, h, pad);
+        let mut fused = [0u8; 256];
+        let mut p0 = [0u8; 256];
+        let mut p1 = [0u8; 256];
+        let mut out = [0u8; 256];
+        for mv0 in [[0i16; 2], [7, -3], [-41, 22]] {
+            for mv1 in [[2i16; 2], [5, 1], [-13, 9]] {
+                for &(pw, ph) in &[(16usize, 16usize), (8, 8), (4, 4)] {
+                    mc_luma(&r, 4, 4, mv0, pw, ph, pw, &mut p0, Put::Set);
+                    mc_luma(&r, 4, 4, mv1, pw, ph, pw, &mut p1, Put::Set);
+                    combine(&mut out, &p0, &p1, true, true, &Weights::DEFAULT, pw * ph);
+                    // The fused shape: first list into the picture, second
+                    // averaged on top of it.
+                    fused[..pw * ph].copy_from_slice(&p0[..pw * ph]);
+                    mc_luma(&r, 4, 4, mv1, pw, ph, pw, &mut fused, Put::Avg);
+                    assert_eq!(
+                        fused[..pw * ph],
+                        out[..pw * ph],
+                        "mv {mv0:?} + {mv1:?} {pw}x{ph}"
+                    );
                 }
             }
         }
@@ -697,7 +1027,7 @@ mod tests {
             for fy in 0..8i16 {
                 for fx in 0..8i16 {
                     let mv = [fx, fy];
-                    mc_chroma(&r, px, py, mv, 8, 8, 8, &mut ours);
+                    mc_chroma(&r, px, py, mv, 8, 8, 8, &mut ours, Put::Set);
                     for row in 0..8i32 {
                         for col in 0..8i32 {
                             let s = |dx: i32, dy: i32| -> i32 {

@@ -24,7 +24,7 @@ use crate::entropy::{
     BlockCat, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_INTER, FLAG_SKIP, FLAG_TRANS8X8,
     MbCtx, MbInfo,
 };
-use crate::inter::{RefPlane, integer_origin, mc_chroma, mc_luma};
+use crate::inter::{Put, RefPlane, integer_origin, mc_chroma, mc_luma};
 use crate::mv::{MvCtx, neighbour_mvd, predict_mv, write_block, write_intra_mb, write_mvd};
 use crate::pred::{
     PlaneWindow, add_residual_4x4, add_residual_8x8, filter_nbr8, pred_4x4, pred_8x8, pred_16x16,
@@ -863,6 +863,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
                 ch,
                 cw,
                 &mut buf,
+                crate::inter::Put::Set,
             );
             let plane = if comp == 0 { &e.src.u } else { &e.src.v };
             sum += satd_block(
@@ -910,7 +911,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
                 );
                 return sad(&e.src.y, sw, x0, y0, &plane.data[o..], plane.stride, w, h) + bits;
             }
-            mc_luma(&plane, x0 as i32, y0 as i32, mv, w, h, w, &mut buf);
+            mc_luma(&plane, x0 as i32, y0 as i32, mv, w, h, w, &mut buf, crate::inter::Put::Set);
             let d = if satd {
                 satd_block(&e.src.y, sw, x0, y0, &buf, w, 0, w, h)
             } else {
@@ -1001,7 +1002,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<I
     let cost16 = cost16 + chroma_satd(0, 0, 16, 16, mv16);
     let skip_cost = {
         let mut buf = [0u8; 256];
-        mc_luma(&plane, sx as i32, sy as i32, skip_mv, 16, 16, 16, &mut buf);
+        mc_luma(&plane, sx as i32, sy as i32, skip_mv, 16, 16, 16, &mut buf, Put::Set);
         // P_Skip's rebate is the signalling it genuinely saves. Re-measured on
         // consecutive pictures: 0 and 2 read -1.102/-1.154 dB on the film clip
         // and -0.741/-0.696 on the screen capture -- the two contents disagree
@@ -2962,7 +2963,7 @@ fn compensate_part(
     };
     let stride = pic.y.stride;
     let origin = pic.y.at(mb_x * 16 + bx * 4, mb_y * 16 + by * 4);
-    mc_luma(&plane, x0, y0, mv, w, h, stride, &mut pic.y.data[origin..]);
+    mc_luma(&plane, x0, y0, mv, w, h, stride, &mut pic.y.data[origin..], Put::Set);
     for comp in 0..2 {
         let src = if comp == 0 {
             &reference.cb
@@ -2989,6 +2990,7 @@ fn compensate_part(
             h / 2,
             stride,
             &mut dst.data[origin..],
+            Put::Set,
         );
     }
 }

@@ -901,6 +901,14 @@ impl SliceCtx {
         refs.get(self.lists[list].get(idx as usize)?)
     }
 
+    /// True when no slice-level weighting can apply at all, so every
+    /// component of every partition resolves to [`Weights::DEFAULT`] without
+    /// the per-component lookup: neither weighted prediction (P) nor
+    /// weighted/bi-prediction (B) is signalled.
+    fn no_weights(&self) -> bool {
+        self.weighted_bipred_idc == 0 && !self.weighted_pred
+    }
+
     /// Prediction weights of one component (clause 8.4.3).
     fn weights_for(
         &self,
@@ -2226,13 +2234,21 @@ fn compensate(
     let x0 = (mb_x * 16 + px * 4) as i32;
     let y0 = (mb_y * 16 + py * 4) as i32;
     let (w, h) = (pw * 4, ph * 4);
-
-    let wt = ctx.weights_for(refs, 0, ref_idx[0], ref_idx[1], use0, use1);
-    // 8.4.2.3.1 over one list is the identity, so the interpolation of that one
-    // list IS the prediction: it is written straight into the picture at the
-    // picture's own pitch, rather than into a temporary that is combined into a
-    // second temporary and copied a third time.
-    let direct = wt.is_default() && (use0 != use1);
+    // A stream carrying no weighted prediction at all resolves every
+    // component to the identity weighting without the per-component lookup.
+    let plain = ctx.no_weights();
+    let wt = if plain {
+        Weights::DEFAULT
+    } else {
+        ctx.weights_for(refs, 0, ref_idx[0], ref_idx[1], use0, use1)
+    };
+    // 8.4.2.3.1 over one list is the identity, so the interpolation of that
+    // one list IS the prediction: it is written straight into the picture at
+    // the picture's own pitch. Over both lists the combined prediction is the
+    // rounded byte average of the two clipped ones, so list 0 interpolates
+    // into the picture and list 1 averages on top of it (Put::Avg) — no
+    // temporaries, no combining pass, no copy back.
+    let direct = wt.is_default();
     let luma_ref = |list: usize| -> Result<RefPlane<'_>> {
         let rp = ctx.reference(refs, list, ref_idx[list]).ok_or_else(|| {
             Error::corrupt("reference index names a picture the buffer does not hold")
@@ -2248,7 +2264,46 @@ fn compensate(
     };
     let stride = pic.y.stride;
     let origin = pic.y.at(x0 as usize, y0 as usize);
-    if direct {
+    // Weighted bi-prediction fuses the same way: the combining formula is
+    // per-sample, so list 0 lands in the picture and list 1 combines on top
+    // of it (Put::AvgW) with 8.4.2.3.2's exact integers.
+    let weighted_put = if !direct && use0 && use1 {
+        Some(crate::inter::Put::AvgW {
+            w0: wt.w[0],
+            w1: wt.w[1],
+            shift: (wt.log_wd + 1) as u32,
+            round: 1 << wt.log_wd,
+            off: (wt.o[0] + wt.o[1] + 1) >> 1,
+        })
+    } else {
+        None
+    };
+    if direct && use0 && use1 {
+        let plane = luma_ref(0)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[0],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+            crate::inter::Put::Set,
+        );
+        let plane = luma_ref(1)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[1],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+            crate::inter::Put::Avg,
+        );
+    } else if direct {
         // No scratch buffer is declared on this path at all: the scratch is
         // zeroed on entry, and most partitions of a P slice come through here.
         let list = usize::from(!use0);
@@ -2262,6 +2317,32 @@ fn compensate(
             h,
             stride,
             &mut pic.y.data[origin..],
+            crate::inter::Put::Set,
+        );
+    } else if let Some(put) = weighted_put {
+        let plane = luma_ref(0)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[0],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+            crate::inter::Put::Set,
+        );
+        let plane = luma_ref(1)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[1],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+            put,
         );
     } else {
         let mut part = [[0u8; 256]; 2];
@@ -2270,7 +2351,7 @@ fn compensate(
                 continue;
             }
             let plane = luma_ref(list)?;
-            mc_luma(&plane, x0, y0, mv[list], w, h, w, &mut part[list]);
+            mc_luma(&plane, x0, y0, mv[list], w, h, w, &mut part[list], crate::inter::Put::Set);
         }
         let mut out = [0u8; 256];
         let (p0, p1) = part.split_at(1);
@@ -2286,8 +2367,26 @@ fn compensate(
     let (cw, ch) = (w / 2, h / 2);
     let (cx0, cy0) = (x0 / 2, y0 / 2);
     for comp in 0..2 {
-        let wt = ctx.weights_for(refs, comp + 1, ref_idx[0], ref_idx[1], use0, use1);
-        let direct = wt.is_default() && (use0 != use1);
+        let wt = if plain {
+            Weights::DEFAULT
+        } else {
+            ctx.weights_for(refs, comp + 1, ref_idx[0], ref_idx[1], use0, use1)
+        };
+        let direct = wt.is_default();
+        // The combining weights are per-component syntax (luma and chroma
+        // carry their own denoms, weights and offsets), so this component's
+        // fused mode is built from ITS OWN lookup — never the luma one.
+        let weighted_put = if !direct && use0 && use1 {
+            Some(crate::inter::Put::AvgW {
+                w0: wt.w[0],
+                w1: wt.w[1],
+                shift: (wt.log_wd + 1) as u32,
+                round: 1 << wt.log_wd,
+                off: (wt.o[0] + wt.o[1] + 1) >> 1,
+            })
+        } else {
+            None
+        };
         let chroma_ref = |list: usize| -> RefPlane<'_> {
             let rp = ctx
                 .reference(refs, list, ref_idx[list])
@@ -2305,7 +2404,57 @@ fn compensate(
         let plane_out = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
         let stride = plane_out.stride;
         let origin = plane_out.at(cx0 as usize, cy0 as usize);
-        if direct {
+        if direct && use0 && use1 {
+            let plane = chroma_ref(0);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[0],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+                crate::inter::Put::Set,
+            );
+            let plane = chroma_ref(1);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[1],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+                crate::inter::Put::Avg,
+            );
+        } else if let Some(put) = weighted_put {
+            let plane = chroma_ref(0);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[0],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+                crate::inter::Put::Set,
+            );
+            let plane = chroma_ref(1);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[1],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+                put,
+            );
+        } else if direct {
             let list = usize::from(!use0);
             let plane = chroma_ref(list);
             mc_chroma(
@@ -2317,6 +2466,7 @@ fn compensate(
                 ch,
                 stride,
                 &mut plane_out.data[origin..],
+                crate::inter::Put::Set,
             );
         } else {
             let mut cpart = [[0u8; 64]; 2];
@@ -2325,7 +2475,17 @@ fn compensate(
                     continue;
                 }
                 let plane = chroma_ref(list);
-                mc_chroma(&plane, cx0, cy0, mv[list], cw, ch, cw, &mut cpart[list]);
+                mc_chroma(
+                    &plane,
+                    cx0,
+                    cy0,
+                    mv[list],
+                    cw,
+                    ch,
+                    cw,
+                    &mut cpart[list],
+                    crate::inter::Put::Set,
+                );
             }
             let mut cout = [0u8; 64];
             let (c0, c1) = cpart.split_at(1);
@@ -2816,4 +2976,143 @@ fn boundary_strength(
         (qbx, qby - 1)
     };
     bs_between(&bs_side(pic, pbx, pby), &bs_side(pic, qbx, qby), edge == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpb::RefList;
+    use ec_h264_syntax::{PredWeightTable, WeightEntry};
+
+    /// A picture whose visible samples are a fixed ramp, borders replicated.
+    fn ramp_picture(value: impl Fn(usize, usize) -> u8) -> Picture {
+        let mut pic = Picture::default();
+        pic.mb_w = 1;
+        pic.mb_h = 1;
+        for (plane, size) in [(0usize, 16usize), (1, 8), (2, 8)] {
+            let p = match plane {
+                0 => &mut pic.y,
+                1 => &mut pic.cb,
+                _ => &mut pic.cr,
+            };
+            let pad = 8;
+            let stride = size + 2 * pad;
+            let mut data = vec![0u8; stride * (size + 2 * pad)];
+            for y in 0..size {
+                for x in 0..size {
+                    data[(pad + y) * stride + pad + x] = value(x, y);
+                }
+            }
+            *p = Plane8 {
+                data,
+                stride,
+                origin: pad * stride + pad,
+                width: size,
+                height: size,
+                pad,
+            };
+            p.extend_borders();
+        }
+        pic
+    }
+
+    fn plane_byte(p: &Plane8, x: usize, y: usize) -> u8 {
+        p.data[p.origin + y * p.stride + x]
+    }
+
+    /// Explicit-weight bipred combines each component with ITS OWN weights:
+    /// luma and chroma signal independent denoms/weights/offsets, so chroma
+    /// must never ride the luma lookup (regression guard for the fused
+    /// weighted path in [`compensate`]).
+    #[test]
+    fn weighted_bipred_combines_per_component() {
+        let refs = vec![
+            ramp_picture(|x, y| (40 + x * 3 + y) as u8),
+            ramp_picture(|x, y| (220 - x - y * 2) as u8),
+        ];
+        let mut l0 = RefList::default();
+        l0.push(0);
+        let mut l1 = RefList::default();
+        l1.push(1);
+        let ctx = SliceCtx {
+            slice_id: 0,
+            slice_type: SliceType::B,
+            qp: 30,
+            cb_qp_offset: 0,
+            cr_qp_offset: 0,
+            transform_8x8_mode: false,
+            constrained_intra_pred: false,
+            qp_delta_inc: 0,
+            lists: [l0, l1],
+            num_ref_idx: [1, 1],
+            direct_spatial: true,
+            direct_8x8_inference: true,
+            weighted_pred: false,
+            weighted_bipred_idc: 1,
+            weights: Some(PredWeightTable {
+                luma_log2_weight_denom: 1,
+                chroma_log2_weight_denom: 2,
+                l0: vec![WeightEntry {
+                    luma: Some((2, 1)),
+                    chroma: Some([(5, 2), (7, 3)]),
+                }],
+                l1: vec![WeightEntry {
+                    luma: Some((2, 1)),
+                    chroma: Some([(5, 2), (7, 3)]),
+                }],
+            }),
+            poc: 4,
+            shapes: MbShapes::default(),
+        };
+        let mut pic = ramp_picture(|_, _| 0);
+
+        compensate(&mut pic, &refs, &ctx, 0, 0, 0, 0, 4, 4, [[0, 0]; 2], [0, 0])
+            .expect("compensate");
+
+        let expected = |p0: u8, p1: u8, w: i32, log_wd: u32, o: i32| -> u8 {
+            let v = (((i32::from(p0) * w + i32::from(p1) * w + (1 << log_wd))
+                >> (log_wd + 1))
+                + o)
+                .clamp(0, 255);
+            v as u8
+        };
+        // Luma: weights (2, 1) — whatever luma does is the luma reference
+        // behaviour; the point is chroma below.
+        for y in 0..16 {
+            for x in 0..16 {
+                let (p0, p1) = (
+                    plane_byte(&refs[0].y, x, y),
+                    plane_byte(&refs[1].y, x, y),
+                );
+                assert_eq!(
+                    plane_byte(&pic.y, x, y),
+                    expected(p0, p1, 2, 1, 1),
+                    "luma ({x},{y})"
+                );
+            }
+        }
+        // Chroma Cb: weights (5, 2) with denom 2 — NOT the luma weights.
+        for y in 0..8 {
+            for x in 0..8 {
+                let (p0, p1) = (
+                    plane_byte(&refs[0].cb, x, y),
+                    plane_byte(&refs[1].cb, x, y),
+                );
+                assert_eq!(
+                    plane_byte(&pic.cb, x, y),
+                    expected(p0, p1, 5, 2, 2),
+                    "cb ({x},{y})"
+                );
+                let (p0, p1) = (
+                    plane_byte(&refs[0].cr, x, y),
+                    plane_byte(&refs[1].cr, x, y),
+                );
+                assert_eq!(
+                    plane_byte(&pic.cr, x, y),
+                    expected(p0, p1, 7, 2, 3),
+                    "cr ({x},{y})"
+                );
+            }
+        }
+    }
 }
