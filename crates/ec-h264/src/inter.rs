@@ -128,8 +128,28 @@ fn store_half8(dst: &mut [u8], v: i16x8, put: Put) {
     let c = ((v + i16x8::splat(16)) >> 5u32)
         .max(i16x8::ZERO)
         .min(i16x8::splat(255));
-    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
-        store_u8(o, s as u8, put);
+    match put {
+        Put::Set => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = s as u8;
+            }
+        }
+        Put::Avg => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = avg(*o, s as u8);
+            }
+        }
+        Put::AvgW {
+            w0,
+            w1,
+            shift,
+            round,
+            off,
+        } => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                store_weighted(o, s as u8, w0, w1, shift, round, off);
+            }
+        }
     }
 }
 
@@ -139,8 +159,28 @@ fn store_half16(dst: &mut [u8], v: i16x16, put: Put) {
     let c = ((v + i16x16::splat(16)) >> 5u32)
         .max(i16x16::ZERO)
         .min(i16x16::splat(255));
-    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
-        store_u8(o, s as u8, put);
+    match put {
+        Put::Set => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = s as u8;
+            }
+        }
+        Put::Avg => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = avg(*o, s as u8);
+            }
+        }
+        Put::AvgW {
+            w0,
+            w1,
+            shift,
+            round,
+            off,
+        } => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                store_weighted(o, s as u8, w0, w1, shift, round, off);
+            }
+        }
     }
 }
 /// One 6-tap half-sample pass over a `w` x `h` block whose top-left sample is
@@ -206,8 +246,28 @@ fn store_centre(dst: &mut [u8], v: i32x8, put: Put) {
     let c = ((v + i32x8::splat(512)) >> 10u32)
         .max(i32x8::ZERO)
         .min(i32x8::splat(255));
-    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
-        store_u8(o, s as u8, put);
+    match put {
+        Put::Set => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = s as u8;
+            }
+        }
+        Put::Avg => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                *o = avg(*o, s as u8);
+            }
+        }
+        Put::AvgW {
+            w0,
+            w1,
+            shift,
+            round,
+            off,
+        } => {
+            for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+                store_weighted(o, s as u8, w0, w1, shift, round, off);
+            }
+        }
     }
 }
 
@@ -253,6 +313,13 @@ fn avg_rows_to_contig(out: &mut [u8], a: &[u8], b: &[u8], n: usize, put: Put) {
                 out[i] = avg(avg(a[i], b[i]), out[i]);
             }
         }
+        Put::AvgW {
+            w0,
+            w1,
+            shift,
+            round,
+            off,
+        } => avg_rows_weighted(out, a, b, n, w0, w1, shift, round, off),
     }
 }
 
@@ -270,6 +337,13 @@ fn copy_rows(out: &mut [u8], os: usize, src: &[u8], w: usize, h: usize, put: Put
                     *d = avg(*d, s);
                 }
             }
+            Put::AvgW {
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            } => copy_rows_weighted(dst, src, w0, w1, shift, round, off),
         }
     }
 }
@@ -328,18 +402,41 @@ pub(crate) fn mc_luma(
 
     // Full sample: a straight copy.
     if fx == 0 && fy == 0 {
-        for row in 0..h {
-            let src = base + row * stride;
-            let dst = &mut out[row * os..row * os + w];
-            let s = &r.data[src..src + w];
-            match put {
-                Put::Set => dst.copy_from_slice(s),
-                Put::Avg => {
-                    for (d, &v) in dst.iter_mut().zip(s) {
+        match put {
+            Put::Set => {
+                for row in 0..h {
+                    let src = base + row * stride;
+                    out[row * os..row * os + w].copy_from_slice(&r.data[src..src + w]);
+                }
+            }
+            Put::Avg => {
+                for row in 0..h {
+                    let src = base + row * stride;
+                    let dst = &mut out[row * os..row * os + w];
+                    for (d, &v) in dst.iter_mut().zip(&r.data[src..src + w]) {
                         *d = avg(*d, v);
                     }
                 }
             }
+            Put::AvgW {
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            } => copy_weighted(
+                out,
+                os,
+                &r.data[base..],
+                stride,
+                w,
+                h,
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            ),
         }
         return;
     }
@@ -412,8 +509,36 @@ pub(crate) fn mc_luma(
                 let s = &r.data[src..src + w];
                 let hl = &half[row * w..row * w + w];
                 let dst = &mut out[row * os..row * os + w];
-                for col in 0..w {
-                    store_u8(&mut dst[col], avg(s[col], hl[col]), put);
+                match put {
+                    Put::Set => {
+                        for col in 0..w {
+                            dst[col] = avg(s[col], hl[col]);
+                        }
+                    }
+                    Put::Avg => {
+                        for col in 0..w {
+                            dst[col] = avg(dst[col], avg(s[col], hl[col]));
+                        }
+                    }
+                    Put::AvgW {
+                        w0,
+                        w1,
+                        shift,
+                        round,
+                        off,
+                    } => {
+                        for col in 0..w {
+                            store_weighted(
+                                &mut dst[col],
+                                avg(s[col], hl[col]),
+                                w0,
+                                w1,
+                                shift,
+                                round,
+                                off,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -451,7 +576,17 @@ fn chroma_rows<const W: usize>(
                 + u16::from(q[c]) * wt[2]
                 + u16::from(q[c + 1]) * wt[3]
                 + 32;
-            store_u8(&mut dst[c], (v >> 6) as u8, put);
+            match put {
+                Put::Set => dst[c] = (v >> 6) as u8,
+                Put::Avg => dst[c] = avg(dst[c], (v >> 6) as u8),
+                Put::AvgW {
+                    w0,
+                    w1,
+                    shift,
+                    round,
+                    off,
+                } => store_weighted(&mut dst[c], (v >> 6) as u8, w0, w1, shift, round, off),
+            }
         }
     }
 }
@@ -478,18 +613,41 @@ pub(crate) fn mc_chroma(
     // Full sample: a straight copy. A zero motion vector is the most common
     // vector in real content, and it lands here.
     if fx == 0 && fy == 0 {
-        for row in 0..h {
-            let src = base + row * stride;
-            let dst = &mut out[row * os..row * os + w];
-            let s = &r.data[src..src + w];
-            match put {
-                Put::Set => dst.copy_from_slice(s),
-                Put::Avg => {
-                    for (d, &v) in dst.iter_mut().zip(s) {
+        match put {
+            Put::Set => {
+                for row in 0..h {
+                    let src = base + row * stride;
+                    out[row * os..row * os + w].copy_from_slice(&r.data[src..src + w]);
+                }
+            }
+            Put::Avg => {
+                for row in 0..h {
+                    let src = base + row * stride;
+                    let dst = &mut out[row * os..row * os + w];
+                    for (d, &v) in dst.iter_mut().zip(&r.data[src..src + w]) {
                         *d = avg(*d, v);
                     }
                 }
             }
+            Put::AvgW {
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            } => copy_weighted(
+                out,
+                os,
+                &r.data[base..],
+                stride,
+                w,
+                h,
+                w0,
+                w1,
+                shift,
+                round,
+                off,
+            ),
         }
         return;
     }
@@ -533,26 +691,95 @@ impl Weights {
 /// How an interpolation result lands in `out`: written outright, or rounded
 /// into what is already there.
 ///
-/// `Avg` is the second list of a default-weighted bi-prediction (8.4.2.3.1):
-/// the combined prediction is the rounded average of the two lists' *clipped
-/// byte* predictions, so the first list interpolates straight into the
-/// picture and the second averages on top of it. The average reads the same
-/// bytes whether the first one arrived through a temporary or not — no
-/// temporary, no combining pass, no copy back.
+/// The weighted second pass of 8.4.2.3.2 is a fusion mode as well: the first
+/// prediction sits in `out`, and the second list's sample `v` combines with
+/// it as `clip((out*w0 + v*w1 + round) >> shift) + off` — the same integer
+/// formula, on the same bytes, as running the combining pass over the two
+/// clipped predictions.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Put {
     /// Write the prediction.
     Set,
     /// Average the prediction into the bytes already in `out`.
     Avg,
+    /// Weighted-average the prediction into the bytes already in `out`.
+    AvgW {
+        w0: i32,
+        w1: i32,
+        shift: u32,
+        round: i32,
+        off: i32,
+    },
 }
 
+/// The 8.4.2.3.2 combining step for one sample: list 0's prediction is the
+/// byte already in `dst`, list 1's is `v`.
 #[inline]
-fn store_u8(dst: &mut u8, v: u8, put: Put) {
-    if put == Put::Avg {
-        *dst = avg(*dst, v);
-    } else {
-        *dst = v;
+fn store_weighted(dst: &mut u8, v: u8, w0: i32, w1: i32, shift: u32, round: i32, off: i32) {
+    let p0 = i32::from(*dst);
+    *dst = clip8((((p0 * w0 + i32::from(v) * w1 + round) >> shift) + off) as i32);
+}
+/// The weighted combining pass over a whole block: `h` rows of `w` samples
+/// from a `stride`-pitch source into an `os`-pitch destination.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn copy_weighted(
+    out: &mut [u8],
+    os: usize,
+    src: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    w0: i32,
+    w1: i32,
+    shift: u32,
+    round: i32,
+    off: i32,
+) {
+    for row in 0..h {
+        let dst = &mut out[row * os..row * os + w];
+        let s = &src[row * stride..row * stride + w];
+        for (d, &v) in dst.iter_mut().zip(s) {
+            store_weighted(d, v, w0, w1, shift, round, off);
+        }
+    }
+}
+
+/// The weighted combining pass over contiguous equal-length slices, where
+/// list 1's sample is the rounded average of `a` and `b`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn avg_rows_weighted(
+    out: &mut [u8],
+    a: &[u8],
+    b: &[u8],
+    n: usize,
+    w0: i32,
+    w1: i32,
+    shift: u32,
+    round: i32,
+    off: i32,
+) {
+    let (out, a, b) = (&mut out[..n], &a[..n], &b[..n]);
+    for i in 0..n {
+        store_weighted(&mut out[i], avg(a[i], b[i]), w0, w1, shift, round, off);
+    }
+}
+
+/// The weighted combining pass over a whole block from a `w`-pitch source.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn copy_rows_weighted(
+    out: &mut [u8],
+    src: &[u8],
+    w0: i32,
+    w1: i32,
+    shift: u32,
+    round: i32,
+    off: i32,
+) {
+    for (d, &s) in out.iter_mut().zip(src) {
+        store_weighted(d, s, w0, w1, shift, round, off);
     }
 }
 
