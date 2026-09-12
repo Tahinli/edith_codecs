@@ -22,6 +22,7 @@ pub mod intra;
 pub mod loopfilter;
 mod mc;
 pub mod modes;
+pub mod stream;
 pub mod tables;
 pub mod tokens;
 pub mod transform;

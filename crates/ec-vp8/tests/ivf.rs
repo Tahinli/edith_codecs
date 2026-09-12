@@ -7,6 +7,7 @@ pub struct IvfFrame {
     #[allow(dead_code)]
     pub pts: u64,
     /// The compressed VP8 frame payload.
+    #[allow(dead_code)] // pts-only consumers exist in the stream witnesses
     pub data: Vec<u8>,
 }
 
@@ -47,6 +48,7 @@ pub fn parse_ivf(bytes: &[u8]) -> (&str, u16, u16, Vec<IvfFrame>) {
 
 /// Extract the VP8 payload from a lossy WebP file (RIFF/WEBP with a VP8
 /// chunk) — the same VP8 key-frame bytes in a different container.
+#[allow(dead_code)] // only the keyframe_exact binary exercises WebP
 pub fn webp_vp8_chunk(bytes: &[u8]) -> Vec<u8> {
     assert_eq!(&bytes[0..4], b"RIFF");
     assert_eq!(&bytes[8..12], b"WEBP");
