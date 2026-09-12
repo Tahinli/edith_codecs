@@ -462,9 +462,11 @@ pub fn find_near_mvs(
         }
     }
 
-    // libvpx checks `cnt[CNT_SPLITMV]` BEFORE computing it (the write
-    // happens later in the same branch), so the above-left merge is
-    // effectively dead there; ported as-is with the same dead guard.
+    // Above-left merge (libvpx decodemv.c:366): when the above-left
+    // pushed a THIRD distinct candidate, its count landed in
+    // cnt[CNT_SPLITMV] (cntx reached slot 3), and if that candidate
+    // equals the nearest candidate, NEAREST absorbs it. The split count
+    // is then overwritten with the SPLITMV-neighbour census below.
     if cnt[CNT_SPLITMV] != 0 && mvs[idx] == mvs[CNT_NEAREST] {
         cnt[CNT_NEAREST] += 1;
     }
