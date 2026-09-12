@@ -48,6 +48,14 @@ pub(crate) fn trace_enabled() -> bool {
     }
 }
 
+/// Cached AVX2 availability for the explicit-SIMD kernels (`mc`).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx2_supported() -> bool {
+    static AVX2: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
+    *AVX2
+}
+
 /// Whether `EC_VP8_DEBUG` per-macroblock dumps are enabled (same shape as
 /// [`trace_enabled`]; the check sits in the per-MB reconstruct path).
 pub(crate) fn debug_enabled() -> bool {
