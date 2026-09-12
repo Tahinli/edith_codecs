@@ -392,7 +392,7 @@ impl FrameHeader {
             128
         };
         // Interframe-only probability updates.
-            if std::env::var_os("EC_VP8_TRACE").is_some() {
+            if crate::trace_enabled() {
                 eprintln!("STAGE interprobs");
             }
         let mut ymode_probs_updated = false;
@@ -423,7 +423,7 @@ impl FrameHeader {
                     }
                 }
             }
-            if std::env::var_os("EC_VP8_TRACE").is_some() {
+            if crate::trace_enabled() {
                 eprintln!("YUV ymode = {:?} uv = {:?}", state.ymode_probs, state.uv_mode_probs);
                 eprintln!("MVT c0 = {:?}", state.mv_probs[0]);
                 eprintln!("MVT c1 = {:?}", state.mv_probs[1]);
