@@ -171,6 +171,7 @@ pub struct Decoder {
 }
 
 /// A decoded, displayable frame: cropped contiguous planes.
+#[derive(Clone)]
 pub struct Picture {
     /// Luma plane, `stride`-spaced rows of `width` pixels.
     pub y: Vec<u8>,
