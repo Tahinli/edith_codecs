@@ -2750,7 +2750,9 @@ const CACHE_ROW_MAX: usize = 64;
 pub(crate) fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
     let base = cache_index(band, lm);
     let count = CACHE_BITS[base] as usize;
-    assert!(
+    // Statically decidable from the unchanged CACHE_BITS table (reviewer P3);
+    // the copy below still panics if the table ever outgrew the window.
+    debug_assert!(
         count < CACHE_ROW_MAX,
         "CACHE_BITS row overflows the fixed window"
     );
