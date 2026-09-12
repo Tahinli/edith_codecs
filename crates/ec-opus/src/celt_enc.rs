@@ -384,7 +384,7 @@ struct EncBand {
 }
 
 /// Per-frame encoder diagnostics for the dropout investigation. Captured at
-/// the end of [`CeltEncoder::encode`]; read via [`CeltEncoder::last_diag`].
+/// the end of `CeltEncoder::encode`; read via [`CeltEncoder::last_diag`].
 #[derive(Clone, Debug)]
 pub struct CeltFrameDiag {
     /// Transient flag as coded into the bitstream.
@@ -603,9 +603,7 @@ impl CeltEncoder {
         self.channels
     }
 
-    /// Diagnostics captured at the end of the most recent [`encode`] call.
-    ///
-    /// [`encode`]: CeltEncoder::encode
+    /// Diagnostics captured at the end of the most recent `encode` call.
     pub fn last_diag(&self) -> &CeltFrameDiag {
         &self.last_diag
     }
