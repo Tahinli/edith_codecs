@@ -147,7 +147,6 @@ impl TokenContexts {
 /// type; `n0` the first coded position (1 for Y blocks after a Y2).
 /// Returns the number of significant coefficients. Coefficients are
 /// written dequantized into `out` (natural order).
-#[allow(unused_assignments)] // v is always read on every path that matters
 fn get_coeffs(
     bc: &mut BoolDecoder<'_>,
     probs_t: &[[[u8; 11]; 3]; 8],
@@ -158,74 +157,68 @@ fn get_coeffs(
     out: &mut [i16; 16],
 ) -> usize {
     let trace = std::env::var_os("EC_VP8_TRACE").is_some();
-    macro_rules! ann {
-        ($n:expr, $band:expr, $ctx:expr, $node:expr) => {
+    // One token decision: decode the bool, then — under EC_VP8_TRACE —
+    // print the consulted (n, band, ctx, prob) and the decoded bit so the
+    // stream can be diffed read-for-read against scripts/vp8ref_model.py.
+    macro_rules! g {
+        ($n:expr, $band:expr, $c:expr, $prob:expr) => {{
+            let bit = bc.read_bool($prob);
             if trace {
-                eprintln!("G n={} band={} ctx={} prob={}", $n, $band, $ctx, $node);
+                eprintln!(
+                    "G n={} band={} ctx={} prob={} bit={}",
+                    $n, $band, $c, $prob, u8::from(bit)
+                );
             }
-        };
+            bit
+        }};
     }
     let mut n = n0;
     let mut band = BANDS[n0];
     let mut c = ctx;
     let mut p = &probs_t[band as usize][c];
-    ann!(n, band, c, 0);
-    if !bc.read_bool(p[0]) {
+    if !g!(n, band, c, p[0]) {
         return 0; // immediate EOB
     }
     loop {
         n += 1;
         let mut v: i32;
-        ann!(n, band, c, 1);
-        if !bc.read_bool(p[1]) {
-            // DCT_0: the next decision skips the EOB branch (§13.2).
+        if !g!(n, band, c, p[1]) {
+            // DCT_0: the next decision skips the EOB branch (§13.2) and
+            // libvpx forces the context to 0 after a zero token.
             c = 0;
             band = BANDS[n];
             p = &probs_t[band as usize][0];
         } else {
-            ann!(n, band, c, 2);
-            if !bc.read_bool(p[2]) {
+            if !g!(n, band, c, p[2]) {
                 c = 1;
                 band = BANDS[n];
                 p = &probs_t[band as usize][1];
                 v = 1;
             } else {
-                ann!(n, band, c, 3);
-                if !bc.read_bool(p[3]) {
-                    ann!(n, band, c, 4);
-                    if !bc.read_bool(p[4]) {
+                if !g!(n, band, c, p[3]) {
+                    if !g!(n, band, c, p[4]) {
                         v = 2;
                     } else {
-                        ann!(n, band, c, 5);
-                        v = 3 + i32::from(bc.read_bool(p[5]));
+                        v = 3 + i32::from(g!(n, band, c, p[5]));
                     }
-                    let _ = v;
                 } else {
-                    ann!(n, band, c, 6);
-                    if !bc.read_bool(p[6]) {
-                        ann!(n, band, c, 7);
-                        if !bc.read_bool(p[7]) {
-                            ann!(n, band, c, 91);
-                            v = 5 + i32::from(bc.read_bool(159));
+                    if !g!(n, band, c, p[6]) {
+                        if !g!(n, band, c, p[7]) {
+                            v = 5 + i32::from(g!(n, band, c, 159u8));
                         } else {
-                            ann!(n, band, c, 161);
-                            v = 7 + 2 * i32::from(bc.read_bool(165));
-                            ann!(n, band, c, 162);
-                            v += i32::from(bc.read_bool(145));
+                            v = 7 + 2 * i32::from(g!(n, band, c, 165u8));
+                            v += i32::from(g!(n, band, c, 145u8));
                         }
                     } else {
-                        ann!(n, band, c, 8);
-                        let bit1 = usize::from(bc.read_bool(p[8]));
-                        ann!(n, band, c, 9);
-                        let bit0 = usize::from(bc.read_bool(p[9 + bit1]));
+                        let bit1 = usize::from(g!(n, band, c, p[8]));
+                        let bit0 = usize::from(g!(n, band, c, p[9 + bit1]));
                         let cat = 2 * bit1 + bit0;
                         v = 0;
-                        for (i, &prob) in CAT_EXTRA[cat].iter().enumerate() {
+                        for &prob in CAT_EXTRA[cat].iter() {
                             if prob == 0 {
                                 break;
                             }
-                            ann!(n, band, c, 30 + i);
-                            v += v + i32::from(bc.read_bool(prob));
+                            v += v + i32::from(g!(n, band, c, prob));
                         }
                         v += 3 + (8 << cat);
                     }
@@ -233,25 +226,24 @@ fn get_coeffs(
                 c = 2;
                 band = BANDS[n];
                 p = &probs_t[band as usize][2];
+            }
 
-                // Sign flag, then dequantize (first coded position is DC).
-                ann!(n, band, c, 128);
-                let mag = if bc.read_bool(128) { -v } else { v };
-                out[ZIGZAG[n - 1]] = if n - 1 == 0 {
-                    (mag * i32::from(dc_factor)) as i16
-                } else {
-                    (mag * i32::from(ac_factor)) as i16
-                };
-                if n < 16 {
-                    ann!(n, band, c, 0);
-                }
-                if n == 16 || !bc.read_bool(p[0]) {
-                    return n;
-                }
+            // Sign flag, then dequantize (first coded position is DC).
+            // Shared by the ONE and magnitude paths, exactly like the
+            // reference walk (libvpx detokenize.c GetCoeffs).
+            let neg = g!(n, band, c, 128u8);
+            let mag = if neg { -v } else { v };
+            out[ZIGZAG[n - 1]] = if n - 1 == 0 {
+                (mag * i32::from(dc_factor)) as i16
+            } else {
+                (mag * i32::from(ac_factor)) as i16
+            };
+            if n < 16 && !g!(n, band, c, p[0]) {
+                return n; // EOB
             }
-            if n == 16 {
-                return 16; // malformed without EOB: stop like the reference
-            }
+        }
+        if n == 16 {
+            return 16; // malformed without EOB: stop like the reference
         }
     }
 }

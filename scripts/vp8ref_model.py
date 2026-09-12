@@ -26,8 +26,6 @@ class BD:
         self.bit_count = 0
 
     def bool(self, prob):
-        global DEC
-        DEC += 1
         split = 1 + (((self.range - 1) * prob) >> 8)
         big = split << 8
         if self.value >= big:
@@ -77,7 +75,6 @@ def table(name):
     return [int(x) for x in re.findall(r"-?\d+", body)]
 
 
-DEC = 0
 
 
 def main():
@@ -170,60 +167,70 @@ def main():
     skips = [[False] * (cols + 1) for _ in range(rows + 1)]
     above_ctx = [[0] * 9 for _ in range(cols)]
 
-    DEC = [0]
-    def get_coeffs(ptype, n0, ctx, out):
+    def get_coeffs(ptype, n0, ctx0, out):
         base = ptype * 264
         n = n0
-        p = base + BANDS[n0] * 33 + ctx * 11
-        DEC[0] += 1
-        if DEC[0] == 2563:
-            print(f"# at2563: ptype={ptype} n0={n0} n={n} band={BANDS[n]} ctx={ctx} nodeoff=0 entry={p} val={probs[p]}")
-        if not d2.bool(probs[p]):
+        band = BANDS[n0]
+        c = ctx0
+        p = base + band * 33 + c * 11
+
+        def g(prob_):
+            bit = d2.bool(prob_)
+            print(f"G n={n} band={band} ctx={c} prob={prob_} bit={1 if bit else 0}")
+            return bit
+
+        if not g(probs[p]):
             return 0
         while True:
             n += 1
-            DEC[0] += 1
-            if DEC[0] == 2563:
-                print(f"# at2563: ptype={ptype} n={n} band={BANDS[n]} nodeoff=1 entry={p+1} val={probs[p+1]}")
-            if not d2.bool(probs[p + 1]):
-                p = base + BANDS[n] * 33
+            if not g(probs[p + 1]):
+                c = 0
+                band = BANDS[n]
+                p = base + band * 33
             else:
-                DEC[0] += 1
-                if DEC[0] == 2563:
-                    print(f"# at2563: nodeoff=2 n={n} band={BANDS[n]} ctx={ctx} p={p}")
-                if not d2.bool(probs[p + 2]):
-                    p = base + BANDS[n] * 33 + 11
+                if not g(probs[p + 2]):
+                    c = 1
+                    band = BANDS[n]
+                    p = base + band * 33 + 11
                     v = 1
                 else:
-                    if not d2.bool(probs[p + 3]):
-                        if not d2.bool(probs[p + 4]):
+                    if not g(probs[p + 3]):
+                        if not g(probs[p + 4]):
                             v = 2
                         else:
-                            v = 3 + d2.bool(probs[p + 5])
+                            v = 3 + (1 if g(probs[p + 5]) else 0)
                     else:
-                        if not d2.bool(probs[p + 6]):
-                            if not d2.bool(probs[p + 7]):
-                                v = 5 + d2.bool(159)
+                        if not g(probs[p + 6]):
+                            if not g(probs[p + 7]):
+                                v = 5 + (1 if g(159) else 0)
                             else:
-                                v = 7 + 2 * d2.bool(165)
-                                v += d2.bool(145)
+                                v = 7 + 2 * (1 if g(165) else 0)
+                                v += 1 if g(145) else 0
                         else:
-                            bit1 = d2.bool(probs[p + 8])
-                            bit0 = d2.bool(probs[p + 9 + bit1])
+                            bit1 = 1 if g(probs[p + 8]) else 0
+                            bit0 = 1 if g(probs[p + 9 + bit1]) else 0
                             cat = 2 * bit1 + bit0
                             v = 0
                             for prob in CAT_EXTRA[cat]:
-                                v += v + d2.bool(prob)
+                                v += v + (1 if g(prob) else 0)
                             v += 3 + (8 << cat)
-                    p = base + BANDS[n] * 33 + 22
-                out[ZIGZAG[n - 1]] = -v if d2.bool(128) else v
-                if n == 16 or not d2.bool(probs[p]):
+                    c = 2
+                    band = BANDS[n]
+                    p = base + band * 33 + 22
+                out[ZIGZAG[n - 1]] = -v if g(128) else v
+                if n < 16 and not g(probs[p]):
                     return n
             if n == 16:
                 return 16
 
+    # One PERSISTENT bool decoder per token partition: rows that share a
+    # partition continue its stream (dixie/libvpx behaviour).
+    d2s = [None] * nparts
     for r in range(1, rows + 1):
-        d2 = BD(parts[(r - 1) % nparts])
+        pi = (r - 1) % nparts
+        if d2s[pi] is None:
+            d2s[pi] = BD(parts[pi])
+        d2 = d2s[pi]
         left_ctx = [0] * 9
         # phase 1: every mode record of the row (partition 0)
         for c in range(1, cols + 1):
