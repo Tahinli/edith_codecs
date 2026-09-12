@@ -4993,6 +4993,107 @@ mod tests {
             eprintln!("SKIP the ffmpeg half: no ffmpeg");
         }
     }
+    /// lane-intertx's witness: on a clip the screen detector calls
+    /// NON-screen, the inter luma search offers the wider
+    /// `reduced_tx_set = 0` alphabets and CODES a 1-D `V_DCT`/`H_DCT` unit
+    /// (a `coded > 0` guard on the committed-winners census, class
+    /// `gate-blind-to-feature`), the block's chroma transforms inherit that
+    /// type reduced to the chroma size's set against the frame's own honest
+    /// header bit, and BOTH decoders reconstruct every frame sample-exact on
+    /// ALL THREE planes -- chroma is the plane the inheritance desync
+    /// corrupts, so luma-only comparisons cannot see it.
+    #[test]
+    #[ignore = "sets process-global search levers: run it alone"]
+    fn a_non_screen_inter_clip_codes_a_one_d_type_both_decoders_read_every_plane_exactly() {
+        let _knobs = crate::speed::knob_write();
+        let _gate_lock = crate::stream::tests::lock_gate_counters();
+        crate::encode::set_intra_tx_search(Some(true));
+        crate::encode::set_inter_tx_search(Some(true));
+        crate::encode::set_wide_tx_set(Some(true));
+        crate::encode::force_screen(Some(false));
+        let (width, height) = (320usize, 192usize);
+        // The wide witness's moving card: vertical steps (where a 1-D
+        // `V_DCT`/`H_DCT` beats the 2-D DCT on the motion-compensated
+        // residual), ramps (`ADST`) and moving plateaus (`IDTX`), translated
+        // a few samples per frame so the inter search sees real motion.
+        let sources: Vec<Picture> = (0..4)
+            .map(|t| {
+                let mut p = test_card(width, height, t * 3);
+                for y in 0..height {
+                    for x in 0..width {
+                        let v = match ((x + t * 5) / 16 % 2, (y + t * 3) / 16 % 2) {
+                            (0, 0) => 16u16,
+                            (1, 0) => 235,
+                            (0, 1) => ((x + t) % 64 * 3) as u16,
+                            _ => ((y + t) % 64 * 3) as u16,
+                        };
+                        p.y[y * width + x] = v;
+                    }
+                }
+                p
+            })
+            .collect();
+        let config = EncoderConfig {
+            width,
+            height,
+            base_q_idx: 90,
+            gop: 4,
+            colour: Colour::Bt709Limited,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        };
+        let mut enc = Av1Encoder::new(config).unwrap();
+        let _ = crate::encode::take_inter_tx_type_hits();
+        let mut stream = Vec::new();
+        for packet in encode_all(&mut enc, &sources) {
+            stream.extend_from_slice(&packet.data);
+        }
+        let hits = crate::encode::take_inter_tx_type_hits();
+        crate::encode::force_screen(None);
+        crate::encode::set_wide_tx_set(None);
+        crate::encode::set_inter_tx_search(None);
+        crate::encode::set_intra_tx_search(None);
+        use crate::transform::TxType;
+        eprintln!(
+            "inter wide-set witness: inter hits {hits:?}, {} bytes",
+            stream.len()
+        );
+        assert!(
+            hits[TxType::Idtx as usize] > 0,
+            "no inter luma unit was CODED IDTX: {hits:?}"
+        );
+        assert!(
+            hits[TxType::VDct as usize] + hits[TxType::HDct as usize] > 0,
+            "no inter luma unit was CODED a 1-D type -- the wider search \
+             never fired on non-screen content (class gate-blind-to-feature): {hits:?}"
+        );
+        let ours = crate::stream::decode_stream(&stream).expect("our decoder");
+        assert_eq!(ours.len(), sources.len(), "our decoder's frames");
+        if have_ffmpeg() {
+            let theirs = ffmpeg_decode_planes(&stream, width, height);
+            assert_eq!(theirs.len(), sources.len(), "ffmpeg's frames");
+            let (cw, ch) = (width / 2, height / 2);
+            for (i, (a, (y, u, v))) in ours.iter().zip(&theirs).enumerate() {
+                for (name, got16, want, w) in
+                    [("y", &a.y, y, width), ("u", &a.u, u, cw), ("v", &a.v, v, ch)]
+                {
+                    let got: Vec<u8> = got16.iter().map(|&s| s as u8).collect();
+                    assert_eq!(got.len(), want.len(), "frame {i} {name} plane size");
+                    if let Some(at) = got.iter().zip(want.iter()).position(|(x, y)| x != y) {
+                        panic!(
+                            "frame {i}: {name} differs first at ({}, {}): ours {} vs ffmpeg {}",
+                            at % w,
+                            at / w,
+                            got[at],
+                            want[at],
+                        );
+                    }
+                }
+            }
+        } else {
+            eprintln!("SKIP the ffmpeg half: no ffmpeg");
+        }
+    }
 
     /// Every SHIPPED SPEED PRESET codes a stream both decoders reconstruct
     /// sample-exact -- ours and ffmpeg's -- and codes a DIFFERENT stream from
