@@ -4827,6 +4827,7 @@ fn write_block(
         tx_mode,
         tx_select,
         block_tx_type(block),
+        false,
     );
     neighbours.record_planes(at, side, mode, grids, !split);
     clear_skip_band(neighbours, at_mi, side);
@@ -4927,6 +4928,7 @@ fn write_leaf8(
         tx_mode,
         tx_select,
         block_tx_type(block),
+        false,
     );
     neighbours.record_mi_planes(leaf_mi, 8, grids, !split);
     clear_skip_band(neighbours, leaf_mi, 8);
@@ -4951,7 +4953,20 @@ fn write_block_planes(
     // This block's single luma transform type (lane-txset); chroma's is
     // derived from its mode by the decoder and codes no symbol.
     luma_tx_type: TxType,
+    // lane-intertx: an INTER block's chroma transforms INHERIT the luma
+    // type (reduced to the chroma set against this frame's own
+    // `reduced_tx_set` bit); an intra block's comes off its UV mode and
+    // rides `DCT_DCT`'s 2D class exactly as before.
+    inter: bool,
 ) {
+    // lane-intertx, desync (b): the writer used to code every chroma plane
+    // `DCT_DCT`. Chroma codes no `tx_type` symbol, but the type names the
+    // transform class, and the class picks the scan, the `eob_pt` row and
+    // the context offsets (the lane-txw note in `write_coeffs`) -- so an
+    // inherited 1-D luma type desynced the chroma exactly as luma itself
+    // once did. The reduced bit read here is the frame's own header bit,
+    // the ONE the writer's `Cdfs` is armed with (`Cdfs::reduced_tx_set`).
+    let reduced = cdfs.reduced_tx_set;
     for (plane, (grid, scan)) in grids.iter().zip(scans.iter()).enumerate() {
         if plane == 0 && skip_luma {
             continue;
@@ -4969,15 +4984,28 @@ fn write_block_planes(
         let before = enc.tell();
         #[cfg(test)]
         let q_ctx = cdfs.q_ctx;
+        let mut coding = cdfs.txb(planes[plane], mode);
+        let tx_type = if plane == 0 {
+            luma_tx_type
+        } else if inter {
+            crate::decode::reduce_inherited_chroma_tx_type_flagged(
+                luma_tx_type,
+                coding.side.min(32),
+                coding.side.min(32),
+                reduced,
+            )
+        } else {
+            TxType::DctDct
+        };
         write_coeffs(
             enc,
-            &mut cdfs.txb(planes[plane], mode),
+            &mut coding,
             grid,
             scan,
             skip_ctx,
             dc_sign_ctx(around[plane].dc_vote),
             Some(plane),
-            if plane == 0 { luma_tx_type } else { TxType::DctDct },
+            tx_type,
         );
         #[cfg(test)]
         census_record(
@@ -7474,6 +7502,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         0,
                         split,
                         block_tx_type(block),
+                        true,
                     );
                     neighbours.record_planes(sb_at, SB, 0, &grids, !split);
                 }
@@ -7938,6 +7967,7 @@ pub(crate) fn sb_coeff_inter_frame_tile_cdfs(
                         mode_for_tx,
                         split,
                         block_tx_type(block),
+                        is_inter,
                     );
                     neighbours.record_planes(at, BLOCK, mode_for_tx, &grids, !split);
                 }
@@ -8179,6 +8209,7 @@ fn write_inter_frame_leaf(
             mode_for_tx,
             split,
             block_tx_type(block),
+            is_inter,
         );
         neighbours.record_planes(at, SUB, mode_for_tx, &grids, !split);
     }
@@ -8432,6 +8463,7 @@ fn write_inter_frame_leaf8(
             mode_for_tx,
             split,
             block_tx_type(block),
+            is_inter,
         );
         neighbours.record_mi_planes(leaf_mi, 8, &grids, !split);
         neighbours.record_inter_mi(leaf_mi, 8, block.skip, is_inter, block_ref(block));
