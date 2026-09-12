@@ -92,8 +92,15 @@ stream position — a coefficient-context/bookkeeping difference that
 only manifests from the second MB onward (cross-MB token contexts or a
 block-sequencing slip). Debug aids: `EC_VP8_TRACE` (decision + node
 trace), `EC_VP8_DEBUG` (per-MB coeff dump), `examples/dbg_first.rs`,
-python model at `/tmp/vp8ref.py` (re-create from this description if
-lost; it needs the RFC at ~/.cache/vp8/rfc6386.txt and tables.rs).
+python model preserved at `scripts/vp8ref_model.py` (needs the RFC at
+~/.cache/vp8/rfc6386.txt and tables.rs; run from the worktree root).
+Additional finding: the divergent decision 2563 is ~28 reads into
+MB(0,0) block 0's token walk (not MB(0,1) as first thought); both
+sides read the same (pos,bit_count) stream position but consult
+different table entries - the next step is to print the consulted
+PROBABILITY on each G-annotation line on both sides and take the first
+G-line whose prob differs (the rust G lines print n/band/ctx/prob;
+the python model needs the same one-line prob added to its G prints).
 
 ## Repro
 
