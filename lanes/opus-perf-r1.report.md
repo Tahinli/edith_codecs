@@ -102,3 +102,47 @@ Committed state, local, loadavg 0.3–7 (two consistent batteries):
 
 Housekeeping: `opus-perf-ab` is a scratch crate outside the family tree;
 `fixtures` symlink in the worktree root is gitignored as usual.
+
+## Round 2 (c86a49fd) — decode target met
+
+- `fft-rustfft` (default feature): rustfft plans the MDCT's quarter-size
+  complex inverse directly (pure Rust, runtime-detected AVX butterflies, no
+  C). Scratch preallocated — `process` would allocate per call and the
+  steady-state zero-alloc encode contract caught it. Dependency-free build
+  stays green under `--no-default-features`.
+- `stereo_itheta`: reference float build's `fast_atan2f` instead of libm f64
+  `atan2` (~2.5% of encode).
+- `bits2pulses`: bisection over a fixed row window (bounds-check folding).
+  No measurable decode delta on its own — the 6.7% profile share was largely
+  attribution noise; kept as cleanup.
+- Measured and kept: none of the round-1 reverted search variants were
+  retried; `#![forbid(unsafe_code)]` + `wide` (no bit-cast on `f32x8`) rule
+  out the comparator's rsqrt-AVX2 shape honestly.
+
+Fidelity: full suite green on the default build (35 lib + 28 conformance,
+zero-alloc encode test included) and the dependency-free lib build green;
+per-commit as before.
+
+### VPS-3 clean-machine final table (4 vCPU, loadavg 2.2-3.0 at start,
+1.1-1.8 at end; min-of-7 alternating; media dir ~/opusperf/media)
+
+| row | ec-opus | comparator | ratio |
+|---|---|---|---|
+| decode 5.1 120 s film | 124x | 133x ruopus-FFT | 0.93 |
+| decode stereo 120 s film | 279x | 298x ruopus-FFT | 0.93 |
+| encode 128k CBR | 169x | 228x opus-rs | 0.74 |
+| encode 256k CBR | 127x | 173x opus-rs | 0.74 |
+| encode 510k CBR | 114x | 113x opus-rs | 1.01 |
+| encode 256k VBR | 127x | 173x opus-rs | 0.73 |
+| encode 256k | 128x | 210x ruopus | 0.61 |
+| encode 5.1 384k (absolute) | 51x | — | — |
+
+Targets: decode ≥0.9 of ruopus-FFT — MET (0.93 / 0.93). Encode ≥0.8 of
+opus-rs — NOT met honestly: 0.74 at the product rates, 1.01 at 510k. Per the
+charter's stop rule the encode lever stops here: the residual gap is the
+comparator's rsqrt-AVX2 pulse search, unreachable under the family's
+`forbid(unsafe_code)` without a new safe-SIMD shape, and the seat the product
+pays is decode-dominated (0.93-0.93 vs the replaced seats' 0.60-0.66).
+
+Local quiet-box (loadavg ~1.2-1.4, 12-core) same commit: decode 5.1 242x/
+254x = 0.95, stereo 515x/532x = 0.97; encode 0.69-0.70 (256k), 1.00 (510k).
