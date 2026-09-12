@@ -125,6 +125,7 @@ pub(crate) fn predict_luma(
     dst_stride: usize,
     bw: usize,
     bh: usize,
+    bilinear: bool,
 ) {
     debug_assert!(bw >= 4 && bw <= 16 && bw % 4 == 0);
     debug_assert!(bh >= 4 && bh <= 16 && bh % 4 == 0);
@@ -143,6 +144,28 @@ pub(crate) fn predict_luma(
     debug_assert!(sx >= 2 && sy >= 2, "reference read outside bordered plane");
     let (sx, sy) = (sx as usize, sy as usize);
 
+    if bilinear {
+        bilinear_block(src, stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
+    } else {
+        sixtap_block(src, stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
+    }
+}
+
+/// Six-tap separable sub-pel predictor (libvpx vp8_sixtap_predict*,
+/// filter.c). `(sx, sy)` is the full-pel block origin in the bordered
+/// reference, `(fx, fy)` the sub-pel phases 0..7 (0 = copy).
+fn sixtap_block(
+    src: &[u8],
+    stride: usize,
+    sx: usize,
+    sy: usize,
+    fx: usize,
+    fy: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    bw: usize,
+    bh: usize,
+) {
     if fx == 0 && fy == 0 {
         // reconinter.c build_inter_predictors_b / vp8_copy_mem*.
         for r in 0..bh {
@@ -191,22 +214,71 @@ pub(crate) fn predict_luma(
     }
 }
 
+/// Two-tap bilinear separable predictor (libvpx vp8_bilinear_predict*,
+/// filter.c). The dot products are provably in 0..=255 (taps are
+/// non-negative and sum to 128 over 0..=255 inputs), which is why libvpx's
+/// bilinear passes store `unsigned short` intermediates and skip the clamp.
+fn bilinear_block(
+    src: &[u8],
+    stride: usize,
+    sx: usize,
+    sy: usize,
+    fx: usize,
+    fy: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    bw: usize,
+    bh: usize,
+) {
+    if fx == 0 && fy == 0 {
+        for r in 0..bh {
+            let s = (sy + r) * stride + sx;
+            dst[r * dst_stride..r * dst_stride + bw].copy_from_slice(&src[s..s + bw]);
+        }
+        return;
+    }
+
+    let hf = &BILINEAR_FILTERS[fx];
+    let vf = &BILINEAR_FILTERS[fy];
+
+    // filter.c filter_block2d_bil_first_pass: `bh + 1` rows, horizontal
+    // taps [0] and [1]. Phase 0 is the exact identity, as above.
+    let mut tmp = [0u16; 17 * 16]; // C: unsigned short FData[17 * 16]
+    for i in 0..bh + 1 {
+        let row = (sy + i) * stride + sx;
+        for j in 0..bw {
+            let p = row + j;
+            let acc = i32::from(src[p]) * hf[0] + i32::from(src[p + 1]) * hf[1]
+                + (VP8_FILTER_WEIGHT / 2); /* Rounding */
+            tmp[i * bw + j] = (acc >> VP8_FILTER_SHIFT) as u16;
+        }
+    }
+
+    // filter.c filter_block2d_bil_second_pass: vertical taps [0] and
+    // `[width]` (the next intermediate row).
+    for r in 0..bh {
+        for c in 0..bw {
+            let acc = i32::from(tmp[r * bw + c]) * vf[0]
+                + i32::from(tmp[(r + 1) * bw + c]) * vf[1]
+                + (VP8_FILTER_WEIGHT / 2); /* Rounding */
+            dst[r * dst_stride + c] = (acc >> VP8_FILTER_SHIFT) as u8;
+        }
+    }
+}
+
 /// Chroma predictor for one `bw` x `bh` block whose visible-image top-left
 /// chroma pixel is `(x, y)`.
 ///
-/// Semantics of `vp8_build_inter16x16_predictors_mbuv` /
-/// `build_4x4uvmvs` consumers + `vp8_bilinear_predict*` (reconinter.c,
-/// filter.c): separable 2-tap bilinear, `vp8_bilinear_filters[8][2]`,
-/// weight 128 shift 7, `(dot + 64) >> 7` per pass. `mv` is the chroma MV in
-/// eighth-CHROMA-pel units (the caller derives it from luma per libvpx: sum
-/// of the four luma subblock MVs, rounding division by 8 with C
-/// truncation-toward-zero, `& fullpixel_mask`).
+/// `mv` is the chroma MV in eighth-CHROMA-pel units (the caller derives it
+/// from luma per libvpx: round-half-away-from-zero division by 2 (whole MB)
+/// or sum-then-divide-by-8 (SPLITMV), `& fullpixel_mask`).
 ///
-/// The bilinear dot products are provably in 0..=255 (taps are
-/// non-negative and sum to 128 over 0..=255 inputs), which is why libvpx's
-/// bilinear passes store `unsigned short` intermediates and skip the clamp;
-/// the values equal the RFC 6386 §18.3 `interp()` pseudo-code (which clamps)
-/// regardless.
+/// The interpolation filter is the FRAME's MC filter, exactly like luma:
+/// `vp8_setup_version` picks six-tap for version 0 (and reserved 4-7) and
+/// bilinear for versions 1-3 (decodeframe.c:851-860 assigns BOTH
+/// `subpixel_predict` and `subpixel_predict8x8` from that one switch, and
+/// reconinter.c uses them for the chroma predicts). `bilinear` is that
+/// per-frame selection.
 ///
 /// When `need_clamp` is set, the MV is first passed through
 /// [`clamp_uvmv_to_umv_border`].
@@ -224,6 +296,7 @@ pub(crate) fn predict_chroma(
     dst_stride: usize,
     bw: usize,
     bh: usize,
+    bilinear: bool,
 ) {
     debug_assert!(bw >= 2 && bw <= 16 && bw % 2 == 0);
     debug_assert!(bh >= 2 && bh <= 16 && bh % 2 == 0);
@@ -243,42 +316,14 @@ pub(crate) fn predict_chroma(
     let fy = (mv.0 & 7) as usize;
     let sx = border as i32 + x as i32 + (mv.1 >> 3);
     let sy = border as i32 + y as i32 + (mv.0 >> 3);
-    debug_assert!(sx >= 0 && sy >= 0, "reference read outside bordered plane");
+    // 6-tap reads reach 2 before / 3 after the origin.
+    debug_assert!(sx >= 2 && sy >= 2, "reference read outside bordered plane");
     let (sx, sy) = (sx as usize, sy as usize);
 
-    if fx == 0 && fy == 0 {
-        for r in 0..bh {
-            let s = (sy + r) * uv_stride + sx;
-            dst[r * dst_stride..r * dst_stride + bw].copy_from_slice(&src[s..s + bw]);
-        }
-        return;
-    }
-
-    let hf = &BILINEAR_FILTERS[fx];
-    let vf = &BILINEAR_FILTERS[fy];
-
-    // filter.c filter_block2d_bil_first_pass: `bh + 1` rows, horizontal
-    // taps [0] and [1]. Phase 0 is the exact identity, as above.
-    let mut tmp = [0u16; 17 * 16]; // C: unsigned short FData[17 * 16]
-    for i in 0..bh + 1 {
-        let row = (sy + i) * uv_stride + sx;
-        for j in 0..bw {
-            let p = row + j;
-            let acc = i32::from(src[p]) * hf[0] + i32::from(src[p + 1]) * hf[1]
-                + (VP8_FILTER_WEIGHT / 2); /* Rounding */
-            tmp[i * bw + j] = (acc >> VP8_FILTER_SHIFT) as u16;
-        }
-    }
-
-    // filter.c filter_block2d_bil_second_pass: vertical taps [0] and
-    // `[width]` (the next intermediate row).
-    for r in 0..bh {
-        for c in 0..bw {
-            let acc = i32::from(tmp[r * bw + c]) * vf[0]
-                + i32::from(tmp[(r + 1) * bw + c]) * vf[1]
-                + (VP8_FILTER_WEIGHT / 2); /* Rounding */
-            dst[r * dst_stride + c] = (acc >> VP8_FILTER_SHIFT) as u8;
-        }
+    if bilinear {
+        bilinear_block(src, uv_stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
+    } else {
+        sixtap_block(src, uv_stride, sx, sy, fx, fy, dst, dst_stride, bw, bh);
     }
 }
 
@@ -471,7 +516,7 @@ mod tests {
         // every read inside the visible region of the unextended plane.
         predict_luma(
             &p, STRIDE, BORDER, VIS_W, VIS_H, 8, 8, (16, -8), false, &mut dst, 16, 16, 16,
-        );
+        false);
         for r in 0..16 {
             for c in 0..16 {
                 assert_eq!(dst[r * 16 + c], vis(&p, 8 - 1 + c, 8 + 2 + r), "({r},{c})");
@@ -481,7 +526,7 @@ mod tests {
         // Zero MV → identity copy.
         predict_luma(
             &p, STRIDE, BORDER, VIS_W, VIS_H, 8, 8, (0, 0), false, &mut dst, 16, 16, 16,
-        );
+        false);
         for r in 0..16 {
             for c in 0..16 {
                 assert_eq!(dst[r * 16 + c], vis(&p, 8 + c, 8 + r), "({r},{c})");
@@ -493,7 +538,7 @@ mod tests {
         let mut dst8 = [0u8; 8 * 8];
         predict_chroma(
             &p, STRIDE, BORDER, VIS_W, VIS_H, 4, 4, (-16, 8), false, &mut dst8, 8, 8, 8,
-        );
+        false);
         for r in 0..8 {
             for c in 0..8 {
                 assert_eq!(dst8[r * 8 + c], vis(&p, 4 + 1 + c, 4 - 2 + r), "({r},{c})");
@@ -508,7 +553,7 @@ mod tests {
 
         // mv = (0, 4): full-pel start (16, 12), fx = 4, fy = 0.
         predict_luma(
-            &p, STRIDE, BORDER, VIS_W, VIS_H, 16, 12, (0, 4), false, &mut dst, 4, 4, 4,
+            &p, STRIDE, BORDER, VIS_W, VIS_H, 16, 12, (0, 4), false, &mut dst, 4, 4, 4, false,
         );
 
         // Hand-computed from vp8_sub_pel_filters[4] = { 3, -16, 77, 77, -16, 3 }
@@ -551,7 +596,7 @@ mod tests {
 
         // mv = (14, 18): full-pel start (10, 9), fx = 2, fy = 6.
         predict_luma(
-            &p, STRIDE, BORDER, VIS_W, VIS_H, 8, 8, (14, 18), false, &mut dst, 16, 16, 16,
+            &p, STRIDE, BORDER, VIS_W, VIS_H, 8, 8, (14, 18), false, &mut dst, 16, 16, 16, false,
         );
 
         // vp8_sub_pel_filters[2] = { 2, -11, 108, 36, -8, 1 }, each
@@ -608,7 +653,7 @@ mod tests {
 
         // mv = (11, 5): full-pel start (4, 7), fx = 5, fy = 3.
         predict_chroma(
-            &p, STRIDE, BORDER, VIS_W, VIS_H, 4, 6, (11, 5), false, &mut dst, 8, 8, 8,
+            &p, STRIDE, BORDER, VIS_W, VIS_H, 4, 6, (11, 5), false, &mut dst, 8, 8, 8, true,
         );
 
         // Horizontal taps { 48, 80 } (phase 5), vertical { 80, 48 } (phase 3),
@@ -654,36 +699,36 @@ mod tests {
         // (left - (16 << 3)); prediction must equal an explicit (-128, -128).
         predict_luma(
             &p, STRIDE, BORDER, 16, 16, 0, 0, (-1000, -1000), true, &mut a, 16, 16, 16,
-        );
+        false);
         predict_luma(
             &p, STRIDE, BORDER, 16, 16, 0, 0, (-128, -128), false, &mut b, 16, 16, 16,
-        );
+        false);
         assert_eq!(a, b);
 
         // Strict threshold: (-152, -152) is NOT clamped (condition is strict
         // `<`), (-153, -153) IS clamped to (-128, -128).
         predict_luma(
             &p, STRIDE, BORDER, 16, 16, 0, 0, (-152, -152), true, &mut a, 16, 16, 16,
-        );
+        false);
         predict_luma(
             &p, STRIDE, BORDER, 16, 16, 0, 0, (-152, -152), false, &mut b, 16, 16, 16,
-        );
+        false);
         assert_eq!(a, b);
         predict_luma(
             &p, STRIDE, BORDER, 16, 16, 0, 0, (-153, -153), true, &mut a, 16, 16, 16,
-        );
+        false);
         predict_luma(
             &p, STRIDE, BORDER, 16, 16, 0, 0, (-128, -128), false, &mut b, 16, 16, 16,
-        );
+        false);
         assert_eq!(a, b);
 
         // Right/bottom: mv (4000, 4000) > 0 + 144 → set to +128.
         predict_luma(
             &p, STRIDE, BORDER, 16, 16, 0, 0, (4000, 4000), true, &mut a, 16, 16, 16,
-        );
+        false);
         predict_luma(
             &p, STRIDE, BORDER, 16, 16, 0, 0, (128, 128), false, &mut b, 16, 16, 16,
-        );
+        false);
         assert_eq!(a, b);
 
         // Chroma: 2 * (-2000) < -152 → (-128 >> 1) = -64 per component.
@@ -691,27 +736,27 @@ mod tests {
         let mut cb = [0u8; 8 * 8];
         predict_chroma(
             &p, STRIDE, BORDER, 8, 8, 0, 0, (-2000, -2000), true, &mut ca, 8, 8, 8,
-        );
+        false);
         predict_chroma(
             &p, STRIDE, BORDER, 8, 8, 0, 0, (-64, -64), false, &mut cb, 8, 8, 8,
-        );
+        false);
         assert_eq!(ca, cb);
 
         // Chroma right/bottom: 2 * 2000 > 144 → (128 >> 1) = 64.
         predict_chroma(
             &p, STRIDE, BORDER, 8, 8, 0, 0, (2000, 2000), true, &mut ca, 8, 8, 8,
-        );
+        false);
         predict_chroma(
             &p, STRIDE, BORDER, 8, 8, 0, 0, (64, 64), false, &mut cb, 8, 8, 8,
-        );
+        false);
         assert_eq!(ca, cb);
 
         // An in-range MV with need_clamp=true must pass through untouched.
         predict_luma(
-            &p, STRIDE, BORDER, 16, 16, 0, 0, (10, -10), true, &mut a, 16, 16, 16,
+            &p, STRIDE, BORDER, 16, 16, 0, 0, (10, -10), true, &mut a, 16, 16, 16, false,
         );
         predict_luma(
-            &p, STRIDE, BORDER, 16, 16, 0, 0, (10, -10), false, &mut b, 16, 16, 16,
+            &p, STRIDE, BORDER, 16, 16, 0, 0, (10, -10), false, &mut b, 16, 16, 16, false,
         );
         assert_eq!(a, b);
     }

@@ -161,6 +161,13 @@ pub struct Decoder {
     /// frame does not re-code the map, ids carry over).
     segment_map: Vec<u8>,
     frame_decoded: bool,
+    /// Per-frame MC filter selection (libvpx `vp8_setup_version`,
+    /// alloccommon.c:131-167: version 0 and the reserved 4-7 use the
+    /// six-tap filters, versions 1-3 the bilinear ones) and full-pel
+    /// flag (version 3: `fullpixel_mask = ~7`). The decoder never reads
+    /// `no_lpf` — dead there too.
+    mc_bilinear: bool,
+    mc_fullpel: bool,
 }
 
 /// A decoded, displayable frame: cropped contiguous planes.
@@ -211,6 +218,8 @@ impl Decoder {
             refs: [None, None, None, None],
             segment_map: Vec::new(),
             frame_decoded: false,
+            mc_bilinear: false,
+            mc_fullpel: false,
         }
     }
 
@@ -223,16 +232,38 @@ impl Decoder {
     /// Decode one frame; returns the picture when it is for display
     /// (`show_frame`). Hidden frames still update the decode state.
     pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Picture>> {
-        // Entropy revert (§9.7): the probability updates this frame
-        // applies are transient unless `refresh_entropy` says they
-        // persist. Snapshots are cheap array copies; segmentation and
-        // loop-filter deltas live outside the frame context and never
-        // revert (libvpx saves only `fc`).
-        let coeff_probs = self.state.coeff_probs;
-        let mv_probs = self.state.mv_probs;
-        let ymode_probs = self.state.ymode_probs;
-        let uv_mode_probs = self.state.uv_mode_probs;
+        // Entropy revert (§9.7, libvpx decodeframe.c:1156/1245): when
+        // `refresh_entropy` is 0 the frame's probability updates are
+        // transient — libvpx copies `fc` into `lfc` at this point in
+        // the header and restores it after the frame. On a KEY frame
+        // `fc` has already been reset to defaults by then (init_frame
+        // runs before header parsing), so a key frame with
+        // refresh_entropy == 0 reverts to DEFAULTS, not to whatever the
+        // previous stream carried. Segmentation and loop-filter deltas
+        // live outside `fc` and never revert.
+        let key = frame.first().is_some_and(|b| b & 1 == 0);
+        let defaults = PersistedState::default();
+        let (coeff_probs, mv_probs, ymode_probs, uv_mode_probs) = if key {
+            (
+                defaults.coeff_probs,
+                defaults.mv_probs,
+                defaults.ymode_probs,
+                defaults.uv_mode_probs,
+            )
+        } else {
+            (
+                self.state.coeff_probs,
+                self.state.mv_probs,
+                self.state.ymode_probs,
+                self.state.uv_mode_probs,
+            )
+        };
         let (header, hdr_dec) = FrameHeader::parse(frame, &mut self.state)?;
+        // vp8_setup_version (decodeframe.c:935): the tag's version bits
+        // pick the MC interpolation filter and full-pel mode for this
+        // frame (see the field docs on Decoder).
+        self.mc_bilinear = matches!(header.tag.version, 1..=3);
+        self.mc_fullpel = header.tag.version == 3;
         let refresh_entropy = header.refresh.refresh_entropy;
         let pic = match header.tag.frame_type {
             FrameType::Key => self.decode_keyframe(frame, header, hdr_dec),
@@ -562,7 +593,9 @@ impl Decoder {
         self.token_ctxs.reset_above_row();
 
         // Phase 1: every mode record of the frame, row-major (§16).
-        eprintln!("STAGE modes");
+        if std::env::var_os("EC_VP8_TRACE").is_some() {
+            eprintln!("STAGE modes");
+        }
         for row in 1..=self.mb_rows {
             for col in 1..=self.mb_cols {
                 let mut mb = MbInfo::default();
@@ -682,17 +715,16 @@ impl Decoder {
     ) {
         if !d.read_bool(header.prob_intra) {
             // Intra-coded MB inside an inter frame (§16.1). Subblock
-            // modes use the same fixed context table as key frames.
+            // modes decode at one CONSTANT probability array with no
+            // above/left context (libvpx decodemv.c:467 reads
+            // `fc.bmode_prob` — the flat vp8_bmode_prob default; the
+            // context-dependent kf_bmode_prob table is key-frame-only).
             mb.ref_frame = 0;
             let ymode = modes::read_ymode(d, ymode_probs);
             mb.y_mode = ymode.as_u8();
             if ymode == modes::YMode::BPred {
-                for j in 0..16u8 {
-                    let a = self.above_block_mode(row, col, j, mb);
-                    let l = self.left_block_mode(row, col, j, mb);
-                    mb.b_modes[usize::from(j)] =
-                        modes::read_bmode(d, &KF_BMODE_PROB[usize::from(a)][usize::from(l)])
-                            .as_u8();
+                for j in 0..16usize {
+                    mb.b_modes[j] = modes::read_bmode(d, &modes::INTER_BMODE_PROBS).as_u8();
                 }
             }
             mb.uv_mode = modes::read_uvmode(d, uv_mode_probs).as_u8();
@@ -887,52 +919,61 @@ impl Decoder {
                 mc::predict_luma(
                     &reff.y, reff.stride, MC_BORDER, w, h, x + bx, y + by, mb.bmi[b],
                     mb.mv_clamp && corner,
-                    &mut py[by * 16 + bx..], 16, 4, 4,
+                    &mut py[by * 16 + bx..], 16, 4, 4, self.mc_bilinear,
                 );
             }
         } else {
             mc::predict_luma(
                 &reff.y, reff.stride, MC_BORDER, w, h, x, y, mb.mv, mb.mv_clamp, &mut py, 16,
-                16, 16,
+                16, 16, self.mc_bilinear,
             );
         }
 
-        // Chroma: one 8x8 predict per quadrant per plane. Whole-MB modes
-        // halve the single vector; SPLITMV sums its quadrant's four
-        // subblock vectors (§16.4, libvpx build_4x4uvmvs). The whole-MB
+        // Chroma: libvpx predicts each plane as ONE 8x8 block for
+        // whole-MB modes (vp8_build_inter16x16_predictors_mb) or four
+        // independent 4x4 blocks for SPLITMV (build_inter4x4_predictors_mb,
+        // each from its quadrant's build_4x4uvmvs vector). The whole-MB
         // path re-clamps UNCONDITIONALLY (reconinter.c: rounding the
         // derived chroma MV to full-pel can move it outside the tap
         // window even when the luma MV was in range); the SPLITMV path
         // clamps only under need_to_clamp_mvs.
         let mut pu = [0u8; 256];
         let mut pv = [0u8; 256];
-        for q in 0..4usize {
-            let (qx16, qy16) = ((q % 2) * 8, (q / 2) * 8);
-            let (cx, cy) = (x / 2 + qx16, y / 2 + qy16);
-            let (uvmv, uv_clamp) = if mb.mv_ref == 4 {
+        if mb.mv_ref == 4 {
+            for q in 0..4usize {
+                // Quadrant q: 4x4 chroma pixels at (qx4, qy4) in the MB.
+                let (qx4, qy4) = ((q % 2) * 4, (q / 2) * 4);
+                let (cx, cy) = (x / 2 + qx4, y / 2 + qy4);
                 let (qx, qy) = ((q % 2) * 2, (q / 2) * 2);
-                (
-                    modes::chroma_mv_split(&[
+                let uvmv = modes::chroma_mv_split(
+                    &[
                         mb.bmi[qy * 4 + qx],
                         mb.bmi[qy * 4 + qx + 1],
                         mb.bmi[qy * 4 + qx + 4],
                         mb.bmi[qy * 4 + qx + 5],
-                    ]),
-                    mb.mv_clamp,
-                )
-            } else {
-                (modes::chroma_mv_whole(mb.mv), true)
-            };
-            // The clamp's MB grid is shared with luma (libvpx
-            // clamp_uvmv_to_umv_border compares against the LUMA
-            // mb_to_*_edges), so the LUMA vis dims feed the edge math.
+                    ],
+                    self.mc_fullpel,
+                );
+                mc::predict_chroma(
+                    &reff.u, reff.uv_stride, MC_BORDER, w, h, cx, cy, uvmv,
+                    mb.mv_clamp, &mut pu[qy4 * 16 + qx4..], 16, 4, 4,
+                    self.mc_bilinear,
+                );
+                mc::predict_chroma(
+                    &reff.v, reff.uv_stride, MC_BORDER, w, h, cx, cy, uvmv,
+                    mb.mv_clamp, &mut pv[qy4 * 16 + qx4..], 16, 4, 4,
+                    self.mc_bilinear,
+                );
+            }
+        } else {
+            let uvmv = modes::chroma_mv_whole(mb.mv, self.mc_fullpel);
             mc::predict_chroma(
-                &reff.u, reff.uv_stride, MC_BORDER, w, h, cx, cy, uvmv, uv_clamp,
-                &mut pu[qy16 * 16 + qx16..], 16, 8, 8,
+                &reff.u, reff.uv_stride, MC_BORDER, w, h, x / 2, y / 2, uvmv, true,
+                &mut pu, 16, 8, 8, self.mc_bilinear,
             );
             mc::predict_chroma(
-                &reff.v, reff.uv_stride, MC_BORDER, w, h, cx, cy, uvmv, uv_clamp,
-                &mut pv[qy16 * 16 + qx16..], 16, 8, 8,
+                &reff.v, reff.uv_stride, MC_BORDER, w, h, x / 2, y / 2, uvmv, true,
+                &mut pv, 16, 8, 8, self.mc_bilinear,
             );
         }
         if std::env::var_os("EC_VP8_TRACE").is_some() && row == 0 && col == 0 {

@@ -127,6 +127,7 @@ def main():
     UV_MODE_TREE = [0, 2, -1, 4, -2, -3]
     YMODE_TREE = [0, 2, 4, 6, -1, -2, -3, -4]
     YMODE_MAP = {0: 0, 1: 2, 2: 3, 3: 1}
+    INTER_BMODE = [120, 90, 79, 133, 87, 85, 80, 111, 151]  # libvpx vp8_bmode_prob
     LEFT = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8]
     ABOVE = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7, 8]
 
@@ -144,8 +145,8 @@ def main():
     ctx = {
         "coef": DEF_COEF[:],
         "mv": DEF_MV[:],
-        "ymode": [145, 156, 163, 128],
-        "uv": [142, 114, 183],
+        "ymode": [112, 86, 140, 37],
+        "uv": [162, 101, 204],
     }
     probs = None
     seg_map = [0] * 65536
@@ -500,23 +501,13 @@ def main():
                         mbref[r][c] = 0
                         ym = d.tree(YMODE_TREE, ctx["ymode"])
                         mbmode[r][c] = ym
-                        hasy2[r][c] = ym != 4
                         if ym == 4:
+                            # Interframe B_PRED subblocks: CONSTANT
+                            # probs, no above/left context (libvpx
+                            # decodemv.c:467 reads fc.bmode_prob =
+                            # vp8_bmode_prob).
                             for j in range(16):
-                                if j < 4:
-                                    am = mbmode[r - 1][c]
-                                    a = bmode[r - 1][c][j + 12] if am == 4 else YMODE_MAP[am]
-                                else:
-                                    a = bmode[r][c][j - 4]
-                                if j % 4 == 0:
-                                    lm = mbmode[r][c - 1]
-                                    l = bmode[r][c - 1][j + 3] if lm == 4 else YMODE_MAP[lm]
-                                else:
-                                    l = bmode[r][c][j - 1]
-                                bmode[r][c][j] = d.tree(
-                                    BMODE_TREE,
-                                    KF_BMODE[(a * 10 + l) * 9 : (a * 10 + l) * 9 + 9],
-                                )
+                                bmode[r][c][j] = d.tree(BMODE_TREE, INTER_BMODE)
                         d.tree(UV_MODE_TREE, ctx["uv"])
                     else:
                         if not d.bool(prob_last):

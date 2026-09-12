@@ -85,6 +85,19 @@ fn multi_partition_keyframe_matches_ffmpeg() {
     compare("mparts-160x96.ivf", false);
 }
 
+/// M3 witness: full inter-frame streams — simple-filter GOP, multi-token-
+/// partition, hidden-altref and the OBS screen-content clip — decode
+/// byte-exact against ffmpeg, every frame.
+#[test]
+fn interframe_streams_match_ffmpeg() {
+    for name in [
+        "gop-160x96.ivf",
+        "clip-obs-320x192.ivf",
+        "altref-160x96.ivf",
+    ] {
+        compare(name, false);
+    }
+}
 #[test]
 fn vp8_in_webp_still_matches_ffmpeg() {
     let Some(dir) = ivf::fixture_dir() else {
