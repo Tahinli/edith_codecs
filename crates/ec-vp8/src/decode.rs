@@ -558,6 +558,7 @@ impl Decoder {
         ];
 
         // Phase 1: every mode record of the frame, row-major (§16).
+        eprintln!("STAGE modes");
         for row in 1..=self.mb_rows {
             for col in 1..=self.mb_cols {
                 let mut mb = MbInfo::default();
@@ -708,6 +709,9 @@ impl Decoder {
         let left = self.mv_neighbor(row, col - 1, sign_bias);
         let aboveleft = self.mv_neighbor(row - 1, col - 1, sign_bias);
         let (mut near_mvs, cnt) = modes::find_near_mvs(above, left, aboveleft, to_bias);
+        if std::env::var_os("EC_VP8_TRACE").is_some() {
+            eprintln!("CNT r={} c={} cnt={:?} mvs={:?}", row - 1, col - 1, cnt, near_mvs);
+        }
 
         if !d.read_bool(modes::MODE_CONTEXTS[cnt[modes::CNT_INTRA] as usize][0]) {
             mb.mv_ref = 0; // ZEROMV
@@ -815,6 +819,24 @@ impl Decoder {
                     mv
                 }
             };
+            if std::env::var_os("EC_VP8_TRACE").is_some() {
+                eprintln!(
+                    "SP r={} c={} j={} k={} l=({},{}) a=({},{}) ctx={} mv=({},{}) best=({},{})",
+                    row - 1,
+                    col - 1,
+                    j,
+                    k,
+                    leftmv.0,
+                    leftmv.1,
+                    abovemv.0,
+                    abovemv.1,
+                    ctx,
+                    blockmv.0,
+                    blockmv.1,
+                    best.0,
+                    best.1
+                );
+            }
             mb.mv_clamp |= modes::mv_out_of_bounds(blockmv, edges);
             let count = modes::MBSPLIT_FILL_COUNT[s];
             for &off in &modes::MBSPLIT_FILL_OFFSET[s][j * count..(j + 1) * count] {
