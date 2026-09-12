@@ -9,7 +9,10 @@
 //!
 //! # Unsafe
 //!
-//! This crate contains no `unsafe` code.
+//! The decoder logic is safe Rust. The one exception is the explicit
+//! `std::arch::x86_64` SIMD kernels in `mc` and `transform` (each confined
+//! to its own `#[allow(unsafe_code)]` module, dispatch-gated at run time
+//! and lane-for-lane tested against its scalar reference).
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -62,4 +65,12 @@ pub(crate) fn debug_enabled() -> bool {
         1 => false,
         _ => true,
     }
+}
+
+/// Cached AVX2 availability for the explicit-SIMD kernels (`mc`, `transform`).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx2_supported() -> bool {
+    static AVX2: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
+    *AVX2
 }
