@@ -278,10 +278,11 @@ pub(crate) struct TxbTables<'a> {
     pub txb_skip: &'a mut [[u16; 3]],
     /// The end-of-block group, whose alphabet the transform size sets.
     pub eob_pt: &'a mut [u16],
-    /// `eob_pt`'s `TX_CLASS_HORIZ`/`TX_CLASS_VERT` sibling table (r5): read
-    /// instead of `eob_pt` once this TU's `tx_type` is known to be
-    /// `V_DCT`/`H_DCT`. `None` for any size/set whose `tx_type` alphabet
-    /// cannot produce those two symbols (chroma, and every inter set).
+    /// Read instead of `eob_pt` once this TU's `tx_type` is known to be
+    /// `V_DCT`/`H_DCT` (lane-intertx doc fix: every set here carries the
+    /// row -- the older "none for chroma and every inter set" note
+    /// described the r5 alphabet, before the wider inter/chroma-reachable
+    /// sets made those classes reachable there).
     pub eob_pt_class1: Option<&'a mut [u16]>,
     /// The top bit of the offset inside that group.
     pub eob_extra: &'a mut [[u16; 3]; 9],

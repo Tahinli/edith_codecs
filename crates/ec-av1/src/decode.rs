@@ -18711,10 +18711,19 @@ fn read_inter_luma8(
 /// sync and only corrupted the inverse transform (one 64x64 superblock of
 /// high-frequency chroma noise, luma bit-exact).
 pub(crate) fn reduce_inherited_chroma_tx_type(t: TxType, w: usize, h: usize, fctx: &crate::decode::FrameCtx) -> TxType {
+    reduce_inherited_chroma_tx_type_flagged(t, w, h, fctx.reduced_tx_set_inter.with(std::cell::Cell::get))
+}
+
+/// [`reduce_inherited_chroma_tx_type`] against an explicit `reduced_tx_set`
+/// bit (lane-intertx): the WRITER calls this with the frame's own header bit
+/// ([`crate::cdf_state::Cdfs::reduced_tx_set`]) to derive the type an inter
+/// block's chroma transform is coded with, the same derivation its reader
+/// makes -- it has no `FrameCtx` in reach and must not silently read one
+/// whose value can lag the frame being written (class `stale-context-bit`).
+pub(crate) fn reduce_inherited_chroma_tx_type_flagged(t: TxType, w: usize, h: usize, reduced: bool) -> TxType {
     use TxType::*;
     let sqr_up = w.max(h);
     let sqr = w.min(h);
-    let reduced = fctx.reduced_tx_set_inter.with(std::cell::Cell::get);
     // `av1_get_ext_tx_set_type(tx_size, is_inter = 1, reduced)`.
     let allowed: &[TxType] = if sqr_up > 32 {
         // EXT_TX_SET_DCTONLY
