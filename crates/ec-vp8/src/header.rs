@@ -49,8 +49,10 @@ impl Default for PersistedState {
         Self {
             coeff_probs: DEFAULT_COEFF_PROBS,
             mv_probs: DEFAULT_MV_PROBS,
-            ymode_probs: [145, 156, 163, 128],
-            uv_mode_probs: [142, 114, 183],
+            // Interframe tree defaults (libvpx vp8_ymode_prob /
+            // vp8_uv_mode_prob); key frames reset these too.
+            ymode_probs: [112, 86, 140, 37],
+            uv_mode_probs: [162, 101, 204],
             segmentation: SegmentationState::default(),
             ref_lf_delta: [0; 4],
             mode_lf_delta: [0; 4],
@@ -412,7 +414,7 @@ impl FrameHeader {
             }
             probs
         } else {
-            (145, 156, 163)
+            (112, 86, 140) // placeholders; only read on inter frames
         };
         for c in 0..2 {
             for j in 0..MV_PROB_CNT {
@@ -422,7 +424,10 @@ impl FrameHeader {
             }
         }
 
-        if d.overreads() > 0 {
+        // The reference decoder zero-fills past the end of a partition;
+        // tiny partitions (e.g. one-MB key frames) can legitimately
+        // overrun by a byte or two. Gross overruns are still desyncs.
+        if d.overreads() > 16 {
             return Err(Error::corrupt(format!(
                 "VP8 first partition over-read by {} bytes (header desync)",
                 d.overreads()

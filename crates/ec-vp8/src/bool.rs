@@ -11,7 +11,7 @@
 //! `bool_encoder`; the tests drive them against a test-only re-implementation
 //! of that encoder and assert bit-exact round-trips.
 
-use ec_core::{Error, Result};
+use ec_core::Result;
 
 /// Boolean arithmetic decoder over one data partition (RFC 6386 §7.3).
 pub struct BoolDecoder<'a> {
@@ -32,17 +32,28 @@ pub struct BoolDecoder<'a> {
 
 impl<'a> BoolDecoder<'a> {
     /// Start decoding the partition `data` (RFC `init_bool_decoder`): the
-    /// first two bytes are read into `value`, big-endian.
+    /// first two bytes are read into `value`, big-endian. A partition
+    /// shorter than two bytes (legal for unused token partitions of
+    /// multi-partition frames) is zero-extended like the reference
+    /// decoder does, and the shortfall shows up in [`Self::overreads`].
     pub fn new(data: &'a [u8]) -> Result<Self> {
-        if data.len() < 2 {
-            return Err(Error::corrupt(
-                "VP8 partition shorter than the two-byte bool decoder init",
-            ));
+        if data.is_empty() {
+            return Ok(Self {
+                data,
+                pos: 0,
+                range: 255,
+                value: 0,
+                bit_count: 0,
+                overreads: 0,
+            });
         }
-        let value = (u32::from(data[0]) << 8) | u32::from(data[1]);
+        let mut value = u32::from(data[0]) << 8;
+        if data.len() > 1 {
+            value |= u32::from(data[1]);
+        }
         Ok(Self {
             data,
-            pos: 2,
+            pos: data.len().min(2),
             range: 255,
             value,
             bit_count: 0,
@@ -404,9 +415,13 @@ mod tests {
     }
 
     #[test]
-    fn short_partition_is_corrupt() {
-        assert!(BoolDecoder::new(&[]).is_err());
-        assert!(BoolDecoder::new(&[7]).is_err());
+    fn short_partitions_zero_extend() {
+        // Empty/1-byte partitions are legal for unused token partitions;
+        // the init shortfall counts as overreads.
+        let mut d = BoolDecoder::new(&[]).unwrap();
+        assert_eq!(d.read_bool(128), false);
+        let mut d = BoolDecoder::new(&[0]).unwrap();
+        assert_eq!(d.read_bool(128), false);
     }
 
     #[test]

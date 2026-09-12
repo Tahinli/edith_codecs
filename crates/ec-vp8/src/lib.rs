@@ -15,9 +15,15 @@
 #![warn(missing_docs)]
 
 pub mod bool;
+pub mod decode;
 pub mod frame;
 pub mod header;
+pub mod intra;
+pub mod loopfilter;
+pub mod modes;
 pub mod tables;
+pub mod tokens;
+pub mod transform;
 
 pub use ec_core::{Error, Result};
 pub use header::PersistedState;
