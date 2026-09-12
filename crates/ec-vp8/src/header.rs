@@ -192,7 +192,7 @@ impl FrameHeader {
     pub fn parse<'a>(
         data: &'a [u8],
         state: &mut PersistedState,
-    ) -> Result<(FrameHeader, &'a [u8])> {
+    ) -> Result<(FrameHeader, BoolDecoder<'a>)> {
         let tag = FrameTag::parse(data)?;
         let key = tag.frame_type == FrameType::Key;
         let mut off = crate::frame::FRAME_TAG_SZ;
@@ -372,10 +372,16 @@ impl FrameHeader {
         // --- entropy updates (§9.9; dixie decode_entropy_header) ---
         // Coefficient probability updates are read for every frame; on
         // key frames the tables were reset to defaults above.
+        let trace = std::env::var_os("EC_VP8_TRACE").is_some();
+        let mut idx = 0;
         for i in 0..4 {
             for j in 0..8 {
                 for k in 0..3 {
                     for l in 0..11 {
+                        if trace {
+                            eprintln!("IDX {idx} flag={}", crate::tables::COEFF_UPDATE_PROBS[i][j][k][l]);
+                        }
+                        idx += 1;
                         if d.read_bool(crate::tables::COEFF_UPDATE_PROBS[i][j][k][l]) {
                             state.coeff_probs[i][j][k][l] = d.read_literal(8) as u8;
                         }
@@ -412,17 +418,18 @@ impl FrameHeader {
                     state.uv_mode_probs[i] = d.read_literal(8) as u8;
                 }
             }
+            // MV probability updates: P(7) form, x ? x << 1 : 1 (§17.2).
+            for c in 0..2 {
+                for j in 0..MV_PROB_CNT {
+                    if d.read_bool(MV_UPDATE_PROBS[c][j]) {
+                        state.mv_probs[c][j] = d.read_prob7();
+                    }
+                }
+            }
             probs
         } else {
             (112, 86, 140) // placeholders; only read on inter frames
         };
-        for c in 0..2 {
-            for j in 0..MV_PROB_CNT {
-                if d.read_bool(MV_UPDATE_PROBS[c][j]) {
-                    state.mv_probs[c][j] = d.read_prob7();
-                }
-            }
-        }
 
         // The reference decoder zero-fills past the end of a partition;
         // tiny partitions (e.g. one-MB key frames) can legitimately
@@ -458,6 +465,9 @@ impl FrameHeader {
             token_data_offset: part0_end,
             partition_sizes,
         };
-        Ok((header, &data[off..part0_end]))
+        let _ = off;
+        // The partition-0 decoder is returned mid-stream: the per-MB
+        // mode records continue from exactly where the header stopped.
+        Ok((header, d))
     }
 }

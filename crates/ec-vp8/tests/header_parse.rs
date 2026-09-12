@@ -39,8 +39,8 @@ fn parses_real_key_frame_headers() {
         assert_eq!((kf.h_scale, kf.v_scale), (0, 0), "{name} unscaled");
 
         let mut state = PersistedState::default();
-        let (header, part0) = FrameHeader::parse(first, &mut state).unwrap();
-        assert_eq!(part0.len(), tag.first_part_size as usize);
+        let (header, _) = FrameHeader::parse(first, &mut state).unwrap();
+        assert_eq!(header.token_data_offset - 10, tag.first_part_size as usize);
         assert!(header.dims.is_some());
         assert_eq!(header.color_space, 0, "{name}: YUV colour space");
         assert_eq!(
