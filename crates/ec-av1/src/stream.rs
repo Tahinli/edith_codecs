@@ -3035,8 +3035,11 @@ pub(crate) mod tests {
                 &encoded.cdef,
                 &encoded.loop_filter,
                 encoded.tx_select,
-                // Our own encoder always writes `reduced_tx_set: true`.
-                true,
+                // lane-intertx: the frame's own `reduced_tx_set` -- a screen
+                // key frame at preset 0 codes the wider intra alphabets, so
+                // the old hardcoded `true` (ours "always" wrote true) is a
+                // stale-header bug waiting for the first screen fixture.
+                encoded.reduced_tx_set,
                 // `allow_screen_content_tools` off the frame the encoder
                 // actually wrote: a screen-content picture codes two palette
                 // symbols per intra block, and a raw tile decode that guessed

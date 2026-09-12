@@ -472,21 +472,24 @@ fn inter_tx_type_search() -> InterTxSearch {
 
 /// The inter luma [`TxbSet`] a `tx`-sided transform unit reads, `None` for the
 /// 64-point one (it codes no `tx_type` symbol).
-/// lane-txw: the INTER half of the widening is still NOT applied here, and
-/// the reason lane-txi recorded (the `refs` lane's DPB bookkeeping) was
-/// WRONG -- the refusal is `refusal-from-own-desync` twice over. Half of it
+/// lane-txw history, resolved by lane-intertx: the INTER half of the
+/// widening was blocked by `refusal-from-own-desync` twice over. Half of it
 /// was this writer coding a `V_DCT`/`H_DCT` unit as `TX_CLASS_2D`
-/// (`tile::write_coeffs`, fixed by this lane, which is what unblocked the
-/// intra half). What remains is the CHROMA inheritance: an inter block's
+/// (`tile::write_coeffs`, fixed by lane-txw, which unblocked the intra
+/// half). The other half was the CHROMA inheritance: an inter block's
 /// chroma transform type is the luma type reduced to the chroma size's set
 /// (`decode::reduce_inherited_chroma_tx_type`), and (a) the encoder never
-/// sets `FrameCtx::reduced_tx_set_inter`, so [`recode_inter_chroma`] reduces
-/// against the REDUCED allowance while a `reduced_tx_set = 0` frame's
-/// decoder allows the full one, and (b) `tile::write_block_planes` codes
-/// every chroma plane as `DCT_DCT`, so an inherited 1-D type desyncs the
-/// chroma exactly as luma did. Both are deferred with the wider inter search
-/// itself; the intra half needs neither (an intra block's chroma type comes
-/// off its own UV mode, never off luma).
+/// set `FrameCtx::reduced_tx_set_inter`, so [`recode_inter_chroma`] reduced
+/// against a STALE allowance, and (b) `tile::write_block_planes` coded
+/// every chroma plane as `DCT_DCT`, so an inherited 1-D type desynced the
+/// chroma exactly as luma did. lane-intertx fixed both -- the frame sets
+/// its own bit on the context (`encode_inter_frame`), the writer derives
+/// the chroma type from this frame's own header bit
+/// (`reduce_inherited_chroma_tx_type_flagged`) -- and the widened SEARCH
+/// names these sets through [`luma_set_for`] at its call sites, so the
+/// wider candidates are reachable and honestly priced. The intra half
+/// never needed either (an intra block's chroma type comes off its own UV
+/// mode, never off luma).
 fn inter_luma_set(tx: usize) -> Option<TxbSet> {
     Some(match tx {
         4 => TxbSet::Luma4Inter,
@@ -1794,6 +1797,7 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         tx_select: encoded.tx_select,
         switchable_motion_mode: encoded.switchable_motion_mode,
         screen: encoded.screen,
+        reduced_tx_set: encoded.reduced_tx_set,
         start_cdfs: encoded.start_cdfs.clone(),
         next_cdfs: encoded.next_cdfs.clone(),
         loop_filter: encoded.loop_filter,
@@ -1880,6 +1884,14 @@ pub struct Encoded {
     /// palette-mode symbols under it, so a raw tile decode that guessed
     /// `false` would desync at the first block (same class as `tx_select`).
     pub(crate) screen: bool,
+    /// This frame header's own `reduced_tx_set` (spec 5.9.2) -- the bit that
+    /// picks the inter `tx_type` alphabets AND, on an inter block, the
+    /// allowance the chroma transform's inherited type reduces against
+    /// ([`crate::decode::reduce_inherited_chroma_tx_type`]). A raw tile
+    /// decode that guesses `true` here mis-derives every inherited chroma
+    /// type on a `reduced_tx_set = 0` frame (lane-intertx; same class as
+    /// `tx_select`/`screen` above).
+    pub(crate) reduced_tx_set: bool,
     /// This frame header's chosen loop restoration parameters, threaded for
     /// the same reason as `loop_filter` -- and doubly so: the per-unit
     /// filters themselves are coded in `tile`, so a decode of it under a
@@ -5109,7 +5121,15 @@ fn commit_inter_luma(
     let mut flat_typed: Option<Trial> = None;
     let mut flat_type = TxType::DctDct;
     if !skip {
-        if let Some(fset) = inter_luma_set(side) {
+        // lane-intertx: on a `reduced_tx_set = 0` frame the search names the
+        // Set1 alphabet the writer codes into ([`luma_set_for`], the shape
+        // the intra search already takes), which is what makes the wider
+        // seven-type candidate list below reachable -- and prices every
+        // candidate, `IDTX` included, in the alphabet its symbol is really
+        // coded into.
+        if let Some(fset) =
+            inter_luma_set(side).map(|set| luma_set_for(set, search.screen))
+        {
             let lambda = search.lambda * tx_type_lambda_mult();
             let cost = |t: &Trial| t.sse + lambda * t.bits;
             for &tx_type in inter_tx_type_candidates(fset, search.screen) {
@@ -5200,14 +5220,17 @@ fn commit_inter_luma(
         return (flat_ref.levels.clone(), 0, flat_gain, vec![flat_type]);
     }
     let tx = side / 2;
-    let set = if tx >= 32 {
-        // lane-b64b: the 64x64 root's halved transform is TX_32X32.
-        TxbSet::Luma32Inter
-    } else if tx >= 16 {
-        TxbSet::Luma16Inter
-    } else {
-        TxbSet::Luma8Inter
-    };
+    let set = luma_set_for(
+        if tx >= 32 {
+            // lane-b64b: the 64x64 root's halved transform is TX_32X32.
+            TxbSet::Luma32Inter
+        } else if tx >= 16 {
+            TxbSet::Luma16Inter
+        } else {
+            TxbSet::Luma8Inter
+        },
+        search.screen,
+    );
     let mut levels = vec![0i32; side * side];
     let (mut sse, mut bits) = (0.0, 0.0);
     let mut units = Vec::with_capacity(4);
@@ -8859,6 +8882,7 @@ pub(crate) fn encode_key_frame_inner(
         // A key frame codes no inter block, so no motion_mode symbol.
         switchable_motion_mode: false,
         screen,
+        reduced_tx_set: header.reduced_tx_set,
         next_cdfs: start_cdfs.clone(),
         start_cdfs,
         loop_filter: header.loop_filter,
@@ -12594,6 +12618,14 @@ pub(crate) fn encode_inter_frame(
     // lane-txi, as on the key frame: the header bit the writer's own
     // `Cdfs` then reads for every luma `tx_type` symbol.
     header.reduced_tx_set = !wide_tx_set(screen);
+    // lane-intertx, desync (a): the frame context this value is read back
+    // through ([`decode::reduce_inherited_chroma_tx_type`] inside
+    // `recode_inter_chroma`, and every inter decode helper the search's own
+    // trial decode shares) must carry THIS frame's bit, not whatever the
+    // previous frame's trial decode last left in the shared cell -- a stale
+    // `true` here narrows the chroma allowance the search reconstructs
+    // against under the one the header's bit actually allows.
+    fctx.reduced_tx_set_inter.set(header.reduced_tx_set);
     // The search prices coefficients against the tables this frame's writer
     // starts from, not against the defaults (lane-av1txbits) -- but only on a
     // frame the screen detector said no to (lane-av1price2): armed HERE, after
@@ -14088,6 +14120,7 @@ pub(crate) fn encode_inter_frame(
         tx_select,
         switchable_motion_mode,
         screen,
+        reduced_tx_set: header.reduced_tx_set,
         start_cdfs,
         next_cdfs,
         loop_filter: header.loop_filter,
