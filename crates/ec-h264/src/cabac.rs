@@ -188,16 +188,20 @@ impl<'a> Cabac<'a> {
     /// One bit of slice data; zero past the end (see the module note).
     #[inline]
     fn bit(&mut self) -> u32 {
-        u32::from(self.r.read_bit().unwrap_or(false))
+        self.r.bit_zero_fill()
     }
 
     /// 9.3.3.2.2 RenormD.
+    ///
+    /// codIRange is at most 510, so the number of doublings the loop form
+    /// would take is `leading_zeros - 23` — zero when no renorm is due. One
+    /// bulk read replaces the per-bit supply, and the position accounting of
+    /// the zero-filled read matches the loop's bit-by-bit one exactly.
     #[inline]
     fn renorm(&mut self) {
-        while self.range < 256 {
-            self.range <<= 1;
-            self.offset = (self.offset << 1) | self.bit();
-        }
+        let shifts = self.range.leading_zeros() - 23;
+        self.range <<= shifts;
+        self.offset = (self.offset << shifts) | self.r.bits_zero_fill(shifts);
     }
 
     /// 9.3.3.2.1 DecodeDecision, with the state transition of 9.3.3.2.1.1.
@@ -787,14 +791,15 @@ impl<'a> Cabac<'a> {
                 4.min(1 + num_eq1) as usize
             };
             let inc1 = 5 + (4 - u32::from(chroma_dc)).min(num_gt1) as usize;
-            // Prefix: TU with cMax = uCoff = 14.
+            // Prefix: TU with cMax = uCoff = 14. The first bin reads the
+            // inc0 context, every later one the inc1 context, so the two
+            // spellings are hoisted out of the loop.
             let mut prefix = 0u32;
-            while prefix < 14 {
-                let ctx_idx = abs_base + if prefix == 0 { inc0 } else { inc1 };
-                if !self.decision(ctx_idx) {
-                    break;
+            if self.decision(abs_base + inc0) {
+                prefix = 1;
+                while prefix < 14 && self.decision(abs_base + inc1) {
+                    prefix += 1;
                 }
-                prefix += 1;
             }
             let abs_minus1 = if prefix < 14 {
                 prefix
