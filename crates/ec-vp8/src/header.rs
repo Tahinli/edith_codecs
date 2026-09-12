@@ -392,6 +392,7 @@ impl FrameHeader {
             128
         };
         // Interframe-only probability updates.
+            eprintln!("STAGE interprobs");
         let mut ymode_probs_updated = false;
         let mut uv_mode_probs_updated = false;
         let (prob_intra, prob_last, prob_gf) = if !key {
@@ -419,6 +420,11 @@ impl FrameHeader {
                         state.mv_probs[c][j] = d.read_prob7();
                     }
                 }
+            }
+            if std::env::var_os("EC_VP8_TRACE").is_some() {
+                eprintln!("YUV ymode = {:?} uv = {:?}", state.ymode_probs, state.uv_mode_probs);
+                eprintln!("MVT c0 = {:?}", state.mv_probs[0]);
+                eprintln!("MVT c1 = {:?}", state.mv_probs[1]);
             }
             probs
         } else {
