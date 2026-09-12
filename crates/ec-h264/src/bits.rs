@@ -132,6 +132,43 @@ impl<'a> BitCursor<'a> {
         Ok(v)
     }
 
+    /// Read `n` bits (`n <= 32`) MSB-first, zero-filled past the end of the
+    /// stream — the CABAC engine's supply contract (see the module note in
+    /// `cabac.rs`): a conformant stream never depends on those bits, and the
+    /// phantom reads do not advance `bit_position` beyond the real ones.
+    #[inline]
+    pub fn bits_zero_fill(&mut self, n: u32) -> u32 {
+        debug_assert!(n <= 32);
+        if n == 0 {
+            return 0;
+        }
+        if self.cached < n {
+            self.refill();
+        }
+        if self.cached >= n {
+            let v = (self.cache >> (64 - n)) as u32;
+            self.cache <<= n;
+            self.cached -= n;
+            return v;
+        }
+        // Genuinely past the end: consume what is cached, zero-fill the rest.
+        let have = self.cached;
+        let v = if have == 0 {
+            0
+        } else {
+            ((self.cache >> (64 - have)) as u32) << (n - have)
+        };
+        self.cache <<= have;
+        self.cached = 0;
+        v
+    }
+
+    /// One bit, zero-filled past the end (see [`bits_zero_fill`]).
+    #[inline]
+    pub fn bit_zero_fill(&mut self) -> u32 {
+        self.bits_zero_fill(1)
+    }
+
     /// Count leading zero bits up to and including the terminating one bit
     /// (level_prefix / exp-Golomb prefix). Capped at `cap` zeros.
     #[inline]
