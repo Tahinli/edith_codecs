@@ -147,6 +147,7 @@ impl TokenContexts {
 /// type; `n0` the first coded position (1 for Y blocks after a Y2).
 /// Returns the number of significant coefficients. Coefficients are
 /// written dequantized into `out` (natural order).
+#[allow(unused_assignments)] // v is always read on every path that matters
 fn get_coeffs(
     bc: &mut BoolDecoder<'_>,
     probs_t: &[[[u8; 11]; 3]; 8],
@@ -156,68 +157,101 @@ fn get_coeffs(
     ac_factor: i16,
     out: &mut [i16; 16],
 ) -> usize {
+    let trace = std::env::var_os("EC_VP8_TRACE").is_some();
+    macro_rules! ann {
+        ($n:expr, $band:expr, $ctx:expr, $node:expr) => {
+            if trace {
+                eprintln!("G n={} band={} ctx={} prob={}", $n, $band, $ctx, $node);
+            }
+        };
+    }
     let mut n = n0;
-    let mut p = &probs_t[BANDS[n0] as usize][ctx];
+    let mut band = BANDS[n0];
+    let mut c = ctx;
+    let mut p = &probs_t[band as usize][c];
+    ann!(n, band, c, 0);
     if !bc.read_bool(p[0]) {
         return 0; // immediate EOB
     }
     loop {
         n += 1;
         let mut v: i32;
+        ann!(n, band, c, 1);
         if !bc.read_bool(p[1]) {
-            // DCT_0: next decision skips the EOB branch (§13.2).
-            p = &probs_t[BANDS[n] as usize][0];
+            // DCT_0: the next decision skips the EOB branch (§13.2).
+            c = 0;
+            band = BANDS[n];
+            p = &probs_t[band as usize][0];
         } else {
+            ann!(n, band, c, 2);
             if !bc.read_bool(p[2]) {
-                p = &probs_t[BANDS[n] as usize][1];
+                c = 1;
+                band = BANDS[n];
+                p = &probs_t[band as usize][1];
                 v = 1;
-            } else if !bc.read_bool(p[3]) {
-                if !bc.read_bool(p[4]) {
-                    v = 2;
-                } else {
-                    v = 3 + i32::from(bc.read_bool(p[5]));
-                }
-            } else if !bc.read_bool(p[6]) {
-                if !bc.read_bool(p[7]) {
-                    v = 5 + i32::from(bc.read_bool(159));
-                } else {
-                    v = 7 + 2 * i32::from(bc.read_bool(165));
-                    v += i32::from(bc.read_bool(145));
-                }
             } else {
-                // Categories 3..6: two tree bits pick the category, then
-                // DCTextra (§13.2).
-                let bit1 = usize::from(bc.read_bool(p[8]));
-                let bit0 = usize::from(bc.read_bool(p[9 + bit1]));
-                let cat = 2 * bit1 + bit0;
-                v = 0;
-                for &prob in CAT_EXTRA[cat] {
-                    if prob == 0 {
-                        break;
+                ann!(n, band, c, 3);
+                if !bc.read_bool(p[3]) {
+                    ann!(n, band, c, 4);
+                    if !bc.read_bool(p[4]) {
+                        v = 2;
+                    } else {
+                        ann!(n, band, c, 5);
+                        v = 3 + i32::from(bc.read_bool(p[5]));
                     }
-                    v += v + i32::from(bc.read_bool(prob));
+                    let _ = v;
+                } else {
+                    ann!(n, band, c, 6);
+                    if !bc.read_bool(p[6]) {
+                        ann!(n, band, c, 7);
+                        if !bc.read_bool(p[7]) {
+                            ann!(n, band, c, 91);
+                            v = 5 + i32::from(bc.read_bool(159));
+                        } else {
+                            ann!(n, band, c, 161);
+                            v = 7 + 2 * i32::from(bc.read_bool(165));
+                            ann!(n, band, c, 162);
+                            v += i32::from(bc.read_bool(145));
+                        }
+                    } else {
+                        ann!(n, band, c, 8);
+                        let bit1 = usize::from(bc.read_bool(p[8]));
+                        ann!(n, band, c, 9);
+                        let bit0 = usize::from(bc.read_bool(p[9 + bit1]));
+                        let cat = 2 * bit1 + bit0;
+                        v = 0;
+                        for (i, &prob) in CAT_EXTRA[cat].iter().enumerate() {
+                            if prob == 0 {
+                                break;
+                            }
+                            ann!(n, band, c, 30 + i);
+                            v += v + i32::from(bc.read_bool(prob));
+                        }
+                        v += 3 + (8 << cat);
+                    }
                 }
-                v += 3 + (8 << cat);
-            }
+                c = 2;
+                band = BANDS[n];
+                p = &probs_t[band as usize][2];
 
-            // Sign flag, then dequantize (first coded position is DC).
-            let mag = if bc.read_bool(128) { -v } else { v };
-            out[ZIGZAG[n - 1]] = if n - 1 == 0 {
-                (mag * i32::from(dc_factor)) as i16
-            } else {
-                (mag * i32::from(ac_factor)) as i16
-            };
-            if n < 16 {
-                // Non-zero coefficients set the magnitude context for
-                // the next coefficient (§13.3).
-                p = &probs_t[BANDS[n] as usize][2];
+                // Sign flag, then dequantize (first coded position is DC).
+                ann!(n, band, c, 128);
+                let mag = if bc.read_bool(128) { -v } else { v };
+                out[ZIGZAG[n - 1]] = if n - 1 == 0 {
+                    (mag * i32::from(dc_factor)) as i16
+                } else {
+                    (mag * i32::from(ac_factor)) as i16
+                };
+                if n < 16 {
+                    ann!(n, band, c, 0);
+                }
+                if n == 16 || !bc.read_bool(p[0]) {
+                    return n;
+                }
             }
-            if n == 16 || !bc.read_bool(p[0]) {
-                return n;
+            if n == 16 {
+                return 16; // malformed without EOB: stop like the reference
             }
-        }
-        if n == 16 {
-            return 16; // malformed without EOB: stop like the reference
         }
     }
 }
