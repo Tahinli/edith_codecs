@@ -342,6 +342,12 @@ def main():
                         cnt[cx] += wgt
                     else:
                         cnt[0] += wgt
+            # libvpx decodemv.c:366 — when the above-left pushed a THIRD
+            # distinct candidate it counted into cnt[CNT_SPLITMV] (cntx
+            # reached slot 3), and if that candidate equals the nearest,
+            # NEAREST absorbs it. Alive, not dead.
+            if cnt[3] != 0 and mvs[ix] == mvs[1]:
+                cnt[1] += 1
             cnt[3] = (above["split"] * 2) + (left["split"] * 2) + aboveleft["split"]
             if cnt[2] > cnt[1]:
                 cnt[1], cnt[2] = cnt[2], cnt[1]
@@ -525,7 +531,7 @@ def main():
                             import traceback; traceback.print_exc()
                             print(f"EXC at r={r} c={c}: {e}")
                             raise SystemExit(1)
-                        mvref_print = 4 if mbsplit[r][c] else {-1: 3, -2: 1, -3: 2, -4: 3}.get(
+                        mvref_print = 4 if mbsplit[r][c] else {-1: 0, -2: 1, -3: 2, -4: 3}.get(
                             mbmode[r][c], 0
                         )
                         print(
