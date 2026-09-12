@@ -83,7 +83,9 @@ impl Plane8 {
     /// Replicate the edge samples into the padding, which turns the per-sample
     /// `Clip3` of Equations 8-239/8-240 into ordinary reads (see
     /// [`crate::inter`]).
-    fn extend_borders(&mut self) {
+    /// Replicate edge samples into the border; also the setup decoder tests
+    /// need for planes that inter::RefPlane reads.
+    pub(crate) fn extend_borders(&mut self) {
         let (w, h, pad, stride) = (self.width, self.height, self.pad, self.stride);
         for y in 0..h {
             let row = self.origin + y * stride;
@@ -307,7 +309,9 @@ impl RefList {
         (idx < self.len).then(|| usize::from(self.entries[idx]))
     }
 
-    fn push(&mut self, idx: usize) {
+    /// Append one DPB index; also the constructor decoder tests need to name
+    /// a non-empty reference list.
+    pub(crate) fn push(&mut self, idx: usize) {
         if self.len < self.entries.len() {
             self.entries[self.len] = idx as u8;
             self.len += 1;
