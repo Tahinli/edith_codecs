@@ -250,17 +250,35 @@ struct Indices {
 /// packets against ffmpeg-libopus's.
 #[derive(Clone, Debug, Default)]
 pub struct SilkDecIndices {
+    /// 0 = inactive/unvoiced, 1 = unvoiced, 2 = voiced (SILK `SignalType`).
     pub signal_type: i32,
+    /// Quantization offset flavor: 0 = low-bitrate offset, 1 = default offset.
     pub quant_offset_type: i32,
+    /// Per-subframe coded excitation gains; each is an index into the gain
+    /// dequantization table, not a linear gain.
     pub gains: [i8; 4],
+    /// Quantized normalized LSF coefficients; 17 entries (`MAX_LPC_ORDER + 1`),
+    /// the last being the interpolated residual-energy weight.
     pub nlsf: [i8; 17],
+    /// Interpolation weight between the previous and current frame's NLSFs,
+    /// Q2 in [0, 4] (4 = no interpolation).
     pub nlsf_interp_coef_q2: i32,
+    /// Raw pitch lag index; the lag in samples is derived from this plus the
+    /// frame's lag range and minimum lag.
     pub lag_index: i32,
+    /// Index into the pitch-contour codebook for the current bandwidth and
+    /// subframe count.
     pub contour_index: i32,
+    /// Periodicity index selecting the LTP filter scaling per subframe.
     pub per_index: usize,
+    /// Per-subframe LTP codebook indices; `usize::MAX` means LTP is off for
+    /// that subframe.
     pub ltp_index: [usize; 4],
+    /// Index of the LTP gain scaling factor applied to all subframes.
     pub ltp_scale_index: usize,
+    /// Pseudorandom seed for excitation sign/pulse decoding.
     pub seed: i32,
+    /// Diagnostic-only counter of SILK frames this state has decoded.
     pub frames_decoded: usize,
 }
 
