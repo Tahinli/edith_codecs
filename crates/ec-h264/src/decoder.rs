@@ -2264,6 +2264,20 @@ fn compensate(
     };
     let stride = pic.y.stride;
     let origin = pic.y.at(x0 as usize, y0 as usize);
+    // Weighted bi-prediction fuses the same way: the combining formula is
+    // per-sample, so list 0 lands in the picture and list 1 combines on top
+    // of it (Put::AvgW) with 8.4.2.3.2's exact integers.
+    let weighted_put = if !direct && use0 && use1 {
+        Some(crate::inter::Put::AvgW {
+            w0: wt.w[0],
+            w1: wt.w[1],
+            shift: (wt.log_wd + 1) as u32,
+            round: 1 << wt.log_wd,
+            off: (wt.o[0] + wt.o[1] + 1) >> 1,
+        })
+    } else {
+        None
+    };
     if direct && use0 && use1 {
         let plane = luma_ref(0)?;
         mc_luma(
@@ -2304,6 +2318,31 @@ fn compensate(
             stride,
             &mut pic.y.data[origin..],
             crate::inter::Put::Set,
+        );
+    } else if let Some(put) = weighted_put {
+        let plane = luma_ref(0)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[0],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+            crate::inter::Put::Set,
+        );
+        let plane = luma_ref(1)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[1],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+            put,
         );
     } else {
         let mut part = [[0u8; 256]; 2];
@@ -2375,6 +2414,31 @@ fn compensate(
                 stride,
                 &mut plane_out.data[origin..],
                 crate::inter::Put::Avg,
+            );
+        } else if let Some(put) = weighted_put {
+            let plane = chroma_ref(0);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[0],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+                crate::inter::Put::Set,
+            );
+            let plane = chroma_ref(1);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[1],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+                put,
             );
         } else if direct {
             let list = usize::from(!use0);
