@@ -20658,8 +20658,6 @@ mod tests {
                  {i64_edge} on a superblock the frame edge cuts",
                 100.0 * i64_whole as f64 / i64_offered.max(1) as f64,
             );
-            let _ = take_b128_rectres_hits();
-            let _ = crate::tile::take_sb128_rectres_hits();
             eprintln!(
                 "{name}: 128x128 roots {} (search) / {} (writer), with a residual \
                  {} (search) / {} (writer); rect/AB pieces with a residual \
