@@ -146,10 +146,17 @@ impl Ac3Decoder {
     /// broken bit stream [`Error::Corrupt`], and a construct this build does
     /// not implement [`Error::Unsupported`] with the reason named — never a
     /// panic, on any input.
+    ///
+    /// After the frame, `data` may hold only padding that is not itself a
+    /// syncframe: container slack is ignored. A tail that *begins* another
+    /// syncframe is stream this decoder would otherwise drop in silence — a
+    /// dependent substream whose channels extend the frame, or a second frame
+    /// altogether — and that is [`Error::Unsupported`] naming what it is;
+    /// containers hand frames over one at a time.
     pub fn decode_frame(&mut self, data: &[u8]) -> Result<AudioFrame> {
         let mut samples = Vec::new();
         let (info, consumed) = self.decode_substream(data, &mut samples)?;
-        let _ = consumed;
+        reject_tail(&data[consumed..])?;
         let layout = self.layout(&info);
         let interleaved = self.fold(samples, &info);
         let channels = layout.channel_count();
@@ -385,5 +392,50 @@ impl Decoder for Ac3Decoder {
         self.core.reset();
         self.pending = None;
         self.flushed = false;
+    }
+}
+
+/// What the bytes after a decoded frame may say. Nothing, or padding that is
+/// not itself a syncframe — the slack a container's block may carry around a
+/// frame. A tail that *begins* a syncframe is stream the caller handed over in
+/// one packet that this decoder decodes only the first of: a dependent
+/// substream whose channels extend the frame, or a second frame altogether.
+/// Dropping either loses audio in silence, so both are named refusals; a
+/// `0x0B77` coincidence that does not parse as a header is junk, and junk is
+/// the spec's own allowance.
+fn reject_tail(tail: &[u8]) -> Result<()> {
+    // Both syntaxes announce a frame with 0x0B77, and no header is shorter
+    // than six bytes.
+    if tail.len() < 6 || u16::from_be_bytes([tail[0], tail[1]]) != syncinfo::SYNCWORD {
+        return Ok(());
+    }
+    let named = if tail[5] >> 3 > 10 {
+        match eac3::parse_from(&mut ec_core::BitReader::new(tail)) {
+            // The 7.1-as-5.1-plus-dependents shape: the first substream is
+            // exactly what decoded, the tail is the extension channels this
+            // build does not assemble.
+            Ok(hdr) if hdr.strmtyp == eac3::StreamType::Dependent => Some((
+                "E-AC-3 dependent substream in the tail of the packet",
+                "a dependent substream carries channel extensions for an \
+                 independent one that has to be decoded first",
+            )),
+            Ok(_) => Some((
+                "a second syncframe in the tail of the packet",
+                "one packet is one syncframe and the substreams that belong \
+                 to it; hand frames to the decoder one at a time",
+            )),
+            // A syncword coincidence that is no header is padding, not stream.
+            Err(_) => None,
+        }
+    } else {
+        syncinfo::parse(tail).is_ok().then_some((
+            "a second syncframe in the tail of the packet",
+            "one packet is one syncframe and the substreams that belong \
+                 to it; hand frames to the decoder one at a time",
+        ))
+    };
+    match named {
+        Some((what, why)) => Err(Error::unsupported(what, why)),
+        None => Ok(()),
     }
 }
