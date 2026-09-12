@@ -1305,9 +1305,7 @@ fn ymode_as_bmode(y: u8) -> u8 {
 
 /// Add one 4x4 block's dequantized-coefficient residual to its
 /// prediction: reads the prediction patch from `pred`, clamps, writes
-/// into the strided plane (§14.4/§14.5). The transform, the add and the
-/// strided store live in `transform::idct_add_strided` (scalar reference
-/// + AVX2 kernel).
+/// into the strided plane (§14.4/§14.5).
 fn idct_add_into(
     plane: &mut [u8],
     coeffs: &[i16; 16],
@@ -1317,5 +1315,15 @@ fn idct_add_into(
     dst_off: usize,
     dst_stride: usize,
 ) {
-    transform::idct_add_strided(plane, coeffs, pred, pred_stride, pred_off, dst_off, dst_stride);
+    let mut p = [0u8; 16];
+    for i in 0..4 {
+        let s = pred_off + i * pred_stride;
+        p[i * 4..i * 4 + 4].copy_from_slice(&pred[s..s + 4]);
+    }
+    let mut out = [0u8; 16];
+    transform::idct4x4_add(coeffs, &p, &mut out);
+    for i in 0..4 {
+        let d = dst_off + i * dst_stride;
+        plane[d..d + 4].copy_from_slice(&out[i * 4..i * 4 + 4]);
+    }
 }
