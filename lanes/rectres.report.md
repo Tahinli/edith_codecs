@@ -1,12 +1,14 @@
 # lane-rectres — non-skip residual on Rect128/Ab128 pieces
 
 Base: `3b4673fe` (lane-rectres worktree). Disposition: **stays-off**
-(inert + exact — the RD takes 0 rect/AB residual fires per frame on every
-gate clip). `EC_AV1_RECTRES` keeps its default (off): OFF is today's
-behavior bit for bit — the search never flips a rect/AB piece to non-skip,
-so the writer's lifted refusal is never reached. Pins untouched at
-8291 / 33227 (no default change, so no pin run, no lib suite). Never
-merged, never pushed.
+(ACTIVE but BD-neutral + exact — under the knob the RD does take
+non-skip rect/AB pieces on every gate clip (up to 4.5 writer
+fires/frame on film A long-GOP), and the BD table moves at most 0.1
+anywhere). `EC_AV1_RECTRES` keeps its default (off): OFF is today's
+behavior bit for bit — the search never flips a rect/AB piece to
+non-skip, so the writer's lifted refusal is never reached. Pins
+untouched at 8291 / 33227 (no default change, so no pin run, no lib
+suite). Never merged, never pushed.
 
 ## 1. What shipped (commit `26a9b79e`)
 
@@ -117,35 +119,49 @@ EVIDENCE: ~/.cache/rectres/native-arm.log | VPS-2 gate, five rows,
 EC_AV1_RECTRES=1 | table above, "on" columns. LOADAVG 0.08/0.42/0.77
 before, 1.07/1.10/1.09 after.
 
-### 3c. Fire census (arm runs; per clip, over the four-q ladder)
+| clip | rect/AB residual fires (search / writer) | writer per frame |
+|---|---|---|
+| film A long-GOP (192 frames) | 34794 / 873 | 4.5 |
+| film B long-GOP (192 frames) | 20098 / 186 | 1.0 |
+| bars 1080p (48 frames) | 4915 / 105 | 2.2 |
+| bars 2160p (48 frames) | 3144 / 25 | 0.5 |
+| film A 12f (48 frames) | 7719 / 197 | 4.1 |
+| film B 12f (48 frames) | 6067 / 75 | 1.6 |
+| screen capture (48 frames) | 1056 / 85 | 1.8 |
 
-| clip | rect/AB residual fires (search / writer) |
-|---|---|
-| film A long-GOP (192 frames) | 0 / 0 |
-| film B long-GOP (192 frames) | 0 / 0 |
-| bars 1080p (48 frames) | 0 / 0 |
-| bars 2160p (48 frames) | 0 / 0 |
-| film A 12f (48 frames) | 0 / 0 |
-| film B 12f (48 frames) | 0 / 0 |
-| screen capture (48 frames) | 0 / 0 |
+The arm FIRES for real — an order of magnitude above the parked
+whole-128 residual arm (0.4-1.9 writer fires/frame) — and the BD table
+still moves at most 0.1 in either direction on every row of both gates.
+The RD finds non-skip rect/AB pieces worth taking; taking them buys
+nothing measured. The wall deltas (+1-4%) are the extra trial cost.
 
-ZERO fires everywhere under the knob: unlike the parked whole-128 arm
-(0.4-1.9 writer fires/frame), the RD never once finds a non-skip rect/AB
-piece worth taking on real content. The arm is not merely flat — it never
-fires. The wall deltas above (+1-4%) are the trial cost paid on every
-skip-winning rect/AB piece for a win that never comes.
+These numbers are the POST-FIX census (commit `8cf40077`): the first
+arm runs printed structurally-guaranteed zeros because two drain
+statements zeroed the counters immediately before the census line read
+them (class `drain-then-read counter` — reviewer catch). Both arm gates
+were re-run with the fix; the BD tables were byte-identical to the
+pre-fix arm runs (the fix touches only the census print). The drains
+inside the witness tests are pre-run hygiene and stay.
+EVIDENCE: ~/.cache/rectres/longgop-arm2.log | VPS-2, EC_AV1_RECTRES=1,
+post-8cf40077 | film A 34794/873, film B 20098/186; BD +20.9/-9.0,
++70.5/-2.1 (== pre-fix arm). exit=0, 3121.8s.
+EVIDENCE: ~/.cache/rectres/native-arm2.log | VPS-2, EC_AV1_RECTRES=1,
+post-8cf40077 | five rows: 4915/105, 3144/25, 7719/197, 6067/75,
+1056/85; BD rows == pre-fix arm to the digit. exit=0, 2121.8s.
+LOADAVG 0.18/0.17/0.44 before, 1.16/1.18/1.07 after.
 
 ## 4. Keep rule — NOT met; disposition
 
 One film row >=0.5 BD down on a column: best delta anywhere is -0.1.
 Other film row flat within +/-0.3: yes. Screen not worse by 0.3: yes.
-Wall <= +15%: yes. The deciding column fails and the arm is inert
-(0 fires) — the charter's stays-off branch, now on measurement rather
-than on a missing fixture. Default stays OFF; no pins, no suite (default
-did not flip). `fix-now | deferred(<unblock>) | accepted`: nothing
-deferred — the measurement asked by the charter is complete; the arm
-itself stays parked behind `EC_AV1_RECTRES`, witnessed exact if a future
-cost model ever makes it fire.
+Wall <= +15%: yes. The deciding column fails — with the arm now known
+to fire for real, 'BD-neutral on real fires' is the measured verdict,
+not inertness — the charter's stays-off branch. Default stays OFF; no
+pins, no suite (default did not flip). `fix-now | deferred(<unblock>)
+| accepted`: nothing deferred — the measurement asked by the charter is
+complete; the arm itself stays parked behind `EC_AV1_RECTRES`, witnessed
+exact, and the census says the pieces ARE taken — a future cost-model
+change re-measures BD, not fire counts.
 
 ## 5. Procedure notes (VPS-2 gates)
 
