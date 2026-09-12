@@ -538,7 +538,7 @@ def main():
                             f"IMB r={r-1} c={c-1} ref={mbref[r][c]} mvref={mvref_print} "
                             f"mv=({mbmv[r][c][0]},{mbmv[r][c][1]}) clamp={mbmvclamp[r][c]}"
                         )
-                        if 0 < mbref[r][c] and mbmode[r][c] >= 0:
+                        if 0 < mbref[r][c] and mbmode[r][c] < 0:
                             hasy2[r][c] = True
 
         def row_tokens(r):
