@@ -21,6 +21,7 @@
 //! are reproduced exactly (`i32 >> 3` and `& 7` on negatives).
 //!
 //! [RFC 6386]: https://www.rfc-editor.org/rfc/rfc6386
+use crate::avx2_supported;
 
 /// `VP8_FILTER_WEIGHT` (filter.c): tap weights sum to this, DC passes.
 const VP8_FILTER_WEIGHT: i32 = 128;
@@ -260,15 +261,6 @@ fn sixtap_v_scalar(
             dst[r * dst_stride + c] = clamp255(acc >> VP8_FILTER_SHIFT) as u8;
         }
     }
-}
-
-/// Cached AVX2 availability (the per-block detection load is cheap, but
-/// MC blocks are the hottest call in an inter decode).
-#[cfg(target_arch = "x86_64")]
-fn avx2_supported() -> bool {
-    static AVX2: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
-    *AVX2
 }
 
 /// Explicit `std::arch::x86_64` kernels for the six-tap and bilinear
