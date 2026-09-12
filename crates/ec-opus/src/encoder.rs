@@ -108,7 +108,7 @@ pub struct Encoder {
     /// Scratch space for the SILK packet payload, sized once so the steady-state
     /// loop (`steady_state_encode_loop_zero_alloc`) doesn't allocate.
     silk_buf: [u8; MAX_SILK_PACKET_BYTES],
-    /// Hybrid: the last [`Encoder::hybrid_silk_delay_48k`] samples of SILK-layer input.
+    /// Hybrid: the last `Encoder::hybrid_silk_delay_48k` samples of SILK-layer input.
     silk_delay: Vec<f32>,
     /// Scratch space for the zero-stuffed SILK/hybrid input, sized once so
     /// the steady-state loop doesn't allocate a `Vec` per frame.
@@ -241,11 +241,11 @@ impl Encoder {
     /// delay compensation, 312 samples at 48 kHz.
     /// SILK (10, 20, 40 or 60 ms frames, when the application/bitrate or an
     /// explicit [`Encoder::set_mode`] select it — the same
-    /// [`Encoder::silk_choice`] predicate `encode_toc_and_payload` dispatches
+    /// `Encoder::silk_choice` predicate `encode_toc_and_payload` dispatches
     /// on, so this always matches which layer actually codes the frame):
-    /// [`SILK_LOOK_AHEAD_48K_NB`], [`SILK_LOOK_AHEAD_48K_MB`] or
-    /// [`SILK_LOOK_AHEAD_48K_WB`]. Hybrid: CELT's 120, the SILK layer being
-    /// delayed to meet it ([`Encoder::hybrid_silk_delay_48k`]). Any other frame size
+    /// `SILK_LOOK_AHEAD_48K_NB`, `SILK_LOOK_AHEAD_48K_MB` or
+    /// `SILK_LOOK_AHEAD_48K_WB`. Hybrid: CELT's 120, the SILK layer being
+    /// delayed to meet it (`Encoder::hybrid_silk_delay_48k`). Any other frame size
     /// falls back to CELT here exactly as `encode_toc_and_payload` does.
     pub fn look_ahead(&self, frame_size: usize) -> usize {
         let frame_48k = frame_size * self.upsample;
@@ -499,7 +499,7 @@ impl Encoder {
 
     /// Zero-stuffs a mono, `frame_size`-sample native-rate frame up to
     /// `frame_size * upsample` samples at 48 kHz, the rate [`SilkEncoder`]
-    /// takes — the same technique [`CeltEncoder::encode`] uses, scaled by
+    /// takes — the same technique `CeltEncoder::encode` uses, scaled by
     /// `upsample` so the passband gain survives the stuffing. Writes into
     /// `out` (an `Encoder` scratch field, not a fresh `Vec` per call) rather
     /// than returning one, so the caller doesn't allocate every frame; the
@@ -958,7 +958,7 @@ impl Encoder {
     /// One hybrid frame (10 or 20 ms, mono or stereo, `bandwidth` SWB or FB)
     /// into the internal range coder, returning its byte length: the SILK
     /// layer's symbols (WB, 16 kHz internal, fed the input delayed by
-    /// [`Encoder::hybrid_silk_delay_48k`]), the no-redundancy flag under the decoder's
+    /// `Encoder::hybrid_silk_delay_48k`), the no-redundancy flag under the decoder's
     /// exact presence rule, then the CELT layer from band 17 in the same
     /// coder. CBR: the packet is the bitrate's size unless SILK alone needs
     /// more, in which case CELT keeps [`HYBRID_CELT_MIN_BYTES`] on top.

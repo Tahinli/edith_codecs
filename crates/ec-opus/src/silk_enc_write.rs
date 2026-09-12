@@ -1,4 +1,4 @@
-//! SILK payload writer (subtask D2a): turns the analysis in [`crate::silk_enc`]
+//! SILK payload writer (subtask D2a): turns the analysis in `crate::silk_enc`
 //! into decodable SILK packets, NB (8 kHz), MB (12 kHz) or WB (16 kHz).
 //!
 //! Symbol order is exactly `silk::decode()`'s, and every decision is made
@@ -42,14 +42,25 @@ const MAX_PULSE: i32 = 1023;
 /// call, for the speech-quality diagnostic lane.
 #[derive(Clone, Debug, Default)]
 pub struct SilkFrameDiag {
+    /// Whether the VAD classified the input frame as voiced.
     pub voiced: bool,
+    /// SILK signal type chosen by the encoder (0 inactive, 1 unvoiced,
+    /// 2 voiced).
     pub signal_type: i32,
+    /// Per-subframe gain codebook indices as written to the bitstream.
     pub gain_idx: [i8; MAX_NB_SUBFR],
+    /// Number of subframes in the frame (2 for 10 ms, 4 for 20 ms).
     pub nb_subfr: usize,
+    /// Raw pitch lag index written to the bitstream (first subframe's).
     pub lag_index: i32,
+    /// Pitch lag in samples per subframe as used by the LTP analysis.
     pub pitch_l: [i32; MAX_NB_SUBFR],
+    /// NLSF interpolation coefficient (Q2, 0..4) encoded for this frame.
     pub nlsf_interp: i32,
+    /// Number of payload bytes the frame's encode produced.
     pub bytes: usize,
+    /// Total LTP excitation gain across subframes (linear scale, 0 if the
+    /// frame had no LTP).
     pub ltp_gain: f32,
 }
 
