@@ -40,7 +40,6 @@ use crate::celt::{
     SPREAD_NONE, SPREAD_NORMAL, TF_SELECT, TRIM_ICDF,
     bitexact_cos, bitexact_log2tan, bits2pulses, cache_index, compute_allocation_encode,
     compute_qn, deinterleave_hadamard, exp_rotation, frac_mul16, get_pulses, haar1, pulses2bits,
-    unext,
 };
 use crate::range::RangeEncoder;
 
@@ -296,31 +295,22 @@ fn laplace_encode(enc: &mut RangeEncoder, value: &mut i32, mut fs: u32, decay: i
 
 /// `encode_pulses()` for the general case: index the pulse vector in the
 /// V(N,K) enumeration and code it as one uniform symbol (Section 5.3.4).
-fn encode_pulses(enc: &mut RangeEncoder, iy: &[i32], n: usize, k: usize, u: &mut [u32]) {
+fn encode_pulses(enc: &mut RangeEncoder, iy: &[i32], n: usize, k: usize) {
     debug_assert!(n >= 2 && k > 0);
-    u[0] = 0;
-    for (kk, slot) in u.iter_mut().enumerate().take(k + 2).skip(1) {
-        *slot = (2 * kk - 1) as u32;
-    }
-    let mut i = u32::from(iy[n - 1] < 0);
-    let mut kk = iy[n - 1].unsigned_abs() as usize;
-    let j = n - 2;
-    i = i.wrapping_add(u[kk]);
-    kk += iy[j].unsigned_abs() as usize;
-    if iy[j] < 0 {
-        i = i.wrapping_add(u[kk + 1]);
-    }
-    let mut j = j;
+    let mut j = n - 1;
+    let mut i = u32::from(iy[j] < 0);
+    let mut kk = iy[j].unsigned_abs() as usize;
     while j > 0 {
         j -= 1;
-        unext(&mut u[..k + 2], 0);
-        i = i.wrapping_add(u[kk]);
+        // The row the reference stepping left in place at this dimension is
+        // `U(n - j, .)`; read it from the table instead.
+        i = i.wrapping_add(celt::pvq_u(n - j, kk));
         kk += iy[j].unsigned_abs() as usize;
         if iy[j] < 0 {
-            i = i.wrapping_add(u[kk + 1]);
+            i = i.wrapping_add(celt::pvq_u(n - j, kk + 1));
         }
     }
-    let nc = u[kk].wrapping_add(u[kk + 1]);
+    let nc = celt::pvq_v(n, kk);
     enc.enc_uint(i, nc.max(2));
 }
 
@@ -345,10 +335,13 @@ fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
     let mid = emid.sqrt();
     let side = eside.sqrt();
     // 0.63662 is the reference's own 2/pi literal (vq.c, stereo_itheta); the
-    // exact constant would round a boundary theta differently.
+    // exact constant would round a boundary theta differently. The angle is
+    // the reference float build's `fast_atan2f` (the rational approximation
+    // the tonality features share), which also keeps libm's `atan2` out of
+    // the per-band loop.
     #[allow(clippy::approx_constant)]
-    const TWO_OVER_PI: f64 = 0.63662;
-    (0.5 + 16384.0 * TWO_OVER_PI * (side as f64).atan2(mid as f64)).floor() as i32
+    const TWO_OVER_PI: f32 = 0.63662;
+    (TWO_OVER_PI * 16384.0 * crate::analysis::fast_atan2f(side, mid) + 0.5).floor() as i32
 }
 
 /// `l1_metric()` from the reference: L1 norm scaled by `(1 + LM*bias)`.
@@ -529,7 +522,6 @@ pub struct CeltEncoder {
     iy: Vec<i32>,
     pvq_y: Vec<f32>,
     pvq_sign: Vec<i32>,
-    urow: Vec<u32>,
     /// Per-frame diagnostics captured at the end of the last `encode` call.
     last_diag: CeltFrameDiag,
     /// libopus `st->analysis`'s per-frame output, handed in by
@@ -592,7 +584,6 @@ impl CeltEncoder {
             iy: vec![0; max_n],
             pvq_y: vec![0.0; max_n],
             pvq_sign: vec![0; max_n],
-            urow: vec![0; 1280],
             last_diag: CeltFrameDiag::default(),
             info: AnalysisInfo::default(),
         }
@@ -2681,10 +2672,7 @@ impl CeltEncoder {
                 iy[j] = -iy[j];
             }
         }
-        if self.urow.len() < k + 2 {
-            self.urow.resize(k + 2, 0);
-        }
-        encode_pulses(enc, &self.iy[..n], n, k, &mut self.urow);
+        encode_pulses(enc, &self.iy[..n], n, k);
     }
 }
 
@@ -2787,15 +2775,13 @@ mod tests {
                 }
                 let mut enc = RangeEncoder::new();
                 enc.reset(600);
-                let mut u = vec![0u32; k + 2];
-                encode_pulses(&mut enc, &iy, n, k, &mut u);
+                encode_pulses(&mut enc, &iy, n, k);
                 enc.done();
                 assert!(!enc.error());
                 let data = enc.data().to_vec();
                 let mut dec = RangeDecoder::new(&data);
                 let mut got = vec![0i32; n];
-                let mut u2 = vec![0u32; k + 2];
-                crate::celt::decode_pulses(&mut dec, n, k, &mut got, &mut u2);
+                crate::celt::decode_pulses(&mut dec, n, k, &mut got);
                 assert_eq!(got, iy, "n={n} k={k}");
             }
         }
