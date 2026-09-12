@@ -401,39 +401,44 @@ fn filter_mb_v_edge(
     hev: i32,
     size: usize,
 ) {
+    // Taps are contiguous around each anchor: one slice read per pixel;
+    // most pixels fail the threshold, so stores stay conditional.
     for row in 0..8 * size {
         let a = anchor + row * stride;
         debug_assert!(a >= 4 && a + 3 < plane.len());
-        let px = [
-            i32::from(plane[a - 4]),
-            i32::from(plane[a - 3]),
-            i32::from(plane[a - 2]),
-            i32::from(plane[a - 1]),
-            i32::from(plane[a]),
-            i32::from(plane[a + 1]),
-            i32::from(plane[a + 2]),
-            i32::from(plane[a + 3]),
+        let mut px = [0u8; 8];
+        px.copy_from_slice(&plane[a - 4..a + 4]);
+        let c = [
+            i32::from(px[0]),
+            i32::from(px[1]),
+            i32::from(px[2]),
+            i32::from(px[3]),
+            i32::from(px[4]),
+            i32::from(px[5]),
+            i32::from(px[6]),
+            i32::from(px[7]),
         ];
-        if !normal_threshold(&px, center_limit, interior) {
+        if !normal_threshold(&c, center_limit, interior) {
             continue;
         }
-        let [_, p2, p1, p0, q0, q1, q2, _] = px;
+        let [_, p2, p1, p0, q0, q1, q2, _] = c;
         if high_edge_variance(p1, p0, q0, q1, hev) {
             // dixie: filter_common with outer taps (p1/q1 unchanged).
             let f = filter_common(p1, p0, q0, q1, true);
-            plane[a - 2] = f[0] as u8;
-            plane[a - 1] = f[1] as u8;
-            plane[a] = f[2] as u8;
-            plane[a + 1] = f[3] as u8;
+            px[2] = f[0] as u8;
+            px[3] = f[1] as u8;
+            px[4] = f[2] as u8;
+            px[5] = f[3] as u8;
         } else {
             let m = filter_mb_edge(p2, p1, p0, q0, q1, q2);
-            plane[a - 3] = m[0] as u8;
-            plane[a - 2] = m[1] as u8;
-            plane[a - 1] = m[2] as u8;
-            plane[a] = m[3] as u8;
-            plane[a + 1] = m[4] as u8;
-            plane[a + 2] = m[5] as u8;
+            px[1] = m[0] as u8;
+            px[2] = m[1] as u8;
+            px[3] = m[2] as u8;
+            px[4] = m[3] as u8;
+            px[5] = m[4] as u8;
+            px[6] = m[5] as u8;
         }
+        plane[a - 3..a + 3].copy_from_slice(&px[1..7]);
     }
 }
 
@@ -450,19 +455,20 @@ fn filter_subblock_v_edge(
     for row in 0..8 * size {
         let a = anchor + row * stride;
         debug_assert!(a >= 4 && a + 3 < plane.len());
-        let px = [
-            i32::from(plane[a - 4]),
-            i32::from(plane[a - 3]),
-            i32::from(plane[a - 2]),
-            i32::from(plane[a - 1]),
-            i32::from(plane[a]),
-            i32::from(plane[a + 1]),
-            i32::from(plane[a + 2]),
-            i32::from(plane[a + 3]),
+        let px: [u8; 8] = plane[a - 4..a + 4].try_into().unwrap();
+        let c = [
+            i32::from(px[0]),
+            i32::from(px[1]),
+            i32::from(px[2]),
+            i32::from(px[3]),
+            i32::from(px[4]),
+            i32::from(px[5]),
+            i32::from(px[6]),
+            i32::from(px[7]),
         ];
-        if normal_threshold(&px, center_limit, interior) {
-            let outer = high_edge_variance(px[2], px[3], px[4], px[5], hev);
-            let f = filter_common(px[2], px[3], px[4], px[5], outer);
+        if normal_threshold(&c, center_limit, interior) {
+            let outer = high_edge_variance(c[2], c[3], c[4], c[5], hev);
+            let f = filter_common(c[2], c[3], c[4], c[5], outer);
             plane[a - 2] = f[0] as u8;
             plane[a - 1] = f[1] as u8;
             plane[a] = f[2] as u8;
@@ -481,37 +487,45 @@ fn filter_mb_h_edge(
     hev: i32,
     size: usize,
 ) {
-    for i in 0..8 * size {
-        let a = anchor + i;
-        debug_assert!(a >= 4 * stride && a + 3 * stride < plane.len());
-        let px = [
-            i32::from(plane[a - 4 * stride]),
-            i32::from(plane[a - 3 * stride]),
-            i32::from(plane[a - 2 * stride]),
-            i32::from(plane[a - stride]),
-            i32::from(plane[a]),
-            i32::from(plane[a + stride]),
-            i32::from(plane[a + 2 * stride]),
-            i32::from(plane[a + 3 * stride]),
+    // Columns are contiguous (anchor + i), taps sit `stride` apart: the
+    // tap rows are pulled in with one bounds-checked slice each (most
+    // columns fail the threshold and need no store, so writes stay
+    // per-column).
+    let n = 8 * size;
+    let mut px = [[0u8; 64]; 8];
+    for (k, r) in px.iter_mut().enumerate() {
+        let a = anchor - (4 - k) * stride;
+        r[..n].copy_from_slice(&plane[a..a + n]);
+    }
+    for i in 0..n {
+        let c = [
+            i32::from(px[0][i]),
+            i32::from(px[1][i]),
+            i32::from(px[2][i]),
+            i32::from(px[3][i]),
+            i32::from(px[4][i]),
+            i32::from(px[5][i]),
+            i32::from(px[6][i]),
+            i32::from(px[7][i]),
         ];
-        if !normal_threshold(&px, center_limit, interior) {
+        if !normal_threshold(&c, center_limit, interior) {
             continue;
         }
-        let [_, p2, p1, p0, q0, q1, q2, _] = px;
+        let [_, p2, p1, p0, q0, q1, q2, _] = c;
         if high_edge_variance(p1, p0, q0, q1, hev) {
             let f = filter_common(p1, p0, q0, q1, true);
-            plane[a - 2 * stride] = f[0] as u8;
-            plane[a - stride] = f[1] as u8;
-            plane[a] = f[2] as u8;
-            plane[a + stride] = f[3] as u8;
+            plane[anchor - 2 * stride + i] = f[0] as u8;
+            plane[anchor - stride + i] = f[1] as u8;
+            plane[anchor + i] = f[2] as u8;
+            plane[anchor + stride + i] = f[3] as u8;
         } else {
             let m = filter_mb_edge(p2, p1, p0, q0, q1, q2);
-            plane[a - 3 * stride] = m[0] as u8;
-            plane[a - 2 * stride] = m[1] as u8;
-            plane[a - stride] = m[2] as u8;
-            plane[a] = m[3] as u8;
-            plane[a + stride] = m[4] as u8;
-            plane[a + 2 * stride] = m[5] as u8;
+            plane[anchor - 3 * stride + i] = m[0] as u8;
+            plane[anchor - 2 * stride + i] = m[1] as u8;
+            plane[anchor - stride + i] = m[2] as u8;
+            plane[anchor + i] = m[3] as u8;
+            plane[anchor + stride + i] = m[4] as u8;
+            plane[anchor + 2 * stride + i] = m[5] as u8;
         }
     }
 }
@@ -526,26 +540,30 @@ fn filter_subblock_h_edge(
     hev: i32,
     size: usize,
 ) {
-    for i in 0..8 * size {
-        let a = anchor + i;
-        debug_assert!(a >= 4 * stride && a + 3 * stride < plane.len());
-        let px = [
-            i32::from(plane[a - 4 * stride]),
-            i32::from(plane[a - 3 * stride]),
-            i32::from(plane[a - 2 * stride]),
-            i32::from(plane[a - stride]),
-            i32::from(plane[a]),
-            i32::from(plane[a + stride]),
-            i32::from(plane[a + 2 * stride]),
-            i32::from(plane[a + 3 * stride]),
+    let n = 8 * size;
+    let mut px = [[0u8; 64]; 8];
+    for (k, r) in px.iter_mut().enumerate() {
+        let a = anchor - (4 - k) * stride;
+        r[..n].copy_from_slice(&plane[a..a + n]);
+    }
+    for i in 0..n {
+        let c = [
+            i32::from(px[0][i]),
+            i32::from(px[1][i]),
+            i32::from(px[2][i]),
+            i32::from(px[3][i]),
+            i32::from(px[4][i]),
+            i32::from(px[5][i]),
+            i32::from(px[6][i]),
+            i32::from(px[7][i]),
         ];
-        if normal_threshold(&px, center_limit, interior) {
-            let outer = high_edge_variance(px[2], px[3], px[4], px[5], hev);
-            let f = filter_common(px[2], px[3], px[4], px[5], outer);
-            plane[a - 2 * stride] = f[0] as u8;
-            plane[a - stride] = f[1] as u8;
-            plane[a] = f[2] as u8;
-            plane[a + stride] = f[3] as u8;
+        if normal_threshold(&c, center_limit, interior) {
+            let outer = high_edge_variance(c[2], c[3], c[4], c[5], hev);
+            let f = filter_common(c[2], c[3], c[4], c[5], outer);
+            plane[anchor - 2 * stride + i] = f[0] as u8;
+            plane[anchor - stride + i] = f[1] as u8;
+            plane[anchor + i] = f[2] as u8;
+            plane[anchor + stride + i] = f[3] as u8;
         }
     }
 }
@@ -556,10 +574,11 @@ fn filter_v_edge_simple(plane: &mut [u8], stride: usize, anchor: usize, limit: i
     for row in 0..16 {
         let a = anchor + row * stride;
         debug_assert!(a >= 2 && a + 1 < plane.len());
-        let p1 = i32::from(plane[a - 2]);
-        let p0 = i32::from(plane[a - 1]);
-        let q0 = i32::from(plane[a]);
-        let q1 = i32::from(plane[a + 1]);
+        let px: [u8; 4] = plane[a - 2..a + 2].try_into().unwrap();
+        let p1 = i32::from(px[0]);
+        let p0 = i32::from(px[1]);
+        let q0 = i32::from(px[2]);
+        let q1 = i32::from(px[3]);
         if simple_threshold(p1, p0, q0, q1, limit) {
             let f = filter_common(p1, p0, q0, q1, true);
             plane[a - 1] = f[1] as u8;
@@ -570,17 +589,21 @@ fn filter_v_edge_simple(plane: &mut [u8], stride: usize, anchor: usize, limit: i
 
 /// dixie `filter_h_edge_simple`: horizontal edge, simple filter.
 fn filter_h_edge_simple(plane: &mut [u8], stride: usize, anchor: usize, limit: i32) {
+    // Contiguous columns, strided taps: chunked loads, conditional stores.
+    let mut px = [[0u8; 16]; 4];
+    for (k, r) in px.iter_mut().enumerate() {
+        let a = anchor - (2 - k) * stride;
+        r.copy_from_slice(&plane[a..a + 16]);
+    }
     for i in 0..16 {
-        let a = anchor + i;
-        debug_assert!(a >= 2 * stride && a + stride < plane.len());
-        let p1 = i32::from(plane[a - 2 * stride]);
-        let p0 = i32::from(plane[a - stride]);
-        let q0 = i32::from(plane[a]);
-        let q1 = i32::from(plane[a + stride]);
+        let p1 = i32::from(px[0][i]);
+        let p0 = i32::from(px[1][i]);
+        let q0 = i32::from(px[2][i]);
+        let q1 = i32::from(px[3][i]);
         if simple_threshold(p1, p0, q0, q1, limit) {
             let f = filter_common(p1, p0, q0, q1, true);
-            plane[a - stride] = f[1] as u8;
-            plane[a] = f[2] as u8;
+            plane[anchor - stride + i] = f[1] as u8;
+            plane[anchor + i] = f[2] as u8;
         }
     }
 }
