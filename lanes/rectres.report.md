@@ -1,11 +1,12 @@
 # lane-rectres — non-skip residual on Rect128/Ab128 pieces
 
-Base: `3b4673fe` (lane-rectres worktree). Disposition: **stays-off (BD
-unmeasured — fixtures prerequisite missing; see §4)**. `EC_AV1_RECTRES`
-keeps its default (off): OFF is today's behavior bit for bit — the search
-never flips a rect/AB piece to non-skip, so the writer's lifted refusal is
-never reached. Pins untouched at 8291 / 33227 (no default change, so no pin
-run, no lib suite). Never merged, never pushed.
+Base: `3b4673fe` (lane-rectres worktree). Disposition: **stays-off**
+(inert + exact — the RD takes 0 rect/AB residual fires per frame on every
+gate clip). `EC_AV1_RECTRES` keeps its default (off): OFF is today's
+behavior bit for bit — the search never flips a rect/AB piece to non-skip,
+so the writer's lifted refusal is never reached. Pins untouched at
+8291 / 33227 (no default change, so no pin run, no lib suite). Never
+merged, never pushed.
 
 ## 1. What shipped (commit `26a9b79e`)
 
@@ -69,51 +70,100 @@ run, no lib suite). Never merged, never pushed.
   "writer coded 2760; 64x64 CDEF units taking another unit's literal: 62",
   ok. LOADAVG 7.90/7.85/9.32 before, 9.39/8.16/9.37 after.
 
-## 3. BD measurement — NOT RUN (prerequisite missing)
+## 3. BD measurement (VPS-2, per Main's recipe)
 
-The control attempt of `bd_rate_film_long_gop` (gated
-`systemd-run --user -p MemoryMax=14G --wait
---unit=rectres-longgop-control`) skipped by name: the worktree has no
-`fixtures/` — `h264-1080p/2160p...mp4` and
-`real-library-manifest.tsv` are absent, and the gate resolves fixtures at
-`CARGO_MANIFEST_DIR/../../fixtures` INSIDE this worktree
-(`~/.cache/rectres/longgop-control.log`: five "SKIP ... missing" lines,
-"SKIP bd_rate_film_long_gop: no clip"). Media files are read-only and the
-main checkout must not be touched, so the gate needs the worktree's
-fixtures directory populated (copy or symlink of the main checkout's
-`fixtures/`) before control and arm (`EC_AV1_RECTRES=1`) runs. Neither BD
-table, fire census per clip, nor wall deltas exist yet; the keep rule is
-UNMEASURED.
+The worktree has no `fixtures/`, so all four gates ran on VPS-2
+(tCloud@2.28.124.204, 4 vCPU, MemoryMax=5G units, ffmpeg PATH shim). The
+sanity gate PASSED before drawing any conclusion: the control run
+reproduces the standing table (b128res.report §2/§3) to the digit —
+long-GOP film A +20.9/-9.0 and film B +70.4/-2.2, and all five native
+rows identical (±0.0 per cell, requirement was ±0.2).
 
-UNBLOCK (verified 2026-09-12): the media fixtures themselves DO exist in
-the main checkout's `fixtures/` (e.g.
-`/home/tahinli/Documents/Code/Rust/edith_codecs/fixtures/video/av1-1080p-23.976-8bit.mp4`
-and `real-library-manifest.tsv`); only the worktree's copy is missing.
-From the worktree root: `ln -s ../edith_codecs/fixtures fixtures` (a
-worktree-side symlink; the media stays read-only), then re-run the two
-gates: control (`cargo test -p ec-av1 --release --lib -- --ignored
---exact --nocapture encode::tests::bd_rate_film_long_gop`) and the same
-under `EC_AV1_RECTRES=1`, then `bd_rate_screen_native` both ways, each
-under `systemd-run --user -p MemoryMax=14G --wait --unit=rectres-<name>`,
-one at a time, LOADAVG before/after.
+### 3a. Long-GOP BD (deciding; 48 pictures, gop=48, both films)
 
-## 4. Disposition
+Control = default (off), arm = `EC_AV1_RECTRES=1`, same HEAD. BD-rate,
+lower better:
 
-`stays-off`. Charter branches: mismatch → stopped (none: all witnesses
-exact); keep rule met → ships-on (unmeasurable here); inert+exact → stays
-off. With BD unrun the only safe disposition is default OFF — which is
-bit-exact today's behavior by construction (the knob gates the only path
-that flips a piece to non-skip). `fix-now | deferred(<unblock>) |
-accepted`: BD control+arm runs and the census report are
-`deferred(worktree fixtures/ populated with the real-library manifest)`;
-witnesses, writer, search arms, owner map and census line are shipped and
-accepted. Pins unmoved at 8291 / 33227. No suite run (default did not
-flip).
+| row | off vs libaom | off vs rav1e | on vs libaom | on vs rav1e |
+|---|---|---|---|---|
+| film A (1080p) 1920x768 | +20.9% | -9.0% | +20.9% | -9.0% |
+| film B (2160p HDR) 1920x1024 | +70.4% | -2.2% | +70.5% | -2.1% |
 
-## 5. Non-goals respected
+Wall ours: film A 1394.1s -> 1417.6s (+1.7%), film B 1076.6s -> 1118.3s
+(+3.9%).
+
+EVIDENCE: ~/.cache/rectres/longgop-control.log | VPS-2 gate, MemoryMax=5G,
+ffmpeg shim PATH | film A +20.9%/-9.0%, film B +70.4%/-2.2%; three-way
+exactness assertion held at every clip x q x frame. LOADAVG 0.15/0.17/0.18
+before, 1.08/1.09/1.09 after.
+EVIDENCE: ~/.cache/rectres/longgop-arm.log | VPS-2 gate, EC_AV1_RECTRES=1,
+MemoryMax=5G | film A +20.9%/-9.0%, film B +70.5%/-2.1%. LOADAVG
+0.14/0.23/0.58 before, 1.05/1.08/1.08 after.
+
+### 3b. 12-frame native guard (all five rows)
+
+| row | off vs libaom | off vs rav1e | on vs libaom | on vs rav1e | wall ours off->on |
+|---|---|---|---|---|---|
+| bars 1080p | -3.3% | -19.0% | -3.4% | -19.0% | 424.8s -> 435.7s |
+| bars 2160p | +8.4% | -13.9% | +8.5% | -13.9% | 365.0s -> 372.8s |
+| film A | +17.9% | -6.3% | +17.8% | -6.4% | 369.4s -> 376.9s |
+| film B | +22.6% | -3.8% | +22.5% | -3.9% | 311.9s -> 318.4s |
+| screen capture | +14.4% | -33.2% | +14.4% | -33.2% | 246.4s -> 249.2s |
+
+EVIDENCE: ~/.cache/rectres/native-control.log | VPS-2 gate, five rows,
+MemoryMax=5G | table above, "off" columns; matches the standing table to
+the digit. LOADAVG 0.09/0.20/0.56 before, 1.14/1.15/1.09 after.
+EVIDENCE: ~/.cache/rectres/native-arm.log | VPS-2 gate, five rows,
+EC_AV1_RECTRES=1 | table above, "on" columns. LOADAVG 0.08/0.42/0.77
+before, 1.07/1.10/1.09 after.
+
+### 3c. Fire census (arm runs; per clip, over the four-q ladder)
+
+| clip | rect/AB residual fires (search / writer) |
+|---|---|
+| film A long-GOP (192 frames) | 0 / 0 |
+| film B long-GOP (192 frames) | 0 / 0 |
+| bars 1080p (48 frames) | 0 / 0 |
+| bars 2160p (48 frames) | 0 / 0 |
+| film A 12f (48 frames) | 0 / 0 |
+| film B 12f (48 frames) | 0 / 0 |
+| screen capture (48 frames) | 0 / 0 |
+
+ZERO fires everywhere under the knob: unlike the parked whole-128 arm
+(0.4-1.9 writer fires/frame), the RD never once finds a non-skip rect/AB
+piece worth taking on real content. The arm is not merely flat — it never
+fires. The wall deltas above (+1-4%) are the trial cost paid on every
+skip-winning rect/AB piece for a win that never comes.
+
+## 4. Keep rule — NOT met; disposition
+
+One film row >=0.5 BD down on a column: best delta anywhere is -0.1.
+Other film row flat within +/-0.3: yes. Screen not worse by 0.3: yes.
+Wall <= +15%: yes. The deciding column fails and the arm is inert
+(0 fires) — the charter's stays-off branch, now on measurement rather
+than on a missing fixture. Default stays OFF; no pins, no suite (default
+did not flip). `fix-now | deferred(<unblock>) | accepted`: nothing
+deferred — the measurement asked by the charter is complete; the arm
+itself stays parked behind `EC_AV1_RECTRES`, witnessed exact if a future
+cost model ever makes it fire.
+
+## 5. Procedure notes (VPS-2 gates)
+
+Three setup snags hit and solved, for the next lane running gates there:
+`systemd-run --user` units start in $HOME, not the caller's cwd — put the
+`cd` inside the unit (`--pipe bash -lc 'cd ... && cargo ...'`); the
+rsync'd worktree's `.git` FILE (a worktree pointer, not covered by
+`--exclude /.git/`) must be `rm -f .git && git init -q .` on the VPS or
+the repo's memguard test-runner (`git rev-parse --show-toplevel`) refuses
+every test binary; and a failed unit needs
+`systemctl --user reset-failed <unit>` before the name is reusable.
+`pkill -f` with the unit name in the pattern kills your own ssh session.
+
+## 6. Non-goals respected
 
 Main checkout untouched, never pushed/merged, no repo-wide formatters (a
 scoped rustfmt reflow of the two edited files was fully reverted by
 restoring HEAD bytes and replaying the semantic edits — the committed diff
-is semantic-only, 643+/39-), media files read-only, one gate at a time,
-logs under ~/.cache/rectres/.
+is semantic-only, 643+/39-), media files read-only, one gate at a time
+(both locally and on VPS-2), logs under ~/.cache/rectres/ and
+/home/tCloud/gates/logs/.
