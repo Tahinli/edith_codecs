@@ -372,16 +372,10 @@ impl FrameHeader {
         // --- entropy updates (§9.9; dixie decode_entropy_header) ---
         // Coefficient probability updates are read for every frame; on
         // key frames the tables were reset to defaults above.
-        let trace = std::env::var_os("EC_VP8_TRACE").is_some();
-        let mut idx = 0;
         for i in 0..4 {
             for j in 0..8 {
                 for k in 0..3 {
                     for l in 0..11 {
-                        if trace {
-                            eprintln!("IDX {idx} flag={}", crate::tables::COEFF_UPDATE_PROBS[i][j][k][l]);
-                        }
-                        idx += 1;
                         if d.read_bool(crate::tables::COEFF_UPDATE_PROBS[i][j][k][l]) {
                             state.coeff_probs[i][j][k][l] = d.read_literal(8) as u8;
                         }
