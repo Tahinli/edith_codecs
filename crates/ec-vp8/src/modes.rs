@@ -520,29 +520,48 @@ pub fn mv_out_of_bounds(mv: (i16, i16), edges: (i32, i32, i32, i32)) -> bool {
 /// Chroma motion vector for a whole-MB mode (libvpx
 /// `vp8_build_inter16x16_predictors_mb`): halve each component with
 /// round-half-away-from-zero (`x += 1 | (x >> 31); x /= 2`).
-pub fn chroma_mv_whole(mv: (i16, i16)) -> (i16, i16) {
-    fn half(x: i16) -> i16 {
+pub fn chroma_mv_whole(mv: (i16, i16), fullpel: bool) -> (i16, i16) {
+    fn half(x: i16, fullpel: bool) -> i16 {
         let x = i32::from(x);
-        ((x + (1 | (x >> 31))) / 2) as i16
+        let v = ((x + (1 | (x >> 31))) / 2) as i16;
+        // `& fullpixel_mask` (reconinter.c:333-334): version-3 streams
+        // are full-pel, so the sub-pel bits are cleared after rounding.
+        if fullpel {
+            v & !7
+        } else {
+            v
+        }
     }
-    (half(mv.0), half(mv.1))
+    (half(mv.0, fullpel), half(mv.1, fullpel))
 }
 
 /// Chroma motion vector for one 8x8 quadrant of a SPLITMB (libvpx
 /// `build_4x4uvmvs`): sum the quadrant's four subblock vectors, then
 /// divide by 8 with round-half-away-from-zero
 /// (`t += 4 + (t >> 31) * 8; t /= 8`).
-pub fn chroma_mv_split(quadrant: &[(i16, i16); 4]) -> (i16, i16) {
-    fn eighth(parts: [i16; 4]) -> i16 {
+pub fn chroma_mv_split(quadrant: &[(i16, i16); 4], fullpel: bool) -> (i16, i16) {
+    fn eighth(parts: [i16; 4], fullpel: bool) -> i16 {
         let t = i32::from(parts[0])
             + i32::from(parts[1])
             + i32::from(parts[2])
             + i32::from(parts[3]);
         let t = t + 4 + (t >> 31) * 8;
-        (t / 8) as i16
+        let v = (t / 8) as i16;
+        // `& fullpixel_mask` (reconinter.c:472-481).
+        if fullpel {
+            v & !7
+        } else {
+            v
+        }
     }
     (
-        eighth([quadrant[0].0, quadrant[1].0, quadrant[2].0, quadrant[3].0]),
-        eighth([quadrant[0].1, quadrant[1].1, quadrant[2].1, quadrant[3].1]),
+        eighth(
+            [quadrant[0].0, quadrant[1].0, quadrant[2].0, quadrant[3].0],
+            fullpel,
+        ),
+        eighth(
+            [quadrant[0].1, quadrant[1].1, quadrant[2].1, quadrant[3].1],
+            fullpel,
+        ),
     )
 }
