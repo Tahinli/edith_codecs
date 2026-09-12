@@ -268,7 +268,13 @@ pub(crate) fn decode_mb_tokens(
             let n0 = usize::from($ptype == 0);
             let (l, a) = ctxs.ctx_pair(mb_col, $idx);
             let ctx = (usize::from(l) + usize::from(a)).min(2);
+            if std::env::var_os("EC_VP8_TRACE").is_some() {
+                eprintln!("TB {} ctx={} l={} a={}", $idx, ctx, l, a);
+            }
             let eob = get_coeffs(bc, &probs[$ptype], ctx, n0, $dc, $ac, $slot);
+            if std::env::var_os("EC_VP8_TRACE").is_some() {
+                eprintln!("TBE {} eob={}", $idx, eob);
+            }
             out.eobs[$idx] = eob as u8;
             let t = u8::from(eob > 0);
             ctxs.set_ctx(mb_col, $idx, t);

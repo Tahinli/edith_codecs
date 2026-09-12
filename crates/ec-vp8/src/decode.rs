@@ -557,6 +557,10 @@ impl Decoder {
             header.refresh.sign_bias_altref,
         ];
 
+        // §13.3: non-existent neighbours are empty — the above context
+        // is cleared at every frame start, like the key-frame path.
+        self.token_ctxs.reset_above_row();
+
         // Phase 1: every mode record of the frame, row-major (§16).
         eprintln!("STAGE modes");
         for row in 1..=self.mb_rows {

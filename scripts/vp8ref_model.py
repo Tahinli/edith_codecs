@@ -299,7 +299,7 @@ def main():
                 x = 0
                 for i in range(3):
                     x += d.bool(p[9 + i]) << i
-                for i in (8, 7, 6, 5, 4):
+                for i in (9, 8, 7, 6, 5, 4):
                     x += d.bool(p[9 + i]) << i
                 if (x & 0xFFF0) == 0 or d.bool(p[9 + 3]):
                     x += 8
@@ -610,8 +610,10 @@ def main():
                 def one(blkidx, ptype, n0):
                     o = [0] * 16
                     ctxv = min(2, left_ctx[LEFT[blkidx]] + above_ctx[c - 1][ABOVE[blkidx]])
+                    print(f"TB {blkidx} ctx={ctxv} l={left_ctx[LEFT[blkidx]]} a={above_ctx[c - 1][ABOVE[blkidx]]}")
                     print(f"T {r-1} {c-1} {blkidx} {ptype} {ctxv}")
                     eob = get_coeffs(ptype, n0, ctxv, o)
+                    print(f"TBE {blkidx} eob={eob}")
                     t = 1 if eob > 0 else 0
                     left_ctx[LEFT[blkidx]] = t
                     above_ctx[c - 1][ABOVE[blkidx]] = t

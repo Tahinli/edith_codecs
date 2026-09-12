@@ -356,7 +356,7 @@ pub fn read_mv_component(d: &mut BoolDecoder<'_>, probs: &[u8; MVP_COUNT]) -> i1
         for i in 0..3 {
             x += i32::from(d.read_bool(probs[MVP_BITS + i])) << i;
         }
-        let mut i = 8;
+        let mut i = 9;
         loop {
             x += i32::from(d.read_bool(probs[MVP_BITS + i])) << i;
             i -= 1;
