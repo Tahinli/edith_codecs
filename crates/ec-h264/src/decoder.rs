@@ -901,6 +901,14 @@ impl SliceCtx {
         refs.get(self.lists[list].get(idx as usize)?)
     }
 
+    /// True when no slice-level weighting can apply at all, so every
+    /// component of every partition resolves to [`Weights::DEFAULT`] without
+    /// the per-component lookup: neither weighted prediction (P) nor
+    /// weighted/bi-prediction (B) is signalled.
+    fn no_weights(&self) -> bool {
+        self.weighted_bipred_idc == 0 && !self.weighted_pred
+    }
+
     /// Prediction weights of one component (clause 8.4.3).
     fn weights_for(
         &self,
@@ -2226,13 +2234,21 @@ fn compensate(
     let x0 = (mb_x * 16 + px * 4) as i32;
     let y0 = (mb_y * 16 + py * 4) as i32;
     let (w, h) = (pw * 4, ph * 4);
-
-    let wt = ctx.weights_for(refs, 0, ref_idx[0], ref_idx[1], use0, use1);
-    // 8.4.2.3.1 over one list is the identity, so the interpolation of that one
-    // list IS the prediction: it is written straight into the picture at the
-    // picture's own pitch, rather than into a temporary that is combined into a
-    // second temporary and copied a third time.
-    let direct = wt.is_default() && (use0 != use1);
+    // A stream carrying no weighted prediction at all resolves every
+    // component to the identity weighting without the per-component lookup.
+    let plain = ctx.no_weights();
+    let wt = if plain {
+        Weights::DEFAULT
+    } else {
+        ctx.weights_for(refs, 0, ref_idx[0], ref_idx[1], use0, use1)
+    };
+    // 8.4.2.3.1 over one list is the identity, so the interpolation of that
+    // one list IS the prediction: it is written straight into the picture at
+    // the picture's own pitch. Over both lists the combined prediction is the
+    // rounded byte average of the two clipped ones, so list 0 interpolates
+    // into the picture and list 1 averages on top of it (Put::Avg) — no
+    // temporaries, no combining pass, no copy back.
+    let direct = wt.is_default();
     let luma_ref = |list: usize| -> Result<RefPlane<'_>> {
         let rp = ctx.reference(refs, list, ref_idx[list]).ok_or_else(|| {
             Error::corrupt("reference index names a picture the buffer does not hold")
@@ -2248,7 +2264,32 @@ fn compensate(
     };
     let stride = pic.y.stride;
     let origin = pic.y.at(x0 as usize, y0 as usize);
-    if direct {
+    if direct && use0 && use1 {
+        let plane = luma_ref(0)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[0],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+            crate::inter::Put::Set,
+        );
+        let plane = luma_ref(1)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[1],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+            crate::inter::Put::Avg,
+        );
+    } else if direct {
         // No scratch buffer is declared on this path at all: the scratch is
         // zeroed on entry, and most partitions of a P slice come through here.
         let list = usize::from(!use0);
@@ -2262,6 +2303,7 @@ fn compensate(
             h,
             stride,
             &mut pic.y.data[origin..],
+            crate::inter::Put::Set,
         );
     } else {
         let mut part = [[0u8; 256]; 2];
@@ -2270,7 +2312,7 @@ fn compensate(
                 continue;
             }
             let plane = luma_ref(list)?;
-            mc_luma(&plane, x0, y0, mv[list], w, h, w, &mut part[list]);
+            mc_luma(&plane, x0, y0, mv[list], w, h, w, &mut part[list], crate::inter::Put::Set);
         }
         let mut out = [0u8; 256];
         let (p0, p1) = part.split_at(1);
@@ -2286,8 +2328,12 @@ fn compensate(
     let (cw, ch) = (w / 2, h / 2);
     let (cx0, cy0) = (x0 / 2, y0 / 2);
     for comp in 0..2 {
-        let wt = ctx.weights_for(refs, comp + 1, ref_idx[0], ref_idx[1], use0, use1);
-        let direct = wt.is_default() && (use0 != use1);
+        let wt = if plain {
+            Weights::DEFAULT
+        } else {
+            ctx.weights_for(refs, comp + 1, ref_idx[0], ref_idx[1], use0, use1)
+        };
+        let direct = wt.is_default();
         let chroma_ref = |list: usize| -> RefPlane<'_> {
             let rp = ctx
                 .reference(refs, list, ref_idx[list])
@@ -2305,7 +2351,32 @@ fn compensate(
         let plane_out = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
         let stride = plane_out.stride;
         let origin = plane_out.at(cx0 as usize, cy0 as usize);
-        if direct {
+        if direct && use0 && use1 {
+            let plane = chroma_ref(0);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[0],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+                crate::inter::Put::Set,
+            );
+            let plane = chroma_ref(1);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[1],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+                crate::inter::Put::Avg,
+            );
+        } else if direct {
             let list = usize::from(!use0);
             let plane = chroma_ref(list);
             mc_chroma(
@@ -2317,6 +2388,7 @@ fn compensate(
                 ch,
                 stride,
                 &mut plane_out.data[origin..],
+                crate::inter::Put::Set,
             );
         } else {
             let mut cpart = [[0u8; 64]; 2];
@@ -2325,7 +2397,17 @@ fn compensate(
                     continue;
                 }
                 let plane = chroma_ref(list);
-                mc_chroma(&plane, cx0, cy0, mv[list], cw, ch, cw, &mut cpart[list]);
+                mc_chroma(
+                    &plane,
+                    cx0,
+                    cy0,
+                    mv[list],
+                    cw,
+                    ch,
+                    cw,
+                    &mut cpart[list],
+                    crate::inter::Put::Set,
+                );
             }
             let mut cout = [0u8; 64];
             let (c0, c1) = cpart.split_at(1);
