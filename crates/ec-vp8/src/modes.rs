@@ -181,17 +181,27 @@ pub enum MvRef {
 }
 
 /// mv_ref coding tree (RFC 6386 §16.2): leaves are [`MvRef`] integers.
+/// mv_ref coding tree (RFC 6386 §16.2); leaves are [`MvRef`] integers.
 pub const MV_REF_TREE: [i8; 8] = [0, 2, -1, 4, -2, 6, -3, -4];
 
 /// Motion-vector component: row then column, each with the 19-probability
 /// table (§17.1).
+/// Probability-table offsets of one MV component (RFC 6386 §17.1).
 pub const MVP_IS_SHORT: usize = 0;
+/// Sign probability offset (§17.1).
 pub const MVP_SIGN: usize = 1;
+/// Short-value tree offset (§17.1).
+/// Short-value tree offset (§17.1).
 pub const MVP_SHORT: usize = 2;
+/// Long-value bit probabilities offset (§17.1).
+/// Long-value bit probabilities offset (§17.1).
 pub const MVP_BITS: usize = MVP_SHORT + 7;
+/// Total probabilities per MV component (§17.1).
+/// Total probabilities per MV component (§17.1).
 pub const MVP_COUNT: usize = MVP_BITS + 10;
 
 /// Small-value coding tree for MV components (§17.1 `small_mvtree`).
+/// Small-value coding tree for MV components (§17.1).
 pub const SMALL_MV_TREE: [i8; 14] = [
     2, 8, // "0" / "1" subtrees
     4, 6, // "00" / "01"
@@ -206,6 +216,7 @@ pub const SMALL_MV_TREE: [i8; 14] = [
 /// RFC's `MVpartition` integers: 0 = top/bottom, 1 = left/right,
 /// 2 = quarters, 3 = MV_16.
 pub const MV_PARTITION_TREE: [i8; 6] = [-3, 2, -2, 4, 0, -1];
+/// SPLITMV partition tree fixed probabilities (§16.4).
 pub const MV_PARTITION_PROBS: [u8; 3] = [110, 111, 150];
 
 /// The four SPLITMV partitionings as subblock groups (§16.4), indexed
@@ -240,6 +251,8 @@ pub enum SubMvRef {
     New4x4 = 3,
 }
 
+/// Sub-MV coding tree (RFC 6386 §16.4); leaves are [`SubMvRef`] integers.
+/// Sub-MV coding tree (RFC 6386 §16.4); leaves are [`SubMvRef`] integers.
 pub const SUB_MV_REF_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 
 /// Context-conditioned sub-MV probabilities (§16.4 `sub_mv_ref_prob`).
@@ -253,6 +266,7 @@ pub const SUB_MV_REF_PROBS: [[u8; 3]; 5] = [
 
 /// Sub-MV tree context (§16.4 `vp8_mvCont`): 4 = left==above==zero,
 /// 3 = left==above, 2 = above zero, 1 = left zero, 0 = normal.
+/// Sub-MV tree context (§16.4 `vp8_mvCont`): 4 = left==above==zero,
 pub fn mv_cont(l: (i16, i16), a: (i16, i16)) -> usize {
     let lez = l == (0, 0);
     let aez = a == (0, 0);

@@ -119,7 +119,9 @@ pub struct Picture {
     pub u: Vec<u8>,
     /// V (Cr) plane, half resolution.
     pub v: Vec<u8>,
+    /// Frame width in pixels.
     pub width: u16,
+    /// Frame height in pixels.
     pub height: u16,
     /// Luma row pitch of the returned planes.
     pub stride: usize,
@@ -167,9 +169,9 @@ impl Decoder {
     /// Decode one frame; returns the picture when it is for display
     /// (`show_frame`). Hidden frames still update the decode state.
     pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Picture>> {
-        let (header, _part0) = FrameHeader::parse(frame, &mut self.state)?;
+        let (header, hdr_dec) = FrameHeader::parse(frame, &mut self.state)?;
         match header.tag.frame_type {
-            FrameType::Key => self.decode_keyframe(frame, header),
+            FrameType::Key => self.decode_keyframe(frame, header, hdr_dec),
             FrameType::Inter => Err(Error::unsupported(
                 "VP8 inter frame",
                 "inter-frame decoding is the next milestone of this crate",
@@ -209,7 +211,12 @@ impl Decoder {
         &mut self.mb_info[row * w + col]
     }
 
-    fn decode_keyframe(&mut self, frame: &[u8], header: FrameHeader) -> Result<Option<Picture>> {
+    fn decode_keyframe(
+        &mut self,
+        frame: &[u8],
+        header: FrameHeader,
+        mut hdr_dec: BoolDecoder<'_>,
+    ) -> Result<Option<Picture>> {
         let kf = header.dims.expect("key frame header carries dimensions");
         self.ensure_buffers(kf);
 
@@ -255,9 +262,6 @@ impl Decoder {
             );
         }
 
-        let hdr_start = crate::frame::FRAME_TAG_SZ + crate::frame::KEYFRAME_HEADER_SZ;
-        let mut hdr_dec = BoolDecoder::new(&frame[hdr_start..header.token_data_offset])?;
-
         self.token_ctxs.reset_above_row();
 
         for row in 1..=self.mb_rows {
@@ -280,6 +284,9 @@ impl Decoder {
             // `r` (0-based) reads partition `r % n` like the reference.
             let part = (row - 1) % partitions.len();
             for col in 1..=self.mb_cols {
+                if std::env::var_os("EC_VP8_TRACE").is_some() {
+                    eprintln!("M {} {}", row - 1, col - 1);
+                }
                 let mb = self.mbi(row, col).clone();
                 let has_y2 = mb.has_y2();
                 let seg_i = usize::from(header.segmentation.enabled) * usize::from(mb.segment_id);
@@ -292,6 +299,9 @@ impl Decoder {
                     y2_dc: dq.y2_dc,
                     y2_ac: dq.y2_ac,
                 };
+                if std::env::var_os("EC_VP8_TRACE").is_some() {
+                    eprintln!("T {} {} hy2={}", row - 1, col - 1, has_y2);
+                }
                 let probs = self.state.coeff_probs;
                 let coeffs = if mb.skip {
                     tokens::skip_mb_tokens(&mut self.token_ctxs, col - 1, has_y2)
