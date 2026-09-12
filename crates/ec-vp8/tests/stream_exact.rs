@@ -4,6 +4,7 @@
 
 mod ivf;
 
+use ec_vp8::decode::Decoder;
 use ec_vp8::stream::decode_stream;
 
 /// Every IVF fixture in the witness set (the WebP still is covered by
@@ -34,12 +35,13 @@ fn decode_stream_matches_ffmpeg_on_every_fixture() {
         let (_, w, h, frames) = ivf::parse_ivf(&bytes);
         let all = ffmpeg_raw_yuv(&path);
         let frame_len = usize::from(w) * usize::from(h) * 3 / 2;
-        assert_eq!(all.len(), frames.len() * frame_len, "{name}: ffmpeg output size");
+        let shown = frames.iter().filter(|f| ivf::show_frame(&f.data)).count();
+        assert_eq!(all.len(), shown * frame_len, "{name}: ffmpeg output size");
         assert!(!frames[0].data.is_empty(), "{name}: empty first frame");
 
         let pictures =
             decode_stream(&bytes).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
-        assert_eq!(pictures.len(), frames.len(), "{name}: picture count");
+        assert_eq!(pictures.len(), shown, "{name}: picture count (shown only)");
         for (i, pic) in pictures.iter().enumerate() {
             let expect = &all[i * frame_len..(i + 1) * frame_len];
             let (cw, ch) = (usize::from(w + 1) / 2, usize::from(h + 1) / 2);
@@ -48,6 +50,58 @@ fn decode_stream_matches_ffmpeg_on_every_fixture() {
             assert_eq!(pic.v, &expect[usize::from(w) * usize::from(h) + cw * ch..], "{name} frame {i}: V");
         }
     }
+}
+
+/// The hidden-frame contract, end to end on a REAL auto-alt-ref stream:
+/// `Decoder::decode` returns `Ok(None)` for a hidden frame while its
+/// reference content stays live — the frames that follow (which the
+/// encoder predicted across the hidden altref) stay byte-exact against
+/// ffmpeg.
+#[test]
+fn hidden_frames_update_references_and_produce_no_picture() {
+    let Some(dir) = ivf::fixture_dir() else {
+        panic!("fixtures missing; run scripts/gen_vp8_fixtures.sh");
+    };
+    let path = dir.join("altref-160x96.ivf");
+    let bytes = std::fs::read(&path).unwrap();
+    let (_, w, h, frames) = ivf::parse_ivf(&bytes);
+    let hidden_at: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !ivf::show_frame(&f.data))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        hidden_at.len() >= 6,
+        "altref-160x96.ivf lost its hidden frames ({}) — regenerate",
+        hidden_at.len()
+    );
+
+    // ffmpeg's display stream, shown-frame-indexed.
+    let all = ffmpeg_raw_yuv(&path);
+    let frame_len = usize::from(w) * usize::from(h) * 3 / 2;
+    let mut dec = Decoder::new();
+    let mut shown_seen = 0;
+    for (i, f) in frames.iter().enumerate() {
+        let pic = dec.decode(&f.data).expect("hidden frame decodes");
+        if ivf::show_frame(&f.data) {
+            let expect = &all[shown_seen * frame_len..(shown_seen + 1) * frame_len];
+            let y = &pic.as_ref().expect("shown frame has picture").y;
+            assert_eq!(y, &expect[..usize::from(w) * usize::from(h)], "frame {i}: Y");
+            // The frame right after the FIRST hidden altref must already
+            // be byte-exact: it predicts across the hidden reference.
+            if i == hidden_at[0] + 1 {
+                assert!(
+                    y[..32] == expect[..32] && y == &expect[..y.len()],
+                    "frame after hidden altref diverges"
+                );
+            }
+            shown_seen += 1;
+        } else {
+            assert!(pic.is_none(), "hidden frame {i} produced a picture");
+        }
+    }
+    assert_eq!(shown_seen * frame_len, all.len());
 }
 
 /// ffmpeg's decoded rawvideo byte stream for an IVF file.

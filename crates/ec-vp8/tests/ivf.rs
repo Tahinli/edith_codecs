@@ -11,6 +11,13 @@ pub struct IvfFrame {
     pub data: Vec<u8>,
 }
 
+/// The frame tag's `show_frame` bit (RFC 6386 §9.1): hidden frames
+/// (`false`) update the reference buffers but are never displayed.
+#[allow(dead_code)] // not every witness binary needs the census
+pub fn show_frame(data: &[u8]) -> bool {
+    (data[0] >> 4) & 1 == 1
+}
+
 /// Parse an IVF file into (fourcc, width, height, frames).
 pub fn parse_ivf(bytes: &[u8]) -> (&str, u16, u16, Vec<IvfFrame>) {
     assert_eq!(&bytes[0..4], b"DKIF", "not an IVF file");
