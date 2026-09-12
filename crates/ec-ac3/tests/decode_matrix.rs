@@ -275,3 +275,83 @@ fn damaged_input_never_panics() {
     }
     let _ = decoder.decode_frame(&noise);
 }
+
+/// A packet that carries a second frame after the first — the shape a
+/// Matroska block for 7.1 DD+ really has (independent substream plus its
+/// dependent) — must not decode to the first frame's samples in silence:
+/// the tail is stream, and dropping it loses the extension channels without
+/// a word. Built from two real frames of the fixture: the tail as it stands
+/// (another independent frame) is refused as a second syncframe, and the
+/// same packet with the tail's stream-type bits flipped to `dependent` is
+/// refused as the dependent substream it then claims to be. The AC-3 path
+/// answers the same way for an AC-3 tail.
+#[test]
+fn a_concatenated_tail_is_refused_by_name_not_dropped() {
+    let dir = fixtures();
+    if !dir.join("eac3-5.1-48000.eac3").exists() {
+        eprintln!("skipping: no fixtures");
+        return;
+    }
+    for name in ["ac3-5.1-48000.ac3", "eac3-5.1-48000.eac3"] {
+        let data = std::fs::read(dir.join(name)).expect("fixture");
+        let first = ec_ac3::frame_size(&data).expect("first frame size");
+        let second = ec_ac3::frame_size(&data[first..]).expect("second frame size");
+        let mut packet = data[..first].to_vec();
+        packet.extend_from_slice(&data[first..first + second]);
+
+        let mut dec = Ac3Decoder::new();
+        let err = dec
+            .decode_frame(&packet)
+            .expect_err("{name}: the tail is stream, not padding");
+        let text = err.to_string();
+        eprintln!("{name}: {text}");
+        assert!(
+            text.contains("second syncframe"),
+            "{name}: the independent tail must name itself: {text}"
+        );
+        if name.starts_with("eac3") {
+            // Flip the tail's stream-type (bits 16..18 of a frame: the top
+            // two bits of byte 2) to `dependent`. The packet is then the
+            // shape a 7.1 DD+ block carries, and the refusal names the
+            // dependent substream.
+            let mut dep_packet = packet.clone();
+            dep_packet[first + 2] = (dep_packet[first + 2] & 0x3F) | 0x40;
+            let err = dec
+                .decode_frame(&dep_packet)
+                .expect_err("the dependent tail is stream");
+            let text = err.to_string();
+            eprintln!("{name} (tail flipped to dependent): {text}");
+            assert!(
+                text.contains("dependent substream"),
+                "the dependent tail must name itself: {text}"
+            );
+        }
+    }
+}
+
+/// The spec's own allowance: a container may pad a block around a frame, and
+/// padding that is not itself a syncframe decodes exactly like the bare
+/// frame — sample for sample, whatever its length.
+#[test]
+fn padding_that_is_not_a_syncframe_still_decodes() {
+    let path = fixtures().join("ac3-5.1-48000.ac3");
+    if !path.exists() {
+        eprintln!("skipping: no fixtures");
+        return;
+    }
+    let data = std::fs::read(&path).expect("fixture");
+    let first = ec_ac3::frame_size(&data).expect("frame size");
+    let frame = &data[..first];
+    let mut dec = Ac3Decoder::new();
+    let bare = dec.decode_frame(frame).expect("bare frame");
+    for pad in [1usize, 6, 64, 1024] {
+        let mut padded = frame.to_vec();
+        padded.resize(first + pad, 0x00);
+        let mut dec = Ac3Decoder::new();
+        let got = dec.decode_frame(&padded).expect("padded frame decodes");
+        assert!(
+            got.data[0].iter().eq(bare.data[0].iter()),
+            "pad of {pad} bytes changed the audio"
+        );
+    }
+}
