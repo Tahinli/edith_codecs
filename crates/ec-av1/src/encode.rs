@@ -752,15 +752,56 @@ fn b128_root() -> bool {
 /// the decoder derives, and on this HEAD the same row re-measures three-way
 /// EXACT (encoder reconstruction == ffmpeg == `decode_stream`, every frame,
 /// every plane, both gates). The knob stays as the arm's gate, not as a
-/// defect flag; the residual arm is also what
-/// [`crate::tile::write_inter_block_128_rect`]'s skip-only halves would
-/// share if they ever carry one.
+/// defect flag.
 fn b128_residual() -> bool {
     static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
         crate::envflags::var("EC_AV1_B128RES").ok().map(|v| v != "0")
     });
     (ENV.unwrap_or(false) || FORCE_B128_RESIDUAL.load(std::sync::atomic::Ordering::Relaxed))
         && b128_root()
+}
+/// lane-rectres: whether the 128 root's RECTANGULAR pieces -- the two
+/// HORZ/VERT halves and the four AB shapes' three pieces (two 64x64 squares
+/// plus one half) -- price a REAL residual in the RD as well as the skip arm
+/// ([`search_root_128_rect`] / [`search_root_128_ab`], written through
+/// [`crate::tile::write_inter_block_128_rect`]). **Off by default**
+/// (`EC_AV1_RECTRES=1` turns it on): OFF is today's behavior bit for bit --
+/// no rect/AB piece can come out non-skip, so the writer's refusal is never
+/// reached. The residual shape is the whole 128 block's, halved or quartered
+/// per piece: one TX_64X64 luma unit plus a TX_32X32 chroma pair per 64x64
+/// mu chunk, var-tx depth 0 (exactly what the decoder's mu-chunk loop reads
+/// for any inter partition shape).
+fn rectres() -> bool {
+    static ENV: std::sync::LazyLock<Option<bool>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_RECTRES")
+            .ok()
+            .map(|v| v != "0")
+    });
+    ENV.unwrap_or(false) || FORCE_B128_RECTRES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only: take the rect/AB pieces' residual arm whatever it costs, so a
+/// witness clip codes the shape rather than waiting for content on which the
+/// RD picks it (the same role [`FORCE_B128_RESIDUAL`] plays at the NONE
+/// root). Never read outside `#[cfg(test)]` builds.
+static FORCE_B128_RECTRES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arms [`FORCE_B128_RECTRES`] for the rest of the process.
+#[cfg(test)]
+pub(crate) fn force_b128_rectres(on: bool) {
+    FORCE_B128_RECTRES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many rect/AB pieces the search left WITH a residual rather than
+/// skipped, since the last [`take_b128_rectres_hits`] (class
+/// `gate-blind-to-feature`).
+static B128_RECTRES_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The rect/AB-piece-residual count since the last call, and zero it.
+pub fn take_b128_rectres_hits() -> usize {
+    B128_RECTRES_HITS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// lane-b128r: whether the 128 root offers the COMPOUND candidates the 64
@@ -9905,11 +9946,124 @@ fn search_root_128(
     ))
 }
 
+/// lane-rectres: one rect/AB piece's REAL residual, priced against the skip
+/// arm the caller's [`search_skip_64`] just committed to the planes (which
+/// IS the winner's prediction, sample for sample -- the same rule
+/// [`search_root_128`]'s residual arm runs at the NONE root). The piece's
+/// residual is one TX_64X64 luma unit plus a TX_32X32 chroma pair per 64x64
+/// mu chunk (two chunks for a 128x64 / 64x128 half, one for a 64x64 square),
+/// each trial at sides the forward network already reaches, never a
+/// rectangular transform; var-tx depth 0 only -- the units ARE the tree's
+/// leaves, exactly what `decode_inter_block`'s mu-chunk loop reads.
+///
+/// The depth-0 `txfm_partition` symbols the writer codes for the units are
+/// not priced, exactly as [`search_root_128`] does not price its four (their
+/// contexts are only known at write time); at two symbols a half this is
+/// under a bit against residuals of hundreds. On a win (or under the witness
+/// force) the trials are committed to the planes, `block` is flipped to
+/// carry the packed level grids [`crate::tile::write_inter_block_128_rect`]
+/// slices back out, and the new cost is returned; otherwise `cost` passes
+/// through untouched. Counts [`take_b128_rectres_hits`] on a win.
+#[allow(clippy::too_many_arguments)]
+fn search_rect_residual(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    // The piece's own top-left, in luma samples.
+    (px, py): (usize, usize),
+    // Its true footprint: (128, 64) HORZ, (64, 128) VERT, (64, 64) square.
+    (w, h): (usize, usize),
+    cost: f64,
+    lambda: f64,
+    search: &Search<'_>,
+    // The piece's own mv stack, for the skip symbol's cost either way.
+    stack: &crate::mvstack::MvStack,
+    block: &mut BlockCoeffs,
+) -> f64 {
+    /// The 64x64 "mu" chunk side, luma; chroma halves it.
+    const MU: usize = SUPERBLOCK;
+    let chunks: [(usize, usize); 2] = match (w, h) {
+        (128, 64) => [(0, 0), (0, 1)],
+        (64, 128) => [(0, 0), (1, 0)],
+        _ => [(0, 0), (0, 0)],
+    };
+    let n = if w.max(h) > MU { 2 } else { 1 };
+    // Every unit's coded level grid is 32x32 (a 64-point transform codes
+    // only its top-left corner), packed per plane into one 64-wide grid with
+    // chunk (cr, cc) at (cr * 32, cc * 32) -- the layout the writer slices
+    // back out in the same chunk order.
+    let mut packed = [vec![0i32; 64 * 64], vec![0i32; 64 * 64], vec![0i32; 64 * 64]];
+    let mut sse_skip = 0.0f64;
+    let mut sse_res = 0.0f64;
+    let mut coeff_bits = 0.0f64;
+    let mut trials_per_chunk: Vec<[Trial; 3]> = Vec::with_capacity(n);
+    for &(cr, cc) in &chunks[..n] {
+        let (cxx, cyy) = (px + cc * MU, py + cr * MU);
+        let (cx, cy) = (cxx / 2, cyy / 2);
+        let half = MU / 2;
+        let pred_y = rows_of(&luma.reconstruction, luma.width, cxx, cyy, MU);
+        let pred_u = rows_of(&chroma[0].reconstruction, chroma[0].width, cx, cy, half);
+        let pred_v = rows_of(&chroma[1].reconstruction, chroma[1].width, cx, cy, half);
+        sse_skip += luma.block_sse(cxx, cyy, MU, &pred_y)
+            + chroma[0].block_sse(cx, cy, half, &pred_u)
+            + chroma[1].block_sse(cx, cy, half, &pred_v);
+        let trials = [
+            luma.code_from_prediction(
+                cxx, cyy, MU, &pred_y, false, search.base_q_idx, search.deadzone,
+                TxbSet::Luma64,
+            ),
+            chroma[0].code_from_prediction(
+                cx, cy, half, &pred_u, false, search.base_q_idx, search.deadzone,
+                TxbSet::Chroma32,
+            ),
+            chroma[1].code_from_prediction(
+                cx, cy, half, &pred_v, false, search.base_q_idx, search.deadzone,
+                TxbSet::Chroma32,
+            ),
+        ];
+        for (plane, trial) in trials.iter().enumerate() {
+            sse_res += trial.sse;
+            coeff_bits += trial.bits;
+            for row in 0..32 {
+                packed[plane][(cr * 32 + row) * 64 + cc * 32..][..32]
+                    .copy_from_slice(&trial.levels[row * 32..][..32]);
+            }
+        }
+        trials_per_chunk.push(trials);
+    }
+    // `cost` is the skip arm's own `sse + lambda * syntax`; the residual arm
+    // pays the same syntax with `skip` coded 0 instead of 1, plus its
+    // coefficients.
+    let unskip = skip_bits_at(stack, false) - skip_bits_at(stack, true);
+    let res_cost = cost - sse_skip + sse_res + lambda * (unskip + coeff_bits);
+    if res_cost < cost || FORCE_B128_RECTRES.load(std::sync::atomic::Ordering::Relaxed) {
+        for (trials, &(cr, cc)) in trials_per_chunk.iter().zip(&chunks[..n]) {
+            let (cxx, cyy) = (px + cc * MU, py + cr * MU);
+            let (cx, cy) = (cxx / 2, cyy / 2);
+            let half = MU / 2;
+            luma.commit(cxx, cyy, MU, &trials[0]);
+            chroma[0].commit(cx, cy, half, &trials[1]);
+            chroma[1].commit(cx, cy, half, &trials[2]);
+        }
+        block.skip = false;
+        block.tx_depth = 0;
+        block.luma_tx_types = Vec::new();
+        block.luma = coeffs(&packed[0], 64);
+        block.u = coeffs(&packed[1], 64);
+        block.v = coeffs(&packed[2], 64);
+        B128_RECTRES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        res_cost
+    } else {
+        cost
+    }
+}
+
 /// lane-b128hv: the `PARTITION_HORZ` / `PARTITION_VERT` candidate for a whole
 /// 128 superblock root -- two 128x64 (`horz`) or 64x128 inter blocks, the
-/// shipped NONE machinery halved. Skip only, single reference or compound,
-/// exactly what `crate::tile::write_inter_block_128_rect` codes and
-/// `decode_inter_block` reads at `sb128_rect`.
+/// shipped NONE machinery halved. Skip-only by default, single reference or
+/// compound; under `EC_AV1_RECTRES` each half also prices a REAL residual
+/// ([`search_rect_residual`]) -- exactly what
+/// `crate::tile::write_inter_block_128_rect` codes and `decode_inter_block`
+/// reads at `sb128_rect`.
 ///
 /// The FIRST half is published into `grid` before the second is searched --
 /// the writer publishes it too, so a second half searched against the stale
@@ -10041,7 +10195,23 @@ fn search_root_128_rect(
             fctx,
         );
         match found {
-            Some((c, block)) => {
+            Some((mut c, mut block)) => {
+                // lane-rectres: the same prediction with a REAL residual,
+                // priced against the skip arm the search just committed to
+                // the planes -- two 64x64 mu chunks for a half.
+                if rectres() && block.skip {
+                    c = search_rect_residual(
+                        luma,
+                        chroma,
+                        (mc * 4, mr * 4),
+                        (w, h),
+                        c,
+                        root_search.lambda,
+                        &root_search,
+                        &stack,
+                        &mut block,
+                    );
+                }
                 cost += c;
                 record_mi_rect(grid, mr, mc, (w_mi, h_mi), block.inter, block.skip);
                 halves.push(block);
@@ -10081,8 +10251,9 @@ fn search_root_128_rect(
 /// `encoder-grid-drift-invisible-to-pixel-gate`). The grid and both planes
 /// are put back before returning; the caller re-applies the winner.
 ///
-/// SKIP only, for the reason [`search_root_128_rect`] gives: the 128 residual
-/// arm the pieces would share is itself parked behind `EC_AV1_B128RES`.
+/// Skip-only by default; under `EC_AV1_RECTRES` each piece also prices a
+/// REAL residual ([`search_rect_residual`]) -- the 64x64 squares are where
+/// libaom's own AB shapes earn their keep.
 ///
 /// Returns `(cost, lambda, the three pieces, reconstruction)`, the cost
 /// already carrying the root's own partition symbol so it ranks against the
@@ -10197,7 +10368,25 @@ fn search_root_128_ab(
             fctx,
         );
         match found {
-            Some((c, block)) => {
+            Some((mut c, mut block)) => {
+                // lane-rectres: the same prediction with a REAL residual,
+                // priced against the skip arm the search just committed to
+                // the planes -- one mu chunk for a 64x64 square, two for a
+                // half. The 64x64 squares are where libaom's own AB shapes
+                // earn their keep.
+                if rectres() && block.skip {
+                    c = search_rect_residual(
+                        luma,
+                        chroma,
+                        (mc * 4, mr * 4),
+                        (w, h),
+                        c,
+                        root_search.lambda,
+                        &root_search,
+                        &stack,
+                        &mut block,
+                    );
+                }
                 cost += c;
                 record_mi_rect(grid, mr, mc, (w_mi, h_mi), block.inter, block.skip);
                 pieces.push(block);
@@ -17253,6 +17442,227 @@ mod tests {
         }
     }
 
+    /// lane-rectres: a `PARTITION_HORZ` 128 root whose two 128x64 halves
+    /// CARRY A RESIDUAL -- the mu-chunk shape (one TX_64X64 luma unit plus a
+    /// TX_32X32 chroma pair per chunk) `write_inter_block_128_rect` now
+    /// codes under `EC_AV1_RECTRES`, at the footprint the decoder's own
+    /// mu-chunk loop reads. The arm is FORCED ([`force_b128_rectres`], the
+    /// rect partition with [`force_b128_rect`]) so every inter root of the
+    /// clip goes through it; the `coded > 0` assert is the guard that catches
+    /// the next fixture drift (the whole-128 twin of this witness went RED
+    /// twice that way).
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored --exact \
+    ///         encode::tests::a_rect128_half_with_a_real_residual --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_rect128_half_with_a_real_residual_decodes_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-rectres-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("smpte-pan-1280x768.y4m");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "smptebars=size=1600x768:rate=24"])
+            .args(["-vf", "crop=1280:768:'min(n*2,300)':0", "-frames:v", "8"])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 8);
+        force_b128_rect(1);
+        force_b128_rectres(true);
+        let _ = take_b128_rectres_hits();
+        let _ = crate::tile::take_sb128_rectres_hits();
+        let encoded = encode_sequence(&pictures, 60, 0.5).unwrap();
+        let (won, coded) =
+            (take_b128_rectres_hits(), crate::tile::take_sb128_rectres_hits());
+        eprintln!("rect halves WITH a residual: search won {won}, writer coded {coded}");
+        assert!(
+            coded > 0,
+            "no 128x64 half carried a residual on this clip, so it cannot witness the arm",
+        );
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            let recon = &frame.reconstruction;
+            for (plane, got, want) in [
+                ("luma", &dec.y, &recon.y),
+                ("U", &dec.u, &recon.u),
+                ("V", &dec.v, &recon.v),
+            ] {
+                let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ, 0,
+                    "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
+                     own reconstruction",
+                    got.len()
+                );
+            }
+        }
+        let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: ffmpeg V");
+        }
+    }
+
+    /// lane-rectres: an AB shape (`PARTITION_HORZ_A` forced) whose THREE
+    /// pieces carry residuals -- the 128x64 half through the two-chunk arm,
+    /// the two 64x64 squares through the one-chunk arm (the shape libaom's
+    /// own AB partitions earn their keep with). testsrc2 at 12 frames, the
+    /// shipped AB witness's own recipe: an 8-frame clip parks an ARF whose
+    /// reference picture the GOP has not produced yet, which refuses before
+    /// any AB root is coded.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored --exact \
+    ///         encode::tests::an_ab128_piece_with_a_real_residual --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn an_ab128_piece_with_a_real_residual_decodes_exact_through_both_decoders() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-rectres-ab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("testsrc2-1280x768.y4m");
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=1280x768:rate=24"])
+            .args(["-frames:v", "12", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        force_b128_ab(4);
+        force_b128_rectres(true);
+        let _ = take_b128_rectres_hits();
+        let _ = crate::tile::take_sb128_rectres_hits();
+        let encoded = encode_sequence(&pictures, 60, 0.5).unwrap();
+        let (won, coded) =
+            (take_b128_rectres_hits(), crate::tile::take_sb128_rectres_hits());
+        eprintln!("AB pieces WITH a residual: search won {won}, writer coded {coded}");
+        assert!(
+            coded > 0,
+            "no AB piece carried a residual on this clip, so it cannot witness the arm",
+        );
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            let recon = &frame.reconstruction;
+            for (plane, got, want) in [
+                ("luma", &dec.y, &recon.y),
+                ("U", &dec.u, &recon.u),
+                ("V", &dec.v, &recon.v),
+            ] {
+                let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differ, 0,
+                    "frame {i}: {plane} -- {differ} of {} samples differ from the encoder's \
+                     own reconstruction",
+                    got.len()
+                );
+            }
+        }
+        let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: ffmpeg V");
+        }
+    }
+
+    /// lane-rectres, lane-edge128's interaction on the rect shapes: a HORZ
+    /// half WITH a residual under a clip whose CDEF search codes a
+    /// per-64x64 `cdef_idx` list. The half codes ONE literal at its origin
+    /// and the decoder stamps BOTH units it spans with it, so the owner map
+    /// ([`crate::tile::cdef_unit_owner`], now extended past Whole128) has to
+    /// collapse the pair -- exactly the bug class that broke bars 2160p at
+    /// the whole-128 root. RED before this lane by construction: no rect
+    /// piece could carry a residual, so no such literal existed.
+    ///
+    ///     cargo test -p ec-av1 --release --lib -- --ignored --exact \
+    ///         encode::tests::a_rect128_residual_half_under_a_per_unit_cdef --nocapture
+    #[test]
+    #[ignore = "sets the process-global superblock size: run it alone"]
+    fn a_rect128_residual_half_under_a_per_unit_cdef_list_decodes_exact() {
+        let _knobs = crate::speed::knob_write();
+        if !have_ffmpeg() {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        }
+        force_sb128(true);
+        let dir = std::env::temp_dir().join(format!("ec-av1-rectres-cdef-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("testsrc2-1280x768.y4m");
+        // Detailed synthetic content: its CDEF search spends more than one
+        // strength pair, which is what puts a `cdef_idx` literal in the tile.
+        let ok = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=1280x768:rate=24"])
+            .args(["-frames:v", "12", "-pix_fmt", "yuv420p"])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg failed to run")
+            .success();
+        assert!(ok, "ffmpeg could not write the synthetic clip");
+        let (width, height) = (1280usize, 768usize);
+        let pictures =
+            crate::probe::source(clip.to_str().unwrap(), "0", "null", width, height, 12);
+        force_b128_rect(1);
+        force_b128_rectres(true);
+        let _ = crate::tile::take_sb128_rectres_hits();
+        let _ = crate::filter_search::take_cdef_covered_units();
+        let encoded = encode_sequence(&pictures, 90, 0.5).unwrap();
+        let coded = crate::tile::take_sb128_rectres_hits();
+        let covered = crate::filter_search::take_cdef_covered_units();
+        eprintln!(
+            "rect halves WITH a residual: writer coded {coded}; 64x64 CDEF units taking \
+             another unit's literal: {covered}"
+        );
+        assert!(coded > 0, "no 128x64 half carried a residual on this clip");
+        assert!(
+            covered > 0,
+            "no 64x64 unit took a non-zero preset from another unit's literal, so this clip \
+             cannot witness the rule",
+        );
+        let decoded = crate::stream::decode_stream(&encoded.stream).expect("our decoder");
+        assert_eq!(decoded.len(), encoded.frames.len(), "frame count");
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            for (plane, got, want) in [
+                ("luma", &dec.y, &frame.reconstruction.y),
+                ("U", &dec.u, &frame.reconstruction.u),
+                ("V", &dec.v, &frame.reconstruction.v),
+            ] {
+                let differ = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(differ, 0, "frame {i}: {plane} -- {differ} samples differ");
+            }
+        }
+        let ff = ffmpeg_decode_sequence(&encoded.stream, width, height, pictures.len());
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&ff).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: ffmpeg luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: ffmpeg U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: ffmpeg V");
+        }
+    }
+
     /// lane-b128r: the COMPOUND arm at the 128 root -- one 128x128 block
     /// naming `LAST` plus `GOLDEN`/`ALTREF`, through the same
     /// `write_compound_block` chain every smaller compound block takes, at a
@@ -20248,13 +20658,18 @@ mod tests {
                  {i64_edge} on a superblock the frame edge cuts",
                 100.0 * i64_whole as f64 / i64_offered.max(1) as f64,
             );
+            let _ = take_b128_rectres_hits();
+            let _ = crate::tile::take_sb128_rectres_hits();
             eprintln!(
                 "{name}: 128x128 roots {} (search) / {} (writer), with a residual \
+                 {} (search) / {} (writer); rect/AB pieces with a residual \
                  {} (search) / {} (writer)",
                 take_b128_none_hits(),
                 crate::tile::take_sb128_none_hits(),
                 take_b128_residual_hits(),
                 crate::tile::take_sb128_residual_hits(),
+                take_b128_rectres_hits(),
+                crate::tile::take_sb128_rectres_hits(),
             );
             eprintln!(
                 "{name}: 64x64 roots {} (with a residual {}, split luma {}, compound {})",
