@@ -335,10 +335,13 @@ fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
     let mid = emid.sqrt();
     let side = eside.sqrt();
     // 0.63662 is the reference's own 2/pi literal (vq.c, stereo_itheta); the
-    // exact constant would round a boundary theta differently.
+    // exact constant would round a boundary theta differently. The angle is
+    // the reference float build's `fast_atan2f` (the rational approximation
+    // the tonality features share), which also keeps libm's `atan2` out of
+    // the per-band loop.
     #[allow(clippy::approx_constant)]
-    const TWO_OVER_PI: f64 = 0.63662;
-    (0.5 + 16384.0 * TWO_OVER_PI * (side as f64).atan2(mid as f64)).floor() as i32
+    const TWO_OVER_PI: f32 = 0.63662;
+    (TWO_OVER_PI * 16384.0 * crate::analysis::fast_atan2f(side, mid) + 0.5).floor() as i32
 }
 
 /// `l1_metric()` from the reference: L1 norm scaled by `(1 + LM*bias)`.

@@ -22,7 +22,6 @@
 //! exactly as the reference does it, never an O(N^2) direct evaluation.
 
 use ec_core::{Error, Result};
-use ec_dsp::Fft;
 
 use crate::range::{RangeDecoder, RangeEncoder};
 
@@ -294,83 +293,155 @@ pub(crate) fn overlap_window() -> Vec<f32> {
 // The N/4 FFT and the inverse MDCT
 // ---------------------------------------------------------------------------
 
-/// A complex FFT of size `15 * 2^k`, the only sizes CELT needs.
+/// A complex inverse FFT of the sizes CELT needs (`15 * 2^k`).
 ///
-/// [`ec_dsp::Fft`] covers the `2^k` factor; the factor of 15 is one extra
-/// decimation stage, so the whole transform stays `O(n log n)` without a
-/// mixed-radix kernel in the DSP crate.
-#[derive(Clone, Debug)]
-pub(crate) struct Fft15 {
-    n: usize,
-    /// Sub-transform of length `n/15`.
-    sub: Fft<f32>,
-    /// `exp(2 pi i * k1 * n2 / n)` twiddles, split.
-    tw_re: Vec<f32>,
-    tw_im: Vec<f32>,
-    scratch_re: Vec<f32>,
-    scratch_im: Vec<f32>,
-}
+/// Two backends behind one signature, selected at compile time:
+///
+/// - default, the in-project shape: [`ec_dsp::Fft`] covers the `2^k` factor
+///   and the factor of 15 is one extra decimation stage (3 x 5), so the whole
+///   transform stays `O(n log n)` without a mixed-radix kernel in the DSP
+///   crate;
+/// - under the optional `fft-rustfft` feature, a rustfft plan plans the size
+///   directly (pure Rust, runtime-detected AVX butterflies, no C). The
+///   family's dependency-free build stays the default; the feature is the
+///   measured speed option.
+///
+/// Both deliver the same contract: an UNSCALED inverse transform,
+/// `X[k] = sum x[n] exp(+2 pi i n k / N)`, over split-complex buffers.
+#[cfg(not(feature = "fft-rustfft"))]
+mod fft15 {
+    use super::dft15;
+    use ec_dsp::Fft;
 
-impl Fft15 {
-    pub(crate) fn new(n: usize) -> Fft15 {
-        assert!(n.is_multiple_of(15) && (n / 15).is_power_of_two());
-        let l = n / 15;
-        let mut tw_re = vec![0.0; n];
-        let mut tw_im = vec![0.0; n];
-        for k1 in 0..15 {
-            for n2 in 0..l {
-                let a = 2.0 * core::f64::consts::PI * (k1 * n2) as f64 / n as f64;
-                tw_re[k1 * l + n2] = a.cos() as f32;
-                tw_im[k1 * l + n2] = a.sin() as f32;
-            }
-        }
-        Fft15 {
-            n,
-            sub: Fft::new(l),
-            tw_re,
-            tw_im,
-            scratch_re: vec![0.0; n],
-            scratch_im: vec![0.0; n],
-        }
+    #[derive(Clone, Debug)]
+    pub(crate) struct Fft15 {
+        n: usize,
+        /// Sub-transform of length `n/15`.
+        sub: Fft<f32>,
+        /// `exp(2 pi i * k1 * n2 / n)` twiddles, split.
+        tw_re: Vec<f32>,
+        tw_im: Vec<f32>,
+        scratch_re: Vec<f32>,
+        scratch_im: Vec<f32>,
     }
 
-    /// Unscaled inverse transform: `X[k] = sum x[n] exp(+2 pi i n k / N)`.
-    pub(crate) fn inverse(&mut self, re: &mut [f32], im: &mut [f32]) {
-        let n = self.n;
-        let l = n / 15;
-        debug_assert_eq!(re.len(), n);
-        // Stage 1: 15-point DFTs over n1 at stride L, twiddled on the way out.
-        for n2 in 0..l {
-            let mut xr = [0.0f32; 15];
-            let mut xi = [0.0f32; 15];
-            for n1 in 0..15 {
-                xr[n1] = re[l * n1 + n2];
-                xi[n1] = im[l * n1 + n2];
-            }
-            let (yr, yi) = dft15(&xr, &xi);
+    impl Fft15 {
+        pub(crate) fn new(n: usize) -> Fft15 {
+            assert!(n.is_multiple_of(15) && (n / 15).is_power_of_two());
+            let l = n / 15;
+            let mut tw_re = vec![0.0; n];
+            let mut tw_im = vec![0.0; n];
             for k1 in 0..15 {
-                let (tr, ti) = (self.tw_re[k1 * l + n2], self.tw_im[k1 * l + n2]);
-                self.scratch_re[k1 * l + n2] = yr[k1] * tr - yi[k1] * ti;
-                self.scratch_im[k1 * l + n2] = yr[k1] * ti + yi[k1] * tr;
+                for n2 in 0..l {
+                    let a = 2.0 * core::f64::consts::PI * (k1 * n2) as f64 / n as f64;
+                    tw_re[k1 * l + n2] = a.cos() as f32;
+                    tw_im[k1 * l + n2] = a.sin() as f32;
+                }
+            }
+            Fft15 {
+                n,
+                sub: Fft::new(l),
+                tw_re,
+                tw_im,
+                scratch_re: vec![0.0; n],
+                scratch_im: vec![0.0; n],
             }
         }
-        // Stage 2: L-point transforms, one per k1, written out at stride 15.
-        for k1 in 0..15 {
-            let rr = &mut self.scratch_re[k1 * l..(k1 + 1) * l];
-            let ii = &mut self.scratch_im[k1 * l..(k1 + 1) * l];
-            // ec-dsp scales its inverse by 1/L; undo that to keep the
+
+        /// Unscaled inverse transform.
+        pub(crate) fn inverse(&mut self, re: &mut [f32], im: &mut [f32]) {
+            let n = self.n;
+            let l = n / 15;
+            debug_assert_eq!(re.len(), n);
+            // Stage 1: 15-point DFTs over n1 at stride L, twiddled on the way
+            // out.
+            for n2 in 0..l {
+                let mut xr = [0.0f32; 15];
+                let mut xi = [0.0f32; 15];
+                for n1 in 0..15 {
+                    xr[n1] = re[l * n1 + n2];
+                    xi[n1] = im[l * n1 + n2];
+                }
+                let (yr, yi) = dft15(&xr, &xi);
+                for k1 in 0..15 {
+                    let (tr, ti) = (self.tw_re[k1 * l + n2], self.tw_im[k1 * l + n2]);
+                    self.scratch_re[k1 * l + n2] = yr[k1] * tr - yi[k1] * ti;
+                    self.scratch_im[k1 * l + n2] = yr[k1] * ti + yi[k1] * tr;
+                }
+            }
+            // Stage 2: L-point transforms, one per k1, written out at stride
+            // 15. ec-dsp scales its inverse by 1/L; undo that to keep the
             // transform unscaled, which is what the MDCT expects.
-            self.sub.inverse_split(rr, ii);
-            for (k2, (&r, &i)) in rr.iter().zip(ii.iter()).enumerate() {
-                re[k1 + 15 * k2] = r * l as f32;
-                im[k1 + 15 * k2] = i * l as f32;
+            for k1 in 0..15 {
+                let rr = &mut self.scratch_re[k1 * l..(k1 + 1) * l];
+                let ii = &mut self.scratch_im[k1 * l..(k1 + 1) * l];
+                self.sub.inverse_split(rr, ii);
+                for (k2, (&r, &i)) in rr.iter().zip(ii.iter()).enumerate() {
+                    re[k1 + 15 * k2] = r * l as f32;
+                    im[k1 + 15 * k2] = i * l as f32;
+                }
             }
         }
     }
 }
+
+#[cfg(feature = "fft-rustfft")]
+mod fft15 {
+    use rustfft::num_complex::Complex;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    pub(crate) struct Fft15 {
+        n: usize,
+        plan: Arc<dyn rustfft::Fft<f32>>,
+        cbuf: Vec<Complex<f32>>,
+        /// Preallocated once: `process` would allocate this per call, and the
+        /// encoder's steady-state loop is a zero-allocation contract.
+        scratch: Vec<Complex<f32>>,
+    }
+
+    impl core::fmt::Debug for Fft15 {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Fft15").field("n", &self.n).finish()
+        }
+    }
+
+    impl Fft15 {
+        pub(crate) fn new(n: usize) -> Fft15 {
+            assert!(n.is_multiple_of(15) && (n / 15).is_power_of_two());
+            let mut planner = rustfft::FftPlanner::<f32>::new();
+            let plan = planner.plan_fft_inverse(n);
+            let cbuf = vec![Complex::ZERO; n];
+            let scratch = vec![Complex::ZERO; plan.get_inplace_scratch_len()];
+            Fft15 {
+                n,
+                plan,
+                cbuf,
+                scratch,
+            }
+        }
+
+        /// Unscaled inverse transform. rustfft does not scale, which is
+        /// exactly the contract here.
+        pub(crate) fn inverse(&mut self, re: &mut [f32], im: &mut [f32]) {
+            for (c, (r, i)) in self.cbuf.iter_mut().zip(re.iter().zip(im.iter())) {
+                *c = Complex::new(*r, *i);
+            }
+            self.plan
+                .process_with_scratch(&mut self.cbuf, &mut self.scratch);
+            for ((c, r), i) in self.cbuf.iter().zip(re.iter_mut()).zip(im.iter_mut()) {
+                *r = c.re;
+                *i = c.im;
+            }
+        }
+    }
+}
+
+pub(crate) use fft15::Fft15;
 
 /// A 15-point DFT as 5 radix-3 stages then 3 radix-5 stages (Cooley-Tukey on
 /// 15 = 3*5), which costs about a third of the direct evaluation.
+#[cfg(not(feature = "fft-rustfft"))]
 #[inline]
 fn dft15(xr: &[f32; 15], xi: &[f32; 15]) -> ([f32; 15], [f32; 15]) {
     // exp(+2 pi i / 3) and the two fifth-root cosines/sines.
@@ -2671,14 +2742,26 @@ pub(crate) fn get_pulses(i: i32) -> i32 {
     }
 }
 
+/// Longest CACHE_BITS row is far under this (the whole table is 392 bytes);
+/// the fixed local window in [`bits2pulses`] lets the bisection compile
+/// without a bounds check per access.
+const CACHE_ROW_MAX: usize = 64;
+
 pub(crate) fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
-    let cache = &CACHE_BITS[cache_index(band, lm)..];
+    let base = cache_index(band, lm);
+    let count = CACHE_BITS[base] as usize;
+    assert!(
+        count < CACHE_ROW_MAX,
+        "CACHE_BITS row overflows the fixed window"
+    );
+    let mut row = [0u8; CACHE_ROW_MAX];
+    row[..=count].copy_from_slice(&CACHE_BITS[base..=base + count]);
     let mut lo = 0i32;
-    let mut hi = cache[0] as i32;
+    let mut hi = count as i32;
     let bits = bits - 1;
     for _ in 0..6 {
         let mid = (lo + hi + 1) >> 1;
-        if cache[mid as usize] as i32 >= bits {
+        if row[mid as usize] as i32 >= bits {
             hi = mid;
         } else {
             lo = mid;
@@ -2687,9 +2770,9 @@ pub(crate) fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
     let lo_cost = if lo == 0 {
         -1
     } else {
-        cache[lo as usize] as i32
+        row[lo as usize] as i32
     };
-    if bits - lo_cost <= cache[hi as usize] as i32 - bits {
+    if bits - lo_cost <= row[hi as usize] as i32 - bits {
         lo
     } else {
         hi
@@ -2700,8 +2783,8 @@ pub(crate) fn pulses2bits(band: usize, lm: i32, pulses: i32) -> i32 {
     if pulses == 0 {
         return 0;
     }
-    let cache = &CACHE_BITS[cache_index(band, lm)..];
-    cache[pulses as usize] as i32 + 1
+    let base = cache_index(band, lm);
+    CACHE_BITS[base + pulses as usize] as i32 + 1
 }
 
 /// One level of the Haar transform, used for the time/frequency changes.

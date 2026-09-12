@@ -120,7 +120,7 @@ impl Default for AnalysisInfo {
 
 /// libopus `fast_atan2f()` — the rational approximation `analysis.c` uses for
 /// the per-bin phase, kept because the tonality features are calibrated on it.
-fn fast_atan2f(y: f32, x: f32) -> f32 {
+pub(crate) fn fast_atan2f(y: f32, x: f32) -> f32 {
     const CA: f32 = 0.431_579_74;
     const CB: f32 = 0.678_484_04;
     const CC: f32 = 0.085_955_42;
