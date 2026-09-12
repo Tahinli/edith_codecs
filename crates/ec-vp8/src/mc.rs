@@ -230,7 +230,13 @@ pub(crate) fn predict_chroma(
 
     let mut mv = (i32::from(mv.0), i32::from(mv.1));
     if need_clamp {
-        clamp_uvmv_to_umv_border(&mut mv, x >> 3, y >> 3, vis_w, vis_h);
+        // A right/bottom chroma quadrant starts at x == vis_w; it still
+        // lives in the last MB, so clamp the derived MB index.
+        let mb_cols = (vis_w + 15) >> 4;
+        let mb_rows = (vis_h + 15) >> 4;
+        let mbc = (x >> 3).min(mb_cols - 1);
+        let mbr = (y >> 3).min(mb_rows - 1);
+        clamp_uvmv_to_umv_border(&mut mv, mbc, mbr, vis_w, vis_h);
     }
 
     let fx = (mv.1 & 7) as usize;

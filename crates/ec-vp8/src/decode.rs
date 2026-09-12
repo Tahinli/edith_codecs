@@ -870,7 +870,6 @@ impl Decoder {
         let y = row * 16;
         let w = self.mb_cols * 16;
         let h = self.mb_rows * 16;
-        let (cw, ch) = (w / 2, h / 2);
         // Luma: one 16x16 predict, or 16 independent 4x4 predicts for
         // SPLITMV (identical output to libvpx's grouped predicts). Each
         // predict lands at its own (bx, by) slot of one 16x16 patch.
@@ -878,8 +877,12 @@ impl Decoder {
         if mb.mv_ref == 4 {
             for b in 0..16usize {
                 let (bx, by) = ((b % 4) * 4, (b / 4) * 4);
+                // reconinter.c:370-374: the four corner subblocks clamp
+                // their MVs under need_to_clamp_mvs; the rest don't.
+                let corner = matches!(b, 0 | 2 | 8 | 10);
                 mc::predict_luma(
-                    &reff.y, reff.stride, MC_BORDER, w, h, x + bx, y + by, mb.bmi[b], false,
+                    &reff.y, reff.stride, MC_BORDER, w, h, x + bx, y + by, mb.bmi[b],
+                    mb.mv_clamp && corner,
                     &mut py[by * 16 + bx..], 16, 4, 4,
                 );
             }
@@ -916,12 +919,15 @@ impl Decoder {
             } else {
                 (modes::chroma_mv_whole(mb.mv), true)
             };
+            // The clamp's MB grid is shared with luma (libvpx
+            // clamp_uvmv_to_umv_border compares against the LUMA
+            // mb_to_*_edges), so the LUMA vis dims feed the edge math.
             mc::predict_chroma(
-                &reff.u, reff.uv_stride, MC_BORDER, cw, ch, cx, cy, uvmv, uv_clamp,
+                &reff.u, reff.uv_stride, MC_BORDER, w, h, cx, cy, uvmv, uv_clamp,
                 &mut pu[qy16 * 16 + qx16..], 16, 8, 8,
             );
             mc::predict_chroma(
-                &reff.v, reff.uv_stride, MC_BORDER, cw, ch, cx, cy, uvmv, uv_clamp,
+                &reff.v, reff.uv_stride, MC_BORDER, w, h, cx, cy, uvmv, uv_clamp,
                 &mut pv[qy16 * 16 + qx16..], 16, 8, 8,
             );
         }
