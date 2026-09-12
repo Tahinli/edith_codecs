@@ -558,71 +558,124 @@ impl ImdctPlan {
 // PVQ
 // ---------------------------------------------------------------------------
 
-/// Builds the `U(n, .)` row used to count PVQ codewords, returning `V(n, k)`.
-///
-/// `V(n,k) = U(n,k) + U(n,k+1)` with `U` obeying
-/// `u[n][k] = u[n-1][k] + u[n][k-1] + u[n-1][k-1]` (Section 4.3.4.2).
-fn pvq_urow(n: usize, k: usize, u: &mut [u32]) -> u32 {
-    u[0] = 0;
-    u[1] = 1;
-    for (j, slot) in u.iter_mut().enumerate().take(k + 2).skip(2) {
-        *slot = (2 * j - 1) as u32;
+/// Offsets of each `U` row in the flat table below (`CELT_PVQ_U_ROW`, the
+/// non-custom reference build's layout): row `m` holds `U(m, c)` at index
+/// `PVQ_U_ROW[m] + c` for `c ≥ m`, exploiting the symmetry `U(n, k) = U(k, n)`.
+/// The walks below only ever read entries with `min(n, k) ≤ 14`, which holds
+/// because every entry they read is bounded by `i < V(n, k)` — a bound the
+/// range decode enforces and the cache-bounded allocation guarantees.
+const PVQ_U_ROW: [usize; 16] = [
+    0, 176, 351, 525, 698, 870, 1041, 1131, 1178, 1207, 1226, 1240, 1248, 1254, 1257, 1272,
+];
+const PVQ_U_LEN: usize = PVQ_U_ROW[15];
+
+/// The flat `U` table, computed at compile time from the same recurrence the
+/// row-stepping used, `U(m,c) = U(m-1,c) + U(m,c-1) + U(m-1,c-1)` off
+/// `U(0,0) = 1` (Section 4.3.4.2), in wrapping arithmetic: unreachable entries
+/// wrap exactly as the runtime stepping wrapped.
+const fn compute_pvq_u() -> [u32; PVQ_U_LEN] {
+    // The full triangle for a ≤ 14, b ≤ 176 (the widest standard band),
+    // then scattered so `U(m, c)` sits at `PVQ_U_ROW[m] + c`.
+    let mut uu = [[0u32; 177]; 15];
+    uu[0][0] = 1; // U(0,0)=1; U(0,b>0) = U(a>0,0) = 0.
+    let mut a = 1;
+    while a < 15 {
+        let mut b = 1;
+        while b < 177 {
+            uu[a][b] = uu[a - 1][b].wrapping_add(uu[a][b - 1]).wrapping_add(uu[a - 1][b - 1]);
+            b += 1;
+        }
+        a += 1;
     }
-    for _ in 2..n {
-        unext(&mut u[1..k + 2], 1);
+    let mut d = [0u32; PVQ_U_LEN];
+    let mut m = 0;
+    while m < 15 {
+        let start = PVQ_U_ROW[m] + m; // raw start of row m
+        let end = if m < 14 {
+            PVQ_U_ROW[m + 1] + (m + 1)
+        } else {
+            PVQ_U_ROW[15]
+        };
+        let mut p = start;
+        while p < end {
+            d[p] = uu[m][p - PVQ_U_ROW[m]];
+            p += 1;
+        }
+        m += 1;
     }
-    u[k].wrapping_add(u[k + 1])
+    d
 }
 
-/// Steps a `U` row up one dimension in place.
-pub(crate) fn unext(u: &mut [u32], mut ui0: u32) {
-    for j in 1..u.len() {
-        let ui1 = u[j].wrapping_add(u[j - 1]).wrapping_add(ui0);
-        u[j - 1] = ui0;
-        ui0 = ui1;
-    }
-    let last = u.len() - 1;
-    u[last] = ui0;
+static PVQ_U: [u32; PVQ_U_LEN] = compute_pvq_u();
+
+/// `U(n, k)` from the table.
+#[inline]
+pub(crate) fn pvq_u(n: usize, k: usize) -> u32 {
+    let (lo, hi) = if n < k { (n, k) } else { (k, n) };
+    debug_assert!(lo <= 14, "U({n},{k}) outside the reference table");
+    PVQ_U[PVQ_U_ROW[lo] + hi]
 }
 
-/// Steps a `U` row down one dimension in place.
-fn uprev(u: &mut [u32], mut ui0: u32) {
-    for j in 1..u.len() {
-        let ui1 = u[j].wrapping_sub(u[j - 1]).wrapping_sub(ui0);
-        u[j - 1] = ui0;
-        ui0 = ui1;
-    }
-    let last = u.len() - 1;
-    u[last] = ui0;
+/// `V(n, k) = U(n,k) + U(n,k+1)`: the size of the `(n, k)` PVQ codebook.
+#[inline]
+pub(crate) fn pvq_v(n: usize, k: usize) -> u32 {
+    pvq_u(n, k).wrapping_add(pvq_u(n, k + 1))
 }
 
 /// Decodes one PVQ codeword of `k` pulses in `n` dimensions.
-pub(crate) fn decode_pulses(
-    dec: &mut RangeDecoder,
-    n: usize,
-    k: usize,
-    y: &mut [i32],
-    u: &mut [u32],
-) {
-    let v = pvq_urow(n, k, u);
+///
+/// The reference Appendix A unranking walk (`cwrsi`), with the `U` row read
+/// from the table instead of stepped one dimension at a time: `O(N)` lookups
+/// rather than `O(N·K)` row arithmetic.
+pub(crate) fn decode_pulses(dec: &mut RangeDecoder, n: usize, k: usize, y: &mut [i32]) {
+    let v = pvq_v(n, k);
     let mut i = dec.dec_uint(v.max(2));
+    let dims = n;
+    let mut n = n;
     let mut k = k;
-    for slot in y.iter_mut().take(n) {
-        let p = u[k + 1];
-        let neg = i >= p;
-        if neg {
+    for slot in y.iter_mut().take(dims) {
+        if n > 2 {
+            let mut p = pvq_u(n, k + 1);
+            let neg = i >= p;
+            if neg {
+                i -= p;
+            }
+            let k0 = k;
+            p = pvq_u(n, k);
+            while p > i {
+                k -= 1;
+                p = pvq_u(n, k);
+            }
             i -= p;
+            let mag = (k0 - k) as i32;
+            *slot = if neg { -mag } else { mag };
+            n -= 1;
+        } else if n == 2 {
+            // `U(2, k) = 2k-1` and `U(2, k+1) = 2k+1`: one sign, then the
+            // largest split the index leaves room for.
+            let p = 2 * k as u32 + 1;
+            let neg = i >= p;
+            if neg {
+                i -= p;
+            }
+            let k0 = k;
+            k = ((i + 1) >> 1) as usize;
+            if k != 0 {
+                i -= 2 * k as u32 - 1;
+            }
+            let mag = (k0 - k) as i32;
+            *slot = if neg { -mag } else { mag };
+            n -= 1;
+        } else {
+            // `U(1, k)` is 1 for k ≥ 1 and 0 at k = 0, so `V(1, k) = 2`: the
+            // index is one sign plus a remainder that is already zero here.
+            let neg = i >= 1;
+            if neg {
+                i -= 1;
+            }
+            debug_assert_eq!(i, 0, "PVQ index overrun at the last dimension");
+            *slot = if neg { -(k as i32) } else { k as i32 };
         }
-        let k0 = k;
-        let mut p = u[k];
-        while p > i {
-            k -= 1;
-            p = u[k];
-        }
-        i -= p;
-        let mag = (k0 - k) as i32;
-        *slot = if neg { -mag } else { mag };
-        uprev(&mut u[..k + 2], 0);
     }
 }
 
@@ -1182,7 +1235,6 @@ pub struct CeltDecoder {
     tf_res: [i32; NB_BANDS],
     collapse_masks: [u8; 2 * NB_BANDS],
     iy: Vec<i32>,
-    urow: Vec<u32>,
     mdct_buf: Vec<f32>,
     diag: CeltDecDiag,
 }
@@ -1225,7 +1277,6 @@ impl CeltDecoder {
             tf_res: [0; NB_BANDS],
             collapse_masks: [0; 2 * NB_BANDS],
             iy: vec![0; max_n],
-            urow: vec![0; 256],
             mdct_buf: vec![0.0; max_n + OVERLAP],
             diag: CeltDecDiag {
                 silence: false,
@@ -2355,10 +2406,7 @@ impl CeltDecoder {
         b_blocks: usize,
         gain: f32,
     ) -> u32 {
-        if self.urow.len() < k + 2 {
-            self.urow.resize(k + 2, 0);
-        }
-        decode_pulses(dec, n, k, &mut self.iy, &mut self.urow);
+        decode_pulses(dec, n, k, &mut self.iy);
         let mut ryy = 0.0f32;
         for j in 0..n {
             ryy += (self.iy[j] * self.iy[j]) as f32;
@@ -2946,21 +2994,58 @@ mod tests {
     #[test]
     fn pvq_index_round_trips_within_v() {
         // V(N,K) from the recursion in Section 4.3.4.2, checked against the
-        // closed forms the RFC gives for small N.
-        let mut u = vec![0u32; 300];
-        assert_eq!(pvq_urow(2, 1, &mut u), 4);
-        assert_eq!(pvq_urow(2, 3, &mut u), 12);
-        assert_eq!(pvq_urow(3, 2, &mut u), 18);
-        assert_eq!(pvq_urow(4, 2, &mut u), 32);
-        // V(N,K) = V(N-1,K) + V(N,K-1) + V(N-1,K-1).
+        // closed forms the RFC gives for small N, and the table against a
+        // fresh runtime build of the same recurrence over the whole stored
+        // triangle.
+        assert_eq!(pvq_v(2, 1), 4);
+        assert_eq!(pvq_v(2, 3), 12);
+        assert_eq!(pvq_v(3, 2), 18);
+        assert_eq!(pvq_v(4, 2), 32);
+        // U(N,K) = U(N-1,K) + U(N,K-1) + U(N-1,K-1).
         for n in 3..8usize {
             for k in 2..8usize {
-                let mut a = vec![0u32; 300];
-                let v = pvq_urow(n, k, &mut a);
-                let v1 = pvq_urow(n - 1, k, &mut a);
-                let v2 = pvq_urow(n, k - 1, &mut a);
-                let v3 = pvq_urow(n - 1, k - 1, &mut a);
-                assert_eq!(v, v1 + v2 + v3, "V({n},{k})");
+                let (v1, v2, v3, v) =
+                    (pvq_v(n - 1, k), pvq_v(n, k - 1), pvq_v(n - 1, k - 1), pvq_v(n, k));
+                assert_eq!(v, v1.wrapping_add(v2).wrapping_add(v3), "V({n},{k})");
+            }
+        }
+        // The table equals the runtime row-stepping everywhere it is stored:
+        // rows 0..15, columns as laid out by PVQ_U_ROW.
+        let mut u = vec![0u32; 400];
+        for n in 0..=176usize {
+            for k in 0..=176usize {
+                let (lo, hi) = if n < k { (n, k) } else { (k, n) };
+                if lo > 14 {
+                    continue;
+                }
+                let col_max = if lo < 14 {
+                    PVQ_U_ROW[lo + 1] - PVQ_U_ROW[lo] + lo
+                } else {
+                    14
+                };
+                if hi > col_max || hi < 2 {
+                    // Outside the stored span, or a base row the row-stepping
+                    // never built (rows 0 and 1 are its seeds).
+                    continue;
+                }
+                // Runtime U via the old row-stepping, in wrapping arithmetic.
+                u[0] = 0;
+                u[1] = 1;
+                for (j, slot) in u.iter_mut().enumerate().take(hi + 2).skip(2) {
+                    *slot = (2 * j - 1) as u32;
+                }
+                for _ in 2..hi {
+                    // unext over the slice u[1..lo+2] with ui0 = 1, exactly as
+                    // the row-stepping drove it.
+                    let mut ui0 = 1u32;
+                    for j in 2..lo + 2 {
+                        let ui1 = u[j].wrapping_add(u[j - 1]).wrapping_add(ui0);
+                        u[j - 1] = ui0;
+                        ui0 = ui1;
+                    }
+                    u[lo + 1] = ui0;
+                }
+                assert_eq!(pvq_u(hi, lo), u[lo], "U({hi},{lo})");
             }
         }
     }
