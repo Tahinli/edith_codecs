@@ -493,8 +493,12 @@ fn filter_mb_h_edge(
     // per-column).
     let n = 8 * size;
     let mut px = [[0u8; 64]; 8];
+    debug_assert!(anchor >= 4 * stride && anchor + 3 * stride + n <= plane.len());
     for (k, r) in px.iter_mut().enumerate() {
-        let a = anchor - (4 - k) * stride;
+        // Add the row offset before backing up 4 rows: `anchor` is only
+        // guaranteed to sit >= 4 rows into the plane, and the subtracted
+        // form `anchor - (4 - k) * stride` underflows for k > 4.
+        let a = anchor + k * stride - 4 * stride;
         r[..n].copy_from_slice(&plane[a..a + n]);
     }
     for i in 0..n {
@@ -542,8 +546,11 @@ fn filter_subblock_h_edge(
 ) {
     let n = 8 * size;
     let mut px = [[0u8; 64]; 8];
+    debug_assert!(anchor >= 4 * stride && anchor + 3 * stride + n <= plane.len());
     for (k, r) in px.iter_mut().enumerate() {
-        let a = anchor - (4 - k) * stride;
+        // Same add-first form as [`filter_mb_h_edge`]: the subtracted
+        // expression underflows for k > 4.
+        let a = anchor + k * stride - 4 * stride;
         r[..n].copy_from_slice(&plane[a..a + n]);
     }
     for i in 0..n {
@@ -591,8 +598,11 @@ fn filter_v_edge_simple(plane: &mut [u8], stride: usize, anchor: usize, limit: i
 fn filter_h_edge_simple(plane: &mut [u8], stride: usize, anchor: usize, limit: i32) {
     // Contiguous columns, strided taps: chunked loads, conditional stores.
     let mut px = [[0u8; 16]; 4];
+    debug_assert!(anchor >= 2 * stride && anchor + stride + 16 <= plane.len());
     for (k, r) in px.iter_mut().enumerate() {
-        let a = anchor - (2 - k) * stride;
+        // Add-first form (see [`filter_mb_h_edge`]): the subtracted
+        // expression underflows for k > 2.
+        let a = anchor + k * stride - 2 * stride;
         r.copy_from_slice(&plane[a..a + 16]);
     }
     for i in 0..16 {
