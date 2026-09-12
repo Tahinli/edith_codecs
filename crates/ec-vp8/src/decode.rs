@@ -384,7 +384,7 @@ impl Decoder {
             // `r` (0-based) reads partition `r % n` like the reference.
             let part = (row - 1) % partitions.len();
             for col in 1..=self.mb_cols {
-                if std::env::var_os("EC_VP8_TRACE").is_some() {
+                if crate::trace_enabled() {
                     eprintln!("M {} {}", row - 1, col - 1);
                 }
                 let mb = self.mbi(row, col).clone();
@@ -399,7 +399,7 @@ impl Decoder {
                     y2_dc: dq.y2_dc,
                     y2_ac: dq.y2_ac,
                 };
-                if std::env::var_os("EC_VP8_TRACE").is_some() {
+                if crate::trace_enabled() {
                     eprintln!("T {} {} hy2={}", row - 1, col - 1, has_y2);
                 }
                 let probs = self.state.coeff_probs;
@@ -594,7 +594,7 @@ impl Decoder {
         self.token_ctxs.reset_above_row();
 
         // Phase 1: every mode record of the frame, row-major (§16).
-        if std::env::var_os("EC_VP8_TRACE").is_some() {
+        if crate::trace_enabled() {
             eprintln!("STAGE modes");
         }
         for row in 1..=self.mb_rows {
@@ -746,7 +746,7 @@ impl Decoder {
         let left = self.mv_neighbor(row, col - 1, sign_bias);
         let aboveleft = self.mv_neighbor(row - 1, col - 1, sign_bias);
         let (mut near_mvs, cnt) = modes::find_near_mvs(above, left, aboveleft, to_bias);
-        if std::env::var_os("EC_VP8_TRACE").is_some() {
+        if crate::trace_enabled() {
             eprintln!("CNT r={} c={} cnt={:?} mvs={:?}", row - 1, col - 1, cnt, near_mvs);
         }
 
@@ -856,7 +856,7 @@ impl Decoder {
                     mv
                 }
             };
-            if std::env::var_os("EC_VP8_TRACE").is_some() {
+            if crate::trace_enabled() {
                 eprintln!(
                     "SP r={} c={} j={} k={} l=({},{}) a=({},{}) ctx={} mv=({},{}) best=({},{})",
                     row - 1,
@@ -894,7 +894,7 @@ impl Decoder {
             self.reconstruct_intra_mb(row, col, mb, coeffs);
             return;
         }
-        if std::env::var_os("EC_VP8_TRACE").is_some() {
+        if crate::trace_enabled() {
             eprintln!(
                 "IMB r={} c={} ref={} mvref={} mv=({},{}) clamp={} skip={}",
                 row, col, mb.ref_frame, mb.mv_ref, mb.mv.0, mb.mv.1, mb.mv_clamp, mb.skip
@@ -977,7 +977,7 @@ impl Decoder {
                 &mut pv, 16, 8, 8, self.mc_bilinear,
             );
         }
-        if std::env::var_os("EC_VP8_TRACE").is_some() && row == 0 && col == 0 {
+        if crate::trace_enabled() && row == 0 && col == 0 {
             eprintln!(
                 "CHROMA pred_u[0..8]={:?} refu_vis[0..8]={:?} coeffs.u0dcsum={}",
                 &pu[0..8],
@@ -1087,7 +1087,7 @@ impl Decoder {
         } else {
             [0; 16]
         };
-        if std::env::var_os("EC_VP8_DEBUG").is_some() {
+        if crate::debug_enabled() {
             eprintln!(
                 "MB({row},{col}) ymode={} uv={} y2={:?} y2has={} y0[:4]={:?} eobs24={} dcs={:?}",
                 y_mode,
