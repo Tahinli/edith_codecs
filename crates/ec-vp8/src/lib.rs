@@ -20,6 +20,7 @@ pub mod frame;
 pub mod header;
 pub mod intra;
 pub mod loopfilter;
+mod mc;
 pub mod modes;
 pub mod tables;
 pub mod tokens;

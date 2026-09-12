@@ -323,3 +323,224 @@ pub fn read_sub_mv_ref(d: &mut BoolDecoder<'_>, ctx: usize) -> SubMvRef {
         v => unreachable!("sub_mv_ref tree produced {v}"),
     }
 }
+
+/// First subblock of each SPLITMV subset, per partition shape (libvpx
+/// `vp8_mbsplit_offset`; shapes 16x8, 8x16, 8x8, 4x4).
+pub const MBSPLIT_OFFSET: [[u8; 16]; 4] = [
+    [0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 2, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+];
+
+/// Subblocks filled by one subset, per partition shape (libvpx
+/// `mbsplit_fill_count`).
+pub const MBSPLIT_FILL_COUNT: [usize; 4] = [8, 8, 4, 1];
+
+/// Subblock indices each subset fills, per shape (libvpx
+/// `mbsplit_fill_offset`; subset j starts at j * fill_count).
+pub const MBSPLIT_FILL_OFFSET: [[u8; 16]; 4] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15],
+    [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+];
+
+/// Decode one motion-vector component (§17.1, libvpx `read_mvcomponent`):
+/// either a 3-bit small value off [`SMALL_MV_TREE`] or a 9-bit long form
+/// whose bit 3 is sometimes implicit, then a sign flag.
+pub fn read_mv_component(d: &mut BoolDecoder<'_>, probs: &[u8; MVP_COUNT]) -> i16 {
+    let mut x: i32 = 0;
+    if d.read_bool(probs[MVP_IS_SHORT]) {
+        // Large: bits 0..2, then 8..4 (bit 3 is implicit below).
+        for i in 0..3 {
+            x += i32::from(d.read_bool(probs[MVP_BITS + i])) << i;
+        }
+        let mut i = 8;
+        loop {
+            x += i32::from(d.read_bool(probs[MVP_BITS + i])) << i;
+            i -= 1;
+            if i <= 3 {
+                break;
+            }
+        }
+        if (x & 0xFFF0) == 0 || d.read_bool(probs[MVP_BITS + 3]) {
+            x += 8;
+        }
+    } else {
+        x = i32::from(d.read_tree(&SMALL_MV_TREE, &probs[MVP_SHORT..MVP_SHORT + 7]));
+    }
+    if x != 0 && d.read_bool(probs[MVP_SIGN]) {
+        x = -x;
+    }
+    x as i16
+}
+
+/// Both components of a whole-block motion vector (§17.1); the decoded
+/// quarter-pel components double into the decoder's eighth-pel units.
+pub fn read_mv(d: &mut BoolDecoder<'_>, probs: &[[u8; MVP_COUNT]; 2]) -> (i16, i16) {
+    (
+        read_mv_component(d, &probs[0]).wrapping_mul(2),
+        read_mv_component(d, &probs[1]).wrapping_mul(2),
+    )
+}
+
+/// Flip a candidate motion vector when the reference it was coded
+/// against has a different sign bias than the current reference
+/// (§16.3, libvpx `mv_bias`).
+pub fn mv_bias(from_bias: bool, to_bias: bool, mv: (i16, i16)) -> (i16, i16) {
+    if from_bias != to_bias {
+        (-mv.0, -mv.1)
+    } else {
+        mv
+    }
+}
+
+/// One neighbour macroblock's motion-vector census input (§16.3).
+pub struct MvNeighbor {
+    /// The MB is intra-coded (no MV contribution at all).
+    pub intra: bool,
+    /// The MB is inter-coded with a zero motion vector (counts like
+    /// intra in the census).
+    pub zero: bool,
+    /// The MB's motion vector (already sign-bias-adjusted if applicable
+    /// — pass `sign_bias` and the census applies it).
+    pub mv: (i16, i16),
+    /// The MB is SPLITMV (feeds the split census count).
+    pub is_split: bool,
+    /// The sign bias of the reference the MB's MV points into.
+    pub sign_bias: bool,
+}
+
+/// Slot indices of the census result (§16.3).
+pub const CNT_INTRA: usize = 0;
+/// Slot index: nearest-candidate count.
+pub const CNT_NEAREST: usize = 1;
+/// Slot index: near-candidate count.
+pub const CNT_NEAR: usize = 2;
+/// Slot index: split-neighbour count.
+pub const CNT_SPLITMV: usize = 3;
+
+/// The neighborhood motion-vector census (§16.3, libvpx
+/// `find_near_mvs` inlined in `read_mb_modes_mv`): up to three distinct
+/// candidate vectors with per-slot counts, scanned above, left,
+/// above-left; each inter neighbour counts 2/2/1 toward either the
+/// candidate slot it extends or the zero/intra count.
+pub fn find_near_mvs(
+    above: MvNeighbor,
+    left: MvNeighbor,
+    aboveleft: MvNeighbor,
+    to_bias: bool,
+) -> ([(i16, i16); 4], [i32; 4]) {
+    let mut mvs = [(0i16, 0i16); 4];
+    let mut cnt = [0i32; 4];
+    let mut idx = 0usize;
+    let mut cntx = 0usize;
+
+    // Above: the first candidate is pushed unconditionally.
+    if !above.intra {
+        if !above.zero {
+            idx += 1;
+            mvs[idx] = mv_bias(above.sign_bias, to_bias, above.mv);
+            cntx += 1;
+        }
+        cnt[cntx] += 2;
+    }
+    for (mb, w) in [(&left, 2), (&aboveleft, 1)] {
+        if !mb.intra {
+            if !mb.zero {
+                let this = mv_bias(mb.sign_bias, to_bias, mb.mv);
+                if this != mvs[idx] {
+                    idx += 1;
+                    mvs[idx] = this;
+                    cntx += 1;
+                }
+                cnt[cntx] += w;
+            } else {
+                cnt[CNT_INTRA] += i32::from(w);
+            }
+        }
+    }
+
+    // libvpx checks `cnt[CNT_SPLITMV]` BEFORE computing it (the write
+    // happens later in the same branch), so the above-left merge is
+    // effectively dead there; ported as-is with the same dead guard.
+    if cnt[CNT_SPLITMV] != 0 && mvs[idx] == mvs[CNT_NEAREST] {
+        cnt[CNT_NEAREST] += 1;
+    }
+    cnt[CNT_SPLITMV] = i32::from(above.is_split) * 2
+        + i32::from(left.is_split) * 2
+        + i32::from(aboveleft.is_split);
+
+    if cnt[CNT_NEAR] > cnt[CNT_NEAREST] {
+        cnt.swap(CNT_NEAR, CNT_NEAREST);
+        mvs.swap(CNT_NEAR, CNT_NEAREST);
+    }
+    (mvs, cnt)
+}
+
+/// Per-MB motion-vector clamp edges in eighth-pels (libvpx
+/// `mb_to_*_edge`): distance from the MB's edge to the frame edge.
+pub fn mb_edges(col: usize, row: usize, mb_cols: usize, mb_rows: usize) -> (i32, i32, i32, i32) {
+    (
+        -((i32::try_from(col).unwrap() * 16) << 3),
+        ((i32::try_from(mb_cols - 1 - col).unwrap() * 16) << 3),
+        -((i32::try_from(row).unwrap() * 16) << 3),
+        ((i32::try_from(mb_rows - 1 - row).unwrap() * 16) << 3),
+    )
+}
+
+/// Clamp a candidate MV into the current MB's allowed range plus a
+/// 128-eighth-pel margin (§16.2, libvpx `vp8_clamp_mv2`).
+pub fn clamp_mv2(mv: &mut (i16, i16), edges: (i32, i32, i32, i32)) {
+    let (l, r, t, b) = edges;
+    let c = i32::from(mv.1);
+    if c < l - 128 {
+        mv.1 = (l - 128) as i16;
+    } else if c > r + 128 {
+        mv.1 = (r + 128) as i16;
+    }
+    let ro = i32::from(mv.0);
+    if ro < t - 128 {
+        mv.0 = (t - 128) as i16;
+    } else if ro > b + 128 {
+        mv.0 = (b + 128) as i16;
+    }
+}
+
+/// Whether an explicit MV exceeds the MB's bounds (libvpx
+/// `vp8_check_mv_bounds`): strictly outside, no margin.
+pub fn mv_out_of_bounds(mv: (i16, i16), edges: (i32, i32, i32, i32)) -> bool {
+    let (l, r, t, b) = edges;
+    i32::from(mv.1) < l || i32::from(mv.1) > r || i32::from(mv.0) < t || i32::from(mv.0) > b
+}
+
+/// Chroma motion vector for a whole-MB mode (libvpx
+/// `vp8_build_inter16x16_predictors_mb`): halve each component with
+/// round-half-away-from-zero (`x += 1 | (x >> 31); x /= 2`).
+pub fn chroma_mv_whole(mv: (i16, i16)) -> (i16, i16) {
+    fn half(x: i16) -> i16 {
+        let x = i32::from(x);
+        ((x + (1 | (x >> 31))) / 2) as i16
+    }
+    (half(mv.0), half(mv.1))
+}
+
+/// Chroma motion vector for one 8x8 quadrant of a SPLITMB (libvpx
+/// `build_4x4uvmvs`): sum the quadrant's four subblock vectors, then
+/// divide by 8 with round-half-away-from-zero
+/// (`t += 4 + (t >> 31) * 8; t /= 8`).
+pub fn chroma_mv_split(quadrant: &[(i16, i16); 4]) -> (i16, i16) {
+    fn eighth(parts: [i16; 4]) -> i16 {
+        let t = i32::from(parts[0])
+            + i32::from(parts[1])
+            + i32::from(parts[2])
+            + i32::from(parts[3]);
+        let t = t + 4 + (t >> 31) * 8;
+        (t / 8) as i16
+    }
+    (
+        eighth([quadrant[0].0, quadrant[1].0, quadrant[2].0, quadrant[3].0]),
+        eighth([quadrant[0].1, quadrant[1].1, quadrant[2].1, quadrant[3].1]),
+    )
+}

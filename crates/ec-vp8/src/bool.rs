@@ -86,8 +86,12 @@ impl<'a> BoolDecoder<'a> {
     }
 
     /// Decode one bool whose zero-probability is `prob`/256
-    /// (RFC `read_bool`).
+    /// (RFC `read_bool`). Under EC_VP8_TRACE, prints the decoder state
+    /// after the read — `B <pos> <bit_count> <prob> <bit>`, byte-exact
+    /// the same line scripts/vp8ref_model.py prints — so the two
+    /// decoders can be diffed read-for-read.
     pub fn read_bool(&mut self, prob: u8) -> bool {
+        let trace = std::env::var_os("EC_VP8_TRACE").is_some();
         let prob = u32::from(prob);
         let split = 1 + (((self.range - 1) * prob) >> 8);
         let bigsplit = split << 8;
@@ -107,6 +111,9 @@ impl<'a> BoolDecoder<'a> {
                 self.bit_count = 0;
                 self.value |= self.next_byte();
             }
+        }
+        if trace {
+            eprintln!("B {} {} {} {}", self.pos, self.bit_count, prob, u8::from(bit));
         }
         bit
     }

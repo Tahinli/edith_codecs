@@ -14,6 +14,7 @@
 use crate::bool::BoolDecoder;
 use crate::frame::{FrameType, KeyFrameDims, mb_geometry};
 use crate::header::FrameHeader;
+use crate::mc;
 use crate::intra;
 use crate::loopfilter::{self, MbFilterInfo};
 use crate::modes;
@@ -22,6 +23,23 @@ use crate::tokens::{self, Dq, MbCoeffs, TokenContexts};
 use crate::transform;
 use crate::transform::Dequant;
 use crate::{Error, PersistedState, Result};
+/// Copy a visible MB-aligned image out of the 1-pixel-bordered working
+/// plane into the top-left visible corner of a bordered reference
+/// buffer.
+fn copy_plane(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+) {
+    for r in 0..h {
+        let s = (1 + r) * src_stride + 1;
+        let d = (MC_BORDER + r) * dst_stride + MC_BORDER;
+        dst[d..d + w].copy_from_slice(&src[s..s + w]);
+    }
+}
 
 /// Reconstructed-image plane: a padded buffer with a 1-pixel left/top
 /// border (127 on top including the corner, 129 on the left — RFC 6386
@@ -82,10 +100,38 @@ struct MbInfo {
     b_modes: [u8; 16],
     segment_id: u8,
     skip: bool,
+    /// 0 = intra, 1 = last, 2 = golden, 3 = altref (§16.2). Key-frame
+    /// MBs and the border are intra.
+    ref_frame: u8,
+    /// Inter mv_ref leaf (§16.2): 0 = zero, 1 = nearest, 2 = near,
+    /// 3 = new, 4 = split. 0 when intra.
+    mv_ref: u8,
+    /// Whole-MB motion vector in eighth-pels; the bottom-right subblock's
+    /// vector for SPLITMV (what future neighbours' census sees).
+    mv: (i16, i16),
+    /// Per-subblock motion vectors (SPLITMV).
+    bmi: [(i16, i16); 16],
+    /// `need_to_clamp_mvs` (§16.2): the luma MC clamps this MV into the
+    /// extended-frame range.
+    mv_clamp: bool,
     /// Any non-zero coefficient decoded for this MB (bit 31 of dixie's
     /// eob_mask); decides the loop filter's interior edges (§15.1).
     has_nz: bool,
 }
+
+/// One reference-frame slot: bordered planes, 32-pixel edge-replicated
+/// borders around the MB-aligned image (dixie `extend_frame`).
+#[derive(Clone)]
+struct RefFrame {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    stride: usize,
+    uv_stride: usize,
+}
+
+/// MC border width in pixels (libvpx `VP8BORDERINPIXELS`).
+const MC_BORDER: usize = 32;
 
 impl MbInfo {
     fn has_y2(&self) -> bool {
@@ -108,6 +154,12 @@ pub struct Decoder {
     /// DC_PRED border (dixie's `mb_info` border trick).
     mb_info: Vec<MbInfo>,
     token_ctxs: TokenContexts,
+    /// Reference frame slots: [unused, last, golden, altref] (§16.2
+    /// indices). Empty until the first key frame.
+    refs: [Option<RefFrame>; 4],
+    /// Persisted per-MB segment ids, `mb_rows * mb_cols` (§9.3: when a
+    /// frame does not re-code the map, ids carry over).
+    segment_map: Vec<u8>,
     frame_decoded: bool,
 }
 
@@ -156,6 +208,8 @@ impl Decoder {
             },
             mb_info: Vec::new(),
             token_ctxs: TokenContexts::new(0),
+            refs: [None, None, None, None],
+            segment_map: Vec::new(),
             frame_decoded: false,
         }
     }
@@ -169,14 +223,28 @@ impl Decoder {
     /// Decode one frame; returns the picture when it is for display
     /// (`show_frame`). Hidden frames still update the decode state.
     pub fn decode(&mut self, frame: &[u8]) -> Result<Option<Picture>> {
+        // Entropy revert (§9.7): the probability updates this frame
+        // applies are transient unless `refresh_entropy` says they
+        // persist. Snapshots are cheap array copies; segmentation and
+        // loop-filter deltas live outside the frame context and never
+        // revert (libvpx saves only `fc`).
+        let coeff_probs = self.state.coeff_probs;
+        let mv_probs = self.state.mv_probs;
+        let ymode_probs = self.state.ymode_probs;
+        let uv_mode_probs = self.state.uv_mode_probs;
         let (header, hdr_dec) = FrameHeader::parse(frame, &mut self.state)?;
-        match header.tag.frame_type {
+        let refresh_entropy = header.refresh.refresh_entropy;
+        let pic = match header.tag.frame_type {
             FrameType::Key => self.decode_keyframe(frame, header, hdr_dec),
-            FrameType::Inter => Err(Error::unsupported(
-                "VP8 inter frame",
-                "inter-frame decoding is the next milestone of this crate",
-            )),
+            FrameType::Inter => self.decode_interframe(frame, header, hdr_dec),
+        }?;
+        if !refresh_entropy {
+            self.state.coeff_probs = coeff_probs;
+            self.state.mv_probs = mv_probs;
+            self.state.ymode_probs = ymode_probs;
+            self.state.uv_mode_probs = uv_mode_probs;
         }
+        Ok(pic)
     }
 
     fn ensure_buffers(&mut self, kf: KeyFrameDims) {
@@ -322,39 +390,80 @@ impl Decoder {
 
         // Loop filter post-pass (see module docs for the ordering
         // equivalence argument).
-        if header.filter_level > 0 {
-            let infos: Vec<MbFilterInfo> = (0..self.mb_rows)
-                .flat_map(|r| (0..self.mb_cols).map(move |c| (r, c)))
-                .map(|(r, c)| {
-                    let mb = self.mbi(r + 1, c + 1);
-                    MbFilterInfo {
-                        level: self.mb_filter_level(&header, mb),
-                        inner_edges: mb.has_nz || !mb.has_y2(),
-                    }
-                })
-                .collect();
-            // The planes are bordered; the filter sees the unbordered
-            // image (same row pitch) starting at pixel (0, 0).
-            let (ystride, ustride, vstride) = (self.y.stride, self.u.stride, self.v.stride);
-            let (mcols, mrows) = (self.mb_cols, self.mb_rows);
-            let simple = header.filter_type == 1;
-            let sharpness = header.sharpness_level;
-            let yimg = &mut self.y.data[1 + ystride..];
-            let uimg = &mut self.u.data[1 + ustride..];
-            let vimg = &mut self.v.data[1 + vstride..];
-            loopfilter::filter_frame_ex(
-                yimg, uimg, vimg, ystride, ustride, mcols, mrows, sharpness, simple, &infos, true,
-            );
-        }
+        self.run_loopfilter(&header, true);
+
+        // A key frame refreshes every reference slot and clears the
+        // persisted segment map (§9.3, §9.7).
+        self.segment_map = vec![0; self.mb_cols * self.mb_rows];
+        let rf = self.make_ref();
+        self.refs[1] = Some(rf.clone());
+        self.refs[2] = Some(rf.clone());
+        self.refs[3] = Some(rf);
 
         self.frame_decoded = true;
         Ok(header.tag.show_frame.then(|| self.crop()))
     }
 
-    /// Per-MB loop filter level (dixie `calculate_filter_parameters`):
-    /// segment adjustment, then ref/mode deltas, clamped 0..63. Key
-    /// frames are all intra — ref index 0 (`CURRENT_FRAME`), with
-    /// `mode_delta[0]` applying to B_PRED.
+    /// Loop-filter post-pass over the whole frame (dixie order-equivalent
+    /// driver; `inner_edges` follows libvpx's `skip_lf`: skipped MBs
+    /// filter only their boundary edges, except 4x4-coded modes).
+    fn run_loopfilter(&mut self, header: &FrameHeader, is_keyframe: bool) {
+        if header.filter_level == 0 {
+            return;
+        }
+        let infos: Vec<MbFilterInfo> = (0..self.mb_rows)
+            .flat_map(|r| (0..self.mb_cols).map(move |c| (r, c)))
+            .map(|(r, c)| {
+                let mb = self.mbi(r + 1, c + 1);
+                MbFilterInfo {
+                    level: self.mb_filter_level(header, mb),
+                    inner_edges: mb.has_nz || !mb.has_y2(),
+                }
+            })
+            .collect();
+        // The planes are bordered; the filter sees the unbordered
+        // image (same row pitch) starting at pixel (0, 0).
+        let (ystride, ustride, vstride) = (self.y.stride, self.u.stride, self.v.stride);
+        let (mcols, mrows) = (self.mb_cols, self.mb_rows);
+        let simple = header.filter_type == 1;
+        let sharpness = header.sharpness_level;
+        let yimg = &mut self.y.data[1 + ystride..];
+        let uimg = &mut self.u.data[1 + ustride..];
+        let vimg = &mut self.v.data[1 + vstride..];
+        loopfilter::filter_frame_ex(
+            yimg, uimg, vimg, ystride, ustride, mcols, mrows, sharpness, simple, &infos,
+            is_keyframe,
+        );
+    }
+
+    /// Snapshot the reconstructed (post-LF) frame into a bordered
+    /// reference buffer with 32-pixel edge-replicated borders.
+    fn make_ref(&self) -> RefFrame {
+        let w = self.mb_cols * 16;
+        let h = self.mb_rows * 16;
+        let (cw, ch) = (self.mb_cols * 8, self.mb_rows * 8);
+        let mut rf = RefFrame {
+            y: vec![0; (w + 2 * MC_BORDER) * (h + 2 * MC_BORDER)],
+            u: vec![0; (cw + 2 * MC_BORDER) * (ch + 2 * MC_BORDER)],
+            v: vec![0; (cw + 2 * MC_BORDER) * (ch + 2 * MC_BORDER)],
+            stride: w + 2 * MC_BORDER,
+            uv_stride: cw + 2 * MC_BORDER,
+        };
+        copy_plane(&mut rf.y, rf.stride, &self.y.data, self.y.stride, w, h);
+        copy_plane(&mut rf.u, rf.uv_stride, &self.u.data, self.u.stride, cw, ch);
+        copy_plane(&mut rf.v, rf.uv_stride, &self.v.data, self.v.stride, cw, ch);
+        mc::extend_plane(&mut rf.y, rf.stride, w, h, MC_BORDER);
+        mc::extend_plane(&mut rf.u, rf.uv_stride, cw, ch, MC_BORDER);
+        mc::extend_plane(&mut rf.v, rf.uv_stride, cw, ch, MC_BORDER);
+        rf
+    }
+
+
+    /// Per-MB loop filter level (libvpx `loop_filter_frame_init`):
+    /// segment level (clamped), then the reference delta, then the mode
+    /// delta, clamped again. Mode slots: intra B_PRED → 0, other intra
+    /// and ZEROMV → 1 (no delta for other intra), the moving modes → 2,
+    /// SPLITMV → 3.
     fn mb_filter_level(&self, header: &FrameHeader, mb: &MbInfo) -> u8 {
         let seg = &header.segmentation;
         let mut level = i32::from(header.filter_level);
@@ -364,13 +473,470 @@ impl Decoder {
         }
         level = level.clamp(0, 63);
         if header.lf_delta_enabled {
-            level += self.state.ref_lf_delta[0];
-            if mb.y_mode == modes::YMode::BPred.as_u8() {
-                level += self.state.mode_lf_delta[0];
+            level += self.state.ref_lf_delta[usize::from(mb.ref_frame)];
+            let mode_idx = if mb.ref_frame == 0 {
+                if mb.y_mode == modes::YMode::BPred.as_u8() {
+                    Some(0)
+                } else {
+                    None
+                }
+            } else {
+                match mb.mv_ref {
+                    0 => Some(1), // ZEROMV
+                    4 => Some(3), // SPLITMV
+                    _ => Some(2), // NEAREST / NEAR / NEW
+                }
+            };
+            if let Some(mode_idx) = mode_idx {
+                level += self.state.mode_lf_delta[mode_idx];
             }
             level = level.clamp(0, 63);
         }
         level as u8
+    }
+    /// Decode one inter frame (§16): all mode records off partition 0
+    /// (row-major), then per-row tokens and reconstruction off the row's
+    /// token partition, loop filter, then the reference updates (§9.7).
+    fn decode_interframe(
+        &mut self,
+        frame: &[u8],
+        header: FrameHeader,
+        mut hdr_dec: BoolDecoder<'_>,
+    ) -> Result<Option<Picture>> {
+        if self.mb_cols == 0 || self.refs[1..4].iter().any(|r| r.is_none()) {
+            return Err(Error::corrupt("VP8 inter frame before the first key frame"));
+        }
+
+        // Token partition bool decoders (§9.5) — identical tiling to
+        // key frames.
+        let mut partitions = Vec::with_capacity(header.partition_sizes.len());
+        let mut off = header.token_data_offset + 3 * (header.partition_sizes.len() - 1);
+        for &sz in &header.partition_sizes {
+            let end = off + sz as usize;
+            let slice = frame
+                .get(off..end)
+                .ok_or_else(|| Error::corrupt("VP8 token partition extends past frame end"))?;
+            partitions.push(BoolDecoder::new(slice)?);
+            off = end;
+        }
+
+        // Dequant factors per segment (persisted segmentation state).
+        let seg = &header.segmentation;
+        let mut dqf = [Dequant {
+            y1_dc: 0,
+            y1_ac: 0,
+            y2_dc: 0,
+            y2_ac: 0,
+            uv_dc: 0,
+            uv_ac: 0,
+        }; 4];
+        for (i, dq) in dqf.iter_mut().enumerate() {
+            let q = if seg.enabled {
+                if seg.abs_delta {
+                    seg.quant_idx[i]
+                } else {
+                    i32::from(header.quant.yac_qi) + seg.quant_idx[i]
+                }
+            } else {
+                i32::from(header.quant.yac_qi)
+            };
+            *dq = transform::dequant(
+                q,
+                header.quant.ydc_delta,
+                header.quant.y2dc_delta,
+                header.quant.y2ac_delta,
+                header.quant.uvdc_delta,
+                header.quant.uvac_delta,
+            );
+        }
+        let ymode_probs = self.state.ymode_probs;
+        let uv_mode_probs = self.state.uv_mode_probs;
+        let sign_bias = [
+            false,
+            header.refresh.sign_bias_golden,
+            header.refresh.sign_bias_altref,
+        ];
+
+        // Phase 1: every mode record of the frame, row-major (§16).
+        for row in 1..=self.mb_rows {
+            for col in 1..=self.mb_cols {
+                let mut mb = MbInfo::default();
+                if header.segmentation.enabled {
+                    if header.segmentation.update_map {
+                        mb.segment_id =
+                            hdr_dec.read_tree(&SEGMENT_TREE, &header.segmentation.tree_probs);
+                        self.segment_map[(row - 1) * self.mb_cols + (col - 1)] = mb.segment_id;
+                    } else {
+                        mb.segment_id = self.segment_map[(row - 1) * self.mb_cols + (col - 1)];
+                    }
+                }
+                if header.coeff_skip_enabled {
+                    mb.skip = hdr_dec.read_bool(header.prob_skip_false);
+                }
+                self.parse_inter_modes(
+                    &mut hdr_dec,
+                    row,
+                    col,
+                    &mut mb,
+                    &header,
+                    &ymode_probs,
+                    &uv_mode_probs,
+                    &sign_bias,
+                );
+                *self.mbi_mut(row, col) = mb;
+            }
+        }
+
+        // Phases 2+3 per row: tokens, then reconstruction (MC or intra).
+        for row in 1..=self.mb_rows {
+            self.token_ctxs.reset_left();
+            let part = (row - 1) % partitions.len();
+            for col in 1..=self.mb_cols {
+                let mb = self.mbi(row, col).clone();
+                let has_y2 = mb.has_y2();
+                let seg_i = usize::from(header.segmentation.enabled) * usize::from(mb.segment_id);
+                let dq = &dqf[seg_i];
+                let mb_dq = Dq {
+                    y1_dc: dq.y1_dc,
+                    y1_ac: dq.y1_ac,
+                    uv_dc: dq.uv_dc,
+                    uv_ac: dq.uv_ac,
+                    y2_dc: dq.y2_dc,
+                    y2_ac: dq.y2_ac,
+                };
+                let probs = self.state.coeff_probs;
+                let coeffs = if mb.skip {
+                    tokens::skip_mb_tokens(&mut self.token_ctxs, col - 1, has_y2)
+                } else {
+                    tokens::decode_mb_tokens(
+                        &mut partitions[part],
+                        &probs,
+                        &mb_dq,
+                        has_y2,
+                        &mut self.token_ctxs,
+                        col - 1,
+                    )
+                };
+                {
+                    // "Special case: force the loop filter to skip when
+                    // eobtotal is zero" (libvpx decodeframe.c): a decoded
+                    // MB without non-zero coefficients filters like a
+                    // skipped one.
+                    let slot = &mut self.mb_info[row * (self.mb_cols + 1) + col];
+                    slot.has_nz = coeffs.has_nonzero();
+                    slot.skip = mb.skip || !coeffs.has_nonzero();
+                }
+                self.reconstruct_inter_mb(row - 1, col - 1, &mb, &coeffs);
+            }
+        }
+
+        self.run_loopfilter(&header, false);
+
+        // Reference buffer updates, libvpx `swap_frame_buffers` order:
+        // the copies run first (copy_gf = 2 must see a possibly
+        // just-updated altref), then the refreshes, then last.
+        let new = self.make_ref();
+        match header.refresh.copy_arf {
+            1 => self.refs[3] = self.refs[1].clone(),
+            2 => self.refs[3] = self.refs[2].clone(),
+            _ => {}
+        }
+        match header.refresh.copy_gf {
+            1 => self.refs[2] = self.refs[1].clone(),
+            2 => self.refs[2] = self.refs[3].clone(),
+            _ => {}
+        }
+        if header.refresh.refresh_gf {
+            self.refs[2] = Some(new.clone());
+        }
+        if header.refresh.refresh_arf {
+            self.refs[3] = Some(new.clone());
+        }
+        if header.refresh.refresh_last {
+            self.refs[1] = Some(new);
+        }
+
+        self.frame_decoded = true;
+        Ok(header.tag.show_frame.then(|| self.crop()))
+    }
+
+    /// Inter-frame mode record (§16, libvpx `read_mb_modes_mv`): intra
+    /// at the persisted mode probabilities, or an inter mode with its
+    /// motion vectors off the neighborhood census.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_inter_modes(
+        &mut self,
+        d: &mut BoolDecoder<'_>,
+        row: usize,
+        col: usize,
+        mb: &mut MbInfo,
+        header: &FrameHeader,
+        ymode_probs: &[u8; 4],
+        uv_mode_probs: &[u8; 3],
+        sign_bias: &[bool; 3],
+    ) {
+        if !d.read_bool(header.prob_intra) {
+            // Intra-coded MB inside an inter frame (§16.1). Subblock
+            // modes use the same fixed context table as key frames.
+            mb.ref_frame = 0;
+            let ymode = modes::read_ymode(d, ymode_probs);
+            mb.y_mode = ymode.as_u8();
+            if ymode == modes::YMode::BPred {
+                for j in 0..16u8 {
+                    let a = self.above_block_mode(row, col, j, mb);
+                    let l = self.left_block_mode(row, col, j, mb);
+                    mb.b_modes[usize::from(j)] =
+                        modes::read_bmode(d, &KF_BMODE_PROB[usize::from(a)][usize::from(l)])
+                            .as_u8();
+                }
+            }
+            mb.uv_mode = modes::read_uvmode(d, uv_mode_probs).as_u8();
+            return;
+        }
+
+        mb.ref_frame = if !d.read_bool(header.prob_last) {
+            1
+        } else if !d.read_bool(header.prob_gf) {
+            2
+        } else {
+            3
+        };
+        let to_bias = sign_bias[usize::from(mb.ref_frame) - 1];
+
+        let edges = modes::mb_edges(col - 1, row - 1, self.mb_cols, self.mb_rows);
+        let above = self.mv_neighbor(row - 1, col, sign_bias);
+        let left = self.mv_neighbor(row, col - 1, sign_bias);
+        let aboveleft = self.mv_neighbor(row - 1, col - 1, sign_bias);
+        let (mut near_mvs, cnt) = modes::find_near_mvs(above, left, aboveleft, to_bias);
+
+        if !d.read_bool(modes::MODE_CONTEXTS[cnt[modes::CNT_INTRA] as usize][0]) {
+            mb.mv_ref = 0; // ZEROMV
+            return;
+        }
+        if !d.read_bool(modes::MODE_CONTEXTS[cnt[modes::CNT_NEAREST] as usize][1]) {
+            mb.mv_ref = 1; // NEARESTMV
+            mb.mv = near_mvs[modes::CNT_NEAREST];
+            modes::clamp_mv2(&mut mb.mv, edges);
+            return;
+        }
+        if !d.read_bool(modes::MODE_CONTEXTS[cnt[modes::CNT_NEAR] as usize][2]) {
+            mb.mv_ref = 2; // NEARMV
+            mb.mv = near_mvs[modes::CNT_NEAR];
+            modes::clamp_mv2(&mut mb.mv, edges);
+            return;
+        }
+
+        // NEWMV or SPLITMV: both code vectors as deltas off the best
+        // candidate — the nearest one when it dominates the census —
+        // clamped into range first (§16.2-§16.4).
+        let near_index = usize::from(cnt[modes::CNT_NEAREST] >= cnt[modes::CNT_INTRA]);
+        modes::clamp_mv2(&mut near_mvs[near_index], edges);
+        let best = near_mvs[near_index];
+        if !d.read_bool(modes::MODE_CONTEXTS[cnt[modes::CNT_SPLITMV] as usize][3]) {
+            mb.mv_ref = 3; // NEWMV
+            let mut mv = modes::read_mv(d, &self.state.mv_probs);
+            mv.0 = mv.0.wrapping_add(best.0);
+            mv.1 = mv.1.wrapping_add(best.1);
+            mb.mv_clamp = modes::mv_out_of_bounds(mv, edges);
+            mb.mv = mv;
+        } else {
+            self.parse_split_mv(d, row, col, mb, best, edges);
+        }
+    }
+
+    /// Census input from one neighbour slot (§16.3); border and intra
+    /// MBs contribute nothing, zero-vector inter MBs count like intra.
+    fn mv_neighbor(&self, row: usize, col: usize, sign_bias: &[bool; 3]) -> modes::MvNeighbor {
+        if row == 0 || col == 0 || self.mbi(row, col).ref_frame == 0 {
+            return modes::MvNeighbor {
+                intra: true,
+                zero: false,
+                mv: (0, 0),
+                is_split: false,
+                sign_bias: false,
+            };
+        }
+        let mb = self.mbi(row, col);
+        modes::MvNeighbor {
+            intra: false,
+            zero: mb.mv == (0, 0),
+            mv: mb.mv,
+            is_split: mb.mv_ref == 4,
+            sign_bias: sign_bias[usize::from(mb.ref_frame) - 1],
+        }
+    }
+
+    /// SPLITMV mode record (§16.4, libvpx `decode_split_mv`): partition
+    /// shape, then one vector per subset coded against its left/above
+    /// contexts, each filling a whole group of subblocks.
+    fn parse_split_mv(
+        &mut self,
+        d: &mut BoolDecoder<'_>,
+        row: usize,
+        col: usize,
+        mb: &mut MbInfo,
+        best: (i16, i16),
+        edges: (i32, i32, i32, i32),
+    ) {
+        let s = modes::read_mv_partition(d);
+        let num_p = modes::MV_PARTITION_COUNT[s];
+        let mv_probs = self.state.mv_probs;
+        for j in 0..num_p {
+            let k = usize::from(modes::MBSPLIT_OFFSET[s][j]);
+            let leftmv = if k % 4 == 0 {
+                let lm = self.mbi(row, col - 1);
+                if lm.mv_ref == 4 {
+                    lm.bmi[k + 3]
+                } else {
+                    lm.mv
+                }
+            } else {
+                mb.bmi[k - 1]
+            };
+            let abovemv = if k < 4 {
+                let am = self.mbi(row - 1, col);
+                if am.mv_ref == 4 {
+                    am.bmi[k + 12]
+                } else {
+                    am.mv
+                }
+            } else {
+                mb.bmi[k - 4]
+            };
+            let ctx = modes::mv_cont(leftmv, abovemv);
+            let blockmv = match modes::read_sub_mv_ref(d, ctx) {
+                modes::SubMvRef::Left4x4 => leftmv,
+                modes::SubMvRef::Above4x4 => abovemv,
+                modes::SubMvRef::Zero4x4 => (0, 0),
+                modes::SubMvRef::New4x4 => {
+                    let mut mv = modes::read_mv(d, &mv_probs);
+                    mv.0 = mv.0.wrapping_add(best.0);
+                    mv.1 = mv.1.wrapping_add(best.1);
+                    mv
+                }
+            };
+            mb.mv_clamp |= modes::mv_out_of_bounds(blockmv, edges);
+            let count = modes::MBSPLIT_FILL_COUNT[s];
+            for &off in &modes::MBSPLIT_FILL_OFFSET[s][j * count..(j + 1) * count] {
+                mb.bmi[usize::from(off)] = blockmv;
+            }
+        }
+        mb.mv_ref = 4;
+        // 4x4 residual coding without a Y2 block (like B_PRED).
+        mb.y_mode = modes::YMode::BPred.as_u8();
+        // Neighbours' census sees the bottom-right subblock's vector.
+        mb.mv = mb.bmi[15];
+    }
+
+    /// Reconstruct one inter-frame MB: motion compensation from the
+    /// reference (or intra prediction), then the residual (§16, §14).
+    fn reconstruct_inter_mb(&mut self, row: usize, col: usize, mb: &MbInfo, coeffs: &MbCoeffs) {
+        if mb.ref_frame == 0 {
+            self.reconstruct_intra_mb(row, col, mb, coeffs);
+            return;
+        }
+        if std::env::var_os("EC_VP8_TRACE").is_some() {
+            eprintln!(
+                "IMB r={} c={} ref={} mvref={} mv=({},{}) clamp={} skip={}",
+                row, col, mb.ref_frame, mb.mv_ref, mb.mv.0, mb.mv.1, mb.mv_clamp, mb.skip
+            );
+        }
+        let reff = self.refs[usize::from(mb.ref_frame)]
+            .as_ref()
+            .expect("reference slots checked at frame start");
+        let x = col * 16;
+        let y = row * 16;
+        let w = self.mb_cols * 16;
+        let h = self.mb_rows * 16;
+        let (cw, ch) = (w / 2, h / 2);
+        // Luma: one 16x16 predict, or 16 independent 4x4 predicts for
+        // SPLITMV (identical output to libvpx's grouped predicts). Each
+        // predict lands at its own (bx, by) slot of one 16x16 patch.
+        let mut py = [0u8; 256];
+        if mb.mv_ref == 4 {
+            for b in 0..16usize {
+                let (bx, by) = ((b % 4) * 4, (b / 4) * 4);
+                mc::predict_luma(
+                    &reff.y, reff.stride, MC_BORDER, w, h, x + bx, y + by, mb.bmi[b], false,
+                    &mut py[by * 16 + bx..], 16, 4, 4,
+                );
+            }
+        } else {
+            mc::predict_luma(
+                &reff.y, reff.stride, MC_BORDER, w, h, x, y, mb.mv, mb.mv_clamp, &mut py, 16,
+                16, 16,
+            );
+        }
+
+        // Chroma: one 8x8 predict per quadrant per plane. Whole-MB modes
+        // halve the single vector; SPLITMV sums its quadrant's four
+        // subblock vectors (§16.4, libvpx build_4x4uvmvs). The whole-MB
+        // path re-clamps UNCONDITIONALLY (reconinter.c: rounding the
+        // derived chroma MV to full-pel can move it outside the tap
+        // window even when the luma MV was in range); the SPLITMV path
+        // clamps only under need_to_clamp_mvs.
+        let mut pu = [0u8; 256];
+        let mut pv = [0u8; 256];
+        for q in 0..4usize {
+            let (qx16, qy16) = ((q % 2) * 8, (q / 2) * 8);
+            let (cx, cy) = (x / 2 + qx16, y / 2 + qy16);
+            let (uvmv, uv_clamp) = if mb.mv_ref == 4 {
+                let (qx, qy) = ((q % 2) * 2, (q / 2) * 2);
+                (
+                    modes::chroma_mv_split(&[
+                        mb.bmi[qy * 4 + qx],
+                        mb.bmi[qy * 4 + qx + 1],
+                        mb.bmi[qy * 4 + qx + 4],
+                        mb.bmi[qy * 4 + qx + 5],
+                    ]),
+                    mb.mv_clamp,
+                )
+            } else {
+                (modes::chroma_mv_whole(mb.mv), true)
+            };
+            mc::predict_chroma(
+                &reff.u, reff.uv_stride, MC_BORDER, cw, ch, cx, cy, uvmv, uv_clamp,
+                &mut pu[qy16 * 16 + qx16..], 16, 8, 8,
+            );
+            mc::predict_chroma(
+                &reff.v, reff.uv_stride, MC_BORDER, cw, ch, cx, cy, uvmv, uv_clamp,
+                &mut pv[qy16 * 16 + qx16..], 16, 8, 8,
+            );
+        }
+        if std::env::var_os("EC_VP8_TRACE").is_some() && row == 0 && col == 0 {
+            eprintln!(
+                "CHROMA pred_u[0..8]={:?} refu_vis[0..8]={:?} coeffs.u0dcsum={}",
+                &pu[0..8],
+                &reff.u[MC_BORDER * reff.uv_stride + MC_BORDER..MC_BORDER * reff.uv_stride + MC_BORDER + 8],
+                coeffs.u[0].iter().sum::<i16>()
+            );
+        }
+
+        // Residual: every block adds onto its MC prediction.
+        let y_dcs: [i16; 16] = if coeffs.has_y2 {
+            transform::iwht4x4(&coeffs.y2)
+        } else {
+            [0; 16]
+        };
+        for b in 0..16usize {
+            let (bx, by) = ((b % 4) * 4, (b / 4) * 4);
+            let mut c = coeffs.y[b];
+            if coeffs.has_y2 {
+                c[0] = y_dcs[b];
+            }
+            let dst = self.y.at(x + bx, y + by);
+            idct_add_into(&mut self.y.data, &c, &py, 16, by * 16 + bx, dst, self.y.stride);
+        }
+        for (plane_data, coeffs_uv, pred, stride) in [
+            (&mut self.u.data, &coeffs.u, &pu, self.u.stride),
+            (&mut self.v.data, &coeffs.v, &pv, self.v.stride),
+        ] {
+            for b in 0..4usize {
+                let (bx, by) = ((b % 2) * 4, (b / 2) * 4);
+                let dst = (1 + y / 2 + by) * stride + 1 + x / 2 + bx;
+                idct_add_into(plane_data, &coeffs_uv[b], pred, 16, by * 16 + bx, dst, stride);
+            }
+        }
     }
 
     /// Key-frame mode record (§11): Y mode at fixed probabilities, then

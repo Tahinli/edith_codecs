@@ -9,7 +9,7 @@ Never merged, never pushed. Pins untouched (no ec-av1 changes at all).
 |---|---|---|
 | M1 bool decoder + frame tag + full first-partition header | **done/verified** | commit `57b5a53a`; 12 unit tests green; real vpxenc/ffmpeg streams (6 sizes/q, 8-token-partition, WebP still) parse with exact partition tiling, correct dims (incl. 76x52 non-MB-aligned), 0 desyncs |
 | M2 key-frame-only decode, sample-exact vs ffmpeg | **root cause FIXED, verified at frame level** — decision-exact vs the reference model for the whole frame (19131 reads, 0 diffs) and frame-0 byte-exact vs ffmpeg on ALL 8 kf/mparts fixtures; the `keyframe_exact` suite goes 3/3 when inter frames land (each fixture carries 1 KF + inter frames), see M3 | commits `20f7d742`, `072f842f`, M2-fix commit (this one) |
-| M3 inter frames | **not attempted** (fixtures + spec recon done) | `clip-obs-320x192.ivf` (169 fr, 4 KFs), `altref-160x96.ivf`, `mparts-160x96.ivf` (8 partitions), `gop-160x96.ivf`; §16-18 read; inter trees/tables in `modes.rs` |
+| M3 inter frames | **implemented end-to-end, walled on one parse divergence** — full inter pipeline lands (mode/MV parse incl. SPLITMV, census, MC via `mc.rs` w/ libvpx-fuzzed predictors, ref buffers, entropy revert, LF deltas); inter frames decode without desync but pixels diverge from MB(0,5) of gop-160x96 frame 1 rightward (51% frame match); `EC_VP8_TRACE` B-line read tracing added to `BoolDecoder` mirroring the Python model's, diff is the next step | this commit (WIP) |
 | M4 public API + docs | **not attempted** | `Decoder::decode(&[u8]) -> Result<Option<Picture>>` exists; ec-av1-style `decode_stream` not yet |
 
 ## What shipped (M1 `57b5a53a`, M2 WIP `20f7d742`)
