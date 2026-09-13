@@ -19,7 +19,7 @@
 
 use crate::filterbank::{Analysis, alias_expand};
 use crate::header::{ChannelMode, FrameHeader, Version};
-use crate::huffman::{self, Table};
+use crate::huffman::{self, BitBuf, Table};
 use crate::tables::{MAX_QUANT, SLEN, long_starts, power43, short_starts, short_widths, windows};
 use ec_core::bitio::BitWriter;
 use ec_core::error::{Error, Result};
@@ -94,7 +94,7 @@ const DEMAND_SPLIT: f64 = 0.7;
 /// One granule's worth of coded spectrum plus the side info describing it.
 #[derive(Clone, Debug)]
 struct CodedGranule {
-    bits: Vec<bool>,
+    bits: BitBuf,
     part2_3_length: u32,
     big_values: u32,
     global_gain: u32,
@@ -932,13 +932,10 @@ impl Mp3Encode {
         debug_assert_eq!(side_bytes.len(), side_info_len);
 
         // Append the granule data to the stream at `used`, byte aligned.
-        let mut main = BitWriter::new();
+        let mut main = BitBuf::new();
         for granule in &coded {
-            for bit in &granule.bits {
-                main.write_bit(*bit);
-            }
+            main.append(&granule.bits);
         }
-        main.align_to_byte();
         let main_bytes = main.into_bytes();
         // Stream positions the reservoir cap skipped over are stuffing, not
         // data, so they are zeros rather than a shorter stream.
@@ -1103,7 +1100,7 @@ fn quantise_granule(
     if xr.iter().all(|v| v.abs() <= ZERO_QUANT_THRESHOLD) {
         return (
             CodedGranule {
-                bits: Vec::new(),
+                bits: BitBuf::new(),
                 part2_3_length: 0,
                 big_values: 0,
                 global_gain: 0,
@@ -1211,29 +1208,35 @@ fn census(exit: (&str, usize)) {
     }
 }
 
-/// Bitstream order for a short block's spectrum.
+/// Puts a spectrum into bitstream order in `out`.
 ///
 /// A short granule is coded band by band, window by window, line by line,
 /// while the spectrum the transform produces interleaves the three windows on
 /// every line — the decoder's reorder step. The encoder has to undo it before
 /// Huffman coding; writing spectral order instead costs exactly the same
 /// number of bits, lands exactly on `part2_3_length`, and hands the decoder a
-/// permuted granule, which comes back as noise.
-fn short_reorder(sample_rate: u32, spectral: &[i32]) -> Vec<i32> {
+/// permuted granule, which comes back as noise. A long block is already in
+/// order and is copied as is.
+fn recode_into(spectral: &[i32; 576], block_type: u8, sample_rate: u32, out: &mut [i32; 576]) {
+    if block_type != 2 {
+        *out = *spectral;
+        return;
+    }
     let widths = short_widths(sample_rate);
     let starts = short_starts(sample_rate);
-    let mut out = Vec::with_capacity(576);
+    let mut position = 0usize;
     for sfb in 0..13 {
         let (width, start) = (usize::from(widths[sfb]), usize::from(starts[sfb]));
         for window in 0..3 {
             for line in 0..width {
-                let position = (start + line) * 3 + window;
-                out.push(spectral.get(position).copied().unwrap_or(0));
+                out[position] = spectral[(start + line) * 3 + window];
+                position += 1;
             }
         }
     }
-    out.resize(576, 0);
-    out
+    for slot in out.iter_mut().skip(position) {
+        *slot = 0;
+    }
 }
 
 /// The largest scalefactor a band can actually carry.
@@ -1273,6 +1276,13 @@ fn band_thresholds(threshold: &[f32], block_type: u8, sample_rate: u32) -> Vec<f
 
 /// Quantises with a fixed scalefactor set, running the rate loop on
 /// `global_gain`, and reports the noise each band ends up with.
+///
+/// The rate loop judges every candidate gain by Huffman cost alone
+/// ([`plan_spectrum`]); the granule's bits are materialised exactly once,
+/// for the configuration the loop keeps ([`write_spectrum`]). Writing the
+/// bits per round — and re-expanding them into a `Vec<bool>` to hand them
+/// to the frame writer — was the largest single cost in the encoder's
+/// profile, and said nothing the cost pass had not already said.
 fn code_with(
     xr: &[f32],
     block_type: u8,
@@ -1298,21 +1308,19 @@ fn code_with(
         210
     };
     let mut gain = start.clamp(0, 255);
-    let mut ix = vec![0i32; 576];
-    let mut coded;
+    let mut ix = [0i32; 576];
+    let mut coding = [0i32; 576];
+    let mut trial: [i32; 576];
     // The rate loop runs both ways: down while there are bits to spare, up
     // while the granule is too big for them. A line that saturates the coding
     // range is not "cheap", it is clipped, so that check comes first.
     let saturated = |ix: &[i32]| ix.iter().any(|v| v.abs() > 8191);
-    let for_coding = |ix: &[i32]| -> Vec<i32> {
-        if block_type == 2 {
-            short_reorder(sample_rate, ix)
-        } else {
-            ix.to_vec()
-        }
+    let mut plan_of = |ix: &[i32; 576]| -> SpectrumPlan {
+        recode_into(ix, block_type, sample_rate, &mut coding);
+        plan_spectrum(&coding, block_type, sample_rate)
     };
     quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
-    coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
+    let mut coded = plan_of(&ix);
     if peak <= 1e-20 {
         // Below the smallest representable level: every line quantises to
         // zero at any gain (the quantiser's scale multiplies zero either
@@ -1325,26 +1333,26 @@ fn code_with(
         gain = 0;
     } else {
         loop {
-            if (saturated(&ix) || coded.0 > target_bits) && gain < 255 {
+            if (saturated(&ix) || coded.cost > target_bits) && gain < 255 {
                 gain += 1;
                 quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
-                coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
+                coded = plan_of(&ix);
                 continue;
             }
-            if saturated(&ix) || coded.0 > target_bits || gain == 0 {
+            if saturated(&ix) || coded.cost > target_bits || gain == 0 {
                 break;
             }
             // Try one step quieter; keep it only if it still fits and stays
             // inside the coding range.
-            let mut trial = ix.clone();
+            trial = ix;
             quantise(xr, gain - 1, scalefac, sample_rate, block_type, &mut trial);
-            let trial_coded = code_spectrum(&for_coding(&trial), block_type, sample_rate);
-            if trial_coded.0 > target_bits || saturated(&trial) {
+            let trial_plan = plan_of(&trial);
+            if trial_plan.cost > target_bits || saturated(&trial) {
                 break;
             }
             gain -= 1;
             ix = trial;
-            coded = trial_coded;
+            coded = trial_plan;
         }
     }
     // Last resort: if even the quietest legal gain will not fit the bits we
@@ -1352,14 +1360,13 @@ fn code_with(
     // overruns its budget would corrupt the reservoir for every frame after
     // it, which is far worse than a low-passed one.
     let mut limit = 576usize;
-    while coded.0 > target_bits && limit > 4 {
+    while coded.cost > target_bits && limit > 4 {
         limit = limit * 3 / 4;
         for slot in ix.iter_mut().skip(limit) {
             *slot = 0;
         }
-        coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
+        coded = plan_of(&ix);
     }
-    let (_, big_values, tables, region0, region1, count1_select, bits) = coded;
     let mut noise = [0.0f32; SFB_LONG];
     let power = power43();
     let residual = |i: usize, band: usize| -> f32 {
@@ -1384,41 +1391,38 @@ fn code_with(
             noise[band] = sum;
         }
     }
-    let mut out = BitWriter::new();
+    // Materialise the granule: scalefactors, then the spectrum the plan
+    // chose, in bitstream order.
+    recode_into(&ix, block_type, sample_rate, &mut coding);
+    let mut bits = BitBuf::new();
     if block_type == 2 {
         // The decoder reads short scalefactors band-major, three windows at a
         // time; ours are one per band, so each is written three times.
         for (band, value) in scalefac.iter().enumerate().take(12) {
             let slen = if band < 6 { slen1 } else { slen2 };
             for _window in 0..3 {
-                out.write_bits(u32::from(*value), slen);
+                bits.push_bits(u64::from(*value), slen);
             }
         }
     } else {
         for (band, value) in scalefac.iter().enumerate() {
             let slen = if band < 11 { slen1 } else { slen2 };
-            out.write_bits(u32::from(*value), slen);
+            bits.push_bits(u64::from(*value), slen);
         }
     }
-    let scalefac_bits = out.bit_len() as u32;
-    let mut bits_out: Vec<bool> = Vec::with_capacity((scalefac_bits + bits.len() as u32) as usize);
-    let bytes = out.into_bytes();
-    for i in 0..scalefac_bits as usize {
-        bits_out.push((bytes[i / 8] >> (7 - i % 8)) & 1 == 1);
-    }
-    bits_out.extend_from_slice(&bits);
+    write_spectrum(&coded, &coding, &mut bits);
     let granule = CodedGranule {
-        part2_3_length: bits_out.len() as u32,
-        bits: bits_out,
-        big_values,
+        part2_3_length: bits.bit_len(),
+        bits,
+        big_values: coded.big_values,
         global_gain: gain as u32,
         scalefac_compress: compress,
         block_type,
-        table_select: tables,
-        region0_count: region0,
-        region1_count: region1,
+        table_select: coded.tables,
+        region0_count: coded.region0,
+        region1_count: coded.region1,
         scalefac_scale: false,
-        count1table_select: count1_select,
+        count1table_select: coded.count1_select,
     };
     (granule, noise)
 }
@@ -1481,14 +1485,29 @@ fn short_band(index: usize, sample_rate: u32) -> usize {
         .unwrap_or(0)
 }
 
-/// Chooses the region split, the tables and the count1 boundary, and writes the
-/// spectrum. Returns the bit cost first so the rate loop can stop early.
-#[allow(clippy::type_complexity)]
-fn code_spectrum(
-    ix: &[i32],
+/// The coding a spectrum gets: region split, tables, count1 boundary, and
+/// the bit cost the rate loop judges candidate gains by.
+#[derive(Clone, Copy, Debug)]
+struct SpectrumPlan {
+    cost: u32,
+    big_values: u32,
+    tables: [u8; 3],
+    region0: u32,
+    region1: u32,
+    count1_select: bool,
+    bounds: [usize; 3],
+    big_end: usize,
+    count1_end: usize,
+}
+
+/// Trailing zeros, the count1 boundary, and the region split for a coded
+/// spectrum, in bitstream order. The planner and the writer read these off
+/// one structure so both see the same boundaries.
+fn regions(
+    ix: &[i32; 576],
     block_type: u8,
     sample_rate: u32,
-) -> (u32, u32, [u8; 3], u32, u32, bool, Vec<bool>) {
+) -> (u32, u32, [usize; 3], usize, usize) {
     // Trailing zeros are not coded at all; before them, a run of values in
     // -1..=1 is coded four at a time.
     let mut rzero = 576;
@@ -1539,9 +1558,16 @@ fn code_spectrum(
             (r0 as u32, r1 as u32, [a, b.max(a), big_end])
         }
     };
+    (region0, region1, bounds, big_end, count1_end)
+}
 
+/// Chooses the region split, the tables and the count1 boundary, and prices
+/// the spectrum. The rate loop calls this for every candidate gain; only the
+/// configuration it keeps is ever written ([`write_spectrum`]).
+fn plan_spectrum(ix: &[i32; 576], block_type: u8, sample_rate: u32) -> SpectrumPlan {
+    let (region0, region1, bounds, big_end, count1_end) = regions(ix, block_type, sample_rate);
     let mut tables = [0u8; 3];
-    let mut writer = BitWriter::new();
+    let mut cost = 0u32;
     let mut from = 0usize;
     for (region, to) in bounds.iter().enumerate() {
         let to = (*to).min(big_end);
@@ -1551,43 +1577,64 @@ fn code_spectrum(
             let table = huffman::big_table(usize::from(select)).expect("table exists");
             let mut i = from;
             while i + 1 < to {
-                huffman::write_pair(&mut writer, table, ix[i], ix[i + 1]);
+                cost += huffman::pair_bits(table, ix[i].unsigned_abs(), ix[i + 1].unsigned_abs())
+                    .expect("the chosen table codes every pair in its region");
                 i += 2;
             }
         }
         from = to;
     }
     // count1: try both tables, keep the cheaper.
-    let quads: Vec<[i32; 4]> = (big_end..count1_end)
-        .step_by(4)
-        .filter(|i| i + 4 <= 576)
-        .map(|i| [ix[i], ix[i + 1], ix[i + 2], ix[i + 3]])
-        .collect();
-    let cost = |select: bool| -> u32 {
-        quads
-            .iter()
-            .map(|quad| huffman::quad_bits(select, *quad))
-            .sum()
+    let quads_cost = |select: bool| -> u32 {
+        let mut sum = 0;
+        let mut i = big_end;
+        while i + 4 <= count1_end {
+            sum += huffman::quad_bits(select, [ix[i], ix[i + 1], ix[i + 2], ix[i + 3]]);
+            i += 4;
+        }
+        sum
     };
-    let count1_select = cost(true) < cost(false);
-    for quad in &quads {
-        huffman::write_quad(&mut writer, count1_select, *quad);
-    }
-    let bit_len = writer.bit_len() as usize;
-    let bytes = writer.into_bytes();
-    let mut bits = Vec::with_capacity(bit_len);
-    for i in 0..bit_len {
-        bits.push((bytes[i / 8] >> (7 - i % 8)) & 1 == 1);
-    }
-    (
-        bits.len() as u32,
-        (big_end / 2) as u32,
+    let count1_select = quads_cost(true) < quads_cost(false);
+    cost += quads_cost(count1_select);
+    SpectrumPlan {
+        cost,
+        big_values: (big_end / 2) as u32,
         tables,
         region0,
         region1,
         count1_select,
-        bits,
-    )
+        bounds,
+        big_end,
+        count1_end,
+    }
+}
+
+/// Writes the coded spectrum the plan names into `out`, pairs and quadruples
+/// in bitstream order. `ix` is the spectrum in bitstream order, the same
+/// array the plan was computed from.
+fn write_spectrum(plan: &SpectrumPlan, ix: &[i32; 576], out: &mut BitBuf) {
+    let mut from = 0usize;
+    for (region, to) in plan.bounds.iter().enumerate() {
+        let to = (*to).min(plan.big_end);
+        if to > from {
+            let table = huffman::big_table(usize::from(plan.tables[region])).expect("table exists");
+            let mut i = from;
+            while i + 1 < to {
+                huffman::write_pair(out, table, ix[i], ix[i + 1]);
+                i += 2;
+            }
+        }
+        from = to;
+    }
+    let mut i = plan.big_end;
+    while i + 4 <= plan.count1_end {
+        huffman::write_quad(
+            out,
+            plan.count1_select,
+            [ix[i], ix[i + 1], ix[i + 2], ix[i + 3]],
+        );
+        i += 4;
+    }
 }
 
 /// Tables that can code a region whose largest magnitude is `max`, cheapest

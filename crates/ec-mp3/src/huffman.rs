@@ -2,7 +2,7 @@
 //! process, and the encoder's cost/write side.
 
 use crate::huffman_tables::*;
-use ec_core::bitio::{BitReader, BitWriter};
+use ec_core::bitio::BitReader;
 use ec_core::error::{Error, Result};
 use std::sync::OnceLock;
 
@@ -175,6 +175,93 @@ pub(crate) fn decode_quad(
     Ok(())
 }
 
+/// A byte-backed bit accumulator for the granule coder: the same MSB-first
+/// convention as [`ec_core::bitio::BitWriter`], but buffering through a `u64`
+/// accumulator and appending whole bit runs, so a granule's Huffman codes and
+/// its splice into the main-data stream stop costing one call per bit.
+///
+/// The encoder's profile was ~45% inside `BitWriter::write_bit`'s per-bit
+/// branch-store cycle (plus the `Vec<bool>` materialisation every rate-loop
+/// round paid to hand granule bits up to the frame writer); this is the same
+/// bitstream, emitted a word at a time.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BitBuf {
+    /// Completed bytes.
+    bytes: Vec<u8>,
+    /// Pending bits, top-aligned in the accumulator (`used < 8`).
+    acc: u64,
+    used: u32,
+}
+
+impl BitBuf {
+    /// An empty buffer.
+    pub(crate) fn new() -> BitBuf {
+        BitBuf::default()
+    }
+
+    /// Bits written so far.
+    pub(crate) fn bit_len(&self) -> u32 {
+        (self.bytes.len() as u32) * 8 + self.used
+    }
+
+    /// Appends the low `n` bits of `value` (`n <= 64`), most significant first.
+    pub(crate) fn push_bits(&mut self, value: u64, n: u32) {
+        debug_assert!(n <= 64, "push_bits: n = {n} > 64");
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        self.acc |= (value & mask) << (64 - self.used - n);
+        self.used += n;
+        while self.used >= 8 {
+            self.bytes.push((self.acc >> 56) as u8);
+            self.acc <<= 8;
+            self.used -= 8;
+        }
+    }
+
+    /// Appends one bit.
+    pub(crate) fn push_bit(&mut self, bit: bool) {
+        if bit {
+            self.acc |= 1u64 << (63 - self.used);
+        }
+        self.used += 1;
+        if self.used == 8 {
+            self.bytes.push((self.acc >> 56) as u8);
+            self.acc = 0;
+            self.used = 0;
+        }
+    }
+
+    /// Appends the first `nbits` of `src`, most significant first — the bulk
+    /// path a granule's bits take into the frame's main-data stream.
+    pub(crate) fn push_bits_from(&mut self, src: &[u8], nbits: u32) {
+        let mut bit = 0;
+        while bit < nbits {
+            let take = (nbits - bit).min(8);
+            let byte = src[(bit / 8) as usize];
+            let off = bit % 8;
+            let value = u64::from(byte >> (8 - off - take)) & ((1u64 << take) - 1);
+            self.push_bits(value, take);
+            bit += take;
+        }
+    }
+
+    /// Appends every bit of `other`.
+    pub(crate) fn append(&mut self, other: &BitBuf) {
+        self.push_bits_from(&other.bytes, (other.bytes.len() as u32) * 8);
+        if other.used > 0 {
+            self.push_bits(other.acc >> (64 - other.used), other.used);
+        }
+    }
+
+    /// Zero-pads to the byte boundary and hands back the bytes, the partial
+    /// byte's unused low bits zero — exactly what `BitWriter` produces.
+    pub(crate) fn into_bytes(mut self) -> Vec<u8> {
+        if self.used > 0 {
+            self.bytes.push((self.acc >> 56) as u8);
+        }
+        self.bytes
+    }
+}
+
 /// Bits one pair costs in `table`, or `None` when the pair is out of range.
 pub(crate) fn pair_bits(table: Table, x: u32, y: u32) -> Option<u32> {
     let max = u32::from(table.dim) - 1;
@@ -203,19 +290,19 @@ pub(crate) fn pair_bits(table: Table, x: u32, y: u32) -> Option<u32> {
 }
 
 /// Writes one pair; the caller has already checked it fits the table.
-pub(crate) fn write_pair(writer: &mut BitWriter, table: Table, x: i32, y: i32) {
+pub(crate) fn write_pair(writer: &mut BitBuf, table: Table, x: i32, y: i32) {
     let max = u32::from(table.dim) - 1;
     let escape = table.linbits > 0;
     let (ax, ay) = (x.unsigned_abs(), y.unsigned_abs());
     let (ix, iy) = (ax.min(max), ay.min(max));
     let (len, code) = table.codes[(ix * u32::from(table.dim) + iy) as usize];
-    writer.write_bits(u32::from(code), u32::from(len));
+    writer.push_bits(u64::from(code), u32::from(len));
     for (value, abs) in [(x, ax), (y, ay)] {
         if abs >= max && escape {
-            writer.write_bits(abs - max, u32::from(table.linbits));
+            writer.push_bits(u64::from(abs - max), u32::from(table.linbits));
         }
         if abs != 0 {
-            writer.write_bit(value < 0);
+            writer.push_bit(value < 0);
         }
     }
 }
@@ -230,15 +317,15 @@ pub(crate) fn quad_bits(select: bool, quad: [i32; 4]) -> u32 {
 }
 
 /// Writes one count1 quadruple.
-pub(crate) fn write_quad(writer: &mut BitWriter, select: bool, quad: [i32; 4]) {
+pub(crate) fn write_quad(writer: &mut BitBuf, select: bool, quad: [i32; 4]) {
     let index = quad
         .iter()
         .fold(0usize, |acc, v| acc * 2 + usize::from(*v != 0));
     let (len, code) = count1_table(select)[index];
-    writer.write_bits(u32::from(code), u32::from(len));
+    writer.push_bits(u64::from(code), u32::from(len));
     for value in quad {
         if value != 0 {
-            writer.write_bit(value < 0);
+            writer.push_bit(value < 0);
         }
     }
 }
@@ -299,7 +386,7 @@ mod tests {
                 continue;
             }
             let max = u32::from(table.dim) - 1;
-            let mut writer = BitWriter::new();
+            let mut writer = BitBuf::new();
             let mut wanted = Vec::new();
             for x in 0..=max {
                 for y in 0..=max {
@@ -321,7 +408,7 @@ mod tests {
     #[test]
     fn quads_round_trip() {
         for select in [false, true] {
-            let mut writer = BitWriter::new();
+            let mut writer = BitBuf::new();
             let mut wanted = Vec::new();
             for index in 0..16 {
                 let quad = [
