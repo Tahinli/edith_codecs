@@ -1322,10 +1322,8 @@ fn code_with(
     let mut gain = start.clamp(0, 255);
     let mut ix = [0i32; 576];
     let mut coding = [0i32; 576];
-    let mut trial: [i32; 576];
-    // The rate loop runs both ways: down while there are bits to spare, up
-    // while the granule is too big for them. A line that saturates the coding
-    // range is not "cheap", it is clipped, so that check comes first.
+    // A line that saturates the coding range is not "cheap", it is clipped;
+    // the gain search below reads saturation as "does not fit".
     let saturated = |ix: &[i32]| ix.iter().any(|v| v.abs() > 8191);
     let mut plan_of = |ix: &[i32; 576]| -> SpectrumPlan {
         recode_into(ix, block_type, sample_rate, &mut coding);
@@ -1344,28 +1342,79 @@ fn code_with(
         // depend on gain.
         gain = 0;
     } else {
-        loop {
-            if (saturated(&ix) || coded.cost > target_bits) && gain < 255 {
-                gain += 1;
-                quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
-                coded = plan_of(&ix);
-                continue;
+        // The rate loop wants the smallest gain whose granule fits the
+        // budget without clipping. A higher gain shrinks every quantised
+        // line, and a smaller spectrum costs no more to code, so "fits" is
+        // monotone in the gain. This shipped as a one-step-at-a-time walk
+        // from the start estimate and paid ~31 quantise-plus-plan
+        // evaluations per granule; now the start estimate seeds a geometric
+        // straddle (doubling steps, so a boundary `d` gains away costs
+        // about 2·log2 d probes instead of d) followed by a bisection of
+        // the bracket. The walk's two hard stops stay: gain 255 stands even
+        // when it does not fit (the low-pass loop below trims the
+        // spectrum), and gain 0 is the quietest legal gain.
+        let mut probe_of = |g: i32, out: &mut [i32; 576]| -> (bool, SpectrumPlan) {
+            quantise(xr, g, scalefac, sample_rate, block_type, out);
+            let plan = plan_of(out);
+            (plan.cost <= target_bits && !saturated(out), plan)
+        };
+        let mut probe = [0i32; 576];
+        // `floor` is the largest gain known to miss, `ceil` the smallest
+        // known to fit; −1 stands for "even 0 misses would not matter", the
+        // gain-0 floor.
+        let mut floor = -1i32;
+        let mut ceil = 255i32;
+        let mut capped = false;
+        let first = start.clamp(0, 255);
+        let (fits, _) = probe_of(first, &mut probe);
+        if fits {
+            // The boundary is at or below the estimate: stride down until a
+            // gain misses.
+            ceil = first;
+            let mut step = 1i32;
+            while ceil > 0 {
+                let next = (ceil - step).max(0);
+                let (next_fits, _) = probe_of(next, &mut probe);
+                if !next_fits {
+                    floor = next;
+                    break;
+                }
+                ceil = next;
+                step *= 2;
             }
-            if saturated(&ix) || coded.cost > target_bits || gain == 0 {
-                break;
+        } else {
+            // The boundary is above the estimate: stride up until a gain
+            // fits, honouring the walk's 255 cap.
+            floor = first;
+            let mut step = 1i32;
+            loop {
+                let next = (floor + step).min(255);
+                let (next_fits, _) = probe_of(next, &mut probe);
+                if next_fits {
+                    ceil = next;
+                    break;
+                }
+                floor = next;
+                if next == 255 {
+                    capped = true;
+                    break;
+                }
+                step *= 2;
             }
-            // Try one step quieter; keep it only if it still fits and stays
-            // inside the coding range.
-            trial = ix;
-            quantise(xr, gain - 1, scalefac, sample_rate, block_type, &mut trial);
-            let trial_plan = plan_of(&trial);
-            if trial_plan.cost > target_bits || saturated(&trial) {
-                break;
-            }
-            gain -= 1;
-            ix = trial;
-            coded = trial_plan;
         }
+        while ceil - floor > 1 {
+            let mid = (floor + ceil) / 2;
+            let (mid_fits, _) = probe_of(mid, &mut probe);
+            if mid_fits {
+                ceil = mid;
+            } else {
+                floor = mid;
+            }
+        }
+        gain = if capped { 255 } else { ceil };
+        let (_, plan) = probe_of(gain, &mut probe);
+        ix = probe;
+        coded = plan;
     }
     // Last resort: if even the quietest legal gain will not fit the bits we
     // were given, drop the top of the spectrum until it does. A granule that
