@@ -3971,6 +3971,99 @@ mod tests {
         crate::speed::set_speed(was);
     }
 
+    /// lane-arfmode: the top ARF's leaf offer set. Three guards in one
+    /// witness, over 17 pictures at gop 32 (three groups, so several top
+    /// ARFs) at q=60 -- the lookahead witness's lesson: at a fine q the
+    /// anchor carries real coefficients, so a cut that moves only the
+    /// hidden frame's internal decisions cannot hide behind "everything
+    /// quantized to the same bytes":
+    ///
+    /// 1. OFF (default and explicit `Some(0)`) is byte-identical -- the
+    ///    shipped table is 0 and the lever is bit-exact when off;
+    /// 2. each armed mode (1 no intra, 2 no 8x8, 4 no compound) really
+    ///    FIRES -- its own [`crate::encode::take_arfmode_hits`] counter
+    ///    moves (class `gate-blind-to-feature`) -- and MOVES THE STREAM;
+    /// 3. the coding order and levels never change, and every armed stream
+    ///    decodes sample-exact through `decode_stream` AND ffmpeg.
+    #[test]
+    fn the_arf_leaf_offer_set_fires_moves_the_stream_and_decodes_sample_exact() {
+        let _knobs = crate::speed::knob_write();
+        let was = crate::speed::speed();
+        crate::speed::set_speed(0);
+        crate::encode::force_screen(Some(false));
+        let (width, height) = (128usize, 128usize);
+        let run = |mode: Option<u8>| -> (Vec<u8>, Vec<Packet>) {
+            crate::encode::set_arfmode(mode);
+            let _ = crate::encode::take_arfmode_hits();
+            let config = EncoderConfig {
+                base_q_idx: 60,
+                width,
+                height,
+                gop: 32,
+                colour: Colour::Bt709Limited,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
+            };
+            let mut enc = Av1Encoder::with_pyramid(config, Pyramid::default()).unwrap();
+            // Groups at three luma LEVELS (the base ramp 40/110/180): the
+            // middle group's top ARF sits halfway between the two dark/light
+            // anchors its slots hold, which is exactly where neither
+            // single-reference prediction nor intra wins by default -- the
+            // AVERAGE of two references (compound) and the DC of the new
+            // level (intra) do. Without this the synthetic cards' noise
+            // quantizes to skip and no arm can move anything (measured:
+            // 516 intra trials skipped, zero won, stream identical).
+            let sources: Vec<Picture> = (0..17)
+                .map(|t| {
+                    let mut p = noisy_card(width, height, t);
+                    let shift = 70i32 * (t / 8) as i32;
+                    for v in p.y.iter_mut() {
+                        *v = (i32::from(*v) + shift).clamp(0, 255) as u16;
+                    }
+                    p
+                })
+                .collect();
+            let packets = encode_all(&mut enc, &sources);
+            (concat(&packets), packets)
+        };
+        let (off, off_packets) = run(None);
+        let (explicit_off, _) = run(Some(0));
+        assert_eq!(off, explicit_off, "mode 0 is not bit-exact with the default");
+        for (mode, arm) in [(1u8, 0usize), (2, 1), (4, 2)] {
+            let (on, packets) = run(Some(mode));
+            let hits = crate::encode::take_arfmode_hits();
+            assert_eq!(
+                packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                off_packets.iter().map(|p| (p.order, p.key, p.level)).collect::<Vec<_>>(),
+                "mode {mode}: coding order/levels moved"
+            );
+            assert!(
+                hits[arm] > 0,
+                "mode {mode}: its counter never fired ({hits:?}) -- the lever is \
+                 gate-blind on this fixture",
+            );
+            assert_ne!(
+                off, on,
+                "mode {mode} left the stream byte-identical despite {} firing hits",
+                hits[arm],
+            );
+            eprintln!("mode {mode}: {} -> {} B, hits {hits:?}", off.len(), on.len());
+            let ours = crate::stream::decode_stream(&on).expect("our decoder");
+            assert_eq!(ours.len(), 17, "mode {mode}: our decoder's picture count");
+            if !have_ffmpeg() {
+                continue;
+            }
+            let theirs = ffmpeg_decode_luma(&on, width, height);
+            assert_eq!(theirs.len(), 17, "mode {mode}: ffmpeg's picture count");
+            for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                let got: Vec<u8> = a.y.iter().map(|&v| v as u8).collect();
+                assert!(got == *b, "mode {mode}, frame {i}: ours differs from ffmpeg");
+            }
+        }
+        crate::encode::set_arfmode(None);
+        crate::speed::set_speed(was);
+    }
+
     fn pyramid_round_trip(pyramid: Pyramid, hidden: usize) {
         let (width, height) = (128usize, 128usize);
         let config = EncoderConfig {
