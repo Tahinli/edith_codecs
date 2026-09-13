@@ -7,7 +7,7 @@
 //! band attenuated at a time), which is also why they are stated as widths: a
 //! width table cannot silently disagree with itself about where 576 ends.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 /// Widths of the 22 long scalefactor bands, by sample rate.
 pub(crate) fn long_widths(sample_rate: u32) -> &'static [u16; 22] {
@@ -173,6 +173,45 @@ pub(crate) fn alias_coefficients() -> &'static [(f32, f32); 8] {
         }
         out
     })
+}
+
+/// The forward MDCT's cosine kernel, `cos(pi/72 · (2n+19)(2k+1))`, laid out
+/// `[k][n]` so each of the 18 output coefficients of a long block is one dot
+/// product. The encoder recomputed these with libm for every subband of
+/// every granule — 23% of its runtime — where the decoder has had its
+/// inverse table since it was written.
+static FORWARD_MDCT_LONG: LazyLock<[[f32; 36]; 18]> = LazyLock::new(|| {
+    let mut table = [[0.0f32; 36]; 18];
+    for (k, row) in table.iter_mut().enumerate() {
+        for (n, slot) in row.iter_mut().enumerate() {
+            let angle = std::f64::consts::PI / 72.0 * ((2 * n + 19) * (2 * k + 1)) as f64;
+            *slot = angle.cos() as f32;
+        }
+    }
+    table
+});
+
+/// The forward MDCT kernel for a long block.
+pub(crate) fn forward_mdct_long() -> &'static [[f32; 36]; 18] {
+    &FORWARD_MDCT_LONG
+}
+
+/// The short-block kernel, `cos(pi/24 · (2n+7)(2k+1))`, laid out `[k][n]`
+/// for one 12-sample window; the three windows share it at 6-sample offsets.
+static FORWARD_MDCT_SHORT: LazyLock<[[f32; 12]; 6]> = LazyLock::new(|| {
+    let mut table = [[0.0f32; 12]; 6];
+    for (k, row) in table.iter_mut().enumerate() {
+        for (n, slot) in row.iter_mut().enumerate() {
+            let angle = std::f64::consts::PI / 24.0 * ((2 * n + 7) * (2 * k + 1)) as f64;
+            *slot = angle.cos() as f32;
+        }
+    }
+    table
+});
+
+/// The forward MDCT kernel for one short window.
+pub(crate) fn forward_mdct_short() -> &'static [[f32; 12]; 6] {
+    &FORWARD_MDCT_SHORT
 }
 
 #[cfg(test)]

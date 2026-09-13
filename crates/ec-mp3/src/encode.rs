@@ -19,11 +19,15 @@
 
 use crate::filterbank::{Analysis, alias_expand};
 use crate::header::{ChannelMode, FrameHeader, Version};
-use crate::huffman::{self, Table};
-use crate::tables::{MAX_QUANT, SLEN, long_starts, power43, short_starts, short_widths, windows};
+use crate::huffman::{self, BitBuf};
+use crate::tables::{
+    MAX_QUANT, SLEN, forward_mdct_long, forward_mdct_short, long_starts, power43, short_starts,
+    short_widths, windows,
+};
 use ec_core::bitio::BitWriter;
 use ec_core::error::{Error, Result};
 use ec_dsp::{RealFft, Window};
+use wide::f32x8;
 
 /// Encoder settings.
 ///
@@ -94,7 +98,7 @@ const DEMAND_SPLIT: f64 = 0.7;
 /// One granule's worth of coded spectrum plus the side info describing it.
 #[derive(Clone, Debug)]
 struct CodedGranule {
-    bits: Vec<bool>,
+    bits: BitBuf,
     part2_3_length: u32,
     big_values: u32,
     global_gain: u32,
@@ -134,6 +138,8 @@ pub struct Mp3Encode {
     fft: RealFft<f32>,
     fft_window: Window<f32>,
     psy_history: Vec<Vec<f32>>,
+    /// Deinterleave scratch for `encode_block`, grown once and reused.
+    pcm_scratch: Vec<f32>,
     /// The main-data byte stream and how much of it frames have carried.
     stream: Vec<u8>,
     used: usize,
@@ -216,6 +222,7 @@ impl Mp3Encode {
             assigned: 0,
             written: 0,
             queued: std::collections::VecDeque::new(),
+            pcm_scratch: Vec::new(),
             ready: std::collections::VecDeque::new(),
             frames: 0,
             frame_bytes: 0,
@@ -347,26 +354,34 @@ impl Mp3Encoder {
     }
 
     fn drain(&mut self, flush: bool) {
-        let Some(core) = self.core.as_mut() else {
+        let Self {
+            core, pcm, frames, ..
+        } = self;
+        let Some(core) = core.as_mut() else {
             return;
         };
         let channels = core.channels;
         let need = core.frame_samples() * channels;
-        while self.pcm.len() >= need {
-            let block: Vec<f32> = self.pcm.drain(..need).collect();
-            core.encode_block(&block);
+        // Encode behind a read cursor and shift the leftovers once: draining
+        // per frame memmoved the whole remaining push for every frame, which
+        // on a single large push is quadratic in the file length.
+        let mut pos = 0usize;
+        while pcm.len() - pos >= need {
+            core.encode_block(&pcm[pos..pos + need]);
+            pos += need;
         }
+        pcm.drain(..pos);
         if flush {
-            if !self.pcm.is_empty() {
-                let mut block = std::mem::take(&mut self.pcm);
-                block.resize(need, 0.0);
-                core.encode_block(&block);
+            if !pcm.is_empty() {
+                pcm.resize(need, 0.0);
+                core.encode_block(pcm);
+                pcm.clear();
             }
             core.flush_pending();
             core.flush_frames();
         }
         while let Some(frame) = core.ready.pop_front() {
-            self.frames.push_back(frame);
+            frames.push_back(frame);
         }
     }
 
@@ -511,10 +526,15 @@ impl Mp3Encode {
         let granules = self.granules();
         // Polyphase analysis, one channel at a time.
         for ch in 0..channels {
-            let mut mono: Vec<f32> = Vec::with_capacity(pcm.len() / channels);
+            // One deinterleave buffer per encoder, grown once: this frame's
+            // mono channel used to be a fresh allocation per channel per
+            // frame.
+            self.pcm_scratch.clear();
+            self.pcm_scratch.reserve(pcm.len() / channels);
             for frame in pcm.chunks(channels) {
-                mono.push(frame[ch]);
+                self.pcm_scratch.push(frame[ch]);
             }
+            let mono = &self.pcm_scratch;
             for chunk in mono.chunks(32) {
                 if chunk.len() < 32 {
                     break;
@@ -523,7 +543,13 @@ impl Mp3Encode {
                     self.slots[ch].push(slot);
                 }
             }
-            self.psy_push(ch, &mono);
+            // The masking model's history update, inlined from `psy_push` so
+            // it can touch `psy_history` while `mono` borrows `pcm_scratch`.
+            let n = mono.len().min(1024);
+            let history = &mut self.psy_history[ch];
+            history.copy_within(n.., 0);
+            let keep = 1024 - n;
+            history[keep..].copy_from_slice(&mono[mono.len() - n..]);
         }
         // A granule is 18 slots; hold one back so block switching can look
         // ahead at the next granule's energy.
@@ -552,15 +578,6 @@ impl Mp3Encode {
         while self.pending.len() >= per_frame + channels {
             self.emit_frame();
         }
-    }
-
-    /// One FFT per granule of input, kept for the masking model.
-    fn psy_push(&mut self, ch: usize, mono: &[f32]) {
-        let n = 1024.min(mono.len());
-        let history = &mut self.psy_history[ch];
-        history.copy_within(n.., 0);
-        let keep = 1024 - n;
-        history[keep..].copy_from_slice(&mono[mono.len() - n..]);
     }
 
     /// Allowed noise per long scalefactor band, from the masking model, in
@@ -699,18 +716,21 @@ impl Mp3Encode {
         // every bitrate candidate VBR tries below; compute them once.
         let mut xrs: Vec<Vec<f32>> = Vec::with_capacity(granules * channels);
         let mut thresholds: Vec<Vec<f32>> = Vec::with_capacity(granules * channels);
+        // Take the held-back granules once: the per-granule clone that used
+        // to feed `mdct` copied every subband and threshold just to keep the
+        // borrow checker happy about `history`.
+        let held: Vec<PendingGranule> = self.pending.drain(..granules * channels).collect();
         for gr in 0..granules {
             for ch in 0..channels {
                 let index = gr * channels + ch;
-                let granule = self.pending[index].clone();
+                let granule = &held[index];
                 xrs.push(self.mdct(ch, &granule.subband, types[index]));
                 thresholds.push(match vbr {
                     Some(quality) => quality_threshold(&granule.threshold, quality),
-                    None => granule.threshold,
+                    None => granule.threshold.clone(),
                 });
             }
         }
-        self.pending.drain(..granules * channels);
 
         // Mid/side stereo. The two channels of real music are mostly the same
         // signal, and coding their sum and difference puts nearly all of the
@@ -765,7 +785,16 @@ impl Mp3Encode {
         let count = (granules * channels).max(1);
         let demand: Vec<f64> = xrs
             .iter()
-            .map(|xr| xr.iter().map(|v| f64::from(v.abs()).powf(0.75)).sum())
+            .map(|xr| {
+                xr.iter()
+                    .map(|v| {
+                        let x = f64::from(v.abs());
+                        // |x|^(3/4) as a cube and two square roots, the same
+                        // shape the quantiser uses.
+                        (x * x * x).sqrt().sqrt()
+                    })
+                    .sum()
+            })
             .collect();
         let demand_total: f64 = demand.iter().sum();
         let demand_share = |budget: usize, index: usize| -> u32 {
@@ -932,13 +961,10 @@ impl Mp3Encode {
         debug_assert_eq!(side_bytes.len(), side_info_len);
 
         // Append the granule data to the stream at `used`, byte aligned.
-        let mut main = BitWriter::new();
+        let mut main = BitBuf::new();
         for granule in &coded {
-            for bit in &granule.bits {
-                main.write_bit(*bit);
-            }
+            main.append(&granule.bits);
         }
-        main.align_to_byte();
         let main_bytes = main.into_bytes();
         // Stream positions the reservoir cap skipped over are stuffing, not
         // data, so they are zeros rather than a shorter stream.
@@ -1037,17 +1063,17 @@ impl Mp3Encode {
 /// unscaled inverse reconstructs the input under overlap-add.
 fn mdct_long(input: &[f32; 36], block_type: u8, out: &mut [f32]) {
     let window = &windows()[usize::from(block_type)];
+    let kernel = forward_mdct_long();
     let mut windowed = [0.0f32; 36];
     for i in 0..36 {
         windowed[i] = input[i] * window[i];
     }
-    for (k, slot) in out.iter_mut().enumerate() {
+    for (k, row) in kernel.iter().enumerate() {
         let mut sum = 0.0f64;
         for (n, value) in windowed.iter().enumerate() {
-            let angle = std::f64::consts::PI / 72.0 * ((2 * n + 19) * (2 * k + 1)) as f64;
-            sum += f64::from(*value) * angle.cos();
+            sum += f64::from(*value) * f64::from(row[n]);
         }
-        *slot = (sum / 9.0) as f32;
+        out[k] = (sum / 9.0) as f32;
     }
 }
 
@@ -1055,13 +1081,13 @@ fn mdct_long(input: &[f32; 36], block_type: u8, out: &mut [f32]) {
 /// into the spectrum the way the decoder reads them back.
 fn mdct_short(input: &[f32; 36], out: &mut [f32]) {
     let window = &windows()[2];
+    let kernel = forward_mdct_short();
     for w in 0..3 {
-        for k in 0..6 {
+        for (k, row) in kernel.iter().enumerate() {
             let mut sum = 0.0f64;
             for n in 0..12 {
                 let sample = input[6 + 6 * w + n] * window[n];
-                let angle = std::f64::consts::PI / 24.0 * ((2 * n + 7) * (2 * k + 1)) as f64;
-                sum += f64::from(sample) * angle.cos();
+                sum += f64::from(sample) * f64::from(row[n]);
             }
             out[k * 3 + w] = (sum / 3.0) as f32;
         }
@@ -1103,7 +1129,7 @@ fn quantise_granule(
     if xr.iter().all(|v| v.abs() <= ZERO_QUANT_THRESHOLD) {
         return (
             CodedGranule {
-                bits: Vec::new(),
+                bits: BitBuf::new(),
                 part2_3_length: 0,
                 big_values: 0,
                 global_gain: 0,
@@ -1211,29 +1237,35 @@ fn census(exit: (&str, usize)) {
     }
 }
 
-/// Bitstream order for a short block's spectrum.
+/// Puts a spectrum into bitstream order in `out`.
 ///
 /// A short granule is coded band by band, window by window, line by line,
 /// while the spectrum the transform produces interleaves the three windows on
 /// every line — the decoder's reorder step. The encoder has to undo it before
 /// Huffman coding; writing spectral order instead costs exactly the same
 /// number of bits, lands exactly on `part2_3_length`, and hands the decoder a
-/// permuted granule, which comes back as noise.
-fn short_reorder(sample_rate: u32, spectral: &[i32]) -> Vec<i32> {
+/// permuted granule, which comes back as noise. A long block is already in
+/// order and is copied as is.
+fn recode_into(spectral: &[i32; 576], block_type: u8, sample_rate: u32, out: &mut [i32; 576]) {
+    if block_type != 2 {
+        *out = *spectral;
+        return;
+    }
     let widths = short_widths(sample_rate);
     let starts = short_starts(sample_rate);
-    let mut out = Vec::with_capacity(576);
+    let mut position = 0usize;
     for sfb in 0..13 {
         let (width, start) = (usize::from(widths[sfb]), usize::from(starts[sfb]));
         for window in 0..3 {
             for line in 0..width {
-                let position = (start + line) * 3 + window;
-                out.push(spectral.get(position).copied().unwrap_or(0));
+                out[position] = spectral[(start + line) * 3 + window];
+                position += 1;
             }
         }
     }
-    out.resize(576, 0);
-    out
+    for slot in out.iter_mut().skip(position) {
+        *slot = 0;
+    }
 }
 
 /// The largest scalefactor a band can actually carry.
@@ -1273,6 +1305,13 @@ fn band_thresholds(threshold: &[f32], block_type: u8, sample_rate: u32) -> Vec<f
 
 /// Quantises with a fixed scalefactor set, running the rate loop on
 /// `global_gain`, and reports the noise each band ends up with.
+///
+/// The rate loop judges every candidate gain by Huffman cost alone
+/// ([`plan_spectrum`]); the granule's bits are materialised exactly once,
+/// for the configuration the loop keeps ([`write_spectrum`]). Writing the
+/// bits per round — and re-expanding them into a `Vec<bool>` to hand them
+/// to the frame writer — was the largest single cost in the encoder's
+/// profile, and said nothing the cost pass had not already said.
 fn code_with(
     xr: &[f32],
     block_type: u8,
@@ -1298,21 +1337,17 @@ fn code_with(
         210
     };
     let mut gain = start.clamp(0, 255);
-    let mut ix = vec![0i32; 576];
-    let mut coded;
-    // The rate loop runs both ways: down while there are bits to spare, up
-    // while the granule is too big for them. A line that saturates the coding
-    // range is not "cheap", it is clipped, so that check comes first.
+    let mut ix = [0i32; 576];
+    let mut coding = [0i32; 576];
+    // A line that saturates the coding range is not "cheap", it is clipped;
+    // the gain search below reads saturation as "does not fit".
     let saturated = |ix: &[i32]| ix.iter().any(|v| v.abs() > 8191);
-    let for_coding = |ix: &[i32]| -> Vec<i32> {
-        if block_type == 2 {
-            short_reorder(sample_rate, ix)
-        } else {
-            ix.to_vec()
-        }
+    let mut plan_of = |ix: &[i32; 576]| -> SpectrumPlan {
+        recode_into(ix, block_type, sample_rate, &mut coding);
+        plan_spectrum(&coding, block_type, sample_rate)
     };
     quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
-    coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
+    let mut coded = plan_of(&ix);
     if peak <= 1e-20 {
         // Below the smallest representable level: every line quantises to
         // zero at any gain (the quantiser's scale multiplies zero either
@@ -1324,47 +1359,102 @@ fn code_with(
         // depend on gain.
         gain = 0;
     } else {
-        loop {
-            if (saturated(&ix) || coded.0 > target_bits) && gain < 255 {
-                gain += 1;
-                quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
-                coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
-                continue;
+        // The rate loop wants the smallest gain whose granule fits the
+        // budget without clipping. A higher gain shrinks every quantised
+        // line, and a smaller spectrum costs no more to code, so "fits" is
+        // monotone in the gain. This shipped as a one-step-at-a-time walk
+        // from the start estimate and paid ~31 quantise-plus-plan
+        // evaluations per granule; now the start estimate seeds a geometric
+        // straddle (doubling steps, so a boundary `d` gains away costs
+        // about 2·log2 d probes instead of d) followed by a bisection of
+        // the bracket. The walk's two hard stops stay: gain 255 stands even
+        // when it does not fit (the low-pass loop below trims the
+        // spectrum), and gain 0 is the quietest legal gain.
+        let mut probe_of = |g: i32, out: &mut [i32; 576]| -> (bool, SpectrumPlan) {
+            quantise(xr, g, scalefac, sample_rate, block_type, out);
+            let plan = plan_of(out);
+            (plan.cost <= target_bits && !saturated(out), plan)
+        };
+        let mut probe = [0i32; 576];
+        // `floor` is the largest gain known to miss, `ceil` the smallest
+        // known to fit; −1 stands for "even 0 misses would not matter", the
+        // gain-0 floor.
+        let mut floor = -1i32;
+        let mut ceil = 255i32;
+        let mut capped = false;
+        let first = start.clamp(0, 255);
+        let (fits, _) = probe_of(first, &mut probe);
+        if fits {
+            // The boundary is at or below the estimate: stride down until a
+            // gain misses.
+            ceil = first;
+            let mut step = 1i32;
+            while ceil > 0 {
+                let next = (ceil - step).max(0);
+                let (next_fits, _) = probe_of(next, &mut probe);
+                if !next_fits {
+                    floor = next;
+                    break;
+                }
+                ceil = next;
+                step *= 2;
             }
-            if saturated(&ix) || coded.0 > target_bits || gain == 0 {
-                break;
+        } else {
+            // The boundary is above the estimate: stride up until a gain
+            // fits, honouring the walk's 255 cap.
+            floor = first;
+            let mut step = 1i32;
+            loop {
+                let next = (floor + step).min(255);
+                let (next_fits, _) = probe_of(next, &mut probe);
+                if next_fits {
+                    ceil = next;
+                    break;
+                }
+                floor = next;
+                if next == 255 {
+                    capped = true;
+                    break;
+                }
+                step *= 2;
             }
-            // Try one step quieter; keep it only if it still fits and stays
-            // inside the coding range.
-            let mut trial = ix.clone();
-            quantise(xr, gain - 1, scalefac, sample_rate, block_type, &mut trial);
-            let trial_coded = code_spectrum(&for_coding(&trial), block_type, sample_rate);
-            if trial_coded.0 > target_bits || saturated(&trial) {
-                break;
-            }
-            gain -= 1;
-            ix = trial;
-            coded = trial_coded;
         }
+        while ceil - floor > 1 {
+            let mid = (floor + ceil) / 2;
+            let (mid_fits, _) = probe_of(mid, &mut probe);
+            if mid_fits {
+                ceil = mid;
+            } else {
+                floor = mid;
+            }
+        }
+        gain = if capped { 255 } else { ceil };
+        let (_, plan) = probe_of(gain, &mut probe);
+        ix = probe;
+        coded = plan;
     }
     // Last resort: if even the quietest legal gain will not fit the bits we
     // were given, drop the top of the spectrum until it does. A granule that
     // overruns its budget would corrupt the reservoir for every frame after
     // it, which is far worse than a low-passed one.
     let mut limit = 576usize;
-    while coded.0 > target_bits && limit > 4 {
+    while coded.cost > target_bits && limit > 4 {
         limit = limit * 3 / 4;
         for slot in ix.iter_mut().skip(limit) {
             *slot = 0;
         }
-        coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
+        coded = plan_of(&ix);
     }
-    let (_, big_values, tables, region0, region1, count1_select, bits) = coded;
     let mut noise = [0.0f32; SFB_LONG];
     let power = power43();
+    // One band gain per band, not one per line: the residual ran an exp2 for
+    // every spectral line of the granule.
+    let mut scales = [0.0f32; SFB_LONG];
+    for (band, slot) in scales.iter_mut().enumerate() {
+        *slot = band_gain(gain, scalefac[band], block_type);
+    }
     let residual = |i: usize, band: usize| -> f32 {
-        let scale = band_gain(gain, scalefac[band], block_type);
-        let magnitude = power[(ix[i].unsigned_abs() as usize).min(MAX_QUANT)] * scale;
+        let magnitude = power[(ix[i].unsigned_abs() as usize).min(MAX_QUANT)] * scales[band];
         let reconstructed = if ix[i] < 0 { -magnitude } else { magnitude };
         (xr[i] - reconstructed).powi(2)
     };
@@ -1384,41 +1474,38 @@ fn code_with(
             noise[band] = sum;
         }
     }
-    let mut out = BitWriter::new();
+    // Materialise the granule: scalefactors, then the spectrum the plan
+    // chose, in bitstream order.
+    recode_into(&ix, block_type, sample_rate, &mut coding);
+    let mut bits = BitBuf::new();
     if block_type == 2 {
         // The decoder reads short scalefactors band-major, three windows at a
         // time; ours are one per band, so each is written three times.
         for (band, value) in scalefac.iter().enumerate().take(12) {
             let slen = if band < 6 { slen1 } else { slen2 };
             for _window in 0..3 {
-                out.write_bits(u32::from(*value), slen);
+                bits.push_bits(u64::from(*value), slen);
             }
         }
     } else {
         for (band, value) in scalefac.iter().enumerate() {
             let slen = if band < 11 { slen1 } else { slen2 };
-            out.write_bits(u32::from(*value), slen);
+            bits.push_bits(u64::from(*value), slen);
         }
     }
-    let scalefac_bits = out.bit_len() as u32;
-    let mut bits_out: Vec<bool> = Vec::with_capacity((scalefac_bits + bits.len() as u32) as usize);
-    let bytes = out.into_bytes();
-    for i in 0..scalefac_bits as usize {
-        bits_out.push((bytes[i / 8] >> (7 - i % 8)) & 1 == 1);
-    }
-    bits_out.extend_from_slice(&bits);
+    write_spectrum(&coded, &coding, &mut bits);
     let granule = CodedGranule {
-        part2_3_length: bits_out.len() as u32,
-        bits: bits_out,
-        big_values,
+        part2_3_length: bits.bit_len(),
+        bits,
+        big_values: coded.big_values,
         global_gain: gain as u32,
         scalefac_compress: compress,
         block_type,
-        table_select: tables,
-        region0_count: region0,
-        region1_count: region1,
+        table_select: coded.tables,
+        region0_count: coded.region0,
+        region1_count: coded.region1,
         scalefac_scale: false,
-        count1table_select: count1_select,
+        count1table_select: coded.count1_select,
     };
     (granule, noise)
 }
@@ -1437,19 +1524,32 @@ fn quantise(
     block_type: u8,
     ix: &mut [i32],
 ) {
+    // The scalar form, kept for spans shorter than one SIMD width.
     let quantise_line = |xr: f32, scale: f32| -> i32 {
-        let value = (xr.abs() * scale).powf(0.75);
-        let magnitude = (value + 0.4054).min(MAX_QUANT as f32) as i32;
+        let x = f64::from(xr.abs()) * f64::from(scale);
+        let value = (x * x * x).sqrt().sqrt();
+        let magnitude = (value + 0.4054).min(MAX_QUANT as f64) as i32;
         if xr < 0.0 { -magnitude } else { magnitude }
     };
     if block_type == 2 {
         // Short blocks: twelve bands, each with its own scalefactor shared by
         // the three windows. Without them the quantiser's noise is flat across
         // the spectrum, which is what made a switched granule the worst-coded
-        // one in the stream.
-        for (i, slot) in ix.iter_mut().enumerate().take(576) {
-            let scale = 1.0 / band_gain(gain, scalefac[short_band(i, sample_rate)], block_type);
-            *slot = quantise_line(xr[i], scale);
+        // one in the stream. One band gain per band, not one per line: the
+        // interleaved layout means a line's band search ran 576 exp2 calls
+        // and 576 linear band searches per quantisation.
+        let short = short_starts(sample_rate);
+        let mut scales = [0.0f32; 13];
+        for (band, slot) in scales.iter_mut().enumerate() {
+            *slot = 1.0 / band_gain(gain, scalefac[band], block_type);
+        }
+        for band in 0..13 {
+            let (from, to) = (
+                usize::from(short[band]) * 3,
+                usize::from(short[band + 1]) * 3,
+            );
+            let scale = scales[band];
+            quantise_span(xr, ix, from, to.min(576), scale, &quantise_line);
         }
         return;
     }
@@ -1463,9 +1563,46 @@ fn quantise(
         );
         let scalefac = if band < SFB_LONG { scalefac[band] } else { 0 };
         let scale = 1.0 / band_gain(gain, scalefac, block_type);
-        for i in from..to {
-            ix[i] = quantise_line(xr[i], scale);
+        quantise_span(xr, ix, from, to, scale, &quantise_line);
+    }
+}
+
+/// Quantises `xr[from..to]` at `scale` into `ix[from..to]`, eight lanes at a
+/// time through `wide` — the per-line curve the scalar closure carries out
+/// one line per call. Overflow lanes to `inf`, which the `MAX_QUANT` clamp
+/// folds back the same way the scalar path clamps a saturated line; the
+/// signed value truncates toward zero, exactly the sign-and-floor the scalar
+/// form does in two steps. Levels can differ from the scalar path by one
+/// step where the true level sits within f32 rounding of a boundary; the
+/// decoded-quality gate exists for exactly that.
+fn quantise_span(
+    xr: &[f32],
+    ix: &mut [i32],
+    from: usize,
+    to: usize,
+    scale: f32,
+    scalar: &impl Fn(f32, f32) -> i32,
+) {
+    let mut i = from;
+    if to - i >= 8 {
+        let vscale = f32x8::splat(scale);
+        let voff = f32x8::splat(0.4054);
+        let vmax = f32x8::splat(MAX_QUANT as f32);
+        while i + 8 <= to {
+            let mut block = [0.0f32; 8];
+            block.copy_from_slice(&xr[i..i + 8]);
+            let v = f32x8::new(block);
+            let x = v.abs() * vscale;
+            let value = (x * x * x).sqrt().sqrt();
+            let magnitude = (value + voff).min(vmax);
+            let ints = magnitude.copysign(v).trunc_int();
+            ix[i..i + 8].copy_from_slice(&ints.to_array());
+            i += 8;
         }
+    }
+    while i < to {
+        ix[i] = scalar(xr[i], scale);
+        i += 1;
     }
 }
 
@@ -1481,14 +1618,29 @@ fn short_band(index: usize, sample_rate: u32) -> usize {
         .unwrap_or(0)
 }
 
-/// Chooses the region split, the tables and the count1 boundary, and writes the
-/// spectrum. Returns the bit cost first so the rate loop can stop early.
-#[allow(clippy::type_complexity)]
-fn code_spectrum(
-    ix: &[i32],
+/// The coding a spectrum gets: region split, tables, count1 boundary, and
+/// the bit cost the rate loop judges candidate gains by.
+#[derive(Clone, Copy, Debug)]
+struct SpectrumPlan {
+    cost: u32,
+    big_values: u32,
+    tables: [u8; 3],
+    region0: u32,
+    region1: u32,
+    count1_select: bool,
+    bounds: [usize; 3],
+    big_end: usize,
+    count1_end: usize,
+}
+
+/// Trailing zeros, the count1 boundary, and the region split for a coded
+/// spectrum, in bitstream order. The planner and the writer read these off
+/// one structure so both see the same boundaries.
+fn regions(
+    ix: &[i32; 576],
     block_type: u8,
     sample_rate: u32,
-) -> (u32, u32, [u8; 3], u32, u32, bool, Vec<bool>) {
+) -> (u32, u32, [usize; 3], usize, usize) {
     // Trailing zeros are not coded at all; before them, a run of values in
     // -1..=1 is coded four at a time.
     let mut rzero = 576;
@@ -1539,55 +1691,77 @@ fn code_spectrum(
             (r0 as u32, r1 as u32, [a, b.max(a), big_end])
         }
     };
+    (region0, region1, bounds, big_end, count1_end)
+}
 
+/// Chooses the region split, the tables and the count1 boundary, and prices
+/// the spectrum. The rate loop calls this for every candidate gain; only the
+/// configuration it keeps is ever written ([`write_spectrum`]).
+fn plan_spectrum(ix: &[i32; 576], block_type: u8, sample_rate: u32) -> SpectrumPlan {
+    let (region0, region1, bounds, big_end, count1_end) = regions(ix, block_type, sample_rate);
     let mut tables = [0u8; 3];
-    let mut writer = BitWriter::new();
+    let mut cost = 0u32;
     let mut from = 0usize;
     for (region, to) in bounds.iter().enumerate() {
         let to = (*to).min(big_end);
         if to > from {
-            let select = best_table(ix, from, to);
+            let (select, region_cost) = best_table_cost(ix, from, to);
             tables[region] = select;
-            let table = huffman::big_table(usize::from(select)).expect("table exists");
+            cost += region_cost;
+        }
+        from = to;
+    }
+    // count1: try both tables, keep the cheaper.
+    let quads_cost = |select: bool| -> u32 {
+        let mut sum = 0;
+        let mut i = big_end;
+        while i + 4 <= count1_end {
+            sum += huffman::quad_bits(select, [ix[i], ix[i + 1], ix[i + 2], ix[i + 3]]);
+            i += 4;
+        }
+        sum
+    };
+    let count1_select = quads_cost(true) < quads_cost(false);
+    cost += quads_cost(count1_select);
+    SpectrumPlan {
+        cost,
+        big_values: (big_end / 2) as u32,
+        tables,
+        region0,
+        region1,
+        count1_select,
+        bounds,
+        big_end,
+        count1_end,
+    }
+}
+
+/// Writes the coded spectrum the plan names into `out`, pairs and quadruples
+/// in bitstream order. `ix` is the spectrum in bitstream order, the same
+/// array the plan was computed from.
+fn write_spectrum(plan: &SpectrumPlan, ix: &[i32; 576], out: &mut BitBuf) {
+    let mut from = 0usize;
+    for (region, to) in plan.bounds.iter().enumerate() {
+        let to = (*to).min(plan.big_end);
+        if to > from {
+            let table = huffman::big_table(usize::from(plan.tables[region])).expect("table exists");
             let mut i = from;
             while i + 1 < to {
-                huffman::write_pair(&mut writer, table, ix[i], ix[i + 1]);
+                huffman::write_pair(out, table, ix[i], ix[i + 1]);
                 i += 2;
             }
         }
         from = to;
     }
-    // count1: try both tables, keep the cheaper.
-    let quads: Vec<[i32; 4]> = (big_end..count1_end)
-        .step_by(4)
-        .filter(|i| i + 4 <= 576)
-        .map(|i| [ix[i], ix[i + 1], ix[i + 2], ix[i + 3]])
-        .collect();
-    let cost = |select: bool| -> u32 {
-        quads
-            .iter()
-            .map(|quad| huffman::quad_bits(select, *quad))
-            .sum()
-    };
-    let count1_select = cost(true) < cost(false);
-    for quad in &quads {
-        huffman::write_quad(&mut writer, count1_select, *quad);
+    let mut i = plan.big_end;
+    while i + 4 <= plan.count1_end {
+        huffman::write_quad(
+            out,
+            plan.count1_select,
+            [ix[i], ix[i + 1], ix[i + 2], ix[i + 3]],
+        );
+        i += 4;
     }
-    let bit_len = writer.bit_len() as usize;
-    let bytes = writer.into_bytes();
-    let mut bits = Vec::with_capacity(bit_len);
-    for i in 0..bit_len {
-        bits.push((bytes[i / 8] >> (7 - i % 8)) & 1 == 1);
-    }
-    (
-        bits.len() as u32,
-        (big_end / 2) as u32,
-        tables,
-        region0,
-        region1,
-        count1_select,
-        bits,
-    )
 }
 
 /// Tables that can code a region whose largest magnitude is `max`, cheapest
@@ -1611,40 +1785,102 @@ fn candidates(max: u32) -> &'static [u8] {
     }
 }
 
-/// The cheapest table for one region.
-fn best_table(ix: &[i32], from: usize, to: usize) -> u8 {
-    let max = ix[from..to]
-        .iter()
-        .map(|v| v.unsigned_abs())
-        .max()
-        .unwrap_or(0);
-    let mut best = (u32::MAX, 0u8);
-    for &select in candidates(max) {
+/// The cheapest table for one region, with its cost.
+///
+/// One walk over the pairs accumulates every shortlisted candidate's cost at
+/// once; the former shape — a full `pair_bits` pass per candidate, up to nine
+/// walks over the same pairs — was half of the encoder's remaining runtime.
+/// A candidate any pair falls outside dies on the spot, exactly as the
+/// per-candidate `pair_bits` propagation did, and ties keep the earlier
+/// (nominally cheaper) candidate, as the strict less-than did.
+fn best_table_cost(ix: &[i32], from: usize, to: usize) -> (u8, u32) {
+    let mut max = 0u32;
+    for &v in &ix[from..to] {
+        max = max.max(v.unsigned_abs());
+    }
+    let shortlist = candidates(max);
+    // Per-candidate state, fetched once: the table, its escape shape, the
+    // cost of a (0, 0) pair, and a running cost. A candidate the region's
+    // largest magnitude falls outside is dropped before the walk — exactly
+    // what the per-pair range check did, since some pair carries `max`.
+    let mut tables = [None; 9];
+    let mut tmax = [0u32; 9];
+    let mut linbits = [0u32; 9];
+    let mut dim = [0u32; 9];
+    let mut zero_bits = [0u32; 9];
+    let mut feasible = [false; 9];
+    let mut costs = [0u32; 9];
+    let mut live = 0usize;
+    for (slot, &select) in shortlist.iter().enumerate() {
         let Ok(table) = huffman::big_table(usize::from(select)) else {
             continue;
         };
-        if let Some(cost) = table_cost(ix, from, to, table)
-            && cost < best.0
-        {
-            best = (cost, select);
+        let cap = u32::from(table.dim) - 1;
+        let escape = table.linbits > 0;
+        let reach = cap + if escape { (1 << table.linbits) - 1 } else { 0 };
+        if max > reach {
+            continue;
+        }
+        tables[slot] = Some(table);
+        tmax[slot] = cap;
+        linbits[slot] = if escape { u32::from(table.linbits) } else { 0 };
+        dim[slot] = u32::from(table.dim);
+        zero_bits[slot] = u32::from(table.codes[0].0);
+        feasible[slot] = true;
+        live += 1;
+    }
+    let mut i = from;
+    while i + 1 < to && live > 0 {
+        let (x, y) = (ix[i].unsigned_abs(), ix[i + 1].unsigned_abs());
+        if x == 0 && y == 0 {
+            for slot in 0..shortlist.len() {
+                if feasible[slot] {
+                    costs[slot] += zero_bits[slot];
+                }
+            }
+            i += 2;
+            continue;
+        }
+        let signs = u32::from(x != 0) + u32::from(y != 0);
+        for slot in 0..shortlist.len() {
+            if !feasible[slot] {
+                continue;
+            }
+            let table = tables[slot].expect("feasible candidates hold a table");
+            let (cap, lin) = (tmax[slot], linbits[slot]);
+            let (len, _) = table.codes[(x.min(cap) * dim[slot] + y.min(cap)) as usize];
+            if len == 0 {
+                // A hole in the table: this candidate cannot code the pair,
+                // so it is out for the whole region.
+                feasible[slot] = false;
+                live -= 1;
+                continue;
+            }
+            let mut bits = u32::from(len) + signs;
+            if lin > 0 {
+                if x >= cap {
+                    bits += lin;
+                }
+                if y >= cap {
+                    bits += lin;
+                }
+            }
+            costs[slot] += bits;
+        }
+        i += 2;
+    }
+    let mut best = (u32::MAX, 0u8);
+    for (slot, &select) in shortlist.iter().enumerate() {
+        if feasible[slot] && costs[slot] < best.0 {
+            best = (costs[slot], select);
         }
     }
     if best.1 == 0 {
         // Nothing in the shortlist fits, which only a value above the coding
         // range can cause; fall back to the widest escape table.
-        return 23;
+        return (23, 0);
     }
-    best.1
-}
-
-fn table_cost(ix: &[i32], from: usize, to: usize, table: Table) -> Option<u32> {
-    let mut sum = 0;
-    let mut i = from;
-    while i + 1 < to {
-        sum += huffman::pair_bits(table, ix[i].unsigned_abs(), ix[i + 1].unsigned_abs())?;
-        i += 2;
-    }
-    Some(sum)
+    (best.1, best.0)
 }
 
 /// The `scalefac_compress` index whose two lengths hold these scalefactors.
