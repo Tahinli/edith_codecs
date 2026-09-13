@@ -396,6 +396,7 @@ version = "0.1.0"
 dependencies = [
  "ec-core",
  "ec-dsp",
+ "wide",
 ]
 
 [[package]]
