@@ -262,33 +262,6 @@ impl BitBuf {
     }
 }
 
-/// Bits one pair costs in `table`, or `None` when the pair is out of range.
-pub(crate) fn pair_bits(table: Table, x: u32, y: u32) -> Option<u32> {
-    let max = u32::from(table.dim) - 1;
-    let escape = u32::from(table.linbits) > 0;
-    let (ix, iy) = (x.min(max), y.min(max));
-    if (x > max && !escape) || (y > max && !escape) {
-        return None;
-    }
-    if escape && (x > max + (1 << table.linbits) - 1 || y > max + (1 << table.linbits) - 1) {
-        return None;
-    }
-    let (len, _) = table.codes[(ix * u32::from(table.dim) + iy) as usize];
-    if len == 0 && !(x == 0 && y == 0) {
-        return None;
-    }
-    let mut bits = u32::from(len);
-    for value in [x, y] {
-        if value >= max && escape {
-            bits += u32::from(table.linbits);
-        }
-        if value != 0 {
-            bits += 1;
-        }
-    }
-    Some(bits)
-}
-
 /// Writes one pair; the caller has already checked it fits the table.
 pub(crate) fn write_pair(writer: &mut BitBuf, table: Table, x: i32, y: i32) {
     let max = u32::from(table.dim) - 1;
