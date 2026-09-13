@@ -86,3 +86,26 @@ scalar-curve change landed, both gated above).
 - Cross-machine final table on an idle VPS not run: both engines share one
   process here, so every ratio above is already same-machine/same-load; a
   quiet-box pass would tighten the absolute x-realtime numbers only.
+
+## Audit corrections (glm53 audit, pre-merge)
+
+Provenance-verified clean rebuilds of every commit contradict two claims
+above, both documentation-level (code, quality, and perf conclusions all
+stand):
+
+- f51fef8f (MDCT cosine table) is NOT byte-identical: the table rounds
+  the kernel to f32 (`as f32`) and widens per product, where the old
+  code multiplied full-f64 cosines — music3s-cbr192 moved 6 bytes at
+  exactly this step (offsets 2773, 2988, 3697, 5882, 68143, 68144),
+  including re-flipping the byte c056aa4d moved. Same ulp-boundary
+  class; corr 0.999998 held at this step too. The attribution above to
+  the gain-search step (46a73869) is WRONG: clean rebuilds of 891dd0b2
+  and 46a73869 are byte-identical on all 8 fixtures — the bracket moved
+  nothing (consistent with fits() being monotone in gain). The actual
+  movers: c056aa4d (1 byte), f51fef8f (6 bytes).
+- The 2h-film wall arithmetic: 7200 s / 139.9x ≈ 51 s (slowest row
+  63.8x → 113 s), not ~2.5 min. Direction stands; the number did not.
+- The SIMD quantiser (e51d830d) computes the level curve in f32 where
+  the scalar closure uses f64: ±1-step boundary flips are possible by
+  construction (documented at encode.rs:1573-1577), and the empirical
+  byte-identity on these fixtures is contingent, not structural.
