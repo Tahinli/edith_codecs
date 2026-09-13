@@ -20,7 +20,10 @@
 use crate::filterbank::{Analysis, alias_expand};
 use crate::header::{ChannelMode, FrameHeader, Version};
 use crate::huffman::{self, BitBuf, Table};
-use crate::tables::{MAX_QUANT, SLEN, long_starts, power43, short_starts, short_widths, windows};
+use crate::tables::{
+    MAX_QUANT, SLEN, forward_mdct_long, forward_mdct_short, long_starts, power43, short_starts,
+    short_widths, windows,
+};
 use ec_core::bitio::BitWriter;
 use ec_core::error::{Error, Result};
 use ec_dsp::{RealFft, Window};
@@ -1043,17 +1046,17 @@ impl Mp3Encode {
 /// unscaled inverse reconstructs the input under overlap-add.
 fn mdct_long(input: &[f32; 36], block_type: u8, out: &mut [f32]) {
     let window = &windows()[usize::from(block_type)];
+    let kernel = forward_mdct_long();
     let mut windowed = [0.0f32; 36];
     for i in 0..36 {
         windowed[i] = input[i] * window[i];
     }
-    for (k, slot) in out.iter_mut().enumerate() {
+    for (k, row) in kernel.iter().enumerate() {
         let mut sum = 0.0f64;
         for (n, value) in windowed.iter().enumerate() {
-            let angle = std::f64::consts::PI / 72.0 * ((2 * n + 19) * (2 * k + 1)) as f64;
-            sum += f64::from(*value) * angle.cos();
+            sum += f64::from(*value) * f64::from(row[n]);
         }
-        *slot = (sum / 9.0) as f32;
+        out[k] = (sum / 9.0) as f32;
     }
 }
 
@@ -1061,13 +1064,13 @@ fn mdct_long(input: &[f32; 36], block_type: u8, out: &mut [f32]) {
 /// into the spectrum the way the decoder reads them back.
 fn mdct_short(input: &[f32; 36], out: &mut [f32]) {
     let window = &windows()[2];
+    let kernel = forward_mdct_short();
     for w in 0..3 {
-        for k in 0..6 {
+        for (k, row) in kernel.iter().enumerate() {
             let mut sum = 0.0f64;
             for n in 0..12 {
                 let sample = input[6 + 6 * w + n] * window[n];
-                let angle = std::f64::consts::PI / 24.0 * ((2 * n + 7) * (2 * k + 1)) as f64;
-                sum += f64::from(sample) * angle.cos();
+                sum += f64::from(sample) * f64::from(row[n]);
             }
             out[k * 3 + w] = (sum / 3.0) as f32;
         }
