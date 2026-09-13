@@ -73,6 +73,13 @@ fn main() {
             println!("  census luma SAD rank of RD winner: {}", pct(&luma_rank));
             println!("  census chroma SAD rank of RD winner: {}", pct(&chroma_rank));
         }
+        // lane-arfmode: the engagement counter of the top ARF's offer-set
+        // lever, taken once per point so an armed run PRINTS a non-zero count
+        // (class gate-blind-to-feature; a BD number over a counter of zero
+        // proves nothing). Zeros when `EC_AV1_ARFMODE` is unset, which is the
+        // control's own expectation.
+        let hits = ec_av1::encode::take_arfmode_hits();
+        println!("  arfmode hits: {} {} {}", hits[0], hits[1], hits[2]);
     }
     println!("wall {:.3}s", start.elapsed().as_secs_f64());
 }
