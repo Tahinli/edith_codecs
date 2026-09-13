@@ -638,7 +638,7 @@ impl AacEncoder {
             // scalefactors: that keeps the noise following the shape the model
             // asked for, and lets a band whose signal falls under its own mask
             // drop out entirely instead of being coded ever more coarsely.
-            let target = frame.threshold[b] * 2f32.powf(offset as f32 * 0.5);
+            let target = frame.threshold[b] * POW_HALF[(offset + 240) as usize];
             if profile.energy[b] / profile.count[b].max(1) as f32 <= target {
                 continue;
             }
@@ -693,11 +693,12 @@ impl AacEncoder {
                     }
                     continue;
                 }
+                let gain = pow_quarter(SF_OFFSET - sf[b]);
                 let mut peak = 0i32;
                 for w in 0..windows {
                     let base = if short { w * SHORT_LEN } else { 0 };
                     for k in lo..hi {
-                        let q = quantise_one(frame.coef[base + k], sf[b]);
+                        let q = quantise_one(frame.coef[base + k], gain);
                         quant[base + k] = q;
                         peak = peak.max(q.abs());
                     }
@@ -759,14 +760,15 @@ impl AacEncoder {
         short: bool,
     ) -> f32 {
         let (lo, hi) = (usize::from(swb[band]), usize::from(swb[band + 1]));
-        let gain = 2f32.powf((sf - SF_OFFSET) as f32 * 0.25);
+        let gain = pow_quarter(sf - SF_OFFSET);
+        let gain_inv = pow_quarter(SF_OFFSET - sf);
         let mut noise = 0.0f32;
         let mut count = 0usize;
         for w in 0..windows {
             let base = if short { w * SHORT_LEN } else { 0 };
             for k in base + lo..base + hi {
                 let x = frame.coef[k];
-                let q = quantise_one(x, sf);
+                let q = quantise_one(x, gain_inv);
                 let mut back = pow43(q.unsigned_abs()) * gain;
                 if q < 0 {
                     back = -back;
@@ -888,6 +890,29 @@ static POW43: LazyLock<Vec<f32>> = LazyLock::new(|| {
         .collect()
 });
 
+/// `2^(v/4)` for every integer v the rate loop asks for: a band's quantiser
+/// step is `2^((sf-100)/4)` in `band_noise` and its reciprocal inside
+/// [`quantise_one`], and the exponent's integer range over sf in 0..=255 is
+/// -100..=155 either way. Every entry is produced by the very `powf` call it
+/// replaces, so lookups return the bit-identical value.
+static POW_QUARTER: LazyLock<Vec<f32>> = LazyLock::new(|| {
+    (-155i32..=155)
+        .map(|v| 2f32.powf(v as f32 * 0.25))
+        .collect()
+});
+
+fn pow_quarter(v: i32) -> f32 {
+    POW_QUARTER[(v + 155) as usize]
+}
+
+/// `2^(offset/2)`, the rate loop's mask scale, same table trick at the
+/// half-octave stride; the bisection bounds keep offset in -240..=240.
+static POW_HALF: LazyLock<Vec<f32>> = LazyLock::new(|| {
+    (-240i32..=240)
+        .map(|o| 2f32.powf(o as f32 * 0.5))
+        .collect()
+});
+
 fn pow43(q: u32) -> f32 {
     POW43[q.min(MAX_QUANT as u32) as usize]
 }
@@ -900,11 +925,14 @@ fn sf_floor(peak: f32) -> i32 {
     SF_OFFSET + want.ceil() as i32
 }
 
-fn quantise_one(x: f32, sf: i32) -> i32 {
+/// The gain is the band's `2^((sf-100)/4)` reciprocal -- `pow_quarter`'s
+/// job -- hoisted to the call sites so the inner-inner loop is sqrts only.
+/// The value is the same f32 the old per-coefficient `powf` produced, so the
+/// quantised integers do not move.
+fn quantise_one(x: f32, gain: f32) -> i32 {
     if x == 0.0 {
         return 0;
     }
-    let gain = 2f32.powf(-(sf - SF_OFFSET) as f32 * 0.25);
     // x^0.75 == sqrt(x * sqrt(x)): two sqrtf beat one powf by a wide margin,
     // and this call site is the rate loop's inner-inner loop.
     let v = x.abs() * gain;
