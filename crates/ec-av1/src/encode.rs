@@ -7845,15 +7845,13 @@ fn arfmode_hit_and_no() -> bool {
     false
 }
 
-/// Takes (and clears) the counts.
-#[cfg(test)]
-pub(crate) fn take_arfmode_hits() -> [usize; 3] {
+/// Takes (and clears) the counts. `pub` for `examples/enc_probe`, so a
+/// probe point can print a non-zero engagement count under the env knob
+/// itself -- the counter the gate BD numbers are read against.
+pub fn take_arfmode_hits() -> [usize; 3] {
     [0, 1, 2].map(|i| ARFMODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
-/// [`Search::top_k`]'s value: `None` keeps every mode's search unchanged
-/// (the default, until a lever's quality gate justifies pruning by default);
-/// `EC_AV1_PRUNE_K` sweeps it in a test build without touching callers.
 fn prune_top_k() -> Option<usize> {
     #[cfg(test)]
     {
