@@ -6862,7 +6862,14 @@ fn code_square_inter(
     refs: &[Option<&Picture>; 8],
     fctx: &crate::decode::FrameCtx,
 ) -> (BlockCoeffs, f64) {
-    let (intra_block, intra_cost) =
+    // lane-arfmode: at the top ARF (arm 1) the leaf offers no intra
+    // candidate at all -- `intra_cost` stays at infinity, so every
+    // comparison below takes an inter candidate and the fallback arm at the
+    // tail is unreachable. The planes hold what the caller snapshotted until
+    // the winner commits: the intra trial used to commit here and be
+    // overwritten by the inter commit, so skipping it changes no committed
+    // sample, only work.
+    let (intra_block, intra_cost) = if search.arf_leaf_intra {
         code_square(
             luma,
             chroma,
@@ -6874,7 +6881,11 @@ fn code_square_inter(
             None,
             false,
             fctx,
-        );
+        )
+    } else {
+        arfmode_hit(0);
+        (BlockCoeffs::default(), f64::INFINITY)
+    };
     let luma_set = if side == 8 {
         TxbSet::Luma8Inter
     } else {
@@ -7129,7 +7140,13 @@ fn code_square_inter(
     // SECOND-reference search of its own -- `NEAREST_NEWMV` and `NEW_NEWMV`
     // too. Priced with the same static-CDF approximation, plus the
     // compound-only syntax the writer emits.
-    for (ref1, g, cstack) in compound.iter().filter(|_| leaf_compound()) {
+    if leaf_compound() && !search.arf_leaf_compound && !compound.is_empty() {
+        // lane-arfmode: arm 4 drops this leaf's compound set (counted once
+        // per leaf, not once per pair); the single-reference candidates
+        // above stay.
+        arfmode_hit(2);
+    }
+    for (ref1, g, cstack) in compound.iter().filter(|_| leaf_compound() && search.arf_leaf_compound) {
         let (ref1, g) = (*ref1, *g);
         // The whole `comp_mode` + reference-pair tree at the writer's own
         // contexts, for THIS pair (lane-ctx).
@@ -7762,11 +7779,79 @@ struct Search<'a> {
     /// `intra_pruning_with_hog` -- never prunes it away). `None` runs every
     /// mode through full RD, unchanged from before this lever.
     top_k: Option<usize>,
+    /// lane-arfmode: the top ARF's offer set ([`crate::speed::ARFMODE`])
+    /// -- `false` cuts the named candidate group from the whole-32 search
+    /// ([`search_inter_block`]), the 16x16/8x8 leaf search
+    /// ([`code_square_inter`]) and the 8x8 split offer, at the top ARF
+    /// ([`DqLevel::TopArf`] frames only). `true` everywhere else, which is
+    /// the pre-lane behaviour: the mid and quarter hidden frames, the shown
+    /// leaves and the flat path keep intra and compound, and the
+    /// straddling-edge 8x8s are only mode-gated, never partition-gated.
+    /// The probe's correction: with the leaf gate ALONE the film A stream
+    /// was byte-identical to the control -- the ARF's intra area lives at
+    /// the whole-32 level, so the intra arm must cut it there too.
+    arf_leaf_intra: bool,
+    arf_leaf8: bool,
+    arf_leaf_compound: bool,
 }
 
-/// [`Search::top_k`]'s value: `None` keeps every mode's search unchanged
-/// (the default, until a lever's quality gate justifies pruning by default);
-/// `EC_AV1_PRUNE_K` sweeps it in a test build without touching callers.
+/// [`Search`]'s ARF fields' source: [`crate::speed::ARFMODE`], or what
+/// `EC_AV1_ARFMODE` names on one build (a missing or broken value keeps the
+/// shipped table -- 0, bit-exact with the pre-lane encoder).
+fn arfmode() -> u8 {
+    match ARFMODE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        u8::MAX => {}
+        n => return n,
+    }
+    static ENV: std::sync::LazyLock<Option<u8>> = std::sync::LazyLock::new(|| {
+        crate::envflags::var("EC_AV1_ARFMODE").ok().and_then(|v| v.parse().ok())
+    });
+    ENV.unwrap_or_else(|| crate::speed::at(&crate::speed::ARFMODE))
+}
+
+/// [`ARFMODE_OVERRIDE`]: `u8::MAX` clears it.
+static ARFMODE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Sets [`ARFMODE_OVERRIDE`]; `None` clears it. Test-only: the env is a
+/// process constant ([`crate::envflags`]), so an in-process witness needs
+/// this to arm the lever.
+#[allow(dead_code)] // set only from the `#[cfg(test)]` witness
+pub(crate) fn set_arfmode(n: Option<u8>) {
+    ARFMODE_OVERRIDE.store(n.unwrap_or(u8::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How often each armed [`crate::speed::ARFMODE`] arm actually fired since
+/// the last take (class `gate-blind-to-feature`): 0 = a top-ARF leaf coded
+/// with its intra candidate skipped, 1 = a top-ARF 16x16 leaf whose 8x8
+/// split the search would have offered and the arm refused, 2 = a top-ARF
+/// leaf whose compound set was dropped. A green gate over counts of zero
+/// proves nothing about the lever.
+static ARFMODE_HITS: [std::sync::atomic::AtomicUsize; 3] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// Records one such hit.
+fn arfmode_hit(which: usize) {
+    ARFMODE_HITS[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`arfmode_hit`]`(1)` and "no": the `||` arm of the top ARF's 8x8-offer
+/// condition, so the counter only runs when every other prune let the split
+/// through and the arm alone refuses it.
+fn arfmode_hit_and_no() -> bool {
+    arfmode_hit(1);
+    false
+}
+
+/// Takes (and clears) the counts. `pub` for `examples/enc_probe`, so a
+/// probe point can print a non-zero engagement count under the env knob
+/// itself -- the counter the gate BD numbers are read against.
+pub fn take_arfmode_hits() -> [usize; 3] {
+    [0, 1, 2].map(|i| ARFMODE_HITS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 fn prune_top_k() -> Option<usize> {
     #[cfg(test)]
     {
@@ -8419,6 +8504,9 @@ pub(crate) fn encode_key_frame_inner(
         modes,
         top_k: prune_top_k(),
         screen,
+        arf_leaf_intra: true,
+        arf_leaf8: true,
+        arf_leaf_compound: true,
     };
 
     // The block grid this frame is coded over: [`crate::tile::block_grid`]'s
@@ -10932,43 +11020,52 @@ fn search_inter_block(
         _ => search.modes.to_vec(),
     };
     census_add(5, 1);
-    census_add(6, intra_modes.len());
-    for &mode in &intra_modes {
-        let luma_trial = luma.trial(
-            At {
-                x,
-                y,
-                side: BLOCK,
-                reach,
-                set: luma_set,
-            },
-            mode,
-            0,
-            search.base_q_idx,
-            search.deadzone, fctx,
-        );
-        let u = u_trial.clone();
-        let v = v_trial.clone();
-        let cost = luma_trial.sse
-            + u.sse
-            + v.sse
-            + search.lambda
-                * (luma_trial.bits
-                    + u.bits
-                    + v.bits
-                    + mode_bits[usize::from(mode)]
-                    + skip_bits(false)
-                    + intra_inter_bits(false));
-        consider(Candidate {
-            cost,
-            luma: luma_trial,
-            u,
-            v,
-            mode,
-            skip: false,
-            inter: None,
-            mode_bits: mode_bits[usize::from(mode)],
-        });
+    census_add(6, if search.arf_leaf_intra { intra_modes.len() } else { 0 });
+    // lane-arfmode: arm 1 drops the whole-32 block's intra candidates at the
+    // top ARF too -- the probe proved the ARF's intra AREA lives HERE, not at
+    // the leaves (film A arm 1 vs control byte-identical with the leaf gate
+    // alone), so "the 32x32 whole keeps intra as the scene-cut hatch" was a
+    // hatch nothing else was using. Counted once per block.
+    if search.arf_leaf_intra {
+        for &mode in &intra_modes {
+            let luma_trial = luma.trial(
+                At {
+                    x,
+                    y,
+                    side: BLOCK,
+                    reach,
+                    set: luma_set,
+                },
+                mode,
+                0,
+                search.base_q_idx,
+                search.deadzone, fctx,
+            );
+            let u = u_trial.clone();
+            let v = v_trial.clone();
+            let cost = luma_trial.sse
+                + u.sse
+                + v.sse
+                + search.lambda
+                    * (luma_trial.bits
+                        + u.bits
+                        + v.bits
+                        + mode_bits[usize::from(mode)]
+                        + skip_bits(false)
+                        + intra_inter_bits(false));
+            consider(Candidate {
+                cost,
+                luma: luma_trial,
+                u,
+                v,
+                mode,
+                skip: false,
+                inter: None,
+                mode_bits: mode_bits[usize::from(mode)],
+            });
+        }
+    } else {
+        arfmode_hit(0);
     }
 
     // The reference frame buffer a spec decoder holds is exactly the true
@@ -12863,6 +12960,11 @@ pub(crate) fn encode_inter_frame(
     ];
 
     let step = f64::from(ac_q(8, i32::from(base_q_idx))) / 8.0;
+    let top_arf = matches!(
+        pyramid,
+        Some(p) if p.dq_level == DqLevel::TopArf
+    );
+    let arfmode_v = arfmode();
     let search = Search {
         base_q_idx,
         deadzone,
@@ -12876,6 +12978,14 @@ pub(crate) fn encode_inter_frame(
         modes: &KEY_FRAME_MODES,
         top_k: prune_top_k_inter(),
         screen,
+        // lane-arfmode: the group's own anchor ([`DqLevel::TopArf`], whose
+        // offset is the pyramid's own `arf_q_offset`) reads its leaf offer
+        // set from [`crate::speed::ARFMODE`]; every other frame -- the mid
+        // and quarter hidden frames, the leaves, the flat path -- keeps the
+        // full set.
+        arf_leaf_intra: !top_arf || arfmode_v & 1 == 0,
+        arf_leaf8: !top_arf || arfmode_v & 2 == 0,
+        arf_leaf_compound: !top_arf || arfmode_v & 4 == 0,
     };
     let mode_bits_table = inter_mode_bits();
     // lane-av1tpl: one lambda factor per 64x64 superblock, from how much of
@@ -13586,7 +13696,17 @@ pub(crate) fn encode_inter_frame(
                                 let eight = (!leaf.skip
                                     && !split_rd_breakout(leaf_cost, SUB, search.lambda)
                                     && (breakout == 0 || leaf.luma.len() > breakout)
-                                    && split_inter_8())
+                                    && split_inter_8()
+                                    // lane-arfmode: arm 2 makes 16x16 the top
+                                    // ARF's leaf floor -- the RD-optional 8x8
+                                    // comparison is not offered. Counted only
+                                    // when every other prune let it through,
+                                    // so the counter means "refused", not
+                                    // "never considered". The spec-forced 8x8s
+                                    // at a straddling 16x16 (the
+                                    // `sub_positions` path below) are a
+                                    // different site and stay.
+                                    && (search.arf_leaf8 || arfmode_hit_and_no()))
                                     .then(|| {
                                         restore(
                                             &mut luma, &mut chroma, (lx, ly), SUB, &leaf_base,
