@@ -460,6 +460,26 @@ pub(crate) const ARF_TF_WIN: [usize; 11] = [3; 11];
 /// so [`ARF_TF`] stays where lane-arftf put it.
 pub(crate) const ARF_TF_WIN_FUT: [usize; 11] = [3; 11];
 
+/// lane-arfmode: the top ARF's LEAF offer set, as a bitmask -- `1` the 16x16
+/// and 8x8 leaves of the group's own anchor ([`crate::encode::DqLevel::
+/// TopArf`]) offer no INTRA candidate, `2` a 16x16 leaf under it is not
+/// offered the 8x8 split, `4` the leaves offer no compound candidates;
+/// combinations OR, `0` (the default) is bit-exact with the pre-lane
+/// encoder. `EC_AV1_ARFMODE=<n>` overrides it. The 32x32 whole keeps its
+/// full offer set (the scene-cut hatch), and the spec-forced 8x8s at
+/// straddling edges are untouched -- only RD-optional offers are cut.
+///
+/// The census it answers to (lanes/arfmode.charter.md, at 0d81d6c5): the top
+/// ARF's syntax gap against rav1e's own ARF at the same position is
+/// film A +1337 / film B +971 B a frame across mode+mv+partition, and the
+/// mode family is carried by syntax rav1e does not spend there -- an intra
+/// fallback whose 4-15% area share de-optimizes the shared `intra_inter`
+/// CDF (ours 138 B/frame against its 10 on film B), compound at 19-24% of
+/// the area against its 0%, and an 8x8 split rate 2.4x its own. CAUTION the
+/// same census records: on the grain film even rav1e keeps 12.3% intra area
+/// at its ARF, so arm 1's residual risk is concentrated exactly there.
+pub(crate) const ARFMODE: [u8; 11] = [0; 11];
+
 /// lane-lookahead: whether [`crate::encoder::Av1Encoder`] holds one whole
 /// mini-GOP of lookahead -- the next group's sources are buffered before the
 /// current group's top ARF is coded, so that ARF has display-FUTURE pictures
