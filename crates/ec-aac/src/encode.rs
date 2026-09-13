@@ -523,10 +523,22 @@ impl AacEncoder {
         // so the finest quantisation that fits the budget is a bisection --
         // which also means the psychoacoustic model only has to get the shape
         // of the allocation right, not its absolute level.
+        // Per-band peak, energy and scalefactor floor on the post-M/S
+        // coefficients: none of them depend on the rate loop's offset, so
+        // they are computed once per channel and read by every cost probe.
+        let profiles: Vec<Vec<BandProfile>> = elements
+            .iter()
+            .map(|plan| {
+                plan.frames
+                    .iter()
+                    .map(|frame| band_profile(frame, swb, max_sfb, short))
+                    .collect()
+            })
+            .collect();
         let cost = |enc: &AacEncoder, offset: i32| -> (i32, Vec<Coded>) {
             let mut coded = Vec::new();
             let mut bits = 10i32; // END element plus byte-alignment slack
-            for plan in &elements {
+            for (plan, profiles) in elements.iter().zip(&profiles) {
                 bits += 3
                     + 4
                     + if plan.element == Element::Cpe {
@@ -534,8 +546,8 @@ impl AacEncoder {
                     } else {
                         0
                     };
-                for frame in &plan.frames {
-                    let c = enc.quantise(frame, seq, swb, max_sfb, offset);
+                for (frame, profile) in plan.frames.iter().zip(profiles) {
+                    let c = enc.quantise(frame, profile, seq, swb, max_sfb, offset);
                     bits += c.bits;
                     coded.push(c);
                 }
@@ -543,8 +555,8 @@ impl AacEncoder {
             (bits, coded)
         };
         let (mut lo, mut hi) = (-240i32, 240i32);
-        let (mut bits, mut coded) = cost(self, hi);
-        if bits > budget {
+        let (probe_bits, mut coded) = cost(self, hi);
+        if probe_bits > budget {
             // Even the coarsest setting overflows: take it and let the
             // reservoir absorb the overshoot.
             lo = hi;
@@ -554,21 +566,16 @@ impl AacEncoder {
                 let (b, c) = cost(self, mid);
                 if b <= budget {
                     hi = mid;
-                    bits = b;
                     coded = c;
                 } else {
                     lo = mid + 1;
                 }
             }
-            if lo < 240 {
-                let (b, c) = cost(self, lo);
-                if b <= budget {
-                    bits = b;
-                    coded = c;
-                }
-            }
         }
-        let _ = (lo, bits);
+        // When the loop ends, `coded` is the probe at `lo`: `hi` only ever
+        // moves to a probe that was taken, and `lo` converges to `hi` (the
+        // overflow guard above leaves both at the coarsest setting).
+        let _ = lo;
 
         let mut w = BitWriter::new();
         let mut at = 0usize;
@@ -612,6 +619,7 @@ impl AacEncoder {
     fn quantise(
         &self,
         frame: &ChannelFrame,
+        profile: &BandProfile,
         seq: WindowSequence,
         swb: &'static [u16],
         max_sfb: usize,
@@ -623,15 +631,7 @@ impl AacEncoder {
         let mut floor = vec![0i32; max_sfb];
         let mut zero = vec![true; max_sfb];
         for b in 0..max_sfb {
-            let (lo, hi) = (usize::from(swb[b]), usize::from(swb[b + 1]));
-            let mut peak = 0.0f32;
-            for w in 0..windows {
-                let base = if short { w * SHORT_LEN } else { 0 };
-                for k in base + lo..base + hi {
-                    peak = peak.max(frame.coef[k].abs());
-                }
-            }
-            if peak < 1e-4 {
+            if profile.peak[b] < 1e-4 {
                 continue;
             }
             // The rate loop scales the whole mask rather than shifting the
@@ -639,19 +639,10 @@ impl AacEncoder {
             // asked for, and lets a band whose signal falls under its own mask
             // drop out entirely instead of being coded ever more coarsely.
             let target = frame.threshold[b] * 2f32.powf(offset as f32 * 0.5);
-            let mut energy = 0.0f32;
-            let mut count = 0usize;
-            for w in 0..windows {
-                let base = if short { w * SHORT_LEN } else { 0 };
-                for k in base + lo..base + hi {
-                    energy += frame.coef[k] * frame.coef[k];
-                    count += 1;
-                }
-            }
-            if energy / count.max(1) as f32 <= target {
+            if profile.energy[b] / profile.count[b].max(1) as f32 <= target {
                 continue;
             }
-            floor[b] = sf_floor(peak).max(0);
+            floor[b] = profile.floor[b];
             // Noise is non-decreasing in level (coarser step -> more error),
             // the same assumption the original linear scan relied on to break
             // on first overage; bisect for the largest level still under
@@ -825,6 +816,45 @@ fn ms_wins(l: &ChannelFrame, r: &ChannelFrame, swb: &[u16], band: usize, short: 
     let lr = (el.max(er) + 1e-9) / (el.min(er) + 1e-9);
     let ms = (em.max(es) + 1e-9) / (em.min(es) + 1e-9);
     ms > lr * 1.5
+}
+
+/// Per-band constants of one channel's quantised frame: the peak magnitude,
+/// the coefficient energy and the escape-codebook scalefactor floor. All
+/// three are independent of the rate loop's offset, so `write_frame` computes
+/// them once and every cost probe reads them back.
+struct BandProfile {
+    peak: Vec<f32>,
+    energy: Vec<f32>,
+    /// Coefficient count per band, the energy's divisor.
+    count: Vec<usize>,
+    floor: Vec<i32>,
+}
+
+fn band_profile(frame: &ChannelFrame, swb: &[u16], max_sfb: usize, short: bool) -> BandProfile {
+    let windows = if short { 8 } else { 1 };
+    let mut peak = vec![0.0f32; max_sfb];
+    let mut energy = vec![0.0f32; max_sfb];
+    let mut count = vec![0usize; max_sfb];
+    let mut floor = vec![0i32; max_sfb];
+    for b in 0..max_sfb {
+        let (lo, hi) = (usize::from(swb[b]), usize::from(swb[b + 1]));
+        for w in 0..windows {
+            let base = if short { w * SHORT_LEN } else { 0 };
+            for k in base + lo..base + hi {
+                let c = frame.coef[k];
+                peak[b] = peak[b].max(c.abs());
+                energy[b] += c * c;
+                count[b] += 1;
+            }
+        }
+        floor[b] = sf_floor(peak[b]).max(0);
+    }
+    BandProfile {
+        peak,
+        energy,
+        count,
+        floor,
+    }
 }
 
 fn apply_ms(pair: &mut [ChannelFrame], ms: &[bool], swb: &[u16], max_sfb: usize, short: bool) {
