@@ -535,9 +535,14 @@ impl AacEncoder {
                     .collect()
             })
             .collect();
-        let cost = |enc: &AacEncoder, offset: i32| -> (i32, Vec<Coded>) {
+        // Every noise query a probe makes is memoised for the frame: the
+        // bisection probes revisit the same (band, scalefactor) pairs across
+        // the outer loop, and band_noise is pure per frame.
+        let mut memo = NoiseMemo::new(self.channels * max_sfb * 256);
+        let mut cost = |enc: &AacEncoder, offset: i32| -> (i32, Vec<Coded>) {
             let mut coded = Vec::new();
             let mut bits = 10i32; // END element plus byte-alignment slack
+            let mut ch_slot = 0usize;
             for (plan, profiles) in elements.iter().zip(&profiles) {
                 bits += 3
                     + 4
@@ -547,9 +552,11 @@ impl AacEncoder {
                         0
                     };
                 for (frame, profile) in plan.frames.iter().zip(profiles) {
-                    let c = enc.quantise(frame, profile, seq, swb, max_sfb, offset);
+                    let c =
+                        enc.quantise(frame, profile, &mut memo, ch_slot, seq, swb, max_sfb, offset);
                     bits += c.bits;
                     coded.push(c);
+                    ch_slot += 1;
                 }
             }
             (bits, coded)
@@ -620,6 +627,8 @@ impl AacEncoder {
         &self,
         frame: &ChannelFrame,
         profile: &BandProfile,
+        memo: &mut NoiseMemo,
+        ch_slot: usize,
         seq: WindowSequence,
         swb: &'static [u16],
         max_sfb: usize,
@@ -648,11 +657,20 @@ impl AacEncoder {
             // on first overage; bisect for the largest level still under
             // target instead of walking it one step at a time.
             let mut best = floor[b];
-            if self.band_noise(frame, swb, b, floor[b], windows, short) <= target {
+            if memo.noise(
+                ch_slot,
+                max_sfb,
+                b,
+                floor[b],
+                || self.band_noise(frame, swb, b, floor[b], windows, short),
+            ) <= target
+            {
                 let (mut lo, mut hi) = (floor[b], 255);
                 while lo < hi {
                     let mid = lo + (hi - lo + 1) / 2;
-                    if self.band_noise(frame, swb, b, mid, windows, short) <= target {
+                    if memo.noise(ch_slot, max_sfb, b, mid, || {
+                        self.band_noise(frame, swb, b, mid, windows, short)
+                    }) <= target {
                         lo = mid;
                     } else {
                         hi = mid - 1;
@@ -856,6 +874,45 @@ fn band_profile(frame: &ChannelFrame, swb: &[u16], max_sfb: usize, short: bool) 
         energy,
         count,
         floor,
+    }
+}
+
+/// Per-frame cache for the noise search: `band_noise(band, sf)` is pure for
+/// one frame's coefficients, and the outer rate loop's probes re-ask the same
+/// (band, scalefactor) pairs, so each pair is computed at most once per frame
+/// clearing pass.
+struct NoiseMemo {
+    stamp: Vec<u32>,
+    val: Vec<f32>,
+    cur: u32,
+}
+
+impl NoiseMemo {
+    fn new(capacity: usize) -> NoiseMemo {
+        NoiseMemo {
+            stamp: vec![0; capacity],
+            val: vec![0.0; capacity],
+            cur: 1,
+        }
+    }
+
+    /// The memoised noise at `(band, sf)`, computing through `f` on a miss.
+    fn noise(
+        &mut self,
+        ch_slot: usize,
+        max_sfb: usize,
+        band: usize,
+        sf: i32,
+        f: impl FnOnce() -> f32,
+    ) -> f32 {
+        let idx = (ch_slot * max_sfb + band) * 256 + sf as usize;
+        if self.stamp[idx] == self.cur {
+            return self.val[idx];
+        }
+        let noise = f();
+        self.stamp[idx] = self.cur;
+        self.val[idx] = noise;
+        noise
     }
 }
 
