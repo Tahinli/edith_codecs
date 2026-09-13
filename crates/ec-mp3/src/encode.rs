@@ -27,6 +27,7 @@ use crate::tables::{
 use ec_core::bitio::BitWriter;
 use ec_core::error::{Error, Result};
 use ec_dsp::{RealFft, Window};
+use wide::f32x8;
 
 /// Encoder settings.
 ///
@@ -1523,12 +1524,8 @@ fn quantise(
     block_type: u8,
     ix: &mut [i32],
 ) {
+    // The scalar form, kept for spans shorter than one SIMD width.
     let quantise_line = |xr: f32, scale: f32| -> i32 {
-        // |xr·scale|^(3/4) as a cube and two square roots: the libm `powf`
-        // this replaces was a tenth of the encoder's runtime all by itself.
-        // The two forms differ by an ulp or two, which next to the level
-        // boundary offset below can flip the rare line by one quantisation
-        // step and nothing more.
         let x = f64::from(xr.abs()) * f64::from(scale);
         let value = (x * x * x).sqrt().sqrt();
         let magnitude = (value + 0.4054).min(MAX_QUANT as f64) as i32;
@@ -1552,9 +1549,7 @@ fn quantise(
                 usize::from(short[band + 1]) * 3,
             );
             let scale = scales[band];
-            for i in from..to.min(576) {
-                ix[i] = quantise_line(xr[i], scale);
-            }
+            quantise_span(xr, ix, from, to.min(576), scale, &quantise_line);
         }
         return;
     }
@@ -1568,9 +1563,46 @@ fn quantise(
         );
         let scalefac = if band < SFB_LONG { scalefac[band] } else { 0 };
         let scale = 1.0 / band_gain(gain, scalefac, block_type);
-        for i in from..to {
-            ix[i] = quantise_line(xr[i], scale);
+        quantise_span(xr, ix, from, to, scale, &quantise_line);
+    }
+}
+
+/// Quantises `xr[from..to]` at `scale` into `ix[from..to]`, eight lanes at a
+/// time through `wide` — the per-line curve the scalar closure carries out
+/// one line per call. Overflow lanes to `inf`, which the `MAX_QUANT` clamp
+/// folds back the same way the scalar path clamps a saturated line; the
+/// signed value truncates toward zero, exactly the sign-and-floor the scalar
+/// form does in two steps. Levels can differ from the scalar path by one
+/// step where the true level sits within f32 rounding of a boundary; the
+/// decoded-quality gate exists for exactly that.
+fn quantise_span(
+    xr: &[f32],
+    ix: &mut [i32],
+    from: usize,
+    to: usize,
+    scale: f32,
+    scalar: &impl Fn(f32, f32) -> i32,
+) {
+    let mut i = from;
+    if to - i >= 8 {
+        let vscale = f32x8::splat(scale);
+        let voff = f32x8::splat(0.4054);
+        let vmax = f32x8::splat(MAX_QUANT as f32);
+        while i + 8 <= to {
+            let mut block = [0.0f32; 8];
+            block.copy_from_slice(&xr[i..i + 8]);
+            let v = f32x8::new(block);
+            let x = v.abs() * vscale;
+            let value = (x * x * x).sqrt().sqrt();
+            let magnitude = (value + voff).min(vmax);
+            let ints = magnitude.copysign(v).trunc_int();
+            ix[i..i + 8].copy_from_slice(&ints.to_array());
+            i += 8;
         }
+    }
+    while i < to {
+        ix[i] = scalar(xr[i], scale);
+        i += 1;
     }
 }
 
