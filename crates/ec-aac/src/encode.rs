@@ -122,6 +122,9 @@ pub struct AacEncoder {
     queue: std::collections::VecDeque<EncodedPacket>,
     frames_out: i64,
     reservoir: i32,
+    /// The rate loop's working point from the previous frame, where the next
+    /// frame's search starts looking for its own edge.
+    warm_offset: i32,
     flushed: bool,
     initialised: bool,
 }
@@ -155,6 +158,7 @@ impl AacEncoder {
             queue: std::collections::VecDeque::new(),
             frames_out: 0,
             reservoir: 0,
+            warm_offset: 0,
             flushed: false,
             initialised: false,
         }
@@ -561,28 +565,88 @@ impl AacEncoder {
             }
             (bits, coded)
         };
-        let (mut lo, mut hi) = (-240i32, 240i32);
-        let (probe_bits, mut coded) = cost(self, hi);
+        let (probe_bits, mut coded) = cost(self, 240);
+        let mut answer = 240i32;
         if probe_bits > budget {
             // Even the coarsest setting overflows: take it and let the
             // reservoir absorb the overshoot.
-            lo = hi;
         } else {
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let (b, c) = cost(self, mid);
-                if b <= budget {
-                    hi = mid;
-                    coded = c;
-                } else {
-                    lo = mid + 1;
+            // Bits fall monotonically as the offset rises, so "fits the
+            // budget" is true on an upper interval and the finest fitting
+            // setting is its left edge. Last frame's working point sits next
+            // to that edge, so probe it first and gallop outward until one
+            // side is known to fail, then bisect the short bracket -- the
+            // same edge a full-range bisection would find, in a few probes.
+            let start = self.warm_offset.clamp(-240, 240);
+            let (start_bits, start_coded) = cost(self, start);
+            if start_bits <= budget {
+                // Known to fit: the edge is at or below `start`. Walk down.
+                let mut hi = start;
+                coded = start_coded;
+                let mut fail = None;
+                let mut step = 1i32;
+                loop {
+                    let probe = (start - step).max(-240);
+                    let (b, c) = cost(self, probe);
+                    if b <= budget {
+                        hi = probe;
+                        coded = c;
+                    } else {
+                        fail = Some(probe);
+                    }
+                    let done = probe == -240 || fail.is_some();
+                    if done {
+                        break;
+                    }
+                    step *= 2;
                 }
+                if let Some(mut lo) = fail {
+                    while hi - lo > 1 {
+                        let mid = lo + (hi - lo + 1) / 2;
+                        let (b, c) = cost(self, mid);
+                        if b <= budget {
+                            hi = mid;
+                            coded = c;
+                        } else {
+                            lo = mid;
+                        }
+                    }
+                }
+                answer = hi;
+            } else {
+                // `start` sits past the edge: the answer is above it. Walk up.
+                let mut lo = start;
+                let mut hi = 240i32; // known to fit from the first probe
+                let mut step = 1i32;
+                loop {
+                    let probe = (start + step).min(240);
+                    if probe == 240 {
+                        // Already probed and known to fit; `hi` keeps 240.
+                        break;
+                    }
+                    let (b, c) = cost(self, probe);
+                    if b <= budget {
+                        hi = probe;
+                        coded = c;
+                        break;
+                    }
+                    lo = probe;
+                    step *= 2;
+                }
+                while hi - lo > 1 {
+                    let mid = lo + (hi - lo + 1) / 2;
+                    let (b, c) = cost(self, mid);
+                    if b <= budget {
+                        hi = mid;
+                        coded = c;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                answer = hi;
             }
         }
-        // When the loop ends, `coded` is the probe at `lo`: `hi` only ever
-        // moves to a probe that was taken, and `lo` converges to `hi` (the
-        // overflow guard above leaves both at the coarsest setting).
-        let _ = lo;
+        self.warm_offset = answer;
 
         let mut w = BitWriter::new();
         let mut at = 0usize;
@@ -684,6 +748,9 @@ impl AacEncoder {
 
         let mut quant = vec![0i32; FRAME_LEN];
         let mut books = vec![0u8; max_sfb];
+        // Bands whose scalefactor the delta chain moved since they were last
+        // quantised; every band is dirty on the first pass.
+        let mut dirty = vec![true; max_sfb];
         for _ in 0..4 {
             let mut settled = true;
             let mut prev: Option<i32> = None;
@@ -697,6 +764,7 @@ impl AacEncoder {
                 };
                 if fixed != sf[b] {
                     sf[b] = fixed;
+                    dirty[b] = true;
                     settled = false;
                 }
                 prev = Some(sf[b]);
@@ -709,6 +777,12 @@ impl AacEncoder {
                         let base = if short { w * SHORT_LEN } else { 0 };
                         quant[base + lo..base + hi].fill(0);
                     }
+                    dirty[b] = false;
+                    continue;
+                }
+                // A band the delta chain left alone keeps its quantised
+                // values, its peak and its codebook from the previous pass.
+                if !dirty[b] {
                     continue;
                 }
                 let gain = pow_quarter(SF_OFFSET - sf[b]);
@@ -722,6 +796,7 @@ impl AacEncoder {
                     }
                 }
                 books[b] = codebook_for(peak);
+                dirty[b] = false;
                 if peak == 0 {
                     // Nothing survived: the band leaves the delta chain, which
                     // may free the bands after it to go coarser.
