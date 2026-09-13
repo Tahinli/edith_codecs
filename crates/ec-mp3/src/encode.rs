@@ -1799,61 +1799,73 @@ fn best_table_cost(ix: &[i32], from: usize, to: usize) -> (u8, u32) {
         max = max.max(v.unsigned_abs());
     }
     let shortlist = candidates(max);
-    // Per-candidate state, fetched once: the table, its escape shape, and a
-    // running cost. A candidate a pair rejects never revives, so `feasible`
-    // only ever clears.
+    // Per-candidate state, fetched once: the table, its escape shape, the
+    // cost of a (0, 0) pair, and a running cost. A candidate the region's
+    // largest magnitude falls outside is dropped before the walk — exactly
+    // what the per-pair range check did, since some pair carries `max`.
     let mut tables = [None; 9];
     let mut tmax = [0u32; 9];
-    let mut escape = [false; 9];
     let mut linbits = [0u32; 9];
     let mut dim = [0u32; 9];
+    let mut zero_bits = [0u32; 9];
     let mut feasible = [false; 9];
     let mut costs = [0u32; 9];
     let mut live = 0usize;
     for (slot, &select) in shortlist.iter().enumerate() {
-        if let Ok(table) = huffman::big_table(usize::from(select)) {
-            tables[slot] = Some(table);
-            tmax[slot] = u32::from(table.dim) - 1;
-            escape[slot] = table.linbits > 0;
-            linbits[slot] = u32::from(table.linbits);
-            dim[slot] = u32::from(table.dim);
-            feasible[slot] = true;
-            live += 1;
+        let Ok(table) = huffman::big_table(usize::from(select)) else {
+            continue;
+        };
+        let cap = u32::from(table.dim) - 1;
+        let escape = table.linbits > 0;
+        let reach = cap + if escape { (1 << table.linbits) - 1 } else { 0 };
+        if max > reach {
+            continue;
         }
+        tables[slot] = Some(table);
+        tmax[slot] = cap;
+        linbits[slot] = if escape { u32::from(table.linbits) } else { 0 };
+        dim[slot] = u32::from(table.dim);
+        zero_bits[slot] = u32::from(table.codes[0].0);
+        feasible[slot] = true;
+        live += 1;
     }
     let mut i = from;
     while i + 1 < to && live > 0 {
         let (x, y) = (ix[i].unsigned_abs(), ix[i + 1].unsigned_abs());
+        if x == 0 && y == 0 {
+            for slot in 0..shortlist.len() {
+                if feasible[slot] {
+                    costs[slot] += zero_bits[slot];
+                }
+            }
+            i += 2;
+            continue;
+        }
         let signs = u32::from(x != 0) + u32::from(y != 0);
         for slot in 0..shortlist.len() {
             if !feasible[slot] {
                 continue;
             }
-            let (cap, esc) = (tmax[slot], escape[slot]);
-            let out_of_range =
-                |value: u32| value > cap && (!esc || value > cap + (1 << linbits[slot]) - 1);
-            if out_of_range(x) || out_of_range(y) {
-                feasible[slot] = false;
-                live -= 1;
-                continue;
-            }
             let table = tables[slot].expect("feasible candidates hold a table");
+            let (cap, lin) = (tmax[slot], linbits[slot]);
             let (len, _) = table.codes[(x.min(cap) * dim[slot] + y.min(cap)) as usize];
-            if len == 0 && !(x == 0 && y == 0) {
+            if len == 0 {
+                // A hole in the table: this candidate cannot code the pair,
+                // so it is out for the whole region.
                 feasible[slot] = false;
                 live -= 1;
                 continue;
             }
-            let mut bits = u32::from(len);
-            if esc {
+            let mut bits = u32::from(len) + signs;
+            if lin > 0 {
                 if x >= cap {
-                    bits += linbits[slot];
+                    bits += lin;
                 }
                 if y >= cap {
-                    bits += linbits[slot];
+                    bits += lin;
                 }
             }
-            costs[slot] += bits + signs;
+            costs[slot] += bits;
         }
         i += 2;
     }
