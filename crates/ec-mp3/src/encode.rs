@@ -19,7 +19,7 @@
 
 use crate::filterbank::{Analysis, alias_expand};
 use crate::header::{ChannelMode, FrameHeader, Version};
-use crate::huffman::{self, BitBuf, Table};
+use crate::huffman::{self, BitBuf};
 use crate::tables::{
     MAX_QUANT, SLEN, forward_mdct_long, forward_mdct_short, long_starts, power43, short_starts,
     short_widths, windows,
@@ -1608,15 +1608,9 @@ fn plan_spectrum(ix: &[i32; 576], block_type: u8, sample_rate: u32) -> SpectrumP
     for (region, to) in bounds.iter().enumerate() {
         let to = (*to).min(big_end);
         if to > from {
-            let select = best_table(ix, from, to);
+            let (select, region_cost) = best_table_cost(ix, from, to);
             tables[region] = select;
-            let table = huffman::big_table(usize::from(select)).expect("table exists");
-            let mut i = from;
-            while i + 1 < to {
-                cost += huffman::pair_bits(table, ix[i].unsigned_abs(), ix[i + 1].unsigned_abs())
-                    .expect("the chosen table codes every pair in its region");
-                i += 2;
-            }
+            cost += region_cost;
         }
         from = to;
     }
@@ -1694,40 +1688,90 @@ fn candidates(max: u32) -> &'static [u8] {
     }
 }
 
-/// The cheapest table for one region.
-fn best_table(ix: &[i32], from: usize, to: usize) -> u8 {
-    let max = ix[from..to]
-        .iter()
-        .map(|v| v.unsigned_abs())
-        .max()
-        .unwrap_or(0);
+/// The cheapest table for one region, with its cost.
+///
+/// One walk over the pairs accumulates every shortlisted candidate's cost at
+/// once; the former shape — a full `pair_bits` pass per candidate, up to nine
+/// walks over the same pairs — was half of the encoder's remaining runtime.
+/// A candidate any pair falls outside dies on the spot, exactly as the
+/// per-candidate `pair_bits` propagation did, and ties keep the earlier
+/// (nominally cheaper) candidate, as the strict less-than did.
+fn best_table_cost(ix: &[i32], from: usize, to: usize) -> (u8, u32) {
+    let mut max = 0u32;
+    for &v in &ix[from..to] {
+        max = max.max(v.unsigned_abs());
+    }
+    let shortlist = candidates(max);
+    // Per-candidate state, fetched once: the table, its escape shape, and a
+    // running cost. A candidate a pair rejects never revives, so `feasible`
+    // only ever clears.
+    let mut tables = [None; 9];
+    let mut tmax = [0u32; 9];
+    let mut escape = [false; 9];
+    let mut linbits = [0u32; 9];
+    let mut dim = [0u32; 9];
+    let mut feasible = [false; 9];
+    let mut costs = [0u32; 9];
+    let mut live = 0usize;
+    for (slot, &select) in shortlist.iter().enumerate() {
+        if let Ok(table) = huffman::big_table(usize::from(select)) {
+            tables[slot] = Some(table);
+            tmax[slot] = u32::from(table.dim) - 1;
+            escape[slot] = table.linbits > 0;
+            linbits[slot] = u32::from(table.linbits);
+            dim[slot] = u32::from(table.dim);
+            feasible[slot] = true;
+            live += 1;
+        }
+    }
+    let mut i = from;
+    while i + 1 < to && live > 0 {
+        let (x, y) = (ix[i].unsigned_abs(), ix[i + 1].unsigned_abs());
+        let signs = u32::from(x != 0) + u32::from(y != 0);
+        for slot in 0..shortlist.len() {
+            if !feasible[slot] {
+                continue;
+            }
+            let (cap, esc) = (tmax[slot], escape[slot]);
+            let out_of_range =
+                |value: u32| value > cap && (!esc || value > cap + (1 << linbits[slot]) - 1);
+            if out_of_range(x) || out_of_range(y) {
+                feasible[slot] = false;
+                live -= 1;
+                continue;
+            }
+            let table = tables[slot].expect("feasible candidates hold a table");
+            let (len, _) = table.codes[(x.min(cap) * dim[slot] + y.min(cap)) as usize];
+            if len == 0 && !(x == 0 && y == 0) {
+                feasible[slot] = false;
+                live -= 1;
+                continue;
+            }
+            let mut bits = u32::from(len);
+            if esc {
+                if x >= cap {
+                    bits += linbits[slot];
+                }
+                if y >= cap {
+                    bits += linbits[slot];
+                }
+            }
+            costs[slot] += bits + signs;
+        }
+        i += 2;
+    }
     let mut best = (u32::MAX, 0u8);
-    for &select in candidates(max) {
-        let Ok(table) = huffman::big_table(usize::from(select)) else {
-            continue;
-        };
-        if let Some(cost) = table_cost(ix, from, to, table)
-            && cost < best.0
-        {
-            best = (cost, select);
+    for (slot, &select) in shortlist.iter().enumerate() {
+        if feasible[slot] && costs[slot] < best.0 {
+            best = (costs[slot], select);
         }
     }
     if best.1 == 0 {
         // Nothing in the shortlist fits, which only a value above the coding
         // range can cause; fall back to the widest escape table.
-        return 23;
+        return (23, 0);
     }
-    best.1
-}
-
-fn table_cost(ix: &[i32], from: usize, to: usize, table: Table) -> Option<u32> {
-    let mut sum = 0;
-    let mut i = from;
-    while i + 1 < to {
-        sum += huffman::pair_bits(table, ix[i].unsigned_abs(), ix[i + 1].unsigned_abs())?;
-        i += 2;
-    }
-    Some(sum)
+    (best.1, best.0)
 }
 
 /// The `scalefac_compress` index whose two lengths hold these scalefactors.
