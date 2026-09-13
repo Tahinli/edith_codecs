@@ -122,6 +122,9 @@ pub struct AacEncoder {
     queue: std::collections::VecDeque<EncodedPacket>,
     frames_out: i64,
     reservoir: i32,
+    /// The rate loop's working point from the previous frame, where the next
+    /// frame's search starts looking for its own edge.
+    warm_offset: i32,
     flushed: bool,
     initialised: bool,
 }
@@ -155,6 +158,7 @@ impl AacEncoder {
             queue: std::collections::VecDeque::new(),
             frames_out: 0,
             reservoir: 0,
+            warm_offset: 0,
             flushed: false,
             initialised: false,
         }
@@ -523,10 +527,27 @@ impl AacEncoder {
         // so the finest quantisation that fits the budget is a bisection --
         // which also means the psychoacoustic model only has to get the shape
         // of the allocation right, not its absolute level.
-        let cost = |enc: &AacEncoder, offset: i32| -> (i32, Vec<Coded>) {
+        // Per-band peak, energy and scalefactor floor on the post-M/S
+        // coefficients: none of them depend on the rate loop's offset, so
+        // they are computed once per channel and read by every cost probe.
+        let profiles: Vec<Vec<BandProfile>> = elements
+            .iter()
+            .map(|plan| {
+                plan.frames
+                    .iter()
+                    .map(|frame| band_profile(frame, swb, max_sfb, short))
+                    .collect()
+            })
+            .collect();
+        // Every noise query a probe makes is memoised for the frame: the
+        // bisection probes revisit the same (band, scalefactor) pairs across
+        // the outer loop, and band_noise is pure per frame.
+        let mut memo = NoiseMemo::new(self.channels * max_sfb * 256);
+        let mut cost = |enc: &AacEncoder, offset: i32| -> (i32, Vec<Coded>) {
             let mut coded = Vec::new();
             let mut bits = 10i32; // END element plus byte-alignment slack
-            for plan in &elements {
+            let mut ch_slot = 0usize;
+            for (plan, profiles) in elements.iter().zip(&profiles) {
                 bits += 3
                     + 4
                     + if plan.element == Element::Cpe {
@@ -534,41 +555,98 @@ impl AacEncoder {
                     } else {
                         0
                     };
-                for frame in &plan.frames {
-                    let c = enc.quantise(frame, seq, swb, max_sfb, offset);
+                for (frame, profile) in plan.frames.iter().zip(profiles) {
+                    let c =
+                        enc.quantise(frame, profile, &mut memo, ch_slot, seq, swb, max_sfb, offset);
                     bits += c.bits;
                     coded.push(c);
+                    ch_slot += 1;
                 }
             }
             (bits, coded)
         };
-        let (mut lo, mut hi) = (-240i32, 240i32);
-        let (mut bits, mut coded) = cost(self, hi);
-        if bits > budget {
+        let (probe_bits, mut coded) = cost(self, 240);
+        let mut answer = 240i32;
+        if probe_bits > budget {
             // Even the coarsest setting overflows: take it and let the
             // reservoir absorb the overshoot.
-            lo = hi;
         } else {
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let (b, c) = cost(self, mid);
-                if b <= budget {
-                    hi = mid;
-                    bits = b;
-                    coded = c;
-                } else {
-                    lo = mid + 1;
+            // Bits fall monotonically as the offset rises, so "fits the
+            // budget" is true on an upper interval and the finest fitting
+            // setting is its left edge. Last frame's working point sits next
+            // to that edge, so probe it first and gallop outward until one
+            // side is known to fail, then bisect the short bracket -- the
+            // same edge a full-range bisection would find, in a few probes.
+            let start = self.warm_offset.clamp(-240, 240);
+            let (start_bits, start_coded) = cost(self, start);
+            if start_bits <= budget {
+                // Known to fit: the edge is at or below `start`. Walk down.
+                let mut hi = start;
+                coded = start_coded;
+                let mut fail = None;
+                let mut step = 1i32;
+                loop {
+                    let probe = (start - step).max(-240);
+                    let (b, c) = cost(self, probe);
+                    if b <= budget {
+                        hi = probe;
+                        coded = c;
+                    } else {
+                        fail = Some(probe);
+                    }
+                    let done = probe == -240 || fail.is_some();
+                    if done {
+                        break;
+                    }
+                    step *= 2;
                 }
-            }
-            if lo < 240 {
-                let (b, c) = cost(self, lo);
-                if b <= budget {
-                    bits = b;
-                    coded = c;
+                if let Some(mut lo) = fail {
+                    while hi - lo > 1 {
+                        let mid = lo + (hi - lo + 1) / 2;
+                        let (b, c) = cost(self, mid);
+                        if b <= budget {
+                            hi = mid;
+                            coded = c;
+                        } else {
+                            lo = mid;
+                        }
+                    }
                 }
+                answer = hi;
+            } else {
+                // `start` sits past the edge: the answer is above it. Walk up.
+                let mut lo = start;
+                let mut hi = 240i32; // known to fit from the first probe
+                let mut step = 1i32;
+                loop {
+                    let probe = (start + step).min(240);
+                    if probe == 240 {
+                        // Already probed and known to fit; `hi` keeps 240.
+                        break;
+                    }
+                    let (b, c) = cost(self, probe);
+                    if b <= budget {
+                        hi = probe;
+                        coded = c;
+                        break;
+                    }
+                    lo = probe;
+                    step *= 2;
+                }
+                while hi - lo > 1 {
+                    let mid = lo + (hi - lo + 1) / 2;
+                    let (b, c) = cost(self, mid);
+                    if b <= budget {
+                        hi = mid;
+                        coded = c;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                answer = hi;
             }
         }
-        let _ = (lo, bits);
+        self.warm_offset = answer;
 
         let mut w = BitWriter::new();
         let mut at = 0usize;
@@ -612,6 +690,9 @@ impl AacEncoder {
     fn quantise(
         &self,
         frame: &ChannelFrame,
+        profile: &BandProfile,
+        memo: &mut NoiseMemo,
+        ch_slot: usize,
         seq: WindowSequence,
         swb: &'static [u16],
         max_sfb: usize,
@@ -623,45 +704,37 @@ impl AacEncoder {
         let mut floor = vec![0i32; max_sfb];
         let mut zero = vec![true; max_sfb];
         for b in 0..max_sfb {
-            let (lo, hi) = (usize::from(swb[b]), usize::from(swb[b + 1]));
-            let mut peak = 0.0f32;
-            for w in 0..windows {
-                let base = if short { w * SHORT_LEN } else { 0 };
-                for k in base + lo..base + hi {
-                    peak = peak.max(frame.coef[k].abs());
-                }
-            }
-            if peak < 1e-4 {
+            if profile.peak[b] < 1e-4 {
                 continue;
             }
             // The rate loop scales the whole mask rather than shifting the
             // scalefactors: that keeps the noise following the shape the model
             // asked for, and lets a band whose signal falls under its own mask
             // drop out entirely instead of being coded ever more coarsely.
-            let target = frame.threshold[b] * 2f32.powf(offset as f32 * 0.5);
-            let mut energy = 0.0f32;
-            let mut count = 0usize;
-            for w in 0..windows {
-                let base = if short { w * SHORT_LEN } else { 0 };
-                for k in base + lo..base + hi {
-                    energy += frame.coef[k] * frame.coef[k];
-                    count += 1;
-                }
-            }
-            if energy / count.max(1) as f32 <= target {
+            let target = frame.threshold[b] * POW_HALF[(offset + 240) as usize];
+            if profile.energy[b] / profile.count[b].max(1) as f32 <= target {
                 continue;
             }
-            floor[b] = sf_floor(peak).max(0);
+            floor[b] = profile.floor[b];
             // Noise is non-decreasing in level (coarser step -> more error),
             // the same assumption the original linear scan relied on to break
             // on first overage; bisect for the largest level still under
             // target instead of walking it one step at a time.
             let mut best = floor[b];
-            if self.band_noise(frame, swb, b, floor[b], windows, short) <= target {
+            if memo.noise(
+                ch_slot,
+                max_sfb,
+                b,
+                floor[b],
+                || self.band_noise(frame, swb, b, floor[b], windows, short),
+            ) <= target
+            {
                 let (mut lo, mut hi) = (floor[b], 255);
                 while lo < hi {
                     let mid = lo + (hi - lo + 1) / 2;
-                    if self.band_noise(frame, swb, b, mid, windows, short) <= target {
+                    if memo.noise(ch_slot, max_sfb, b, mid, || {
+                        self.band_noise(frame, swb, b, mid, windows, short)
+                    }) <= target {
                         lo = mid;
                     } else {
                         hi = mid - 1;
@@ -675,6 +748,9 @@ impl AacEncoder {
 
         let mut quant = vec![0i32; FRAME_LEN];
         let mut books = vec![0u8; max_sfb];
+        // Bands whose scalefactor the delta chain moved since they were last
+        // quantised; every band is dirty on the first pass.
+        let mut dirty = vec![true; max_sfb];
         for _ in 0..4 {
             let mut settled = true;
             let mut prev: Option<i32> = None;
@@ -688,6 +764,7 @@ impl AacEncoder {
                 };
                 if fixed != sf[b] {
                     sf[b] = fixed;
+                    dirty[b] = true;
                     settled = false;
                 }
                 prev = Some(sf[b]);
@@ -700,18 +777,26 @@ impl AacEncoder {
                         let base = if short { w * SHORT_LEN } else { 0 };
                         quant[base + lo..base + hi].fill(0);
                     }
+                    dirty[b] = false;
                     continue;
                 }
+                // A band the delta chain left alone keeps its quantised
+                // values, its peak and its codebook from the previous pass.
+                if !dirty[b] {
+                    continue;
+                }
+                let gain = pow_quarter(SF_OFFSET - sf[b]);
                 let mut peak = 0i32;
                 for w in 0..windows {
                     let base = if short { w * SHORT_LEN } else { 0 };
                     for k in lo..hi {
-                        let q = quantise_one(frame.coef[base + k], sf[b]);
+                        let q = quantise_one(frame.coef[base + k], gain);
                         quant[base + k] = q;
                         peak = peak.max(q.abs());
                     }
                 }
                 books[b] = codebook_for(peak);
+                dirty[b] = false;
                 if peak == 0 {
                     // Nothing survived: the band leaves the delta chain, which
                     // may free the bands after it to go coarser.
@@ -768,14 +853,15 @@ impl AacEncoder {
         short: bool,
     ) -> f32 {
         let (lo, hi) = (usize::from(swb[band]), usize::from(swb[band + 1]));
-        let gain = 2f32.powf((sf - SF_OFFSET) as f32 * 0.25);
+        let gain = pow_quarter(sf - SF_OFFSET);
+        let gain_inv = pow_quarter(SF_OFFSET - sf);
         let mut noise = 0.0f32;
         let mut count = 0usize;
         for w in 0..windows {
             let base = if short { w * SHORT_LEN } else { 0 };
             for k in base + lo..base + hi {
                 let x = frame.coef[k];
-                let q = quantise_one(x, sf);
+                let q = quantise_one(x, gain_inv);
                 let mut back = pow43(q.unsigned_abs()) * gain;
                 if q < 0 {
                     back = -back;
@@ -827,6 +913,84 @@ fn ms_wins(l: &ChannelFrame, r: &ChannelFrame, swb: &[u16], band: usize, short: 
     ms > lr * 1.5
 }
 
+/// Per-band constants of one channel's quantised frame: the peak magnitude,
+/// the coefficient energy and the escape-codebook scalefactor floor. All
+/// three are independent of the rate loop's offset, so `write_frame` computes
+/// them once and every cost probe reads them back.
+struct BandProfile {
+    peak: Vec<f32>,
+    energy: Vec<f32>,
+    /// Coefficient count per band, the energy's divisor.
+    count: Vec<usize>,
+    floor: Vec<i32>,
+}
+
+fn band_profile(frame: &ChannelFrame, swb: &[u16], max_sfb: usize, short: bool) -> BandProfile {
+    let windows = if short { 8 } else { 1 };
+    let mut peak = vec![0.0f32; max_sfb];
+    let mut energy = vec![0.0f32; max_sfb];
+    let mut count = vec![0usize; max_sfb];
+    let mut floor = vec![0i32; max_sfb];
+    for b in 0..max_sfb {
+        let (lo, hi) = (usize::from(swb[b]), usize::from(swb[b + 1]));
+        for w in 0..windows {
+            let base = if short { w * SHORT_LEN } else { 0 };
+            for k in base + lo..base + hi {
+                let c = frame.coef[k];
+                peak[b] = peak[b].max(c.abs());
+                energy[b] += c * c;
+                count[b] += 1;
+            }
+        }
+        floor[b] = sf_floor(peak[b]).max(0);
+    }
+    BandProfile {
+        peak,
+        energy,
+        count,
+        floor,
+    }
+}
+
+/// Per-frame cache for the noise search: `band_noise(band, sf)` is pure for
+/// one frame's coefficients, and the outer rate loop's probes re-ask the same
+/// (band, scalefactor) pairs, so each pair is computed at most once per frame
+/// clearing pass.
+struct NoiseMemo {
+    stamp: Vec<u32>,
+    val: Vec<f32>,
+    cur: u32,
+}
+
+impl NoiseMemo {
+    fn new(capacity: usize) -> NoiseMemo {
+        NoiseMemo {
+            stamp: vec![0; capacity],
+            val: vec![0.0; capacity],
+            cur: 1,
+        }
+    }
+
+    /// The memoised noise at `(band, sf)`, computing through `f` on a miss.
+    fn noise(
+        &mut self,
+        ch_slot: usize,
+        max_sfb: usize,
+        band: usize,
+        sf: i32,
+        f: impl FnOnce() -> f32,
+    ) -> f32 {
+        let idx = (ch_slot * max_sfb + band) * 256 + sf as usize;
+        if self.stamp[idx] == self.cur {
+            return self.val[idx];
+        }
+        let noise = f();
+        self.stamp[idx] = self.cur;
+        self.val[idx] = noise;
+        noise
+    }
+}
+
 fn apply_ms(pair: &mut [ChannelFrame], ms: &[bool], swb: &[u16], max_sfb: usize, short: bool) {
     let windows = if short { 8 } else { 1 };
     for b in 0..max_sfb {
@@ -858,6 +1022,29 @@ static POW43: LazyLock<Vec<f32>> = LazyLock::new(|| {
         .collect()
 });
 
+/// `2^(v/4)` for every integer v the rate loop asks for: a band's quantiser
+/// step is `2^((sf-100)/4)` in `band_noise` and its reciprocal inside
+/// [`quantise_one`], and the exponent's integer range over sf in 0..=255 is
+/// -100..=155 either way. Every entry is produced by the very `powf` call it
+/// replaces, so lookups return the bit-identical value.
+static POW_QUARTER: LazyLock<Vec<f32>> = LazyLock::new(|| {
+    (-155i32..=155)
+        .map(|v| 2f32.powf(v as f32 * 0.25))
+        .collect()
+});
+
+fn pow_quarter(v: i32) -> f32 {
+    POW_QUARTER[(v + 155) as usize]
+}
+
+/// `2^(offset/2)`, the rate loop's mask scale, same table trick at the
+/// half-octave stride; the bisection bounds keep offset in -240..=240.
+static POW_HALF: LazyLock<Vec<f32>> = LazyLock::new(|| {
+    (-240i32..=240)
+        .map(|o| 2f32.powf(o as f32 * 0.5))
+        .collect()
+});
+
 fn pow43(q: u32) -> f32 {
     POW43[q.min(MAX_QUANT as u32) as usize]
 }
@@ -870,11 +1057,14 @@ fn sf_floor(peak: f32) -> i32 {
     SF_OFFSET + want.ceil() as i32
 }
 
-fn quantise_one(x: f32, sf: i32) -> i32 {
+/// The gain is the band's `2^((sf-100)/4)` reciprocal -- `pow_quarter`'s
+/// job -- hoisted to the call sites so the inner-inner loop is sqrts only.
+/// The value is the same f32 the old per-coefficient `powf` produced, so the
+/// quantised integers do not move.
+fn quantise_one(x: f32, gain: f32) -> i32 {
     if x == 0.0 {
         return 0;
     }
-    let gain = 2f32.powf(-(sf - SF_OFFSET) as f32 * 0.25);
     // x^0.75 == sqrt(x * sqrt(x)): two sqrtf beat one powf by a wide margin,
     // and this call site is the rate loop's inner-inner loop.
     let v = x.abs() * gain;
