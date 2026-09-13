@@ -137,6 +137,8 @@ pub struct Mp3Encode {
     fft: RealFft<f32>,
     fft_window: Window<f32>,
     psy_history: Vec<Vec<f32>>,
+    /// Deinterleave scratch for `encode_block`, grown once and reused.
+    pcm_scratch: Vec<f32>,
     /// The main-data byte stream and how much of it frames have carried.
     stream: Vec<u8>,
     used: usize,
@@ -219,6 +221,7 @@ impl Mp3Encode {
             assigned: 0,
             written: 0,
             queued: std::collections::VecDeque::new(),
+            pcm_scratch: Vec::new(),
             ready: std::collections::VecDeque::new(),
             frames: 0,
             frame_bytes: 0,
@@ -350,26 +353,34 @@ impl Mp3Encoder {
     }
 
     fn drain(&mut self, flush: bool) {
-        let Some(core) = self.core.as_mut() else {
+        let Self {
+            core, pcm, frames, ..
+        } = self;
+        let Some(core) = core.as_mut() else {
             return;
         };
         let channels = core.channels;
         let need = core.frame_samples() * channels;
-        while self.pcm.len() >= need {
-            let block: Vec<f32> = self.pcm.drain(..need).collect();
-            core.encode_block(&block);
+        // Encode behind a read cursor and shift the leftovers once: draining
+        // per frame memmoved the whole remaining push for every frame, which
+        // on a single large push is quadratic in the file length.
+        let mut pos = 0usize;
+        while pcm.len() - pos >= need {
+            core.encode_block(&pcm[pos..pos + need]);
+            pos += need;
         }
+        pcm.drain(..pos);
         if flush {
-            if !self.pcm.is_empty() {
-                let mut block = std::mem::take(&mut self.pcm);
-                block.resize(need, 0.0);
-                core.encode_block(&block);
+            if !pcm.is_empty() {
+                pcm.resize(need, 0.0);
+                core.encode_block(pcm);
+                pcm.clear();
             }
             core.flush_pending();
             core.flush_frames();
         }
         while let Some(frame) = core.ready.pop_front() {
-            self.frames.push_back(frame);
+            frames.push_back(frame);
         }
     }
 
@@ -514,10 +525,15 @@ impl Mp3Encode {
         let granules = self.granules();
         // Polyphase analysis, one channel at a time.
         for ch in 0..channels {
-            let mut mono: Vec<f32> = Vec::with_capacity(pcm.len() / channels);
+            // One deinterleave buffer per encoder, grown once: this frame's
+            // mono channel used to be a fresh allocation per channel per
+            // frame.
+            self.pcm_scratch.clear();
+            self.pcm_scratch.reserve(pcm.len() / channels);
             for frame in pcm.chunks(channels) {
-                mono.push(frame[ch]);
+                self.pcm_scratch.push(frame[ch]);
             }
+            let mono = &self.pcm_scratch;
             for chunk in mono.chunks(32) {
                 if chunk.len() < 32 {
                     break;
@@ -526,7 +542,13 @@ impl Mp3Encode {
                     self.slots[ch].push(slot);
                 }
             }
-            self.psy_push(ch, &mono);
+            // The masking model's history update, inlined from `psy_push` so
+            // it can touch `psy_history` while `mono` borrows `pcm_scratch`.
+            let n = mono.len().min(1024);
+            let history = &mut self.psy_history[ch];
+            history.copy_within(n.., 0);
+            let keep = 1024 - n;
+            history[keep..].copy_from_slice(&mono[mono.len() - n..]);
         }
         // A granule is 18 slots; hold one back so block switching can look
         // ahead at the next granule's energy.
@@ -555,15 +577,6 @@ impl Mp3Encode {
         while self.pending.len() >= per_frame + channels {
             self.emit_frame();
         }
-    }
-
-    /// One FFT per granule of input, kept for the masking model.
-    fn psy_push(&mut self, ch: usize, mono: &[f32]) {
-        let n = 1024.min(mono.len());
-        let history = &mut self.psy_history[ch];
-        history.copy_within(n.., 0);
-        let keep = 1024 - n;
-        history[keep..].copy_from_slice(&mono[mono.len() - n..]);
     }
 
     /// Allowed noise per long scalefactor band, from the masking model, in
@@ -702,18 +715,21 @@ impl Mp3Encode {
         // every bitrate candidate VBR tries below; compute them once.
         let mut xrs: Vec<Vec<f32>> = Vec::with_capacity(granules * channels);
         let mut thresholds: Vec<Vec<f32>> = Vec::with_capacity(granules * channels);
+        // Take the held-back granules once: the per-granule clone that used
+        // to feed `mdct` copied every subband and threshold just to keep the
+        // borrow checker happy about `history`.
+        let held: Vec<PendingGranule> = self.pending.drain(..granules * channels).collect();
         for gr in 0..granules {
             for ch in 0..channels {
                 let index = gr * channels + ch;
-                let granule = self.pending[index].clone();
+                let granule = &held[index];
                 xrs.push(self.mdct(ch, &granule.subband, types[index]));
                 thresholds.push(match vbr {
                     Some(quality) => quality_threshold(&granule.threshold, quality),
-                    None => granule.threshold,
+                    None => granule.threshold.clone(),
                 });
             }
         }
-        self.pending.drain(..granules * channels);
 
         // Mid/side stereo. The two channels of real music are mostly the same
         // signal, and coding their sum and difference puts nearly all of the
