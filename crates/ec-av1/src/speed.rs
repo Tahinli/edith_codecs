@@ -460,14 +460,15 @@ pub(crate) const ARF_TF_WIN: [usize; 11] = [3; 11];
 /// so [`ARF_TF`] stays where lane-arftf put it.
 pub(crate) const ARF_TF_WIN_FUT: [usize; 11] = [3; 11];
 
-/// lane-arfmode: the top ARF's LEAF offer set, as a bitmask -- `1` the 16x16
-/// and 8x8 leaves of the group's own anchor ([`crate::encode::DqLevel::
-/// TopArf`]) offer no INTRA candidate, `2` a 16x16 leaf under it is not
-/// offered the 8x8 split, `4` the leaves offer no compound candidates;
-/// combinations OR, `0` (the default) is bit-exact with the pre-lane
-/// encoder. `EC_AV1_ARFMODE=<n>` overrides it. The 32x32 whole keeps its
-/// full offer set (the scene-cut hatch), and the spec-forced 8x8s at
-/// straddling edges are untouched -- only RD-optional offers are cut.
+/// lane-arfmode: the top ARF's offer set, as a bitmask -- `1` the group's
+/// own anchor ([`crate::encode::DqLevel::TopArf`]) offers no INTRA
+/// candidate at any block size (the whole-32 search and the 16x16/8x8
+/// leaves), `2` a 16x16 leaf under it is not offered the 8x8 split, `4` the
+/// leaves offer no compound candidates; combinations OR, `0` (the default)
+/// is bit-exact with the pre-lane encoder. `EC_AV1_ARFMODE=<n>` overrides
+/// it. The spec-forced 8x8s at straddling edges are untouched -- only
+/// RD-optional offers are cut; the mid and quarter hidden frames and every
+/// shown leaf keep the full set.
 ///
 /// The census it answers to (lanes/arfmode.charter.md, at 0d81d6c5): the top
 /// ARF's syntax gap against rav1e's own ARF at the same position is

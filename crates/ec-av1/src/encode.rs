@@ -7779,13 +7779,17 @@ struct Search<'a> {
     /// `intra_pruning_with_hog` -- never prunes it away). `None` runs every
     /// mode through full RD, unchanged from before this lever.
     top_k: Option<usize>,
-    /// lane-arfmode: the top ARF's leaf offer set ([`crate::speed::ARFMODE`])
-    /// -- `false` cuts the named candidate group from the 16x16/8x8 LEAF
-    /// search ([`code_square_inter`]) and the 8x8 split offer at the top ARF
+    /// lane-arfmode: the top ARF's offer set ([`crate::speed::ARFMODE`])
+    /// -- `false` cuts the named candidate group from the whole-32 search
+    /// ([`search_inter_block`]), the 16x16/8x8 leaf search
+    /// ([`code_square_inter`]) and the 8x8 split offer, at the top ARF
     /// ([`DqLevel::TopArf`] frames only). `true` everywhere else, which is
-    /// the pre-lane behaviour: the key frame never reaches
-    /// [`code_square_inter`], the 32x32 whole keeps its full set, and the
+    /// the pre-lane behaviour: the mid and quarter hidden frames, the shown
+    /// leaves and the flat path keep intra and compound, and the
     /// straddling-edge 8x8s are only mode-gated, never partition-gated.
+    /// The probe's correction: with the leaf gate ALONE the film A stream
+    /// was byte-identical to the control -- the ARF's intra area lives at
+    /// the whole-32 level, so the intra arm must cut it there too.
     arf_leaf_intra: bool,
     arf_leaf8: bool,
     arf_leaf_compound: bool,
@@ -11018,43 +11022,52 @@ fn search_inter_block(
         _ => search.modes.to_vec(),
     };
     census_add(5, 1);
-    census_add(6, intra_modes.len());
-    for &mode in &intra_modes {
-        let luma_trial = luma.trial(
-            At {
-                x,
-                y,
-                side: BLOCK,
-                reach,
-                set: luma_set,
-            },
-            mode,
-            0,
-            search.base_q_idx,
-            search.deadzone, fctx,
-        );
-        let u = u_trial.clone();
-        let v = v_trial.clone();
-        let cost = luma_trial.sse
-            + u.sse
-            + v.sse
-            + search.lambda
-                * (luma_trial.bits
-                    + u.bits
-                    + v.bits
-                    + mode_bits[usize::from(mode)]
-                    + skip_bits(false)
-                    + intra_inter_bits(false));
-        consider(Candidate {
-            cost,
-            luma: luma_trial,
-            u,
-            v,
-            mode,
-            skip: false,
-            inter: None,
-            mode_bits: mode_bits[usize::from(mode)],
-        });
+    census_add(6, if search.arf_leaf_intra { intra_modes.len() } else { 0 });
+    // lane-arfmode: arm 1 drops the whole-32 block's intra candidates at the
+    // top ARF too -- the probe proved the ARF's intra AREA lives HERE, not at
+    // the leaves (film A arm 1 vs control byte-identical with the leaf gate
+    // alone), so "the 32x32 whole keeps intra as the scene-cut hatch" was a
+    // hatch nothing else was using. Counted once per block.
+    if search.arf_leaf_intra {
+        for &mode in &intra_modes {
+            let luma_trial = luma.trial(
+                At {
+                    x,
+                    y,
+                    side: BLOCK,
+                    reach,
+                    set: luma_set,
+                },
+                mode,
+                0,
+                search.base_q_idx,
+                search.deadzone, fctx,
+            );
+            let u = u_trial.clone();
+            let v = v_trial.clone();
+            let cost = luma_trial.sse
+                + u.sse
+                + v.sse
+                + search.lambda
+                    * (luma_trial.bits
+                        + u.bits
+                        + v.bits
+                        + mode_bits[usize::from(mode)]
+                        + skip_bits(false)
+                        + intra_inter_bits(false));
+            consider(Candidate {
+                cost,
+                luma: luma_trial,
+                u,
+                v,
+                mode,
+                skip: false,
+                inter: None,
+                mode_bits: mode_bits[usize::from(mode)],
+            });
+        }
+    } else {
+        arfmode_hit(0);
     }
 
     // The reference frame buffer a spec decoder holds is exactly the true
