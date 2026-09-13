@@ -765,7 +765,16 @@ impl Mp3Encode {
         let count = (granules * channels).max(1);
         let demand: Vec<f64> = xrs
             .iter()
-            .map(|xr| xr.iter().map(|v| f64::from(v.abs()).powf(0.75)).sum())
+            .map(|xr| {
+                xr.iter()
+                    .map(|v| {
+                        let x = f64::from(v.abs());
+                        // |x|^(3/4) as a cube and two square roots, the same
+                        // shape the quantiser uses.
+                        (x * x * x).sqrt().sqrt()
+                    })
+                    .sum()
+            })
             .collect();
         let demand_total: f64 = demand.iter().sum();
         let demand_share = |budget: usize, index: usize| -> u32 {
@@ -1369,9 +1378,14 @@ fn code_with(
     }
     let mut noise = [0.0f32; SFB_LONG];
     let power = power43();
+    // One band gain per band, not one per line: the residual ran an exp2 for
+    // every spectral line of the granule.
+    let mut scales = [0.0f32; SFB_LONG];
+    for (band, slot) in scales.iter_mut().enumerate() {
+        *slot = band_gain(gain, scalefac[band], block_type);
+    }
     let residual = |i: usize, band: usize| -> f32 {
-        let scale = band_gain(gain, scalefac[band], block_type);
-        let magnitude = power[(ix[i].unsigned_abs() as usize).min(MAX_QUANT)] * scale;
+        let magnitude = power[(ix[i].unsigned_abs() as usize).min(MAX_QUANT)] * scales[band];
         let reconstructed = if ix[i] < 0 { -magnitude } else { magnitude };
         (xr[i] - reconstructed).powi(2)
     };
@@ -1442,18 +1456,37 @@ fn quantise(
     ix: &mut [i32],
 ) {
     let quantise_line = |xr: f32, scale: f32| -> i32 {
-        let value = (xr.abs() * scale).powf(0.75);
-        let magnitude = (value + 0.4054).min(MAX_QUANT as f32) as i32;
+        // |xr·scale|^(3/4) as a cube and two square roots: the libm `powf`
+        // this replaces was a tenth of the encoder's runtime all by itself.
+        // The two forms differ by an ulp or two, which next to the level
+        // boundary offset below can flip the rare line by one quantisation
+        // step and nothing more.
+        let x = f64::from(xr.abs()) * f64::from(scale);
+        let value = (x * x * x).sqrt().sqrt();
+        let magnitude = (value + 0.4054).min(MAX_QUANT as f64) as i32;
         if xr < 0.0 { -magnitude } else { magnitude }
     };
     if block_type == 2 {
         // Short blocks: twelve bands, each with its own scalefactor shared by
         // the three windows. Without them the quantiser's noise is flat across
         // the spectrum, which is what made a switched granule the worst-coded
-        // one in the stream.
-        for (i, slot) in ix.iter_mut().enumerate().take(576) {
-            let scale = 1.0 / band_gain(gain, scalefac[short_band(i, sample_rate)], block_type);
-            *slot = quantise_line(xr[i], scale);
+        // one in the stream. One band gain per band, not one per line: the
+        // interleaved layout means a line's band search ran 576 exp2 calls
+        // and 576 linear band searches per quantisation.
+        let short = short_starts(sample_rate);
+        let mut scales = [0.0f32; 13];
+        for (band, slot) in scales.iter_mut().enumerate() {
+            *slot = 1.0 / band_gain(gain, scalefac[band], block_type);
+        }
+        for band in 0..13 {
+            let (from, to) = (
+                usize::from(short[band]) * 3,
+                usize::from(short[band + 1]) * 3,
+            );
+            let scale = scales[band];
+            for i in from..to.min(576) {
+                ix[i] = quantise_line(xr[i], scale);
+            }
         }
         return;
     }
