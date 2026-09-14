@@ -38,22 +38,25 @@ pub(crate) const TX_MODE_TO_BIGGEST_TX_SIZE: [usize; 5] =
 
 /// spec 6.3.5 `partition_tree`.
 pub(crate) const PARTITION_TREE: [i8; 6] = [-0, 2, -1, 4, -2, -3];
-/// spec 6.3.4 y mode tree (8.2 `read_intra_mode`).
+/// libvpx `vp9_intra_mode_tree` (vp9_entropymode.c:245), verbatim. v1.15
+/// uses this one tree for both y and uv modes (decodemv.c `read_intra_mode`);
+/// the spec document's separate chain-shaped `uv_mode_tree` does not exist
+/// in libvpx and does not match its bitstream.
 pub(crate) const INTRA_MODE_TREE: [i8; 18] = [
-    -0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -5, -6, -3, 14, -7, 16, -8, -4,
+    -0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7,
 ];
-/// spec 6.3.4 uv mode tree.
-pub(crate) const UV_MODE_TREE: [i8; 18] = [
-    -0, 2, -1, 4, -2, 6, -3, 8, -4, 10, -5, 12, -6, 14, -7, 16, -8, -9,
-];
-/// spec 6.2 segment id tree.
-pub(crate) const SEGMENT_TREE: [i8; 14] =
-    [-0, 2, -1, 4, -2, 6, -3, 8, -4, 10, -5, 12, -6, -7];
+/// libvpx `vp9_segment_tree` (vp9_seg_common.c:58): node refs first, then
+/// a balanced leaf block — not the spec doc's right-leaning chain.
+pub(crate) const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
 
 /// blockd.h `get_y_mode`.
 #[inline]
 pub(crate) fn get_y_mode(sb_type: usize, bmi: [u8; 4], mode: u8, block: usize) -> u8 {
-    if sb_type < 3 { bmi[block] } else { mode }
+    if sb_type < 3 {
+        bmi[block]
+    } else {
+        mode
+    }
 }
 
 /// vp9_blockd.c `vp9_above_block_mode` (keyframes: neighbours are intra).
@@ -136,5 +139,9 @@ pub(crate) fn corrupt(what: impl Into<String>) -> Error {
 }
 
 pub(crate) fn ensure(cond: bool, what: &str) -> Result<()> {
-    if cond { Ok(()) } else { Err(corrupt(what)) }
+    if cond {
+        Ok(())
+    } else {
+        Err(corrupt(what))
+    }
 }

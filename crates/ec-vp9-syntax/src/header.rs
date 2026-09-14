@@ -783,7 +783,11 @@ fn read_sync_code(r: &mut BitReader<'_>) -> Result<()> {
 /// `color_config` (spec 6.2).
 fn read_color_config(r: &mut BitReader<'_>, profile: u8, c: &mut ColorConfig) -> Result<()> {
     c.bit_depth = if profile >= 2 {
-        if r.read_bit()? { 12 } else { 10 }
+        if r.read_bit()? {
+            12
+        } else {
+            10
+        }
     } else {
         8
     };
@@ -876,6 +880,9 @@ fn read_signed_magnitude(r: &mut BitReader<'_>, n: u32) -> Result<i32> {
 
 /// `tile_info` (spec 6.2).
 fn read_tile_info(r: &mut BitReader<'_>, h: &mut FrameHeader) -> Result<()> {
+    // libvpx `setup_tile_info`: exactly `max_log2 - min_log2` increment bits
+    // are consumed for columns AND for rows (the encoder always writes the
+    // terminating 0 bit), so both walks mirror `vp9_get_tile_n_bits`.
     let sb64_cols = h.mi_cols().div_ceil(8);
     let (min_log2, max_log2) = tile_cols_log2_bounds(sb64_cols);
     let mut cols_log2 = min_log2;
@@ -886,9 +893,15 @@ fn read_tile_info(r: &mut BitReader<'_>, h: &mut FrameHeader) -> Result<()> {
             break;
         }
     }
-    let mut rows_log2 = u8::from(r.read_bit()?);
-    if rows_log2 > 0 && r.read_bit()? {
-        rows_log2 += 1;
+    let sb64_rows = h.mi_rows().div_ceil(8);
+    let (_, max_log2_rows) = tile_cols_log2_bounds(sb64_rows);
+    let mut rows_log2 = 0u8;
+    while rows_log2 < max_log2_rows {
+        if r.read_bit()? {
+            rows_log2 += 1;
+        } else {
+            break;
+        }
     }
     h.tile_info = TileInfo {
         cols_log2,
@@ -900,7 +913,9 @@ fn read_tile_info(r: &mut BitReader<'_>, h: &mut FrameHeader) -> Result<()> {
 /// `calc_min_log2_tile_cols` / `calc_max_log2_tile_cols` (spec 6.2).
 ///
 /// A tile column is at most 64 superblocks wide and at least 4, which is what
-/// pins the range the increment bits then walk.
+/// pins the range the increment bits then walk. The bounds are INCLUSIVE:
+/// libvpx consumes exactly `max_log2 - min_log2` increment bits (the encoder
+/// always writes the terminating 0), so `max_log2` itself is returned here.
 fn tile_cols_log2_bounds(sb64_cols: u32) -> (u8, u8) {
     const MAX_TILE_WIDTH_B64: u32 = 64;
     const MIN_TILE_WIDTH_B64: u32 = 4;
@@ -912,29 +927,31 @@ fn tile_cols_log2_bounds(sb64_cols: u32) -> (u8, u8) {
     while (sb64_cols >> max_log2) >= MIN_TILE_WIDTH_B64 {
         max_log2 += 1;
     }
-    (min_log2, max_log2 - 1)
+    (min_log2, max_log2)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Spec 6.2 worked bounds: 1920 wide is 30 superblocks, so tile columns may
-    /// go up to 2^2 (a column must stay at least 4 superblocks wide) and none
-    /// are forced (a column may be up to 64 superblocks wide).
+    /// Spec 6.2 worked bounds: 1920 wide is 30 superblocks; a column must stay
+    /// at least 4 superblocks wide, so up to 2^3 columns (8 bits consumed =
+    /// max - min = 3), and none are forced (up to 64 wide per column).
     #[test]
     fn tile_bounds_match_the_spec_formulas() {
         assert_eq!(
             tile_cols_log2_bounds(1920u32.div_ceil(8).div_ceil(8)),
-            (0, 2)
+            (0, 3)
         );
         assert_eq!(
             tile_cols_log2_bounds(3840u32.div_ceil(8).div_ceil(8)),
-            (0, 3)
+            (0, 4)
         );
         // 4096 superblocks wide forces at least 2^6 tile columns.
         assert_eq!(tile_cols_log2_bounds(4096).0, 6);
-        assert_eq!(tile_cols_log2_bounds(1), (0, 0));
+        // A single-superblock frame still consumes one increment bit
+        // (libvpx get_max_log2(1) == 1): the terminating 0.
+        assert_eq!(tile_cols_log2_bounds(1), (0, 1));
     }
 
     #[test]

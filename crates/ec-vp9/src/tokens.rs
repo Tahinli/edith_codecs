@@ -13,7 +13,10 @@ pub(crate) struct PlaneContexts {
 
 impl PlaneContexts {
     pub(crate) fn new(above_len: usize) -> Self {
-        Self { above: vec![0; above_len], left: [0; 32] }
+        Self {
+            above: vec![0; above_len],
+            left: [0; 32],
+        }
     }
 }
 
@@ -25,7 +28,11 @@ fn get_coef_context(nb: &[i16], token_cache: &[u8; 1024], c: usize) -> usize {
 
 #[inline]
 fn band_at(tx_size: usize, c: usize) -> usize {
-    if tx_size == TX_4X4 { COEFBAND_TRANS_4X4[c] as usize } else { COEFBAND_TRANS_8X8PLUS[c] as usize }
+    if tx_size == TX_4X4 {
+        COEFBAND_TRANS_4X4[c] as usize
+    } else {
+        COEFBAND_TRANS_8X8PLUS[c] as usize
+    }
 }
 
 #[inline]
@@ -56,7 +63,10 @@ pub(crate) fn decode_coefs(
     probs4d: &[[[[[u8; 3]; 6]; 6]; 2]; 2],
 ) -> CoeffBlock {
     let max_eob = 16 << (tx_size << 1);
-    let mut coef = CoeffBlock { coeffs: vec![0i32; max_eob].into_boxed_slice(), eob: 0 };
+    let mut coef = CoeffBlock {
+        coeffs: vec![0i32; max_eob].into_boxed_slice(),
+        eob: 0,
+    };
     let mut token_cache = [0u8; 1024];
     let mut c = 0usize;
     let dq_shift = usize::from(tx_size == TX_32X32);
@@ -132,6 +142,12 @@ pub(crate) fn decode_coefs(
         dqv = dequant[1] as i32;
     }
     coef.eob = c;
+    if crate::trace_enabled() {
+        eprintln!(
+            "C pt={} tx={} eob={} c0={}",
+            plane_type, tx_size, c, coef.coeffs[0]
+        );
+    }
     coef
 }
 
