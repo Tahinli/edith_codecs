@@ -225,29 +225,30 @@ pub(crate) fn read_intra_frame_mode_info(
             mi.mode = mi.bmi[3];
         }
         1 => {
-            // BLOCK_4X8
+            // BLOCK_4X8; decodemv.c commits bmi[0]/bmi[2] BEFORE the
+            // second mode's probs are derived from the current bmi.
             let a0 = above_block_mode(&mi.bmi, above_pair, 0);
             let l0 = left_block_mode(&mi.bmi, left_pair, 0);
             let m0 = r.read_tree(&INTRA_MODE_TREE, &kf_y_mode_probs(a0, l0));
+            mi.bmi[0] = m0;
+            mi.bmi[2] = m0;
             let a1 = above_block_mode(&mi.bmi, above_pair, 1);
             let l1 = left_block_mode(&mi.bmi, left_pair, 1);
             let m1 = r.read_tree(&INTRA_MODE_TREE, &kf_y_mode_probs(a1, l1));
-            mi.bmi[0] = m0;
-            mi.bmi[2] = m0;
             mi.bmi[1] = m1;
             mi.bmi[3] = m1;
             mi.mode = m1;
         }
         2 => {
-            // BLOCK_8X4
+            // BLOCK_8X4; same commit-before-read ordering.
             let a0 = above_block_mode(&mi.bmi, above_pair, 0);
             let l0 = left_block_mode(&mi.bmi, left_pair, 0);
             let m0 = r.read_tree(&INTRA_MODE_TREE, &kf_y_mode_probs(a0, l0));
+            mi.bmi[0] = m0;
+            mi.bmi[1] = m0;
             let a2 = above_block_mode(&mi.bmi, above_pair, 2);
             let l2 = left_block_mode(&mi.bmi, left_pair, 2);
             let m2 = r.read_tree(&INTRA_MODE_TREE, &kf_y_mode_probs(a2, l2));
-            mi.bmi[0] = m0;
-            mi.bmi[1] = m0;
             mi.bmi[2] = m2;
             mi.bmi[3] = m2;
             mi.mode = m2;

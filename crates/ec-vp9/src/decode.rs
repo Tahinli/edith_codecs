@@ -242,10 +242,12 @@ impl Decoder {
         let mut ti = 0usize;
         for tr in 0..tile_rows {
             let row_lo = ((sb64_rows * tr) >> hdr.tile_info.rows_log2) * SB_MI;
-            let row_hi = ((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2).min(mi_rows);
+            let row_hi =
+                (((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2) * SB_MI).min(mi_rows);
             for tc in 0..tile_cols {
                 let col_lo = ((sb64_cols * tc) >> hdr.tile_info.cols_log2) * SB_MI;
-                let col_hi = ((sb64_cols * (tc + 1)) >> hdr.tile_info.cols_log2).min(mi_cols);
+                let col_hi =
+                    (((sb64_cols * (tc + 1)) >> hdr.tile_info.cols_log2) * SB_MI).min(mi_cols);
                 if crate::trace_enabled() {
                     eprintln!(
                         "TILE {} bytes first={:02x?}",
@@ -263,12 +265,12 @@ impl Decoder {
                 let mut mi = MiState::new(mi_cols, mi_rows);
                 ectx.iter_mut().for_each(|p| p.above.fill(0));
                 mi.above_seg.fill(0);
-                for sb_row in row_lo..row_hi {
-                    if sb_row % SB_MI == 0 {
+                for sb_row in (row_lo..row_hi).step_by(SB_MI) {
+                    if sb_row == row_lo {
                         ectx.iter_mut().for_each(|p| p.left = [0; 32]);
                         mi.left_seg = [0; 32];
                     }
-                    for sb_col in col_lo..col_hi {
+                    for sb_col in (col_lo..col_hi).step_by(SB_MI) {
                         self.decode_partition(
                             &mut r,
                             &mut mi,
@@ -698,6 +700,11 @@ impl Decoder {
         let y0 = ((mi_row * 8) >> s) + tx_row * 4;
         let up = tx_row != 0 || mi_row > tile_row_start;
         let lft = tx_col != 0 || mi_col > tile_col_start;
+        // vp9_predict_intra_block `have_right`: the tx block is not in the
+        // last tx column of ITS OWN block (pd->n4_w units) — above-right
+        // past the block's right edge belongs to a not-yet-decoded
+        // neighbour, so it must stage as unavailable.
+        let rgt = tx_col + (1usize << tx_size) < bw * 2 >> s;
 
         // 1. Intra prediction (reads reconstructed neighbours).
         {
@@ -713,7 +720,7 @@ impl Decoder {
                 bs,
                 up,
                 lft,
-                x0 + bs < pw,
+                rgt,
             );
         }
 
@@ -739,8 +746,24 @@ impl Decoder {
         let ax = ((mi_col << 1) >> s) + tx_col;
         let lrows = 32usize >> s;
         let ay = (((mi_row << 1) >> s) + tx_row) % lrows;
-        let ctx_in =
-            usize::from(ectx[plane].above[ax] != 0) + usize::from(ectx[plane].left[ay] != 0);
+        // libvpx reads the context as !!*(uintN_t *)a / l over the WHOLE
+        // tx-block span (uint16 for 8x8, uint32 for 16x16, uint64 for
+        // 32x32), not just the first entry.
+        let nblocks = 1usize << tx_size;
+        let ctx_in = usize::from(ectx[plane].above[ax..ax + nblocks].iter().any(|&v| v != 0))
+            + usize::from(ectx[plane].left[ay..ay + nblocks].iter().any(|&v| v != 0));
+        if crate::trace_enabled() {
+            eprintln!(
+                "CTX p={} prob={:?} ax={} ay={} a={} l={} ctx={}",
+                plane,
+                self.ctx.coef[tx_size][ptype][0][0][ctx_in],
+                ax,
+                ay,
+                ectx[plane].above[ax],
+                ectx[plane].left[ay],
+                ctx_in
+            );
+        }
         let coef = decode_coefs(
             r,
             ptype,
@@ -806,8 +829,21 @@ impl Decoder {
         if coef.eob > 0 {
             let dst_off = y0 * stride + x0;
             let (data, _) = planes.plane(plane);
-            let t = if crate::trace_enabled() && plane == 0 && mi_row == 0 && mi_col == 0 {
-                Some(data[0])
+            let probe = crate::trace_enabled()
+                && plane == 0
+                && std::env::var("EC_VP9_PROBE_TU")
+                    .ok()
+                    .and_then(|s| {
+                        let mut it = s.split(',');
+                        Some((it.next()?.parse::<usize>().ok()?, it.next()?.parse().ok()?))
+                    })
+                    .is_some_and(|(px, py)| x0 == px && y0 == py);
+            let t: Option<Vec<Vec<u8>>> = if probe {
+                Some(
+                    (0..4usize)
+                        .map(|rr| data[dst_off + rr * stride..dst_off + rr * stride + 4].to_vec())
+                        .collect(),
+                )
             } else {
                 None
             };
@@ -821,11 +857,13 @@ impl Decoder {
                 lossless,
             );
             if let Some(before) = t {
-                let row: Vec<u8> = data[0..8].to_vec();
-                eprintln!(
-                    "RC x0={x0} y0={y0} tx={tx_size} before={before} after={} row0={row:?}",
-                    data[0]
-                );
+                let after: Vec<Vec<u8>> = (0..4usize)
+                    .map(|rr| data[dst_off + rr * stride..dst_off + rr * stride + 4].to_vec())
+                    .collect();
+                eprintln!("RC x0={x0} y0={y0} tx={tx_size} mode={mode}");
+                for rr in 0..4 {
+                    eprintln!("  pred{rr}={:?} after{rr}={:?}", before[rr], after[rr]);
+                }
             }
         }
         Ok(())
