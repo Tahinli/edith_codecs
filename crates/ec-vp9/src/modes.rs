@@ -66,11 +66,28 @@ impl MiState {
     }
 
     /// `dec_update_partition_context`; `partition_context_lookup[subsize]`.
-    pub(crate) fn update_partition_ctx(&mut self, row: usize, col: usize, subsize: usize, bw: usize) {
+    pub(crate) fn update_partition_ctx(
+        &mut self,
+        row: usize,
+        col: usize,
+        subsize: usize,
+        bw: usize,
+    ) {
         // (above, left) per BLOCK_SIZE, common_data.c:230.
         const LOOKUP: [(u8, u8); 13] = [
-            (15, 15), (15, 14), (14, 15), (14, 14), (14, 12), (12, 14), (12, 12),
-            (12, 8), (8, 12), (8, 8), (8, 0), (0, 8), (0, 0),
+            (15, 15),
+            (15, 14),
+            (14, 15),
+            (14, 14),
+            (14, 12),
+            (12, 14),
+            (12, 12),
+            (12, 8),
+            (8, 12),
+            (8, 8),
+            (8, 0),
+            (0, 8),
+            (0, 0),
         ];
         let (a, l) = LOOKUP[subsize];
         self.above_seg[col..col + bw].fill(a);
@@ -143,7 +160,10 @@ pub(crate) fn read_intra_frame_mode_info(
         + left_mi.as_ref().map_or(0, |u| u32::from(u.skip));
     let skip_ctx = skip_ctx as usize;
     let seg_skip = seg.enabled
-        && seg.feature_enabled.get(segment as usize).is_some_and(|f| f[3]);
+        && seg
+            .feature_enabled
+            .get(segment as usize)
+            .is_some_and(|f| f[3]);
     let skip = if seg_skip {
         true
     } else {
@@ -155,14 +175,12 @@ pub(crate) fn read_intra_frame_mode_info(
     let tx_size = if tx_mode == TX_MODE_SELECT && sb_type >= 3 {
         // read_selected_tx_size: ctx from above/left tx sizes.
         let ctx = {
-            let a = above_mi.as_ref().map_or(max_tx, |m| {
-                if m.skip {
-                    max_tx
-                } else {
-                    m.tx_size
-                }
-            });
-            let l = left_mi.as_ref().map_or(a, |m| if m.skip { max_tx } else { m.tx_size });
+            let a = above_mi
+                .as_ref()
+                .map_or(max_tx, |m| if m.skip { max_tx } else { m.tx_size });
+            let l = left_mi
+                .as_ref()
+                .map_or(a, |m| if m.skip { max_tx } else { m.tx_size });
             usize::from(a + l > max_tx)
         };
         let probs: &[u8] = match max_tx {
@@ -240,17 +258,8 @@ pub(crate) fn read_intra_frame_mode_info(
             mi.mode = r.read_tree(&INTRA_MODE_TREE, &kf_y_mode_probs(a, l));
         }
     }
-    // uv mode: kf_uv table indexed by y mode (decodemv.c read_intra_mode_uv
-    // for keyframes uses vp9_kf_uv_mode_prob).
-    mi.uv_mode = r.read_tree(&UV_MODE_TREE, &kf_uv_probs(mi.mode));
+    // uv mode: `vp9_kf_uv_mode_prob` indexed by y mode, decoded with the
+    // SAME intra_mode_tree (decodemv.c:232 calls read_intra_mode).
+    mi.uv_mode = r.read_tree(&INTRA_MODE_TREE, &kf_uv_probs(mi.mode));
     Ok(mi)
 }
-
-/// `vp9_kf_uv_mode_prob` reshaped per y mode.
-pub(crate) fn kf_uv_probs(mode: u8) -> [u8; 9] {
-    let mut out = [0u8; 9];
-    let base = mode as usize * 9;
-    out.copy_from_slice(&KF_UV_MODE_PROB[base..base + 9]);
-    out
-}
-

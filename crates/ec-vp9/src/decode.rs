@@ -83,7 +83,7 @@ impl Decoder {
     pub fn new() -> Self {
         Decoder {
             parser: Vp9Parser::new(),
-            ctx: FrameContext::new(),
+            ctx: FrameContext::new(true),
             refs: [const { None }; 8],
             planes: None,
         }
@@ -133,7 +133,7 @@ impl Decoder {
         }
         // A keyframe resets the frame context (spec 7.2) before the
         // compressed header codes this frame's updates on top.
-        self.ctx = FrameContext::new();
+        self.ctx = FrameContext::new(hdr.frame_type == FrameType::Key);
         let hdr_start = hdr.uncompressed_header_size as usize;
         let tx_mode = read_compressed_header(
             &frame[hdr_start..hdr_start + hdr.header_size_in_bytes as usize],
@@ -162,15 +162,24 @@ impl Decoder {
             aw,
             ah,
         });
-        let tail_start =
-            hdr.uncompressed_header_size as usize + hdr.header_size_in_bytes as usize;
+        let tail_start = std::env::var("EC_VP9_FORCE_TAIL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                hdr.uncompressed_header_size as usize + hdr.header_size_in_bytes as usize
+            });
         let tail: Vec<u8> = frame[tail_start..].to_vec();
         let res = self.decode_keyframe_inner(hdr, tx_mode, &tail);
         self.planes = None;
         res
     }
 
-    fn decode_keyframe_inner(&mut self, hdr: &FrameHeader, tx_mode: u8, tail: &[u8]) -> Result<Picture> {
+    fn decode_keyframe_inner(
+        &mut self,
+        hdr: &FrameHeader,
+        tx_mode: u8,
+        tail: &[u8],
+    ) -> Result<Picture> {
         let aw = self.planes.as_ref().expect("frame scratch").aw;
         let ah = self.planes.as_ref().expect("frame scratch").ah;
         let width = hdr.width as usize;
@@ -224,6 +233,13 @@ impl Decoder {
             for tc in 0..tile_cols {
                 let col_lo = ((sb64_cols * tc) >> hdr.tile_info.cols_log2) * SB_MI;
                 let col_hi = ((sb64_cols * (tc + 1)) >> hdr.tile_info.cols_log2).min(mi_cols);
+                if crate::trace_enabled() {
+                    eprintln!(
+                        "TILE {} bytes first={:02x?}",
+                        tiles[ti].len(),
+                        &tiles[ti][..8.min(tiles[ti].len())]
+                    );
+                }
                 let mut r = crate::bool::BoolDecoder::new(tiles[ti])?;
                 ti += 1;
                 let mut ectx = [
@@ -264,7 +280,15 @@ impl Decoder {
         if hdr.loop_filter.level > 0 {
             let p = self.planes.as_mut().expect("frame scratch");
             grids.filter_frame(
-                &mut p.y, p.ys, &mut p.u, &mut p.v, p.uvs, aw, ah, aw / 2, ah / 2,
+                &mut p.y,
+                p.ys,
+                &mut p.u,
+                &mut p.v,
+                p.uvs,
+                aw,
+                ah,
+                aw / 2,
+                ah / 2,
                 hdr.loop_filter.sharpness,
             );
         }
@@ -312,49 +336,139 @@ impl Decoder {
         let hbs = (1usize << n8) >> 1;
         let has_rows = row + hbs < mi.mi_rows;
         let has_cols = col + hbs < mi.mi_cols;
-        // Spec 6.3.5: partition symbols are coded only for blocks >= 8x8;
-        // the 4x4 sub-blocks of a split 8x8 carry none (implicitly NONE).
-        let partition = if n4 == 1 {
-            0
-        } else {
+        // libvpx reads the partition symbol at EVERY level INCLUDING 8x8
+        // (decodeframe.c:1188 runs before the `!hbs` branch): the 8x8
+        // symbol picks 8x8 / 8x4 / 4x8 / 4x4-split — the sub-8x8 shapes.
+        // Only the 4x4 level has no symbol, and SPLIT recursion never
+        // reaches it (it stops at n4 == 1).
         let partition = {
             let ctx = mi.partition_ctx(row, col, n8 as u32);
             let probs = &self.ctx.partition[ctx];
             if has_rows && has_cols {
                 r.read_tree(&PARTITION_TREE, probs)
             } else if !has_rows && has_cols {
-                if r.read_bool(probs[1]) { 3 } else { 1 }
+                if r.read_bool(probs[1]) {
+                    3
+                } else {
+                    1
+                }
             } else if has_rows && !has_cols {
-                if r.read_bool(probs[2]) { 3 } else { 2 }
+                if r.read_bool(probs[2]) {
+                    3
+                } else {
+                    2
+                }
             } else {
                 3
             }
         };
-        partition
-        };
         let bsize = bsize_of_n4(n4);
         let subsize = SUBSIZE_LOOKUP[partition as usize * 13 + bsize] as usize;
         if hbs == 0 {
-            self.decode_block(r, mi, ectx, grids, level_of_seg, hdr, row, col, subsize, 1, 1,
-                tile_row_start, tile_col_start, tx_mode)?;
+            self.decode_block(
+                r,
+                mi,
+                ectx,
+                grids,
+                level_of_seg,
+                hdr,
+                row,
+                col,
+                subsize,
+                1,
+                1,
+                tile_row_start,
+                tile_col_start,
+                tx_mode,
+            )?;
         } else {
             match partition {
-                0 => self.decode_block(r, mi, ectx, grids, level_of_seg, hdr, row, col, subsize,
-                    n4, n4, tile_row_start, tile_col_start, tx_mode)?,
+                0 => self.decode_block(
+                    r,
+                    mi,
+                    ectx,
+                    grids,
+                    level_of_seg,
+                    hdr,
+                    row,
+                    col,
+                    subsize,
+                    n4,
+                    n4,
+                    tile_row_start,
+                    tile_col_start,
+                    tx_mode,
+                )?,
                 1 => {
-                    self.decode_block(r, mi, ectx, grids, level_of_seg, hdr, row, col, subsize,
-                        n4, n8, tile_row_start, tile_col_start, tx_mode)?;
+                    self.decode_block(
+                        r,
+                        mi,
+                        ectx,
+                        grids,
+                        level_of_seg,
+                        hdr,
+                        row,
+                        col,
+                        subsize,
+                        n4,
+                        n8,
+                        tile_row_start,
+                        tile_col_start,
+                        tx_mode,
+                    )?;
                     if has_rows {
-                        self.decode_block(r, mi, ectx, grids, level_of_seg, hdr, row + hbs, col,
-                            subsize, n4, n8, tile_row_start, tile_col_start, tx_mode)?;
+                        self.decode_block(
+                            r,
+                            mi,
+                            ectx,
+                            grids,
+                            level_of_seg,
+                            hdr,
+                            row + hbs,
+                            col,
+                            subsize,
+                            n4,
+                            n8,
+                            tile_row_start,
+                            tile_col_start,
+                            tx_mode,
+                        )?;
                     }
                 }
                 2 => {
-                    self.decode_block(r, mi, ectx, grids, level_of_seg, hdr, row, col, subsize,
-                        n8, n4, tile_row_start, tile_col_start, tx_mode)?;
+                    self.decode_block(
+                        r,
+                        mi,
+                        ectx,
+                        grids,
+                        level_of_seg,
+                        hdr,
+                        row,
+                        col,
+                        subsize,
+                        n8,
+                        n4,
+                        tile_row_start,
+                        tile_col_start,
+                        tx_mode,
+                    )?;
                     if has_cols {
-                        self.decode_block(r, mi, ectx, grids, level_of_seg, hdr, row, col + hbs,
-                            subsize, n8, n4, tile_row_start, tile_col_start, tx_mode)?;
+                        self.decode_block(
+                            r,
+                            mi,
+                            ectx,
+                            grids,
+                            level_of_seg,
+                            hdr,
+                            row,
+                            col + hbs,
+                            subsize,
+                            n8,
+                            n4,
+                            tile_row_start,
+                            tile_col_start,
+                            tx_mode,
+                        )?;
                     }
                 }
                 _ => {
@@ -364,8 +478,20 @@ impl Decoder {
                         (row + hbs, col),
                         (row + hbs, col + hbs),
                     ] {
-                        self.decode_partition(r, mi, ectx, grids, level_of_seg, hdr, rr, cc, n8,
-                            tile_row_start, tile_col_start, tx_mode)?;
+                        self.decode_partition(
+                            r,
+                            mi,
+                            ectx,
+                            grids,
+                            level_of_seg,
+                            hdr,
+                            rr,
+                            cc,
+                            n8,
+                            tile_row_start,
+                            tile_col_start,
+                            tx_mode,
+                        )?;
                     }
                 }
             }
@@ -401,20 +527,31 @@ impl Decoder {
         let y_mis = bh.min(mi.mi_rows - row);
 
         let info = read_intra_frame_mode_info(
-            r, mi, &hdr.segmentation, &self.ctx.partition, row, col, sb_type, x_mis, y_mis,
-            tile_row_start, tile_col_start, tx_mode, &self.ctx.skip,
+            r,
+            mi,
+            &hdr.segmentation,
+            &self.ctx.partition,
+            row,
+            col,
+            sb_type,
+            x_mis,
+            y_mis,
+            tile_row_start,
+            tile_col_start,
+            tx_mode,
+            &self.ctx.skip,
         )?;
 
-        // Per-plane 4x4 counts; sub-8x8 blocks use their block-size dims
-        // (luma 1x1 / 1x2 / 2x1), chroma is processed once per 8x8 (TL).
-        let sub = sb_type < 3;
-        let n4w = if sub {
-            [NUM_4X4_BLOCKS_WIDE_LOOKUP[sb_type] as usize, 1, 1]
+        // Per-plane 4x4 counts. Sub-8x8 shapes still occupy the WHOLE 8x8
+        // mi area (libvpx set_plane_n4 with bw=bh=1): luma walks 2x2 4x4
+        // TUs, chroma is one 4x4 (n4 >> subsampling), coded once per 8x8.
+        let n4w = if sb_type < 3 {
+            [2, 1, 1]
         } else {
             [bw * 2, bw, bw]
         };
-        let n4h = if sub {
-            [NUM_4X4_BLOCKS_HIGH_LOOKUP[sb_type] as usize, 1, 1]
+        let n4h = if sb_type < 3 {
+            [2, 1, 1]
         } else {
             [bh * 2, bh, bh]
         };
@@ -427,7 +564,11 @@ impl Decoder {
                 let cell = (row + dy) * mi.mi_cols + col + dx;
                 grids.level8[cell] = level;
                 grids.blk[cell] = (sb_type as u8, row as u32, col as u32);
-                grids.otx[cell] = if sb_type < 3 { TX_4X4 as u8 } else { info.tx_size as u8 };
+                grids.otx[cell] = if sb_type < 3 {
+                    TX_4X4 as u8
+                } else {
+                    info.tx_size as u8
+                };
             }
         }
         // Luma tx4 grid (block-uniform in VP9).
@@ -436,8 +577,7 @@ impl Decoder {
             let maxh = (n4h[0] as i32 + (mb_to_bottom.min(0) >> 5)).max(0) as usize;
             for rr in 0..maxh.min(n4h[0]) {
                 for cc in 0..maxw.min(n4w[0]) {
-                    grids.tx4[(row * 2 + rr) * mi.mi_cols * 2 + col * 2 + cc] =
-                        info.tx_size as u8;
+                    grids.tx4[(row * 2 + rr) * mi.mi_cols * 2 + col * 2 + cc] = info.tx_size as u8;
                 }
             }
         }
@@ -469,16 +609,27 @@ impl Decoder {
                 (n4w[plane] as i32 + (mb_to_right.min(0) >> (5 + s))).max(0) as usize;
             let max_blocks_high =
                 (n4h[plane] as i32 + (mb_to_bottom.min(0) >> (5 + s))).max(0) as usize;
-            // Sub-8x8 chroma is coded once per 8x8, with the first
-            // (top-left) sub-block.
-            if sub && plane != 0 && !(row % 2 == 0 && col % 2 == 0) {
-                continue;
-            }
             for brow in (0..max_blocks_high).step_by(step) {
                 for bcol in (0..max_blocks_wide).step_by(step) {
-                    self.predict_and_reconstruct(r, ectx, hdr, &info, plane, row, col, brow, bcol,
-                        tx_size, sb_type, bw, bh, mb_to_right, mb_to_bottom, tile_row_start,
-                        tile_col_start)?;
+                    self.predict_and_reconstruct(
+                        r,
+                        ectx,
+                        hdr,
+                        &info,
+                        plane,
+                        row,
+                        col,
+                        brow,
+                        bcol,
+                        tx_size,
+                        sb_type,
+                        bw,
+                        bh,
+                        mb_to_right,
+                        mb_to_bottom,
+                        tile_row_start,
+                        tile_col_start,
+                    )?;
                 }
             }
         }
@@ -538,7 +689,19 @@ impl Decoder {
         // 1. Intra prediction (reads reconstructed neighbours).
         {
             let (data, _) = planes.plane(plane);
-            build_intra_predictors(data, stride, pw, ph, x0, y0, mode, bs, up, lft, x0 + bs < pw);
+            build_intra_predictors(
+                data,
+                stride,
+                pw,
+                ph,
+                x0,
+                y0,
+                mode,
+                bs,
+                up,
+                lft,
+                x0 + bs < pw,
+            );
         }
 
         if info.skip {
@@ -565,8 +728,16 @@ impl Decoder {
         let ay = ((mi_row << 1) >> s) % lrows;
         let ctx_in =
             usize::from(ectx[plane].above[ax] != 0) + usize::from(ectx[plane].left[ay] != 0);
-        let coef =
-            decode_coefs(r, ptype, tx_size, &dequant, ctx_in, scan, nb, &self.ctx.coef[tx_size]);
+        let coef = decode_coefs(
+            r,
+            ptype,
+            tx_size,
+            &dequant,
+            ctx_in,
+            scan,
+            nb,
+            &self.ctx.coef[tx_size],
+        );
 
         // 3. Context write-back (vp9_decode_block_tokens, v1.15 shifts).
         let n4w = bw * 2 >> s;
@@ -620,7 +791,27 @@ impl Decoder {
         if coef.eob > 0 {
             let dst_off = y0 * stride + x0;
             let (data, _) = planes.plane(plane);
-            inverse_transform_add(tx_size, tx_type, &coef.coeffs, data, dst_off, stride, lossless);
+            let t = if crate::trace_enabled() && plane == 0 && mi_row == 0 && mi_col == 0 {
+                Some(data[0])
+            } else {
+                None
+            };
+            inverse_transform_add(
+                tx_size,
+                tx_type,
+                &coef.coeffs,
+                data,
+                dst_off,
+                stride,
+                lossless,
+            );
+            if let Some(before) = t {
+                let row: Vec<u8> = data[0..8].to_vec();
+                eprintln!(
+                    "RC x0={x0} y0={y0} tx={tx_size} before={before} after={} row0={row:?}",
+                    data[0]
+                );
+            }
         }
         Ok(())
     }
@@ -637,7 +828,8 @@ fn bsize_of_n4(n4: usize) -> usize {
     match n4 {
         4 => 12, // BLOCK_64X64
         3 => 9,  // BLOCK_32X32
-        2 => 3,  // BLOCK_8X8
-        _ => 0,  // BLOCK_4X4
+        2 => 6,  // BLOCK_16X16
+        1 => 3,  // BLOCK_8X8
+        _ => 0,  // BLOCK_4X4 (recursion never reaches n4 == 0)
     }
 }

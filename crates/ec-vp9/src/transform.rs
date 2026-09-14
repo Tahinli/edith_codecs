@@ -668,3 +668,18 @@ pub(crate) fn inverse_transform_add(
     }
 }
 
+
+#[cfg(test)]
+mod scratch_probe {
+    use super::*;
+    #[test]
+    fn probe_dc38() {
+        for (name, tt) in [("dct_dct", DCT_DCT), ("dct_adst", DCT_ADST)] {
+            let mut c = [0i32; 64];
+            c[0] = 38;
+            let mut d = vec![129u8; 64];
+            inverse_transform_add(TX_8X8, tt, &c, &mut d, 0, 8, false);
+            println!("{name}: {:?}", &d[..8]);
+        }
+    }
+}
