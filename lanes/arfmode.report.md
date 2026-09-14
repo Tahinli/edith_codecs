@@ -114,74 +114,70 @@ level ramp is what makes intra/compound competitive on synthetic content.)
 Nothing dead, nothing promoted on a probe alone (arfpred's rule): the gate
 arms are 2, 3 = 1|2, and 7 = 1|2|4 against the control.
 
-## 6. The deciding gates — VPS-1, `bd_rate_film_long_gop` (48 pictures)
+## 6. The deciding gates — VPS-2 + VPS-3, `bd_rate_film_long_gop` (48 pictures)
 
-`tCloud@2.28.112.3`, managed skill recipe: repo-arfmode, target-arfmode,
-fixtures symlink, `.git` stub (re-fixed after the re-sync — see §9),
-warm-compiled, one gate at a time, chain as a user unit, linger on.
-LOADAVG before → after each gate from the chain log.
-
-| gate | film A | film B | wall A (ours) | wall B (ours) |
-|---|---|---|---|---|
-| control (`EC_AV1_ARFMODE` unset) | GATE-LGC-A | GATE-LGC-B | WALL-LGC-A | WALL-LGC-B |
-| arm 2 | GATE-LGA2-A | GATE-LGA2-B | WALL-LGA2-A | WALL-LGA2-B |
-| arm 3 = 1\|2 | GATE-LGA3-A | GATE-LGA3-B | WALL-LGA3-A | WALL-LGA3-B |
-| arm 7 = 1\|2\|4 | GATE-LGA7-A | GATE-LGA7-B | WALL-LGA7-A | WALL-LGA7-B |
-
-### Control — measured, film A row in hand
-
-The chain (below) measured the control's film A row before this report was
-written (the lane's request budget ran out mid-chain; the chain is a user
-unit on the VPS with linger on, so it continues without this session):
-
-| gate | film A | wall A (ours) |
-|---|---|---|
-| control | **+20.9% / −9.0% — the standing table to the digit** | 1283.6 s |
-
-The control reproducing the standing table is the gate's precondition for
-trusting arm deltas; it holds.
-
-### Arm gates — PENDING, chain running on VPS-1
-
-`GATE lgc` started 03:20:46 UTC with `GATE lga2` → `lga3` → `lga7` behind
-it, one gate at a time (~52 min each ≈ done by ~07:40 UTC). Read, do not
-re-run:
-
-    ssh tCloud@2.28.112.3 cat /home/tCloud/gates/chain-arfmode.log   # per-gate START/EXIT + LOADAVG pairs
-    ssh tCloud@2.28.112.3 grep -E '^\| (film|bars|screen)' /home/tCloud/gates/arfmode-{lgc,lga2,lga3,lga7}.log
+VPS-1 (`2.28.112.3`) is unreachable from this host. Re-ran 2026-09-14 on
+VPS-2 (`tCloud@2.28.124.204`: control, arm 2, arm 3) and VPS-3
+(`tCloud@178.105.165.182`: control, arm 7). Same recipe: repo-arfmode,
+target-arfmode, fixtures symlink, `rm -rf .git && git init -q`, PATH
+`$HOME/.cargo/bin:/home/tCloud/gates/bin:/usr/bin` inside the unit, chain
+as a user unit, linger on. Film hashes
+`2112cf3753b4…` / `79e1800804d5…`. Each VPS ran its own control so arm
+deltas stay on that substrate.
 
 Each log row is `film | ladder points | BD vs libaom | BD vs rav1e | ours:libaom:rav1e walls`.
-The keep rule reads each arm against the control: one film row ≥0.5 BD
-down, the other film flat ±0.3; screen rows not worse 0.3; wall ≤ +15%.
+
+| gate | film A libaom / rav1e | film B libaom / rav1e | wall A / B (ours) | loadavg before → after |
+|---|---|---|---|---|
+| VPS-2 control | **+20.9% / −9.0%** | **+70.4% / −2.2%** | 1422.5s / 1109.6s | 1.85 → 1.03 |
+| VPS-2 arm 2 | +21.8% / −8.6% | +71.0% / −1.9% | 1316.6s / 1031.7s | 1.03 → 1.13 |
+| VPS-2 arm 3 = 1\|2 | +23.8% / −7.8% | +70.1% / −3.1% | 1298.4s / 1033.8s | 1.13 → 1.18 |
+| VPS-3 control | **+20.9% / −9.0%** | **+70.4% / −2.2%** | 1188.3s / 932.1s | 1.47 → 1.16 |
+| VPS-3 arm 7 = 1\|2\|4 | +25.8% / −6.7% | +72.1% / −2.1% | 1037.8s / 818.1s | 1.16 → 1.03 |
+
+Both controls reprint the standing table to the digit (film A +20.9/−9.0,
+film B +70.4/−2.2), same byte ladders as each other
+(A 186167/319027/531588/1120986, B 68680/138142/288789/784645). Arm
+deltas are therefore attributable.
+
+Delta vs same-VPS control (libaom column = merge currency):
+
+| arm | film A | film B | rav1e A / B | wall |
+|---|---|---|---|---|
+| 2 no-8x8 | **+0.9 worse** | **+0.6 worse** | +0.4 / +0.3 | −7% / −7% |
+| 3 = 1\|2 | **+2.9 worse** | −0.3 | +1.2 / −0.9 | −9% / −7% |
+| 7 = 1\|2\|4 | **+4.9 worse** | **+1.7 worse** | +2.3 / +0.1 | −13% / −12% |
+
+Keep rule: one film ≥0.5 BD down, the other flat ±0.3, wall ≤ +15%.
+Walls all pass (faster). Quality does not: no arm has a film at ≥0.5
+down with the other flat. Arm 3's film B rav1e −0.9 is the only ≥0.5
+column, and film A is not flat. Bytes dropped; PSNR dropped more.
+The two-point probe's sign was wrong (arm 2 −2.05%/−2.49% bytes at the
+control's PSNR) — same class as lane-arfpred (`probe-sign-mismatch`).
+
+Chain walls: VPS-2 lgc 52m14s, lga2 49m16s, lga3 49m21s; VPS-3 lgc
+44m01s, lga7 39m39s. Warm 53s / 45s.
 
 ## 7. Guard gate — `bd_rate_screen_native` (12 pictures, five rows)
 
-PENDING — run AFTER the long-GOP verdict picks the disposition arm, same
-recipe, both arms (this lever ENGAGES at the native gate's shape: 12 frames
-→ gop 12 → one group of 11 → its ARF is a `DqLevel::TopArf` — the arm is
-NOT its control):
-
-    env for control: (none)           env for arm N: EC_AV1_ARFMODE=N
-    cargo test -p ec-av1 --release --lib -- --ignored --exact --nocapture \
-      encode::tests::bd_rate_screen_native
+Skipped. The native pair is required for an ON disposition; keep-rule
+failed on the long-GOP table, so there is no disposition arm to guard.
+accepted — not deferred.
 
 ## 8. Keep rule and disposition
 
-**Default OFF — unchanged, byte-exact.** The gate evidence is still
-accumulating (chain above), and the ON disposition requires it; until a
-reader applies §6's rule to the finished logs and re-runs the native pair,
-`speed::ARFMODE` ships `[0; 11]`, the pins hold at `(150, 8291)` /
-`(60, 33227)`, and `EC_AV1_ARFMODE=<n>` arms the lever for A/B on one
-build. fix-now | deferred(<the §6 log read + the native pair, unblocked the
-moment the chain lands>) — every other acceptance item (prior-art
-reconciliation, gap decomposition, lever, witnesses with printed non-zero
-counts, probe, control reproduction) is done and committed.
+**Default OFF — keep-rule not met.** `speed::ARFMODE` stays `[0; 11]`,
+pins `(150, 8291)` / `(60, 33227)` hold, `EC_AV1_ARFMODE=<n>` remains the
+A/B override. Cutting the top ARF's intra / 8x8 / compound offer set
+saves syntax bytes and loses more in residual. The probe is not a
+promotion signal for this lever.
+
 
 ## 9. What this lane did NOT do
 
 * `deferred: the compound trio at the ARF alone (arm 4): the probe reads
-  film A −1.58% / film B −0.30% — worth a gate if a later lane can afford
-  one; the gate's arm 7 carries it only in combination.`
+  film A −1.58% / film B −0.30%. Arm 7 (1|2|4) was the worst long-GOP
+  arm on film A (+4.9 vs libaom) — do not promote on the probe.`
 * `deferred: motion_mode/warp syntax at the ARF (64-90 B/frame, rav1e 0) —
   untouched; warp is a shipped default and an ARF-only cut is a fresh
   measurement.`
@@ -191,4 +187,4 @@ counts, probe, control reproduction) is done and committed.
   the lag-8 anchor pair; the mv column (+310/+454) is block count plus
   longer residuals, not a syntax lever.`
 
-No merge, no push.
+Lever already merged default-OFF at `dcbddc65`. This update is the keep-rule close.
