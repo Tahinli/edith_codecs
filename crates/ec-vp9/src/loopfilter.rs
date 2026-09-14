@@ -436,11 +436,16 @@ impl LfGrids {
                     if c % step != 0 {
                         continue;
                     }
-                    let taps = match uv_tx {
+                    // vp9_adjust_mask: 4-tap on a 64x64 left border is
+                    // promoted to 8-tap (`left_uv[TX_4] & 0x1111` → TX_8).
+                    let mut taps = match uv_tx {
                         TX_16X16 | TX_32X32 if c * 4 >= 8 && c * 4 + 8 <= uv_w => 16,
                         TX_16X16 | TX_32X32 | TX_8X8 => 8,
                         _ => 4,
                     };
+                    if taps == 4 && c % 8 == 0 {
+                        taps = 8;
+                    }
                     let (bl, li, th) = limits(level, sharpness);
                     let off = r * 4 * uv_stride + c * 4;
                     if uv_w >= c * 4 + 4 {
@@ -464,11 +469,16 @@ impl LfGrids {
                     if r % step != 0 {
                         continue;
                     }
-                    let taps = match uv_tx {
+                    // above_border_uv 0x000f: 4-tap on a 64x64 top border
+                    // is promoted to 8-tap.
+                    let mut taps = match uv_tx {
                         TX_16X16 | TX_32X32 if r * 4 >= 8 && r * 4 + 8 <= uv_h => 16,
                         TX_16X16 | TX_32X32 | TX_8X8 => 8,
                         _ => 4,
                     };
+                    if taps == 4 && r % 8 == 0 {
+                        taps = 8;
+                    }
                     let (bl, li, th) = limits(level, sharpness);
                     let off = r * 4 * uv_stride + c * 4;
                     if uv_h >= r * 4 + 4 {

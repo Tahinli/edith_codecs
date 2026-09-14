@@ -339,3 +339,19 @@ Next: chroma ss11 at U(31,11) — likely remaining 4-vs-8 dual threshold or TX_3
 
 Flash 429 until 2026-09-18 19:27. Continue on main grok.
 
+## HANDOFF #7 (2026-09-15) — chroma 64x64 border 4→8
+
+`vp9_adjust_mask` promotes 4-tap UV on a 64x64 border to 8-tap
+(`left_uv[TX_4] & 0x1111` → TX_8; `above_uv[TX_4] & 0x000f` → TX_8).
+Also: TX_32 UV bits are OR'd into TX_16 before ss11 reads them — do not
+skip TX_32; do not treat skip as the 16-pixel miss.
+
+U 16→7, V 20→11. Y still 0. Isolated `vpx_lpf_horizontal_4` matches our
+filter4; remaining cluster is U(31..32,11..12) where 8-tap inner p0/q0
+disagree after V+H (x31 is the last pixel of the previous 8-pack H).
+
+Next: port `vp9_setup_mask` UV rule for <16x16 (only the first 8x8 of
+each 16x16 calls `build_masks`; the other three are `build_y_mask`).
+Do not touch luma.
+
+
