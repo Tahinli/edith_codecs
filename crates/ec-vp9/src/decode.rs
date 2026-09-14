@@ -292,7 +292,7 @@ impl Decoder {
         }
 
         // Loop filter post-pass (level 0 disables it for the frame).
-        if hdr.loop_filter.level > 0 {
+        if hdr.loop_filter.level > 0 && std::env::var_os("EC_VP9_SKIP_LF").is_none() {
             let p = self.planes.as_mut().expect("frame scratch");
             grids.filter_frame(
                 &mut p.y,

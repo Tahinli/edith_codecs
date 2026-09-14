@@ -73,96 +73,176 @@ fn lpf_edge(
     // `dir` 0 = horizontal edges (rows step by stride), 1 = vertical
     // (columns step by 1). `taps` in {4, 8, 16}.
     let step: isize = if dir == 0 { stride as isize } else { 1 };
-    let edge = off as isize;
-    macro_rules! rd { ($k:expr) => { data[(edge + $k * step) as usize] as i32 } }
-    macro_rules! put { ($k:expr, $v:expr) => { data[(edge + $k * step) as usize] = $v; } }
-    // filter_mask (vpx_dsp/loopfilter.c:34): p3..q3 gradient limits +
-    // blimit; shared by the 4-, 8- and 16-tap entry points.
-    let mask = (rd!(-4) - rd!(-3)).abs() <= limit
-        && (rd!(-3) - rd!(-2)).abs() <= limit
-        && (rd!(-2) - rd!(-1)).abs() <= limit
-        && (rd!(1) - rd!(0)).abs() <= limit
-        && (rd!(2) - rd!(1)).abs() <= limit
-        && (rd!(3) - rd!(2)).abs() <= limit
-        && 2 * (rd!(-1) - rd!(0)).abs() + (rd!(-2) - rd!(1)).abs() / 2 <= blimit;
-    let idx4 = [
-        (edge - 2 * step) as usize,
-        (edge - step) as usize,
-        edge as usize,
-        (edge + step) as usize,
-    ];
-    if taps == 4 {
-        filter4(data, idx4, thresh, mask);
-        return;
-    }
-    if !mask {
-        return;
-    }
-    // flat_mask4(1, p3..q3)
-    let flat = (rd!(-2) - rd!(-1)).abs() <= 1
-        && (rd!(1) - rd!(0)).abs() <= 1
-        && (rd!(-3) - rd!(-1)).abs() <= 1
-        && (rd!(2) - rd!(0)).abs() <= 1
-        && (rd!(-4) - rd!(-1)).abs() <= 1
-        && (rd!(3) - rd!(0)).abs() <= 1;
-    if taps == 8 || !flat {
-        if !flat {
-            // plain filter4 with the real mask and hev threshold
-            filter4(data, idx4, thresh, mask);
-            return;
+    let line_step: isize = if dir == 0 { 1 } else { stride as isize };
+    // The kernel filters a single pixel-line; one call covers a 4-pixel
+    // chunk, so run it on each of the four lines crossing the edge
+    // (every row for a vertical edge, every column for a horizontal one)
+    // — this is the per-row `s += pitch` walk inside vpx_lpf_*_c.
+    for line in 0..4isize {
+        let edge = off as isize + line * line_step;
+        macro_rules! rd {
+            ($k:expr) => {
+                data[(edge + $k * step) as usize] as i32
+            };
         }
-        // 7-tap [1,1,1,2,1,1,1] outputs (filter8).
-        let (p3, p2, p1, p0, q0, q1, q2, q3) =
-            (rd!(-4), rd!(-3), rd!(-2), rd!(-1), rd!(0), rd!(1), rd!(2), rd!(3));
-        put!(-3, ((p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3) as u8);
-        put!(-2, ((p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3) as u8);
-        put!(-1, ((p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3) as u8);
-        put!(0, ((p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3) as u8);
-        put!(1, ((p1 + p0 + q0 + q1 * 2 + q2 + q3 + q3 + 4) >> 3) as u8);
-        put!(2, ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as u8);
-        return;
+        macro_rules! put {
+            ($k:expr, $v:expr) => {
+                data[(edge + $k * step) as usize] = $v;
+            };
+        }
+        // filter_mask (vpx_dsp/loopfilter.c:34): p3..q3 gradient limits +
+        // blimit; shared by the 4-, 8- and 16-tap entry points.
+        let mask = (rd!(-4) - rd!(-3)).abs() <= limit
+            && (rd!(-3) - rd!(-2)).abs() <= limit
+            && (rd!(-2) - rd!(-1)).abs() <= limit
+            && (rd!(1) - rd!(0)).abs() <= limit
+            && (rd!(2) - rd!(1)).abs() <= limit
+            && (rd!(3) - rd!(2)).abs() <= limit
+            && 2 * (rd!(-1) - rd!(0)).abs() + (rd!(-2) - rd!(1)).abs() / 2 <= blimit;
+        let idx4 = [
+            (edge - 2 * step) as usize,
+            (edge - step) as usize,
+            edge as usize,
+            (edge + step) as usize,
+        ];
+        if taps == 4 {
+            filter4(data, idx4, thresh, mask);
+            continue;
+        }
+        if !mask {
+            continue;
+        }
+        // flat_mask4(1, p3..q3)
+        let flat = (rd!(-2) - rd!(-1)).abs() <= 1
+            && (rd!(1) - rd!(0)).abs() <= 1
+            && (rd!(-3) - rd!(-1)).abs() <= 1
+            && (rd!(2) - rd!(0)).abs() <= 1
+            && (rd!(-4) - rd!(-1)).abs() <= 1
+            && (rd!(3) - rd!(0)).abs() <= 1;
+        if taps == 8 || !flat {
+            if !flat {
+                // plain filter4 with the real mask and hev threshold
+                filter4(data, idx4, thresh, mask);
+                continue;
+            }
+            // 7-tap [1,1,1,2,1,1,1] outputs (filter8).
+            let (p3, p2, p1, p0, q0, q1, q2, q3) = (
+                rd!(-4),
+                rd!(-3),
+                rd!(-2),
+                rd!(-1),
+                rd!(0),
+                rd!(1),
+                rd!(2),
+                rd!(3),
+            );
+            put!(-3, ((p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3) as u8);
+            put!(-2, ((p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3) as u8);
+            put!(-1, ((p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3) as u8);
+            put!(0, ((p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3) as u8);
+            put!(1, ((p1 + p0 + q0 + q1 * 2 + q2 + q3 + q3 + 4) >> 3) as u8);
+            put!(2, ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as u8);
+            continue;
+        }
+        // flat2 = flat_mask5(1, s[-8..-5], p0, q0, s[4..7]) with the C
+        // call's shifted parameter names: p7..p4 and q4..q6 compare
+        // against p0, while the outermost q7 compares against q0; q0..q3
+        // and p1..p3 are not tested at all.
+        let flat2 = (rd!(-8) - rd!(-1)).abs() <= 1
+            && (rd!(-7) - rd!(-1)).abs() <= 1
+            && (rd!(-6) - rd!(-1)).abs() <= 1
+            && (rd!(-5) - rd!(-1)).abs() <= 1
+            && (rd!(4) - rd!(-1)).abs() <= 1
+            && (rd!(5) - rd!(-1)).abs() <= 1
+            && (rd!(6) - rd!(-1)).abs() <= 1
+            && (rd!(7) - rd!(0)).abs() <= 1;
+        if !flat2 {
+            let (p3, p2, p1, p0, q0, q1, q2, q3) = (
+                rd!(-4),
+                rd!(-3),
+                rd!(-2),
+                rd!(-1),
+                rd!(0),
+                rd!(1),
+                rd!(2),
+                rd!(3),
+            );
+            put!(-3, ((p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3) as u8);
+            put!(-2, ((p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3) as u8);
+            put!(-1, ((p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3) as u8);
+            put!(0, ((p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3) as u8);
+            put!(1, ((p1 + p0 + q0 + q1 * 2 + q2 + q3 + q3 + 4) >> 3) as u8);
+            put!(2, ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as u8);
+            continue;
+        }
+        // 15-tap filter [1 x 7, 2, 1 x 7] (filter16, weights verbatim).
+        let (p7, p6, p5, p4) = (rd!(-8), rd!(-7), rd!(-6), rd!(-5));
+        let (p3, p2, p1, p0) = (rd!(-4), rd!(-3), rd!(-2), rd!(-1));
+        let (q0, q1, q2, q3) = (rd!(0), rd!(1), rd!(2), rd!(3));
+        let (q4, q5, q6, q7) = (rd!(4), rd!(5), rd!(6), rd!(7));
+        put!(
+            -7,
+            ((p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0 + 8) >> 4) as u8
+        );
+        put!(
+            -6,
+            ((p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1 + 8) >> 4) as u8
+        );
+        put!(
+            -5,
+            ((p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4) as u8
+        );
+        put!(
+            -4,
+            ((p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3 + 8) >> 4) as u8
+        );
+        put!(
+            -3,
+            ((p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 + 8) >> 4)
+                as u8
+        );
+        put!(
+            -2,
+            ((p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + q4 + q5 + 8) >> 4)
+                as u8
+        );
+        put!(
+            -1,
+            ((p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + q5 + q6 + 8)
+                >> 4) as u8
+        );
+        put!(
+            0,
+            ((p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + q6 + q7 + 8)
+                >> 4) as u8
+        );
+        put!(
+            1,
+            ((p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + q7 * 2 + 8) >> 4)
+                as u8
+        );
+        put!(
+            2,
+            ((p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 + q4 + q5 + q6 + q7 * 3 + 8) >> 4)
+                as u8
+        );
+        put!(
+            3,
+            ((p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4 + 8) >> 4) as u8
+        );
+        put!(
+            4,
+            ((p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5 + 8) >> 4) as u8
+        );
+        put!(
+            5,
+            ((p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6 + 8) >> 4) as u8
+        );
+        put!(
+            6,
+            ((p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7 + 8) >> 4) as u8
+        );
     }
-    // 16-tap: flat2 = flat_mask5(1, p7..p4, p0, q0, q4..q7) — every
-    // sample compared against p0 (rd!(-1)).
-    let flat2 = (rd!(-8) - rd!(-1)).abs() <= 1
-        && (rd!(-7) - rd!(-1)).abs() <= 1
-        && (rd!(-6) - rd!(-1)).abs() <= 1
-        && (rd!(-5) - rd!(-1)).abs() <= 1
-        && (rd!(0) - rd!(-1)).abs() <= 1
-        && (rd!(4) - rd!(-1)).abs() <= 1
-        && (rd!(5) - rd!(-1)).abs() <= 1
-        && (rd!(6) - rd!(-1)).abs() <= 1
-        && (rd!(7) - rd!(-1)).abs() <= 1;
-    if !flat2 {
-        let (p3, p2, p1, p0, q0, q1, q2, q3) =
-            (rd!(-4), rd!(-3), rd!(-2), rd!(-1), rd!(0), rd!(1), rd!(2), rd!(3));
-        put!(-3, ((p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3) as u8);
-        put!(-2, ((p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3) as u8);
-        put!(-1, ((p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3) as u8);
-        put!(0, ((p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3) as u8);
-        put!(1, ((p1 + p0 + q0 + q1 * 2 + q2 + q3 + q3 + 4) >> 3) as u8);
-        put!(2, ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as u8);
-        return;
-    }
-    // 15-tap filter [1 x 7, 2, 1 x 7] (filter16, weights verbatim).
-    let (p7, p6, p5, p4) = (rd!(-8), rd!(-7), rd!(-6), rd!(-5));
-    let (p3, p2, p1, p0) = (rd!(-4), rd!(-3), rd!(-2), rd!(-1));
-    let (q0, q1, q2, q3) = (rd!(0), rd!(1), rd!(2), rd!(3));
-    let (q4, q5, q6, q7) = (rd!(4), rd!(5), rd!(6), rd!(7));
-    put!(-7, ((p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0 + 8) >> 4) as u8);
-    put!(-6, ((p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1 + 8) >> 4) as u8);
-    put!(-5, ((p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4) as u8);
-    put!(-4, ((p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3 + 8) >> 4) as u8);
-    put!(-3, ((p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 + 8) >> 4) as u8);
-    put!(-2, ((p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + q4 + q5 + 8) >> 4) as u8);
-    put!(-1, ((p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + q5 + q6 + 8) >> 4) as u8);
-    put!(0, ((p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + q6 + q7 + 8) >> 4) as u8);
-    put!(1, ((p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + q7 * 2 + 8) >> 4) as u8);
-    put!(2, ((p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 + q4 + q5 + q6 + q7 * 3 + 8) >> 4) as u8);
-    put!(3, ((p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4 + 8) >> 4) as u8);
-    put!(4, ((p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5 + 8) >> 4) as u8);
-    put!(5, ((p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6 + 8) >> 4) as u8);
-    put!(6, ((p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7 + 8) >> 4) as u8);
 }
 
 /// Everything the edge pass needs, recorded during decode.
@@ -210,24 +290,53 @@ impl LfGrids {
     ) {
         let mc2 = self.mi_cols * 2;
         let mr2 = self.mi_rows * 2;
+        if std::env::var_os("LFGRID").is_some() {
+            for r in 0..self.mi_rows {
+                for c in 0..self.mi_cols {
+                    let cell = r * self.mi_cols + c;
+                    println!(
+                        "G {} {} {} {} {}",
+                        r, c, self.blk[cell].0, self.level8[cell], self.otx[cell]
+                    );
+                }
+            }
+        }
         // Luma, vertical edges (4x4 column boundaries).
         for r4 in 0..mr2 {
             for c4 in 1..mc2 {
                 let cell = (r4 / 2) * self.mi_cols + c4 / 2;
-                let (_bsize, bor, boc) = self.blk[cell];
                 let level = self.level8[cell];
                 if level == 0 {
                     continue;
                 }
-                let tx = self.otx[cell] as usize;
-                let mut taps = if c4 == boc as usize * 2 {
-                    match tx {
-                        TX_16X16 | TX_32X32 => 16,
-                        TX_8X8 => 8,
-                        _ if c4 % 8 == 0 => 8,
-                        _ => 4,
+                // The masks are per-MI: every MI of a block contributes
+                // its own left edge (`left_64x64_txform_mask` marks every
+                // MI column for TX_8X8, every other for TX_16X16, every
+                // fourth for TX_32X32), so internal MI boundaries of wide
+                // blocks are filtered too — not just the block origin.
+                let mut taps = if c4 % 2 == 0 {
+                    let tx = self.otx[cell] as usize;
+                    if c4 % 8 == 0 {
+                        match tx {
+                            TX_16X16 | TX_32X32 => 16,
+                            _ => 8,
+                        }
+                    } else if c4 % 4 == 0 {
+                        match tx {
+                            TX_32X32 => continue,
+                            TX_16X16 => 16,
+                            TX_8X8 => 8,
+                            _ => 4,
+                        }
+                    } else {
+                        match tx {
+                            TX_8X8 => 8,
+                            TX_4X4 => 4,
+                            _ => continue,
+                        }
                     }
                 } else if self.tx4[r4 * mc2 + c4] as usize == TX_4X4 {
+                    // mask_4x4_int: internal 4x4 edge at the half position.
                     4
                 } else {
                     continue;
@@ -240,6 +349,14 @@ impl LfGrids {
                 let off = r4 * 4 * stride + c4 * 4;
                 if y_w >= c4 * 4 + 4 {
                     lpf_edge(y, off, stride, 1, taps, bl, li, th);
+                    if std::env::var_os("LFTRACE").is_some() {
+                        let kind = match taps {
+                            16 => "V16",
+                            8 => "V8",
+                            _ => "V4",
+                        };
+                        println!("{kind} {} {}", c4 * 4, r4 * 4);
+                    }
                 }
             }
         }
@@ -247,20 +364,38 @@ impl LfGrids {
         for r4 in 1..mr2 {
             for c4 in 0..mc2 {
                 let cell = (r4 / 2) * self.mi_cols + c4 / 2;
-                let (_bsize, bor, _boc) = self.blk[cell];
                 let level = self.level8[cell];
                 if level == 0 {
                     continue;
                 }
-                let tx = self.otx[cell] as usize;
-                let mut taps = if r4 == bor as usize * 2 {
-                    match tx {
-                        TX_16X16 | TX_32X32 => 16,
-                        TX_8X8 => 8,
-                        _ if r4 % 8 == 0 => 8,
-                        _ => 4,
+                // Horizontal mirror of the vertical rule: the above-masks
+                // mark every MI row for TX_8X8 (`above_64x64_txform_mask`),
+                // every other row for TX_16X16, every fourth for TX_32X32.
+                let mut taps = if r4 % 2 == 0 {
+                    let tx = self.otx[cell] as usize;
+                    if r4 % 8 == 0 {
+                        match tx {
+                            TX_16X16 | TX_32X32 => 16,
+                            _ => 8,
+                        }
+                    } else if r4 % 4 == 0 {
+                        match tx {
+                            TX_32X32 => continue,
+                            TX_16X16 => 16,
+                            TX_8X8 => 8,
+                            _ => 4,
+                        }
+                    } else {
+                        match tx {
+                            TX_8X8 => 8,
+                            TX_4X4 => 4,
+                            _ => continue,
+                        }
                     }
                 } else if self.tx4[r4 * mc2 + c4] as usize == TX_4X4 {
+                    // mask_4x4_int: internal 4x4 edge at the half position
+                    // (filter_selectively_horiz fires it alongside 8/4-tap
+                    // top edges and alone when no top edge exists).
                     4
                 } else {
                     continue;
@@ -272,6 +407,14 @@ impl LfGrids {
                 let off = r4 * 4 * stride + c4 * 4;
                 if y_h >= r4 * 4 + 4 {
                     lpf_edge(y, off, stride, 0, taps, bl, li, th);
+                    if std::env::var_os("LFTRACE").is_some() {
+                        let kind = match taps {
+                            16 => "H16",
+                            8 => "H8",
+                            _ => "H4",
+                        };
+                        println!("{kind} {} {}", c4 * 4, r4 * 4);
+                    }
                 }
             }
         }
