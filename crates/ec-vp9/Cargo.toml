@@ -1,0 +1,11 @@
+[package]
+name = "ec-vp9"
+description = "Native VP9 decoder — key-frame decoding of the full format, byte-exact against libvpx/ffmpeg."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true
+ec-vp9-syntax.workspace = true
