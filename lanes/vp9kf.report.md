@@ -97,3 +97,95 @@ CARGO_TARGET_DIR=$HOME/.cache/cargo-target-vp9 cargo test -p ec-vp9 --test keyfr
   see "Fixed this round" item 4 for the rationale; merge reviewer must approve.
 - No edits to `ec-vp8`, `ec-hw`, or `edith`. Workspace `Cargo.toml` untouched
   (members glob covers the new crate, same as `ec-vp8`).
+
+## HANDOFF #3 (lossless-64 lane, 2026-09-14) — FIRST DISAGREEING STEP: bool-decoder init + lossless tx_mode; FAIL (4009/4096)
+
+Root causes found this round (all proven against an instrumented libvpx 1.15.0 oracle,
+see "Oracle" below — bit-level diffs, not structural reads):
+
+1. **Bool decoder marker bit (FIXED, ec-vp9/src/bool.rs `BoolDecoder::new`).** libvpx 1.15
+   `vpx_reader_init` consumes one marker bit per partition right after the initial fill
+   (bitreader.c:34 `return vpx_read_bit(r) != 0;  // marker bit`); the writer
+   (`vpx_start_encode`, bitwriter.c:22) emits a leading 0 bit per partition. Our spec-8.3.2
+   init did not → one-bit desync on the compressed header AND every tile. Now read and
+   validated; test-only `BoolEncoder::new` writes the parity bit. This is a libvpx-1.15
+   format quirk, not in the VP9 spec document — the spec-based roundtrip hid it.
+2. **Lossless forces ONLY_4X4 in the compressed header (FIXED, ec-vp9/src/header.rs
+   `read_compressed_header(data, ctx, lossless)` + decode.rs call).** decodeframe.c:
+   `cm->tx_mode = xd->lossless ? ONLY_4X4 : read_tx_mode(&r);` — lossless consumes NO
+   tx-mode bits and skips tx-prob updates. We parsed a tx_mode symbol and desynced the
+   whole compressed header for q=0 streams. (read_tx_size needs no lossless branch: 1.15
+   has none; ONLY_4X4 propagates via tx_mode.)
+3. **Tile-info rows walk (FIXED, ec-vp9-syntax/src/header.rs `read_tile_info`).** Rows are
+   NOT a min..max walk: `log2_tile_rows = read_bit(); if (..) += read_bit();` — always ≥1
+   bit. We read 0 bits for 64x64 → header_size_in_bytes read one bit early (113 became 226
+   = 113<<1).
+4. **Tile-info cols max bound (FIXED, same file `tile_cols_log2_bounds`).** max_log2
+   started at 1 and used `>=`: for sb64_cols=1 it returned 1 (reads an extra increment
+   bit). Correct shape: start 0, `while (sb64_cols >> max_log2) > MIN_TILE_WIDTH_B64`.
+
+Two syntax-crate edits this round — same justification as round 2 (hard blockers, libvpx
+line citations above). Merge reviewer must approve.
+
+**Progress:** lossless-64.ivf mismatches 4092/4096 → 4009/4096; first diff moved from
+pixel (0,0) to (8,0). First 6 token blocks byte-match the oracle exactly
+(eob/c0: 4/-1056, 0, 0, 14/464, U 16/760, V 15/408). Pixel (0,0) reconstructs correctly
+now. `scratch_lossless` still FAIL; `lossless_64_matches_ffmpeg` NOT ADDED YET (do not
+write the byte-compare test until the plane matches; scratch_lossless covers it for now).
+keyframes_match_ffmpeg NOT re-run to green (will share whatever the remaining bug is —
+lossless-only forcing is not on key-320's path, but the marker-bit and tile-info fixes are).
+
+**Remaining divergence (next session's first step):** the second 8x8 area at MI (0,1).
+Oracle: `PART row=0 col=1 bsl=0 p=3` (SPLIT → BLOCK_4X4, 4 bmi y-modes, first 4x4
+eob=2 c0=72). Ours: decoded 3 luma 4x4 TUs + chroma for that area — a different
+subshape → our partition read or the sub8x8 mode-info read diverges there. Suspects in
+order: (a) sub8x8 bmi mode loop in modes.rs (`get_y_mode_probs` / bmi above-left
+adjustment per sub-block), (b) `dec_update_partition_context` after sub8x8 blocks
+(above_seg/left_seg bit state feeding the next partition ctx), (c) skip-flag context
+after sub8x8. Diff method: run our `EC_VP9_TRACE=1` (C lines now carry p/x/y/tx) against
+oracle EOB lines; first mismatch at block 7 of 416.
+
+**Oracle (reusable):** instrumented libvpx 1.15.0 built from source at
+`/tmp/vp9loss/libvpx-src` (git clone --depth 1 --branch v1.15.0 webmproject/libvpx;
+./configure --disable-unit-tests --disable-vp8 --disable-vp9-encoder --disable-examples
+--disable-tools; make -j6; ~10 s). Driver `/tmp/vp9loss/drv.c` decodes an IVF frame.
+With `VP9TRACE=1` it prints PART/PARTIN (partition symbol+ctx+probs+reader state),
+MODE (bsize/skip/tx/y/uv per block), TXB (ctx a/l + dequant per token block), EOB
+(eob + c0), CH (compressed-header tx_mode + updated probs), CHDATA. Diff its trace
+against ours line-by-line — this found all four root causes above in one session.
+/tmp is volatile; rebuild takes ~1 min.
+
+Note: CAT6_MIN_VAL is 67 in this libvpx (contiguous 5,7,11,19,35,67) — NOT 1344; our
+tokens.rs is correct. read_tx_size/decode_coefs structural port re-verified clean.
+Scratch: `tests/scratch_bool.rs`, `tests/scratch_hdr2.rs` added; `EC_VP9_FORCE_UH/HSZ`
+probe override in decode.rs (decode_one) — all removable after match.
+
+### HANDOFF #3 addendum (same session, post-commit draft)
+
+5. **Left-context row index ignored tx_row (FIXED, ec-vp9/src/decode.rs decode_txb).**
+   `ay = ((mi_row<<1)>>s) % lrows` dropped the tx-block row → for the 2nd 4x4 row of any
+   block the left entropy context aliased row 0 (ax already had +tx_col). Now
+   `ay = (((mi_row<<1)>>s) + tx_row) % lrows`. Found by per-symbol TOK diff against the
+   oracle: altref f0 block (0,4) decoded with ctx=2 vs oracle ctx=1.
+   lossless-64: first diff now pixel (16,0) (was (8,0)); matches through the whole first
+   8x8 including its BLOCK_4X4 neighbour group start.
+6. **tile_cols_log2_bounds max side (FIXED AGAIN, ec-vp9-syntax).** My earlier `> MIN`
+   rewrite was wrong: libvpx `get_max_log2_tile_cols` = the `>= MIN` loop returning
+   **max_log2 - 1** (tile_common.c:40-49). Original syntax code had the right loop but
+   dropped the `-1`; for sb64_cols=5 (320px) that read a phantom cols increment bit →
+   hsz 498 instead of 249 → key-320 frame 0 errored ("marker bit") after fix #1.
+   Now: loop unchanged, `max_log2 - 1` applied.
+
+**State at yield:** lossless-64 3960/4096 mismatching, first diff (16,0) ours 135 ref 145;
+key-320 f0 decodes without error, `keyframes_match_ffmpeg` fails on CONTENT only at
+pixel (7,0): ours 74 vs ref 75 (single-rounding-class errors now, not desync).
+`inter_is_named_unsupported` fails: altref f0 (single-subframe keyframe, 320x240,
+q=36, lf=2) hits "vp9: tile bool decoder desync" in OUR tile decode — oracle decodes
+it fine, headers parse identical (uh=18 hsz=225 verified both sides). Suspect: another
+entropy-context bookkeeping bug of the same class as #5 (above/left write-back spans or
+skip-context clearing), NOT the header. Next steps: (1) diff altref f0 first tile with
+oracle TOK/TXB line-by-line from block (4,4) onward using per-symbol probs — instrument
+ours with a TOK-style trace in tokens.rs decode_coefs (oracle TOK print is in
+/tmp/vp9loss/libvpx-src/vp9/decoder/vp9_detokenize.c decode_coefs loop top);
+(2) re-check `lossless_64_matches_ffmpeg` after; keep scratch files until green.
+Oracle: /tmp/vp9loss/{libvpx-src,drv} (see above; TOK c/band/ctx/p0 print per symbol).

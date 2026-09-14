@@ -61,6 +61,8 @@ pub(crate) fn decode_coefs(
     scan: &[i16],
     nb: &[i16],
     probs4d: &[[[[[u8; 3]; 6]; 6]; 2]; 2],
+    #[allow(unused_variables)] pos: (usize, usize),
+    #[allow(unused_variables)] plane: usize,
 ) -> CoeffBlock {
     let max_eob = 16 << (tx_size << 1);
     let mut coef = CoeffBlock {
@@ -144,8 +146,8 @@ pub(crate) fn decode_coefs(
     coef.eob = c;
     if crate::trace_enabled() {
         eprintln!(
-            "C pt={} tx={} eob={} c0={}",
-            plane_type, tx_size, c, coef.coeffs[0]
+            "C p={} x={} y={} tx={} eob={} c0={}",
+            plane, pos.0, pos.1, tx_size, c, coef.coeffs[0]
         );
     }
     coef

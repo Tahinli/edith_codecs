@@ -893,15 +893,14 @@ fn read_tile_info(r: &mut BitReader<'_>, h: &mut FrameHeader) -> Result<()> {
             break;
         }
     }
-    let sb64_rows = h.mi_rows().div_ceil(8);
-    let (_, max_log2_rows) = tile_cols_log2_bounds(sb64_rows);
+    // Rows: one bit always codes whether log2_tile_rows is nonzero, and a
+    // second bit only follows when it is (decodeframe.c `setup_tile_info`:
+    // `cm->log2_tile_rows = vpx_rb_read_bit(rb);
+    //  if (cm->log2_tile_rows) cm->log2_tile_rows += vpx_rb_read_bit(rb);`).
+    // This is not a min..max walk like the columns side.
     let mut rows_log2 = 0u8;
-    while rows_log2 < max_log2_rows {
-        if r.read_bit()? {
-            rows_log2 += 1;
-        } else {
-            break;
-        }
+    if r.read_bit()? {
+        rows_log2 = 1 + u8::from(r.read_bit()?);
     }
     h.tile_info = TileInfo {
         cols_log2,
@@ -927,6 +926,8 @@ fn tile_cols_log2_bounds(sb64_cols: u32) -> (u8, u8) {
     while (sb64_cols >> max_log2) >= MIN_TILE_WIDTH_B64 {
         max_log2 += 1;
     }
+    // libvpx `get_max_log2_tile_cols` returns max_log2 - 1 (tile_common.c:48).
+    let max_log2 = max_log2 - 1;
     (min_log2, max_log2)
 }
 

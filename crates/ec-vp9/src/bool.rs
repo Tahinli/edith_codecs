@@ -13,7 +13,7 @@
 //! spec's reference encoder (8.3.3, the carry-propagating writer) and
 //! assert bit-exact round-trips.
 
-use ec_core::Result;
+use ec_core::{Error, Result};
 
 /// Boolean arithmetic decoder over one data partition (spec 8.3.2).
 pub struct BoolDecoder<'a> {
@@ -52,14 +52,23 @@ impl<'a> BoolDecoder<'a> {
         if data.len() > 1 {
             value |= u32::from(data[1]);
         }
-        Ok(Self {
+        let mut dec = Self {
             data,
             pos: data.len().min(2),
             range: 255,
             value,
             bit_count: 0,
             overreads: 0,
-        })
+        };
+        // libvpx 1.15 consumes one marker bit per partition right after the
+        // initial fill (bitreader.c `vpx_reader_init`:
+        // `return vpx_read_bit(r) != 0;  // marker bit`); the matching writer
+        // (`vpx_start_encode`) emits a leading 0 bit per partition. A 1 here
+        // means the partition is not a libvpx bool stream.
+        if dec.read_bool(128) {
+            return Err(Error::corrupt("bool decoder marker bit is set"));
+        }
+        Ok(dec)
     }
 
     /// Bytes consumed past the end of the partition, read as zero. Any
@@ -171,12 +180,16 @@ struct BoolEncoder {
 #[cfg(test)]
 impl BoolEncoder {
     fn new() -> Self {
-        Self {
+        let mut e = Self {
             out: Vec::new(),
             range: 255,
             bottom: 0,
             bit_count: 24,
-        }
+        };
+        // `vpx_start_encode` parity: the writer emits a leading 0 bit per
+        // partition, which the decoder consumes as its marker bit.
+        e.write_bool(false, 128);
+        e
     }
 
     fn add_one_to_output(out: &mut [u8]) {
