@@ -80,6 +80,9 @@ pub(crate) fn decode_coefs(
     }
 
     while c < max_eob {
+        if crate::trace_enabled() {
+            eprintln!("TOK c={c} band={band} ctx={ctx} p0={},{},{}", prob[0], prob[1], prob[2]);
+        }
         if !r.read_bool(prob[0]) {
             break;
         }
@@ -146,7 +149,7 @@ pub(crate) fn decode_coefs(
     coef.eob = c;
     if crate::trace_enabled() {
         eprintln!(
-            "C p={} x={} y={} tx={} eob={} c0={}",
+            "EOB p={} x={} y={} tx={} eob={} c0={}",
             plane, pos.0, pos.1, tx_size, c, coef.coeffs[0]
         );
     }

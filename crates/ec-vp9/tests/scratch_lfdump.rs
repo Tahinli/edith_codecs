@@ -18,8 +18,8 @@ fn ffmpeg_raw_yuv(path: &std::path::Path) -> Vec<u8> {
 
 #[test]
 fn dump_lf_diff_map() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/vp9/key-320.ivf");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/vp9/key-320.ivf");
     let bytes = std::fs::read(&path).unwrap();
     let (_f, _w, _h, frames) = ivf::parse_ivf(&bytes);
     let reference = ffmpeg_raw_yuv(&path);
@@ -44,12 +44,9 @@ fn dump_lf_diff_map() {
     let pre = &pic_pre.y[..ysz];
     let post = &pic_post.y[..ysz];
 
-    let pre_diffs: Vec<usize> =
-        (0..ysz).filter(|&i| pre[i] != ff[i]).collect();
-    let post_diffs: Vec<usize> =
-        (0..ysz).filter(|&i| post[i] != ff[i]).collect();
-    let lf_changed_ours: Vec<usize> =
-        (0..ysz).filter(|&i| pre[i] != post[i]).collect();
+    let pre_diffs: Vec<usize> = (0..ysz).filter(|&i| pre[i] != ff[i]).collect();
+    let post_diffs: Vec<usize> = (0..ysz).filter(|&i| post[i] != ff[i]).collect();
+    let lf_changed_ours: Vec<usize> = (0..ysz).filter(|&i| pre[i] != post[i]).collect();
     println!("pre-LF diffs vs ffmpeg : {}", pre_diffs.len());
     println!("post-LF diffs vs ffmpeg: {}", post_diffs.len());
     println!("pixels our LF changed  : {}", lf_changed_ours.len());
@@ -107,4 +104,30 @@ fn dump_lf_diff_map() {
         "diff rows>0   : {:?}",
         (0..h).filter(|&r| rows[r] > 0).take(24).collect::<Vec<_>>()
     );
+    let uv = (w / 2) * (h / 2);
+    let ff_u = &reference[ysz..ysz + uv];
+    let ff_v = &reference[ysz + uv..ysz + 2 * uv];
+    let uw = w / 2;
+    let u_d: Vec<_> = (0..uv).filter(|&i| pic_post.u[i] != ff_u[i]).collect();
+    let v_d: Vec<_> = (0..uv).filter(|&i| pic_post.v[i] != ff_v[i]).collect();
+    println!("U post diffs: {}", u_d.len());
+    for &i in u_d.iter().take(12) {
+        println!(
+            "  U ({}, {}) ours {} ff {}",
+            i % uw,
+            i / uw,
+            pic_post.u[i],
+            ff_u[i]
+        );
+    }
+    println!("V post diffs: {}", v_d.len());
+    for &i in v_d.iter().take(12) {
+        println!(
+            "  V ({}, {}) ours {} ff {}",
+            i % uw,
+            i / uw,
+            pic_post.v[i],
+            ff_v[i]
+        );
+    }
 }

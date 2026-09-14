@@ -321,3 +321,21 @@ block ~207 (MI row 3, col 11 area).
 profile1_444 all PASS; keyframes_match_ffmpeg FAIL, first diff (76,2)
 ours 47 ref 48. NOT pushed (gate not green). Branch lane-vp9-kf has the
 three loopfilter fixes + probe hooks + scratch_lfdump.
+
+## HANDOFF #6 (main session after flash 429, 2026-09-14)
+
+Pre-LF Y vs libvpx SKIPLF: **0 diffs** (the 684 figure was ffmpeg-with-LF vs our SKIP_LF).
+Post-LF Y vs ffmpeg: **0 diffs**.
+
+Fixes this round:
+1. generic d153 wrote `dst[(r+1)*stride + 2+c]` so row 1 leaked 128s. Now `dst[r*stride+2+c] = dst[(r-1)*stride+c]` (vpx `dst[r][2+c] = dst[r-1][c]`).
+2. idct32 was missing vpx stage 8 (`inv_txfm.c:1120`) cospi_16 rotation of 20..27.
+3. **flat2 was wrong.** `flat_mask5(1, s[-8]..s[-5], p0, q0, s[4]..s[7])` compares q4..q7 to **q0**, not p0. HANDOFF #5's "q4..q6 vs p0" misread the C parameter names. That was the 8 Y pixels at row 2 cols 76-86 (V16 at x=80 fell into filter8).
+4. Chroma was filtering every MI (4 px) regardless of uv tx. Now step `1<<uv_tx` (TX_8 every 2 MI, TX_16/32 every 4/8) and 8-line kernels. U 179→16, V 100→20.
+
+**Still FAIL:** `keyframes_match_ffmpeg` first miss U(31,11) 111 vs 110. 16 U + 20 V left. Y exact. lossless_64 PASS. inter named-Error PASS. lib 8/8.
+
+Next: chroma ss11 at U(31,11) — likely remaining 4-vs-8 dual threshold or TX_32 uv bucket (ss11 never reads `left_uv[TX_32]`). Do not touch luma LF; it is byte-exact.
+
+Flash 429 until 2026-09-18 19:27. Continue on main grok.
+
