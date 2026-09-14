@@ -417,7 +417,24 @@ pub(crate) fn idct32(input: &[i32], output: &mut [i32]) {
     step1[13] = step2[2] - step2[13];
     step1[14] = step2[1] - step2[14];
     step1[15] = step2[0] - step2[15];
-    step1[16..32].copy_from_slice(&step2[16..32]);
+    // stage 8 (inv_txfm.c:1120): cospi_16 rotation of 20..27 before the
+    // final combine — omitting it desyncs every 32x32 residual.
+    step1[16] = step2[16];
+    step1[17] = step2[17];
+    step1[18] = step2[18];
+    step1[19] = step2[19];
+    step1[20] = dcrs((-g(step2[20]) + g(step2[27])) * C16);
+    step1[27] = dcrs((g(step2[20]) + g(step2[27])) * C16);
+    step1[21] = dcrs((-g(step2[21]) + g(step2[26])) * C16);
+    step1[26] = dcrs((g(step2[21]) + g(step2[26])) * C16);
+    step1[22] = dcrs((-g(step2[22]) + g(step2[25])) * C16);
+    step1[25] = dcrs((g(step2[22]) + g(step2[25])) * C16);
+    step1[23] = dcrs((-g(step2[23]) + g(step2[24])) * C16);
+    step1[24] = dcrs((g(step2[23]) + g(step2[24])) * C16);
+    step1[28] = step2[28];
+    step1[29] = step2[29];
+    step1[30] = step2[30];
+    step1[31] = step2[31];
     for i in 0..16 {
         output[i] = step1[i] + step1[31 - i];
         output[31 - i] = step1[i] - step1[31 - i];

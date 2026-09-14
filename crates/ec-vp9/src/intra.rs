@@ -158,13 +158,26 @@ pub(crate) fn build_intra_predictors(
             "STAGE x0={x0} y0={y0} mode={mode} bs={bs} above={:?} cor={} left={:?}",
             &above_data[A..A + 8],
             above_data[A - 1],
-            &left_col[..4]
+            &left_col[..8]
         );
     }
     let dst = &mut data[y0 * stride + x0..];
     dispatch(
         mode, bs, dst, stride, &above_data, &left_col, up_available, left_available,
     );
+    if crate::trace_enabled()
+        && std::env::var("EC_VP9_PROBE_TU")
+            .ok()
+            .and_then(|s| {
+                let mut it = s.split(',');
+                Some((it.next()?.parse::<usize>().ok()?, it.next()?.parse().ok()?))
+            })
+            .is_some_and(|(px, py)| x0 == px && y0 == py)
+    {
+        for rr in 0..bs {
+            eprintln!("PRED r={rr} {:?}", &dst[rr * stride..rr * stride + bs]);
+        }
+    }
 }
 
 fn dispatch(
@@ -325,7 +338,7 @@ fn dispatch(
             }
             for r in 1..bs {
                 for c in 0..bs - 2 {
-                    dst[(r + 1) * stride + 2 + c] = dst[r * stride + c];
+                    dst[r * stride + 2 + c] = dst[(r - 1) * stride + c];
                 }
             }
         }

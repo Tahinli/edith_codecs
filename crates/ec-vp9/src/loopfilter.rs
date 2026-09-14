@@ -69,16 +69,14 @@ fn lpf_edge(
     blimit: i32,
     limit: i32,
     thresh: i32,
+    nlines: isize,
 ) {
     // `dir` 0 = horizontal edges (rows step by stride), 1 = vertical
     // (columns step by 1). `taps` in {4, 8, 16}.
     let step: isize = if dir == 0 { stride as isize } else { 1 };
     let line_step: isize = if dir == 0 { 1 } else { stride as isize };
-    // The kernel filters a single pixel-line; one call covers a 4-pixel
-    // chunk, so run it on each of the four lines crossing the edge
-    // (every row for a vertical edge, every column for a horizontal one)
-    // — this is the per-row `s += pitch` walk inside vpx_lpf_*_c.
-    for line in 0..4isize {
+    // luma: 4 lines per 4x4; chroma ss11: 8 lines matching vpx_lpf_*_c.
+    for line in 0..nlines {
         let edge = off as isize + line * line_step;
         macro_rules! rd {
             ($k:expr) => {
@@ -144,17 +142,16 @@ fn lpf_edge(
             put!(2, ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as u8);
             continue;
         }
-        // flat2 = flat_mask5(1, s[-8..-5], p0, q0, s[4..7]) with the C
-        // call's shifted parameter names: p7..p4 and q4..q6 compare
-        // against p0, while the outermost q7 compares against q0; q0..q3
-        // and p1..p3 are not tested at all.
+        // flat_mask5(1, s[-8], s[-7], s[-6], s[-5], p0, q0, s[4], s[5], s[6], s[7]):
+        // |p7..p4 - p0| and |q4..q7 - q0| (the C names are shifted; q4..q6
+        // are the q1..q3 args of the inner flat_mask4 and compare to q0).
         let flat2 = (rd!(-8) - rd!(-1)).abs() <= 1
             && (rd!(-7) - rd!(-1)).abs() <= 1
             && (rd!(-6) - rd!(-1)).abs() <= 1
             && (rd!(-5) - rd!(-1)).abs() <= 1
-            && (rd!(4) - rd!(-1)).abs() <= 1
-            && (rd!(5) - rd!(-1)).abs() <= 1
-            && (rd!(6) - rd!(-1)).abs() <= 1
+            && (rd!(4) - rd!(0)).abs() <= 1
+            && (rd!(5) - rd!(0)).abs() <= 1
+            && (rd!(6) - rd!(0)).abs() <= 1
             && (rd!(7) - rd!(0)).abs() <= 1;
         if !flat2 {
             let (p3, p2, p1, p0, q0, q1, q2, q3) = (
@@ -348,7 +345,7 @@ impl LfGrids {
                 let (bl, li, th) = limits(level, sharpness);
                 let off = r4 * 4 * stride + c4 * 4;
                 if y_w >= c4 * 4 + 4 {
-                    lpf_edge(y, off, stride, 1, taps, bl, li, th);
+                    lpf_edge(y, off, stride, 1, taps, bl, li, th, 4);
                     if std::env::var_os("LFTRACE").is_some() {
                         let kind = match taps {
                             16 => "V16",
@@ -406,7 +403,7 @@ impl LfGrids {
                 let (bl, li, th) = limits(level, sharpness);
                 let off = r4 * 4 * stride + c4 * 4;
                 if y_h >= r4 * 4 + 4 {
-                    lpf_edge(y, off, stride, 0, taps, bl, li, th);
+                    lpf_edge(y, off, stride, 0, taps, bl, li, th, 4);
                     if std::env::var_os("LFTRACE").is_some() {
                         let kind = match taps {
                             16 => "H16",
@@ -418,13 +415,15 @@ impl LfGrids {
                 }
             }
         }
-        // Chroma (4:2:0): one 4x4 chroma TU per MI, so the only filtered
-        // edges are the MI boundaries (vp9_filter_block_plane_ss11):
-        // vertical on every MI column boundary, horizontal on every MI
-        // row boundary, taps from the plane's uv transform size.
+        // Chroma 4:2:0 (vp9_filter_block_plane_ss11): MI is 4 chroma
+        // pixels. Edges follow uv tx size, not every MI — TX_8 every 8
+        // chroma px (2 MI), TX_16/32 every 16/32. TX_4 hits every MI
+        // (int_4x4_uv is those odd columns).
         for data in [&mut *u, &mut *v] {
-            // Vertical: left edge of each MI (except the leftmost column).
             for r in 0..self.mi_rows {
+                if r % 2 != 0 {
+                    continue;
+                }
                 for c in 1..self.mi_cols {
                     let cell = r * self.mi_cols + c;
                     let (bsize, _bor, _boc) = self.blk[cell];
@@ -433,22 +432,27 @@ impl LfGrids {
                         continue;
                     }
                     let uv_tx = uv_txsize_lookup(bsize as usize, self.otx[cell] as usize);
+                    let step = 1usize << uv_tx;
+                    if c % step != 0 {
+                        continue;
+                    }
                     let taps = match uv_tx {
-                        TX_16X16 if c * 4 >= 8 && c * 4 + 8 <= uv_w => 16,
-                        TX_16X16 => 8,
-                        TX_8X8 => 8,
+                        TX_16X16 | TX_32X32 if c * 4 >= 8 && c * 4 + 8 <= uv_w => 16,
+                        TX_16X16 | TX_32X32 | TX_8X8 => 8,
                         _ => 4,
                     };
                     let (bl, li, th) = limits(level, sharpness);
                     let off = r * 4 * uv_stride + c * 4;
                     if uv_w >= c * 4 + 4 {
-                        lpf_edge(data, off, uv_stride, 1, taps, bl, li, th);
+                        lpf_edge(data, off, uv_stride, 1, taps, bl, li, th, 8);
                     }
                 }
             }
-            // Horizontal: top edge of each MI (except the top row).
             for r in 1..self.mi_rows {
                 for c in 0..self.mi_cols {
+                    if c % 2 != 0 {
+                        continue;
+                    }
                     let cell = r * self.mi_cols + c;
                     let (bsize, _bor, _boc) = self.blk[cell];
                     let level = self.level8[cell];
@@ -456,16 +460,19 @@ impl LfGrids {
                         continue;
                     }
                     let uv_tx = uv_txsize_lookup(bsize as usize, self.otx[cell] as usize);
+                    let step = 1usize << uv_tx;
+                    if r % step != 0 {
+                        continue;
+                    }
                     let taps = match uv_tx {
-                        TX_16X16 if r * 4 >= 8 && r * 4 + 8 <= uv_h => 16,
-                        TX_16X16 => 8,
-                        TX_8X8 => 8,
+                        TX_16X16 | TX_32X32 if r * 4 >= 8 && r * 4 + 8 <= uv_h => 16,
+                        TX_16X16 | TX_32X32 | TX_8X8 => 8,
                         _ => 4,
                     };
                     let (bl, li, th) = limits(level, sharpness);
                     let off = r * 4 * uv_stride + c * 4;
                     if uv_h >= r * 4 + 4 {
-                        lpf_edge(data, off, uv_stride, 0, taps, bl, li, th);
+                        lpf_edge(data, off, uv_stride, 0, taps, bl, li, th, 8);
                     }
                 }
             }

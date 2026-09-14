@@ -262,5 +262,11 @@ pub(crate) fn read_intra_frame_mode_info(
     // uv mode: `vp9_kf_uv_mode_prob` indexed by y mode, decoded with the
     // SAME intra_mode_tree (decodemv.c:232 calls read_intra_mode).
     mi.uv_mode = r.read_tree(&INTRA_MODE_TREE, &kf_uv_probs(mi.mode));
+    if crate::trace_enabled() {
+        eprintln!(
+            "MODE row={} col={} bsize={} skip={} tx={} y={} uv={}",
+            row, col, sb_type, mi.skip as u8, mi.tx_size, mi.mode, mi.uv_mode
+        );
+    }
     Ok(mi)
 }

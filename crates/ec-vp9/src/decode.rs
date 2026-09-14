@@ -242,8 +242,7 @@ impl Decoder {
         let mut ti = 0usize;
         for tr in 0..tile_rows {
             let row_lo = ((sb64_rows * tr) >> hdr.tile_info.rows_log2) * SB_MI;
-            let row_hi =
-                (((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2) * SB_MI).min(mi_rows);
+            let row_hi = (((sb64_rows * (tr + 1)) >> hdr.tile_info.rows_log2) * SB_MI).min(mi_rows);
             for tc in 0..tile_cols {
                 let col_lo = ((sb64_cols * tc) >> hdr.tile_info.cols_log2) * SB_MI;
                 let col_hi =
@@ -709,19 +708,7 @@ impl Decoder {
         // 1. Intra prediction (reads reconstructed neighbours).
         {
             let (data, _) = planes.plane(plane);
-            build_intra_predictors(
-                data,
-                stride,
-                pw,
-                ph,
-                x0,
-                y0,
-                mode,
-                bs,
-                up,
-                lft,
-                rgt,
-            );
+            build_intra_predictors(data, stride, pw, ph, x0, y0, mode, bs, up, lft, rgt);
         }
 
         if info.skip {
@@ -762,6 +749,19 @@ impl Decoder {
                 ectx[plane].above[ax],
                 ectx[plane].left[ay],
                 ctx_in
+            );
+        }
+        if crate::trace_enabled() {
+            eprintln!(
+                "TXB p={} x={} y={} tx={} a={} l={} deq={},{}",
+                plane,
+                x0,
+                y0,
+                tx_size,
+                ectx[plane].above[ax],
+                ectx[plane].left[ay],
+                dequant[0],
+                dequant[1]
             );
         }
         let coef = decode_coefs(
