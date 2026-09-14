@@ -238,3 +238,86 @@ EC_VP9_FORCE_UH/HSZ, scratch_* tests, and the EC_VP9_PROBE_TU/STAGE/CTX
 debug prints in decode.rs/intra.rs.
 Oracle: /tmp/vp9loss/{libvpx-src,drv}; /tmp/vp9loss/d45probe2.c proves
 SIMD==C for the specialized 4x4 kernels.
+
+## HANDOFF #5 (Vp9Lf, 2026-09-14) — loopfilter semantics fixed (3 root causes); first diff now (76,2); NEW dominant bug is decode-side at (88,24)
+
+### Fixed this round (loopfilter.rs, all proven against the instrumented oracle)
+
+1. **Per-MI edge masks (was: block-origin only).** libvpx builds masks per-MI —
+   every MI of a wide block carries its own left/top edge
+   (`left/above_64x64_txform_mask`: every MI col for TX_8X8, every 2nd for
+   TX_16X16, every 4th for TX_32X32). We skipped internal MI boundaries of
+   wide blocks via the tx4 grid. Vertical+horizontal loops now derive taps
+   per-MI: c4%8==0 → 16-tap for TX_16X16/32 else 8; c4%4==0 → 16/8/4 by tx
+   (TX_32X32 none); else 8-px → 8/4; odd → 4 iff tx4==TX_4X4 (mask_4x4_int).
+   **Luma edge set now byte-identical to the oracle's: 3044/3044 anchors**
+   (kind+position, LFTRACE diff — 0 missing, 0 extra).
+2. **lpf_edge line coverage (the (7,1) root cause).** The kernel filters ONE
+   pixel-line but was called once per 4x4 chunk — only every 4th row/col was
+   ever filtered (row 0 changed, rows 1-3 never). lpf_edge now loops the 4
+   lines (the `s += pitch` walk inside vpx_lpf_*_c). Post diffs 1219 → 696.
+3. **flat2 = flat_mask5 shifted-parameter semantics.** With the C call
+   `flat_mask5(1, s[-8], s[-7], s[-6], s[-5], p0, q0, s[4], s[5], s[6], s[7])`
+   the tests are: p7..p4 and q4..q6 vs **p0**, but the outermost q7 vs **q0**;
+   q0..q3 and p1..p3 are never tested. We had a bogus |q0-p0| clause and
+   compared q7 against p0.
+
+### Remaining loopfilter diff (8 pixels)
+
+Row 2 only, cols 76-86: ours 47,47,47,49,49,50,50,48 vs vpx/ffmpeg
+48,48,48,48,48,49,49,49. Zone = V16 anchor (80,0) + H4 anchors at y=4
+(H4@y=4 writes rows 2..5; p1 row = 2). V-only python sim of the trace
+matches vpx on rows 1,3 — the residual is in H-pass behavior on post-V
+bytes around these anchors. Next: instrument H4@(72..84,4) mask/hev
+verdicts on post-V bytes; re-check the filter_selectively_horiz 8-branch
+int-alongside handling and the H4 mask's p3..q3 column bytes.
+
+### NEW dominant bug — decode diverges BEFORE the loop filter
+
+Pre-LF planes (EC_VP9_SKIP_LF=1) vs oracle SKIPLF dump: **684 differing
+bytes, first at pixel (88,24): ours 78, vpx 48** (region top-left of that is
+byte-exact — (7,1) pre matched 75=75). This is ~block 207+ — exactly where
+HANDOFF #4's per-block verification stopped. The loop filter is exonerated
+for the remaining mass: edge grid/levels/kinds/positions match the oracle
+exactly, so 688 of the 696 post diffs are these pre-LF bytes flowing
+through. Chase with the HANDOFF #3 protocol: oracle TOK/TXB diff from
+block ~207 (MI row 3, col 11 area).
+
+### Reusable verification assets built this round
+
+- `EC_VP9_SKIP_LF=1` env (decode.rs): decode without loop filter.
+- `LFTRACE=1` on OUR side: prints `V4|V8|V16|H4|H8|H16 x y` per luma
+  lpf_edge call (loopfilter.rs, env-gated; removable after green).
+- Oracle `/tmp/vp9loss/libvpx-src` is PATCHED: `LFTRACE=1` prints the same
+  anchor format per vpx_lpf_* call site (filter_selectively_vert_row2 +
+  filter_selectively_horiz, luma-gated via ss00/ss11 entry hooks); LFINIT
+  prints stride/border; `drv` gained `SKIPLF=1` (VP9_SET_SKIP_LOOP_FILTER)
+  and `YDUMP=<file>` (raw Y-plane dump). `/tmp` is volatile — if lost,
+  rebuild libvpx then re-apply: the patch is mechanical (globals + one
+  lf_tr() helper + getenv hook in loop_filter_rows + brace-wrapped call
+  sites), ~40 lines; git checkout the file first.
+- `tests/scratch_lfdump.rs`: dumps `/tmp/y_{pre,post}_ours.raw`, prints
+  diff maps vs ffmpeg. Compare against `drv SKIPLF=1 YDUMP=...` (pre) and
+  plain `YDUMP=...` (post). ffmpeg Y frame 0 == libvpx Y frame 0 (verified
+  byte-equal), so either is a valid oracle target.
+
+### Trace-reading pitfalls learned (do not re-learn)
+
+- The oracle LF runs via `vp9_loop_filter_frame_mt` → loop_filter_rows fires
+  once per worker CHUNK (3x for this frame, same buffer) — LFINIT repeats
+  are chunking, not multi-pass; anchors union to the single-pass set.
+- Luma-gate the oracle trace (chroma u/v buffers sit ~300 "rows" past the Y
+  base and poison the x/y decomposition).
+- libvpx vertical anchors sit on 8-px columns EXCEPT mask_4x4_int anchors at
+  +4 (x%8==4) — don't mistake them for chroma.
+- One vpx_lpf_* call covers 8 lines; our lpf_edge covers 4 — expand vpx
+  anchors by +4 (rows for V, cols for H) before set-diffing.
+- cargo test swallows eprintln unless `-- --nocapture`; byte dumps are the
+  robust channel.
+- VP8's filter_mask and VP9's are IDENTICAL in vpx_dsp (abs(p0-q0)*2 +
+  abs(p1-q1)/2) — don't "fix" that; the flat_mask5 asymmetry IS real.
+
+**State at yield:** lib 8/8 PASS; lossless_64, inter_is_named_unsupported,
+profile1_444 all PASS; keyframes_match_ffmpeg FAIL, first diff (76,2)
+ours 47 ref 48. NOT pushed (gate not green). Branch lane-vp9-kf has the
+three loopfilter fixes + probe hooks + scratch_lfdump.
