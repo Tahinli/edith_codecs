@@ -145,6 +145,22 @@ pub(crate) fn build_intra_predictors(
 
     // The C's `const_above_row = above_ref` shortcut for bs==4 &&
     // right&&left stages the same bytes, so above_data is equivalent.
+    if crate::trace_enabled()
+        && std::env::var("EC_VP9_PROBE_TU")
+            .ok()
+            .and_then(|s| {
+                let mut it = s.split(',');
+                Some((it.next()?.parse::<usize>().ok()?, it.next()?.parse().ok()?))
+            })
+            .is_some_and(|(px, py)| x0 == px && y0 == py)
+    {
+        eprintln!(
+            "STAGE x0={x0} y0={y0} mode={mode} bs={bs} above={:?} cor={} left={:?}",
+            &above_data[A..A + 8],
+            above_data[A - 1],
+            &left_col[..4]
+        );
+    }
     let dst = &mut data[y0 * stride + x0..];
     dispatch(
         mode, bs, dst, stride, &above_data, &left_col, up_available, left_available,
@@ -192,6 +208,51 @@ fn dispatch(
                 dst[r * stride..r * stride + bs].fill(left[r]);
             }
         }
+        // The 4x4 kernels in intrapred.c are specialized implementations,
+        // NOT the shared `d45_predictor`/`d63_predictor`/`d153_predictor`
+        // INLINE loops: they continue the diagonal with the staged
+        // above-right samples (vpx_d45/d63_predictor_4x4_c, and d153's
+        // DST(2,3)). Only 8x8+ use the generic loops below.
+        3 if bs == 4 => {
+            // vpx_d45_predictor_4x4_c
+            for r in 0..4usize {
+                for c in 0..4usize {
+                    dst[r * stride + c] = if r + c < 6 {
+                        avg3(ab[r + c], ab[r + c + 1], ab[r + c + 2])
+                    } else {
+                        ab[7]
+                    };
+                }
+            }
+        }
+        6 if bs == 4 => {
+            // vpx_d153_predictor_4x4_c
+            dst[0] = avg2(left[0], cor);
+            dst[stride] = avg2(left[1], left[0]);
+            dst[2 * stride] = avg2(left[2], left[1]);
+            dst[3 * stride] = avg2(left[3], left[2]);
+            dst[1] = avg3(left[0], cor, ab[0]);
+            dst[stride + 1] = avg3(left[1], left[0], cor);
+            dst[2 * stride + 1] = avg3(left[2], left[1], left[0]);
+            dst[3 * stride + 1] = avg3(left[3], left[2], left[1]);
+            dst[2] = avg3(cor, ab[0], ab[1]);
+            dst[stride + 2] = dst[0];
+            dst[2 * stride + 2] = dst[stride];
+            dst[3 * stride + 2] = dst[2 * stride];
+            dst[3] = avg3(ab[0], ab[1], ab[2]);
+            dst[stride + 3] = dst[1];
+            dst[2 * stride + 3] = avg3(left[1], left[0], cor); // DST(3, 2)
+            dst[3 * stride + 3] = avg3(left[2], left[1], left[0]);
+        }
+        8 if bs == 4 => {
+            // vpx_d63_predictor_4x4_c
+            for c in 0..4usize {
+                dst[c] = avg2(ab[c], ab[c + 1]);
+                dst[stride + c] = avg3(ab[c], ab[c + 1], ab[c + 2]);
+                dst[2 * stride + c] = avg2(ab[c + 1], ab[c + 2]);
+                dst[3 * stride + c] = avg3(ab[c + 1], ab[c + 2], ab[c + 3]);
+            }
+        }
         3 => {
             // d45
             let above_right = ab[bs - 1];
@@ -237,8 +298,10 @@ fn dispatch(
                 dst[stride + c] = avg3(above[A + c - 2], ab[c - 1], ab[c]);
             }
             dst[2 * stride] = avg3(cor, left[0], left[1]);
+            // libvpx anchors this loop at row 2 (`dst` walked twice);
+            // our `dst` is the block base, so the index is absolute.
             for r in 3..bs {
-                dst[(r - 2) * stride] = avg3(left[r - 3], left[r - 2], left[r - 1]);
+                dst[r * stride] = avg3(left[r - 3], left[r - 2], left[r - 1]);
             }
             for r in 2..bs {
                 for c in 1..bs {

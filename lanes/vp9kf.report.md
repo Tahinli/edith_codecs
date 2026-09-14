@@ -189,3 +189,52 @@ ours with a TOK-style trace in tokens.rs decode_coefs (oracle TOK print is in
 /tmp/vp9loss/libvpx-src/vp9/decoder/vp9_detokenize.c decode_coefs loop top);
 (2) re-check `lossless_64_matches_ffmpeg` after; keep scratch files until green.
 Oracle: /tmp/vp9loss/{libvpx-src,drv} (see above; TOK c/band/ctx/p0 print per symbol).
+
+## HANDOFF #4 (Vp9Sub8, 2026-09-14) — lossless 4096/4096 GREEN; key-320 decode matches, loop-filter 4x4-int edge remains
+
+1. **Sub8x8 second y-mode ctx (FIXED, ec-vp9/src/modes.rs).** decodemv.c
+   commits bmi[0]/bmi[2] (4X8) or bmi[0]/bmi[1] (8X4) BEFORE deriving the
+   second mode's probs from the current bmi; we read both modes first, so
+   the second mode always saw DC/DC.
+2. **D117 first-column anchor (FIXED, ec-vp9/src/intra.rs).** libvpx's
+   loop is anchored at row 2 (its `dst` walks twice); our base-relative
+   `dst[(r-2)*stride]` wrote row 1 instead of row r.
+3. **Specialized 4x4 predictors (FIXED, intra.rs).** intrapred.c's
+   vpx_d45/d63/d153_predictor_4x4_c are NOT the shared INLINE loops: they
+   continue the diagonal with the staged above-right (d153 also differs
+   at DST(3,2)). d117/d135/d207 4x4 equal the generic loops; d45/d63/
+   d153 do not.
+4. **`have_right` decode-order semantics (FIXED, decode.rs).**
+   vp9_predict_intra_block's have_right = (aoff + txw) < n4_w — not a
+   frame-geometry test. Above-right past the block's own edge reads
+   not-yet-decoded neighbours and must stage as unavailable.
+5. **Entropy-ctx span read (FIXED, decode.rs).** vp9_decode_block_tokens
+   computes ctx as !!*(uintN_t *)a over the WHOLE tx span; we read only
+   above[ax]/left[ay]. Wrong ctx on TX_8X8+ desynced key-320 tokens.
+6. **Tile SB walk units (FIXED, decode.rs).** row_hi/col_hi are SB-unit
+   boundaries but the loop stepped per-MI — for 320x240 the 64x64
+   decode_partition ran at every MI (overlapping re-decodes); lossless-64
+   only survived because its single-tile boundary collapses to 1. This
+   was the altref f0 "tile bool decoder desync" class. Loop now steps by
+   SB_MI and clamps to mi_rows/mi_cols.
+7. **Loop filter rewrite (loopfilter.rs).** filter4 slot mapping was
+   scrambled (p0/q0 updates written into q1/p1), lpf4 used a VP8-style
+   mask instead of the shared p3..q3 filter_mask, the lpf8 non-flat
+   fallback passed mask=true with limit as thresh, flat2 compared the q
+   side against q0 instead of p0, hev_thr (lvl>>4) was missing, and the
+   chroma pass used an 8-px MI stride with no horizontal edges (OOB on
+   320x240). All re-derived from vpx_dsp/loopfilter.c +
+   vp9_loopfilter.c.
+
+**State at yield:** lossless-64 4096/4096 vs ffmpeg (Y/U/V byte-exact;
+`lossless_64_matches_ffmpeg` added). key-320: tokens + prediction match
+the oracle (inter_is_named_unsupported PASSES — the desync is gone);
+keyframes_match_ffmpeg first diff (7,1) ours 75 ref 76 — remaining class
+is the luma 4x4-internal-edge filter (libvpx filter_selectively_*
+mask_4x4_int half-position variant), NOT tokens or prediction. Next:
+(1) port mask_4x4_int shifted filtering (and the frame bottom/right tap
+rules), then re-run keyframes_match_ffmpeg; (2) after green remove
+EC_VP9_FORCE_UH/HSZ, scratch_* tests, and the EC_VP9_PROBE_TU/STAGE/CTX
+debug prints in decode.rs/intra.rs.
+Oracle: /tmp/vp9loss/{libvpx-src,drv}; /tmp/vp9loss/d45probe2.c proves
+SIMD==C for the specialized 4x4 kernels.

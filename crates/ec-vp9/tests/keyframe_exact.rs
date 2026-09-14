@@ -94,6 +94,29 @@ fn keyframes_match_ffmpeg() {
 }
 
 #[test]
+fn lossless_64_matches_ffmpeg() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let path = dir.join("fixtures/vp9/lossless-64.ivf");
+    let bytes = std::fs::read(&path).unwrap();
+    let (_fourcc, w, h, frames) = ivf::parse_ivf(&bytes);
+    let reference = ffmpeg_raw_yuv(&path);
+    let mut decoder = Decoder::new();
+    let pic = decoder
+        .decode(&frames[0].data)
+        .expect("decode must succeed")
+        .expect("frame is shown");
+    let (w, h) = (w as usize, h as usize);
+    let uv = (w / 2) * (h / 2);
+    let want_y = &reference[..w * h];
+    let want_u = &reference[w * h..w * h + uv];
+    let want_v = &reference[w * h + uv..];
+    assert!(pic.y.iter().eq(want_y.iter()), "lossless Y must be byte-exact");
+    assert!(pic.u.iter().eq(want_u.iter()), "lossless U must be byte-exact");
+    assert!(pic.v.iter().eq(want_v.iter()), "lossless V must be byte-exact");
+    assert_eq!((pic.width, pic.height), (w as u16, h as u16));
+}
+
+#[test]
 fn inter_is_named_unsupported() {
     let Some(dir) = ivf::fixture_dir() else { return };
     // The altref clip contains hidden (inter) frames.

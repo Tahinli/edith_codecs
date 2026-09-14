@@ -26,11 +26,14 @@ fn sc(x: i32) -> i32 {
 }
 
 /// `filter4` kernel; `idx` = [op1, op0, oq0, oq1].
+/// `vpx_dsp filter4`: updates p1/p0/q0/q1 in place. `mask` gates the
+/// whole filter, `hev` the outer taps (vp9_loopfilter.c:81).
 fn filter4(s: &mut [u8], idx: [usize; 4], thresh: i32, mask: bool) {
     if !mask {
         return;
     }
-    let (p1, p0, q0, q1) = (s[idx[0]], s[idx[1]], s[idx[2]], s[idx[3]]);
+    let (op1, op0, oq0, oq1) = (idx[0], idx[1], idx[2], idx[3]);
+    let (p1, p0, q0, q1) = (s[op1], s[op0], s[oq0], s[oq1]);
     let hev = (p1 as i32 - p0 as i32).abs() > thresh || (q1 as i32 - q0 as i32).abs() > thresh;
     let (ps1, ps0, qs0, qs1) = (
         (p1 ^ 0x80) as i8 as i32,
@@ -39,60 +42,60 @@ fn filter4(s: &mut [u8], idx: [usize; 4], thresh: i32, mask: bool) {
         (q1 ^ 0x80) as i8 as i32,
     );
     let mut filter = sc(ps1 - qs1);
-    if !hev {
+    if hev {
+        // add outer taps if we have high edge variance (& hev mask)
+    } else {
         filter = 0;
     }
+    // inner taps
     filter = sc(filter + 3 * (qs0 - ps0));
+    // round one side +4 and the other +3
     let filter1 = sc(filter + 4) >> 3;
     let filter2 = sc(filter + 3) >> 3;
-    s[idx[3]] = (sc(qs0 - filter1) ^ 0x80) as u8;
-    s[idx[2]] = (sc(ps0 + filter2) ^ 0x80) as u8;
-    let mut f = (filter1 + 1) >> 1;
-    if hev {
-        f = 0;
-    }
-    s[idx[1]] = (sc(ps1 + f) ^ 0x80) as u8;
-    s[idx[0]] = (sc(qs1 - f) ^ 0x80) as u8;
+    s[oq0] = (sc(qs0 - filter1) ^ 0x80) as u8;
+    s[op0] = (sc(ps0 + filter2) ^ 0x80) as u8;
+    // outer tap adjustments (& ~hev)
+    let f = if hev { 0 } else { (filter1 + 1) >> 1 };
+    s[oq1] = (sc(qs1 - f) ^ 0x80) as u8;
+    s[op1] = (sc(ps1 + f) ^ 0x80) as u8;
 }
 
-/// The tapped edge filter: `dir` 0 = horizontal edges (rows step by
-/// stride), 1 = vertical (columns step by 1). `taps` in {4, 8, 16}.
-fn lpf_edge(data: &mut [u8], off: usize, stride: usize, dir: u8, taps: u8, blimit: i32, limit: i32) {
+fn lpf_edge(
+    data: &mut [u8],
+    off: usize,
+    stride: usize,
+    dir: u8,
+    taps: u8,
+    blimit: i32,
+    limit: i32,
+    thresh: i32,
+) {
+    // `dir` 0 = horizontal edges (rows step by stride), 1 = vertical
+    // (columns step by 1). `taps` in {4, 8, 16}.
     let step: isize = if dir == 0 { stride as isize } else { 1 };
     let edge = off as isize;
-    if std::env::var_os("EC_VP9_DBG").is_some() {
-        let need = if taps == 16 { 8 } else if taps == 8 { 4 } else { 2 };
-        let lo = edge - need * step;
-        let hi = edge + need * step;
-        if lo < 0 || hi >= data.len() as isize {
-            eprintln!("DBG lpf OOB off={off} dir={dir} taps={taps} len={}", data.len());
-        }
-    }
     macro_rules! rd { ($k:expr) => { data[(edge + $k * step) as usize] as i32 } }
     macro_rules! put { ($k:expr, $v:expr) => { data[(edge + $k * step) as usize] = $v; } }
-    // filter_mask (loopfilter.c:30): p3..q3 gradient limits + blimit.
-    let mask8 = (rd!(-4) - rd!(-3)).abs() <= limit
+    // filter_mask (vpx_dsp/loopfilter.c:34): p3..q3 gradient limits +
+    // blimit; shared by the 4-, 8- and 16-tap entry points.
+    let mask = (rd!(-4) - rd!(-3)).abs() <= limit
         && (rd!(-3) - rd!(-2)).abs() <= limit
         && (rd!(-2) - rd!(-1)).abs() <= limit
         && (rd!(1) - rd!(0)).abs() <= limit
         && (rd!(2) - rd!(1)).abs() <= limit
         && (rd!(3) - rd!(2)).abs() <= limit
         && 2 * (rd!(-1) - rd!(0)).abs() + (rd!(-2) - rd!(1)).abs() / 2 <= blimit;
+    let idx4 = [
+        (edge - 2 * step) as usize,
+        (edge - step) as usize,
+        edge as usize,
+        (edge + step) as usize,
+    ];
     if taps == 4 {
-        // lpf4 uses the p1/p0/q0/q1 form of the mask.
-        let mask = (rd!(-1) - rd!(0)).abs() <= limit
-            && (rd!(1) - rd!(0)).abs() <= limit
-            && 2 * (rd!(-1) - rd!(0)).abs() + (rd!(-2) - rd!(1)).abs() / 2 <= blimit;
-        let idx = [
-            (edge - 2 * step) as usize,
-            (edge - step) as usize,
-            edge as usize,
-            (edge + step) as usize,
-        ];
-        filter4(data, idx, limit, mask);
+        filter4(data, idx4, thresh, mask);
         return;
     }
-    if !mask8 {
+    if !mask {
         return;
     }
     // flat_mask4(1, p3..q3)
@@ -104,13 +107,8 @@ fn lpf_edge(data: &mut [u8], off: usize, stride: usize, dir: u8, taps: u8, blimi
         && (rd!(3) - rd!(0)).abs() <= 1;
     if taps == 8 || !flat {
         if !flat {
-            let idx = [
-                (edge - 2 * step) as usize,
-                (edge - step) as usize,
-                edge as usize,
-                (edge + step) as usize,
-            ];
-            filter4(data, idx, limit, true);
+            // plain filter4 with the real mask and hev threshold
+            filter4(data, idx4, thresh, mask);
             return;
         }
         // 7-tap [1,1,1,2,1,1,1] outputs (filter8).
@@ -124,16 +122,17 @@ fn lpf_edge(data: &mut [u8], off: usize, stride: usize, dir: u8, taps: u8, blimi
         put!(2, ((p0 + q0 + q1 + q2 * 2 + q3 + q3 + q3 + 4) >> 3) as u8);
         return;
     }
-    // 16-tap: flat2 via flat_mask5(1, p7..q7)
-    let flat2 = flat
-        && (rd!(-8) - rd!(-1)).abs() <= 1
-        && (rd!(8) - rd!(0)).abs() <= 1
+    // 16-tap: flat2 = flat_mask5(1, p7..p4, p0, q0, q4..q7) — every
+    // sample compared against p0 (rd!(-1)).
+    let flat2 = (rd!(-8) - rd!(-1)).abs() <= 1
         && (rd!(-7) - rd!(-1)).abs() <= 1
-        && (rd!(7) - rd!(0)).abs() <= 1
         && (rd!(-6) - rd!(-1)).abs() <= 1
-        && (rd!(6) - rd!(0)).abs() <= 1
         && (rd!(-5) - rd!(-1)).abs() <= 1
-        && (rd!(5) - rd!(0)).abs() <= 1;
+        && (rd!(0) - rd!(-1)).abs() <= 1
+        && (rd!(4) - rd!(-1)).abs() <= 1
+        && (rd!(5) - rd!(-1)).abs() <= 1
+        && (rd!(6) - rd!(-1)).abs() <= 1
+        && (rd!(7) - rd!(-1)).abs() <= 1;
     if !flat2 {
         let (p3, p2, p1, p0, q0, q1, q2, q3) =
             (rd!(-4), rd!(-3), rd!(-2), rd!(-1), rd!(0), rd!(1), rd!(2), rd!(3));
@@ -180,8 +179,9 @@ pub(crate) struct LfGrids {
     pub mi_rows: usize,
 }
 
-/// limits for a level (spec 8.8.1, `update_sharpness`).
-fn limits(level: u8, sharpness: u8) -> (i32, i32) {
+/// limits for a level (spec 8.8.1, `update_sharpness` +
+/// `vp9_loop_filter_init`): (mblim, lim, hev_thr).
+fn limits(level: u8, sharpness: u8) -> (i32, i32, i32) {
     let mut bil = level as i32 >> ((usize::from(sharpness > 0)) + (usize::from(sharpness > 4)));
     if sharpness > 0 && bil > 9 - sharpness as i32 {
         bil = 9 - sharpness as i32;
@@ -189,7 +189,7 @@ fn limits(level: u8, sharpness: u8) -> (i32, i32) {
     if bil < 1 {
         bil = 1;
     }
-    (2 * (level as i32 + 2) + bil, bil)
+    (2 * (level as i32 + 2) + bil, bil, level as i32 >> 4)
 }
 
 impl LfGrids {
@@ -236,10 +236,10 @@ impl LfGrids {
                 if taps == 16 && (c4 * 4 < 8 || c4 * 4 + 8 > y_w) {
                     taps = 8;
                 }
-                let (bl, li) = limits(level, sharpness);
+                let (bl, li, th) = limits(level, sharpness);
                 let off = r4 * 4 * stride + c4 * 4;
                 if y_w >= c4 * 4 + 4 {
-                    lpf_edge(y, off, stride, 1, taps, bl, li);
+                    lpf_edge(y, off, stride, 1, taps, bl, li, th);
                 }
             }
         }
@@ -268,47 +268,61 @@ impl LfGrids {
                 if taps == 16 && (r4 * 4 < 8 || r4 * 4 + 8 > y_h) {
                     taps = 8;
                 }
-                let (bl, li) = limits(level, sharpness);
+                let (bl, li, th) = limits(level, sharpness);
                 let off = r4 * 4 * stride + c4 * 4;
                 if y_h >= r4 * 4 + 4 {
-                    lpf_edge(y, off, stride, 0, taps, bl, li);
+                    lpf_edge(y, off, stride, 0, taps, bl, li, th);
                 }
             }
         }
-        // Chroma (uv 4x4 grid = mi grid).
+        // Chroma (4:2:0): one 4x4 chroma TU per MI, so the only filtered
+        // edges are the MI boundaries (vp9_filter_block_plane_ss11):
+        // vertical on every MI column boundary, horizontal on every MI
+        // row boundary, taps from the plane's uv transform size.
         for data in [&mut *u, &mut *v] {
+            // Vertical: left edge of each MI (except the leftmost column).
             for r in 0..self.mi_rows {
                 for c in 1..self.mi_cols {
                     let cell = r * self.mi_cols + c;
-                    let (bsize, _bor, boc) = self.blk[cell];
+                    let (bsize, _bor, _boc) = self.blk[cell];
                     let level = self.level8[cell];
                     if level == 0 {
                         continue;
                     }
                     let uv_tx = uv_txsize_lookup(bsize as usize, self.otx[cell] as usize);
-                    let taps = if bsize as usize >= 6 {
-                        if c == boc as usize {
-                            match uv_tx {
-                                TX_16X16 if c * 8 >= 8 && c * 8 + 8 <= uv_w => 16,
-                                TX_16X16 => 8,
-                                TX_8X8 => 8,
-                                _ if c % 4 == 0 => 8,
-                                _ => 4,
-                            }
-                        } else if uv_tx == TX_4X4 {
-                            4
-                        } else {
-                            continue;
-                        }
-                    } else if c % 2 == 0 && r % 2 == 0 {
-                        if c % 4 == 0 { 8 } else { 4 }
-                    } else {
-                        continue;
+                    let taps = match uv_tx {
+                        TX_16X16 if c * 4 >= 8 && c * 4 + 8 <= uv_w => 16,
+                        TX_16X16 => 8,
+                        TX_8X8 => 8,
+                        _ => 4,
                     };
-                    let (bl, li) = limits(level, sharpness);
-                    let off = r * 8 * uv_stride + c * 8;
-                    if uv_w >= c * 8 + 8 {
-                        lpf_edge(data, off, uv_stride, 1, taps, bl, li);
+                    let (bl, li, th) = limits(level, sharpness);
+                    let off = r * 4 * uv_stride + c * 4;
+                    if uv_w >= c * 4 + 4 {
+                        lpf_edge(data, off, uv_stride, 1, taps, bl, li, th);
+                    }
+                }
+            }
+            // Horizontal: top edge of each MI (except the top row).
+            for r in 1..self.mi_rows {
+                for c in 0..self.mi_cols {
+                    let cell = r * self.mi_cols + c;
+                    let (bsize, _bor, _boc) = self.blk[cell];
+                    let level = self.level8[cell];
+                    if level == 0 {
+                        continue;
+                    }
+                    let uv_tx = uv_txsize_lookup(bsize as usize, self.otx[cell] as usize);
+                    let taps = match uv_tx {
+                        TX_16X16 if r * 4 >= 8 && r * 4 + 8 <= uv_h => 16,
+                        TX_16X16 => 8,
+                        TX_8X8 => 8,
+                        _ => 4,
+                    };
+                    let (bl, li, th) = limits(level, sharpness);
+                    let off = r * 4 * uv_stride + c * 4;
+                    if uv_h >= r * 4 + 4 {
+                        lpf_edge(data, off, uv_stride, 0, taps, bl, li, th);
                     }
                 }
             }
