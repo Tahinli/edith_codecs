@@ -31,6 +31,7 @@ pub(crate) const ADST_ADST: usize = 3;
 pub(crate) const BLOCK_INVALID: u8 = 255;
 
 // spec 5.3 (TX_MODE)
+pub(crate) const ONLY_4X4: u8 = 0;
 pub(crate) const TX_MODE_SELECT: u8 = 4;
 /// decodeframe.c `tx_mode_to_biggest_tx_size`.
 pub(crate) const TX_MODE_TO_BIGGEST_TX_SIZE: [usize; 5] =

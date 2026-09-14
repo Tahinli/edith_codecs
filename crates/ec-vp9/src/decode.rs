@@ -134,10 +134,23 @@ impl Decoder {
         // A keyframe resets the frame context (spec 7.2) before the
         // compressed header codes this frame's updates on top.
         self.ctx = FrameContext::new(hdr.frame_type == FrameType::Key);
+        // [scratch probe] EC_VP9_FORCE_UH / EC_VP9_FORCE_HSZ: override the
+        // uncompressed-header size / header_size_in_bytes split for diagnosis.
+        let hdr = {
+            let mut h = hdr;
+            if let Ok(v) = std::env::var("EC_VP9_FORCE_UH") {
+                h.uncompressed_header_size = v.parse().unwrap_or(h.uncompressed_header_size);
+            }
+            if let Ok(v) = std::env::var("EC_VP9_FORCE_HSZ") {
+                h.header_size_in_bytes = v.parse().unwrap_or(h.header_size_in_bytes);
+            }
+            h
+        };
         let hdr_start = hdr.uncompressed_header_size as usize;
         let tx_mode = read_compressed_header(
             &frame[hdr_start..hdr_start + hdr.header_size_in_bytes as usize],
             &mut self.ctx,
+            hdr.quantization.lossless(),
         )?;
 
         let pic = self.decode_keyframe(&hdr, frame, tx_mode)?;
@@ -725,7 +738,7 @@ impl Decoder {
         let ptype = usize::from(plane != 0);
         let ax = ((mi_col << 1) >> s) + tx_col;
         let lrows = 32usize >> s;
-        let ay = ((mi_row << 1) >> s) % lrows;
+        let ay = (((mi_row << 1) >> s) + tx_row) % lrows;
         let ctx_in =
             usize::from(ectx[plane].above[ax] != 0) + usize::from(ectx[plane].left[ay] != 0);
         let coef = decode_coefs(
@@ -737,6 +750,8 @@ impl Decoder {
             scan,
             nb,
             &self.ctx.coef[tx_size],
+            (x0, y0),
+            plane,
         );
 
         // 3. Context write-back (vp9_decode_block_tokens, v1.15 shifts).

@@ -161,9 +161,21 @@ fn read_tx_mode(r: &mut BoolDecoder) -> u8 {
 
 /// `read_compressed_header` for intra frames (the inter branch is dead
 /// in this lane): tx mode, tx probs, coef probs, skip probs.
-pub(crate) fn read_compressed_header(data: &[u8], ctx: &mut FrameContext) -> crate::Result<u8> {
+///
+/// Lossless forces `ONLY_4X4` and consumes no tx-mode bits — decodeframe.c
+/// `read_compressed_header`: `cm->tx_mode = xd->lossless ? ONLY_4X4 :
+/// read_tx_mode(&r);`.
+pub(crate) fn read_compressed_header(
+    data: &[u8],
+    ctx: &mut FrameContext,
+    lossless: bool,
+) -> crate::Result<u8> {
     let mut r = BoolDecoder::new(data)?;
-    let tx_mode = read_tx_mode(&mut r);
+    let tx_mode = if lossless {
+        ONLY_4X4
+    } else {
+        read_tx_mode(&mut r)
+    };
     if tx_mode == TX_MODE_SELECT {
         for row in 0..2 {
             for j in 0..1 {
