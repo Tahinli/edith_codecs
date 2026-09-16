@@ -269,10 +269,28 @@ impl Decoder {
                 ectx.iter_mut().for_each(|p| p.above.fill(0));
                 mi.above_seg.fill(0);
                 for sb_row in (row_lo..row_hi).step_by(SB_MI) {
-                    if sb_row == row_lo {
-                        ectx.iter_mut().for_each(|p| p.left = [0; 32]);
-                        mi.left_seg = [0; 32];
-                    }
+                    // libvpx zeroes the left ENTROPY and PARTITION contexts at
+                    // the start of EVERY superblock row, not just the tile's
+                    // first one (vp9_decodeframe.c:2256-2258 plain
+                    // `decode_tiles`; the row-mt twin is :2114-2115 and the
+                    // per-tile-row twins :1825-1826 / :1898-1899): the left
+                    // edge of an SB row has no pixels to its left. Our luma
+                    // left index wraps at mi_row 16, so a stale value from two
+                    // SB rows earlier would otherwise be read here.
+                    // `above_context`/`above_seg_context` are frame-scoped in
+                    // libvpx (`memset` at :2076-2080, before the tile-row
+                    // loop) and indexed by ABSOLUTE mi_col (`set_skip_context`,
+                    // vp9_onyxc_int.h:409-412), so zeroing them once per tile
+                    // is equivalent only for `log2_tile_rows == 0`, where the
+                    // disjoint-column argument holds (each tile's xd points
+                    // into its own column range: vp9_init_macroblockd,
+                    // vp9_onyxc_int.h:381-393). With tile ROWS the first SB row
+                    // of tile row k > 0 may legitimately read above state
+                    // written by tile row k - 1, which the fills at :269-270
+                    // discard: the tile-row path is NOT equivalent and is not
+                    // handled here.
+                    ectx.iter_mut().for_each(|p| p.left = [0; 32]);
+                    mi.left_seg = [0; 32];
                     for sb_col in (col_lo..col_hi).step_by(SB_MI) {
                         self.decode_partition(
                             &mut r,
