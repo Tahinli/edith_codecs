@@ -455,3 +455,58 @@ commands are the charter's ffmpeg invocations.
 - **non-420 / high-bitdepth / profiles 1 and 3** (only profile 0 8-bit is ported);
 - the 12 trace hooks and 10 `scratch_*` harnesses from HANDOFF #8's "not cleaned up"
   list, if a future lane wants a bare tree.
+
+## OPEN DEFECT LANE (2026-09-16) — the fixtures were too weak: real content desyncs mid-frame
+
+Found by sweeping REAL content through the merged decoder
+(`crates/ec-vp9/tests/scratch_realsweep.rs`, added here). The library has **no VP9
+content at all** (the only webm under `~/Downloads` is VP8), so the sweep encodes an
+all-intra VP9 (`-g 1`, every frame a keyframe) from a real file and diffs Y/U/V against
+ffmpeg's decode of the same IVF.
+
+| source (real, 3 frames, all-intra) | result |
+|---|---|
+| `~/Downloads/2024-07-30 14-31-30.mp4` 1920x1080, default tiles | REFUSED (`truncated tile data`, see below) |
+| same, `-tile-columns 0 -tile-rows 0` | PANICKED at `intra.rs:380` before the buffer fix; now decodes but **Y differs in 1.8M/2.07M px** |
+| `~/Videos/he_is_not_the_only_one.mp4` 3840x1608 | REFUSED (same) |
+| `~/Downloads/linkedin-video.mp4` 576x1024 | REFUSED (same) |
+| real 320x240 (`scale=320:240`, same encoder) | **rows 0-127 exact, rows 128+ garbage** |
+
+The 320x240 case is the sharp one: **the first two superblock rows are byte-exact and
+every row from 128 down is wrong** (0 diffs for rows 0-127, 19477 for 128-191, 15337 for
+192-239). Same for 1080p — the rendered frame shows the true image at the top and a
+blocky mess below. A desync that leaves a clean SB-row boundary means the entropy
+decoder diverged at a block in SB row 2, so **the fixtures (`key-320.ivf` = testsrc2,
+`lossless-64.ivf` = testsrc2) never reach the syntax real imagery uses**. Weakening the
+claim: "byte-exact" is *fixture-exact*; it does not generalise.
+
+Two defects were fixed on the way (both real, both verified against the fixture suite):
+
+1. **Plane buffers were 8-aligned, not superblock-padded** — libvpx decodes an edge block
+   at its full size and lets the overhang land in the frame border
+   (`decodeframe.c:1216`), so a 32x32 block starting at mi_row 132 of a 1080-row frame
+   wrote 8 rows past the buffer (`intra.rs:380` panic). Buffers are now SB-aligned
+   (`decode.rs`), and `filter_frame` receives the MI-aligned *visible* extent, not the
+   padded one (passing the padded size OOB'd the level grid).
+2. **`Picture::stride`/`uv_stride` lied** — the crop packs rows (`width` per row) but the
+   fields reported the aligned `aw`; a consumer reading with `stride` would misread any
+   frame whose width is not 64-aligned. Now `width` / `width / 2`.
+
+Third finding, not fixed: **multi-tile frames fail with a wrong message**. Default
+ffmpeg tiles at 1080p (`cols_log2 == 2`), and the decoder reports
+`Corrupt: truncated tile data` — the tile-size prefix it reads at
+`uhs + header_size_in_bytes` is implausible. Either the tile walk or the tile-data offset
+is wrong for >1 tile; "corrupt" is the wrong claim until that is known.
+
+### Next lane charter seed (in priority order)
+
+1. Localize the real-content desync with the existing oracle (`/tmp/vp9loss/drv` +
+   `scratch_lfdump`-style dumps): first differing block, then mode/tx/coef trace. Start
+   with the 320x240 real frame — SB row 2, mi_row 16.
+2. Multi-tile: decide whether the offset or the walk is wrong; if multi-tile is genuinely
+   unsupported, say so in the error instead of "corrupt".
+3. Re-record the fixture recipes (they are not in this report): the two `ffmpeg` commands
+   that generated `fixtures/vp9/*.ivf` must be written down next to a real-content
+   fixture, otherwise "byte-exact" keeps meaning "testsrc2-exact".
+
+`scratch_tiledbg.rs` (header/tile-offset dump) is the companion probe.
