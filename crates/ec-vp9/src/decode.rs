@@ -199,8 +199,6 @@ impl Decoder {
         tx_mode: u8,
         tail: &[u8],
     ) -> Result<Picture> {
-        let aw = self.planes.as_ref().expect("frame scratch").aw;
-        let ah = self.planes.as_ref().expect("frame scratch").ah;
         let width = hdr.width as usize;
         let height = hdr.height as usize;
         let mi_cols = hdr.mi_cols() as usize;
