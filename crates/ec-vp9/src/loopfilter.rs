@@ -614,13 +614,13 @@ impl LfGrids {
                                 }
                             }
                         }
-                        // Internal 4x4 UV edge at yy + 4 (skipped on the
-                        // frame's last MI row: `skip_border_4x4_r`).
-                        if int4 & bit != 0
-                            && sbr + row != self.mi_rows - 1
-                            && yy + 8 <= y_h
-                            && xx + 8 <= y_w
-                        {
+                        // Internal 4x4 luma edge at yy + 4. libvpx's luma
+                        // path has NO last-row skip: `vp9_filter_block_plane_
+                        // ss00` passes `lfm->int_4x4_y & 0xff` for every MI row
+                        // (vp9_loopfilter.c:1286-1311). `skip_border_4x4_r`
+                        // exists only in the 4:2:0-chroma path (ss11,
+                        // vp9_loopfilter.c:1382) and in non420 under `ss_y`.
+                        if int4 & bit != 0 && yy + 8 <= y_h && xx + 8 <= y_w {
                             lpf_edge(y, (yy + 4) * stride + xx, stride, 0, 4, bl, li, th, 8);
                             if std::env::var_os("LFTRACE").is_some() {
                                 eprintln!("H4I {} {}", xx, yy + 4);
@@ -852,3 +852,55 @@ impl LfGrids {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::TX_4X4;
+
+    /// One 64x64 frame (8x8 MI) where every cell is a BLOCK_4X4 at `level`.
+    fn grid(level: u8) -> LfGrids {
+        let (mi_cols, mi_rows) = (8usize, 8usize);
+        LfGrids {
+            level8: vec![level; mi_cols * mi_rows],
+            blk: vec![(0u8, 0, 0); mi_cols * mi_rows], // 0 == BLOCK_4X4
+            otx: vec![TX_4X4 as u8; mi_cols * mi_rows],
+            mi_cols,
+            mi_rows,
+        }
+    }
+
+    fn run(g: &LfGrids, y: &mut [u8]) {
+        let mut u = vec![128u8; 32 * 32];
+        let mut v = vec![128u8; 32 * 32];
+        g.filter_frame(y, 64, &mut u, &mut v, 32, 64, 64, 32, 32, 0);
+    }
+
+    /// The luma internal-4x4 horizontal edge fires on the frame's LAST MI row.
+    ///
+    /// `vp9_filter_block_plane_ss00` passes `lfm->int_4x4_y & 0xff` for every
+    /// MI row (vp9_loopfilter.c:1286-1311) - there is no last-row skip in the
+    /// luma path. `skip_border_4x4_r` exists only for 4:2:0 chroma in
+    /// `vp9_filter_block_plane_ss11` (:1382) and in non420 under `ss_y`.
+    ///
+    /// Last MI row here is 56, so the internal edge sits at row 60 with taps
+    /// p1,p0 = rows 58,59 (100) and q0,q1 = rows 60,61 (150): q0 moves.
+    #[test]
+    fn luma_int4_h_edge_is_filtered_on_the_last_mi_row() {
+        let g = grid(8);
+        let stride = 64;
+        // A gentle step (4) between rows 59 and 60: sharp steps fail the
+        // filter_mask gradient test, and a flat pattern cannot move.
+        let mut y = vec![100u8; 64 * 64];
+        for row in 60..64 {
+            y[row * stride..row * stride + 64].fill(104);
+        }
+        let before = y.clone();
+        run(&g, &mut y);
+        assert!(
+            (60..62).any(|r| (0..64).any(|c| y[r * stride + c] != before[r * stride + c])),
+            "the internal 4x4 H edge on the last MI row (row 60) was not filtered"
+        );
+    }
+}
+

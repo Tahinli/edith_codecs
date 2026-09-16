@@ -510,3 +510,29 @@ is wrong for >1 tile; "corrupt" is the wrong claim until that is known.
    fixture, otherwise "byte-exact" keeps meaning "testsrc2-exact".
 
 `scratch_tiledbg.rs` (header/tile-offset dump) is the companion probe.
+
+## REVIEWER FINDING CLOSED (2026-09-16) — luma last-row 4x4-int edge
+
+An independent reviewer (panel seat, diff `29f35b77..f86ef080`) returned PASS on all five
+claims (iadst16 vs `inv_txfm.c:520-554` incl. the WRAPLOW casts; all eight mask tables
+value-for-value vs `vp9_loopfilter.c:39-205`; the `vp9_setup_mask` walk case-for-case; the
+V-before-H pass order; the tile-bounds test) and found ONE real port error:
+
+**The luma internal-4x4 horizontal edge was skipped on the frame's last MI row.** The port
+gated it on `sbr + row != self.mi_rows - 1` (and mislabelled it "UV edge"), but
+`skip_border_4x4_r` exists only in the 4:2:0-chroma path (`vp9_filter_block_plane_ss11`,
+vp9_loopfilter.c:1382) and in non420 under `ss_y`; `vp9_filter_block_plane_ss00` passes
+`lfm->int_4x4_y & 0xff` for every MI row (:1286-1311), and `vp9_adjust_mask`'s rows mask
+deliberately keeps the last row's bits (:798-805). So real content loses one filtered edge
+in the bottom 8 rows whenever the bottom MI row holds a 4x4-tx cell - which neither
+fixture has (LFTRACE: the fixtures' last int4 anchors are y=200/y=204; their last MI row is
+232-239), so no existing gate could catch it.
+
+Fixed, with a witness that fails pre-fix:
+`loopfilter::tests::luma_int4_h_edge_is_filtered_on_the_last_mi_row` builds a 64x64 grid of
+BLOCK_4X4 cells at level 8, steps the plane by 4 at row 60 (a sharper step fails the
+filter_mask gradient test and moves nothing), and asserts rows 60-61 changed. With the old
+guard restored the test fails ("...was not filtered"); without it, it passes. lib tests
+9/9; keyframe_exact still 4/4; the real-content sweep numbers are unchanged (that content
+does not reach the shape).
+
