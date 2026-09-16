@@ -205,11 +205,40 @@ impl BitBuf {
     }
 
     /// Appends the low `n` bits of `value` (`n <= 64`), most significant first.
+    ///
+    /// The run is placed after the bits already buffered; when it would spill
+    /// past the accumulator's 64 bits the leading bits complete the buffered
+    /// bytes, those bytes are emitted, and the remainder starts a fresh word.
+    /// Since `used < 8`, the free space is always at least 57 bits, so the
+    /// remainder is under eight bits and the trailing drain below is the same
+    /// one the un-split path runs. A zero-length run is a no-op: the
+    /// scalefactor coder emits one for every band whose `slen` is zero.
     pub(crate) fn push_bits(&mut self, value: u64, n: u32) {
         debug_assert!(n <= 64, "push_bits: n = {n} > 64");
+        if n == 0 {
+            return;
+        }
         let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
-        self.acc |= (value & mask) << (64 - self.used - n);
-        self.used += n;
+        let value = value & mask;
+        let free = 64 - self.used;
+        if n <= free {
+            self.acc |= value << (free - n);
+            self.used += n;
+        } else {
+            // Spill: the run's top `free` bits fill the accumulator exactly,
+            // flush it, then the low `n - free` bits sit at the top of an
+            // empty word.
+            self.acc |= value >> (n - free);
+            self.used = 64;
+            while self.used >= 8 {
+                self.bytes.push((self.acc >> 56) as u8);
+                self.acc <<= 8;
+                self.used -= 8;
+            }
+            let tail = n - free;
+            self.acc |= (value & ((1u64 << tail) - 1)) << (64 - tail);
+            self.used = tail;
+        }
         while self.used >= 8 {
             self.bytes.push((self.acc >> 56) as u8);
             self.acc <<= 8;
@@ -376,6 +405,50 @@ mod tests {
                 assert_eq!(got, want, "table {select}");
             }
         }
+    }
+
+    /// `push_bits` appends any run up to 64 bits, even one that straddles the
+    /// accumulator's own width, and a zero-length run is a no-op. Byte-for-byte
+    /// against a plain MSB-first reference. The cases that bite: a zero-length
+    /// run at `used == 0` (which the scalefactor path hits whenever `slen` is
+    /// zero) shifted by the full 64, and a run whose leading bits complete the
+    /// buffered bytes plus a remainder.
+    #[test]
+    fn bits_survive_the_accumulator_boundary() {
+        let mut writer = BitBuf::new();
+        let mut bits: Vec<bool> = Vec::new();
+        let push = |writer: &mut BitBuf, bits: &mut Vec<bool>, value: u64, n: u32| {
+            for i in (0..n).rev() {
+                bits.push((value >> i) & 1 == 1);
+            }
+            writer.push_bits(value, n);
+        };
+        for &(value, n) in &[
+            (0u64, 0u32),                        // zero-length run, empty buffer
+            (0b101, 3),                          // part-fill
+            (0xABCD_EF01_2345_6789, 64),         // a full word, straddling
+            (0b1_0110, 5),
+            (0x00FF_00FF_00FF_00FF, 60),         // 5 + 60 > 64: a spill
+            (0, 0),                              // zero-length mid-stream
+            (0xDEAD_BEEF, 32),
+            (0b111, 3),
+            (0x5555_5555_5555_5555, 57),         // another spill
+        ] {
+            push(&mut writer, &mut bits, value, n);
+        }
+        let mut want = Vec::new();
+        let mut byte = 0u8;
+        for (i, bit) in bits.iter().enumerate() {
+            byte = (byte << 1) | u8::from(*bit);
+            if i % 8 == 7 {
+                want.push(byte);
+                byte = 0;
+            }
+        }
+        if bits.len() % 8 != 0 {
+            want.push(byte << (8 - bits.len() % 8));
+        }
+        assert_eq!(writer.into_bytes(), want);
     }
 
     #[test]
