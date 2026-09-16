@@ -9,15 +9,15 @@
 //! returns the buffered reference picture instead of pretending to
 //! decode.
 
-use crate::header::{read_compressed_header, FrameContext};
+use crate::header::{FrameContext, read_compressed_header};
 use crate::intra::build_intra_predictors;
 use crate::loopfilter::LfGrids;
-use crate::modes::{read_intra_frame_mode_info, MiInfo, MiState};
+use crate::modes::{MiInfo, MiState, read_intra_frame_mode_info};
 use crate::tables::*;
-use crate::tokens::{decode_coefs, scan_for, PlaneContexts};
+use crate::tokens::{PlaneContexts, decode_coefs, scan_for};
 use crate::transform::inverse_transform_add;
 use crate::{Error, Result};
-use ec_vp9_syntax::{superframe, FrameHeader, FrameType, Vp9Parser};
+use ec_vp9_syntax::{FrameHeader, FrameType, Vp9Parser, superframe};
 
 const SB_MI: usize = 8; // a 64x64 superblock in mi (8x8) units
 
@@ -34,9 +34,9 @@ pub struct Picture {
     pub width: u16,
     /// Frame height in pixels.
     pub height: u16,
-    /// Luma row pitch of the returned planes.
+    /// Luma row pitch of the returned planes (== `width`; the crop packs rows).
     pub stride: usize,
-    /// Chroma row pitch of the returned planes.
+    /// Chroma row pitch of the returned planes (== `width / 2`).
     pub uv_stride: usize,
 }
 
@@ -164,8 +164,14 @@ impl Decoder {
     fn decode_keyframe(&mut self, hdr: &FrameHeader, frame: &[u8], tx_mode: u8) -> Result<Picture> {
         let width = hdr.width as usize;
         let height = hdr.height as usize;
-        let aw = width.div_ceil(8) * 8;
-        let ah = height.div_ceil(8) * 8;
+        // The decode buffer is padded to whole superblocks: libvpx decodes a
+        // block at the frame edge at its FULL size (decodeframe.c:1216,
+        // `PARTITION_NONE` needs only `mi_row < mi_rows`) and writes the
+        // overhang into the frame buffer's border. Clipping to 8 pixels
+        // instead panicked on real 1080p content (a 32x32 block starting at
+        // mi_row 132 writes 8 rows past a 1080-row buffer).
+        let aw = width.div_ceil(64) * 64;
+        let ah = height.div_ceil(64) * 64;
         self.planes = Some(Planes {
             y: vec![128u8; aw * ah],
             u: vec![128u8; aw / 2 * ah / 2],
@@ -290,18 +296,21 @@ impl Decoder {
         }
 
         // Loop filter post-pass (level 0 disables it for the frame).
+        // The extents are the MI-aligned VISIBLE plane (libvpx's masks clear
+        // everything past `mi_cols`/`mi_rows`), not the padded buffer size.
         if hdr.loop_filter.level > 0 && std::env::var_os("EC_VP9_SKIP_LF").is_none() {
             let p = self.planes.as_mut().expect("frame scratch");
+            let (vw, vh) = (mi_cols * 8, mi_rows * 8);
             grids.filter_frame(
                 &mut p.y,
                 p.ys,
                 &mut p.u,
                 &mut p.v,
                 p.uvs,
-                aw,
-                ah,
-                aw / 2,
-                ah / 2,
+                vw,
+                vh,
+                vw / 2,
+                vh / 2,
                 hdr.loop_filter.sharpness,
             );
         }
@@ -320,8 +329,10 @@ impl Decoder {
             v: crop(&planes.v, planes.uvs, width / 2, height / 2),
             width: width as u16,
             height: height as u16,
-            stride: aw,
-            uv_stride: aw / 2,
+            // The crop above packs rows: `stride` describes the RETURNED
+            // buffers, not the aligned decode buffer (`aw`).
+            stride: width,
+            uv_stride: width / 2,
         })
     }
 
@@ -360,17 +371,9 @@ impl Decoder {
             if has_rows && has_cols {
                 r.read_tree(&PARTITION_TREE, probs)
             } else if !has_rows && has_cols {
-                if r.read_bool(probs[1]) {
-                    3
-                } else {
-                    1
-                }
+                if r.read_bool(probs[1]) { 3 } else { 1 }
             } else if has_rows && !has_cols {
-                if r.read_bool(probs[2]) {
-                    3
-                } else {
-                    2
-                }
+                if r.read_bool(probs[2]) { 3 } else { 2 }
             } else {
                 3
             }
