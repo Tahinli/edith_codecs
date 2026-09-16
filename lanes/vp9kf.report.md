@@ -492,19 +492,39 @@ Two defects were fixed on the way (both real, both verified against the fixture 
    fields reported the aligned `aw`; a consumer reading with `stride` would misread any
    frame whose width is not 64-aligned. Now `width` / `width / 2`.
 
-Third finding, not fixed: **multi-tile frames fail with a wrong message**. Default
-ffmpeg tiles at 1080p (`cols_log2 == 2`), and the decoder reports
-`Corrupt: truncated tile data` — the tile-size prefix it reads at
-`uhs + header_size_in_bytes` is implausible. Either the tile walk or the tile-data offset
-is wrong for >1 tile; "corrupt" is the wrong claim until that is known.
+Third finding, **CLOSED (2026-09-16, commit `4b6a68b9`) — multi-tile frames were a
+byte-order bug, not a broken walk.** The tile-size prefixes are **BIG-endian**: libvpx
+`get_tile_buffer` reads them with `mem_get_be32` (`vp9_decodeframe.c:1674`, calls at
+:1688/:1690; `vpx_ports/mem_ops.h:88`), while the port used `u32::from_le_bytes`. At 1080p
+the tail starts `00 00 0D DC`, so LE yields `3691839488` against a 71110-byte tail and the
+walk starves with `Corrupt: truncated tile data`; BE yields `3548`, and
+`3548 + 67562 (last tile) == 71110` exactly. One-line fix in `decode.rs`
+(`from_le_bytes` -> `from_be_bytes`); the offset (`uhs + header_size_in_bytes`, the former
+being the bit reader's `(bit_offset + 7) >> 3`) and the tile geometry
+(`get_tile_offset`, `vp9_tile_common.c:18-22`) were already correct.
+
+Evidence that the walk is now right:
+- 8-tile 2560x1440 real-content frame: `prefixes consume 120646 ok=true, last tile 11383`
+  (sum == tail) on both frames; `scratch_tiledbg.rs` prints BE/LE and this accounting.
+- 4-tile stream off non-flat content whose edge crosses a tile boundary: **2/2 frames
+  byte-exact** (its single-tile control also 2/2), so the multi-tile path is proven, not
+  merely unrefused.
+- The single-tile path cannot change (`cols_log2 == 0` reads no prefix) and
+  `keyframe_exact` stays 4/4; `cargo check -p ec-vp9` warning count unchanged at 5.
+- **The remaining real-content divergence is tile-independent**: the same source encoded
+  `-tile-columns 0 -tile-rows 0` produces the identical `tile bool decoder desync` (as do
+  single-tile 1080p `testsrc2` and a single-tile 960x540 gradient). The desync item below
+  stays open and is a sibling lane's to diagnose.
 
 ### Next lane charter seed (in priority order)
 
 1. Localize the real-content desync with the existing oracle (`/tmp/vp9loss/drv` +
    `scratch_lfdump`-style dumps): first differing block, then mode/tx/coef trace. Start
    with the 320x240 real frame — SB row 2, mi_row 16.
-2. Multi-tile: decide whether the offset or the walk is wrong; if multi-tile is genuinely
-   unsupported, say so in the error instead of "corrupt".
+2. ~~Multi-tile: decide whether the offset or the walk is wrong~~ **DONE (2026-09-16,
+   `4b6a68b9`)**: the walk and offset were right; the tile-size *prefix byte order* was
+   wrong (BE, `mem_get_be32`). Multi-tile is supported and proven byte-exact on a 4-tile
+   non-flat stream; the residual `tile bool decoder desync` is the tile-independent item 1.
 3. Re-record the fixture recipes (they are not in this report): the two `ffmpeg` commands
    that generated `fixtures/vp9/*.ivf` must be written down next to a real-content
    fixture, otherwise "byte-exact" keeps meaning "testsrc2-exact".
